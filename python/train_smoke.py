@@ -71,8 +71,9 @@ def parse_args():
                    help="allowed cut directions 0..7 (default: 6 = down)")
     p.add_argument("--chart-len", type=float, default=20.0)
     p.add_argument("--min-hand-gap", type=float, default=0.5)
-    p.add_argument("--shaping-coef", type=float, default=0.2,
-                   help="potential-based shaping strength; 0 disables")
+    p.add_argument("--shaping-coef", type=float, default=0.0,
+                   help="potential-based shaping strength; 0 (default) = pure "
+                        "sim rewards; nonzero only for ablation studies")
     p.add_argument("--ent-coef", type=float, default=0.01,
                    help="entropy bonus coefficient")
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3],

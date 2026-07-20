@@ -39,8 +39,11 @@ class ChartConfig:
     rows: tuple = (0, 1, 2)       # allowed rows
     note_speed: float = 4.0       # m/s toward the plane; z(t) = (hit_time - t) * speed
     # sim-level knob (this dataclass doubles as the env config): coefficient
-    # of the potential-based shaping reward, 0 disables (SPEC.md §Sim rules)
-    shaping_coef: float = 0.2
+    # of the potential-based shaping reward, 0 disables (SPEC.md §Sim rules).
+    # DEFAULT 0 since 2026-07-20 (user direction): rewards come purely from
+    # the sim's scoring, like real Beat Saber; the mechanism remains for
+    # ablation studies only.
+    shaping_coef: float = 0.0
 
     def __post_init__(self):
         assert self.colors in ("right", "both"), self.colors

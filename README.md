@@ -66,5 +66,9 @@ scripted bot ≈ +18.7 (97% good cuts).
   Three skills stacked at once (hand assignment, direction-conditional
   swings, two-hand traffic) broke the shaping staircase. Curriculum
   warm-start from the easy checkpoint is the proposed next step.
-- Next: curriculum to two-hand/8-dir charts, difficulty curriculum,
+- Pure-reward era (2026-07-20, by design): shaping default is OFF —
+  rewards come only from sim scoring (V_MIN 1 m/s). First pure run on the
+  hard config (tf, 600k): 2.2% good cuts vs random 1.2%, shaped-run 5%,
+  scripted 97% — slow upward crawl, no takeoff yet.
+- Next: env-side curriculum (easy→hard charts), longer pure runs,
   real BeatSaver `.dat` parsing (v3).
