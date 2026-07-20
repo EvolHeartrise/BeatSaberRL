@@ -26,7 +26,11 @@ BLOCK = 0.4           # block edge length (m) — drawn by the viewer
 ACCEL = 30.0          # m/s^2
 DRAG = 0.02           # per-tick multiplicative velocity decay (dimensionless)
 V_MAX = 6.0           # m/s
-V_MIN_CUT = 3.0       # min saber speed for a good cut (m/s)
+# Real Beat Saber scores cuts at quite low saber speeds — you don't need a
+# hard swing to get points (user-specified 2026-07-20; was 3.0 = the pure
+# 0.5x unit-scale of the original 6). NOTE: results recorded before this
+# change (easy 93%/91%, hard 3%) used the 3.0 threshold — not comparable.
+V_MIN_CUT = 1.0       # min saber speed for a good cut (m/s)
 CUT_RADIUS = 0.28     # ~= circumscribed circle of the 0.4 m block face
 COS_TOL = 0.5         # cos(60 deg): max angle between swing and required dir
 Z_WINDOW = 0.6        # cuttable slab half-depth (m)

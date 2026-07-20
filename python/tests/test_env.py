@@ -80,8 +80,15 @@ def test_good_cut():
 
 def test_slow_cut_is_bad():
     sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -1.5))
+    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -0.5))
     assert ev == [{"cut": {"note": 0, "good": False, "reason": "slow"}}]
+
+
+def test_gentle_cut_is_good():
+    """V_MIN_CUT is 1 m/s (real BS scores gentle swings): 1.5 m/s passes."""
+    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -1.5))
+    assert ev == [{"cut": {"note": 0, "good": True, "reason": "ok"}}]
 
 
 def test_wrong_angle_is_bad():
