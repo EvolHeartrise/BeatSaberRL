@@ -38,7 +38,7 @@
 <div id="hud">no replay loaded</div>
 <div id="help">space = play/pause · ←/→ = step one tick · +/− = speed · r = restart ·
   40 cm blocks fly in from the tunnel and are cuttable inside the highlighted slab at the plane ·
-  ring around a saber = fast enough to cut (≥ 3 m/s)</div>
+  ring around a saber = fast enough to cut (≥ 1 m/s)</div>
 
 <script>
 "use strict";
@@ -47,7 +47,7 @@
 // 0.4 m cubes approaching from +z at config.note_speed; cuttable |z| <= 0.6.
 const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
 const GX = 1.0, GY = 0.75, Z_WINDOW = 0.6, Z_FAR = 12.0;
-const V_MIN = 3, DT = 1 / 30;
+const V_MIN = 1, DT = 1 / 30;
 const SABER_COLORS = ["#e06c75", "#61afef"];   // left/red, right/blue
 const SABER_DARK = ["#7c3b41", "#33586f"];
 const DIRV = d => [Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)];

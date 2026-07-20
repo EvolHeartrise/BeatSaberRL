@@ -69,7 +69,9 @@ paths contain a space — quote everything.
 - **Cut evaluation**, each tick, for each active uncut note: a saber
   *crosses* the note if its displacement segment `p_prev → p` comes within
   `R` of the note center. Matching-color saber is evaluated first.
-  - Matching saber crosses with `|v| ≥ V_MIN = 3` m/s and
+  - Matching saber crosses with `|v| ≥ V_MIN = 1` m/s (real Beat Saber
+    scores gentle swings — changed from 3.0 on 2026-07-20; results
+    recorded before then used 3.0 and are not comparable) and
     `cos∠(v, dir_vec) ≥ 0.5` (within 60°) → **good cut**.
   - Matching saber crosses but too slow / wrong angle → **bad cut**
     (reason `slow` / `angle`). Wrong-color saber crosses (only checked if
@@ -166,7 +168,7 @@ in at `note_speed` with required-direction arrows on the front face
 (white outline while inside the cuttable slab, which is drawn faintly),
 the 4×3 plane grid with correct occlusion (notes past the plane draw in
 front), saber discs with trails + velocity vectors and a white ring when
-cut-capable (≥ 3 m/s), good cuts as split halves drifting apart,
+cut-capable (≥ 1 m/s), good cuts as split halves drifting apart,
 bad cuts/misses labeled with reason, HUD counters. Controls: space
 play/pause, ←/→ tick-step, +/− speed, r restart, scrub bar. Note
 positions and outcomes are DERIVED from the chart + event stream (single

@@ -5,7 +5,7 @@ See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
 Two sabers (left/red, right/blue) on a hit plane at z=0; 40 cm note
 cubes (real Beat Saber size, 0.5 m lanes, world in meters) fly in at
-4 m/s and must be swung through fast enough (≥3 m/s), in the right
+4 m/s and must be swung through fast enough (≥1 m/s), in the right
 direction, with the matching hand, while inside the ±0.6 m slab at the
 plane. Per-tick discrete acceleration control (9 actions per hand), 30 Hz.
 
@@ -34,7 +34,7 @@ $VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dir
 then open `viz/replay.html` (3D, perspective view) in a browser and drop a
 `python/replays/*.jsonl` file in. Space = play/pause, ←/→ = tick-step,
 +/− = speed, drag the scrub bar. White ring around a saber = fast enough
-to cut (≥3 m/s); arrows on note cubes = required swing direction; white
+to cut (≥1 m/s); arrows on note cubes = required swing direction; white
 outline = inside the cuttable slab; green split = good cut; orange/red
 flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
 are rejected — re-record from a current checkpoint.
