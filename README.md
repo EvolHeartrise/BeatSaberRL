@@ -60,5 +60,11 @@ scripted bot ≈ +18.7 (97% good cuts).
   world-v2 **pool 93% / 17.6** (reparametrization-neutral, as predicted),
   **transformer 91% / 16.9** (big single-seed jump — unexplained,
   needs paired seeds before believing it). Scripted ceiling 97% / 18.7.
-- Next: v1 two-hand/direction-variety charts, difficulty curriculum,
+- Hard config (both hands + 8 dirs, rate 1.0): scripted 96%, but the
+  transformer trained from scratch PLATEAUS at 3% good cuts (600k steps,
+  seed 0) — 70% misses, and half of all touches use the wrong hand.
+  Three skills stacked at once (hand assignment, direction-conditional
+  swings, two-hand traffic) broke the shaping staircase. Curriculum
+  warm-start from the easy checkpoint is the proposed next step.
+- Next: curriculum to two-hand/8-dir charts, difficulty curriculum,
   real BeatSaver `.dat` parsing (v3).
