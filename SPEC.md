@@ -35,36 +35,49 @@ Uses kiting-arena's venv: `../kiting-arena/python/.venv` (torch-cpu,
 gymnasium, pufferlib 3.0, pytest). No new dependencies in v0. No GPU;
 paths contain a space — quote everything.
 
-## Sim rules (`beat_arena_env/sim.py`)
+## Sim rules (`beat_arena_env/sim.py`) — world v2: metric, 3D notes
 
 - Fixed tick `DT = 1/30` s. One policy action per tick.
-- **Cut plane**: 4 columns × 3 rows grid; continuous coords `x ∈ [0,4]`,
-  `y ∈ [0,3]` (y up). Note cell `(col,row)` has center `(col+.5, row+.5)`,
-  cut radius `R = 0.55`.
-- **Sabers**: 2 (index 0 = left/red, 1 = right/blue). Point mass:
-  position `p` clamped to `[-1,5] × [-1,4]` (1 unit of wind-up room beyond
-  the grid; clamping zeroes the clamped velocity component), velocity `v`,
-  speed cap `V_MAX = 12` u/s.
+- **World in METERS**, matching real Beat Saber block dimensions. The hit
+  plane is `z = 0`, centered on the origin. 4 columns × 3 rows grid on a
+  `CELL = 0.5` m lane pitch: cell `(col,row)` center =
+  `((col−1.5)·0.5, (row−1.0)·0.5)`, grid spans `[-1,1] × [-0.75,0.75]`
+  (y up). Notes are `BLOCK = 0.4` m cubes; cut radius `R = 0.28` m
+  (≈ circumscribed circle of the 0.4 m face). All lengths/speeds/accels
+  are the former unit system scaled by 0.5 — a pure unit change,
+  dynamics identical (verified: scripted bot 97/88/66% across
+  difficulties, matching pre-metric 96/88/65%).
+- **Sabers**: 2 (index 0 = left/red, 1 = right/blue). Point mass on the
+  hit plane: position clamped to `[-1.5,1.5] × [-1.25,1.25]` (0.5 m
+  wind-up margin; clamping zeroes the clamped velocity component),
+  velocity `v`, speed cap `V_MAX = 6` m/s. Start at rest at `(∓0.5, 0)`.
 - **Action** per tick, per saber: one of 9 — `0` = coast,
-  `k ∈ 1..8` = accelerate at `A = 60` u/s² in direction `(k−1)·45°`
+  `k ∈ 1..8` = accelerate at `A = 30` m/s² in direction `(k−1)·45°`
   (0° = +x, counter-clockwise). Integration order per tick:
   `v += a·DT`; `v *= (1 − DRAG)` with `DRAG = 0.02`; clamp `|v| ≤ V_MAX`;
   `p += v·DT`; clamp `p`. No action masks — every action is always legal.
 - **Notes**: chart = list of `(hit_time, col, row, color, dir)` sorted by
   `hit_time`; `color ∈ {0 left/red, 1 right/blue}`, `dir ∈ 0..7` = required
   swing direction `(dir)·45°` (so `2` = upward swing, `6` = downward).
-- **Cut window**: a note is *active* while `|t − hit_time| ≤ W`, `W = 0.15` s.
+  A note's 3D position is `(cell center, z)` with
+  **`z(t) = (hit_time − t) · note_speed`** — z is derived from the
+  schedule, so time and space can never disagree. `note_speed` default
+  `4` m/s (config).
+- **Cut window is SPATIAL**: a note is *active* while inside the slab
+  `|z| ≤ Z_WINDOW = 0.6` m (at 4 m/s that is ±0.15 s of travel; faster
+  notes get proportionally less time — tested).
 - **Cut evaluation**, each tick, for each active uncut note: a saber
   *crosses* the note if its displacement segment `p_prev → p` comes within
   `R` of the note center. Matching-color saber is evaluated first.
-  - Matching saber crosses with `|v| ≥ V_MIN = 6` u/s and
+  - Matching saber crosses with `|v| ≥ V_MIN = 3` m/s and
     `cos∠(v, dir_vec) ≥ 0.5` (within 60°) → **good cut**.
   - Matching saber crosses but too slow / wrong angle → **bad cut**
     (reason `slow` / `angle`). Wrong-color saber crosses (only checked if
     the matching one didn't) → **bad cut** (reason `wrong_hand`).
   - Any cut (good or bad) consumes the note. Crossing outside the window
     does nothing (the block "isn't there yet").
-- **Miss**: window expires with the note uncut → note consumed as missed.
+- **Miss**: the note exits the slab past the plane (`z < −Z_WINDOW`)
+  uncut → consumed as missed.
 - **Reward per tick**: `+1.0` per good cut, `−0.25` per bad cut, `−0.5`
   per miss. (Bad cut > miss: engaging wrongly beats not engaging — a
   deliberate shaping gradient. Graded swing quality is v4.)
@@ -73,7 +86,8 @@ paths contain a space — quote everything.
   place×speed×direction×window conjunction, entropy never leaves uniform):
   `reward += 0.99·Φ(s′) − Φ(s)` with
   `Φ = −shaping_coef · Σ_hands min(dist(saber, its earliest pending
-  matching note center), 4)/4`, `Φ(terminal) = 0`. `shaping_coef` default
+  matching note center), 2)/2` (in-plane distance, meters),
+  `Φ(terminal) = 0`. `shaping_coef` default
   `0.2`, `0` disables. Potential-based form per Ng et al. 1999 — provably
   cannot change the optimal policy; it only densifies the gradient.
   Shaping must never change the event stream (tested).
@@ -90,8 +104,8 @@ paths contain a space — quote everything.
 20.0), `colors` (`"right"` = all blue, `"both"`, default `"right"`),
 `dirs` (allowed subset of 0..7, default `[6]` = down-swings),
 `min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
-restricting them is a spatial curriculum dial), `shaping_coef` (see §Sim
-rules).
+restricting them is a spatial curriculum dial), `note_speed` (m/s toward
+the plane, default 4.0), `shaping_coef` (see §Sim rules).
 
 Generation: first note at `t = 1.0`; successive intervals
 `(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
@@ -101,51 +115,65 @@ places at once faster than it can travel). Col/row uniform over the grid.
 
 ## Observation layout (exact, all f32) — order is a contract
 
-- `sabers: [f32; 8]` = per saber `[x/4, y/3, vx/12, vy/12]`, left then right.
-- `notes: [[f32; 14]; 12]` — the next 12 *pending* (uncut, unmissed) notes
-  in hit-time order, slot 0 = soonest. Per note:
-  `[t_until/2 (t_until clipped to [−0.2, 3.0] s — the negative tail keeps
-  "already past hit-time but still in window" visible), cx/4, cy/3, is_left, is_right,
-  dir one-hot (8), valid=1]`. Empty slots all-zero. Slots SHIFT as notes
-  are consumed (no stable identity — nothing targets a slot by index, so
-  stability is not needed; contrast kiting-arena's frozen slots).
+Obs v2 (spatial notes — no explicit time feature):
+
+- `sabers: [f32; 8]` = per saber `[x/1, y/0.75, vx/6, vy/6]`, left then
+  right (normalizers = grid half-extents and `V_MAX`; signed, symmetric).
+- `notes: [[f32; 15]; 12]` — the next 12 *pending* (uncut, unmissed) notes
+  in arrival order, slot 0 = soonest. Per note:
+  `[cx/1, cy/0.75, z/8 (z clipped to [−1, 12] m — the negative tail keeps
+  "past the plane but still in the slab" visible), vz/8 (= −note_speed/8),
+  is_left, is_right, dir one-hot (8), valid=1]`. Empty slots all-zero.
+  Slots SHIFT as notes are consumed (no stable identity — nothing targets
+  a slot by index; contrast kiting-arena's frozen slots).
 - `note_mask: [f32; 12]` — 1.0 = slot holds a pending note.
 
-**Flat vector:** `sabers(8) ++ notes row-major(168) ++ note_mask(12)` →
-**length 188**. Offsets: notes at 8, mask at 176.
+**Flat vector:** `sabers(8) ++ notes row-major(180) ++ note_mask(12)` →
+**length 200**. Offsets: notes at 8, mask at 188. Pre-v2 (188-dim)
+checkpoints are incompatible.
 
-`t_until` is the *temporal position* of the note — the transformer gets
-time as an explicit input feature rather than a sinusoidal positional
-encoding added to embeddings (same job, simpler and exact for this env).
+There is deliberately NO time feature: with constant speed,
+`time_until = z/|vz|` — the approach axis carries the temporal ordering
+spatially, as a player perceives it. `vz` is included so timing stays
+recoverable if per-note speeds ever vary (then z alone is an insufficient
+statistic for arrival). Both properties are pinned by tests.
 
 ## Gymnasium env (`beat_arena_env/env.py`)
 
 `BeatEnv(note_rate, colors, dirs, chart_len_s, min_hand_gap_s, seed)`:
-`observation_space = Box(-2, 2, (188,))` (bounds loose),
+`observation_space = Box(-2, 2, (200,))` (bounds loose),
 `action_space = MultiDiscrete([9, 9])`. New chart every `reset(seed)`.
 `set_record(path)` dumps replay JSONL. `info` on final step carries
 `good_cuts, bad_cuts, misses, n_notes`.
 
-## Replay log (JSONL, version 1)
+## Replay log (JSONL, version 2)
+
+Version 2 = metric world; `config` carries `note_speed`, and viewers
+derive each note's `z` from the schedule (`z = (t_note − t) · speed`).
+The 3D viewer rejects v1 files (pre-metric coordinates).
 
 ```json
-{"header": {"version": 1, "config": {...}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"dir":6}, ...]}}
+{"header": {"version": 2, "config": {..., "note_speed": 4.0}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"dir":6}, ...]}}
 {"t": 0, "time": 0.0, "sabers": [[x,y,vx,vy],[x,y,vx,vy]], "action": [0,5],
  "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok"}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand"}} | {"miss": {"note": 5}}]}
 ```
 
-**Viewer** (`viz/replay.html`): self-contained HTML/canvas, zero
-dependencies — open in a browser, drop a replay `.jsonl` in. Renders the
-grid, saber trails + velocity vectors, a white ring when a saber is
-cut-capable (≥ 6 u/s), note fly-in over the 2 s before hit-time (white
-outline while the cut window is open), required-direction arrows, good
-cuts as split halves, bad cuts/misses with reason labels, HUD counters.
-Controls: space play/pause, ←/→ tick-step, +/− speed, r restart, scrub
-bar. Note outcomes are DERIVED from the event stream (single source of
-truth), not re-simulated. `python/record_replay.py` records episodes from
-a checkpoint / the scripted bot / random, always with `shaping_coef=0` so
-logged rewards are the raw interpretable ones. Every interesting run
-should be recorded.
+**Viewer** (`viz/replay.html`): self-contained HTML/canvas **3D**
+viewer, zero dependencies — open in a browser, drop a replay `.jsonl`
+in. Hand-rolled perspective projection (camera slightly above/behind the
+plane): tunnel rails + depth rings to `z = 12` m, 40 cm note cubes flying
+in at `note_speed` with required-direction arrows on the front face
+(white outline while inside the cuttable slab, which is drawn faintly),
+the 4×3 plane grid with correct occlusion (notes past the plane draw in
+front), saber discs with trails + velocity vectors and a white ring when
+cut-capable (≥ 3 m/s), good cuts as split halves drifting apart,
+bad cuts/misses labeled with reason, HUD counters. Controls: space
+play/pause, ←/→ tick-step, +/− speed, r restart, scrub bar. Note
+positions and outcomes are DERIVED from the chart + event stream (single
+source of truth), not re-simulated. `python/record_replay.py` records
+episodes from a checkpoint / the scripted bot / random (`--tag` prefixes
+filenames), always with `shaping_coef=0` so logged rewards are the raw
+interpretable ones. Every interesting run should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
 
@@ -161,8 +189,8 @@ cuts on the default easy chart (tested).
 
 `NotePolicy(encoder="pool"|"transformer")`, obs contract offsets mirrored:
 
-- Per-note MLP `14 → 64 → 64` (shared across the 12 slots).
-- Per-saber token MLP `6 → 64 → 64` on `[x/4, y/3, vx/12, vy/12, is_left,
+- Per-note MLP `15 → 64 → 64` (shared across the 12 slots).
+- Per-saber token MLP `6 → 64 → 64` on `[x/1, y/0.75, vx/6, vy/6, is_left,
   is_right]` (hand identity via one-hot, weights shared).
 - `encoder="pool"`: masked max-pool over note embeddings (64) ++ raw saber
   features (8) → trunk. Saber–note interaction happens only in the trunk.
@@ -191,13 +219,15 @@ scripted is the ceiling reference.
 
 ## Tests (`python/tests/`, pytest)
 
-1. Obs layout: length 188, offsets, mask semantics.
+1. Obs layout: length 200, offsets, mask semantics.
 2. Determinism: same seed + scripted bot ⇒ identical rewards and event
    stream across two runs.
 3. Cut detection unit scenarios (crafted saber trajectories): good cut
    registers; too-slow → bad `slow`; wrong angle → bad `angle`; wrong hand
-   → bad `wrong_hand`; untouched → miss exactly when window expires; early
-   crossing (before window) does nothing.
+   → bad `wrong_hand`; untouched → miss exactly when the note exits the
+   slab; early crossing (before the slab) does nothing.
+   Plus obs-v2 pins: `time_until = z/|vz|` holds at every step; faster
+   note_speed shortens the slab's time window.
 4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset.
 5. Policy junk-leak (both encoders): garbage in masked note slots changes
    no logprob/entropy/value (transformer key-masking + pool masking).

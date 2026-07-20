@@ -31,6 +31,8 @@ def parse_args():
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--seed", type=int, default=7000, help="base episode seed")
     p.add_argument("--out-dir", type=str, default="replays")
+    p.add_argument("--tag", type=str, default=None,
+                   help="filename prefix (default: run-dir name / scripted / random)")
     p.add_argument("--note-rate", type=float, default=1.0)
     p.add_argument("--colors", choices=["right", "both"], default="right")
     p.add_argument("--dirs", type=int, nargs="+", default=[6])
@@ -60,6 +62,8 @@ def main():
               f"update {ckpt.get('update', '?')})")
     else:
         tag = "scripted" if args.scripted else "random"
+    if args.tag:
+        tag = args.tag
 
     rng = np.random.default_rng(args.seed)
     for ep in range(args.episodes):

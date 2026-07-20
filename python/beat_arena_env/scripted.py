@@ -12,18 +12,19 @@ import numpy as np
 from .chart import Note
 from .sim import ACCEL, DRAG, DT, BeatSim, _DIRS, dir_vec, note_center
 
-# A cut registers at first contact with the note's RADIUS (0.55), not its
-# center — so the speed check happens after only (WINDUP_DIST - 0.55) units
-# of runway. 1.3 gives ~sqrt(2*60*0.75) ~ 9.5 u/s at contact.
-WINDUP_DIST = 1.3
+# A cut registers at first contact with the note's RADIUS (0.28 m), not its
+# center — so the speed check happens after only (WINDUP_DIST - 0.28) m of
+# runway. 0.65 gives ~sqrt(2*30*0.37) ~ 4.7 m/s at contact (V_MIN_CUT = 3).
+# (All lengths/speeds are the pre-metric values scaled by 0.5 — same dynamics.)
+WINDUP_DIST = 0.65
 SWING_T = 0.21       # seconds before hit_time to start the swing
-SWING_SPEED = 10.0
-CRUISE = 8.0
-K_ARRIVE = 4.0       # arrival gain: desired speed ~ K * distance near goal
+SWING_SPEED = 5.0
+CRUISE = 4.0
+K_ARRIVE = 4.0       # arrival gain (1/s): desired speed ~ K * distance — scale-free
 
 # idle hands park OUTSIDE the grid: a saber resting inside it gets hit by
 # arriving blocks (stationary "crossing" = bad cut, reason wrong_hand)
-PARK = {0: np.array([-0.7, 1.5]), 1: np.array([4.7, 1.5])}
+PARK = {0: np.array([-1.35, 0.0]), 1: np.array([1.35, 0.0])}
 
 # candidate per-tick velocity deltas for each of the 9 actions (0 = coast)
 _ACTION_DV = np.vstack([np.zeros(2), ACCEL * DT * _DIRS])

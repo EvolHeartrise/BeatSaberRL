@@ -37,6 +37,7 @@ class ChartConfig:
     first_note_s: float = 1.0
     cols: tuple = (0, 1, 2, 3)    # allowed columns (curriculum: restrict)
     rows: tuple = (0, 1, 2)       # allowed rows
+    note_speed: float = 4.0       # m/s toward the plane; z(t) = (hit_time - t) * speed
     # sim-level knob (this dataclass doubles as the env config): coefficient
     # of the potential-based shaping reward, 0 disables (SPEC.md §Sim rules)
     shaping_coef: float = 0.2
@@ -46,6 +47,7 @@ class ChartConfig:
         assert len(self.dirs) > 0 and all(0 <= d <= 7 for d in self.dirs)
         assert self.note_rate > 0
         assert self.shaping_coef >= 0
+        assert self.note_speed > 0
 
 
 def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:

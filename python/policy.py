@@ -8,9 +8,10 @@ Two encoder arms over the 12-slot upcoming-note window:
 - ``transformer``: the notes AND two saber tokens form a 14-token
   sequence run through 2 full pre-LN transformer blocks (LayerNorm ->
   single-head self-attention -> residual; LayerNorm -> FFN -> residual).
-  Time-until-hit is an input feature on every note token — it plays the
-  role of a positional encoding (temporal order is data here, not slot
-  index). Readout = the two saber tokens' output embeddings, i.e. each
+  Each note token carries its z position along the approach axis (obs v2)
+  — with constant note speed that IS the temporal ordering, expressed
+  spatially (time_until = z / |vz|), so no separate positional encoding
+  is needed. Readout = the two saber tokens' output embeddings, i.e. each
   hand's token gathers what it needs from the note stream via attention
   (a CLS-token-style readout, one per hand).
 
@@ -29,12 +30,12 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Observation layout (contract; mirrors beat_arena_env/env.py).
+# Observation layout (contract; mirrors beat_arena_env/env.py, obs v2).
 OFF_NOTES = 8
 N_NOTE_SLOTS = 12
-NOTE_FEAT = 14
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 176
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 188
+NOTE_FEAT = 15
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 188
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 200
 N_ACTIONS = 9
 
 NEG_INF = -1e9

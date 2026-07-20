@@ -3,10 +3,11 @@
 Beat Saber-style toy RL environment + transformer policy experiments.
 See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
-Two sabers (left/red, right/blue) on a 4×3 cut plane; notes arrive on a
-schedule and must be swung through fast enough, in the right direction,
-with the matching hand, inside a ±0.15 s window. Per-tick discrete
-acceleration control (9 actions per hand), 30 Hz.
+Two sabers (left/red, right/blue) on a hit plane at z=0; 40 cm note
+cubes (real Beat Saber size, 0.5 m lanes, world in meters) fly in at
+4 m/s and must be swung through fast enough (≥3 m/s), in the right
+direction, with the matching hand, while inside the ±0.6 m slab at the
+plane. Per-tick discrete acceleration control (9 actions per hand), 30 Hz.
 
 ## Quick start
 
@@ -26,19 +27,21 @@ Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0
 ## Watching replays
 
 ```bash
-$VENV/bin/python record_replay.py --ckpt runs/long_pool/final.pt --episodes 3
+$VENV/bin/python record_replay.py --ckpt runs/v2_pool/final.pt --episodes 3
 $VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
 ```
 
-then open `viz/replay.html` in a browser and drop a
+then open `viz/replay.html` (3D, perspective view) in a browser and drop a
 `python/replays/*.jsonl` file in. Space = play/pause, ←/→ = tick-step,
 +/− = speed, drag the scrub bar. White ring around a saber = fast enough
-to cut; arrows on notes = required swing direction; green split = good
-cut; orange/red flash = bad cut / miss, labeled with the reason.
+to cut (≥3 m/s); arrows on note cubes = required swing direction; white
+outline = inside the cuttable slab; green split = good cut; orange/red
+flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
+are rejected — re-record from a current checkpoint.
 
 Reference points on the default easy chart (rate 1.0, right hand only,
 down-swings, 20 s ≈ 19 notes), unshaped returns: random ≈ −8.8,
-scripted bot ≈ +18.5 (96% good cuts).
+scripted bot ≈ +18.7 (97% good cuts).
 
 ## Status
 
@@ -47,8 +50,15 @@ scripted bot ≈ +18.5 (96% good cuts).
 - Raw reward proved too sparse to learn from (flat at random, entropy
   stuck at uniform) → potential-based shaping added (`shaping_coef`,
   see SPEC) and takeoff needs patience: learning starts ~100–150k steps.
+- World v2 (same day): metric units (0.5 m lanes, 40 cm blocks — real
+  Beat Saber size), hit plane at z=0 centered on the origin, notes carry
+  (x, y, z, vz) instead of a time feature (z/|vz| IS time-until), spatial
+  cut slab, 3D perspective viewer. Obs 188→200; pre-v2 checkpoints
+  incompatible.
 - 500k-step results, easy chart, seed 0, unshaped eval over 30 eps:
-  **pool 93% good cuts, return 17.7** (≈ scripted); **transformer 75%,
-  return 12.3** in 2.2× the wall-clock. Single seed — no verdicts.
+  pre-metric **pool 93% good cuts / 17.7, transformer 75% / 12.3**;
+  world-v2 **pool 93% / 17.6** (reparametrization-neutral, as predicted),
+  **transformer 91% / 16.9** (big single-seed jump — unexplained,
+  needs paired seeds before believing it). Scripted ceiling 97% / 18.7.
 - Next: v1 two-hand/direction-variety charts, difficulty curriculum,
-  replay visualizer, real BeatSaver `.dat` parsing (v3).
+  real BeatSaver `.dat` parsing (v3).
