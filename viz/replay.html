@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Beat Arena — replay viewer</title>
+<title>Beat Arena — 3D replay viewer</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; background: #14161c; color: #cfd3dc; font: 14px/1.4 system-ui, sans-serif;
@@ -11,7 +11,7 @@
   #drop { border: 1.5px dashed #4a4f5c; border-radius: 10px; padding: 10px 18px; margin: 6px 0;
           color: #9aa0ae; cursor: pointer; }
   #drop.hover { border-color: #7aa2f7; color: #cfd3dc; }
-  canvas { background: #0d0f13; border-radius: 10px; margin-top: 10px; max-width: 96vw; }
+  canvas { background: #0b0d11; border-radius: 10px; margin-top: 10px; max-width: 96vw; }
   #bar { display: flex; gap: 10px; align-items: center; margin: 10px 0 4px; flex-wrap: wrap;
          justify-content: center; }
   button { background: #232733; color: #cfd3dc; border: 1px solid #3a4050; border-radius: 6px;
@@ -21,11 +21,11 @@
   #hud { font-variant-numeric: tabular-nums; color: #9aa0ae; margin-bottom: 16px; }
   #hud b { color: #e8eaf0; }
   .good { color: #7dd3a0; } .bad { color: #f0a35e; } .miss { color: #e06c75; }
-  #help { font-size: 12px; color: #6b7180; margin-bottom: 14px; }
+  #help { font-size: 12px; color: #6b7180; margin-bottom: 14px; max-width: 900px; text-align: center; }
 </style>
 </head>
 <body>
-<h1>Beat Arena — replay viewer</h1>
+<h1>Beat Arena — 3D replay viewer</h1>
 <div id="drop">drop a replay <code>.jsonl</code> here, or click to choose
   <input id="file" type="file" accept=".jsonl,.json" hidden></div>
 <canvas id="cv" width="960" height="700"></canvas>
@@ -37,45 +37,58 @@
 </div>
 <div id="hud">no replay loaded</div>
 <div id="help">space = play/pause · ←/→ = step one tick · +/− = speed · r = restart ·
-  ring around a saber = fast enough to cut (≥ 6 u/s)</div>
+  40 cm blocks fly in from the tunnel and are cuttable inside the highlighted slab at the plane ·
+  ring around a saber = fast enough to cut (≥ 3 m/s)</div>
 
 <script>
 "use strict";
-// ---- replay format v1 (SPEC.md §Replay log) --------------------------------
-// world: x in [-1, 5], y in [-1, 4]; grid cells [0,4]x[0,3]; y up.
-const W = { x0: -1, x1: 5, y0: -1, y1: 4 };
-const CUT_R = 0.55, V_MIN = 6, DT = 1 / 30, APPROACH_S = 2.0;
+// ---- replay format v2 (SPEC.md §Replay log): metric world ------------------
+// hit plane z = 0; grid spans [-1,1] x [-0.75,0.75] (0.5 m lanes); notes are
+// 0.4 m cubes approaching from +z at config.note_speed; cuttable |z| <= 0.6.
+const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
+const GX = 1.0, GY = 0.75, Z_WINDOW = 0.6, Z_FAR = 12.0;
+const V_MIN = 3, DT = 1 / 30;
 const SABER_COLORS = ["#e06c75", "#61afef"];   // left/red, right/blue
+const SABER_DARK = ["#7c3b41", "#33586f"];
 const DIRV = d => [Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)];
 
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
-let rep = null;          // {config, chart, ticks, outcomes}
-let cur = 0;             // fractional tick position
-let playing = false, speed = 1.0, lastTs = null;
+let rep = null, cur = 0, playing = false, speed = 1.0, lastTs = null;
+
+// ---- perspective projection ------------------------------------------------
+const EYE_Y = 0.35, CAM_D = 2.2, F = 700, CX = 480, CY = 320;
+function proj(x, y, z) {
+  const s = F / (z + CAM_D);
+  return [CX + x * s, CY - (y - EYE_Y) * s, s];
+}
 
 function parseReplay(text) {
   const lines = text.split("\n").filter(l => l.trim());
   const head = JSON.parse(lines[0]);
-  if (!head.header || head.header.version !== 1)
-    throw new Error("not a beat-arena v1 replay");
+  if (!head.header) throw new Error("not a beat-arena replay");
+  if (head.header.version !== 2)
+    throw new Error("replay version " + head.header.version +
+                    " — this viewer needs v2 (metric); re-record with record_replay.py");
   const ticks = lines.slice(1).map(JSON.parse);
   const chart = head.header.chart;
-  // derive each note's outcome from the event stream
-  const outcomes = chart.map(() => null);   // {kind:"good"|"bad"|"miss", reason, tick}
+  const outcomes = chart.map(() => null);
   ticks.forEach(t => t.events.forEach(e => {
     if (e.cut) outcomes[e.cut.note] = { kind: e.cut.good ? "good" : "bad",
                                         reason: e.cut.reason, tick: t.t };
     if (e.miss !== undefined) outcomes[e.miss.note] = { kind: "miss", reason: "miss", tick: t.t };
   }));
-  return { config: head.header.config, chart, ticks, outcomes };
+  return { config: head.header.config, chart, ticks, outcomes,
+           noteSpeed: head.header.config.note_speed };
 }
 
-// ---- world -> canvas -------------------------------------------------------
-function sx(x) { return (x - W.x0) / (W.x1 - W.x0) * cv.width; }
-function sy(y) { return cv.height - (y - W.y0) / (W.y1 - W.y0) * cv.height; }
-const CELL = () => sx(1) - sx(0);
-
+function noteCenter(n) { return [(n.col - 1.5) * CELL, (n.row - 1.0) * CELL]; }
 function lerp(a, b, u) { return a + (b - a) * u; }
+function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+function poly(pts, close) {
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (close) ctx.closePath();
+}
 
 function saberAt(tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
@@ -83,95 +96,132 @@ function saberAt(tickIdx, u, s) {
   return [lerp(a[0], b[0], u), lerp(a[1], b[1], u), b[2], b[3]];
 }
 
-// ---- drawing ---------------------------------------------------------------
-function drawGrid() {
-  ctx.strokeStyle = "#232733"; ctx.lineWidth = 1;
-  ctx.strokeRect(sx(W.x0) + 1, sy(W.y1) + 1, cv.width - 2, cv.height - 2);
-  ctx.strokeStyle = "#2c313f";
-  for (let c = 0; c <= 4; c++) { line(sx(c), sy(0), sx(c), sy(3)); }
-  for (let r = 0; r <= 3; r++) { line(sx(0), sy(r), sx(4), sy(r)); }
-}
-function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
-
-function drawNote(n, i, time) {
-  const out = rep.outcomes[i];
-  const cx = sx(n.col + 0.5), cy = sy(n.row + 0.5);
-  const tUntil = n.t - time;
-  const resolvedAt = out ? (out.tick + 1) * DT : Infinity;
-
-  if (time < resolvedAt) {                       // pending: fly-in
-    if (tUntil > APPROACH_S) return;
-    const u = 1 - Math.max(tUntil, 0) / APPROACH_S;   // 0 far -> 1 at plane
-    const size = CELL() * (0.25 + 0.65 * u);
-    ctx.globalAlpha = 0.25 + 0.75 * u;
-    noteBlock(cx, cy, size, SABER_COLORS[n.color], n.dir, tUntil <= 0.15);
-    ctx.globalAlpha = 1;
-  } else {                                       // resolved: brief aftermath
-    const age = time - resolvedAt;
-    if (age > 0.6) return;
-    ctx.globalAlpha = 1 - age / 0.6;
-    const col = out.kind === "good" ? "#7dd3a0" : out.kind === "bad" ? "#f0a35e" : "#e06c75";
-    if (out.kind === "good") {                   // split halves drifting apart
-      const d = DIRV(n.dir), off = age * 90;
-      const px = -d[1], py = d[0];               // perpendicular
-      halfBlock(cx + px * off, cy - py * off, CELL() * 0.85, col);
-      halfBlock(cx - px * off, cy + py * off, CELL() * 0.85, col);
-    } else {
-      ctx.strokeStyle = col; ctx.lineWidth = 3;
-      ctx.strokeRect(cx - CELL() * 0.42, cy - CELL() * 0.42, CELL() * 0.84, CELL() * 0.84);
-      ctx.fillStyle = col; ctx.font = "bold 15px system-ui"; ctx.textAlign = "center";
-      ctx.fillText(out.reason.replace("_", " "), cx, cy - CELL() * 0.55);
-    }
-    ctx.globalAlpha = 1;
+// ---- scene pieces ----------------------------------------------------------
+function drawTunnel() {
+  // corner rails receding to Z_FAR + depth rings every 2 m
+  ctx.strokeStyle = "#1d212b"; ctx.lineWidth = 1;
+  const corners = [[-GX, -GY], [GX, -GY], [GX, GY], [-GX, GY]];
+  corners.forEach(([x, y]) => {
+    const [x0, y0] = proj(x, y, 0), [x1, y1] = proj(x, y, Z_FAR);
+    line(x0, y0, x1, y1);
+  });
+  for (let z = 2; z <= Z_FAR; z += 2) {
+    poly(corners.map(([x, y]) => proj(x, y, z)), true);
+    ctx.stroke();
+  }
+  // floor lane lines for depth
+  for (let c = 0; c <= 4; c++) {
+    const x = -GX + c * CELL;
+    const [x0, y0] = proj(x, -GY, 0), [x1, y1] = proj(x, -GY, Z_FAR);
+    line(x0, y0, x1, y1);
   }
 }
 
-function noteBlock(cx, cy, size, color, dir, inWindow) {
-  ctx.fillStyle = color;
-  ctx.fillRect(cx - size / 2, cy - size / 2, size, size);
-  if (inWindow) { ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2.5;
-    ctx.strokeRect(cx - size / 2, cy - size / 2, size, size); }
-  const d = DIRV(dir), L = size * 0.32;          // required swing direction arrow
-  ctx.strokeStyle = "#0d0f13"; ctx.lineWidth = Math.max(2, size * 0.09);
+function drawSlab() {
+  // the cuttable slab: faint box from z=-0.6 to z=+0.6 at the plane
+  ctx.strokeStyle = "#2a3040"; ctx.lineWidth = 1;
+  [[Z_WINDOW], [-Z_WINDOW]].forEach(([z]) => {
+    poly([[-GX, -GY], [GX, -GY], [GX, GY], [-GX, GY]].map(([x, y]) => proj(x, y, z)), true);
+    ctx.stroke();
+  });
+}
+
+function drawPlaneGrid() {
+  ctx.strokeStyle = "#39404f"; ctx.lineWidth = 1.5;
+  for (let c = 0; c <= 4; c++) {
+    const x = -GX + c * CELL;
+    const [x0, y0] = proj(x, -GY, 0), [x1, y1] = proj(x, GY, 0);
+    line(x0, y0, x1, y1);
+  }
+  for (let r = 0; r <= 3; r++) {
+    const y = -GY + r * CELL;
+    const [x0, y0] = proj(-GX, y, 0), [x1, y1] = proj(GX, y, 0);
+    line(x0, y0, x1, y1);
+  }
+}
+
+function cubeFaces(cx0, cy0, z) {
+  // front/back squares of the 0.4 m cube (front = closer to camera)
+  const sq = zz => [[cx0 - HALF, cy0 - HALF], [cx0 + HALF, cy0 - HALF],
+                    [cx0 + HALF, cy0 + HALF], [cx0 - HALF, cy0 + HALF]]
+                   .map(([x, y]) => proj(x, y, zz));
+  return { front: sq(z - HALF), back: sq(z + HALF) };
+}
+
+function drawNoteCube(n, z, inSlab) {
+  const [cx0, cy0] = noteCenter(n);
+  const { front, back } = cubeFaces(cx0, cy0, z);
+  ctx.fillStyle = SABER_DARK[n.color];
+  poly(back, true); ctx.fill();
+  ctx.strokeStyle = SABER_DARK[n.color]; ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) line(back[i][0], back[i][1], front[i][0], front[i][1]);
+  ctx.fillStyle = SABER_COLORS[n.color];
+  poly(front, true); ctx.fill();
+  if (inSlab) { ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2.5; poly(front, true); ctx.stroke(); }
+  // required swing direction arrow on the front face
+  const d = DIRV(n.dir);
+  const [ax0, ay0] = proj(cx0 - d[0] * HALF * 0.6, cy0 - d[1] * HALF * 0.6, z - HALF);
+  const [ax1, ay1] = proj(cx0 + d[0] * HALF * 0.6, cy0 + d[1] * HALF * 0.6, z - HALF);
+  ctx.strokeStyle = "#0b0d11"; ctx.lineWidth = Math.max(2, (F / (z + CAM_D)) * 0.035);
+  line(ax0, ay0, ax1, ay1);
+  const ang = Math.atan2(ay1 - ay0, ax1 - ax0), L = Math.hypot(ax1 - ax0, ay1 - ay0) * 0.45;
   ctx.beginPath();
-  ctx.moveTo(cx - d[0] * L, cy + d[1] * L);
-  ctx.lineTo(cx + d[0] * L, cy - d[1] * L);
-  ctx.stroke();
-  const hx = cx + d[0] * L, hy = cy - d[1] * L, a = Math.atan2(-d[1], d[0]);
-  ctx.beginPath();
-  ctx.moveTo(hx, hy);
-  ctx.lineTo(hx - Math.cos(a - 0.5) * L * 0.5, hy - Math.sin(a - 0.5) * L * 0.5);
-  ctx.moveTo(hx, hy);
-  ctx.lineTo(hx - Math.cos(a + 0.5) * L * 0.5, hy - Math.sin(a + 0.5) * L * 0.5);
+  ctx.moveTo(ax1, ay1);
+  ctx.lineTo(ax1 - Math.cos(ang - 0.5) * L, ay1 - Math.sin(ang - 0.5) * L);
+  ctx.moveTo(ax1, ay1);
+  ctx.lineTo(ax1 - Math.cos(ang + 0.5) * L, ay1 - Math.sin(ang + 0.5) * L);
   ctx.stroke();
 }
 
-function halfBlock(cx, cy, size, color) {
-  ctx.fillStyle = color;
-  ctx.fillRect(cx - size / 2, cy - size / 4, size, size / 2);
+function drawAftermath(n, i, time) {
+  const out = rep.outcomes[i];
+  const resolvedAt = (out.tick + 1) * DT;
+  const age = time - resolvedAt;
+  if (age < 0 || age > 0.6) return;
+  const [cx0, cy0] = noteCenter(n);
+  ctx.globalAlpha = 1 - age / 0.6;
+  const col = out.kind === "good" ? "#7dd3a0" : out.kind === "bad" ? "#f0a35e" : "#e06c75";
+  if (out.kind === "good") {
+    const d = DIRV(n.dir), off = age * 1.4;       // halves drift apart (m)
+    const px = -d[1], py = d[0];
+    [[px * off, py * off], [-px * off, -py * off]].forEach(([ox, oy]) => {
+      const sq = [[-HALF, -HALF * 0.5], [HALF, -HALF * 0.5], [HALF, HALF * 0.5], [-HALF, HALF * 0.5]]
+        .map(([x, y]) => proj(cx0 + ox + x, cy0 + oy + y, 0));
+      ctx.fillStyle = col; poly(sq, true); ctx.fill();
+    });
+  } else {
+    const { front } = cubeFaces(cx0, cy0, 0);
+    ctx.strokeStyle = col; ctx.lineWidth = 3;
+    poly(front, true); ctx.stroke();
+    const [tx, ty] = proj(cx0, cy0 + HALF * 1.6, 0);
+    ctx.fillStyle = col; ctx.font = "bold 15px system-ui"; ctx.textAlign = "center";
+    ctx.fillText(out.reason.replace("_", " "), tx, ty);
+  }
+  ctx.globalAlpha = 1;
 }
 
 function drawSaber(tickIdx, u, s) {
-  // trail over the last 10 ticks
   ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2; ctx.globalAlpha = 0.35;
   ctx.beginPath();
   for (let k = Math.max(0, tickIdx - 10); k <= tickIdx; k++) {
     const p = rep.ticks[k].sabers[s];
-    (k === Math.max(0, tickIdx - 10)) ? ctx.moveTo(sx(p[0]), sy(p[1]))
-                                      : ctx.lineTo(sx(p[0]), sy(p[1]));
+    const [px, py] = proj(p[0], p[1], 0);
+    (k === Math.max(0, tickIdx - 10)) ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
   }
   ctx.stroke(); ctx.globalAlpha = 1;
 
   const [x, y, vx, vy] = saberAt(tickIdx, u, s);
   const spd = Math.hypot(vx, vy);
+  const [px, py, sc] = proj(x, y, 0);
   ctx.fillStyle = SABER_COLORS[s];
-  ctx.beginPath(); ctx.arc(sx(x), sy(y), 9, 0, 7); ctx.fill();
-  if (spd >= V_MIN) {                            // cut-capable indicator
+  ctx.beginPath(); ctx.arc(px, py, 0.05 * sc, 0, 7); ctx.fill();
+  if (spd >= V_MIN) {
     ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(sx(x), sy(y), 13, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, 0.075 * sc, 0, 7); ctx.stroke();
   }
-  ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2.5;   // velocity vector
-  line(sx(x), sy(y), sx(x + vx * 0.12), sy(y + vy * 0.12));
+  const [qx, qy] = proj(x + vx * 0.12, y + vy * 0.12, 0);
+  ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2.5;
+  line(px, py, qx, qy);
 }
 
 function counts(uptoTick) {
@@ -188,23 +238,43 @@ function counts(uptoTick) {
 
 function render() {
   ctx.clearRect(0, 0, cv.width, cv.height);
-  if (!rep) { drawGrid(); return; }
+  drawTunnel();
+  if (!rep) { drawSlab(); drawPlaneGrid(); return; }
   const tickIdx = Math.min(Math.floor(cur), rep.ticks.length - 1);
   const u = cur - tickIdx;
   const time = (tickIdx + u) * DT;
 
-  drawGrid();
-  rep.chart.forEach((n, i) => drawNote(n, i, time));
+  drawSlab();
+
+  // pending notes with z(t) = (hit_time - t) * speed; draw far -> near,
+  // plane grid inserted between z>0 and z<=0 for correct occlusion
+  const pend = [];
+  rep.chart.forEach((n, i) => {
+    const out = rep.outcomes[i];
+    if (out && time >= (out.tick + 1) * DT) return;
+    const z = (n.t - time) * rep.noteSpeed;
+    if (z <= Z_FAR) pend.push([z, n]);
+  });
+  pend.sort((a, b) => b[0] - a[0]);
+  pend.filter(([z]) => z > 0).forEach(([z, n]) => {
+    ctx.globalAlpha = Math.min(1, (Z_FAR - z) / 2);
+    drawNoteCube(n, z, Math.abs(z) <= Z_WINDOW);
+    ctx.globalAlpha = 1;
+  });
+  drawPlaneGrid();
+  pend.filter(([z]) => z <= 0).forEach(([z, n]) =>
+    drawNoteCube(n, z, Math.abs(z) <= Z_WINDOW));
+
+  rep.chart.forEach((n, i) => { if (rep.outcomes[i]) drawAftermath(n, i, time); });
   drawSaber(tickIdx, u, 0);
   drawSaber(tickIdx, u, 1);
 
   const c = counts(tickIdx);
-  const nNotes = rep.chart.length;
   document.getElementById("hud").innerHTML =
     `t <b>${time.toFixed(2)}s</b> · tick <b>${tickIdx}</b>/${rep.ticks.length - 1} · ` +
     `return <b>${c.reward.toFixed(2)}</b> · ` +
     `<span class="good">good ${c.good}</span> / <span class="bad">bad ${c.bad}</span> / ` +
-    `<span class="miss">miss ${c.miss}</span> of ${nNotes}` +
+    `<span class="miss">miss ${c.miss}</span> of ${rep.chart.length}` +
     (tickIdx >= rep.ticks.length - 1 ? " · <b>END</b>" : "");
   document.getElementById("scrub").value = tickIdx;
 }
@@ -237,7 +307,8 @@ function load(text, name) {
     document.getElementById("scrub").max = rep.ticks.length - 1;
     document.getElementById("drop").textContent = name +
       ` — ${rep.chart.length} notes, ${rep.ticks.length} ticks` +
-      ` (rate ${rep.config.note_rate}, ${rep.config.colors}, dirs [${rep.config.dirs}])`;
+      ` (rate ${rep.config.note_rate}, ${rep.config.colors}, dirs [${rep.config.dirs}],` +
+      ` ${rep.noteSpeed} m/s)`;
     setPlaying(true);
   } catch (err) { alert("could not load replay: " + err.message); }
 }

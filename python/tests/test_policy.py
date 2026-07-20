@@ -60,4 +60,4 @@ def test_junk_in_masked_slots_cannot_leak(encoder):
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 188
+    assert OBS_DIM == 200

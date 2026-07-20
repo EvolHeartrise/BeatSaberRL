@@ -13,15 +13,25 @@ import numpy as np
 from .chart import ChartConfig, Note, generate_chart
 
 DT = 1.0 / 30.0
-ACCEL = 60.0          # u/s^2
-DRAG = 0.02           # per-tick multiplicative velocity decay
-V_MAX = 12.0
-V_MIN_CUT = 6.0       # min speed for a good cut
-CUT_RADIUS = 0.55
-CUT_WINDOW = 0.15     # seconds either side of hit_time
+
+# World in METERS, matching real Beat Saber dimensions: blocks are 0.4 m
+# cubes on a 0.5 m lane pitch. The hit plane is z = 0, centered on the
+# origin; the 4x3 note grid spans [-1,1] x [-0.75,0.75] in-plane; notes
+# approach from +z at cfg.note_speed and are cuttable inside the slab
+# |z| <= Z_WINDOW (at the default 4 m/s that equals +/-0.15 s of travel).
+# All speeds/accelerations are scaled with the lengths, so the dynamics
+# are IDENTICAL to the pre-metric version — a pure unit change.
+CELL = 0.5            # lane pitch (m)
+BLOCK = 0.4           # block edge length (m) — drawn by the viewer
+ACCEL = 30.0          # m/s^2
+DRAG = 0.02           # per-tick multiplicative velocity decay (dimensionless)
+V_MAX = 6.0           # m/s
+V_MIN_CUT = 3.0       # min saber speed for a good cut (m/s)
+CUT_RADIUS = 0.28     # ~= circumscribed circle of the 0.4 m block face
 COS_TOL = 0.5         # cos(60 deg): max angle between swing and required dir
-POS_LO = np.array([-1.0, -1.0])
-POS_HI = np.array([5.0, 4.0])
+Z_WINDOW = 0.6        # cuttable slab half-depth (m)
+POS_LO = np.array([-1.5, -1.25])  # saber clamp: 0.5 m wind-up margin
+POS_HI = np.array([1.5, 1.25])
 
 REWARD_GOOD = 1.0
 REWARD_BAD = -0.25
@@ -33,7 +43,7 @@ REWARD_MISS = -0.5
 # to give exploration a dense gradient (raw cut rewards are too sparse for
 # random motion to ever discover).
 SHAPE_GAMMA = 0.99
-SHAPE_DIST_CLIP = 4.0
+SHAPE_DIST_CLIP = 2.0   # meters
 
 N_SABERS = 2
 LEFT, RIGHT = 0, 1
@@ -50,7 +60,8 @@ def dir_vec(d: int) -> np.ndarray:
 
 
 def note_center(n: Note) -> np.ndarray:
-    return np.array([n.col + 0.5, n.row + 0.5])
+    """In-plane (x, y) of the note's cell center; grid centered on origin."""
+    return np.array([(n.col - 1.5) * CELL, (n.row - 1.0) * CELL])
 
 
 def _seg_point_dist(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -74,7 +85,7 @@ class BeatSim:
         self.tick = 0
         self.time = 0.0
         # sabers start at rest, centered in their half of the grid
-        self.pos = np.array([[1.0, 1.5], [3.0, 1.5]], dtype=np.float64)
+        self.pos = np.array([[-0.5, 0.0], [0.5, 0.0]], dtype=np.float64)
         self.vel = np.zeros((N_SABERS, 2), dtype=np.float64)
         # note status: 0 = pending, 1 = good cut, 2 = bad cut, 3 = missed
         self.status = np.zeros(len(self.chart), dtype=np.int64)
@@ -104,17 +115,22 @@ class BeatSim:
         return phi
 
     # -- recording -----------------------------------------------------------
+    def note_z(self, i: int) -> float:
+        """Note i's z position (distance from the hit plane, +z = incoming)."""
+        return (self.chart[i].hit_time - self.time) * self.cfg.note_speed
+
     def set_record(self, path: str):
         self._record_path = path
         header = {
             "header": {
-                "version": 1,
+                "version": 2,
                 "config": {
                     "note_rate": self.cfg.note_rate,
                     "chart_len_s": self.cfg.chart_len_s,
                     "colors": self.cfg.colors,
                     "dirs": list(self.cfg.dirs),
                     "min_hand_gap_s": self.cfg.min_hand_gap_s,
+                    "note_speed": self.cfg.note_speed,
                 },
                 "chart": [
                     {"t": n.hit_time, "col": n.col, "row": n.row,
@@ -158,11 +174,12 @@ class BeatSim:
         reward = 0.0
         events = []
 
-        # evaluate active notes (window straddles hit_time)
+        # evaluate active notes (inside the cuttable slab around the plane)
         for i in self.pending_notes():
             n = self.chart[i]
-            if abs(self.time - n.hit_time) > CUT_WINDOW:
-                if self.time - n.hit_time > CUT_WINDOW:
+            z = self.note_z(i)
+            if abs(z) > Z_WINDOW:
+                if z < -Z_WINDOW:   # sailed past the plane uncut
                     self.status[i] = 3
                     self.misses += 1
                     reward += REWARD_MISS
