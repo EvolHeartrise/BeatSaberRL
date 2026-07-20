@@ -134,8 +134,18 @@ encoding added to embeddings (same job, simpler and exact for this env).
  "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok"}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand"}} | {"miss": {"note": 5}}]}
 ```
 
-No visualizer in v0 (no matplotlib in the venv) — but every interesting run
-should be recorded so a later renderer can replay it.
+**Viewer** (`viz/replay.html`): self-contained HTML/canvas, zero
+dependencies — open in a browser, drop a replay `.jsonl` in. Renders the
+grid, saber trails + velocity vectors, a white ring when a saber is
+cut-capable (≥ 6 u/s), note fly-in over the 2 s before hit-time (white
+outline while the cut window is open), required-direction arrows, good
+cuts as split halves, bad cuts/misses with reason labels, HUD counters.
+Controls: space play/pause, ←/→ tick-step, +/− speed, r restart, scrub
+bar. Note outcomes are DERIVED from the event stream (single source of
+truth), not re-simulated. `python/record_replay.py` records episodes from
+a checkpoint / the scripted bot / random, always with `shaping_coef=0` so
+logged rewards are the raw interpretable ones. Every interesting run
+should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
 

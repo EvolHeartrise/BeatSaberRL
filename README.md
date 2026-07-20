@@ -23,6 +23,19 @@ $VENV/bin/python train_smoke.py --encoder transformer
 
 Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`.
 
+## Watching replays
+
+```bash
+$VENV/bin/python record_replay.py --ckpt runs/long_pool/final.pt --episodes 3
+$VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
+```
+
+then open `viz/replay.html` in a browser and drop a
+`python/replays/*.jsonl` file in. Space = play/pause, ←/→ = tick-step,
++/− = speed, drag the scrub bar. White ring around a saber = fast enough
+to cut; arrows on notes = required swing direction; green split = good
+cut; orange/red flash = bad cut / miss, labeled with the reason.
+
 Reference points on the default easy chart (rate 1.0, right hand only,
 down-swings, 20 s ≈ 19 notes), unshaped returns: random ≈ −8.8,
 scripted bot ≈ +18.5 (96% good cuts).

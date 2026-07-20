@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Beat Arena — replay viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #14161c; color: #cfd3dc; font: 14px/1.4 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+  h1 { font-size: 16px; font-weight: 600; margin: 14px 0 6px; color: #e8eaf0; }
+  #drop { border: 1.5px dashed #4a4f5c; border-radius: 10px; padding: 10px 18px; margin: 6px 0;
+          color: #9aa0ae; cursor: pointer; }
+  #drop.hover { border-color: #7aa2f7; color: #cfd3dc; }
+  canvas { background: #0d0f13; border-radius: 10px; margin-top: 10px; max-width: 96vw; }
+  #bar { display: flex; gap: 10px; align-items: center; margin: 10px 0 4px; flex-wrap: wrap;
+         justify-content: center; }
+  button { background: #232733; color: #cfd3dc; border: 1px solid #3a4050; border-radius: 6px;
+           padding: 4px 12px; cursor: pointer; font: inherit; }
+  button:hover { background: #2d3342; }
+  input[type=range] { width: 320px; }
+  #hud { font-variant-numeric: tabular-nums; color: #9aa0ae; margin-bottom: 16px; }
+  #hud b { color: #e8eaf0; }
+  .good { color: #7dd3a0; } .bad { color: #f0a35e; } .miss { color: #e06c75; }
+  #help { font-size: 12px; color: #6b7180; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<h1>Beat Arena — replay viewer</h1>
+<div id="drop">drop a replay <code>.jsonl</code> here, or click to choose
+  <input id="file" type="file" accept=".jsonl,.json" hidden></div>
+<canvas id="cv" width="960" height="700"></canvas>
+<div id="bar">
+  <button id="play">▶ play</button>
+  <button id="restart">↺ restart</button>
+  <button id="slower">−</button><span id="speed">1.0×</span><button id="faster">+</button>
+  <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+</div>
+<div id="hud">no replay loaded</div>
+<div id="help">space = play/pause · ←/→ = step one tick · +/− = speed · r = restart ·
+  ring around a saber = fast enough to cut (≥ 6 u/s)</div>
+
+<script>
+"use strict";
+// ---- replay format v1 (SPEC.md §Replay log) --------------------------------
+// world: x in [-1, 5], y in [-1, 4]; grid cells [0,4]x[0,3]; y up.
+const W = { x0: -1, x1: 5, y0: -1, y1: 4 };
+const CUT_R = 0.55, V_MIN = 6, DT = 1 / 30, APPROACH_S = 2.0;
+const SABER_COLORS = ["#e06c75", "#61afef"];   // left/red, right/blue
+const DIRV = d => [Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)];
+
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+let rep = null;          // {config, chart, ticks, outcomes}
+let cur = 0;             // fractional tick position
+let playing = false, speed = 1.0, lastTs = null;
+
+function parseReplay(text) {
+  const lines = text.split("\n").filter(l => l.trim());
+  const head = JSON.parse(lines[0]);
+  if (!head.header || head.header.version !== 1)
+    throw new Error("not a beat-arena v1 replay");
+  const ticks = lines.slice(1).map(JSON.parse);
+  const chart = head.header.chart;
+  // derive each note's outcome from the event stream
+  const outcomes = chart.map(() => null);   // {kind:"good"|"bad"|"miss", reason, tick}
+  ticks.forEach(t => t.events.forEach(e => {
+    if (e.cut) outcomes[e.cut.note] = { kind: e.cut.good ? "good" : "bad",
+                                        reason: e.cut.reason, tick: t.t };
+    if (e.miss !== undefined) outcomes[e.miss.note] = { kind: "miss", reason: "miss", tick: t.t };
+  }));
+  return { config: head.header.config, chart, ticks, outcomes };
+}
+
+// ---- world -> canvas -------------------------------------------------------
+function sx(x) { return (x - W.x0) / (W.x1 - W.x0) * cv.width; }
+function sy(y) { return cv.height - (y - W.y0) / (W.y1 - W.y0) * cv.height; }
+const CELL = () => sx(1) - sx(0);
+
+function lerp(a, b, u) { return a + (b - a) * u; }
+
+function saberAt(tickIdx, u, s) {
+  const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
+  const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
+  return [lerp(a[0], b[0], u), lerp(a[1], b[1], u), b[2], b[3]];
+}
+
+// ---- drawing ---------------------------------------------------------------
+function drawGrid() {
+  ctx.strokeStyle = "#232733"; ctx.lineWidth = 1;
+  ctx.strokeRect(sx(W.x0) + 1, sy(W.y1) + 1, cv.width - 2, cv.height - 2);
+  ctx.strokeStyle = "#2c313f";
+  for (let c = 0; c <= 4; c++) { line(sx(c), sy(0), sx(c), sy(3)); }
+  for (let r = 0; r <= 3; r++) { line(sx(0), sy(r), sx(4), sy(r)); }
+}
+function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
+
+function drawNote(n, i, time) {
+  const out = rep.outcomes[i];
+  const cx = sx(n.col + 0.5), cy = sy(n.row + 0.5);
+  const tUntil = n.t - time;
+  const resolvedAt = out ? (out.tick + 1) * DT : Infinity;
+
+  if (time < resolvedAt) {                       // pending: fly-in
+    if (tUntil > APPROACH_S) return;
+    const u = 1 - Math.max(tUntil, 0) / APPROACH_S;   // 0 far -> 1 at plane
+    const size = CELL() * (0.25 + 0.65 * u);
+    ctx.globalAlpha = 0.25 + 0.75 * u;
+    noteBlock(cx, cy, size, SABER_COLORS[n.color], n.dir, tUntil <= 0.15);
+    ctx.globalAlpha = 1;
+  } else {                                       // resolved: brief aftermath
+    const age = time - resolvedAt;
+    if (age > 0.6) return;
+    ctx.globalAlpha = 1 - age / 0.6;
+    const col = out.kind === "good" ? "#7dd3a0" : out.kind === "bad" ? "#f0a35e" : "#e06c75";
+    if (out.kind === "good") {                   // split halves drifting apart
+      const d = DIRV(n.dir), off = age * 90;
+      const px = -d[1], py = d[0];               // perpendicular
+      halfBlock(cx + px * off, cy - py * off, CELL() * 0.85, col);
+      halfBlock(cx - px * off, cy + py * off, CELL() * 0.85, col);
+    } else {
+      ctx.strokeStyle = col; ctx.lineWidth = 3;
+      ctx.strokeRect(cx - CELL() * 0.42, cy - CELL() * 0.42, CELL() * 0.84, CELL() * 0.84);
+      ctx.fillStyle = col; ctx.font = "bold 15px system-ui"; ctx.textAlign = "center";
+      ctx.fillText(out.reason.replace("_", " "), cx, cy - CELL() * 0.55);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function noteBlock(cx, cy, size, color, dir, inWindow) {
+  ctx.fillStyle = color;
+  ctx.fillRect(cx - size / 2, cy - size / 2, size, size);
+  if (inWindow) { ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2.5;
+    ctx.strokeRect(cx - size / 2, cy - size / 2, size, size); }
+  const d = DIRV(dir), L = size * 0.32;          // required swing direction arrow
+  ctx.strokeStyle = "#0d0f13"; ctx.lineWidth = Math.max(2, size * 0.09);
+  ctx.beginPath();
+  ctx.moveTo(cx - d[0] * L, cy + d[1] * L);
+  ctx.lineTo(cx + d[0] * L, cy - d[1] * L);
+  ctx.stroke();
+  const hx = cx + d[0] * L, hy = cy - d[1] * L, a = Math.atan2(-d[1], d[0]);
+  ctx.beginPath();
+  ctx.moveTo(hx, hy);
+  ctx.lineTo(hx - Math.cos(a - 0.5) * L * 0.5, hy - Math.sin(a - 0.5) * L * 0.5);
+  ctx.moveTo(hx, hy);
+  ctx.lineTo(hx - Math.cos(a + 0.5) * L * 0.5, hy - Math.sin(a + 0.5) * L * 0.5);
+  ctx.stroke();
+}
+
+function halfBlock(cx, cy, size, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(cx - size / 2, cy - size / 4, size, size / 2);
+}
+
+function drawSaber(tickIdx, u, s) {
+  // trail over the last 10 ticks
+  ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2; ctx.globalAlpha = 0.35;
+  ctx.beginPath();
+  for (let k = Math.max(0, tickIdx - 10); k <= tickIdx; k++) {
+    const p = rep.ticks[k].sabers[s];
+    (k === Math.max(0, tickIdx - 10)) ? ctx.moveTo(sx(p[0]), sy(p[1]))
+                                      : ctx.lineTo(sx(p[0]), sy(p[1]));
+  }
+  ctx.stroke(); ctx.globalAlpha = 1;
+
+  const [x, y, vx, vy] = saberAt(tickIdx, u, s);
+  const spd = Math.hypot(vx, vy);
+  ctx.fillStyle = SABER_COLORS[s];
+  ctx.beginPath(); ctx.arc(sx(x), sy(y), 9, 0, 7); ctx.fill();
+  if (spd >= V_MIN) {                            // cut-capable indicator
+    ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx(x), sy(y), 13, 0, 7); ctx.stroke();
+  }
+  ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2.5;   // velocity vector
+  line(sx(x), sy(y), sx(x + vx * 0.12), sy(y + vy * 0.12));
+}
+
+function counts(uptoTick) {
+  const c = { good: 0, bad: 0, miss: 0, reward: 0 };
+  for (let k = 0; k <= uptoTick && k < rep.ticks.length; k++) {
+    c.reward += rep.ticks[k].reward;
+    rep.ticks[k].events.forEach(e => {
+      if (e.cut) c[e.cut.good ? "good" : "bad"]++;
+      if (e.miss !== undefined) c.miss++;
+    });
+  }
+  return c;
+}
+
+function render() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!rep) { drawGrid(); return; }
+  const tickIdx = Math.min(Math.floor(cur), rep.ticks.length - 1);
+  const u = cur - tickIdx;
+  const time = (tickIdx + u) * DT;
+
+  drawGrid();
+  rep.chart.forEach((n, i) => drawNote(n, i, time));
+  drawSaber(tickIdx, u, 0);
+  drawSaber(tickIdx, u, 1);
+
+  const c = counts(tickIdx);
+  const nNotes = rep.chart.length;
+  document.getElementById("hud").innerHTML =
+    `t <b>${time.toFixed(2)}s</b> · tick <b>${tickIdx}</b>/${rep.ticks.length - 1} · ` +
+    `return <b>${c.reward.toFixed(2)}</b> · ` +
+    `<span class="good">good ${c.good}</span> / <span class="bad">bad ${c.bad}</span> / ` +
+    `<span class="miss">miss ${c.miss}</span> of ${nNotes}` +
+    (tickIdx >= rep.ticks.length - 1 ? " · <b>END</b>" : "");
+  document.getElementById("scrub").value = tickIdx;
+}
+
+function frame(ts) {
+  if (playing && rep) {
+    if (lastTs !== null) {
+      cur += (ts - lastTs) / 1000 * 30 * speed;
+      if (cur >= rep.ticks.length - 1) { cur = rep.ticks.length - 1; setPlaying(false); }
+    }
+    lastTs = ts;
+  } else lastTs = ts;
+  render();
+  requestAnimationFrame(frame);
+}
+
+// ---- controls --------------------------------------------------------------
+function setPlaying(p) {
+  playing = p && !!rep;
+  document.getElementById("play").textContent = playing ? "⏸ pause" : "▶ play";
+}
+function setSpeed(s) {
+  speed = Math.min(4, Math.max(0.25, s));
+  document.getElementById("speed").textContent = speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×";
+}
+function load(text, name) {
+  try {
+    rep = parseReplay(text);
+    cur = 0;
+    document.getElementById("scrub").max = rep.ticks.length - 1;
+    document.getElementById("drop").textContent = name +
+      ` — ${rep.chart.length} notes, ${rep.ticks.length} ticks` +
+      ` (rate ${rep.config.note_rate}, ${rep.config.colors}, dirs [${rep.config.dirs}])`;
+    setPlaying(true);
+  } catch (err) { alert("could not load replay: " + err.message); }
+}
+
+const drop = document.getElementById("drop"), fileInput = document.getElementById("file");
+drop.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) fileInput.files[0].text().then(t => load(t, fileInput.files[0].name));
+});
+["dragover", "dragenter"].forEach(ev => document.body.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add("hover"); }));
+["dragleave", "drop"].forEach(ev => document.body.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove("hover"); }));
+document.body.addEventListener("drop", e => {
+  const f = e.dataTransfer.files[0];
+  if (f) f.text().then(t => load(t, f.name));
+});
+
+document.getElementById("play").onclick = () => setPlaying(!playing);
+document.getElementById("restart").onclick = () => { cur = 0; setPlaying(true); };
+document.getElementById("slower").onclick = () => setSpeed(speed / 2);
+document.getElementById("faster").onclick = () => setSpeed(speed * 2);
+document.getElementById("scrub").oninput = e => { setPlaying(false); cur = +e.target.value; };
+document.addEventListener("keydown", e => {
+  if (e.key === " ") { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === "ArrowRight") { setPlaying(false); cur = Math.min(cur + 1, rep ? rep.ticks.length - 1 : 0); }
+  else if (e.key === "ArrowLeft") { setPlaying(false); cur = Math.max(cur - 1, 0); }
+  else if (e.key === "+" || e.key === "=") setSpeed(speed * 2);
+  else if (e.key === "-") setSpeed(speed / 2);
+  else if (e.key === "r") { cur = 0; setPlaying(true); }
+});
+
+setSpeed(1);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
