@@ -20,7 +20,12 @@ VENV=../../kiting-arena/python/.venv
 $VENV/bin/python -m pytest tests/          # incl. Rust/Python parity
 $VENV/bin/python train_smoke.py            # PPO smoke, easy chart, pool encoder
 $VENV/bin/python train_smoke.py --encoder transformer --rust   # Rust sim core
+$VENV/bin/python train_batch.py --num-envs 128                 # batched rollouts
 ```
+
+Batched training (N Rust envs, one forward per vector step) reaches
+~2.9k steps/s (transformer) / ~24k (pool) on 8 CPU cores at --epochs 1 —
+the ceiling is the torch update, not the env (see SPEC §Batched rollouts).
 
 The Rust sim core (63x faster env.step; training 1.3-1.6x on 8 serial
 envs) builds once with:

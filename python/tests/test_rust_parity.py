@@ -65,3 +65,42 @@ def test_scripted_trajectory_parity():
     assert (rs.good_cuts, rs.bad_cuts, rs.misses) == \
            (py.good_cuts, py.bad_cuts, py.misses)
     assert py.good_cuts > 10  # the pair actually cut things
+
+
+def test_vec_sim_matches_single():
+    """VecBeatSim(n=1) must step identically to RawBeatSim."""
+    cfg = ChartConfig(colors="both", dirs=tuple(range(8)))
+    py = BeatSim(cfg, seed=21)
+    chart = [(n.hit_time, n.col, n.row, n.color, n.dir) for n in py.chart]
+    single = beat_arena_rs.RawBeatSim(max_steps=py.max_steps)
+    vec = beat_arena_rs.VecBeatSim(1, max_steps=py.max_steps)
+    o1 = single.set_chart(chart)
+    vec.set_chart(0, chart)
+    np.testing.assert_array_equal(vec.obs(), o1)
+    rng = np.random.default_rng(4)
+    done1 = False
+    while not done1:
+        a = rng.integers(0, 9, size=(1, 2))
+        o1, r1, done1 = single.step(int(a[0, 0]), int(a[0, 1]))
+        ov, rv, dv = vec.step(a)
+        np.testing.assert_array_equal(ov, o1)
+        assert rv[0] == np.float32(r1) and bool(dv[0]) == done1
+    assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
+                               single.misses, single.n_notes)
+
+
+def test_vec_env_auto_reset():
+    from beat_arena_env.vec_env import BeatVecEnv
+    venv = BeatVecEnv(4, colors="both", dirs=tuple(range(8)), chart_len_s=5.0, seed=3)
+    obs = venv.reset()
+    assert obs.shape == (4, 200)
+    rng = np.random.default_rng(0)
+    finished = 0
+    for _ in range(400):
+        obs, rew, done, infos = venv.step(rng.integers(0, 9, size=(4, 2)))
+        finished += len(infos)
+        for info in infos:
+            assert info["n_notes"] > 0
+            i = info["env"]
+            assert obs[i, 188:].sum() > 0  # reset obs row: fresh pending notes
+    assert finished >= 4  # every env cycled at least once
