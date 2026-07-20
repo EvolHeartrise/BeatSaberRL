@@ -1,0 +1,66 @@
+/home/evolheartrise/git projects/claude-teaches/projects/kiting-arena/python/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:64: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+=== Beat Arena PPO run ===
+run dir: runs/probe_c
+total steps: 62000  time cap: nones  encoder: pool  rate: 1.0  colors: right  dirs: [6]  chart: 20.0s
+update   1/60  steps    1024  ep_return(last50)      nan  pg -0.011 v 0.028 ent 4.388 dual 0.0000    0.3s
+update   2/60  steps    2048  ep_return(last50)      nan  pg -0.000 v 0.039 ent 4.384 dual 0.0000    0.7s
+update   3/60  steps    3072  ep_return(last50)      nan  pg -0.004 v 0.033 ent 4.382 dual 0.0000    1.0s
+update   4/60  steps    4096  ep_return(last50)      nan  pg -0.002 v 0.019 ent 4.377 dual 0.0000    1.3s
+update   5/60  steps    5120  ep_return(last50)   -4.580  pg -0.005 v 0.038 ent 4.378 dual 0.0000    1.6s
+update   6/60  steps    6144  ep_return(last50)   -4.580  pg +0.003 v 0.027 ent 4.373 dual 0.0000    1.9s
+update   7/60  steps    7168  ep_return(last50)   -4.580  pg -0.004 v 0.026 ent 4.375 dual 0.0000    2.2s
+update   8/60  steps    8192  ep_return(last50)   -4.580  pg -0.004 v 0.031 ent 4.377 dual 0.0000    2.5s
+update   9/60  steps    9216  ep_return(last50)   -4.580  pg -0.002 v 0.029 ent 4.378 dual 0.0000    2.8s
+update  10/60  steps   10240  ep_return(last50)   -4.455  pg -0.002 v 0.050 ent 4.374 dual 0.0000    3.1s
+update  11/60  steps   11264  ep_return(last50)   -4.455  pg -0.007 v 0.027 ent 4.366 dual 0.0000    3.4s
+update  12/60  steps   12288  ep_return(last50)   -4.455  pg -0.006 v 0.029 ent 4.361 dual 0.0000    3.8s
+update  13/60  steps   13312  ep_return(last50)   -4.455  pg -0.003 v 0.031 ent 4.364 dual 0.0000    4.0s
+update  14/60  steps   14336  ep_return(last50)   -4.472  pg -0.007 v 0.037 ent 4.372 dual 0.0000    4.3s
+update  15/60  steps   15360  ep_return(last50)   -4.462  pg -0.006 v 0.025 ent 4.353 dual 0.0000    4.7s
+update  16/60  steps   16384  ep_return(last50)   -4.462  pg +0.001 v 0.029 ent 4.327 dual 0.0000    5.0s
+update  17/60  steps   17408  ep_return(last50)   -4.462  pg -0.020 v 0.029 ent 4.332 dual 0.0000    5.3s
+update  18/60  steps   18432  ep_return(last50)   -4.462  pg +0.002 v 0.027 ent 4.337 dual 0.0000    5.6s
+update  19/60  steps   19456  ep_return(last50)   -4.575  pg -0.010 v 0.048 ent 4.337 dual 0.0000    5.9s
+update  20/60  steps   20480  ep_return(last50)   -4.575  pg -0.018 v 0.022 ent 4.282 dual 0.0000    6.2s
+update  21/60  steps   21504  ep_return(last50)   -4.575  pg -0.008 v 0.022 ent 4.251 dual 0.0000    6.5s
+update  22/60  steps   22528  ep_return(last50)   -4.575  pg -0.009 v 0.032 ent 4.260 dual 0.0000    6.8s
+update  23/60  steps   23552  ep_return(last50)   -4.593  pg -0.005 v 0.022 ent 4.277 dual 0.0000    7.1s
+update  24/60  steps   24576  ep_return(last50)   -4.630  pg -0.004 v 0.027 ent 4.154 dual 0.0000    7.4s
+update  25/60  steps   25600  ep_return(last50)   -4.630  pg -0.003 v 0.018 ent 4.178 dual 0.0000    7.7s
+update  26/60  steps   26624  ep_return(last50)   -4.630  pg -0.028 v 0.020 ent 4.133 dual 0.0000    8.1s
+update  27/60  steps   27648  ep_return(last50)   -4.630  pg -0.013 v 0.027 ent 4.136 dual 0.0000    8.4s
+update  28/60  steps   28672  ep_return(last50)   -4.633  pg +0.001 v 0.019 ent 4.238 dual 0.0000    8.6s
+update  29/60  steps   29696  ep_return(last50)   -4.633  pg +0.002 v 0.018 ent 4.174 dual 0.0000    9.0s
+update  30/60  steps   30720  ep_return(last50)   -4.633  pg -0.014 v 0.019 ent 4.118 dual 0.0000    9.3s
+update  31/60  steps   31744  ep_return(last50)   -4.633  pg -0.005 v 0.025 ent 4.147 dual 0.0000    9.6s
+update  32/60  steps   32768  ep_return(last50)   -4.629  pg -0.000 v 0.019 ent 4.239 dual 0.0000    9.9s
+update  33/60  steps   33792  ep_return(last50)   -4.726  pg -0.020 v 0.030 ent 4.265 dual 0.0000   10.2s
+update  34/60  steps   34816  ep_return(last50)   -4.726  pg -0.006 v 0.017 ent 4.251 dual 0.0000   10.5s
+update  35/60  steps   35840  ep_return(last50)   -4.726  pg -0.010 v 0.020 ent 4.232 dual 0.0000   10.9s
+update  36/60  steps   36864  ep_return(last50)   -4.726  pg -0.022 v 0.034 ent 4.186 dual 0.0000   11.2s
+update  37/60  steps   37888  ep_return(last50)   -4.722  pg -0.001 v 0.017 ent 4.234 dual 0.0000   11.4s
+update  38/60  steps   38912  ep_return(last50)   -4.754  pg -0.012 v 0.016 ent 4.193 dual 0.0000   11.7s
+update  39/60  steps   39936  ep_return(last50)   -4.754  pg -0.017 v 0.019 ent 4.112 dual 0.0000   12.1s
+update  40/60  steps   40960  ep_return(last50)   -4.754  pg -0.007 v 0.017 ent 4.029 dual 0.0000   12.4s
+update  41/60  steps   41984  ep_return(last50)   -4.754  pg -0.004 v 0.021 ent 4.073 dual 0.0000   12.8s
+update  42/60  steps   43008  ep_return(last50)   -4.915  pg -0.015 v 0.025 ent 4.096 dual 0.0000   13.1s
+update  43/60  steps   44032  ep_return(last50)   -4.915  pg -0.003 v 0.025 ent 4.014 dual 0.0000   13.5s
+update  44/60  steps   45056  ep_return(last50)   -4.915  pg -0.014 v 0.019 ent 4.101 dual 0.0000   13.8s
+update  45/60  steps   46080  ep_return(last50)   -4.915  pg -0.004 v 0.019 ent 4.100 dual 0.0000   14.1s
+update  46/60  steps   47104  ep_return(last50)   -4.903  pg -0.013 v 0.020 ent 4.191 dual 0.0000   14.4s
+update  47/60  steps   48128  ep_return(last50)   -4.930  pg -0.010 v 0.025 ent 4.104 dual 0.0000   14.8s
+update  48/60  steps   49152  ep_return(last50)   -4.930  pg -0.007 v 0.020 ent 4.141 dual 0.0000   15.1s
+update  49/60  steps   50176  ep_return(last50)   -4.930  pg -0.004 v 0.016 ent 4.174 dual 0.0000   15.5s
+update  50/60  steps   51200  ep_return(last50)   -4.930  pg +0.002 v 0.049 ent 4.166 dual 0.0000   15.9s
+update  51/60  steps   52224  ep_return(last50)   -4.934  pg -0.007 v 0.020 ent 4.166 dual 0.0000   16.4s
+update  52/60  steps   53248  ep_return(last50)   -4.900  pg -0.006 v 0.014 ent 4.130 dual 0.0000   16.9s
+update  53/60  steps   54272  ep_return(last50)   -4.900  pg +0.001 v 0.017 ent 4.160 dual 0.0000   17.3s
+update  54/60  steps   55296  ep_return(last50)   -4.900  pg -0.010 v 0.017 ent 4.162 dual 0.0000   17.7s
+update  55/60  steps   56320  ep_return(last50)   -4.931  pg -0.003 v 0.018 ent 4.100 dual 0.0000   18.0s
+update  56/60  steps   57344  ep_return(last50)   -4.990  pg -0.014 v 0.027 ent 4.049 dual 0.0000   18.4s
+update  57/60  steps   58368  ep_return(last50)   -4.990  pg -0.011 v 0.016 ent 4.020 dual 0.0000   18.8s
+update  58/60  steps   59392  ep_return(last50)   -4.990  pg -0.004 v 0.015 ent 4.001 dual 0.0000   19.3s
+update  59/60  steps   60416  ep_return(last50)   -4.990  pg -0.019 v 0.020 ent 4.041 dual 0.0000   19.9s
+update  60/60  steps   61440  ep_return(last50)   -4.986  pg +0.002 v 0.016 ent 4.103 dual 0.0000   20.4s
+saved runs/probe_c/final.pt

@@ -1,0 +1,141 @@
+/home/evolheartrise/git projects/claude-teaches/projects/kiting-arena/python/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:64: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+=== Beat Arena PPO run ===
+run dir: runs/smoke_pool
+total steps: 120000  time cap: 240.0s  encoder: pool  rate: 1.0  colors: right  dirs: [6]  chart: 20.0s
+
+Evaluating RANDOM policy (floor)...
+random mean return: -8.102
+Evaluating SCRIPTED bot (ceiling reference)...
+scripted mean return: 19.429 (good-cut rate 97%)
+update   1/117  steps    1024  ep_return(last50)      nan  pg -0.005 v 0.011 ent 4.389 dual 0.0000    0.3s
+update   2/117  steps    2048  ep_return(last50)      nan  pg -0.006 v 0.026 ent 4.386 dual 0.0000    0.7s
+update   3/117  steps    3072  ep_return(last50)      nan  pg -0.010 v 0.014 ent 4.381 dual 0.0000    1.1s
+update   4/117  steps    4096  ep_return(last50)      nan  pg -0.003 v 0.016 ent 4.373 dual 0.0000    1.4s
+update   5/117  steps    5120  ep_return(last50)   -7.751  pg +0.001 v 0.016 ent 4.368 dual 0.0000    1.7s
+update   6/117  steps    6144  ep_return(last50)   -7.751  pg -0.010 v 0.013 ent 4.332 dual 0.0000    2.1s
+update   7/117  steps    7168  ep_return(last50)   -7.751  pg -0.012 v 0.015 ent 4.319 dual 0.0000    2.4s
+update   8/117  steps    8192  ep_return(last50)   -7.751  pg -0.019 v 0.010 ent 4.327 dual 0.0000    2.7s
+update   9/117  steps    9216  ep_return(last50)   -7.751  pg +0.008 v 0.012 ent 4.339 dual 0.0000    3.0s
+update  10/117  steps   10240  ep_return(last50)   -7.910  pg -0.004 v 0.029 ent 4.330 dual 0.0000    3.3s
+  saved runs/smoke_pool/ckpt_upd0010.pt
+update  11/117  steps   11264  ep_return(last50)   -7.910  pg -0.012 v 0.011 ent 4.275 dual 0.0000    3.7s
+update  12/117  steps   12288  ep_return(last50)   -7.910  pg -0.011 v 0.010 ent 4.243 dual 0.0000    4.0s
+update  13/117  steps   13312  ep_return(last50)   -7.910  pg -0.014 v 0.009 ent 4.245 dual 0.0000    4.4s
+update  14/117  steps   14336  ep_return(last50)   -8.040  pg -0.002 v 0.017 ent 4.244 dual 0.0000    4.7s
+update  15/117  steps   15360  ep_return(last50)   -8.081  pg -0.012 v 0.010 ent 4.140 dual 0.0000    5.1s
+update  16/117  steps   16384  ep_return(last50)   -8.081  pg -0.009 v 0.008 ent 4.160 dual 0.0000    5.4s
+update  17/117  steps   17408  ep_return(last50)   -8.081  pg -0.003 v 0.008 ent 4.173 dual 0.0000    5.8s
+update  18/117  steps   18432  ep_return(last50)   -8.081  pg -0.004 v 0.006 ent 4.204 dual 0.0000    6.1s
+update  19/117  steps   19456  ep_return(last50)   -8.178  pg -0.007 v 0.026 ent 4.251 dual 0.0000    6.4s
+update  20/117  steps   20480  ep_return(last50)   -8.178  pg -0.012 v 0.007 ent 4.252 dual 0.0000    6.8s
+  saved runs/smoke_pool/ckpt_upd0020.pt
+update  21/117  steps   21504  ep_return(last50)   -8.178  pg -0.006 v 0.005 ent 4.244 dual 0.0000    7.1s
+update  22/117  steps   22528  ep_return(last50)   -8.178  pg -0.011 v 0.005 ent 4.231 dual 0.0000    7.5s
+update  23/117  steps   23552  ep_return(last50)   -8.218  pg -0.010 v 0.019 ent 4.261 dual 0.0000    7.8s
+update  24/117  steps   24576  ep_return(last50)   -8.166  pg -0.011 v 0.016 ent 4.252 dual 0.0000    8.1s
+update  25/117  steps   25600  ep_return(last50)   -8.166  pg -0.017 v 0.004 ent 4.251 dual 0.0000    8.5s
+update  26/117  steps   26624  ep_return(last50)   -8.166  pg -0.016 v 0.013 ent 4.254 dual 0.0000    8.8s
+update  27/117  steps   27648  ep_return(last50)   -8.166  pg -0.006 v 0.003 ent 4.266 dual 0.0000    9.1s
+update  28/117  steps   28672  ep_return(last50)   -8.179  pg -0.009 v 0.010 ent 4.298 dual 0.0000    9.4s
+update  29/117  steps   29696  ep_return(last50)   -8.179  pg -0.017 v 0.003 ent 4.281 dual 0.0000    9.8s
+update  30/117  steps   30720  ep_return(last50)   -8.179  pg -0.007 v 0.013 ent 4.284 dual 0.0000   10.1s
+  saved runs/smoke_pool/ckpt_upd0030.pt
+update  31/117  steps   31744  ep_return(last50)   -8.179  pg -0.007 v 0.002 ent 4.297 dual 0.0000   10.5s
+update  32/117  steps   32768  ep_return(last50)   -8.183  pg -0.006 v 0.003 ent 4.317 dual 0.0000   10.8s
+update  33/117  steps   33792  ep_return(last50)   -8.271  pg -0.009 v 0.005 ent 4.321 dual 0.0000   11.1s
+update  34/117  steps   34816  ep_return(last50)   -8.271  pg -0.013 v 0.010 ent 4.293 dual 0.0000   11.4s
+update  35/117  steps   35840  ep_return(last50)   -8.271  pg +0.003 v 0.003 ent 4.296 dual 0.0000   11.8s
+update  36/117  steps   36864  ep_return(last50)   -8.271  pg -0.002 v 0.012 ent 4.295 dual 0.0000   12.1s
+update  37/117  steps   37888  ep_return(last50)   -8.279  pg -0.007 v 0.004 ent 4.311 dual 0.0000   12.4s
+update  38/117  steps   38912  ep_return(last50)   -8.237  pg -0.008 v 0.007 ent 4.258 dual 0.0000   12.8s
+update  39/117  steps   39936  ep_return(last50)   -8.237  pg -0.001 v 0.001 ent 4.251 dual 0.0000   13.1s
+update  40/117  steps   40960  ep_return(last50)   -8.237  pg -0.007 v 0.002 ent 4.250 dual 0.0000   13.5s
+  saved runs/smoke_pool/ckpt_upd0040.pt
+update  41/117  steps   41984  ep_return(last50)   -8.237  pg -0.007 v 0.003 ent 4.275 dual 0.0000   13.8s
+update  42/117  steps   43008  ep_return(last50)   -8.221  pg -0.005 v 0.002 ent 4.297 dual 0.0000   14.2s
+update  43/117  steps   44032  ep_return(last50)   -8.221  pg -0.010 v 0.025 ent 4.269 dual 0.0000   14.5s
+update  44/117  steps   45056  ep_return(last50)   -8.221  pg -0.020 v 0.017 ent 4.263 dual 0.0000   14.9s
+update  45/117  steps   46080  ep_return(last50)   -8.221  pg -0.007 v 0.010 ent 4.276 dual 0.0000   15.2s
+update  46/117  steps   47104  ep_return(last50)   -8.141  pg -0.004 v 0.003 ent 4.315 dual 0.0000   15.5s
+update  47/117  steps   48128  ep_return(last50)   -8.037  pg -0.009 v 0.009 ent 4.308 dual 0.0000   15.9s
+update  48/117  steps   49152  ep_return(last50)   -8.037  pg -0.007 v 0.002 ent 4.291 dual 0.0000   16.3s
+update  49/117  steps   50176  ep_return(last50)   -8.037  pg -0.000 v 0.010 ent 4.277 dual 0.0000   16.7s
+update  50/117  steps   51200  ep_return(last50)   -8.037  pg -0.010 v 0.020 ent 4.292 dual 0.0000   17.0s
+  saved runs/smoke_pool/ckpt_upd0050.pt
+update  51/117  steps   52224  ep_return(last50)   -7.946  pg -0.003 v 0.004 ent 4.333 dual 0.0000   17.3s
+update  52/117  steps   53248  ep_return(last50)   -7.993  pg -0.013 v 0.003 ent 4.304 dual 0.0000   17.8s
+update  53/117  steps   54272  ep_return(last50)   -7.993  pg -0.023 v 0.002 ent 4.291 dual 0.0000   18.1s
+update  54/117  steps   55296  ep_return(last50)   -7.993  pg -0.007 v 0.003 ent 4.272 dual 0.0000   18.4s
+update  55/117  steps   56320  ep_return(last50)   -8.001  pg -0.011 v 0.003 ent 4.281 dual 0.0000   18.7s
+update  56/117  steps   57344  ep_return(last50)   -8.038  pg -0.009 v 0.003 ent 4.279 dual 0.0000   19.1s
+update  57/117  steps   58368  ep_return(last50)   -8.038  pg -0.005 v 0.001 ent 4.257 dual 0.0000   19.4s
+update  58/117  steps   59392  ep_return(last50)   -8.038  pg -0.016 v 0.007 ent 4.283 dual 0.0000   19.8s
+update  59/117  steps   60416  ep_return(last50)   -8.038  pg -0.007 v 0.006 ent 4.307 dual 0.0000   20.1s
+update  60/117  steps   61440  ep_return(last50)   -8.033  pg -0.006 v 0.005 ent 4.338 dual 0.0000   20.4s
+  saved runs/smoke_pool/ckpt_upd0060.pt
+update  61/117  steps   62464  ep_return(last50)   -8.015  pg -0.011 v 0.011 ent 4.308 dual 0.0000   20.7s
+update  62/117  steps   63488  ep_return(last50)   -8.015  pg -0.001 v 0.001 ent 4.286 dual 0.0000   21.1s
+update  63/117  steps   64512  ep_return(last50)   -8.015  pg -0.022 v 0.002 ent 4.254 dual 0.0000   21.4s
+update  64/117  steps   65536  ep_return(last50)   -8.015  pg -0.007 v 0.003 ent 4.239 dual 0.0000   21.7s
+update  65/117  steps   66560  ep_return(last50)   -8.118  pg -0.007 v 0.012 ent 4.257 dual 0.0000   22.0s
+update  66/117  steps   67584  ep_return(last50)   -8.118  pg -0.011 v 0.002 ent 4.150 dual 0.0000   22.3s
+update  67/117  steps   68608  ep_return(last50)   -8.118  pg +0.003 v 0.001 ent 4.161 dual 0.0000   22.7s
+update  68/117  steps   69632  ep_return(last50)   -8.118  pg -0.014 v 0.002 ent 4.154 dual 0.0000   23.0s
+update  69/117  steps   70656  ep_return(last50)   -8.121  pg -0.002 v 0.004 ent 4.230 dual 0.0000   23.2s
+update  70/117  steps   71680  ep_return(last50)   -8.158  pg -0.005 v 0.006 ent 4.136 dual 0.0000   23.6s
+  saved runs/smoke_pool/ckpt_upd0070.pt
+update  71/117  steps   72704  ep_return(last50)   -8.158  pg -0.014 v 0.002 ent 4.057 dual 0.0000   23.9s
+update  72/117  steps   73728  ep_return(last50)   -8.158  pg -0.006 v 0.002 ent 3.996 dual 0.0000   24.2s
+update  73/117  steps   74752  ep_return(last50)   -8.158  pg -0.004 v 0.009 ent 4.089 dual 0.0000   24.5s
+update  74/117  steps   75776  ep_return(last50)   -8.327  pg -0.005 v 0.007 ent 4.231 dual 0.0000   24.8s
+update  75/117  steps   76800  ep_return(last50)   -8.332  pg -0.017 v 0.002 ent 4.040 dual 0.0000   25.2s
+update  76/117  steps   77824  ep_return(last50)   -8.332  pg -0.010 v 0.007 ent 4.096 dual 0.0000   25.5s
+update  77/117  steps   78848  ep_return(last50)   -8.332  pg -0.008 v 0.010 ent 4.160 dual 0.0000   25.8s
+update  78/117  steps   79872  ep_return(last50)   -8.332  pg -0.005 v 0.003 ent 4.230 dual 0.0000   26.1s
+update  79/117  steps   80896  ep_return(last50)   -8.339  pg -0.002 v 0.010 ent 4.242 dual 0.0000   26.4s
+update  80/117  steps   81920  ep_return(last50)   -8.339  pg -0.010 v 0.002 ent 4.124 dual 0.0000   26.8s
+  saved runs/smoke_pool/ckpt_upd0080.pt
+update  81/117  steps   82944  ep_return(last50)   -8.339  pg -0.008 v 0.001 ent 4.127 dual 0.0000   27.1s
+update  82/117  steps   83968  ep_return(last50)   -8.339  pg -0.007 v 0.002 ent 4.141 dual 0.0000   27.4s
+update  83/117  steps   84992  ep_return(last50)   -8.368  pg -0.012 v 0.004 ent 4.268 dual 0.0000   27.7s
+update  84/117  steps   86016  ep_return(last50)   -8.407  pg -0.015 v 0.010 ent 4.163 dual 0.0000   28.0s
+update  85/117  steps   87040  ep_return(last50)   -8.407  pg +0.004 v 0.007 ent 4.082 dual 0.0000   28.4s
+update  86/117  steps   88064  ep_return(last50)   -8.407  pg -0.007 v 0.010 ent 4.076 dual 0.0000   28.7s
+update  87/117  steps   89088  ep_return(last50)   -8.407  pg +0.005 v 0.002 ent 4.133 dual 0.0000   29.0s
+update  88/117  steps   90112  ep_return(last50)   -8.298  pg -0.005 v 0.003 ent 4.213 dual 0.0000   29.3s
+update  89/117  steps   91136  ep_return(last50)   -8.298  pg -0.010 v 0.016 ent 4.022 dual 0.0000   29.7s
+update  90/117  steps   92160  ep_return(last50)   -8.298  pg -0.004 v 0.017 ent 4.062 dual 0.0000   30.0s
+  saved runs/smoke_pool/ckpt_upd0090.pt
+update  91/117  steps   93184  ep_return(last50)   -8.298  pg -0.011 v 0.003 ent 4.134 dual 0.0000   30.3s
+update  92/117  steps   94208  ep_return(last50)   -8.318  pg -0.007 v 0.003 ent 4.218 dual 0.0000   30.6s
+update  93/117  steps   95232  ep_return(last50)   -8.234  pg -0.011 v 0.005 ent 4.119 dual 0.0000   31.0s
+update  94/117  steps   96256  ep_return(last50)   -8.234  pg -0.027 v 0.002 ent 4.071 dual 0.0000   31.3s
+update  95/117  steps   97280  ep_return(last50)   -8.234  pg +0.003 v 0.003 ent 4.132 dual 0.0000   31.7s
+update  96/117  steps   98304  ep_return(last50)   -8.234  pg -0.018 v 0.019 ent 4.151 dual 0.0000   32.0s
+update  97/117  steps   99328  ep_return(last50)   -8.191  pg -0.001 v 0.010 ent 4.262 dual 0.0000   32.3s
+update  98/117  steps  100352  ep_return(last50)   -8.207  pg -0.015 v 0.002 ent 4.143 dual 0.0000   32.7s
+update  99/117  steps  101376  ep_return(last50)   -8.207  pg -0.005 v 0.007 ent 4.171 dual 0.0000   33.1s
+update 100/117  steps  102400  ep_return(last50)   -8.207  pg -0.003 v 0.002 ent 4.149 dual 0.0000   33.5s
+  saved runs/smoke_pool/ckpt_upd0100.pt
+update 101/117  steps  103424  ep_return(last50)   -8.196  pg -0.005 v 0.002 ent 4.167 dual 0.0000   33.9s
+update 102/117  steps  104448  ep_return(last50)   -8.192  pg -0.002 v 0.004 ent 4.108 dual 0.0000   34.2s
+update 103/117  steps  105472  ep_return(last50)   -8.192  pg -0.007 v 0.011 ent 3.998 dual 0.0000   34.8s
+update 104/117  steps  106496  ep_return(last50)   -8.192  pg -0.019 v 0.002 ent 3.984 dual 0.0000   35.2s
+update 105/117  steps  107520  ep_return(last50)   -8.192  pg -0.019 v 0.002 ent 4.012 dual 0.0000   35.6s
+update 106/117  steps  108544  ep_return(last50)   -8.188  pg -0.004 v 0.027 ent 4.074 dual 0.0000   36.0s
+update 107/117  steps  109568  ep_return(last50)   -8.210  pg +0.006 v 0.003 ent 3.942 dual 0.0000   36.4s
+update 108/117  steps  110592  ep_return(last50)   -8.210  pg -0.007 v 0.011 ent 3.898 dual 0.0000   37.0s
+update 109/117  steps  111616  ep_return(last50)   -8.210  pg -0.022 v 0.003 ent 3.950 dual 0.0000   37.5s
+update 110/117  steps  112640  ep_return(last50)   -8.210  pg -0.018 v 0.003 ent 3.955 dual 0.0000   38.0s
+  saved runs/smoke_pool/ckpt_upd0110.pt
+update 111/117  steps  113664  ep_return(last50)   -8.110  pg -0.002 v 0.003 ent 4.075 dual 0.0000   38.7s
+update 112/117  steps  114688  ep_return(last50)   -8.113  pg -0.017 v 0.002 ent 4.006 dual 0.0000   39.1s
+update 113/117  steps  115712  ep_return(last50)   -8.113  pg -0.012 v 0.003 ent 4.134 dual 0.0000   39.7s
+update 114/117  steps  116736  ep_return(last50)   -8.113  pg -0.003 v 0.011 ent 4.121 dual 0.0000   40.1s
+update 115/117  steps  117760  ep_return(last50)   -8.087  pg -0.017 v 0.015 ent 4.207 dual 0.0000   40.4s
+update 116/117  steps  118784  ep_return(last50)   -8.143  pg -0.008 v 0.003 ent 4.178 dual 0.0000   40.8s
+update 117/117  steps  119808  ep_return(last50)   -8.143  pg +0.002 v 0.015 ent 4.112 dual 0.0000   41.2s
+saved runs/smoke_pool/final.pt
+
+Evaluating TRAINED policy...
