@@ -6,7 +6,7 @@
 //! Python-only — this port exists for training/eval throughput.
 //! Parity with the Python sim is pinned by `tests/test_rust_parity.py`.
 
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
 
 const DT: f64 = 1.0 / 30.0;
@@ -69,8 +69,7 @@ fn seg_point_dist(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
     (px * px + py * py).sqrt()
 }
 
-#[pyclass]
-struct RawBeatSim {
+struct Core {
     note_speed: f64,
     shaping_coef: f64,
     max_steps: u32,
@@ -87,7 +86,39 @@ struct RawBeatSim {
     misses: u32,
 }
 
-impl RawBeatSim {
+impl Core {
+    fn new_core(note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+        Core {
+            note_speed,
+            shaping_coef,
+            max_steps,
+            chart: Vec::new(),
+            tick: 0,
+            time: 0.0,
+            pos: [[-0.5, 0.0], [0.5, 0.0]],
+            vel: [[0.0; 2]; 2],
+            status: Vec::new(),
+            phi: 0.0,
+            good_cuts: 0,
+            bad_cuts: 0,
+            misses: 0,
+        }
+    }
+
+    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, u8)>) {
+        self.chart = chart
+            .into_iter()
+            .map(|(t, col, row, color, dir)| Note {
+                hit_time: t,
+                col,
+                row,
+                color,
+                dir,
+            })
+            .collect();
+        self.reset_state();
+    }
+
     fn potential(&self) -> f64 {
         if self.shaping_coef == 0.0 {
             return 0.0;
@@ -249,47 +280,30 @@ impl RawBeatSim {
     }
 }
 
+#[pyclass]
+struct RawBeatSim {
+    core: Core,
+}
+
 #[pymethods]
 impl RawBeatSim {
     #[new]
     #[pyo3(signature = (note_speed=4.0, shaping_coef=0.0, max_steps=630))]
     fn new(note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
         RawBeatSim {
-            note_speed,
-            shaping_coef,
-            max_steps,
-            chart: Vec::new(),
-            tick: 0,
-            time: 0.0,
-            pos: [[-0.5, 0.0], [0.5, 0.0]],
-            vel: [[0.0; 2]; 2],
-            status: Vec::new(),
-            phi: 0.0,
-            good_cuts: 0,
-            bad_cuts: 0,
-            misses: 0,
+            core: Core::new_core(note_speed, shaping_coef, max_steps),
         }
     }
 
     /// chart: list of (hit_time, col, row, color, dir), sorted by hit_time.
-    /// Resets all episode state.
+    /// Resets all episode state and returns the reset observation.
     fn set_chart<'py>(
         &mut self,
         py: Python<'py>,
         chart: Vec<(f64, u8, u8, u8, u8)>,
     ) -> Bound<'py, PyArray1<f32>> {
-        self.chart = chart
-            .into_iter()
-            .map(|(t, col, row, color, dir)| Note {
-                hit_time: t,
-                col,
-                row,
-                color,
-                dir,
-            })
-            .collect();
-        self.reset_state();
-        PyArray1::from_slice_bound(py, &self.build_obs())
+        self.core.set_chart_notes(chart);
+        PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
     fn step<'py>(
@@ -299,9 +313,9 @@ impl RawBeatSim {
         action_right: u8,
     ) -> (Bound<'py, PyArray1<f32>>, f64, bool) {
         assert!(action_left <= 8 && action_right <= 8);
-        let (reward, done) = self.step_inner([action_left, action_right]);
+        let (reward, done) = self.core.step_inner([action_left, action_right]);
         (
-            PyArray1::from_slice_bound(py, &self.build_obs()),
+            PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
             done,
         )
@@ -309,28 +323,107 @@ impl RawBeatSim {
 
     #[getter]
     fn good_cuts(&self) -> u32 {
-        self.good_cuts
+        self.core.good_cuts
     }
     #[getter]
     fn bad_cuts(&self) -> u32 {
-        self.bad_cuts
+        self.core.bad_cuts
     }
     #[getter]
     fn misses(&self) -> u32 {
-        self.misses
+        self.core.misses
     }
     #[getter]
     fn n_notes(&self) -> usize {
-        self.chart.len()
+        self.core.chart.len()
     }
     #[getter]
     fn tick(&self) -> u32 {
-        self.tick
+        self.core.tick
+    }
+}
+
+/// N sims stepped in ONE FFI call per vector step. Chart generation stays
+/// in Python: after any done env, call `set_chart(i, chart)` before the
+/// next `step` (the wrapper in beat_arena_env/vec_env.py handles this).
+#[pyclass]
+struct VecBeatSim {
+    sims: Vec<Core>,
+}
+
+#[pymethods]
+impl VecBeatSim {
+    #[new]
+    #[pyo3(signature = (n, note_speed=4.0, shaping_coef=0.0, max_steps=630))]
+    fn new(n: usize, note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+        VecBeatSim {
+            sims: (0..n)
+                .map(|_| Core::new_core(note_speed, shaping_coef, max_steps))
+                .collect(),
+        }
+    }
+
+    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, u8)>) {
+        self.sims[i].set_chart_notes(chart);
+    }
+
+    /// Current observation of every env, flat (N*200,) — reshape Python-side.
+    fn obs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        let n = self.sims.len();
+        let mut flat = vec![0.0f32; n * OBS_DIM];
+        for (i, sim) in self.sims.iter().enumerate() {
+            flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
+        }
+        PyArray1::from_vec_bound(py, flat)
+    }
+
+    /// actions: (N, 2) int64. Returns (obs flat (N*200,) f32 — reshape
+    /// Python-side, rewards (N,) f32, dones (N,) bool). Done envs must get
+    /// a fresh set_chart before the next step; their returned obs row is
+    /// the terminal obs.
+    fn step<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray2<'py, i64>,
+    ) -> (
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+    ) {
+        let acts = actions.as_array();
+        let n = self.sims.len();
+        assert_eq!(acts.shape(), &[n, 2]);
+        let mut flat = vec![0.0f32; n * OBS_DIM];
+        let mut rewards = vec![0.0f32; n];
+        let mut dones = vec![false; n];
+        for (i, sim) in self.sims.iter_mut().enumerate() {
+            let (r, d) =
+                sim.step_inner([acts[[i, 0]] as u8, acts[[i, 1]] as u8]);
+            flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
+            rewards[i] = r as f32;
+            dones[i] = d;
+        }
+        (
+            PyArray1::from_vec_bound(py, flat),
+            PyArray1::from_vec_bound(py, rewards),
+            PyArray1::from_vec_bound(py, dones),
+        )
+    }
+
+    /// Single env's current obs (200,) — used for cheap post-reset reads.
+    fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
+        PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
+    }
+
+    fn counters(&self, i: usize) -> (u32, u32, u32, usize) {
+        let s = &self.sims[i];
+        (s.good_cuts, s.bad_cuts, s.misses, s.chart.len())
     }
 }
 
 #[pymodule]
 fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawBeatSim>()?;
+    m.add_class::<VecBeatSim>()?;
     Ok(())
 }

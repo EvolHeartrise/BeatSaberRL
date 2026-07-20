@@ -241,6 +241,34 @@ glue). End-to-end training (8 serial envs): pool **1.6×**, transformer
 the whole bottleneck; large parallel-env counts are effectively free on
 the sim side (128 envs ≈ 0.28 ms/vector-step).
 
+## Batched rollouts (`VecBeatSim` + `python/train_batch.py`)
+
+`beat_arena_rs.VecBeatSim`: N sim cores stepped in ONE FFI call per
+vector step (obs returned flat, reshaped Python-side; `obs_one(i)` for
+cheap post-reset rows). `beat_arena_env/vec_env.py: BeatVecEnv` adds
+auto-reset with Python-side chart gen and per-episode info dicts.
+`train_batch.py` = same PPO math as train_smoke, one policy forward per
+vector step; batch = num_envs × horizon. Parity: VecBeatSim(1) ≡
+RawBeatSim (tested); the batched trainer reproduces the serial path's
+learning curve on the easy+shaping reference config.
+
+Throughput measured 2026-07-20 (8-core CPU, hard config, T=128):
+
+| num_envs | transformer | pool |
+|---|---|---|
+| 8 (serial-rust reference) | 1.4k | 4.7k |
+| 32 | **2.0k** | **10.6k** |
+| 128 | 1.8k | 10.4k |
+| 1024 | 1.6k | 8.7k |
+| 128, `--epochs 1` | **2.9k** | **24.1k** |
+
+Update phase is 85–93% of wall-clock once batched (rollout ≤15%): the
+CPU ceiling is torch fwd+bwd per sample, not the env (sim ≈ free at
+1.2 µs/step). Best N ≈ 32–128; larger batches lose to cache effects.
+`--epochs` trades sample reuse for throughput. Overnight capacity at
+these rates: ~84M steps (transformer) / ~700M (pool, epochs 1).
+Further gains need a GPU or a cheaper policy, not more envs.
+
 ## Tests (`python/tests/`, pytest)
 
 1. Obs layout: length 200, offsets, mask semantics.
