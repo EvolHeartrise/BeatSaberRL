@@ -1,0 +1,336 @@
+//! Beat Arena sim core in Rust — a semantics-exact port of
+//! `python/beat_arena_env/sim.py` (step + obs; SPEC.md is the contract).
+//!
+//! Chart generation stays in Python (single source of truth, once per
+//! episode); the chart is injected via `set_chart`. Replay recording is
+//! Python-only — this port exists for training/eval throughput.
+//! Parity with the Python sim is pinned by `tests/test_rust_parity.py`.
+
+use numpy::{PyArray1, PyArrayMethods};
+use pyo3::prelude::*;
+
+const DT: f64 = 1.0 / 30.0;
+const ACCEL: f64 = 30.0;
+const DRAG: f64 = 0.02;
+const V_MAX: f64 = 6.0;
+const V_MIN_CUT: f64 = 1.0;
+const CUT_RADIUS: f64 = 0.28;
+const COS_TOL: f64 = 0.5;
+const Z_WINDOW: f64 = 0.6;
+const CELL: f64 = 0.5;
+const POS_LO: [f64; 2] = [-1.5, -1.25];
+const POS_HI: [f64; 2] = [1.5, 1.25];
+const REWARD_GOOD: f64 = 1.0;
+const REWARD_BAD: f64 = -0.25;
+const REWARD_MISS: f64 = -0.5;
+const SHAPE_GAMMA: f64 = 0.99;
+const SHAPE_DIST_CLIP: f64 = 2.0;
+
+const N_NOTE_SLOTS: usize = 12;
+const NOTE_FEAT: usize = 15;
+const OFF_NOTES: usize = 8;
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 188
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 200
+const X_NORM: f64 = 1.0;
+const Y_NORM: f64 = 0.75;
+const Z_SCALE: f64 = 8.0;
+const Z_CLIP: (f64, f64) = (-1.0, 12.0);
+
+#[derive(Clone, Copy)]
+struct Note {
+    hit_time: f64,
+    col: u8,
+    row: u8,
+    color: u8,
+    dir: u8,
+}
+
+fn dir_vec(d: u8) -> [f64; 2] {
+    let a = d as f64 * std::f64::consts::PI / 4.0;
+    [a.cos(), a.sin()]
+}
+
+fn note_center(n: &Note) -> [f64; 2] {
+    [
+        (n.col as f64 - 1.5) * CELL,
+        (n.row as f64 - 1.0) * CELL,
+    ]
+}
+
+fn seg_point_dist(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let denom = ab[0] * ab[0] + ab[1] * ab[1];
+    if denom < 1e-12 {
+        return ((c[0] - a[0]).powi(2) + (c[1] - a[1]).powi(2)).sqrt();
+    }
+    let t = (((c[0] - a[0]) * ab[0] + (c[1] - a[1]) * ab[1]) / denom).clamp(0.0, 1.0);
+    let px = a[0] + t * ab[0] - c[0];
+    let py = a[1] + t * ab[1] - c[1];
+    (px * px + py * py).sqrt()
+}
+
+#[pyclass]
+struct RawBeatSim {
+    note_speed: f64,
+    shaping_coef: f64,
+    max_steps: u32,
+    chart: Vec<Note>,
+    // state
+    tick: u32,
+    time: f64,
+    pos: [[f64; 2]; 2],
+    vel: [[f64; 2]; 2],
+    status: Vec<u8>, // 0 pending, 1 good, 2 bad, 3 missed
+    phi: f64,
+    good_cuts: u32,
+    bad_cuts: u32,
+    misses: u32,
+}
+
+impl RawBeatSim {
+    fn potential(&self) -> f64 {
+        if self.shaping_coef == 0.0 {
+            return 0.0;
+        }
+        let mut phi = 0.0;
+        let mut seen: u8 = 0;
+        for (i, n) in self.chart.iter().enumerate() {
+            if self.status[i] != 0 {
+                continue;
+            }
+            if seen & (1 << n.color) != 0 {
+                continue;
+            }
+            seen |= 1 << n.color;
+            let c = note_center(n);
+            let p = self.pos[n.color as usize];
+            let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
+            phi -= self.shaping_coef * d.min(SHAPE_DIST_CLIP) / SHAPE_DIST_CLIP;
+            if seen == 3 {
+                break;
+            }
+        }
+        phi
+    }
+
+    fn reset_state(&mut self) {
+        self.tick = 0;
+        self.time = 0.0;
+        self.pos = [[-0.5, 0.0], [0.5, 0.0]];
+        self.vel = [[0.0; 2]; 2];
+        self.status = vec![0; self.chart.len()];
+        self.good_cuts = 0;
+        self.bad_cuts = 0;
+        self.misses = 0;
+        self.phi = self.potential();
+    }
+
+    fn build_obs(&self) -> [f32; OBS_DIM] {
+        let mut obs = [0.0f32; OBS_DIM];
+        for s in 0..2 {
+            obs[s * 4] = (self.pos[s][0] / X_NORM) as f32;
+            obs[s * 4 + 1] = (self.pos[s][1] / Y_NORM) as f32;
+            obs[s * 4 + 2] = (self.vel[s][0] / V_MAX) as f32;
+            obs[s * 4 + 3] = (self.vel[s][1] / V_MAX) as f32;
+        }
+        let mut slot = 0usize;
+        for (i, n) in self.chart.iter().enumerate() {
+            if self.status[i] != 0 {
+                continue;
+            }
+            if slot >= N_NOTE_SLOTS {
+                break;
+            }
+            let base = OFF_NOTES + slot * NOTE_FEAT;
+            let c = note_center(n);
+            let z = ((n.hit_time - self.time) * self.note_speed).clamp(Z_CLIP.0, Z_CLIP.1);
+            obs[base] = (c[0] / X_NORM) as f32;
+            obs[base + 1] = (c[1] / Y_NORM) as f32;
+            obs[base + 2] = (z / Z_SCALE) as f32;
+            obs[base + 3] = (-self.note_speed / Z_SCALE) as f32;
+            obs[base + 4 + n.color as usize] = 1.0;
+            obs[base + 6 + n.dir as usize] = 1.0;
+            obs[base + 14] = 1.0;
+            obs[OFF_NOTE_MASK + slot] = 1.0;
+            slot += 1;
+        }
+        obs
+    }
+
+    fn step_inner(&mut self, actions: [u8; 2]) -> (f64, bool) {
+        let prev_pos = self.pos;
+        for s in 0..2 {
+            let a = actions[s];
+            if a > 0 {
+                let d = dir_vec(a - 1);
+                self.vel[s][0] += ACCEL * DT * d[0];
+                self.vel[s][1] += ACCEL * DT * d[1];
+            }
+            self.vel[s][0] *= 1.0 - DRAG;
+            self.vel[s][1] *= 1.0 - DRAG;
+            let speed = (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
+            if speed > V_MAX {
+                let k = V_MAX / speed;
+                self.vel[s][0] *= k;
+                self.vel[s][1] *= k;
+            }
+            self.pos[s][0] += self.vel[s][0] * DT;
+            self.pos[s][1] += self.vel[s][1] * DT;
+            for ax in 0..2 {
+                if self.pos[s][ax] < POS_LO[ax] || self.pos[s][ax] > POS_HI[ax] {
+                    self.pos[s][ax] = self.pos[s][ax].clamp(POS_LO[ax], POS_HI[ax]);
+                    self.vel[s][ax] = 0.0;
+                }
+            }
+        }
+
+        self.time = (self.tick + 1) as f64 * DT;
+        let mut reward = 0.0;
+
+        for i in 0..self.chart.len() {
+            if self.status[i] != 0 {
+                continue;
+            }
+            let n = self.chart[i];
+            let z = (n.hit_time - self.time) * self.note_speed;
+            if z.abs() > Z_WINDOW {
+                if z < -Z_WINDOW {
+                    self.status[i] = 3;
+                    self.misses += 1;
+                    reward += REWARD_MISS;
+                }
+                continue;
+            }
+            let center = note_center(&n);
+            for &s in &[n.color as usize, 1 - n.color as usize] {
+                let crossed =
+                    seg_point_dist(prev_pos[s], self.pos[s], center) <= CUT_RADIUS;
+                if !crossed {
+                    continue;
+                }
+                let good = if s != n.color as usize {
+                    false // wrong_hand
+                } else {
+                    let speed =
+                        (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
+                    if speed < V_MIN_CUT {
+                        false // slow
+                    } else {
+                        let d = dir_vec(n.dir);
+                        let cosv =
+                            (self.vel[s][0] * d[0] + self.vel[s][1] * d[1]) / speed.max(1e-9);
+                        cosv >= COS_TOL // angle if below
+                    }
+                };
+                self.status[i] = if good { 1 } else { 2 };
+                if good {
+                    self.good_cuts += 1;
+                    reward += REWARD_GOOD;
+                } else {
+                    self.bad_cuts += 1;
+                    reward += REWARD_BAD;
+                }
+                break;
+            }
+        }
+
+        self.tick += 1;
+        let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
+        let pending = self.status.iter().any(|&s| s == 0);
+        let done = (!pending && (self.chart.is_empty() || self.time > last_hit))
+            || self.time > last_hit + 0.5
+            || self.tick >= self.max_steps;
+
+        let new_phi = if done { 0.0 } else { self.potential() };
+        reward += SHAPE_GAMMA * new_phi - self.phi;
+        self.phi = new_phi;
+
+        (reward, done)
+    }
+}
+
+#[pymethods]
+impl RawBeatSim {
+    #[new]
+    #[pyo3(signature = (note_speed=4.0, shaping_coef=0.0, max_steps=630))]
+    fn new(note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+        RawBeatSim {
+            note_speed,
+            shaping_coef,
+            max_steps,
+            chart: Vec::new(),
+            tick: 0,
+            time: 0.0,
+            pos: [[-0.5, 0.0], [0.5, 0.0]],
+            vel: [[0.0; 2]; 2],
+            status: Vec::new(),
+            phi: 0.0,
+            good_cuts: 0,
+            bad_cuts: 0,
+            misses: 0,
+        }
+    }
+
+    /// chart: list of (hit_time, col, row, color, dir), sorted by hit_time.
+    /// Resets all episode state.
+    fn set_chart<'py>(
+        &mut self,
+        py: Python<'py>,
+        chart: Vec<(f64, u8, u8, u8, u8)>,
+    ) -> Bound<'py, PyArray1<f32>> {
+        self.chart = chart
+            .into_iter()
+            .map(|(t, col, row, color, dir)| Note {
+                hit_time: t,
+                col,
+                row,
+                color,
+                dir,
+            })
+            .collect();
+        self.reset_state();
+        PyArray1::from_slice_bound(py, &self.build_obs())
+    }
+
+    fn step<'py>(
+        &mut self,
+        py: Python<'py>,
+        action_left: u8,
+        action_right: u8,
+    ) -> (Bound<'py, PyArray1<f32>>, f64, bool) {
+        assert!(action_left <= 8 && action_right <= 8);
+        let (reward, done) = self.step_inner([action_left, action_right]);
+        (
+            PyArray1::from_slice_bound(py, &self.build_obs()),
+            reward,
+            done,
+        )
+    }
+
+    #[getter]
+    fn good_cuts(&self) -> u32 {
+        self.good_cuts
+    }
+    #[getter]
+    fn bad_cuts(&self) -> u32 {
+        self.bad_cuts
+    }
+    #[getter]
+    fn misses(&self) -> u32 {
+        self.misses
+    }
+    #[getter]
+    fn n_notes(&self) -> usize {
+        self.chart.len()
+    }
+    #[getter]
+    fn tick(&self) -> u32 {
+        self.tick
+    }
+}
+
+#[pymodule]
+fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<RawBeatSim>()?;
+    Ok(())
+}

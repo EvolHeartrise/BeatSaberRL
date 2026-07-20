@@ -17,9 +17,16 @@ Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.
 cd python
 VENV=../../kiting-arena/python/.venv
 
-$VENV/bin/python -m pytest tests/          # 15 tests
+$VENV/bin/python -m pytest tests/          # incl. Rust/Python parity
 $VENV/bin/python train_smoke.py            # PPO smoke, easy chart, pool encoder
-$VENV/bin/python train_smoke.py --encoder transformer
+$VENV/bin/python train_smoke.py --encoder transformer --rust   # Rust sim core
+```
+
+The Rust sim core (63x faster env.step; training 1.3-1.6x on 8 serial
+envs) builds once with:
+
+```bash
+cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
 Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`.

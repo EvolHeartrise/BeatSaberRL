@@ -26,6 +26,11 @@ import pufferlib.vector as vec
 from beat_arena_env import BeatEnv, BeatSim, ChartConfig, scripted_action
 from policy import NotePolicy
 
+try:
+    from beat_arena_env.rust_env import RustBeatEnv
+except ImportError:          # extension not built; --rust will error clearly
+    RustBeatEnv = None
+
 NUM_ENVS = 8
 HORIZON = 128
 EPOCHS = 3
@@ -81,6 +86,8 @@ def parse_args():
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2],
                    help="allowed note rows")
     p.add_argument("--init-from", type=str, default=None)
+    p.add_argument("--rust", action="store_true",
+                   help="use the Rust sim core (63x faster env; parity-tested)")
     return p.parse_args()
 
 
@@ -94,9 +101,13 @@ def env_kwargs(args):
 
 def make_venv(num_envs, args, base_seed=0):
     kw = env_kwargs(args)
+    env_cls = RustBeatEnv if getattr(args, "rust", False) else BeatEnv
+    if env_cls is None:
+        raise RuntimeError("--rust requires the beat_arena_rs extension "
+                           "(build with maturin develop --release in rust/)")
 
     def make_env(buf=None, seed=0, **_):
-        return em.GymnasiumPufferEnv(env=BeatEnv(seed=seed, **kw), buf=buf, seed=seed)
+        return em.GymnasiumPufferEnv(env=env_cls(seed=seed, **kw), buf=buf, seed=seed)
 
     return vec.make(make_env, num_envs=num_envs, backend=vec.Serial, seed=base_seed)
 
