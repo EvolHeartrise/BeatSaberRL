@@ -28,7 +28,8 @@ projects/beat-arena/
     beat_arena_env/      # package: chart gen, sim core, gymnasium env, scripted bot
     policy.py            # NotePolicy: pool | transformer encoder
     train_smoke.py       # CPU PPO (mirrors kiting-arena harness)
-    tests/               # pytest
+    tests/               # pytest (incl. Rust/Python parity)
+  rust/                  # beat-arena-rs: PyO3 port of the sim core (throughput)
 ```
 
 Uses kiting-arena's venv: `../kiting-arena/python/.venv` (torch-cpu,
@@ -218,6 +219,27 @@ vf 0.5, Adam 3e-4, grad clip 0.5. Flags: `--total-steps --time-cap
 Checkpoints record the encoder arm. Eval reports
 random / trained / **scripted** mean return over the same eval seeds —
 scripted is the ceiling reference.
+
+## Rust sim core (`rust/`, crate `beat-arena-rs`)
+
+Semantics-exact port of `sim.py`'s step + obs path, exposed to Python as
+`beat_arena_rs.RawBeatSim` (PyO3 0.22 + numpy 0.22; build with
+`VIRTUAL_ENV=<venv> maturin develop --release` from `rust/`). Chart
+generation and replay recording stay in Python — the chart is injected
+per episode via `set_chart` (sidesteps RNG parity; ~0.5 µs/step
+amortized). `beat_arena_env/rust_env.py: RustBeatEnv` is the drop-in
+Gymnasium wrapper; `train_smoke.py --rust` selects it. Parity is pinned
+by `tests/test_rust_parity.py`: identical rewards (1e-9), obs (1e-6),
+done flags, and cut counters across 5 configs + a scripted (cut-heavy)
+trajectory. When sim rules change, BOTH implementations must change and
+the parity suite is the gate.
+
+Measured 2026-07-20 (8-core CPU): Python `env.step` 137 µs vs Rust
+2.18 µs (**63×**; raw sim call 1.19 µs — the difference is gym-wrapper
+glue). End-to-end training (8 serial envs): pool **1.6×**, transformer
+**~1.3×** — the env is now ~0.3% of wall-clock and the torch policy is
+the whole bottleneck; large parallel-env counts are effectively free on
+the sim side (128 envs ≈ 0.28 ms/vector-step).
 
 ## Tests (`python/tests/`, pytest)
 
