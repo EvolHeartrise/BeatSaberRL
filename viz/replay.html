@@ -33,6 +33,7 @@
   <button id="play">▶ play</button>
   <button id="restart">↺ restart</button>
   <button id="slower">−</button><span id="speed">1.0×</span><button id="faster">+</button>
+  <button id="export">⏺ export video</button>
   <input id="scrub" type="range" min="0" max="0" value="0" step="1">
 </div>
 <div id="hud">no replay loaded</div>
@@ -54,6 +55,7 @@ const ANGV = a => [Math.cos(a), Math.sin(a)];
 
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 let rep = null, cur = 0, playing = false, speed = 1.0, lastTs = null;
+let replayName = null, exporting = false;
 
 // ---- perspective projection ------------------------------------------------
 const EYE_Y = 0.35, CAM_D = 2.2, F = 700, CX = 480, CY = 320;
@@ -315,6 +317,7 @@ function setSpeed(s) {
 function load(text, name) {
   try {
     rep = parseReplay(text);
+    replayName = name.replace(/\.[^.]*$/, "");
     cur = 0;
     document.getElementById("scrub").max = rep.ticks.length - 1;
     const spd = rep.config.note_speed_max
@@ -355,6 +358,38 @@ document.addEventListener("keydown", e => {
   else if (e.key === "-") setSpeed(speed / 2);
   else if (e.key === "r") { cur = 0; setPlaying(true); }
 });
+
+// ---- video export (client-side: canvas.captureStream + MediaRecorder) -----
+// Records one real-time playback pass at the CURRENT speed setting and
+// downloads a .webm. ~3 Mbps keeps a 20 s replay well under 10 MB.
+const exportBtn = document.getElementById("export");
+if (!("MediaRecorder" in window)) exportBtn.disabled = true;
+exportBtn.onclick = () => {
+  if (!rep || exporting) return;
+  exporting = true;
+  const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+    ? "video/webm;codecs=vp9" : "video/webm";
+  const rec = new MediaRecorder(cv.captureStream(30),
+    { mimeType: mime, videoBitsPerSecond: 3_000_000 });
+  const chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
+    a.download = (replayName || "replay") + ".webm";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    exporting = false;
+    exportBtn.textContent = "⏺ export video";
+  };
+  cur = 0;
+  setPlaying(true);
+  exportBtn.textContent = "⏺ recording…";
+  rec.start();
+  const poll = setInterval(() => {           // playback auto-pauses at the end
+    if (!playing) { clearInterval(poll); rec.stop(); }
+  }, 200);
+};
 
 setSpeed(1);
 requestAnimationFrame(frame);
