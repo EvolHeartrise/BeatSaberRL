@@ -14,6 +14,7 @@ apples-to-apples without retuning (LR, epochs).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 from datetime import datetime
@@ -56,6 +57,13 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--lr-decay", choices=["none", "cosine", "linear"],
+                   default="none",
+                   help="anneal lr from --lr to --lr-final over the run "
+                        "(motivated by the 2026-07-21 finding: 3e-4 "
+                        "discovers, ~1e-4 refines)")
+    p.add_argument("--lr-final", type=float, default=1e-4,
+                   help="end-of-run lr for --lr-decay")
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
@@ -214,6 +222,15 @@ def main():
           f"minibatch {mb_size}, device {device} ===", flush=True)
 
     for update in range(num_updates):
+        if args.lr_decay != "none":
+            frac = update / max(1, num_updates - 1)
+            if args.lr_decay == "cosine":
+                lr_now = args.lr_final + (args.lr - args.lr_final) * 0.5 * (
+                    1.0 + math.cos(math.pi * frac))
+            else:
+                lr_now = args.lr + (args.lr_final - args.lr) * frac
+            for g in opt.param_groups:
+                g["lr"] = lr_now
         t0 = time.perf_counter()
         for t in range(T):
             b_obs[t] = obs
