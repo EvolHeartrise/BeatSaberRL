@@ -20,7 +20,7 @@ BLOCK = 0.4           # block edge (m)
 POS_LO = (-1.5, -1.25)
 POS_HI = (1.5, 1.25)
 REWARD_GOOD = 1.0
-REWARD_BAD = -0.25
+REWARD_BAD = -0.5   # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 
 # obs layout (order is a contract; mirrored in policy.py)

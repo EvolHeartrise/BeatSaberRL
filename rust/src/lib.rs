@@ -21,7 +21,11 @@ const CELL: f64 = 0.5;
 const POS_LO: [f64; 2] = [-1.5, -1.25];
 const POS_HI: [f64; 2] = [1.5, 1.25];
 const REWARD_GOOD: f64 = 1.0;
-const REWARD_BAD: f64 = -0.25;
+// Equal to a miss since 2026-07-20 (user audit): in real Beat Saber a
+// bad cut and a miss are equally terminal (no score, combo break). The
+// old -0.25 was a v0 exploration crutch (engagement gradient) that
+// under-punished wrong_hand once the policy learned to engage.
+const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
 const SHAPE_GAMMA: f64 = 0.99;
 const SHAPE_DIST_CLIP: f64 = 2.0;
