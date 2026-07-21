@@ -23,12 +23,13 @@ REWARD_GOOD = 1.0
 REWARD_BAD = -0.5   # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 
-# obs layout (order is a contract; mirrored in policy.py)
+# obs layout v3 (order is a contract; mirrored in policy.py):
+# per note [cx, cy, z, vz, is_left, is_right, dir_cos, dir_sin, valid]
 N_NOTE_SLOTS = 12
-NOTE_FEAT = 15
+NOTE_FEAT = 9
 OFF_NOTES = 8
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 188
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 200
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 116
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 128
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-1.0, 12.0)

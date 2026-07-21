@@ -34,19 +34,21 @@ def _step_events(sim, saber, pos, vel):
 def test_obs_layout():
     env = RustBeatEnv(seed=3)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (200,)
-    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 188
+    assert obs.shape == (OBS_DIM,) == (128,)
+    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 116
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
     base = OFF_NOTES
-    assert obs[base + 14] == 1.0
+    assert obs[base + 8] == 1.0
     assert obs[base + 0] == pytest.approx((n.col - 1.5) / 2.0)
     assert obs[base + 1] == pytest.approx((n.row - 1.0) / 1.5)
     z = min(n.hit_time * env.cfg.note_speed, 12.0)
     assert obs[base + 2] == pytest.approx(z / 8.0)
     assert obs[base + 3] == pytest.approx(-env.cfg.note_speed / 8.0)
-    assert obs[base + 6 + n.dir] == 1.0
+    theta = n.dir * np.pi / 4
+    assert obs[base + 6] == pytest.approx(np.cos(theta), abs=1e-6)
+    assert obs[base + 7] == pytest.approx(np.sin(theta), abs=1e-6)
     for slot in range(n_pending, N_NOTE_SLOTS):
         assert not obs[OFF_NOTES + slot * NOTE_FEAT:
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()

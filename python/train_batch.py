@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
-from policy import NotePolicy
+from policy import NotePolicy, OBS_DIM
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -105,7 +105,7 @@ def main():
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32)
 
-    b_obs = torch.zeros((T, N, 200))
+    b_obs = torch.zeros((T, N, OBS_DIM))
     b_act = torch.zeros((T, N, 2), dtype=torch.long)
     b_logp = torch.zeros((T, N))
     b_rew = torch.zeros((T, N))
@@ -150,7 +150,7 @@ def main():
                 adv[t] = lastgae
             returns = adv + b_val
 
-        f_obs = b_obs.reshape(-1, 200)
+        f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, 2)
         f_logp = b_logp.reshape(-1)
         f_adv = adv.reshape(-1)
