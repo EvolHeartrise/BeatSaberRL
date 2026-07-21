@@ -62,6 +62,8 @@ def parse_args():
     p.add_argument("--init-from", type=str, default=None)
     p.add_argument("--bench", action="store_true",
                    help="short run, prints steps/s split (rollout vs update)")
+    p.add_argument("--device", type=str, default=None,
+                   help="cuda|cpu (default: cuda if available)")
     # env config (mirrors train_smoke)
     p.add_argument("--note-rate", type=float, default=1.0)
     p.add_argument("--colors", choices=["right", "both"], default="right")
@@ -103,10 +105,16 @@ def parse_args():
     return p.parse_args()
 
 
+def cpu_state(policy):
+    """Checkpoint state_dict on CPU regardless of the training device."""
+    return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
+
+
 def greedy_fc_eval(policy, notes):
     """Play a fixed chart once with argmax actions (deterministic since the
     sim is deterministic). Aborts on the first combo break — FC needs zero.
     Returns (fc: bool, good, breaks, n_notes)."""
+    dev = next(policy.parameters()).device
     env = RustBeatEnv(external_chart=notes, shaping_coef=0.0, seed=0)
     obs, _ = env.reset()
     good = breaks = 0
@@ -114,7 +122,8 @@ def greedy_fc_eval(policy, notes):
     while not done and breaks == 0:
         with torch.no_grad():
             left_l, right_l, _ = policy(
-                torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
+                torch.as_tensor(obs, dtype=torch.float32,
+                                device=dev).unsqueeze(0))
         act = (int(left_l.argmax()), int(right_l.argmax()))
         obs, _, done, _, info = env.step(act)
         for _, reason in info["events"]:
@@ -136,6 +145,8 @@ def main():
     os.makedirs(args.run_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     N, T = args.num_envs, args.horizon
     batch = N * T
@@ -170,16 +181,17 @@ def main():
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
         policy.load_state_dict(ckpt["state_dict"])
         print(f"warm-started from {args.init_from}", flush=True)
+    policy = policy.to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=LR)
 
-    obs = torch.as_tensor(venv.reset(), dtype=torch.float32)
+    obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
-    b_obs = torch.zeros((T, N, OBS_DIM))
-    b_act = torch.zeros((T, N, 2), dtype=torch.long)
-    b_logp = torch.zeros((T, N))
-    b_rew = torch.zeros((T, N))
-    b_done = torch.zeros((T, N))
-    b_val = torch.zeros((T, N))
+    b_obs = torch.zeros((T, N, OBS_DIM), device=device)
+    b_act = torch.zeros((T, N, 2), dtype=torch.long, device=device)
+    b_logp = torch.zeros((T, N), device=device)
+    b_rew = torch.zeros((T, N), device=device)
+    b_done = torch.zeros((T, N), device=device)
+    b_val = torch.zeros((T, N), device=device)
 
     ep_returns = []
     num_updates = max(1, args.total_steps // batch)
@@ -188,7 +200,7 @@ def main():
     start = time.time()
 
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size} ===", flush=True)
+          f"minibatch {mb_size}, device {device} ===", flush=True)
 
     for update in range(num_updates):
         t0 = time.perf_counter()
@@ -197,22 +209,22 @@ def main():
             with torch.no_grad():
                 a, logp, _, v = policy.get_action_and_value(obs)
             b_act[t], b_logp[t], b_val[t] = a, logp, v
-            nobs, rew, done, infos = venv.step(a.numpy())
-            b_rew[t] = torch.as_tensor(rew)
-            b_done[t] = torch.as_tensor(done.astype(np.float32))
+            nobs, rew, done, infos = venv.step(a.cpu().numpy())
+            b_rew[t] = torch.as_tensor(rew, device=device)
+            b_done[t] = torch.as_tensor(done.astype(np.float32), device=device)
             for info in infos:
                 ep_returns.append(info["episode_return"])
                 if curriculum is not None:
                     curriculum.note_result(info)
-            obs = torch.as_tensor(nobs, dtype=torch.float32)
+            obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
             global_step += N
         t_rollout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
         with torch.no_grad():
             _, _, _, next_val = policy.get_action_and_value(obs)
-            adv = torch.zeros((T, N))
-            lastgae = torch.zeros(N)
+            adv = torch.zeros((T, N), device=device)
+            lastgae = torch.zeros(N, device=device)
             for t in reversed(range(T)):
                 nonterminal = 1.0 - b_done[t]
                 nextvalue = next_val if t == T - 1 else b_val[t + 1]
@@ -231,7 +243,7 @@ def main():
         for _ in range(args.epochs):
             np.random.shuffle(idx)
             for s in range(0, batch, mb_size):
-                mb = idx[s:s + mb_size]
+                mb = torch.as_tensor(idx[s:s + mb_size], device=device)
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     f_obs[mb], f_act[mb])
                 ratio = (newlogp - f_logp[mb]).exp()
@@ -264,7 +276,7 @@ def main():
                   flush=True)
             print(curriculum.summary(), flush=True)
             if fc:
-                torch.save({"state_dict": policy.state_dict(),
+                torch.save({"state_dict": cpu_state(policy),
                             "encoder": policy.encoder, "update": update + 1,
                             "global_step": global_step,
                             "fc_map": newest["song"], "stars": newest["stars"]},
@@ -277,7 +289,7 @@ def main():
                           f"will retry next FC check", flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
-            torch.save({"state_dict": policy.state_dict(), "encoder": policy.encoder,
+            torch.save({"state_dict": cpu_state(policy), "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
                         "recent_return": float(recent)},
                        os.path.join(args.run_dir, f"ckpt_upd{update+1:04d}.pt"))
@@ -286,7 +298,7 @@ def main():
             break
 
     recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
-    torch.save({"state_dict": policy.state_dict(), "encoder": policy.encoder,
+    torch.save({"state_dict": cpu_state(policy), "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
                 "recent_return": float(recent)},
                os.path.join(args.run_dir, "final.pt"))
