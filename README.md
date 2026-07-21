@@ -84,5 +84,10 @@ scripted bot ≈ +18.7 (97% good cuts).
   beating the scripted bot (96%) — pure rewards, no shaping, no
   curriculum, ~65 min total training at ~4.4k steps/s.** Checkpoint arc:
   2.7% (1M) → 19% (4M) → 41% (8M) → 68% (12M) → 98% (14M).
-- Next: harder charts (higher rate, tighter hand gaps), real BeatSaver
-  `.dat` parsing (v3), model scale on GPU.
+- Dynamic gym (env v4): continuous angles + per-note speeds; 19M-step
+  policy reaches 75-80% vs scripted 81%.
+- **v3 milestone: real BeatSaver maps parse (v2+v3 schemas, dot notes,
+  precision angles) and sight-read** — e.g. 81% on Spectre [Easy] with
+  zero training on real charts. Try:
+  `python sightread.py --map maps/<map>.zip --difficulty Easy --ckpt <ckpt> --replay out.jsonl`
+- Next: close the human-pattern distribution gap, model scale on GPU.

@@ -49,8 +49,9 @@ struct Note {
     col: u8,
     row: u8,
     color: u8,
-    angle: f64, // required swing direction in radians (0 = +x, CCW)
-    speed: f64, // approach speed toward the plane (m/s)
+    angle: f64,    // required swing direction in radians (0 = +x, CCW)
+    speed: f64,    // approach speed toward the plane (m/s)
+    any_dir: bool, // dot note: any swing direction scores
 }
 
 fn action_dir(a: u8) -> [f64; 2] {
@@ -111,16 +112,17 @@ impl Core {
         }
     }
 
-    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, f64, f64)>) {
+    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>) {
         self.chart = chart
             .into_iter()
-            .map(|(t, col, row, color, angle, speed)| Note {
+            .map(|(t, col, row, color, angle, speed, any_dir)| Note {
                 hit_time: t,
                 col,
                 row,
                 color,
                 angle,
                 speed,
+                any_dir,
             })
             .collect();
         self.reset_state();
@@ -187,7 +189,9 @@ impl Core {
             obs[base + 2] = (z / Z_SCALE) as f32;
             obs[base + 3] = (-n.speed / Z_SCALE) as f32;
             obs[base + 4 + n.color as usize] = 1.0;
-            let d = [n.angle.cos(), n.angle.sin()];
+            // dot notes encode direction as the ZERO vector — the one point
+            // that is no direction at all (unit-circle points = constraints)
+            let d = if n.any_dir { [0.0, 0.0] } else { [n.angle.cos(), n.angle.sin()] };
             obs[base + 6] = d[0] as f32;   // cos(theta): swing dir x
             obs[base + 7] = d[1] as f32;   // sin(theta): swing dir y
             obs[base + 8] = 1.0;           // valid
@@ -258,6 +262,8 @@ impl Core {
                         (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
                     if speed < V_MIN_CUT {
                         1 // slow
+                    } else if n.any_dir {
+                        0 // dot note: any direction scores
                     } else {
                         let d = [n.angle.cos(), n.angle.sin()];
                         let cosv =
@@ -309,12 +315,12 @@ impl RawBeatSim {
         }
     }
 
-    /// chart: list of (hit_time, col, row, color, angle_rad, speed),
+    /// chart: list of (hit_time, col, row, color, angle_rad, speed, any_dir),
     /// sorted by hit_time. Resets state, returns the reset observation.
     fn set_chart<'py>(
         &mut self,
         py: Python<'py>,
-        chart: Vec<(f64, u8, u8, u8, f64, f64)>,
+        chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>,
     ) -> Bound<'py, PyArray1<f32>> {
         self.core.set_chart_notes(chart);
         PyArray1::from_slice_bound(py, &self.core.build_obs())
@@ -401,7 +407,7 @@ impl VecBeatSim {
         }
     }
 
-    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, f64, f64)>) {
+    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>) {
         self.sims[i].set_chart_notes(chart);
     }
 

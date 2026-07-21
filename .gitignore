@@ -6,3 +6,4 @@ python/replays/
 *.pt
 resources
 rust/target/
+python/maps/
