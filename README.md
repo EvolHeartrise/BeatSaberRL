@@ -112,5 +112,11 @@ scripted bot ≈ +18.7 (97% good cuts).
   ~24.7k steps/s vs 8.5k CPU; rollout is now the bottleneck (77%).
   20M-step dynamic-gym run from scratch in 13.5 min, seed 1: **84.7%
   good cuts greedy — first policy above the 81% scripted ceiling.**
-- Next: close the human-pattern distribution gap, model scale on GPU
-  (rollout-bound now, so bigger models are nearly free).
+- GPU-resident sim (2026-07-21): `--env torch` runs the whole vec env as
+  tensor ops on the GPU (`beat_arena_env/torch_env.py`); Rust remains the
+  reference — float64 parity is exact (tests). 89k steps/s at N=8192
+  (vs 24.7k at N=128), but so does Rust at wide N: the PPO update is the
+  ceiling on this GPU, not the env. Scale `--minibatches` with N or WDDM
+  memory oversubscription silently tanks throughput.
+- Next: close the human-pattern distribution gap; retune LR/minibatch for
+  the wide-batch (N≥4096) regime if 100M+ step runs are wanted.

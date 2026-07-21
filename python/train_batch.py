@@ -73,6 +73,11 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
+    p.add_argument("--env", choices=["rust", "torch"], default="rust",
+                   help="torch = GPU-resident sim (obs born on device; "
+                        "procedural charts only, no curriculum)")
+    p.add_argument("--chart-pool", type=int, default=1024,
+                   help="pregenerated chart pool size for --env torch")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
     p.add_argument("--embed", type=int, default=64)
     p.add_argument("--trunk-dim", type=int, default=128)
@@ -166,6 +171,9 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
+    assert not (args.curriculum and args.env == "torch"), (
+        "--curriculum needs --env rust (real-map sampler is Python-side)")
+    torch_env = args.env == "torch"
     curriculum = None
     if args.curriculum:
         from beat_arena_env.curriculum import Curriculum
@@ -181,6 +189,16 @@ def main():
             N, shaping_coef=args.shaping_coef, seed=args.seed,
             chart_sampler=curriculum.sample,
             max_steps=int(args.max_song_s * 30) + 30)
+    elif args.env == "torch":
+        from beat_arena_env.torch_env import TorchBeatVecEnv
+        venv = TorchBeatVecEnv(
+            N, note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
+            cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
+            min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
+            note_speed_max=args.note_speed_max,
+            continuous_dirs=args.continuous_dirs,
+            shaping_coef=args.shaping_coef, seed=args.seed,
+            chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
             N, note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
@@ -237,15 +255,24 @@ def main():
             with torch.no_grad():
                 a, logp, _, v = policy.get_action_and_value(obs)
             b_act[t], b_logp[t], b_val[t] = a, logp, v
-            nobs, rew, done, infos = venv.step(a.cpu().numpy())
-            b_rew[t] = torch.as_tensor(rew, device=device)
-            b_done[t] = torch.as_tensor(done.astype(np.float32), device=device)
+            if torch_env:
+                nobs, rew, done, infos = venv.step(a)
+                b_rew[t] = rew.to(b_rew.dtype)
+                b_done[t] = done.to(b_done.dtype)
+                obs = nobs
+            else:
+                nobs, rew, done, infos = venv.step(a.cpu().numpy())
+                b_rew[t] = torch.as_tensor(rew, device=device)
+                b_done[t] = torch.as_tensor(
+                    done.astype(np.float32), device=device)
+                obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
             for info in infos:
                 ep_returns.append(info["episode_return"])
                 if curriculum is not None:
                     curriculum.note_result(info)
-            obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
             global_step += N
+        if torch_env:
+            ep_returns.extend(venv.pop_stats())
         t_rollout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
