@@ -20,15 +20,15 @@ from beat_arena_rs import RawBeatSim
 DOWN = 6 * np.pi / 4  # downward swing angle
 
 
-def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0):
+def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False):
     return Note(hit_time=hit_time, col=col, row=row, color=color,
-                angle=angle, speed=speed)
+                angle=angle, speed=speed, any_dir=any_dir)
 
 
 def _sim_with_note(note):
+    from beat_arena_env.chart import note_tuple
     sim = RawBeatSim(shaping_coef=0.0, max_steps=630)
-    sim.set_chart([(note.hit_time, note.col, note.row, note.color,
-                    note.angle, note.speed)])
+    sim.set_chart([note_tuple(note)])
     return sim
 
 
@@ -141,6 +141,21 @@ def test_miss_fires_exactly_at_slab_exit():
     assert sim.misses == 1
 
 
+def test_dot_note_scores_from_any_direction():
+    """any_dir (dot) notes: any fast swing is a good cut."""
+    for vel in ((0.0, 5.0), (5.0, 0.0), (-3.5, -3.5)):
+        sim = _sim_with_note(_note(DT, 2, 1, any_dir=True))
+        assert _step_events(sim, 1, (0.25, -0.05 * np.sign(vel[1] or 1)), vel) == [(0, 0)]
+
+
+def test_dot_note_obs_is_zero_vector():
+    from beat_arena_env.chart import note_tuple
+    sim = RawBeatSim(shaping_coef=0.0, max_steps=630)
+    obs = sim.set_chart([note_tuple(_note(2.0, 1, 1, any_dir=True))])
+    assert obs[OFF_NOTES + 6] == 0.0 and obs[OFF_NOTES + 7] == 0.0
+    assert obs[OFF_NOTES + 8] == 1.0  # still valid
+
+
 def test_early_crossing_does_nothing():
     sim = _sim_with_note(_note(0.5, 2, 1))
     assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == []
@@ -166,8 +181,8 @@ def test_shaping_changes_rewards_not_events():
     def run(coef):
         sim = RawBeatSim(shaping_coef=coef, max_steps=630)
         chart = generate_chart(ChartConfig(), np.random.default_rng(5))
-        sim.set_chart([(n.hit_time, n.col, n.row, n.color,
-                        n.angle, n.speed) for n in chart])
+        from beat_arena_env.chart import note_tuple
+        sim.set_chart([note_tuple(n) for n in chart])
         rng = np.random.default_rng(2)
         rewards, events = [], []
         done = False
@@ -245,3 +260,44 @@ def test_recording_roundtrip(tmp_path):
                 if "cut" in e and e["cut"]["good"])
     assert goods == info["good_cuts"]
     assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 4 for t in ticks)
+
+
+# --- BeatSaver parser (fixtures cover both real schemas) ---------------------
+
+def test_beatsaver_parser_v2_and_v3(tmp_path):
+    import json, math
+    from beat_arena_env.beatsaver import load_beatmap
+    info = {"_beatsPerMinute": 120.0, "_songName": "fixture",
+            "_difficultyBeatmapSets": [{
+                "_beatmapCharacteristicName": "Standard",
+                "_difficultyBeatmaps": [
+                    {"_difficulty": "Normal", "_beatmapFilename": "Normal.dat",
+                     "_noteJumpMovementSpeed": 10.0}]}]}
+    (tmp_path / "Info.dat").write_text(json.dumps(info))
+
+    # v2 schema: down-cut, bomb (skipped), dot note
+    v2 = {"_version": "2.0.0", "_notes": [
+        {"_time": 4, "_lineIndex": 1, "_lineLayer": 0, "_type": 0, "_cutDirection": 1},
+        {"_time": 5, "_lineIndex": 2, "_lineLayer": 1, "_type": 3, "_cutDirection": 0},
+        {"_time": 6, "_lineIndex": 3, "_lineLayer": 2, "_type": 1, "_cutDirection": 8},
+    ]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v2))
+    notes, meta = load_beatmap(str(tmp_path), "Normal", speed_scale=0.3,
+                               first_note_s=2.0)
+    assert len(notes) == 2                       # bomb dropped
+    assert notes[0].hit_time == pytest.approx(2.0)          # shifted
+    assert notes[1].hit_time == pytest.approx(3.0)          # 2 beats @120bpm = 1s
+    assert notes[0].angle == pytest.approx(3 * np.pi / 2)   # down
+    assert notes[0].color == 0 and notes[1].color == 1
+    assert notes[1].any_dir                                  # dot
+    assert notes[0].speed == pytest.approx(3.0)              # njs 10 * 0.3
+
+    # v3 schema: right-cut with +15deg precision offset
+    v3 = {"version": "3.3.0", "colorNotes": [
+        {"b": 4, "x": 0, "y": 0, "c": 1, "d": 3, "a": 15},
+    ]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, meta = load_beatmap(str(tmp_path), "Normal")
+    assert len(notes) == 1
+    assert notes[0].angle == pytest.approx(math.radians(15))  # 0 + 15deg CCW
+    assert not notes[0].any_dir

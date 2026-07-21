@@ -26,6 +26,7 @@ class Note:
     color: int    # 0 = left/red, 1 = right/blue
     angle: float  # required swing direction in RADIANS (0 = +x, CCW)
     speed: float  # approach speed toward the plane (m/s)
+    any_dir: bool = False  # dot note: any swing direction scores
 
 
 @dataclass
@@ -56,6 +57,11 @@ class ChartConfig:
         assert self.note_rate > 0
         assert self.shaping_coef >= 0
         assert self.note_speed > 0
+
+
+def note_tuple(n: Note):
+    """The (t, col, row, color, angle, speed, any_dir) tuple the Rust sim eats."""
+    return (n.hit_time, n.col, n.row, n.color, n.angle, n.speed, n.any_dir)
 
 
 def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:

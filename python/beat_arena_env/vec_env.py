@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .chart import ChartConfig, generate_chart
+from .chart import ChartConfig, generate_chart, note_tuple
 from .constants import OBS_DIM
 
 from beat_arena_rs import VecBeatSim
@@ -38,8 +38,7 @@ class BeatVecEnv:
     def _new_chart(self, i):
         chart = generate_chart(self.cfg, np.random.default_rng(
             int(self._rng.integers(0, 2**63 - 1))))
-        self.sim.set_chart(i, [(n.hit_time, n.col, n.row, n.color,
-                                n.angle, n.speed) for n in chart])
+        self.sim.set_chart(i, [note_tuple(n) for n in chart])
 
     def reset(self):
         for i in range(self.num_envs):

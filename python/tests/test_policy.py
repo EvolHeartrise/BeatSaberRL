@@ -87,8 +87,8 @@ def test_vec_matches_single():
     from beat_arena_env import ChartConfig, generate_chart
     chart_notes = generate_chart(ChartConfig(colors="both", dirs=tuple(range(8))),
                                  np.random.default_rng(21))
-    chart = [(n.hit_time, n.col, n.row, n.color, n.angle, n.speed)
-             for n in chart_notes]
+    from beat_arena_env.chart import note_tuple
+    chart = [note_tuple(n) for n in chart_notes]
     single = beat_arena_rs.RawBeatSim(max_steps=630)
     vec = beat_arena_rs.VecBeatSim(1, max_steps=630)
     o1 = single.set_chart(chart)

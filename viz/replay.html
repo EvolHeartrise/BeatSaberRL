@@ -164,6 +164,12 @@ function drawNoteCube(n, z, inSlab) {
   ctx.fillStyle = SABER_COLORS[n.color];
   poly(front, true); ctx.fill();
   if (inSlab) { ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2.5; poly(front, true); ctx.stroke(); }
+  if (n.any) {   // dot note: filled circle instead of an arrow
+    const [dx, dy, ds] = proj(cx0, cy0, z - HALF);
+    ctx.fillStyle = "#0b0d11";
+    ctx.beginPath(); ctx.arc(dx, dy, HALF * 0.35 * ds, 0, 7); ctx.fill();
+    return;
+  }
   // required swing direction arrow on the front face
   const d = ANGV(n.angle);
   const [ax0, ay0] = proj(cx0 - d[0] * HALF * 0.6, cy0 - d[1] * HALF * 0.6, z - HALF);
