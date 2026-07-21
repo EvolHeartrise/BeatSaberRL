@@ -1,134 +1,181 @@
-"""Env tests (SPEC.md §Tests 1-4, 6)."""
+"""Env tests against the Rust sim — THE implementation (SPEC.md §Tests).
+
+The Python sim was deleted 2026-07-20 (surface-area reduction); the cut
+scenarios that used to gate Python/Rust parity now gate the Rust sim
+directly, via its set_saber test hook and event stream.
+"""
 
 import numpy as np
 import pytest
 
 from beat_arena_env import (
     OBS_DIM, OFF_NOTES, OFF_NOTE_MASK, N_NOTE_SLOTS, NOTE_FEAT,
-    BeatEnv, BeatSim, ChartConfig, Note, generate_chart, scripted_action,
+    ChartConfig, Note, RustBeatEnv, generate_chart, scripted_action,
 )
-from beat_arena_env.sim import DT, Z_WINDOW
+from beat_arena_env.constants import DT, Z_WINDOW
+
+from beat_arena_rs import RawBeatSim
 
 
-def _sim_with_note(note):
-    """Fresh sim whose chart is exactly [note]."""
-    sim = BeatSim(ChartConfig(), seed=0)
-    sim.chart = [note]
-    sim.status = np.zeros(1, dtype=np.int64)
+def _sim_with_note(note, note_speed=4.0):
+    sim = RawBeatSim(note_speed=note_speed, shaping_coef=0.0, max_steps=630)
+    sim.set_chart([(note.hit_time, note.col, note.row, note.color, note.dir)])
     return sim
 
 
-# --- 1. obs layout -----------------------------------------------------------
+def _step_events(sim, saber, pos, vel):
+    sim.set_saber(saber, pos[0], pos[1], vel[0], vel[1])
+    _, _, _, events = sim.step(0, 0)
+    return events
+
+
+# --- obs layout --------------------------------------------------------------
 
 def test_obs_layout():
-    env = BeatEnv(seed=3)
+    env = RustBeatEnv(seed=3)
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (200,)
     assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 188
-    n_pending = min(len(env.sim.chart), N_NOTE_SLOTS)
-    mask = obs[OFF_NOTE_MASK:]
-    assert mask.sum() == n_pending
-    # slot 0 = soonest note; valid flag set, features match the chart
-    n = env.sim.chart[0]
+    n_pending = min(len(env.chart), N_NOTE_SLOTS)
+    assert obs[OFF_NOTE_MASK:].sum() == n_pending
+    n = env.chart[0]
     base = OFF_NOTES
     assert obs[base + 14] == 1.0
     assert obs[base + 0] == pytest.approx((n.col - 1.5) / 2.0)
     assert obs[base + 1] == pytest.approx((n.row - 1.0) / 1.5)
-    z = min(n.hit_time * env.cfg.note_speed, 12.0)     # sim.time == 0 at reset
+    z = min(n.hit_time * env.cfg.note_speed, 12.0)
     assert obs[base + 2] == pytest.approx(z / 8.0)
     assert obs[base + 3] == pytest.approx(-env.cfg.note_speed / 8.0)
     assert obs[base + 6 + n.dir] == 1.0
-    # empty slots are all-zero
     for slot in range(n_pending, N_NOTE_SLOTS):
         assert not obs[OFF_NOTES + slot * NOTE_FEAT:
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()
 
 
-# --- 2. determinism ----------------------------------------------------------
+def test_z_is_time_times_speed():
+    """time_until = z / |vz| at every step (spatial obs contract)."""
+    env = RustBeatEnv(seed=9)
+    obs, _ = env.reset()
+    for _ in range(60):
+        obs, _, done, _, _ = env.step((0, 0))
+        if done:
+            break
+        status = env.sim.status()
+        pending = [i for i, s in enumerate(status) if s == 0][:12]
+        for slot, i in enumerate(pending):
+            z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
+            vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
+            t_until = env.chart[i].hit_time - env.sim.time
+            if -1.0 < t_until * env.cfg.note_speed < 12.0:
+                assert z_obs / -vz_obs == pytest.approx(t_until, abs=1e-4)
 
-def test_determinism_scripted():
+
+# --- determinism -------------------------------------------------------------
+
+def test_determinism():
     def run():
-        sim = BeatSim(ChartConfig(colors="both", note_rate=1.5), seed=7)
-        rewards, events = [], []
+        env = RustBeatEnv(colors="both", note_rate=1.5, seed=7)
+        env.reset(seed=7)
+        rng = np.random.default_rng(1)
+        out = []
         done = False
         while not done:
-            r, done, ev = sim.step(*scripted_action(sim))
-            rewards.append(r)
-            events.append(ev)
-        return rewards, events
+            _, r, done, _, info = env.step(rng.integers(0, 9, size=2))
+            out.append((r, tuple(info["events"])))
+        return out
 
-    r1, e1 = run()
-    r2, e2 = run()
-    assert r1 == r2 and e1 == e2
+    assert run() == run()
 
 
-# --- 3. cut detection scenarios ---------------------------------------------
-
-def _step_events(sim, saber, pos, vel):
-    sim.pos[saber] = np.array(pos, dtype=np.float64)
-    sim.vel[saber] = np.array(vel, dtype=np.float64)
-    _, _, events = sim.step(0, 0)
-    return events
-
+# --- cut detection scenarios (Rust sim, via set_saber hook) ------------------
 
 def test_good_cut():
     sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -5.0))
-    assert ev == [{"cut": {"note": 0, "good": True, "reason": "ok"}}]
+    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == [(0, 0)]  # ok
     assert sim.good_cuts == 1
+
+
+def test_gentle_cut_is_good():
+    """V_MIN_CUT is 1 m/s: a 1.5 m/s swing scores."""
+    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -1.5)) == [(0, 0)]
 
 
 def test_slow_cut_is_bad():
     sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -0.5))
-    assert ev == [{"cut": {"note": 0, "good": False, "reason": "slow"}}]
-
-
-def test_gentle_cut_is_good():
-    """V_MIN_CUT is 1 m/s (real BS scores gentle swings): 1.5 m/s passes."""
-    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -1.5))
-    assert ev == [{"cut": {"note": 0, "good": True, "reason": "ok"}}]
+    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -0.5)) == [(0, 1)]  # slow
 
 
 def test_wrong_angle_is_bad():
     sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, -0.05), vel=(0.0, 5.0))  # swinging UP
-    assert ev == [{"cut": {"note": 0, "good": False, "reason": "angle"}}]
+    assert _step_events(sim, 1, (0.25, -0.05), (0.0, 5.0)) == [(0, 2)]  # angle
 
 
 def test_wrong_hand_is_bad():
     sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6))
-    sim.pos[1] = np.array([1.25, -1.0])  # matching (right) saber far away
-    ev = _step_events(sim, 0, pos=(-0.75, 0.55), vel=(0.0, -5.0))
-    assert ev == [{"cut": {"note": 0, "good": False, "reason": "wrong_hand"}}]
+    sim.set_saber(1, 1.25, -1.0, 0.0, 0.0)   # matching (right) saber far away
+    assert _step_events(sim, 0, (-0.75, 0.55), (0.0, -5.0)) == [(0, 3)]
 
 
-def test_miss_fires_exactly_at_window_expiry():
-    # note far from both resting sabers, nobody moves
+def test_miss_fires_exactly_at_slab_exit():
     sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6))
-    all_events = []
+    events = []
     for _ in range(8):
-        _, _, ev = sim.step(0, 0)
-        all_events.append(ev)
-    miss_ticks = [i for i, ev in enumerate(all_events)
-                  if any("miss" in e for e in ev)]
+        _, _, _, ev = sim.step(0, 0)
+        events.append(ev)
+    miss_ticks = [i for i, ev in enumerate(events) if (0, 4) in ev]
     assert len(miss_ticks) == 1
     t_miss = (miss_ticks[0] + 1) * DT
-    w = Z_WINDOW / sim.cfg.note_speed         # slab half-depth in seconds
-    assert t_miss - DT > w                     # strictly after window closes
-    assert t_miss - DT <= w + DT + 1e-9        # by at most one tick
+    w = Z_WINDOW / 4.0
+    assert w < t_miss - DT <= w + DT + 1e-9
     assert sim.misses == 1
 
 
 def test_early_crossing_does_nothing():
     sim = _sim_with_note(Note(hit_time=0.5, col=2, row=1, color=1, dir=6))
-    ev = _step_events(sim, 1, pos=(0.25, 0.05), vel=(0.0, -5.0))
-    assert ev == []
-    assert sim.status[0] == 0  # still pending
+    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == []
+    assert sim.status()[0] == 0
 
 
-# --- 4. chart generation -----------------------------------------------------
+def test_note_speed_scales_the_time_window():
+    """Faster notes spend less TIME in the fixed spatial slab."""
+    ticks = {}
+    for speed in (4.0, 8.0):
+        sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6),
+                             note_speed=speed)
+        t = 0
+        while sim.status()[0] == 0:
+            sim.step(0, 0)
+            t += 1
+        ticks[speed] = t
+    assert ticks[8.0] < ticks[4.0]
+
+
+# --- shaping (ablation-only mechanism, still contract-tested) ---------------
+
+def test_shaping_changes_rewards_not_events():
+    def run(coef):
+        sim = RawBeatSim(note_speed=4.0, shaping_coef=coef, max_steps=630)
+        chart = generate_chart(ChartConfig(), np.random.default_rng(5))
+        sim.set_chart([(n.hit_time, n.col, n.row, n.color, n.dir) for n in chart])
+        rng = np.random.default_rng(2)
+        rewards, events = [], []
+        done = False
+        while not done:
+            a = rng.integers(0, 9, size=2)
+            _, r, done, ev = sim.step(int(a[0]), int(a[1]))
+            rewards.append(r)
+            events.append(ev)
+        return rewards, events
+
+    r0, e0 = run(0.0)
+    r1, e1 = run(0.2)
+    assert e0 == e1
+    assert r0 != r1
+    assert abs(sum(r1) - sum(r0)) < 1.0
+
+
+# --- chart generation --------------------------------------------------------
 
 def test_chart_respects_hand_gap_and_dirs():
     cfg = ChartConfig(note_rate=3.0, colors="both", dirs=(2, 6),
@@ -142,74 +189,38 @@ def test_chart_respects_hand_gap_and_dirs():
     assert all(a.hit_time <= b.hit_time for a, b in zip(chart, chart[1:]))
 
 
-# --- 6. scripted bot solvability --------------------------------------------
+# --- scripted bot solvability ------------------------------------------------
 
 def test_scripted_bot_solves_easy():
     good, total = 0, 0
+    env = RustBeatEnv(seed=0)
     for seed in range(5):
-        sim = BeatSim(ChartConfig(), seed=seed)
+        env.reset(seed=seed)
         done = False
         while not done:
-            _, done, _ = sim.step(*scripted_action(sim))
-        good += sim.good_cuts
-        total += len(sim.chart)
+            _, _, done, _, info = env.step(scripted_action(env))
+        good += info["good_cuts"]
+        total += info["n_notes"]
     assert good / total >= 0.8
 
 
-# --- 7. shaping is potential-based: events identical, reward densified -------
+# --- recording (JSONL v2 from the Rust event stream) ------------------------
 
-def test_shaping_changes_rewards_not_events():
-    def run(coef):
-        sim = BeatSim(ChartConfig(shaping_coef=coef), seed=5)
-        rewards, events = [], []
-        done = False
-        while not done:
-            r, done, ev = sim.step(*scripted_action(sim))
-            rewards.append(r)
-            events.append(ev)
-        return rewards, events
-
-    r0, e0 = run(0.0)
-    r1, e1 = run(0.2)
-    assert e0 == e1                      # same trajectory, same cuts/misses
-    assert r0 != r1                      # but the reward signal is denser
-    # telescoping: total shaping contribution is small (bounded by phi range)
-    assert abs(sum(r1) - sum(r0)) < 1.0
-
-
-# --- 8. obs v2: z encodes time spatially -------------------------------------
-
-def test_z_is_time_times_speed():
-    """time_until = z / |vz| must hold at every step (the reparametrization
-    that replaced the explicit time feature)."""
-    from beat_arena_env.env import OFF_NOTES as ON, NOTE_FEAT as NF, Z_SCALE
-    env = BeatEnv(seed=9)
-    obs, _ = env.reset()
-    for _ in range(60):
-        obs, _, done, _, _ = env.step((0, 0))
-        if done:
-            break
-        pending = env.sim.pending_notes()[:12]
-        for slot, i in enumerate(pending):
-            z_obs = obs[ON + slot * NF + 2] * Z_SCALE
-            vz_obs = obs[ON + slot * NF + 3] * Z_SCALE
-            t_until = env.sim.chart[i].hit_time - env.sim.time
-            if -1.0 < t_until * env.cfg.note_speed < 12.0:  # inside clip range
-                assert z_obs / -vz_obs == pytest.approx(t_until, abs=1e-4)
-
-
-def test_note_speed_scales_the_time_window():
-    """Faster notes spend less TIME in the fixed spatial slab."""
-    for speed, ticks_expected in ((4.0, None), (8.0, None)):
-        sim = BeatSim(ChartConfig(note_speed=speed), seed=0)
-        # cell (0,2) center is far from both resting sabers
-        sim.chart = [Note(hit_time=DT, col=0, row=2, color=1, dir=6)]
-        sim.status = np.zeros(1, dtype=np.int64)
-        t = 0
-        while sim.status[0] == 0:
-            sim.step(0, 0)
-            t += 1
-        if speed == 4.0:
-            slow = t
-        else:
-            assert t < slow  # halves the slab-crossing time
+def test_recording_roundtrip(tmp_path):
+    import json
+    path = str(tmp_path / "ep.jsonl")
+    env = RustBeatEnv(seed=5, chart_len_s=6.0)
+    env.set_record(path)
+    env.reset(seed=5)
+    done = False
+    while not done:
+        _, _, done, _, info = env.step(scripted_action(env))
+    lines = [json.loads(l) for l in open(path) if l.strip()]
+    head, ticks = lines[0], lines[1:]
+    assert head["header"]["version"] == 2
+    assert head["header"]["config"]["note_speed"] == 4.0
+    assert len(head["header"]["chart"]) == info["n_notes"]
+    goods = sum(1 for t in ticks for e in t["events"]
+                if "cut" in e and e["cut"]["good"])
+    assert goods == info["good_cuts"]
+    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 4 for t in ticks)

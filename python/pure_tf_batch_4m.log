@@ -1,0 +1,82 @@
+/home/evolheartrise/git projects/claude-teaches/projects/kiting-arena/python/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:64: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+warm-started from runs/pure_tf_batch_1m/final.pt
+=== batched PPO: 128 envs x 128 horizon = 16384 steps/update, minibatch 4096, encoder transformer ===
+update   1/183  steps     16384  ep_return(last100)      nan  ent 4.311     3,550 steps/s     4.6s
+update   2/183  steps     32768  ep_return(last100)      nan  ent 4.318     3,731 steps/s     8.8s
+update   3/183  steps     49152  ep_return(last100)      nan  ent 4.308     3,921 steps/s    12.5s
+update   4/183  steps     65536  ep_return(last100)      nan  ent 4.299     3,991 steps/s    16.4s
+update   5/183  steps     81920  ep_return(last100)   -8.227  ent 4.305     4,005 steps/s    20.5s
+update   6/183  steps     98304  ep_return(last100)   -8.227  ent 4.297     4,052 steps/s    24.3s
+update   7/183  steps    114688  ep_return(last100)   -8.227  ent 4.285     4,059 steps/s    28.3s
+update   8/183  steps    131072  ep_return(last100)   -8.227  ent 4.279     4,086 steps/s    32.1s
+update   9/183  steps    147456  ep_return(last100)   -8.297  ent 4.269     4,084 steps/s    36.1s
+update  10/183  steps    163840  ep_return(last100)   -8.340  ent 4.280     4,045 steps/s    40.5s
+update  11/183  steps    180224  ep_return(last100)   -8.340  ent 4.271     4,033 steps/s    44.7s
+update  12/183  steps    196608  ep_return(last100)   -8.340  ent 4.266     3,996 steps/s    49.2s
+update  13/183  steps    212992  ep_return(last100)   -8.340  ent 4.251     4,007 steps/s    53.2s
+update  14/183  steps    229376  ep_return(last100)   -8.320  ent 4.258     4,018 steps/s    57.1s
+update  15/183  steps    245760  ep_return(last100)   -8.307  ent 4.276     4,025 steps/s    61.1s
+update  16/183  steps    262144  ep_return(last100)   -8.307  ent 4.259     4,044 steps/s    64.8s
+update  17/183  steps    278528  ep_return(last100)   -8.307  ent 4.258     4,067 steps/s    68.5s
+update  18/183  steps    294912  ep_return(last100)   -8.307  ent 4.245     4,095 steps/s    72.0s
+update  19/183  steps    311296  ep_return(last100)   -8.160  ent 4.260     4,114 steps/s    75.7s
+update  20/183  steps    327680  ep_return(last100)   -8.160  ent 4.257     4,117 steps/s    79.6s
+update  21/183  steps    344064  ep_return(last100)   -8.160  ent 4.227     4,111 steps/s    83.7s
+update  22/183  steps    360448  ep_return(last100)   -8.160  ent 4.201     4,121 steps/s    87.5s
+update  23/183  steps    376832  ep_return(last100)   -8.207  ent 4.188     4,133 steps/s    91.2s
+update  24/183  steps    393216  ep_return(last100)   -8.140  ent 4.236     4,118 steps/s    95.5s
+update  25/183  steps    409600  ep_return(last100)   -8.140  ent 4.219     4,118 steps/s    99.5s
+update  26/183  steps    425984  ep_return(last100)   -8.140  ent 4.183     4,108 steps/s   103.7s
+update  27/183  steps    442368  ep_return(last100)   -8.140  ent 4.133     4,104 steps/s   107.8s
+update  28/183  steps    458752  ep_return(last100)   -8.150  ent 4.168     4,105 steps/s   111.8s
+update  29/183  steps    475136  ep_return(last100)   -8.152  ent 4.185     4,105 steps/s   115.8s
+update  30/183  steps    491520  ep_return(last100)   -8.152  ent 4.163     4,108 steps/s   119.7s
+update  31/183  steps    507904  ep_return(last100)   -8.152  ent 4.146     4,113 steps/s   123.5s
+update  32/183  steps    524288  ep_return(last100)   -8.098  ent 4.127     4,119 steps/s   127.3s
+update  33/183  steps    540672  ep_return(last100)   -7.835  ent 4.175     4,122 steps/s   131.2s
+update  34/183  steps    557056  ep_return(last100)   -7.835  ent 4.151     4,124 steps/s   135.1s
+update  35/183  steps    573440  ep_return(last100)   -7.835  ent 4.154     4,121 steps/s   139.2s
+update  36/183  steps    589824  ep_return(last100)   -7.835  ent 4.149     4,126 steps/s   143.0s
+update  37/183  steps    606208  ep_return(last100)   -7.690  ent 4.156     4,129 steps/s   146.8s
+update  38/183  steps    622592  ep_return(last100)   -7.715  ent 4.156     4,133 steps/s   150.6s
+update  39/183  steps    638976  ep_return(last100)   -7.715  ent 4.154     4,139 steps/s   154.4s
+update  40/183  steps    655360  ep_return(last100)   -7.715  ent 4.130     4,141 steps/s   158.3s
+update  41/183  steps    671744  ep_return(last100)   -7.705  ent 4.123     4,140 steps/s   162.3s
+update  42/183  steps    688128  ep_return(last100)   -7.843  ent 4.158     4,141 steps/s   166.2s
+update  43/183  steps    704512  ep_return(last100)   -7.843  ent 4.147     4,134 steps/s   170.4s
+update  44/183  steps    720896  ep_return(last100)   -7.843  ent 4.166     4,137 steps/s   174.3s
+update  45/183  steps    737280  ep_return(last100)   -7.843  ent 4.158     4,139 steps/s   178.1s
+update  46/183  steps    753664  ep_return(last100)   -7.790  ent 4.154     4,144 steps/s   181.9s
+update  47/183  steps    770048  ep_return(last100)   -7.640  ent 4.190     4,149 steps/s   185.6s
+update  48/183  steps    786432  ep_return(last100)   -7.640  ent 4.183     4,150 steps/s   189.5s
+update  49/183  steps    802816  ep_return(last100)   -7.640  ent 4.161     4,152 steps/s   193.4s
+update  50/183  steps    819200  ep_return(last100)   -7.640  ent 4.143     4,154 steps/s   197.2s
+update  51/183  steps    835584  ep_return(last100)   -7.888  ent 4.156     4,154 steps/s   201.2s
+update  52/183  steps    851968  ep_return(last100)   -7.970  ent 4.140     4,158 steps/s   204.9s
+update  53/183  steps    868352  ep_return(last100)   -7.970  ent 4.136     4,157 steps/s   208.9s
+update  54/183  steps    884736  ep_return(last100)   -7.970  ent 4.098     4,148 steps/s   213.3s
+update  55/183  steps    901120  ep_return(last100)   -7.942  ent 4.096     4,129 steps/s   218.2s
+update  56/183  steps    917504  ep_return(last100)   -7.660  ent 4.139     4,129 steps/s   222.2s
+update  57/183  steps    933888  ep_return(last100)   -7.660  ent 4.087     4,124 steps/s   226.5s
+update  58/183  steps    950272  ep_return(last100)   -7.660  ent 4.092     4,108 steps/s   231.3s
+update  59/183  steps    966656  ep_return(last100)   -7.660  ent 4.072     4,106 steps/s   235.4s
+update  60/183  steps    983040  ep_return(last100)   -7.465  ent 4.090     4,103 steps/s   239.6s
+update  61/183  steps    999424  ep_return(last100)   -7.285  ent 4.096     4,100 steps/s   243.7s
+update  62/183  steps   1015808  ep_return(last100)   -7.285  ent 4.107     4,097 steps/s   247.9s
+update  63/183  steps   1032192  ep_return(last100)   -7.285  ent 4.105     4,093 steps/s   252.2s
+update  64/183  steps   1048576  ep_return(last100)   -7.335  ent 4.096     4,092 steps/s   256.3s
+update  65/183  steps   1064960  ep_return(last100)   -7.673  ent 4.123     4,089 steps/s   260.5s
+update  66/183  steps   1081344  ep_return(last100)   -7.617  ent 4.116     4,090 steps/s   264.4s
+update  67/183  steps   1097728  ep_return(last100)   -7.617  ent 4.113     4,089 steps/s   268.5s
+update  68/183  steps   1114112  ep_return(last100)   -7.617  ent 4.091     4,088 steps/s   272.5s
+update  69/183  steps   1130496  ep_return(last100)   -7.145  ent 4.088     4,087 steps/s   276.6s
+update  70/183  steps   1146880  ep_return(last100)   -6.700  ent 4.107     4,083 steps/s   280.9s
+update  71/183  steps   1163264  ep_return(last100)   -6.700  ent 4.084     4,079 steps/s   285.2s
+update  72/183  steps   1179648  ep_return(last100)   -6.700  ent 4.075     4,075 steps/s   289.5s
+update  73/183  steps   1196032  ep_return(last100)   -6.700  ent 4.066     4,060 steps/s   294.6s
+update  74/183  steps   1212416  ep_return(last100)   -6.665  ent 4.061     4,045 steps/s   299.8s
+update  75/183  steps   1228800  ep_return(last100)   -6.603  ent 4.022     4,038 steps/s   304.3s

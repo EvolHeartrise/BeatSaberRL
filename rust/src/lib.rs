@@ -188,7 +188,8 @@ impl Core {
         obs
     }
 
-    fn step_inner(&mut self, actions: [u8; 2]) -> (f64, bool) {
+    // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss
+    fn step_inner(&mut self, actions: [u8; 2]) -> (f64, bool, Vec<(u32, u8)>) {
         let prev_pos = self.pos;
         for s in 0..2 {
             let a = actions[s];
@@ -217,6 +218,7 @@ impl Core {
 
         self.time = (self.tick + 1) as f64 * DT;
         let mut reward = 0.0;
+        let mut events: Vec<(u32, u8)> = Vec::new();
 
         for i in 0..self.chart.len() {
             if self.status[i] != 0 {
@@ -229,6 +231,7 @@ impl Core {
                     self.status[i] = 3;
                     self.misses += 1;
                     reward += REWARD_MISS;
+                    events.push((i as u32, 4));
                 }
                 continue;
             }
@@ -239,20 +242,21 @@ impl Core {
                 if !crossed {
                     continue;
                 }
-                let good = if s != n.color as usize {
-                    false // wrong_hand
+                let code: u8 = if s != n.color as usize {
+                    3 // wrong_hand
                 } else {
                     let speed =
                         (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
                     if speed < V_MIN_CUT {
-                        false // slow
+                        1 // slow
                     } else {
                         let d = dir_vec(n.dir);
                         let cosv =
                             (self.vel[s][0] * d[0] + self.vel[s][1] * d[1]) / speed.max(1e-9);
-                        cosv >= COS_TOL // angle if below
+                        if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
                     }
                 };
+                let good = code == 0;
                 self.status[i] = if good { 1 } else { 2 };
                 if good {
                     self.good_cuts += 1;
@@ -261,6 +265,7 @@ impl Core {
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
                 }
+                events.push((i as u32, code));
                 break;
             }
         }
@@ -276,7 +281,7 @@ impl Core {
         reward += SHAPE_GAMMA * new_phi - self.phi;
         self.phi = new_phi;
 
-        (reward, done)
+        (reward, done, events)
     }
 }
 
@@ -306,19 +311,39 @@ impl RawBeatSim {
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
+    /// Returns (obs, reward, done, events); events = [(note_idx, code)]
+    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         action_left: u8,
         action_right: u8,
-    ) -> (Bound<'py, PyArray1<f32>>, f64, bool) {
+    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8)>) {
         assert!(action_left <= 8 && action_right <= 8);
-        let (reward, done) = self.core.step_inner([action_left, action_right]);
+        let (reward, done, events) = self.core.step_inner([action_left, action_right]);
         (
             PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
             done,
+            events,
         )
+    }
+
+    /// Saber state [[x, y, vx, vy]; 2] (world units).
+    fn sabers(&self) -> [[f64; 4]; 2] {
+        [0, 1].map(|s| [self.core.pos[s][0], self.core.pos[s][1],
+                        self.core.vel[s][0], self.core.vel[s][1]])
+    }
+
+    /// Per-note status: 0 pending, 1 good, 2 bad, 3 missed.
+    fn status(&self) -> Vec<u8> {
+        self.core.status.clone()
+    }
+
+    /// TEST HOOK: overwrite one saber's position/velocity before a step.
+    fn set_saber(&mut self, s: usize, x: f64, y: f64, vx: f64, vy: f64) {
+        self.core.pos[s] = [x, y];
+        self.core.vel[s] = [vx, vy];
     }
 
     #[getter]
@@ -340,6 +365,10 @@ impl RawBeatSim {
     #[getter]
     fn tick(&self) -> u32 {
         self.core.tick
+    }
+    #[getter]
+    fn time(&self) -> f64 {
+        self.core.time
     }
 }
 
@@ -397,7 +426,7 @@ impl VecBeatSim {
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
         for (i, sim) in self.sims.iter_mut().enumerate() {
-            let (r, d) =
+            let (r, d, _events) =
                 sim.step_inner([acts[[i, 0]] as u8, acts[[i, 1]] as u8]);
             flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
             rewards[i] = r as f32;

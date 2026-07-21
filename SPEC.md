@@ -25,18 +25,28 @@ projects/beat-arena/
   SPEC.md
   README.md
   python/
-    beat_arena_env/      # package: chart gen, sim core, gymnasium env, scripted bot
-    policy.py            # NotePolicy: pool | transformer encoder
-    train_smoke.py       # CPU PPO (mirrors kiting-arena harness)
-    tests/               # pytest (incl. Rust/Python parity)
-  rust/                  # beat-arena-rs: PyO3 port of the sim core (throughput)
+    beat_arena_env/      # chart gen, constants, gym wrappers, scripted bot
+    policy.py            # NotePolicy (transformer)
+    train_batch.py       # batched CPU PPO (the only trainer)
+    record_replay.py     # replay recorder (Rust event stream -> JSONL v2)
+    tests/               # pytest
+  rust/                  # beat-arena-rs: THE sim implementation
 ```
+
+**Single-implementation policy (since 2026-07-20, user direction):** the
+Python sim, the pool encoder, and the serial trainer were deleted to cut
+maintenance surface. `rust/src/lib.rs` is the only physics
+implementation; `beat_arena_env/constants.py` mirrors its constants for
+tooling and this SPEC remains the written contract. Rule changes land in
+lib.rs and are gated by the scenario tests in `tests/test_env.py`
+(which drive the Rust sim directly via its `set_saber` hook and event
+stream).
 
 Uses kiting-arena's venv: `../kiting-arena/python/.venv` (torch-cpu,
 gymnasium, pufferlib 3.0, pytest). No new dependencies in v0. No GPU;
 paths contain a space — quote everything.
 
-## Sim rules (`beat_arena_env/sim.py`) — world v2: metric, 3D notes
+## Sim rules (`rust/src/lib.rs`) — world v2: metric, 3D notes
 
 - Fixed tick `DT = 1/30` s. One policy action per tick.
 - **World in METERS**, matching real Beat Saber block dimensions. The hit
@@ -141,13 +151,17 @@ spatially, as a player perceives it. `vz` is included so timing stays
 recoverable if per-note speeds ever vary (then z alone is an insufficient
 statistic for arrival). Both properties are pinned by tests.
 
-## Gymnasium env (`beat_arena_env/env.py`)
+## Gymnasium env (`beat_arena_env/rust_env.py`)
 
-`BeatEnv(note_rate, colors, dirs, chart_len_s, min_hand_gap_s, seed)`:
+`RustBeatEnv(note_rate, colors, dirs, chart_len_s, min_hand_gap_s,
+shaping_coef, cols, rows, note_speed, seed)`:
 `observation_space = Box(-2, 2, (200,))` (bounds loose),
-`action_space = MultiDiscrete([9, 9])`. New chart every `reset(seed)`.
-`set_record(path)` dumps replay JSONL. `info` on final step carries
-`good_cuts, bad_cuts, misses, n_notes`.
+`action_space = MultiDiscrete([9, 9])`. New chart every `reset(seed)`
+(chart gen stays in Python — single source for charts). Per-step
+`info["events"]` = (note_idx, reason) from the Rust event stream; final
+step adds `good_cuts, bad_cuts, misses, n_notes`. `set_record(path)`
+dumps replay JSONL v2 built from those events. Batched training path:
+`beat_arena_env/vec_env.py: BeatVecEnv` over `VecBeatSim`.
 
 ## Replay log (JSONL, version 2)
 
@@ -190,49 +204,43 @@ cuts on the default easy chart (tested).
 
 ## Policy (`python/policy.py`)
 
-`NotePolicy(encoder="pool"|"transformer")`, obs contract offsets mirrored:
+`NotePolicy()` — transformer only (the pool baseline was deleted
+2026-07-20 after the easy-config studies concluded; checkpoints still
+record `encoder: "transformer"`):
 
 - Per-note MLP `15 → 64 → 64` (shared across the 12 slots).
 - Per-saber token MLP `6 → 64 → 64` on `[x/1, y/0.75, vx/6, vy/6, is_left,
   is_right]` (hand identity via one-hot, weights shared).
-- `encoder="pool"`: masked max-pool over note embeddings (64) ++ raw saber
-  features (8) → trunk. Saber–note interaction happens only in the trunk.
-- `encoder="transformer"`: token sequence = `[saber_L, saber_R,
-  note_0..11]` (14 tokens); key mask `[1, 1, note_mask]`. **2 × full
-  pre-LN transformer blocks** (LayerNorm → single-head QKV self-attention
-  → residual; LayerNorm → FFN 64→128→64 → residual) — unlike kiting-arena's
-  deliberately minimal arm, this applies its lesson: give attention its
-  standard optimization aids. Readout = concat of the two saber tokens'
-  output embeddings (128) → trunk.
+- Token sequence = `[saber_L, saber_R, note_0..11]` (14 tokens); key mask
+  `[1, 1, note_mask]`. **2 × full pre-LN transformer blocks** (LayerNorm →
+  single-head QKV self-attention → residual; LayerNorm → FFN 64→128→64 →
+  residual). Readout = concat of the two saber tokens' output embeddings
+  (128) → trunk.
 - Trunk `→ 128 → 128`, heads: `left(9)`, `right(9)`, `value(1)`.
-  Both heads always execute; `logprob = logp_left + logp_right` (true
-  independence factorization — no conditional gating, unlike kiting).
+  Both heads always execute; `logprob = logp_left + logp_right`.
 
-## Training (`python/train_smoke.py`)
+## Training (`python/train_batch.py` — the only trainer)
 
-Same harness shape as kiting-arena: PufferLib
-`GymnasiumPufferEnv` + `vector.Serial`, 8 envs × 128 horizon, 3 epochs ×
-4 minibatches, GAE(γ=0.99, λ=0.95), dual-clip PPO (ε=0.2, c=3), ent 0.01,
-vf 0.5, Adam 3e-4, grad clip 0.5. Flags: `--total-steps --time-cap
---ckpt-every --run-dir --seed --encoder --note-rate --colors --dirs
---cols --rows --chart-len --shaping-coef --ent-coef --init-from`.
-Checkpoints record the encoder arm. Eval reports
-random / trained / **scripted** mean return over the same eval seeds —
-scripted is the ceiling reference.
+Batched PPO: `BeatVecEnv` (N Rust envs, one FFI call per vector step),
+one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
+(ε=0.2, c=3), ent 0.01, vf 0.5, Adam 3e-4, grad clip 0.5. Flags:
+`--num-envs --horizon --minibatches --epochs --total-steps --time-cap
+--ent-coef --seed --ckpt-every --run-dir --init-from --bench` + env
+config (`--note-rate --colors --dirs --cols --rows --chart-len
+--min-hand-gap --note-speed --shaping-coef`). Batch = num_envs×horizon;
+NOTE: batch shape changes the optimization regime (gradient passes per
+env step) — cross-shape learning comparisons need retuning.
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
-Semantics-exact port of `sim.py`'s step + obs path, exposed to Python as
-`beat_arena_rs.RawBeatSim` (PyO3 0.22 + numpy 0.22; build with
-`VIRTUAL_ENV=<venv> maturin develop --release` from `rust/`). Chart
-generation and replay recording stay in Python — the chart is injected
-per episode via `set_chart` (sidesteps RNG parity; ~0.5 µs/step
-amortized). `beat_arena_env/rust_env.py: RustBeatEnv` is the drop-in
-Gymnasium wrapper; `train_smoke.py --rust` selects it. Parity is pinned
-by `tests/test_rust_parity.py`: identical rewards (1e-9), obs (1e-6),
-done flags, and cut counters across 5 configs + a scripted (cut-heavy)
-trajectory. When sim rules change, BOTH implementations must change and
-the parity suite is the gate.
+THE physics implementation (PyO3 0.22 + numpy 0.22; build with
+`VIRTUAL_ENV=<venv> maturin develop --release` from `rust/`). Charts are
+injected per episode via `set_chart` (~0.5 µs/step amortized).
+`RawBeatSim.step` returns `(obs, reward, done, events)` — events =
+`(note_idx, code)` with codes 0 ok / 1 slow / 2 angle / 3 wrong_hand /
+4 miss — plus getters `sabers()/status()/time/counters` and a
+`set_saber` test hook. `VecBeatSim` steps N sims per FFI call. The
+scenario tests in `tests/test_env.py` gate every rule change.
 
 Measured 2026-07-20 (8-core CPU): Python `env.step` 137 µs vs Rust
 2.18 µs (**63×**; raw sim call 1.19 µs — the difference is gym-wrapper
@@ -274,13 +282,14 @@ Further gains need a GPU or a cheaper policy, not more envs.
 1. Obs layout: length 200, offsets, mask semantics.
 2. Determinism: same seed + scripted bot ⇒ identical rewards and event
    stream across two runs.
-3. Cut detection unit scenarios (crafted saber trajectories): good cut
-   registers; too-slow → bad `slow`; wrong angle → bad `angle`; wrong hand
-   → bad `wrong_hand`; untouched → miss exactly when the note exits the
-   slab; early crossing (before the slab) does nothing.
+3. Cut detection unit scenarios driven on the RUST sim via `set_saber`
+   + the event stream: good cut registers (incl. gentle 1.5 m/s);
+   too-slow → `slow`; wrong angle → `angle`; wrong hand → `wrong_hand`;
+   untouched → miss exactly at slab exit; early crossing does nothing.
    Plus obs-v2 pins: `time_until = z/|vz|` holds at every step; faster
-   note_speed shortens the slab's time window.
+   note_speed shortens the slab's time window. Recording round-trip
+   (JSONL v2 counters match sim counters) and VecBeatSim(1) ≡ RawBeatSim.
 4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset.
-5. Policy junk-leak (both encoders): garbage in masked note slots changes
-   no logprob/entropy/value (transformer key-masking + pool masking).
+5. Policy junk-leak: garbage in masked note slots changes no
+   logprob/entropy/value (key-masking).
 6. Scripted bot ≥ 80% good cuts on default easy chart (solvability).

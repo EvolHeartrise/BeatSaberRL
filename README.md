@@ -17,15 +17,15 @@ Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.
 cd python
 VENV=../../kiting-arena/python/.venv
 
-$VENV/bin/python -m pytest tests/          # incl. Rust/Python parity
-$VENV/bin/python train_smoke.py            # PPO smoke, easy chart, pool encoder
-$VENV/bin/python train_smoke.py --encoder transformer --rust   # Rust sim core
-$VENV/bin/python train_batch.py --num-envs 128                 # batched rollouts
+$VENV/bin/python -m pytest tests/
+$VENV/bin/python train_batch.py --num-envs 128 --epochs 1   # the trainer
 ```
 
-Batched training (N Rust envs, one forward per vector step) reaches
-~2.9k steps/s (transformer) / ~24k (pool) on 8 CPU cores at --epochs 1 —
-the ceiling is the torch update, not the env (see SPEC §Batched rollouts).
+Since 2026-07-20 the Rust crate (`rust/`) is the ONLY sim implementation
+and the transformer the only policy — the Python sim, pool encoder, and
+serial trainer were deleted (surface-area reduction). Batched training
+reaches ~4.5k steps/s (transformer, 8 CPU cores, --epochs 1); the
+ceiling is the torch update, not the env (SPEC §Batched rollouts).
 
 The Rust sim core (63x faster env.step; training 1.3-1.6x on 8 serial
 envs) builds once with:
@@ -39,7 +39,7 @@ Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0
 ## Watching replays
 
 ```bash
-$VENV/bin/python record_replay.py --ckpt runs/v2_pool/final.pt --episodes 3
+$VENV/bin/python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
 $VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
 ```
 
@@ -57,8 +57,8 @@ scripted bot ≈ +18.7 (97% good cuts).
 
 ## Status
 
-- v0 (2026-07-20): env + chart gen + scripted bot + pool/transformer
-  policies + PPO harness built; 16 tests green.
+- v0 (2026-07-20): env + chart gen + scripted bot + policies + PPO
+  harness built (pool encoder + Python sim later deleted; see SPEC).
 - Raw reward proved too sparse to learn from (flat at random, entropy
   stuck at uniform) → potential-based shaping added (`shaping_coef`,
   see SPEC) and takeoff needs patience: learning starts ~100–150k steps.
