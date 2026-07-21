@@ -126,5 +126,8 @@ scripted bot ≈ +18.7 (97% good cuts).
   ~10 min** — the best one-command from-scratch recipe on this card:
   `--env torch --num-envs 4096 --minibatches 16 --lr 1e-3 --epochs 4
   --lr-decay cosine`.
-- Next: close the human-pattern distribution gap; 30M wide-cosine run
-  (97%+ territory?); density knee (e5-6); recipe seed replication.
+- **Project record (2026-07-21): 98.2% good cuts / +46.3 on the dynamic gym
+  — 30M steps, one command, ~15 min from scratch** (`runs/wide_e4cos_30m`):
+  the wide-cosine recipe above with `--total-steps 30000000`.
+- Next: close the human-pattern distribution gap; recipe seed replication;
+  density knee (e5-6).
