@@ -1,0 +1,297 @@
+[curriculum] resumed 3-stage ladder from runs/curr_3m/curriculum.json
+warm-started from runs/curr_1m/final.pt
+=== batched PPO: 128 envs x 128 horizon = 16384 steps/update, minibatch 4096 ===
+update   1/122  steps     16384  ep_return(last100)   10.052  ent 3.089     4,629 steps/s     3.5s
+update   2/122  steps     32768  ep_return(last100)    4.835  ent 3.060     4,597 steps/s     7.1s
+update   3/122  steps     49152  ep_return(last100)    3.360  ent 2.992     4,580 steps/s    10.7s
+update   4/122  steps     65536  ep_return(last100)    4.125  ent 3.088     4,464 steps/s    14.7s
+update   5/122  steps     81920  ep_return(last100)    5.825  ent 3.050     4,183 steps/s    19.6s
+[curriculum] FC check 'Delightful Introduction' 1.00★: good 7/12, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   78.2% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   78.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   55.4% good (last 20 eps)  <- current
+update   6/122  steps     98304  ep_return(last100)    6.840  ent 3.080     4,082 steps/s    24.1s
+update   7/122  steps    114688  ep_return(last100)    7.815  ent 3.104     4,068 steps/s    28.2s
+update   8/122  steps    131072  ep_return(last100)    8.855  ent 3.100     4,147 steps/s    31.6s
+update   9/122  steps    147456  ep_return(last100)    9.640  ent 3.042     4,167 steps/s    35.4s
+update  10/122  steps    163840  ep_return(last100)   10.275  ent 3.101     4,197 steps/s    39.0s
+[curriculum] FC check 'Delightful Introduction' 1.00★: good 12/12, breaks 0  *** FULL COMBO ***
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   95.6% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   87.5% good (last 20 eps)  <- current
+[curriculum] stage 4: 'Quiet Water' [Easy] 1.89★  20 notes / 18s (1.11 nps)
+update  11/122  steps    180224  ep_return(last100)   10.950  ent 3.239     4,087 steps/s    44.1s
+update  12/122  steps    196608  ep_return(last100)   12.220  ent 3.398     4,135 steps/s    47.5s
+update  13/122  steps    212992  ep_return(last100)   12.800  ent 3.633     4,174 steps/s    51.0s
+update  14/122  steps    229376  ep_return(last100)   12.985  ent 3.658     4,222 steps/s    54.3s
+update  15/122  steps    245760  ep_return(last100)   12.175  ent 3.700     4,261 steps/s    57.7s
+[curriculum] FC check 'Quiet Water' 1.89★: good 19/20, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.6% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   95.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   93.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   64.8% good (last 20 eps)  <- current
+update  16/122  steps    262144  ep_return(last100)   10.625  ent 3.631     4,278 steps/s    61.3s
+update  17/122  steps    278528  ep_return(last100)   11.235  ent 3.600     4,313 steps/s    64.6s
+update  18/122  steps    294912  ep_return(last100)   12.020  ent 3.612     4,346 steps/s    67.9s
+update  19/122  steps    311296  ep_return(last100)   11.940  ent 3.654     4,375 steps/s    71.2s
+update  20/122  steps    327680  ep_return(last100)   12.540  ent 3.660     4,396 steps/s    74.5s
+[curriculum] FC check 'Quiet Water' 1.89★: good 20/20, breaks 0  *** FULL COMBO ***
+  [0] 0.99★ 'Dogbass' [Expert]   97.6% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   95.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   92.9% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   81.2% good (last 20 eps)  <- current
+[curriculum] stage 5: 'G.O.M.D' [Easy] 2.15★  59 notes / 117s (0.51 nps)
+update  21/122  steps    344064  ep_return(last100)   13.465  ent 3.644     4,298 steps/s    80.1s
+update  22/122  steps    360448  ep_return(last100)   13.360  ent 3.702     4,311 steps/s    83.6s
+update  23/122  steps    376832  ep_return(last100)   13.455  ent 3.764     4,330 steps/s    87.0s
+update  24/122  steps    393216  ep_return(last100)   13.420  ent 3.764     4,355 steps/s    90.3s
+update  25/122  steps    409600  ep_return(last100)   13.985  ent 3.836     4,376 steps/s    93.6s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 0/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   97.1% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   96.9% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   95.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   87.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]  no episodes yet  <- current
+update  26/122  steps    425984  ep_return(last100)   13.535  ent 3.839     4,393 steps/s    97.0s
+update  27/122  steps    442368  ep_return(last100)   13.425  ent 3.906     4,412 steps/s   100.3s
+update  28/122  steps    458752  ep_return(last100)   13.570  ent 3.913     4,433 steps/s   103.5s
+update  29/122  steps    475136  ep_return(last100)   13.700  ent 3.934     4,449 steps/s   106.8s
+update  30/122  steps    491520  ep_return(last100)   13.785  ent 3.951     4,463 steps/s   110.1s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 9/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   93.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   92.5% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.0% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]  no episodes yet  <- current
+update  31/122  steps    507904  ep_return(last100)   13.800  ent 3.904     4,414 steps/s   115.1s
+update  32/122  steps    524288  ep_return(last100)   13.890  ent 3.956     4,409 steps/s   118.9s
+update  33/122  steps    540672  ep_return(last100)   13.745  ent 3.920     4,406 steps/s   122.7s
+update  34/122  steps    557056  ep_return(last100)   13.655  ent 3.947     4,411 steps/s   126.3s
+update  35/122  steps    573440  ep_return(last100)   13.580  ent 3.906     4,402 steps/s   130.3s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 18/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   93.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   92.5% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   86.0% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]  no episodes yet  <- current
+update  36/122  steps    589824  ep_return(last100)   13.580  ent 3.865     4,379 steps/s   134.7s
+update  37/122  steps    606208  ep_return(last100)   13.580  ent 3.888     4,368 steps/s   138.8s
+update  38/122  steps    622592  ep_return(last100)   13.580  ent 3.901     4,367 steps/s   142.6s
+update  39/122  steps    638976  ep_return(last100)   13.580  ent 3.923     4,369 steps/s   146.3s
+update  40/122  steps    655360  ep_return(last100)   13.580  ent 3.903     4,375 steps/s   149.8s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 58/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   93.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   92.5% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   86.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]  no episodes yet  <- current
+update  41/122  steps    671744  ep_return(last100)   13.580  ent 3.928     4,301 steps/s   156.2s
+update  42/122  steps    688128  ep_return(last100)   13.580  ent 3.933     4,303 steps/s   159.9s
+update  43/122  steps    704512  ep_return(last100)   13.580  ent 3.902     4,302 steps/s   163.8s
+update  44/122  steps    720896  ep_return(last100)   13.580  ent 3.943     4,307 steps/s   167.4s
+update  45/122  steps    737280  ep_return(last100)   13.580  ent 3.929     4,307 steps/s   171.2s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 58/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   93.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   92.5% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   86.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]  no episodes yet  <- current
+update  46/122  steps    753664  ep_return(last100)   13.580  ent 3.931     4,248 steps/s   177.4s
+update  47/122  steps    770048  ep_return(last100)   13.580  ent 3.921     4,251 steps/s   181.2s
+update  48/122  steps    786432  ep_return(last100)   13.865  ent 3.965     4,248 steps/s   185.1s
+update  49/122  steps    802816  ep_return(last100)   19.520  ent 3.934     4,252 steps/s   188.8s
+update  50/122  steps    819200  ep_return(last100)   27.340  ent 3.850     4,251 steps/s   192.7s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 21/59, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   93.5% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   90.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   85.0% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   86.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   83.1% good (last 20 eps)  <- current
+update  51/122  steps    835584  ep_return(last100)   30.915  ent 3.858     4,222 steps/s   197.9s
+update  52/122  steps    851968  ep_return(last100)   32.660  ent 3.891     4,210 steps/s   202.4s
+update  53/122  steps    868352  ep_return(last100)   32.260  ent 3.874     4,206 steps/s   206.5s
+update  54/122  steps    884736  ep_return(last100)   30.920  ent 3.886     4,210 steps/s   210.2s
+update  55/122  steps    901120  ep_return(last100)   30.435  ent 3.889     4,208 steps/s   214.1s
+[curriculum] FC check 'G.O.M.D' 2.15★: good 59/59, breaks 0  *** FULL COMBO ***
+  [0] 0.99★ 'Dogbass' [Expert]   90.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   85.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   79.2% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   83.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   88.2% good (last 20 eps)  <- current
+[curriculum] stage 6: 'Watch Me Dance!' [Easy] 2.23★  93 notes / 66s (1.40 nps)
+update  56/122  steps    917504  ep_return(last100)   31.105  ent 3.891     4,133 steps/s   222.0s
+update  57/122  steps    933888  ep_return(last100)   31.190  ent 3.835     4,141 steps/s   225.5s
+update  58/122  steps    950272  ep_return(last100)   31.425  ent 3.834     4,151 steps/s   228.9s
+update  59/122  steps    966656  ep_return(last100)   31.325  ent 3.786     4,162 steps/s   232.3s
+update  60/122  steps    983040  ep_return(last100)   29.955  ent 3.737     4,171 steps/s   235.7s
+[curriculum] FC check 'Watch Me Dance!' 2.23★: good 2/93, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   93.8% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   82.5% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   81.2% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   80.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   91.7% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]  no episodes yet  <- current
+update  61/122  steps    999424  ep_return(last100)   28.320  ent 3.770     4,180 steps/s   239.1s
+update  62/122  steps   1015808  ep_return(last100)   28.320  ent 3.720     4,185 steps/s   242.8s
+update  63/122  steps   1032192  ep_return(last100)   28.085  ent 3.736     4,177 steps/s   247.1s
+update  64/122  steps   1048576  ep_return(last100)   28.100  ent 3.691     4,174 steps/s   251.2s
+update  65/122  steps   1064960  ep_return(last100)   27.470  ent 3.689     4,184 steps/s   254.5s
+[curriculum] FC check 'Watch Me Dance!' 2.23★: good 15/93, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   90.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   83.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   85.0% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   83.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   92.4% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]  no episodes yet  <- current
+update  66/122  steps   1081344  ep_return(last100)   27.195  ent 3.682     4,188 steps/s   258.2s
+update  67/122  steps   1097728  ep_return(last100)   27.195  ent 3.742     4,198 steps/s   261.5s
+update  68/122  steps   1114112  ep_return(last100)   26.865  ent 3.649     4,206 steps/s   264.9s
+update  69/122  steps   1130496  ep_return(last100)   26.800  ent 3.742     4,211 steps/s   268.4s
+update  70/122  steps   1146880  ep_return(last100)   26.800  ent 3.701     4,219 steps/s   271.8s
+[curriculum] FC check 'Watch Me Dance!' 2.23★: good 8/93, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   90.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   83.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   85.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.0% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   92.4% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]  no episodes yet  <- current
+update  71/122  steps   1163264  ep_return(last100)   26.470  ent 3.687     4,222 steps/s   275.5s
+update  72/122  steps   1179648  ep_return(last100)   30.770  ent 3.697     4,221 steps/s   279.5s
+update  73/122  steps   1196032  ep_return(last100)   33.340  ent 3.742     4,224 steps/s   283.2s
+update  74/122  steps   1212416  ep_return(last100)   34.835  ent 3.704     4,228 steps/s   286.8s
+update  75/122  steps   1228800  ep_return(last100)   37.230  ent 3.763     4,230 steps/s   290.5s
+[curriculum] FC check 'Watch Me Dance!' 2.23★: good 93/93, breaks 0  *** FULL COMBO ***
+  [0] 0.99★ 'Dogbass' [Expert]   90.6% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   81.9% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   82.9% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   92.4% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   89.3% good (last 20 eps)  <- current
+[curriculum] stage 7: 'Sleeping With Roses' [Easy] 2.37★  28 notes / 60s (0.47 nps)
+update  76/122  steps   1245184  ep_return(last100)   37.590  ent 3.777     4,191 steps/s   297.1s
+update  77/122  steps   1261568  ep_return(last100)   43.215  ent 3.801     4,194 steps/s   300.8s
+update  78/122  steps   1277952  ep_return(last100)   48.365  ent 3.730     4,200 steps/s   304.2s
+update  79/122  steps   1294336  ep_return(last100)   52.475  ent 3.770     4,207 steps/s   307.7s
+update  80/122  steps   1310720  ep_return(last100)   51.490  ent 3.733     4,215 steps/s   310.9s
+[curriculum] FC check 'Sleeping With Roses' 2.37★: good 20/28, breaks 2
+  [0] 0.99★ 'Dogbass' [Expert]   87.1% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   80.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   83.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   96.6% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   90.9% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]  no episodes yet  <- current
+update  81/122  steps   1327104  ep_return(last100)   49.555  ent 3.737     4,212 steps/s   315.1s
+update  82/122  steps   1343488  ep_return(last100)   45.645  ent 3.720     4,216 steps/s   318.6s
+update  83/122  steps   1359872  ep_return(last100)   45.285  ent 3.779     4,218 steps/s   322.4s
+update  84/122  steps   1376256  ep_return(last100)   45.255  ent 3.659     4,220 steps/s   326.1s
+update  85/122  steps   1392640  ep_return(last100)   43.225  ent 3.672     4,223 steps/s   329.8s
+[curriculum] FC check 'Sleeping With Roses' 2.37★: good 18/28, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   90.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   76.9% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   81.7% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   86.2% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   97.3% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   91.1% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]  no episodes yet  <- current
+update  86/122  steps   1409024  ep_return(last100)   42.760  ent 3.709     4,213 steps/s   334.4s
+update  87/122  steps   1425408  ep_return(last100)   42.290  ent 3.715     4,216 steps/s   338.1s
+update  88/122  steps   1441792  ep_return(last100)   43.440  ent 3.708     4,219 steps/s   341.7s
+update  89/122  steps   1458176  ep_return(last100)   46.435  ent 3.746     4,222 steps/s   345.4s
+update  90/122  steps   1474560  ep_return(last100)   45.780  ent 3.782     4,226 steps/s   348.9s
+[curriculum] FC check 'Sleeping With Roses' 2.37★: good 28/28, breaks 0  *** FULL COMBO ***
+  [0] 0.99★ 'Dogbass' [Expert]   92.1% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   75.6% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   80.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   97.3% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   94.1% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   89.3% good (last 2 eps)  <- current
+[curriculum] stage 8: 'Magnetism' [Easy] 2.33★  156 notes / 96s (1.62 nps)
+update  91/122  steps   1490944  ep_return(last100)   44.545  ent 3.781     4,200 steps/s   355.0s
+update  92/122  steps   1507328  ep_return(last100)   39.915  ent 3.785     4,205 steps/s   358.5s
+update  93/122  steps   1523712  ep_return(last100)   39.140  ent 3.737     4,211 steps/s   361.8s
+update  94/122  steps   1540096  ep_return(last100)   37.505  ent 3.674     4,218 steps/s   365.2s
+update  95/122  steps   1556480  ep_return(last100)   35.045  ent 3.674     4,219 steps/s   368.9s
+[curriculum] FC check 'Magnetism' 2.33★: good 1/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   92.6% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   81.2% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   74.2% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   84.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   96.7% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   95.7% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   90.2% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]  no episodes yet  <- current
+update  96/122  steps   1572864  ep_return(last100)   30.955  ent 3.645     4,214 steps/s   373.3s
+update  97/122  steps   1589248  ep_return(last100)   28.380  ent 3.615     4,210 steps/s   377.5s
+update  98/122  steps   1605632  ep_return(last100)   29.095  ent 3.579     4,211 steps/s   381.3s
+update  99/122  steps   1622016  ep_return(last100)   28.135  ent 3.595     4,207 steps/s   385.6s
+update 100/122  steps   1638400  ep_return(last100)   26.585  ent 3.559     4,212 steps/s   389.0s
+[curriculum] FC check 'Magnetism' 2.33★: good 41/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   95.0% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   81.2% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   74.2% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   83.2% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   96.7% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   95.8% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   90.2% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]  no episodes yet  <- current
+update 101/122  steps   1654784  ep_return(last100)   26.800  ent 3.566     4,202 steps/s   393.8s
+update 102/122  steps   1671168  ep_return(last100)   26.265  ent 3.574     4,199 steps/s   398.0s
+update 103/122  steps   1687552  ep_return(last100)   25.940  ent 3.579     4,198 steps/s   402.0s
+update 104/122  steps   1703936  ep_return(last100)   24.855  ent 3.540     4,198 steps/s   405.9s
+update 105/122  steps   1720320  ep_return(last100)   24.455  ent 3.503     4,199 steps/s   409.7s
+[curriculum] FC check 'Magnetism' 2.33★: good 143/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   94.4% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   82.5% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   76.7% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.0% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   95.8% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   95.8% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   91.6% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]  no episodes yet  <- current
+update 106/122  steps   1736704  ep_return(last100)   24.455  ent 3.486     4,179 steps/s   415.6s
+update 107/122  steps   1753088  ep_return(last100)   24.485  ent 3.531     4,184 steps/s   419.0s
+update 108/122  steps   1769472  ep_return(last100)   26.385  ent 3.431     4,189 steps/s   422.4s
+update 109/122  steps   1785856  ep_return(last100)   27.205  ent 3.492     4,194 steps/s   425.8s
+update 110/122  steps   1802240  ep_return(last100)   27.705  ent 3.428     4,200 steps/s   429.1s
+[curriculum] FC check 'Magnetism' 2.33★: good 72/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   92.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   83.1% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   76.7% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   85.8% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   94.8% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   96.0% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   91.6% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]  no episodes yet  <- current
+update 111/122  steps   1818624  ep_return(last100)   27.925  ent 3.393     4,197 steps/s   433.3s
+update 112/122  steps   1835008  ep_return(last100)   28.635  ent 3.444     4,198 steps/s   437.1s
+update 113/122  steps   1851392  ep_return(last100)   30.415  ent 3.401     4,198 steps/s   441.0s
+update 114/122  steps   1867776  ep_return(last100)   36.600  ent 3.436     4,197 steps/s   445.1s
+update 115/122  steps   1884160  ep_return(last100)   45.745  ent 3.437     4,197 steps/s   448.9s
+[curriculum] FC check 'Magnetism' 2.33★: good 72/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   90.6% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   85.0% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   79.6% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   87.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   94.6% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   96.0% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   91.8% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]   93.5% good (last 14 eps)  <- current
+update 116/122  steps   1900544  ep_return(last100)   59.415  ent 3.463     4,188 steps/s   453.9s
+update 117/122  steps   1916928  ep_return(last100)   68.555  ent 3.491     4,188 steps/s   457.8s
+update 118/122  steps   1933312  ep_return(last100)   77.615  ent 3.474     4,188 steps/s   461.6s
+update 119/122  steps   1949696  ep_return(last100)   82.945  ent 3.497     4,188 steps/s   465.6s
+update 120/122  steps   1966080  ep_return(last100)   93.820  ent 3.538     4,188 steps/s   469.4s
+[curriculum] FC check 'Magnetism' 2.33★: good 72/156, breaks 1
+  [0] 0.99★ 'Dogbass' [Expert]   90.9% good (last 20 eps)  FC
+  [1] 1.00★ 'Delightful Introduction' [Expert]   88.8% good (last 20 eps)  FC
+  [2] 1.00★ 'Delightful Introduction' [ExpertPlus]   75.8% good (last 20 eps)  FC
+  [3] 1.89★ 'Quiet Water' [Easy]   91.5% good (last 20 eps)  FC
+  [4] 2.15★ 'G.O.M.D' [Easy]   94.6% good (last 20 eps)  FC
+  [5] 2.23★ 'Watch Me Dance!' [Easy]   96.0% good (last 20 eps)  FC
+  [6] 2.37★ 'Sleeping With Roses' [Easy]   91.6% good (last 20 eps)  FC
+  [7] 2.33★ 'Magnetism' [Easy]   95.0% good (last 20 eps)  <- current
+update 121/122  steps   1982464  ep_return(last100)   98.505  ent 3.500     4,181 steps/s   474.1s
+update 122/122  steps   1998848  ep_return(last100)   98.865  ent 3.567     4,182 steps/s   478.0s
+THROUGHPUT: 4,182 steps/s total | rollout 21% update 79% | N=128 T=128
