@@ -91,9 +91,12 @@ paths contain a space — quote everything.
     does nothing (the block "isn't there yet").
 - **Miss**: the note exits the slab past the plane (`z < −Z_WINDOW`)
   uncut → consumed as missed.
-- **Reward per tick**: `+1.0` per good cut, `−0.25` per bad cut, `−0.5`
-  per miss. (Bad cut > miss: engaging wrongly beats not engaging — a
-  deliberate shaping gradient. Graded swing quality is v4.)
+- **Reward per tick**: `+1.0` per good cut, `−0.5` per bad cut, `−0.5`
+  per miss. Bad cut = miss severity since 2026-07-20 (real Beat Saber
+  parity: both are score-zero combo breaks). The original `−0.25` bad
+  cut was an "engagement gradient" exploration crutch, retired after a
+  user audit once policies reliably engaged; returns recorded before the
+  change are not comparable. Graded swing quality is v4.
 - **Potential-based shaping** (added after the first smoke run showed the
   raw reward is too sparse — random motion never discovers the
   place×speed×direction×window conjunction, entropy never leaves uniform):
