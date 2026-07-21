@@ -1,0 +1,22 @@
+ARM lr3e4: training (--lr 3e-4)
+runs/wide_lr3e4/final.pt: good 3.2%  bad 305  miss 1077  return -21.50
+ARM lr1e3: training (--lr 1e-3)
+runs/wide_lr1e3/final.pt: good 7.5%  bad 375  miss 946  return -18.45
+ARM lr3e3: training (--lr 3e-3)
+runs/wide_lr3e3/final.pt: good 1.1%  bad 302  miss 1111  return -23.05
+ARM lr1e3e2: training (--lr 1e-3 --epochs 2)
+runs/wide_lr1e3e2/final.pt: good 73.5%  bad 135  miss 243  return +28.70
+ARM lr1e3cos: training (--lr 1e-3 --lr-decay cosine)
+runs/wide_lr1e3cos/final.pt: good 2.5%  bad 259  miss 1134  return -22.05
+ARM lr3e3cos: training (--lr 3e-3 --lr-decay cosine)
+runs/wide_lr3e3cos/final.pt: good 2.4%  bad 196  miss 1198  return -22.10
+STUDY COMPLETE
+ARM lr1e3e3: training
+runs/wide_lr1e3e3/final.pt: good 81.6%  bad 79  miss 184  return +34.45
+ARM lr1e3e4: training
+runs/wide_lr1e3e4/final.pt: good 92.2%  bad 28  miss 83  return +42.05
+E34 COMPLETE
+ARM lr1e3e4cos: training
+runs/wide_lr1e3e4cos/final.pt: good 95.3%  bad 23  miss 44  return +44.25
+ARM e4cos30M: training
+runs/wide_e4cos_30m/final.pt: good 98.2%  bad 13  miss 13  return +46.30
