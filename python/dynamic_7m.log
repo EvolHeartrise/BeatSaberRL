@@ -1,0 +1,13 @@
+/home/evolheartrise/git projects/claude-teaches/projects/kiting-arena/python/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:64: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+=== batched PPO: 128 envs x 128 horizon = 16384 steps/update, minibatch 4096 ===
+update   1/427  steps     16384  ep_return(last100)      nan  ent 4.356     4,578 steps/s     3.6s
+update   2/427  steps     32768  ep_return(last100)      nan  ent 4.344     4,688 steps/s     7.0s
+update   3/427  steps     49152  ep_return(last100)      nan  ent 4.313     4,714 steps/s    10.4s
+update   4/427  steps     65536  ep_return(last100)      nan  ent 4.293     4,704 steps/s    13.9s
+update   5/427  steps     81920  ep_return(last100)  -22.920  ent 4.325     4,586 steps/s    17.9s
+update   6/427  steps     98304  ep_return(last100)  -22.920  ent 4.320     4,486 steps/s    21.9s
+update   7/427  steps    114688  ep_return(last100)  -22.920  ent 4.285     4,461 steps/s    25.7s

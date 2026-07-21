@@ -18,26 +18,28 @@ from beat_arena_rs import VecBeatSim
 
 class BeatVecEnv:
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
-                 chart_len_s=20.0, min_hand_gap_s=0.5, shaping_coef=0.0,
-                 cols=(0, 1, 2, 3), rows=(0, 1, 2), note_speed=4.0, seed=0):
+                 continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
+                 shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
+                 note_speed=4.0, note_speed_max=None, seed=0):
         self.num_envs = num_envs
         self.cfg = ChartConfig(
             note_rate=note_rate, colors=colors, dirs=tuple(dirs),
-            chart_len_s=chart_len_s, min_hand_gap_s=min_hand_gap_s,
-            shaping_coef=shaping_coef, cols=tuple(cols), rows=tuple(rows),
-            note_speed=note_speed,
+            continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
+            min_hand_gap_s=min_hand_gap_s, shaping_coef=shaping_coef,
+            cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
+            note_speed_max=note_speed_max,
         )
         max_steps = int(chart_len_s * 30) + 30
-        self.sim = VecBeatSim(num_envs, note_speed=note_speed,
-                              shaping_coef=shaping_coef, max_steps=max_steps)
+        self.sim = VecBeatSim(num_envs, shaping_coef=shaping_coef,
+                              max_steps=max_steps)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
 
     def _new_chart(self, i):
         chart = generate_chart(self.cfg, np.random.default_rng(
             int(self._rng.integers(0, 2**63 - 1))))
-        self.sim.set_chart(i, [(n.hit_time, n.col, n.row, n.color, n.dir)
-                               for n in chart])
+        self.sim.set_chart(i, [(n.hit_time, n.col, n.row, n.color,
+                                n.angle, n.speed) for n in chart])
 
     def reset(self):
         for i in range(self.num_envs):

@@ -42,7 +42,7 @@ def _hand_action(hand, pos, vel, time, target):
         desired = to_park / dist * min(CRUISE, K_ARRIVE * dist) if dist > 0.1 else np.zeros(2)
         return _steer_to_velocity(vel, desired)
     center = np.array(note_center(target))
-    d = _DIRS[target.dir]
+    d = np.array([np.cos(target.angle), np.sin(target.angle)])
     t_until = target.hit_time - time
     if t_until > SWING_T:
         goal = center - WINDUP_DIST * d

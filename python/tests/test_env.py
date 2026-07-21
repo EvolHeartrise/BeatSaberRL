@@ -17,9 +17,18 @@ from beat_arena_env.constants import DT, Z_WINDOW
 from beat_arena_rs import RawBeatSim
 
 
-def _sim_with_note(note, note_speed=4.0):
-    sim = RawBeatSim(note_speed=note_speed, shaping_coef=0.0, max_steps=630)
-    sim.set_chart([(note.hit_time, note.col, note.row, note.color, note.dir)])
+DOWN = 6 * np.pi / 4  # downward swing angle
+
+
+def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0):
+    return Note(hit_time=hit_time, col=col, row=row, color=color,
+                angle=angle, speed=speed)
+
+
+def _sim_with_note(note):
+    sim = RawBeatSim(shaping_coef=0.0, max_steps=630)
+    sim.set_chart([(note.hit_time, note.col, note.row, note.color,
+                    note.angle, note.speed)])
     return sim
 
 
@@ -43,12 +52,11 @@ def test_obs_layout():
     assert obs[base + 8] == 1.0
     assert obs[base + 0] == pytest.approx((n.col - 1.5) / 2.0)
     assert obs[base + 1] == pytest.approx((n.row - 1.0) / 1.5)
-    z = min(n.hit_time * env.cfg.note_speed, 12.0)
+    z = min(n.hit_time * n.speed, 12.0)
     assert obs[base + 2] == pytest.approx(z / 8.0)
-    assert obs[base + 3] == pytest.approx(-env.cfg.note_speed / 8.0)
-    theta = n.dir * np.pi / 4
-    assert obs[base + 6] == pytest.approx(np.cos(theta), abs=1e-6)
-    assert obs[base + 7] == pytest.approx(np.sin(theta), abs=1e-6)
+    assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
+    assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
+    assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
     for slot in range(n_pending, N_NOTE_SLOTS):
         assert not obs[OFF_NOTES + slot * NOTE_FEAT:
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()
@@ -68,7 +76,7 @@ def test_z_is_time_times_speed():
             z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
             vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
             t_until = env.chart[i].hit_time - env.sim.time
-            if -1.0 < t_until * env.cfg.note_speed < 12.0:
+            if -1.0 < t_until * env.chart[i].speed < 12.0:
                 assert z_obs / -vz_obs == pytest.approx(t_until, abs=1e-4)
 
 
@@ -92,35 +100,35 @@ def test_determinism():
 # --- cut detection scenarios (Rust sim, via set_saber hook) ------------------
 
 def test_good_cut():
-    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 2, 1))
     assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == [(0, 0)]  # ok
     assert sim.good_cuts == 1
 
 
 def test_gentle_cut_is_good():
     """V_MIN_CUT is 1 m/s: a 1.5 m/s swing scores."""
-    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 2, 1))
     assert _step_events(sim, 1, (0.25, 0.05), (0.0, -1.5)) == [(0, 0)]
 
 
 def test_slow_cut_is_bad():
-    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 2, 1))
     assert _step_events(sim, 1, (0.25, 0.05), (0.0, -0.5)) == [(0, 1)]  # slow
 
 
 def test_wrong_angle_is_bad():
-    sim = _sim_with_note(Note(hit_time=DT, col=2, row=1, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 2, 1))
     assert _step_events(sim, 1, (0.25, -0.05), (0.0, 5.0)) == [(0, 2)]  # angle
 
 
 def test_wrong_hand_is_bad():
-    sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 0, 2))
     sim.set_saber(1, 1.25, -1.0, 0.0, 0.0)   # matching (right) saber far away
     assert _step_events(sim, 0, (-0.75, 0.55), (0.0, -5.0)) == [(0, 3)]
 
 
 def test_miss_fires_exactly_at_slab_exit():
-    sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6))
+    sim = _sim_with_note(_note(DT, 0, 2))
     events = []
     for _ in range(8):
         _, _, _, ev = sim.step(0, 0)
@@ -134,7 +142,7 @@ def test_miss_fires_exactly_at_slab_exit():
 
 
 def test_early_crossing_does_nothing():
-    sim = _sim_with_note(Note(hit_time=0.5, col=2, row=1, color=1, dir=6))
+    sim = _sim_with_note(_note(0.5, 2, 1))
     assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == []
     assert sim.status()[0] == 0
 
@@ -143,8 +151,7 @@ def test_note_speed_scales_the_time_window():
     """Faster notes spend less TIME in the fixed spatial slab."""
     ticks = {}
     for speed in (4.0, 8.0):
-        sim = _sim_with_note(Note(hit_time=DT, col=0, row=2, color=1, dir=6),
-                             note_speed=speed)
+        sim = _sim_with_note(_note(DT, 0, 2, speed=speed))
         t = 0
         while sim.status()[0] == 0:
             sim.step(0, 0)
@@ -157,9 +164,10 @@ def test_note_speed_scales_the_time_window():
 
 def test_shaping_changes_rewards_not_events():
     def run(coef):
-        sim = RawBeatSim(note_speed=4.0, shaping_coef=coef, max_steps=630)
+        sim = RawBeatSim(shaping_coef=coef, max_steps=630)
         chart = generate_chart(ChartConfig(), np.random.default_rng(5))
-        sim.set_chart([(n.hit_time, n.col, n.row, n.color, n.dir) for n in chart])
+        sim.set_chart([(n.hit_time, n.col, n.row, n.color,
+                        n.angle, n.speed) for n in chart])
         rng = np.random.default_rng(2)
         rewards, events = [], []
         done = False
@@ -184,11 +192,22 @@ def test_chart_respects_hand_gap_and_dirs():
                       min_hand_gap_s=0.5, chart_len_s=30.0)
     chart = generate_chart(cfg, np.random.default_rng(11))
     assert len(chart) > 20
-    assert all(n.dir in (2, 6) for n in chart)
+    assert all(n.angle in (2 * np.pi / 4, 6 * np.pi / 4) for n in chart)
     for color in (0, 1):
         times = [n.hit_time for n in chart if n.color == color]
         assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:]))
     assert all(a.hit_time <= b.hit_time for a, b in zip(chart, chart[1:]))
+
+
+def test_chart_continuous_dirs_and_speed_range():
+    cfg = ChartConfig(note_rate=2.0, colors="both", continuous_dirs=True,
+                      note_speed=3.0, note_speed_max=6.0, chart_len_s=30.0)
+    chart = generate_chart(cfg, np.random.default_rng(13))
+    assert len(chart) > 20
+    assert all(0.0 <= n.angle < 2 * np.pi for n in chart)
+    assert all(3.0 <= n.speed <= 6.0 for n in chart)
+    assert len({round(n.angle, 3) for n in chart}) > 10   # actually continuous
+    assert len({round(n.speed, 3) for n in chart}) > 10
 
 
 # --- scripted bot solvability ------------------------------------------------
@@ -219,7 +238,7 @@ def test_recording_roundtrip(tmp_path):
         _, _, done, _, info = env.step(scripted_action(env))
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 2
+    assert head["header"]["version"] == 3
     assert head["header"]["config"]["note_speed"] == 4.0
     assert len(head["header"]["chart"]) == info["n_notes"]
     goods = sum(1 for t in ticks for e in t["events"]
