@@ -58,7 +58,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 200
+    assert OBS_DIM == 128
 
 
 def test_pool_encoder_removed():
@@ -69,7 +69,7 @@ def test_pool_encoder_removed():
 def test_vec_env_auto_reset():
     venv = BeatVecEnv(4, colors="both", dirs=tuple(range(8)), chart_len_s=5.0, seed=3)
     obs = venv.reset()
-    assert obs.shape == (4, 200)
+    assert obs.shape == (4, 128)
     rng = np.random.default_rng(0)
     finished = 0
     for _ in range(400):
@@ -77,7 +77,7 @@ def test_vec_env_auto_reset():
         finished += len(infos)
         for info in infos:
             assert info["n_notes"] > 0
-            assert obs[info["env"], 188:].sum() > 0  # fresh pending notes
+            assert obs[info["env"], 116:].sum() > 0  # fresh pending notes
     assert finished >= 4
 
 

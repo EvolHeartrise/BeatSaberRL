@@ -31,10 +31,13 @@ const SHAPE_GAMMA: f64 = 0.99;
 const SHAPE_DIST_CLIP: f64 = 2.0;
 
 const N_NOTE_SLOTS: usize = 12;
-const NOTE_FEAT: usize = 15;
+// obs v3 (2026-07-20): direction as its unit vector (cos, sin) instead of
+// an 8-dim one-hot — ready for continuous precision angles, and it hands
+// the network the exact object the cut rule uses (cos angle = v . d / |v|).
+const NOTE_FEAT: usize = 9;
 const OFF_NOTES: usize = 8;
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 188
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 200
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 116
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 128
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
@@ -184,8 +187,10 @@ impl Core {
             obs[base + 2] = (z / Z_SCALE) as f32;
             obs[base + 3] = (-self.note_speed / Z_SCALE) as f32;
             obs[base + 4 + n.color as usize] = 1.0;
-            obs[base + 6 + n.dir as usize] = 1.0;
-            obs[base + 14] = 1.0;
+            let d = dir_vec(n.dir);
+            obs[base + 6] = d[0] as f32;   // cos(theta): swing dir x
+            obs[base + 7] = d[1] as f32;   // sin(theta): swing dir y
+            obs[base + 8] = 1.0;           // valid
             obs[OFF_NOTE_MASK + slot] = 1.0;
             slot += 1;
         }

@@ -29,12 +29,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Observation layout (contract; mirrors beat_arena_env/env.py, obs v2).
+# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v3:
+# direction = (cos, sin) unit vector, continuous-angle ready).
 OFF_NOTES = 8
 N_NOTE_SLOTS = 12
-NOTE_FEAT = 15
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 188
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 200
+NOTE_FEAT = 9
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 116
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 128
 N_ACTIONS = 9
 
 NEG_INF = -1e9

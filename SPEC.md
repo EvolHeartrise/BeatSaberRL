@@ -131,22 +131,29 @@ places at once faster than it can travel). Col/row uniform over the grid.
 
 ## Observation layout (exact, all f32) — order is a contract
 
-Obs v2 (spatial notes — no explicit time feature):
+Obs v3 (spatial notes; continuous-ready directions):
 
 - `sabers: [f32; 8]` = per saber `[x/1, y/0.75, vx/6, vy/6]`, left then
   right (normalizers = grid half-extents and `V_MAX`; signed, symmetric).
-- `notes: [[f32; 15]; 12]` — the next 12 *pending* (uncut, unmissed) notes
+- `notes: [[f32; 9]; 12]` — the next 12 *pending* (uncut, unmissed) notes
   in arrival order, slot 0 = soonest. Per note:
   `[cx/1, cy/0.75, z/8 (z clipped to [−1, 12] m — the negative tail keeps
   "past the plane but still in the slab" visible), vz/8 (= −note_speed/8),
-  is_left, is_right, dir one-hot (8), valid=1]`. Empty slots all-zero.
+  is_left, is_right, dir_cos, dir_sin, valid=1]`. The direction is its
+  UNIT VECTOR (cos θ, sin θ) — obs v3, 2026-07-20, replacing the 8-dim
+  one-hot: continuous precision angles drop in without an obs change, and
+  the network receives the exact object the cut rule uses
+  (`cos∠ = v·d/|v|`); adjacent directions share representation. Empty
+  slots all-zero.
   Slots SHIFT as notes are consumed (no stable identity — nothing targets
   a slot by index; contrast kiting-arena's frozen slots).
 - `note_mask: [f32; 12]` — 1.0 = slot holds a pending note.
 
-**Flat vector:** `sabers(8) ++ notes row-major(180) ++ note_mask(12)` →
-**length 200**. Offsets: notes at 8, mask at 188. Pre-v2 (188-dim)
-checkpoints are incompatible.
+**Flat vector:** `sabers(8) ++ notes row-major(108) ++ note_mask(12)` →
+**length 128**. Offsets: notes at 8, mask at 116. Checkpoints from obs
+v1 (188-dim) and v2 (200-dim, one-hot dirs) are incompatible — the
+16M-step v2 lineage ended at obs v3 (no exact rank-2 reconstruction of
+the 8 learned one-hot direction embeddings exists).
 
 There is deliberately NO time feature: with constant speed,
 `time_until = z/|vz|` — the approach axis carries the temporal ordering
