@@ -55,6 +55,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
+    p.add_argument("--lr", type=float, default=LR)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
@@ -192,7 +193,7 @@ def main():
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
-    opt = torch.optim.Adam(policy.parameters(), lr=LR)
+    opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
