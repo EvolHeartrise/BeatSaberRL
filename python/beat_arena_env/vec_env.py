@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from .chart import ChartConfig, generate_chart
-from .env import OBS_DIM
+from .constants import OBS_DIM
 
 from beat_arena_rs import VecBeatSim
 

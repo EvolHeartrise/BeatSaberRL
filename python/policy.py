@@ -2,10 +2,9 @@
 
 Two encoder arms over the 12-slot upcoming-note window:
 
-- ``pool``: per-note MLP -> masked max-pool -> concat raw saber features.
-  Sabers and notes only interact inside the trunk. The set-summary
-  baseline, same family as kiting-arena's pool arm.
-- ``transformer``: the notes AND two saber tokens form a 14-token
+- ``transformer`` (the only encoder since 2026-07-20 — the pool
+  baseline was deleted at user direction after the easy-config studies
+  concluded): the notes AND two saber tokens form a 14-token
   sequence run through 2 full pre-LN transformer blocks (LayerNorm ->
   single-head self-attention -> residual; LayerNorm -> FFN -> residual).
   Each note token carries its z position along the approach axis (obs v2)
@@ -76,20 +75,17 @@ class Block(nn.Module):
 
 class NotePolicy(nn.Module):
     def __init__(self, embed: int = 64, trunk_dim: int = 128,
-                 encoder: str = "pool", n_blocks: int = 2):
+                 encoder: str = "transformer", n_blocks: int = 2):
         super().__init__()
-        assert encoder in ("pool", "transformer"), f"unknown encoder: {encoder}"
+        assert encoder == "transformer", (
+            f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         self.encoder = encoder
         self.embed = embed
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
-        if encoder == "transformer":
-            # saber token features: [x, y, vx, vy, is_left, is_right]
-            self.saber_mlp = _mlp([6, embed, embed])
-            self.blocks = nn.ModuleList(Block(embed) for _ in range(n_blocks))
-            trunk_in = 2 * embed          # the two saber tokens' outputs
-        else:
-            trunk_in = embed + 8          # pooled notes + raw saber features
-        self.trunk = _mlp([trunk_in, trunk_dim, trunk_dim])
+        # saber token features: [x, y, vx, vy, is_left, is_right]
+        self.saber_mlp = _mlp([6, embed, embed])
+        self.blocks = nn.ModuleList(Block(embed) for _ in range(n_blocks))
+        self.trunk = _mlp([2 * embed, trunk_dim, trunk_dim])
         self.left_head = nn.Linear(trunk_dim, N_ACTIONS)
         self.right_head = nn.Linear(trunk_dim, N_ACTIONS)
         self.value_head = nn.Linear(trunk_dim, 1)
@@ -104,25 +100,15 @@ class NotePolicy(nn.Module):
     def forward(self, obs: torch.Tensor):
         sabers, notes, note_mask = self._split(obs)
         emb = self.note_mlp(notes)                                   # (B, 12, 64)
-
-        if self.encoder == "transformer":
-            B = obs.shape[0]
-            hand_id = torch.eye(2, device=obs.device).expand(B, 2, 2)
-            saber_feat = torch.cat([sabers.reshape(B, 2, 4), hand_id], dim=-1)
-            tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 14, 64)
-            key_mask = torch.cat(
-                [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
-            for blk in self.blocks:
-                tokens = blk(tokens, key_mask)
-            h = self.trunk(tokens[:, :2].reshape(B, -1))             # saber readout
-        else:
-            m = note_mask.unsqueeze(-1)
-            masked = torch.where(m > 0.5, emb, torch.full_like(emb, NEG_INF))
-            pooled, _ = masked.max(dim=1)                            # (B, 64)
-            any_note = (note_mask.sum(dim=1, keepdim=True) > 0.5).float()
-            pooled = pooled * any_note                               # zero if no notes
-            h = self.trunk(torch.cat([pooled, sabers], dim=1))
-
+        B = obs.shape[0]
+        hand_id = torch.eye(2, device=obs.device).expand(B, 2, 2)
+        saber_feat = torch.cat([sabers.reshape(B, 2, 4), hand_id], dim=-1)
+        tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 14, 64)
+        key_mask = torch.cat(
+            [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
+        for blk in self.blocks:
+            tokens = blk(tokens, key_mask)
+        h = self.trunk(tokens[:, :2].reshape(B, -1))                 # saber readout
         return (self.left_head(h), self.right_head(h),
                 self.value_head(h).squeeze(-1))
 

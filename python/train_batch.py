@@ -24,7 +24,26 @@ import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
 from policy import NotePolicy
-from train_smoke import pg_loss_fn, GAMMA, GAE_LAMBDA, VF_COEF, LR, MAX_GRAD_NORM
+
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+CLIP = 0.2
+DUAL_CLIP_C = 3.0
+VF_COEF = 0.5
+LR = 3e-4
+MAX_GRAD_NORM = 0.5
+
+
+def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
+    """Dual-clip PPO policy loss (arXiv:1912.09729)."""
+    pg1 = -adv * ratio
+    pg2 = -adv * torch.clamp(ratio, 1 - clip, 1 + clip)
+    standard = torch.max(pg1, pg2)
+    ceiling = -dual_clip_c * adv
+    dual = torch.min(standard, ceiling)
+    loss = torch.where(adv < 0, dual, standard)
+    frac_active = ((adv < 0) & (ceiling < standard)).float().mean()
+    return loss.mean(), frac_active
 
 
 def parse_args():
@@ -36,7 +55,6 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
     p.add_argument("--ent-coef", type=float, default=0.01)
-    p.add_argument("--encoder", choices=["pool", "transformer"], default="transformer")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
     p.add_argument("--run-dir", type=str, default=None)
@@ -78,7 +96,7 @@ def main():
         min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
         shaping_coef=args.shaping_coef, seed=args.seed)
 
-    policy = NotePolicy(encoder=args.encoder)
+    policy = NotePolicy()
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
         policy.load_state_dict(ckpt["state_dict"])
@@ -101,7 +119,7 @@ def main():
     start = time.time()
 
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size}, encoder {args.encoder} ===", flush=True)
+          f"minibatch {mb_size} ===", flush=True)
 
     for update in range(num_updates):
         t0 = time.perf_counter()
@@ -182,7 +200,7 @@ def main():
     tot = t_rollout + t_update
     print(f"THROUGHPUT: {global_step / (time.time() - start):,.0f} steps/s total | "
           f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% | "
-          f"encoder {args.encoder} N={N} T={T}", flush=True)
+          f"N={N} T={T}", flush=True)
 
 
 if __name__ == "__main__":
