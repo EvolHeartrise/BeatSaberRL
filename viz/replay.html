@@ -50,7 +50,7 @@ const GX = 1.0, GY = 0.75, Z_WINDOW = 0.6, Z_FAR = 12.0;
 const V_MIN = 1, DT = 1 / 30;
 const SABER_COLORS = ["#e06c75", "#61afef"];   // left/red, right/blue
 const SABER_DARK = ["#7c3b41", "#33586f"];
-const DIRV = d => [Math.cos(d * Math.PI / 4), Math.sin(d * Math.PI / 4)];
+const ANGV = a => [Math.cos(a), Math.sin(a)];
 
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 let rep = null, cur = 0, playing = false, speed = 1.0, lastTs = null;
@@ -66,19 +66,25 @@ function parseReplay(text) {
   const lines = text.split("\n").filter(l => l.trim());
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
-  if (head.header.version !== 2)
-    throw new Error("replay version " + head.header.version +
-                    " — this viewer needs v2 (metric); re-record with record_replay.py");
+  const v = head.header.version;
+  if (v !== 2 && v !== 3)
+    throw new Error("replay version " + v +
+                    " — this viewer reads v2/v3; re-record with record_replay.py");
   const ticks = lines.slice(1).map(JSON.parse);
-  const chart = head.header.chart;
+  // normalize: every note gets .angle (radians) and .speed (m/s).
+  // v2 charts carry a dir index 0..7 and a single config-wide speed.
+  const chart = head.header.chart.map(n => ({
+    ...n,
+    angle: n.angle !== undefined ? n.angle : n.dir * Math.PI / 4,
+    speed: n.speed !== undefined ? n.speed : head.header.config.note_speed,
+  }));
   const outcomes = chart.map(() => null);
   ticks.forEach(t => t.events.forEach(e => {
     if (e.cut) outcomes[e.cut.note] = { kind: e.cut.good ? "good" : "bad",
                                         reason: e.cut.reason, tick: t.t };
     if (e.miss !== undefined) outcomes[e.miss.note] = { kind: "miss", reason: "miss", tick: t.t };
   }));
-  return { config: head.header.config, chart, ticks, outcomes,
-           noteSpeed: head.header.config.note_speed };
+  return { config: head.header.config, chart, ticks, outcomes };
 }
 
 function noteCenter(n) { return [(n.col - 1.5) * CELL, (n.row - 1.0) * CELL]; }
@@ -159,7 +165,7 @@ function drawNoteCube(n, z, inSlab) {
   poly(front, true); ctx.fill();
   if (inSlab) { ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2.5; poly(front, true); ctx.stroke(); }
   // required swing direction arrow on the front face
-  const d = DIRV(n.dir);
+  const d = ANGV(n.angle);
   const [ax0, ay0] = proj(cx0 - d[0] * HALF * 0.6, cy0 - d[1] * HALF * 0.6, z - HALF);
   const [ax1, ay1] = proj(cx0 + d[0] * HALF * 0.6, cy0 + d[1] * HALF * 0.6, z - HALF);
   ctx.strokeStyle = "#0b0d11"; ctx.lineWidth = Math.max(2, (F / (z + CAM_D)) * 0.035);
@@ -182,7 +188,7 @@ function drawAftermath(n, i, time) {
   ctx.globalAlpha = 1 - age / 0.6;
   const col = out.kind === "good" ? "#7dd3a0" : out.kind === "bad" ? "#f0a35e" : "#e06c75";
   if (out.kind === "good") {
-    const d = DIRV(n.dir), off = age * 1.4;       // halves drift apart (m)
+    const d = ANGV(n.angle), off = age * 1.4;     // halves drift apart (m)
     const px = -d[1], py = d[0];
     [[px * off, py * off], [-px * off, -py * off]].forEach(([ox, oy]) => {
       const sq = [[-HALF, -HALF * 0.5], [HALF, -HALF * 0.5], [HALF, HALF * 0.5], [-HALF, HALF * 0.5]]
@@ -252,7 +258,7 @@ function render() {
   rep.chart.forEach((n, i) => {
     const out = rep.outcomes[i];
     if (out && time >= (out.tick + 1) * DT) return;
-    const z = (n.t - time) * rep.noteSpeed;
+    const z = (n.t - time) * n.speed;
     if (z <= Z_FAR) pend.push([z, n]);
   });
   pend.sort((a, b) => b[0] - a[0]);
@@ -305,10 +311,13 @@ function load(text, name) {
     rep = parseReplay(text);
     cur = 0;
     document.getElementById("scrub").max = rep.ticks.length - 1;
+    const spd = rep.config.note_speed_max
+      ? `${rep.config.note_speed}-${rep.config.note_speed_max} m/s`
+      : `${rep.config.note_speed} m/s`;
+    const dirs = rep.config.continuous_dirs ? "360°" : `dirs [${rep.config.dirs}]`;
     document.getElementById("drop").textContent = name +
       ` — ${rep.chart.length} notes, ${rep.ticks.length} ticks` +
-      ` (rate ${rep.config.note_rate}, ${rep.config.colors}, dirs [${rep.config.dirs}],` +
-      ` ${rep.noteSpeed} m/s)`;
+      ` (rate ${rep.config.note_rate}, ${rep.config.colors}, ${dirs}, ${spd})`;
     setPlaying(true);
   } catch (err) { alert("could not load replay: " + err.message); }
 }

@@ -23,8 +23,9 @@ class Note:
     hit_time: float
     col: int
     row: int
-    color: int  # 0 = left/red, 1 = right/blue
-    dir: int    # 0..7, required swing direction = dir * 45 deg (0 = +x, CCW)
+    color: int    # 0 = left/red, 1 = right/blue
+    angle: float  # required swing direction in RADIANS (0 = +x, CCW)
+    speed: float  # approach speed toward the plane (m/s)
 
 
 @dataclass
@@ -33,6 +34,8 @@ class ChartConfig:
     chart_len_s: float = 20.0
     colors: str = "right"         # "right" (all blue) or "both"
     dirs: tuple = (6,)            # allowed cut directions (6 = down-swing)
+    continuous_dirs: bool = False # True: angle ~ U(0, 2pi), ignores `dirs`
+    note_speed_max: float = None  # if set: per-note speed ~ U(note_speed, max)
     min_hand_gap_s: float = 0.5   # min spacing between same-hand notes
     first_note_s: float = 1.0
     cols: tuple = (0, 1, 2, 3)    # allowed columns (curriculum: restrict)
@@ -48,6 +51,8 @@ class ChartConfig:
     def __post_init__(self):
         assert self.colors in ("right", "both"), self.colors
         assert len(self.dirs) > 0 and all(0 <= d <= 7 for d in self.dirs)
+        if self.note_speed_max is not None:
+            assert self.note_speed_max >= self.note_speed
         assert self.note_rate > 0
         assert self.shaping_coef >= 0
         assert self.note_speed > 0
@@ -63,13 +68,22 @@ def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
         earliest = last_hand_time[color] + cfg.min_hand_gap_s
         hit = max(t, earliest)
         if hit <= cfg.chart_len_s:
+            if cfg.continuous_dirs:
+                angle = float(rng.uniform(0.0, 2.0 * np.pi))
+            else:
+                angle = int(cfg.dirs[rng.integers(0, len(cfg.dirs))]) * np.pi / 4
+            if cfg.note_speed_max is not None:
+                speed = float(rng.uniform(cfg.note_speed, cfg.note_speed_max))
+            else:
+                speed = cfg.note_speed
             notes.append(
                 Note(
                     hit_time=float(hit),
                     col=int(cfg.cols[rng.integers(0, len(cfg.cols))]),
                     row=int(cfg.rows[rng.integers(0, len(cfg.rows))]),
                     color=color,
-                    dir=int(cfg.dirs[rng.integers(0, len(cfg.dirs))]),
+                    angle=angle,
+                    speed=speed,
                 )
             )
             last_hand_time[color] = hit

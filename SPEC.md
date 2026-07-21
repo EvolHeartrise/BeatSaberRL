@@ -67,16 +67,19 @@ paths contain a space — quote everything.
   (0° = +x, counter-clockwise). Integration order per tick:
   `v += a·DT`; `v *= (1 − DRAG)` with `DRAG = 0.02`; clamp `|v| ≤ V_MAX`;
   `p += v·DT`; clamp `p`. No action masks — every action is always legal.
-- **Notes**: chart = list of `(hit_time, col, row, color, dir)` sorted by
-  `hit_time`; `color ∈ {0 left/red, 1 right/blue}`, `dir ∈ 0..7` = required
-  swing direction `(dir)·45°` (so `2` = upward swing, `6` = downward).
-  A note's 3D position is `(cell center, z)` with
-  **`z(t) = (hit_time − t) · note_speed`** — z is derived from the
-  schedule, so time and space can never disagree. `note_speed` default
-  `4` m/s (config).
+- **Notes** (env v4, 2026-07-20 — dynamic charts): chart = list of
+  `(hit_time, col, row, color, angle, speed)` sorted by `hit_time`;
+  `color ∈ {0 left/red, 1 right/blue}`; **`angle`** = required swing
+  direction in radians (0 = +x, CCW; discrete mode restricts to
+  `dirs·45°`, `continuous_dirs` draws U(0, 2π)); **`speed`** = per-note
+  approach speed in m/s (constant `note_speed`, or per-note
+  U(note_speed, note_speed_max) when the max is set). A note's 3D
+  position is `(cell center, z)` with **`z(t) = (hit_time − t) · speed`**
+  — z derived from the schedule, so time and space can never disagree.
 - **Cut window is SPATIAL**: a note is *active* while inside the slab
-  `|z| ≤ Z_WINDOW = 0.6` m (at 4 m/s that is ±0.15 s of travel; faster
-  notes get proportionally less time — tested).
+  `|z| ≤ Z_WINDOW = 0.6` m — faster notes get proportionally less TIME
+  in the slab (tested), which is what makes per-note speeds a real
+  difficulty axis.
 - **Cut evaluation**, each tick, for each active uncut note: a saber
   *crosses* the note if its displacement segment `p_prev → p` comes within
   `R` of the note center. Matching-color saber is evaluated first.
@@ -138,7 +141,8 @@ Obs v3 (spatial notes; continuous-ready directions):
 - `notes: [[f32; 9]; 12]` — the next 12 *pending* (uncut, unmissed) notes
   in arrival order, slot 0 = soonest. Per note:
   `[cx/1, cy/0.75, z/8 (z clipped to [−1, 12] m — the negative tail keeps
-  "past the plane but still in the slab" visible), vz/8 (= −note_speed/8),
+  "past the plane but still in the slab" visible), vz/8 (= −speed/8,
+  PER-NOTE since env v4 — vz is a live feature under variable speeds),
   is_left, is_right, dir_cos, dir_sin, valid=1]`. The direction is its
   UNIT VECTOR (cos θ, sin θ) — obs v3, 2026-07-20, replacing the 8-dim
   one-hot: continuous precision angles drop in without an obs change, and
@@ -163,8 +167,9 @@ statistic for arrival). Both properties are pinned by tests.
 
 ## Gymnasium env (`beat_arena_env/rust_env.py`)
 
-`RustBeatEnv(note_rate, colors, dirs, chart_len_s, min_hand_gap_s,
-shaping_coef, cols, rows, note_speed, seed)`:
+`RustBeatEnv(note_rate, colors, dirs, continuous_dirs, chart_len_s,
+min_hand_gap_s, shaping_coef, cols, rows, note_speed, note_speed_max,
+seed)`:
 `observation_space = Box(-2, 2, (200,))` (bounds loose),
 `action_space = MultiDiscrete([9, 9])`. New chart every `reset(seed)`
 (chart gen stays in Python — single source for charts). Per-step
@@ -173,11 +178,12 @@ step adds `good_cuts, bad_cuts, misses, n_notes`. `set_record(path)`
 dumps replay JSONL v2 built from those events. Batched training path:
 `beat_arena_env/vec_env.py: BeatVecEnv` over `VecBeatSim`.
 
-## Replay log (JSONL, version 2)
+## Replay log (JSONL, version 3)
 
-Version 2 = metric world; `config` carries `note_speed`, and viewers
-derive each note's `z` from the schedule (`z = (t_note − t) · speed`).
-The 3D viewer rejects v1 files (pre-metric coordinates).
+Version 3 (env v4): chart entries carry per-note `angle` (radians) and
+`speed`; viewers derive z per note. The 3D viewer reads v3 and v2 (v2
+notes carry a `dir` index + config-wide speed and are normalized on
+load); v1 (pre-metric) is rejected.
 
 ```json
 {"header": {"version": 2, "config": {..., "note_speed": 4.0}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"dir":6}, ...]}}

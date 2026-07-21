@@ -49,12 +49,13 @@ struct Note {
     col: u8,
     row: u8,
     color: u8,
-    dir: u8,
+    angle: f64, // required swing direction in radians (0 = +x, CCW)
+    speed: f64, // approach speed toward the plane (m/s)
 }
 
-fn dir_vec(d: u8) -> [f64; 2] {
-    let a = d as f64 * std::f64::consts::PI / 4.0;
-    [a.cos(), a.sin()]
+fn action_dir(a: u8) -> [f64; 2] {
+    let th = a as f64 * std::f64::consts::PI / 4.0;
+    [th.cos(), th.sin()]
 }
 
 fn note_center(n: &Note) -> [f64; 2] {
@@ -77,7 +78,6 @@ fn seg_point_dist(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 }
 
 struct Core {
-    note_speed: f64,
     shaping_coef: f64,
     max_steps: u32,
     chart: Vec<Note>,
@@ -94,9 +94,8 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+    fn new_core(shaping_coef: f64, max_steps: u32) -> Self {
         Core {
-            note_speed,
             shaping_coef,
             max_steps,
             chart: Vec::new(),
@@ -112,15 +111,16 @@ impl Core {
         }
     }
 
-    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, u8)>) {
+    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, f64, f64)>) {
         self.chart = chart
             .into_iter()
-            .map(|(t, col, row, color, dir)| Note {
+            .map(|(t, col, row, color, angle, speed)| Note {
                 hit_time: t,
                 col,
                 row,
                 color,
-                dir,
+                angle,
+                speed,
             })
             .collect();
         self.reset_state();
@@ -181,13 +181,13 @@ impl Core {
             }
             let base = OFF_NOTES + slot * NOTE_FEAT;
             let c = note_center(n);
-            let z = ((n.hit_time - self.time) * self.note_speed).clamp(Z_CLIP.0, Z_CLIP.1);
+            let z = ((n.hit_time - self.time) * n.speed).clamp(Z_CLIP.0, Z_CLIP.1);
             obs[base] = (c[0] / X_NORM) as f32;
             obs[base + 1] = (c[1] / Y_NORM) as f32;
             obs[base + 2] = (z / Z_SCALE) as f32;
-            obs[base + 3] = (-self.note_speed / Z_SCALE) as f32;
+            obs[base + 3] = (-n.speed / Z_SCALE) as f32;
             obs[base + 4 + n.color as usize] = 1.0;
-            let d = dir_vec(n.dir);
+            let d = [n.angle.cos(), n.angle.sin()];
             obs[base + 6] = d[0] as f32;   // cos(theta): swing dir x
             obs[base + 7] = d[1] as f32;   // sin(theta): swing dir y
             obs[base + 8] = 1.0;           // valid
@@ -203,7 +203,7 @@ impl Core {
         for s in 0..2 {
             let a = actions[s];
             if a > 0 {
-                let d = dir_vec(a - 1);
+                let d = action_dir(a - 1);
                 self.vel[s][0] += ACCEL * DT * d[0];
                 self.vel[s][1] += ACCEL * DT * d[1];
             }
@@ -234,7 +234,7 @@ impl Core {
                 continue;
             }
             let n = self.chart[i];
-            let z = (n.hit_time - self.time) * self.note_speed;
+            let z = (n.hit_time - self.time) * n.speed;
             if z.abs() > Z_WINDOW {
                 if z < -Z_WINDOW {
                     self.status[i] = 3;
@@ -259,7 +259,7 @@ impl Core {
                     if speed < V_MIN_CUT {
                         1 // slow
                     } else {
-                        let d = dir_vec(n.dir);
+                        let d = [n.angle.cos(), n.angle.sin()];
                         let cosv =
                             (self.vel[s][0] * d[0] + self.vel[s][1] * d[1]) / speed.max(1e-9);
                         if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
@@ -302,19 +302,19 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (note_speed=4.0, shaping_coef=0.0, max_steps=630))]
-    fn new(note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+    #[pyo3(signature = (shaping_coef=0.0, max_steps=630))]
+    fn new(shaping_coef: f64, max_steps: u32) -> Self {
         RawBeatSim {
-            core: Core::new_core(note_speed, shaping_coef, max_steps),
+            core: Core::new_core(shaping_coef, max_steps),
         }
     }
 
-    /// chart: list of (hit_time, col, row, color, dir), sorted by hit_time.
-    /// Resets all episode state and returns the reset observation.
+    /// chart: list of (hit_time, col, row, color, angle_rad, speed),
+    /// sorted by hit_time. Resets state, returns the reset observation.
     fn set_chart<'py>(
         &mut self,
         py: Python<'py>,
-        chart: Vec<(f64, u8, u8, u8, u8)>,
+        chart: Vec<(f64, u8, u8, u8, f64, f64)>,
     ) -> Bound<'py, PyArray1<f32>> {
         self.core.set_chart_notes(chart);
         PyArray1::from_slice_bound(py, &self.core.build_obs())
@@ -392,16 +392,16 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, note_speed=4.0, shaping_coef=0.0, max_steps=630))]
-    fn new(n: usize, note_speed: f64, shaping_coef: f64, max_steps: u32) -> Self {
+    #[pyo3(signature = (n, shaping_coef=0.0, max_steps=630))]
+    fn new(n: usize, shaping_coef: f64, max_steps: u32) -> Self {
         VecBeatSim {
             sims: (0..n)
-                .map(|_| Core::new_core(note_speed, shaping_coef, max_steps))
+                .map(|_| Core::new_core(shaping_coef, max_steps))
                 .collect(),
         }
     }
 
-    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, u8)>) {
+    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, f64, f64)>) {
         self.sims[i].set_chart_notes(chart);
     }
 

@@ -27,13 +27,15 @@ class RustBeatEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, note_rate=1.0, colors="right", dirs=(6,),
-                 chart_len_s=20.0, min_hand_gap_s=0.5, shaping_coef=0.0,
-                 cols=(0, 1, 2, 3), rows=(0, 1, 2), note_speed=4.0, seed=0):
+                 continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
+                 shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
+                 note_speed=4.0, note_speed_max=None, seed=0):
         self.cfg = ChartConfig(
             note_rate=note_rate, colors=colors, dirs=tuple(dirs),
-            chart_len_s=chart_len_s, min_hand_gap_s=min_hand_gap_s,
-            shaping_coef=shaping_coef, cols=tuple(cols), rows=tuple(rows),
-            note_speed=note_speed,
+            continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
+            min_hand_gap_s=min_hand_gap_s, shaping_coef=shaping_coef,
+            cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
+            note_speed_max=note_speed_max,
         )
         self._base_seed = seed
         self._episode = 0
@@ -41,8 +43,7 @@ class RustBeatEnv(gym.Env):
         self._record_lines = None
         self.chart = []
         max_steps = int(chart_len_s * 30) + 30
-        self.sim = RawBeatSim(note_speed=note_speed, shaping_coef=shaping_coef,
-                              max_steps=max_steps)
+        self.sim = RawBeatSim(shaping_coef=shaping_coef, max_steps=max_steps)
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )
@@ -55,7 +56,7 @@ class RustBeatEnv(gym.Env):
 
     def _start_record(self):
         header = {"header": {
-            "version": 2,
+            "version": 3,
             "config": {
                 "note_rate": self.cfg.note_rate,
                 "chart_len_s": self.cfg.chart_len_s,
@@ -63,9 +64,12 @@ class RustBeatEnv(gym.Env):
                 "dirs": list(self.cfg.dirs),
                 "min_hand_gap_s": self.cfg.min_hand_gap_s,
                 "note_speed": self.cfg.note_speed,
+                "note_speed_max": self.cfg.note_speed_max,
+                "continuous_dirs": self.cfg.continuous_dirs,
             },
             "chart": [{"t": n.hit_time, "col": n.col, "row": n.row,
-                       "color": n.color, "dir": n.dir} for n in self.chart],
+                       "color": n.color, "angle": round(n.angle, 5),
+                       "speed": round(n.speed, 4)} for n in self.chart],
         }}
         self._record_lines = [json.dumps(header)]
 
@@ -92,8 +96,8 @@ class RustBeatEnv(gym.Env):
             seed = self._base_seed + self._episode * 9973
         self._episode += 1
         self.chart = generate_chart(self.cfg, np.random.default_rng(seed))
-        obs = self.sim.set_chart([(n.hit_time, n.col, n.row, n.color, n.dir)
-                                  for n in self.chart])
+        obs = self.sim.set_chart([(n.hit_time, n.col, n.row, n.color,
+                                   n.angle, n.speed) for n in self.chart])
         if self._record_path is not None:
             self._start_record()
         return obs, {}

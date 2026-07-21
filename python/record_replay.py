@@ -40,7 +40,11 @@ def parse_args():
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
     p.add_argument("--min-hand-gap", type=float, default=0.5)
-    p.add_argument("--note-speed", type=float, default=4.0)
+    p.add_argument("--note-speed", type=float, default=4.0,
+                   help="approach speed; MIN of the range if --note-speed-max set")
+    p.add_argument("--note-speed-max", type=float, default=None)
+    p.add_argument("--continuous-dirs", action="store_true",
+                   help="angles ~ U(0, 2pi) instead of the --dirs subset")
     return p.parse_args()
 
 
@@ -50,7 +54,8 @@ def main():
     kw = dict(note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
               cols=tuple(args.cols), rows=tuple(args.rows),
               chart_len_s=args.chart_len, min_hand_gap_s=args.min_hand_gap,
-              note_speed=args.note_speed, shaping_coef=0.0)
+              note_speed=args.note_speed, note_speed_max=args.note_speed_max,
+              continuous_dirs=args.continuous_dirs, shaping_coef=0.0)
 
     policy = None
     if args.ckpt:
