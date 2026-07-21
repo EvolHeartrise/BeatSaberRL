@@ -122,6 +122,9 @@ scripted bot ≈ +18.7 (97% good cuts).
   wide arms all fail (1–8%) at any LR/schedule; epochs climb 73.5/81.6/92.2%
   (e2/e3/e4). **`--env torch --num-envs 4096 --minibatches 16 --lr 1e-3
   --epochs 4` beats the narrow default outright: 92.2% @ 20M in ~10 min vs
-  84.7% in 13.5 (N=128).** New from-scratch default on this card.
-- Next: close the human-pattern distribution gap; e4+cosine at wide (97%
-  territory?); density knee (e5-6).
+  84.7% in 13.5 (N=128).** Adding `--lr-decay cosine` → **95.3% @ 20M in
+  ~10 min** — the best one-command from-scratch recipe on this card:
+  `--env torch --num-envs 4096 --minibatches 16 --lr 1e-3 --epochs 4
+  --lr-decay cosine`.
+- Next: close the human-pattern distribution gap; 30M wide-cosine run
+  (97%+ territory?); density knee (e5-6); recipe seed replication.
