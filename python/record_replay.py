@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from beat_arena_env import RustBeatEnv, scripted_action
-from policy import NotePolicy
+from policy import load_policy
 
 
 def parse_args():
@@ -60,8 +60,7 @@ def main():
     policy = None
     if args.ckpt:
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-        policy = NotePolicy()
-        policy.load_state_dict(ckpt["state_dict"])
+        policy = load_policy(ckpt)
         policy.eval()
         tag = os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))
         print(f"loaded {args.ckpt} (update {ckpt.get('update', '?')})")
