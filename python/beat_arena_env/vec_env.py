@@ -20,8 +20,13 @@ class BeatVecEnv:
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
-                 note_speed=4.0, note_speed_max=None, seed=0):
+                 note_speed=4.0, note_speed_max=None, seed=0,
+                 chart_sampler=None, max_steps=None):
+        """chart_sampler: callable (env_idx, rng) -> list[Note]; replaces
+        procedural generation (curriculum mode). max_steps: tick-cap
+        override — REQUIRED with a sampler whose charts outrun chart_len_s."""
         self.num_envs = num_envs
+        self._sampler = chart_sampler
         self.cfg = ChartConfig(
             note_rate=note_rate, colors=colors, dirs=tuple(dirs),
             continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
@@ -29,15 +34,17 @@ class BeatVecEnv:
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
         )
-        max_steps = int(chart_len_s * 30) + 30
+        if max_steps is None:
+            max_steps = int(chart_len_s * 30) + 30
         self.sim = VecBeatSim(num_envs, shaping_coef=shaping_coef,
                               max_steps=max_steps)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
 
     def _new_chart(self, i):
-        chart = generate_chart(self.cfg, np.random.default_rng(
-            int(self._rng.integers(0, 2**63 - 1))))
+        rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
+        chart = (self._sampler(i, rng) if self._sampler is not None
+                 else generate_chart(self.cfg, rng))
         self.sim.set_chart(i, [note_tuple(n) for n in chart])
 
     def reset(self):
