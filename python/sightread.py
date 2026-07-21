@@ -18,7 +18,7 @@ import torch
 
 from beat_arena_env import RustBeatEnv, scripted_action
 from beat_arena_env.beatsaver import list_difficulties, load_beatmap
-from policy import NotePolicy
+from policy import load_policy
 
 
 def parse_args():
@@ -49,8 +49,7 @@ def main():
     policy = None
     if args.ckpt:
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-        policy = NotePolicy()
-        policy.load_state_dict(ckpt["state_dict"])
+        policy = load_policy(ckpt)
         policy.eval()
 
     env = RustBeatEnv(external_chart=notes, shaping_coef=0.0, seed=1)

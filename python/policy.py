@@ -51,41 +51,66 @@ def _mlp(sizes, act=nn.ReLU):
 
 
 class Block(nn.Module):
-    """Full pre-LN transformer block, single-head."""
+    """Full pre-LN transformer block.
 
-    def __init__(self, d: int):
+    n_heads == 1 keeps the legacy layout (v added straight into the
+    residual stream, no output projection) so pre-2026-07-21 checkpoints
+    load unchanged. n_heads > 1 uses standard multi-head attention with
+    a concat-heads output projection.
+    """
+
+    def __init__(self, d: int, n_heads: int = 1):
         super().__init__()
+        assert d % n_heads == 0, f"embed {d} not divisible by {n_heads} heads"
         self.ln_attn = nn.LayerNorm(d)
         self.q_proj = nn.Linear(d, d)
         self.k_proj = nn.Linear(d, d)
         self.v_proj = nn.Linear(d, d)
+        self.out_proj = nn.Linear(d, d) if n_heads > 1 else None
         self.ln_ffn = nn.LayerNorm(d)
         self.ffn = _mlp([d, 2 * d, d])
         self.d = d
+        self.n_heads = n_heads
+        self.dh = d // n_heads
 
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor) -> torch.Tensor:
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
+        B, T, _ = x.shape
         h = self.ln_attn(x)
         q, k, v = self.q_proj(h), self.k_proj(h), self.v_proj(h)
-        scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, T, T)
-        scores = scores + (key_mask.unsqueeze(1) - 1.0) * 1e9  # mask key columns
-        x = x + torch.softmax(scores, dim=-1) @ v
+        if self.n_heads == 1:
+            scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, T, T)
+            scores = scores + (key_mask.unsqueeze(1) - 1.0) * 1e9
+            x = x + torch.softmax(scores, dim=-1) @ v
+        else:
+            q = q.view(B, T, self.n_heads, self.dh).transpose(1, 2)  # (B,H,T,dh)
+            k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
+            v = v.view(B, T, self.n_heads, self.dh).transpose(1, 2)
+            scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)      # (B,H,T,T)
+            scores = scores + (key_mask[:, None, None, :] - 1.0) * 1e9
+            att = torch.softmax(scores, dim=-1) @ v                  # (B,H,T,dh)
+            att = att.transpose(1, 2).reshape(B, T, self.d)
+            x = x + self.out_proj(att)
         x = x + self.ffn(self.ln_ffn(x))
         return x
 
 
 class NotePolicy(nn.Module):
     def __init__(self, embed: int = 64, trunk_dim: int = 128,
-                 encoder: str = "transformer", n_blocks: int = 2):
+                 encoder: str = "transformer", n_blocks: int = 2,
+                 n_heads: int = 1):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         self.encoder = encoder
         self.embed = embed
+        self.arch = {"embed": embed, "trunk_dim": trunk_dim,
+                     "n_blocks": n_blocks, "n_heads": n_heads}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
         # saber token features: [x, y, vx, vy, is_left, is_right]
         self.saber_mlp = _mlp([6, embed, embed])
-        self.blocks = nn.ModuleList(Block(embed) for _ in range(n_blocks))
+        self.blocks = nn.ModuleList(
+            Block(embed, n_heads) for _ in range(n_blocks))
         self.trunk = _mlp([2 * embed, trunk_dim, trunk_dim])
         self.left_head = nn.Linear(trunk_dim, N_ACTIONS)
         self.right_head = nn.Linear(trunk_dim, N_ACTIONS)
@@ -121,3 +146,15 @@ class NotePolicy(nn.Module):
         logprob = d_left.log_prob(action[:, 0]) + d_right.log_prob(action[:, 1])
         entropy = d_left.entropy() + d_right.entropy()
         return action, logprob, entropy, value
+
+
+def load_policy(ckpt) -> NotePolicy:
+    """Rebuild a NotePolicy from a checkpoint dict. Checkpoints since
+    2026-07-21 carry an "arch" dict; older ones fall back to the original
+    d64/1-head/2-block defaults."""
+    arch = ckpt.get("arch", {})
+    policy = NotePolicy(
+        embed=arch.get("embed", 64), trunk_dim=arch.get("trunk_dim", 128),
+        n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1))
+    policy.load_state_dict(ckpt["state_dict"])
+    return policy

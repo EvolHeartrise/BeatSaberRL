@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from beat_arena_env.rust_env import RustBeatEnv
 from beat_arena_env.vec_env import BeatVecEnv
-from policy import NotePolicy, OBS_DIM
+from policy import NotePolicy, OBS_DIM, load_policy
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -64,6 +64,11 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
+    # model arch (ignored with --init-from: the checkpoint's arch wins)
+    p.add_argument("--embed", type=int, default=64)
+    p.add_argument("--trunk-dim", type=int, default=128)
+    p.add_argument("--n-blocks", type=int, default=2)
+    p.add_argument("--n-heads", type=int, default=1)
     # env config (mirrors train_smoke)
     p.add_argument("--note-rate", type=float, default=1.0)
     p.add_argument("--colors", choices=["right", "both"], default="right")
@@ -176,11 +181,16 @@ def main():
             continuous_dirs=args.continuous_dirs,
             shaping_coef=args.shaping_coef, seed=args.seed)
 
-    policy = NotePolicy()
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
-        policy.load_state_dict(ckpt["state_dict"])
-        print(f"warm-started from {args.init_from}", flush=True)
+        policy = load_policy(ckpt)
+        print(f"warm-started from {args.init_from} (arch {policy.arch})",
+              flush=True)
+    else:
+        policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
+                            n_blocks=args.n_blocks, n_heads=args.n_heads)
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=LR)
 
@@ -276,7 +286,7 @@ def main():
                   flush=True)
             print(curriculum.summary(), flush=True)
             if fc:
-                torch.save({"state_dict": cpu_state(policy),
+                torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                             "encoder": policy.encoder, "update": update + 1,
                             "global_step": global_step,
                             "fc_map": newest["song"], "stars": newest["stars"]},
@@ -289,7 +299,8 @@ def main():
                           f"will retry next FC check", flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
-            torch.save({"state_dict": cpu_state(policy), "encoder": policy.encoder,
+            torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
+                        "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
                         "recent_return": float(recent)},
                        os.path.join(args.run_dir, f"ckpt_upd{update+1:04d}.pt"))
@@ -298,7 +309,8 @@ def main():
             break
 
     recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
-    torch.save({"state_dict": cpu_state(policy), "encoder": policy.encoder,
+    torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
+                "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
                 "recent_return": float(recent)},
                os.path.join(args.run_dir, "final.pt"))
