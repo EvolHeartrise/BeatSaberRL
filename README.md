@@ -107,4 +107,10 @@ scripted bot ≈ +18.7 (97% good cuts).
   precision angles) and sight-read** — e.g. 81% on Spectre [Easy] with
   zero training on real charts. Try:
   `python sightread.py --map maps/<map>.zip --difficulty Easy --ckpt <ckpt> --replay out.jsonl`
-- Next: close the human-pattern distribution gap, model scale on GPU.
+- GPU training (2026-07-21, Windows box): `--device cuda` on a GTX 1080
+  (torch cu126 wheels — the last line with Pascal kernels) sustains
+  ~24.7k steps/s vs 8.5k CPU; rollout is now the bottleneck (77%).
+  20M-step dynamic-gym run from scratch in 13.5 min, seed 1: **84.7%
+  good cuts greedy — first policy above the 81% scripted ceiling.**
+- Next: close the human-pattern distribution gap, model scale on GPU
+  (rollout-bound now, so bigger models are nearly free).
