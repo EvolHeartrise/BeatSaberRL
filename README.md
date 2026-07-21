@@ -78,9 +78,11 @@ scripted bot ≈ +18.7 (97% good cuts).
   Three skills stacked at once (hand assignment, direction-conditional
   swings, two-hand traffic) broke the shaping staircase. Curriculum
   warm-start from the easy checkpoint is the proposed next step.
-- Pure-reward era (2026-07-20, by design): shaping default is OFF —
-  rewards come only from sim scoring (V_MIN 1 m/s). First pure run on the
-  hard config (tf, 600k): 2.2% good cuts vs random 1.2%, shaped-run 5%,
-  scripted 97% — slow upward crawl, no takeoff yet.
-- Next: env-side curriculum (easy→hard charts), longer pure runs,
-  real BeatSaver `.dat` parsing (v3).
+- Pure-reward era (2026-07-20, by design): shaping OFF, rewards only
+  from sim scoring (V_MIN 1 m/s; bad cut = miss = −0.5).
+- **Hard config (both hands, 8 dirs) SOLVED at 14M steps: 98% good cuts,
+  beating the scripted bot (96%) — pure rewards, no shaping, no
+  curriculum, ~65 min total training at ~4.4k steps/s.** Checkpoint arc:
+  2.7% (1M) → 19% (4M) → 41% (8M) → 68% (12M) → 98% (14M).
+- Next: harder charts (higher rate, tighter hand gaps), real BeatSaver
+  `.dat` parsing (v3), model scale on GPU.
