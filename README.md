@@ -118,5 +118,10 @@ scripted bot ≈ +18.7 (97% good cuts).
   (vs 24.7k at N=128), but so does Rust at wide N: the PPO update is the
   ceiling on this GPU, not the env. Scale `--minibatches` with N or WDDM
   memory oversubscription silently tanks throughput.
-- Next: close the human-pattern distribution gap; retune LR/minibatch for
-  the wide-batch (N≥4096) regime if 100M+ step runs are wanted.
+- Wide-batch tuning (2026-07-21): update DENSITY is the lever — single-pass
+  wide arms all fail (1–8%) at any LR/schedule; epochs climb 73.5/81.6/92.2%
+  (e2/e3/e4). **`--env torch --num-envs 4096 --minibatches 16 --lr 1e-3
+  --epochs 4` beats the narrow default outright: 92.2% @ 20M in ~10 min vs
+  84.7% in 13.5 (N=128).** New from-scratch default on this card.
+- Next: close the human-pattern distribution gap; e4+cosine at wide (97%
+  territory?); density knee (e5-6).
