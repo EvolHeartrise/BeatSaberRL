@@ -1,0 +1,69 @@
+"""30-episode greedy eval of a checkpoint (defaults = the dynamic-gym config).
+
+Prints one line: ckpt path, good-cut %, bad/miss counts, mean unshaped return.
+Same protocol as the session studies: charts + env seeded 9000..9000+N-1.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import numpy as np
+import torch
+
+from beat_arena_env import RustBeatEnv
+from beat_arena_env.chart import ChartConfig, generate_chart
+from policy import load_policy
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--episodes", type=int, default=30)
+    p.add_argument("--seed0", type=int, default=9000)
+    p.add_argument("--note-rate", type=float, default=2.5)
+    p.add_argument("--colors", default="both")
+    p.add_argument("--discrete-dirs", action="store_true",
+                   help="use --dirs instead of continuous angles")
+    p.add_argument("--dirs", type=int, nargs="+", default=[6])
+    p.add_argument("--note-speed", type=float, default=3.0)
+    p.add_argument("--note-speed-max", type=float, default=6.0)
+    args = p.parse_args()
+
+    cfg = ChartConfig(note_rate=args.note_rate, colors=args.colors,
+                      continuous_dirs=not args.discrete_dirs,
+                      dirs=tuple(args.dirs), note_speed=args.note_speed,
+                      note_speed_max=args.note_speed_max, shaping_coef=0.0)
+    pol = load_policy(torch.load(args.ckpt, map_location="cpu",
+                                 weights_only=True))
+    pol.eval()
+    G = B = M = 0
+    rets = []
+    for ep in range(args.episodes):
+        rng = np.random.default_rng(args.seed0 + ep)
+        env = RustBeatEnv(external_chart=generate_chart(cfg, rng),
+                          shaping_coef=0.0, seed=args.seed0 + ep)
+        obs, _ = env.reset()
+        done, ret = False, 0.0
+        while not done:
+            with torch.no_grad():
+                l, r, _ = pol(torch.as_tensor(obs, dtype=torch.float32
+                                              ).unsqueeze(0))
+            obs, rew, done, _, info = env.step((int(l.argmax()),
+                                                int(r.argmax())))
+            ret += rew
+            for _, reason in info["events"]:
+                if reason == "ok":
+                    G += 1
+                elif reason == "miss":
+                    M += 1
+                else:
+                    B += 1
+        rets.append(ret)
+    tot = G + B + M
+    print(f"{args.ckpt}: good {100 * G / tot:.1f}%  bad {B}  miss {M}  "
+          f"return {np.mean(rets):+.2f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
