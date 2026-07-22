@@ -38,6 +38,7 @@ def main():
                                  weights_only=True))
     pol.eval()
     G = B = M = 0
+    score = notes = 0.0
     rets = []
     for ep in range(args.episodes):
         rng = np.random.default_rng(args.seed0 + ep)
@@ -47,22 +48,25 @@ def main():
         done, ret = False, 0.0
         while not done:
             with torch.no_grad():
-                l, r, _ = pol(torch.as_tensor(obs, dtype=torch.float32
-                                              ).unsqueeze(0))
-            obs, rew, done, _, info = env.step((int(l.argmax()),
-                                                int(r.argmax())))
+                logits, _ = pol(torch.as_tensor(obs, dtype=torch.float32
+                                                ).unsqueeze(0))
+            obs, rew, done, _, info = env.step(
+                tuple(int(l.argmax()) for l in logits))
             ret += rew
-            for _, reason in info["events"]:
+            for _, reason, _pts in info["events"]:
                 if reason == "ok":
                     G += 1
                 elif reason == "miss":
                     M += 1
-                else:
+                elif reason != "post":
                     B += 1
+        score += info["score"]
+        notes += info["n_notes"]
         rets.append(ret)
     tot = G + B + M
     print(f"{args.ckpt}: good {100 * G / tot:.1f}%  bad {B}  miss {M}  "
-          f"return {np.mean(rets):+.2f}", flush=True)
+          f"score {score / notes:.1f}/115  return {np.mean(rets):+.2f}",
+          flush=True)
 
 
 if __name__ == "__main__":

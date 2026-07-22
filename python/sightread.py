@@ -69,14 +69,16 @@ def main():
                         torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
                 act = a[0].numpy()
             else:
-                act = rng.integers(0, 9, size=2)
+                act = rng.integers(0, [9, 3, 3, 9, 3, 3])
             obs, r, done, _, info = env.step(act)
             tot += r
-            for _, reason in info["events"]:
-                reasons[reason] += 1
+            for _, reason, _pts in info["events"]:
+                if reason != "post":   # follow-throughs aren't note outcomes
+                    reasons[reason] += 1
         pct = 100 * reasons["ok"] / max(info["n_notes"], 1)
         print(f"ep{ep}: return {tot:7.2f} | good {reasons['ok']}/{info['n_notes']} "
-              f"({pct:.0f}%) | {dict(reasons)}")
+              f"({pct:.0f}%) | score {info['score'] / max(info['n_notes'], 1):.1f}/115 "
+              f"| {dict(reasons)}")
         if args.replay:
             env._record_path = None  # only record the first episode
 

@@ -1,10 +1,16 @@
-//! Beat Arena sim core in Rust — a semantics-exact port of
-//! `python/beat_arena_env/sim.py` (step + obs; SPEC.md is the contract).
+//! Beat Arena sim core in Rust — THE physics implementation (SPEC.md is
+//! the contract; `python/beat_arena_env/constants.py` mirrors constants).
+//!
+//! Env v5 (2026-07-21): blade sabers. Each hand = a wrist (point mass on
+//! the hit plane, the old point-saber dynamics) + a rigid 1 m blade whose
+//! 3D direction is driven by two wrist DOFs: azimuth theta (in-plane
+//! CW/CCW rotation — the swing) and tilt phi (supination/pronation —
+//! pitch toward the incoming notes). Cuts are swept-blade-through-block
+//! events scored with the real Beat Saber 115-point system: 70 pre-swing
+//! (100 deg), 30 follow-through (60 deg), 15 accuracy-to-center.
 //!
 //! Chart generation stays in Python (single source of truth, once per
-//! episode); the chart is injected via `set_chart`. Replay recording is
-//! Python-only — this port exists for training/eval throughput.
-//! Parity with the Python sim is pinned by `tests/test_rust_parity.py`.
+//! episode); the chart is injected via `set_chart`.
 
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -16,28 +22,40 @@ const V_MAX: f64 = 6.0;
 const V_MIN_CUT: f64 = 1.0;
 const CUT_RADIUS: f64 = 0.28;
 const COS_TOL: f64 = 0.5;
-const Z_WINDOW: f64 = 0.6;
 const CELL: f64 = 0.5;
 const POS_LO: [f64; 2] = [-1.5, -1.25];
 const POS_HI: [f64; 2] = [1.5, 1.25];
-const REWARD_GOOD: f64 = 1.0;
-// Equal to a miss since 2026-07-20 (user audit): in real Beat Saber a
-// bad cut and a miss are equally terminal (no score, combo break). The
-// old -0.25 was a v0 exploration crutch (engagement gradient) that
-// under-punished wrong_hand once the policy learned to engage.
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
 const SHAPE_GAMMA: f64 = 0.99;
 const SHAPE_DIST_CLIP: f64 = 2.0;
 
+// --- blade (env v5) ---------------------------------------------------------
+const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
+const ALPHA_ROT: f64 = 200.0; // rad/s^2, both angular DOFs
+const OMEGA_MAX: f64 = 20.0; // rad/s
+const PHI_LIM: f64 = 1.309; // 75 deg — clear of the phi=90 azimuth singularity
+const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
+const REACH_Z: f64 = 1.25; // max tip z (sin 75deg * 1 m) + CUT_RADIUS
+const Z_MISS: f64 = 0.6; // note consumed as missed past this
+
+// --- scoring (real Beat Saber 115) ------------------------------------------
+const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
+const POST_FULL: f64 = 1.0471975511965976; // 60 deg
+const PTS_PRE: f64 = 70.0;
+const PTS_POST: f64 = 30.0;
+const PTS_ACC: f64 = 15.0;
+const SCORE_MAX: f64 = 115.0;
+const SWING_BREAK: f64 = 0.005; // rad/tick below which the swing chain breaks
+const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
+
 const N_NOTE_SLOTS: usize = 12;
-// obs v3 (2026-07-20): direction as its unit vector (cos, sin) instead of
-// an 8-dim one-hot — ready for continuous precision angles, and it hands
-// the network the exact object the cut rule uses (cos angle = v . d / |v|).
 const NOTE_FEAT: usize = 9;
-const OFF_NOTES: usize = 8;
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 116
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 128
+// obs v4: per saber 10 features (wrist + blade pose + pre-swing meter)
+const SABER_FEAT: usize = 10;
+const OFF_NOTES: usize = 2 * SABER_FEAT; // 20
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 128
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 140
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
@@ -60,22 +78,75 @@ fn action_dir(a: u8) -> [f64; 2] {
 }
 
 fn note_center(n: &Note) -> [f64; 2] {
+    [(n.col as f64 - 1.5) * CELL, (n.row as f64 - 1.0) * CELL]
+}
+
+/// Blade direction unit vector from (azimuth, tilt).
+fn blade_dir(theta: f64, phi: f64) -> [f64; 3] {
+    let (st, ct) = theta.sin_cos();
+    let (sp, cp) = phi.sin_cos();
+    [cp * ct, cp * st, sp]
+}
+
+/// d/dt of the blade direction, given the angular velocities.
+fn blade_dir_dot(theta: f64, phi: f64, om_th: f64, om_ph: f64) -> [f64; 3] {
+    let (st, ct) = theta.sin_cos();
+    let (sp, cp) = phi.sin_cos();
     [
-        (n.col as f64 - 1.5) * CELL,
-        (n.row as f64 - 1.0) * CELL,
+        -om_th * cp * st - om_ph * sp * ct,
+        om_th * cp * ct - om_ph * sp * st,
+        om_ph * cp,
     ]
 }
 
-fn seg_point_dist(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let denom = ab[0] * ab[0] + ab[1] * ab[1];
-    if denom < 1e-12 {
-        return ((c[0] - a[0]).powi(2) + (c[1] - a[1]).powi(2)).sqrt();
-    }
-    let t = (((c[0] - a[0]) * ab[0] + (c[1] - a[1]) * ab[1]) / denom).clamp(0.0, 1.0);
+fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let denom = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let t = if denom < 1e-12 {
+        0.0
+    } else {
+        ((ac[0] * ab[0] + ac[1] * ab[1] + ac[2] * ab[2]) / denom).clamp(0.0, 1.0)
+    };
     let px = a[0] + t * ab[0] - c[0];
     let py = a[1] + t * ab[1] - c[1];
-    (px * px + py * py).sqrt()
+    let pz = a[2] + t * ab[2] - c[2];
+    (px * px + py * py + pz * pz).sqrt()
+}
+
+#[derive(Clone, Copy)]
+struct Saber {
+    pos: [f64; 2],
+    vel: [f64; 2],
+    theta: f64,
+    phi: f64,
+    om_th: f64,
+    om_ph: f64,
+    swing_acc: f64,        // arc of the current continuous swing (rad)
+    axis: Option<[f64; 3]>, // last tick's rotation axis (unit)
+}
+
+impl Saber {
+    fn start(x: f64) -> Self {
+        Saber {
+            pos: [x, 0.0],
+            vel: [0.0; 2],
+            theta: std::f64::consts::FRAC_PI_2, // blade straight up
+            phi: 0.0,
+            om_th: 0.0,
+            om_ph: 0.0,
+            swing_acc: 0.0,
+            axis: None,
+        }
+    }
+}
+
+/// A good cut's pending follow-through meter.
+#[derive(Clone, Copy)]
+struct Tracker {
+    note: u32,
+    acc: f64,
+    age: u32,
 }
 
 struct Core {
@@ -85,13 +156,14 @@ struct Core {
     // state
     tick: u32,
     time: f64,
-    pos: [[f64; 2]; 2],
-    vel: [[f64; 2]; 2],
+    sabers: [Saber; 2],
+    trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad, 3 missed
-    phi: f64,
+    phi_pot: f64,    // shaping potential (NOT the tilt angle)
     good_cuts: u32,
     bad_cuts: u32,
     misses: u32,
+    score: f64, // summed points; max = 115 * n_notes
 }
 
 impl Core {
@@ -102,13 +174,14 @@ impl Core {
             chart: Vec::new(),
             tick: 0,
             time: 0.0,
-            pos: [[-0.5, 0.0], [0.5, 0.0]],
-            vel: [[0.0; 2]; 2],
+            sabers: [Saber::start(-0.5), Saber::start(0.5)],
+            trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
-            phi: 0.0,
+            phi_pot: 0.0,
             good_cuts: 0,
             bad_cuts: 0,
             misses: 0,
+            score: 0.0,
         }
     }
 
@@ -143,7 +216,7 @@ impl Core {
             }
             seen |= 1 << n.color;
             let c = note_center(n);
-            let p = self.pos[n.color as usize];
+            let p = self.sabers[n.color as usize].pos;
             let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
             phi -= self.shaping_coef * d.min(SHAPE_DIST_CLIP) / SHAPE_DIST_CLIP;
             if seen == 3 {
@@ -156,22 +229,31 @@ impl Core {
     fn reset_state(&mut self) {
         self.tick = 0;
         self.time = 0.0;
-        self.pos = [[-0.5, 0.0], [0.5, 0.0]];
-        self.vel = [[0.0; 2]; 2];
+        self.sabers = [Saber::start(-0.5), Saber::start(0.5)];
+        self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
         self.good_cuts = 0;
         self.bad_cuts = 0;
         self.misses = 0;
-        self.phi = self.potential();
+        self.score = 0.0;
+        self.phi_pot = self.potential();
     }
 
     fn build_obs(&self) -> [f32; OBS_DIM] {
         let mut obs = [0.0f32; OBS_DIM];
-        for s in 0..2 {
-            obs[s * 4] = (self.pos[s][0] / X_NORM) as f32;
-            obs[s * 4 + 1] = (self.pos[s][1] / Y_NORM) as f32;
-            obs[s * 4 + 2] = (self.vel[s][0] / V_MAX) as f32;
-            obs[s * 4 + 3] = (self.vel[s][1] / V_MAX) as f32;
+        for (s, sab) in self.sabers.iter().enumerate() {
+            let b = s * SABER_FEAT;
+            obs[b] = (sab.pos[0] / X_NORM) as f32;
+            obs[b + 1] = (sab.pos[1] / Y_NORM) as f32;
+            obs[b + 2] = (sab.vel[0] / V_MAX) as f32;
+            obs[b + 3] = (sab.vel[1] / V_MAX) as f32;
+            obs[b + 4] = sab.theta.cos() as f32;
+            obs[b + 5] = sab.theta.sin() as f32;
+            obs[b + 6] = (sab.phi / PHI_LIM) as f32;
+            obs[b + 7] = (sab.om_th / OMEGA_MAX) as f32;
+            obs[b + 8] = (sab.om_ph / OMEGA_MAX) as f32;
+            // live pre-swing meter: 1.0 = full pre-swing credit banked
+            obs[b + 9] = (sab.swing_acc / PRE_FULL).min(2.0) as f32;
         }
         let mut slot = 0usize;
         for (i, n) in self.chart.iter().enumerate() {
@@ -192,46 +274,140 @@ impl Core {
             // dot notes encode direction as the ZERO vector — the one point
             // that is no direction at all (unit-circle points = constraints)
             let d = if n.any_dir { [0.0, 0.0] } else { [n.angle.cos(), n.angle.sin()] };
-            obs[base + 6] = d[0] as f32;   // cos(theta): swing dir x
-            obs[base + 7] = d[1] as f32;   // sin(theta): swing dir y
-            obs[base + 8] = 1.0;           // valid
+            obs[base + 6] = d[0] as f32;
+            obs[base + 7] = d[1] as f32;
+            obs[base + 8] = 1.0; // valid
             obs[OFF_NOTE_MASK + slot] = 1.0;
             slot += 1;
         }
         obs
     }
 
-    // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss
-    fn step_inner(&mut self, actions: [u8; 2]) -> (f64, bool, Vec<(u32, u8)>) {
-        let prev_pos = self.pos;
+    // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
+    // (follow-through resolution; the f32 is the points awarded).
+    fn step_inner(&mut self, actions: [[u8; 3]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
+        let prev_pos = [self.sabers[0].pos, self.sabers[1].pos];
+        let prev_dir = [
+            blade_dir(self.sabers[0].theta, self.sabers[0].phi),
+            blade_dir(self.sabers[1].theta, self.sabers[1].phi),
+        ];
+
+        let mut reward = 0.0;
+        let mut events: Vec<(u32, u8, f32)> = Vec::new();
+        // per saber this tick: (swing delta, did the chain continue)
+        let mut deltas = [0.0f64; 2];
+        let mut continued = [false; 2];
+
         for s in 0..2 {
-            let a = actions[s];
+            let sab = &mut self.sabers[s];
+            // translation (unchanged point-mass wrist dynamics)
+            let a = actions[s][0];
             if a > 0 {
                 let d = action_dir(a - 1);
-                self.vel[s][0] += ACCEL * DT * d[0];
-                self.vel[s][1] += ACCEL * DT * d[1];
+                sab.vel[0] += ACCEL * DT * d[0];
+                sab.vel[1] += ACCEL * DT * d[1];
             }
-            self.vel[s][0] *= 1.0 - DRAG;
-            self.vel[s][1] *= 1.0 - DRAG;
-            let speed = (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
+            sab.vel[0] *= 1.0 - DRAG;
+            sab.vel[1] *= 1.0 - DRAG;
+            let speed = (sab.vel[0].powi(2) + sab.vel[1].powi(2)).sqrt();
             if speed > V_MAX {
                 let k = V_MAX / speed;
-                self.vel[s][0] *= k;
-                self.vel[s][1] *= k;
+                sab.vel[0] *= k;
+                sab.vel[1] *= k;
             }
-            self.pos[s][0] += self.vel[s][0] * DT;
-            self.pos[s][1] += self.vel[s][1] * DT;
+            sab.pos[0] += sab.vel[0] * DT;
+            sab.pos[1] += sab.vel[1] * DT;
             for ax in 0..2 {
-                if self.pos[s][ax] < POS_LO[ax] || self.pos[s][ax] > POS_HI[ax] {
-                    self.pos[s][ax] = self.pos[s][ax].clamp(POS_LO[ax], POS_HI[ax]);
-                    self.vel[s][ax] = 0.0;
+                if sab.pos[ax] < POS_LO[ax] || sab.pos[ax] > POS_HI[ax] {
+                    sab.pos[ax] = sab.pos[ax].clamp(POS_LO[ax], POS_HI[ax]);
+                    sab.vel[ax] = 0.0;
                 }
+            }
+            // rotation: azimuth (CW/CCW) and tilt (supination/pronation)
+            let rot = actions[s][1];
+            sab.om_th += match rot {
+                1 => ALPHA_ROT * DT,
+                2 => -ALPHA_ROT * DT,
+                _ => 0.0,
+            };
+            let tilt = actions[s][2];
+            sab.om_ph += match tilt {
+                1 => ALPHA_ROT * DT,
+                2 => -ALPHA_ROT * DT,
+                _ => 0.0,
+            };
+            sab.om_th = (sab.om_th * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
+            sab.om_ph = (sab.om_ph * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
+            sab.theta += sab.om_th * DT;
+            // wrap azimuth to [-pi, pi) so it never drifts to huge values
+            if sab.theta >= std::f64::consts::PI {
+                sab.theta -= 2.0 * std::f64::consts::PI;
+            } else if sab.theta < -std::f64::consts::PI {
+                sab.theta += 2.0 * std::f64::consts::PI;
+            }
+            sab.phi += sab.om_ph * DT;
+            if sab.phi < -PHI_LIM || sab.phi > PHI_LIM {
+                sab.phi = sab.phi.clamp(-PHI_LIM, PHI_LIM);
+                sab.om_ph = 0.0;
+            }
+
+            // swing chain update (feeds pre-swing + follow-through scores)
+            let d_new = blade_dir(sab.theta, sab.phi);
+            let d_old = prev_dir[s];
+            let dot = (d_old[0] * d_new[0] + d_old[1] * d_new[1] + d_old[2] * d_new[2])
+                .clamp(-1.0, 1.0);
+            let delta = dot.acos();
+            deltas[s] = delta;
+            if delta < SWING_BREAK {
+                sab.swing_acc = 0.0;
+                sab.axis = None;
+            } else {
+                let cx = [
+                    d_old[1] * d_new[2] - d_old[2] * d_new[1],
+                    d_old[2] * d_new[0] - d_old[0] * d_new[2],
+                    d_old[0] * d_new[1] - d_old[1] * d_new[0],
+                ];
+                let cn = (cx[0].powi(2) + cx[1].powi(2) + cx[2].powi(2)).sqrt();
+                let ax = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
+                match sab.axis {
+                    Some(a0) if a0[0] * ax[0] + a0[1] * ax[1] + a0[2] * ax[2] < 0.0 => {
+                        sab.swing_acc = delta; // reversal: a new swing starts
+                    }
+                    _ => {
+                        sab.swing_acc += delta;
+                        continued[s] = true;
+                    }
+                }
+                sab.axis = Some(ax);
             }
         }
 
+        // follow-through trackers (existing ones, BEFORE this tick's cuts):
+        // chain broke/reversed -> resolve; else accumulate and resolve on
+        // reaching 60 deg or timing out.
+        for s in 0..2 {
+            let mut kept: Vec<Tracker> = Vec::new();
+            for mut tr in self.trackers[s].drain(..) {
+                let resolve = if !continued[s] {
+                    true
+                } else {
+                    tr.acc += deltas[s];
+                    tr.age += 1;
+                    tr.acc >= POST_FULL || tr.age >= FOLLOW_TIMEOUT
+                };
+                if resolve {
+                    let pts = PTS_POST * (tr.acc / POST_FULL).min(1.0);
+                    reward += pts / SCORE_MAX;
+                    self.score += pts;
+                    events.push((tr.note, 5, pts as f32));
+                } else {
+                    kept.push(tr);
+                }
+            }
+            self.trackers[s] = kept;
+        }
+
         self.time = (self.tick + 1) as f64 * DT;
-        let mut reward = 0.0;
-        let mut events: Vec<(u32, u8)> = Vec::new();
 
         for i in 0..self.chart.len() {
             if self.status[i] != 0 {
@@ -239,48 +415,83 @@ impl Core {
             }
             let n = self.chart[i];
             let z = (n.hit_time - self.time) * n.speed;
-            if z.abs() > Z_WINDOW {
-                if z < -Z_WINDOW {
-                    self.status[i] = 3;
-                    self.misses += 1;
-                    reward += REWARD_MISS;
-                    events.push((i as u32, 4));
-                }
+            if z < -Z_MISS {
+                self.status[i] = 3;
+                self.misses += 1;
+                reward += REWARD_MISS;
+                events.push((i as u32, 4, 0.0));
                 continue;
             }
-            let center = note_center(&n);
+            if z > REACH_Z {
+                continue;
+            }
+            let center = [note_center(&n)[0], note_center(&n)[1], z];
             for &s in &[n.color as usize, 1 - n.color as usize] {
-                let crossed =
-                    seg_point_dist(prev_pos[s], self.pos[s], center) <= CUT_RADIUS;
-                if !crossed {
+                let sab = self.sabers[s];
+                let d_new = blade_dir(sab.theta, sab.phi);
+                // swept-blade test: 8 sample points along the blade, each
+                // tracing its own displacement segment (full 3D)
+                let mut d_min = f64::INFINITY;
+                let mut s_star = 0.0;
+                for j in 1..=N_BLADE_SAMPLES {
+                    let frac = j as f64 / N_BLADE_SAMPLES as f64;
+                    let r = frac * SABER_LEN;
+                    let p0 = [
+                        prev_pos[s][0] + r * prev_dir[s][0],
+                        prev_pos[s][1] + r * prev_dir[s][1],
+                        r * prev_dir[s][2],
+                    ];
+                    let p1 = [
+                        sab.pos[0] + r * d_new[0],
+                        sab.pos[1] + r * d_new[1],
+                        r * d_new[2],
+                    ];
+                    let d = seg_point_dist3(p0, p1, center);
+                    if d < d_min {
+                        d_min = d;
+                        s_star = r;
+                    }
+                }
+                if d_min > CUT_RADIUS {
                     continue;
                 }
+                // contact velocity: wrist translation + rotation at s*
+                let dd = blade_dir_dot(sab.theta, sab.phi, sab.om_th, sab.om_ph);
+                let vc = [
+                    sab.vel[0] + s_star * dd[0],
+                    sab.vel[1] + s_star * dd[1],
+                    s_star * dd[2],
+                ];
+                let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
                 let code: u8 = if s != n.color as usize {
                     3 // wrong_hand
+                } else if vc_mag < V_MIN_CUT {
+                    1 // slow
+                } else if n.any_dir {
+                    0 // dot note: any direction scores
                 } else {
-                    let speed =
-                        (self.vel[s][0].powi(2) + self.vel[s][1].powi(2)).sqrt();
-                    if speed < V_MIN_CUT {
-                        1 // slow
-                    } else if n.any_dir {
-                        0 // dot note: any direction scores
-                    } else {
-                        let d = [n.angle.cos(), n.angle.sin()];
-                        let cosv =
-                            (self.vel[s][0] * d[0] + self.vel[s][1] * d[1]) / speed.max(1e-9);
-                        if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
-                    }
+                    // direction check on the IN-PLANE contact velocity
+                    let d2 = [n.angle.cos(), n.angle.sin()];
+                    let v2_mag = (vc[0].powi(2) + vc[1].powi(2)).sqrt();
+                    let cosv = (vc[0] * d2[0] + vc[1] * d2[1]) / v2_mag.max(1e-9);
+                    if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
                 };
-                let good = code == 0;
-                self.status[i] = if good { 1 } else { 2 };
-                if good {
+                if code == 0 {
+                    self.status[i] = 1;
                     self.good_cuts += 1;
-                    reward += REWARD_GOOD;
+                    let pre = PTS_PRE * (self.sabers[s].swing_acc / PRE_FULL).min(1.0);
+                    let acc = PTS_ACC * (1.0 - d_min / CUT_RADIUS);
+                    let pts = pre + acc;
+                    reward += pts / SCORE_MAX;
+                    self.score += pts;
+                    self.trackers[s].push(Tracker { note: i as u32, acc: 0.0, age: 0 });
+                    events.push((i as u32, 0, pts as f32));
                 } else {
+                    self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
+                    events.push((i as u32, code, 0.0));
                 }
-                events.push((i as u32, code));
                 break;
             }
         }
@@ -288,13 +499,31 @@ impl Core {
         self.tick += 1;
         let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
         let pending = self.status.iter().any(|&s| s == 0);
-        let done = (!pending && (self.chart.is_empty() || self.time > last_hit))
+        // natural completion waits for pending follow-throughs so the last
+        // note's post-swing isn't truncated; the time/tick caps still end
+        // the episode hard (trackers force-resolve below).
+        let no_trackers = self.trackers[0].is_empty() && self.trackers[1].is_empty();
+        let done = (!pending
+            && no_trackers
+            && (self.chart.is_empty() || self.time > last_hit))
             || self.time > last_hit + 0.5
             || self.tick >= self.max_steps;
 
+        if done {
+            // resolve any pending follow-throughs with their partial arcs
+            for s in 0..2 {
+                for tr in self.trackers[s].drain(..) {
+                    let pts = PTS_POST * (tr.acc / POST_FULL).min(1.0);
+                    reward += pts / SCORE_MAX;
+                    self.score += pts;
+                    events.push((tr.note, 5, pts as f32));
+                }
+            }
+        }
+
         let new_phi = if done { 0.0 } else { self.potential() };
-        reward += SHAPE_GAMMA * new_phi - self.phi;
-        self.phi = new_phi;
+        reward += SHAPE_GAMMA * new_phi - self.phi_pot;
+        self.phi_pot = new_phi;
 
         (reward, done, events)
     }
@@ -326,16 +555,25 @@ impl RawBeatSim {
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
-    /// Returns (obs, reward, done, events); events = [(note_idx, code)]
-    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss.
+    /// Per-hand action = (move 0..8, rot 0..2, tilt 0..2); left then right.
+    /// Returns (obs, reward, done, events); events = [(note_idx, code, points)]
+    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post.
+    #[allow(clippy::too_many_arguments)]
     fn step<'py>(
         &mut self,
         py: Python<'py>,
-        action_left: u8,
-        action_right: u8,
-    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8)>) {
-        assert!(action_left <= 8 && action_right <= 8);
-        let (reward, done, events) = self.core.step_inner([action_left, action_right]);
+        al_move: u8,
+        al_rot: u8,
+        al_tilt: u8,
+        ar_move: u8,
+        ar_rot: u8,
+        ar_tilt: u8,
+    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32)>) {
+        assert!(al_move <= 8 && ar_move <= 8);
+        assert!(al_rot <= 2 && al_tilt <= 2 && ar_rot <= 2 && ar_tilt <= 2);
+        let (reward, done, events) = self
+            .core
+            .step_inner([[al_move, al_rot, al_tilt], [ar_move, ar_rot, ar_tilt]]);
         (
             PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
@@ -344,10 +582,15 @@ impl RawBeatSim {
         )
     }
 
-    /// Saber state [[x, y, vx, vy]; 2] (world units).
-    fn sabers(&self) -> [[f64; 4]; 2] {
-        [0, 1].map(|s| [self.core.pos[s][0], self.core.pos[s][1],
-                        self.core.vel[s][0], self.core.vel[s][1]])
+    /// Saber state [[x, y, vx, vy, theta, phi, om_th, om_ph]; 2] (world units).
+    fn sabers(&self) -> [[f64; 8]; 2] {
+        [0, 1].map(|s| {
+            let sab = self.core.sabers[s];
+            [
+                sab.pos[0], sab.pos[1], sab.vel[0], sab.vel[1],
+                sab.theta, sab.phi, sab.om_th, sab.om_ph,
+            ]
+        })
     }
 
     /// Per-note status: 0 pending, 1 good, 2 bad, 3 missed.
@@ -355,10 +598,27 @@ impl RawBeatSim {
         self.core.status.clone()
     }
 
-    /// TEST HOOK: overwrite one saber's position/velocity before a step.
-    fn set_saber(&mut self, s: usize, x: f64, y: f64, vx: f64, vy: f64) {
-        self.core.pos[s] = [x, y];
-        self.core.vel[s] = [vx, vy];
+    /// TEST HOOK: overwrite one saber's full state before a step.
+    #[allow(clippy::too_many_arguments)]
+    fn set_saber(
+        &mut self,
+        s: usize,
+        x: f64,
+        y: f64,
+        vx: f64,
+        vy: f64,
+        theta: f64,
+        phi: f64,
+        om_th: f64,
+        om_ph: f64,
+    ) {
+        let sab = &mut self.core.sabers[s];
+        sab.pos = [x, y];
+        sab.vel = [vx, vy];
+        sab.theta = theta;
+        sab.phi = phi;
+        sab.om_th = om_th;
+        sab.om_ph = om_ph;
     }
 
     #[getter]
@@ -384,6 +644,11 @@ impl RawBeatSim {
     #[getter]
     fn time(&self) -> f64 {
         self.core.time
+    }
+    /// Summed points across all scored cuts (max 115 * n_notes).
+    #[getter]
+    fn score(&self) -> f64 {
+        self.core.score
     }
 }
 
@@ -411,7 +676,7 @@ impl VecBeatSim {
         self.sims[i].set_chart_notes(chart);
     }
 
-    /// Current observation of every env, flat (N*200,) — reshape Python-side.
+    /// Current observation of every env, flat (N*140,) — reshape Python-side.
     fn obs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
         let n = self.sims.len();
         let mut flat = vec![0.0f32; n * OBS_DIM];
@@ -421,10 +686,10 @@ impl VecBeatSim {
         PyArray1::from_vec_bound(py, flat)
     }
 
-    /// actions: (N, 2) int64. Returns (obs flat (N*200,) f32 — reshape
-    /// Python-side, rewards (N,) f32, dones (N,) bool). Done envs must get
-    /// a fresh set_chart before the next step; their returned obs row is
-    /// the terminal obs.
+    /// actions: (N, 6) int64 — per hand (move, rot, tilt), left first.
+    /// Returns (obs flat (N*140,) f32 — reshape Python-side, rewards (N,)
+    /// f32, dones (N,) bool). Done envs must get a fresh set_chart before
+    /// the next step; their returned obs row is the terminal obs.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -436,13 +701,15 @@ impl VecBeatSim {
     ) {
         let acts = actions.as_array();
         let n = self.sims.len();
-        assert_eq!(acts.shape(), &[n, 2]);
+        assert_eq!(acts.shape(), &[n, 6]);
         let mut flat = vec![0.0f32; n * OBS_DIM];
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
         for (i, sim) in self.sims.iter_mut().enumerate() {
-            let (r, d, _events) =
-                sim.step_inner([acts[[i, 0]] as u8, acts[[i, 1]] as u8]);
+            let (r, d, _events) = sim.step_inner([
+                [acts[[i, 0]] as u8, acts[[i, 1]] as u8, acts[[i, 2]] as u8],
+                [acts[[i, 3]] as u8, acts[[i, 4]] as u8, acts[[i, 5]] as u8],
+            ]);
             flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
             rewards[i] = r as f32;
             dones[i] = d;
@@ -454,14 +721,14 @@ impl VecBeatSim {
         )
     }
 
-    /// Single env's current obs (200,) — used for cheap post-reset reads.
+    /// Single env's current obs (140,) — used for cheap post-reset reads.
     fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
         PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
     }
 
-    fn counters(&self, i: usize) -> (u32, u32, u32, usize) {
+    fn counters(&self, i: usize) -> (u32, u32, u32, usize, f64) {
         let s = &self.sims[i];
-        (s.good_cuts, s.bad_cuts, s.misses, s.chart.len())
+        (s.good_cuts, s.bad_cuts, s.misses, s.chart.len(), s.score)
     }
 }
 

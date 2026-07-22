@@ -3,11 +3,16 @@
 Beat Saber-style toy RL environment + transformer policy experiments.
 See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
-Two sabers (left/red, right/blue) on a hit plane at z=0; 40 cm note
-cubes (real Beat Saber size, 0.5 m lanes, world in meters) fly in at
-4 m/s and must be swung through fast enough (≥1 m/s), in the right
-direction, with the matching hand, while inside the ±0.6 m slab at the
-plane. Per-tick discrete acceleration control (9 actions per hand), 30 Hz.
+Env v5 (blade sabers): each hand is a wrist (point mass on the z=0 hit
+plane) holding a rigid 1 m blade whose direction is driven by two wrist
+DOFs — azimuth (CW/CCW rotation, the swing) and tilt
+(supination/pronation, pitch toward the incoming notes). 40 cm note
+cubes (real Beat Saber size, 0.5 m lanes, world in meters) fly in and
+must be swung through with the matching hand, in the right direction,
+fast enough at the contact point (≥1 m/s). Good cuts are graded with the
+real Beat Saber 115-point system — 70 pre-swing (100°), 30
+follow-through (60°), 15 accuracy-to-center — paid as reward/115.
+Per-tick discrete control at 30 Hz: per hand move(9) × rot(3) × tilt(3).
 
 ## Quick start
 
@@ -69,8 +74,11 @@ flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
 are rejected — re-record from a current checkpoint.
 
 Reference points on the default easy chart (rate 1.0, right hand only,
-down-swings, 20 s ≈ 19 notes), unshaped returns: random ≈ −8.8,
-scripted bot ≈ +18.7 (97% good cuts).
+down-swings, 20 s ≈ 19 notes), env v5 scripted bot: easy 100% good cuts
+/ 97.6 pts per note; hard (both hands, 8 dirs) 95% / 96.3; dynamic gym
+94% / 95.8 — the 1 m blade RAISED the scripted ceiling vs the point
+saber (dynamic was 81%). Pre-v5 reference numbers are point-saber and
+not comparable.
 
 ## Status
 
@@ -131,3 +139,9 @@ scripted bot ≈ +18.7 (97% good cuts).
   the wide-cosine recipe above with `--total-steps 30000000`.
 - Next: close the human-pattern distribution gap; recipe seed replication;
   density knee (e5-6).
+- **Env v5 (2026-07-21, user-designed): blade sabers** — wrist rotation
+  DOFs (azimuth + supination/pronation tilt), real 1 m saber, swept-blade
+  cut geometry replacing the ±0.6 m slab, real-BS 115-point graded
+  scoring (pre-swing/follow-through/accuracy) as reward. All v4
+  checkpoints/replays retired. `--env torch` and `viz/replay.html` not
+  yet ported to v5 (Rust-first; port assessments in the session notes).

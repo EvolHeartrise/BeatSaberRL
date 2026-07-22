@@ -1,8 +1,8 @@
 """Env tests against the Rust sim — THE implementation (SPEC.md §Tests).
 
-The Python sim was deleted 2026-07-20 (surface-area reduction); the cut
-scenarios that used to gate Python/Rust parity now gate the Rust sim
-directly, via its set_saber test hook and event stream.
+Env v5 (blade sabers): the cut scenarios drive the Rust sim directly via
+its set_saber test hook (full saber state: wrist + blade pose + angular
+velocities) and assert on the event stream (note_idx, code, points).
 """
 
 import numpy as np
@@ -12,12 +12,14 @@ from beat_arena_env import (
     OBS_DIM, OFF_NOTES, OFF_NOTE_MASK, N_NOTE_SLOTS, NOTE_FEAT,
     ChartConfig, Note, RustBeatEnv, generate_chart, scripted_action,
 )
-from beat_arena_env.constants import DT, Z_WINDOW
+from beat_arena_env.constants import DT, SABER_FEAT, Z_MISS
 
 from beat_arena_rs import RawBeatSim
 
 
 DOWN = 6 * np.pi / 4  # downward swing angle
+COAST = (0, 0, 0, 0, 0, 0)
+ACTION_NVEC = [9, 3, 3, 9, 3, 3]
 
 
 def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False):
@@ -25,17 +27,29 @@ def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False):
                 angle=angle, speed=speed, any_dir=any_dir)
 
 
-def _sim_with_note(note):
+def _sim_with_note(note, max_steps=630):
     from beat_arena_env.chart import note_tuple
-    sim = RawBeatSim(shaping_coef=0.0, max_steps=630)
+    sim = RawBeatSim(shaping_coef=0.0, max_steps=max_steps)
     sim.set_chart([note_tuple(note)])
     return sim
 
 
-def _step_events(sim, saber, pos, vel):
-    sim.set_saber(saber, pos[0], pos[1], vel[0], vel[1])
-    _, _, _, events = sim.step(0, 0)
-    return events
+def _park(sim, saber, x, y):
+    """Move a saber's wrist far away, blade up, motionless."""
+    sim.set_saber(saber, x, y, 0.0, 0.0, np.pi / 2, 0.0, 0.0, 0.0)
+
+
+def _step(sim, saber, pos, vel=(0.0, 0.0), theta=np.pi / 2, phi=0.0,
+          om_th=0.0, om_ph=0.0):
+    """Set one saber's full state, coast one tick, return (events, reward)."""
+    sim.set_saber(saber, pos[0], pos[1], vel[0], vel[1], theta, phi,
+                  om_th, om_ph)
+    _, r, _, events = sim.step(*COAST)
+    return events, r
+
+
+def _codes(events):
+    return [(i, c) for i, c, _ in events]
 
 
 # --- obs layout --------------------------------------------------------------
@@ -43,8 +57,20 @@ def _step_events(sim, saber, pos, vel):
 def test_obs_layout():
     env = RustBeatEnv(seed=3)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (128,)
-    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 116
+    assert obs.shape == (OBS_DIM,) == (140,)
+    assert OFF_NOTES == 2 * SABER_FEAT == 20
+    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 128
+    # saber block at reset: wrists at (-+0.5, 0), blade straight up, at rest
+    for s, x in ((0, -0.5), (1, 0.5)):
+        b = s * SABER_FEAT
+        assert obs[b] == pytest.approx(x / 1.0)
+        assert obs[b + 1] == 0.0
+        assert obs[b + 2] == obs[b + 3] == 0.0            # wrist velocity
+        assert obs[b + 4] == pytest.approx(0.0, abs=1e-6)  # cos(pi/2)
+        assert obs[b + 5] == pytest.approx(1.0)            # sin(pi/2)
+        assert obs[b + 6] == 0.0                           # tilt
+        assert obs[b + 7] == obs[b + 8] == 0.0             # angular velocity
+        assert obs[b + 9] == 0.0                           # pre-swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
@@ -62,12 +88,31 @@ def test_obs_layout():
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()
 
 
+def test_swing_meter_tracks_rotation():
+    """The pre-swing obs feature rises while swinging, resets on reversal."""
+    env = RustBeatEnv(seed=3)
+    env.reset()
+    b = 1 * SABER_FEAT + 9   # right saber's swing meter
+    obs, _, _, _, _ = env.step((0, 0, 0, 0, 1, 0))   # right: rot CCW
+    m1 = obs[b]
+    obs, _, _, _, _ = env.step((0, 0, 0, 0, 1, 0))
+    m2 = obs[b]
+    assert 0.0 < m1 < m2
+    meters = []
+    for _ in range(6):        # reverse hard until omega flips sign
+        obs, _, _, _, _ = env.step((0, 0, 0, 0, 2, 0))
+        meters.append(obs[b])
+    # the meter must DIP at the reversal (a fresh swing restarts near 0);
+    # afterwards the new swing legitimately re-accumulates
+    assert min(meters) < m1
+
+
 def test_z_is_time_times_speed():
     """time_until = z / |vz| at every step (spatial obs contract)."""
     env = RustBeatEnv(seed=9)
     obs, _ = env.reset()
     for _ in range(60):
-        obs, _, done, _, _ = env.step((0, 0))
+        obs, _, done, _, _ = env.step(COAST)
         if done:
             break
         status = env.sim.status()
@@ -90,7 +135,7 @@ def test_determinism():
         out = []
         done = False
         while not done:
-            _, r, done, _, info = env.step(rng.integers(0, 9, size=2))
+            _, r, done, _, info = env.step(rng.integers(0, ACTION_NVEC))
             out.append((r, tuple(info["events"])))
         return out
 
@@ -98,54 +143,107 @@ def test_determinism():
 
 
 # --- cut detection scenarios (Rust sim, via set_saber hook) ------------------
+# Standard geometry: note at cell (2,1) = center (0.25, 0), hit_time = DT
+# (z = 0 at the end of the first step), down-swing required. The right
+# saber's wrist sits at (1.0, 0) with the blade pointing -x (theta = pi),
+# so the note passes the blade at 75% of its length; CCW rotation
+# (om_th > 0) sweeps the contact point DOWNWARD through the note.
 
-def test_good_cut():
+def test_good_swing_cut_scores():
     sim = _sim_with_note(_note(DT, 2, 1))
-    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == [(0, 0)]  # ok
+    ev, r = _step(sim, 1, (1.0, 0.0), theta=np.pi - 0.25, om_th=15.0)
+    assert _codes(ev) == [(0, 0)]
     assert sim.good_cuts == 1
+    pts = ev[0][2]
+    # one tick of swing (~28 deg) of pre-swing + near-center accuracy
+    assert 20.0 < pts < 45.0
+    assert r == pytest.approx(pts / 115.0, abs=1e-5)
 
 
-def test_gentle_cut_is_good():
-    """V_MIN_CUT is 1 m/s: a 1.5 m/s swing scores."""
+def test_gentle_swing_is_good():
+    """V_MIN_CUT is 1 m/s at the CONTACT POINT: a slow-ish wrist turn whose
+    contact point still moves >= 1 m/s scores."""
     sim = _sim_with_note(_note(DT, 2, 1))
-    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -1.5)) == [(0, 0)]
+    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi, om_th=2.0)
+    assert _codes(ev) == [(0, 0)]
 
 
-def test_slow_cut_is_bad():
+def test_slow_graze_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -0.5)) == [(0, 1)]  # slow
+    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi, om_th=0.5)
+    assert _codes(ev) == [(0, 1)]  # slow
+    assert ev[0][2] == 0.0
 
 
-def test_wrong_angle_is_bad():
+def test_wrong_direction_swing_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    assert _step_events(sim, 1, (0.25, -0.05), (0.0, 5.0)) == [(0, 2)]  # angle
+    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi + 0.25, om_th=-15.0)
+    assert _codes(ev) == [(0, 2)]  # angle (swept upward through a down note)
 
 
 def test_wrong_hand_is_bad():
-    sim = _sim_with_note(_note(DT, 0, 2))
-    sim.set_saber(1, 1.25, -1.0, 0.0, 0.0)   # matching (right) saber far away
-    assert _step_events(sim, 0, (-0.75, 0.55), (0.0, -5.0)) == [(0, 3)]
+    sim = _sim_with_note(_note(DT, 0, 2, color=0))   # LEFT note at (-0.75, 0.5)
+    _park(sim, 0, 1.4, -1.2)                          # matching saber far away
+    ev, _ = _step(sim, 1, (0.0, 0.5), theta=np.pi - 0.25, om_th=15.0)
+    assert _codes(ev) == [(0, 3)]
 
 
-def test_miss_fires_exactly_at_slab_exit():
-    sim = _sim_with_note(_note(DT, 0, 2))
-    events = []
+def test_stab_scores_only_accuracy():
+    """Translation-only cut: valid, but no swing arc -> accuracy points only."""
+    sim = _sim_with_note(_note(DT, 2, 1))
+    # blade pointing DOWN, wrist gliding down: the mid-blade passes dead
+    # through the note center with zero blade rotation
+    ev, r = _step(sim, 1, (0.25, 0.5), vel=(0.0, -5.0), theta=-np.pi / 2)
+    assert _codes(ev) == [(0, 0)]
+    assert ev[0][2] == pytest.approx(15.0, abs=1.0)   # accuracy only
+    for _ in range(5):                                # follow-through window
+        sim.step(*COAST)
+    assert sim.score <= 16.0                          # no post points either
+
+
+def test_full_swing_scores_near_max():
+    """A wound-up swing (>100 deg) + follow-through approaches 115 points.
+
+    speed=8 keeps the note out of blade reach until the contact tick, so
+    the fast-sweeping blade can't graze its edge one tick early."""
+    sim = _sim_with_note(_note(8 * DT, 2, 1, speed=8.0), max_steps=60)
+    # spin CCW at max angular speed; start azimuth so the blade reaches
+    # theta = pi (through the note center) around tick 8, when z ~ 0
+    om, sweep = 20.0, 0.0
+    deltas = []
     for _ in range(8):
-        _, _, _, ev = sim.step(0, 0)
-        events.append(ev)
-    miss_ticks = [i for i, ev in enumerate(events) if (0, 4) in ev]
-    assert len(miss_ticks) == 1
-    t_miss = (miss_ticks[0] + 1) * DT
-    w = Z_WINDOW / 4.0
-    assert w < t_miss - DT <= w + DT + 1e-9
-    assert sim.misses == 1
+        om *= 1.0 - 0.02
+        deltas.append(om * DT)
+        sweep += om * DT
+    theta0 = np.pi - sweep + deltas[-1] / 2
+    sim.set_saber(1, 1.0, 0.0, 0.0, 0.0, theta0, 0.0, 20.0, 0.0)
+    events = []
+    for _ in range(14):
+        _, _, _, ev = sim.step(*COAST)
+        events.extend(ev)
+    cuts = [e for e in events if e[1] == 0]
+    posts = [e for e in events if e[1] == 5]
+    assert len(cuts) == 1 and len(posts) == 1
+    assert cuts[0][2] >= 78.0            # full 70 pre-swing + most accuracy
+    assert posts[0][2] == pytest.approx(30.0, abs=0.5)  # full follow-through
+    assert sim.score >= 105.0
+
+
+def test_accuracy_decreases_off_center():
+    def stab(x):
+        sim = _sim_with_note(_note(DT, 2, 1))
+        ev, _ = _step(sim, 1, (x, 0.5), vel=(0.0, -5.0), theta=-np.pi / 2)
+        assert _codes(ev) == [(0, 0)]
+        return ev[0][2]
+
+    assert stab(0.25) > stab(0.45) > 0.0
 
 
 def test_dot_note_scores_from_any_direction():
-    """any_dir (dot) notes: any fast swing is a good cut."""
-    for vel in ((0.0, 5.0), (5.0, 0.0), (-3.5, -3.5)):
-        sim = _sim_with_note(_note(DT, 2, 1, any_dir=True))
-        assert _step_events(sim, 1, (0.25, -0.05 * np.sign(vel[1] or 1)), vel) == [(0, 0)]
+    """any_dir (dot) notes: an up-swing (angle-bad for a down note) is good."""
+    sim = _sim_with_note(_note(DT, 2, 1, any_dir=True))
+    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi + 0.25, om_th=-15.0)
+    assert _codes(ev) == [(0, 0)]
 
 
 def test_dot_note_obs_is_zero_vector():
@@ -156,20 +254,53 @@ def test_dot_note_obs_is_zero_vector():
     assert obs[OFF_NOTES + 8] == 1.0  # still valid
 
 
-def test_early_crossing_does_nothing():
-    sim = _sim_with_note(_note(0.5, 2, 1))
-    assert _step_events(sim, 1, (0.25, 0.05), (0.0, -5.0)) == []
+def test_tilted_blade_reaches_early_note():
+    """Supination tilts the blade toward +z: contact well before the plane
+    (beyond the old +-0.6 slab), while an in-plane blade can't reach."""
+    # note arrives in 0.3 s: z ~ 1.07 m after one tick
+    sim = _sim_with_note(_note(0.3, 2, 1))
+    phi = 1.2  # tip z = sin(1.2) ~ 0.93
+    ev, _ = _step(sim, 1, (0.25 - np.cos(phi), 0.0), theta=0.0, phi=phi)
+    assert _codes(ev) == [(0, 1)]   # touched it (stationary -> slow)
+    # same pose, flat blade: nothing within reach
+    sim = _sim_with_note(_note(0.3, 2, 1))
+    ev, _ = _step(sim, 1, (0.25 - np.cos(phi), 0.0), theta=0.0, phi=0.0)
+    assert ev == []
+
+
+def test_far_note_is_untouchable():
+    sim = _sim_with_note(_note(1.0, 2, 1))   # z ~ 3.9 after one tick
+    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi - 0.25, om_th=15.0)
+    assert ev == []
     assert sim.status()[0] == 0
 
 
+def test_miss_fires_exactly_at_exit():
+    sim = _sim_with_note(_note(DT, 0, 2))
+    _park(sim, 0, -1.5, -1.25)
+    _park(sim, 1, 1.5, -1.25)
+    events = []
+    for _ in range(10):
+        _, _, _, ev = sim.step(*COAST)
+        events.append(ev)
+    miss_ticks = [i for i, ev in enumerate(events) if (0, 4) in _codes(ev)]
+    assert len(miss_ticks) == 1
+    t_miss = (miss_ticks[0] + 1) * DT
+    w = Z_MISS / 4.0
+    assert w < t_miss - DT <= w + DT + 1e-9
+    assert sim.misses == 1
+
+
 def test_note_speed_scales_the_time_window():
-    """Faster notes spend less TIME in the fixed spatial slab."""
+    """Faster notes reach the miss line sooner (less time near the plane)."""
     ticks = {}
     for speed in (4.0, 8.0):
         sim = _sim_with_note(_note(DT, 0, 2, speed=speed))
+        _park(sim, 0, -1.5, -1.25)
+        _park(sim, 1, 1.5, -1.25)
         t = 0
         while sim.status()[0] == 0:
-            sim.step(0, 0)
+            sim.step(*COAST)
             t += 1
         ticks[speed] = t
     assert ticks[8.0] < ticks[4.0]
@@ -187,8 +318,8 @@ def test_shaping_changes_rewards_not_events():
         rewards, events = [], []
         done = False
         while not done:
-            a = rng.integers(0, 9, size=2)
-            _, r, done, ev = sim.step(int(a[0]), int(a[1]))
+            a = rng.integers(0, ACTION_NVEC)
+            _, r, done, ev = sim.step(*(int(x) for x in a))
             rewards.append(r)
             events.append(ev)
         return rewards, events
@@ -228,7 +359,7 @@ def test_chart_continuous_dirs_and_speed_range():
 # --- scripted bot solvability ------------------------------------------------
 
 def test_scripted_bot_solves_easy():
-    good, total = 0, 0
+    good, total, score = 0, 0, 0.0
     env = RustBeatEnv(seed=0)
     for seed in range(5):
         env.reset(seed=seed)
@@ -237,10 +368,14 @@ def test_scripted_bot_solves_easy():
             _, _, done, _, info = env.step(scripted_action(env))
         good += info["good_cuts"]
         total += info["n_notes"]
+        score += info["score"]
     assert good / total >= 0.8
+    # real swings, not stabs: mean points per note well above the 15-point
+    # stab ceiling
+    assert score / total >= 40.0
 
 
-# --- recording (JSONL v2 from the Rust event stream) ------------------------
+# --- recording (JSONL v4 from the Rust event stream) ------------------------
 
 def test_recording_roundtrip(tmp_path):
     import json
@@ -253,13 +388,19 @@ def test_recording_roundtrip(tmp_path):
         _, _, done, _, info = env.step(scripted_action(env))
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 3
+    assert head["header"]["version"] == 4
     assert head["header"]["config"]["note_speed"] == 4.0
     assert len(head["header"]["chart"]) == info["n_notes"]
     goods = sum(1 for t in ticks for e in t["events"]
                 if "cut" in e and e["cut"]["good"])
     assert goods == info["good_cuts"]
-    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 4 for t in ticks)
+    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 8 for t in ticks)
+    assert all(len(t["action"]) == 6 for t in ticks)
+    pts = sum(e["cut"].get("points", 0.0) for t in ticks for e in t["events"]
+              if "cut" in e)
+    pts += sum(e["post"]["points"] for t in ticks for e in t["events"]
+               if "post" in e)
+    assert pts == pytest.approx(info["score"], abs=0.5)
 
 
 # --- BeatSaver parser (fixtures cover both real schemas) ---------------------
