@@ -8,7 +8,7 @@ import {
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
-  "../../python/replays/v51_50m_ep00_seed7000.jsonl";
+  "../../python/replays/v52_scripted_dyn_ep00_seed7000.jsonl";
 const rep = parseReplay(readFileSync(path, "utf8"));
 console.log(`loaded: ${rep.chart.length} notes, ${rep.ticks.length} ticks, ` +
             `${rep.posts.length} post events`);
@@ -43,9 +43,9 @@ for (const frac of [0, 0.3, 0.6, 0.9, 1.0]) {
   assert.ok(p.length + a.length >= 0 && po.length >= 0);
 }
 
-// pre-v4 replays are rejected
+// replays from retired parameterizations are rejected
 assert.throws(
-  () => parseReplay('{"header": {"version": 3, "config": {}, "chart": []}}'),
-  /version 3/);
+  () => parseReplay('{"header": {"version": 4, "config": {}, "chart": []}}'),
+  /version 4/);
 
 console.log("replay.js smoke test OK");

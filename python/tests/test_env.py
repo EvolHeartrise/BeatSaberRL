@@ -35,17 +35,24 @@ def _sim_with_note(note, max_steps=630):
 
 
 def _park(sim, saber, x, y):
-    """Move a saber's wrist far away, blade up, motionless."""
-    sim.set_saber(saber, x, y, 0.0, 0.0, np.pi / 2, 0.0, 0.0, 0.0)
+    """Move a saber's wrist far away, blade up (roll 0, bend 90), still."""
+    sim.set_saber(saber, x, y, 0.0, 0.0, 0.0, np.pi / 2, 0.0, 0.0)
 
 
-def _step(sim, saber, pos, vel=(0.0, 0.0), theta=np.pi / 2, phi=0.0,
-          om_th=0.0, om_ph=0.0):
+def _step(sim, saber, pos, vel=(0.0, 0.0), roll=0.0, bend=0.0,
+          om_roll=0.0, om_bend=0.0):
     """Set one saber's full state, coast one tick, return (events, reward)."""
-    sim.set_saber(saber, pos[0], pos[1], vel[0], vel[1], theta, phi,
-                  om_th, om_ph)
+    sim.set_saber(saber, pos[0], pos[1], vel[0], vel[1], roll, bend,
+                  om_roll, om_bend)
     _, r, _, events = sim.step(*COAST)
     return events, r
+
+
+def _flat(azimuth):
+    """Joint pose for a blade FLAT in the hit plane at the given in-plane
+    azimuth: bend +90 deg, roll = azimuth - 90 deg (see SPEC — the swept
+    geometry is then identical to the v5.1 in-plane scenarios)."""
+    return dict(roll=azimuth - np.pi / 2, bend=np.pi / 2)
 
 
 def _codes(events):
@@ -60,15 +67,16 @@ def test_obs_layout():
     assert obs.shape == (OBS_DIM,) == (140,)
     assert OFF_NOTES == 2 * SABER_FEAT == 20
     assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 128
-    # saber block at reset: wrists at (-+0.5, 0), blade straight up, at rest
+    # saber block at reset: wrists at (-+0.5, 0), palm down, blades
+    # pointing AT THE NOTES (env v5.2 neutral), at rest
     for s, x in ((0, -0.5), (1, 0.5)):
         b = s * SABER_FEAT
         assert obs[b] == pytest.approx(x / 1.0)
         assert obs[b + 1] == 0.0
         assert obs[b + 2] == obs[b + 3] == 0.0            # wrist velocity
-        assert obs[b + 4] == pytest.approx(0.0, abs=1e-6)  # cos(pi/2)
-        assert obs[b + 5] == pytest.approx(1.0)            # sin(pi/2)
-        assert obs[b + 6] == 0.0                           # tilt
+        assert obs[b + 4] == pytest.approx(1.0)            # cos(roll=0)
+        assert obs[b + 5] == pytest.approx(0.0, abs=1e-6)  # sin(roll=0)
+        assert obs[b + 6] == 0.0                           # bend (forward)
         assert obs[b + 7] == obs[b + 8] == 0.0             # angular velocity
         assert obs[b + 9] == 0.0                           # pre-swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
@@ -89,22 +97,35 @@ def test_obs_layout():
 
 
 def test_swing_meter_tracks_rotation():
-    """The pre-swing obs feature rises while swinging, resets on reversal."""
+    """The pre-swing obs feature rises while swinging, resets on reversal.
+    Uses the BEND joint: bending moves the blade direction from any pose."""
     env = RustBeatEnv(seed=3)
     env.reset()
     b = 1 * SABER_FEAT + 9   # right saber's swing meter
-    obs, _, _, _, _ = env.step((0, 0, 0, 0, 1, 0))   # right: rot CCW
+    obs, _, _, _, _ = env.step((0, 0, 0, 0, 0, 1))   # right: bend +
     m1 = obs[b]
-    obs, _, _, _, _ = env.step((0, 0, 0, 0, 1, 0))
+    obs, _, _, _, _ = env.step((0, 0, 0, 0, 0, 1))
     m2 = obs[b]
     assert 0.0 < m1 < m2
     meters = []
     for _ in range(6):        # reverse hard until omega flips sign
-        obs, _, _, _, _ = env.step((0, 0, 0, 0, 2, 0))
+        obs, _, _, _, _ = env.step((0, 0, 0, 0, 0, 2))
         meters.append(obs[b])
     # the meter must DIP at the reversal (a fresh swing restarts near 0);
     # afterwards the new swing legitimately re-accumulates
     assert min(meters) < m1
+
+
+def test_rolling_a_forward_blade_is_not_a_swing():
+    """Pure roll at bend 0 spins the saber about its own axis: the blade
+    direction never moves, so no swing arc accumulates (correct physics)."""
+    env = RustBeatEnv(seed=3)
+    env.reset()
+    b = 1 * SABER_FEAT + 9
+    for _ in range(4):
+        obs, _, _, _, _ = env.step((0, 0, 0, 0, 1, 0))   # right: roll CCW
+    assert obs[b] == 0.0                                  # meter never moves
+    assert obs[1 * SABER_FEAT + 6] == 0.0                 # bend still 0
 
 
 def test_z_is_time_times_speed():
@@ -143,16 +164,17 @@ def test_determinism():
 
 
 # --- cut detection scenarios (Rust sim, via set_saber hook) ------------------
-# Standard geometry (in-range under the v5.1 roll limits): note at cell
-# (2,1) = center (0.25, 0), hit_time = DT (z = 0 at the end of the first
-# step), down-swing required. The right saber's wrist sits at (-0.5, 0)
-# with the blade pointing +x (theta ~ 0, the natural right-hand down-cut
-# orientation), the note passing the blade at 75% of its length; CW
-# rotation (om_th < 0) sweeps the contact point DOWNWARD through the note.
+# Standard geometry: note at cell (2,1) = center (0.25, 0), hit_time = DT
+# (z = 0 at the end of the first step), down-swing required. The right
+# saber's wrist sits at (-0.5, 0) with the blade FLAT in the plane
+# pointing +x (azimuth ~ 0 via _flat: bend +90, roll -90 — the natural
+# right-hand down-cut orientation), the note passing the blade at 75% of
+# its length; CW roll (om_roll < 0) sweeps the contact point DOWNWARD
+# through the note. Identical swept geometry to the v5.1 scenarios.
 
 def test_good_swing_cut_scores():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, r = _step(sim, 1, (-0.5, 0.0), theta=0.25, om_th=-15.0)
+    ev, r = _step(sim, 1, (-0.5, 0.0), **_flat(0.25), om_roll=-15.0)
     assert _codes(ev) == [(0, 0)]
     assert sim.good_cuts == 1
     pts = ev[0][2]
@@ -162,39 +184,39 @@ def test_good_swing_cut_scores():
 
 
 def test_gentle_swing_is_good():
-    """V_MIN_CUT is 1 m/s at the CONTACT POINT: a slow-ish wrist turn whose
+    """V_MIN_CUT is 1 m/s at the CONTACT POINT: a slow-ish roll whose
     contact point still moves >= 1 m/s scores."""
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.0, om_th=-2.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(0.0), om_roll=-2.0)
     assert _codes(ev) == [(0, 0)]
 
 
 def test_slow_graze_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.0, om_th=-0.5)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(0.0), om_roll=-0.5)
     assert _codes(ev) == [(0, 1)]  # slow
     assert ev[0][2] == 0.0
 
 
 def test_wrong_direction_swing_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=-0.25, om_th=15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(-0.25), om_roll=15.0)
     assert _codes(ev) == [(0, 2)]  # angle (swept upward through a down note)
 
 
 def test_wrong_hand_is_bad():
     sim = _sim_with_note(_note(DT, 0, 2, color=0))   # LEFT note at (-0.75, 0.5)
     _park(sim, 0, 1.4, -1.2)                          # matching saber far away
-    ev, _ = _step(sim, 1, (-1.5, 0.5), theta=0.25, om_th=-15.0)
+    ev, _ = _step(sim, 1, (-1.5, 0.5), **_flat(0.25), om_roll=-15.0)
     assert _codes(ev) == [(0, 3)]
 
 
 def test_stab_scores_only_accuracy():
     """Translation-only cut: valid, but no swing arc -> accuracy points only."""
     sim = _sim_with_note(_note(DT, 2, 1))
-    # blade pointing DOWN, wrist gliding down: the mid-blade passes dead
-    # through the note center with zero blade rotation
-    ev, r = _step(sim, 1, (0.25, 0.5), vel=(0.0, -5.0), theta=-np.pi / 2)
+    # blade flat pointing DOWN, wrist gliding down: the mid-blade passes
+    # dead through the note center with zero blade rotation
+    ev, r = _step(sim, 1, (0.25, 0.5), vel=(0.0, -5.0), **_flat(-np.pi / 2))
     assert _codes(ev) == [(0, 0)]
     assert ev[0][2] == pytest.approx(15.0, abs=1.0)   # accuracy only
     for _ in range(5):                                # follow-through window
@@ -206,9 +228,10 @@ def test_full_swing_scores_near_max():
     """A wound-up swing (>100 deg) + follow-through approaches 115 points.
 
     speed=10 keeps the note out of blade reach until the contact tick, so
-    the sweeping blade can't graze its edge a tick early. CW at 12 rad/s:
-    the whole arc (start ~159 deg, contact at 0, follow-through toward
-    -100 deg) fits the right hand's [-100, 180] deg roll range."""
+    the sweeping blade can't graze its edge a tick early. CW roll at
+    12 rad/s with the blade flat: the whole azimuth arc (start ~159 deg,
+    contact at 0, follow-through toward -100 deg) fits the right hand's
+    azimuth window."""
     sim = _sim_with_note(_note(8 * DT, 2, 1, speed=10.0), max_steps=60)
     om, sweep = 12.0, 0.0
     deltas = []
@@ -216,8 +239,9 @@ def test_full_swing_scores_near_max():
         om *= 1.0 - 0.02
         deltas.append(om * DT)
         sweep += om * DT
-    theta0 = sweep - deltas[-1] / 2   # crosses theta = 0 mid-tick-8
-    sim.set_saber(1, -0.5, 0.0, 0.0, 0.0, theta0, 0.0, -12.0, 0.0)
+    az0 = sweep - deltas[-1] / 2   # azimuth crosses 0 mid-tick-8
+    sim.set_saber(1, -0.5, 0.0, 0.0, 0.0, az0 - np.pi / 2, np.pi / 2,
+                  -12.0, 0.0)
     events = []
     for _ in range(14):
         _, _, _, ev = sim.step(*COAST)
@@ -233,7 +257,7 @@ def test_full_swing_scores_near_max():
 def test_accuracy_decreases_off_center():
     def stab(x):
         sim = _sim_with_note(_note(DT, 2, 1))
-        ev, _ = _step(sim, 1, (x, 0.5), vel=(0.0, -5.0), theta=-np.pi / 2)
+        ev, _ = _step(sim, 1, (x, 0.5), vel=(0.0, -5.0), **_flat(-np.pi / 2))
         assert _codes(ev) == [(0, 0)]
         return ev[0][2]
 
@@ -243,7 +267,7 @@ def test_accuracy_decreases_off_center():
 def test_dot_note_scores_from_any_direction():
     """any_dir (dot) notes: an up-swing (angle-bad for a down note) is good."""
     sim = _sim_with_note(_note(DT, 2, 1, any_dir=True))
-    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=-0.25, om_th=15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(-0.25), om_roll=15.0)
     assert _codes(ev) == [(0, 0)]
 
 
@@ -255,45 +279,64 @@ def test_dot_note_obs_is_zero_vector():
     assert obs[OFF_NOTES + 8] == 1.0  # still valid
 
 
-def test_tilted_blade_reaches_early_note():
-    """Supination tilts the blade toward +z: contact well before the plane
-    (beyond the old +-0.6 slab), while an in-plane blade can't reach."""
+def test_forward_blade_reaches_early_note():
+    """The neutral (forward) blade contacts notes ~1 m before the plane
+    (far beyond the old +-0.6 slab), while a flat blade can't reach."""
     # note arrives in 0.3 s: z ~ 1.07 m after one tick
     sim = _sim_with_note(_note(0.3, 2, 1))
-    phi = 1.2  # tip z = sin(1.2) ~ 0.93
-    ev, _ = _step(sim, 1, (0.25 - np.cos(phi), 0.0), theta=0.0, phi=phi)
+    ev, _ = _step(sim, 1, (0.25, 0.0), roll=0.0, bend=0.0)  # pointing at it
     assert _codes(ev) == [(0, 1)]   # touched it (stationary -> slow)
-    # same pose, flat blade: nothing within reach
+    # same wrist, blade flat in the plane: nothing within reach
     sim = _sim_with_note(_note(0.3, 2, 1))
-    ev, _ = _step(sim, 1, (0.25 - np.cos(phi), 0.0), theta=0.0, phi=0.0)
+    ev, _ = _step(sim, 1, (0.25, 0.0), **_flat(np.pi / 2))
     assert ev == []
+
+
+def test_blade_cannot_point_back_at_player():
+    """env v5.2: d_z >= cos(95 deg) by construction — a note 0.5 m behind
+    the plane is untouchable from ANY pose (max back-reach ~0.37 m)."""
+    from beat_arena_env.constants import BEND_LIM
+    sim = _sim_with_note(_note(DT, 2, 1))
+    _park(sim, 0, -1.5, -1.25)
+    _park(sim, 1, 1.5, -1.25)
+    for _ in range(4):                       # let it fly to z = -0.4
+        sim.step(*COAST)
+    # max-bend poses right on top of the note's lane, various rolls
+    for roll in (-np.pi / 2, 0.0, np.pi / 4):
+        ev, _ = _step(sim, 1, (0.25, 0.9), roll=roll, bend=BEND_LIM)
+        assert ev == [] or all(c == 4 for _, c, _ in ev)
+    # ... and it eventually falls off the miss line uncut
+    while sim.status()[0] == 0:
+        sim.set_saber(1, 1.5, -1.25, 0.0, 0.0, 0.0, np.pi / 2, 0.0, 0.0)
+        sim.step(*COAST)
+    assert sim.misses == 1
 
 
 def test_far_note_is_untouchable():
     sim = _sim_with_note(_note(1.0, 2, 1))   # z ~ 3.9 after one tick
-    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.25, om_th=-15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(0.25), om_roll=-15.0)
     assert ev == []
     assert sim.status()[0] == 0
 
 
 def test_wrist_limits_clamp_and_kill_roll():
-    """env v5.1: azimuth is bounded per hand ([0,280] deg left,
-    [-100,180] right), tilt +-95 deg; hitting a limit zeroes the omega."""
+    """env v5.2: roll is bounded per hand ([-90,190] deg left,
+    [-190,90] right), bend +-95 deg; hitting a limit zeroes the omega."""
     sim = _sim_with_note(_note(5.0, 2, 1))   # far note: no interference
-    # right saber rolling CCW into its 180 deg limit
-    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, 3.0, 0.0, 15.0, 0.0)
+    # right saber rolling CCW into its +90 deg limit
+    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, 1.5, 0.0, 15.0, 0.0)
     sim.step(*COAST)
     s = sim.sabers()[1]
-    assert s[4] == pytest.approx(np.pi)      # clamped at 180 deg
+    assert s[4] == pytest.approx(np.pi / 2)  # clamped at +90 deg
     assert s[6] == 0.0                       # roll velocity killed
-    # left saber rolling CW into its 0 deg limit
-    sim.set_saber(0, -1.0, -1.0, 0.0, 0.0, 0.1, 0.0, -15.0, 0.0)
+    # left saber rolling CW into its -90 deg limit
+    sim.set_saber(0, -1.0, -1.0, 0.0, 0.0, -1.5, 0.0, -15.0, 0.0)
     sim.step(*COAST)
     s = sim.sabers()[0]
-    assert s[4] == pytest.approx(0.0)
+    assert s[4] == pytest.approx(-np.pi / 2)
     assert s[6] == 0.0
-    # tilt clamps at +-95 deg
-    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, np.pi / 2, 1.6, 0.0, 15.0)
+    # bend clamps at +-95 deg
+    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, 0.0, 1.6, 0.0, 15.0)
     sim.step(*COAST)
     s = sim.sabers()[1]
     assert s[5] == pytest.approx(np.radians(95.0))
@@ -413,7 +456,7 @@ def test_recording_roundtrip(tmp_path):
         _, _, done, _, info = env.step(scripted_action(env))
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 4
+    assert head["header"]["version"] == 5
     assert head["header"]["config"]["note_speed"] == 4.0
     assert len(head["header"]["chart"]) == info["n_notes"]
     goods = sum(1 for t in ticks for e in t["events"]

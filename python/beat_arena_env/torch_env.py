@@ -55,11 +55,11 @@ REWARD_MISS = -0.5
 SABER_LEN = 1.0
 ALPHA_ROT = 200.0
 OMEGA_MAX = 20.0
-# env v5.1 anatomical wrist limits (mirror lib.rs): azimuth per hand
-# [0, 280] deg left / [-100, 180] deg right; tilt +-95 deg
-THETA_LO = (0.0, -1.7453292519943295)
-THETA_HI = (4.886921905584122, math.pi)
-PHI_LIM = 1.6580627893946132
+# env v5.2 forearm-anchored joints (mirror lib.rs): neutral blade points
+# at the notes; roll [-90, 190] deg left / [-190, 90] right; bend +-95
+ROLL_LO = (-1.5707963267948966, -3.3161255787892263)
+ROLL_HI = (3.3161255787892263, 1.5707963267948966)
+BEND_LIM = 1.6580627893946132
 N_BLADE_SAMPLES = 8
 REACH_Z = 1.28
 Z_MISS = 0.6
@@ -149,9 +149,9 @@ class TorchBeatVecEnv:
         zeros = lambda *s, dt=dtype: torch.zeros(*s, device=self.device, dtype=dt)
         # wrist
         self.pos = zeros(N, 2, 2); self.vel = zeros(N, 2, 2)
-        # blade pose + swing chain
-        self.theta = zeros(N, 2); self.phi = zeros(N, 2)
-        self.om_th = zeros(N, 2); self.om_ph = zeros(N, 2)
+        # joint pose + swing chain
+        self.roll = zeros(N, 2); self.bend = zeros(N, 2)
+        self.om_roll = zeros(N, 2); self.om_bend = zeros(N, 2)
         self.swing_acc = zeros(N, 2)
         self.axis = zeros(N, 2, 3)
         self.axis_valid = zeros(N, 2, dt=torch.bool)
@@ -180,9 +180,9 @@ class TorchBeatVecEnv:
                                  device=self.device, dtype=dtype)
         self._lo = torch.tensor(POS_LO, device=self.device, dtype=dtype)
         self._hi = torch.tensor(POS_HI, device=self.device, dtype=dtype)
-        # per-hand azimuth limits, broadcast over (N, 2)
-        self._th_lo = torch.tensor(THETA_LO, device=self.device, dtype=dtype)
-        self._th_hi = torch.tensor(THETA_HI, device=self.device, dtype=dtype)
+        # per-hand roll limits, broadcast over (N, 2)
+        self._roll_lo = torch.tensor(ROLL_LO, device=self.device, dtype=dtype)
+        self._roll_hi = torch.tensor(ROLL_HI, device=self.device, dtype=dtype)
         # episode-return ring buffer (device-side; slot `cap` is the trash row)
         self._cap = 4096
         self._ret_buf = zeros(self._cap + 1)
@@ -192,19 +192,20 @@ class TorchBeatVecEnv:
 
     # -- blade geometry -------------------------------------------------------
     def _blade_dir(self):
-        """(N, 2, 3) unit blade direction from the current pose."""
-        ct, st = self.theta.cos(), self.theta.sin()
-        cp, sp = self.phi.cos(), self.phi.sin()
-        return torch.stack([cp * ct, cp * st, sp], -1)
+        """(N, 2, 3) unit blade direction: neutral +z (at the notes),
+        bent away from forward in the plane the roll orients."""
+        cr, sr = self.roll.cos(), self.roll.sin()
+        cb, sb = self.bend.cos(), self.bend.sin()
+        return torch.stack([-sr * sb, cr * sb, cb], -1)
 
     def _blade_dir_dot(self):
         """(N, 2, 3) d/dt of the blade direction."""
-        ct, st = self.theta.cos(), self.theta.sin()
-        cp, sp = self.phi.cos(), self.phi.sin()
+        cr, sr = self.roll.cos(), self.roll.sin()
+        cb, sb = self.bend.cos(), self.bend.sin()
         return torch.stack([
-            -self.om_th * cp * st - self.om_ph * sp * ct,
-            self.om_th * cp * ct - self.om_ph * sp * st,
-            self.om_ph * cp], -1)
+            -self.om_roll * cr * sb - self.om_bend * sr * cb,
+            -self.om_roll * sr * sb + self.om_bend * cr * cb,
+            -self.om_bend * sb], -1)
 
     # -- resets ---------------------------------------------------------------
     # All resets are full-size torch.where merges (never boolean fancy
@@ -233,9 +234,8 @@ class TorchBeatVecEnv:
                              device=self.device, dtype=self.dtype)
         self.pos = torch.where(m2, start, self.pos)
         self.vel = torch.where(m2, torch.zeros_like(self.vel), self.vel)
-        half_pi = torch.full_like(self.theta, math.pi / 2)
-        self.theta = torch.where(m1, half_pi, self.theta)
-        for t in ("phi", "om_th", "om_ph", "swing_acc"):
+        # start pose: palm down, blade pointing at the notes
+        for t in ("roll", "bend", "om_roll", "om_bend", "swing_acc"):
             setattr(self, t, torch.where(m1, torch.zeros_like(getattr(self, t)),
                                          getattr(self, t)))
         self.axis_valid = self.axis_valid & ~m1
@@ -277,22 +277,23 @@ class TorchBeatVecEnv:
         self.pos = torch.max(torch.min(self.pos, self._hi), self._lo)
         self.vel = torch.where(out, torch.zeros_like(self.vel), self.vel)
 
-        # rotation: azimuth (CW/CCW) and tilt (supination/pronation)
-        self.om_th = ((self.om_th + self._rot[actions[..., 1]])
-                      * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
-        self.om_ph = ((self.om_ph + self._rot[actions[..., 2]])
-                      * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
-        self.theta = self.theta + self.om_th * DT
-        # anatomical roll limits: bounded azimuth per hand, no wrap
-        th_out = (self.theta < self._th_lo) | (self.theta > self._th_hi)
-        self.theta = torch.max(torch.min(self.theta, self._th_hi), self._th_lo)
-        self.om_th = torch.where(th_out, torch.zeros_like(self.om_th),
-                                 self.om_th)
-        self.phi = self.phi + self.om_ph * DT
-        phi_out = (self.phi < -PHI_LIM) | (self.phi > PHI_LIM)
-        self.phi = self.phi.clamp(-PHI_LIM, PHI_LIM)
-        self.om_ph = torch.where(phi_out, torch.zeros_like(self.om_ph),
-                                 self.om_ph)
+        # rotation: forearm roll (CW/CCW) and wrist bend
+        self.om_roll = ((self.om_roll + self._rot[actions[..., 1]])
+                        * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
+        self.om_bend = ((self.om_bend + self._rot[actions[..., 2]])
+                        * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
+        self.roll = self.roll + self.om_roll * DT
+        # anatomical limits: bounded joints per hand, no wrap
+        r_out = (self.roll < self._roll_lo) | (self.roll > self._roll_hi)
+        self.roll = torch.max(
+            torch.min(self.roll, self._roll_hi), self._roll_lo)
+        self.om_roll = torch.where(r_out, torch.zeros_like(self.om_roll),
+                                   self.om_roll)
+        self.bend = self.bend + self.om_bend * DT
+        b_out = (self.bend < -BEND_LIM) | (self.bend > BEND_LIM)
+        self.bend = self.bend.clamp(-BEND_LIM, BEND_LIM)
+        self.om_bend = torch.where(b_out, torch.zeros_like(self.om_bend),
+                                   self.om_bend)
 
         # swing chain update (feeds pre-swing + follow-through scores)
         d_new = self._blade_dir()
@@ -479,9 +480,9 @@ class TorchBeatVecEnv:
         sab = torch.stack([
             self.pos[..., 0] / X_NORM, self.pos[..., 1] / Y_NORM,
             self.vel[..., 0] / V_MAX, self.vel[..., 1] / V_MAX,
-            self.theta.cos(), self.theta.sin(),
-            self.phi / PHI_LIM,
-            self.om_th / OMEGA_MAX, self.om_ph / OMEGA_MAX,
+            self.roll.cos(), self.roll.sin(),
+            self.bend / BEND_LIM,
+            self.om_roll / OMEGA_MAX, self.om_bend / OMEGA_MAX,
             (self.swing_acc / PRE_FULL).clamp(max=2.0)], -1)     # (N,2,10)
         obs[:, :OFF_NOTES] = sab.reshape(N, OFF_NOTES).to(torch.float32)
 

@@ -23,18 +23,20 @@ POS_HI = (1.5, 1.25)
 REWARD_BAD = -0.5   # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 
-# --- blade sabers (env v5, 2026-07-21) ---------------------------------------
+# --- blade sabers (env v5.2, 2026-07-21) -------------------------------------
 SABER_LEN = 1.0       # m (real Beat Saber)
-ALPHA_ROT = 200.0     # rad/s^2, both angular DOFs (azimuth + tilt)
+ALPHA_ROT = 200.0     # rad/s^2, both angular DOFs (roll + bend)
 OMEGA_MAX = 20.0      # rad/s
-# env v5.1 anatomical wrist limits: azimuth per hand from the palm-down
-# neutral (ready stance, blade up, 90 deg): right 90 CCW / 190 CW ->
-# [-100, 180] deg; mirrored left [0, 280]. Tilt +-95 deg from middle.
-THETA_LO = (0.0, math.radians(-100.0))          # (left, right)
-THETA_HI = (math.radians(280.0), math.pi)
-PHI_LIM = math.radians(95.0)
+# env v5.2 forearm-anchored joints: the neutral blade points AT THE NOTES
+# (+z). roll = forearm CW/CCW about the forward axis, palm-down neutral:
+# right 90 CCW / 190 CW -> [-190, 90] deg, mirrored left [-90, 190].
+# bend = wrist deflection away from forward, +-95 deg (90 = blade flat in
+# the hit plane); the blade can never point back at the player.
+ROLL_LO = (math.radians(-90.0), math.radians(-190.0))   # (left, right)
+ROLL_HI = (math.radians(190.0), math.radians(90.0))
+BEND_LIM = math.radians(95.0)
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.28        # cut-test gate: max tip z (sin 95 deg) + CUT_RADIUS
+REACH_Z = 1.28        # cut-test gate: straight-forward tip (1 m) + CUT_RADIUS
 Z_MISS = 0.6          # note consumed as missed past this
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------

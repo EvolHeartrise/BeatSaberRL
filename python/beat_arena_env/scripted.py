@@ -1,12 +1,14 @@
-"""Scripted reference bot (SPEC.md §Scripted reference bot) — env v5.1.
+"""Scripted reference bot (SPEC.md §Scripted reference bot) — env v5.2.
 
-Real swings under anatomical wrist limits: per hand, the bot fits a cut
-orientation inside the hand's bounded azimuth range (at least one of the
-two perpendicular orientations always fits a 280-degree arc), plants its
-wrist so the blade passes through the note perpendicular to the required
-direction, winds back as far as the limits allow (up to 130 degrees),
-then whips through. Stateless per tick; solvability proof and eyeball
-baseline, not optimal play.
+Real swings under forearm-anchored joints: the bot holds the wrist bend
+at +90 deg (blade flat in the hit plane, 5 deg shy of the clamp) and
+swings by ROLLING the forearm, so the blade's in-plane azimuth is
+roll + 90 deg and the reachable azimuth windows are the same as v5.1
+([0, 280] deg left / [-100, 180] right). Per hand it fits a cut
+orientation inside that window, plants the wrist so the blade passes
+through the note perpendicular to the required direction, winds back as
+far as the limits allow (up to 130 degrees), then whips through.
+Stateless per tick; solvability proof and eyeball baseline, not optimal.
 """
 
 from __future__ import annotations
@@ -14,9 +16,14 @@ from __future__ import annotations
 import numpy as np
 
 from .constants import (
-    ACCEL, ALPHA_ROT, DRAG, DT, OMEGA_MAX, SABER_LEN, THETA_HI, THETA_LO,
+    ACCEL, ALPHA_ROT, DRAG, DT, OMEGA_MAX, ROLL_HI, ROLL_LO, SABER_LEN,
     note_center,
 )
+
+# the bot swings flat: in-plane blade azimuth = roll + 90 deg (bend +90)
+AZ_OFF = np.pi / 2
+AZ_LO = tuple(lo + AZ_OFF for lo in ROLL_LO)
+AZ_HI = tuple(hi + AZ_OFF for hi in ROLL_HI)
 
 CONTACT_S = 0.75          # note passes the blade at this fraction of its length
 SWING_ARC = np.radians(130.0)  # ideal wind-up, past the 100 deg full credit
@@ -72,7 +79,7 @@ def _cut_config(hand, center, angle, wrist):
     Rank candidates: full swing room first, then wrist-goal in bounds,
     then nearest. At least one candidate always fits a 280-degree range.
     """
-    lo, hi = THETA_LO[hand], THETA_HI[hand]
+    lo, hi = AZ_LO[hand], AZ_HI[hand]
     best = None
     for sense, th_raw in ((1.0, angle - np.pi / 2), (-1.0, angle + np.pi / 2)):
         th_c = _fit_in_range(th_raw, lo, hi)
@@ -94,16 +101,19 @@ def _cut_config(hand, center, angle, wrist):
 
 def _hand_action(hand, saber, time, target):
     pos, vel = saber[0:2], saber[2:4]
-    theta, phi, om_th, om_ph = saber[4], saber[5], saber[6], saber[7]
-    tilt_act = _steer_omega(om_ph, np.clip(K_ROT * -phi, -OMEGA_MAX, OMEGA_MAX))
+    roll, bend, om_roll, om_bend = saber[4], saber[5], saber[6], saber[7]
+    # hold the blade flat in the hit plane (bend -> +90 deg); the swing
+    # itself is pure forearm roll
+    bend_act = _steer_omega(om_bend, np.clip(
+        K_ROT * (np.pi / 2 - bend), -OMEGA_MAX, OMEGA_MAX))
     if target is None:
         to_park = PARK[hand] - pos
         dist = float(np.linalg.norm(to_park))
         desired = to_park / dist * min(CRUISE, K_ARRIVE * dist) if dist > 0.1 else np.zeros(2)
-        # blade straight up, no spin (in range for both hands)
-        rot_act = _steer_omega(om_th, np.clip(
-            K_ROT * (np.pi / 2 - theta), -OMEGA_MAX, OMEGA_MAX))
-        return (_steer_to_velocity(vel, desired), rot_act, tilt_act)
+        # blade straight up (azimuth 90 = roll 0), no spin
+        roll_act = _steer_omega(om_roll, np.clip(
+            K_ROT * (0.0 - roll), -OMEGA_MAX, OMEGA_MAX))
+        return (_steer_to_velocity(vel, desired), roll_act, bend_act)
 
     center = np.array(note_center(target))
     # dot notes: any direction scores — pretend it's a down-cut
@@ -112,22 +122,22 @@ def _hand_action(hand, saber, time, target):
     t_until = target.hit_time - time
 
     if t_until > _swing_time(arc):
-        # wind-up: park the wrist at the goal, cock the blade back.
+        # wind-up: park the wrist at the goal, cock the roll back.
         # Angles are bounded (no wrap): steer by the DIRECT error — the
         # short way around could cross a limit.
         to_goal = goal - pos
         dist = float(np.linalg.norm(to_goal))
         speed = min(CRUISE, K_ARRIVE * dist)
         desired = to_goal / dist * speed if dist > 1e-6 else np.zeros(2)
-        rot_act = _steer_omega(om_th, np.clip(
-            K_ROT * (th_start - theta), -OMEGA_MAX, OMEGA_MAX))
-        return (_steer_to_velocity(vel, desired), rot_act, tilt_act)
+        roll_act = _steer_omega(om_roll, np.clip(
+            K_ROT * ((th_start - AZ_OFF) - roll), -OMEGA_MAX, OMEGA_MAX))
+        return (_steer_to_velocity(vel, desired), roll_act, bend_act)
 
-    # whip: hold the wrist, full angular accel in the swing sense; the
+    # whip: hold the wrist, full roll accel in the swing sense; the
     # rotation carried past contact is the follow-through
     move_act = _steer_to_velocity(vel, np.zeros(2))
-    rot_act = 1 if sense > 0 else 2
-    return (move_act, rot_act, tilt_act)
+    roll_act = 1 if sense > 0 else 2
+    return (move_act, roll_act, bend_act)
 
 
 def scripted_action(env) -> tuple[int, int, int, int, int, int]:

@@ -167,3 +167,14 @@ not comparable.
   +40.72 (`runs/v51_wide_e4cos_50m`)** — the limits delayed the surge
   ~3–5M steps and taxed score −5, but engagement held completely;
   another sampled full combo (seed 7004, 46/46).
+- **Env v5.2 (user-caught model error): forearm-anchored joints.** The
+  v5.x gauges revealed the 98.7% policy holding blades tilted BACKWARD
+  (impossible). New model: neutral blade = forearm extension pointing AT
+  the notes; roll ψ (forearm CW/CCW, right [−190°, 90°] / left mirrored)
+  orients the plane the wrist bends in; bend φ (±95° from forward,
+  ±90° = flat in the hit plane) — **the blade can never point back at
+  the player** (d_z ≥ cos 95°). Obs/replay semantics changed (replay v5;
+  v5.0–v5.1 checkpoints and replays retired). Scripted bot swings flat
+  (bend 90° + roll): easy 100%/98.0, hard 85%/77.4, dynamic 84%/76.1 —
+  this model is meaningfully harder. 41/41 tests green, torch parity
+  exact, viewer + gauges updated (bend dial: 0 = notes, ±90 = flat).

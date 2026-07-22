@@ -1,8 +1,9 @@
 <script>
-  // Per-hand wrist/joint readouts: a roll dial (needle = blade azimuth,
-  // allowed 280-degree arc bright, forbidden zone dark) and a tilt dial
-  // (+-95 degrees, right = toward the notes), plus numeric angles and
-  // angular velocities. Needles turn orange within 10 degrees of a limit.
+  // Per-hand wrist/joint readouts (env v5.2): a roll dial (needle =
+  // forearm roll, allowed 280-degree arc bright, forbidden zone dark) and
+  // a bend dial (0 = pointing at the notes, +-90 = blade flat in the hit
+  // plane, +-95 = limit), plus numeric angles and angular velocities.
+  // Needles turn orange within 10 degrees of a limit.
   //
   // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
   // screen-fixed under orbiting, show up in exported videos, and need no
@@ -11,7 +12,7 @@
   import * as THREE from "three";
   import { pb } from "./state.svelte.js";
   import {
-    PHI_LIM, SABER_COLORS, THETA_HI, THETA_LO, saberAt,
+    BEND_LIM, ROLL_HI, ROLL_LO, SABER_COLORS, saberAt,
   } from "./replay.js";
 
   const W = 256, H = 310;
@@ -51,7 +52,7 @@
 
   function draw(g, sab) {
     const { hand, ctx } = g;
-    const [lo, hi] = [THETA_LO[hand], THETA_HI[hand]];
+    const [lo, hi] = [ROLL_LO[hand], ROLL_HI[hand]];
     const th = sab[4], ph = sab[5], wt = sab[6], wp = sab[7];
     const col = SABER_COLORS[hand];
 
@@ -87,15 +88,16 @@
     label(ctx, `roll ${deg(th).toFixed(0)}°  ·  ω ${wt.toFixed(1)}`,
       W / 2, 200);
 
-    // ---- tilt dial: up = in-plane, right = toward the incoming notes -------
+    // ---- bend dial: up = at the notes (neutral), +-90 = blade flat in
+    // the hit plane, +-95 = the anatomical limit
     const tx = W / 2, ty = 274, tr = 44;
-    const cAng = (p) => -Math.PI / 2 + p; // canvas angle for tilt p
+    const cAng = (p) => -Math.PI / 2 + p; // canvas angle for bend p
     ctx.lineWidth = 9;
     ctx.strokeStyle = "#3a4050";
     ctx.beginPath();
-    ctx.arc(tx, ty, tr, cAng(-PHI_LIM), cAng(PHI_LIM));
+    ctx.arc(tx, ty, tr, cAng(-BEND_LIM), cAng(BEND_LIM));
     ctx.stroke();
-    for (const b of [-PHI_LIM, PHI_LIM]) {
+    for (const b of [-BEND_LIM, BEND_LIM]) {
       ctx.strokeStyle = "#f0a35e";
       ctx.lineWidth = 3;
       ctx.beginPath();
@@ -103,11 +105,20 @@
       ctx.lineTo(tx + (tr + 8) * Math.cos(cAng(b)), ty + (tr + 8) * Math.sin(cAng(b)));
       ctx.stroke();
     }
-    label(ctx, "notes", tx + tr + 24, ty - 6, "#6b7180", 13);
-    label(ctx, "you", tx - tr - 22, ty - 6, "#6b7180", 13);
-    const tiltHot = PHI_LIM - Math.abs(ph) < NEAR;
-    needle(ctx, tx, ty, tr - 8, cAng(ph), tiltHot ? "#f0a35e" : col);
-    label(ctx, `tilt ${deg(ph).toFixed(0)}°  ·  ω ${wp.toFixed(1)}`,
+    for (const b of [-Math.PI / 2, Math.PI / 2]) { // "blade flat" marks
+      ctx.strokeStyle = "#6b7180";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(tx + (tr - 6) * Math.cos(cAng(b)), ty + (tr - 6) * Math.sin(cAng(b)));
+      ctx.lineTo(tx + (tr + 6) * Math.cos(cAng(b)), ty + (tr + 6) * Math.sin(cAng(b)));
+      ctx.stroke();
+    }
+    label(ctx, "notes", tx, ty - tr - 14, "#6b7180", 13);
+    label(ctx, "flat", tx + tr + 22, ty - 6, "#6b7180", 13);
+    label(ctx, "flat", tx - tr - 20, ty - 6, "#6b7180", 13);
+    const bendHot = BEND_LIM - Math.abs(ph) < NEAR;
+    needle(ctx, tx, ty, tr - 8, cAng(ph), bendHot ? "#f0a35e" : col);
+    label(ctx, `bend ${deg(ph).toFixed(0)}°  ·  ω ${wp.toFixed(1)}`,
       W / 2, H - 12);
 
     g.tex.needsUpdate = true;
