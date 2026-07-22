@@ -8,7 +8,7 @@
   // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
   // screen-fixed under orbiting, show up in exported videos, and need no
   // DOM/fonts (offline-safe) — same rationale as the score popups.
-  import { T } from "@threlte/core";
+  import { T, useThrelte } from "@threlte/core";
   import * as THREE from "three";
   import { pb } from "./state.svelte.js";
   import {
@@ -133,14 +133,25 @@
 
   $effect(() => () => hands.forEach((g) => g.tex.dispose()));
 
-  // camera-space placement: at z = -1 with fov 55 the view half-height is
-  // tan(27.5 deg) ~ 0.52; park the panels in the lower corners
+  // camera-space placement: at z = -1 with fov 55 (mirrors Scene.svelte)
+  // the view half-height is tan(27.5 deg) ~ 0.52 and the half-width is
+  // aspect x that. The viewport is now the whole page, so anchor the
+  // panels to the actual corners: a margin in from the sides, and far
+  // enough up to clear the floating bottom UI (hud/bar/help ~ 130 px).
+  const { size } = useThrelte();
+  const HALF_H = Math.tan((55 / 2) * Math.PI / 180);
   const SCALE = [0.26 * (W / H), 0.26, 1];
+  const MARGIN = 0.015;
+  const BOTTOM_UI_PX = 130;
+  const gx = $derived(
+    HALF_H * ($size.width / $size.height) - MARGIN - SCALE[0] / 2);
+  const gy = $derived(
+    -HALF_H + 2 * HALF_H * (BOTTOM_UI_PX / $size.height) + SCALE[1] / 2);
 </script>
 
 {#each hands as g (g.hand)}
   <T.Sprite
-    position={[g.hand === 0 ? -0.56 : 0.56, -0.36, -1]}
+    position={[g.hand === 0 ? -gx : gx, gy, -1]}
     scale={SCALE}
     renderOrder={20}
   >
