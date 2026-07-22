@@ -98,11 +98,11 @@ assert.equal(JOINT_NAMES.length, 6);
 const degLims = (h) => jointLimits(h).map(
   (l) => l.map((v) => Math.round(v * 180 / Math.PI)));
 assert.deepEqual(degLims(0),
-  [[-90, 90], [-100, 45], [-90, 70], [0, 150], [0, 180], [-95, 95]],
-  "left-hand v7.1 limits");
+  [[-90, 65], [-100, 45], [-90, 70], [0, 150], [0, 180], [-95, 95]],
+  "left-hand v7.2 limits");
 assert.deepEqual(degLims(1),
-  [[-90, 90], [-45, 100], [-70, 90], [0, 150], [-180, 0], [-95, 95]],
-  "right-hand v7.1 limits");
+  [[-90, 65], [-45, 100], [-70, 90], [0, 150], [-180, 0], [-95, 95]],
+  "right-hand v7.2 limits");
 for (const hand of [0, 1]) {
   const lims = jointLimits(hand);
   assert.equal(lims.length, 6);
