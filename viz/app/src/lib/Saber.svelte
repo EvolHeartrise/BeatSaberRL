@@ -6,10 +6,10 @@
   // buffer — no per-frame GPU churn).
   import { T } from "@threlte/core";
   import * as THREE from "three";
-  import { pb } from "./state.svelte.js";
+  import { pb, pose } from "./state.svelte.js";
   import {
-    SABER_COLORS, SABER_DARK, SABER_LEN, SHOULDER, V_MIN, armFK, saberAt,
-    tipOf, tipSpeed,
+    SABER_COLORS, SABER_DARK, SABER_LEN, SHOULDER, V_MIN, armFK, poseSaber,
+    saberAt, tipOf, tipSpeed,
   } from "./replay.js";
 
   let { s } = $props();
@@ -18,13 +18,17 @@
   const Y = new THREE.Vector3(0, 1, 0);
   const toScene = (p) => new THREE.Vector3(p[0], p[1], -p[2]);
 
-  const tickIdx = $derived(
-    Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1));
+  // pose mode takes over the arm (static q, omegas 0); it may run with
+  // no replay loaded at all
+  const tickIdx = $derived(pb.rep
+    ? Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1) : 0);
   const u = $derived(pb.cur - tickIdx);
-  const sab = $derived(saberAt(pb.rep, tickIdx, u, s));
+  const sab = $derived(pose.on
+    ? poseSaber(s, pose.q[s]) : saberAt(pb.rep, tickIdx, u, s));
   const fkNow = $derived(armFK(s, sab));
   const tip = $derived(tipOf(s, sab)); // world coords
-  const capable = $derived(tipSpeed(pb.rep, tickIdx, s) >= V_MIN);
+  const capable = $derived(
+    !pose.on && !!pb.rep && tipSpeed(pb.rep, tickIdx, s) >= V_MIN);
 
   // y-aligned cylinder -> arbitrary segment transform
   function seg(a, b) {
@@ -46,6 +50,11 @@
   const trailPos = new Float32Array((TRAIL + 1) * 3);
   trailGeo.setAttribute("position", new THREE.BufferAttribute(trailPos, 3));
   $effect(() => {
+    if (pose.on || !pb.rep) { // no trail for a static pose
+      trailGeo.setDrawRange(0, 0);
+      trailGeo.attributes.position.needsUpdate = true;
+      return;
+    }
     const from = Math.max(0, tickIdx - TRAIL);
     let n = 0;
     for (let k = from; k <= tickIdx; k++) {

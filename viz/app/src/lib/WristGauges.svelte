@@ -10,10 +10,10 @@
   // DOM/fonts (offline-safe) — same rationale as the score popups.
   import { T, useThrelte } from "@threlte/core";
   import * as THREE from "three";
-  import { pb } from "./state.svelte.js";
+  import { pb, pose } from "./state.svelte.js";
   import {
     BEND_LIM, ELBOW_HI, PITCH_LIM, ROLL_HI, ROLL_LO, SABER_COLORS,
-    TWIST_LIM, YAW_HI, YAW_LO, saberAt,
+    TWIST_LIM, YAW_HI, YAW_LO, poseSaber, saberAt,
   } from "./replay.js";
 
   const W = 256, H = 412;
@@ -160,6 +160,10 @@
   }
 
   $effect(() => {
+    if (pose.on) { // gauges reflect the manually posed joints (ω = 0)
+      for (const g of hands) draw(g, poseSaber(g.hand, pose.q[g.hand]));
+      return;
+    }
     if (!pb.rep) return;
     const tickIdx = Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1);
     const u = pb.cur - tickIdx;

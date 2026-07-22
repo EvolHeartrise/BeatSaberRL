@@ -1,8 +1,9 @@
 <script>
   import { Canvas } from "@threlte/core";
   import Scene from "./lib/Scene.svelte";
-  import { pb, lastTick, loadText, setPlaying, setSpeed, step }
-    from "./lib/state.svelte.js";
+  import PosePanel from "./lib/PosePanel.svelte";
+  import { pb, pose, lastTick, loadText, setPlaying, setSpeed, step,
+    togglePose } from "./lib/state.svelte.js";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
 
   let wrap; // canvas container, for video export
@@ -32,6 +33,10 @@
   }
 
   function onKey(e) {
+    // keys aimed at the pose panel's own controls stay there (slider
+    // arrow-key nudges must not step the replay)
+    if (e.target && e.target.closest && e.target.closest("#pose")) return;
+    if (e.key === "p") { togglePose(); return; }
     if (e.key === " ") { e.preventDefault(); setPlaying(!pb.playing); }
     else if (e.key === "ArrowRight") step(1);
     else if (e.key === "ArrowLeft") step(-1);
@@ -113,6 +118,10 @@
     />
   </div>
 
+  {#if pose.on}
+    <PosePanel />
+  {/if}
+
   <div id="bottom" class="overlay">
     <div id="hud" class="panel">
       {#if pb.rep && c}
@@ -139,6 +148,9 @@
       <button onclick={exportVideo} disabled={pb.exporting || !pb.rep}>
         {pb.exporting ? "⏺ recording…" : "⏺ export video"}
       </button>
+      <button class:on={pose.on} onclick={togglePose}>
+        {pose.on ? "🧍 posing" : "🧍 pose"}
+      </button>
       <input
         type="range"
         min="0"
@@ -152,7 +164,8 @@
       drag = orbit · wheel = zoom · right-drag = pan · space = play/pause ·
       ←/→ = step one tick · +/− = speed · r = restart · g = arm gauges ·
       h = real hitbox wireframes (green = matching saber, orange = the
-      small wrong-color box) · env v7: floor at y = 0, real BS lanes/rows;
+      small wrong-color box) · p = manual pose mode (slider-drive the 12
+      arm joints, no replay needed) · env v7: floor at y = 0, real BS lanes/rows;
       blocks, black bombs, squashed chain heads + link slabs fly in; faint
       color tubes = arc scoring hints (free pre/post swing) · each hand is
       a shoulder→elbow→wrist arm chain holding a 1 m blade · white blade
@@ -206,6 +219,7 @@
   }
   button:hover { background: #2d3342; }
   button:disabled { opacity: 0.5; cursor: default; }
+  button.on { border-color: #7aa2f7; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
   #hud {
     font-variant-numeric: tabular-nums; color: #9aa0ae; padding: 5px 14px;
