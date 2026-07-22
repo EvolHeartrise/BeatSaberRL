@@ -20,22 +20,24 @@
 
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
   const edgesGeo = new THREE.EdgesGeometry(boxGeo);
-  const halfGeo = new THREE.BoxGeometry(BLOCK, BLOCK / 2, 0.03);
+  // real split halves (the note's actual cube sliced along the cut
+  // plane): each covers local x in [0, 0.2] / [-0.2, 0]
+  const halfGeo = new THREE.BoxGeometry(HALF, BLOCK, BLOCK);
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
 
-  // arrow (pointing +x, rotated to the note's angle) and dot-note disc
+  // Beat Saber-style low-poly chevron (pointing +x, rotated to the
+  // note's angle): a solid 4-vertex wedge with a notched back — no
+  // tail, white like the real game's glyphs
   const arrowShape = new THREE.Shape();
-  arrowShape.moveTo(-0.13, -0.022);
-  arrowShape.lineTo(0.03, -0.022);
-  arrowShape.lineTo(0.03, -0.07);
-  arrowShape.lineTo(0.14, 0);
-  arrowShape.lineTo(0.03, 0.07);
-  arrowShape.lineTo(0.03, 0.022);
-  arrowShape.lineTo(-0.13, 0.022);
+  arrowShape.moveTo(0.14, 0);
+  arrowShape.lineTo(-0.09, 0.12);
+  arrowShape.lineTo(-0.02, 0);
+  arrowShape.lineTo(-0.09, -0.12);
   arrowShape.closePath();
   const arrowGeo = new THREE.ShapeGeometry(arrowShape);
-  const dotGeo = new THREE.CircleGeometry(0.07, 24);
+  const dotGeo = new THREE.CircleGeometry(0.07, 12);   // low-poly BS dot
+  const GLYPH_COL = "#f0f2f8";                          // BS-white glyphs
 
   const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
@@ -61,7 +63,7 @@
   {/if}
   {#if n.any}
     <T.Mesh geometry={dotGeo} position={[cx, cy, -z + HALF + 0.005]}>
-      <T.MeshBasicMaterial color="#0b0d11" transparent={alpha < 1} opacity={alpha} />
+      <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
     </T.Mesh>
   {:else}
     <T.Mesh
@@ -69,7 +71,7 @@
       position={[cx, cy, -z + HALF + 0.005]}
       rotation={[0, 0, n.angle]}
     >
-      <T.MeshBasicMaterial color="#0b0d11" transparent={alpha < 1} opacity={alpha} />
+      <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
     </T.Mesh>
   {/if}
 {/each}
@@ -77,13 +79,30 @@
 {#each after as { n, o, age, alpha } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {#if o.kind === "good"}
-    {@const px = -Math.sin(n.angle) * age * 1.4}
-    {@const py = Math.cos(n.angle) * age * 1.4}
-    {#each [[px, py], [-px, -py]] as [ox, oy]}
-      <T.Mesh geometry={halfGeo} position={[cx + ox, cy + oy, 0]}
-        rotation={[0, 0, noteRot(n)]}>
-        <T.MeshBasicMaterial color={GOOD_COL} transparent opacity={alpha} />
-      </T.Mesh>
+    <!-- the ACTUAL cube sliced along the cut plane: in the note's own
+         rotated frame the cut direction is local -y, so the halves are
+         the local left/right half-cubes, flying apart along local ±x,
+         carried a little along the cut, tumbling and fading -->
+    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4)}
+    {@const sep = HALF / 2 + age * 1.4}
+    {@const carry = -age * 0.9}
+    {#each [-1, 1] as side}
+      <T.Group
+        position={[cx, cy, -zCut]}
+        rotation={[0, 0, noteRot(n)]}
+      >
+        <T.Mesh
+          geometry={halfGeo}
+          position={[side * sep, carry, 0]}
+          rotation={[0, side * age * 2.2, 0]}
+        >
+          <T.MeshStandardMaterial
+            color={SABER_COLORS[n.color]}
+            transparent
+            opacity={alpha}
+          />
+        </T.Mesh>
+      </T.Group>
     {/each}
     <TextSprite
       text={"+" + o.points.toFixed(0)}
