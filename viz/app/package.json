@@ -1,9 +1,9 @@
 {
   "name": "beat-arena-viewer",
   "private": true,
-  "version": "5.1.0",
+  "version": "5.3.0",
   "type": "module",
-  "description": "Beat Arena 3D replay viewer (env v5.1 blade sabers) — Svelte + Threlte SPA, built to a single static HTML file",
+  "description": "Beat Arena 3D replay viewer (env v5.3 rotated note boxes) — Svelte + Threlte SPA, built to a single static HTML file",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

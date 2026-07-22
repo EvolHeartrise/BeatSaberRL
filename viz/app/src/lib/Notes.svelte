@@ -8,7 +8,8 @@
   import { pb } from "./state.svelte.js";
   import {
     BAD_COL, BLOCK, DT, GOOD_COL, HALF, MISS_COL, REACH_Z, SABER_COLORS,
-    Z_FAR, Z_MISS, activePosts, aftermaths, noteCenter, pendingNotes,
+    Z_FAR, Z_MISS, activePosts, aftermaths, noteCenter, noteRot,
+    pendingNotes,
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -43,7 +44,8 @@
 {#each pend as { n, z } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {@const alpha = fade(z)}
-  <T.Mesh position={[cx, cy, -z]}>
+  {@const rot = noteRot(n)}
+  <T.Mesh position={[cx, cy, -z]} rotation={[0, 0, rot]}>
     <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
     <T.MeshStandardMaterial
       color={SABER_COLORS[n.color]}
@@ -52,7 +54,8 @@
     />
   </T.Mesh>
   {#if inReach(z)}
-    <T.LineSegments geometry={edgesGeo} position={[cx, cy, -z]}>
+    <T.LineSegments geometry={edgesGeo} position={[cx, cy, -z]}
+      rotation={[0, 0, rot]}>
       <T.LineBasicMaterial color="#e8eaf0" />
     </T.LineSegments>
   {/if}
@@ -77,7 +80,8 @@
     {@const px = -Math.sin(n.angle) * age * 1.4}
     {@const py = Math.cos(n.angle) * age * 1.4}
     {#each [[px, py], [-px, -py]] as [ox, oy]}
-      <T.Mesh geometry={halfGeo} position={[cx + ox, cy + oy, 0]}>
+      <T.Mesh geometry={halfGeo} position={[cx + ox, cy + oy, 0]}
+        rotation={[0, 0, noteRot(n)]}>
         <T.MeshBasicMaterial color={GOOD_COL} transparent opacity={alpha} />
       </T.Mesh>
     {/each}
@@ -90,7 +94,8 @@
     />
   {:else}
     {@const col = o.kind === "bad" ? BAD_COL : MISS_COL}
-    <T.LineSegments geometry={failGeo} position={[cx, cy, 0.01]}>
+    <T.LineSegments geometry={failGeo} position={[cx, cy, 0.01]}
+      rotation={[0, 0, noteRot(n)]}>
       <T.LineBasicMaterial color={col} transparent opacity={alpha} />
     </T.LineSegments>
     <TextSprite

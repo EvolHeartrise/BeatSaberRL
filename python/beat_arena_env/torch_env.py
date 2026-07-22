@@ -59,7 +59,8 @@ ROLL_LO = (-1.5707963267948966, -3.3161255787892263)
 ROLL_HI = (3.3161255787892263, 1.5707963267948966)
 BEND_LIM = 1.6580627893946132
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.28
+REACH_Z = 1.2       # straight-forward tip (1 m) + HALF_BLOCK
+HALF_BLOCK = 0.2    # env v5.3: contact = swept blade vs the ROTATED cube
 Z_MISS = 0.6
 PRE_FULL = 1.7453292519943295   # 100 deg
 POST_FULL = 1.0471975511965976  # 60 deg
@@ -100,6 +101,14 @@ def _charts_to_tensors(charts, device, dtype):
             t(any_dir, torch.bool).unsqueeze(-1),
             torch.zeros((P, C, 2), device=device, dtype=dtype),
             torch.stack([t(np.cos(angle)), t(np.sin(angle))], -1)),
+        # box rotation about z (env v5.3): rot = angle - 270 deg, derived
+        # exactly from the angle's own sin/cos (cos_rot = -sin a,
+        # sin_rot = cos a); dot notes stay axis-aligned
+        "rot": torch.where(
+            t(any_dir, torch.bool).unsqueeze(-1),
+            torch.stack([torch.ones((P, C), device=device, dtype=dtype),
+                         torch.zeros((P, C), device=device, dtype=dtype)], -1),
+            torch.stack([t(-np.sin(angle)), t(np.cos(angle))], -1)),
         "any_dir": t(any_dir, torch.bool), "valid": t(valid, torch.bool),
         "n_notes": t(valid.sum(1), torch.long),
         "last_hit": t(np.where(valid.any(1), (hit * valid).max(1), 0.0)),
@@ -166,6 +175,7 @@ class TorchBeatVecEnv:
         for k in ("hit", "speed", "valid", "is_right", "any_dir"):
             setattr(self, "c_" + k, zeros(N, C, dt=self.pool[k].dtype))
         self.c_center = zeros(N, C, 2); self.c_dvec = zeros(N, C, 2)
+        self.c_rot = zeros(N, C, 2)
         self.c_last_hit = zeros(N); self.c_n_notes = zeros(N, dt=torch.long)
         # move-action direction table: 0 = coast, k = accel at (k-1)*45 deg
         ang = (torch.arange(8, device=self.device, dtype=dtype)) * (math.pi / 4)
@@ -222,6 +232,7 @@ class TorchBeatVecEnv:
             setattr(self, "c_" + k, torch.where(m1, self.pool[k][idx], dst))
         self.c_center = torch.where(m2, self.pool["center"][idx], self.c_center)
         self.c_dvec = torch.where(m2, self.pool["dvec"][idx], self.c_dvec)
+        self.c_rot = torch.where(m2, self.pool["rot"][idx], self.c_rot)
         self.c_last_hit = torch.where(mask, self.pool["last_hit"][idx],
                                       self.c_last_hit)
         self.c_n_notes = torch.where(mask, self.pool["n_notes"][idx],
@@ -331,33 +342,66 @@ class TorchBeatVecEnv:
         missed = pending & (z < -Z_MISS)
         cuttable = pending & ~missed & (z <= REACH_Z)
 
-        # swept-blade test: 8 sample points along each blade, each tracing
-        # its own 3D displacement segment against every note center.
+        # swept-blade test (env v5.3): 8 sample points along each blade,
+        # each tracing its own 3D displacement segment against every note's
+        # ROTATED cube (slab clip in the box frame); distance-to-center of
+        # the hitting samples still grades accuracy / picks s*.
         # Static loop over samples bounds memory; first minimum wins ties
         # (matches Rust's strict <, smallest sample fraction kept).
         center3 = torch.cat([self.c_center, z.unsqueeze(-1)], -1)   # (N,C,3)
         c3 = center3.unsqueeze(1)                                   # (N,1,C,3)
+        cr = self.c_rot[..., 0].unsqueeze(1)                        # (N,1,C)
+        sr = self.c_rot[..., 1].unsqueeze(1)
         pos3_prev = torch.cat(
             [prev_pos, torch.zeros_like(prev_pos[..., :1])], -1)    # (N,2,3)
         pos3 = torch.cat([self.pos, torch.zeros_like(self.pos[..., :1])], -1)
         d_min = torch.full((self.num_envs, 2, self.C), float("inf"),
                            device=self.device, dtype=self.dtype)
         s_star = torch.zeros_like(d_min)
+
+        def _box_frame(p):                                # (N,2,C,3) local
+            q = p - c3
+            return torch.stack(
+                [cr * q[..., 0] + sr * q[..., 1],
+                 -sr * q[..., 0] + cr * q[..., 1],
+                 q[..., 2]], -1)
+
+        def _box_hit(la, lb):
+            # segment vs origin-centered cube of half-extent HALF_BLOCK,
+            # slab clipping of the segment parameter to [0, 1] — the same
+            # branch structure as Rust's seg_box_hit (small-axis test is
+            # point-in-slab; divisions, not reciprocal multiplies)
+            d = lb - la
+            small = d.abs() < 1e-12
+            d_safe = torch.where(small, torch.ones_like(d), d)
+            t1 = (-HALF_BLOCK - la) / d_safe
+            t2 = (HALF_BLOCK - la) / d_safe
+            lo = torch.minimum(t1, t2)
+            hi = torch.maximum(t1, t2)
+            inside = la.abs() <= HALF_BLOCK
+            inf = torch.full_like(lo, float("inf"))
+            lo = torch.where(small, torch.where(inside, torch.zeros_like(lo),
+                                                inf), lo)
+            hi = torch.where(small, torch.where(inside, torch.ones_like(hi),
+                                                -inf), hi)
+            return lo.amax(-1).clamp_min(0.0) <= hi.amin(-1).clamp_max(1.0)
+
         for j in range(1, N_BLADE_SAMPLES + 1):
             r = (j / N_BLADE_SAMPLES) * SABER_LEN
             a = (pos3_prev + r * prev_dir).unsqueeze(2)             # (N,2,1,3)
             b = (pos3 + r * d_new).unsqueeze(2)
+            hit = _box_hit(_box_frame(a), _box_frame(b))            # (N,2,C)
             ab = b - a
             denom = (ab * ab).sum(-1)                               # (N,2,1)
             t = ((c3 - a) * ab).sum(-1) / denom.clamp_min(1e-12)
             t = torch.where(denom < 1e-12, torch.zeros_like(t),
                             t.clamp(0.0, 1.0)).unsqueeze(-1)
             d = (a + t * ab - c3).norm(dim=-1)                      # (N,2,C)
-            better = d < d_min
+            better = hit & (d < d_min)
             d_min = torch.where(better, d, d_min)
             s_star = torch.where(better, torch.full_like(s_star, r), s_star)
 
-        crossed = d_min <= CUT_RADIUS                               # (N,2,C)
+        crossed = torch.isfinite(d_min)                             # (N,2,C)
         is_r = self.c_is_right                                      # (N,C)
         match_cross = torch.where(is_r, crossed[:, 1], crossed[:, 0])
         other_cross = torch.where(is_r, crossed[:, 0], crossed[:, 1])
@@ -389,7 +433,9 @@ class TorchBeatVecEnv:
         # follow-through via a tracker
         pre_s = PTS_PRE * (self.swing_acc / PRE_FULL).clamp(max=1.0)  # (N,2)
         pre = torch.where(is_r, pre_s[:, 1:2], pre_s[:, 0:1])         # (N,C)
-        acc_pts = PTS_ACC * (1.0 - dm / CUT_RADIUS)
+        # corner clips can sit outside the circumscribed circle -> floor 0
+        # (also sanitizes dm = inf on never-hit notes: -inf clamps to 0)
+        acc_pts = PTS_ACC * (1.0 - dm / CUT_RADIUS).clamp_min(0.0)
         cut_pts = ((pre + acc_pts) * good.to(self.dtype)).sum(1)      # (N,)
         reward = reward + cut_pts / SCORE_MAX
         self.score = self.score + cut_pts

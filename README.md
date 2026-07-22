@@ -77,12 +77,11 @@ outline = inside the cuttable slab; green split = good cut; orange/red
 flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
 are rejected — re-record from a current checkpoint.
 
-Reference points on the default easy chart (rate 1.0, right hand only,
-down-swings, 20 s ≈ 19 notes), env v5 scripted bot: easy 100% good cuts
-/ 97.6 pts per note; hard (both hands, 8 dirs) 95% / 96.3; dynamic gym
-94% / 95.8 — the 1 m blade RAISED the scripted ceiling vs the point
-saber (dynamic was 81%). Pre-v5 reference numbers are point-saber and
-not comparable.
+Reference points (env v5.3 scripted bot, 30 eps each): easy (rate 1.0,
+right hand only, down-swings) 98.8% good cuts / 96.9 pts per note; hard
+(both hands, 8 dirs) 82.7% / 77.1; dynamic gym 84.6% / 76.8. Pre-v5.3
+reference numbers were measured against sphere contact (and pre-v5.2
+against looser joint models) and are not comparable.
 
 ## Status
 
@@ -187,3 +186,13 @@ not comparable.
   out-learned the exploit-era models: a better body beats extra
   freedom. User's registered mechanism ("full swinging conceptually
   easier") vindicated.
+- **Env v5.3 (2026-07-22): notes are their ACTUAL rotated boxes.** The
+  collision volume is the 0.4 m cube rotated about the approach axis by
+  (angle − 270°) — down-swing notes stay axis-aligned, dot notes never
+  rotate — replacing the rotation-blind 0.28 m contact sphere; REACH_Z
+  1.28 → 1.2 (tip + half-block); accuracy still grades by
+  distance-to-center, floored at 0 on corner clips. Torch env has exact
+  float64 parity (unedited parity tests); the viewer renders the
+  rotated cubes (and rotated split-halves/fail outlines). The v5.2
+  record ckpt re-evals at **98.0% good / 0 miss / 106.8 / +43.72** on
+  the stricter geometry (was 99.1/107.7) — center-cutting generalizes.
