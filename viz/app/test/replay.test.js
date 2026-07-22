@@ -3,9 +3,9 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  KIND_BOMB, activeArcs, activePosts, aftermaths, armFK, counts,
-  cutPlaneLocal, maxScore, parseReplay, pendingNotes, saberAt, tipOf,
-  tipSpeed, DT,
+  JOINT_NAMES, KIND_BOMB, activeArcs, activePosts, aftermaths, armFK,
+  clampQ, counts, cutPlaneLocal, jointLimits, maxScore, mirrorQ,
+  parseReplay, pendingNotes, poseSaber, saberAt, tipOf, tipSpeed, DT,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
@@ -90,6 +90,42 @@ rep.chart.forEach((n, i) => {
 });
 assert.ok(planes > 0, "no cut planes reconstructed at all");
 console.log(`cut planes reconstructed for ${planes} good cuts`);
+
+// ---- manual pose mode pure logic -------------------------------------------
+assert.equal(JOINT_NAMES.length, 6);
+for (const hand of [0, 1]) {
+  const lims = jointLimits(hand);
+  assert.equal(lims.length, 6);
+  lims.forEach(([lo, hi]) => assert.ok(lo < hi));
+  // clamping pins out-of-range joints to the anatomical bounds
+  clampQ(hand, Array(6).fill(99)).forEach((v, j) =>
+    assert.equal(v, lims[j][1], `clamp hi joint ${j} hand ${hand}`));
+  clampQ(hand, Array(6).fill(-99)).forEach((v, j) =>
+    assert.equal(v, lims[j][0], `clamp lo joint ${j} hand ${hand}`));
+  // in-range poses pass through untouched
+  const mid = lims.map(([lo, hi]) => (lo + hi) / 2);
+  assert.deepEqual(clampQ(hand, mid), mid);
+}
+// the hands' ranges are exact mirrors, so a legal left pose mirrors to a
+// legal right pose and its FK wrist mirrors across the body midplane
+const qL = clampQ(0, [0.4, -0.6, 0.3, 0.9, 1.2, -0.5]);
+const qR = mirrorQ(qL);
+assert.deepEqual(clampQ(1, qR), qR, "mirrored pose escapes right limits");
+const wL = armFK(0, qL).wrist, wR = armFK(1, qR).wrist;
+assert.ok(Math.abs(wL[0] + wR[0]) < 1e-12 && Math.abs(wL[1] - wR[1]) < 1e-12
+  && Math.abs(wL[2] - wR[2]) < 1e-12, "mirrored wrist not mirrored");
+// poseSaber: 15-field arm state, omegas zero, wrist = FK
+const ps = poseSaber(1, qR);
+assert.equal(ps.length, 15);
+assert.deepEqual(ps.slice(6, 12), [0, 0, 0, 0, 0, 0]);
+assert.deepEqual(ps.slice(12), wR);
+// neutral pose: arm straight forward (+z) from the shoulder
+const neutral = armFK(0, [0, 0, 0, 0, 0, 0]);
+assert.ok(Math.abs(neutral.wrist[0] + 0.2) < 1e-12
+  && Math.abs(neutral.wrist[1] - 1.47) < 1e-12
+  && Math.abs(neutral.wrist[2] - 0.0) < 1e-12, "neutral wrist off");
+assert.deepEqual(neutral.blade, [0, 0, 1]);
+console.log("pose-mode helpers OK");
 
 // replays from retired parameterizations are rejected with the friendly
 // "re-record" message

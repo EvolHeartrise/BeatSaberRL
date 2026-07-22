@@ -32,6 +32,29 @@ try {
   await page.waitForSelector("#stage canvas", { timeout: 15000 });
   await page.screenshot({ path: "test/out/empty.png" });
 
+  // ---- manual pose mode works straight from the landing state (no file):
+  // toggle 'p', drive two sliders, check the FK readout reacts, screenshot
+  await page.keyboard.press("p");
+  await page.waitForSelector("#pose", { timeout: 5000 });
+  const fk0 = await page.$eval("#pose .fk", (el) => el.textContent);
+  const setSlider = (idx, frac) => page.evaluate(({ idx, frac }) => {
+    const r = document.querySelectorAll("#pose input[type=range]")[idx];
+    const v = +r.min + frac * (+r.max - +r.min);
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+      .set.call(r, v);
+    r.dispatchEvent(new Event("input", { bubbles: true }));
+  }, { idx, frac });
+  await setSlider(0, 0.85);  // L pitch well up
+  await setSlider(9, 0.6);   // R elbow flexed (index 9 = right hand elbow)
+  await setSlider(7, 0.9);   // R yaw swung out
+  await new Promise((r) => setTimeout(r, 400));
+  const fk1 = await page.$eval("#pose .fk", (el) => el.textContent);
+  if (fk0 === fk1) throw new Error("pose sliders did not move the FK readout");
+  await page.screenshot({ path: "test/out/pose.png" });
+  await page.keyboard.press("p"); // leave pose mode
+  await page.waitForFunction(() => !document.querySelector("#pose"),
+    { timeout: 5000 });
+
   const input = await page.$("input[type=file]");
   await input.uploadFile(replay);
   await page.waitForFunction(

@@ -63,6 +63,39 @@ export const ROLL_LO = [-90 * RAD, -190 * RAD]; // left, right
 export const ROLL_HI = [190 * RAD, 90 * RAD];
 export const BEND_LIM = 95 * RAD;
 export const OMEGA_ARM = 8, OMEGA_WRIST = 20;
+
+// ---- manual pose mode (pure helpers; UI in PosePanel.svelte) ---------------
+export const JOINT_NAMES = ["pitch", "yaw", "twist", "elbow", "roll", "bend"];
+
+/** [(lo, hi)] x 6 for one hand, in joint order (mirror of constants.py). */
+export function jointLimits(hand) {
+  return [
+    [-PITCH_LIM, PITCH_LIM],
+    [YAW_LO[hand], YAW_HI[hand]],
+    [-TWIST_LIM, TWIST_LIM],
+    [0, ELBOW_HI],
+    [ROLL_LO[hand], ROLL_HI[hand]],
+    [-BEND_LIM, BEND_LIM],
+  ];
+}
+
+/** Clamp a 6-joint pose into the hand's anatomical ranges. */
+export function clampQ(hand, q) {
+  const lims = jointLimits(hand);
+  return q.map((v, j) => Math.min(lims[j][1], Math.max(lims[j][0], v)));
+}
+
+/** Mirror a pose across the body midplane (left <-> right): yaw, twist
+ * and roll flip sign; pitch, elbow and bend are symmetric. The hands'
+ * joint ranges are exact mirrors, so a legal pose mirrors to a legal one. */
+export const mirrorQ = (q) => [q[0], -q[1], -q[2], q[3], -q[4], q[5]];
+
+/** Synthetic 15-field arm state from a static pose: q(6) | omegas all
+ * zero | FK wrist(3). Drives the same rendering path as replay ticks. */
+export function poseSaber(hand, q) {
+  const { wrist } = armFK(hand, q);
+  return [...q, 0, 0, 0, 0, 0, 0, ...wrist];
+}
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";

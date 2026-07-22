@@ -6,10 +6,10 @@
   import { T, useTask } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
-  import { pb, lastTick, setPlaying } from "./state.svelte.js";
+  import { pb, pose, lastTick, setPlaying } from "./state.svelte.js";
   import {
-    GX0, GX1, GY0, GY1, LANE_X, CELL, REACH_Z, ROW_EDGES, SHOULDER, Z_FAR,
-    Z_MISS,
+    BLOCK, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES, ROW_Y,
+    SHOULDER, Z_FAR, Z_MISS,
   } from "./replay.js";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
@@ -62,6 +62,14 @@
   // torso (env v7 placement): shoulders at (±0.2, 1.47, -0.65); the trunk
   // reaches down toward the floor to suggest a 1.8 m player
   const SH_Y = SHOULDER[1][1], SH_Z = -SHOULDER[1][2]; // scene z = +0.65
+
+  // pose-mode reference note: a static cube at a chosen cell, z = 0
+  const refEdgesGeo = new THREE.EdgesGeometry(
+    new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
+  const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
+    2 * HB.goodHalf[0], 2 * HB.goodHalf[1], 2 * HB.goodHalf[2]));
+  const refBadHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
+    2 * HB.badHalf[0], 2 * HB.badHalf[1], 2 * HB.badHalf[2]));
 </script>
 
 <T.PerspectiveCamera makeDefault position={[0, 2.1, 3.4]} fov={55}>
@@ -71,7 +79,7 @@
     target={[0, 1.4, -1.5]}
     maxDistance={25}
   />
-  {#if pb.rep && pb.gauges}
+  {#if (pb.rep || pose.on) && pb.gauges}
     <WristGauges />
   {/if}
 </T.PerspectiveCamera>
@@ -97,6 +105,30 @@
 
 {#if pb.rep}
   <Notes />
+{/if}
+
+{#if pose.on && pose.ref}
+  <!-- static reference note at a chosen cell, z = 0, for eyeballing reach -->
+  {@const rx = LANE_X[pose.ref.col]}
+  {@const ry = ROW_Y[pose.ref.row]}
+  <T.Mesh position={[rx, ry, 0]}>
+    <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
+    <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />
+  </T.Mesh>
+  <T.LineSegments geometry={refEdgesGeo} position={[rx, ry, 0]}>
+    <T.LineBasicMaterial color="#e8eaf0" />
+  </T.LineSegments>
+  {#if pb.hitboxes}
+    <T.LineSegments geometry={refGoodHbGeo} position={[rx, ry, -HB.goodZShift]}>
+      <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+    </T.LineSegments>
+    <T.LineSegments geometry={refBadHbGeo} position={[rx, ry, 0]}>
+      <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
+    </T.LineSegments>
+  {/if}
+{/if}
+
+{#if pb.rep || pose.on}
   <!-- body: head + shoulder crossbar + trunk down toward the floor -->
   <T.Mesh position={[0, SH_Y + 0.24, SH_Z]}>
     <T.SphereGeometry args={[0.11, 16, 12]} />
