@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 
 from .constants import (
-    ELBOW_HI, L_FORE, L_UPPER, SHOULDER, TWIST_LIM,
+    ELBOW_HI, L_FORE, L_UPPER, SHOULDER, TWIST_HI, TWIST_LO,
 )
 
 
@@ -116,7 +116,7 @@ def ik_arm(hand, wrist_target, swivel=0.0):
         twist = 0.0
     else:
         twist = math.atan2(-g[0], g[1])
-    twist = min(max(twist, -TWIST_LIM), TWIST_LIM)
+    twist = min(max(twist, TWIST_LO[hand]), TWIST_HI[hand])
     return [pitch, yaw, twist, elbow]
 
 

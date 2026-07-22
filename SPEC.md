@@ -79,12 +79,18 @@ checkpoints/replays retire (hard replace).
   - `pitch` ∈ ±90°: + = arm up (about x).
   - `yaw`: + = toward +x; outward 100° / cross-body 45° per hand →
     right `[−45°, 100°]`, left `[−100°, 45°]`.
-  - `twist` (humeral rotation) ∈ ±90°: rotates the arm about its own
-    axis, orienting the elbow's bend plane; doesn't move the elbow.
+  - `twist` (humeral rotation), **env v7.1: right `[−70°, 90°]` / left
+    mirrored** (outward rotation keeps its full range, inward capped):
+    rotates the arm about its own axis, orienting the elbow's bend
+    plane; doesn't move the elbow.
   - `elbow` (flexion) ∈ [0°, 150°]: hinge; curls toward the arm-local
     +y (twist picks the world direction of that).
-  - `roll`/`bend`: the unchanged v5.2 wrist, now in the FOREARM frame —
-    roll right `[−190°, 90°]` / left mirrored, bend ±95°. Blade dir =
+  - `roll`/`bend`: the v5.2 wrist in the FOREARM frame — **env v7.1
+    (user-specified, found via the pose tool): roll right `[−180°, 0°]`
+    / left mirrored** — the old 280° arcs were compensation for the
+    missing arm joints and let training cheat; with bend +90° a wrist
+    roll now covers only a 180° blade fan, so 100°+ swing arcs must
+    come from the arm. Bend ±95°. Blade dir =
     `M_f · d(ψ, φ)` with `d(ψ, φ) = (−sinψ·sinφ, cosψ·sinφ, cosφ)`:
     the neutral blade is the forearm's extension (v5.2's law
     generalized to a moving forearm).

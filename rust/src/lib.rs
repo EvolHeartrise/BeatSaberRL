@@ -62,10 +62,15 @@ const OMEGA_WRIST: f64 = 20.0; // rad/s
 const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg
 const YAW_LO: [f64; 2] = [-1.7453292519943295, -0.7853981633974483]; // L, R
 const YAW_HI: [f64; 2] = [0.7853981633974483, 1.7453292519943295];
-const TWIST_LIM: f64 = 1.5707963267948966; // 90 deg
+// env v7.1 (user-specified): tightened wrist roll + twist — the v5-era
+// roll range was compensation for missing joints and let training
+// cheat. Right roll [-180, 0] deg, twist [-70, 90]; left mirrored.
+const TWIST_LIM: f64 = 1.5707963267948966; // 90 deg — obs normalizer only
+const TWIST_LO: [f64; 2] = [-1.5707963267948966, -1.2217304763960306]; // L, R
+const TWIST_HI: [f64; 2] = [1.2217304763960306, 1.5707963267948966];
 const ELBOW_HI: f64 = 2.6179938779914944; // 150 deg (lo = 0)
-const ROLL_LO: [f64; 2] = [-1.5707963267948966, -3.3161255787892263]; // L, R
-const ROLL_HI: [f64; 2] = [3.3161255787892263, 1.5707963267948966];
+const ROLL_LO: [f64; 2] = [0.0, -3.141592653589793]; // L, R
+const ROLL_HI: [f64; 2] = [3.141592653589793, 0.0];
 const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
 const N_JOINTS: usize = 6;
 const JOINT_ALPHA: [f64; N_JOINTS] =
@@ -77,7 +82,7 @@ fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
     [
         (-PITCH_LIM, PITCH_LIM),
         (YAW_LO[hand], YAW_HI[hand]),
-        (-TWIST_LIM, TWIST_LIM),
+        (TWIST_LO[hand], TWIST_HI[hand]),
         (0.0, ELBOW_HI),
         (ROLL_LO[hand], ROLL_HI[hand]),
         (-BEND_LIM, BEND_LIM),

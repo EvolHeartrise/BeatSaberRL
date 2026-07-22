@@ -1,6 +1,6 @@
 <script>
-  // Per-hand wrist/joint readouts (env v5.2): a roll dial (needle =
-  // forearm roll, allowed 280-degree arc bright, forbidden zone dark) and
+  // Per-hand wrist/joint readouts: a roll dial (needle = forearm roll,
+  // allowed arc bright — 180 degrees since env v7.1 — forbidden zone dark) and
   // a bend dial (0 = pointing at the notes, +-90 = blade flat in the hit
   // plane, +-95 = limit), plus numeric angles and angular velocities.
   // Needles turn orange within 10 degrees of a limit.
@@ -13,7 +13,7 @@
   import { pb, pose } from "./state.svelte.js";
   import {
     BEND_LIM, ELBOW_HI, PITCH_LIM, ROLL_HI, ROLL_LO, SABER_COLORS,
-    TWIST_LIM, YAW_HI, YAW_LO, poseSaber, saberAt,
+    TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber, saberAt,
   } from "./replay.js";
 
   const W = 256, H = 412;
@@ -73,7 +73,7 @@
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, 2 * Math.PI);
     ctx.stroke();
-    ctx.strokeStyle = "#3a4050"; // allowed 280-degree arc
+    ctx.strokeStyle = "#3a4050"; // allowed roll arc (180 deg since v7.1)
     ctx.beginPath();
     ctx.arc(cx, cy, r, -lo, -hi, true);
     ctx.stroke();
@@ -127,7 +127,7 @@
     const bars = [
       ["pitch", sab[0], -PITCH_LIM, PITCH_LIM],
       ["yaw", sab[1], YAW_LO[hand], YAW_HI[hand]],
-      ["twist", sab[2], -TWIST_LIM, TWIST_LIM],
+      ["twist", sab[2], TWIST_LO[hand], TWIST_HI[hand]],
       ["elbow", sab[3], 0, ELBOW_HI],
     ];
     bars.forEach(([name, v, blo, bhi], i) => {

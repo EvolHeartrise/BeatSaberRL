@@ -63,11 +63,21 @@ def _park(sim, hand):
 
 def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=DELTA):
     """FLAT pose: blade along `azimuth` in a z = const plane (aligned
-    wrist frame R_x(-delta) fixes +-x; roll = azimuth - 90 deg,
-    bend = +90 deg). For delta = DELTA the right wrist sits at
+    wrist frame R_x(-delta) fixes +-x; primary rep roll = azimuth - 90
+    deg, bend = +90 deg). Since env v7.1 the roll ranges are 180-degree
+    arcs, so azimuths whose primary roll is out of range use the
+    equivalent representation (roll + 180 deg, bend flipped) — same
+    blade direction. For delta = DELTA the right wrist sits at
     FLAT_WRIST; roll sweeps (om_roll) move the blade vertically."""
-    q = [-np.pi / 2 + delta, 0.0, 0.0, np.pi / 2,
-         azimuth - np.pi / 2, np.pi / 2]
+    from beat_arena_env.constants import joint_limits as jl
+    lo, hi = jl(hand)[4]
+    roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
+    bend = np.pi / 2
+    if not (lo <= roll <= hi):
+        roll = (azimuth + np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
+        bend = -np.pi / 2
+        assert lo <= roll <= hi, f"azimuth {azimuth} unreachable for hand {hand}"
+    q = [-np.pi / 2 + delta, 0.0, 0.0, np.pi / 2, roll, bend]
     sim.set_joints(hand, q, [0.0, 0.0, 0.0, 0.0, om_roll, om_bend])
 
 
@@ -370,20 +380,29 @@ def test_arm_swing_cuts_and_accuracy_decreases_off_center():
     assert aligned[0][2] > offset[0][2] > 0.0
 
 
-def test_full_swing_scores_full_pre_and_post():
-    """A wound-up swing (>100 deg) earns the full 70 pre-swing and the
-    full 30 follow-through (the flat-blade z offset costs accuracy — by
-    design; forward-tilted blades are the high-acc technique)."""
-    sim = _sim_with_note(_note(10 * DT, 3, 1), max_steps=60)
-    om, sweep = 8.0, 0.0
-    for _ in range(11):
-        om *= 1.0 - 0.02
-        sweep += om * DT
-    _set_flat(sim, 1, sweep, om_roll=-8.0)
+def _pitch_pendulum_events(kind=0, ticks=20):
+    """A full-arm pendulum: right arm straight (blade = its extension),
+    pitch from +88 deg falling at full omega through a row-0 note at
+    (0.3, 0.85). Contact comes at pitch ~ -25 deg with ~112 deg of arc
+    banked — since env v7.1 the wrist roll can't sweep 100+ deg through
+    contact, so full pre-swings are ARM swings (the point of the
+    restriction)."""
+    sim = _sim_with_note(_note(0.3, 2, 0, kind=kind), max_steps=60)
+    _park(sim, 0)
+    sim.set_joints(1, [np.radians(88.0), 0.0, 0.0, 0.0, 0.0, 0.0],
+                   [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     events = []
-    for _ in range(20):
+    for _ in range(ticks):
         ev, _ = _coast(sim)
         events.extend(ev)
+    return sim, events
+
+
+def test_full_swing_scores_full_pre_and_post():
+    """A wound-up ARM swing (>100 deg) earns the full 70 pre-swing and
+    the full 30 follow-through (pendulum geometry costs accuracy — by
+    design; forward-tilted precise blades are the high-acc technique)."""
+    sim, events = _pitch_pendulum_events()
     cuts = [e for e in events if e[1] == 0]
     posts = [e for e in events if e[1] == 5]
     assert len(cuts) == 1 and len(posts) == 1
@@ -464,17 +483,7 @@ def test_chain_link_still_requires_speed():
 def test_chain_head_has_no_follow_through():
     """Chain heads score pre + accuracy (max 85) and never open a
     follow-through tracker."""
-    head = _note(10 * DT, 3, 1, kind=KIND_CHAIN_HEAD)
-    sim = _sim_with_note(head, max_steps=60)
-    om, sweep = 8.0, 0.0
-    for _ in range(11):
-        om *= 1.0 - 0.02
-        sweep += om * DT
-    _set_flat(sim, 1, sweep, om_roll=-8.0)
-    events = []
-    for _ in range(20):
-        ev, _ = _coast(sim)
-        events.extend(ev)
+    sim, events = _pitch_pendulum_events(kind=KIND_CHAIN_HEAD)
     cuts = [e for e in events if e[1] == 0]
     posts = [e for e in events if e[1] == 5]
     assert len(cuts) == 1 and posts == []
@@ -539,8 +548,9 @@ def test_joint_limits_clamp_and_kill_omega():
     checks = [
         (0, 1.55, 8.0, np.pi / 2),                    # pitch into +90
         (1, 1.70, 8.0, np.radians(100.0)),            # right yaw into +100
+        (2, -1.15, -8.0, np.radians(-70.0)),          # right twist into -70
         (3, 0.05, -8.0, 0.0),                         # elbow into its floor
-        (4, 1.50, 15.0, np.pi / 2),                   # right roll into +90
+        (4, -0.05, 15.0, 0.0),                        # right roll into 0 (v7.1)
         (5, 1.60, 15.0, np.radians(95.0)),            # bend into +95
     ]
     for j, q0, om0, lim in checks:
