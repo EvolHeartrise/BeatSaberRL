@@ -145,6 +145,16 @@ def _tri_point_dist(a, b, c, p):
             + d[..., 2] * d[..., 2]).sqrt()
 
 
+def _to_box_frame(p, center, cos_r, sin_r):
+    """p relative to `center`, expressed in the box's rotated frame
+    (lib.rs to_box_frame — env v7.4 rotating hitboxes)."""
+    q = p - center
+    return torch.stack([
+        cos_r * q[..., 0] + sin_r * q[..., 1],
+        -sin_r * q[..., 0] + cos_r * q[..., 1],
+        q[..., 2]], -1)
+
+
 def _seg_point_dist(a, b, c):
     """Distance from point c to segment ab (lib.rs seg_point_dist3)."""
     ab = b - a
@@ -186,6 +196,13 @@ def _charts_to_tensors(charts, device, dtype):
     good_hy = np.where(is_link, GOOD_HALF_Y_LINK,
                        np.where(any_dir, GOOD_HALF_Y_DOT, GOOD_HALF_Y))
     bad_hy = np.where(is_link, BAD_HALF_Y_LINK, BAD_HALF)
+    # env v7.4: hitboxes rotate about z by rot = angle - 270 deg —
+    # (cos_r, sin_r) = (-sin a, cos a), from the angle's own sin/cos
+    # (lib.rs note_rot). Arrow notes/heads and chain links (tangent)
+    # rotate; plain dots stay axis-aligned; bombs are spheres (unused).
+    rotates = is_link | ~any_dir
+    rot_c = np.where(rotates, -np.sin(angle), 1.0)
+    rot_s = np.where(rotates, np.cos(angle), 0.0)
     # episode tail: 0.5 + Z_MISS / min speed (lib.rs set_chart_notes)
     min_speed = np.where(valid, speed, np.inf).min(1)
     finite = np.isfinite(min_speed)
@@ -196,6 +213,7 @@ def _charts_to_tensors(charts, device, dtype):
         "hit": t(hit), "speed": t(speed),
         "center": torch.stack([t(x), t(y)], -1),
         "dvec": torch.stack([t(np.cos(angle)), t(np.sin(angle))], -1),
+        "rot": torch.stack([t(rot_c), t(rot_s)], -1),
         "is_right": t(color, torch.bool),
         "any_dir": t(any_dir, torch.bool), "valid": t(valid, torch.bool),
         "is_bomb": t(is_bomb, torch.bool), "is_head": t(is_head, torch.bool),
@@ -219,7 +237,7 @@ class TorchBeatVecEnv:
     _F_NC = ("hit", "speed", "valid", "is_right", "any_dir", "is_bomb",
              "is_head", "is_link", "show_dir", "free_pre", "free_post",
              "good_hy", "bad_hy")
-    _F_NC2 = ("center", "dvec")
+    _F_NC2 = ("center", "dvec", "rot")
     _F_N = ("last_hit", "tail", "n_notes", "n_scoreable")
 
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
@@ -471,16 +489,26 @@ class TorchBeatVecEnv:
                         (z + GOOD_Z_SHIFT).unsqueeze(-1)], -1).unsqueeze(1)
         ghy = self.c_good_hy.unsqueeze(1)                           # (N,1,C)
         bhy = self.c_bad_hy.unsqueeze(1)
+        # env v7.4: both boxes rotate about z with the note (same cos_r/
+        # sin_r); the good box's z shift is along the rotation axis, so
+        # it is unaffected. d_min / s* / contact velocity stay world-space.
+        cr = self.c_rot[..., 0].unsqueeze(1)                        # (N,1,C)
+        sr = self.c_rot[..., 1].unsqueeze(1)
+        w0g = _to_box_frame(w0, gc, cr, sr)
+        t0g = _to_box_frame(t0, gc, cr, sr)
+        t1g = _to_box_frame(t1, gc, cr, sr)
+        w1g = _to_box_frame(w1, gc, cr, sr)
         good_hit = (
-            _tri_box_overlap(w0 - gc, t0 - gc, t1 - gc,
-                             GOOD_HALF_X, ghy, GOOD_HALF_Z)
-            | _tri_box_overlap(w0 - gc, t1 - gc, w1 - gc,
+            _tri_box_overlap(w0g, t0g, t1g, GOOD_HALF_X, ghy, GOOD_HALF_Z)
+            | _tri_box_overlap(w0g, t1g, w1g,
                                GOOD_HALF_X, ghy, GOOD_HALF_Z))      # (N,2,C)
+        w0b = _to_box_frame(w0, bc, cr, sr)
+        t0b = _to_box_frame(t0, bc, cr, sr)
+        t1b = _to_box_frame(t1, bc, cr, sr)
+        w1b = _to_box_frame(w1, bc, cr, sr)
         bad_hit = (
-            _tri_box_overlap(w0 - bc, t0 - bc, t1 - bc,
-                             BAD_HALF, bhy, BAD_HALF)
-            | _tri_box_overlap(w0 - bc, t1 - bc, w1 - bc,
-                               BAD_HALF, bhy, BAD_HALF))
+            _tri_box_overlap(w0b, t0b, t1b, BAD_HALF, bhy, BAD_HALF)
+            | _tri_box_overlap(w0b, t1b, w1b, BAD_HALF, bhy, BAD_HALF))
         d_sweep = torch.minimum(_tri_point_dist(w0, t0, t1, bc),
                                 _tri_point_dist(w0, t1, w1, bc))    # (N,2,C)
 

@@ -63,6 +63,19 @@ try {
   await new Promise((r) => setTimeout(r, 1500)); // let it play a bit
   await page.screenshot({ path: "test/out/playing.png" });
 
+  // ---- v7.4 rotated hitboxes: toggle 'h', scrub to the diagonal-tangent
+  // chain-link cluster (t ~ 12.6 s in the fixture) and screenshot — the
+  // green boxes should visibly tilt with their notes
+  await page.keyboard.press("h");
+  await page.evaluate(() => {
+    const r = document.querySelector("#bottom input[type=range]");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+      .set.call(r, 377); // tick 377 = 12.57 s
+    r.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await new Promise((r) => setTimeout(r, 500));
+  await page.screenshot({ path: "test/out/hitboxes.png" });
+
   const hud = await page.$eval("#hud", (el) => el.textContent);
   console.log("HUD:", hud.replace(/\s+/g, " ").trim());
   if (!/t\s+[1-9]?\d\.\d+s/.test(hud)) throw new Error("time not advancing");

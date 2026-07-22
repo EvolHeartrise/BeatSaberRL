@@ -125,10 +125,13 @@ checkpoints/replays retire (hard replace).
   - otherwise `swing_acc += Δ`; axis stored. `swing_acc` therefore holds
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
-- **Hitboxes** (env v7 — the real ones, axis-aligned, NOT the visual
-  cube; they do NOT rotate with the cut direction — v5.3's rotated
-  collision cube is retired, the real game is axis-aligned and
-  forgiving):
+- **Hitboxes** (env v7 dims, **env v7.4 orientation**): the real boxes,
+  NOT the visual cube, and they **ROTATE with the object about the
+  approach (z) axis** by `rot = angle − 270°` — the game's colliders
+  sit on the rotated note transform (v7.0 shipped them axis-aligned,
+  misreading a BeatLeader-viewer simplification; user-caught). Arrow
+  notes/chain heads rotate by their angle, chain links by their
+  tangent, plain dot notes stay axis-aligned, bombs are spheres:
   - **Good-cut box** (matching saber only): `0.8 × 0.5 × 1.0` m,
     center shifted `0.25` m toward the player — spans z
     `[note_z − 0.75, note_z + 0.25]`, so early and off-center swings

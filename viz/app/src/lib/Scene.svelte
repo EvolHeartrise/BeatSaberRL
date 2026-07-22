@@ -63,7 +63,10 @@
   // reaches down toward the floor to suggest a 1.8 m player
   const SH_Y = SHOULDER[1][1], SH_Z = -SHOULDER[1][2]; // scene z = +0.65
 
-  // pose-mode reference note: a static cube at a chosen cell, z = 0
+  // pose-mode reference note: a static cube at a chosen cell, z = 0.
+  // It is a canonical down-swing note (rot = 0), so the v7.4 rotated
+  // hitboxes coincide with these axis-aligned wireframes; rotate them
+  // with hitboxRot if this reference ever grows an angle control.
   const refEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
   const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(

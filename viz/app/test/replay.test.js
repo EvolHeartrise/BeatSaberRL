@@ -3,10 +3,10 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  JOINT_NAMES, KIND_BOMB, activeArcs, activePosts, aftermaths, armFK,
-  clampQ, counts, cutPlaneLocal, jointLimits, maxScore, mirrorQ,
-  parseReplay, pendingNotes, poseSaber, saberAt, tipOf, tipSpeed, DT,
-  Z_MISS,
+  JOINT_NAMES, KIND_BOMB, KIND_CHAIN_LINK, activeArcs, activePosts,
+  aftermaths, armFK, clampQ, counts, cutPlaneLocal, hitboxRot,
+  jointLimits, maxScore, mirrorQ, noteRot, parseReplay, pendingNotes,
+  poseSaber, saberAt, tipOf, tipSpeed, DT, Z_MISS,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
@@ -137,6 +137,29 @@ assert.ok(Math.abs(neutral.wrist[0] + 0.2) < 1e-12
   && Math.abs(neutral.wrist[2] - 0.0) < 1e-12, "neutral wrist off");
 assert.deepEqual(neutral.blade, [0, 0, 1]);
 console.log("pose-mode helpers OK");
+
+// env v7.4 hitbox rotation (mirror of lib.rs note_rot): arrow notes and
+// chain heads rotate by angle - 270°, chain links rotate by their
+// tangent even though they judge any-direction (any=true), plain dots
+// and bombs stay unrotated
+const deg = Math.PI / 180;
+assert.equal(hitboxRot({ kind: 0, any: false, angle: 270 * deg }), 0,
+  "down-swing note is axis-aligned");
+assert.ok(Math.abs(hitboxRot({ kind: 0, any: false, angle: 315 * deg })
+  - 45 * deg) < 1e-12, "diagonal arrow note rotates by angle - 270°");
+assert.equal(hitboxRot({ kind: 0, any: true, angle: 315 * deg }), 0,
+  "dot note hitbox never rotates");
+assert.ok(Math.abs(hitboxRot({ kind: KIND_CHAIN_LINK, any: true,
+  angle: Math.PI }) - (-Math.PI / 2)) < 1e-12,
+  "chain link rotates by its tangent despite any=true");
+assert.equal(hitboxRot({ kind: KIND_BOMB, any: false, angle: 1 }), 0,
+  "bomb hitbox never rotates");
+// visuals and hitboxes agree except for links (noteRot keeps links
+// following their `any` flag)
+for (const n of [{ kind: 0, any: false, angle: 200 * deg },
+                 { kind: 2, any: false, angle: 45 * deg },
+                 { kind: 0, any: true, angle: 0 }])
+  assert.equal(hitboxRot(n), noteRot(n), "hitboxRot/noteRot mismatch");
 
 // replays from retired parameterizations are rejected with the friendly
 // "re-record" message

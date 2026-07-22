@@ -37,7 +37,9 @@ export const BOMB_RADIUS = 0.2; // visual (collision radius is 0.18)
 export const LINK_W = 0.4, LINK_H = 0.13, LINK_D = 0.13; // link slab visual
 export const HEAD_SQUASH = 0.5; // chain heads are ~half-height cubes
 
-// real-BS axis-aligned hitboxes (for the optional 'h' wireframe overlay)
+// real-BS hitbox sizes (for the optional 'h' wireframe overlay). Since
+// env v7.4 hitboxes ROTATE with the object about the approach (z) axis
+// (see hitboxRot below); half-extents are given in the box's local frame.
 export const HB = {
   goodHalf: [0.4, 0.25, 0.5],      // arrow notes / chain heads
   goodHalfDot: [0.4, 0.4, 0.5],    // dot notes
@@ -49,9 +51,21 @@ export const HB = {
 };
 
 // note cubes are drawn rotated about the approach axis so the block
-// visually tracks its required cut direction (dot notes stay square);
-// since env v7 the COLLISION is axis-aligned — this is visual only.
+// visually tracks its required cut direction (dot notes stay square).
 export const noteRot = (n) => (n.any ? 0 : n.angle - 1.5 * Math.PI);
+
+// env v7.4: hitboxes rotate about the approach (z) axis by
+// rot = angle - 270° too, mirroring lib.rs note_rot. (v7.0 drew/judged
+// them axis-aligned — a BeatLeader-viewer simplification mistaken for
+// game behavior; the real colliders sit on the rotated note transform.)
+// Arrow notes and chain heads rotate by their angle; chain links by
+// their tangent (their `angle` field) even though links judge
+// any-direction; plain dots and bombs stay unrotated. Differs from
+// noteRot only for links (any=true but still rotating).
+export const hitboxRot = (n) =>
+  n.kind !== KIND_BOMB && (n.kind === KIND_CHAIN_LINK || !n.any)
+    ? n.angle - 1.5 * Math.PI
+    : 0;
 export const V_MIN = 1, DT = 1 / 30;
 // env v6 body (v7 placement) + anatomical joint limits (mirror the sim)
 const RAD = Math.PI / 180;
