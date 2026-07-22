@@ -89,8 +89,9 @@ not comparable.
 - v0 (2026-07-20): env + chart gen + scripted bot + policies + PPO
   harness built (pool encoder + Python sim later deleted; see SPEC).
 - Raw reward proved too sparse to learn from (flat at random, entropy
-  stuck at uniform) → potential-based shaping added (`shaping_coef`,
-  see SPEC) and takeoff needs patience: learning starts ~100–150k steps.
+  stuck at uniform) → potential-based shaping added (since REMOVED —
+  see the pure-reward era below) and takeoff needs patience: learning
+  starts ~100–150k steps.
 - World v2 (same day): metric units (0.5 m lanes, 40 cm blocks — real
   Beat Saber size), hit plane at z=0 centered on the origin, notes carry
   (x, y, z, vz) instead of a time feature (z/|vz| IS time-until), spatial
@@ -107,8 +108,9 @@ not comparable.
   Three skills stacked at once (hand assignment, direction-conditional
   swings, two-hand traffic) broke the shaping staircase. Curriculum
   warm-start from the easy checkpoint is the proposed next step.
-- Pure-reward era (2026-07-20, by design): shaping OFF, rewards only
-  from sim scoring (V_MIN 1 m/s; bad cut = miss = −0.5).
+- Pure-reward era (2026-07-20, by design): rewards only from sim
+  scoring (V_MIN 1 m/s; bad cut = miss = −0.5). The shaping mechanism
+  itself was deleted from the code 2026-07-21.
 - **Hard config (both hands, 8 dirs) SOLVED at 14M steps: 98% good cuts,
   beating the scripted bot (96%) — pure rewards, no shaping, no
   curriculum, ~65 min total training at ~4.4k steps/s.** Checkpoint arc:

@@ -27,7 +27,7 @@ def _chart(cfg_kw, seed):
 
 def _rust_episode(chart, policy):
     """Run one Rust episode; returns (actions, obs_list, rewards, counters)."""
-    env = RustBeatEnv(external_chart=chart, shaping_coef=0.0, seed=0)
+    env = RustBeatEnv(external_chart=chart, seed=0)
     obs, _ = env.reset()
     acts, obs_l, rews = [], [obs.copy()], []
     done = False

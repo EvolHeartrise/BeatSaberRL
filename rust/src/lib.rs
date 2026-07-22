@@ -14,7 +14,7 @@
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
 
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2};
+use numpy::{PyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
 const DT: f64 = 1.0 / 30.0;
@@ -29,8 +29,6 @@ const POS_LO: [f64; 2] = [-1.5, -1.25];
 const POS_HI: [f64; 2] = [1.5, 1.25];
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
-const SHAPE_GAMMA: f64 = 0.99;
-const SHAPE_DIST_CLIP: f64 = 2.0;
 
 // --- blade (env v5) ---------------------------------------------------------
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
@@ -162,7 +160,6 @@ struct Tracker {
 }
 
 struct Core {
-    shaping_coef: f64,
     max_steps: u32,
     chart: Vec<Note>,
     // state
@@ -171,7 +168,6 @@ struct Core {
     sabers: [Saber; 2],
     trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad, 3 missed
-    phi_pot: f64,    // shaping potential (NOT the tilt angle)
     good_cuts: u32,
     bad_cuts: u32,
     misses: u32,
@@ -179,9 +175,8 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(shaping_coef: f64, max_steps: u32) -> Self {
+    fn new_core(max_steps: u32) -> Self {
         Core {
-            shaping_coef,
             max_steps,
             chart: Vec::new(),
             tick: 0,
@@ -189,7 +184,6 @@ impl Core {
             sabers: [Saber::start(-0.5), Saber::start(0.5)],
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
-            phi_pot: 0.0,
             good_cuts: 0,
             bad_cuts: 0,
             misses: 0,
@@ -213,31 +207,6 @@ impl Core {
         self.reset_state();
     }
 
-    fn potential(&self) -> f64 {
-        if self.shaping_coef == 0.0 {
-            return 0.0;
-        }
-        let mut phi = 0.0;
-        let mut seen: u8 = 0;
-        for (i, n) in self.chart.iter().enumerate() {
-            if self.status[i] != 0 {
-                continue;
-            }
-            if seen & (1 << n.color) != 0 {
-                continue;
-            }
-            seen |= 1 << n.color;
-            let c = note_center(n);
-            let p = self.sabers[n.color as usize].pos;
-            let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt();
-            phi -= self.shaping_coef * d.min(SHAPE_DIST_CLIP) / SHAPE_DIST_CLIP;
-            if seen == 3 {
-                break;
-            }
-        }
-        phi
-    }
-
     fn reset_state(&mut self) {
         self.tick = 0;
         self.time = 0.0;
@@ -248,7 +217,6 @@ impl Core {
         self.bad_cuts = 0;
         self.misses = 0;
         self.score = 0.0;
-        self.phi_pot = self.potential();
     }
 
     fn build_obs(&self) -> [f32; OBS_DIM] {
@@ -533,10 +501,6 @@ impl Core {
             }
         }
 
-        let new_phi = if done { 0.0 } else { self.potential() };
-        reward += SHAPE_GAMMA * new_phi - self.phi_pot;
-        self.phi_pot = new_phi;
-
         (reward, done, events)
     }
 }
@@ -549,10 +513,10 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (shaping_coef=0.0, max_steps=630))]
-    fn new(shaping_coef: f64, max_steps: u32) -> Self {
+    #[pyo3(signature = (max_steps=630))]
+    fn new(max_steps: u32) -> Self {
         RawBeatSim {
-            core: Core::new_core(shaping_coef, max_steps),
+            core: Core::new_core(max_steps),
         }
     }
 
@@ -675,12 +639,10 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, shaping_coef=0.0, max_steps=630))]
-    fn new(n: usize, shaping_coef: f64, max_steps: u32) -> Self {
+    #[pyo3(signature = (n, max_steps=630))]
+    fn new(n: usize, max_steps: u32) -> Self {
         VecBeatSim {
-            sims: (0..n)
-                .map(|_| Core::new_core(shaping_coef, max_steps))
-                .collect(),
+            sims: (0..n).map(|_| Core::new_core(max_steps)).collect(),
         }
     }
 

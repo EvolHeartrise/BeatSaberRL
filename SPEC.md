@@ -155,16 +155,11 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
   only accuracy (≤ 15/115) — swinging is now the whole game.
 - **Miss**: the note passes `z < −Z_MISS = 0.6` m uncut → consumed as
   missed.
-- **Potential-based shaping** (added after the first smoke run showed the
-  raw reward is too sparse — random motion never discovers the
-  place×speed×direction×window conjunction, entropy never leaves uniform):
-  `reward += 0.99·Φ(s′) − Φ(s)` with
-  `Φ = −shaping_coef · Σ_hands min(dist(saber, its earliest pending
-  matching note center), 2)/2` (in-plane distance, meters),
-  `Φ(terminal) = 0`. `shaping_coef` default
-  `0.2`, `0` disables. Potential-based form per Ng et al. 1999 — provably
-  cannot change the optimal policy; it only densifies the gradient.
-  Shaping must never change the event stream (tested).
+- **No reward shaping** (mechanism REMOVED 2026-07-21, user direction):
+  rewards come only from the sim's scoring, like real Beat Saber. The
+  potential-based shaping (Ng et al. 1999) used in v0's earliest runs was
+  already off by default in the pure-reward era (2026-07-20); its code
+  and the `shaping_coef` knob are now deleted everywhere.
 - **Termination**: all notes consumed AND no follow-through pending (so
   the last note's post-swing isn't truncated), or
   `t > last hit_time + 0.5 s`, or tick count = `max_steps` (default
@@ -181,7 +176,7 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
 `dirs` (allowed subset of 0..7, default `[6]` = down-swings),
 `min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
 restricting them is a spatial curriculum dial), `note_speed` (m/s toward
-the plane, default 4.0), `shaping_coef` (see §Sim rules).
+the plane, default 4.0).
 
 Generation: first note at `t = 1.0`; successive intervals
 `(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
@@ -229,7 +224,7 @@ statistic for arrival). Both properties are pinned by tests.
 ## Gymnasium env (`beat_arena_env/rust_env.py`)
 
 `RustBeatEnv(note_rate, colors, dirs, continuous_dirs, chart_len_s,
-min_hand_gap_s, shaping_coef, cols, rows, note_speed, note_speed_max,
+min_hand_gap_s, cols, rows, note_speed, note_speed_max,
 seed)`:
 `observation_space = Box(-2, 2, (140,))` (bounds loose),
 `action_space = MultiDiscrete([9, 3, 3, 9, 3, 3])` (per hand: move, rot,
@@ -285,8 +280,8 @@ tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
 (MediaRecorder → .webm). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
 `python/record_replay.py` records episodes from a checkpoint / the
-scripted bot / random (`--tag` prefixes filenames), always with
-`shaping_coef=0` so logged rewards are the raw interpretable ones.
+scripted bot / random (`--tag` prefixes filenames); logged rewards are
+the raw interpretable ones.
 Every interesting run should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
@@ -345,7 +340,7 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 `--num-envs --horizon --minibatches --epochs --total-steps --time-cap
 --ent-coef --seed --ckpt-every --run-dir --init-from --bench` + env
 config (`--note-rate --colors --dirs --cols --rows --chart-len
---min-hand-gap --note-speed --shaping-coef`) + curriculum mode
+--min-hand-gap --note-speed`) + curriculum mode
 (`--curriculum` + friends, see §Curriculum training). Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
@@ -424,7 +419,8 @@ auto-reset with Python-side chart gen and per-episode info dicts.
 `train_batch.py` = same PPO math as train_smoke, one policy forward per
 vector step; batch = num_envs × horizon. Parity: VecBeatSim(1) ≡
 RawBeatSim (tested); the batched trainer reproduces the serial path's
-learning curve on the easy+shaping reference config.
+learning curve on the easy reference config (validated pre-v5, when
+shaping still existed).
 
 Throughput measured 2026-07-20 (8-core CPU, hard config, T=128):
 

@@ -29,7 +29,7 @@ def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False):
 
 def _sim_with_note(note, max_steps=630):
     from beat_arena_env.chart import note_tuple
-    sim = RawBeatSim(shaping_coef=0.0, max_steps=max_steps)
+    sim = RawBeatSim(max_steps=max_steps)
     sim.set_chart([note_tuple(note)])
     return sim
 
@@ -273,7 +273,7 @@ def test_dot_note_scores_from_any_direction():
 
 def test_dot_note_obs_is_zero_vector():
     from beat_arena_env.chart import note_tuple
-    sim = RawBeatSim(shaping_coef=0.0, max_steps=630)
+    sim = RawBeatSim(max_steps=630)
     obs = sim.set_chart([note_tuple(_note(2.0, 1, 1, any_dir=True))])
     assert obs[OFF_NOTES + 6] == 0.0 and obs[OFF_NOTES + 7] == 0.0
     assert obs[OFF_NOTES + 8] == 1.0  # still valid
@@ -372,31 +372,6 @@ def test_note_speed_scales_the_time_window():
             t += 1
         ticks[speed] = t
     assert ticks[8.0] < ticks[4.0]
-
-
-# --- shaping (ablation-only mechanism, still contract-tested) ---------------
-
-def test_shaping_changes_rewards_not_events():
-    def run(coef):
-        sim = RawBeatSim(shaping_coef=coef, max_steps=630)
-        chart = generate_chart(ChartConfig(), np.random.default_rng(5))
-        from beat_arena_env.chart import note_tuple
-        sim.set_chart([note_tuple(n) for n in chart])
-        rng = np.random.default_rng(2)
-        rewards, events = [], []
-        done = False
-        while not done:
-            a = rng.integers(0, ACTION_NVEC)
-            _, r, done, ev = sim.step(*(int(x) for x in a))
-            rewards.append(r)
-            events.append(ev)
-        return rewards, events
-
-    r0, e0 = run(0.0)
-    r1, e1 = run(0.2)
-    assert e0 == e1
-    assert r0 != r1
-    assert abs(sum(r1) - sum(r0)) < 1.0
 
 
 # --- chart generation --------------------------------------------------------

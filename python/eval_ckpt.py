@@ -33,7 +33,7 @@ def main():
     cfg = ChartConfig(note_rate=args.note_rate, colors=args.colors,
                       continuous_dirs=not args.discrete_dirs,
                       dirs=tuple(args.dirs), note_speed=args.note_speed,
-                      note_speed_max=args.note_speed_max, shaping_coef=0.0)
+                      note_speed_max=args.note_speed_max)
     pol = load_policy(torch.load(args.ckpt, map_location="cpu",
                                  weights_only=True))
     pol.eval()
@@ -43,7 +43,7 @@ def main():
     for ep in range(args.episodes):
         rng = np.random.default_rng(args.seed0 + ep)
         env = RustBeatEnv(external_chart=generate_chart(cfg, rng),
-                          shaping_coef=0.0, seed=args.seed0 + ep)
+                          seed=args.seed0 + ep)
         obs, _ = env.reset()
         done, ret = False, 0.0
         while not done:
