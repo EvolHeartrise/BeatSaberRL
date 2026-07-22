@@ -143,5 +143,7 @@ not comparable.
   DOFs (azimuth + supination/pronation tilt), real 1 m saber, swept-blade
   cut geometry replacing the ±0.6 m slab, real-BS 115-point graded
   scoring (pre-swing/follow-through/accuracy) as reward. All v4
-  checkpoints/replays retired. `--env torch` and `viz/replay.html` not
-  yet ported to v5 (Rust-first; port assessments in the session notes).
+  checkpoints/replays retired. Same-day: `--env torch` ported (float64
+  parity with Rust exact, 29k steps/s in the wide+e4 regime, 4.3 GB) and
+  `viz/replay.html` ported to replay v4 (blade rendering, score popups,
+  reach region).

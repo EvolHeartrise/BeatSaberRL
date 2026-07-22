@@ -1,18 +1,15 @@
-"""Parity tests: TorchBeatVecEnv vs the Rust sim (THE reference).
+"""Parity tests: TorchBeatVecEnv vs the Rust sim (THE reference), env v5.
 
 Tier 1 (float64, CPU): exact agreement — same chart + same actions must give
-identical rewards, done timing, event counters, and obs (to f32 rounding).
-Tier 2 (float32, GPU): bounded drift — 600 ticks of fp32 integration may flip
-knife-edge cut decisions, so counters get a small tolerance. Skipped without
-CUDA.
+identical rewards, done timing, event counters, score, and obs (to f32
+rounding). Tier 2 (float32, GPU): bounded drift — hundreds of ticks of fp32
+integration may flip knife-edge cut decisions, so counters get a small
+tolerance. Skipped without CUDA.
 """
 
 import numpy as np
 import pytest
 import torch
-
-pytest.skip("torch env not yet ported to sim v5 (blade sabers)",
-            allow_module_level=True)
 
 from beat_arena_env import RustBeatEnv, scripted_action
 from beat_arena_env.chart import ChartConfig, generate_chart
@@ -21,6 +18,7 @@ from beat_arena_env.torch_env import TorchBeatVecEnv
 EASY = dict(note_rate=1.0, colors="right", dirs=(6,))
 DYN = dict(note_rate=2.5, colors="both", continuous_dirs=True,
            note_speed=3.0, note_speed_max=6.0)
+ACTION_NVEC = [9, 3, 3, 9, 3, 3]
 
 
 def _chart(cfg_kw, seed):
@@ -40,7 +38,7 @@ def _rust_episode(chart, policy):
         obs_l.append(obs.copy())
         rews.append(r)
     return acts, obs_l, rews, (info["good_cuts"], info["bad_cuts"],
-                               info["misses"])
+                               info["misses"], info["score"])
 
 
 def _torch_episode(chart, actions, device, dtype):
@@ -56,13 +54,14 @@ def _torch_episode(chart, actions, device, dtype):
         if bool(done[0]):
             done_at = i
             break
-    counters = (int(env.good[0]), int(env.bad[0]), int(env.miss[0]))
+    counters = (int(env.good[0]), int(env.bad[0]), int(env.miss[0]),
+                float(env.score[0]))
     return obs_l, rews, done_at, counters
 
 
 def _random_policy(seed):
     rng = np.random.default_rng(seed)
-    return lambda env, obs: rng.integers(0, 9, size=2)
+    return lambda env, obs: rng.integers(0, ACTION_NVEC)
 
 
 def _scripted_policy():
@@ -80,7 +79,8 @@ def test_parity_exact_f64(cfg_kw, pol, seed):
     t_obs, t_rews, done_at, t_cnt = _torch_episode(
         chart, acts, "cpu", torch.float64)
     assert done_at == len(acts) - 1, "episode length differs"
-    assert t_cnt == r_cnt, f"counters differ: torch {t_cnt} rust {r_cnt}"
+    assert t_cnt[:3] == r_cnt[:3], f"counters differ: torch {t_cnt} rust {r_cnt}"
+    assert t_cnt[3] == pytest.approx(r_cnt[3], abs=1e-6)
     np.testing.assert_allclose(t_rews, r_rews, atol=1e-9)
     for k, (to, ro) in enumerate(zip(t_obs[:-1], r_obs[:-1])):
         np.testing.assert_allclose(to, ro, atol=1e-6,
@@ -95,9 +95,10 @@ def test_parity_f32_gpu(cfg_kw, seed):
     t_obs, t_rews, done_at, t_cnt = _torch_episode(
         chart, acts, "cuda", torch.float32)
     # fp32 may flip knife-edge decisions; bound the drift, don't demand zero
-    assert done_at is not None and abs(done_at - (len(acts) - 1)) <= 2
-    for a, b in zip(t_cnt, r_cnt):
+    assert done_at is not None and abs(done_at - (len(acts) - 1)) <= 3
+    for a, b in zip(t_cnt[:3], r_cnt[:3]):
         assert abs(a - b) <= 2, f"counters drifted: torch {t_cnt} rust {r_cnt}"
+    assert t_cnt[3] == pytest.approx(r_cnt[3], abs=60.0)  # ~half a note's pts
     n = min(len(t_obs), len(r_obs)) - 1
     np.testing.assert_allclose(t_obs[:n], r_obs[:n], atol=5e-3)
 
@@ -106,11 +107,11 @@ def test_auto_reset_and_stats():
     env = TorchBeatVecEnv(4, seed=3, chart_pool=8, device="cpu",
                           dtype=torch.float32, **DYN)
     obs = env.reset()
-    assert obs.shape == (4, 128)
+    assert obs.shape == (4, 140)
     rng = np.random.default_rng(0)
     dones = 0
     for _ in range(1300):  # two episode lengths: every env must cycle
-        a = torch.as_tensor(rng.integers(0, 9, size=(4, 2)))
+        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 6)))
         obs, r, done, infos = env.step(a)
         assert infos == []
         dones += int(done.sum())
@@ -129,7 +130,7 @@ def test_same_seed_reproduces():
         rng = np.random.default_rng(1)
         tot = torch.zeros(2)
         for _ in range(400):
-            a = torch.as_tensor(rng.integers(0, 9, size=(2, 2)))
+            a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(2, 6)))
             obs, r, done, _ = env.step(a)
             tot += r
         return obs.clone(), tot

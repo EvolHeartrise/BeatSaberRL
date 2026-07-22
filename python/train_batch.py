@@ -173,9 +173,6 @@ def main():
 
     assert not (args.curriculum and args.env == "torch"), (
         "--curriculum needs --env rust (real-map sampler is Python-side)")
-    assert args.env != "torch", (
-        "--env torch is not yet ported to sim v5 (blade sabers); "
-        "use --env rust until torch_env.py catches up")
     torch_env = args.env == "torch"
     curriculum = None
     if args.curriculum:
