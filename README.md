@@ -201,6 +201,13 @@ and pre-v6 references are not comparable.
   outlines). The v5.2 record ckpt re-evaled at **98.0% good / 0 miss /
   106.8 / +43.72** on the stricter geometry (was 99.1/107.7) —
   center-cutting generalizes.
+- **v6 PROJECT RECORD (2026-07-22): 99.5% good / 109.7 score / 0 miss /
+  +45.28** — 500M-schedule wide-cosine run (stopped externally at
+  443M; eval = `runs/v6_wide_e4cos_500m/ckpt_upd0800.pt`, 419M steps,
+  ~5.2 h). Beats v5.2's 99.1/107.7 on the far harder body and settles
+  the 50M run's open question: 90.6 was budget starvation, not a d64
+  ceiling — the same 107k-param net plays the 12-DOF arm chain
+  near-perfectly given steps.
 - **First v6 result (2026-07-22): 90.6% good / 91.7 score / 1.3% miss /
   +35.74 on the dynamic gym** — 50M wide-cosine from scratch
   (`runs/v6_wide_e4cos_50m`, 37 min, 22.3k steps/s), 30-ep greedy eval.
