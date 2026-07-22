@@ -136,6 +136,56 @@ export function tipOf(hand, sab) {
   return [0, 1, 2].map((i) => wrist[i] + SABER_LEN * blade[i]);
 }
 
+const _dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const _sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const _cross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const _len = (a) => Math.hypot(a[0], a[1], a[2]);
+
+/** The ACTUAL cut plane of a good cut, reconstructed from the cutting
+ * hand's blade sweep at the cut tick, in NOTE-LOCAL coords (the frame
+ * the cube is drawn in: rotated by noteRot, origin at the note center,
+ * z toward the notes). Returns { p (point on plane, clamped into the
+ * cube), n (unit normal), v (unit sweep dir), b (unit blade dir) } or
+ * null when the sweep is degenerate (pure stab: sweep parallel to the
+ * blade) — callers fall back to the canonical center split. */
+export function cutPlaneLocal(rep, noteIdx) {
+  const n = rep.chart[noteIdx], o = rep.outcomes[noteIdx];
+  if (!o || o.kind !== "good") return null;
+  const k = Math.min(o.tick, rep.ticks.length - 1);
+  const k0 = Math.max(0, k - 1);
+  const hand = n.color; // good cuts are matching-hand by rule
+  const prev = armFK(hand, rep.ticks[k0].sabers[hand]);
+  const cur = armFK(hand, rep.ticks[k].sabers[hand]);
+  const zCut = (n.t - (k + 1) * DT) * n.speed;
+  const [cx, cy] = noteCenter(n);
+  const center = [cx, cy, zCut];
+  // contact fraction: closest point of the tick-k blade line to center
+  const s = Math.min(Math.max(_dot(_sub(center, cur.wrist), cur.blade), 0),
+    SABER_LEN);
+  const p1 = [0, 1, 2].map((i) => cur.wrist[i] + s * cur.blade[i]);
+  const p0 = [0, 1, 2].map((i) => prev.wrist[i] + s * prev.blade[i]);
+  const sweep = _sub(p1, p0);
+  const nrm = _cross(cur.blade, sweep);
+  const nl = _len(nrm), vl = _len(sweep);
+  if (nl < 1e-6 || vl < 1e-9) return null;
+  // world -> note-local: R(-rot) about z, origin at the note center
+  const rot = noteRot(n);
+  const c = Math.cos(rot), sn = Math.sin(rot);
+  const loc = (w) => [c * w[0] + sn * w[1], -sn * w[0] + c * w[1], w[2]];
+  const p = loc(_sub(p1, center)).map(
+    (x) => Math.min(Math.max(x, -HALF * 0.95), HALF * 0.95));
+  return {
+    p,
+    n: loc(nrm.map((x) => x / nl)),
+    v: loc(sweep.map((x) => x / vl)),
+    b: loc(cur.blade),
+  };
+}
+
 /** Contact-capability: tip speed via finite difference across one tick
  * (env v6 contact-velocity semantics). */
 export function tipSpeed(rep, tickIdx, s) {

@@ -3,8 +3,8 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  activePosts, aftermaths, armFK, counts, parseReplay, pendingNotes,
-  saberAt, tipOf, tipSpeed, DT,
+  activePosts, aftermaths, armFK, counts, cutPlaneLocal, parseReplay,
+  pendingNotes, saberAt, tipOf, tipSpeed, DT,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
@@ -48,6 +48,24 @@ for (const frac of [0, 0.3, 0.6, 0.9, 1.0]) {
     po = activePosts(rep, t);
   assert.ok(p.length + a.length >= 0 && po.length >= 0);
 }
+
+// actual-cut-plane reconstruction: every good cut yields a sane plane
+// (unit normal, point inside the cube) or a declared-degenerate null
+let planes = 0;
+rep.chart.forEach((n, i) => {
+  const o = rep.outcomes[i];
+  if (!o || o.kind !== "good") return;
+  const cp = cutPlaneLocal(rep, i);
+  if (!cp) return; // pure stab: canonical fallback
+  planes++;
+  const nl = Math.hypot(...cp.n);
+  assert.ok(Math.abs(nl - 1) < 1e-9, `non-unit cut normal at note ${i}`);
+  assert.ok(cp.p.every((x) => Math.abs(x) <= 0.2 && Number.isFinite(x)),
+    `cut point outside cube at note ${i}`);
+  assert.ok([...cp.v, ...cp.b].every(Number.isFinite));
+});
+assert.ok(planes > 0, "no cut planes reconstructed at all");
+console.log(`cut planes reconstructed for ${planes} good cuts`);
 
 // replays from retired parameterizations are rejected
 assert.throws(
