@@ -101,7 +101,6 @@
   </div>
 
   <div id="top" class="overlay">
-    <h1>Beat Arena — 3D replay viewer</h1>
     <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}>
       {#if pb.rep}
         {pb.name} — {configSummary(pb.rep)}
@@ -160,19 +159,6 @@
         oninput={(e) => { setPlaying(false); pb.cur = +e.target.value; }}
       />
     </div>
-    <div id="help">
-      drag = orbit · wheel = zoom · right-drag = pan · space = play/pause ·
-      ←/→ = step one tick · +/− = speed · r = restart · g = arm gauges ·
-      h = real hitbox wireframes (green = matching saber, orange = the
-      small wrong-color box) · p = manual pose mode (slider-drive the 12
-      arm joints, no replay needed) · env v7: floor at y = 0, real BS lanes/rows;
-      blocks, black bombs, squashed chain heads + link slabs fly in; faint
-      color tubes = arc scoring hints (free pre/post swing) · each hand is
-      a shoulder→elbow→wrist arm chain holding a 1 m blade · white blade
-      core = contact-capable (tip ≥ 1 m/s) · white outline = within blade
-      reach · +N popups = points (115/note: 70 pre-swing, 30
-      follow-through, 15 accuracy; chain heads 85, links flat 20)
-    </div>
   </div>
 </main>
 
@@ -199,10 +185,6 @@
     border-radius: 10px;
     backdrop-filter: blur(6px);
   }
-  h1 {
-    font-size: 15px; font-weight: 600; margin: 0; color: #e8eaf0;
-    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
-  }
   #drop {
     border: 1.5px dashed #4a4f5c; border-radius: 10px; padding: 8px 18px;
     color: #9aa0ae; cursor: pointer; font: inherit;
@@ -228,8 +210,4 @@
   .good { color: #7dd3a0; }
   .bad { color: #f0a35e; }
   .miss { color: #e06c75; }
-  #help {
-    font-size: 11px; color: #6b7180; max-width: min(920px, 92vw);
-    text-align: center; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
-  }
 </style>
