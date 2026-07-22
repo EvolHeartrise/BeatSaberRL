@@ -68,36 +68,43 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
   zeroes the clamped velocity component), velocity `v`, speed cap
   `V_MAX = 6` m/s, accel `A = 30` m/s², drag `DRAG = 0.02` per tick.
   Start at rest at `(∓0.5, 0)`.
-- **Blade** per hand: rigid segment of length `SABER_LEN = 1.0` m (real
-  Beat Saber) from the wrist along direction
-  `d(θ, φ) = (cosφ·cosθ, cosφ·sinθ, sinφ)`:
-  - `θ` = **azimuth**, the in-plane clock angle (0 = +x, CCW) — the
-    swing DOF, driven by wrist CW/CCW rotation. **Clamped per hand
-    (env v5.1, 2026-07-21 — anatomical roll limits, no infinite wrist
-    rolls)**: from the palm-down neutral (= the ready stance, blade up,
-    θ = 90°) the right wrist rolls 90° CCW / 190° CW max →
-    `θ_R ∈ [−100°, 180°]`; mirrored left: `θ_L ∈ [0°, 280°]`. Each hand
-    has a 280° arc; hitting a limit zeroes `ω_θ` (same rule as the tilt
-    clamp). θ no longer wraps — it is a plain bounded angle, and
-    (cos θ, sin θ) stays unique since 280° < 360°. Policies trained
-    before the clamp (the 98.3% v5.0 record) are not comparable.
-  - `φ` = **tilt** out of the plane, driven by supination/pronation:
-    `+φ` pitches the blade toward the incoming notes (+z). Clamped to
-    `±PHI_LIM = 95°` (1.65806 rad) from the in-plane middle (env v5.1
-    anatomical limit; was 75°). The range crosses the φ=90° pole — the
-    blade can tip just past straight-forward/straight-back; `d(θ,φ)`
-    stays smooth there (`d/dθ` vanishes at the pole, which is correct
-    physics: azimuth-spinning a forward-pointing blade moves nothing).
-    Hitting the clamp zeroes `ω_φ`.
+- **Blade** per hand (env v5.2, 2026-07-21 — forearm-anchored
+  parameterization; supersedes the v5.0/v5.1 azimuth+tilt model, whose
+  neutral was in-plane and which let blades point straight back at the
+  player): rigid segment of length `SABER_LEN = 1.0` m (real Beat
+  Saber) from the wrist along
+  `d(ψ, φ) = (−sinψ·sinφ, cosψ·sinφ, cosφ)` — the neutral blade is the
+  forearm's extension, **pointing at the incoming notes (+z)**:
+  - `ψ` = **roll**: forearm CW/CCW rotation about the forward axis
+    (pronation/supination). It orients the plane the wrist bends in; it
+    does NOT move a straight-forward blade (`d` is ψ-independent at
+    φ = 0 — spinning a forward saber about its own axis, correct
+    physics). Anatomical limits from the palm-down neutral (ψ = 0):
+    right 90° CCW / 190° CW → `ψ_R ∈ [−190°, 90°]`; mirrored left
+    `ψ_L ∈ [−90°, 190°]`. 280° arcs, (cos ψ, sin ψ) unique, no wrap;
+    hitting a limit zeroes `ω_ψ`.
+  - `φ` = **bend**: wrist deflection away from straight-forward
+    (flexion/extension), signed, clamped to `±BEND_LIM = 95°`
+    (1.65806 rad). `φ = 0` points at the notes; `|φ| = 90°` lays the
+    blade flat in the hit plane (in-plane azimuth = `ψ + 90°` for
+    `+φ`, `ψ − 90°` for `−φ` — each azimuth is reachable by flexion OR
+    extension, like a real wrist); `|φ| = 95°` reaches 5° past the
+    plane. **The blade can therefore NEVER point back at the player**:
+    `d_z ≥ cos 95° ≈ −0.087` by construction. Hitting the clamp zeroes
+    `ω_φ`.
   - Angular dynamics per DOF mirror the linear ones:
     `ω += ±ALPHA_ROT·DT` (`ALPHA_ROT = 200` rad/s²), `ω *= (1 − DRAG)`,
     clamp `|ω| ≤ OMEGA_MAX = 20` rad/s, `angle += ω·DT`.
-    Start pose: `θ = π/2` (blade straight up), `φ = 0`, `ω = 0`.
-- **Action** per tick, per hand: `(move, rot, tilt)` —
+    Start pose: `ψ = 0, φ = 0` (both blades pointing at the notes),
+    `ω = 0`. Checkpoints/replays from v5.0–v5.1 retire (the 98.7%
+    v5.1 policy demonstrably held blades tilted BACKWARD — the exploit
+    this model closes).
+- **Action** per tick, per hand: `(move, roll, bend)` —
   `move` one of 9 (0 = coast, `k ∈ 1..8` = accelerate at `A` toward
-  `(k−1)·45°`); `rot`/`tilt` each one of 3 (0 = coast, 1 = `+α`,
-  2 = `−α`; `rot` positive = CCW azimuth, `tilt` positive = toward +z).
-  Full action = `MultiDiscrete([9,3,3, 9,3,3])`, left hand first.
+  `(k−1)·45°`); `roll`/`bend` each one of 3 (0 = coast, 1 = `+α`,
+  2 = `−α`; roll positive = CCW from the player's view, bend positive =
+  toward the `+φ` flexion side). Full action =
+  `MultiDiscrete([9,3,3, 9,3,3])`, left hand first.
   Integration order per tick: translation (`v += a·DT`; drag; cap;
   `p += v·DT`; clamp) then rotation (per-DOF as above). No action masks.
 - **Notes** (unchanged from env v4): chart = list of
@@ -115,10 +122,11 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
 - **Cut evaluation** (no more slab): a note is testable while
-  `−Z_MISS ≤ z ≤ REACH_Z = 1.28` m (max tip z `sin(95°)·1 m + R`; the
-  reach window replaces the old ±0.6 m slab — timing tolerance is now
-  physical: an in-plane blade covers |z| ≤ R ≈ ±0.07 s at 4 m/s, and
-  tilting forward buys earlier contact). Each tick the blade sweep is
+  `−Z_MISS ≤ z ≤ REACH_Z = 1.28` m (max tip z = a straight-forward
+  blade, 1 m, + R; the reach window replaces the old ±0.6 m slab —
+  timing tolerance is physical: a flat blade covers |z| ≤ R ≈ ±0.07 s
+  at 4 m/s, pointing forward buys earlier contact, and behind the plane
+  the blade reaches only `cos 95°·1 m + R ≈ 0.37 m`). Each tick the blade sweep is
   approximated by `N_BLADE_SAMPLES = 8` points at `s·SABER_LEN`,
   `s = 1/8 .. 8/8`: each sample's displacement segment (prev wrist+pose →
   current wrist+pose, full 3D) is tested against the note center (3D
@@ -186,11 +194,12 @@ places at once faster than it can travel). Col/row uniform over the grid.
 Obs v4 (env v5 blade state; note block unchanged from v3):
 
 - `sabers: [f32; 20]` = per hand (left then right), 10 features:
-  `[x/1, y/0.75, vx/6, vy/6, cosθ, sinθ, φ/PHI_LIM, ωθ/20, ωφ/20,
-  min(swing_acc/100°, 2)]` — wrist state, blade pose (angle as its unit
-  vector: wrap-free, same convention as note directions), angular
-  velocities, and the live pre-swing meter (1.0 = full pre-swing credit
-  banked; clipped at 2 — reward-relevant state the policy must see).
+  `[x/1, y/0.75, vx/6, vy/6, cosψ, sinψ, φ/BEND_LIM, ωψ/20, ωφ/20,
+  min(swing_acc/100°, 2)]` — wrist state, joint pose (roll as its unit
+  vector — wrap-free and unique on a 280° range; signed normalized
+  bend), angular velocities, and the live pre-swing meter (1.0 = full
+  pre-swing credit banked; clipped at 2 — reward-relevant state the
+  policy must see).
 - `notes: [[f32; 9]; 12]` — the next 12 *pending* (uncut, unmissed) notes
   in arrival order, slot 0 = soonest. Per note:
   `[cx/1, cy/0.75, z/8 (z clipped to [−1, 12] m — the negative tail keeps
@@ -233,17 +242,17 @@ max = 115 · n_notes). `set_record(path)` dumps replay JSONL v4 built
 from those events. Batched training path:
 `beat_arena_env/vec_env.py: BeatVecEnv` over `VecBeatSim`.
 
-## Replay log (JSONL, version 4)
+## Replay log (JSONL, version 5)
 
-Version 4 (env v5): saber entries grow blade pose
-`[x, y, vx, vy, theta, phi, om_th, om_ph]`; cut events carry `points`
-(pre+accuracy at the cut, follow-through via a separate `post` event);
-the action is the 6-int vector. Pre-v4 replays are point-saber and
-rejected by a v5 viewer (and vice versa).
+Version 5 (env v5.2): saber entries carry the joint pose
+`[x, y, vx, vy, roll, bend, om_roll, om_bend]`; cut events carry
+`points` (pre+accuracy at the cut, follow-through via a separate `post`
+event); the action is the 6-int vector. v4 replays (the retired v5.0/
+v5.1 azimuth+tilt parameterization) and older are rejected.
 
 ```json
-{"header": {"version": 4, "config": {..., "note_speed": 4.0}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"angle":4.712,"speed":4.0,"any":false}, ...]}}
-{"t": 0, "time": 0.0, "sabers": [[x,y,vx,vy,theta,phi,om_th,om_ph],[...]], "action": [0,1,0,5,2,0],
+{"header": {"version": 5, "config": {..., "note_speed": 4.0}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"angle":4.712,"speed":4.0,"any":false}, ...]}}
+{"t": 0, "time": 0.0, "sabers": [[x,y,vx,vy,roll,bend,om_roll,om_bend],[...]], "action": [0,1,0,5,2,0],
  "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok", "points": 78.4}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand", "points": 0}} | {"post": {"note": 3, "points": 26.1}} | {"miss": {"note": 5}}]}
 ```
 
@@ -287,20 +296,24 @@ contact the blade must be PERPENDICULAR to the required direction `e`
 (swinging sweeps the contact point along `e`). Two candidates — CCW
 swing (`θ_c = angle − 90°`) or CW (`θ_c = angle + 90°`), each with wrist
 goal `center − 0.75·SABER_LEN·(cosθ_c, sinθ_c)` (note passes the blade
-at 75% of its length). Env v5.1: each candidate's `θ_c` is first fitted
-into the hand's azimuth range (mod 2π; at least one of the two opposite
-orientations always fits a 280° arc); candidates are ranked by
+at 75% of its length). Env v5.2: the bot swings FLAT — it holds the
+bend at `φ = +90°` (blade in the hit plane, 5° shy of the clamp) and
+swings by ROLLING, so the blade's in-plane azimuth is `ψ + 90°` and the
+reachable azimuth window equals `[ψ_lo, ψ_hi] + 90°` (= [0°, 280°] left
+/ [−100°, 180°] right, the same windows as v5.1). Each candidate's
+`θ_c` is fitted into that window (mod 2π; at least one of the two
+opposite orientations always fits a 280° arc); candidates are ranked by
 full-swing feasibility (wind-up room ≥ `SWING_ARC = 130°` AND
 follow-through room ≥ 45° inside the limits), then wrist-goal
 in-bounds, then wrist distance. The wind-up target is
 `θ_c − sense·min(SWING_ARC, room_back − 5°)` and the whip starts at a
-per-arc swing time (accel/Ω_MAX physics + 0.02 s margin) instead of a
-fixed 0.18 s. **Wind-up phase**: wrist steers to the goal (arrival
-steering) while the azimuth steers (bang-bang toward a desired ω via
-the 3-way rot action, direct unwrapped error — the short way around may
-cross a limit) to the wind-up target and tilt steers to `φ = 0`.
-**Swing phase**: full rot accel in the swing sense until the note
-resolves; the leftover rotation after contact is the follow-through.
+per-arc swing time (accel/Ω_MAX physics + 0.02 s margin). **Wind-up
+phase**: wrist steers to the goal (arrival steering) while the roll
+steers (bang-bang toward a desired ω via the 3-way roll action, direct
+unwrapped error — the short way around may cross a limit) to the
+wind-up target and the bend steers to `+90°`. **Swing phase**: full
+roll accel in the swing sense until the note resolves; the leftover
+rotation after contact is the follow-through.
 Stateless per tick; solvability proof and eyeball baseline, not
 optimal. Must land ≥ 80% good cuts on the default easy chart (tested),
 with mean score well above the 15-point stab ceiling.
@@ -388,9 +401,9 @@ injected per episode via `set_chart` (~0.5 µs/step amortized).
 returns `(obs, reward, done, events)` — events = `(note_idx, code,
 points)` with codes 0 ok / 1 slow / 2 angle / 3 wrong_hand / 4 miss /
 5 post (follow-through resolution) — plus getters
-`sabers()` (per hand `[x,y,vx,vy,theta,phi,om_th,om_ph]`),
-`status()/time/score/counters` and a `set_saber(s, x, y, vx, vy, theta,
-phi, om_th, om_ph)` test hook. `VecBeatSim` steps N sims per FFI call
+`sabers()` (per hand `[x,y,vx,vy,roll,bend,om_roll,om_bend]`),
+`status()/time/score/counters` and a `set_saber(s, x, y, vx, vy, roll,
+bend, om_roll, om_bend)` test hook. `VecBeatSim` steps N sims per FFI call
 (actions `(N, 6)` i64); `counters(i)` = `(good, bad, miss, n_notes,
 score)`. The scenario tests in `tests/test_env.py` gate every rule
 change.

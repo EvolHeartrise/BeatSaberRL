@@ -1,9 +1,11 @@
-// Replay format v4 (SPEC.md §Replay log): env v5.1 blade sabers.
+// Replay format v5 (SPEC.md §Replay log): env v5.2 forearm-anchored blades.
 // Pure logic only (no three/svelte imports) — unit-tested in node.
 //
 // World: hit plane z = 0; grid spans [-1,1] x [-0.75,0.75] (0.5 m lanes);
-// 0.4 m note cubes approach from +z. Sabers = [x, y, vx, vy, theta, phi,
-// om_th, om_ph]: wrist on the plane + 1 m blade at azimuth theta / tilt phi.
+// 0.4 m note cubes approach from +z. Sabers = [x, y, vx, vy, roll, bend,
+// om_roll, om_bend]: wrist on the plane + 1 m blade whose neutral points AT
+// the notes; roll orients the bend plane (forearm CW/CCW), bend deflects
+// away from forward (+-95 deg — it can never point back at the player).
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
@@ -12,12 +14,12 @@ export const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
 export const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
 export const SABER_LEN = 1.0, REACH_Z = 1.28, Z_MISS = 0.6;
 export const V_MIN = 1, DT = 1 / 30;
-// env v5.1 anatomical wrist limits (mirror the sim): azimuth per hand,
-// tilt +-95 deg from the in-plane middle
+// env v5.2 anatomical joint limits (mirror the sim): forearm roll per
+// hand, wrist bend +-95 deg from straight-forward
 const RAD = Math.PI / 180;
-export const THETA_LO = [0, -100 * RAD]; // left, right
-export const THETA_HI = [280 * RAD, Math.PI];
-export const PHI_LIM = 95 * RAD;
+export const ROLL_LO = [-90 * RAD, -190 * RAD]; // left, right
+export const ROLL_HI = [190 * RAD, 90 * RAD];
+export const BEND_LIM = 95 * RAD;
 export const OMEGA_MAX = 20;
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
@@ -28,10 +30,10 @@ export function parseReplay(text) {
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 4)
+  if (v !== 5)
     throw new Error(
-      "replay version " + v + " — this viewer reads v4 (env v5 blade " +
-      "sabers); pre-v4 replays are point-saber era",
+      "replay version " + v + " — this viewer reads v5 (env v5.2 forearm-" +
+      "anchored blades); older replays use retired saber parameterizations",
     );
   const ticks = lines.slice(1).map((l) => JSON.parse(l));
   const chart = head.header.chart;
@@ -80,16 +82,20 @@ export function lerpAng(a, b, u) {
   return a + d * u;
 }
 
-export function bladeDir(th, ph) {
-  const ct = Math.cos(th), st = Math.sin(th);
-  const cp = Math.cos(ph), sp = Math.sin(ph);
-  return [cp * ct, cp * st, sp];
+export function bladeDir(roll, bend) {
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const cb = Math.cos(bend), sb = Math.sin(bend);
+  return [-sr * sb, cr * sb, cb];
 }
 
-export function bladeDirDot(th, ph, wt, wp) {
-  const ct = Math.cos(th), st = Math.sin(th);
-  const cp = Math.cos(ph), sp = Math.sin(ph);
-  return [-wt * cp * st - wp * sp * ct, wt * cp * ct - wp * sp * st, wp * cp];
+export function bladeDirDot(roll, bend, wr, wb) {
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const cb = Math.cos(bend), sb = Math.sin(bend);
+  return [
+    -wr * cr * sb - wb * sr * cb,
+    -wr * sr * sb + wb * cr * cb,
+    -wb * sb,
+  ];
 }
 
 /** Interpolated 8-field saber state at (tickIdx + u). */

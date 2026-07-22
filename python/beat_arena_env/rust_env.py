@@ -3,7 +3,7 @@
 Chart generation stays in Python (once per episode); physics, cut logic,
 scoring, and obs building live in rust/src/lib.rs. Per-step cut/miss
 events come back from Rust and are exposed in `info["events"]` as
-(note_idx, reason, points) tuples; replay recording (JSONL v4, SPEC.md)
+(note_idx, reason, points) tuples; replay recording (JSONL v5, SPEC.md)
 is built from them via `set_record`.
 
 Build the extension once with:
@@ -64,7 +64,7 @@ class RustBeatEnv(gym.Env):
 
     def _start_record(self):
         header = {"header": {
-            "version": 4,
+            "version": 5,
             "config": {
                 "note_rate": self.cfg.note_rate,
                 "chart_len_s": self.cfg.chart_len_s,

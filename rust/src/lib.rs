@@ -1,12 +1,14 @@
 //! Beat Arena sim core in Rust — THE physics implementation (SPEC.md is
 //! the contract; `python/beat_arena_env/constants.py` mirrors constants).
 //!
-//! Env v5 (2026-07-21): blade sabers. Each hand = a wrist (point mass on
-//! the hit plane, the old point-saber dynamics) + a rigid 1 m blade whose
-//! 3D direction is driven by two wrist DOFs: azimuth theta (in-plane
-//! CW/CCW rotation — the swing) and tilt phi (supination/pronation —
-//! pitch toward the incoming notes). Cuts are swept-blade-through-block
-//! events scored with the real Beat Saber 115-point system: 70 pre-swing
+//! Env v5.2 (2026-07-21): blade sabers with forearm-anchored joints.
+//! Each hand = a wrist (point mass on the hit plane, the old point-saber
+//! dynamics) + a rigid 1 m blade whose neutral is the forearm's
+//! extension, POINTING AT THE NOTES; two joints drive it: roll (forearm
+//! CW/CCW about the forward axis, per-hand 280-degree range) and bend
+//! (wrist deflection away from forward, +-95 deg — the blade can never
+//! point back at the player). Cuts are swept-blade-through-block events
+//! scored with the real Beat Saber 115-point system: 70 pre-swing
 //! (100 deg), 30 follow-through (60 deg), 15 accuracy-to-center.
 //!
 //! Chart generation stays in Python (single source of truth, once per
@@ -34,16 +36,18 @@ const SHAPE_DIST_CLIP: f64 = 2.0;
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
 const ALPHA_ROT: f64 = 200.0; // rad/s^2, both angular DOFs
 const OMEGA_MAX: f64 = 20.0; // rad/s
-// env v5.1 anatomical wrist limits (2026-07-21, user-specified): no
-// infinite rolls. Azimuth from the palm-down neutral (= ready stance,
-// blade up, 90 deg): right wrist 90 deg CCW / 190 deg CW max ->
-// [-100, 180] deg; mirrored left -> [0, 280] deg. 280-degree arcs, so
-// (cos, sin) stays unique. Tilt: +-95 deg from the in-plane middle.
-const THETA_LO: [f64; 2] = [0.0, -1.7453292519943295]; // left, right
-const THETA_HI: [f64; 2] = [4.886921905584122, std::f64::consts::PI];
-const PHI_LIM: f64 = 1.6580627893946132; // 95 deg
+// env v5.2 forearm-anchored joints (2026-07-21, user-specified): the
+// neutral blade is the forearm's extension, POINTING AT THE NOTES (+z).
+// roll = forearm CW/CCW about the forward axis; from the palm-down
+// neutral the right wrist rolls 90 deg CCW / 190 deg CW ->
+// [-190, 90] deg, mirrored left [-90, 190]. bend = wrist deflection
+// away from forward, +-95 deg (90 = blade flat in the hit plane) — the
+// blade can NEVER point back at the player (d_z >= cos 95 ~ -0.087).
+const ROLL_LO: [f64; 2] = [-1.5707963267948966, -3.3161255787892263]; // L, R
+const ROLL_HI: [f64; 2] = [3.3161255787892263, 1.5707963267948966];
+const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
 const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
-const REACH_Z: f64 = 1.28; // max tip z (sin 95deg * 1 m) + CUT_RADIUS
+const REACH_Z: f64 = 1.28; // straight-forward tip (1 m) + CUT_RADIUS
 const Z_MISS: f64 = 0.6; // note consumed as missed past this
 
 // --- scoring (real Beat Saber 115) ------------------------------------------
@@ -88,21 +92,22 @@ fn note_center(n: &Note) -> [f64; 2] {
     [(n.col as f64 - 1.5) * CELL, (n.row as f64 - 1.0) * CELL]
 }
 
-/// Blade direction unit vector from (azimuth, tilt).
-fn blade_dir(theta: f64, phi: f64) -> [f64; 3] {
-    let (st, ct) = theta.sin_cos();
-    let (sp, cp) = phi.sin_cos();
-    [cp * ct, cp * st, sp]
+/// Blade direction unit vector from (roll, bend): neutral (+z, at the
+/// notes), bent away from forward in the plane the roll orients.
+fn blade_dir(roll: f64, bend: f64) -> [f64; 3] {
+    let (sr, cr) = roll.sin_cos();
+    let (sb, cb) = bend.sin_cos();
+    [-sr * sb, cr * sb, cb]
 }
 
 /// d/dt of the blade direction, given the angular velocities.
-fn blade_dir_dot(theta: f64, phi: f64, om_th: f64, om_ph: f64) -> [f64; 3] {
-    let (st, ct) = theta.sin_cos();
-    let (sp, cp) = phi.sin_cos();
+fn blade_dir_dot(roll: f64, bend: f64, om_r: f64, om_b: f64) -> [f64; 3] {
+    let (sr, cr) = roll.sin_cos();
+    let (sb, cb) = bend.sin_cos();
     [
-        -om_th * cp * st - om_ph * sp * ct,
-        om_th * cp * ct - om_ph * sp * st,
-        om_ph * cp,
+        -om_r * cr * sb - om_b * sr * cb,
+        -om_r * sr * sb + om_b * cr * cb,
+        -om_b * sb,
     ]
 }
 
@@ -125,10 +130,10 @@ fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 struct Saber {
     pos: [f64; 2],
     vel: [f64; 2],
-    theta: f64,
-    phi: f64,
-    om_th: f64,
-    om_ph: f64,
+    roll: f64,
+    bend: f64,
+    om_roll: f64,
+    om_bend: f64,
     swing_acc: f64,        // arc of the current continuous swing (rad)
     axis: Option<[f64; 3]>, // last tick's rotation axis (unit)
 }
@@ -138,10 +143,10 @@ impl Saber {
         Saber {
             pos: [x, 0.0],
             vel: [0.0; 2],
-            theta: std::f64::consts::FRAC_PI_2, // blade straight up
-            phi: 0.0,
-            om_th: 0.0,
-            om_ph: 0.0,
+            roll: 0.0, // palm down
+            bend: 0.0, // blade pointing at the notes
+            om_roll: 0.0,
+            om_bend: 0.0,
             swing_acc: 0.0,
             axis: None,
         }
@@ -254,11 +259,11 @@ impl Core {
             obs[b + 1] = (sab.pos[1] / Y_NORM) as f32;
             obs[b + 2] = (sab.vel[0] / V_MAX) as f32;
             obs[b + 3] = (sab.vel[1] / V_MAX) as f32;
-            obs[b + 4] = sab.theta.cos() as f32;
-            obs[b + 5] = sab.theta.sin() as f32;
-            obs[b + 6] = (sab.phi / PHI_LIM) as f32;
-            obs[b + 7] = (sab.om_th / OMEGA_MAX) as f32;
-            obs[b + 8] = (sab.om_ph / OMEGA_MAX) as f32;
+            obs[b + 4] = sab.roll.cos() as f32;
+            obs[b + 5] = sab.roll.sin() as f32;
+            obs[b + 6] = (sab.bend / BEND_LIM) as f32;
+            obs[b + 7] = (sab.om_roll / OMEGA_MAX) as f32;
+            obs[b + 8] = (sab.om_bend / OMEGA_MAX) as f32;
             // live pre-swing meter: 1.0 = full pre-swing credit banked
             obs[b + 9] = (sab.swing_acc / PRE_FULL).min(2.0) as f32;
         }
@@ -295,8 +300,8 @@ impl Core {
     fn step_inner(&mut self, actions: [[u8; 3]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
         let prev_pos = [self.sabers[0].pos, self.sabers[1].pos];
         let prev_dir = [
-            blade_dir(self.sabers[0].theta, self.sabers[0].phi),
-            blade_dir(self.sabers[1].theta, self.sabers[1].phi),
+            blade_dir(self.sabers[0].roll, self.sabers[0].bend),
+            blade_dir(self.sabers[1].roll, self.sabers[1].bend),
         ];
 
         let mut reward = 0.0;
@@ -330,36 +335,36 @@ impl Core {
                     sab.vel[ax] = 0.0;
                 }
             }
-            // rotation: azimuth (CW/CCW) and tilt (supination/pronation)
-            let rot = actions[s][1];
-            sab.om_th += match rot {
+            // rotation: forearm roll (CW/CCW) and wrist bend
+            let roll_a = actions[s][1];
+            sab.om_roll += match roll_a {
                 1 => ALPHA_ROT * DT,
                 2 => -ALPHA_ROT * DT,
                 _ => 0.0,
             };
-            let tilt = actions[s][2];
-            sab.om_ph += match tilt {
+            let bend_a = actions[s][2];
+            sab.om_bend += match bend_a {
                 1 => ALPHA_ROT * DT,
                 2 => -ALPHA_ROT * DT,
                 _ => 0.0,
             };
-            sab.om_th = (sab.om_th * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
-            sab.om_ph = (sab.om_ph * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
-            sab.theta += sab.om_th * DT;
-            // anatomical roll limits: no wrap — the azimuth is a bounded
-            // angle per hand; hitting a limit kills the roll velocity
-            if sab.theta < THETA_LO[s] || sab.theta > THETA_HI[s] {
-                sab.theta = sab.theta.clamp(THETA_LO[s], THETA_HI[s]);
-                sab.om_th = 0.0;
+            sab.om_roll = (sab.om_roll * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
+            sab.om_bend = (sab.om_bend * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
+            sab.roll += sab.om_roll * DT;
+            // anatomical limits: bounded joints, no wrap — hitting a limit
+            // kills that joint's velocity
+            if sab.roll < ROLL_LO[s] || sab.roll > ROLL_HI[s] {
+                sab.roll = sab.roll.clamp(ROLL_LO[s], ROLL_HI[s]);
+                sab.om_roll = 0.0;
             }
-            sab.phi += sab.om_ph * DT;
-            if sab.phi < -PHI_LIM || sab.phi > PHI_LIM {
-                sab.phi = sab.phi.clamp(-PHI_LIM, PHI_LIM);
-                sab.om_ph = 0.0;
+            sab.bend += sab.om_bend * DT;
+            if sab.bend < -BEND_LIM || sab.bend > BEND_LIM {
+                sab.bend = sab.bend.clamp(-BEND_LIM, BEND_LIM);
+                sab.om_bend = 0.0;
             }
 
             // swing chain update (feeds pre-swing + follow-through scores)
-            let d_new = blade_dir(sab.theta, sab.phi);
+            let d_new = blade_dir(sab.roll, sab.bend);
             let d_old = prev_dir[s];
             let dot = (d_old[0] * d_new[0] + d_old[1] * d_new[1] + d_old[2] * d_new[2])
                 .clamp(-1.0, 1.0);
@@ -435,7 +440,7 @@ impl Core {
             let center = [note_center(&n)[0], note_center(&n)[1], z];
             for &s in &[n.color as usize, 1 - n.color as usize] {
                 let sab = self.sabers[s];
-                let d_new = blade_dir(sab.theta, sab.phi);
+                let d_new = blade_dir(sab.roll, sab.bend);
                 // swept-blade test: 8 sample points along the blade, each
                 // tracing its own displacement segment (full 3D)
                 let mut d_min = f64::INFINITY;
@@ -463,7 +468,7 @@ impl Core {
                     continue;
                 }
                 // contact velocity: wrist translation + rotation at s*
-                let dd = blade_dir_dot(sab.theta, sab.phi, sab.om_th, sab.om_ph);
+                let dd = blade_dir_dot(sab.roll, sab.bend, sab.om_roll, sab.om_bend);
                 let vc = [
                     sab.vel[0] + s_star * dd[0],
                     sab.vel[1] + s_star * dd[1],
@@ -562,7 +567,7 @@ impl RawBeatSim {
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
-    /// Per-hand action = (move 0..8, rot 0..2, tilt 0..2); left then right.
+    /// Per-hand action = (move 0..8, roll 0..2, bend 0..2); left then right.
     /// Returns (obs, reward, done, events); events = [(note_idx, code, points)]
     /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post.
     #[allow(clippy::too_many_arguments)]
@@ -589,13 +594,13 @@ impl RawBeatSim {
         )
     }
 
-    /// Saber state [[x, y, vx, vy, theta, phi, om_th, om_ph]; 2] (world units).
+    /// Saber state [[x, y, vx, vy, roll, bend, om_roll, om_bend]; 2].
     fn sabers(&self) -> [[f64; 8]; 2] {
         [0, 1].map(|s| {
             let sab = self.core.sabers[s];
             [
                 sab.pos[0], sab.pos[1], sab.vel[0], sab.vel[1],
-                sab.theta, sab.phi, sab.om_th, sab.om_ph,
+                sab.roll, sab.bend, sab.om_roll, sab.om_bend,
             ]
         })
     }
@@ -614,18 +619,18 @@ impl RawBeatSim {
         y: f64,
         vx: f64,
         vy: f64,
-        theta: f64,
-        phi: f64,
-        om_th: f64,
-        om_ph: f64,
+        roll: f64,
+        bend: f64,
+        om_roll: f64,
+        om_bend: f64,
     ) {
         let sab = &mut self.core.sabers[s];
         sab.pos = [x, y];
         sab.vel = [vx, vy];
-        sab.theta = theta;
-        sab.phi = phi;
-        sab.om_th = om_th;
-        sab.om_ph = om_ph;
+        sab.roll = roll;
+        sab.bend = bend;
+        sab.om_roll = om_roll;
+        sab.om_bend = om_bend;
     }
 
     #[getter]
