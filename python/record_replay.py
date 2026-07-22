@@ -86,11 +86,12 @@ def main():
                         torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
                 act = a[0].numpy()
             else:
-                act = rng.integers(0, 9, size=2)
+                act = rng.integers(0, [9, 3, 3, 9, 3, 3])
             obs, r, done, _, info = env.step(act)
             tot += r
         print(f"  {path}: return {tot:6.2f} | good {info['good_cuts']}/{info['n_notes']} "
-              f"bad {info['bad_cuts']} miss {info['misses']}")
+              f"bad {info['bad_cuts']} miss {info['misses']} | "
+              f"score {info['score'] / max(info['n_notes'], 1):.1f}/115")
 
 
 if __name__ == "__main__":

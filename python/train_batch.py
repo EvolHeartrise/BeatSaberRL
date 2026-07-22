@@ -140,15 +140,15 @@ def greedy_fc_eval(policy, notes):
     done = False
     while not done and breaks == 0:
         with torch.no_grad():
-            left_l, right_l, _ = policy(
+            logits, _ = policy(
                 torch.as_tensor(obs, dtype=torch.float32,
                                 device=dev).unsqueeze(0))
-        act = (int(left_l.argmax()), int(right_l.argmax()))
+        act = tuple(int(l.argmax()) for l in logits)
         obs, _, done, _, info = env.step(act)
-        for _, reason in info["events"]:
+        for _, reason, _pts in info["events"]:
             if reason == "ok":
                 good += 1
-            else:
+            elif reason != "post":   # follow-throughs aren't note outcomes
                 breaks += 1
     return breaks == 0 and good == len(notes), good, breaks, len(notes)
 
@@ -173,6 +173,9 @@ def main():
 
     assert not (args.curriculum and args.env == "torch"), (
         "--curriculum needs --env rust (real-map sampler is Python-side)")
+    assert args.env != "torch", (
+        "--env torch is not yet ported to sim v5 (blade sabers); "
+        "use --env rust until torch_env.py catches up")
     torch_env = args.env == "torch"
     curriculum = None
     if args.curriculum:
@@ -224,7 +227,7 @@ def main():
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
     b_obs = torch.zeros((T, N, OBS_DIM), device=device)
-    b_act = torch.zeros((T, N, 2), dtype=torch.long, device=device)
+    b_act = torch.zeros((T, N, 6), dtype=torch.long, device=device)
     b_logp = torch.zeros((T, N), device=device)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
@@ -289,7 +292,7 @@ def main():
             returns = adv + b_val
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
-        f_act = b_act.reshape(-1, 2)
+        f_act = b_act.reshape(-1, 6)
         f_logp = b_logp.reshape(-1)
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)

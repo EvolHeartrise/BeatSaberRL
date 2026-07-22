@@ -88,13 +88,14 @@ def test_promote_appends_next_rung(ladder, monkeypatch):
 
 
 def test_vec_env_chart_sampler():
-    # cells far from the resting sabers so coasting really misses them
-    chart = [Note(hit_time=1.0, col=0, row=2, color=1, angle=np.pi, speed=4.0),
-             Note(hit_time=2.0, col=3, row=2, color=0, angle=0.0, speed=4.0)]
+    # row 0 cells sit below the resting vertical blades, so coasting
+    # really misses them (env v5: a blade IN note territory gets grazed)
+    chart = [Note(hit_time=1.0, col=0, row=0, color=1, angle=np.pi, speed=4.0),
+             Note(hit_time=2.0, col=3, row=0, color=0, angle=0.0, speed=4.0)]
     venv = BeatVecEnv(2, chart_sampler=lambda i, rng: chart,
                       max_steps=200, seed=0)
     venv.reset()
-    acts = np.zeros((2, 2), dtype=np.int64)    # coast: miss everything
+    acts = np.zeros((2, 6), dtype=np.int64)    # coast: miss everything
     done_info = None
     for _ in range(200):
         _, _, done, infos = venv.step(acts)

@@ -18,9 +18,10 @@ Unlike kiting-arena's deliberately minimal attention arm, the transformer
 here gets its standard optimization aids (LayerNorm, FFN, residuals) —
 that A/B's live hypothesis (b) was that stripping them handicaps training.
 
-No action masks exist in this env: every acceleration is always legal, so
-logprob = logp_left + logp_right unconditionally (pure independent
-factorization — no kind-gating like kiting).
+No action masks exist in this env: every action is always legal, so the
+logprob is the unconditional sum over the six factored heads (per hand:
+move 9, rot 3, tilt 3 — env v5 blade control; pure independent
+factorization, no kind-gating like kiting).
 """
 
 from __future__ import annotations
@@ -29,14 +30,16 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v3:
-# direction = (cos, sin) unit vector, continuous-angle ready).
-OFF_NOTES = 8
+# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v4:
+# blade sabers — 10 features per hand; notes unchanged from v3).
+SABER_FEAT = 10
+OFF_NOTES = 2 * SABER_FEAT                            # 20
 N_NOTE_SLOTS = 12
 NOTE_FEAT = 9
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 116
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 128
-N_ACTIONS = 9
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 128
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 140
+# per hand: move(9), rot(3), tilt(3) — six factored heads, left hand first
+HEAD_SIZES = (9, 3, 3, 9, 3, 3)
 
 NEG_INF = -1e9
 
@@ -107,19 +110,20 @@ class NotePolicy(nn.Module):
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
-        # saber token features: [x, y, vx, vy, is_left, is_right]
-        self.saber_mlp = _mlp([6, embed, embed])
+        # saber token features: the 10 obs-v4 features + [is_left, is_right]
+        self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
         self.blocks = nn.ModuleList(
             Block(embed, n_heads) for _ in range(n_blocks))
         self.trunk = _mlp([2 * embed, trunk_dim, trunk_dim])
-        self.left_head = nn.Linear(trunk_dim, N_ACTIONS)
-        self.right_head = nn.Linear(trunk_dim, N_ACTIONS)
+        # six factored heads (env v5): per hand move(9), rot(3), tilt(3)
+        self.heads = nn.ModuleList(
+            nn.Linear(trunk_dim, n) for n in HEAD_SIZES)
         self.value_head = nn.Linear(trunk_dim, 1)
 
     def _split(self, obs: torch.Tensor):
-        sabers = obs[:, :OFF_NOTES]                                  # (B, 8)
+        sabers = obs[:, :OFF_NOTES]                                  # (B, 20)
         notes = obs[:, OFF_NOTES:OFF_NOTE_MASK].reshape(
-            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 12, 14)
+            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 12, 9)
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, notes, note_mask
 
@@ -128,23 +132,23 @@ class NotePolicy(nn.Module):
         emb = self.note_mlp(notes)                                   # (B, 12, 64)
         B = obs.shape[0]
         hand_id = torch.eye(2, device=obs.device).expand(B, 2, 2)
-        saber_feat = torch.cat([sabers.reshape(B, 2, 4), hand_id], dim=-1)
+        saber_feat = torch.cat(
+            [sabers.reshape(B, 2, SABER_FEAT), hand_id], dim=-1)
         tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 14, 64)
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
         for blk in self.blocks:
             tokens = blk(tokens, key_mask)
         h = self.trunk(tokens[:, :2].reshape(B, -1))                 # saber readout
-        return (self.left_head(h), self.right_head(h),
-                self.value_head(h).squeeze(-1))
+        return [head(h) for head in self.heads], self.value_head(h).squeeze(-1)
 
     def get_action_and_value(self, obs, action=None):
-        left_l, right_l, value = self.forward(obs)
-        d_left, d_right = Categorical(logits=left_l), Categorical(logits=right_l)
+        logits, value = self.forward(obs)
+        dists = [Categorical(logits=l) for l in logits]
         if action is None:
-            action = torch.stack([d_left.sample(), d_right.sample()], dim=1)
-        logprob = d_left.log_prob(action[:, 0]) + d_right.log_prob(action[:, 1])
-        entropy = d_left.entropy() + d_right.entropy()
+            action = torch.stack([d.sample() for d in dists], dim=1)
+        logprob = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
+        entropy = sum(d.entropy() for d in dists)
         return action, logprob, entropy, value
 
 

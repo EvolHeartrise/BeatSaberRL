@@ -6,7 +6,9 @@ import torch
 
 from beat_arena_env import RustBeatEnv, OFF_NOTES, OFF_NOTE_MASK, NOTE_FEAT
 from beat_arena_env.vec_env import BeatVecEnv
-from policy import NotePolicy, OBS_DIM
+from policy import HEAD_SIZES, NotePolicy, OBS_DIM
+
+ACTION_NVEC = [9, 3, 3, 9, 3, 3]
 
 
 def _obs_batch(n=6):
@@ -16,7 +18,7 @@ def _obs_batch(n=6):
     rows = [obs]
     rng = np.random.default_rng(0)
     for _ in range(n - 1):
-        obs, _, done, _, _ = env.step(rng.integers(0, 9, size=2))
+        obs, _, done, _, _ = env.step(rng.integers(0, ACTION_NVEC))
         if done:
             obs, _ = env.reset()
         rows.append(obs)
@@ -27,11 +29,11 @@ def test_output_shapes():
     torch.manual_seed(0)
     policy = NotePolicy()
     obs = _obs_batch()
-    left_l, right_l, value = policy(obs)
-    assert left_l.shape == (6, 9) and right_l.shape == (6, 9)
+    logits, value = policy(obs)
+    assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]
     assert value.shape == (6,)
     a, logp, ent, v = policy.get_action_and_value(obs)
-    assert a.shape == (6, 2) and logp.shape == (6,)
+    assert a.shape == (6, 6) and logp.shape == (6,)
 
 
 def test_junk_in_masked_slots_cannot_leak():
@@ -49,7 +51,8 @@ def test_junk_in_masked_slots_cannot_leak():
             s = OFF_NOTES + int(slot) * NOTE_FEAT
             junk[b, s:s + NOTE_FEAT] = torch.randn(NOTE_FEAT, generator=g) * 5
 
-    action = torch.randint(0, 9, (obs.shape[0], 2))
+    action = torch.stack(
+        [torch.randint(0, n, (obs.shape[0],)) for n in HEAD_SIZES], dim=1)
     _, lp1, ent1, v1 = policy.get_action_and_value(obs, action)
     _, lp2, ent2, v2 = policy.get_action_and_value(junk, action)
     assert torch.allclose(lp1, lp2, atol=1e-5)
@@ -58,7 +61,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 128
+    assert OBS_DIM == 140
 
 
 def test_pool_encoder_removed():
@@ -69,15 +72,15 @@ def test_pool_encoder_removed():
 def test_vec_env_auto_reset():
     venv = BeatVecEnv(4, colors="both", dirs=tuple(range(8)), chart_len_s=5.0, seed=3)
     obs = venv.reset()
-    assert obs.shape == (4, 128)
+    assert obs.shape == (4, 140)
     rng = np.random.default_rng(0)
     finished = 0
     for _ in range(400):
-        obs, rew, done, infos = venv.step(rng.integers(0, 9, size=(4, 2)))
+        obs, rew, done, infos = venv.step(rng.integers(0, ACTION_NVEC, size=(4, 6)))
         finished += len(infos)
         for info in infos:
             assert info["n_notes"] > 0
-            assert obs[info["env"], 116:].sum() > 0  # fresh pending notes
+            assert obs[info["env"], 128:].sum() > 0  # fresh pending notes
     assert finished >= 4
 
 
@@ -97,10 +100,10 @@ def test_vec_matches_single():
     rng = np.random.default_rng(4)
     done1 = False
     while not done1:
-        a = rng.integers(0, 9, size=(1, 2))
-        o1, r1, done1, _ = single.step(int(a[0, 0]), int(a[0, 1]))
+        a = rng.integers(0, ACTION_NVEC, size=(1, 6))
+        o1, r1, done1, _ = single.step(*(int(x) for x in a[0]))
         ov, rv, dv = vec.step(a)
         np.testing.assert_array_equal(ov, o1)
         assert rv[0] == np.float32(r1) and bool(dv[0]) == done1
     assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
-                               single.misses, single.n_notes)
+                               single.misses, single.n_notes, single.score)

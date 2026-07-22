@@ -1,10 +1,10 @@
 """Gymnasium env over the Rust sim core — THE single-env implementation.
 
 Chart generation stays in Python (once per episode); physics, cut logic,
-and obs building live in rust/src/lib.rs. Per-step cut/miss events come
-back from Rust and are exposed in `info["events"]` as
-(note_idx, reason) tuples; replay recording (JSONL v2, SPEC.md) is built
-from them via `set_record`.
+scoring, and obs building live in rust/src/lib.rs. Per-step cut/miss
+events come back from Rust and are exposed in `info["events"]` as
+(note_idx, reason, points) tuples; replay recording (JSONL v4, SPEC.md)
+is built from them via `set_record`.
 
 Build the extension once with:
   VIRTUAL_ENV=<venv> <venv>/bin/maturin develop --release   (from rust/)
@@ -54,16 +54,17 @@ class RustBeatEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )
-        self.action_space = gym.spaces.MultiDiscrete([9, 9])
+        # per hand: move(9), rot(3), tilt(3); left hand first
+        self.action_space = gym.spaces.MultiDiscrete([9, 3, 3, 9, 3, 3])
 
-    # -- recording (JSONL v2, same format the 3D viewer reads) ---------------
+    # -- recording (JSONL v4, same format the 3D viewer reads) ---------------
     def set_record(self, path: str):
         """Record the NEXT episode (and later ones) to JSONL at path."""
         self._record_path = path
 
     def _start_record(self):
         header = {"header": {
-            "version": 3,
+            "version": 4,
             "config": {
                 "note_rate": self.cfg.note_rate,
                 "chart_len_s": self.cfg.chart_len_s,
@@ -87,13 +88,16 @@ class RustBeatEnv(gym.Env):
             "t": self.sim.tick - 1,
             "time": round(self.sim.time - 1.0 / 30.0, 5),
             "sabers": [[round(v, 4) for v in s] for s in sabers],
-            "action": [int(action[0]), int(action[1])],
+            "action": [int(a) for a in action],
             "reward": round(float(reward), 4),
             "events": [
                 {"miss": {"note": int(i)}} if code == 4 else
+                {"post": {"note": int(i), "points": round(float(pts), 2)}}
+                if code == 5 else
                 {"cut": {"note": int(i), "good": code == 0,
-                         "reason": EVENT_REASONS[code]}}
-                for i, code in events
+                         "reason": EVENT_REASONS[code],
+                         "points": round(float(pts), 2)}}
+                for i, code, pts in events
             ],
         }))
 
@@ -112,15 +116,18 @@ class RustBeatEnv(gym.Env):
 
     def step(self, action):
         a = np.asarray(action).reshape(-1)
-        obs, reward, done, events = self.sim.step(int(a[0]), int(a[1]))
+        obs, reward, done, events = self.sim.step(
+            int(a[0]), int(a[1]), int(a[2]), int(a[3]), int(a[4]), int(a[5]))
         if self._record_lines is not None:
             self._record_tick(a, reward, events)
             if done:
                 with open(self._record_path, "w") as f:
                     f.write("\n".join(self._record_lines) + "\n")
                 self._record_lines = None
-        info = {"events": [(int(i), EVENT_REASONS[c]) for i, c in events]}
+        info = {"events": [(int(i), EVENT_REASONS[c], float(p))
+                           for i, c, p in events]}
         if done:
             info.update(good_cuts=self.sim.good_cuts, bad_cuts=self.sim.bad_cuts,
-                        misses=self.sim.misses, n_notes=self.sim.n_notes)
+                        misses=self.sim.misses, n_notes=self.sim.n_notes,
+                        score=self.sim.score)
         return obs, float(reward), bool(done), False, info

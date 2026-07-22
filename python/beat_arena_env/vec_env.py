@@ -54,17 +54,19 @@ class BeatVecEnv:
         return self.sim.obs().reshape(self.num_envs, OBS_DIM)
 
     def step(self, actions):
-        """actions: (N, 2) int array. Returns (obs, rewards, dones, infos);
-        infos = list of dicts for envs that finished THIS step."""
+        """actions: (N, 6) int array — per hand (move, rot, tilt), left
+        first. Returns (obs, rewards, dones, infos); infos = list of dicts
+        for envs that finished THIS step."""
         obs, rew, done = self.sim.step(np.ascontiguousarray(actions, dtype=np.int64))
         obs = obs.reshape(self.num_envs, OBS_DIM)
         self._returns += rew
         infos = []
         if done.any():
             for i in np.flatnonzero(done):
-                g, b, m, n = self.sim.counters(i)
+                g, b, m, n, score = self.sim.counters(i)
                 infos.append({"env": int(i), "episode_return": float(self._returns[i]),
-                              "good_cuts": g, "bad_cuts": b, "misses": m, "n_notes": n})
+                              "good_cuts": g, "bad_cuts": b, "misses": m,
+                              "n_notes": n, "score": score})
                 self._returns[i] = 0.0
                 self._new_chart(i)
                 obs[i] = self.sim.obs_one(int(i))
