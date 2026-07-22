@@ -2,9 +2,8 @@
 
 Watch them in viz/replay.html (open in a browser, drop the .jsonl in).
 All episodes run on the Rust sim via RustBeatEnv (JSONL v4 recording is
-built from the sim's event stream). Recorded with shaping_coef=0 so the
-logged rewards are the raw interpretable ones (score/115 per good cut,
--0.5 bad/miss).
+built from the sim's event stream). Logged rewards are the raw
+interpretable ones (score/115 per good cut, -0.5 bad/miss).
 
   python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
   python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
@@ -56,7 +55,7 @@ def main():
               cols=tuple(args.cols), rows=tuple(args.rows),
               chart_len_s=args.chart_len, min_hand_gap_s=args.min_hand_gap,
               note_speed=args.note_speed, note_speed_max=args.note_speed_max,
-              continuous_dirs=args.continuous_dirs, shaping_coef=0.0)
+              continuous_dirs=args.continuous_dirs)
 
     policy = None
     if args.ckpt:

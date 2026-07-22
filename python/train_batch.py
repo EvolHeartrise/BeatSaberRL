@@ -96,7 +96,6 @@ def parse_args():
     p.add_argument("--note-speed-max", type=float, default=None)
     p.add_argument("--continuous-dirs", action="store_true",
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
-    p.add_argument("--shaping-coef", type=float, default=0.0)
     # curriculum mode (SPEC §Curriculum): real ScoreSaber-ranked maps on a
     # star ladder instead of the procedural generator
     c = p.add_argument_group("curriculum")
@@ -134,7 +133,7 @@ def greedy_fc_eval(policy, notes):
     sim is deterministic). Aborts on the first combo break — FC needs zero.
     Returns (fc: bool, good, breaks, n_notes)."""
     dev = next(policy.parameters()).device
-    env = RustBeatEnv(external_chart=notes, shaping_coef=0.0, seed=0)
+    env = RustBeatEnv(external_chart=notes, seed=0)
     obs, _ = env.reset()
     good = breaks = 0
     done = False
@@ -186,7 +185,7 @@ def main():
             max_song_s=args.max_song_s,
             acquire_rng=np.random.default_rng(args.seed))
         venv = BeatVecEnv(
-            N, shaping_coef=args.shaping_coef, seed=args.seed,
+            N, seed=args.seed,
             chart_sampler=curriculum.sample,
             max_steps=int(args.max_song_s * 30) + 30)
     elif args.env == "torch":
@@ -196,8 +195,7 @@ def main():
             cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
-            continuous_dirs=args.continuous_dirs,
-            shaping_coef=args.shaping_coef, seed=args.seed,
+            continuous_dirs=args.continuous_dirs, seed=args.seed,
             chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -205,8 +203,7 @@ def main():
             cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
-            continuous_dirs=args.continuous_dirs,
-            shaping_coef=args.shaping_coef, seed=args.seed)
+            continuous_dirs=args.continuous_dirs, seed=args.seed)
 
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)

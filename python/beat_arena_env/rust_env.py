@@ -28,7 +28,7 @@ class RustBeatEnv(gym.Env):
 
     def __init__(self, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
-                 shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
+                 cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, external_chart=None,
                  seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
@@ -36,7 +36,7 @@ class RustBeatEnv(gym.Env):
         self.cfg = ChartConfig(
             note_rate=note_rate, colors=colors, dirs=tuple(dirs),
             continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
-            min_hand_gap_s=min_hand_gap_s, shaping_coef=shaping_coef,
+            min_hand_gap_s=min_hand_gap_s,
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
         )
@@ -50,7 +50,7 @@ class RustBeatEnv(gym.Env):
             max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 30
         else:
             max_steps = int(chart_len_s * 30) + 30
-        self.sim = RawBeatSim(shaping_coef=shaping_coef, max_steps=max_steps)
+        self.sim = RawBeatSim(max_steps=max_steps)
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )

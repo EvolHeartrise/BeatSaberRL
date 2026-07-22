@@ -19,7 +19,7 @@ from beat_arena_rs import VecBeatSim
 class BeatVecEnv:
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
-                 shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
+                 cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
                  chart_sampler=None, max_steps=None):
         """chart_sampler: callable (env_idx, rng) -> list[Note]; replaces
@@ -30,14 +30,13 @@ class BeatVecEnv:
         self.cfg = ChartConfig(
             note_rate=note_rate, colors=colors, dirs=tuple(dirs),
             continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
-            min_hand_gap_s=min_hand_gap_s, shaping_coef=shaping_coef,
+            min_hand_gap_s=min_hand_gap_s,
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
         )
         if max_steps is None:
             max_steps = int(chart_len_s * 30) + 30
-        self.sim = VecBeatSim(num_envs, shaping_coef=shaping_coef,
-                              max_steps=max_steps)
+        self.sim = VecBeatSim(num_envs, max_steps=max_steps)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
 

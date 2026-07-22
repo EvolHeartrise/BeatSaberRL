@@ -22,8 +22,6 @@ Design notes (why it looks the way it does):
 - Auto-reset draws charts from a pregenerated pool; episode returns go to an
   on-device ring buffer fetched with pop_stats() once per PPO update: the
   step loop performs ZERO host<->device synchronizations.
-- Shaping is not implemented (pure-reward era; the Rust sim keeps it for
-  reference runs) — shaping_coef must be 0.
 
 Limits vs BeatVecEnv: no curriculum sampler, no per-step info dicts, no
 event stream (rewards/counters/score only).
@@ -116,12 +114,10 @@ class TorchBeatVecEnv:
 
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
-                 shaping_coef=0.0, cols=(0, 1, 2, 3), rows=(0, 1, 2),
+                 cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
                  charts=None, chart_pool=1024, max_steps=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
-        assert shaping_coef == 0.0, (
-            "torch env is pure-reward only (shaping lives in the Rust sim)")
         self.num_envs = num_envs
         self.device = torch.device(device)
         self.dtype = dtype
