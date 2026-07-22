@@ -38,20 +38,32 @@
 </div>
 <div id="hud">no replay loaded</div>
 <div id="help">space = play/pause · ←/→ = step one tick · +/− = speed · r = restart ·
-  40 cm blocks fly in from the tunnel and are cuttable inside the highlighted slab at the plane ·
-  ring around a saber = fast enough to cut (≥ 1 m/s)</div>
+  40 cm blocks fly in from the tunnel; each hand is a wrist on the plane holding a 1 m blade ·
+  white blade core = contact-capable (tip ≥ 1 m/s) · white block outline = within blade reach ·
+  +N popups = points scored (max 115/note: 70 pre-swing, 30 follow-through, 15 accuracy)</div>
 
 <script>
 "use strict";
-// ---- replay format v2 (SPEC.md §Replay log): metric world ------------------
+// ---- replay format v4 (SPEC.md §Replay log): env v5 blade sabers -----------
 // hit plane z = 0; grid spans [-1,1] x [-0.75,0.75] (0.5 m lanes); notes are
-// 0.4 m cubes approaching from +z at config.note_speed; cuttable |z| <= 0.6.
+// 0.4 m cubes approaching from +z. Sabers = [x, y, vx, vy, theta, phi,
+// om_th, om_ph]: wrist on the plane + 1 m blade at azimuth theta / tilt phi.
 const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
-const GX = 1.0, GY = 0.75, Z_WINDOW = 0.6, Z_FAR = 12.0;
+const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
+const SABER_LEN = 1.0, REACH_Z = 1.25, Z_MISS = 0.6;
 const V_MIN = 1, DT = 1 / 30;
 const SABER_COLORS = ["#e06c75", "#61afef"];   // left/red, right/blue
 const SABER_DARK = ["#7c3b41", "#33586f"];
 const ANGV = a => [Math.cos(a), Math.sin(a)];
+// blade direction and its time derivative from pose + angular velocity
+function bladeDir(th, ph) {
+  const ct = Math.cos(th), st = Math.sin(th), cp = Math.cos(ph), sp = Math.sin(ph);
+  return [cp * ct, cp * st, sp];
+}
+function bladeDirDot(th, ph, wt, wp) {
+  const ct = Math.cos(th), st = Math.sin(th), cp = Math.cos(ph), sp = Math.sin(ph);
+  return [-wt * cp * st - wp * sp * ct, wt * cp * ct - wp * sp * st, wp * cp];
+}
 
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 let rep = null, cur = 0, playing = false, speed = 1.0, lastTs = null;
@@ -69,28 +81,32 @@ function parseReplay(text) {
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 2 && v !== 3)
-    throw new Error("replay version " + v +
-                    " — this viewer reads v2/v3; re-record with record_replay.py");
+  if (v !== 4)
+    throw new Error("replay version " + v + " — this viewer reads v4 (env v5 "
+                    + "blade sabers); pre-v4 replays are point-saber era");
   const ticks = lines.slice(1).map(JSON.parse);
-  // normalize: every note gets .angle (radians) and .speed (m/s).
-  // v2 charts carry a dir index 0..7 and a single config-wide speed.
-  const chart = head.header.chart.map(n => ({
-    ...n,
-    angle: n.angle !== undefined ? n.angle : n.dir * Math.PI / 4,
-    speed: n.speed !== undefined ? n.speed : head.header.config.note_speed,
-  }));
+  const chart = head.header.chart;
   const outcomes = chart.map(() => null);
+  const posts = [];   // follow-through resolutions: {note, tick, points}
   ticks.forEach(t => t.events.forEach(e => {
     if (e.cut) outcomes[e.cut.note] = { kind: e.cut.good ? "good" : "bad",
-                                        reason: e.cut.reason, tick: t.t };
-    if (e.miss !== undefined) outcomes[e.miss.note] = { kind: "miss", reason: "miss", tick: t.t };
+                                        reason: e.cut.reason, tick: t.t,
+                                        points: e.cut.points || 0 };
+    if (e.post) posts.push({ note: e.post.note, tick: t.t, points: e.post.points });
+    if (e.miss !== undefined) outcomes[e.miss.note] = { kind: "miss", reason: "miss",
+                                                       tick: t.t, points: 0 };
   }));
-  return { config: head.header.config, chart, ticks, outcomes };
+  return { config: head.header.config, chart, ticks, outcomes, posts };
 }
 
 function noteCenter(n) { return [(n.col - 1.5) * CELL, (n.row - 1.0) * CELL]; }
 function lerp(a, b, u) { return a + (b - a) * u; }
+function lerpAng(a, b, u) {
+  let d = (b - a) % (2 * Math.PI);
+  if (d > Math.PI) d -= 2 * Math.PI;
+  if (d < -Math.PI) d += 2 * Math.PI;
+  return a + d * u;
+}
 function line(x0, y0, x1, y1) { ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); }
 function poly(pts, close) {
   ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
@@ -101,7 +117,13 @@ function poly(pts, close) {
 function saberAt(tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
-  return [lerp(a[0], b[0], u), lerp(a[1], b[1], u), b[2], b[3]];
+  return [lerp(a[0], b[0], u), lerp(a[1], b[1], u), b[2], b[3],
+          lerpAng(a[4], b[4], u), lerp(a[5], b[5], u), b[6], b[7]];
+}
+
+function tipOf(sab) {
+  const d = bladeDir(sab[4], sab[5]);
+  return [sab[0] + SABER_LEN * d[0], sab[1] + SABER_LEN * d[1], SABER_LEN * d[2]];
 }
 
 // ---- scene pieces ----------------------------------------------------------
@@ -125,10 +147,11 @@ function drawTunnel() {
   }
 }
 
-function drawSlab() {
-  // the cuttable slab: faint box from z=-0.6 to z=+0.6 at the plane
+function drawReach() {
+  // blade-reach region: from the miss line (z=-0.6) to max tilted reach
+  // (z=1.25) — the physical replacement for the old cuttable slab
   ctx.strokeStyle = "#2a3040"; ctx.lineWidth = 1;
-  [[Z_WINDOW], [-Z_WINDOW]].forEach(([z]) => {
+  [[REACH_Z], [-Z_MISS]].forEach(([z]) => {
     poly([[-GX, -GY], [GX, -GY], [GX, GY], [-GX, GY]].map(([x, y]) => proj(x, y, z)), true);
     ctx.stroke();
   });
@@ -203,6 +226,10 @@ function drawAftermath(n, i, time) {
         .map(([x, y]) => proj(cx0 + ox + x, cy0 + oy + y, 0));
       ctx.fillStyle = col; poly(sq, true); ctx.fill();
     });
+    // pre-swing + accuracy points, floating up
+    const [tx, ty] = proj(cx0, cy0 + HALF * 1.2 + age * 0.5, 0);
+    ctx.fillStyle = col; ctx.font = "bold 16px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("+" + out.points.toFixed(0), tx, ty);
   } else {
     const { front } = cubeFaces(cx0, cy0, 0);
     ctx.strokeStyle = col; ctx.lineWidth = 3;
@@ -214,36 +241,68 @@ function drawAftermath(n, i, time) {
   ctx.globalAlpha = 1;
 }
 
+function drawPostPopups(time) {
+  // follow-through resolutions: smaller popup below the note position
+  rep.posts.forEach(p => {
+    const age = time - (p.tick + 1) * DT;
+    if (age < 0 || age > 0.6) return;
+    const n = rep.chart[p.note];
+    const [cx0, cy0] = noteCenter(n);
+    const [tx, ty] = proj(cx0, cy0 - HALF * 1.4 - age * 0.4, 0);
+    ctx.globalAlpha = 1 - age / 0.6;
+    ctx.fillStyle = "#9ece6a"; ctx.font = "13px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("+" + p.points.toFixed(0) + " follow", tx, ty);
+    ctx.globalAlpha = 1;
+  });
+}
+
 function drawSaber(tickIdx, u, s) {
+  // tip trail (3D path of the blade tip over the last 10 ticks)
   ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2; ctx.globalAlpha = 0.35;
   ctx.beginPath();
   for (let k = Math.max(0, tickIdx - 10); k <= tickIdx; k++) {
-    const p = rep.ticks[k].sabers[s];
-    const [px, py] = proj(p[0], p[1], 0);
+    const t3 = tipOf(rep.ticks[k].sabers[s]);
+    const [px, py] = proj(t3[0], t3[1], t3[2]);
     (k === Math.max(0, tickIdx - 10)) ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
   }
   ctx.stroke(); ctx.globalAlpha = 1;
 
-  const [x, y, vx, vy] = saberAt(tickIdx, u, s);
-  const spd = Math.hypot(vx, vy);
-  const [px, py, sc] = proj(x, y, 0);
-  ctx.fillStyle = SABER_COLORS[s];
-  ctx.beginPath(); ctx.arc(px, py, 0.05 * sc, 0, 7); ctx.fill();
-  if (spd >= V_MIN) {
-    ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(px, py, 0.075 * sc, 0, 7); ctx.stroke();
+  const sab = saberAt(tickIdx, u, s);
+  const [x, y, vx, vy, th, ph, wt, wp] = sab;
+  const tip = tipOf(sab);
+  const [wx, wy, wsc] = proj(x, y, 0);
+  const [txp, typ, tsc] = proj(tip[0], tip[1], tip[2]);
+  // contact-point (tip) velocity decides cut-capability
+  const dd = bladeDirDot(th, ph, wt, wp);
+  const tipSpd = Math.hypot(vx + SABER_LEN * dd[0], vy + SABER_LEN * dd[1],
+                            SABER_LEN * dd[2]);
+  // blade: colored stroke, white-hot core when contact-capable
+  ctx.lineCap = "round";
+  ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 0.045 * (wsc + tsc) / 2;
+  line(wx, wy, txp, typ);
+  if (tipSpd >= V_MIN) {
+    ctx.strokeStyle = "#e8eaf0"; ctx.lineWidth = 0.018 * (wsc + tsc) / 2;
+    line(wx, wy, txp, typ);
   }
+  ctx.lineCap = "butt";
+  // wrist = filled disc; small dark hilt ring so the two ends read apart
+  ctx.fillStyle = SABER_COLORS[s];
+  ctx.beginPath(); ctx.arc(wx, wy, 0.05 * wsc, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#0b0d11"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(wx, wy, 0.05 * wsc, 0, 7); ctx.stroke();
+  // wrist velocity vector (translation component only)
   const [qx, qy] = proj(x + vx * 0.12, y + vy * 0.12, 0);
   ctx.strokeStyle = SABER_COLORS[s]; ctx.lineWidth = 2.5;
-  line(px, py, qx, qy);
+  line(wx, wy, qx, qy);
 }
 
 function counts(uptoTick) {
-  const c = { good: 0, bad: 0, miss: 0, reward: 0 };
+  const c = { good: 0, bad: 0, miss: 0, reward: 0, score: 0 };
   for (let k = 0; k <= uptoTick && k < rep.ticks.length; k++) {
     c.reward += rep.ticks[k].reward;
     rep.ticks[k].events.forEach(e => {
-      if (e.cut) c[e.cut.good ? "good" : "bad"]++;
+      if (e.cut) { c[e.cut.good ? "good" : "bad"]++; c.score += e.cut.points || 0; }
+      if (e.post) c.score += e.post.points;
       if (e.miss !== undefined) c.miss++;
     });
   }
@@ -253,12 +312,12 @@ function counts(uptoTick) {
 function render() {
   ctx.clearRect(0, 0, cv.width, cv.height);
   drawTunnel();
-  if (!rep) { drawSlab(); drawPlaneGrid(); return; }
+  if (!rep) { drawReach(); drawPlaneGrid(); return; }
   const tickIdx = Math.min(Math.floor(cur), rep.ticks.length - 1);
   const u = cur - tickIdx;
   const time = (tickIdx + u) * DT;
 
-  drawSlab();
+  drawReach();
 
   // pending notes with z(t) = (hit_time - t) * speed; draw far -> near,
   // plane grid inserted between z>0 and z<=0 for correct occlusion
@@ -270,23 +329,26 @@ function render() {
     if (z <= Z_FAR) pend.push([z, n]);
   });
   pend.sort((a, b) => b[0] - a[0]);
+  const inReach = z => z <= REACH_Z && z >= -Z_MISS;
   pend.filter(([z]) => z > 0).forEach(([z, n]) => {
     ctx.globalAlpha = Math.min(1, (Z_FAR - z) / 2);
-    drawNoteCube(n, z, Math.abs(z) <= Z_WINDOW);
+    drawNoteCube(n, z, inReach(z));
     ctx.globalAlpha = 1;
   });
   drawPlaneGrid();
-  pend.filter(([z]) => z <= 0).forEach(([z, n]) =>
-    drawNoteCube(n, z, Math.abs(z) <= Z_WINDOW));
+  pend.filter(([z]) => z <= 0).forEach(([z, n]) => drawNoteCube(n, z, inReach(z)));
 
   rep.chart.forEach((n, i) => { if (rep.outcomes[i]) drawAftermath(n, i, time); });
+  drawPostPopups(time);
   drawSaber(tickIdx, u, 0);
   drawSaber(tickIdx, u, 1);
 
   const c = counts(tickIdx);
+  const maxScore = 115 * rep.chart.length;
   document.getElementById("hud").innerHTML =
     `t <b>${time.toFixed(2)}s</b> · tick <b>${tickIdx}</b>/${rep.ticks.length - 1} · ` +
     `return <b>${c.reward.toFixed(2)}</b> · ` +
+    `score <b>${c.score.toFixed(0)}</b>/${maxScore} · ` +
     `<span class="good">good ${c.good}</span> / <span class="bad">bad ${c.bad}</span> / ` +
     `<span class="miss">miss ${c.miss}</span> of ${rep.chart.length}` +
     (tickIdx >= rep.ticks.length - 1 ? " · <b>END</b>" : "");

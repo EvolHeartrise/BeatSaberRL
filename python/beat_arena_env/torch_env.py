@@ -1,25 +1,32 @@
 """GPU-resident vectorized Beat Arena sim (torch tensors, one row per env).
 
-A semantics-exact port of rust/src/lib.rs step_inner + build_obs — the Rust
-crate remains THE reference implementation; this port exists so rollouts can
-run wide (N in the thousands) on the GPU with observations born on-device.
-Parity with Rust is pinned by tests/test_torch_env.py: exact event/reward/obs
-agreement in float64, bounded drift in float32.
+A semantics-exact port of rust/src/lib.rs step_inner + build_obs (env v5,
+blade sabers) — the Rust crate remains THE reference implementation; this
+port exists so rollouts can run wide (N in the thousands) on the GPU with
+observations born on-device. Parity with Rust is pinned by
+tests/test_torch_env.py: exact event/reward/obs agreement in float64,
+bounded drift in float32.
 
 Design notes (why it looks the way it does):
 - All charts are padded to a common length C; a `valid` mask marks real notes.
   Consumed/padded notes never match any condition, so every rule is a pure
   masked tensor op — no per-env branching anywhere.
-- Auto-reset draws charts from a pregenerated pool (chart generation stays in
-  Python/NumPy — single source of truth — but runs ONCE at construction, not
-  per reset).
-- Episode returns are recorded into an on-device ring buffer at reset time and
-  fetched with pop_stats() once per PPO update: the step loop performs ZERO
-  host↔device synchronizations.
+- The swept-blade cut test loops the 8 blade samples STATICALLY (bounded
+  memory, no data-dependent shapes, no host syncs).
+- Follow-through trackers are fixed ring slots per saber. Trackers spawned
+  by the same saber in the same tick share identical (arc, age) forever, so
+  they aggregate into ONE slot with a note COUNT — at most one spawn per
+  saber per tick. A surviving tracker lives <= FOLLOW_TIMEOUT ticks and the
+  ring has K = FOLLOW_TIMEOUT + 1 slots, so a slot being rewritten is
+  provably inactive: the ring is EXACT, not an approximation.
+- Auto-reset draws charts from a pregenerated pool; episode returns go to an
+  on-device ring buffer fetched with pop_stats() once per PPO update: the
+  step loop performs ZERO host<->device synchronizations.
 - Shaping is not implemented (pure-reward era; the Rust sim keeps it for
   reference runs) — shaping_coef must be 0.
 
-Limits vs BeatVecEnv: no curriculum sampler, no per-step info dicts.
+Limits vs BeatVecEnv: no curriculum sampler, no per-step info dicts, no
+event stream (rewards/counters/score only).
 """
 
 from __future__ import annotations
@@ -40,21 +47,34 @@ V_MAX = 6.0
 V_MIN_CUT = 1.0
 CUT_RADIUS = 0.28
 COS_TOL = 0.5
-Z_WINDOW = 0.6
 CELL = 0.5
 POS_LO = (-1.5, -1.25)
 POS_HI = (1.5, 1.25)
-REWARD_GOOD = 1.0
 REWARD_BAD = -0.5
 REWARD_MISS = -0.5
+SABER_LEN = 1.0
+ALPHA_ROT = 200.0
+OMEGA_MAX = 20.0
+PHI_LIM = 1.309
+N_BLADE_SAMPLES = 8
+REACH_Z = 1.25
+Z_MISS = 0.6
+PRE_FULL = 1.7453292519943295   # 100 deg
+POST_FULL = 1.0471975511965976  # 60 deg
+PTS_PRE, PTS_POST, PTS_ACC = 70.0, 30.0, 15.0
+SCORE_MAX = 115.0
+SWING_BREAK = 0.005
+FOLLOW_TIMEOUT = 15
+N_TRACKERS = FOLLOW_TIMEOUT + 1  # ring slots; see module docstring
 X_NORM = 1.0
 Y_NORM = 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-1.0, 12.0)
 N_NOTE_SLOTS = 12
 NOTE_FEAT = 9
-OFF_NOTES = 8
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 116
+SABER_FEAT = 10
+OFF_NOTES = 2 * SABER_FEAT                             # 20
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 128
 
 
 def _charts_to_tensors(charts, device, dtype):
@@ -85,9 +105,10 @@ def _charts_to_tensors(charts, device, dtype):
 
 
 class TorchBeatVecEnv:
-    """BeatVecEnv-alike over pure tensor state. step() takes an (N, 2) long
-    action tensor and returns (obs, reward, done, []) — all tensors on
-    `device`, infos always empty (use pop_stats() once per update)."""
+    """BeatVecEnv-alike over pure tensor state. step() takes an (N, 6) long
+    action tensor (per hand: move, rot, tilt; left first) and returns
+    (obs, reward, done, []) — all tensors on `device`, infos always empty
+    (use pop_stats() once per update)."""
 
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
@@ -120,23 +141,39 @@ class TorchBeatVecEnv:
         self._gen.manual_seed(seed)
         self._episode = 0  # test-mode sequential chart assignment counter
 
-        N, C = num_envs, self.C
+        N, C, K = num_envs, self.C, N_TRACKERS
         zeros = lambda *s, dt=dtype: torch.zeros(*s, device=self.device, dtype=dt)
+        # wrist
         self.pos = zeros(N, 2, 2); self.vel = zeros(N, 2, 2)
+        # blade pose + swing chain
+        self.theta = zeros(N, 2); self.phi = zeros(N, 2)
+        self.om_th = zeros(N, 2); self.om_ph = zeros(N, 2)
+        self.swing_acc = zeros(N, 2)
+        self.axis = zeros(N, 2, 3)
+        self.axis_valid = zeros(N, 2, dt=torch.bool)
+        # follow-through tracker ring (aggregated: `cnt` notes per slot)
+        self.tr_acc = zeros(N, 2, K); self.tr_age = zeros(N, 2, K, dt=torch.long)
+        self.tr_cnt = zeros(N, 2, K, dt=torch.long)
+        self.tr_active = zeros(N, 2, K, dt=torch.bool)
+        self.tr_ptr = zeros(N, 2, dt=torch.long)
         self.tick = zeros(N, dt=torch.long)
         self.status = zeros(N, C, dt=torch.uint8)  # 0 pend 1 good 2 bad 3 miss
         self.ep_return = zeros(N)
         self.good = zeros(N, dt=torch.long); self.bad = zeros(N, dt=torch.long)
         self.miss = zeros(N, dt=torch.long)
+        self.score = zeros(N)
         # per-env chart fields (rows copied from the pool at reset)
         for k in ("hit", "speed", "valid", "is_right", "any_dir"):
             setattr(self, "c_" + k, zeros(N, C, dt=self.pool[k].dtype))
         self.c_center = zeros(N, C, 2); self.c_dvec = zeros(N, C, 2)
         self.c_last_hit = zeros(N); self.c_n_notes = zeros(N, dt=torch.long)
-        # action direction table: 0 = coast, k = accel at (k-1)*45 deg
+        # move-action direction table: 0 = coast, k = accel at (k-1)*45 deg
         ang = (torch.arange(8, device=self.device, dtype=dtype)) * (math.pi / 4)
         self._act = torch.cat(
             [zeros(1, 2), torch.stack([ang.cos(), ang.sin()], -1)])
+        # rot/tilt action table: 0 = coast, 1 = +alpha, 2 = -alpha
+        self._rot = torch.tensor([0.0, ALPHA_ROT * DT, -ALPHA_ROT * DT],
+                                 device=self.device, dtype=dtype)
         self._lo = torch.tensor(POS_LO, device=self.device, dtype=dtype)
         self._hi = torch.tensor(POS_HI, device=self.device, dtype=dtype)
         # episode-return ring buffer (device-side; slot `cap` is the trash row)
@@ -145,6 +182,22 @@ class TorchBeatVecEnv:
         self._ret_total = zeros((), dt=torch.long)
         self._popped = 0
         self._obs = zeros(N, OBS_DIM, dt=torch.float32)
+
+    # -- blade geometry -------------------------------------------------------
+    def _blade_dir(self):
+        """(N, 2, 3) unit blade direction from the current pose."""
+        ct, st = self.theta.cos(), self.theta.sin()
+        cp, sp = self.phi.cos(), self.phi.sin()
+        return torch.stack([cp * ct, cp * st, sp], -1)
+
+    def _blade_dir_dot(self):
+        """(N, 2, 3) d/dt of the blade direction."""
+        ct, st = self.theta.cos(), self.theta.sin()
+        cp, sp = self.phi.cos(), self.phi.sin()
+        return torch.stack([
+            -self.om_th * cp * st - self.om_ph * sp * ct,
+            self.om_th * cp * ct - self.om_ph * sp * st,
+            self.om_ph * cp], -1)
 
     # -- resets ---------------------------------------------------------------
     # All resets are full-size torch.where merges (never boolean fancy
@@ -173,6 +226,14 @@ class TorchBeatVecEnv:
                              device=self.device, dtype=self.dtype)
         self.pos = torch.where(m2, start, self.pos)
         self.vel = torch.where(m2, torch.zeros_like(self.vel), self.vel)
+        half_pi = torch.full_like(self.theta, math.pi / 2)
+        self.theta = torch.where(m1, half_pi, self.theta)
+        for t in ("phi", "om_th", "om_ph", "swing_acc"):
+            setattr(self, t, torch.where(m1, torch.zeros_like(getattr(self, t)),
+                                         getattr(self, t)))
+        self.axis_valid = self.axis_valid & ~m1
+        self.tr_active = self.tr_active & ~m2
+        self.tr_ptr = torch.where(m1, torch.zeros_like(self.tr_ptr), self.tr_ptr)
         self.tick = torch.where(mask, torch.zeros_like(self.tick), self.tick)
         self.status = torch.where(m1, torch.zeros_like(self.status),
                                   self.status)
@@ -182,6 +243,7 @@ class TorchBeatVecEnv:
         self.good = torch.where(mask, zl, self.good)
         self.bad = torch.where(mask, zl, self.bad)
         self.miss = torch.where(mask, zl, self.miss)
+        self.score = torch.where(mask, torch.zeros_like(self.score), self.score)
 
     def reset(self):
         ones = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -194,11 +256,12 @@ class TorchBeatVecEnv:
     def step(self, actions):
         if not torch.is_tensor(actions):
             actions = torch.as_tensor(np.asarray(actions), device=self.device)
-        actions = actions.to(self.device).long()
+        actions = actions.to(self.device).long().view(self.num_envs, 2, 3)
         prev_pos = self.pos.clone()
+        prev_dir = self._blade_dir()
 
-        # integrate: accel -> drag -> speed cap -> move -> clamp (zeroing v)
-        self.vel = self.vel + self._act[actions] * (ACCEL * DT)
+        # translation: accel -> drag -> speed cap -> move -> clamp (zeroing v)
+        self.vel = self.vel + self._act[actions[..., 0]] * (ACCEL * DT)
         self.vel = self.vel * (1.0 - DRAG)
         spd = self.vel.norm(dim=-1, keepdim=True)
         self.vel = self.vel * torch.clamp(V_MAX / spd.clamp_min(1e-12), max=1.0)
@@ -207,39 +270,124 @@ class TorchBeatVecEnv:
         self.pos = torch.max(torch.min(self.pos, self._hi), self._lo)
         self.vel = torch.where(out, torch.zeros_like(self.vel), self.vel)
 
+        # rotation: azimuth (CW/CCW) and tilt (supination/pronation)
+        self.om_th = ((self.om_th + self._rot[actions[..., 1]])
+                      * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
+        self.om_ph = ((self.om_ph + self._rot[actions[..., 2]])
+                      * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
+        self.theta = self.theta + self.om_th * DT
+        self.theta = torch.where(self.theta >= math.pi,
+                                 self.theta - 2.0 * math.pi, self.theta)
+        self.theta = torch.where(self.theta < -math.pi,
+                                 self.theta + 2.0 * math.pi, self.theta)
+        self.phi = self.phi + self.om_ph * DT
+        phi_out = (self.phi < -PHI_LIM) | (self.phi > PHI_LIM)
+        self.phi = self.phi.clamp(-PHI_LIM, PHI_LIM)
+        self.om_ph = torch.where(phi_out, torch.zeros_like(self.om_ph),
+                                 self.om_ph)
+
+        # swing chain update (feeds pre-swing + follow-through scores)
+        d_new = self._blade_dir()
+        dot = (prev_dir * d_new).sum(-1).clamp(-1.0, 1.0)
+        delta = dot.acos()                                       # (N, 2)
+        cross = torch.cross(prev_dir, d_new, dim=-1)
+        cn = cross.norm(dim=-1, keepdim=True)
+        ax = cross / cn.clamp_min(1e-30)
+        sw_ok = delta >= SWING_BREAK
+        rev = sw_ok & self.axis_valid & ((self.axis * ax).sum(-1) < 0.0)
+        cont = sw_ok & ~rev                                      # (N, 2)
+        self.swing_acc = torch.where(
+            cont, self.swing_acc + delta,
+            torch.where(rev, delta, torch.zeros_like(delta)))
+        self.axis = torch.where(sw_ok.unsqueeze(-1), ax, self.axis)
+        self.axis_valid = sw_ok
+
+        # follow-through trackers (existing ones, BEFORE this tick's cuts):
+        # chain broke/reversed -> resolve; else accumulate, resolve at 60 deg
+        # or timeout. Trackers with cnt notes pay cnt * points.
+        cont_k = cont.unsqueeze(-1)                              # (N, 2, 1)
+        acc_new = torch.where(cont_k, self.tr_acc + delta.unsqueeze(-1),
+                              self.tr_acc)
+        age_new = torch.where(cont_k, self.tr_age + 1, self.tr_age)
+        resolve = self.tr_active & (
+            ~cont_k | (acc_new >= POST_FULL) | (age_new >= FOLLOW_TIMEOUT))
+        post_pts = (PTS_POST * (acc_new / POST_FULL).clamp(max=1.0)
+                    * self.tr_cnt.to(self.dtype))
+        post_paid = (post_pts * resolve.to(self.dtype)).sum((1, 2))  # (N,)
+        reward = post_paid / SCORE_MAX
+        self.score = self.score + post_paid
+        self.tr_acc, self.tr_age = acc_new, age_new
+        self.tr_active = self.tr_active & ~resolve
+
         time_new = (self.tick + 1).to(self.dtype) * DT              # (N,)
         z = (self.c_hit - time_new[:, None]) * self.c_speed         # (N,C)
         pending = (self.status == 0) & self.c_valid
 
-        missed = pending & (z < -Z_WINDOW)
-        in_slab = pending & (z.abs() <= Z_WINDOW)
+        missed = pending & (z < -Z_MISS)
+        cuttable = pending & ~missed & (z <= REACH_Z)
 
-        # segment->point distance per saber, against every note center
-        crossed = []
-        for s in (0, 1):
-            a = prev_pos[:, s, :].unsqueeze(1)                      # (N,1,2)
-            ab = (self.pos[:, s, :] - prev_pos[:, s, :]).unsqueeze(1)
-            denom = (ab * ab).sum(-1)                               # (N,1)
-            t = ((self.c_center - a) * ab).sum(-1) / denom.clamp_min(1e-12)
+        # swept-blade test: 8 sample points along each blade, each tracing
+        # its own 3D displacement segment against every note center.
+        # Static loop over samples bounds memory; first minimum wins ties
+        # (matches Rust's strict <, smallest sample fraction kept).
+        center3 = torch.cat([self.c_center, z.unsqueeze(-1)], -1)   # (N,C,3)
+        c3 = center3.unsqueeze(1)                                   # (N,1,C,3)
+        pos3_prev = torch.cat(
+            [prev_pos, torch.zeros_like(prev_pos[..., :1])], -1)    # (N,2,3)
+        pos3 = torch.cat([self.pos, torch.zeros_like(self.pos[..., :1])], -1)
+        d_min = torch.full((self.num_envs, 2, self.C), float("inf"),
+                           device=self.device, dtype=self.dtype)
+        s_star = torch.zeros_like(d_min)
+        for j in range(1, N_BLADE_SAMPLES + 1):
+            r = (j / N_BLADE_SAMPLES) * SABER_LEN
+            a = (pos3_prev + r * prev_dir).unsqueeze(2)             # (N,2,1,3)
+            b = (pos3 + r * d_new).unsqueeze(2)
+            ab = b - a
+            denom = (ab * ab).sum(-1)                               # (N,2,1)
+            t = ((c3 - a) * ab).sum(-1) / denom.clamp_min(1e-12)
             t = torch.where(denom < 1e-12, torch.zeros_like(t),
                             t.clamp(0.0, 1.0)).unsqueeze(-1)
-            dist = (a + t * ab - self.c_center).norm(dim=-1)        # (N,C)
-            crossed.append(dist <= CUT_RADIUS)
-        match_cross = torch.where(self.c_is_right, crossed[1], crossed[0])
-        other_cross = torch.where(self.c_is_right, crossed[0], crossed[1])
+            d = (a + t * ab - c3).norm(dim=-1)                      # (N,2,C)
+            better = d < d_min
+            d_min = torch.where(better, d, d_min)
+            s_star = torch.where(better, torch.full_like(s_star, r), s_star)
 
-        # matching saber first (Rust breaks before checking the other hand)
-        matched = in_slab & match_cross
-        wrong = in_slab & ~match_cross & other_cross
-        vel_note = torch.where(self.c_is_right.unsqueeze(-1),
-                               self.vel[:, 1, :].unsqueeze(1),
-                               self.vel[:, 0, :].unsqueeze(1))      # (N,C,2)
-        vspeed = vel_note.norm(dim=-1)
-        slow = vspeed < V_MIN_CUT
-        cosv = (vel_note * self.c_dvec).sum(-1) / vspeed.clamp_min(1e-9)
+        crossed = d_min <= CUT_RADIUS                               # (N,2,C)
+        is_r = self.c_is_right                                      # (N,C)
+        match_cross = torch.where(is_r, crossed[:, 1], crossed[:, 0])
+        other_cross = torch.where(is_r, crossed[:, 0], crossed[:, 1])
+        dm = torch.where(is_r, d_min[:, 1], d_min[:, 0])            # (N,C)
+        ss = torch.where(is_r, s_star[:, 1], s_star[:, 0])
+
+        # contact velocity of the MATCHING saber at its contact point
+        vel3 = torch.cat([self.vel, torch.zeros_like(self.vel[..., :1])], -1)
+        dd = self._blade_dir_dot()                                  # (N,2,3)
+        vel_m = torch.where(is_r.unsqueeze(-1),
+                            vel3[:, 1].unsqueeze(1).expand(-1, self.C, -1),
+                            vel3[:, 0].unsqueeze(1).expand(-1, self.C, -1))
+        dd_m = torch.where(is_r.unsqueeze(-1),
+                           dd[:, 1].unsqueeze(1).expand(-1, self.C, -1),
+                           dd[:, 0].unsqueeze(1).expand(-1, self.C, -1))
+        vc = vel_m + ss.unsqueeze(-1) * dd_m                        # (N,C,3)
+        vc_mag = vc.norm(dim=-1)
+        slow = vc_mag < V_MIN_CUT
+        v2_mag = vc[..., :2].norm(dim=-1)
+        cosv = (vc[..., :2] * self.c_dvec).sum(-1) / v2_mag.clamp_min(1e-9)
         angle_ok = self.c_any_dir | (cosv >= COS_TOL)
+
+        matched = cuttable & match_cross
+        wrong = cuttable & ~match_cross & other_cross
         good = matched & ~slow & angle_ok
         bad = (matched & (slow | ~angle_ok)) | wrong
+
+        # graded score for good cuts: pre-swing + accuracy now, the
+        # follow-through via a tracker
+        pre_s = PTS_PRE * (self.swing_acc / PRE_FULL).clamp(max=1.0)  # (N,2)
+        pre = torch.where(is_r, pre_s[:, 1:2], pre_s[:, 0:1])         # (N,C)
+        acc_pts = PTS_ACC * (1.0 - dm / CUT_RADIUS)
+        cut_pts = ((pre + acc_pts) * good.to(self.dtype)).sum(1)      # (N,)
+        reward = reward + cut_pts / SCORE_MAX
+        self.score = self.score + cut_pts
 
         self.status = torch.where(
             good, torch.ones_like(self.status),
@@ -248,19 +396,43 @@ class TorchBeatVecEnv:
                                     self.status)))
         n_good = good.sum(1); n_bad = bad.sum(1); n_miss = missed.sum(1)
         self.good += n_good; self.bad += n_bad; self.miss += n_miss
-        reward = (n_good.to(self.dtype) * REWARD_GOOD
-                  + n_bad.to(self.dtype) * REWARD_BAD
-                  + n_miss.to(self.dtype) * REWARD_MISS)
-        self.ep_return = self.ep_return + reward
+        reward = reward + (n_bad.to(self.dtype) * REWARD_BAD
+                           + n_miss.to(self.dtype) * REWARD_MISS)
+
+        # spawn aggregated follow-through trackers (one slot per saber per
+        # tick; same-tick trackers share (arc, age) forever, so a count is
+        # exact). The ring slot being written is provably inactive.
+        n_new = torch.stack([(good & ~is_r).sum(1), (good & is_r).sum(1)], 1)
+        spawn = n_new > 0                                           # (N,2)
+        slot_hot = torch.nn.functional.one_hot(
+            self.tr_ptr, N_TRACKERS).bool() & spawn.unsqueeze(-1)   # (N,2,K)
+        self.tr_acc = torch.where(slot_hot, torch.zeros_like(self.tr_acc),
+                                  self.tr_acc)
+        self.tr_age = torch.where(slot_hot, torch.zeros_like(self.tr_age),
+                                  self.tr_age)
+        self.tr_cnt = torch.where(slot_hot, n_new.unsqueeze(-1), self.tr_cnt)
+        self.tr_active = self.tr_active | slot_hot
+        self.tr_ptr = (self.tr_ptr + spawn.long()) % N_TRACKERS
 
         self.tick = self.tick + 1
         time_now = self.tick.to(self.dtype) * DT
         pending_after = ((self.status == 0) & self.c_valid).any(1)
-        done = ((~pending_after
+        no_trackers = ~self.tr_active.any((1, 2))
+        done = ((~pending_after & no_trackers
                  & ((self.c_n_notes == 0) | (time_now > self.c_last_hit)))
                 | (time_now > self.c_last_hit + 0.5)
                 | (self.tick >= self.max_steps))
 
+        # hard episode ends force-resolve pending follow-throughs (partial)
+        end_resolve = self.tr_active & done.view(-1, 1, 1)
+        end_pts = (PTS_POST * (self.tr_acc / POST_FULL).clamp(max=1.0)
+                   * self.tr_cnt.to(self.dtype))
+        end_paid = (end_pts * end_resolve.to(self.dtype)).sum((1, 2))
+        reward = reward + end_paid / SCORE_MAX
+        self.score = self.score + end_paid
+        self.tr_active = self.tr_active & ~end_resolve
+
+        self.ep_return = self.ep_return + reward
         self._record_returns(done)
         if self.auto_reset:
             self._reset_envs(done)
@@ -296,10 +468,14 @@ class TorchBeatVecEnv:
         N, C = self.num_envs, self.C
         obs = self._obs
         obs.zero_()
-        sab = torch.stack([self.pos[..., 0] / X_NORM, self.pos[..., 1] / Y_NORM,
-                           self.vel[..., 0] / V_MAX, self.vel[..., 1] / V_MAX],
-                          -1)                                       # (N,2,4)
-        obs[:, :OFF_NOTES] = sab.reshape(N, 8).to(torch.float32)
+        sab = torch.stack([
+            self.pos[..., 0] / X_NORM, self.pos[..., 1] / Y_NORM,
+            self.vel[..., 0] / V_MAX, self.vel[..., 1] / V_MAX,
+            self.theta.cos(), self.theta.sin(),
+            self.phi / PHI_LIM,
+            self.om_th / OMEGA_MAX, self.om_ph / OMEGA_MAX,
+            (self.swing_acc / PRE_FULL).clamp(max=2.0)], -1)     # (N,2,10)
+        obs[:, :OFF_NOTES] = sab.reshape(N, OFF_NOTES).to(torch.float32)
 
         time_now = self.tick.to(self.dtype) * DT
         pending = (self.status == 0) & self.c_valid

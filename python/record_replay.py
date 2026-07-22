@@ -1,9 +1,10 @@
 """Record replay JSONL episodes from a checkpoint, the scripted bot, or random.
 
 Watch them in viz/replay.html (open in a browser, drop the .jsonl in).
-All episodes run on the Rust sim via RustBeatEnv (JSONL v2 recording is
+All episodes run on the Rust sim via RustBeatEnv (JSONL v4 recording is
 built from the sim's event stream). Recorded with shaping_coef=0 so the
-logged rewards are the raw interpretable ones (+1 / -0.25 / -0.5).
+logged rewards are the raw interpretable ones (score/115 per good cut,
+-0.5 bad/miss).
 
   python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
   python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
