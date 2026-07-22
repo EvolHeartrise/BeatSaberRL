@@ -77,6 +77,15 @@
 
 {#if pb.rep}
   <Notes />
+  <!-- torso (env v6): shoulder crossbar + trunk hint behind the plane -->
+  <T.Mesh position={[0, 0.45, 0.35]} rotation={[0, 0, Math.PI / 2]}>
+    <T.CylinderGeometry args={[0.045, 0.045, 0.4, 10]} />
+    <T.MeshStandardMaterial color="#2a2f3b" />
+  </T.Mesh>
+  <T.Mesh position={[0, 0.13, 0.35]}>
+    <T.BoxGeometry args={[0.34, 0.56, 0.15]} />
+    <T.MeshStandardMaterial color="#20242e" />
+  </T.Mesh>
   <Saber s={0} />
   <Saber s={1} />
 {/if}

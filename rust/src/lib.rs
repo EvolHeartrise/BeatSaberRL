@@ -1,20 +1,18 @@
 //! Beat Arena sim core in Rust — THE physics implementation (SPEC.md is
 //! the contract; `python/beat_arena_env/constants.py` mirrors constants).
 //!
-//! Env v5.2 (2026-07-21): blade sabers with forearm-anchored joints.
-//! Each hand = a wrist (point mass on the hit plane, the old point-saber
-//! dynamics) + a rigid 1 m blade whose neutral is the forearm's
-//! extension, POINTING AT THE NOTES; two joints drive it: roll (forearm
-//! CW/CCW about the forward axis, per-hand 280-degree range) and bend
-//! (wrist deflection away from forward, +-95 deg — the blade can never
-//! point back at the player). Cuts are swept-blade-through-block events
-//! scored with the real Beat Saber 115-point system: 70 pre-swing
-//! (100 deg), 30 follow-through (60 deg), 15 accuracy-to-center.
-//!
-//! Env v5.3 (2026-07-22): the collision volume is the note's ACTUAL
-//! 0.4 m cube, rotated about the approach axis by (angle - 270 deg) so
-//! the block tracks its cut direction (down-swing = axis-aligned; dot
-//! notes don't rotate) — replacing the rotation-blind 0.28 m sphere.
+//! Env v6 (2026-07-22, user-designed): kinematic upper body. Each hand
+//! is a chain from a FIXED SHOULDER anchor: upper arm -> elbow (hinge)
+//! -> forearm -> the v5.2 wrist (roll + bend, in the forearm frame) ->
+//! 1 m blade. No force interactions — every joint integrates the same
+//! way (accel, drag, omega cap, anatomical limits that zero omega);
+//! the wrist is wherever forward kinematics puts it (fully 3D). Tiered
+//! dynamics: ponderous shoulder/elbow, snappy wrists. Contact velocity
+//! is the contact point's finite-difference displacement over the tick.
+//! Cuts are swept-blade-through-block events (the note's actual 0.4 m
+//! cube, rotated to its cut direction — env v5.3) scored with the real
+//! Beat Saber 115-point system: 70 pre-swing (100 deg), 30
+//! follow-through (60 deg), 15 accuracy-to-center.
 //!
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
@@ -23,9 +21,8 @@ use numpy::{PyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
 const DT: f64 = 1.0 / 30.0;
-const ACCEL: f64 = 30.0;
 const DRAG: f64 = 0.02;
-const V_MAX: f64 = 6.0;
+const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
 const V_MIN_CUT: f64 = 1.0;
 // accuracy normalizer only (circumscribed circle of the 0.4 m face) —
 // contact itself is the swept blade vs the note's ROTATED box (env v5.3)
@@ -33,27 +30,60 @@ const CUT_RADIUS: f64 = 0.28;
 const HALF_BLOCK: f64 = 0.2;
 const COS_TOL: f64 = 0.5;
 const CELL: f64 = 0.5;
-const POS_LO: [f64; 2] = [-1.5, -1.25];
-const POS_HI: [f64; 2] = [1.5, 1.25];
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
 
-// --- blade (env v5) ---------------------------------------------------------
+// --- upper body (env v6, 2026-07-22, user-designed) -------------------------
+// Kinematic chain per hand: fixed shoulder anchor -> upper arm -> elbow
+// (hinge) -> forearm -> the v5.2 wrist (roll + bend) -> 1 m blade. No
+// force interactions — every joint integrates the same way (accel, drag,
+// omega cap, limits that zero omega). The wrist is wherever forward
+// kinematics puts it (fully 3D; the z = 0 plane confinement is gone).
+// Realistic fixed proportions: shoulder width 0.4 m, shoulders 0.45 m
+// above grid center and 0.35 m behind the hit plane.
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
-const ALPHA_ROT: f64 = 200.0; // rad/s^2, both angular DOFs
-const OMEGA_MAX: f64 = 20.0; // rad/s
-// env v5.2 forearm-anchored joints (2026-07-21, user-specified): the
-// neutral blade is the forearm's extension, POINTING AT THE NOTES (+z).
-// roll = forearm CW/CCW about the forward axis; from the palm-down
-// neutral the right wrist rolls 90 deg CCW / 190 deg CW ->
-// [-190, 90] deg, mirrored left [-90, 190]. bend = wrist deflection
-// away from forward, +-95 deg (90 = blade flat in the hit plane) — the
-// blade can NEVER point back at the player (d_z >= cos 95 ~ -0.087).
+const SHOULDER: [[f64; 3]; 2] = [[-0.2, 0.45, -0.35], [0.2, 0.45, -0.35]];
+const L_UPPER: f64 = 0.35; // m
+const L_FORE: f64 = 0.30; // m
+// tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
+const ALPHA_ARM: f64 = 80.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
+const OMEGA_ARM: f64 = 8.0; // rad/s
+const ALPHA_WRIST: f64 = 200.0; // rad/s^2 (roll, bend — v5 values)
+const OMEGA_WRIST: f64 = 20.0; // rad/s
+// joint order per hand: pitch, yaw, twist, elbow, roll, bend.
+// Neutral (all zeros) = arm straight forward (+z), blade its extension.
+// pitch: + = arm up, +-90 deg. yaw: + = toward +x; outward 100 deg /
+// cross-body 45 deg per hand (mirrored). twist (humeral rotation):
+// +-90 deg, orients the elbow's bend plane. elbow flexion: 0..150 deg,
+// curls toward local +y. roll/bend: the unchanged v5.2 wrist.
+const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg
+const YAW_LO: [f64; 2] = [-1.7453292519943295, -0.7853981633974483]; // L, R
+const YAW_HI: [f64; 2] = [0.7853981633974483, 1.7453292519943295];
+const TWIST_LIM: f64 = 1.5707963267948966; // 90 deg
+const ELBOW_HI: f64 = 2.6179938779914944; // 150 deg (lo = 0)
 const ROLL_LO: [f64; 2] = [-1.5707963267948966, -3.3161255787892263]; // L, R
 const ROLL_HI: [f64; 2] = [3.3161255787892263, 1.5707963267948966];
 const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
+const N_JOINTS: usize = 6;
+const JOINT_ALPHA: [f64; N_JOINTS] =
+    [ALPHA_ARM, ALPHA_ARM, ALPHA_ARM, ALPHA_ARM, ALPHA_WRIST, ALPHA_WRIST];
+const JOINT_OMEGA: [f64; N_JOINTS] =
+    [OMEGA_ARM, OMEGA_ARM, OMEGA_ARM, OMEGA_ARM, OMEGA_WRIST, OMEGA_WRIST];
+
+fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
+    [
+        (-PITCH_LIM, PITCH_LIM),
+        (YAW_LO[hand], YAW_HI[hand]),
+        (-TWIST_LIM, TWIST_LIM),
+        (0.0, ELBOW_HI),
+        (ROLL_LO[hand], ROLL_HI[hand]),
+        (-BEND_LIM, BEND_LIM),
+    ]
+}
 const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
-const REACH_Z: f64 = 1.2; // straight-forward tip (1 m) + HALF_BLOCK
+// broad-phase gate: max wrist z (0.3, arm straight forward) + blade + half
+// block — beyond this no pose can touch a note
+const REACH_Z: f64 = 1.5;
 const Z_MISS: f64 = 0.6; // note consumed as missed past this
 
 // --- scoring (real Beat Saber 115) ------------------------------------------
@@ -68,11 +98,13 @@ const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 
 const N_NOTE_SLOTS: usize = 12;
 const NOTE_FEAT: usize = 9;
-// obs v4: per saber 10 features (wrist + blade pose + pre-swing meter)
-const SABER_FEAT: usize = 10;
-const OFF_NOTES: usize = 2 * SABER_FEAT; // 20
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 128
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 140
+// obs v5: per hand 23 features — 6 joint angles (roll as cos/sin -> 7
+// numbers), 6 angular velocities, derived wrist pos (3) + finite-diff
+// wrist vel (3) + blade unit dir (3), and the live pre-swing meter
+const SABER_FEAT: usize = 23;
+const OFF_NOTES: usize = 2 * SABER_FEAT; // 46
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 154
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 166
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
@@ -89,32 +121,51 @@ struct Note {
     any_dir: bool, // dot note: any swing direction scores
 }
 
-fn action_dir(a: u8) -> [f64; 2] {
-    let th = a as f64 * std::f64::consts::PI / 4.0;
-    [th.cos(), th.sin()]
-}
-
 fn note_center(n: &Note) -> [f64; 2] {
     [(n.col as f64 - 1.5) * CELL, (n.row as f64 - 1.0) * CELL]
 }
 
-/// Blade direction unit vector from (roll, bend): neutral (+z, at the
-/// notes), bent away from forward in the plane the roll orients.
-fn blade_dir(roll: f64, bend: f64) -> [f64; 3] {
-    let (sr, cr) = roll.sin_cos();
-    let (sb, cb) = bend.sin_cos();
-    [-sr * sb, cr * sb, cb]
-}
-
-/// d/dt of the blade direction, given the angular velocities.
-fn blade_dir_dot(roll: f64, bend: f64, om_r: f64, om_b: f64) -> [f64; 3] {
-    let (sr, cr) = roll.sin_cos();
-    let (sb, cb) = bend.sin_cos();
-    [
-        -om_r * cr * sb - om_b * sr * cb,
-        -om_r * sr * sb + om_b * cr * cb,
-        -om_b * sb,
-    ]
+/// Forward kinematics: (elbow, wrist, blade unit dir) from the six joint
+/// angles q = [pitch, yaw, twist, elbow, roll, bend].
+///
+/// Arm frame  M = R_y(yaw) · R_x(−pitch) · R_z(twist)  (local +z = upper
+/// arm; at zero everything points at the notes). Elbow flexion rotates
+/// about the twist-oriented local x: forearm = M · (0, sin e, cos e).
+/// The blade is the v5.2 wrist in the FOREARM frame
+/// M_f = M · R_x(−elbow):  d(roll, bend) = (−sinψ·sinφ, cosψ·sinφ, cosφ)
+/// — the neutral blade is the forearm's extension, exactly v5.2's law
+/// generalized to a moving forearm.
+fn fk(hand: usize, q: &[f64; N_JOINTS]) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let (sp, cp) = q[0].sin_cos();
+    let (sy, cy) = q[1].sin_cos();
+    let (st, ct) = q[2].sin_cos();
+    let (se, ce) = q[3].sin_cos();
+    let m = [
+        [cy * ct - sy * sp * st, -cy * st - sy * sp * ct, sy * cp],
+        [cp * st, cp * ct, sp],
+        [-sy * ct - cy * sp * st, sy * st - cy * sp * ct, cy * cp],
+    ];
+    let sh = SHOULDER[hand];
+    let e = [
+        sh[0] + L_UPPER * m[0][2],
+        sh[1] + L_UPPER * m[1][2],
+        sh[2] + L_UPPER * m[2][2],
+    ];
+    let f = [
+        m[0][1] * se + m[0][2] * ce,
+        m[1][1] * se + m[1][2] * ce,
+        m[2][1] * se + m[2][2] * ce,
+    ];
+    let w = [e[0] + L_FORE * f[0], e[1] + L_FORE * f[1], e[2] + L_FORE * f[2]];
+    let (sr, cr) = q[4].sin_cos();
+    let (sb, cb) = q[5].sin_cos();
+    let d = [-sr * sb, cr * sb, cb];
+    let b = [
+        m[0][0] * d[0] + (m[0][1] * ce - m[0][2] * se) * d[1] + f[0] * d[2],
+        m[1][0] * d[0] + (m[1][1] * ce - m[1][2] * se) * d[1] + f[1] * d[2],
+        m[2][0] * d[0] + (m[2][1] * ce - m[2][2] * se) * d[1] + f[2] * d[2],
+    ];
+    (e, w, b)
 }
 
 /// Env v5.3: a note is its actual 0.4 m cube, rotated about the approach
@@ -182,26 +233,26 @@ fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 }
 
 #[derive(Clone, Copy)]
-struct Saber {
-    pos: [f64; 2],
-    vel: [f64; 2],
-    roll: f64,
-    bend: f64,
-    om_roll: f64,
-    om_bend: f64,
-    swing_acc: f64,        // arc of the current continuous swing (rad)
+struct Arm {
+    q: [f64; N_JOINTS],  // pitch, yaw, twist, elbow, roll, bend
+    om: [f64; N_JOINTS], // angular velocities
+    wrist: [f64; 3],     // FK cache (updated whenever q changes)
+    blade: [f64; 3],     // FK cache, unit blade direction
+    wrist_vel: [f64; 3], // finite difference across the last tick
+    swing_acc: f64,      // arc of the current continuous swing (rad)
     axis: Option<[f64; 3]>, // last tick's rotation axis (unit)
 }
 
-impl Saber {
-    fn start(x: f64) -> Self {
-        Saber {
-            pos: [x, 0.0],
-            vel: [0.0; 2],
-            roll: 0.0, // palm down
-            bend: 0.0, // blade pointing at the notes
-            om_roll: 0.0,
-            om_bend: 0.0,
+impl Arm {
+    fn start(hand: usize) -> Self {
+        // all joints zero: arm straight forward, blade its extension
+        let (_, w, b) = fk(hand, &[0.0; N_JOINTS]);
+        Arm {
+            q: [0.0; N_JOINTS],
+            om: [0.0; N_JOINTS],
+            wrist: w,
+            blade: b,
+            wrist_vel: [0.0; 3],
             swing_acc: 0.0,
             axis: None,
         }
@@ -222,7 +273,7 @@ struct Core {
     // state
     tick: u32,
     time: f64,
-    sabers: [Saber; 2],
+    arms: [Arm; 2],
     trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad, 3 missed
     good_cuts: u32,
@@ -238,7 +289,7 @@ impl Core {
             chart: Vec::new(),
             tick: 0,
             time: 0.0,
-            sabers: [Saber::start(-0.5), Saber::start(0.5)],
+            arms: [Arm::start(0), Arm::start(1)],
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
             good_cuts: 0,
@@ -267,7 +318,7 @@ impl Core {
     fn reset_state(&mut self) {
         self.tick = 0;
         self.time = 0.0;
-        self.sabers = [Saber::start(-0.5), Saber::start(0.5)];
+        self.arms = [Arm::start(0), Arm::start(1)];
         self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
         self.good_cuts = 0;
@@ -278,19 +329,30 @@ impl Core {
 
     fn build_obs(&self) -> [f32; OBS_DIM] {
         let mut obs = [0.0f32; OBS_DIM];
-        for (s, sab) in self.sabers.iter().enumerate() {
+        for (s, arm) in self.arms.iter().enumerate() {
             let b = s * SABER_FEAT;
-            obs[b] = (sab.pos[0] / X_NORM) as f32;
-            obs[b + 1] = (sab.pos[1] / Y_NORM) as f32;
-            obs[b + 2] = (sab.vel[0] / V_MAX) as f32;
-            obs[b + 3] = (sab.vel[1] / V_MAX) as f32;
-            obs[b + 4] = sab.roll.cos() as f32;
-            obs[b + 5] = sab.roll.sin() as f32;
-            obs[b + 6] = (sab.bend / BEND_LIM) as f32;
-            obs[b + 7] = (sab.om_roll / OMEGA_MAX) as f32;
-            obs[b + 8] = (sab.om_bend / OMEGA_MAX) as f32;
+            // joint pose: bounded scalars normalized to their ranges,
+            // except roll (280 deg arc) which keeps its v5 cos/sin coding
+            obs[b] = (arm.q[0] / PITCH_LIM) as f32;
+            obs[b + 1] = (arm.q[1] / YAW_HI[1]) as f32;
+            obs[b + 2] = (arm.q[2] / TWIST_LIM) as f32;
+            obs[b + 3] = ((2.0 * arm.q[3] - ELBOW_HI) / ELBOW_HI) as f32;
+            obs[b + 4] = arm.q[4].cos() as f32;
+            obs[b + 5] = arm.q[4].sin() as f32;
+            obs[b + 6] = (arm.q[5] / BEND_LIM) as f32;
+            for j in 0..N_JOINTS {
+                obs[b + 7 + j] = (arm.om[j] / JOINT_OMEGA[j]) as f32;
+            }
+            // derived hand state: FK wrist, finite-diff velocity, blade dir
+            obs[b + 13] = (arm.wrist[0] / X_NORM) as f32;
+            obs[b + 14] = (arm.wrist[1] / Y_NORM) as f32;
+            obs[b + 15] = arm.wrist[2] as f32;
+            for k in 0..3 {
+                obs[b + 16 + k] = (arm.wrist_vel[k] / V_NORM) as f32;
+                obs[b + 19 + k] = arm.blade[k] as f32;
+            }
             // live pre-swing meter: 1.0 = full pre-swing credit banked
-            obs[b + 9] = (sab.swing_acc / PRE_FULL).min(2.0) as f32;
+            obs[b + 22] = (arm.swing_acc / PRE_FULL).min(2.0) as f32;
         }
         let mut slot = 0usize;
         for (i, n) in self.chart.iter().enumerate() {
@@ -322,82 +384,51 @@ impl Core {
 
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
     // (follow-through resolution; the f32 is the points awarded).
-    fn step_inner(&mut self, actions: [[u8; 3]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
-        let prev_pos = [self.sabers[0].pos, self.sabers[1].pos];
-        let prev_dir = [
-            blade_dir(self.sabers[0].roll, self.sabers[0].bend),
-            blade_dir(self.sabers[1].roll, self.sabers[1].bend),
-        ];
+    fn step_inner(&mut self, actions: [[u8; N_JOINTS]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
+        let prev_pos = [self.arms[0].wrist, self.arms[1].wrist];
+        let prev_dir = [self.arms[0].blade, self.arms[1].blade];
 
         let mut reward = 0.0;
         let mut events: Vec<(u32, u8, f32)> = Vec::new();
-        // per saber this tick: (swing delta, did the chain continue)
+        // per arm this tick: (swing delta, did the chain continue)
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
 
         for s in 0..2 {
-            let sab = &mut self.sabers[s];
-            // translation (unchanged point-mass wrist dynamics)
-            let a = actions[s][0];
-            if a > 0 {
-                let d = action_dir(a - 1);
-                sab.vel[0] += ACCEL * DT * d[0];
-                sab.vel[1] += ACCEL * DT * d[1];
-            }
-            sab.vel[0] *= 1.0 - DRAG;
-            sab.vel[1] *= 1.0 - DRAG;
-            let speed = (sab.vel[0].powi(2) + sab.vel[1].powi(2)).sqrt();
-            if speed > V_MAX {
-                let k = V_MAX / speed;
-                sab.vel[0] *= k;
-                sab.vel[1] *= k;
-            }
-            sab.pos[0] += sab.vel[0] * DT;
-            sab.pos[1] += sab.vel[1] * DT;
-            for ax in 0..2 {
-                if sab.pos[ax] < POS_LO[ax] || sab.pos[ax] > POS_HI[ax] {
-                    sab.pos[ax] = sab.pos[ax].clamp(POS_LO[ax], POS_HI[ax]);
-                    sab.vel[ax] = 0.0;
+            let arm = &mut self.arms[s];
+            // one integrator for every joint: accel, drag, omega cap,
+            // angle step, limit clamp (hitting a limit kills the omega)
+            let lims = joint_limits(s);
+            for j in 0..N_JOINTS {
+                arm.om[j] += match actions[s][j] {
+                    1 => JOINT_ALPHA[j] * DT,
+                    2 => -JOINT_ALPHA[j] * DT,
+                    _ => 0.0,
+                };
+                arm.om[j] =
+                    (arm.om[j] * (1.0 - DRAG)).clamp(-JOINT_OMEGA[j], JOINT_OMEGA[j]);
+                arm.q[j] += arm.om[j] * DT;
+                if arm.q[j] < lims[j].0 || arm.q[j] > lims[j].1 {
+                    arm.q[j] = arm.q[j].clamp(lims[j].0, lims[j].1);
+                    arm.om[j] = 0.0;
                 }
             }
-            // rotation: forearm roll (CW/CCW) and wrist bend
-            let roll_a = actions[s][1];
-            sab.om_roll += match roll_a {
-                1 => ALPHA_ROT * DT,
-                2 => -ALPHA_ROT * DT,
-                _ => 0.0,
-            };
-            let bend_a = actions[s][2];
-            sab.om_bend += match bend_a {
-                1 => ALPHA_ROT * DT,
-                2 => -ALPHA_ROT * DT,
-                _ => 0.0,
-            };
-            sab.om_roll = (sab.om_roll * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
-            sab.om_bend = (sab.om_bend * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
-            sab.roll += sab.om_roll * DT;
-            // anatomical limits: bounded joints, no wrap — hitting a limit
-            // kills that joint's velocity
-            if sab.roll < ROLL_LO[s] || sab.roll > ROLL_HI[s] {
-                sab.roll = sab.roll.clamp(ROLL_LO[s], ROLL_HI[s]);
-                sab.om_roll = 0.0;
-            }
-            sab.bend += sab.om_bend * DT;
-            if sab.bend < -BEND_LIM || sab.bend > BEND_LIM {
-                sab.bend = sab.bend.clamp(-BEND_LIM, BEND_LIM);
-                sab.om_bend = 0.0;
+            let (_, w, d_new) = fk(s, &arm.q);
+            arm.wrist = w;
+            arm.blade = d_new;
+            for k in 0..3 {
+                arm.wrist_vel[k] = (w[k] - prev_pos[s][k]) / DT;
             }
 
             // swing chain update (feeds pre-swing + follow-through scores)
-            let d_new = blade_dir(sab.roll, sab.bend);
             let d_old = prev_dir[s];
             let dot = (d_old[0] * d_new[0] + d_old[1] * d_new[1] + d_old[2] * d_new[2])
                 .clamp(-1.0, 1.0);
             let delta = dot.acos();
             deltas[s] = delta;
             if delta < SWING_BREAK {
-                sab.swing_acc = 0.0;
-                sab.axis = None;
+                arm.swing_acc = 0.0;
+                arm.axis = None;
             } else {
                 let cx = [
                     d_old[1] * d_new[2] - d_old[2] * d_new[1],
@@ -406,16 +437,16 @@ impl Core {
                 ];
                 let cn = (cx[0].powi(2) + cx[1].powi(2) + cx[2].powi(2)).sqrt();
                 let ax = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
-                match sab.axis {
+                match arm.axis {
                     Some(a0) if a0[0] * ax[0] + a0[1] * ax[1] + a0[2] * ax[2] < 0.0 => {
-                        sab.swing_acc = delta; // reversal: a new swing starts
+                        arm.swing_acc = delta; // reversal: a new swing starts
                     }
                     _ => {
-                        sab.swing_acc += delta;
+                        arm.swing_acc += delta;
                         continued[s] = true;
                     }
                 }
-                sab.axis = Some(ax);
+                arm.axis = Some(ax);
             }
         }
 
@@ -465,8 +496,8 @@ impl Core {
             let center = [note_center(&n)[0], note_center(&n)[1], z];
             let (cos_r, sin_r) = note_rot(&n);
             for &s in &[n.color as usize, 1 - n.color as usize] {
-                let sab = self.sabers[s];
-                let d_new = blade_dir(sab.roll, sab.bend);
+                let arm = self.arms[s];
+                let d_new = arm.blade;
                 // swept-blade test: 8 sample points along the blade, each
                 // tracing its own displacement segment (full 3D) against
                 // the note's ROTATED cube; distance-to-center of the
@@ -479,12 +510,12 @@ impl Core {
                     let p0 = [
                         prev_pos[s][0] + r * prev_dir[s][0],
                         prev_pos[s][1] + r * prev_dir[s][1],
-                        r * prev_dir[s][2],
+                        prev_pos[s][2] + r * prev_dir[s][2],
                     ];
                     let p1 = [
-                        sab.pos[0] + r * d_new[0],
-                        sab.pos[1] + r * d_new[1],
-                        r * d_new[2],
+                        arm.wrist[0] + r * d_new[0],
+                        arm.wrist[1] + r * d_new[1],
+                        arm.wrist[2] + r * d_new[2],
                     ];
                     if !seg_box_hit(
                         to_box_frame(p0, center, cos_r, sin_r),
@@ -502,12 +533,16 @@ impl Core {
                 if !d_min.is_finite() {
                     continue;
                 }
-                // contact velocity: wrist translation + rotation at s*
-                let dd = blade_dir_dot(sab.roll, sab.bend, sab.om_roll, sab.om_bend);
+                // contact velocity (env v6): the contact point's actual
+                // displacement over the tick / DT — the same segments the
+                // collision test sweeps, no chain Jacobian needed
                 let vc = [
-                    sab.vel[0] + s_star * dd[0],
-                    sab.vel[1] + s_star * dd[1],
-                    s_star * dd[2],
+                    (arm.wrist[0] + s_star * d_new[0]
+                        - prev_pos[s][0] - s_star * prev_dir[s][0]) / DT,
+                    (arm.wrist[1] + s_star * d_new[1]
+                        - prev_pos[s][1] - s_star * prev_dir[s][1]) / DT,
+                    (arm.wrist[2] + s_star * d_new[2]
+                        - prev_pos[s][2] - s_star * prev_dir[s][2]) / DT,
                 ];
                 let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
                 let code: u8 = if s != n.color as usize {
@@ -526,7 +561,7 @@ impl Core {
                 if code == 0 {
                     self.status[i] = 1;
                     self.good_cuts += 1;
-                    let pre = PTS_PRE * (self.sabers[s].swing_acc / PRE_FULL).min(1.0);
+                    let pre = PTS_PRE * (self.arms[s].swing_acc / PRE_FULL).min(1.0);
                     // corner clips of the rotated box can sit slightly
                     // outside the circumscribed circle -> floor at 0
                     let acc = PTS_ACC * (1.0 - d_min / CUT_RADIUS).max(0.0);
@@ -600,25 +635,22 @@ impl RawBeatSim {
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
-    /// Per-hand action = (move 0..8, roll 0..2, bend 0..2); left then right.
+    /// actions: 12 ints in 0..2 — per hand (pitch, yaw, twist, elbow,
+    /// roll, bend), left hand first; 0 = coast, 1 = +alpha, 2 = -alpha.
     /// Returns (obs, reward, done, events); events = [(note_idx, code, points)]
     /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post.
-    #[allow(clippy::too_many_arguments)]
     fn step<'py>(
         &mut self,
         py: Python<'py>,
-        al_move: u8,
-        al_rot: u8,
-        al_tilt: u8,
-        ar_move: u8,
-        ar_rot: u8,
-        ar_tilt: u8,
+        actions: Vec<u8>,
     ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32)>) {
-        assert!(al_move <= 8 && ar_move <= 8);
-        assert!(al_rot <= 2 && al_tilt <= 2 && ar_rot <= 2 && ar_tilt <= 2);
-        let (reward, done, events) = self
-            .core
-            .step_inner([[al_move, al_rot, al_tilt], [ar_move, ar_rot, ar_tilt]]);
+        assert_eq!(actions.len(), 2 * N_JOINTS);
+        assert!(actions.iter().all(|&a| a <= 2));
+        let mut acts = [[0u8; N_JOINTS]; 2];
+        for s in 0..2 {
+            acts[s].copy_from_slice(&actions[s * N_JOINTS..(s + 1) * N_JOINTS]);
+        }
+        let (reward, done, events) = self.core.step_inner(acts);
         (
             PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
@@ -627,15 +659,23 @@ impl RawBeatSim {
         )
     }
 
-    /// Saber state [[x, y, vx, vy, roll, bend, om_roll, om_bend]; 2].
-    fn sabers(&self) -> [[f64; 8]; 2] {
+    /// Arm state [[q(6) ++ om(6) ++ wrist(3)]; 2] — joint angles
+    /// (pitch, yaw, twist, elbow, roll, bend), angular velocities, and
+    /// the FK wrist position.
+    fn sabers(&self) -> [[f64; 15]; 2] {
         [0, 1].map(|s| {
-            let sab = self.core.sabers[s];
-            [
-                sab.pos[0], sab.pos[1], sab.vel[0], sab.vel[1],
-                sab.roll, sab.bend, sab.om_roll, sab.om_bend,
-            ]
+            let a = self.core.arms[s];
+            let mut out = [0.0; 15];
+            out[..6].copy_from_slice(&a.q);
+            out[6..12].copy_from_slice(&a.om);
+            out[12..].copy_from_slice(&a.wrist);
+            out
         })
+    }
+
+    /// Blade unit directions [[x, y, z]; 2] (FK cache).
+    fn blades(&self) -> [[f64; 3]; 2] {
+        [0, 1].map(|s| self.core.arms[s].blade)
     }
 
     /// Per-note status: 0 pending, 1 good, 2 bad, 3 missed.
@@ -643,27 +683,18 @@ impl RawBeatSim {
         self.core.status.clone()
     }
 
-    /// TEST HOOK: overwrite one saber's full state before a step.
-    #[allow(clippy::too_many_arguments)]
-    fn set_saber(
-        &mut self,
-        s: usize,
-        x: f64,
-        y: f64,
-        vx: f64,
-        vy: f64,
-        roll: f64,
-        bend: f64,
-        om_roll: f64,
-        om_bend: f64,
-    ) {
-        let sab = &mut self.core.sabers[s];
-        sab.pos = [x, y];
-        sab.vel = [vx, vy];
-        sab.roll = roll;
-        sab.bend = bend;
-        sab.om_roll = om_roll;
-        sab.om_bend = om_bend;
+    /// TEST HOOK: overwrite one arm's joint state before a step (FK cache
+    /// refreshes immediately; the finite-diff wrist velocity resets).
+    fn set_joints(&mut self, s: usize, q: Vec<f64>, om: Vec<f64>) {
+        assert_eq!(q.len(), N_JOINTS);
+        assert_eq!(om.len(), N_JOINTS);
+        let arm = &mut self.core.arms[s];
+        arm.q.copy_from_slice(&q);
+        arm.om.copy_from_slice(&om);
+        let (_, w, b) = fk(s, &arm.q);
+        arm.wrist = w;
+        arm.blade = b;
+        arm.wrist_vel = [0.0; 3];
     }
 
     #[getter]
@@ -729,10 +760,11 @@ impl VecBeatSim {
         PyArray1::from_vec_bound(py, flat)
     }
 
-    /// actions: (N, 6) int64 — per hand (move, rot, tilt), left first.
-    /// Returns (obs flat (N*140,) f32 — reshape Python-side, rewards (N,)
-    /// f32, dones (N,) bool). Done envs must get a fresh set_chart before
-    /// the next step; their returned obs row is the terminal obs.
+    /// actions: (N, 12) int64 — per hand (pitch, yaw, twist, elbow, roll,
+    /// bend), left first. Returns (obs flat (N*166,) f32 — reshape
+    /// Python-side, rewards (N,) f32, dones (N,) bool). Done envs must get
+    /// a fresh set_chart before the next step; their returned obs row is
+    /// the terminal obs.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -744,15 +776,18 @@ impl VecBeatSim {
     ) {
         let acts = actions.as_array();
         let n = self.sims.len();
-        assert_eq!(acts.shape(), &[n, 6]);
+        assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
         let mut flat = vec![0.0f32; n * OBS_DIM];
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
         for (i, sim) in self.sims.iter_mut().enumerate() {
-            let (r, d, _events) = sim.step_inner([
-                [acts[[i, 0]] as u8, acts[[i, 1]] as u8, acts[[i, 2]] as u8],
-                [acts[[i, 3]] as u8, acts[[i, 4]] as u8, acts[[i, 5]] as u8],
-            ]);
+            let mut a = [[0u8; N_JOINTS]; 2];
+            for s in 0..2 {
+                for j in 0..N_JOINTS {
+                    a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
+                }
+            }
+            let (r, d, _events) = sim.step_inner(a);
             flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
             rewards[i] = r as f32;
             dones[i] = d;

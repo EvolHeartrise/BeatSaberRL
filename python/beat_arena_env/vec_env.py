@@ -53,9 +53,9 @@ class BeatVecEnv:
         return self.sim.obs().reshape(self.num_envs, OBS_DIM)
 
     def step(self, actions):
-        """actions: (N, 6) int array — per hand (move, rot, tilt), left
-        first. Returns (obs, rewards, dones, infos); infos = list of dicts
-        for envs that finished THIS step."""
+        """actions: (N, 12) int array — per hand (pitch, yaw, twist,
+        elbow, roll, bend), left first. Returns (obs, rewards, dones,
+        infos); infos = list of dicts for envs that finished THIS step."""
         obs, rew, done = self.sim.step(np.ascontiguousarray(actions, dtype=np.int64))
         obs = obs.reshape(self.num_envs, OBS_DIM)
         self._returns += rew
