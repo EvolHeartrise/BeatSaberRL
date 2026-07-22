@@ -201,6 +201,15 @@ and pre-v6 references are not comparable.
   outlines). The v5.2 record ckpt re-evaled at **98.0% good / 0 miss /
   106.8 / +43.72** on the stricter geometry (was 99.1/107.7) —
   center-cutting generalizes.
+- **First v6 result (2026-07-22): 90.6% good / 91.7 score / 1.3% miss /
+  +35.74 on the dynamic gym** — 50M wide-cosine from scratch
+  (`runs/v6_wide_e4cos_50m`, 37 min, 22.3k steps/s), 30-ep greedy eval.
+  Pure rewards learned arm-positioning + wrist-whipping through the
+  3^12 action space and beat the 61.2% scripted ceiling by 29 points;
+  onset was late (return crossed 0 at ~34M vs v5.2's ~23M) and the run
+  ended mid-surge under the cosine tail, so 90.6 is likely not this
+  body's ceiling. Residual errors are bad cuts (8.1%), not misses —
+  engagement solved; swing-credit under time pressure is the frontier.
 - **Env v6 (2026-07-22, user-designed): kinematic upper body.** Wrists
   stop free-floating: fixed shoulders at (±0.2, 0.45, −0.35), upper arm
   0.35 m, forearm 0.30 m, 4-DOF arm (shoulder pitch/yaw/twist + elbow)
