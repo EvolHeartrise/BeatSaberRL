@@ -12,7 +12,7 @@
   import * as THREE from "three";
   import { pb, pose } from "./state.svelte.js";
   import {
-    BEND_LIM, ELBOW_HI, PITCH_LIM, ROLL_HI, ROLL_LO, SABER_COLORS,
+    BEND_LIM, ELBOW_HI, PITCH_HI, PITCH_LO, ROLL_HI, ROLL_LO, SABER_COLORS,
     TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber, saberAt,
   } from "./replay.js";
 
@@ -125,7 +125,7 @@
 
     // ---- arm-joint bars (env v6): angle within its anatomical range ------
     const bars = [
-      ["pitch", sab[0], -PITCH_LIM, PITCH_LIM],
+      ["pitch", sab[0], PITCH_LO, PITCH_HI],
       ["yaw", sab[1], YAW_LO[hand], YAW_HI[hand]],
       ["twist", sab[2], TWIST_LO[hand], TWIST_HI[hand]],
       ["elbow", sab[3], 0, ELBOW_HI],

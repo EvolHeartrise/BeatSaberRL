@@ -54,7 +54,8 @@ export const V_MIN = 1, DT = 1 / 30;
 const RAD = Math.PI / 180;
 export const SHOULDER = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
 export const L_UPPER = 0.35, L_FORE = 0.3;
-export const PITCH_LIM = 90 * RAD;
+// env v7.2: pitch capped at +65 deg (up); -90 straight-down unchanged
+export const PITCH_LO = -90 * RAD, PITCH_HI = 65 * RAD;
 export const YAW_LO = [-100 * RAD, -45 * RAD]; // left, right
 export const YAW_HI = [45 * RAD, 100 * RAD];
 // env v7.1: twist and roll tightened, per-hand mirrored ranges
@@ -72,7 +73,7 @@ export const JOINT_NAMES = ["pitch", "yaw", "twist", "elbow", "roll", "bend"];
 /** [(lo, hi)] x 6 for one hand, in joint order (mirror of constants.py). */
 export function jointLimits(hand) {
   return [
-    [-PITCH_LIM, PITCH_LIM],
+    [PITCH_LO, PITCH_HI],
     [YAW_LO[hand], YAW_HI[hand]],
     [TWIST_LO[hand], TWIST_HI[hand]],
     [0, ELBOW_HI],
