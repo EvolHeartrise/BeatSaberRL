@@ -153,4 +153,13 @@ not comparable.
   command, 28.5 min from scratch (`runs/v5_wide_e4cos_50m`). First v5
   full combo: seed 7000, 48/48 sampled, 105.2/115
   (`replays/v5_50m_ep00_seed7000.jsonl`). Pure rewards climbed the whole
-  stab→swing staircase.
+  stab→swing staircase. SUPERSEDED by v5.1: that policy exploited
+  unbounded wrist rolls.
+- **Env v5.1 (same night, user-specified): anatomical wrist limits** —
+  azimuth right [−100°, 180°] / left [0°, 280°] (280° arcs from the
+  palm-down neutral), tilt ±95°; limits zero the angular velocity.
+  Scripted bot refits arcs into range: easy 100%/95.9, hard 90%/80.0,
+  dynamic 92%/83.1. **Fresh 50M run: 98.7% good / 0 miss / 99.1/115 /
+  +40.72 (`runs/v51_wide_e4cos_50m`)** — the limits delayed the surge
+  ~3–5M steps and taxed score −5, but engagement held completely;
+  another sampled full combo (seed 7004, 46/46).
