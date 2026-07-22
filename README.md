@@ -178,3 +178,10 @@ not comparable.
   (bend 90° + roll): easy 100%/98.0, hard 85%/77.4, dynamic 84%/76.1 —
   this model is meaningfully harder. 41/41 tests green, torch parity
   exact, viewer + gauges updated (bend dial: 0 = notes, ±90 = flat).
+- **PROJECT RECORD (v5.2, 2026-07-21 night): 99.1% good / 0 miss /
+  score 107.7/115 / +44.37** — 50M wide-cosine from scratch
+  (`runs/v52_wide_e4cos_50m`), beating both prior v5.x runs on every
+  axis ON the strictest body model. The correct joint configuration
+  out-learned the exploit-era models: a better body beats extra
+  freedom. User's registered mechanism ("full swinging conceptually
+  easier") vindicated.
