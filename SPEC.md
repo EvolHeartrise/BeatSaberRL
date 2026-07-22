@@ -265,6 +265,12 @@ v5.1 azimuth+tilt parameterization) and older are rejected.
 (three.js) SPA** compiled to that single static HTML file — still a
 double-clickable, drop-a-`.jsonl`-in, zero-server page): real WebGL 3D
 with **OrbitControls** (drag = orbit, wheel = zoom, right-drag = pan).
+Since 2026-07-22 the viewport IS the page (fullscreen canvas) and all
+DOM chrome floats on top of it: title + file pill at the top,
+HUD/controls/help in translucent panels at the bottom
+(`pointer-events: none` containers so drags reach the canvas). The
+camera-attached gauge sprites anchor to the actual viewport corners
+(aspect-aware) and sit above the floating bottom UI.
 Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 `npm install && npm run build`, then copy `dist/index.html` over
 `../replay.html`. `npm test` runs the pure-logic tests (node) and
