@@ -341,9 +341,45 @@ fn sweep_tris(
     [[w0, t0, t1], [w0, t1, w1]]
 }
 
-fn sweep_hits_box(tris: &[[[f64; 3]; 3]; 2], center: [f64; 3], h: [f64; 3]) -> bool {
+/// Env v7.4: hitboxes ROTATE with the object about the approach (z)
+/// axis by rot = angle - 270 deg — the real game's colliders sit on the
+/// rotated note transform (v7.0's axis-aligned reading was a
+/// BeatLeader-viewer simplification). Down-swing notes are axis-aligned
+/// (rot = 0); dot notes never rotate; chain links rotate with their
+/// tangent. (cos_r, sin_r) derived exactly from the angle's own
+/// sin/cos: cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a.
+fn note_rot(angle: f64, rotates: bool) -> (f64, f64) {
+    if rotates {
+        let (sa, ca) = angle.sin_cos();
+        (-sa, ca)
+    } else {
+        (1.0, 0.0)
+    }
+}
+
+/// p relative to `center`, expressed in the box's rotated frame.
+fn to_box_frame(p: [f64; 3], center: [f64; 3], cos_r: f64, sin_r: f64) -> [f64; 3] {
+    let q = sub(p, center);
+    [
+        cos_r * q[0] + sin_r * q[1],
+        -sin_r * q[0] + cos_r * q[1],
+        q[2],
+    ]
+}
+
+fn sweep_hits_box(
+    tris: &[[[f64; 3]; 3]; 2],
+    center: [f64; 3],
+    h: [f64; 3],
+    cos_r: f64,
+    sin_r: f64,
+) -> bool {
     for t in tris {
-        let rel = [sub(t[0], center), sub(t[1], center), sub(t[2], center)];
+        let rel = [
+            to_box_frame(t[0], center, cos_r, sin_r),
+            to_box_frame(t[1], center, cos_r, sin_r),
+            to_box_frame(t[2], center, cos_r, sin_r),
+        ];
         if tri_box_overlap(rel, h) {
             return true;
         }
@@ -682,8 +718,12 @@ impl Core {
             };
             let good_center = [n.x, n.y, z + GOOD_Z_SHIFT];
             let good_h = [GOOD_HALF_X, good_hy, GOOD_HALF_Z];
+            // arrow notes/heads and chain links (tangent) rotate their
+            // hitboxes; plain dots stay axis-aligned
+            let rotates = n.kind == KIND_CHAIN_LINK || !n.any_dir;
+            let (cos_r, sin_r) = note_rot(n.angle, rotates);
 
-            if sweep_hits_box(&tris[m], good_center, good_h) {
+            if sweep_hits_box(&tris[m], good_center, good_h, cos_r, sin_r) {
                 // contact point: the blade sample whose displacement
                 // segment passes closest to the note center; its
                 // finite-difference velocity is the contact velocity
@@ -774,7 +814,8 @@ impl Core {
                 } else {
                     BAD_HALF
                 };
-                if sweep_hits_box(&tris[1 - m], center, [BAD_HALF, bad_hy, BAD_HALF]) {
+                if sweep_hits_box(&tris[1 - m], center, [BAD_HALF, bad_hy, BAD_HALF],
+                                  cos_r, sin_r) {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;

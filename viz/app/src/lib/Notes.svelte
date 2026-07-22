@@ -14,7 +14,7 @@
     BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB, HEAD_SQUASH,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
     MISS_COL, REACH_Z, SABER_COLORS, Z_FAR, Z_MISS, activeArcs, activePosts,
-    aftermaths, cutPlaneLocal, noteCenter, noteRot, pendingNotes,
+    aftermaths, cutPlaneLocal, hitboxRot, noteCenter, noteRot, pendingNotes,
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -34,8 +34,11 @@
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
 
-  // real v7 hitboxes ('h' overlay): axis-aligned, good box shifted toward
-  // the player; the small box is all the wrong-color saber can trigger
+  // real hitboxes ('h' overlay): good box shifted toward the player; the
+  // small box is all the wrong-color saber can trigger. Env v7.4 rotates
+  // both about the approach axis with the note (hitboxRot) — v7.0's
+  // axis-aligned boxes were a BeatLeader-viewer simplification mistaken
+  // for game behavior; real colliders sit on the rotated note transform.
   const hbGeo = (h) => new THREE.EdgesGeometry(
     new THREE.BoxGeometry(2 * h[0], 2 * h[1], 2 * h[2]));
   const goodHbGeo = hbGeo(HB.goodHalf);
@@ -217,15 +220,18 @@
   {/if}
   {#if pb.hitboxes}
     {@const hb = hitboxFor(n)}
-    <T.LineSegments geometry={hb.good}
-      position={[cx, cy, -(z + HB.goodZShift)]}>
-      <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
-    </T.LineSegments>
-    {#if hb.bad}
-      <T.LineSegments geometry={hb.bad} position={[cx, cy, -z]}>
-        <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
+    <!-- group rotates about the NOTE CENTER; the good box's z-shift is
+         along the rotation axis, so it lives inside the group -->
+    <T.Group position={[cx, cy, -z]} rotation={[0, 0, hitboxRot(n)]}>
+      <T.LineSegments geometry={hb.good} position={[0, 0, -HB.goodZShift]}>
+        <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
       </T.LineSegments>
-    {/if}
+      {#if hb.bad}
+        <T.LineSegments geometry={hb.bad}>
+          <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
+        </T.LineSegments>
+      {/if}
+    </T.Group>
   {/if}
 {/each}
 

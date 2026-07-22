@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.3 scripted bot, 10 eps each): easy (rate 1.0,
+Reference points (env v7.4 scripted bot, 10 eps each): easy (rate 1.0,
 right hand only, down-swings) 87.3% good cuts / 59.4 pts per note; hard
-(both hands, 8 dirs) 69.9% / 52.2; dynamic gym 67.8% / 50.3. The real
+(both hands, 8 dirs) 74.6% / 54.9; dynamic gym 68.5% / 51.1. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -293,3 +293,18 @@ partially uses. Pre-v7 references are not comparable.
   Suite green, parity zero-edit. Bot: easy 87.3 / hard 69.9 /
   dynamic 67.8 (dynamic UP from 63.5 — its stray late contacts
   behind the head were mostly bad cuts, now silent misses cost less).
+- **First v7.3 run (2026-07-22): 97.8% good / 96.6 / 0.35% miss /
+  +39.48** — 50M wide-cosine (`runs/v73_wide_e4cos_50m`), onset ~21M
+  (vs v7.1's ~40M): the user's miss-plane credit fix (+ pitch cap,
+  confounded) transformed learning; best 50M in project history on the
+  most restricted body. Claude's prediction 0-for-5 UNDER after going
+  0-for-5 OVER in round #4 — ledger 17-for-48.
+- **Env v7.4 (2026-07-22, user-caught): hitboxes rotate with the cut
+  direction** — v7.0 shipped them axis-aligned, misreading a
+  BeatLeader-viewer simplification (THREE.Box3); the game's colliders
+  sit on the rotated note transform. Good + small boxes now rotate by
+  (angle − 270°); links rotate with their tangent; dots stay square;
+  research doc A6 corrected. Suite 60 green, parity zero-edit (8th).
+  The v7.3 record ckpt re-evals BETTER on the honest geometry:
+  **98.6% / 97.8 / +40.16** — center-cutting generalizes, v5.3 pattern.
+  Bot: 87.3 / 74.6 / 68.5.

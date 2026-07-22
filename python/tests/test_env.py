@@ -346,6 +346,23 @@ def test_early_cut_through_the_deep_box():
             assert _codes(ev) == [(0, 0)]
 
 
+def test_hitboxes_rotate_with_cut_direction():
+    """Env v7.4: hitboxes sit on the rotated note transform. A blade
+    passing 0.38 m above the center clears an axis-aligned (down-swing)
+    good box (half-height 0.25) but is caught by the raised corner of a
+    57-degree-rotated one (angle 327 deg: vertical extent
+    0.4 sin57 + 0.25 cos57 ~ 0.47) — the contact is then judged
+    normally (here the tilted-frame sweep's in-plane velocity misses
+    the 60-degree tolerance -> 'angle', which is fine: the test pins
+    the COLLISION volume, not the judgment)."""
+    for angle, hit in ((DOWN, False), (np.radians(327.0), True)):
+        sim = _sim_with_note(_note(0.0, 3, 1, angle=angle))
+        _park(sim, 0)
+        _set_flat(sim, 1, 0.0, om_roll=-15.0, delta=1.6)   # y ~1.78 vs 1.40
+        ev, _ = _coast(sim)
+        assert bool(ev) == hit, f"angle {angle}"
+
+
 def test_dot_note_has_taller_hitbox():
     """Modern dots are 0.8 m tall vs 0.5 for arrow notes: a blade passing
     0.38 m above the row-1 center clips the dot box only (delta = 1.6
