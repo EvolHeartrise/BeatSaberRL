@@ -68,7 +68,11 @@ ALPHA_ARM, OMEGA_ARM = 80.0, 8.0        # shoulder pitch/yaw/twist + elbow
 ALPHA_WRIST, OMEGA_WRIST = 200.0, 20.0  # roll + bend (v5 values)
 JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 2
 JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
-PITCH_LIM = math.radians(90.0)
+# env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up) —
+# straight-overhead arms are gone; -90 (straight down) unchanged.
+PITCH_LIM = math.radians(90.0)          # obs normalizer only
+PITCH_LO = math.radians(-90.0)
+PITCH_HI = math.radians(65.0)
 YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
 YAW_HI = (math.radians(45.0), math.radians(100.0))
 # env v7.1 (user-specified, via the pose tool): the v5-era wrist roll
@@ -87,7 +91,7 @@ BEND_LIM = math.radians(95.0)
 
 def joint_limits(hand):
     """[(lo, hi)] x 6 for one hand, in joint order."""
-    return [(-PITCH_LIM, PITCH_LIM), (YAW_LO[hand], YAW_HI[hand]),
+    return [(PITCH_LO, PITCH_HI), (YAW_LO[hand], YAW_HI[hand]),
             (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
             (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM)]
 

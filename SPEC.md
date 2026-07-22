@@ -76,7 +76,8 @@ checkpoints/replays retire (hard replace).
   m, `SABER_LEN = 1.0` m.
 - **Joints** per hand, in order `q = (pitch, yaw, twist, elbow, roll,
   bend)`; all-zero = arm straight forward (+z), blade its extension:
-  - `pitch` ∈ ±90°: + = arm up (about x).
+  - `pitch`, **env v7.2: `[−90°, 65°]`** (+ = arm up, about x —
+    straight-overhead arms are gone; straight-down unchanged).
   - `yaw`: + = toward +x; outward 100° / cross-body 45° per hand →
     right `[−45°, 100°]`, left `[−100°, 45°]`.
   - `twist` (humeral rotation), **env v7.1: right `[−70°, 90°]` / left

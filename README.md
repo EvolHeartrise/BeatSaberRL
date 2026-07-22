@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.1 scripted bot, 10 eps each): easy (rate 1.0,
-right hand only, down-swings) 83.2% good cuts / 57.6 pts per note; hard
-(both hands, 8 dirs) 72.0% / 52.0; dynamic gym 64.1% / 48.1. The real
+Reference points (env v7.2 scripted bot, 10 eps each): easy (rate 1.0,
+right hand only, down-swings) 87.3% good cuts / 59.4 pts per note; hard
+(both hands, 8 dirs) 72.0% / 52.5; dynamic gym 63.5% / 47.6. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -269,3 +269,18 @@ partially uses. Pre-v7 references are not comparable.
   v7 training run (no checkpoints invalidated); torch parity held with
   zero test edits; scripted bot drops to 83.2 / 72.0 / 64.1 (easy
   gate ≥80% still holds).
+- **First v7.1 run (2026-07-22): 68.5% good / 64.3 / 3.3% miss /
+  +19.10** — 50M wide-cosine (`runs/v71_wide_e4cos_50m`, 54 min,
+  15.4k steps/s), 30-ep greedy. Head-to-head #4: BOTH predictions
+  missed HIGH (Claude score 76±10 and 4 more claims all wrong; user
+  82±4) — first joint over-prediction after five under-prediction
+  rounds. Autopsy: forgiving hitboxes make CONTACT free but convert
+  clumsy swings into −0.5 bad cuts (403 bad vs 47 miss at eval);
+  return crossed 0 only at ~40M and the run froze mid-surge —
+  budget starvation again, v6-50M déjà vu.
+- **Env v7.2 (2026-07-22, user-specified): shoulder pitch capped at
+  +65°** (was ±90; straight-down unchanged) — overhead arm poses gone.
+  Suite green, torch parity zero-edit again; bot 87.3 / 72.0 / 63.5.
+  The full-pre-swing test became a combined pitch+bend swing (same
+  rotation plane, chain sums the joints) — neither wrist roll (v7.1
+  fan) nor pitch alone (155°) can bank 100° now.

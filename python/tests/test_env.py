@@ -381,16 +381,19 @@ def test_arm_swing_cuts_and_accuracy_decreases_off_center():
 
 
 def _pitch_pendulum_events(kind=0, ticks=20):
-    """A full-arm pendulum: right arm straight (blade = its extension),
-    pitch from +88 deg falling at full omega through a row-0 note at
-    (0.3, 0.85). Contact comes at pitch ~ -25 deg with ~112 deg of arc
-    banked — since env v7.1 the wrist roll can't sweep 100+ deg through
-    contact, so full pre-swings are ARM swings (the point of the
-    restriction)."""
-    sim = _sim_with_note(_note(0.3, 2, 0, kind=kind), max_steps=60)
+    """A full-arm swing: right arm straight, pitch falling from the
+    +65 deg v7.2 cap at full omega WITH the bend joint sweeping down
+    from +95 in the same world-x rotation plane — the swing chain
+    accumulates their sum (blade elevation starts at 160 deg), so the
+    100 deg pre-swing arc is banked before contact with a row-0 note.
+    Since env v7.1/v7.2 neither the wrist roll (180 deg fan) nor pitch
+    alone (155 deg range) can do this — combined-joint arm swings are
+    the mechanism the restrictions force."""
+    sim = _sim_with_note(_note(9 * DT, 2, 0, kind=kind), max_steps=60)
     _park(sim, 0)
-    sim.set_joints(1, [np.radians(88.0), 0.0, 0.0, 0.0, 0.0, 0.0],
-                   [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    sim.set_joints(1, [np.radians(65.0), 0.0, 0.0, 0.0, 0.0,
+                       np.radians(95.0)],
+                   [-8.0, 0.0, 0.0, 0.0, 0.0, -14.0])
     events = []
     for _ in range(ticks):
         ev, _ = _coast(sim)
@@ -546,7 +549,7 @@ def test_joint_limits_clamp_and_kill_omega():
     (+90) and bend (+95) — arm-tier and wrist-tier joints both."""
     sim = _sim_with_note(_note(5.0, 2, 1))   # far note: no interference
     checks = [
-        (0, 1.55, 8.0, np.pi / 2),                    # pitch into +90
+        (0, 1.10, 8.0, np.radians(65.0)),             # pitch into +65 (v7.2)
         (1, 1.70, 8.0, np.radians(100.0)),            # right yaw into +100
         (2, -1.15, -8.0, np.radians(-70.0)),          # right twist into -70
         (3, 0.05, -8.0, 0.0),                         # elbow into its floor

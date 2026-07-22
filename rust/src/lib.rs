@@ -59,7 +59,10 @@ const ALPHA_ARM: f64 = 80.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
 const OMEGA_ARM: f64 = 8.0; // rad/s
 const ALPHA_WRIST: f64 = 200.0; // rad/s^2 (roll, bend — v5 values)
 const OMEGA_WRIST: f64 = 20.0; // rad/s
-const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg
+// env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up)
+const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg — obs normalizer only
+const PITCH_LO: f64 = -1.5707963267948966;
+const PITCH_HI: f64 = 1.1344640137963142; // 65 deg
 const YAW_LO: [f64; 2] = [-1.7453292519943295, -0.7853981633974483]; // L, R
 const YAW_HI: [f64; 2] = [0.7853981633974483, 1.7453292519943295];
 // env v7.1 (user-specified): tightened wrist roll + twist — the v5-era
@@ -80,7 +83,7 @@ const JOINT_OMEGA: [f64; N_JOINTS] =
 
 fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
     [
-        (-PITCH_LIM, PITCH_LIM),
+        (PITCH_LO, PITCH_HI),
         (YAW_LO[hand], YAW_HI[hand]),
         (TWIST_LO[hand], TWIST_HI[hand]),
         (0.0, ELBOW_HI),

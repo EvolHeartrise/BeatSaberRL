@@ -48,6 +48,7 @@ from .constants import (
     KIND_CHAIN_HEAD, KIND_CHAIN_LINK, L_FORE, L_UPPER, N_BLADE_SAMPLES,
     N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT, OBS_DIM, OFF_NOTE_MASK, OFF_NOTES,
     PITCH_LIM, POST_FULL, PRE_FULL, PTS_ACC, PTS_POST, PTS_PRE, REACH_Z,
+    PITCH_HI, PITCH_LO,
     REWARD_BAD, REWARD_BOMB, REWARD_MISS, ROLL_HI, ROLL_LO, SABER_LEN,
     SCORE_MAX, SHOULDER, SWING_BREAK, TWIST_HI, TWIST_LIM, TWIST_LO,
     V_MIN_CUT, V_NORM,
@@ -292,10 +293,10 @@ class TorchBeatVecEnv:
         self._omega = torch.tensor(JOINT_OMEGA, device=self.device, dtype=dtype)
         # per-hand per-joint limits, broadcast over (N, 2, 6)
         self._q_lo = torch.tensor(
-            [[-PITCH_LIM, YAW_LO[h], TWIST_LO[h], 0.0, ROLL_LO[h], -BEND_LIM]
+            [[PITCH_LO, YAW_LO[h], TWIST_LO[h], 0.0, ROLL_LO[h], -BEND_LIM]
              for h in (0, 1)], device=self.device, dtype=dtype)
         self._q_hi = torch.tensor(
-            [[PITCH_LIM, YAW_HI[h], TWIST_HI[h], ELBOW_HI, ROLL_HI[h], BEND_LIM]
+            [[PITCH_HI, YAW_HI[h], TWIST_HI[h], ELBOW_HI, ROLL_HI[h], BEND_LIM]
              for h in (0, 1)], device=self.device, dtype=dtype)
         self._shoulder = torch.tensor(SHOULDER, device=self.device, dtype=dtype)
         # episode-return ring buffer (device-side; slot `cap` is the trash row)

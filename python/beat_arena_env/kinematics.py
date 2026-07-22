@@ -18,7 +18,8 @@ from __future__ import annotations
 import math
 
 from .constants import (
-    ELBOW_HI, L_FORE, L_UPPER, SHOULDER, TWIST_HI, TWIST_LO,
+    ELBOW_HI, L_FORE, L_UPPER, PITCH_HI, PITCH_LO, SHOULDER, TWIST_HI,
+    TWIST_LO,
 )
 
 
@@ -101,6 +102,7 @@ def ik_arm(hand, wrist_target, swivel=0.0):
     # shoulder pitch/yaw aim the upper arm at the elbow
     ud = [(e[i] - sh[i]) / L_UPPER for i in range(3)]
     pitch = math.asin(max(-1.0, min(1.0, ud[1])))
+    pitch = min(max(pitch, PITCH_LO), PITCH_HI)     # v7.2 cap (fk tells truth)
     yaw = math.atan2(ud[0], ud[2])
 
     # twist so that elbow flexion reaches the wrist: forearm dir in the
