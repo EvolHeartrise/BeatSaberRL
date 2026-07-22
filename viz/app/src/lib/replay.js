@@ -57,10 +57,12 @@ export const L_UPPER = 0.35, L_FORE = 0.3;
 export const PITCH_LIM = 90 * RAD;
 export const YAW_LO = [-100 * RAD, -45 * RAD]; // left, right
 export const YAW_HI = [45 * RAD, 100 * RAD];
-export const TWIST_LIM = 90 * RAD;
+// env v7.1: twist and roll tightened, per-hand mirrored ranges
+export const TWIST_LO = [-90 * RAD, -70 * RAD]; // left, right
+export const TWIST_HI = [70 * RAD, 90 * RAD];
 export const ELBOW_HI = 150 * RAD;
-export const ROLL_LO = [-90 * RAD, -190 * RAD]; // left, right
-export const ROLL_HI = [190 * RAD, 90 * RAD];
+export const ROLL_LO = [0 * RAD, -180 * RAD];   // left, right
+export const ROLL_HI = [180 * RAD, 0 * RAD];
 export const BEND_LIM = 95 * RAD;
 export const OMEGA_ARM = 8, OMEGA_WRIST = 20;
 
@@ -72,7 +74,7 @@ export function jointLimits(hand) {
   return [
     [-PITCH_LIM, PITCH_LIM],
     [YAW_LO[hand], YAW_HI[hand]],
-    [-TWIST_LIM, TWIST_LIM],
+    [TWIST_LO[hand], TWIST_HI[hand]],
     [0, ELBOW_HI],
     [ROLL_LO[hand], ROLL_HI[hand]],
     [-BEND_LIM, BEND_LIM],

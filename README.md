@@ -87,14 +87,15 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7 scripted bot, 10 eps each): easy (rate 1.0,
-right hand only, down-swings) 95.4% good cuts / 88.6 pts per note; hard
-(both hands, 8 dirs) 75.6% / 67.1; dynamic gym 69.1% / 62.3. The real
+Reference points (env v7.1 scripted bot, 10 eps each): easy (rate 1.0,
+right hand only, down-swings) 83.2% good cuts / 57.6 pts per note; hard
+(both hands, 8 dirs) 72.0% / 52.0; dynamic gym 64.1% / 48.1. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
-players), which more than pays for the deeper body placement; its
-flat-blade technique caps accuracy though (~5/15). Pre-v7 references
-are not comparable.
+players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
+taxes its roll-whip technique hard (v7.0 numbers were 95.4 / 88.6 on
+easy): full wind-ups now belong to the arm, which the bot only
+partially uses. Pre-v7 references are not comparable.
 
 ## Status
 
@@ -258,3 +259,13 @@ are not comparable.
   paired-note angle-snap rule; walls/NJS-jump-math/spawn animations/
   combo/energy/modifiers noted in the research doc, deliberately not
   modeled yet. All v6 checkpoints, replays, and references retired.
+- **Env v7.1 (2026-07-22, user-specified): tightened wrist limits.**
+  Found with the viewer's new manual pose mode: the v5-era wrist roll
+  range (280° arcs) was compensation for the then-missing arm joints
+  and let training cheat with wrist-only swings. Right roll
+  [−190°, 90°] → **[−180°, 0°]**, twist ±90° → **[−70°, 90°]**; left
+  mirrored. With bend +90° a wrist roll now covers only a 180° blade
+  fan — 100°+ pre-swing arcs must come from the arm. Landed before any
+  v7 training run (no checkpoints invalidated); torch parity held with
+  zero test edits; scripted bot drops to 83.2 / 72.0 / 64.1 (easy
+  gate ≥80% still holds).

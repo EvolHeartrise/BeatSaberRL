@@ -71,17 +71,24 @@ JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
 PITCH_LIM = math.radians(90.0)
 YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
 YAW_HI = (math.radians(45.0), math.radians(100.0))
-TWIST_LIM = math.radians(90.0)
+# env v7.1 (user-specified, via the pose tool): the v5-era wrist roll
+# range was compensation for missing joints; with the full arm chain it
+# let training cheat. Right roll [-180, 0], twist [-70, 90] (outward
+# humeral rotation keeps its full range, inward is capped); left
+# mirrored. Big swing arcs must now come from the arm, not the wrist.
+TWIST_LIM = math.radians(90.0)          # obs normalizer only
+TWIST_LO = (math.radians(-90.0), math.radians(-70.0))   # (left, right)
+TWIST_HI = (math.radians(70.0), math.radians(90.0))
 ELBOW_HI = math.radians(150.0)          # flexion 0..150 deg
-ROLL_LO = (math.radians(-90.0), math.radians(-190.0))   # (left, right)
-ROLL_HI = (math.radians(190.0), math.radians(90.0))
+ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
+ROLL_HI = (math.radians(180.0), 0.0)
 BEND_LIM = math.radians(95.0)
 
 
 def joint_limits(hand):
     """[(lo, hi)] x 6 for one hand, in joint order."""
     return [(-PITCH_LIM, PITCH_LIM), (YAW_LO[hand], YAW_HI[hand]),
-            (-TWIST_LIM, TWIST_LIM), (0.0, ELBOW_HI),
+            (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
             (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM)]
 
 
