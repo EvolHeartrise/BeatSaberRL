@@ -95,9 +95,13 @@ const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
 // broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm) + blade
 // 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
 const REACH_Z: f64 = 1.75;
-// note consumed as missed past this (~2 m behind the head); notes stay
-// cuttable until they exit — the real game judges misses at despawn
-const Z_MISS: f64 = 2.65;
+// note consumed as missed past this — the HEAD plane (0 m behind the
+// head at z = -0.65). DELIBERATE DEVIATION from the real game (which
+// judges misses at despawn ~2 m behind the head, env v7.0-v7.2's 2.65):
+// the late boundary paid the -0.5 up to ~20 ticks after the plane and
+// kept "lost" notes ambiguous with "rescuable" ones — this tightens
+// miss credit assignment (env v7.3, user-specified 2026-07-22).
+const Z_MISS: f64 = 0.65;
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
