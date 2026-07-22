@@ -55,9 +55,13 @@ REWARD_MISS = -0.5
 SABER_LEN = 1.0
 ALPHA_ROT = 200.0
 OMEGA_MAX = 20.0
-PHI_LIM = 1.309
+# env v5.1 anatomical wrist limits (mirror lib.rs): azimuth per hand
+# [0, 280] deg left / [-100, 180] deg right; tilt +-95 deg
+THETA_LO = (0.0, -1.7453292519943295)
+THETA_HI = (4.886921905584122, math.pi)
+PHI_LIM = 1.6580627893946132
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.25
+REACH_Z = 1.28
 Z_MISS = 0.6
 PRE_FULL = 1.7453292519943295   # 100 deg
 POST_FULL = 1.0471975511965976  # 60 deg
@@ -176,6 +180,9 @@ class TorchBeatVecEnv:
                                  device=self.device, dtype=dtype)
         self._lo = torch.tensor(POS_LO, device=self.device, dtype=dtype)
         self._hi = torch.tensor(POS_HI, device=self.device, dtype=dtype)
+        # per-hand azimuth limits, broadcast over (N, 2)
+        self._th_lo = torch.tensor(THETA_LO, device=self.device, dtype=dtype)
+        self._th_hi = torch.tensor(THETA_HI, device=self.device, dtype=dtype)
         # episode-return ring buffer (device-side; slot `cap` is the trash row)
         self._cap = 4096
         self._ret_buf = zeros(self._cap + 1)
@@ -276,10 +283,11 @@ class TorchBeatVecEnv:
         self.om_ph = ((self.om_ph + self._rot[actions[..., 2]])
                       * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX)
         self.theta = self.theta + self.om_th * DT
-        self.theta = torch.where(self.theta >= math.pi,
-                                 self.theta - 2.0 * math.pi, self.theta)
-        self.theta = torch.where(self.theta < -math.pi,
-                                 self.theta + 2.0 * math.pi, self.theta)
+        # anatomical roll limits: bounded azimuth per hand, no wrap
+        th_out = (self.theta < self._th_lo) | (self.theta > self._th_hi)
+        self.theta = torch.max(torch.min(self.theta, self._th_hi), self._th_lo)
+        self.om_th = torch.where(th_out, torch.zeros_like(self.om_th),
+                                 self.om_th)
         self.phi = self.phi + self.om_ph * DT
         phi_out = (self.phi < -PHI_LIM) | (self.phi > PHI_LIM)
         self.phi = self.phi.clamp(-PHI_LIM, PHI_LIM)

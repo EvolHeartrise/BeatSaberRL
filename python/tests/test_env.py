@@ -143,15 +143,16 @@ def test_determinism():
 
 
 # --- cut detection scenarios (Rust sim, via set_saber hook) ------------------
-# Standard geometry: note at cell (2,1) = center (0.25, 0), hit_time = DT
-# (z = 0 at the end of the first step), down-swing required. The right
-# saber's wrist sits at (1.0, 0) with the blade pointing -x (theta = pi),
-# so the note passes the blade at 75% of its length; CCW rotation
-# (om_th > 0) sweeps the contact point DOWNWARD through the note.
+# Standard geometry (in-range under the v5.1 roll limits): note at cell
+# (2,1) = center (0.25, 0), hit_time = DT (z = 0 at the end of the first
+# step), down-swing required. The right saber's wrist sits at (-0.5, 0)
+# with the blade pointing +x (theta ~ 0, the natural right-hand down-cut
+# orientation), the note passing the blade at 75% of its length; CW
+# rotation (om_th < 0) sweeps the contact point DOWNWARD through the note.
 
 def test_good_swing_cut_scores():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, r = _step(sim, 1, (1.0, 0.0), theta=np.pi - 0.25, om_th=15.0)
+    ev, r = _step(sim, 1, (-0.5, 0.0), theta=0.25, om_th=-15.0)
     assert _codes(ev) == [(0, 0)]
     assert sim.good_cuts == 1
     pts = ev[0][2]
@@ -164,27 +165,27 @@ def test_gentle_swing_is_good():
     """V_MIN_CUT is 1 m/s at the CONTACT POINT: a slow-ish wrist turn whose
     contact point still moves >= 1 m/s scores."""
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi, om_th=2.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.0, om_th=-2.0)
     assert _codes(ev) == [(0, 0)]
 
 
 def test_slow_graze_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi, om_th=0.5)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.0, om_th=-0.5)
     assert _codes(ev) == [(0, 1)]  # slow
     assert ev[0][2] == 0.0
 
 
 def test_wrong_direction_swing_is_bad():
     sim = _sim_with_note(_note(DT, 2, 1))
-    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi + 0.25, om_th=-15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=-0.25, om_th=15.0)
     assert _codes(ev) == [(0, 2)]  # angle (swept upward through a down note)
 
 
 def test_wrong_hand_is_bad():
     sim = _sim_with_note(_note(DT, 0, 2, color=0))   # LEFT note at (-0.75, 0.5)
     _park(sim, 0, 1.4, -1.2)                          # matching saber far away
-    ev, _ = _step(sim, 1, (0.0, 0.5), theta=np.pi - 0.25, om_th=15.0)
+    ev, _ = _step(sim, 1, (-1.5, 0.5), theta=0.25, om_th=-15.0)
     assert _codes(ev) == [(0, 3)]
 
 
@@ -204,19 +205,19 @@ def test_stab_scores_only_accuracy():
 def test_full_swing_scores_near_max():
     """A wound-up swing (>100 deg) + follow-through approaches 115 points.
 
-    speed=8 keeps the note out of blade reach until the contact tick, so
-    the fast-sweeping blade can't graze its edge one tick early."""
-    sim = _sim_with_note(_note(8 * DT, 2, 1, speed=8.0), max_steps=60)
-    # spin CCW at max angular speed; start azimuth so the blade reaches
-    # theta = pi (through the note center) around tick 8, when z ~ 0
-    om, sweep = 20.0, 0.0
+    speed=10 keeps the note out of blade reach until the contact tick, so
+    the sweeping blade can't graze its edge a tick early. CW at 12 rad/s:
+    the whole arc (start ~159 deg, contact at 0, follow-through toward
+    -100 deg) fits the right hand's [-100, 180] deg roll range."""
+    sim = _sim_with_note(_note(8 * DT, 2, 1, speed=10.0), max_steps=60)
+    om, sweep = 12.0, 0.0
     deltas = []
     for _ in range(8):
         om *= 1.0 - 0.02
         deltas.append(om * DT)
         sweep += om * DT
-    theta0 = np.pi - sweep + deltas[-1] / 2
-    sim.set_saber(1, 1.0, 0.0, 0.0, 0.0, theta0, 0.0, 20.0, 0.0)
+    theta0 = sweep - deltas[-1] / 2   # crosses theta = 0 mid-tick-8
+    sim.set_saber(1, -0.5, 0.0, 0.0, 0.0, theta0, 0.0, -12.0, 0.0)
     events = []
     for _ in range(14):
         _, _, _, ev = sim.step(*COAST)
@@ -242,7 +243,7 @@ def test_accuracy_decreases_off_center():
 def test_dot_note_scores_from_any_direction():
     """any_dir (dot) notes: an up-swing (angle-bad for a down note) is good."""
     sim = _sim_with_note(_note(DT, 2, 1, any_dir=True))
-    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi + 0.25, om_th=-15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=-0.25, om_th=15.0)
     assert _codes(ev) == [(0, 0)]
 
 
@@ -270,9 +271,33 @@ def test_tilted_blade_reaches_early_note():
 
 def test_far_note_is_untouchable():
     sim = _sim_with_note(_note(1.0, 2, 1))   # z ~ 3.9 after one tick
-    ev, _ = _step(sim, 1, (1.0, 0.0), theta=np.pi - 0.25, om_th=15.0)
+    ev, _ = _step(sim, 1, (-0.5, 0.0), theta=0.25, om_th=-15.0)
     assert ev == []
     assert sim.status()[0] == 0
+
+
+def test_wrist_limits_clamp_and_kill_roll():
+    """env v5.1: azimuth is bounded per hand ([0,280] deg left,
+    [-100,180] right), tilt +-95 deg; hitting a limit zeroes the omega."""
+    sim = _sim_with_note(_note(5.0, 2, 1))   # far note: no interference
+    # right saber rolling CCW into its 180 deg limit
+    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, 3.0, 0.0, 15.0, 0.0)
+    sim.step(*COAST)
+    s = sim.sabers()[1]
+    assert s[4] == pytest.approx(np.pi)      # clamped at 180 deg
+    assert s[6] == 0.0                       # roll velocity killed
+    # left saber rolling CW into its 0 deg limit
+    sim.set_saber(0, -1.0, -1.0, 0.0, 0.0, 0.1, 0.0, -15.0, 0.0)
+    sim.step(*COAST)
+    s = sim.sabers()[0]
+    assert s[4] == pytest.approx(0.0)
+    assert s[6] == 0.0
+    # tilt clamps at +-95 deg
+    sim.set_saber(1, 1.0, -1.0, 0.0, 0.0, np.pi / 2, 1.6, 0.0, 15.0)
+    sim.step(*COAST)
+    s = sim.sabers()[1]
+    assert s[5] == pytest.approx(np.radians(95.0))
+    assert s[7] == 0.0
 
 
 def test_miss_fires_exactly_at_exit():

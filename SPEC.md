@@ -72,11 +72,23 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
   Beat Saber) from the wrist along direction
   `d(θ, φ) = (cosφ·cosθ, cosφ·sinθ, sinφ)`:
   - `θ` = **azimuth**, the in-plane clock angle (0 = +x, CCW) — the
-    swing DOF, driven by wrist CW/CCW rotation. Unbounded (wraps).
+    swing DOF, driven by wrist CW/CCW rotation. **Clamped per hand
+    (env v5.1, 2026-07-21 — anatomical roll limits, no infinite wrist
+    rolls)**: from the palm-down neutral (= the ready stance, blade up,
+    θ = 90°) the right wrist rolls 90° CCW / 190° CW max →
+    `θ_R ∈ [−100°, 180°]`; mirrored left: `θ_L ∈ [0°, 280°]`. Each hand
+    has a 280° arc; hitting a limit zeroes `ω_θ` (same rule as the tilt
+    clamp). θ no longer wraps — it is a plain bounded angle, and
+    (cos θ, sin θ) stays unique since 280° < 360°. Policies trained
+    before the clamp (the 98.3% v5.0 record) are not comparable.
   - `φ` = **tilt** out of the plane, driven by supination/pronation:
     `+φ` pitches the blade toward the incoming notes (+z). Clamped to
-    `±PHI_LIM = 1.309` rad (75°; stays clear of the φ=90° azimuth
-    singularity); hitting the clamp zeroes `ω_φ`.
+    `±PHI_LIM = 95°` (1.65806 rad) from the in-plane middle (env v5.1
+    anatomical limit; was 75°). The range crosses the φ=90° pole — the
+    blade can tip just past straight-forward/straight-back; `d(θ,φ)`
+    stays smooth there (`d/dθ` vanishes at the pole, which is correct
+    physics: azimuth-spinning a forward-pointing blade moves nothing).
+    Hitting the clamp zeroes `ω_φ`.
   - Angular dynamics per DOF mirror the linear ones:
     `ω += ±ALPHA_ROT·DT` (`ALPHA_ROT = 200` rad/s²), `ω *= (1 − DRAG)`,
     clamp `|ω| ≤ OMEGA_MAX = 20` rad/s, `angle += ω·DT`.
@@ -103,7 +115,7 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
 - **Cut evaluation** (no more slab): a note is testable while
-  `−Z_MISS ≤ z ≤ REACH_Z = 1.25` m (max tip z `sin(75°)·1 m + R`; the
+  `−Z_MISS ≤ z ≤ REACH_Z = 1.28` m (max tip z `sin(95°)·1 m + R`; the
   reach window replaces the old ±0.6 m slab — timing tolerance is now
   physical: an in-plane blade covers |z| ≤ R ≈ ±0.07 s at 4 m/s, and
   tilting forward buys earlier contact). Each tick the blade sweep is
@@ -174,7 +186,7 @@ places at once faster than it can travel). Col/row uniform over the grid.
 Obs v4 (env v5 blade state; note block unchanged from v3):
 
 - `sabers: [f32; 20]` = per hand (left then right), 10 features:
-  `[x/1, y/0.75, vx/6, vy/6, cosθ, sinθ, φ/1.309, ωθ/20, ωφ/20,
+  `[x/1, y/0.75, vx/6, vy/6, cosθ, sinθ, φ/PHI_LIM, ωθ/20, ωφ/20,
   min(swing_acc/100°, 2)]` — wrist state, blade pose (angle as its unit
   vector: wrap-free, same convention as note directions), angular
   velocities, and the live pre-swing meter (1.0 = full pre-swing credit
@@ -259,17 +271,23 @@ contact the blade must be PERPENDICULAR to the required direction `e`
 (swinging sweeps the contact point along `e`). Two candidates — CCW
 swing (`θ_c = angle − 90°`) or CW (`θ_c = angle + 90°`), each with wrist
 goal `center − 0.75·SABER_LEN·(cosθ_c, sinθ_c)` (note passes the blade
-at 75% of its length); the bot picks the in-bounds candidate nearest the
-current wrist. **Wind-up phase**: wrist steers to the goal (arrival
-steering, as before) while the azimuth steers (bang-bang toward a
-desired ω via the 3-way rot action) to `θ_c − sense·SWING_ARC`
-(`SWING_ARC = 130°` > the 100° full pre-swing) and tilt steers to
-`φ = 0`. **Swing phase** (`t_until ≤ 0.18` s): full rot accel in the
-swing sense until the note resolves; the leftover rotation after
-contact is the follow-through. Stateless per tick; solvability proof
-and eyeball baseline, not optimal. Must land ≥ 80% good cuts on the
-default easy chart (tested), with mean score well above the 15-point
-stab ceiling.
+at 75% of its length). Env v5.1: each candidate's `θ_c` is first fitted
+into the hand's azimuth range (mod 2π; at least one of the two opposite
+orientations always fits a 280° arc); candidates are ranked by
+full-swing feasibility (wind-up room ≥ `SWING_ARC = 130°` AND
+follow-through room ≥ 45° inside the limits), then wrist-goal
+in-bounds, then wrist distance. The wind-up target is
+`θ_c − sense·min(SWING_ARC, room_back − 5°)` and the whip starts at a
+per-arc swing time (accel/Ω_MAX physics + 0.02 s margin) instead of a
+fixed 0.18 s. **Wind-up phase**: wrist steers to the goal (arrival
+steering) while the azimuth steers (bang-bang toward a desired ω via
+the 3-way rot action, direct unwrapped error — the short way around may
+cross a limit) to the wind-up target and tilt steers to `φ = 0`.
+**Swing phase**: full rot accel in the swing sense until the note
+resolves; the leftover rotation after contact is the follow-through.
+Stateless per tick; solvability proof and eyeball baseline, not
+optimal. Must land ≥ 80% good cuts on the default easy chart (tested),
+with mean score well above the 15-point stab ceiling.
 
 ## Policy (`python/policy.py`)
 

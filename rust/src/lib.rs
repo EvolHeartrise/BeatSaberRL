@@ -34,9 +34,16 @@ const SHAPE_DIST_CLIP: f64 = 2.0;
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
 const ALPHA_ROT: f64 = 200.0; // rad/s^2, both angular DOFs
 const OMEGA_MAX: f64 = 20.0; // rad/s
-const PHI_LIM: f64 = 1.309; // 75 deg — clear of the phi=90 azimuth singularity
+// env v5.1 anatomical wrist limits (2026-07-21, user-specified): no
+// infinite rolls. Azimuth from the palm-down neutral (= ready stance,
+// blade up, 90 deg): right wrist 90 deg CCW / 190 deg CW max ->
+// [-100, 180] deg; mirrored left -> [0, 280] deg. 280-degree arcs, so
+// (cos, sin) stays unique. Tilt: +-95 deg from the in-plane middle.
+const THETA_LO: [f64; 2] = [0.0, -1.7453292519943295]; // left, right
+const THETA_HI: [f64; 2] = [4.886921905584122, std::f64::consts::PI];
+const PHI_LIM: f64 = 1.6580627893946132; // 95 deg
 const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
-const REACH_Z: f64 = 1.25; // max tip z (sin 75deg * 1 m) + CUT_RADIUS
+const REACH_Z: f64 = 1.28; // max tip z (sin 95deg * 1 m) + CUT_RADIUS
 const Z_MISS: f64 = 0.6; // note consumed as missed past this
 
 // --- scoring (real Beat Saber 115) ------------------------------------------
@@ -339,11 +346,11 @@ impl Core {
             sab.om_th = (sab.om_th * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
             sab.om_ph = (sab.om_ph * (1.0 - DRAG)).clamp(-OMEGA_MAX, OMEGA_MAX);
             sab.theta += sab.om_th * DT;
-            // wrap azimuth to [-pi, pi) so it never drifts to huge values
-            if sab.theta >= std::f64::consts::PI {
-                sab.theta -= 2.0 * std::f64::consts::PI;
-            } else if sab.theta < -std::f64::consts::PI {
-                sab.theta += 2.0 * std::f64::consts::PI;
+            // anatomical roll limits: no wrap — the azimuth is a bounded
+            // angle per hand; hitting a limit kills the roll velocity
+            if sab.theta < THETA_LO[s] || sab.theta > THETA_HI[s] {
+                sab.theta = sab.theta.clamp(THETA_LO[s], THETA_HI[s]);
+                sab.om_th = 0.0;
             }
             sab.phi += sab.om_ph * DT;
             if sab.phi < -PHI_LIM || sab.phi > PHI_LIM {
