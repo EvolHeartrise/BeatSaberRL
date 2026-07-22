@@ -12,10 +12,11 @@
   import * as THREE from "three";
   import { pb } from "./state.svelte.js";
   import {
-    BEND_LIM, ROLL_HI, ROLL_LO, SABER_COLORS, saberAt,
+    BEND_LIM, ELBOW_HI, PITCH_LIM, ROLL_HI, ROLL_LO, SABER_COLORS,
+    TWIST_LIM, YAW_HI, YAW_LO, saberAt,
   } from "./replay.js";
 
-  const W = 256, H = 310;
+  const W = 256, H = 412;
   const NEAR = 10 * Math.PI / 180; // limit-proximity warning band
   const deg = (r) => (r * 180 / Math.PI);
 
@@ -53,7 +54,8 @@
   function draw(g, sab) {
     const { hand, ctx } = g;
     const [lo, hi] = [ROLL_LO[hand], ROLL_HI[hand]];
-    const th = sab[4], ph = sab[5], wt = sab[6], wp = sab[7];
+    // env v6 arm state: q(6) | om(6) | wrist(3)
+    const th = sab[4], ph = sab[5], wt = sab[10], wp = sab[11];
     const col = SABER_COLORS[hand];
 
     ctx.clearRect(0, 0, W, H);
@@ -61,7 +63,7 @@
     ctx.beginPath();
     ctx.roundRect(0, 0, W, H, 16);
     ctx.fill();
-    label(ctx, hand === 0 ? "L wrist" : "R wrist", W / 2, 20, col, 19, true);
+    label(ctx, hand === 0 ? "L arm" : "R arm", W / 2, 20, col, 19, true);
 
     // ---- roll dial: needle = blade azimuth as the player sees it -----------
     // world theta (0 = +x, CCW) -> canvas angle -theta (canvas y is down)
@@ -119,7 +121,40 @@
     const bendHot = BEND_LIM - Math.abs(ph) < NEAR;
     needle(ctx, tx, ty, tr - 8, cAng(ph), bendHot ? "#f0a35e" : col);
     label(ctx, `bend ${deg(ph).toFixed(0)}°  ·  ω ${wp.toFixed(1)}`,
-      W / 2, H - 12);
+      W / 2, 344);
+
+    // ---- arm-joint bars (env v6): angle within its anatomical range ------
+    const bars = [
+      ["pitch", sab[0], -PITCH_LIM, PITCH_LIM],
+      ["yaw", sab[1], YAW_LO[hand], YAW_HI[hand]],
+      ["twist", sab[2], -TWIST_LIM, TWIST_LIM],
+      ["elbow", sab[3], 0, ELBOW_HI],
+    ];
+    bars.forEach(([name, v, blo, bhi], i) => {
+      const y = 364 + i * 13;
+      const x0 = 62, x1 = W - 52;
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#6b7180";
+      ctx.font = "12px system-ui, sans-serif";
+      ctx.fillText(name, x0 - 6, y + 4);
+      ctx.strokeStyle = "#3a4050";
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x1, y);
+      ctx.stroke();
+      const t = (v - blo) / (bhi - blo);
+      const hot = Math.min(v - blo, bhi - v) < NEAR;
+      ctx.strokeStyle = hot ? "#f0a35e" : col;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x0 + t * (x1 - x0), y - 5);
+      ctx.lineTo(x0 + t * (x1 - x0), y + 5);
+      ctx.stroke();
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#6b7180";
+      ctx.fillText(`${deg(v).toFixed(0)}°`, x1 + 8, y + 4);
+    });
 
     g.tex.needsUpdate = true;
   }

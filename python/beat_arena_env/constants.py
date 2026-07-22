@@ -10,9 +10,8 @@ the written contract.
 import math
 
 DT = 1.0 / 30.0
-ACCEL = 30.0          # m/s^2
-DRAG = 0.02           # per-tick multiplicative velocity decay
-V_MAX = 6.0           # m/s
+DRAG = 0.02           # per-tick multiplicative velocity decay (all joints)
+V_NORM = 6.0          # wrist-velocity obs normalizer (m/s)
 V_MIN_CUT = 1.0       # min contact-point speed for a good cut (m/s)
 CUT_RADIUS = 0.28     # accuracy normalizer (circumscribed circle of a face)
 COS_TOL = 0.5
@@ -27,20 +26,40 @@ POS_HI = (1.5, 1.25)
 REWARD_BAD = -0.5   # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 
-# --- blade sabers (env v5.2, 2026-07-21) -------------------------------------
+# --- upper body (env v6, 2026-07-22, user-designed) --------------------------
+# Kinematic chain per hand: fixed shoulder -> upper arm -> elbow (hinge)
+# -> forearm -> the v5.2 wrist (roll + bend) -> blade. Joint order per
+# hand: (pitch, yaw, twist, elbow, roll, bend); all-zero = arm straight
+# forward (+z), blade its extension. See kinematics.py for FK/IK.
 SABER_LEN = 1.0       # m (real Beat Saber)
-ALPHA_ROT = 200.0     # rad/s^2, both angular DOFs (roll + bend)
-OMEGA_MAX = 20.0      # rad/s
-# env v5.2 forearm-anchored joints: the neutral blade points AT THE NOTES
-# (+z). roll = forearm CW/CCW about the forward axis, palm-down neutral:
-# right 90 CCW / 190 CW -> [-190, 90] deg, mirrored left [-90, 190].
-# bend = wrist deflection away from forward, +-95 deg (90 = blade flat in
-# the hit plane); the blade can never point back at the player.
+SHOULDER = ((-0.2, 0.45, -0.35), (0.2, 0.45, -0.35))    # (left, right)
+L_UPPER = 0.35        # m
+L_FORE = 0.30         # m
+N_JOINTS = 6
+# tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
+ALPHA_ARM, OMEGA_ARM = 80.0, 8.0        # shoulder pitch/yaw/twist + elbow
+ALPHA_WRIST, OMEGA_WRIST = 200.0, 20.0  # roll + bend (v5 values)
+JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 2
+JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
+PITCH_LIM = math.radians(90.0)
+YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
+YAW_HI = (math.radians(45.0), math.radians(100.0))
+TWIST_LIM = math.radians(90.0)
+ELBOW_HI = math.radians(150.0)          # flexion 0..150 deg
 ROLL_LO = (math.radians(-90.0), math.radians(-190.0))   # (left, right)
 ROLL_HI = (math.radians(190.0), math.radians(90.0))
 BEND_LIM = math.radians(95.0)
+
+
+def joint_limits(hand):
+    """[(lo, hi)] x 6 for one hand, in joint order."""
+    return [(-PITCH_LIM, PITCH_LIM), (YAW_LO[hand], YAW_HI[hand]),
+            (-TWIST_LIM, TWIST_LIM), (0.0, ELBOW_HI),
+            (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM)]
+
+
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.2         # cut-test gate: straight-forward tip (1 m) + HALF_BLOCK
+REACH_Z = 1.5         # broad-phase gate: max wrist z + blade + half block
 Z_MISS = 0.6          # note consumed as missed past this
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------
@@ -51,15 +70,17 @@ SCORE_MAX = 115.0
 SWING_BREAK = 0.005   # rad/tick below which the swing chain breaks
 FOLLOW_TIMEOUT = 15   # ticks a follow-through may keep accumulating
 
-# obs layout v4 (order is a contract; mirrored in policy.py):
-# per saber [x, y, vx, vy, cos_th, sin_th, phi, om_th, om_ph, swing_meter]
+# obs layout v5 (order is a contract; mirrored in policy.py):
+# per hand [pitch_n, yaw_n, twist_n, elbow_n, cos_roll, sin_roll, bend_n,
+#           om(6)/JOINT_OMEGA, wrist x/1 y/0.75 z/1, wrist_vel(3)/6,
+#           blade dir(3), swing_meter]  -> 23
 # per note  [cx, cy, z, vz, is_left, is_right, dir_cos, dir_sin, valid]
 N_NOTE_SLOTS = 12
 NOTE_FEAT = 9
-SABER_FEAT = 10
-OFF_NOTES = 2 * SABER_FEAT                             # 20
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 128
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                 # 140
+SABER_FEAT = 23
+OFF_NOTES = 2 * SABER_FEAT                             # 46
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 154
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                 # 166
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-1.0, 12.0)

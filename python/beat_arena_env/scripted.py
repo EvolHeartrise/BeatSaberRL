@@ -1,14 +1,18 @@
-"""Scripted reference bot (SPEC.md §Scripted reference bot) — env v5.2.
+"""Scripted reference bot (SPEC.md §Scripted reference bot) — env v6.
 
-Real swings under forearm-anchored joints: the bot holds the wrist bend
-at +90 deg (blade flat in the hit plane, 5 deg shy of the clamp) and
-swings by ROLLING the forearm, so the blade's in-plane azimuth is
-roll + 90 deg and the reachable azimuth windows are the same as v5.1
-([0, 280] deg left / [-100, 180] right). Per hand it fits a cut
-orientation inside that window, plants the wrist so the blade passes
-through the note perpendicular to the required direction, winds back as
-far as the limits allow (up to 130 degrees), then whips through.
-Stateless per tick; solvability proof and eyeball baseline, not optimal.
+The blade-level plan is unchanged from v5.2: for its color's earliest
+pending note, plant so the blade lies in the hit plane perpendicular to
+the required cut direction, cock back up to 130 degrees, then whip
+through (the leftover rotation is the follow-through). What changed is
+the body: the wrist is no longer a free point — the bot solves
+closed-form two-link IK for the four arm joints (shoulder pitch/yaw/
+twist + elbow) to park the wrist as near the goal as the arm reaches,
+and converts desired world blade directions into (roll, bend) targets in
+the live forearm frame (kinematics.wrist_for_blade). Every joint is then
+steered independently: desired omega = gain * error, bang-bang action
+toward it — legal because v6 joints are force-free independent
+integrators. Stateless per tick; solvability proof and eyeball baseline,
+not optimal.
 """
 
 from __future__ import annotations
@@ -16,132 +20,169 @@ from __future__ import annotations
 import numpy as np
 
 from .constants import (
-    ACCEL, ALPHA_ROT, DRAG, DT, OMEGA_MAX, ROLL_HI, ROLL_LO, SABER_LEN,
-    note_center,
+    ALPHA_WRIST, DRAG, DT, JOINT_ALPHA, JOINT_OMEGA, L_FORE, L_UPPER,
+    OMEGA_WRIST, SABER_LEN, SHOULDER, joint_limits, note_center,
 )
-
-# the bot swings flat: in-plane blade azimuth = roll + 90 deg (bend +90)
-AZ_OFF = np.pi / 2
-AZ_LO = tuple(lo + AZ_OFF for lo in ROLL_LO)
-AZ_HI = tuple(hi + AZ_OFF for hi in ROLL_HI)
+from .kinematics import fk, ik_arm, wrist_for_blade
 
 CONTACT_S = 0.75          # note passes the blade at this fraction of its length
 SWING_ARC = np.radians(130.0)  # ideal wind-up, past the 100 deg full credit
-FOLLOW_ROOM = np.radians(45.0) # wanted room past contact for follow-through
-CRUISE = 4.0
-K_ARRIVE = 4.0            # wrist arrival gain (1/s)
-K_ROT = 10.0              # angular arrival gain (1/s)
+FOLLOW_AIM = np.radians(70.0)  # whip target past contact (follow-through room)
+REACH = L_UPPER + L_FORE - 0.02   # usable wrist-reach radius around a shoulder
+K_JOINT = 4.0             # per-joint arrival gain (1/s)
+K_WRIST = 10.0            # wrist roll/bend tracking gain (1/s)
 
-# idle hands park OUTSIDE the grid with the blade vertical: a blade
-# resting inside note territory gets grazed by arriving blocks
-PARK = {0: np.array([-1.45, -0.6]), 1: np.array([1.45, -0.6])}
-
-_DIRS = np.array([[np.cos(k * np.pi / 4), np.sin(k * np.pi / 4)] for k in range(8)])
-_ACTION_DV = np.vstack([np.zeros(2), ACCEL * DT * _DIRS])
-_ROT_DW = np.array([0.0, ALPHA_ROT * DT, -ALPHA_ROT * DT])  # action 0/1/2
+# idle pose per hand: arm dropped and out, elbow half bent, blade up
+PARK_Q = {
+    0: np.array([-0.5, -0.7, 0.0, 0.8]),
+    1: np.array([-0.5, 0.7, 0.0, 0.8]),
+}
 
 
-def _steer_to_velocity(vel, desired_v):
-    """Pick the move action whose one-tick velocity update lands closest."""
-    v_next = (vel + _ACTION_DV) * (1.0 - DRAG)
-    return int(np.argmin(np.linalg.norm(v_next - desired_v, axis=1)))
+def _steer(q, om, target, j):
+    """Ternary action driving joint j's angle toward `target`."""
+    desired = np.clip(K_JOINT * (target - q), -JOINT_OMEGA[j], JOINT_OMEGA[j])
+    dw = np.array([0.0, JOINT_ALPHA[j] * DT, -JOINT_ALPHA[j] * DT])
+    om_next = np.clip((om + dw) * (1.0 - DRAG),
+                      -JOINT_OMEGA[j], JOINT_OMEGA[j])
+    return int(np.argmin(np.abs(om_next - desired)))
 
 
-def _steer_omega(om, desired_om):
-    """Pick the rot/tilt action whose one-tick omega lands closest."""
-    om_next = np.clip((om + _ROT_DW) * (1.0 - DRAG), -OMEGA_MAX, OMEGA_MAX)
-    return int(np.argmin(np.abs(om_next - desired_om)))
+def _steer_wrist(q, om, target, j, gain=K_WRIST):
+    desired = np.clip(gain * (target - q), -OMEGA_WRIST, OMEGA_WRIST)
+    dw = np.array([0.0, ALPHA_WRIST * DT, -ALPHA_WRIST * DT])
+    om_next = np.clip((om + dw) * (1.0 - DRAG), -OMEGA_WRIST, OMEGA_WRIST)
+    return int(np.argmin(np.abs(om_next - desired)))
 
 
-def _fit_in_range(angle, lo, hi):
-    """Shift angle by 2*pi*k into [lo, hi]; None if no k works."""
-    for k in (0, 1, -1):
-        a = angle + 2.0 * np.pi * k
-        if lo - 1e-9 <= a <= hi + 1e-9:
-            return float(np.clip(a, lo, hi))
-    return None
+def _roll_reps(hand, roll, bend):
+    """Both in-range representatives of a blade direction:
+    d(roll, bend) = d(roll + pi, -bend), rolls 2*pi-shifted into the
+    hand's 280-degree range. Deterministic (no dependence on the current
+    state), so steering targets never thrash. Returns 1-2 (roll, bend)
+    pairs; positive-bend rep first when both fit."""
+    lo, hi = joint_limits(hand)[4]
+    if bend < 0.0:
+        roll, bend = roll + np.pi, -bend
+    reps = []
+    for r0, b0 in ((roll, bend), (roll + np.pi, -bend)):
+        for k in (0.0, 2 * np.pi, -2 * np.pi):
+            if lo - 1e-9 <= r0 + k <= hi + 1e-9:
+                reps.append((float(np.clip(r0 + k, lo, hi)), b0))
+                break
+    return reps or [(float(np.clip(roll, lo, hi)), bend)]
+
+
+def _fit_roll(hand, roll, bend):
+    """First (preferred) in-range representative — see _roll_reps."""
+    return _roll_reps(hand, roll, bend)[0]
 
 
 def _swing_time(arc):
-    """Seconds to sweep `arc` from rest at full accel (+ a small margin)."""
-    if arc <= OMEGA_MAX ** 2 / (2 * ALPHA_ROT):
-        return float(np.sqrt(2 * arc / ALPHA_ROT)) + 0.02
-    return OMEGA_MAX / (2 * ALPHA_ROT) + arc / OMEGA_MAX + 0.02
+    """Seconds to sweep `arc` from rest at full wrist accel (+ margin)."""
+    if arc <= OMEGA_WRIST ** 2 / (2 * ALPHA_WRIST):
+        return float(np.sqrt(2 * arc / ALPHA_WRIST)) + 0.04
+    return OMEGA_WRIST / (2 * ALPHA_WRIST) + arc / OMEGA_WRIST + 0.04
 
 
-def _cut_config(hand, center, angle, wrist):
-    """(sense, theta_c, theta_start, wrist_goal) for a note, respecting
-    the hand's azimuth limits.
+def _cut_config(hand, center3, angle):
+    """(sense, theta_c, wrist_goal3) — blade perpendicular to the cut
+    direction at contact, wrist ON the blade line through the note.
 
-    The blade must be perpendicular to the cut direction at contact; a
-    CCW swing (sense +1) puts the contact point's velocity along the cut
-    direction when theta_c = angle - 90 deg, a CW swing when +90 deg.
-    Rank candidates: full swing room first, then wrist-goal in bounds,
-    then nearest. At least one candidate always fits a 280-degree range.
-    """
-    lo, hi = AZ_LO[hand], AZ_HI[hand]
+    For each swing sense the wrist goal slides along the ray
+    center - s * (cos th_c, sin th_c, 0): the search picks the s whose
+    goal the arm can reach (nearest s = CONTACT_S wins), so the blade
+    still passes through the note even when the ideal plant is out of
+    reach. Candidates ranked by leftover overreach."""
+    sh = np.array(SHOULDER[hand])
     best = None
-    for sense, th_raw in ((1.0, angle - np.pi / 2), (-1.0, angle + np.pi / 2)):
-        th_c = _fit_in_range(th_raw, lo, hi)
-        if th_c is None:
-            continue
-        room_back = (th_c - lo) if sense > 0 else (hi - th_c)
-        room_fwd = (hi - th_c) if sense > 0 else (th_c - lo)
-        goal = center - CONTACT_S * SABER_LEN * np.array(
-            [np.cos(th_c), np.sin(th_c)])
-        in_b = -1.45 <= goal[0] <= 1.45 and -1.2 <= goal[1] <= 1.2
-        full = room_back >= SWING_ARC and room_fwd >= FOLLOW_ROOM
-        key = (not full, not in_b, float(np.linalg.norm(goal - wrist)))
-        if best is None or key < best[0]:
-            best = (key, sense, th_c, goal, room_back)
-    _, sense, th_c, goal, room_back = best
-    arc = min(SWING_ARC, max(room_back - np.radians(5), np.radians(20)))
-    return sense, th_c, th_c - sense * arc, goal, arc
+    for sense, th_c in ((1.0, angle - np.pi / 2), (-1.0, angle + np.pi / 2)):
+        ray = np.array([np.cos(th_c), np.sin(th_c), 0.0])
+        s_best, over_best = CONTACT_S, np.inf
+        for s in np.linspace(0.3, 0.95, 14):
+            over = max(0.0, float(np.linalg.norm(center3 - s * ray - sh))
+                       - REACH)
+            key = (over, abs(s - CONTACT_S))
+            if key < (over_best, abs(s_best - CONTACT_S)):
+                s_best, over_best = float(s), over
+        if best is None or over_best < best[0]:
+            best = (over_best, sense, th_c, center3 - s_best * ray)
+    _, sense, th_c, goal = best
+    return sense, th_c, goal
 
 
-def _hand_action(hand, saber, time, target):
-    pos, vel = saber[0:2], saber[2:4]
-    roll, bend, om_roll, om_bend = saber[4], saber[5], saber[6], saber[7]
-    # hold the blade flat in the hit plane (bend -> +90 deg); the swing
-    # itself is pure forearm roll
-    bend_act = _steer_omega(om_bend, np.clip(
-        K_ROT * (np.pi / 2 - bend), -OMEGA_MAX, OMEGA_MAX))
+def _hand_action(hand, arm, time, target):
+    q, om = np.asarray(arm[:6]), np.asarray(arm[6:12])
+
     if target is None:
-        to_park = PARK[hand] - pos
-        dist = float(np.linalg.norm(to_park))
-        desired = to_park / dist * min(CRUISE, K_ARRIVE * dist) if dist > 0.1 else np.zeros(2)
-        # blade straight up (azimuth 90 = roll 0), no spin
-        roll_act = _steer_omega(om_roll, np.clip(
-            K_ROT * (0.0 - roll), -OMEGA_MAX, OMEGA_MAX))
-        return (_steer_to_velocity(vel, desired), roll_act, bend_act)
+        acts = [_steer(q[j], om[j], PARK_Q[hand][j], j) for j in range(4)]
+        r_t, b_t = _fit_roll(hand, *wrist_for_blade(
+            hand, q[:4], (0.0, 1.0, 0.0)))                    # blade up
+        acts.append(_steer_wrist(q[4], om[4], r_t, 4))
+        acts.append(_steer_wrist(q[5], om[5], b_t, 5))
+        return acts
 
-    center = np.array(note_center(target))
-    # dot notes: any direction scores — pretend it's a down-cut
+    center3 = np.array([*note_center(target), 0.0])
     angle = target.angle if not target.any_dir else 3 * np.pi / 2
-    sense, th_c, th_start, goal, arc = _cut_config(hand, center, angle, pos)
+    _, _, goal = _cut_config(hand, center3, angle)
+    q_arm = ik_arm(hand, goal, swivel="back")
+    acts = [_steer(q[j], om[j], q_arm[j], j) for j in range(4)]
+
+    # re-aim off the pose the arm will actually reach: contact blade
+    # orientation = wrist -> note (exact when the plant is reachable,
+    # best-effort otherwise); the 60-degree cut tolerance absorbs the
+    # residual between this and the ideal perpendicular plant.
+    _, w_pred, _ = fk(hand, list(q_arm) + [0.0, 0.0])
+    th_aim = float(np.arctan2(center3[1] - w_pred[1],
+                              center3[0] - w_pred[0]))
+    # swing plan: over BOTH wrist representations of the contact blade
+    # direction (roll +- pi with flipped bend reach the same blade) and
+    # both sweep senses, require the sweep velocity within ~55 deg of the
+    # cut direction (hard cap — past the 60-deg rule it's a guaranteed
+    # angle-fail), then rank by roll room: wind-up arc behind the contact
+    # roll, >= 45 deg of follow-through beyond it (v5.2's room ranking,
+    # in roll space).
+    lo, hi = joint_limits(hand)[4]
+    err = lambda s: abs(np.angle(np.exp(1j * (angle - th_aim - s * np.pi / 2))))
+    reps = _roll_reps(hand, *wrist_for_blade(
+        hand, list(q[:4]),
+        (float(np.cos(th_aim)), float(np.sin(th_aim)), 0.0)))
+    best = None
+    for r_c, b_c in reps:
+        for sense in (1.0, -1.0):
+            back = (r_c - lo) if sense > 0 else (hi - r_c)
+            fwd = (hi - r_c) if sense > 0 else (r_c - lo)
+            full = back >= SWING_ARC and fwd >= np.radians(45.0)
+            key = (err(sense) > np.radians(55.0), not full,
+                   -min(fwd, np.radians(45.0)), err(sense))
+            if best is None or key < best[0]:
+                best = (key, sense, back, r_c, b_c)
+    _, sense, back, r_c, b_c = best
+    arc = float(np.clip(back - np.radians(5.0), np.radians(20.0), SWING_ARC))
+
     t_until = target.hit_time - time
-
     if t_until > _swing_time(arc):
-        # wind-up: park the wrist at the goal, cock the roll back.
-        # Angles are bounded (no wrap): steer by the DIRECT error — the
-        # short way around could cross a limit.
-        to_goal = goal - pos
-        dist = float(np.linalg.norm(to_goal))
-        speed = min(CRUISE, K_ARRIVE * dist)
-        desired = to_goal / dist * speed if dist > 1e-6 else np.zeros(2)
-        roll_act = _steer_omega(om_roll, np.clip(
-            K_ROT * ((th_start - AZ_OFF) - roll), -OMEGA_MAX, OMEGA_MAX))
-        return (_steer_to_velocity(vel, desired), roll_act, bend_act)
+        # wind-up: cock the roll `arc` behind the contact roll (stable
+        # target — same representative every tick)
+        acts.append(_steer_wrist(q[4], om[4], r_c - sense * arc, 4))
+        acts.append(_steer_wrist(q[5], om[5], b_c, 5))
+        return acts
 
-    # whip: hold the wrist, full roll accel in the swing sense; the
-    # rotation carried past contact is the follow-through
-    move_act = _steer_to_velocity(vel, np.zeros(2))
-    roll_act = 1 if sense > 0 else 2
-    return (move_act, roll_act, bend_act)
+    # whip (v5.2 semantics): FULL roll accel in the swing sense until the
+    # note resolves — timed so the blade sweeps THROUGH th_aim at contact;
+    # the leftover rotation is the follow-through. +roll sweeps the blade
+    # CCW in the forearm frame (the back-swivel IK keeps the forearm
+    # pointing at the notes, so the world sense matches). Bend holds its
+    # contact value.
+    acts.append(1 if sense > 0 else 2)
+    acts.append(_steer_wrist(q[5], om[5], b_c, 5))
+    return acts
 
 
-def scripted_action(env) -> tuple[int, int, int, int, int, int]:
-    """env: RustBeatEnv (needs .chart, .sim.status()/sabers()/time)."""
+def scripted_action(env):
+    """env: RustBeatEnv (needs .chart, .sim.status()/sabers()/time).
+    Returns the 12-int action (per hand: pitch, yaw, twist, elbow, roll,
+    bend; left first)."""
     status = env.sim.status()
     targets = {0: None, 1: None}
     for i, n in enumerate(env.chart):
@@ -149,10 +190,10 @@ def scripted_action(env) -> tuple[int, int, int, int, int, int]:
             targets[n.color] = n
         if targets[0] is not None and targets[1] is not None:
             break
-    sabers = env.sim.sabers()
+    arms = env.sim.sabers()
     time = env.sim.time
     acts = []
     for hand in (0, 1):
-        acts.extend(_hand_action(hand, np.asarray(sabers[hand]), time,
+        acts.extend(_hand_action(hand, np.asarray(arms[hand]), time,
                                  targets[hand]))
     return tuple(acts)

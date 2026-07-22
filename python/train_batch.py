@@ -25,7 +25,9 @@ import torch.nn as nn
 
 from beat_arena_env.rust_env import RustBeatEnv
 from beat_arena_env.vec_env import BeatVecEnv
-from policy import NotePolicy, OBS_DIM, load_policy
+from policy import HEAD_SIZES, NotePolicy, OBS_DIM, load_policy
+
+A_DIM = len(HEAD_SIZES)  # 12 factored joint heads (env v6)
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -221,7 +223,7 @@ def main():
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
     b_obs = torch.zeros((T, N, OBS_DIM), device=device)
-    b_act = torch.zeros((T, N, 6), dtype=torch.long, device=device)
+    b_act = torch.zeros((T, N, A_DIM), dtype=torch.long, device=device)
     b_logp = torch.zeros((T, N), device=device)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
@@ -286,7 +288,7 @@ def main():
             returns = adv + b_val
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
-        f_act = b_act.reshape(-1, 6)
+        f_act = b_act.reshape(-1, A_DIM)
         f_logp = b_logp.reshape(-1)
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)

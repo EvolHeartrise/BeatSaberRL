@@ -1,4 +1,4 @@
-"""Parity tests: TorchBeatVecEnv vs the Rust sim (THE reference), env v5.
+"""Parity tests: TorchBeatVecEnv vs the Rust sim (THE reference), env v6.
 
 Tier 1 (float64, CPU): exact agreement — same chart + same actions must give
 identical rewards, done timing, event counters, score, and obs (to f32
@@ -18,7 +18,7 @@ from beat_arena_env.torch_env import TorchBeatVecEnv
 EASY = dict(note_rate=1.0, colors="right", dirs=(6,))
 DYN = dict(note_rate=2.5, colors="both", continuous_dirs=True,
            note_speed=3.0, note_speed_max=6.0)
-ACTION_NVEC = [9, 3, 3, 9, 3, 3]
+ACTION_NVEC = [3] * 12
 
 
 def _chart(cfg_kw, seed):
@@ -107,11 +107,11 @@ def test_auto_reset_and_stats():
     env = TorchBeatVecEnv(4, seed=3, chart_pool=8, device="cpu",
                           dtype=torch.float32, **DYN)
     obs = env.reset()
-    assert obs.shape == (4, 140)
+    assert obs.shape == (4, 166)
     rng = np.random.default_rng(0)
     dones = 0
     for _ in range(1300):  # two episode lengths: every env must cycle
-        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 6)))
+        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 12)))
         obs, r, done, infos = env.step(a)
         assert infos == []
         dones += int(done.sum())
@@ -130,7 +130,7 @@ def test_same_seed_reproduces():
         rng = np.random.default_rng(1)
         tot = torch.zeros(2)
         for _ in range(400):
-            a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(2, 6)))
+            a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(2, 12)))
             obs, r, done, _ = env.step(a)
             tot += r
         return obs.clone(), tot

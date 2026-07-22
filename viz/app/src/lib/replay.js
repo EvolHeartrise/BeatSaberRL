@@ -1,31 +1,38 @@
-// Replay format v5 (SPEC.md §Replay log): env v5.2 forearm-anchored blades.
+// Replay format v6 (SPEC.md §Replay log): env v6 kinematic upper body.
 // Pure logic only (no three/svelte imports) — unit-tested in node.
 //
 // World: hit plane z = 0; grid spans [-1,1] x [-0.75,0.75] (0.5 m lanes);
-// 0.4 m note cubes approach from +z. Sabers = [x, y, vx, vy, roll, bend,
-// om_roll, om_bend]: wrist on the plane + 1 m blade whose neutral points AT
-// the notes; roll orients the bend plane (forearm CW/CCW), bend deflects
-// away from forward (+-95 deg — it can never point back at the player).
+// 0.4 m note cubes approach from +z. Sabers = 15 numbers per hand:
+// [q(6) = pitch, yaw, twist, elbow, roll, bend | om(6) | wrist x, y, z].
+// Each hand is a chain from a fixed shoulder: upper arm -> elbow ->
+// forearm -> wrist (roll + bend) -> 1 m blade; armFK mirrors the sim's
+// forward kinematics exactly.
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
 
 export const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
 export const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
-export const SABER_LEN = 1.0, REACH_Z = 1.2, Z_MISS = 0.6;
+export const SABER_LEN = 1.0, REACH_Z = 1.5, Z_MISS = 0.6;
 
 // env v5.3: note cubes are rotated about the approach axis so the block
 // tracks its required cut direction (down-swing = axis-aligned); dot
 // notes stay square. Mirrors the sims' collision volume.
 export const noteRot = (n) => (n.any ? 0 : n.angle - 1.5 * Math.PI);
 export const V_MIN = 1, DT = 1 / 30;
-// env v5.2 anatomical joint limits (mirror the sim): forearm roll per
-// hand, wrist bend +-95 deg from straight-forward
+// env v6 body + anatomical joint limits (mirror the sim)
 const RAD = Math.PI / 180;
+export const SHOULDER = [[-0.2, 0.45, -0.35], [0.2, 0.45, -0.35]];
+export const L_UPPER = 0.35, L_FORE = 0.3;
+export const PITCH_LIM = 90 * RAD;
+export const YAW_LO = [-100 * RAD, -45 * RAD]; // left, right
+export const YAW_HI = [45 * RAD, 100 * RAD];
+export const TWIST_LIM = 90 * RAD;
+export const ELBOW_HI = 150 * RAD;
 export const ROLL_LO = [-90 * RAD, -190 * RAD]; // left, right
 export const ROLL_HI = [190 * RAD, 90 * RAD];
 export const BEND_LIM = 95 * RAD;
-export const OMEGA_MAX = 20;
+export const OMEGA_ARM = 8, OMEGA_WRIST = 20;
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
@@ -35,10 +42,10 @@ export function parseReplay(text) {
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 5)
+  if (v !== 6)
     throw new Error(
-      "replay version " + v + " — this viewer reads v5 (env v5.2 forearm-" +
-      "anchored blades); older replays use retired saber parameterizations",
+      "replay version " + v + " — this viewer reads v6 (env v6 kinematic " +
+      "upper body); older replays use retired saber parameterizations",
     );
   const ticks = lines.slice(1).map((l) => JSON.parse(l));
   const chart = head.header.chart;
@@ -87,50 +94,57 @@ export function lerpAng(a, b, u) {
   return a + d * u;
 }
 
-export function bladeDir(roll, bend) {
-  const cr = Math.cos(roll), sr = Math.sin(roll);
-  const cb = Math.cos(bend), sb = Math.sin(bend);
-  return [-sr * sb, cr * sb, cb];
-}
-
-export function bladeDirDot(roll, bend, wr, wb) {
-  const cr = Math.cos(roll), sr = Math.sin(roll);
-  const cb = Math.cos(bend), sb = Math.sin(bend);
-  return [
-    -wr * cr * sb - wb * sr * cb,
-    -wr * sr * sb + wb * cr * cb,
-    -wb * sb,
+/** Forward kinematics — MIRROR of the sim's fk() (SPEC §Sim rules).
+ * q = [pitch, yaw, twist, elbow, roll, bend] (world coords, z toward
+ * the notes). Returns {elbow, wrist, blade} — blade is a unit vector. */
+export function armFK(hand, q) {
+  const sp = Math.sin(q[0]), cp = Math.cos(q[0]);
+  const sy = Math.sin(q[1]), cy = Math.cos(q[1]);
+  const st = Math.sin(q[2]), ct = Math.cos(q[2]);
+  const se = Math.sin(q[3]), ce = Math.cos(q[3]);
+  const m = [
+    [cy * ct - sy * sp * st, -cy * st - sy * sp * ct, sy * cp],
+    [cp * st, cp * ct, sp],
+    [-sy * ct - cy * sp * st, sy * st - cy * sp * ct, cy * cp],
   ];
+  const sh = SHOULDER[hand];
+  const elbow = [0, 1, 2].map((i) => sh[i] + L_UPPER * m[i][2]);
+  const f = [0, 1, 2].map((i) => m[i][1] * se + m[i][2] * ce);
+  const wrist = [0, 1, 2].map((i) => elbow[i] + L_FORE * f[i]);
+  const sr = Math.sin(q[4]), cr = Math.cos(q[4]);
+  const sb = Math.sin(q[5]), cb = Math.cos(q[5]);
+  const d = [-sr * sb, cr * sb, cb];
+  const blade = [0, 1, 2].map(
+    (i) => m[i][0] * d[0] + (m[i][1] * ce - m[i][2] * se) * d[1] + f[i] * d[2]);
+  return { elbow, wrist, blade };
 }
 
-/** Interpolated 8-field saber state at (tickIdx + u). */
+/** Interpolated 15-field arm state at (tickIdx + u): joint angles lerped
+ * (all joints are bounded, no wrap), omegas + wrist from the later tick. */
 export function saberAt(rep, tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
-  return [
-    lerp(a[0], b[0], u), lerp(a[1], b[1], u), b[2], b[3],
-    lerpAng(a[4], b[4], u), lerp(a[5], b[5], u), b[6], b[7],
-  ];
+  const out = [];
+  for (let j = 0; j < 6; j++) out.push(lerp(a[j], b[j], u));
+  for (let j = 6; j < 15; j++) out.push(b[j]);
+  return out;
 }
 
-/** Blade tip in WORLD coords [x, y, z] from an 8-field saber state. */
-export function tipOf(sab) {
-  const d = bladeDir(sab[4], sab[5]);
-  return [
-    sab[0] + SABER_LEN * d[0],
-    sab[1] + SABER_LEN * d[1],
-    SABER_LEN * d[2],
-  ];
+/** Blade tip in WORLD coords [x, y, z] from a 15-field arm state. */
+export function tipOf(hand, sab) {
+  const { wrist, blade } = armFK(hand, sab);
+  return [0, 1, 2].map((i) => wrist[i] + SABER_LEN * blade[i]);
 }
 
-/** Contact-capability: speed of the blade TIP (wrist velocity + rotation). */
-export function tipSpeed(sab) {
-  const dd = bladeDirDot(sab[4], sab[5], sab[6], sab[7]);
-  return Math.hypot(
-    sab[2] + SABER_LEN * dd[0],
-    sab[3] + SABER_LEN * dd[1],
-    SABER_LEN * dd[2],
-  );
+/** Contact-capability: tip speed via finite difference across one tick
+ * (env v6 contact-velocity semantics). */
+export function tipSpeed(rep, tickIdx, s) {
+  const k = Math.min(tickIdx, rep.ticks.length - 1);
+  const k0 = Math.max(0, k - 1);
+  const t1 = tipOf(s, rep.ticks[k].sabers[s]);
+  const t0 = tipOf(s, rep.ticks[k0].sabers[s]);
+  if (k === k0) return 0;
+  return Math.hypot(t1[0] - t0[0], t1[1] - t0[1], t1[2] - t0[2]) / DT;
 }
 
 /** Cumulative HUD counters up to and including uptoTick. */

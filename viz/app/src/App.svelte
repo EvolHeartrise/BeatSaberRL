@@ -144,13 +144,14 @@
     </div>
     <div id="help">
       drag = orbit · wheel = zoom · right-drag = pan · space = play/pause ·
-      ←/→ = step one tick · +/− = speed · r = restart · g = wrist gauges
+      ←/→ = step one tick · +/− = speed · r = restart · g = arm gauges
       (roll dial shows the allowed 280° arc; bend 0° = at the notes,
-      ±90° = flat, ±95° = limit; orange = near a joint limit) ·
-      40 cm blocks fly in; each hand is a wrist on the plane holding a 1 m
-      blade · white blade core = contact-capable (tip ≥ 1 m/s) · white block
-      outline = within blade reach · +N popups = points (max 115/note:
-      70 pre-swing, 30 follow-through, 15 accuracy)
+      ±90° = flat; bars = shoulder pitch/yaw/twist + elbow in their
+      anatomical ranges; orange = near a joint limit) · 40 cm blocks fly
+      in; each hand is a shoulder→elbow→wrist arm chain holding a 1 m
+      blade · white blade core = contact-capable (tip ≥ 1 m/s) · white
+      block outline = within blade reach · +N popups = points (max
+      115/note: 70 pre-swing, 30 follow-through, 15 accuracy)
     </div>
   </div>
 </main>

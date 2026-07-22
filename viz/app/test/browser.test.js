@@ -10,7 +10,7 @@ import puppeteer from "puppeteer-core";
 const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
 const dist = resolve("dist/index.html");
 const replay = resolve(process.argv[2] ??
-  "../../python/replays/v52_scripted_dyn_ep00_seed7000.jsonl");
+  "../../python/replays/v6_scripted_dyn_ep00_seed7000.jsonl");
 if (!existsSync(dist)) throw new Error("run `npm run build` first");
 mkdirSync("test/out", { recursive: true });
 

@@ -3,16 +3,20 @@
 Beat Saber-style toy RL environment + transformer policy experiments.
 See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
-Env v5 (blade sabers): each hand is a wrist (point mass on the z=0 hit
-plane) holding a rigid 1 m blade whose direction is driven by two wrist
-DOFs — azimuth (CW/CCW rotation, the swing) and tilt
-(supination/pronation, pitch toward the incoming notes). 40 cm note
-cubes (real Beat Saber size, 0.5 m lanes, world in meters) fly in and
-must be swung through with the matching hand, in the right direction,
-fast enough at the contact point (≥1 m/s). Good cuts are graded with the
+Env v6 (kinematic upper body): each hand is a chain from a fixed
+shoulder anchor — upper arm, elbow (hinge), forearm, a two-DOF wrist
+(roll + bend), and a rigid 1 m blade as the forearm's extension. No
+force interactions; every joint is an independent integrator with
+anatomical limits, and the big joints (shoulder, elbow: Ω ≤ 8 rad/s)
+are slower than the wrists (Ω ≤ 20 rad/s) — position with the arm, whip
+with the wrist. 40 cm note cubes (real Beat Saber size, 0.5 m lanes,
+world in meters, cubes rotated to their cut direction) fly in and must
+be swung through with the matching hand, in the right direction, fast
+enough at the contact point (≥1 m/s). Good cuts are graded with the
 real Beat Saber 115-point system — 70 pre-swing (100°), 30
 follow-through (60°), 15 accuracy-to-center — paid as reward/115.
-Per-tick discrete control at 30 Hz: per hand move(9) × rot(3) × tilt(3).
+Per-tick discrete control at 30 Hz: 12 ternary joint heads (per hand:
+pitch, yaw, twist, elbow, roll, bend).
 
 ## Quick start
 
@@ -77,11 +81,12 @@ outline = inside the cuttable slab; green split = good cut; orange/red
 flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
 are rejected — re-record from a current checkpoint.
 
-Reference points (env v5.3 scripted bot, 30 eps each): easy (rate 1.0,
-right hand only, down-swings) 98.8% good cuts / 96.9 pts per note; hard
-(both hands, 8 dirs) 82.7% / 77.1; dynamic gym 84.6% / 76.8. Pre-v5.3
-reference numbers were measured against sphere contact (and pre-v5.2
-against looser joint models) and are not comparable.
+Reference points (env v6 scripted bot, 30 eps each): easy (rate 1.0,
+right hand only, down-swings) 85.4% good cuts / 75.4 pts per note; hard
+(both hands, 8 dirs) 69.5% / 66.0; dynamic gym 61.0% / 59.3. The
+realistic body costs the bot dearly vs the v5.3 free-wrist numbers
+(98.8 / 82.7 / 84.6) — reach and joint limits are now real constraints,
+and pre-v6 references are not comparable.
 
 ## Status
 
@@ -189,10 +194,26 @@ against looser joint models) and are not comparable.
 - **Env v5.3 (2026-07-22): notes are their ACTUAL rotated boxes.** The
   collision volume is the 0.4 m cube rotated about the approach axis by
   (angle − 270°) — down-swing notes stay axis-aligned, dot notes never
-  rotate — replacing the rotation-blind 0.28 m contact sphere; REACH_Z
-  1.28 → 1.2 (tip + half-block); accuracy still grades by
-  distance-to-center, floored at 0 on corner clips. Torch env has exact
-  float64 parity (unedited parity tests); the viewer renders the
-  rotated cubes (and rotated split-halves/fail outlines). The v5.2
-  record ckpt re-evals at **98.0% good / 0 miss / 106.8 / +43.72** on
-  the stricter geometry (was 99.1/107.7) — center-cutting generalizes.
+  rotate — replacing the rotation-blind 0.28 m contact sphere; accuracy
+  still grades by distance-to-center, floored at 0 on corner clips.
+  Torch env has exact float64 parity (unedited parity tests); the
+  viewer renders the rotated cubes (and rotated split-halves/fail
+  outlines). The v5.2 record ckpt re-evaled at **98.0% good / 0 miss /
+  106.8 / +43.72** on the stricter geometry (was 99.1/107.7) —
+  center-cutting generalizes.
+- **Env v6 (2026-07-22, user-designed): kinematic upper body.** Wrists
+  stop free-floating: fixed shoulders at (±0.2, 0.45, −0.35), upper arm
+  0.35 m, forearm 0.30 m, 4-DOF arm (shoulder pitch/yaw/twist + elbow)
+  + the v5.2 wrist pair per hand, all with anatomical limits and tiered
+  dynamics (shoulder/elbow 80 rad/s² / 8 rad/s; wrists 200 / 20). The
+  9-way translation head is gone — action = MultiDiscrete([3]×12); obs
+  140 → 166 (joint state + FK wrist/blade); contact velocity is the
+  contact point's finite-difference displacement (no Jacobians
+  anywhere); replay v6 logs joint state + FK wrist. Closed-form FK/IK
+  in `beat_arena_env/kinematics.py` powers the rewritten scripted bot
+  (two-link IK with a forearm-forward "back" swivel, re-aimed blade,
+  room-ranked swing senses over both wrist representations). Torch env
+  ported with exact float64 parity; viewer draws the full body (torso,
+  arm segments, joints) with arm-joint bars added to the gauges, FK
+  mirror validated against sim-logged wrists. All v5.x checkpoints,
+  replays, and reference numbers retired.

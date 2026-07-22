@@ -19,9 +19,9 @@ here gets its standard optimization aids (LayerNorm, FFN, residuals) —
 that A/B's live hypothesis (b) was that stripping them handicaps training.
 
 No action masks exist in this env: every action is always legal, so the
-logprob is the unconditional sum over the six factored heads (per hand:
-move 9, rot 3, tilt 3 — env v5 blade control; pure independent
-factorization, no kind-gating like kiting).
+logprob is the unconditional sum over the twelve factored heads (per
+hand: pitch, yaw, twist, elbow, roll, bend — env v6 joint control, all
+ternary; pure independent factorization, no kind-gating like kiting).
 """
 
 from __future__ import annotations
@@ -30,16 +30,17 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v4:
-# blade sabers — 10 features per hand; notes unchanged from v3).
-SABER_FEAT = 10
-OFF_NOTES = 2 * SABER_FEAT                            # 20
+# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v5:
+# env v6 arm chains — 23 features per hand; notes unchanged from v3).
+SABER_FEAT = 23
+OFF_NOTES = 2 * SABER_FEAT                            # 46
 N_NOTE_SLOTS = 12
 NOTE_FEAT = 9
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 128
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 140
-# per hand: move(9), rot(3), tilt(3) — six factored heads, left hand first
-HEAD_SIZES = (9, 3, 3, 9, 3, 3)
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 154
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 166
+# env v6: per hand 6 ternary joint heads (pitch, yaw, twist, elbow, roll,
+# bend) — twelve factored heads, left hand first
+HEAD_SIZES = (3,) * 12
 
 NEG_INF = -1e9
 
