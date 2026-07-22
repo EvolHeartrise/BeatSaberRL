@@ -147,3 +147,10 @@ not comparable.
   parity with Rust exact, 29k steps/s in the wide+e4 regime, 4.3 GB) and
   `viz/replay.html` ported to replay v4 (blade rendering, score popups,
   reach region).
+- **First v5 record (2026-07-21, night): 98.3% good / 0 miss /
+  score 104.1/115 / +42.67 on the dynamic gym — beats the scripted bot
+  (94% / 95.8) on both axes.** 50M steps, wide-cosine recipe, one
+  command, 28.5 min from scratch (`runs/v5_wide_e4cos_50m`). First v5
+  full combo: seed 7000, 48/48 sampled, 105.2/115
+  (`replays/v5_50m_ep00_seed7000.jsonl`). Pure rewards climbed the whole
+  stab→swing staircase.
