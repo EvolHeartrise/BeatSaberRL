@@ -8,6 +8,7 @@
   import { CELL, GX, GY, REACH_Z, Z_FAR, Z_MISS } from "./replay.js";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
+  import WristGauges from "./WristGauges.svelte";
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {
@@ -56,6 +57,9 @@
     target={[0, 0, -1.5]}
     maxDistance={25}
   />
+  {#if pb.rep && pb.gauges}
+    <WristGauges />
+  {/if}
 </T.PerspectiveCamera>
 
 <T.AmbientLight intensity={1.1} />

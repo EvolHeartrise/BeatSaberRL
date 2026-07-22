@@ -12,6 +12,13 @@ export const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
 export const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
 export const SABER_LEN = 1.0, REACH_Z = 1.28, Z_MISS = 0.6;
 export const V_MIN = 1, DT = 1 / 30;
+// env v5.1 anatomical wrist limits (mirror the sim): azimuth per hand,
+// tilt +-95 deg from the in-plane middle
+const RAD = Math.PI / 180;
+export const THETA_LO = [0, -100 * RAD]; // left, right
+export const THETA_HI = [280 * RAD, Math.PI];
+export const PHI_LIM = 95 * RAD;
+export const OMEGA_MAX = 20;
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
