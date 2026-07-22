@@ -27,9 +27,14 @@ REWARD_MISS = -0.5
 SABER_LEN = 1.0       # m (real Beat Saber)
 ALPHA_ROT = 200.0     # rad/s^2, both angular DOFs (azimuth + tilt)
 OMEGA_MAX = 20.0      # rad/s
-PHI_LIM = 1.309       # tilt clamp, 75 deg
+# env v5.1 anatomical wrist limits: azimuth per hand from the palm-down
+# neutral (ready stance, blade up, 90 deg): right 90 CCW / 190 CW ->
+# [-100, 180] deg; mirrored left [0, 280]. Tilt +-95 deg from middle.
+THETA_LO = (0.0, math.radians(-100.0))          # (left, right)
+THETA_HI = (math.radians(280.0), math.pi)
+PHI_LIM = math.radians(95.0)
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.25        # cut-test gate: max tip z + CUT_RADIUS
+REACH_Z = 1.28        # cut-test gate: max tip z (sin 95 deg) + CUT_RADIUS
 Z_MISS = 0.6          # note consumed as missed past this
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------
