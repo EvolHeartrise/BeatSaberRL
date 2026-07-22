@@ -100,10 +100,13 @@ N_BLADE_SAMPLES = 8   # contact-point/velocity samples along the blade
 # broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm 0.65) +
 # blade 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
 REACH_Z = 1.75
-# note consumed as missed past this (~2 m behind the head at z -0.65);
-# notes stay CUTTABLE until they exit — the real game judges misses at
-# despawn, well behind the player
-Z_MISS = 2.65
+# note consumed as missed past this — the HEAD plane (0 m behind the
+# head at z = -0.65). DELIBERATE DEVIATION from the real game (despawn
+# ~2 m behind the head, v7.0-v7.2's 2.65): tightens miss credit
+# assignment — the -0.5 lands ~5 ticks after the plane instead of ~20,
+# and a passed note is certainly lost, never ambiguously rescuable
+# (env v7.3, user-specified 2026-07-22).
+Z_MISS = 0.65
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------
 PRE_FULL = math.radians(100.0)   # full pre-swing arc

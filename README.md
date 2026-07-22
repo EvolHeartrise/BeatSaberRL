@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.2 scripted bot, 10 eps each): easy (rate 1.0,
+Reference points (env v7.3 scripted bot, 10 eps each): easy (rate 1.0,
 right hand only, down-swings) 87.3% good cuts / 59.4 pts per note; hard
-(both hands, 8 dirs) 72.0% / 52.5; dynamic gym 63.5% / 47.6. The real
+(both hands, 8 dirs) 69.9% / 52.2; dynamic gym 67.8% / 50.3. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -284,3 +284,12 @@ partially uses. Pre-v7 references are not comparable.
   The full-pre-swing test became a combined pitch+bend swing (same
   rotation plane, chain sums the joints) — neither wrist roll (v7.1
   fan) nor pitch alone (155°) can bank 100° now.
+- **Env v7.3 (2026-07-22, user-specified): miss plane at the HEAD
+  (Z_MISS 2.65 → 0.65)** — a DELIBERATE deviation from real-game
+  despawn rules, for credit assignment: the miss penalty lands ~5
+  ticks after the play plane instead of ~20 (γλ trace over those 15
+  ticks diluted the responsible actions' advantage to ~0.4x), and a
+  passed note is certainly lost rather than ambiguously rescuable.
+  Suite green, parity zero-edit. Bot: easy 87.3 / hard 69.9 /
+  dynamic 67.8 (dynamic UP from 63.5 — its stray late contacts
+  behind the head were mostly bad cuts, now silent misses cost less).

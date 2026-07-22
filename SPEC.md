@@ -173,11 +173,15 @@ checkpoints/replays retire (hard replace).
   head ≤ 85/115); bad cut `−0.5`; miss `−0.5`; **bomb hit `−0.5`**;
   a bomb passing by is free and silent. A rotation-free "stab" scores
   only accuracy (≤ 15/115) — swinging is the game.
-- **Miss**: the object passes `z < −Z_MISS = 2.65` m uncut (~2 m behind
-  the head — the real game judges misses at despawn; objects stay
-  CUTTABLE until then). Bombs passing are consumed silently (status 4,
-  no event). The episode tail after the last `hit_time` is
-  `0.5 + Z_MISS / min_speed` so final misses always register.
+- **Miss**: the object passes `z < −Z_MISS = 0.65` m uncut — the HEAD
+  plane. **DELIBERATE DEVIATION from the real game** (which judges
+  misses at despawn ~2 m behind the head; v7.0-v7.2 used 2.65),
+  user-specified for credit assignment: the −0.5 lands ~5 ticks after
+  the play plane instead of ~20, and a passed note is certainly lost,
+  never ambiguously rescuable. Objects stay cuttable until the head
+  plane. Bombs passing are consumed silently (status 4, no event). The
+  episode tail after the last `hit_time` is `0.5 + Z_MISS / min_speed`
+  so final misses always register.
 - **No reward shaping** (mechanism REMOVED 2026-07-21, user direction):
   rewards come only from the sim's scoring, like real Beat Saber. The
   potential-based shaping (Ng et al. 1999) used in v0's earliest runs was
