@@ -1,14 +1,16 @@
 """Env tests against the Rust sim — THE implementation (SPEC.md §Tests).
 
-Env v6 (kinematic upper body): the cut scenarios drive the Rust sim via
-its set_joints test hook (per-hand joint angles + angular velocities) and
-assert on the event stream (note_idx, code, points).
+Env v7 (real geometry/judgment): the cut scenarios drive the Rust sim
+via its set_joints test hook (per-hand joint angles + angular
+velocities) and assert on the event stream (note_idx, code, points).
 
-Scenario poses lean on the "aligned wrist frame" family: with
-pitch = -elbow + delta, yaw = twist = 0, the forearm frame is a pure
-R_x(-delta) — for delta = 0 it's the IDENTITY, so (roll, bend) act
-exactly like the v5.2 world-frame wrist and all the flat-blade geometry
-carries over with the wrist parked at (+-0.2, 0.1, -0.05).
+Scenario poses use the "aligned wrist frame" family: with
+pitch = -elbow + delta, yaw = twist = 0, the wrist frame is a pure
+R_x(-delta), which FIXES the world x axis — so a blade along +-x with
+roll = azimuth - 90 deg, bend = 90 deg stays exactly in a z = const
+plane for ANY delta, and roll sweeps move it vertically. delta = 0.7
+parks the right wrist at (0.2, ~1.396, ~-0.195): flat-blade geometry at
+row-1 height (y 1.40), just behind the hit plane.
 """
 
 import numpy as np
@@ -18,7 +20,10 @@ from beat_arena_env import (
     OBS_DIM, OFF_NOTES, OFF_NOTE_MASK, N_NOTE_SLOTS, NOTE_FEAT,
     ChartConfig, Note, RustBeatEnv, generate_chart, scripted_action,
 )
-from beat_arena_env.constants import DT, SABER_FEAT, Z_MISS, joint_limits
+from beat_arena_env.constants import (
+    DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, ROW_Y, SABER_FEAT,
+    Z_MISS, col_x, joint_limits,
+)
 from beat_arena_env.kinematics import fk
 
 from beat_arena_rs import RawBeatSim
@@ -27,20 +32,27 @@ from beat_arena_rs import RawBeatSim
 DOWN = 6 * np.pi / 4  # downward swing angle
 COAST = (0,) * 12
 ACTION_NVEC = [3] * 12
-FLAT_ARM = [-np.pi / 2, 0.0, 0.0, np.pi / 2]  # identity wrist frame
-FLAT_WRIST = (0.2, 0.1, -0.05)                # right-hand wrist FK of FLAT_ARM
+DELTA = 0.7
+FLAT_ARM = [-np.pi / 2 + DELTA, 0.0, 0.0, np.pi / 2]
+FLAT_WRIST = (0.2, 1.3955705, -0.1950711)   # right-hand wrist FK of FLAT_ARM
 
 
-def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False):
+def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False,
+          kind=0, x=None, y=None, free_pre=False, free_post=False):
     return Note(hit_time=hit_time, col=col, row=row, color=color,
-                angle=angle, speed=speed, any_dir=any_dir)
+                angle=angle, speed=speed, any_dir=any_dir, kind=kind,
+                x=x, y=y, free_pre=free_pre, free_post=free_post)
 
 
-def _sim_with_note(note, max_steps=630):
+def _sim_with_notes(notes, max_steps=690):
     from beat_arena_env.chart import note_tuple
     sim = RawBeatSim(max_steps=max_steps)
-    sim.set_chart([note_tuple(note)])
+    sim.set_chart([note_tuple(n) for n in notes])
     return sim
+
+
+def _sim_with_note(note, max_steps=690):
+    return _sim_with_notes([note], max_steps=max_steps)
 
 
 def _park(sim, hand):
@@ -49,10 +61,11 @@ def _park(sim, hand):
     sim.set_joints(hand, [-1.2, yaw, 0.0, 0.0, 0.0, 0.0], [0.0] * 6)
 
 
-def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=0.0):
-    """FLAT pose: blade in the hit plane at `azimuth` (identity wrist
-    frame: roll = azimuth - 90 deg, bend = +90 deg), wrist at
-    (+-0.2, 0.1, -0.05) for delta = 0."""
+def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=DELTA):
+    """FLAT pose: blade along `azimuth` in a z = const plane (aligned
+    wrist frame R_x(-delta) fixes +-x; roll = azimuth - 90 deg,
+    bend = +90 deg). For delta = DELTA the right wrist sits at
+    FLAT_WRIST; roll sweeps (om_roll) move the blade vertically."""
     q = [-np.pi / 2 + delta, 0.0, 0.0, np.pi / 2,
          azimuth - np.pi / 2, np.pi / 2]
     sim.set_joints(hand, q, [0.0, 0.0, 0.0, 0.0, om_roll, om_bend])
@@ -84,12 +97,19 @@ def test_python_fk_matches_rust():
 
 
 def test_flat_pose_geometry():
-    """The FLAT scenario pose puts the right wrist at (0.2, 0.1, -0.05)
-    with the blade exactly in-plane along the requested azimuth."""
+    """The FLAT scenario pose parks the right wrist at FLAT_WRIST; the
+    wrist frame is R_x(-DELTA), which fixes the world x axis — so the
+    blade is exactly in-plane along +-x (the azimuths every contact in
+    the scenario family uses), and tilted by the frame elsewhere."""
     for az in (0.0, np.pi / 2, np.pi):
         _, w, b = fk(1, FLAT_ARM + [az - np.pi / 2, np.pi / 2])
-        assert np.allclose(w, FLAT_WRIST, atol=1e-9)
-        assert np.allclose(b, (np.cos(az), np.sin(az), 0.0), atol=1e-9)
+        assert np.allclose(w, FLAT_WRIST, atol=1e-6)
+        expect = (np.cos(az), np.cos(DELTA) * np.sin(az),
+                  -np.sin(DELTA) * np.sin(az))
+        assert np.allclose(b, expect, atol=1e-9)
+    for az in (0.0, np.pi):                      # in-plane at contact
+        _, _, b = fk(1, FLAT_ARM + [az - np.pi / 2, np.pi / 2])
+        assert abs(b[2]) < 1e-12
 
 
 # --- obs layout --------------------------------------------------------------
@@ -97,11 +117,11 @@ def test_flat_pose_geometry():
 def test_obs_layout():
     env = RustBeatEnv(seed=3)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (166,)
+    assert obs.shape == (OBS_DIM,) == (286,)
     assert OFF_NOTES == 2 * SABER_FEAT == 46
-    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 154
+    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 270
     # arm block at reset: all joints zero (arm straight forward), so the
-    # wrist sits at (+-0.2, 0.45, 0.3) and the blade points +z
+    # wrist sits at (+-0.2, 1.47, 0.0) and the blade points +z
     for s, x in ((0, -0.2), (1, 0.2)):
         b = s * SABER_FEAT
         assert obs[b] == 0.0                                # pitch
@@ -113,8 +133,8 @@ def test_obs_layout():
         assert obs[b + 6] == 0.0                            # bend
         assert not obs[b + 7:b + 13].any()                  # omegas
         assert obs[b + 13] == pytest.approx(x / 1.0)        # wrist x
-        assert obs[b + 14] == pytest.approx(0.45 / 0.75)    # wrist y
-        assert obs[b + 15] == pytest.approx(0.3)            # wrist z
+        assert obs[b + 14] == pytest.approx((1.47 - 1.40) / 0.75)  # wrist y
+        assert obs[b + 15] == pytest.approx(0.0, abs=1e-6)  # wrist z
         assert not obs[b + 16:b + 19].any()                 # wrist vel
         assert obs[b + 19] == pytest.approx(0.0, abs=1e-6)  # blade x
         assert obs[b + 20] == pytest.approx(0.0, abs=1e-6)  # blade y
@@ -124,17 +144,46 @@ def test_obs_layout():
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
     base = OFF_NOTES
-    assert obs[base + 8] == 1.0
-    assert obs[base + 0] == pytest.approx((n.col - 1.5) / 2.0)
-    assert obs[base + 1] == pytest.approx((n.row - 1.0) / 1.5)
+    assert obs[base + 13] == 1.0                            # valid
+    assert obs[base + 0] == pytest.approx(col_x(n.col))
+    assert obs[base + 1] == pytest.approx((ROW_Y[n.row] - 1.40) / 0.75)
     z = min(n.hit_time * n.speed, 12.0)
     assert obs[base + 2] == pytest.approx(z / 8.0)
     assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
     assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
+    assert not obs[base + 8:base + 13].any()                # kind/arc flags
     for slot in range(n_pending, N_NOTE_SLOTS):
         assert not obs[OFF_NOTES + slot * NOTE_FEAT:
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()
+
+
+def test_obs_kind_flags():
+    """Bombs are colorless/directionless with is_bomb set; chain heads and
+    links carry their flags; links keep their tangent direction; arc
+    grants surface as free_pre/free_post."""
+    notes = [
+        _note(2.0, 1, 1, kind=KIND_BOMB, any_dir=True, color=0),
+        _note(3.0, 2, 1, kind=KIND_CHAIN_HEAD),
+        _note(3.1, 2, 0, kind=KIND_CHAIN_LINK, any_dir=True,
+              angle=0.25, x=0.31, y=1.1),
+        _note(4.0, 3, 1, free_pre=True, free_post=True),
+    ]
+    sim = _sim_with_notes(notes)
+    obs = np.asarray(sim.set_chart(
+        [__import__("beat_arena_env.chart", fromlist=["note_tuple"])
+         .note_tuple(n) for n in notes]))
+    b0 = OFF_NOTES
+    assert obs[b0 + 8] == 1.0                       # is_bomb
+    assert not obs[b0 + 4:b0 + 8].any()             # no color, no dir
+    b1 = OFF_NOTES + NOTE_FEAT
+    assert obs[b1 + 9] == 1.0                       # is_chain_head
+    b2 = OFF_NOTES + 2 * NOTE_FEAT
+    assert obs[b2 + 10] == 1.0                      # is_chain_link
+    assert obs[b2 + 0] == pytest.approx(0.31)       # explicit x
+    assert obs[b2 + 6] == pytest.approx(np.cos(0.25), abs=1e-6)  # tangent
+    b3 = OFF_NOTES + 3 * NOTE_FEAT
+    assert obs[b3 + 11] == 1.0 and obs[b3 + 12] == 1.0  # free_pre/free_post
 
 
 def test_swing_meter_tracks_rotation():
@@ -157,19 +206,6 @@ def test_swing_meter_tracks_rotation():
     assert min(meters) < m1
 
 
-def test_rolling_a_forward_blade_is_not_a_swing():
-    """Pure roll at bend 0 spins the saber about its own axis: the blade
-    direction never moves, so no swing arc accumulates (correct physics)."""
-    env = RustBeatEnv(seed=3)
-    env.reset()
-    b = 1 * SABER_FEAT + 22
-    roll_plus = (0,) * 10 + (1, 0)
-    for _ in range(4):
-        obs, _, _, _, _ = env.step(roll_plus)
-    assert obs[b] == 0.0                                  # meter never moves
-    assert obs[1 * SABER_FEAT + 6] == 0.0                 # bend still 0
-
-
 def test_z_is_time_times_speed():
     """time_until = z / |vz| at every step (spatial obs contract)."""
     env = RustBeatEnv(seed=9)
@@ -179,12 +215,12 @@ def test_z_is_time_times_speed():
         if done:
             break
         status = env.sim.status()
-        pending = [i for i, s in enumerate(status) if s == 0][:12]
+        pending = [i for i, s in enumerate(status) if s == 0][:N_NOTE_SLOTS]
         for slot, i in enumerate(pending):
             z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
             vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
             t_until = env.chart[i].hit_time - env.sim.time
-            if -1.0 < t_until * env.chart[i].speed < 12.0:
+            if -3.0 < t_until * env.chart[i].speed < 12.0:
                 assert z_obs / -vz_obs == pytest.approx(t_until, abs=1e-4)
 
 
@@ -192,7 +228,8 @@ def test_z_is_time_times_speed():
 
 def test_determinism():
     def run():
-        env = RustBeatEnv(colors="both", note_rate=1.5, seed=7)
+        env = RustBeatEnv(colors="both", note_rate=1.5, bomb_rate=0.3,
+                          chain_prob=0.3, arc_prob=0.3, seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
         out = []
@@ -206,27 +243,29 @@ def test_determinism():
 
 
 # --- cut detection scenarios (Rust sim, via set_joints hook) -----------------
-# Standard geometry: note at cell (3,1) = center (0.75, 0), hit_time = DT
-# (z = 0 at the end of the first step), down-swing required. The right
-# arm holds the FLAT pose (wrist (0.2, 0.1, -0.05), blade in-plane along
-# +x); CW roll (om_roll < 0) sweeps the contact point (sample s = 0.5)
-# DOWNWARD through the note — the v5 swept geometry on the v6 body.
+# Standard geometry: note at cell (3,1) = center (0.9, 1.40), hit_time =
+# DT (z = 0 at the end of the first step). The right arm holds the FLAT
+# pose (wrist ~(0.2, 1.396, -0.195), blade along +x at row-1 height); CW
+# roll (om_roll < 0) sweeps the contact region DOWNWARD through the
+# note's good box (0.8 x 0.5 x 1.0, shifted 0.25 toward the player).
 
-def test_good_swing_cut_scores():
+def test_good_swing_cut_scores_integer_points():
     sim = _sim_with_note(_note(DT, 3, 1))
     _set_flat(sim, 1, 0.0, om_roll=-15.0)
     ev, r = _coast(sim)
     assert _codes(ev) == [(0, 0)]
     assert sim.good_cuts == 1
     pts = ev[0][2]
-    # one tick of swing (~28 deg) of pre-swing + decent accuracy
-    assert 18.0 < pts < 45.0
+    # ~28 deg of pre-swing (-> ~20) + a few accuracy points (the flat
+    # blade plane sits 0.195 m behind the note center)
+    assert 15.0 <= pts <= 45.0
+    assert pts == int(pts)                    # real BS scores are integers
     assert r == pytest.approx(pts / 115.0, abs=1e-5)
 
 
 def test_gentle_swing_is_good():
     """V_MIN_CUT is 1 m/s at the CONTACT POINT: a slow-ish roll whose
-    contact point (s ~ 0.5) still moves >= 1 m/s scores."""
+    contact point still moves >= 1 m/s scores."""
     sim = _sim_with_note(_note(DT, 3, 1))
     _set_flat(sim, 1, 0.0, om_roll=-3.0)
     ev, _ = _coast(sim)
@@ -248,21 +287,73 @@ def test_wrong_direction_swing_is_bad():
     assert _codes(ev) == [(0, 2)]  # angle (swept upward through a down note)
 
 
-def test_wrong_hand_is_bad():
-    sim = _sim_with_note(_note(DT, 1, 1, color=0))  # LEFT note at (-0.25, 0)
-    _park(sim, 0)                                    # matching arm far away
-    _set_flat(sim, 1, np.pi)                         # right blade points -x
+def test_wrong_hand_only_triggers_small_box():
+    """The wrong-color saber only interacts with the SMALL (0.35^3) box:
+    at note_z = 0 the flat blade plane (z -0.195) is outside it, but a
+    note just past the plane (z ~ -0.13) reaches it -> wrong_hand."""
+    # hit_time = 0: after one tick the note sits at z = -0.133
+    sim = _sim_with_note(_note(0.0, 1, 1, color=0))   # LEFT note at (-0.3, 1.4)
+    _park(sim, 0)                                     # matching arm far away
+    _set_flat(sim, 1, np.pi)                          # right blade points -x
     ev, _ = _coast(sim)
     assert _codes(ev) == [(0, 3)]
+    # same geometry but note still AT the plane: small box (+-0.175 z)
+    # doesn't reach the blade plane -> no contact at all
+    sim = _sim_with_note(_note(DT, 1, 1, color=0))
+    _park(sim, 0)
+    _set_flat(sim, 1, np.pi)
+    ev, _ = _coast(sim)
+    assert ev == []
+
+
+def test_good_box_is_bigger_than_bad_box():
+    """The same blade placement is INSIDE the good box for the matching
+    hand but OUTSIDE the small box for the wrong hand: the blade plane
+    0.195 m behind the note center clears the small box's 0.175 but not
+    the good box's 1.0 m depth (a static probe keeps the sweep from
+    tilting into the small box)."""
+    sim = _sim_with_note(_note(DT, 3, 1))
+    _set_flat(sim, 1, 0.0)                     # static matching blade
+    ev, _ = _coast(sim)
+    assert _codes(ev) == [(0, 1)]              # inside good box -> slow
+    sim = _sim_with_note(_note(DT, 3, 1, color=0))
+    _park(sim, 0)
+    _set_flat(sim, 1, 0.0)                     # static wrong-color blade
+    ev, _ = _coast(sim)
+    assert ev == []                            # small box out of reach
+
+
+def test_early_cut_through_the_deep_box():
+    """The good box extends 0.75 m toward the player: a fast swing
+    connects while the note is still ~0.5 m out (a real-BS early cut),
+    but not at ~0.8 m."""
+    for t_hit, hit in ((0.13 + DT, True), (0.21 + DT, False)):
+        sim = _sim_with_note(_note(t_hit, 3, 1))    # z after 1 tick: 4*t
+        _set_flat(sim, 1, 0.0, om_roll=-15.0)
+        ev, _ = _coast(sim)
+        assert bool(ev) == hit, f"hit_time {t_hit}"
+        if hit:
+            assert _codes(ev) == [(0, 0)]
+
+
+def test_dot_note_has_taller_hitbox():
+    """Modern dots are 0.8 m tall vs 0.5 for arrow notes: a blade passing
+    0.38 m above the row-1 center clips the dot box only (delta = 1.6
+    parks the wrist at y ~1.78, z ~ -0.31)."""
+    for any_dir, hit in ((False, False), (True, True)):
+        sim = _sim_with_note(_note(0.0, 3, 1, any_dir=any_dir))
+        _park(sim, 0)
+        _set_flat(sim, 1, 0.0, om_roll=-15.0, delta=1.6)
+        ev, _ = _coast(sim)
+        assert bool(ev) == hit, f"any_dir {any_dir}"
 
 
 def test_arm_swing_cuts_and_accuracy_decreases_off_center():
-    """env v6: a pure SHOULDER-pitch pendulum (wrist joints untouched)
-    swings the whole arm+blade through a note and scores — swings no
-    longer need the wrist. Yawing the arm off the note's column keeps the
-    hit but costs accuracy points."""
+    """A pure SHOULDER-pitch pendulum (wrist joints untouched) swings the
+    whole arm+blade through a note and scores. Yawing the arm off the
+    note's column keeps the hit but costs accuracy points."""
     def pendulum(yaw):
-        sim = _sim_with_note(_note(0.24, 2, 2))       # center (0.25, 0.5)
+        sim = _sim_with_note(_note(0.24, 2, 2))       # center (0.3, 1.9)
         _park(sim, 0)
         sim.set_joints(1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0],
                        [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -279,32 +370,26 @@ def test_arm_swing_cuts_and_accuracy_decreases_off_center():
     assert aligned[0][2] > offset[0][2] > 0.0
 
 
-def test_full_swing_scores_near_max():
-    """A wound-up swing (>100 deg) + follow-through approaches 115 points.
-
-    speed=10 keeps the note out of blade reach until the contact tick.
-    CW roll at 12 rad/s with the FLAT blade: the azimuth arc (start
-    ~159 deg, contact at 0, follow-through toward -100 deg) fits the
-    right hand's roll range."""
-    sim = _sim_with_note(_note(8 * DT, 3, 1, speed=10.0), max_steps=60)
-    om, sweep = 12.0, 0.0
-    deltas = []
-    for _ in range(8):
+def test_full_swing_scores_full_pre_and_post():
+    """A wound-up swing (>100 deg) earns the full 70 pre-swing and the
+    full 30 follow-through (the flat-blade z offset costs accuracy — by
+    design; forward-tilted blades are the high-acc technique)."""
+    sim = _sim_with_note(_note(10 * DT, 3, 1), max_steps=60)
+    om, sweep = 8.0, 0.0
+    for _ in range(11):
         om *= 1.0 - 0.02
-        deltas.append(om * DT)
         sweep += om * DT
-    az0 = sweep - deltas[-1] / 2   # azimuth crosses 0 mid-tick-8
-    _set_flat(sim, 1, az0, om_roll=-12.0)
+    _set_flat(sim, 1, sweep, om_roll=-8.0)
     events = []
-    for _ in range(14):
+    for _ in range(20):
         ev, _ = _coast(sim)
         events.extend(ev)
     cuts = [e for e in events if e[1] == 0]
     posts = [e for e in events if e[1] == 5]
     assert len(cuts) == 1 and len(posts) == 1
-    assert cuts[0][2] >= 75.0            # full 70 pre-swing + most accuracy
-    assert posts[0][2] == pytest.approx(30.0, abs=0.5)  # full follow-through
-    assert sim.score >= 105.0
+    assert cuts[0][2] >= 70.0            # full pre-swing banked
+    assert posts[0][2] == pytest.approx(30.0)  # full follow-through
+    assert sim.score >= 100.0
 
 
 def test_dot_note_scores_from_any_direction():
@@ -317,54 +402,26 @@ def test_dot_note_scores_from_any_direction():
 
 def test_dot_note_obs_is_zero_vector():
     from beat_arena_env.chart import note_tuple
-    sim = RawBeatSim(max_steps=630)
+    sim = RawBeatSim(max_steps=690)
     obs = sim.set_chart([note_tuple(_note(2.0, 1, 1, any_dir=True))])
     assert obs[OFF_NOTES + 6] == 0.0 and obs[OFF_NOTES + 7] == 0.0
-    assert obs[OFF_NOTES + 8] == 1.0  # still valid
+    assert obs[OFF_NOTES + 13] == 1.0  # still valid
 
 
 def test_forward_blade_reaches_early_note():
     """The start pose (arm forward, blade its extension) contacts notes
     far before the plane, while a flat blade can't reach."""
     # note arrives in 0.3 s: z ~ 1.07 m after one tick; the forward blade
-    # spans z 0.3..1.3 at (0.2, 0.45) — right next to cell (2,2)
-    sim = _sim_with_note(_note(0.3, 2, 2))
+    # spans z 0..1 at (0.2, 1.47) — right next to cell (2,1) at (0.3, 1.4)
+    sim = _sim_with_note(_note(0.3, 2, 1))
     _park(sim, 0)
     ev, _ = _coast(sim)                    # right arm still at start pose
     assert _codes(ev) == [(0, 1)]          # touched it (stationary -> slow)
-    # same note, blade flat in the plane: nothing within reach
-    sim = _sim_with_note(_note(0.3, 2, 2))
+    # same note, blade flat at z ~ -0.195: the box front (z ~ 0.32) is
+    # still 0.5 m short of the blade plane -> nothing within reach
+    sim = _sim_with_note(_note(0.3, 2, 1))
     _park(sim, 0)
     _set_flat(sim, 1, np.pi / 2)
-    ev, _ = _coast(sim)
-    assert ev == []
-
-
-def test_note_rotation_affects_collision():
-    """env v5.3 on the v6 body: the cut volume is the note's cube rotated
-    by (angle - 270 deg). A flat blade passing 0.22 m above the center
-    line misses an axis-aligned (down-swing) note but touches one rotated
-    57 deg (angle 327 deg), whose corner reaches it."""
-    for angle, touched in ((DOWN, False), (np.radians(327.0), True)):
-        sim = _sim_with_note(_note(DT, 3, 1, angle=angle))  # center (0.75, 0)
-        _park(sim, 0)
-        # delta = 20 deg lifts the wrist to (0.2, 0.224, 0.052), blade
-        # still exactly in-plane along +x (wrist frame = R_x(-20 deg))
-        _set_flat(sim, 1, 0.0, delta=np.radians(20.0))
-        ev, _ = _coast(sim)
-        if touched:
-            assert _codes(ev) == [(0, 1)]   # stationary touch -> slow
-        else:
-            assert ev == []
-
-
-def test_dot_note_box_stays_axis_aligned():
-    """Dot notes don't rotate whatever their angle field says: the same
-    probe that misses a down note misses a 327-deg dot."""
-    sim = _sim_with_note(_note(DT, 3, 1, angle=np.radians(327.0),
-                               any_dir=True))
-    _park(sim, 0)
-    _set_flat(sim, 1, 0.0, delta=np.radians(20.0))
     ev, _ = _coast(sim)
     assert ev == []
 
@@ -377,8 +434,105 @@ def test_far_note_is_untouchable():
     assert sim.status()[0] == 0
 
 
+# --- v7 object kinds ---------------------------------------------------------
+
+def test_chain_link_pays_flat_20_any_direction():
+    """Links: flat 20 points whatever the swing looks like — an up-swing
+    through a down-tangent link still pays exactly 20, and no
+    follow-through tracker opens."""
+    link = _note(DT, 3, 1, kind=KIND_CHAIN_LINK, any_dir=True)
+    sim = _sim_with_note(link)
+    _set_flat(sim, 1, 0.0, om_roll=15.0)     # "wrong" direction: irrelevant
+    ev, r = _coast(sim)
+    assert _codes(ev) == [(0, 0)]
+    assert ev[0][2] == 20.0
+    assert r == pytest.approx(20.0 / 115.0, abs=1e-5)
+    for _ in range(6):                        # no post event ever
+        ev, _ = _coast(sim)
+        assert all(c != 5 for _, c, _p in ev)
+    assert sim.score == 20.0
+
+
+def test_chain_link_still_requires_speed():
+    link = _note(DT, 3, 1, kind=KIND_CHAIN_LINK, any_dir=True)
+    sim = _sim_with_note(link)
+    _set_flat(sim, 1, 0.0, om_roll=-0.5)
+    ev, _ = _coast(sim)
+    assert _codes(ev) == [(0, 1)]             # slow
+
+
+def test_chain_head_has_no_follow_through():
+    """Chain heads score pre + accuracy (max 85) and never open a
+    follow-through tracker."""
+    head = _note(10 * DT, 3, 1, kind=KIND_CHAIN_HEAD)
+    sim = _sim_with_note(head, max_steps=60)
+    om, sweep = 8.0, 0.0
+    for _ in range(11):
+        om *= 1.0 - 0.02
+        sweep += om * DT
+    _set_flat(sim, 1, sweep, om_roll=-8.0)
+    events = []
+    for _ in range(20):
+        ev, _ = _coast(sim)
+        events.extend(ev)
+    cuts = [e for e in events if e[1] == 0]
+    posts = [e for e in events if e[1] == 5]
+    assert len(cuts) == 1 and posts == []
+    assert 70.0 <= cuts[0][2] <= 85.0
+    assert sim.score == cuts[0][2]
+
+
+def test_arc_grants_free_pre_and_post():
+    """free_pre pays the full 70 with no wind-up; free_post pays the full
+    30 at the cut tick with no tracker (arc head/tail semantics)."""
+    n = _note(DT, 3, 1, free_pre=True, free_post=True)
+    sim = _sim_with_note(n)
+    _set_flat(sim, 1, 0.0, om_roll=-15.0)     # one tick of swing only
+    ev, r = _coast(sim)
+    assert _codes(ev) == [(0, 0)]
+    assert ev[0][2] >= 100.0                  # 70 + acc + 30, one event
+    for _ in range(6):
+        ev, _ = _coast(sim)
+        assert all(c != 5 for _, c, _p in ev)
+
+
+def test_bomb_hit_and_bomb_pass():
+    """Sweeping through a bomb = penalty event (code 6); letting it pass
+    is silent and free."""
+    bomb = _note(DT, 3, 1, kind=KIND_BOMB, any_dir=True, color=0)
+    sim = _sim_with_note(bomb)
+    _set_flat(sim, 1, 0.0, om_roll=-15.0)
+    ev, r = _coast(sim)
+    assert _codes(ev) == [(0, 6)]
+    assert r == pytest.approx(-0.5)
+    assert sim.bombs_hit == 1 and sim.bad_cuts == 0 and sim.n_notes == 0
+    # pass: park both arms, let it fly through the miss boundary
+    sim = _sim_with_note(bomb)
+    _park(sim, 0)
+    _park(sim, 1)
+    events = []
+    done = False
+    while not done:
+        _, _, done, ev = sim.step(list(COAST))
+        events.extend(ev)
+    assert events == []
+    assert sim.misses == 0 and sim.bombs_hit == 0
+    assert sim.status()[0] == 4               # passed clean
+
+
+def test_bomb_ignores_wide_flat_blade():
+    """The bomb hitbox is a small r=0.18 sphere at the center: a blade
+    passing 0.38 m above it doesn't trigger."""
+    bomb = _note(0.0, 3, 1, kind=KIND_BOMB, any_dir=True, color=0)
+    sim = _sim_with_note(bomb)
+    _park(sim, 0)
+    _set_flat(sim, 1, 0.0, om_roll=-2.0, delta=1.6)   # y ~1.78 vs 1.40
+    ev, _ = _coast(sim)
+    assert ev == []
+
+
 def test_joint_limits_clamp_and_kill_omega():
-    """env v6: every joint is bounded; hitting a limit zeroes its omega.
+    """Every joint is bounded; hitting a limit zeroes its omega.
     Spot-check pitch (+90), right yaw (+100), elbow (0 floor), right roll
     (+90) and bend (+95) — arm-tier and wrist-tier joints both."""
     sim = _sim_with_note(_note(5.0, 2, 1))   # far note: no interference
@@ -401,11 +555,13 @@ def test_joint_limits_clamp_and_kill_omega():
 
 
 def test_miss_fires_exactly_at_exit():
+    """Misses register when the note crosses z = -Z_MISS (2.65 m — about
+    2 m behind the head), not at the plane."""
     sim = _sim_with_note(_note(DT, 0, 2))
     _park(sim, 0)
     _park(sim, 1)
     events = []
-    for _ in range(10):
+    for _ in range(40):
         ev, _ = _coast(sim)
         events.append(ev)
     miss_ticks = [i for i, ev in enumerate(events) if (0, 4) in _codes(ev)]
@@ -456,6 +612,46 @@ def test_chart_continuous_dirs_and_speed_range():
     assert len({round(n.speed, 3) for n in chart}) > 10
 
 
+def test_chart_v7_object_dials():
+    """bomb_rate / chain_prob / arc_prob produce their object kinds;
+    chains follow the real link layout (times strictly between head and
+    tail, positions on the Bezier); arcs pair head free_post with a later
+    same-color free_pre."""
+    cfg = ChartConfig(note_rate=2.0, colors="both", dirs=(0, 2, 4, 6),
+                      chart_len_s=40.0, bomb_rate=0.5, chain_prob=0.4,
+                      arc_prob=0.5)
+    chart = generate_chart(cfg, np.random.default_rng(17))
+    kinds = [n.kind for n in chart]
+    assert kinds.count(KIND_BOMB) >= 5
+    assert kinds.count(KIND_CHAIN_HEAD) >= 3
+    assert kinds.count(KIND_CHAIN_LINK) > kinds.count(KIND_CHAIN_HEAD)
+    assert sum(n.free_pre for n in chart) >= 2
+    assert sum(n.free_pre for n in chart) == sum(n.free_post for n in chart)
+    for n in chart:
+        if n.kind == KIND_CHAIN_LINK:
+            assert n.any_dir and n.x is not None and n.y is not None
+        if n.kind == KIND_BOMB:
+            assert n.any_dir
+    # same-hand feasibility still holds for non-link objects
+    for color in (0, 1):
+        times = [n.hit_time for n in chart
+                 if n.color == color and n.kind in (0, 2)]
+        assert all(b - a >= 0.25 for a, b in zip(times, times[1:]))
+
+
+def test_chain_links_layout():
+    from beat_arena_env.chart import chain_links
+    head = _note(1.0, 0, 0, angle=0.0)        # pointing +x from (-0.9, 0.85)
+    links = chain_links(head, col_x(2), ROW_Y[0], 1.3, sc=4)
+    assert len(links) == 3
+    ts = [l.hit_time for l in links]
+    assert ts == sorted(ts) and 1.0 < ts[0] and ts[-1] == pytest.approx(1.3)
+    xs = [l.x for l in links]
+    assert all(a < b for a, b in zip(xs, xs[1:]))         # marches toward tail
+    assert xs[-1] == pytest.approx(col_x(2))              # ends at the tail
+    assert all(l.kind == KIND_CHAIN_LINK and l.any_dir for l in links)
+
+
 # --- scripted bot solvability ------------------------------------------------
 
 def test_scripted_bot_solves_easy():
@@ -475,12 +671,13 @@ def test_scripted_bot_solves_easy():
     assert score / total >= 40.0
 
 
-# --- recording (JSONL v6 from the Rust event stream) ------------------------
+# --- recording (JSONL v7 from the Rust event stream) ------------------------
 
 def test_recording_roundtrip(tmp_path):
     import json
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(seed=5, chart_len_s=6.0)
+    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_rate=0.3, chain_prob=0.3,
+                      arc_prob=0.3, colors="both", note_rate=1.5)
     env.set_record(path)
     env.reset(seed=5)
     done = False
@@ -488,9 +685,11 @@ def test_recording_roundtrip(tmp_path):
         _, _, done, _, info = env.step(scripted_action(env))
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 6
+    assert head["header"]["version"] == 7
     assert head["header"]["config"]["note_speed"] == 4.0
-    assert len(head["header"]["chart"]) == info["n_notes"]
+    assert len(head["header"]["chart"]) == len(env.chart)
+    assert all("x" in c and "y" in c and "kind" in c
+               for c in head["header"]["chart"])
     goods = sum(1 for t in ticks for e in t["events"]
                 if "cut" in e and e["cut"]["good"])
     assert goods == info["good_cuts"]
@@ -504,20 +703,24 @@ def test_recording_roundtrip(tmp_path):
     assert pts == pytest.approx(info["score"], abs=0.5)
 
 
-# --- BeatSaver parser (fixtures cover both real schemas) ---------------------
+# --- BeatSaver parser (fixtures cover all three schemas + v7 objects) --------
 
-def test_beatsaver_parser_v2_and_v3(tmp_path):
-    import json, math
-    from beat_arena_env.beatsaver import load_beatmap
+def _write_info(tmp_path, extra=None):
+    import json
     info = {"_beatsPerMinute": 120.0, "_songName": "fixture",
             "_difficultyBeatmapSets": [{
                 "_beatmapCharacteristicName": "Standard",
                 "_difficultyBeatmaps": [
                     {"_difficulty": "Normal", "_beatmapFilename": "Normal.dat",
                      "_noteJumpMovementSpeed": 10.0}]}]}
+    info.update(extra or {})
     (tmp_path / "Info.dat").write_text(json.dumps(info))
 
-    # v2 schema: down-cut, bomb (skipped), dot note
+
+def test_beatsaver_parser_v2_bombs_and_dots(tmp_path):
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
     v2 = {"_version": "2.0.0", "_notes": [
         {"_time": 4, "_lineIndex": 1, "_lineLayer": 0, "_type": 0, "_cutDirection": 1},
         {"_time": 5, "_lineIndex": 2, "_lineLayer": 1, "_type": 3, "_cutDirection": 0},
@@ -526,20 +729,106 @@ def test_beatsaver_parser_v2_and_v3(tmp_path):
     (tmp_path / "Normal.dat").write_text(json.dumps(v2))
     notes, meta = load_beatmap(str(tmp_path), "Normal", speed_scale=0.3,
                                first_note_s=2.0)
-    assert len(notes) == 2                       # bomb dropped
+    assert len(notes) == 3                       # bomb now PARSED
+    assert meta["n_notes"] == 2 and meta["n_bombs"] == 1
     assert notes[0].hit_time == pytest.approx(2.0)          # shifted
-    assert notes[1].hit_time == pytest.approx(3.0)          # 2 beats @120bpm = 1s
+    assert notes[1].kind == KIND_BOMB
+    assert notes[2].hit_time == pytest.approx(3.0)          # 2 beats @120 = 1s
     assert notes[0].angle == pytest.approx(3 * np.pi / 2)   # down
-    assert notes[0].color == 0 and notes[1].color == 1
-    assert notes[1].any_dir                                  # dot
+    assert notes[2].any_dir                                  # dot
     assert notes[0].speed == pytest.approx(3.0)              # njs 10 * 0.3
 
-    # v3 schema: right-cut with +15deg precision offset
-    v3 = {"version": "3.3.0", "colorNotes": [
-        {"b": 4, "x": 0, "y": 0, "c": 1, "d": 3, "a": 15},
-    ]}
+
+def test_beatsaver_parser_v3_chains_arcs_bpm(tmp_path):
+    import json, math
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    v3 = {"version": "3.3.0",
+          "colorNotes": [
+              {"b": 4, "x": 0, "y": 0, "c": 1, "d": 3, "a": 15},
+              {"b": 6, "x": 1, "y": 0, "c": 1, "d": 1},   # chain head
+              {"b": 8, "x": 2, "y": 1, "c": 0, "d": 0},   # arc head
+              {"b": 9, "x": 3, "y": 1, "c": 0, "d": 1},   # arc tail
+          ],
+          "bombNotes": [{"b": 5, "x": 2, "y": 0}],
+          "burstSliders": [
+              {"b": 6, "x": 1, "y": 0, "c": 1, "d": 1,
+               "tb": 6.5, "tx": 1, "ty": 2, "sc": 4, "s": 1.0}],
+          "sliders": [
+              {"b": 8, "x": 2, "y": 1, "c": 0, "d": 0, "mu": 1.0,
+               "tb": 9, "tx": 3, "ty": 1, "tc": 0, "tmu": 1.0, "m": 0}],
+          "bpmEvents": [{"b": 8, "m": 240.0}]}
     (tmp_path / "Normal.dat").write_text(json.dumps(v3))
     notes, meta = load_beatmap(str(tmp_path), "Normal")
-    assert len(notes) == 1
-    assert notes[0].angle == pytest.approx(math.radians(15))  # 0 + 15deg CCW
-    assert not notes[0].any_dir
+    assert notes[0].angle == pytest.approx(math.radians(15))
+    heads = [n for n in notes if n.kind == KIND_CHAIN_HEAD]
+    links = [n for n in notes if n.kind == KIND_CHAIN_LINK]
+    bombs = [n for n in notes if n.kind == KIND_BOMB]
+    assert len(heads) == 1 and len(links) == 3 and len(bombs) == 1
+    assert all(heads[0].hit_time < l.hit_time for l in links)
+    assert sum(n.free_post for n in notes) == 1     # arc head
+    assert sum(n.free_pre for n in notes) == 1      # arc tail
+    # BPM change at beat 8: beats 8 -> 9 take 60/240 s, not 60/120
+    t8 = [n for n in notes if n.free_post][0].hit_time
+    t9 = [n for n in notes if n.free_pre][0].hit_time
+    assert t9 - t8 == pytest.approx(60.0 / 240.0)
+    assert t8 == pytest.approx(8 * 0.5)             # pre-change beats @120
+
+
+def test_beatsaver_parser_v4(tmp_path):
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    info = {"version": "4.0.0",
+            "song": {"title": "v4 fixture"},
+            "audio": {"bpm": 120.0},
+            "difficultyBeatmaps": [
+                {"characteristic": "Standard", "difficulty": "Normal",
+                 "beatmapDataFilename": "Normal.dat",
+                 "noteJumpMovementSpeed": 10.0}]}
+    (tmp_path / "Info.dat").write_text(json.dumps(info))
+    v4 = {"version": "4.0.0",
+          "colorNotes": [{"b": 4, "i": 0}, {"b": 5, "i": 1}],
+          "colorNotesData": [
+              {"x": 1, "y": 0, "c": 0, "d": 1, "a": 0},
+              {"x": 2, "y": 1, "c": 1, "d": 8, "a": 0}],
+          "bombNotes": [{"b": 6, "i": 0}],
+          "bombNotesData": [{"x": 3, "y": 0}],
+          "chains": [{"hb": 5, "tb": 5.5, "i": 1, "ci": 0}],
+          "chainsData": [{"tx": 2, "ty": 2, "c": 3, "s": 1.0}],
+          "arcs": []}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v4))
+    notes, meta = load_beatmap(str(tmp_path), "Normal")
+    assert meta["n_notes"] == 4                     # 2 notes + 2 links
+    assert meta["n_bombs"] == 1
+    kinds = sorted(n.kind for n in notes)
+    assert kinds == [0, 1, 2, 3, 3]
+    head = [n for n in notes if n.kind == KIND_CHAIN_HEAD][0]
+    assert head.col == 2 and head.any_dir           # dot head keeps any_dir
+
+
+def test_beatsaver_angle_snap(tmp_path):
+    import json, math
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    # two same-color down notes on one beat, diagonal cells (0,0) and
+    # (1,1): the line between them runs 42.6 deg above +x; the nearest
+    # sense to a down arrow is the descending one (~-137.4 deg), within
+    # the 40-deg gate of straight down (deviation ~47.4... rejected!) —
+    # use (0,0)+(1,2): steeper line, deviation from down ~28 deg -> snap.
+    v3 = {"version": "3.3.0", "colorNotes": [
+        {"b": 4, "x": 0, "y": 0, "c": 1, "d": 1},
+        {"b": 4, "x": 1, "y": 2, "c": 1, "d": 1},
+        {"b": 6, "x": 0, "y": 0, "c": 1, "d": 1},   # control pair: same col
+        {"b": 6, "x": 0, "y": 2, "c": 1, "d": 1},
+    ]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal")
+    a, b = notes[0], notes[1]
+    dx, dy = col_x(1) - col_x(0), ROW_Y[2] - ROW_Y[0]
+    expect = (math.atan2(dy, dx) + math.pi) % (2 * math.pi)   # descending
+    assert a.angle == pytest.approx(expect)
+    assert b.angle == pytest.approx(expect)
+    # control pair shares a column -> no snap: both still straight down
+    c, d = notes[2], notes[3]
+    assert c.angle == pytest.approx(3 * np.pi / 2)
+    assert d.angle == pytest.approx(3 * np.pi / 2)

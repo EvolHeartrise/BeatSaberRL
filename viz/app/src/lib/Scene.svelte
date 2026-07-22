@@ -1,11 +1,16 @@
 <script>
-  // The 3D scene: camera + orbit controls, lights, static tunnel/grid/reach
-  // geometry, playback clock, notes and sabers. World -> scene: (x, y, -z).
+  // The 3D scene: camera + orbit controls, lights, static floor/tunnel/grid/
+  // reach geometry, playback clock, notes and sabers. World -> scene: (x, y, -z).
+  // Env v7: floor-based world — the floor plane is at y = 0; the 4x3 cell
+  // grid uses the real 0.6 m lanes and non-uniform row heights.
   import { T, useTask } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
   import { pb, lastTick, setPlaying } from "./state.svelte.js";
-  import { CELL, GX, GY, REACH_Z, Z_FAR, Z_MISS } from "./replay.js";
+  import {
+    GX0, GX1, GY0, GY1, LANE_X, CELL, REACH_Z, ROW_EDGES, SHOULDER, Z_FAR,
+    Z_MISS,
+  } from "./replay.js";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
   import WristGauges from "./WristGauges.svelte";
@@ -27,34 +32,43 @@
     return g;
   }
   const rect = (z) => [
-    [[-GX, -GY, z], [GX, -GY, z]], [[GX, -GY, z], [GX, GY, z]],
-    [[GX, GY, z], [-GX, GY, z]], [[-GX, GY, z], [-GX, -GY, z]],
+    [[GX0, GY0, z], [GX1, GY0, z]], [[GX1, GY0, z], [GX1, GY1, z]],
+    [[GX1, GY1, z], [GX0, GY1, z]], [[GX0, GY1, z], [GX0, GY0, z]],
   ];
 
   const tunnelPairs = [];
-  for (const [x, y] of [[-GX, -GY], [GX, -GY], [GX, GY], [-GX, GY]])
+  for (const [x, y] of [[GX0, GY0], [GX1, GY0], [GX1, GY1], [GX0, GY1]])
     tunnelPairs.push([[x, y, 0], [x, y, Z_FAR]]);
   for (let z = 2; z <= Z_FAR; z += 2) tunnelPairs.push(...rect(z));
   for (let c = 0; c <= 4; c++)
-    tunnelPairs.push([[-GX + c * CELL, -GY, 0], [-GX + c * CELL, -GY, Z_FAR]]);
+    tunnelPairs.push([[GX0 + c * CELL, GY0, 0], [GX0 + c * CELL, GY0, Z_FAR]]);
+  // floor edge lines along the tunnel (the runway on the y = 0 floor)
+  for (const x of [GX0, GX1])
+    tunnelPairs.push([[x, 0, -Z_MISS], [x, 0, Z_FAR]]);
   const tunnelGeo = segs(tunnelPairs);
 
+  // 4x3 cell grid at the hit plane: lane edges every 0.6 m; row edges
+  // midway between the real non-uniform row centers
   const gridPairs = [];
   for (let c = 0; c <= 4; c++)
-    gridPairs.push([[-GX + c * CELL, -GY, 0], [-GX + c * CELL, GY, 0]]);
-  for (let r = 0; r <= 3; r++)
-    gridPairs.push([[-GX, -GY + r * CELL, 0], [GX, -GY + r * CELL, 0]]);
+    gridPairs.push([[GX0 + c * CELL, GY0, 0], [GX0 + c * CELL, GY1, 0]]);
+  for (const y of ROW_EDGES) gridPairs.push([[GX0, y, 0], [GX1, y, 0]]);
   const gridGeo = segs(gridPairs);
 
-  // blade-reach region: miss line (z = -0.6) to max tilted reach (z = 1.28)
+  // blade-reach region: miss boundary (z = -2.65, ~2 m behind the head)
+  // to max reach (z = 1.75)
   const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
+
+  // torso (env v7 placement): shoulders at (±0.2, 1.47, -0.65); the trunk
+  // reaches down toward the floor to suggest a 1.8 m player
+  const SH_Y = SHOULDER[1][1], SH_Z = -SHOULDER[1][2]; // scene z = +0.65
 </script>
 
-<T.PerspectiveCamera makeDefault position={[0, 1.1, 3.2]} fov={55}>
+<T.PerspectiveCamera makeDefault position={[0, 2.1, 3.4]} fov={55}>
   <OrbitControls
     enableDamping
     dampingFactor={0.12}
-    target={[0, 0, -1.5]}
+    target={[0, 1.4, -1.5]}
     maxDistance={25}
   />
   {#if pb.rep && pb.gauges}
@@ -64,6 +78,12 @@
 
 <T.AmbientLight intensity={1.1} />
 <T.DirectionalLight position={[3, 6, 5]} intensity={1.4} />
+
+<!-- the floor: y = 0 plane under the whole play area -->
+<T.Mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, (Z_MISS - Z_FAR) / 2]}>
+  <T.PlaneGeometry args={[2 * (GX1 + 0.8), Z_FAR + Z_MISS]} />
+  <T.MeshStandardMaterial color="#12151c" />
+</T.Mesh>
 
 <T.LineSegments geometry={tunnelGeo}>
   <T.LineBasicMaterial color="#1d212b" />
@@ -77,14 +97,23 @@
 
 {#if pb.rep}
   <Notes />
-  <!-- torso (env v6): shoulder crossbar + trunk hint behind the plane -->
-  <T.Mesh position={[0, 0.45, 0.35]} rotation={[0, 0, Math.PI / 2]}>
+  <!-- body: head + shoulder crossbar + trunk down toward the floor -->
+  <T.Mesh position={[0, SH_Y + 0.24, SH_Z]}>
+    <T.SphereGeometry args={[0.11, 16, 12]} />
+    <T.MeshStandardMaterial color="#2a2f3b" />
+  </T.Mesh>
+  <T.Mesh position={[0, SH_Y, SH_Z]} rotation={[0, 0, Math.PI / 2]}>
     <T.CylinderGeometry args={[0.045, 0.045, 0.4, 10]} />
     <T.MeshStandardMaterial color="#2a2f3b" />
   </T.Mesh>
-  <T.Mesh position={[0, 0.13, 0.35]}>
-    <T.BoxGeometry args={[0.34, 0.56, 0.15]} />
+  <T.Mesh position={[0, 1.12, SH_Z]}>
+    <T.BoxGeometry args={[0.34, 0.62, 0.16]} />
     <T.MeshStandardMaterial color="#20242e" />
+  </T.Mesh>
+  <!-- legs hint: trunk continues to the floor -->
+  <T.Mesh position={[0, 0.41, SH_Z]}>
+    <T.BoxGeometry args={[0.24, 0.82, 0.13]} />
+    <T.MeshStandardMaterial color="#1a1e26" />
   </T.Mesh>
   <Saber s={0} />
   <Saber s={1} />

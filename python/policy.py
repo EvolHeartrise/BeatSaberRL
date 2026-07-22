@@ -30,14 +30,15 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v5:
-# env v6 arm chains — 23 features per hand; notes unchanged from v3).
+# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
+# env v7 — 16 object slots x 14 features incl. kind flags (bomb, chain
+# head/link) and arc pre/post-swing grants; sabers unchanged from v6).
 SABER_FEAT = 23
 OFF_NOTES = 2 * SABER_FEAT                            # 46
-N_NOTE_SLOTS = 12
-NOTE_FEAT = 9
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 154
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 166
+N_NOTE_SLOTS = 16
+NOTE_FEAT = 14
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 270
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 286
 # env v6: per hand 6 ternary joint heads (pitch, yaw, twist, elbow, roll,
 # bend) — twelve factored heads, left hand first
 HEAD_SIZES = (3,) * 12
@@ -122,20 +123,20 @@ class NotePolicy(nn.Module):
         self.value_head = nn.Linear(trunk_dim, 1)
 
     def _split(self, obs: torch.Tensor):
-        sabers = obs[:, :OFF_NOTES]                                  # (B, 20)
+        sabers = obs[:, :OFF_NOTES]                                  # (B, 46)
         notes = obs[:, OFF_NOTES:OFF_NOTE_MASK].reshape(
-            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 12, 9)
+            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 16, 14)
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, notes, note_mask
 
     def forward(self, obs: torch.Tensor):
         sabers, notes, note_mask = self._split(obs)
-        emb = self.note_mlp(notes)                                   # (B, 12, 64)
+        emb = self.note_mlp(notes)                                   # (B, 16, 64)
         B = obs.shape[0]
         hand_id = torch.eye(2, device=obs.device).expand(B, 2, 2)
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT), hand_id], dim=-1)
-        tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 14, 64)
+        tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 18, 64)
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
         for blk in self.blocks:

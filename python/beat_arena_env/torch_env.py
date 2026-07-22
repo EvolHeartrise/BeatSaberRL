@@ -1,18 +1,25 @@
 """GPU-resident vectorized Beat Arena sim (torch tensors, one row per env).
 
-A semantics-exact port of rust/src/lib.rs step_inner + build_obs (env v6,
-kinematic arm chains) — the Rust crate remains THE reference implementation; this
-port exists so rollouts can run wide (N in the thousands) on the GPU with
-observations born on-device. Parity with Rust is pinned by
-tests/test_torch_env.py: exact event/reward/obs agreement in float64,
-bounded drift in float32.
+A semantics-exact port of rust/src/lib.rs step_inner + build_obs (env v7,
+real BS geometry/judgment on the v6 kinematic arm chains) — the Rust crate
+remains THE reference implementation; this port exists so rollouts can run
+wide (N in the thousands) on the GPU with observations born on-device.
+Parity with Rust is pinned by tests/test_torch_env.py: exact event/reward/
+obs agreement in float64, bounded drift in float32.
 
 Design notes (why it looks the way it does):
-- All charts are padded to a common length C; a `valid` mask marks real notes.
-  Consumed/padded notes never match any condition, so every rule is a pure
-  masked tensor op — no per-env branching anywhere.
-- The swept-blade cut test loops the 8 blade samples STATICALLY (bounded
-  memory, no data-dependent shapes, no host syncs).
+- All charts are padded to a common length C; a `valid` mask marks real
+  objects. Consumed/padded objects never match any condition, so every rule
+  is a pure masked tensor op — no per-env branching anywhere.
+- Collision is the swept blade SURFACE per tick (quad prev->cur blade as
+  two triangles) vs the axis-aligned good/bad boxes via the Akenine-Möller
+  triangle-AABB SAT, and Ericson point-triangle distances for accuracy and
+  bombs — the exact expression trees of lib.rs, with Rust's early-return
+  branches folded into boolean AND-chains / priority torch.where ladders
+  (identical f64 predicates -> identical booleans).
+- The contact-point argmin loops the 8 blade samples STATICALLY (bounded
+  memory, no data-dependent shapes, no host syncs); first strict minimum
+  wins, matching Rust's `<` scan in sample order.
 - Follow-through trackers are fixed ring slots per saber. Trackers spawned
   by the same saber in the same tick share identical (arc, age) forever, so
   they aggregate into ONE slot with a note COUNT — at most one spawn per
@@ -29,98 +36,175 @@ event stream (rewards/counters/score only).
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import torch
 
 from .chart import ChartConfig, generate_chart
-from .constants import OBS_DIM
+from .constants import (
+    ACC_NORM, BAD_HALF, BAD_HALF_Y_LINK, BEND_LIM, BOMB_RADIUS,
+    CHAIN_LINK_PTS, COS_TOL, DRAG, DT, ELBOW_HI, FOLLOW_TIMEOUT,
+    GOOD_HALF_X, GOOD_HALF_Y, GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK,
+    GOOD_HALF_Z, GOOD_Z_SHIFT, JOINT_ALPHA, JOINT_OMEGA, KIND_BOMB,
+    KIND_CHAIN_HEAD, KIND_CHAIN_LINK, L_FORE, L_UPPER, N_BLADE_SAMPLES,
+    N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT, OBS_DIM, OFF_NOTE_MASK, OFF_NOTES,
+    PITCH_LIM, POST_FULL, PRE_FULL, PTS_ACC, PTS_POST, PTS_PRE, REACH_Z,
+    REWARD_BAD, REWARD_BOMB, REWARD_MISS, ROLL_HI, ROLL_LO, SABER_LEN,
+    SCORE_MAX, SHOULDER, SWING_BREAK, TWIST_LIM, V_MIN_CUT, V_NORM,
+    X_NORM, Y_CENTER, Y_NORM, YAW_HI, YAW_LO, Z_CLIP, Z_MISS, Z_SCALE,
+    note_center,
+)
 
-# Physics constants — mirror rust/src/lib.rs (SPEC.md is the contract).
-DT = 1.0 / 30.0
-DRAG = 0.02
-V_NORM = 6.0
-V_MIN_CUT = 1.0
-CUT_RADIUS = 0.28
-COS_TOL = 0.5
-CELL = 0.5
-REWARD_BAD = -0.5
-REWARD_MISS = -0.5
-SABER_LEN = 1.0
-# env v6 upper body (see lib.rs / constants.py)
-SHOULDER = ((-0.2, 0.45, -0.35), (0.2, 0.45, -0.35))
-L_UPPER = 0.35
-L_FORE = 0.30
-N_JOINTS = 6
-ALPHA_ARM, OMEGA_ARM = 80.0, 8.0
-ALPHA_WRIST, OMEGA_WRIST = 200.0, 20.0
-JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 2
-JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
-PITCH_LIM = 1.5707963267948966
-YAW_LO = (-1.7453292519943295, -0.7853981633974483)
-YAW_HI = (0.7853981633974483, 1.7453292519943295)
-TWIST_LIM = 1.5707963267948966
-ELBOW_HI = 2.6179938779914944
-# env v5.2 forearm-anchored joints (mirror lib.rs): neutral blade points
-# at the notes; roll [-90, 190] deg left / [-190, 90] right; bend +-95
-ROLL_LO = (-1.5707963267948966, -3.3161255787892263)
-ROLL_HI = (3.3161255787892263, 1.5707963267948966)
-BEND_LIM = 1.6580627893946132
-N_BLADE_SAMPLES = 8
-REACH_Z = 1.5       # max wrist z (0.3) + blade (1) + HALF_BLOCK
-HALF_BLOCK = 0.2    # env v5.3: contact = swept blade vs the ROTATED cube
-Z_MISS = 0.6
-PRE_FULL = 1.7453292519943295   # 100 deg
-POST_FULL = 1.0471975511965976  # 60 deg
-PTS_PRE, PTS_POST, PTS_ACC = 70.0, 30.0, 15.0
-SCORE_MAX = 115.0
-SWING_BREAK = 0.005
-FOLLOW_TIMEOUT = 15
 N_TRACKERS = FOLLOW_TIMEOUT + 1  # ring slots; see module docstring
-X_NORM = 1.0
-Y_NORM = 0.75
-Z_SCALE = 8.0
-Z_CLIP = (-1.0, 12.0)
-N_NOTE_SLOTS = 12
-NOTE_FEAT = 9
-SABER_FEAT = 23
-OFF_NOTES = 2 * SABER_FEAT                             # 46
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 154
+
+
+# -- geometry kernels (mirror lib.rs; identical f64 expression trees) ---------
+def _dot(a, b):
+    """dot3: explicit left-to-right x*x + y*y + z*z (matches lib.rs)."""
+    return a[..., 0] * b[..., 0] + a[..., 1] * b[..., 1] + a[..., 2] * b[..., 2]
+
+
+def _tri_box_overlap(v0, v1, v2, hx, hy, hz):
+    """Akenine-Möller triangle-AABB SAT (lib.rs tri_box_overlap). Verts
+    RELATIVE to the box center; (hx, hy, hz) half extents (hy may be a
+    per-note tensor). Rust's early returns fold into one AND-chain —
+    identical predicates on identical f64 values give identical booleans."""
+    h = (hx, hy, hz)
+    ok = None
+    for k in range(3):  # box-axis tests
+        lo = torch.minimum(torch.minimum(v0[..., k], v1[..., k]), v2[..., k])
+        hi = torch.maximum(torch.maximum(v0[..., k], v1[..., k]), v2[..., k])
+        sep = (lo > h[k]) | (hi < -h[k])
+        ok = ~sep if ok is None else ok & ~sep
+    edges = (v1 - v0, v2 - v1, v0 - v2)
+    zero = torch.zeros((), device=v0.device, dtype=v0.dtype)
+    for e in edges:  # 9 cross-axis tests: a = u_k x e_j
+        ex, ey, ez = e[..., 0], e[..., 1], e[..., 2]
+        for ax, ay, az in ((zero, -ez, ey), (ez, zero, -ex), (-ey, ex, zero)):
+            p0 = v0[..., 0] * ax + v0[..., 1] * ay + v0[..., 2] * az
+            p1 = v1[..., 0] * ax + v1[..., 1] * ay + v1[..., 2] * az
+            p2 = v2[..., 0] * ax + v2[..., 1] * ay + v2[..., 2] * az
+            r = hx * ax.abs() + hy * ay.abs() + hz * az.abs()
+            lo = torch.minimum(torch.minimum(p0, p1), p2)
+            hi = torch.maximum(torch.maximum(p0, p1), p2)
+            ok = ok & ~((lo > r) | (hi < -r))
+    e0, e1 = edges[0], edges[1]  # triangle-plane test
+    nx = e0[..., 1] * e1[..., 2] - e0[..., 2] * e1[..., 1]
+    ny = e0[..., 2] * e1[..., 0] - e0[..., 0] * e1[..., 2]
+    nz = e0[..., 0] * e1[..., 1] - e0[..., 1] * e1[..., 0]
+    r = hx * nx.abs() + hy * ny.abs() + hz * nz.abs()
+    plane = (nx * v0[..., 0] + ny * v0[..., 1] + nz * v0[..., 2]).abs() <= r
+    return ok & plane
+
+
+def _tri_point_dist(a, b, c, p):
+    """Closest distance point p -> triangle (a, b, c) — Ericson's 7-region
+    algorithm (lib.rs tri_point_dist). The region cascade becomes a
+    priority torch.where ladder applied LAST-region-first so earlier
+    regions win, exactly like Rust's early returns; guarded divisions
+    mirror the |denom| < 1e-15 -> 0 rule."""
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = _dot(ab, ap)
+    d2 = _dot(ac, ap)
+    bp = p - b
+    d3 = _dot(ab, bp)
+    d4 = _dot(ac, bp)
+    cp = p - c
+    d5 = _dot(ab, cp)
+    d6 = _dot(ac, cp)
+    vc = d1 * d4 - d3 * d2
+    vb = d5 * d2 - d1 * d6
+    va = d3 * d6 - d5 * d4
+
+    def gdiv(num, den):
+        return torch.where(den.abs() < 1e-15, torch.zeros_like(num), num / den)
+
+    r1 = (d1 <= 0.0) & (d2 <= 0.0)                       # vertex a
+    r2 = (d3 >= 0.0) & (d4 <= d3)                        # vertex b
+    r3 = (vc <= 0.0) & (d1 >= 0.0) & (d3 <= 0.0)         # edge ab
+    r4 = (d6 >= 0.0) & (d5 <= d6)                        # vertex c
+    r5 = (vb <= 0.0) & (d2 >= 0.0) & (d6 <= 0.0)         # edge ac
+    r6 = (va <= 0.0) & ((d4 - d3) >= 0.0) & ((d5 - d6) >= 0.0)  # edge bc
+    v3 = gdiv(d1, d1 - d3).unsqueeze(-1)
+    q3 = a + v3 * ab
+    w5 = gdiv(d2, d2 - d6).unsqueeze(-1)
+    q5 = a + w5 * ac
+    w6 = gdiv(d4 - d3, (d4 - d3) + (d5 - d6)).unsqueeze(-1)
+    q6 = b + w6 * (c - b)
+    denom = 1.0 / (va + vb + vc)                         # interior
+    v = (vb * denom).unsqueeze(-1)
+    w = (vc * denom).unsqueeze(-1)
+    q = a + ab * v + ac * w
+    for cond, qi in ((r6, q6), (r5, q5), (r4, c), (r3, q3), (r2, b), (r1, a)):
+        q = torch.where(cond.unsqueeze(-1), qi, q)
+    d = p - q
+    return (d[..., 0] * d[..., 0] + d[..., 1] * d[..., 1]
+            + d[..., 2] * d[..., 2]).sqrt()
+
+
+def _seg_point_dist(a, b, c):
+    """Distance from point c to segment ab (lib.rs seg_point_dist3)."""
+    ab = b - a
+    denom = _dot(ab, ab)
+    ac = c - a
+    t = torch.where(denom < 1e-12, torch.zeros_like(denom),
+                    (_dot(ac, ab) / denom).clamp(0.0, 1.0))
+    px = a[..., 0] + t * ab[..., 0] - c[..., 0]
+    py = a[..., 1] + t * ab[..., 1] - c[..., 1]
+    pz = a[..., 2] + t * ab[..., 2] - c[..., 2]
+    return (px * px + py * py + pz * pz).sqrt()
 
 
 def _charts_to_tensors(charts, device, dtype):
-    """Pad a list[list[Note]] into per-field (P, C) tensors."""
+    """Pad a list[list[Note]] into per-field (P, C) tensors (env v7:
+    explicit world x/y via note_center, object kinds, arc grants, per-note
+    hitbox half-heights, per-chart episode tail)."""
     P = len(charts)
     C = max(1, max(len(ch) for ch in charts))
-    hit = np.zeros((P, C)); col = np.zeros((P, C)); row = np.zeros((P, C))
+    hit = np.zeros((P, C)); x = np.zeros((P, C)); y = np.zeros((P, C))
     color = np.zeros((P, C)); angle = np.zeros((P, C)); speed = np.ones((P, C))
-    any_dir = np.zeros((P, C), dtype=bool); valid = np.zeros((P, C), dtype=bool)
+    any_dir = np.zeros((P, C), dtype=bool); kind = np.zeros((P, C), np.int64)
+    fpre = np.zeros((P, C), dtype=bool); fpost = np.zeros((P, C), dtype=bool)
+    valid = np.zeros((P, C), dtype=bool)
     for p, ch in enumerate(charts):
         for j, n in enumerate(ch):
-            hit[p, j] = n.hit_time; col[p, j] = n.col; row[p, j] = n.row
+            hit[p, j] = n.hit_time
+            x[p, j], y[p, j] = note_center(n)
             color[p, j] = n.color; angle[p, j] = n.angle; speed[p, j] = n.speed
-            any_dir[p, j] = n.any_dir; valid[p, j] = True
+            any_dir[p, j] = n.any_dir; kind[p, j] = n.kind
+            fpre[p, j] = n.free_pre; fpost[p, j] = n.free_post
+            valid[p, j] = True
+    is_bomb = valid & (kind == KIND_BOMB)
+    is_head = valid & (kind == KIND_CHAIN_HEAD)
+    is_link = valid & (kind == KIND_CHAIN_LINK)
+    # dot notes encode obs direction as the ZERO vector; chain links carry
+    # their tangent despite judging any-direction (lib.rs build_obs)
+    show_dir = ~is_bomb & (~any_dir | is_link)
+    good_hy = np.where(is_link, GOOD_HALF_Y_LINK,
+                       np.where(any_dir, GOOD_HALF_Y_DOT, GOOD_HALF_Y))
+    bad_hy = np.where(is_link, BAD_HALF_Y_LINK, BAD_HALF)
+    # episode tail: 0.5 + Z_MISS / min speed (lib.rs set_chart_notes)
+    min_speed = np.where(valid, speed, np.inf).min(1)
+    finite = np.isfinite(min_speed)
+    tail = np.where(finite, 0.5 + Z_MISS / np.where(finite, min_speed, 1.0),
+                    0.5)
     t = lambda a, dt=dtype: torch.as_tensor(a, device=device, dtype=dt)
     return {
         "hit": t(hit), "speed": t(speed),
-        "center": torch.stack([(t(col) - 1.5) * CELL, (t(row) - 1.0) * CELL], -1),
+        "center": torch.stack([t(x), t(y)], -1),
+        "dvec": torch.stack([t(np.cos(angle)), t(np.sin(angle))], -1),
         "is_right": t(color, torch.bool),
-        "dvec": torch.where(
-            t(any_dir, torch.bool).unsqueeze(-1),
-            torch.zeros((P, C, 2), device=device, dtype=dtype),
-            torch.stack([t(np.cos(angle)), t(np.sin(angle))], -1)),
-        # box rotation about z (env v5.3): rot = angle - 270 deg, derived
-        # exactly from the angle's own sin/cos (cos_rot = -sin a,
-        # sin_rot = cos a); dot notes stay axis-aligned
-        "rot": torch.where(
-            t(any_dir, torch.bool).unsqueeze(-1),
-            torch.stack([torch.ones((P, C), device=device, dtype=dtype),
-                         torch.zeros((P, C), device=device, dtype=dtype)], -1),
-            torch.stack([t(-np.sin(angle)), t(np.cos(angle))], -1)),
         "any_dir": t(any_dir, torch.bool), "valid": t(valid, torch.bool),
+        "is_bomb": t(is_bomb, torch.bool), "is_head": t(is_head, torch.bool),
+        "is_link": t(is_link, torch.bool),
+        "show_dir": t(show_dir, torch.bool),
+        "free_pre": t(fpre, torch.bool), "free_post": t(fpost, torch.bool),
+        "good_hy": t(good_hy), "bad_hy": t(bad_hy),
         "n_notes": t(valid.sum(1), torch.long),
+        "n_scoreable": t((valid & ~is_bomb).sum(1), torch.long),
         "last_hit": t(np.where(valid.any(1), (hit * valid).max(1), 0.0)),
+        "tail": t(tail),
     }
 
 
@@ -130,10 +214,17 @@ class TorchBeatVecEnv:
     left first) and returns (obs, reward, done, []) — all tensors on
     `device`, infos always empty (use pop_stats() once per update)."""
 
+    _F_NC = ("hit", "speed", "valid", "is_right", "any_dir", "is_bomb",
+             "is_head", "is_link", "show_dir", "free_pre", "free_post",
+             "good_hy", "bad_hy")
+    _F_NC2 = ("center", "dvec")
+    _F_N = ("last_hit", "tail", "n_notes", "n_scoreable")
+
     def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
+                 bomb_rate=0.0, chain_prob=0.0, arc_prob=0.0,
                  charts=None, chart_pool=1024, max_steps=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
@@ -147,13 +238,16 @@ class TorchBeatVecEnv:
                 continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
                 min_hand_gap_s=min_hand_gap_s, cols=tuple(cols),
                 rows=tuple(rows), note_speed=note_speed,
-                note_speed_max=note_speed_max)
+                note_speed_max=note_speed_max, bomb_rate=bomb_rate,
+                chain_prob=chain_prob, arc_prob=arc_prob)
             rng = np.random.default_rng(seed)
             charts = [generate_chart(cfg, rng) for _ in range(chart_pool)]
         self.pool = _charts_to_tensors(charts, self.device, dtype)
         self.pool_size, self.C = self.pool["hit"].shape
         if max_steps is None:
-            max_steps = int(chart_len_s * 30) + 30
+            # +90: the tail must cover the miss-boundary trip (Z_MISS
+            # 2.65 m at the slowest speeds) past the last note
+            max_steps = int(chart_len_s * 30) + 90
         self.max_steps = max_steps
         self._gen = torch.Generator(device=self.device)
         self._gen.manual_seed(seed)
@@ -175,17 +269,20 @@ class TorchBeatVecEnv:
         self.tr_active = zeros(N, 2, K, dt=torch.bool)
         self.tr_ptr = zeros(N, 2, dt=torch.long)
         self.tick = zeros(N, dt=torch.long)
-        self.status = zeros(N, C, dt=torch.uint8)  # 0 pend 1 good 2 bad 3 miss
+        # 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed clean
+        self.status = zeros(N, C, dt=torch.uint8)
         self.ep_return = zeros(N)
         self.good = zeros(N, dt=torch.long); self.bad = zeros(N, dt=torch.long)
         self.miss = zeros(N, dt=torch.long)
+        self.bombs = zeros(N, dt=torch.long)
         self.score = zeros(N)
         # per-env chart fields (rows copied from the pool at reset)
-        for k in ("hit", "speed", "valid", "is_right", "any_dir"):
+        for k in self._F_NC:
             setattr(self, "c_" + k, zeros(N, C, dt=self.pool[k].dtype))
-        self.c_center = zeros(N, C, 2); self.c_dvec = zeros(N, C, 2)
-        self.c_rot = zeros(N, C, 2)
-        self.c_last_hit = zeros(N); self.c_n_notes = zeros(N, dt=torch.long)
+        for k in self._F_NC2:
+            setattr(self, "c_" + k, zeros(N, C, 2))
+        for k in self._F_N:
+            setattr(self, "c_" + k, zeros(N, dt=self.pool[k].dtype))
         # per-joint action table: action a in 0..2 -> sign {0, +1, -1},
         # scaled by the joint's alpha
         self._sgn = torch.tensor([0.0, 1.0, -1.0],
@@ -254,16 +351,15 @@ class TorchBeatVecEnv:
                                 generator=self._gen)
         m1 = mask.unsqueeze(-1)
         m2 = mask.unsqueeze(-1).unsqueeze(-1)
-        for k in ("hit", "speed", "valid", "is_right", "any_dir"):
+        for k in self._F_NC:
             dst = getattr(self, "c_" + k)
             setattr(self, "c_" + k, torch.where(m1, self.pool[k][idx], dst))
-        self.c_center = torch.where(m2, self.pool["center"][idx], self.c_center)
-        self.c_dvec = torch.where(m2, self.pool["dvec"][idx], self.c_dvec)
-        self.c_rot = torch.where(m2, self.pool["rot"][idx], self.c_rot)
-        self.c_last_hit = torch.where(mask, self.pool["last_hit"][idx],
-                                      self.c_last_hit)
-        self.c_n_notes = torch.where(mask, self.pool["n_notes"][idx],
-                                     self.c_n_notes)
+        for k in self._F_NC2:
+            dst = getattr(self, "c_" + k)
+            setattr(self, "c_" + k, torch.where(m2, self.pool[k][idx], dst))
+        for k in self._F_N:
+            dst = getattr(self, "c_" + k)
+            setattr(self, "c_" + k, torch.where(mask, self.pool[k][idx], dst))
         # start pose: all joints zero (arm straight forward, blade its
         # extension), at rest — refresh the FK caches for the reset rows
         self.q = torch.where(m2, torch.zeros_like(self.q), self.q)
@@ -285,6 +381,7 @@ class TorchBeatVecEnv:
         self.good = torch.where(mask, zl, self.good)
         self.bad = torch.where(mask, zl, self.bad)
         self.miss = torch.where(mask, zl, self.miss)
+        self.bombs = torch.where(mask, zl, self.bombs)
         self.score = torch.where(mask, torch.zeros_like(self.score), self.score)
 
     def reset(self):
@@ -332,15 +429,17 @@ class TorchBeatVecEnv:
 
         # follow-through trackers (existing ones, BEFORE this tick's cuts):
         # chain broke/reversed -> resolve; else accumulate, resolve at 60 deg
-        # or timeout. Trackers with cnt notes pay cnt * points.
+        # or timeout. Points are integer-rounded PER TRACKER (round_pts),
+        # then a slot with cnt notes pays cnt * points.
         cont_k = cont.unsqueeze(-1)                              # (N, 2, 1)
         acc_new = torch.where(cont_k, self.tr_acc + delta.unsqueeze(-1),
                               self.tr_acc)
         age_new = torch.where(cont_k, self.tr_age + 1, self.tr_age)
         resolve = self.tr_active & (
             ~cont_k | (acc_new >= POST_FULL) | (age_new >= FOLLOW_TIMEOUT))
-        post_pts = (PTS_POST * (acc_new / POST_FULL).clamp(max=1.0)
-                    * self.tr_cnt.to(self.dtype))
+        post_pts = (torch.floor(
+            PTS_POST * (acc_new / POST_FULL).clamp(max=1.0) + 0.5)
+            * self.tr_cnt.to(self.dtype))
         post_paid = (post_pts * resolve.to(self.dtype)).sum((1, 2))  # (N,)
         reward = post_paid / SCORE_MAX
         self.score = self.score + post_paid
@@ -352,119 +451,125 @@ class TorchBeatVecEnv:
         pending = (self.status == 0) & self.c_valid
 
         missed = pending & (z < -Z_MISS)
+        miss_note = missed & ~self.c_is_bomb
+        bomb_pass = missed & self.c_is_bomb   # consumed SILENTLY (status 4)
         cuttable = pending & ~missed & (z <= REACH_Z)
 
-        # swept-blade test (env v5.3): 8 sample points along each blade,
-        # each tracing its own 3D displacement segment against every note's
-        # ROTATED cube (slab clip in the box frame); distance-to-center of
-        # the hitting samples still grades accuracy / picks s*.
-        # Static loop over samples bounds memory; first minimum wins ties
-        # (matches Rust's strict <, smallest sample fraction kept).
+        # swept SURFACE per tick (env v7): quad (prev_wrist->prev_tip,
+        # cur_wrist->cur_tip) split into triangles (w0,t0,t1) and (w0,t1,w1),
+        # tested vs the axis-aligned boxes (SAT) and graded by the closest
+        # approach of the surface to the note center (Ericson)
         center3 = torch.cat([self.c_center, z.unsqueeze(-1)], -1)   # (N,C,3)
-        c3 = center3.unsqueeze(1)                                   # (N,1,C,3)
-        cr = self.c_rot[..., 0].unsqueeze(1)                        # (N,1,C)
-        sr = self.c_rot[..., 1].unsqueeze(1)
-        pos3_prev = prev_pos                                        # (N,2,3)
-        pos3 = self.wrist
-        d_min = torch.full((self.num_envs, 2, self.C), float("inf"),
-                           device=self.device, dtype=self.dtype)
-        s_star = torch.zeros_like(d_min)
+        tip_prev = prev_pos + SABER_LEN * prev_dir                  # (N,2,3)
+        tip_new = self.wrist + SABER_LEN * self.blade
+        w0 = prev_pos.unsqueeze(2); t0 = tip_prev.unsqueeze(2)      # (N,2,1,3)
+        t1 = tip_new.unsqueeze(2); w1 = self.wrist.unsqueeze(2)
+        bc = center3.unsqueeze(1)                                   # (N,1,C,3)
+        gc = torch.cat([self.c_center,
+                        (z + GOOD_Z_SHIFT).unsqueeze(-1)], -1).unsqueeze(1)
+        ghy = self.c_good_hy.unsqueeze(1)                           # (N,1,C)
+        bhy = self.c_bad_hy.unsqueeze(1)
+        good_hit = (
+            _tri_box_overlap(w0 - gc, t0 - gc, t1 - gc,
+                             GOOD_HALF_X, ghy, GOOD_HALF_Z)
+            | _tri_box_overlap(w0 - gc, t1 - gc, w1 - gc,
+                               GOOD_HALF_X, ghy, GOOD_HALF_Z))      # (N,2,C)
+        bad_hit = (
+            _tri_box_overlap(w0 - bc, t0 - bc, t1 - bc,
+                             BAD_HALF, bhy, BAD_HALF)
+            | _tri_box_overlap(w0 - bc, t1 - bc, w1 - bc,
+                               BAD_HALF, bhy, BAD_HALF))
+        d_sweep = torch.minimum(_tri_point_dist(w0, t0, t1, bc),
+                                _tri_point_dist(w0, t1, w1, bc))    # (N,2,C)
 
-        def _box_frame(p):                                # (N,2,C,3) local
-            q = p - c3
-            return torch.stack(
-                [cr * q[..., 0] + sr * q[..., 1],
-                 -sr * q[..., 0] + cr * q[..., 1],
-                 q[..., 2]], -1)
-
-        def _box_hit(la, lb):
-            # segment vs origin-centered cube of half-extent HALF_BLOCK,
-            # slab clipping of the segment parameter to [0, 1] — the same
-            # branch structure as Rust's seg_box_hit (small-axis test is
-            # point-in-slab; divisions, not reciprocal multiplies)
-            d = lb - la
-            small = d.abs() < 1e-12
-            d_safe = torch.where(small, torch.ones_like(d), d)
-            t1 = (-HALF_BLOCK - la) / d_safe
-            t2 = (HALF_BLOCK - la) / d_safe
-            lo = torch.minimum(t1, t2)
-            hi = torch.maximum(t1, t2)
-            inside = la.abs() <= HALF_BLOCK
-            inf = torch.full_like(lo, float("inf"))
-            lo = torch.where(small, torch.where(inside, torch.zeros_like(lo),
-                                                inf), lo)
-            hi = torch.where(small, torch.where(inside, torch.ones_like(hi),
-                                                -inf), hi)
-            return lo.amax(-1).clamp_min(0.0) <= hi.amin(-1).clamp_max(1.0)
-
-        for j in range(1, N_BLADE_SAMPLES + 1):
-            r = (j / N_BLADE_SAMPLES) * SABER_LEN
-            a = (pos3_prev + r * prev_dir).unsqueeze(2)             # (N,2,1,3)
-            b = (pos3 + r * d_new).unsqueeze(2)
-            hit = _box_hit(_box_frame(a), _box_frame(b))            # (N,2,C)
-            ab = b - a
-            denom = (ab * ab).sum(-1)                               # (N,2,1)
-            t = ((c3 - a) * ab).sum(-1) / denom.clamp_min(1e-12)
-            t = torch.where(denom < 1e-12, torch.zeros_like(t),
-                            t.clamp(0.0, 1.0)).unsqueeze(-1)
-            d = (a + t * ab - c3).norm(dim=-1)                      # (N,2,C)
-            better = hit & (d < d_min)
-            d_min = torch.where(better, d, d_min)
-            s_star = torch.where(better, torch.full_like(s_star, r), s_star)
-
-        crossed = torch.isfinite(d_min)                             # (N,2,C)
         is_r = self.c_is_right                                      # (N,C)
-        match_cross = torch.where(is_r, crossed[:, 1], crossed[:, 0])
-        other_cross = torch.where(is_r, crossed[:, 0], crossed[:, 1])
-        dm = torch.where(is_r, d_min[:, 1], d_min[:, 0])            # (N,C)
-        ss = torch.where(is_r, s_star[:, 1], s_star[:, 0])
+        match_hit = torch.where(is_r, good_hit[:, 1], good_hit[:, 0])
+        wrong_hit = torch.where(is_r, bad_hit[:, 0], bad_hit[:, 1])
+        dm = torch.where(is_r, d_sweep[:, 1], d_sweep[:, 0])        # d_min
 
-        # contact velocity (env v6): the matching hand's contact-point
-        # displacement over the tick / DT — same segments the sweep tests
+        # bombs: either saber's sweep within BOMB_RADIUS of the center
+        bomb_hit = cuttable & self.c_is_bomb & (
+            (d_sweep[:, 0] <= BOMB_RADIUS) | (d_sweep[:, 1] <= BOMB_RADIUS))
+
+        # contact point s*: the blade sample (r = j/8 * SABER_LEN) whose
+        # displacement segment passes CLOSEST to the note center; first
+        # strict minimum wins (Rust scans samples in order with `<`)
         def _pick(t):                                               # (N,C,3)
             return torch.where(is_r.unsqueeze(-1),
                                t[:, 1].unsqueeze(1).expand(-1, self.C, -1),
                                t[:, 0].unsqueeze(1).expand(-1, self.C, -1))
 
-        ss3 = ss.unsqueeze(-1)
-        vc = (_pick(self.wrist) + ss3 * _pick(self.blade)
-              - _pick(prev_pos) - ss3 * _pick(prev_dir)) / DT       # (N,C,3)
-        vc_mag = vc.norm(dim=-1)
+        w0m, d0m = _pick(prev_pos), _pick(prev_dir)
+        w1m, d1m = _pick(self.wrist), _pick(self.blade)
+        d_seg = torch.full((self.num_envs, self.C), float("inf"),
+                           device=self.device, dtype=self.dtype)
+        s_star = torch.zeros_like(d_seg)
+        for j in range(1, N_BLADE_SAMPLES + 1):
+            r = (j / N_BLADE_SAMPLES) * SABER_LEN
+            d = _seg_point_dist(w0m + r * d0m, w1m + r * d1m, center3)
+            better = d < d_seg
+            d_seg = torch.where(better, d, d_seg)
+            s_star = torch.where(better, torch.full_like(s_star, r), s_star)
+        ss3 = s_star.unsqueeze(-1)
+        vc = (w1m + ss3 * d1m - w0m - ss3 * d0m) / DT               # (N,C,3)
+        vc_mag = (vc[..., 0] * vc[..., 0] + vc[..., 1] * vc[..., 1]
+                  + vc[..., 2] * vc[..., 2]).sqrt()
         slow = vc_mag < V_MIN_CUT
-        v2_mag = vc[..., :2].norm(dim=-1)
-        cosv = (vc[..., :2] * self.c_dvec).sum(-1) / v2_mag.clamp_min(1e-9)
+        v2_mag = (vc[..., 0] * vc[..., 0] + vc[..., 1] * vc[..., 1]).sqrt()
+        cosv = ((vc[..., 0] * self.c_dvec[..., 0]
+                 + vc[..., 1] * self.c_dvec[..., 1]) / v2_mag.clamp_min(1e-9))
         angle_ok = self.c_any_dir | (cosv >= COS_TOL)
 
-        matched = cuttable & match_cross
-        wrong = cuttable & ~match_cross & other_cross
+        note_cut = cuttable & ~self.c_is_bomb
+        matched = note_cut & match_hit
         good = matched & ~slow & angle_ok
-        bad = (matched & (slow | ~angle_ok)) | wrong
+        # matching saber missed the good box -> wrong-color saber vs the
+        # SMALL box only
+        bad = (matched & (slow | ~angle_ok)) | (note_cut & ~match_hit
+                                                & wrong_hit)
 
-        # graded score for good cuts: pre-swing + accuracy now, the
-        # follow-through via a tracker
-        pre_s = PTS_PRE * (self.swing_acc / PRE_FULL).clamp(max=1.0)  # (N,2)
-        pre = torch.where(is_r, pre_s[:, 1:2], pre_s[:, 0:1])         # (N,C)
-        # corner clips can sit outside the circumscribed circle -> floor 0
-        # (also sanitizes dm = inf on never-hit notes: -inf clamps to 0)
-        acc_pts = PTS_ACC * (1.0 - dm / CUT_RADIUS).clamp_min(0.0)
-        cut_pts = ((pre + acc_pts) * good.to(self.dtype)).sum(1)      # (N,)
+        # scoring (real BS 115, integer components via floor(x + 0.5)):
+        # chain link = flat 20; chain head = pre + acc (no follow-through);
+        # note = pre + acc, then free_post ? +30 now : open a tracker
+        swing_m = torch.where(is_r, self.swing_acc[:, 1:2],
+                              self.swing_acc[:, 0:1])               # (N,C)
+        pre = torch.where(
+            self.c_free_pre, torch.full_like(dm, float(PTS_PRE)),
+            torch.floor(PTS_PRE * (swing_m / PRE_FULL).clamp(max=1.0) + 0.5))
+        acc_pts = torch.floor(
+            PTS_ACC * (1.0 - (dm / ACC_NORM).clamp(0.0, 1.0)) + 0.5)
+        post_now = torch.where(self.c_free_post & ~self.c_is_head,
+                               torch.full_like(dm, float(PTS_POST)),
+                               torch.zeros_like(dm))
+        pts = torch.where(self.c_is_link,
+                          torch.full_like(dm, float(CHAIN_LINK_PTS)),
+                          pre + acc_pts + post_now)
+        cut_pts = (pts * good.to(self.dtype)).sum(1)                # (N,)
         reward = reward + cut_pts / SCORE_MAX
         self.score = self.score + cut_pts
 
-        self.status = torch.where(
-            good, torch.ones_like(self.status),
-            torch.where(bad, torch.full_like(self.status, 2),
-                        torch.where(missed, torch.full_like(self.status, 3),
-                                    self.status)))
-        n_good = good.sum(1); n_bad = bad.sum(1); n_miss = missed.sum(1)
-        self.good += n_good; self.bad += n_bad; self.miss += n_miss
+        st = self.status
+        st = torch.where(good, torch.ones_like(st), st)
+        st = torch.where(bad | bomb_hit, torch.full_like(st, 2), st)
+        st = torch.where(miss_note, torch.full_like(st, 3), st)
+        st = torch.where(bomb_pass, torch.full_like(st, 4), st)
+        self.status = st
+        n_good = good.sum(1); n_bad = bad.sum(1)
+        n_miss = miss_note.sum(1); n_bomb = bomb_hit.sum(1)
+        self.good += n_good; self.bad += n_bad
+        self.miss += n_miss; self.bombs += n_bomb
         reward = reward + (n_bad.to(self.dtype) * REWARD_BAD
-                           + n_miss.to(self.dtype) * REWARD_MISS)
+                           + n_miss.to(self.dtype) * REWARD_MISS
+                           + n_bomb.to(self.dtype) * REWARD_BOMB)
 
         # spawn aggregated follow-through trackers (one slot per saber per
         # tick; same-tick trackers share (arc, age) forever, so a count is
-        # exact). The ring slot being written is provably inactive.
-        n_new = torch.stack([(good & ~is_r).sum(1), (good & is_r).sum(1)], 1)
+        # exact). Chain heads/links and arc-headed (free_post) notes spawn
+        # none. The ring slot being written is provably inactive.
+        spawn_note = (good & ~self.c_is_link & ~self.c_is_head
+                      & ~self.c_free_post)
+        n_new = torch.stack([(spawn_note & ~is_r).sum(1),
+                             (spawn_note & is_r).sum(1)], 1)
         spawn = n_new > 0                                           # (N,2)
         slot_hot = torch.nn.functional.one_hot(
             self.tr_ptr, N_TRACKERS).bool() & spawn.unsqueeze(-1)   # (N,2,K)
@@ -482,13 +587,14 @@ class TorchBeatVecEnv:
         no_trackers = ~self.tr_active.any((1, 2))
         done = ((~pending_after & no_trackers
                  & ((self.c_n_notes == 0) | (time_now > self.c_last_hit)))
-                | (time_now > self.c_last_hit + 0.5)
+                | (time_now > self.c_last_hit + self.c_tail)
                 | (self.tick >= self.max_steps))
 
         # hard episode ends force-resolve pending follow-throughs (partial)
         end_resolve = self.tr_active & done.view(-1, 1, 1)
-        end_pts = (PTS_POST * (self.tr_acc / POST_FULL).clamp(max=1.0)
-                   * self.tr_cnt.to(self.dtype))
+        end_pts = (torch.floor(
+            PTS_POST * (self.tr_acc / POST_FULL).clamp(max=1.0) + 0.5)
+            * self.tr_cnt.to(self.dtype))
         end_paid = (end_pts * end_resolve.to(self.dtype)).sum((1, 2))
         reward = reward + end_paid / SCORE_MAX
         self.score = self.score + end_paid
@@ -541,7 +647,7 @@ class TorchBeatVecEnv:
             self.om / self._omega,
             torch.stack([
                 self.wrist[..., 0] / X_NORM,
-                self.wrist[..., 1] / Y_NORM,
+                (self.wrist[..., 1] - Y_CENTER) / Y_NORM,
                 self.wrist[..., 2]], -1),
             self.wrist_vel / V_NORM,
             self.blade,
@@ -554,12 +660,22 @@ class TorchBeatVecEnv:
         slot = torch.cumsum(pending.long(), 1) - 1
         sel = pending & (slot < N_NOTE_SLOTS)
         z = ((self.c_hit - time_now[:, None]) * self.c_speed).clamp(*Z_CLIP)
+        zero = torch.zeros_like(z)
+        colored = ~self.c_is_bomb  # bombs: no color one-hot, no direction
         feat = torch.stack([
-            self.c_center[..., 0] / X_NORM, self.c_center[..., 1] / Y_NORM,
+            self.c_center[..., 0] / X_NORM,
+            (self.c_center[..., 1] - Y_CENTER) / Y_NORM,
             z / Z_SCALE, -self.c_speed / Z_SCALE,
-            (~self.c_is_right).to(self.dtype), self.c_is_right.to(self.dtype),
-            self.c_dvec[..., 0], self.c_dvec[..., 1],
-            torch.ones_like(z)], -1)                                # (N,C,9)
+            (colored & ~self.c_is_right).to(self.dtype),
+            (colored & self.c_is_right).to(self.dtype),
+            torch.where(self.c_show_dir, self.c_dvec[..., 0], zero),
+            torch.where(self.c_show_dir, self.c_dvec[..., 1], zero),
+            self.c_is_bomb.to(self.dtype),
+            self.c_is_head.to(self.dtype),
+            self.c_is_link.to(self.dtype),
+            self.c_free_pre.to(self.dtype),
+            self.c_free_post.to(self.dtype),
+            torch.ones_like(z)], -1)                             # (N,C,14)
 
         env_i = torch.arange(N, device=self.device).unsqueeze(1).expand(N, C)
         flat_slot = torch.where(

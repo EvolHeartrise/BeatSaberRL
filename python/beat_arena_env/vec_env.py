@@ -21,6 +21,7 @@ class BeatVecEnv:
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
+                 bomb_rate=0.0, chain_prob=0.0, arc_prob=0.0,
                  chart_sampler=None, max_steps=None):
         """chart_sampler: callable (env_idx, rng) -> list[Note]; replaces
         procedural generation (curriculum mode). max_steps: tick-cap
@@ -33,9 +34,12 @@ class BeatVecEnv:
             min_hand_gap_s=min_hand_gap_s,
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
+            bomb_rate=bomb_rate, chain_prob=chain_prob, arc_prob=arc_prob,
         )
         if max_steps is None:
-            max_steps = int(chart_len_s * 30) + 30
+            # +90: the episode tail must cover the miss boundary trip
+            # (Z_MISS 2.65 m at the slowest speeds) past the last note
+            max_steps = int(chart_len_s * 30) + 90
         self.sim = VecBeatSim(num_envs, max_steps=max_steps)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
@@ -62,10 +66,10 @@ class BeatVecEnv:
         infos = []
         if done.any():
             for i in np.flatnonzero(done):
-                g, b, m, n, score = self.sim.counters(i)
+                g, b, m, n, score, bombs = self.sim.counters(i)
                 infos.append({"env": int(i), "episode_return": float(self._returns[i]),
                               "good_cuts": g, "bad_cuts": b, "misses": m,
-                              "n_notes": n, "score": score})
+                              "n_notes": n, "score": score, "bombs_hit": bombs})
                 self._returns[i] = 0.0
                 self._new_chart(i)
                 obs[i] = self.sim.obs_one(int(i))

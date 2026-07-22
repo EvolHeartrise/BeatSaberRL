@@ -28,16 +28,21 @@ def main():
     p.add_argument("--dirs", type=int, nargs="+", default=[6])
     p.add_argument("--note-speed", type=float, default=3.0)
     p.add_argument("--note-speed-max", type=float, default=6.0)
+    p.add_argument("--bomb-rate", type=float, default=0.0)
+    p.add_argument("--chain-prob", type=float, default=0.0)
+    p.add_argument("--arc-prob", type=float, default=0.0)
     args = p.parse_args()
 
     cfg = ChartConfig(note_rate=args.note_rate, colors=args.colors,
                       continuous_dirs=not args.discrete_dirs,
                       dirs=tuple(args.dirs), note_speed=args.note_speed,
-                      note_speed_max=args.note_speed_max)
+                      note_speed_max=args.note_speed_max,
+                      bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
+                      arc_prob=args.arc_prob)
     pol = load_policy(torch.load(args.ckpt, map_location="cpu",
                                  weights_only=True))
     pol.eval()
-    G = B = M = 0
+    G = B = M = BOMB = 0
     score = notes = 0.0
     rets = []
     for ep in range(args.episodes):
@@ -58,6 +63,8 @@ def main():
                     G += 1
                 elif reason == "miss":
                     M += 1
+                elif reason == "bomb":
+                    BOMB += 1
                 elif reason != "post":
                     B += 1
         score += info["score"]
@@ -65,8 +72,8 @@ def main():
         rets.append(ret)
     tot = G + B + M
     print(f"{args.ckpt}: good {100 * G / tot:.1f}%  bad {B}  miss {M}  "
-          f"score {score / notes:.1f}/115  return {np.mean(rets):+.2f}",
-          flush=True)
+          f"bombs_hit {BOMB}  score {score / notes:.1f}/115  "
+          f"return {np.mean(rets):+.2f}", flush=True)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
   import Scene from "./lib/Scene.svelte";
   import { pb, lastTick, loadText, setPlaying, setSpeed, step }
     from "./lib/state.svelte.js";
-  import { DT, configSummary, counts } from "./lib/replay.js";
+  import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
 
   let wrap; // canvas container, for video export
   let dropHover = $state(false);
@@ -13,6 +13,10 @@
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
   const time = $derived(pb.cur * DT);
   const c = $derived(pb.rep ? counts(pb.rep, tickIdx) : null);
+  // bombs are not scoreable — they resolve silently unless hit
+  const scoreable = $derived(
+    pb.rep ? pb.rep.chart.filter((n) => n.kind !== 1).length : 0);
+  const nBombs = $derived(pb.rep ? pb.rep.chart.length - scoreable : 0);
 
   function load(text, name) {
     try {
@@ -35,6 +39,7 @@
     else if (e.key === "-") setSpeed(pb.speed / 2);
     else if (e.key === "r") { pb.cur = 0; setPlaying(true); }
     else if (e.key === "g") pb.gauges = !pb.gauges;
+    else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
   }
 
   const speedLabel = $derived(
@@ -113,10 +118,11 @@
       {#if pb.rep && c}
         t <b>{time.toFixed(2)}s</b> · tick <b>{tickIdx}</b>/{lastTick()} ·
         return <b>{c.reward.toFixed(2)}</b> ·
-        score <b>{c.score.toFixed(0)}</b>/{115 * pb.rep.chart.length} ·
+        score <b>{c.score.toFixed(0)}</b>/{maxScore(pb.rep.chart)} ·
         <span class="good">good {c.good}</span> /
         <span class="bad">bad {c.bad}</span> /
-        <span class="miss">miss {c.miss}</span> of {pb.rep.chart.length}
+        <span class="miss">miss {c.miss}</span> of {scoreable}
+        {#if nBombs}· <span class="miss">bombs {c.bombs}</span>/{nBombs}{/if}
         {#if tickIdx >= lastTick()}· <b>END</b>{/if}
       {:else}
         no replay loaded
@@ -144,14 +150,15 @@
     </div>
     <div id="help">
       drag = orbit · wheel = zoom · right-drag = pan · space = play/pause ·
-      ←/→ = step one tick · +/− = speed · r = restart · g = arm gauges
-      (roll dial shows the allowed 280° arc; bend 0° = at the notes,
-      ±90° = flat; bars = shoulder pitch/yaw/twist + elbow in their
-      anatomical ranges; orange = near a joint limit) · 40 cm blocks fly
-      in; each hand is a shoulder→elbow→wrist arm chain holding a 1 m
-      blade · white blade core = contact-capable (tip ≥ 1 m/s) · white
-      block outline = within blade reach · +N popups = points (max
-      115/note: 70 pre-swing, 30 follow-through, 15 accuracy)
+      ←/→ = step one tick · +/− = speed · r = restart · g = arm gauges ·
+      h = real hitbox wireframes (green = matching saber, orange = the
+      small wrong-color box) · env v7: floor at y = 0, real BS lanes/rows;
+      blocks, black bombs, squashed chain heads + link slabs fly in; faint
+      color tubes = arc scoring hints (free pre/post swing) · each hand is
+      a shoulder→elbow→wrist arm chain holding a 1 m blade · white blade
+      core = contact-capable (tip ≥ 1 m/s) · white outline = within blade
+      reach · +N popups = points (115/note: 70 pre-swing, 30
+      follow-through, 15 accuracy; chain heads 85, links flat 20)
     </div>
   </div>
 </main>

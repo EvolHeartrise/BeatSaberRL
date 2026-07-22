@@ -42,7 +42,8 @@ def main():
                                speed_scale=args.speed_scale, first_note_s=2.0)
     print(f"map: {meta['song_name']} [{meta['difficulty']}]  "
           f"bpm {meta['bpm']}  njs {meta['njs']} -> {meta['speed']:.2f} m/s  "
-          f"{meta['n_notes']} notes over {meta['duration_s']:.0f}s "
+          f"{meta['n_notes']} notes + {meta['n_bombs']} bombs over "
+          f"{meta['duration_s']:.0f}s "
           f"({meta['nps']:.2f} nps)  dropped {meta['dropped']}")
     print(f"difficulties available: {[d[0] for d in list_difficulties(args.map)]}")
 

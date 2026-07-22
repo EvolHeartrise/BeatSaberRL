@@ -1,28 +1,58 @@
-// Replay format v6 (SPEC.md §Replay log): env v6 kinematic upper body.
+// Replay format v7 (SPEC.md §Replay log): env v7 real-BS geometry.
 // Pure logic only (no three/svelte imports) — unit-tested in node.
 //
-// World: hit plane z = 0; grid spans [-1,1] x [-0.75,0.75] (0.5 m lanes);
-// 0.4 m note cubes approach from +z. Sabers = 15 numbers per hand:
+// World (env v7): floor-based coordinates, y = 0 is the floor. Lanes at
+// x = -0.9, -0.3, 0.3, 0.9 (0.6 m pitch); row centers y = 0.85, 1.40,
+// 1.90. Hit plane z = 0; objects approach from +z; misses register at
+// z = -2.65 (~2 m behind the head). Chart entries carry EXPLICIT world
+// (x, y) plus a kind: 0 note, 1 bomb, 2 chain head, 3 chain link, and
+// arc grants fpre/fpost. Sabers = 15 numbers per hand:
 // [q(6) = pitch, yaw, twist, elbow, roll, bend | om(6) | wrist x, y, z].
-// Each hand is a chain from a fixed shoulder: upper arm -> elbow ->
-// forearm -> wrist (roll + bend) -> 1 m blade; armFK mirrors the sim's
-// forward kinematics exactly.
+// Each hand is a chain from a fixed shoulder (±0.2, 1.47, -0.65):
+// upper arm -> elbow -> forearm -> wrist (roll + bend) -> 1 m blade;
+// armFK mirrors the sim's forward kinematics exactly.
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
 
-export const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
-export const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
-export const SABER_LEN = 1.0, REACH_Z = 1.5, Z_MISS = 0.6;
+export const CELL = 0.6, BLOCK = 0.4, HALF = BLOCK / 2;
+export const LANE_X = [-0.9, -0.3, 0.3, 0.9];
+export const ROW_Y = [0.85, 1.4, 1.9];
+// grid frame: lane cell edges; row edges midway between the non-uniform
+// row centers (extrapolated at the ends)
+export const GX0 = -1.2, GX1 = 1.2;
+export const GY0 = 0.575, GY1 = 2.15;
+export const ROW_EDGES = [GY0, 1.125, 1.65, GY1];
+export const Z_FAR = 12.0;
+export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 2.65;
+export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 
-// env v5.3: note cubes are rotated about the approach axis so the block
-// tracks its required cut direction (down-swing = axis-aligned); dot
-// notes stay square. Mirrors the sims' collision volume.
+// object kinds (chart entry `kind`)
+export const KIND_NOTE = 0, KIND_BOMB = 1, KIND_CHAIN_HEAD = 2,
+  KIND_CHAIN_LINK = 3;
+export const BOMB_RADIUS = 0.2; // visual (collision radius is 0.18)
+export const LINK_W = 0.4, LINK_H = 0.13, LINK_D = 0.13; // link slab visual
+export const HEAD_SQUASH = 0.5; // chain heads are ~half-height cubes
+
+// real-BS axis-aligned hitboxes (for the optional 'h' wireframe overlay)
+export const HB = {
+  goodHalf: [0.4, 0.25, 0.5],      // arrow notes / chain heads
+  goodHalfDot: [0.4, 0.4, 0.5],    // dot notes
+  goodHalfLink: [0.4, 0.1, 0.5],   // chain links
+  goodZShift: -0.25,               // box center = note_z - 0.25 (toward player)
+  badHalf: [0.175, 0.175, 0.175],  // wrong-color small box
+  badHalfLink: [0.175, 0.05, 0.175],
+  bombR: 0.18,
+};
+
+// note cubes are drawn rotated about the approach axis so the block
+// visually tracks its required cut direction (dot notes stay square);
+// since env v7 the COLLISION is axis-aligned — this is visual only.
 export const noteRot = (n) => (n.any ? 0 : n.angle - 1.5 * Math.PI);
 export const V_MIN = 1, DT = 1 / 30;
-// env v6 body + anatomical joint limits (mirror the sim)
+// env v6 body (v7 placement) + anatomical joint limits (mirror the sim)
 const RAD = Math.PI / 180;
-export const SHOULDER = [[-0.2, 0.45, -0.35], [0.2, 0.45, -0.35]];
+export const SHOULDER = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
 export const L_UPPER = 0.35, L_FORE = 0.3;
 export const PITCH_LIM = 90 * RAD;
 export const YAW_LO = [-100 * RAD, -45 * RAD]; // left, right
@@ -37,15 +67,18 @@ export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
 
+// per-kind max points (real BS: 115 note, 85 chain head, 20 link, bombs 0)
+export const KIND_MAX = [115, 0, 85, 20];
+
 export function parseReplay(text) {
   const lines = text.split("\n").filter((l) => l.trim());
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 6)
+  if (v !== 7)
     throw new Error(
-      "replay version " + v + " — this viewer reads v6 (env v6 kinematic " +
-      "upper body); older replays use retired saber parameterizations",
+      "replay version " + v + " — this viewer reads v7 (env v7 real Beat " +
+      "Saber geometry); re-record from a current checkpoint",
     );
   const ticks = lines.slice(1).map((l) => JSON.parse(l));
   const chart = head.header.chart;
@@ -66,9 +99,38 @@ export function parseReplay(text) {
         outcomes[e.miss.note] = {
           kind: "miss", reason: "miss", tick: t.t, points: 0,
         };
+      if (e.bomb !== undefined)
+        outcomes[e.bomb.note] = {
+          kind: "bomb", reason: "bomb", tick: t.t, points: 0,
+        };
     }),
   );
-  return { config: head.header.config, chart, ticks, outcomes, posts };
+  return {
+    config: head.header.config, chart, ticks, outcomes, posts,
+    arcs: arcPairs(chart),
+  };
+}
+
+/** Arc scoring hints: pair each fpost note (arc head) with the NEXT
+ * same-color fpre note (arc tail) within ARC_WINDOW seconds. */
+export function arcPairs(chart) {
+  const arcs = [];
+  chart.forEach((n, i) => {
+    if (!n.fpost) return;
+    for (let j = i + 1; j < chart.length; j++) {
+      const m = chart[j];
+      if (m.t - n.t > ARC_WINDOW) break;
+      if (m.fpre && m.color === n.color && m.t > n.t) {
+        arcs.push({ head: i, tail: j });
+        break;
+      }
+    }
+  });
+  return arcs;
+}
+
+export function maxScore(chart) {
+  return chart.reduce((a, n) => a + KIND_MAX[n.kind], 0);
 }
 
 export function configSummary(rep) {
@@ -77,12 +139,18 @@ export function configSummary(rep) {
     ? `${c.note_speed}-${c.note_speed_max} m/s`
     : `${c.note_speed} m/s`;
   const dirs = c.continuous_dirs ? "360°" : `dirs [${c.dirs}]`;
-  return `${rep.chart.length} notes, ${rep.ticks.length} ticks ` +
-    `(rate ${c.note_rate}, ${c.colors}, ${dirs}, ${spd})`;
+  const extras = [];
+  if (c.bomb_rate) extras.push(`bombs ${c.bomb_rate}`);
+  if (c.chain_prob) extras.push(`chains ${c.chain_prob}`);
+  if (c.arc_prob) extras.push(`arcs ${c.arc_prob}`);
+  return `${rep.chart.length} objects, ${rep.ticks.length} ticks ` +
+    `(rate ${c.note_rate}, ${c.colors}, ${dirs}, ${spd}` +
+    (extras.length ? `, ${extras.join(", ")}` : "") + `)`;
 }
 
+/** In-plane world (x, y) — explicit in the v7 chart. */
 export function noteCenter(n) {
-  return [(n.col - 1.5) * CELL, (n.row - 1.0) * CELL];
+  return [n.x, n.y];
 }
 
 export const lerp = (a, b, u) => a + (b - a) * u;
@@ -199,7 +267,7 @@ export function tipSpeed(rep, tickIdx, s) {
 
 /** Cumulative HUD counters up to and including uptoTick. */
 export function counts(rep, uptoTick) {
-  const c = { good: 0, bad: 0, miss: 0, reward: 0, score: 0 };
+  const c = { good: 0, bad: 0, miss: 0, bombs: 0, reward: 0, score: 0 };
   for (let k = 0; k <= uptoTick && k < rep.ticks.length; k++) {
     c.reward += rep.ticks[k].reward;
     rep.ticks[k].events.forEach((e) => {
@@ -209,26 +277,29 @@ export function counts(rep, uptoTick) {
       }
       if (e.post) c.score += e.post.points;
       if (e.miss !== undefined) c.miss++;
+      if (e.bomb !== undefined) c.bombs++;
     });
   }
   return c;
 }
 
-/** Notes still flying at `time`, with their world z. */
+/** Objects still flying at `time`, with their world z. Bombs that were
+ * never hit produce NO event — they despawn at the miss boundary. */
 export function pendingNotes(rep, time) {
   const out = [];
   rep.chart.forEach((n, i) => {
     const o = rep.outcomes[i];
     if (o && time >= (o.tick + 1) * DT) return;
     const z = (n.t - time) * n.speed;
-    if (z <= Z_FAR) out.push({ n, i, z });
+    if (z <= Z_FAR && z >= -Z_MISS) out.push({ n, i, z });
   });
   return out;
 }
 
 const FADE_S = 0.6;
 
-/** Resolved-note effects (0.6 s window): split halves / fail outline. */
+/** Resolved-note effects (0.6 s window): split halves / link pop /
+ * bomb flash / fail outline. */
 export function aftermaths(rep, time) {
   const out = [];
   rep.chart.forEach((n, i) => {
@@ -247,4 +318,22 @@ export function activePosts(rep, time) {
     .map((p) => ({ ...p, age: time - (p.tick + 1) * DT }))
     .filter((p) => p.age >= 0 && p.age <= FADE_S)
     .map((p) => ({ ...p, alpha: 1 - p.age / FADE_S }));
+}
+
+/** Arc hint tubes visible at `time`: head/tail world positions of each
+ * paired arc whose span overlaps the visible tunnel. */
+export function activeArcs(rep, time) {
+  const out = [];
+  rep.arcs.forEach(({ head, tail }, k) => {
+    const h = rep.chart[head], t = rep.chart[tail];
+    const zh = (h.t - time) * h.speed;
+    const zt = (t.t - time) * t.speed;
+    if (zt > Z_FAR || zh < -Z_MISS) return;
+    out.push({
+      k, head, tail, color: h.color,
+      a: [...noteCenter(h), zh],
+      b: [...noteCenter(t), zt],
+    });
+  });
+  return out;
 }
