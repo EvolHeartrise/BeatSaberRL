@@ -264,10 +264,15 @@ discs (white edge outline while in reach), **blades drawn wrist→tip as
 cylinders** (white-hot core when the TIP is contact-capable ≥ 1 m/s)
 with 10-tick tip trails, wrist discs + velocity vectors, good cuts as
 split halves drifting apart with "+N" score popups, follow-through
-"+N follow" popups, bad cuts/misses labeled with reason. All in-scene
-text is canvas-texture sprites (not DOM overlays) so exported videos
-keep it and the file works fully offline. Controls: space play/pause,
-←/→ tick-step, +/− speed, r restart, scrub bar, ⏺ export video
+"+N follow" popups, bad cuts/misses labeled with reason. **Per-hand wrist
+gauges** (toggle `g`): camera-attached panels showing the roll dial
+(needle = blade azimuth inside the hand's allowed 280° arc, forbidden
+zone dark, limit ticks) and the tilt dial (±95°, right = toward the
+notes), with numeric angles + angular velocities; needles turn orange
+within 10° of a joint limit. All in-scene text/panels are
+canvas-texture sprites (not DOM overlays) so exported videos keep them
+and the file works fully offline. Controls: space play/pause, ←/→
+tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
 (MediaRecorder → .webm). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
 `python/record_replay.py` records episodes from a checkpoint / the

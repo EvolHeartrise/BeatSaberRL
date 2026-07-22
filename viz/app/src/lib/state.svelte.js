@@ -8,6 +8,7 @@ export const pb = $state({
   playing: false,
   speed: 1.0,
   exporting: false,
+  gauges: true, // per-hand wrist/joint angle dials
 });
 
 export function lastTick() {

@@ -34,6 +34,7 @@
     else if (e.key === "+" || e.key === "=") setSpeed(pb.speed * 2);
     else if (e.key === "-") setSpeed(pb.speed / 2);
     else if (e.key === "r") { pb.cur = 0; setPlaying(true); }
+    else if (e.key === "g") pb.gauges = !pb.gauges;
   }
 
   const speedLabel = $derived(
@@ -141,7 +142,9 @@
   </div>
   <div id="help">
     drag = orbit · wheel = zoom · right-drag = pan · space = play/pause ·
-    ←/→ = step one tick · +/− = speed · r = restart ·
+    ←/→ = step one tick · +/− = speed · r = restart · g = wrist gauges
+    (roll dial shows the allowed 280° arc, tilt ±95°; orange = near a
+    joint limit) ·
     40 cm blocks fly in; each hand is a wrist on the plane holding a 1 m
     blade · white blade core = contact-capable (tip ≥ 1 m/s) · white block
     outline = within blade reach · +N popups = points (max 115/note:
