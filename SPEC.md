@@ -247,22 +247,33 @@ rejected by a v5 viewer (and vice versa).
  "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok", "points": 78.4}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand", "points": 0}} | {"post": {"note": 3, "points": 26.1}} | {"miss": {"note": 5}}]}
 ```
 
-**Viewer** (`viz/replay.html`): self-contained HTML/canvas **3D**
-viewer, zero dependencies — open in a browser, drop a replay `.jsonl`
-in. Hand-rolled perspective projection (camera slightly above/behind the
-plane): tunnel rails + depth rings to `z = 12` m, 40 cm note cubes flying
-in at `note_speed` with required-direction arrows on the front face
-(white outline while inside the cuttable slab, which is drawn faintly),
-the 4×3 plane grid with correct occlusion (notes past the plane draw in
-front), saber discs with trails + velocity vectors and a white ring when
-cut-capable (≥ 1 m/s), good cuts as split halves drifting apart,
-bad cuts/misses labeled with reason, HUD counters. Controls: space
-play/pause, ←/→ tick-step, +/− speed, r restart, scrub bar. Note
-positions and outcomes are DERIVED from the chart + event stream (single
-source of truth), not re-simulated. `python/record_replay.py` records
-episodes from a checkpoint / the scripted bot / random (`--tag` prefixes
-filenames), always with `shaping_coef=0` so logged rewards are the raw
-interpretable ones. Every interesting run should be recorded.
+**Viewer** (`viz/replay.html`, since 2026-07-21 a **Svelte 5 + Threlte 8
+(three.js) SPA** compiled to that single static HTML file — still a
+double-clickable, drop-a-`.jsonl`-in, zero-server page): real WebGL 3D
+with **OrbitControls** (drag = orbit, wheel = zoom, right-drag = pan).
+Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
+`npm install && npm run build`, then copy `dist/index.html` over
+`../replay.html`. `npm test` runs the pure-logic tests (node) and
+`node test/browser.test.js` drives the built file in headless Edge
+(loads a real replay via the file input, asserts playback advances with
+zero page errors, screenshots to `test/out/`). Scene (world → three.js:
+`(x, y, z) → (x, y, −z)`, camera on +z): tunnel rails + depth rings to
+`z = 12` m, the 4×3 plane grid, the blade-reach region (z −0.6..1.28)
+drawn faintly, 40 cm note cubes with required-direction arrows / dot
+discs (white edge outline while in reach), **blades drawn wrist→tip as
+cylinders** (white-hot core when the TIP is contact-capable ≥ 1 m/s)
+with 10-tick tip trails, wrist discs + velocity vectors, good cuts as
+split halves drifting apart with "+N" score popups, follow-through
+"+N follow" popups, bad cuts/misses labeled with reason. All in-scene
+text is canvas-texture sprites (not DOM overlays) so exported videos
+keep it and the file works fully offline. Controls: space play/pause,
+←/→ tick-step, +/− speed, r restart, scrub bar, ⏺ export video
+(MediaRecorder → .webm). Note positions and outcomes are DERIVED from
+the chart + event stream (single source of truth), not re-simulated.
+`python/record_replay.py` records episodes from a checkpoint / the
+scripted bot / random (`--tag` prefixes filenames), always with
+`shaping_coef=0` so logged rewards are the raw interpretable ones.
+Every interesting run should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
 

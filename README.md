@@ -65,8 +65,12 @@ $VENV/bin/python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episod
 $VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
 ```
 
-then open `viz/replay.html` (3D, perspective view) in a browser and drop a
-`python/replays/*.jsonl` file in. Space = play/pause, ←/→ = tick-step,
+then open `viz/replay.html` in a browser and drop a
+`python/replays/*.jsonl` file in. Since 2026-07-21 the viewer is a
+Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
+wheel = zoom, right-drag = pan), compiled to that single static file —
+source in `viz/app/`, rebuild with `npm install && npm run build` and
+copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-step,
 +/− = speed, drag the scrub bar. White ring around a saber = fast enough
 to cut (≥1 m/s); arrows on note cubes = required swing direction; white
 outline = inside the cuttable slab; green split = good cut; orange/red
