@@ -289,8 +289,11 @@ upper-arm/forearm segments with shoulder/elbow/wrist joints (positions
 from `armFK`, the JS mirror of the sim's FK — validated against the
 sim-logged wrist in the node tests) plus the blade wrist→tip as a
 cylinder (white-hot core when the TIP is contact-capable ≥ 1 m/s via
-the finite-difference velocity semantics) with 10-tick tip trails, good
-cuts as split halves drifting apart with "+N" score popups,
+the finite-difference velocity semantics) with 10-tick tip trails.
+Note glyphs are Beat Saber-style low-poly white chevrons / dot discs;
+a good cut slices the ACTUAL cube along the cut plane at its cut-tick
+z — the two colored half-cubes fly apart perpendicular to the swing,
+carried along it, tumbling and fading — with "+N" score popups,
 follow-through "+N follow" popups, bad cuts/misses labeled with reason.
 **Per-hand arm gauges** (toggle `g`): camera-attached panels showing
 the roll dial (needle = blade azimuth inside the hand's allowed 280°
