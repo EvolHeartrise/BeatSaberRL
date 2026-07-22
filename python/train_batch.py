@@ -98,6 +98,12 @@ def parse_args():
     p.add_argument("--note-speed-max", type=float, default=None)
     p.add_argument("--continuous-dirs", action="store_true",
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
+    p.add_argument("--bomb-rate", type=float, default=0.0,
+                   help="bombs per second in procedural charts")
+    p.add_argument("--chain-prob", type=float, default=0.0,
+                   help="P(a non-dot note becomes a chain)")
+    p.add_argument("--arc-prob", type=float, default=0.0,
+                   help="P(consecutive same-color pair gets an arc)")
     # curriculum mode (SPEC §Curriculum): real ScoreSaber-ranked maps on a
     # star ladder instead of the procedural generator
     c = p.add_argument_group("curriculum")
@@ -132,11 +138,14 @@ def cpu_state(policy):
 
 def greedy_fc_eval(policy, notes):
     """Play a fixed chart once with argmax actions (deterministic since the
-    sim is deterministic). Aborts on the first combo break — FC needs zero.
-    Returns (fc: bool, good, breaks, n_notes)."""
+    sim is deterministic). Aborts on the first combo break — FC needs zero
+    (bomb hits break combo too; passed bombs are silent and free).
+    Returns (fc: bool, good, breaks, n_scoreable)."""
+    from beat_arena_env.constants import KIND_BOMB
     dev = next(policy.parameters()).device
     env = RustBeatEnv(external_chart=notes, seed=0)
     obs, _ = env.reset()
+    n_scoreable = sum(n.kind != KIND_BOMB for n in notes)
     good = breaks = 0
     done = False
     while not done and breaks == 0:
@@ -149,9 +158,9 @@ def greedy_fc_eval(policy, notes):
         for _, reason, _pts in info["events"]:
             if reason == "ok":
                 good += 1
-            elif reason != "post":   # follow-throughs aren't note outcomes
+            elif reason != "post":   # bad cut / miss / bomb hit all break
                 breaks += 1
-    return breaks == 0 and good == len(notes), good, breaks, len(notes)
+    return breaks == 0 and good == n_scoreable, good, breaks, n_scoreable
 
 
 def main():
@@ -189,7 +198,7 @@ def main():
         venv = BeatVecEnv(
             N, seed=args.seed,
             chart_sampler=curriculum.sample,
-            max_steps=int(args.max_song_s * 30) + 30)
+            max_steps=int(args.max_song_s * 30) + 90)
     elif args.env == "torch":
         from beat_arena_env.torch_env import TorchBeatVecEnv
         venv = TorchBeatVecEnv(
@@ -198,6 +207,8 @@ def main():
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
             continuous_dirs=args.continuous_dirs, seed=args.seed,
+            bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
+            arc_prob=args.arc_prob,
             chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -205,7 +216,9 @@ def main():
             cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
-            continuous_dirs=args.continuous_dirs, seed=args.seed)
+            continuous_dirs=args.continuous_dirs, seed=args.seed,
+            bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
+            arc_prob=args.arc_prob)
 
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)

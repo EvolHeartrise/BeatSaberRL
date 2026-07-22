@@ -1,17 +1,20 @@
 <script>
-  // Flying note cubes (direction arrows, dot discs, in-reach outlines),
-  // resolved-note aftermath (split halves / fail outline + reason), and
-  // score popups. Positions/outcomes are DERIVED from chart + events —
-  // never re-simulated (single source of truth, as in the old viewer).
+  // Flying objects (env v7: notes, bombs, chain heads/links — direction
+  // arrows, dot discs, in-reach outlines, arc hint tubes), resolved-object
+  // aftermath (split halves / link pop / bomb flash / fail outline +
+  // reason), and score popups. Positions/outcomes are DERIVED from chart +
+  // events — never re-simulated (single source of truth, as in the old
+  // viewer).
   import { T } from "@threlte/core";
   import * as THREE from "three";
   import { ConvexGeometry }
     from "three/addons/geometries/ConvexGeometry.js";
   import { pb } from "./state.svelte.js";
   import {
-    BAD_COL, BLOCK, DT, GOOD_COL, HALF, MISS_COL, REACH_Z, SABER_COLORS,
-    Z_FAR, Z_MISS, activePosts, aftermaths, cutPlaneLocal, noteCenter,
-    noteRot, pendingNotes,
+    BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB, HEAD_SQUASH,
+    KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
+    MISS_COL, REACH_Z, SABER_COLORS, Z_FAR, Z_MISS, activeArcs, activePosts,
+    aftermaths, cutPlaneLocal, noteCenter, noteRot, pendingNotes,
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -19,11 +22,35 @@
   const pend = $derived(pendingNotes(pb.rep, time));
   const after = $derived(aftermaths(pb.rep, time));
   const posts = $derived(activePosts(pb.rep, time));
+  const arcs = $derived(activeArcs(pb.rep, time));
 
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
+  const headGeo = new THREE.BoxGeometry(BLOCK, BLOCK * HEAD_SQUASH, BLOCK);
+  const linkGeo = new THREE.BoxGeometry(LINK_W, LINK_H, LINK_D);
+  const bombGeo = new THREE.SphereGeometry(BOMB_RADIUS, 20, 14);
   const edgesGeo = new THREE.EdgesGeometry(boxGeo);
+  const headEdgesGeo = new THREE.EdgesGeometry(headGeo);
+  const linkEdgesGeo = new THREE.EdgesGeometry(linkGeo);
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
+
+  // real v7 hitboxes ('h' overlay): axis-aligned, good box shifted toward
+  // the player; the small box is all the wrong-color saber can trigger
+  const hbGeo = (h) => new THREE.EdgesGeometry(
+    new THREE.BoxGeometry(2 * h[0], 2 * h[1], 2 * h[2]));
+  const goodHbGeo = hbGeo(HB.goodHalf);
+  const goodHbDotGeo = hbGeo(HB.goodHalfDot);
+  const goodHbLinkGeo = hbGeo(HB.goodHalfLink);
+  const badHbGeo = hbGeo(HB.badHalf);
+  const badHbLinkGeo = hbGeo(HB.badHalfLink);
+  const bombHbGeo = new THREE.EdgesGeometry(
+    new THREE.SphereGeometry(HB.bombR, 10, 6));
+  function hitboxFor(n) {
+    if (n.kind === KIND_BOMB) return { good: bombHbGeo, bad: null };
+    if (n.kind === KIND_CHAIN_LINK)
+      return { good: goodHbLinkGeo, bad: badHbLinkGeo };
+    return { good: n.any ? goodHbDotGeo : goodHbGeo, bad: badHbGeo };
+  }
 
   // ---- real cut splits: slice the cube by the ACTUAL cut plane -------------
   // (reconstructed from the cutting blade's sweep — see cutPlaneLocal).
@@ -98,52 +125,155 @@
   const dotGeo = new THREE.CircleGeometry(0.07, 12);   // low-poly BS dot
   const GLYPH_COL = "#f0f2f8";                          // BS-white glyphs
 
-  const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
+  // notes stay cuttable all the way to the z = -2.65 miss boundary, but
+  // the white outline stops at the head plane — behind it the outline
+  // would project huge across the near camera
+  const inReach = (z) => z <= REACH_Z && z >= -0.65;
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
+
+  // arc hint tube: y-aligned cylinder -> segment between two world points
+  const Y_AXIS = new THREE.Vector3(0, 1, 0);
+  function arcSeg(a, b) {
+    const av = toScene(a), bv = toScene(b);
+    const dir = bv.clone().sub(av);
+    const q = new THREE.Quaternion().setFromUnitVectors(
+      Y_AXIS, dir.clone().normalize());
+    const mid = av.clone().add(bv).multiplyScalar(0.5);
+    return { pos: [mid.x, mid.y, mid.z], quat: [q.x, q.y, q.z, q.w],
+             len: dir.length() };
+  }
 </script>
+
+<!-- arc grants: subtle glowing tube head -> tail (a scoring hint) -->
+{#each arcs as a (a.k)}
+  {@const s = arcSeg(a.a, a.b)}
+  {#if s.len > 1e-4}
+    <T.Mesh position={s.pos} quaternion={s.quat}>
+      <T.CylinderGeometry args={[0.035, 0.035, s.len, 8, 1, true]} />
+      <T.MeshBasicMaterial
+        color={SABER_COLORS[a.color]}
+        transparent
+        opacity={0.22}
+        depthWrite={false}
+      />
+    </T.Mesh>
+  {/if}
+{/each}
 
 {#each pend as { n, z } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {@const alpha = fade(z)}
   {@const rot = noteRot(n)}
-  <T.Mesh position={[cx, cy, -z]} rotation={[0, 0, rot]}>
-    <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
-    <T.MeshStandardMaterial
-      color={SABER_COLORS[n.color]}
-      transparent={alpha < 1}
-      opacity={alpha}
-    />
-  </T.Mesh>
-  {#if inReach(z)}
-    <T.LineSegments geometry={edgesGeo} position={[cx, cy, -z]}
-      rotation={[0, 0, rot]}>
-      <T.LineBasicMaterial color="#e8eaf0" />
-    </T.LineSegments>
-  {/if}
-  {#if n.any}
-    <T.Mesh geometry={dotGeo} position={[cx, cy, -z + HALF + 0.005]}>
-      <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+  {#if n.kind === KIND_BOMB}
+    <!-- bomb: black sphere with a faint emissive rim, no glyph -->
+    <T.Mesh geometry={bombGeo} position={[cx, cy, -z]}>
+      <T.MeshStandardMaterial
+        color="#14151b"
+        emissive="#3a2a33"
+        emissiveIntensity={0.7}
+        roughness={0.35}
+        transparent={alpha < 1}
+        opacity={alpha}
+      />
     </T.Mesh>
   {:else}
-    <T.Mesh
-      geometry={arrowGeo}
-      position={[cx, cy, -z + HALF + 0.005]}
-      rotation={[0, 0, n.angle]}
-    >
-      <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+    {@const geo = n.kind === KIND_CHAIN_LINK ? linkGeo
+      : n.kind === KIND_CHAIN_HEAD ? headGeo : boxGeo}
+    {@const edges = n.kind === KIND_CHAIN_LINK ? linkEdgesGeo
+      : n.kind === KIND_CHAIN_HEAD ? headEdgesGeo : edgesGeo}
+    <T.Mesh geometry={geo} position={[cx, cy, -z]} rotation={[0, 0, rot]}>
+      <T.MeshStandardMaterial
+        color={SABER_COLORS[n.color]}
+        transparent={alpha < 1}
+        opacity={alpha}
+      />
     </T.Mesh>
+    {#if inReach(z)}
+      <T.LineSegments geometry={edges} position={[cx, cy, -z]}
+        rotation={[0, 0, rot]}>
+        <T.LineBasicMaterial color="#e8eaf0" />
+      </T.LineSegments>
+    {/if}
+    {#if n.kind !== KIND_CHAIN_LINK}
+      {#if n.any}
+        <T.Mesh geometry={dotGeo} position={[cx, cy, -z + HALF + 0.005]}>
+          <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+        </T.Mesh>
+      {:else}
+        <T.Mesh
+          geometry={arrowGeo}
+          position={[cx, cy, -z + HALF + 0.005]}
+          rotation={[0, 0, n.angle]}
+        >
+          <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+        </T.Mesh>
+      {/if}
+    {/if}
+  {/if}
+  {#if n.fpre}
+    <TextSprite text="free pre" color="#9ece6a" size={0.07} bold={false}
+      position={[cx, cy - HALF - 0.1, -z]} opacity={alpha * 0.85} />
+  {/if}
+  {#if n.fpost}
+    <TextSprite text="free post" color="#9ece6a" size={0.07} bold={false}
+      position={[cx, cy + HALF + 0.1, -z]} opacity={alpha * 0.85} />
+  {/if}
+  {#if pb.hitboxes}
+    {@const hb = hitboxFor(n)}
+    <T.LineSegments geometry={hb.good}
+      position={[cx, cy, -(z + HB.goodZShift)]}>
+      <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+    </T.LineSegments>
+    {#if hb.bad}
+      <T.LineSegments geometry={hb.bad} position={[cx, cy, -z]}>
+        <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
+      </T.LineSegments>
+    {/if}
   {/if}
 {/each}
 
 {#each after as { n, i, o, age, alpha } (n)}
   {@const [cx, cy] = noteCenter(n)}
-  {#if o.kind === "good"}
+  {#if o.kind === "bomb"}
+    <!-- bomb hit: red flash + label at the bomb's position at hit time -->
+    {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed}
+    <T.Mesh position={[cx, cy, -zHit]}>
+      <T.SphereGeometry args={[BOMB_RADIUS + age * 1.2, 20, 14]} />
+      <T.MeshBasicMaterial color="#ff4a4a" transparent
+        opacity={alpha * 0.55} depthWrite={false} />
+    </T.Mesh>
+    <TextSprite
+      text="bomb!"
+      color={MISS_COL}
+      size={0.16}
+      position={[cx, cy + BOMB_RADIUS + 0.15 + age * 0.4, -zHit]}
+      opacity={alpha}
+    />
+  {:else if o.kind === "good" && n.kind === KIND_CHAIN_LINK}
+    <!-- link good cut: quick shrink/pop of the slab -->
+    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4)}
+    {@const sc = Math.max(0.02, 1 - age * 2.4)}
+    <T.Mesh geometry={linkGeo} position={[cx, cy, -zCut]}
+      rotation={[0, 0, noteRot(n)]} scale={[sc, sc, sc]}>
+      <T.MeshStandardMaterial color={SABER_COLORS[n.color]} transparent
+        opacity={alpha} flatShading />
+    </T.Mesh>
+    <TextSprite
+      text={"+" + o.points.toFixed(0)}
+      color={GOOD_COL}
+      size={0.13}
+      position={[cx, cy + LINK_H + age * 0.5, 0.02]}
+      opacity={alpha}
+    />
+  {:else if o.kind === "good"}
     <!-- the cube sliced by the ACTUAL cut plane (blade sweep at the cut
          tick): the two pieces separate along the plane normal, get
          carried along the sweep, tumble about the blade axis, fade.
-         Off-center cuts produce honestly unequal chunks. -->
+         Off-center cuts produce honestly unequal chunks. Chain heads
+         reuse the split squashed to their half-height look. -->
     {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4)}
     {@const sp = splitFor(i)}
+    {@const squash = n.kind === KIND_CHAIN_HEAD ? HEAD_SQUASH : 1}
     {#each sp.sides as side}
       <T.Group
         position={[cx, cy, -zCut]}
@@ -151,6 +281,7 @@
       >
         <T.Mesh
           geometry={side.geo}
+          scale={[1, squash, 1]}
           position={[
             side.sign * age * 1.4 * sp.cp.n[0] + age * 0.9 * sp.cp.v[0],
             side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1],
@@ -175,16 +306,23 @@
       opacity={alpha}
     />
   {:else}
+    <!-- bad cut / miss: reason label at the object's position when the
+         event fired. Misses now register at z = -2.65, well behind the
+         camera — the outline square is drawn only for bad cuts (near the
+         plane); a near-camera outline would fill the screen. -->
     {@const col = o.kind === "bad" ? BAD_COL : MISS_COL}
-    <T.LineSegments geometry={failGeo} position={[cx, cy, 0.01]}
-      rotation={[0, 0, noteRot(n)]}>
-      <T.LineBasicMaterial color={col} transparent opacity={alpha} />
-    </T.LineSegments>
+    {@const zEv = (n.t - (o.tick + 1) * DT) * n.speed}
+    {#if o.kind === "bad"}
+      <T.LineSegments geometry={failGeo} position={[cx, cy, -zEv]}
+        rotation={[0, 0, noteRot(n)]}>
+        <T.LineBasicMaterial color={col} transparent opacity={alpha} />
+      </T.LineSegments>
+    {/if}
     <TextSprite
       text={o.reason.replace("_", " ")}
       color={col}
       size={0.14}
-      position={[cx, cy + HALF * 1.6, 0.02]}
+      position={[cx, cy + HALF * 1.6, -zEv]}
       opacity={alpha}
     />
   {/if}

@@ -3,27 +3,41 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  activePosts, aftermaths, armFK, counts, cutPlaneLocal, parseReplay,
-  pendingNotes, saberAt, tipOf, tipSpeed, DT,
+  KIND_BOMB, activeArcs, activePosts, aftermaths, armFK, counts,
+  cutPlaneLocal, maxScore, parseReplay, pendingNotes, saberAt, tipOf,
+  tipSpeed, DT,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
-  "../../python/replays/v6_scripted_dyn_ep00_seed7000.jsonl";
+  "../../python/replays/v7fix_ep00_seed7000.jsonl";
 const rep = parseReplay(readFileSync(path, "utf8"));
-console.log(`loaded: ${rep.chart.length} notes, ${rep.ticks.length} ticks, ` +
-            `${rep.posts.length} post events`);
+console.log(`loaded: ${rep.chart.length} objects, ${rep.ticks.length} ticks, ` +
+            `${rep.posts.length} post events, ${rep.arcs.length} arc pairs`);
 
-// outcomes cover the chart exactly
+// v7 chart entries carry explicit world positions and kinds
+rep.chart.forEach((n, i) => {
+  assert.ok(Number.isFinite(n.x) && Number.isFinite(n.y),
+    `chart entry ${i} lacks explicit x/y`);
+  assert.ok(n.y > 0 && n.y < 2.5, `implausible object height at ${i}: ${n.y}`);
+  assert.ok([0, 1, 2, 3].includes(n.kind), `unknown kind at ${i}`);
+});
+
+// every scoreable object resolves exactly once; bombs only resolve if hit
 const last = rep.ticks.length - 1;
 const c = counts(rep, last);
-assert.equal(c.good + c.bad + c.miss, rep.chart.length,
-  "every note resolves exactly once");
+const scoreable = rep.chart.filter((n) => n.kind !== KIND_BOMB).length;
+const nBombs = rep.chart.length - scoreable;
+assert.equal(c.good + c.bad + c.miss, scoreable,
+  "every scoreable object resolves exactly once");
+assert.ok(c.bombs <= nBombs, "more bomb hits than bombs");
 // score = sum of all event points, reward sums to the episode return
 const evPts = rep.ticks.flatMap((t) => t.events).reduce((a, e) =>
   a + (e.cut ? e.cut.points || 0 : 0) + (e.post ? e.post.points : 0), 0);
 assert.ok(Math.abs(c.score - evPts) < 1e-6, "counts.score matches events");
+assert.ok(c.score <= maxScore(rep.chart), "score exceeds the per-kind max");
 console.log(`counts: good ${c.good} bad ${c.bad} miss ${c.miss} ` +
-            `score ${c.score.toFixed(1)} return ${c.reward.toFixed(2)}`);
+            `bombs ${c.bombs}/${nBombs} score ${c.score.toFixed(1)}` +
+            `/${maxScore(rep.chart)} return ${c.reward.toFixed(2)}`);
 
 // arm interpolation and blade math stay finite over the whole episode,
 // and the JS forward kinematics MIRROR matches the sim-logged wrist
@@ -45,9 +59,19 @@ for (let k = 0; k < last; k += 7) {
 for (const frac of [0, 0.3, 0.6, 0.9, 1.0]) {
   const t = frac * last * DT;
   const p = pendingNotes(rep, t), a = aftermaths(rep, t),
-    po = activePosts(rep, t);
-  assert.ok(p.length + a.length >= 0 && po.length >= 0);
+    po = activePosts(rep, t), ar = activeArcs(rep, t);
+  assert.ok(p.length + a.length >= 0 && po.length >= 0 && ar.length >= 0);
+  // objects past the miss boundary never linger in the pending list
+  p.forEach(({ z }) => assert.ok(z >= -2.65 - 1e-9 && z <= 12 + 1e-9));
 }
+
+// arc pairs are sane: same color, tail after head, within the window
+rep.arcs.forEach(({ head, tail }) => {
+  const h = rep.chart[head], t = rep.chart[tail];
+  assert.ok(h.fpost && t.fpre, "arc pair without fpost/fpre grants");
+  assert.equal(h.color, t.color, "arc pair colors differ");
+  assert.ok(t.t > h.t && t.t - h.t <= 2.5, "arc pair outside the window");
+});
 
 // actual-cut-plane reconstruction: every good cut yields a sane plane
 // (unit normal, point inside the cube) or a declared-degenerate null
@@ -67,7 +91,11 @@ rep.chart.forEach((n, i) => {
 assert.ok(planes > 0, "no cut planes reconstructed at all");
 console.log(`cut planes reconstructed for ${planes} good cuts`);
 
-// replays from retired parameterizations are rejected
+// replays from retired parameterizations are rejected with the friendly
+// "re-record" message
+assert.throws(
+  () => parseReplay('{"header": {"version": 6, "config": {}, "chart": []}}'),
+  /version 6.*re-record/s);
 assert.throws(
   () => parseReplay('{"header": {"version": 5, "config": {}, "chart": []}}'),
   /version 5/);

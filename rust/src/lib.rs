@@ -1,18 +1,23 @@
 //! Beat Arena sim core in Rust — THE physics implementation (SPEC.md is
 //! the contract; `python/beat_arena_env/constants.py` mirrors constants).
 //!
-//! Env v6 (2026-07-22, user-designed): kinematic upper body. Each hand
-//! is a chain from a FIXED SHOULDER anchor: upper arm -> elbow (hinge)
-//! -> forearm -> the v5.2 wrist (roll + bend, in the forearm frame) ->
-//! 1 m blade. No force interactions — every joint integrates the same
-//! way (accel, drag, omega cap, anatomical limits that zero omega);
-//! the wrist is wherever forward kinematics puts it (fully 3D). Tiered
-//! dynamics: ponderous shoulder/elbow, snappy wrists. Contact velocity
-//! is the contact point's finite-difference displacement over the tick.
-//! Cuts are swept-blade-through-block events (the note's actual 0.4 m
-//! cube, rotated to its cut direction — env v5.3) scored with the real
-//! Beat Saber 115-point system: 70 pre-swing (100 deg), 30
-//! follow-through (60 deg), 15 accuracy-to-center.
+//! Env v7 (2026-07-22, research-driven): real Beat Saber geometry and
+//! judgment on the v6 kinematic upper body. Floor-based world (y = 0 is
+//! the floor), 0.6 m lanes, real non-uniform row heights; the good-cut
+//! hitbox is the real elongated axis-aligned box (0.8 x 0.5 x 1.0,
+//! shifted 0.25 m toward the player; dots 0.8 tall), the wrong-color
+//! hitbox the real small box (0.35^3) — v5.3's rotated visual-cube
+//! collision is retired. The saber sweep is the full swept surface
+//! between the previous and current blade segments (two triangles), not
+//! sampled points. Scoring is the real integer 115: floor(x+0.5)-rounded
+//! components, accuracy normalized by 0.3 m. New object kinds: bombs
+//! (r 0.18 sphere, hit = penalty, pass = free), chain heads (max 85, no
+//! follow-through), chain links (flat 20, any direction, speed still
+//! required), and arc pre/post-swing grants on anchoring notes.
+//!
+//! Body: the v6 arm chains, shoulders at (+-0.2, 1.47, -0.65) — a 1.8 m
+//! player with the head 0.65 m behind the hit plane. Notes stay cuttable
+//! until ~2 m behind the head (Z_MISS 2.65), where misses register.
 //!
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
@@ -24,25 +29,29 @@ const DT: f64 = 1.0 / 30.0;
 const DRAG: f64 = 0.02;
 const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
 const V_MIN_CUT: f64 = 1.0;
-// accuracy normalizer only (circumscribed circle of the 0.4 m face) —
-// contact itself is the swept blade vs the note's ROTATED box (env v5.3)
-const CUT_RADIUS: f64 = 0.28;
-const HALF_BLOCK: f64 = 0.2;
+const ACC_NORM: f64 = 0.3; // real BS accuracy normalizer (m)
 const COS_TOL: f64 = 0.5;
-const CELL: f64 = 0.5;
+// lanes at x = -0.9 .. 0.9 (0.6 m pitch), rows at y = 0.85/1.40/1.90 —
+// positions arrive PRE-RESOLVED in the chart tuple (constants.py owns them)
+const Y_CENTER: f64 = 1.40; // obs y normalization
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
+const REWARD_BOMB: f64 = -0.5;
 
-// --- upper body (env v6, 2026-07-22, user-designed) -------------------------
-// Kinematic chain per hand: fixed shoulder anchor -> upper arm -> elbow
-// (hinge) -> forearm -> the v5.2 wrist (roll + bend) -> 1 m blade. No
-// force interactions — every joint integrates the same way (accel, drag,
-// omega cap, limits that zero omega). The wrist is wherever forward
-// kinematics puts it (fully 3D; the z = 0 plane confinement is gone).
-// Realistic fixed proportions: shoulder width 0.4 m, shoulders 0.45 m
-// above grid center and 0.35 m behind the hit plane.
+// --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
+const GOOD_HALF_X: f64 = 0.4;
+const GOOD_HALF_Y: f64 = 0.25;
+const GOOD_HALF_Y_DOT: f64 = 0.4;
+const GOOD_HALF_Y_LINK: f64 = 0.1;
+const GOOD_HALF_Z: f64 = 0.5;
+const GOOD_Z_SHIFT: f64 = -0.25; // box center = note_z + shift (toward player)
+const BAD_HALF: f64 = 0.175;
+const BAD_HALF_Y_LINK: f64 = 0.05;
+const BOMB_RADIUS: f64 = 0.18;
+
+// --- upper body (env v6 chains, v7 placement) --------------------------------
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
-const SHOULDER: [[f64; 3]; 2] = [[-0.2, 0.45, -0.35], [0.2, 0.45, -0.35]];
+const SHOULDER: [[f64; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
 const L_UPPER: f64 = 0.35; // m
 const L_FORE: f64 = 0.30; // m
 // tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
@@ -50,12 +59,6 @@ const ALPHA_ARM: f64 = 80.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
 const OMEGA_ARM: f64 = 8.0; // rad/s
 const ALPHA_WRIST: f64 = 200.0; // rad/s^2 (roll, bend — v5 values)
 const OMEGA_WRIST: f64 = 20.0; // rad/s
-// joint order per hand: pitch, yaw, twist, elbow, roll, bend.
-// Neutral (all zeros) = arm straight forward (+z), blade its extension.
-// pitch: + = arm up, +-90 deg. yaw: + = toward +x; outward 100 deg /
-// cross-body 45 deg per hand (mirrored). twist (humeral rotation):
-// +-90 deg, orients the elbow's bend plane. elbow flexion: 0..150 deg,
-// curls toward local +y. roll/bend: the unchanged v5.2 wrist.
 const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg
 const YAW_LO: [f64; 2] = [-1.7453292519943295, -0.7853981633974483]; // L, R
 const YAW_HI: [f64; 2] = [0.7853981633974483, 1.7453292519943295];
@@ -80,49 +83,62 @@ fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
         (-BEND_LIM, BEND_LIM),
     ]
 }
-const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
-// broad-phase gate: max wrist z (0.3, arm straight forward) + blade + half
-// block — beyond this no pose can touch a note
-const REACH_Z: f64 = 1.5;
-const Z_MISS: f64 = 0.6; // note consumed as missed past this
+const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
+// broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm) + blade
+// 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
+const REACH_Z: f64 = 1.75;
+// note consumed as missed past this (~2 m behind the head); notes stay
+// cuttable until they exit — the real game judges misses at despawn
+const Z_MISS: f64 = 2.65;
 
-// --- scoring (real Beat Saber 115) ------------------------------------------
+// --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
 const POST_FULL: f64 = 1.0471975511965976; // 60 deg
 const PTS_PRE: f64 = 70.0;
 const PTS_POST: f64 = 30.0;
 const PTS_ACC: f64 = 15.0;
 const SCORE_MAX: f64 = 115.0;
+const CHAIN_LINK_PTS: f64 = 20.0;
 const SWING_BREAK: f64 = 0.005; // rad/tick below which the swing chain breaks
 const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 
-const N_NOTE_SLOTS: usize = 12;
-const NOTE_FEAT: usize = 9;
-// obs v5: per hand 23 features — 6 joint angles (roll as cos/sin -> 7
+// object kinds (mirrors constants.py; 0 = plain note)
+const KIND_BOMB: u8 = 1;
+const KIND_CHAIN_HEAD: u8 = 2;
+const KIND_CHAIN_LINK: u8 = 3;
+
+const N_NOTE_SLOTS: usize = 16;
+const NOTE_FEAT: usize = 14;
+// obs v6: per hand 23 features — 6 joint angles (roll as cos/sin -> 7
 // numbers), 6 angular velocities, derived wrist pos (3) + finite-diff
 // wrist vel (3) + blade unit dir (3), and the live pre-swing meter
 const SABER_FEAT: usize = 23;
 const OFF_NOTES: usize = 2 * SABER_FEAT; // 46
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 154
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 166
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 270
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 286
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
-const Z_CLIP: (f64, f64) = (-1.0, 12.0);
+const Z_CLIP: (f64, f64) = (-3.0, 12.0);
+
+/// Real BS scores are integers; explicit floor(x + 0.5) so every
+/// implementation (Rust, torch, Python tools) agrees on halves.
+fn round_pts(x: f64) -> f64 {
+    (x + 0.5).floor()
+}
 
 #[derive(Clone, Copy)]
 struct Note {
     hit_time: f64,
-    col: u8,
-    row: u8,
+    x: f64, // world position at the hit plane (meters)
+    y: f64,
     color: u8,
-    angle: f64,    // required swing direction in radians (0 = +x, CCW)
-    speed: f64,    // approach speed toward the plane (m/s)
-    any_dir: bool, // dot note: any swing direction scores
-}
-
-fn note_center(n: &Note) -> [f64; 2] {
-    [(n.col as f64 - 1.5) * CELL, (n.row as f64 - 1.0) * CELL]
+    angle: f64,     // required swing direction in radians (0 = +x, CCW)
+    speed: f64,     // approach speed toward the plane (m/s)
+    any_dir: bool,  // dot note / chain link: any swing direction scores
+    kind: u8,       // KIND_NOTE / _BOMB / _CHAIN_HEAD / _CHAIN_LINK
+    free_pre: bool, // arc tail: full 70 pre-swing granted
+    free_post: bool, // arc head: full 30 follow-through granted
 }
 
 /// Forward kinematics: (elbow, wrist, blade unit dir) from the six joint
@@ -168,68 +184,164 @@ fn fk(hand: usize, q: &[f64; N_JOINTS]) -> ([f64; 3], [f64; 3], [f64; 3]) {
     (e, w, b)
 }
 
-/// Env v5.3: a note is its actual 0.4 m cube, rotated about the approach
-/// (z) axis so the block's "up" tracks the required cut direction:
-/// rot = angle - 270 deg (a down-swing note is axis-aligned, as before;
-/// dot notes don't rotate). (cos_rot, sin_rot) derived exactly from the
-/// angle's own sin/cos: cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a.
-fn note_rot(n: &Note) -> (f64, f64) {
-    if n.any_dir {
-        (1.0, 0.0)
-    } else {
-        let (sa, ca) = n.angle.sin_cos();
-        (-sa, ca)
-    }
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-
-/// p relative to the box center, expressed in the box's rotated frame.
-fn to_box_frame(p: [f64; 3], center: [f64; 3], cos_r: f64, sin_r: f64) -> [f64; 3] {
-    let q = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
-        cos_r * q[0] + sin_r * q[1],
-        -sin_r * q[0] + cos_r * q[1],
-        q[2],
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
     ]
 }
 
-/// Segment vs origin-centered axis-aligned cube of half-extent `h`
-/// (slab clipping of the segment parameter to [0, 1]).
-fn seg_box_hit(a: [f64; 3], b: [f64; 3], h: f64) -> bool {
-    let mut tmin = 0.0f64;
-    let mut tmax = 1.0f64;
+/// Triangle vs axis-aligned box (Akenine-Möller SAT). Verts are given
+/// RELATIVE to the box center; h = half extents.
+fn tri_box_overlap(v: [[f64; 3]; 3], h: [f64; 3]) -> bool {
+    // box-axis tests
     for k in 0..3 {
-        let d = b[k] - a[k];
-        if d.abs() < 1e-12 {
-            if a[k].abs() > h {
-                return false;
-            }
-        } else {
-            let t1 = (-h - a[k]) / d;
-            let t2 = (h - a[k]) / d;
-            let (lo, hi) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
-            tmin = tmin.max(lo);
-            tmax = tmax.min(hi);
-            if tmin > tmax {
+        let lo = v[0][k].min(v[1][k]).min(v[2][k]);
+        let hi = v[0][k].max(v[1][k]).max(v[2][k]);
+        if lo > h[k] || hi < -h[k] {
+            return false;
+        }
+    }
+    let e = [sub(v[1], v[0]), sub(v[2], v[1]), sub(v[0], v[2])];
+    // 9 cross-axis tests: a = u_k x e_j (u_k = box axes)
+    for j in 0..3 {
+        let ax = [
+            [0.0, -e[j][2], e[j][1]],
+            [e[j][2], 0.0, -e[j][0]],
+            [-e[j][1], e[j][0], 0.0],
+        ];
+        for a in ax {
+            let p0 = dot3(v[0], a);
+            let p1 = dot3(v[1], a);
+            let p2 = dot3(v[2], a);
+            let r = h[0] * a[0].abs() + h[1] * a[1].abs() + h[2] * a[2].abs();
+            if p0.min(p1).min(p2) > r || p0.max(p1).max(p2) < -r {
                 return false;
             }
         }
     }
-    true
+    // triangle-plane test
+    let n = cross3(e[0], e[1]);
+    let r = h[0] * n[0].abs() + h[1] * n[1].abs() + h[2] * n[2].abs();
+    dot3(n, v[0]).abs() <= r
+}
+
+/// Closest distance from point p to triangle (a, b, c) (Ericson,
+/// Real-Time Collision Detection §5.1.5). Handles degenerate triangles
+/// via the edge/vertex regions.
+fn tri_point_dist(a: [f64; 3], b: [f64; 3], c: [f64; 3], p: [f64; 3]) -> f64 {
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot3(ab, ap);
+    let d2 = dot3(ac, ap);
+    let dist = |q: [f64; 3]| {
+        let d = sub(p, q);
+        dot3(d, d).sqrt()
+    };
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return dist(a);
+    }
+    let bp = sub(p, b);
+    let d3 = dot3(ab, bp);
+    let d4 = dot3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return dist(b);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let denom = d1 - d3;
+        let v = if denom.abs() < 1e-15 { 0.0 } else { d1 / denom };
+        return dist([a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]]);
+    }
+    let cp = sub(p, c);
+    let d5 = dot3(ab, cp);
+    let d6 = dot3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return dist(c);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let denom = d2 - d6;
+        let w = if denom.abs() < 1e-15 { 0.0 } else { d2 / denom };
+        return dist([a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]]);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let denom = (d4 - d3) + (d5 - d6);
+        let w = if denom.abs() < 1e-15 { 0.0 } else { (d4 - d3) / denom };
+        return dist([
+            b[0] + w * (c[0] - b[0]),
+            b[1] + w * (c[1] - b[1]),
+            b[2] + w * (c[2] - b[2]),
+        ]);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    dist([
+        a[0] + ab[0] * v + ac[0] * w,
+        a[1] + ab[1] * v + ac[1] * w,
+        a[2] + ab[2] * v + ac[2] * w,
+    ])
 }
 
 fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let denom = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let ab = sub(b, a);
+    let denom = dot3(ab, ab);
+    let ac = sub(c, a);
     let t = if denom < 1e-12 {
         0.0
     } else {
-        ((ac[0] * ab[0] + ac[1] * ab[1] + ac[2] * ab[2]) / denom).clamp(0.0, 1.0)
+        (dot3(ac, ab) / denom).clamp(0.0, 1.0)
     };
     let px = a[0] + t * ab[0] - c[0];
     let py = a[1] + t * ab[1] - c[1];
     let pz = a[2] + t * ab[2] - c[2];
     (px * px + py * py + pz * pz).sqrt()
+}
+
+/// The swept blade surface over one tick: quad (w0->t0) to (w1->t1),
+/// split into triangles (w0, t0, t1) and (w0, t1, w1).
+fn sweep_tris(
+    w0: [f64; 3],
+    d0: [f64; 3],
+    w1: [f64; 3],
+    d1: [f64; 3],
+) -> [[[f64; 3]; 3]; 2] {
+    let t0 = [
+        w0[0] + SABER_LEN * d0[0],
+        w0[1] + SABER_LEN * d0[1],
+        w0[2] + SABER_LEN * d0[2],
+    ];
+    let t1 = [
+        w1[0] + SABER_LEN * d1[0],
+        w1[1] + SABER_LEN * d1[1],
+        w1[2] + SABER_LEN * d1[2],
+    ];
+    [[w0, t0, t1], [w0, t1, w1]]
+}
+
+fn sweep_hits_box(tris: &[[[f64; 3]; 3]; 2], center: [f64; 3], h: [f64; 3]) -> bool {
+    for t in tris {
+        let rel = [sub(t[0], center), sub(t[1], center), sub(t[2], center)];
+        if tri_box_overlap(rel, h) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sweep_dist(tris: &[[[f64; 3]; 3]; 2], p: [f64; 3]) -> f64 {
+    tri_point_dist(tris[0][0], tris[0][1], tris[0][2], p)
+        .min(tri_point_dist(tris[1][0], tris[1][1], tris[1][2], p))
 }
 
 #[derive(Clone, Copy)]
@@ -267,19 +379,24 @@ struct Tracker {
     age: u32,
 }
 
+type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
+
 struct Core {
     max_steps: u32,
     chart: Vec<Note>,
+    tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
     // state
     tick: u32,
     time: f64,
     arms: [Arm; 2],
     trackers: [Vec<Tracker>; 2],
-    status: Vec<u8>, // 0 pending, 1 good, 2 bad, 3 missed
+    status: Vec<u8>, // 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed
     good_cuts: u32,
     bad_cuts: u32,
     misses: u32,
-    score: f64, // summed points; max = 115 * n_notes
+    bombs_hit: u32,
+    n_scoreable: u32, // chart objects that are not bombs
+    score: f64,       // summed points; max = 115*notes + 85*heads + 20*links
 }
 
 impl Core {
@@ -287,6 +404,7 @@ impl Core {
         Core {
             max_steps,
             chart: Vec::new(),
+            tail_s: 0.5,
             tick: 0,
             time: 0.0,
             arms: [Arm::start(0), Arm::start(1)],
@@ -295,23 +413,40 @@ impl Core {
             good_cuts: 0,
             bad_cuts: 0,
             misses: 0,
+            bombs_hit: 0,
+            n_scoreable: 0,
             score: 0.0,
         }
     }
 
-    fn set_chart_notes(&mut self, chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>) {
+    fn set_chart_notes(&mut self, chart: Vec<ChartTuple>) {
         self.chart = chart
             .into_iter()
-            .map(|(t, col, row, color, angle, speed, any_dir)| Note {
+            .map(|(t, x, y, color, angle, speed, any_dir, kind, fpre, fpost)| Note {
                 hit_time: t,
-                col,
-                row,
+                x,
+                y,
                 color,
                 angle,
                 speed,
                 any_dir,
+                kind,
+                free_pre: fpre,
+                free_post: fpost,
             })
             .collect();
+        // the episode tail must cover the slowest object's trip from the
+        // plane to the miss boundary, or final misses never register
+        let min_speed = self
+            .chart
+            .iter()
+            .map(|n| n.speed)
+            .fold(f64::INFINITY, f64::min);
+        self.tail_s = if min_speed.is_finite() {
+            0.5 + Z_MISS / min_speed
+        } else {
+            0.5
+        };
         self.reset_state();
     }
 
@@ -324,6 +459,8 @@ impl Core {
         self.good_cuts = 0;
         self.bad_cuts = 0;
         self.misses = 0;
+        self.bombs_hit = 0;
+        self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.score = 0.0;
     }
 
@@ -345,7 +482,7 @@ impl Core {
             }
             // derived hand state: FK wrist, finite-diff velocity, blade dir
             obs[b + 13] = (arm.wrist[0] / X_NORM) as f32;
-            obs[b + 14] = (arm.wrist[1] / Y_NORM) as f32;
+            obs[b + 14] = ((arm.wrist[1] - Y_CENTER) / Y_NORM) as f32;
             obs[b + 15] = arm.wrist[2] as f32;
             for k in 0..3 {
                 obs[b + 16 + k] = (arm.wrist_vel[k] / V_NORM) as f32;
@@ -363,19 +500,28 @@ impl Core {
                 break;
             }
             let base = OFF_NOTES + slot * NOTE_FEAT;
-            let c = note_center(n);
             let z = ((n.hit_time - self.time) * n.speed).clamp(Z_CLIP.0, Z_CLIP.1);
-            obs[base] = (c[0] / X_NORM) as f32;
-            obs[base + 1] = (c[1] / Y_NORM) as f32;
+            obs[base] = (n.x / X_NORM) as f32;
+            obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
             obs[base + 2] = (z / Z_SCALE) as f32;
             obs[base + 3] = (-n.speed / Z_SCALE) as f32;
-            obs[base + 4 + n.color as usize] = 1.0;
-            // dot notes encode direction as the ZERO vector — the one point
-            // that is no direction at all (unit-circle points = constraints)
-            let d = if n.any_dir { [0.0, 0.0] } else { [n.angle.cos(), n.angle.sin()] };
-            obs[base + 6] = d[0] as f32;
-            obs[base + 7] = d[1] as f32;
-            obs[base + 8] = 1.0; // valid
+            if n.kind != KIND_BOMB {
+                obs[base + 4 + n.color as usize] = 1.0;
+            }
+            // dot notes encode direction as the ZERO vector; chain links
+            // carry their tangent (path information) despite judging as
+            // any-direction — is_chain_link disambiguates
+            let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
+            if n.kind != KIND_BOMB && show_dir {
+                obs[base + 6] = n.angle.cos() as f32;
+                obs[base + 7] = n.angle.sin() as f32;
+            }
+            obs[base + 8] = (n.kind == KIND_BOMB) as u8 as f32;
+            obs[base + 9] = (n.kind == KIND_CHAIN_HEAD) as u8 as f32;
+            obs[base + 10] = (n.kind == KIND_CHAIN_LINK) as u8 as f32;
+            obs[base + 11] = n.free_pre as u8 as f32;
+            obs[base + 12] = n.free_post as u8 as f32;
+            obs[base + 13] = 1.0; // valid
             obs[OFF_NOTE_MASK + slot] = 1.0;
             slot += 1;
         }
@@ -383,7 +529,7 @@ impl Core {
     }
 
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
-    // (follow-through resolution; the f32 is the points awarded).
+    // (follow-through resolution), 6 bomb hit. The f32 is points awarded.
     fn step_inner(&mut self, actions: [[u8; N_JOINTS]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
         let prev_pos = [self.arms[0].wrist, self.arms[1].wrist];
         let prev_dir = [self.arms[0].blade, self.arms[1].blade];
@@ -430,11 +576,7 @@ impl Core {
                 arm.swing_acc = 0.0;
                 arm.axis = None;
             } else {
-                let cx = [
-                    d_old[1] * d_new[2] - d_old[2] * d_new[1],
-                    d_old[2] * d_new[0] - d_old[0] * d_new[2],
-                    d_old[0] * d_new[1] - d_old[1] * d_new[0],
-                ];
+                let cx = cross3(d_old, d_new);
                 let cn = (cx[0].powi(2) + cx[1].powi(2) + cx[2].powi(2)).sqrt();
                 let ax = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
                 match arm.axis {
@@ -464,7 +606,7 @@ impl Core {
                     tr.acc >= POST_FULL || tr.age >= FOLLOW_TIMEOUT
                 };
                 if resolve {
-                    let pts = PTS_POST * (tr.acc / POST_FULL).min(1.0);
+                    let pts = round_pts(PTS_POST * (tr.acc / POST_FULL).min(1.0));
                     reward += pts / SCORE_MAX;
                     self.score += pts;
                     events.push((tr.note, 5, pts as f32));
@@ -477,6 +619,12 @@ impl Core {
 
         self.time = (self.tick + 1) as f64 * DT;
 
+        // both sabers' swept surfaces this tick
+        let tris = [
+            sweep_tris(prev_pos[0], prev_dir[0], self.arms[0].wrist, self.arms[0].blade),
+            sweep_tris(prev_pos[1], prev_dir[1], self.arms[1].wrist, self.arms[1].blade),
+        ];
+
         for i in 0..self.chart.len() {
             if self.status[i] != 0 {
                 continue;
@@ -484,73 +632,86 @@ impl Core {
             let n = self.chart[i];
             let z = (n.hit_time - self.time) * n.speed;
             if z < -Z_MISS {
-                self.status[i] = 3;
-                self.misses += 1;
-                reward += REWARD_MISS;
-                events.push((i as u32, 4, 0.0));
+                if n.kind == KIND_BOMB {
+                    self.status[i] = 4; // passed clean: no penalty, no event
+                } else {
+                    self.status[i] = 3;
+                    self.misses += 1;
+                    reward += REWARD_MISS;
+                    events.push((i as u32, 4, 0.0));
+                }
                 continue;
             }
             if z > REACH_Z {
                 continue;
             }
-            let center = [note_center(&n)[0], note_center(&n)[1], z];
-            let (cos_r, sin_r) = note_rot(&n);
-            for &s in &[n.color as usize, 1 - n.color as usize] {
-                let arm = self.arms[s];
-                let d_new = arm.blade;
-                // swept-blade test: 8 sample points along the blade, each
-                // tracing its own displacement segment (full 3D) against
-                // the note's ROTATED cube; distance-to-center of the
-                // hitting samples still grades accuracy / picks s*
-                let mut d_min = f64::INFINITY;
+            let center = [n.x, n.y, z];
+
+            if n.kind == KIND_BOMB {
+                for s in 0..2 {
+                    if sweep_dist(&tris[s], center) <= BOMB_RADIUS {
+                        self.status[i] = 2;
+                        self.bombs_hit += 1;
+                        reward += REWARD_BOMB;
+                        events.push((i as u32, 6, 0.0));
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            let m = n.color as usize; // matching saber
+            let good_hy = if n.kind == KIND_CHAIN_LINK {
+                GOOD_HALF_Y_LINK
+            } else if n.any_dir {
+                GOOD_HALF_Y_DOT
+            } else {
+                GOOD_HALF_Y
+            };
+            let good_center = [n.x, n.y, z + GOOD_Z_SHIFT];
+            let good_h = [GOOD_HALF_X, good_hy, GOOD_HALF_Z];
+
+            if sweep_hits_box(&tris[m], good_center, good_h) {
+                // contact point: the blade sample whose displacement
+                // segment passes closest to the note center; its
+                // finite-difference velocity is the contact velocity
+                let arm = self.arms[m];
+                let mut d_seg = f64::INFINITY;
                 let mut s_star = 0.0;
                 for j in 1..=N_BLADE_SAMPLES {
-                    let frac = j as f64 / N_BLADE_SAMPLES as f64;
-                    let r = frac * SABER_LEN;
+                    let r = (j as f64 / N_BLADE_SAMPLES as f64) * SABER_LEN;
                     let p0 = [
-                        prev_pos[s][0] + r * prev_dir[s][0],
-                        prev_pos[s][1] + r * prev_dir[s][1],
-                        prev_pos[s][2] + r * prev_dir[s][2],
+                        prev_pos[m][0] + r * prev_dir[m][0],
+                        prev_pos[m][1] + r * prev_dir[m][1],
+                        prev_pos[m][2] + r * prev_dir[m][2],
                     ];
                     let p1 = [
-                        arm.wrist[0] + r * d_new[0],
-                        arm.wrist[1] + r * d_new[1],
-                        arm.wrist[2] + r * d_new[2],
+                        arm.wrist[0] + r * arm.blade[0],
+                        arm.wrist[1] + r * arm.blade[1],
+                        arm.wrist[2] + r * arm.blade[2],
                     ];
-                    if !seg_box_hit(
-                        to_box_frame(p0, center, cos_r, sin_r),
-                        to_box_frame(p1, center, cos_r, sin_r),
-                        HALF_BLOCK,
-                    ) {
-                        continue;
-                    }
                     let d = seg_point_dist3(p0, p1, center);
-                    if d < d_min {
-                        d_min = d;
+                    if d < d_seg {
+                        d_seg = d;
                         s_star = r;
                     }
                 }
-                if !d_min.is_finite() {
-                    continue;
-                }
-                // contact velocity (env v6): the contact point's actual
-                // displacement over the tick / DT — the same segments the
-                // collision test sweeps, no chain Jacobian needed
                 let vc = [
-                    (arm.wrist[0] + s_star * d_new[0]
-                        - prev_pos[s][0] - s_star * prev_dir[s][0]) / DT,
-                    (arm.wrist[1] + s_star * d_new[1]
-                        - prev_pos[s][1] - s_star * prev_dir[s][1]) / DT,
-                    (arm.wrist[2] + s_star * d_new[2]
-                        - prev_pos[s][2] - s_star * prev_dir[s][2]) / DT,
+                    (arm.wrist[0] + s_star * arm.blade[0]
+                        - prev_pos[m][0] - s_star * prev_dir[m][0]) / DT,
+                    (arm.wrist[1] + s_star * arm.blade[1]
+                        - prev_pos[m][1] - s_star * prev_dir[m][1]) / DT,
+                    (arm.wrist[2] + s_star * arm.blade[2]
+                        - prev_pos[m][2] - s_star * prev_dir[m][2]) / DT,
                 ];
                 let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
-                let code: u8 = if s != n.color as usize {
-                    3 // wrong_hand
-                } else if vc_mag < V_MIN_CUT {
+                // accuracy: closest approach of the swept surface to the
+                // note center, normalized by the real 0.3 m
+                let d_min = sweep_dist(&tris[m], center);
+                let code: u8 = if vc_mag < V_MIN_CUT {
                     1 // slow
                 } else if n.any_dir {
-                    0 // dot note: any direction scores
+                    0 // dot note / chain link: any direction scores
                 } else {
                     // direction check on the IN-PLANE contact velocity
                     let d2 = [n.angle.cos(), n.angle.sin()];
@@ -561,14 +722,32 @@ impl Core {
                 if code == 0 {
                     self.status[i] = 1;
                     self.good_cuts += 1;
-                    let pre = PTS_PRE * (self.arms[s].swing_acc / PRE_FULL).min(1.0);
-                    // corner clips of the rotated box can sit slightly
-                    // outside the circumscribed circle -> floor at 0
-                    let acc = PTS_ACC * (1.0 - d_min / CUT_RADIUS).max(0.0);
-                    let pts = pre + acc;
+                    let pts = if n.kind == KIND_CHAIN_LINK {
+                        CHAIN_LINK_PTS // flat, regardless of swing
+                    } else {
+                        let pre = if n.free_pre {
+                            PTS_PRE
+                        } else {
+                            round_pts(PTS_PRE * (self.arms[m].swing_acc / PRE_FULL).min(1.0))
+                        };
+                        let acc =
+                            round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)));
+                        let mut p = pre + acc;
+                        if n.kind == KIND_CHAIN_HEAD {
+                            // chain heads have no follow-through (max 85)
+                        } else if n.free_post {
+                            p += PTS_POST; // arc head: granted in full
+                        } else {
+                            self.trackers[m].push(Tracker {
+                                note: i as u32,
+                                acc: 0.0,
+                                age: 0,
+                            });
+                        }
+                        p
+                    };
                     reward += pts / SCORE_MAX;
                     self.score += pts;
-                    self.trackers[s].push(Tracker { note: i as u32, acc: 0.0, age: 0 });
                     events.push((i as u32, 0, pts as f32));
                 } else {
                     self.status[i] = 2;
@@ -576,7 +755,19 @@ impl Core {
                     reward += REWARD_BAD;
                     events.push((i as u32, code, 0.0));
                 }
-                break;
+            } else {
+                // wrong-color saber only triggers the SMALL box
+                let bad_hy = if n.kind == KIND_CHAIN_LINK {
+                    BAD_HALF_Y_LINK
+                } else {
+                    BAD_HALF
+                };
+                if sweep_hits_box(&tris[1 - m], center, [BAD_HALF, bad_hy, BAD_HALF]) {
+                    self.status[i] = 2;
+                    self.bad_cuts += 1;
+                    reward += REWARD_BAD;
+                    events.push((i as u32, 3, 0.0)); // wrong_hand
+                }
             }
         }
 
@@ -590,14 +781,14 @@ impl Core {
         let done = (!pending
             && no_trackers
             && (self.chart.is_empty() || self.time > last_hit))
-            || self.time > last_hit + 0.5
+            || self.time > last_hit + self.tail_s
             || self.tick >= self.max_steps;
 
         if done {
             // resolve any pending follow-throughs with their partial arcs
             for s in 0..2 {
                 for tr in self.trackers[s].drain(..) {
-                    let pts = PTS_POST * (tr.acc / POST_FULL).min(1.0);
+                    let pts = round_pts(PTS_POST * (tr.acc / POST_FULL).min(1.0));
                     reward += pts / SCORE_MAX;
                     self.score += pts;
                     events.push((tr.note, 5, pts as f32));
@@ -617,19 +808,20 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (max_steps=630))]
+    #[pyo3(signature = (max_steps=690))]
     fn new(max_steps: u32) -> Self {
         RawBeatSim {
             core: Core::new_core(max_steps),
         }
     }
 
-    /// chart: list of (hit_time, col, row, color, angle_rad, speed, any_dir),
-    /// sorted by hit_time. Resets state, returns the reset observation.
+    /// chart: list of (hit_time, x, y, color, angle_rad, speed, any_dir,
+    /// kind, free_pre, free_post), sorted by hit_time; positions in
+    /// meters (env v7). Resets state, returns the reset observation.
     fn set_chart<'py>(
         &mut self,
         py: Python<'py>,
-        chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>,
+        chart: Vec<ChartTuple>,
     ) -> Bound<'py, PyArray1<f32>> {
         self.core.set_chart_notes(chart);
         PyArray1::from_slice_bound(py, &self.core.build_obs())
@@ -638,7 +830,7 @@ impl RawBeatSim {
     /// actions: 12 ints in 0..2 — per hand (pitch, yaw, twist, elbow,
     /// roll, bend), left hand first; 0 = coast, 1 = +alpha, 2 = -alpha.
     /// Returns (obs, reward, done, events); events = [(note_idx, code, points)]
-    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post.
+    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post, 6 bomb.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -678,7 +870,8 @@ impl RawBeatSim {
         [0, 1].map(|s| self.core.arms[s].blade)
     }
 
-    /// Per-note status: 0 pending, 1 good, 2 bad, 3 missed.
+    /// Per-note status: 0 pending, 1 good, 2 bad/bomb-hit, 3 missed,
+    /// 4 bomb passed clean.
     fn status(&self) -> Vec<u8> {
         self.core.status.clone()
     }
@@ -710,8 +903,13 @@ impl RawBeatSim {
         self.core.misses
     }
     #[getter]
-    fn n_notes(&self) -> usize {
-        self.core.chart.len()
+    fn bombs_hit(&self) -> u32 {
+        self.core.bombs_hit
+    }
+    /// Scoreable objects (notes + chain heads + links; bombs excluded).
+    #[getter]
+    fn n_notes(&self) -> u32 {
+        self.core.n_scoreable
     }
     #[getter]
     fn tick(&self) -> u32 {
@@ -721,7 +919,7 @@ impl RawBeatSim {
     fn time(&self) -> f64 {
         self.core.time
     }
-    /// Summed points across all scored cuts (max 115 * n_notes).
+    /// Summed points across all scored cuts.
     #[getter]
     fn score(&self) -> f64 {
         self.core.score
@@ -739,18 +937,18 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, max_steps=630))]
+    #[pyo3(signature = (n, max_steps=690))]
     fn new(n: usize, max_steps: u32) -> Self {
         VecBeatSim {
             sims: (0..n).map(|_| Core::new_core(max_steps)).collect(),
         }
     }
 
-    fn set_chart(&mut self, i: usize, chart: Vec<(f64, u8, u8, u8, f64, f64, bool)>) {
+    fn set_chart(&mut self, i: usize, chart: Vec<ChartTuple>) {
         self.sims[i].set_chart_notes(chart);
     }
 
-    /// Current observation of every env, flat (N*140,) — reshape Python-side.
+    /// Current observation of every env, flat (N*286,) — reshape Python-side.
     fn obs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
         let n = self.sims.len();
         let mut flat = vec![0.0f32; n * OBS_DIM];
@@ -761,7 +959,7 @@ impl VecBeatSim {
     }
 
     /// actions: (N, 12) int64 — per hand (pitch, yaw, twist, elbow, roll,
-    /// bend), left first. Returns (obs flat (N*166,) f32 — reshape
+    /// bend), left first. Returns (obs flat (N*286,) f32 — reshape
     /// Python-side, rewards (N,) f32, dones (N,) bool). Done envs must get
     /// a fresh set_chart before the next step; their returned obs row is
     /// the terminal obs.
@@ -799,14 +997,22 @@ impl VecBeatSim {
         )
     }
 
-    /// Single env's current obs (140,) — used for cheap post-reset reads.
+    /// Single env's current obs (286,) — used for cheap post-reset reads.
     fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
         PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
     }
 
-    fn counters(&self, i: usize) -> (u32, u32, u32, usize, f64) {
+    /// (good, bad, miss, n_scoreable, score, bombs_hit) for env i.
+    fn counters(&self, i: usize) -> (u32, u32, u32, u32, f64, u32) {
         let s = &self.sims[i];
-        (s.good_cuts, s.bad_cuts, s.misses, s.chart.len(), s.score)
+        (
+            s.good_cuts,
+            s.bad_cuts,
+            s.misses,
+            s.n_scoreable,
+            s.score,
+            s.bombs_hit,
+        )
     }
 }
 

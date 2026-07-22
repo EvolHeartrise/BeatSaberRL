@@ -3,20 +3,23 @@
 Beat Saber-style toy RL environment + transformer policy experiments.
 See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
-Env v6 (kinematic upper body): each hand is a chain from a fixed
-shoulder anchor — upper arm, elbow (hinge), forearm, a two-DOF wrist
-(roll + bend), and a rigid 1 m blade as the forearm's extension. No
-force interactions; every joint is an independent integrator with
-anatomical limits, and the big joints (shoulder, elbow: Ω ≤ 8 rad/s)
-are slower than the wrists (Ω ≤ 20 rad/s) — position with the arm, whip
-with the wrist. 40 cm note cubes (real Beat Saber size, 0.5 m lanes,
-world in meters, cubes rotated to their cut direction) fly in and must
-be swung through with the matching hand, in the right direction, fast
-enough at the contact point (≥1 m/s). Good cuts are graded with the
-real Beat Saber 115-point system — 70 pre-swing (100°), 30
-follow-through (60°), 15 accuracy-to-center — paid as reward/115.
-Per-tick discrete control at 30 Hz: 12 ternary joint heads (per hand:
-pitch, yaw, twist, elbow, roll, bend).
+Env v7 (real Beat Saber geometry & judgment on the v6 kinematic upper
+body): each hand is a chain from a fixed shoulder — upper arm, elbow,
+forearm, two-DOF wrist, 1 m blade; independent integrators with
+anatomical limits, slow shoulders (Ω ≤ 8 rad/s) vs snappy wrists
+(≤ 20) — position with the arm, whip with the wrist. The world is the
+REAL one (sourced from the ArcViewer/BeatLeader code inventory in
+`research/`): floor-based coords, 0.6 m lanes at x ±0.9/±0.3, rows at
+y 0.85/1.40/1.90, shoulders at (±0.2, 1.47, −0.65) — a 1.8 m player.
+Collision uses the real axis-aligned hitboxes (good box 0.8×0.5×1.0
+shifted 0.25 m toward the player — early cuts are real; wrong-color
+small box 0.35³) with full swept-surface saber tests. Scoring is the
+real integer 115 — round(70·pre) + round(30·post) + round(15·acc)
+with the real 0.3 m accuracy normalizer — paid as reward/115. New
+object types: bombs (r 0.18, hit = −0.5, pass = free), chains (head
+max 85, links flat 20 on the real Bézier layout), and arcs as
+pre/post-swing grants. Per-tick discrete control at 30 Hz: 12 ternary
+joint heads (per hand: pitch, yaw, twist, elbow, roll, bend).
 
 ## Quick start
 
@@ -43,7 +46,8 @@ envs) builds once with:
 cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
-Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`.
+Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`,
+plus the v7 object dials `--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
 
 ## Curriculum training (real maps, ScoreSaber star ladder)
 
@@ -75,18 +79,22 @@ Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
 wheel = zoom, right-drag = pan), compiled to that single static file —
 source in `viz/app/`, rebuild with `npm install && npm run build` and
 copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-step,
-+/− = speed, drag the scrub bar. White ring around a saber = fast enough
-to cut (≥1 m/s); arrows on note cubes = required swing direction; white
-outline = inside the cuttable slab; green split = good cut; orange/red
-flash = bad cut / miss, labeled with the reason. Pre-metric (v1) replays
-are rejected — re-record from a current checkpoint.
++/− = speed, `h` = real-hitbox wireframes, drag the scrub bar. White
+ring around a saber = fast enough to cut (≥1 m/s); arrows = required
+swing direction; bombs are black spheres (red flash on hit), chain
+heads half-height cubes, links thin slabs ("+20" pops), arc grants
+faint tubes; green split = good cut; orange/red flash = bad cut / miss,
+labeled with the reason. Pre-v7 replays are rejected — re-record from a
+current checkpoint.
 
-Reference points (env v6 scripted bot, 30 eps each): easy (rate 1.0,
-right hand only, down-swings) 85.4% good cuts / 75.4 pts per note; hard
-(both hands, 8 dirs) 69.5% / 66.0; dynamic gym 61.0% / 59.3. The
-realistic body costs the bot dearly vs the v5.3 free-wrist numbers
-(98.8 / 82.7 / 84.6) — reach and joint limits are now real constraints,
-and pre-v6 references are not comparable.
+Reference points (env v7 scripted bot, 10 eps each): easy (rate 1.0,
+right hand only, down-swings) 95.4% good cuts / 88.6 pts per note; hard
+(both hands, 8 dirs) 75.6% / 67.1; dynamic gym 69.1% / 62.3. The real
+hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
+the bot whips through the contact angle 0.10 s early, like real
+players), which more than pays for the deeper body placement; its
+flat-blade technique caps accuracy though (~5/15). Pre-v7 references
+are not comparable.
 
 ## Status
 
@@ -233,3 +241,20 @@ and pre-v6 references are not comparable.
   arm segments, joints) with arm-joint bars added to the gauges, FK
   mirror validated against sim-logged wrists. All v5.x checkpoints,
   replays, and reference numbers retired.
+- **Env v7 (2026-07-22, research-driven): real Beat Saber geometry &
+  judgment.** Built from the ArcViewer + BeatLeader mechanics inventory
+  (`research/2026-07-22-bs-mechanics-inventory.md`). Floor-based world,
+  0.6 m lanes, real non-uniform row heights (0.85/1.40/1.90), body at
+  real 1.8 m-player placement (shoulders ±0.2, 1.47, −0.65); real
+  axis-aligned hitboxes replace v5.3's rotated cubes (good 0.8×0.5×1.0
+  offset 0.25 m playerward, dots 0.8 tall; wrong-color 0.35³; bomb
+  r 0.18); saber collision = full swept-surface (triangle-AABB SAT);
+  integer 115 scoring with the real 0.3 m accuracy normalizer; misses
+  register ~2 m behind the head (Z_MISS 2.65). New objects end-to-end
+  (sim, obs 166 → 286 with 16 slots + kind/arc flags, generator dials
+  `--bomb-rate --chain-prob --arc-prob`, parser, replay v7, viewer):
+  bombs, chains (head 85 / links 20, real Bézier layout), arcs as
+  swing grants. Parser adds v4 schema, BPM changes, and the
+  paired-note angle-snap rule; walls/NJS-jump-math/spawn animations/
+  combo/energy/modifiers noted in the research doc, deliberately not
+  modeled yet. All v6 checkpoints, replays, and references retired.

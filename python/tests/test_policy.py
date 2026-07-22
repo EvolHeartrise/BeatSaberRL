@@ -61,7 +61,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 166
+    assert OBS_DIM == 286
 
 
 def test_pool_encoder_removed():
@@ -72,7 +72,7 @@ def test_pool_encoder_removed():
 def test_vec_env_auto_reset():
     venv = BeatVecEnv(4, colors="both", dirs=tuple(range(8)), chart_len_s=5.0, seed=3)
     obs = venv.reset()
-    assert obs.shape == (4, 166)
+    assert obs.shape == (4, 286)
     rng = np.random.default_rng(0)
     finished = 0
     for _ in range(400):
@@ -106,4 +106,5 @@ def test_vec_matches_single():
         np.testing.assert_array_equal(ov, o1)
         assert rv[0] == np.float32(r1) and bool(dv[0]) == done1
     assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
-                               single.misses, single.n_notes, single.score)
+                               single.misses, single.n_notes, single.score,
+                               single.bombs_hit)

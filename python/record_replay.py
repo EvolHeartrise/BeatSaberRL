@@ -45,6 +45,9 @@ def parse_args():
     p.add_argument("--note-speed-max", type=float, default=None)
     p.add_argument("--continuous-dirs", action="store_true",
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
+    p.add_argument("--bomb-rate", type=float, default=0.0)
+    p.add_argument("--chain-prob", type=float, default=0.0)
+    p.add_argument("--arc-prob", type=float, default=0.0)
     return p.parse_args()
 
 
@@ -55,7 +58,8 @@ def main():
               cols=tuple(args.cols), rows=tuple(args.rows),
               chart_len_s=args.chart_len, min_hand_gap_s=args.min_hand_gap,
               note_speed=args.note_speed, note_speed_max=args.note_speed_max,
-              continuous_dirs=args.continuous_dirs)
+              continuous_dirs=args.continuous_dirs, bomb_rate=args.bomb_rate,
+              chain_prob=args.chain_prob, arc_prob=args.arc_prob)
 
     policy = None
     if args.ckpt:
@@ -90,7 +94,8 @@ def main():
             obs, r, done, _, info = env.step(act)
             tot += r
         print(f"  {path}: return {tot:6.2f} | good {info['good_cuts']}/{info['n_notes']} "
-              f"bad {info['bad_cuts']} miss {info['misses']} | "
+              f"bad {info['bad_cuts']} miss {info['misses']} "
+              f"bombs {info['bombs_hit']} | "
               f"score {info['score'] / max(info['n_notes'], 1):.1f}/115")
 
 

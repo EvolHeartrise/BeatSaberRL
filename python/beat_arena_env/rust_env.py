@@ -18,7 +18,7 @@ import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import EVENT_REASONS, OBS_DIM
+from .constants import EVENT_REASONS, OBS_DIM, note_center
 
 from beat_arena_rs import RawBeatSim
 
@@ -30,6 +30,7 @@ class RustBeatEnv(gym.Env):
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, external_chart=None,
+                 bomb_rate=0.0, chain_prob=0.0, arc_prob=0.0,
                  seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
@@ -39,6 +40,7 @@ class RustBeatEnv(gym.Env):
             min_hand_gap_s=min_hand_gap_s,
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
+            bomb_rate=bomb_rate, chain_prob=chain_prob, arc_prob=arc_prob,
         )
         self._base_seed = seed
         self._episode = 0
@@ -46,10 +48,12 @@ class RustBeatEnv(gym.Env):
         self._record_lines = None
         self.chart = []
         self._external = list(external_chart) if external_chart else None
+        # +90 ticks: the episode tail must cover the miss-boundary trip
+        # (Z_MISS 2.65 m at the slowest speeds) past the last note
         if self._external:
-            max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 30
+            max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 90
         else:
-            max_steps = int(chart_len_s * 30) + 30
+            max_steps = int(chart_len_s * 30) + 90
         self.sim = RawBeatSim(max_steps=max_steps)
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
@@ -65,7 +69,7 @@ class RustBeatEnv(gym.Env):
 
     def _start_record(self):
         header = {"header": {
-            "version": 6,
+            "version": 7,
             "config": {
                 "note_rate": self.cfg.note_rate,
                 "chart_len_s": self.cfg.chart_len_s,
@@ -75,10 +79,19 @@ class RustBeatEnv(gym.Env):
                 "note_speed": self.cfg.note_speed,
                 "note_speed_max": self.cfg.note_speed_max,
                 "continuous_dirs": self.cfg.continuous_dirs,
+                "bomb_rate": self.cfg.bomb_rate,
+                "chain_prob": self.cfg.chain_prob,
+                "arc_prob": self.cfg.arc_prob,
             },
-            "chart": [{"t": n.hit_time, "col": n.col, "row": n.row,
+            # env v7: explicit world positions (meters), object kinds and
+            # arc grants; the viewer derives everything from these
+            "chart": [{"t": n.hit_time,
+                       "x": round(note_center(n)[0], 4),
+                       "y": round(note_center(n)[1], 4),
                        "color": n.color, "angle": round(n.angle, 5),
-                       "speed": round(n.speed, 4), "any": n.any_dir}
+                       "speed": round(n.speed, 4), "any": n.any_dir,
+                       "kind": n.kind,
+                       "fpre": n.free_pre, "fpost": n.free_post}
                       for n in self.chart],
         }}
         self._record_lines = [json.dumps(header)]
@@ -95,6 +108,7 @@ class RustBeatEnv(gym.Env):
                 {"miss": {"note": int(i)}} if code == 4 else
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}
                 if code == 5 else
+                {"bomb": {"note": int(i)}} if code == 6 else
                 {"cut": {"note": int(i), "good": code == 0,
                          "reason": EVENT_REASONS[code],
                          "points": round(float(pts), 2)}}
@@ -129,5 +143,5 @@ class RustBeatEnv(gym.Env):
         if done:
             info.update(good_cuts=self.sim.good_cuts, bad_cuts=self.sim.bad_cuts,
                         misses=self.sim.misses, n_notes=self.sim.n_notes,
-                        score=self.sim.score)
+                        score=self.sim.score, bombs_hit=self.sim.bombs_hit)
         return obs, float(reward), bool(done), False, info

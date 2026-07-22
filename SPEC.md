@@ -18,8 +18,11 @@ curriculum + generalization eval) → v3 (parse real BeatSaver `.dat` maps,
 sight-read eval) → v4 (dynamic gym: continuous angles, per-note speeds)
 → v5 (blade sabers: wrist rotation DOFs, real saber length, 115-point
 graded swing scoring; v5.3 = notes are rotated boxes)
-→ **v6 (kinematic upper body: shoulder→elbow→wrist arm chains —
-current)**.
+→ v6 (kinematic upper body: shoulder→elbow→wrist arm chains)
+→ **v7 (real Beat Saber geometry & judgment: real lanes/rows/hitboxes,
+swept-surface collision, integer 115, bombs/chains/arcs — current)**.
+v7's constants are sourced from the ArcViewer + BeatLeader code
+inventory: `../research/2026-07-22-bs-mechanics-inventory.md`.
 
 ## Layout
 
@@ -49,29 +52,28 @@ Uses kiting-arena's venv: `../kiting-arena/python/.venv` (torch-cpu,
 gymnasium, pufferlib 3.0, pytest). No new dependencies in v0. No GPU;
 paths contain a space — quote everything.
 
-## Sim rules (`rust/src/lib.rs`) — env v6: kinematic upper body
+## Sim rules (`rust/src/lib.rs`) — env v7: real geometry & judgment
 
-Env v6 (2026-07-22, user-designed): the wrists stop being free-floating
-points on a plane. Each hand is a **kinematic chain from a fixed
-shoulder anchor**: upper arm → elbow (hinge) → forearm → the v5.2 wrist
-(roll + bend) → 1 m blade. No forces/torque interactions between
-segments — every joint integrates identically (accel, drag, ω cap,
-anatomical limits that zero ω). The wrist is wherever forward kinematics
-puts it, fully 3D. Cuts remain blade-through-rotated-box sweeps scored
-with the real Beat Saber 115-point system. All v5.x checkpoints/replays
-retire (hard replace).
+Env v7 (2026-07-22, research-driven): the v6 body plays in the REAL
+Beat Saber world. Geometry, hitboxes, scoring arithmetic, and the new
+object types are sourced from the ArcViewer/BeatLeader inventory
+(`research/2026-07-22-bs-mechanics-inventory.md`). All v6
+checkpoints/replays retire (hard replace).
 
 - Fixed tick `DT = 1/30` s. One policy action per tick.
-- **World in METERS**, matching real Beat Saber block dimensions. The hit
-  plane is `z = 0`, centered on the origin. 4 columns × 3 rows grid on a
-  `CELL = 0.5` m lane pitch: cell `(col,row)` center =
-  `((col−1.5)·0.5, (row−1.0)·0.5)`, grid spans `[-1,1] × [-0.75,0.75]`
-  (y up). Notes are `BLOCK = 0.4` m cubes; `R = 0.28` m survives as the
-  accuracy normalizer. Notes fly in from +z.
-- **Body (realistic fixed proportions, user-locked)**: shoulder anchors
-  at `(∓0.2, 0.45, −0.35)` (0.4 m shoulder width, 0.45 m above grid
-  center, 0.35 m behind the hit plane); `L_UPPER = 0.35` m,
-  `L_FORE = 0.30` m, `SABER_LEN = 1.0` m.
+- **World in METERS, floor-based** (y = 0 is the floor). The hit plane
+  is `z = 0`; notes fly in from +z. 4 columns on the real **0.6 m lane
+  pitch**: column x = `(col−1.5)·0.6` ∈ {−0.9, −0.3, 0.3, 0.9}. 3 rows
+  at the real **non-uniform at-player heights** y = 0.85 / 1.40 / 1.90.
+  Notes spawn at their final heights (the real rise-in-flight gravity
+  arc is documented in the research doc, deliberately not modeled yet).
+  `BLOCK = 0.4` m is now VISUAL only — collision uses the real hitboxes
+  below. Objects carry explicit world positions `(x, y)` in the chart
+  (chain links sit off-grid on their Bézier).
+- **Body (v6 chains, real placement)**: a 1.8 m player — shoulder
+  anchors at `(∓0.2, 1.47, −0.65)` (0.4 m shoulder width, head at the
+  real 0.65 m cut-plane distance); `L_UPPER = 0.35` m, `L_FORE = 0.30`
+  m, `SABER_LEN = 1.0` m.
 - **Joints** per hand, in order `q = (pitch, yaw, twist, elbow, roll,
   bend)`; all-zero = arm straight forward (+z), blade its extension:
   - `pitch` ∈ ±90°: + = arm up (about x).
@@ -100,10 +102,12 @@ retire (hard replace).
   1 = `+α`, 2 = `−α`). Full action = `MultiDiscrete([3]×12)`, left hand
   first, joint order as above. No action masks. The 9-way translation
   head is GONE — all motion is joint-driven.
-- **Notes** (unchanged from env v4): chart = list of
-  `(hit_time, col, row, color, angle, speed, any_dir)` sorted by
-  `hit_time`; a note's 3D position is `(cell center, z)` with
-  **`z(t) = (hit_time − t) · speed`**.
+- **Objects** (env v7): chart = list of `(hit_time, x, y, color, angle,
+  speed, any_dir, kind, free_pre, free_post)` sorted by `hit_time`;
+  positions in meters; **`z(t) = (hit_time − t) · speed`**. `kind`:
+  0 = note, 1 = bomb, 2 = chain head, 3 = chain link. `free_pre` (arc
+  tail) grants the full 70 pre-swing; `free_post` (arc head) grants the
+  full 30 follow-through at the cut tick.
 - **Swing tracking** per hand (feeds the score): each tick, with
   `Δ = ∠(d_prev, d_cur)` (3D geodesic) and rotation axis
   `a = d_prev × d_cur` (normalized):
@@ -114,64 +118,71 @@ retire (hard replace).
   - otherwise `swing_acc += Δ`; axis stored. `swing_acc` therefore holds
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
-- **Cut evaluation** (env v5.3, 2026-07-22 — the note is its ACTUAL
-  cube): the collision volume is the 0.4 m cube **rotated about the
-  approach (z) axis by `rot = angle − 270°`** so the block tracks its
-  required cut direction — a down-swing note is axis-aligned (exactly
-  the old orientation), diagonal/precision angles tilt the square, dot
-  notes never rotate. (Before v5.3 contact was a rotation-blind sphere
-  of radius `R = 0.28` around the center; `R` survives only as the
-  accuracy normalizer.) A note is testable while
-  `−Z_MISS ≤ z ≤ REACH_Z = 1.5` m (max wrist z 0.3 with the arm
-  straight forward + 1 m blade + `HALF_BLOCK = 0.2`). Each tick the
-  blade sweep is approximated by `N_BLADE_SAMPLES = 8` points at
-  `s·SABER_LEN`, `s = 1/8 .. 8/8`: each sample's displacement segment
-  (prev wrist+pose → current wrist+pose, full 3D — wrists are 3D points
-  since env v6) is transformed into the note's rotated frame and
-  slab-clipped against the cube (segment-box intersection = crossed).
-  Matching-color saber first; contact sample `s*` = the **crossing**
-  sample with minimum distance-to-center `d_min` (distance still grades
-  accuracy; corner clips can exceed `R`, so accuracy floors at 0).
-- **Contact velocity** (env v6): the contact point's finite-difference
-  displacement over the tick, `v_c = (p1(s*) − p0(s*)) / DT` — exactly
-  the segment the collision test sweeps; no chain Jacobian. `|v_c| ≥
-  V_MIN = 1` m/s or the cut is `slow`; the in-plane direction check
-  `cos∠((v_c.x, v_c.y), dir_vec) ≥ 0.5` (dot notes exempt) is
-  unchanged.
-  - Contact velocity `v_c = (vx, vy, 0) + s*·SABER_LEN·ḋ` where
-    `ḋ = θ̇·(−cosφ·sinθ, cosφ·cosθ, 0) + φ̇·(−sinφ·cosθ, −sinφ·sinθ, cosφ)`
-    — wrist translation plus blade rotation at the contact point.
-  - Wrong-color saber crosses (checked only if matching didn't) →
-    **bad cut** (`wrong_hand`). Matching saber: `|v_c| < V_MIN = 1` m/s
-    → `slow`; else in-plane direction check
-    `cos∠((v_c.x, v_c.y), dir_vec) ≥ 0.5` (dot notes exempt) → **good
-    cut**, otherwise `angle`. Any cut consumes the note.
-- **Score** per good cut — real Beat Saber 115: 
-  - **pre-swing** `70 · min(swing_acc / 100°, 1)` — the wind-up arc.
-  - **accuracy** `15 · max(0, 1 − d_min/R)` — how centered the cut was.
-  - **follow-through** `30 · min(post_arc / 60°, 1)` — a per-note
-    tracker opens at the cut and accumulates the hand's subsequent swing
-    arc under the same chain rules (break/reversal ends it); it resolves
-    when 60° is reached, the chain ends, `FOLLOW_TIMEOUT = 15` ticks
-    pass, or the episode terminates.
-- **Reward per tick**: good cut pays `(pre + accuracy)/115` at the cut
-  tick and `follow-through/115` at its resolution tick (max total +1.0
-  per note, same scale as v4); bad cut `−0.5`; miss `−0.5`. A
-  rotation-free "stab" (translation only) is a valid good cut but scores
-  only accuracy (≤ 15/115) — swinging is now the whole game.
-- **Miss**: the note passes `z < −Z_MISS = 0.6` m uncut → consumed as
-  missed.
+- **Hitboxes** (env v7 — the real ones, axis-aligned, NOT the visual
+  cube; they do NOT rotate with the cut direction — v5.3's rotated
+  collision cube is retired, the real game is axis-aligned and
+  forgiving):
+  - **Good-cut box** (matching saber only): `0.8 × 0.5 × 1.0` m,
+    center shifted `0.25` m toward the player — spans z
+    `[note_z − 0.75, note_z + 0.25]`, so early and off-center swings
+    connect. Dot notes are `0.8` tall (modern "new dots"); chain links
+    `0.2` tall.
+  - **Small box** (wrong-color saber only): `0.35³` (links
+    `0.35 × 0.1 × 0.35`), centered — smaller than the visual cube, so
+    off-hand corner grazes are forgiven.
+  - **Bomb**: sphere `r = 0.18`, either saber.
+- **Saber sweep** (env v7): the full swept SURFACE between the previous
+  and current blade segments — quad `(w0→t0, w1→t1)` split into
+  triangles `(w0, t0, t1)` and `(w0, t1, w1)` — tested against the
+  boxes with the Akenine-Möller triangle-AABB SAT (no sampled-segment
+  tunneling; thin chain links stay hittable). An object is testable
+  while `−Z_MISS ≤ z ≤ REACH_Z = 1.75` (max wrist z 0.0 + blade 1.0 ≥
+  good-box near face at `note_z − 0.75`).
+- **Contact point & velocity**: `s*` = the blade sample
+  (`N_BLADE_SAMPLES = 8`) whose displacement segment passes closest to
+  the object center; `v_c = (p1(s*) − p0(s*)) / DT`. `|v_c| ≥ V_MIN =
+  1` m/s or the cut is `slow`; in-plane direction check
+  `cos∠((v_c.x, v_c.y), dir_vec) ≥ 0.5` (dots and chain links exempt).
+- **Judgment order** per pending object: bombs — either saber's sweep
+  within `0.18` of center → **bomb hit** (event code 6). Notes/heads/
+  links — matching saber vs good box → judged (slow/angle/good);
+  matching saber missed → wrong-color saber vs SMALL box →
+  `wrong_hand`. Any cut consumes the object.
+- **Score** per good cut — real integer Beat Saber points, every
+  component `floor(x + 0.5)`-rounded:
+  - **pre-swing** `round(70 · min(swing_acc / 100°, 1))`; `free_pre`
+    (arc tail) → flat 70.
+  - **accuracy** `round(15 · (1 − clamp(d_min / 0.3, 0, 1)))` where
+    `d_min` = closest approach of the swept surface to the object
+    center (the real 0.3 m normalizer; a cut far from the center plane
+    — including EARLY cuts through the deep box — floors at 0).
+  - **follow-through** `round(30 · min(post_arc / 60°, 1))` — tracker
+    unchanged (break/reversal ends it, `FOLLOW_TIMEOUT = 15`);
+    `free_post` (arc head) → flat 30 paid at the cut tick, no tracker.
+  - **Chain heads**: pre + accuracy only, max 85 — no follow-through.
+  - **Chain links**: flat 20 on any valid cut (color + speed;
+    direction exempt) — no pre/acc/post.
+- **Reward per tick**: good cut pays `pts/115` (so a link is +20/115, a
+  head ≤ 85/115); bad cut `−0.5`; miss `−0.5`; **bomb hit `−0.5`**;
+  a bomb passing by is free and silent. A rotation-free "stab" scores
+  only accuracy (≤ 15/115) — swinging is the game.
+- **Miss**: the object passes `z < −Z_MISS = 2.65` m uncut (~2 m behind
+  the head — the real game judges misses at despawn; objects stay
+  CUTTABLE until then). Bombs passing are consumed silently (status 4,
+  no event). The episode tail after the last `hit_time` is
+  `0.5 + Z_MISS / min_speed` so final misses always register.
 - **No reward shaping** (mechanism REMOVED 2026-07-21, user direction):
   rewards come only from the sim's scoring, like real Beat Saber. The
   potential-based shaping (Ng et al. 1999) used in v0's earliest runs was
   already off by default in the pure-reward era (2026-07-20); its code
   and the `shaping_coef` knob are now deleted everywhere.
-- **Termination**: all notes consumed AND no follow-through pending (so
-  the last note's post-swing isn't truncated), or
-  `t > last hit_time + 0.5 s`, or tick count = `max_steps` (default
-  `chart_len_s·30 + 30`); the hard ends force-resolve pending
-  follow-throughs with their partial arcs. All ends are termination (no
-  bootstrap-relevant truncation — episodes are natural-length).
+- **Termination**: all objects consumed AND no follow-through pending
+  (so the last note's post-swing isn't truncated), or
+  `t > last hit_time + tail` (tail = `0.5 + Z_MISS/min_speed`), or tick
+  count = `max_steps` (default `chart_len_s·30 + 90`); the hard ends
+  force-resolve pending follow-throughs with their partial arcs. All
+  ends are termination (no bootstrap-relevant truncation — episodes are
+  natural-length).
 - **RNG**: `numpy.random.Generator(PCG64(seed))`; all randomness (chart
   gen) flows from it. Same seed + same action sequence ⇒ identical episode.
 
@@ -182,47 +193,57 @@ retire (hard replace).
 `dirs` (allowed subset of 0..7, default `[6]` = down-swings),
 `min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
 restricting them is a spatial curriculum dial), `note_speed` (m/s toward
-the plane, default 4.0).
+the plane, default 4.0), and the **env v7 object dials** (all default
+0): `bomb_rate` (bombs/s), `chain_prob` (P(non-dot note → chain)),
+`arc_prob` (P(consecutive same-color pair → arc)).
 
 Generation: first note at `t = 1.0`; successive intervals
 `(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
 is pushed later if its hand's previous note is closer than `min_hand_gap_s`
 (physical-feasibility guarantee — the same hand is never asked to be in two
 places at once faster than it can travel). Col/row uniform over the grid.
+Chains: sc ∈ 3..6 pieces, tail `U(0.10, 0.25)` s later, 1-2 cells along
+the head's direction; links laid on the real quadratic Bézier
+(`chart.chain_links`: control point = head + dirVec·dist/2, link i at
+curve parameter `(i/(sc−1))·squish`, time lerped unsquished, angle =
+curve tangent — BeatLeader beat.js:424-463); the hand is busy until the
+tail. Bombs: an independent `(1/bomb_rate)·U(0.8, 1.2)` stream, cell
+re-rolled up to 4× to avoid sitting within 0.3 m / 0.25 s of a note.
+Arcs: consecutive same-color plain-note pairs ≤ 2 s apart get
+`free_post` (head) + `free_pre` (tail).
 
 ## Observation layout (exact, all f32) — order is a contract
 
-Obs v5 (env v6 arm state; note block unchanged from v3):
+Obs v6 (env v7 — 16 object slots × 14 features; sabers unchanged from
+obs v5 except y normalization):
 
 - `sabers: [f32; 46]` = per hand (left then right), 23 features:
   `[pitch/90°, yaw/100°, twist/90°, (2·elbow−150°)/150°, cosψ, sinψ,
-  bend/95°, ω(6)/Ω_joint, wrist x/1, y/0.75, z/1, wrist_vel(3)/6,
+  bend/95°, ω(6)/Ω_joint, wrist x/1, (y−1.4)/0.75, z/1, wrist_vel(3)/6,
   blade dir(3), min(swing_acc/100°, 2)]` — joint pose (bounded scalars
   normalized to their ranges; roll keeps its v5 cos/sin coding),
   per-joint angular velocities, then the DERIVED hand state the reward
-  actually runs on: FK wrist position (3D), finite-difference wrist
-  velocity, unit blade direction, and the live pre-swing meter (1.0 =
-  full credit banked; clipped at 2).
-- `notes: [[f32; 9]; 12]` — the next 12 *pending* (uncut, unmissed) notes
-  in arrival order, slot 0 = soonest. Per note:
-  `[cx/1, cy/0.75, z/8 (z clipped to [−1, 12] m — the negative tail keeps
-  "past the plane but still in the slab" visible), vz/8 (= −speed/8,
-  PER-NOTE since env v4 — vz is a live feature under variable speeds),
-  is_left, is_right, dir_cos, dir_sin, valid=1]`. The direction is its
-  UNIT VECTOR (cos θ, sin θ) — obs v3, 2026-07-20, replacing the 8-dim
-  one-hot: continuous precision angles drop in without an obs change, and
-  the network receives the exact object the cut rule uses
-  (`cos∠ = v·d/|v|`); adjacent directions share representation. Empty
-  slots all-zero.
-  Slots SHIFT as notes are consumed (no stable identity — nothing targets
-  a slot by index; contrast kiting-arena's frozen slots).
-- `note_mask: [f32; 12]` — 1.0 = slot holds a pending note.
+  actually runs on: FK wrist position (3D; y centered on the middle
+  row), finite-difference wrist velocity, unit blade direction, and the
+  live pre-swing meter (1.0 = full credit banked; clipped at 2).
+- `notes: [[f32; 14]; 16]` — the next 16 *pending* objects (notes,
+  bombs, chain heads/links) in arrival order, slot 0 = soonest. Per
+  object: `[x/1, (y−1.4)/0.75, z/8 (clipped to [−3, 12] m — the
+  negative tail keeps "behind the plane but still cuttable" visible),
+  vz/8 (= −speed/8, per-object), is_left, is_right, dir_cos, dir_sin,
+  is_bomb, is_chain_head, is_chain_link, free_pre, free_post,
+  valid=1]`. Direction stays the unit vector; dot notes encode the ZERO
+  vector; **chain links carry their Bézier tangent** (path information
+  — `is_chain_link` disambiguates; they still judge as any-direction).
+  Bombs have no color one-hot and no direction. Empty slots all-zero.
+  Slots SHIFT as objects are consumed (no stable identity; 16 slots so
+  a chain burst doesn't evict upcoming notes).
+- `note_mask: [f32; 16]` — 1.0 = slot holds a pending object.
 
-**Flat vector:** `sabers(46) ++ notes row-major(108) ++ note_mask(12)` →
-**length 166**. Offsets: notes at 46, mask at 154. Checkpoints from obs
-v1 (188), v2 (200), v3 (128, point sabers), and v4 (140, planar wrists —
-the whole v5.x lineage incl. the 99.1% v5.2 record) are all
-incompatible.
+**Flat vector:** `sabers(46) ++ notes row-major(224) ++ note_mask(16)` →
+**length 286**. Offsets: notes at 46, mask at 270. Checkpoints from all
+earlier obs versions (incl. the 166-dim v6 lineage and its 99.5%
+record) are incompatible.
 
 There is deliberately NO time feature: with constant speed,
 `time_until = z/|vz|` — the approach axis carries the temporal ordering
@@ -233,33 +254,36 @@ statistic for arrival). Both properties are pinned by tests.
 ## Gymnasium env (`beat_arena_env/rust_env.py`)
 
 `RustBeatEnv(note_rate, colors, dirs, continuous_dirs, chart_len_s,
-min_hand_gap_s, cols, rows, note_speed, note_speed_max,
-seed)`:
-`observation_space = Box(-2, 2, (166,))` (bounds loose),
+min_hand_gap_s, cols, rows, note_speed, note_speed_max, bomb_rate,
+chain_prob, arc_prob, seed)`:
+`observation_space = Box(-2, 2, (286,))` (bounds loose),
 `action_space = MultiDiscrete([3]×12)` (per hand: pitch, yaw, twist,
 elbow, roll, bend; left first). New chart every `reset(seed)` (chart
 gen stays in Python — single source for charts). Per-step `info["events"]` =
 (note_idx, reason, points) from the Rust event stream (reason `post` =
-follow-through resolution, note already counted); final step adds
-`good_cuts, bad_cuts, misses, n_notes, score` (score = summed points;
-max = 115 · n_notes). `set_record(path)` dumps replay JSONL v4 built
-from those events. Batched training path:
+follow-through resolution, note already counted; `bomb` = bomb hit);
+final step adds `good_cuts, bad_cuts, misses, n_notes, score,
+bombs_hit` (n_notes = scoreable objects, bombs excluded; score max =
+115·notes + 85·heads + 20·links). `set_record(path)` dumps replay JSONL
+v7 built from those events. Batched training path:
 `beat_arena_env/vec_env.py: BeatVecEnv` over `VecBeatSim`.
 
-## Replay log (JSONL, version 6)
+## Replay log (JSONL, version 7)
 
-Version 6 (env v6): saber entries carry the full arm state — 15 numbers
-per hand, `q(6) = [pitch, yaw, twist, elbow, roll, bend]` ++ `om(6)` ++
+Version 7 (env v7): chart entries carry EXPLICIT world positions and
+object kinds; saber entries keep the v6 arm state — 15 numbers per
+hand, `q(6) = [pitch, yaw, twist, elbow, roll, bend]` ++ `om(6)` ++
 the FK `wrist [x, y, z]` (logged so viewers/tools can validate their FK
 mirrors); cut events carry `points` (pre+accuracy at the cut,
-follow-through via a separate `post` event); the action is the 12-int
-vector. v5 replays and older (retired planar-wrist parameterizations)
-are rejected.
+follow-through via a separate `post` event); bomb hits are `bomb`
+events; the action is the 12-int vector. v6 replays and older are
+rejected.
 
 ```json
-{"header": {"version": 6, "config": {..., "note_speed": 4.0}, "chart": [{"t":1.0,"col":2,"row":1,"color":1,"angle":4.712,"speed":4.0,"any":false}, ...]}}
+{"header": {"version": 7, "config": {..., "note_speed": 4.0, "bomb_rate": 0.0, "chain_prob": 0.0, "arc_prob": 0.0},
+ "chart": [{"t":1.0,"x":0.3,"y":1.4,"color":1,"angle":4.712,"speed":4.0,"any":false,"kind":0,"fpre":false,"fpost":false}, ...]}}
 {"t": 0, "time": 0.0, "sabers": [[pitch,yaw,twist,elbow,roll,bend, om...6, wx,wy,wz],[...]], "action": [0,1,0,2,1,0, 0,0,1,0,2,0],
- "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok", "points": 78.4}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand", "points": 0}} | {"post": {"note": 3, "points": 26.1}} | {"miss": {"note": 5}}]}
+ "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok", "points": 78}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand", "points": 0}} | {"post": {"note": 3, "points": 26}} | {"miss": {"note": 5}} | {"bomb": {"note": 6}}]}
 ```
 
 **Viewer** (`viz/replay.html`, since 2026-07-21 a **Svelte 5 + Threlte 8
@@ -278,18 +302,25 @@ Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 `node test/browser.test.js` drives the built file in headless Edge
 (loads a real replay via the file input, asserts playback advances with
 zero page errors, screenshots to `test/out/`). Scene (world → three.js:
-`(x, y, z) → (x, y, −z)`, camera on +z): tunnel rails + depth rings to
-`z = 12` m, the 4×3 plane grid, the blade-reach region (z −0.6..1.5)
-drawn faintly, 40 cm note cubes **rotated to their cut direction (env
-v5.3, matching the sims' collision volume; dot notes stay square)**
-with required-direction arrows / dot discs (white edge outline while in
-reach), and since env v6 the **whole upper body**: a torso hint
-(shoulder crossbar + trunk box behind the plane) and per hand the
-upper-arm/forearm segments with shoulder/elbow/wrist joints (positions
-from `armFK`, the JS mirror of the sim's FK — validated against the
-sim-logged wrist in the node tests) plus the blade wrist→tip as a
-cylinder (white-hot core when the TIP is contact-capable ≥ 1 m/s via
-the finite-difference velocity semantics) with 10-tick tip trails.
+`(x, y, z) → (x, y, −z)`, camera on +z, orbit target y 1.4): a FLOOR
+plane at y = 0, tunnel rails + depth rings to `z = 12` m, the 4×3 grid
+at the real v7 lane/row positions, the blade-reach region
+(z −2.65..1.75) drawn faintly, and per-kind objects at their explicit
+chart `(x, y)`: 40 cm note cubes visually rotated to their cut
+direction with arrows / dot discs, **bombs** (black spheres, red flash
++ "bomb!" on hit, silent despawn at z −2.65), **chain heads**
+(half-height cubes), **chain links** (thin tinted slabs, shrink/pop +
+"+20" on cut), and **arc hints** (faint tube from each fpost head to
+its fpre tail + "free pre/post" glyphs). `h` toggles the REAL hitbox
+wireframes (shifted good boxes, dot/link variants, small wrong-color
+box, bomb sphere). Since env v6 the **whole upper body** renders: a
+torso (shoulder crossbar at 1.47, trunk + legs hint to the floor,
+head sphere) and per hand the upper-arm/forearm segments with
+shoulder/elbow/wrist joints (positions from `armFK`, the JS mirror of
+the sim's FK — validated against the sim-logged wrist in the node
+tests) plus the blade wrist→tip as a cylinder (white-hot core when the
+TIP is contact-capable ≥ 1 m/s via the finite-difference velocity
+semantics) with 10-tick tip trails.
 Note glyphs are Beat Saber-style low-poly white chevrons / dot discs;
 a good cut slices the ACTUAL cube along the cut plane at its cut-tick
 z — the two colored half-cubes fly apart perpendicular to the swing,
@@ -313,17 +344,25 @@ Every interesting run should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
 
-Per hand, against its color's earliest pending note. Env v6: the
-blade-level plan survives from v5.2 (plant, cock up to
-`SWING_ARC = 130°`, whip through; the leftover rotation is the
-follow-through) but the executor is IK-driven:
+Per hand, against its color's earliest pending scoreable object (bombs
+are never targets; chain links are targeted with their TANGENT as the
+swing direction, so one whip sweeps consecutive links). Env v7 changes:
+the wrist plants at `PLANT_Z = −0.25` (shoulders sit 0.65 m behind the
+plane — an on-plane wrist would be at full stretch), and the whip is
+timed to pass through the contact angle `EARLY_S = 0.10` s BEFORE
+`hit_time` — the elongated good box reaches the blade zone early, and a
+plane-timed swing gets caught mid-wind-up (`angle`/`slow`); cutting
+early inside the deep box is exactly what real players do. Otherwise
+the v6 plan survives (plant, cock up to `SWING_ARC = 130°`, whip
+through; the leftover rotation is the follow-through):
 
 1. **Plant**: the wrist goal slides along the ray
-   `center − s·(cosθ_c, sinθ_c, 0)` (both perpendicular candidates,
-   s ∈ [0.3, 0.95], ideal s = 0.75) to the most reachable point;
-   `kinematics.ik_arm(hand, goal, swivel="back")` solves closed-form
-   two-link IK with the elbow pushed toward −z, which keeps the FOREARM
-   pointing at the notes — roll-swings then sweep near the hit plane.
+   `center − s·(cosθ_c, sinθ_c, 0)` + `(0, 0, PLANT_Z)` (both
+   perpendicular candidates, s ∈ [0.3, 0.95], ideal s = 0.75) to the
+   most reachable point; `kinematics.ik_arm(hand, goal, swivel="back")`
+   solves closed-form two-link IK with the elbow pushed toward −z,
+   which keeps the FOREARM pointing at the notes — roll-swings then
+   sweep near the hit plane.
 2. **Re-aim**: the contact blade orientation is `θ_aim` = wrist→note
    from the pose the arm will actually reach (exact when the plant is
    reachable, best-effort otherwise — the 60° cut tolerance absorbs the
@@ -339,9 +378,12 @@ follow-through) but the executor is IK-driven:
 
 Stateless per tick; solvability proof and eyeball baseline, not
 optimal. Must land ≥ 80% good cuts on the default easy chart (tested),
-with mean score well above the 15-point stab ceiling. The realistic
-body costs it dearly on harder configs (see README reference numbers) —
-by design ("that's the game").
+with mean score well above the 15-point stab ceiling. Its flat-blade
+technique caps accuracy (~5 of 15 — the blade plane sits ~0.2 m behind
+the note center; forward-TILTED blades sweeping through the box depth
+are the real-BS high-accuracy technique, open to the learned policy).
+The realistic body costs it dearly on harder configs (see README
+reference numbers) — by design ("that's the game").
 
 ## Policy (`python/policy.py`)
 
@@ -349,15 +391,15 @@ by design ("that's the game").
 2026-07-20 after the easy-config studies concluded; checkpoints still
 record `encoder: "transformer"`):
 
-- Per-note MLP `9 → 64 → 64` (shared across the 12 slots).
-- Per-saber token MLP `25 → 64 → 64` on the 23 obs-v5 arm features +
+- Per-note MLP `14 → 64 → 64` (shared across the 16 object slots).
+- Per-saber token MLP `25 → 64 → 64` on the 23 obs-v6 arm features +
   `[is_left, is_right]` (hand identity via one-hot, weights shared).
-- Token sequence = `[saber_L, saber_R, note_0..11]` (14 tokens); key mask
+- Token sequence = `[saber_L, saber_R, note_0..15]` (18 tokens); key mask
   `[1, 1, note_mask]`. **2 × full pre-LN transformer blocks** (LayerNorm →
   single-head QKV self-attention → residual; LayerNorm → FFN 64→128→64 →
   residual). Readout = concat of the two saber tokens' output embeddings
   (128) → trunk.
-- Trunk `→ 128 → 128`, heads (env v6): 12 × 3-way — per hand
+- Trunk `→ 128 → 128`, heads (unchanged since env v6): 12 × 3-way — per hand
   `pitch, yaw, twist, elbow, roll, bend`, left first — plus `value(1)`.
   All heads always execute; `logprob = Σ` over the twelve factored heads
   (pure independent factorization, as before).
@@ -421,17 +463,20 @@ memes (e.g. Dogbass, 17 notes / 4 s, 0.99★) are legitimate rungs.
 
 THE physics implementation (PyO3 0.22 + numpy 0.22; build with
 `VIRTUAL_ENV=<venv> maturin develop --release` from `rust/`). Charts are
-injected per episode via `set_chart` (~0.5 µs/step amortized).
+injected per episode via `set_chart` (env v7 tuples: `(t, x, y, color,
+angle, speed, any_dir, kind, free_pre, free_post)`).
 `RawBeatSim.step(actions)` (12 ints, per hand pitch/yaw/twist/elbow/
 roll/bend) returns `(obs, reward, done, events)` — events = `(note_idx,
 code, points)` with codes 0 ok / 1 slow / 2 angle / 3 wrong_hand /
-4 miss / 5 post (follow-through resolution) — plus getters `sabers()`
-(per hand `q(6) ++ om(6) ++ wrist(3)`), `blades()` (unit blade dirs),
-`status()/time/score/counters` and a `set_joints(s, q, om)` test hook
-(FK cache refreshes immediately). `VecBeatSim` steps N sims per FFI
-call (actions `(N, 12)` i64); `counters(i)` = `(good, bad, miss,
-n_notes, score)`. The scenario tests in `tests/test_env.py` gate every
-rule change.
+4 miss / 5 post (follow-through resolution) / 6 bomb hit — plus getters
+`sabers()` (per hand `q(6) ++ om(6) ++ wrist(3)`), `blades()` (unit
+blade dirs), `status()` (0 pending / 1 good / 2 bad·bomb-hit / 3 missed
+/ 4 bomb passed), `bombs_hit`, `n_notes` (scoreable, bombs excluded),
+`time/score` and a `set_joints(s, q, om)` test hook (FK cache refreshes
+immediately). `VecBeatSim` steps N sims per FFI call (actions `(N, 12)`
+i64); `counters(i)` = `(good, bad, miss, n_scoreable, score,
+bombs_hit)`. The scenario tests in `tests/test_env.py` gate every rule
+change.
 
 Measured 2026-07-20 (8-core CPU): Python `env.step` 137 µs vs Rust
 2.18 µs (**63×**; raw sim call 1.19 µs — the difference is gym-wrapper
@@ -471,32 +516,46 @@ Further gains need a GPU or a cheaper policy, not more envs.
 
 ## Tests (`python/tests/`, pytest)
 
-1. Obs layout: length 166, offsets, arm-state block, mask semantics;
-   the Python FK/IK mirror (`kinematics.py`) pinned against the sim's
-   getters on random poses.
-2. Determinism: same seed + fixed action stream ⇒ identical rewards and
-   events across two runs.
+1. Obs layout: length 286, offsets, arm-state block, kind/arc flags,
+   mask semantics; the Python FK/IK mirror (`kinematics.py`) pinned
+   against the sim's getters on random poses.
+2. Determinism: same seed + fixed action stream (all object kinds in
+   the chart) ⇒ identical rewards and events across two runs.
 3. Cut detection unit scenarios driven on the RUST sim via `set_joints`
    + the event stream, mostly in the "aligned wrist frame" pose family
    (`pitch = −elbow + δ, yaw = twist = 0` makes the wrist frame a pure
-   `R_x(−δ)`, so v5's flat-blade geometry carries over): rotational
-   good cut with sensible points; too-slow → `slow`; opposite swing →
-   `angle`; wrong hand → `wrong_hand`; untouched → miss exactly at the
-   z = −0.6 exit; a pure SHOULDER-pitch pendulum cuts (arm swings work
-   without the wrist) and its accuracy drops off-column; full pre-swing
-   wind-up ≈ 70+acc points; follow-through emits a `post` event (total
-   ≈ 115); the arm-forward start pose contacts early notes a flat blade
-   can't reach; every joint's limit clamps and kills its ω; rotation
-   matters (a flat blade passing 0.22 m above the center line misses an
-   axis-aligned note but touches a 57°-rotated one's corner; dot notes
-   stay axis-aligned whatever their angle field says).
-   Recording round-trip (JSONL v4 counters + score match the sim) and
-   VecBeatSim(1) ≡ RawBeatSim.
-4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset.
+   `R_x(−δ)`, which fixes the world x axis — a ±x blade stays exactly
+   in a z = const plane; δ = 0.7 parks it at row-1 height): rotational
+   good cut with sensible INTEGER points; too-slow → `slow`; opposite
+   swing → `angle`; wrong hand only via the SMALL box (`wrong_hand`;
+   the same placement that the good box catches is out of the small
+   box's reach); the good box's 0.75 m front extension allows early
+   cuts (~0.5 m out) but not too early (~0.8 m); dot notes have the
+   0.8 m-tall box (arrow notes don't); untouched → miss exactly at the
+   z = −2.65 exit; a pure SHOULDER-pitch pendulum cuts and its accuracy
+   drops off-column; full pre-swing wind-up → 70 + follow-through 30;
+   chain links pay flat 20 from any direction but still need speed;
+   chain heads never emit `post` (max 85); `free_pre`/`free_post` grant
+   their components; bombs: sweep-through = code-6 event and −0.5,
+   pass-by = silent (status 4); the small bomb sphere ignores a blade
+   0.38 m above it; the arm-forward start pose contacts early notes a
+   flat blade can't reach; every joint's limit clamps and kills its ω.
+   Recording round-trip (JSONL v7 counters + score match the sim) and
+   VecBeatSim(1) ≡ RawBeatSim (6-tuple counters).
+4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset;
+   the v7 dials produce their kinds; chain-link Bézier layout (times
+   strictly increasing to the tail, positions marching along the curve).
 5. Policy junk-leak: garbage in masked note slots changes no
    logprob/entropy/value (key-masking).
 6. Scripted bot ≥ 80% good cuts on default easy chart (solvability).
 7. Curriculum (offline, network monkeypatched): state save/load
    round-trip, newest-map sample weighting, per-stage episode
    bookkeeping, promotion appends the next rung, `chart_sampler` path
-   through `BeatVecEnv`, `greedy_fc_eval` counters.
+   through `BeatVecEnv`, `greedy_fc_eval` counters (bombs break FC).
+   NOTE: the ladder tests skip when the local (gitignored) fixture zips
+   are absent.
+8. BeatSaver parser fixtures: v2 (notes + bombs + dots), v3 (chains
+   with the link Bézier, arcs as grants, precision angles, BPM change
+   events), v4 (index-indirected arrays, dot chain heads), and the
+   paired-note ANGLE SNAP rule (snapped diagonal pair; same-column
+   control pair unsnapped).

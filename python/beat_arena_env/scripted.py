@@ -20,8 +20,9 @@ from __future__ import annotations
 import numpy as np
 
 from .constants import (
-    ALPHA_WRIST, DRAG, DT, JOINT_ALPHA, JOINT_OMEGA, L_FORE, L_UPPER,
-    OMEGA_WRIST, SABER_LEN, SHOULDER, joint_limits, note_center,
+    ALPHA_WRIST, DRAG, DT, JOINT_ALPHA, JOINT_OMEGA, KIND_BOMB,
+    KIND_CHAIN_LINK, L_FORE, L_UPPER, OMEGA_WRIST, SABER_LEN, SHOULDER,
+    joint_limits, note_center,
 )
 from .kinematics import fk, ik_arm, wrist_for_blade
 
@@ -31,6 +32,16 @@ FOLLOW_AIM = np.radians(70.0)  # whip target past contact (follow-through room)
 REACH = L_UPPER + L_FORE - 0.02   # usable wrist-reach radius around a shoulder
 K_JOINT = 4.0             # per-joint arrival gain (1/s)
 K_WRIST = 10.0            # wrist roll/bend tracking gain (1/s)
+# env v7: shoulders sit 0.65 m behind the hit plane, so a wrist ON the
+# plane is at full stretch — plant it here instead. The roll-swing sweeps
+# in a plane near the wrist's z; the good hitbox (note_z - 0.75 ..
+# note_z + 0.25) contains z = -0.25 while the note is near the plane.
+PLANT_Z = -0.25
+# whip THROUGH the contact angle this early: the elongated hitbox reaches
+# the blade zone ~0.15 s before hit_time, so a plane-timed swing gets
+# caught mid-wind-up ('angle'/'slow'). Cutting early inside the deep box
+# is exactly what real players do.
+EARLY_S = 0.10
 
 # idle pose per hand: arm dropped and out, elbow half bent, blade up
 PARK_Q = {
@@ -90,23 +101,25 @@ def _cut_config(hand, center3, angle):
     direction at contact, wrist ON the blade line through the note.
 
     For each swing sense the wrist goal slides along the ray
-    center - s * (cos th_c, sin th_c, 0): the search picks the s whose
-    goal the arm can reach (nearest s = CONTACT_S wins), so the blade
-    still passes through the note even when the ideal plant is out of
-    reach. Candidates ranked by leftover overreach."""
+    center - s * (cos th_c, sin th_c, 0), planted at z = PLANT_Z: the
+    search picks the s whose goal the arm can reach (nearest
+    s = CONTACT_S wins), so the blade still passes through the note even
+    when the ideal plant is out of reach. Candidates ranked by leftover
+    overreach."""
     sh = np.array(SHOULDER[hand])
+    plant = np.array([0.0, 0.0, PLANT_Z])
     best = None
     for sense, th_c in ((1.0, angle - np.pi / 2), (-1.0, angle + np.pi / 2)):
         ray = np.array([np.cos(th_c), np.sin(th_c), 0.0])
         s_best, over_best = CONTACT_S, np.inf
         for s in np.linspace(0.3, 0.95, 14):
-            over = max(0.0, float(np.linalg.norm(center3 - s * ray - sh))
-                       - REACH)
+            over = max(0.0, float(
+                np.linalg.norm(center3 - s * ray + plant - sh)) - REACH)
             key = (over, abs(s - CONTACT_S))
             if key < (over_best, abs(s_best - CONTACT_S)):
                 s_best, over_best = float(s), over
         if best is None or over_best < best[0]:
-            best = (over_best, sense, th_c, center3 - s_best * ray)
+            best = (over_best, sense, th_c, center3 - s_best * ray + plant)
     _, sense, th_c, goal = best
     return sense, th_c, goal
 
@@ -123,7 +136,13 @@ def _hand_action(hand, arm, time, target):
         return acts
 
     center3 = np.array([*note_center(target), 0.0])
-    angle = target.angle if not target.any_dir else 3 * np.pi / 2
+    # chain links carry their tangent as `angle`: swinging along the
+    # chain's path sweeps through consecutive links naturally. Plain dot
+    # notes get a default down-swing.
+    if not target.any_dir or target.kind == KIND_CHAIN_LINK:
+        angle = target.angle
+    else:
+        angle = 3 * np.pi / 2
     _, _, goal = _cut_config(hand, center3, angle)
     q_arm = ik_arm(hand, goal, swivel="back")
     acts = [_steer(q[j], om[j], q_arm[j], j) for j in range(4)]
@@ -160,7 +179,7 @@ def _hand_action(hand, arm, time, target):
     _, sense, back, r_c, b_c = best
     arc = float(np.clip(back - np.radians(5.0), np.radians(20.0), SWING_ARC))
 
-    t_until = target.hit_time - time
+    t_until = target.hit_time - EARLY_S - time
     if t_until > _swing_time(arc):
         # wind-up: cock the roll `arc` behind the contact roll (stable
         # target — same representative every tick)
@@ -186,6 +205,8 @@ def scripted_action(env):
     status = env.sim.status()
     targets = {0: None, 1: None}
     for i, n in enumerate(env.chart):
+        if n.kind == KIND_BOMB:            # bombs are never targets
+            continue
         if status[i] == 0 and targets[n.color] is None:
             targets[n.color] = n
         if targets[0] is not None and targets[1] is not None:
