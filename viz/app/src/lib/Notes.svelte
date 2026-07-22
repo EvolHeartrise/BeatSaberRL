@@ -125,10 +125,7 @@
   const dotGeo = new THREE.CircleGeometry(0.07, 12);   // low-poly BS dot
   const GLYPH_COL = "#f0f2f8";                          // BS-white glyphs
 
-  // notes stay cuttable all the way to the z = -2.65 miss boundary, but
-  // the white outline stops at the head plane — behind it the outline
-  // would project huge across the near camera
-  const inReach = (z) => z <= REACH_Z && z >= -0.65;
+  const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
 
   // arc hint tube: y-aligned cylinder -> segment between two world points
@@ -306,18 +303,16 @@
       opacity={alpha}
     />
   {:else}
-    <!-- bad cut / miss: reason label at the object's position when the
-         event fired. Misses now register at z = -2.65, well behind the
-         camera — the outline square is drawn only for bad cuts (near the
-         plane); a near-camera outline would fill the screen. -->
+    <!-- bad cut / miss: outline + reason at the object's position when
+         the event fired. Since env v7.3 misses register at the head
+         plane (z = -0.65) so the outline reads fine there; the clamp
+         only guards pre-v7.3 replays whose misses fired further back. -->
     {@const col = o.kind === "bad" ? BAD_COL : MISS_COL}
-    {@const zEv = (n.t - (o.tick + 1) * DT) * n.speed}
-    {#if o.kind === "bad"}
-      <T.LineSegments geometry={failGeo} position={[cx, cy, -zEv]}
-        rotation={[0, 0, noteRot(n)]}>
-        <T.LineBasicMaterial color={col} transparent opacity={alpha} />
-      </T.LineSegments>
-    {/if}
+    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS)}
+    <T.LineSegments geometry={failGeo} position={[cx, cy, -zEv]}
+      rotation={[0, 0, noteRot(n)]}>
+      <T.LineBasicMaterial color={col} transparent opacity={alpha} />
+    </T.LineSegments>
     <TextSprite
       text={o.reason.replace("_", " ")}
       color={col}

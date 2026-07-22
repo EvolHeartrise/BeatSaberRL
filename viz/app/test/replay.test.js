@@ -6,6 +6,7 @@ import {
   JOINT_NAMES, KIND_BOMB, activeArcs, activePosts, aftermaths, armFK,
   clampQ, counts, cutPlaneLocal, jointLimits, maxScore, mirrorQ,
   parseReplay, pendingNotes, poseSaber, saberAt, tipOf, tipSpeed, DT,
+  Z_MISS,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
@@ -61,8 +62,8 @@ for (const frac of [0, 0.3, 0.6, 0.9, 1.0]) {
   const p = pendingNotes(rep, t), a = aftermaths(rep, t),
     po = activePosts(rep, t), ar = activeArcs(rep, t);
   assert.ok(p.length + a.length >= 0 && po.length >= 0 && ar.length >= 0);
-  // objects past the miss boundary never linger in the pending list
-  p.forEach(({ z }) => assert.ok(z >= -2.65 - 1e-9 && z <= 12 + 1e-9));
+  // objects past the miss plane (head plane since v7.3) never linger
+  p.forEach(({ z }) => assert.ok(z >= -Z_MISS - 1e-9 && z <= 12 + 1e-9));
 }
 
 // arc pairs are sane: same color, tail after head, within the window

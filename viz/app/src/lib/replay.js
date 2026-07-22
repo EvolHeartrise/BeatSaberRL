@@ -4,7 +4,7 @@
 // World (env v7): floor-based coordinates, y = 0 is the floor. Lanes at
 // x = -0.9, -0.3, 0.3, 0.9 (0.6 m pitch); row centers y = 0.85, 1.40,
 // 1.90. Hit plane z = 0; objects approach from +z; misses register at
-// z = -2.65 (~2 m behind the head). Chart entries carry EXPLICIT world
+// z = -0.65 (the head plane). Chart entries carry EXPLICIT world
 // (x, y) plus a kind: 0 note, 1 bomb, 2 chain head, 3 chain link, and
 // arc grants fpre/fpost. Sabers = 15 numbers per hand:
 // [q(6) = pitch, yaw, twist, elbow, roll, bend | om(6) | wrist x, y, z].
@@ -24,7 +24,10 @@ export const GX0 = -1.2, GX1 = 1.2;
 export const GY0 = 0.575, GY1 = 2.15;
 export const ROW_EDGES = [GY0, 1.125, 1.65, GY1];
 export const Z_FAR = 12.0;
-export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 2.65;
+// env v7.3: the miss plane is the HEAD plane (z = -0.65) — a deliberate
+// deviation from the real game's despawn (~2 m behind the head) to
+// tighten credit assignment; mirrors constants.py / lib.rs
+export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 0.65;
 export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 
 // object kinds (chart entry `kind`)

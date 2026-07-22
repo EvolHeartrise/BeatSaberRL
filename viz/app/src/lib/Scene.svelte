@@ -55,8 +55,8 @@
   for (const y of ROW_EDGES) gridPairs.push([[GX0, y, 0], [GX1, y, 0]]);
   const gridGeo = segs(gridPairs);
 
-  // blade-reach region: miss boundary (z = -2.65, ~2 m behind the head)
-  // to max reach (z = 1.75)
+  // blade-reach region: miss plane (z = -0.65, the head plane since
+  // env v7.3) to max reach (z = 1.75)
   const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
 
   // torso (env v7 placement): shoulders at (±0.2, 1.47, -0.65); the trunk
