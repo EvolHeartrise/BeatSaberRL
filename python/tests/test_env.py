@@ -312,6 +312,31 @@ def test_blade_cannot_point_back_at_player():
     assert sim.misses == 1
 
 
+def test_note_rotation_affects_collision():
+    """env v5.3: the cut volume is the note's ACTUAL cube, rotated by
+    (angle - 270 deg) about the approach axis. A forward blade parked
+    0.24 m beside the center misses an axis-aligned (down-swing) note
+    (half-extent 0.2) but touches a 45-deg-rotated one (its corner
+    reaches sqrt(2)*0.2 ~ 0.283)."""
+    for angle, touched in ((DOWN, False), (7 * np.pi / 4, True)):
+        sim = _sim_with_note(_note(DT, 2, 1, angle=angle))  # center (0.25, 0)
+        _park(sim, 0, -1.5, -1.25)
+        ev, _ = _step(sim, 1, (0.49, 0.0), roll=0.0, bend=0.0)
+        if touched:
+            assert _codes(ev) == [(0, 1)]   # stationary touch -> slow
+        else:
+            assert ev == []
+
+
+def test_dot_note_box_stays_axis_aligned():
+    """Dot notes don't rotate whatever their angle field says: the same
+    0.24 m-offset probe that misses a down note misses a 45-deg dot."""
+    sim = _sim_with_note(_note(DT, 2, 1, angle=7 * np.pi / 4, any_dir=True))
+    _park(sim, 0, -1.5, -1.25)
+    ev, _ = _step(sim, 1, (0.49, 0.0), roll=0.0, bend=0.0)
+    assert ev == []
+
+
 def test_far_note_is_untouchable():
     sim = _sim_with_note(_note(1.0, 2, 1))   # z ~ 3.9 after one tick
     ev, _ = _step(sim, 1, (-0.5, 0.0), **_flat(0.25), om_roll=-15.0)

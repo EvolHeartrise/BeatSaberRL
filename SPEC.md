@@ -17,7 +17,7 @@ Milestones: v0 (easy one-hand charts, pool baseline + transformer both train)
 curriculum + generalization eval) → v3 (parse real BeatSaver `.dat` maps,
 sight-read eval) → v4 (dynamic gym: continuous angles, per-note speeds)
 → **v5 (blade sabers: wrist rotation DOFs, real saber length, 115-point
-graded swing scoring — current)**.
+graded swing scoring; v5.3 = notes are rotated boxes — current)**.
 
 ## Layout
 
@@ -121,17 +121,27 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
   - otherwise `swing_acc += Δ`; axis stored. `swing_acc` therefore holds
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
-- **Cut evaluation** (no more slab): a note is testable while
-  `−Z_MISS ≤ z ≤ REACH_Z = 1.28` m (max tip z = a straight-forward
-  blade, 1 m, + R; the reach window replaces the old ±0.6 m slab —
-  timing tolerance is physical: a flat blade covers |z| ≤ R ≈ ±0.07 s
-  at 4 m/s, pointing forward buys earlier contact, and behind the plane
-  the blade reaches only `cos 95°·1 m + R ≈ 0.37 m`). Each tick the blade sweep is
+- **Cut evaluation** (env v5.3, 2026-07-22 — the note is its ACTUAL
+  cube): the collision volume is the 0.4 m cube **rotated about the
+  approach (z) axis by `rot = angle − 270°`** so the block tracks its
+  required cut direction — a down-swing note is axis-aligned (exactly
+  the old orientation), diagonal/precision angles tilt the square, dot
+  notes never rotate. (Before v5.3 contact was a rotation-blind sphere
+  of radius `R = 0.28` around the center; `R` survives only as the
+  accuracy normalizer.) A note is testable while
+  `−Z_MISS ≤ z ≤ REACH_Z = 1.2` m (max tip z = a straight-forward
+  blade, 1 m, + `HALF_BLOCK = 0.2`; timing tolerance is physical: a
+  flat blade covers |z| ≤ 0.2 ≈ ±0.05 s at 4 m/s, pointing forward
+  buys earlier contact, and behind the plane the blade reaches only
+  `cos 95°·1 m + 0.2 ≈ 0.29 m`). Each tick the blade sweep is
   approximated by `N_BLADE_SAMPLES = 8` points at `s·SABER_LEN`,
   `s = 1/8 .. 8/8`: each sample's displacement segment (prev wrist+pose →
-  current wrist+pose, full 3D) is tested against the note center (3D
-  point-segment distance ≤ `R` = crossed). Matching-color saber first;
-  contact sample `s*` = the sample with minimum distance `d_min`.
+  current wrist+pose, full 3D) is transformed into the note's rotated
+  frame and slab-clipped against the cube (segment-box intersection =
+  crossed). Matching-color saber first; contact sample `s*` = the
+  **crossing** sample with minimum distance-to-center `d_min`
+  (distance still grades accuracy; corner clips can exceed `R`, so
+  accuracy floors at 0).
   - Contact velocity `v_c = (vx, vy, 0) + s*·SABER_LEN·ḋ` where
     `ḋ = θ̇·(−cosφ·sinθ, cosφ·cosθ, 0) + φ̇·(−sinφ·cosθ, −sinφ·sinθ, cosφ)`
     — wrist translation plus blade rotation at the contact point.
@@ -142,7 +152,7 @@ through / accuracy). All v4 checkpoints/replays retire (hard replace).
     cut**, otherwise `angle`. Any cut consumes the note.
 - **Score** per good cut — real Beat Saber 115: 
   - **pre-swing** `70 · min(swing_acc / 100°, 1)` — the wind-up arc.
-  - **accuracy** `15 · (1 − d_min/R)` — how centered the cut was.
+  - **accuracy** `15 · max(0, 1 − d_min/R)` — how centered the cut was.
   - **follow-through** `30 · min(post_arc / 60°, 1)` — a per-note
     tracker opens at the cut and accumulates the hand's subsequent swing
     arc under the same chain rules (break/reversal ends it); it resolves
@@ -262,10 +272,11 @@ Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 (loads a real replay via the file input, asserts playback advances with
 zero page errors, screenshots to `test/out/`). Scene (world → three.js:
 `(x, y, z) → (x, y, −z)`, camera on +z): tunnel rails + depth rings to
-`z = 12` m, the 4×3 plane grid, the blade-reach region (z −0.6..1.28)
-drawn faintly, 40 cm note cubes with required-direction arrows / dot
-discs (white edge outline while in reach), **blades drawn wrist→tip as
-cylinders** (white-hot core when the TIP is contact-capable ≥ 1 m/s)
+`z = 12` m, the 4×3 plane grid, the blade-reach region (z −0.6..1.2)
+drawn faintly, 40 cm note cubes **rotated to their cut direction (env
+v5.3, matching the sims' collision volume; dot notes stay square)**
+with required-direction arrows / dot discs (white edge outline while in
+reach), **blades drawn wrist→tip as cylinders** (white-hot core when the TIP is contact-capable ≥ 1 m/s)
 with 10-tick tip trails, wrist discs + velocity vectors, good cuts as
 split halves drifting apart with "+N" score popups, follow-through
 "+N follow" popups, bad cuts/misses labeled with reason. **Per-hand wrist
@@ -451,7 +462,10 @@ Further gains need a GPU or a cheaper policy, not more envs.
    translation-only stab is good but scores ≤ accuracy (15); full
    pre-swing wind-up ≈ 70+acc points; follow-through emits a `post`
    event (total ≈ 115); accuracy decreases off-center; tilted blade
-   reaches a note beyond the old slab, unreachable note untouched.
+   reaches a note beyond the old slab, unreachable note untouched;
+   rotation matters (a probe 0.24 m off-center misses an axis-aligned
+   note but touches a 45°-rotated one's corner; dot notes stay
+   axis-aligned whatever their angle field says).
    Recording round-trip (JSONL v4 counters + score match the sim) and
    VecBeatSim(1) ≡ RawBeatSim.
 4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset.

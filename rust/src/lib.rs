@@ -11,6 +11,11 @@
 //! scored with the real Beat Saber 115-point system: 70 pre-swing
 //! (100 deg), 30 follow-through (60 deg), 15 accuracy-to-center.
 //!
+//! Env v5.3 (2026-07-22): the collision volume is the note's ACTUAL
+//! 0.4 m cube, rotated about the approach axis by (angle - 270 deg) so
+//! the block tracks its cut direction (down-swing = axis-aligned; dot
+//! notes don't rotate) — replacing the rotation-blind 0.28 m sphere.
+//!
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
 
@@ -22,7 +27,10 @@ const ACCEL: f64 = 30.0;
 const DRAG: f64 = 0.02;
 const V_MAX: f64 = 6.0;
 const V_MIN_CUT: f64 = 1.0;
+// accuracy normalizer only (circumscribed circle of the 0.4 m face) —
+// contact itself is the swept blade vs the note's ROTATED box (env v5.3)
 const CUT_RADIUS: f64 = 0.28;
+const HALF_BLOCK: f64 = 0.2;
 const COS_TOL: f64 = 0.5;
 const CELL: f64 = 0.5;
 const POS_LO: [f64; 2] = [-1.5, -1.25];
@@ -45,7 +53,7 @@ const ROLL_LO: [f64; 2] = [-1.5707963267948966, -3.3161255787892263]; // L, R
 const ROLL_HI: [f64; 2] = [3.3161255787892263, 1.5707963267948966];
 const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
 const N_BLADE_SAMPLES: usize = 8; // sweep test points along the blade
-const REACH_Z: f64 = 1.28; // straight-forward tip (1 m) + CUT_RADIUS
+const REACH_Z: f64 = 1.2; // straight-forward tip (1 m) + HALF_BLOCK
 const Z_MISS: f64 = 0.6; // note consumed as missed past this
 
 // --- scoring (real Beat Saber 115) ------------------------------------------
@@ -107,6 +115,55 @@ fn blade_dir_dot(roll: f64, bend: f64, om_r: f64, om_b: f64) -> [f64; 3] {
         -om_r * sr * sb + om_b * cr * cb,
         -om_b * sb,
     ]
+}
+
+/// Env v5.3: a note is its actual 0.4 m cube, rotated about the approach
+/// (z) axis so the block's "up" tracks the required cut direction:
+/// rot = angle - 270 deg (a down-swing note is axis-aligned, as before;
+/// dot notes don't rotate). (cos_rot, sin_rot) derived exactly from the
+/// angle's own sin/cos: cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a.
+fn note_rot(n: &Note) -> (f64, f64) {
+    if n.any_dir {
+        (1.0, 0.0)
+    } else {
+        let (sa, ca) = n.angle.sin_cos();
+        (-sa, ca)
+    }
+}
+
+/// p relative to the box center, expressed in the box's rotated frame.
+fn to_box_frame(p: [f64; 3], center: [f64; 3], cos_r: f64, sin_r: f64) -> [f64; 3] {
+    let q = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+    [
+        cos_r * q[0] + sin_r * q[1],
+        -sin_r * q[0] + cos_r * q[1],
+        q[2],
+    ]
+}
+
+/// Segment vs origin-centered axis-aligned cube of half-extent `h`
+/// (slab clipping of the segment parameter to [0, 1]).
+fn seg_box_hit(a: [f64; 3], b: [f64; 3], h: f64) -> bool {
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    for k in 0..3 {
+        let d = b[k] - a[k];
+        if d.abs() < 1e-12 {
+            if a[k].abs() > h {
+                return false;
+            }
+        } else {
+            let t1 = (-h - a[k]) / d;
+            let t2 = (h - a[k]) / d;
+            let (lo, hi) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            tmin = tmin.max(lo);
+            tmax = tmax.min(hi);
+            if tmin > tmax {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
@@ -406,11 +463,14 @@ impl Core {
                 continue;
             }
             let center = [note_center(&n)[0], note_center(&n)[1], z];
+            let (cos_r, sin_r) = note_rot(&n);
             for &s in &[n.color as usize, 1 - n.color as usize] {
                 let sab = self.sabers[s];
                 let d_new = blade_dir(sab.roll, sab.bend);
                 // swept-blade test: 8 sample points along the blade, each
-                // tracing its own displacement segment (full 3D)
+                // tracing its own displacement segment (full 3D) against
+                // the note's ROTATED cube; distance-to-center of the
+                // hitting samples still grades accuracy / picks s*
                 let mut d_min = f64::INFINITY;
                 let mut s_star = 0.0;
                 for j in 1..=N_BLADE_SAMPLES {
@@ -426,13 +486,20 @@ impl Core {
                         sab.pos[1] + r * d_new[1],
                         r * d_new[2],
                     ];
+                    if !seg_box_hit(
+                        to_box_frame(p0, center, cos_r, sin_r),
+                        to_box_frame(p1, center, cos_r, sin_r),
+                        HALF_BLOCK,
+                    ) {
+                        continue;
+                    }
                     let d = seg_point_dist3(p0, p1, center);
                     if d < d_min {
                         d_min = d;
                         s_star = r;
                     }
                 }
-                if d_min > CUT_RADIUS {
+                if !d_min.is_finite() {
                     continue;
                 }
                 // contact velocity: wrist translation + rotation at s*
@@ -460,7 +527,9 @@ impl Core {
                     self.status[i] = 1;
                     self.good_cuts += 1;
                     let pre = PTS_PRE * (self.sabers[s].swing_acc / PRE_FULL).min(1.0);
-                    let acc = PTS_ACC * (1.0 - d_min / CUT_RADIUS);
+                    // corner clips of the rotated box can sit slightly
+                    // outside the circumscribed circle -> floor at 0
+                    let acc = PTS_ACC * (1.0 - d_min / CUT_RADIUS).max(0.0);
                     let pts = pre + acc;
                     reward += pts / SCORE_MAX;
                     self.score += pts;

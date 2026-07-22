@@ -14,10 +14,14 @@ ACCEL = 30.0          # m/s^2
 DRAG = 0.02           # per-tick multiplicative velocity decay
 V_MAX = 6.0           # m/s
 V_MIN_CUT = 1.0       # min contact-point speed for a good cut (m/s)
-CUT_RADIUS = 0.28
+CUT_RADIUS = 0.28     # accuracy normalizer (circumscribed circle of a face)
 COS_TOL = 0.5
 CELL = 0.5            # lane pitch (m)
 BLOCK = 0.4           # block edge (m)
+# env v5.3: contact = swept blade vs the note's ACTUAL cube, rotated about
+# the approach (z) axis by (angle - 270 deg) — a down-swing note is
+# axis-aligned, dot notes don't rotate
+HALF_BLOCK = BLOCK / 2
 POS_LO = (-1.5, -1.25)
 POS_HI = (1.5, 1.25)
 REWARD_BAD = -0.5   # = miss since 2026-07-20 (real-BS severity parity)
@@ -36,7 +40,7 @@ ROLL_LO = (math.radians(-90.0), math.radians(-190.0))   # (left, right)
 ROLL_HI = (math.radians(190.0), math.radians(90.0))
 BEND_LIM = math.radians(95.0)
 N_BLADE_SAMPLES = 8
-REACH_Z = 1.28        # cut-test gate: straight-forward tip (1 m) + CUT_RADIUS
+REACH_Z = 1.2         # cut-test gate: straight-forward tip (1 m) + HALF_BLOCK
 Z_MISS = 0.6          # note consumed as missed past this
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------

@@ -12,7 +12,12 @@
 
 export const CELL = 0.5, BLOCK = 0.4, HALF = BLOCK / 2;
 export const GX = 1.0, GY = 0.75, Z_FAR = 12.0;
-export const SABER_LEN = 1.0, REACH_Z = 1.28, Z_MISS = 0.6;
+export const SABER_LEN = 1.0, REACH_Z = 1.2, Z_MISS = 0.6;
+
+// env v5.3: note cubes are rotated about the approach axis so the block
+// tracks its required cut direction (down-swing = axis-aligned); dot
+// notes stay square. Mirrors the sims' collision volume.
+export const noteRot = (n) => (n.any ? 0 : n.angle - 1.5 * Math.PI);
 export const V_MIN = 1, DT = 1 / 30;
 // env v5.2 anatomical joint limits (mirror the sim): forearm roll per
 // hand, wrist bend +-95 deg from straight-forward
