@@ -499,6 +499,20 @@ max_score, api_max_score, accuracy, pp, good_cuts, bad_cuts, misses,
 bombs_hit, highest_combo, full_combo (skipped levels carry a `skipped`
 reason instead of scores).
 
+Throughput ceiling (measured 2026-07-23, GTX 1080 box, cached maps):
+~38-39k ticks/s ≈ 445 maps/min ≈ **14 min for the full 6.1k catalog**;
+`--num-envs` knees at ~512 (256→28k, 512→37.2k, 1024→38.6k ticks/s).
+The wall is the serial Python loop over per-env `RustBeatEnv.step()` +
+event consumption, not the GPU (forward is amortized and near-idle).
+FUTURE UNLOCK if 14 min ever isn't fast enough: the bench cannot use
+`VecBeatSim`'s one-FFI-call stepping because it returns counters only
+— the combo/multiplier walk needs each env's ORDERED event stream.
+Exposing vectorized per-env events from Rust (e.g. `step()` also
+returning a flat `(env_idx, note_idx, code, points)` array per vector
+step) would collapse the Python loop and likely buy 3-5×. Cruder
+alternative: multi-process sharding by star range (the merge logic
+already tolerates it). Neither is worth building at the current cost.
+
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
 THE physics implementation (PyO3 0.22 + numpy 0.22; build with
