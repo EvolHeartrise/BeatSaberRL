@@ -217,9 +217,12 @@ is pushed later if its hand's previous note is closer than `min_hand_gap_s`
 (physical-feasibility guarantee — the same hand is never asked to be in two
 places at once faster than it can travel). **Positions (env v7.5) are
 CONTINUOUS**: x, y ~ U over the rectangle spanned by the allowed
-cols/rows (the cell dials survive as range clamps; a single allowed
-col/row pins that axis; real BeatSaver maps keep their grid cells;
-note col/row become nearest-cell metadata).
+cols/rows **padded by `POS_PAD = 0.2` m on every side** (defaults:
+x [−1.1, 1.1], y [0.65, 2.1] — under uniform sampling the old edge
+cells became measure-zero extremes; the margin keeps outer-edge
+capability trained). The cell dials survive as range clamps (a single
+allowed col/row → a ±0.2 m corridor); real BeatSaver maps keep their
+grid cells; note col/row become nearest-cell metadata.
 Chains: sc ∈ 3..6 pieces, tail `U(0.10, 0.25)` s later, 0.6-1.2 m along
 the head's direction (clamped into range); links laid on the real quadratic Bézier
 (`chart.chain_links`: control point = head + dirVec·dist/2, link i at
