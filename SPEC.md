@@ -454,6 +454,51 @@ config (`--note-rate --colors --dirs --cols --rows --chart-len
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
 
+## ScoreSaber bench (`python/bench_scoresaber.py`, 2026-07-23)
+
+Standalone checkpoint benchmark (NOT part of training): every ranked
+ScoreSaber leaderboard, one greedy argmax rollout each (deterministic
+sim + fixed chart ⇒ exact), no replays. `--stars MIN MAX` restricts the
+range; runs on the same checkpoint MERGE into one JSON per checkpoint
+(default `bench/<run>_<ckpt>.json`): evaluated levels are skipped on
+rerun (star ranges accumulate), skipped levels (parse/network) are
+retried, `--force` re-evaluates, and a model-hash mismatch (sha256 over
+weight names+shapes+bytes) is an error, not a merge.
+
+Machinery (`beat_arena_env/scoresaber.py`):
+
+- **Catalog**: `/api/leaderboards?ranked=true` paginated to completion
+  (~6.1k SoloStandard difficulties), cached at
+  `maps/scoresaber_catalog.json`; per-leaderboard stars + maxPP +
+  maxScore from the API. Map chart data downloads from BeatSaver by
+  hash into `maps/scoresaber/<hash>/` — extracted, media stripped
+  (~100 KB vs ~10 MB per song). Downloads run on a producer thread
+  while rollouts proceed (N envs, one batched policy forward).
+- **Combo multiplier** (bench-only — the training gym deliberately
+  stays multiplier-free): tiers 1x/2x/4x/8x, progress bar 2/4/8 hits,
+  the promoted multiplier applies to the hit that fills the bar
+  (decoded from ScoreSaber's own max-score formula 115·(8n−63), n ≥ 14
+  plain notes — reproduced exactly by our walk, pinned by tests AND
+  validated live: computed max == API maxScore on every leaderboard
+  checked). Combo breaks (bad cut, miss, bomb hit) halve the
+  multiplier and reset the bar. A note's full points (cut +
+  follow-through) commit at its cut-time multiplier. Units: note 115,
+  chain head 85, link 20; bombs score nothing.
+- **PP**: accuracy = multiplied score / multiplied max score;
+  pp = curve(acc) × maxPP where maxPP = 42.117208413 × stars and the
+  curve is ScoreSaber's official 37-point piecewise-linear accuracy
+  curve (fetched from `/api/v2/realms/1/pp-curve`, 2026-07-23;
+  curve(95%) = 1, curve(100%) = 5.37). Total = Σ ppᵢ·0.965^(rank−1),
+  best first (wiki.scoresaber.com/ranking-system).
+
+Result JSON: checkpoint path/name, model_hash, arch, global_step,
+speed_scale, updated timestamp, total_weighted_pp, n_evaluated,
+n_skipped, and `levels[]` — per level: leaderboard_id, song_hash, song,
+mapper, difficulty, stars, max_pp, duration_s, n_notes, score,
+max_score, api_max_score, accuracy, pp, good_cuts, bad_cuts, misses,
+bombs_hit, highest_combo, full_combo (skipped levels carry a `skipped`
+reason instead of scores).
+
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
 THE physics implementation (PyO3 0.22 + numpy 0.22; build with
@@ -543,7 +588,14 @@ Further gains need a GPU or a cheaper policy, not more envs.
 5. Policy junk-leak: garbage in masked note slots changes no
    logprob/entropy/value (key-masking).
 6. Scripted bot ≥ 80% good cuts on default easy chart (solvability).
-7. BeatSaver parser fixtures: v2 (notes + bombs + dots), v3 (chains
+7. ScoreSaber bench (offline, network monkeypatched): PP-curve anchors
+   (0.95→1, 1.0→5.367…, interpolation, monotonicity), 0.965-weighted
+   totals, the multiplier walk vs ScoreSaber's 115·(8n−63) formula,
+   break-halving + cut-time-multiplier commit semantics, per-kind max
+   walk, catalog pagination/filtering, media-stripping map cache,
+   weight-hash stability, results save/merge (hash mismatch refuses),
+   and a full greedy-rollout smoke on a procedural chart.
+8. BeatSaver parser fixtures: v2 (notes + bombs + dots), v3 (chains
    with the link Bézier, arcs as grants, precision angles, BPM change
    events), v4 (index-indirected arrays, dot chain heads), and the
    paired-note ANGLE SNAP rule (snapped diagonal pair; same-column

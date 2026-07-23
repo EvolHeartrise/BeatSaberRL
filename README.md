@@ -49,6 +49,31 @@ cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`,
 plus the v7 object dials `--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
 
+## ScoreSaber bench (checkpoint evaluation on all ranked maps)
+
+```bash
+$VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt [--stars 2 4]
+```
+
+One greedy (argmax) rollout per ranked ScoreSaber leaderboard — ~6.1k
+difficulties over ~2.5k songs; deterministic sim + fixed chart means one
+rollout is the exact answer. No replays are recorded. Scoring uses the
+REAL combo multiplier (1x/2x/4x/8x, halves on a combo break — bench-only;
+the training gym stays multiplier-free) and ScoreSaber's official PP
+curve: pp = curve(acc) x maxPP, profile total weighted 0.965^rank.
+Computed max scores match the API's `maxScore` field exactly (validated).
+
+Results land in `bench/<run>_<ckpt>.json`: checkpoint name + weight
+sha256, per-level entries (score, accuracy, pp, misses, bad cuts,
+bombs hit, highest combo, FC flag) and the weighted total PP. Reruns
+MERGE: already-evaluated levels are skipped (so star ranges accumulate
+across runs), previously-skipped ones are retried, `--force`
+re-evaluates, and a different model writing to the same file is an
+error. The ranked catalog caches at `maps/scoresaber_catalog.json`
+(`--refresh-catalog` to refetch) and chart data at `maps/scoresaber/`
+(audio stripped, ~100 KB/song). `--limit N` for smoke runs;
+`--num-envs` maps play in parallel through one batched policy.
+
 ## Watching replays
 
 ```bash
