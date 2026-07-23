@@ -125,7 +125,9 @@ def test_flat_pose_geometry():
 # --- obs layout --------------------------------------------------------------
 
 def test_obs_layout():
-    env = RustBeatEnv(seed=3)
+    # bomb_rate 0: this test pins slot/feature offsets against chart[0],
+    # which must be a plain note for the color/dir assertions
+    env = RustBeatEnv(seed=3, bomb_rate=0.0)
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (286,)
     assert OFF_NOTES == 2 * SABER_FEAT == 46
@@ -646,10 +648,13 @@ def test_chart_respects_hand_gap_and_dirs():
     cfg = ChartConfig(note_rate=3.0, colors="both", dirs=(2, 6),
                       min_hand_gap_s=0.5, chart_len_s=30.0)
     chart = generate_chart(cfg, np.random.default_rng(11))
-    assert len(chart) > 20
-    assert all(n.angle in (2 * np.pi / 4, 6 * np.pi / 4) for n in chart)
+    notes = [n for n in chart if n.kind == 0]        # bombs are default now
+    bombs = [n for n in chart if n.kind == KIND_BOMB]
+    assert len(notes) > 20
+    assert len(bombs) >= 4                            # ~0.25/s over 30 s
+    assert all(n.angle in (2 * np.pi / 4, 6 * np.pi / 4) for n in notes)
     for color in (0, 1):
-        times = [n.hit_time for n in chart if n.color == color]
+        times = [n.hit_time for n in notes if n.color == color]
         assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:]))
     assert all(a.hit_time <= b.hit_time for a, b in zip(chart, chart[1:]))
 
@@ -658,11 +663,12 @@ def test_chart_continuous_dirs_and_speed_range():
     cfg = ChartConfig(note_rate=2.0, colors="both", continuous_dirs=True,
                       note_speed=3.0, note_speed_max=6.0, chart_len_s=30.0)
     chart = generate_chart(cfg, np.random.default_rng(13))
-    assert len(chart) > 20
+    notes = [n for n in chart if n.kind == 0]
+    assert len(notes) > 20
     assert all(0.0 <= n.angle < 2 * np.pi for n in chart)
     assert all(3.0 <= n.speed <= 6.0 for n in chart)
-    assert len({round(n.angle, 3) for n in chart}) > 10   # actually continuous
-    assert len({round(n.speed, 3) for n in chart}) > 10
+    assert len({round(n.angle, 3) for n in notes}) > 10   # actually continuous
+    assert len({round(n.speed, 3) for n in notes}) > 10
 
 
 def test_chart_v7_object_dials():

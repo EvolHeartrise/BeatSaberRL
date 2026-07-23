@@ -21,7 +21,7 @@ class BeatVecEnv:
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
-                 bomb_rate=0.0, chain_prob=0.0, arc_prob=0.0,
+                 bomb_rate=0.25, chain_prob=0.0, arc_prob=0.0,
                  chart_sampler=None, max_steps=None):
         """chart_sampler: callable (env_idx, rng) -> list[Note]; replaces
         procedural generation (curriculum mode). max_steps: tick-cap

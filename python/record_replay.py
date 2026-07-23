@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument("--note-speed-max", type=float, default=None)
     p.add_argument("--continuous-dirs", action="store_true",
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
-    p.add_argument("--bomb-rate", type=float, default=0.0)
+    p.add_argument("--bomb-rate", type=float, default=0.25)
     p.add_argument("--chain-prob", type=float, default=0.0)
     p.add_argument("--arc-prob", type=float, default=0.0)
     return p.parse_args()

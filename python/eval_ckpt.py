@@ -28,7 +28,7 @@ def main():
     p.add_argument("--dirs", type=int, nargs="+", default=[6])
     p.add_argument("--note-speed", type=float, default=3.0)
     p.add_argument("--note-speed-max", type=float, default=6.0)
-    p.add_argument("--bomb-rate", type=float, default=0.0)
+    p.add_argument("--bomb-rate", type=float, default=0.25)
     p.add_argument("--chain-prob", type=float, default=0.0)
     p.add_argument("--arc-prob", type=float, default=0.0)
     args = p.parse_args()
