@@ -69,7 +69,9 @@ class ChartConfig:
     cols: tuple = (0, 1, 2, 3)    # allowed columns (curriculum: restrict)
     rows: tuple = (0, 1, 2)       # allowed rows
     note_speed: float = 4.0       # m/s toward the plane; z(t) = (hit_time - t) * speed
-    bomb_rate: float = 0.0        # bombs per second (0 = none)
+    # bombs are part of the DEFAULT random gym since env v7.7
+    # (user-directed): ~5 per 20 s chart, ~1:10 vs dynamic-gym notes
+    bomb_rate: float = 0.25       # bombs per second (0 = none)
     chain_prob: float = 0.0       # P(a non-dot note becomes a chain)
     arc_prob: float = 0.0         # P(consecutive same-color pair gets an arc)
 

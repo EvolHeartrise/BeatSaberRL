@@ -87,9 +87,11 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.6 scripted bot, padded gym, 10 eps each): easy
-(rate 1.0, right hand only, down-swings) 82.9% good cuts / 51.4 pts per
-note; hard (both hands, 8 dirs) 77.7% / 55.6; dynamic gym 68.9% / 51.3. The real
+Reference points (env v7.7 scripted bot, padded gym with default bombs,
+10 eps each): easy (rate 1.0, right hand only, down-swings) 82.9% good
+cuts / 51.4 pts per note, ~1.2 bombs hit/ep; hard (both hands, 8 dirs)
+77.7% / 55.6; dynamic gym 68.9% / 51.3 (the bot ignores bombs as
+targets and clips some incidentally). The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -333,3 +335,10 @@ partially uses. Pre-v7 references are not comparable.
   spawn-settle info timeline deliberately skipped. λ = 0 reproduces
   v7.4 exactly. Record ckpt on v7.6: **98.3 / 97.3 / +40.02** — still
   rising. Bot: 82.9 / 77.7 / 68.9.
+- **Env v7.7 (2026-07-22, user-directed): bombs in the default gym**
+  (`bomb_rate` default 0.25/s everywhere — ChartConfig, env wrappers,
+  CLI flags; ~5 per 20 s chart, ~1:10 vs dynamic notes). The
+  bomb-naive v7.3 record ckpt does NOT absorb this one: it slices
+  ~2/3 of bombs (61 hits / 30 eps → 92.7 / 89.5 / +34.44) — the first
+  v7.x change requiring retraining, i.e. the reason bombs belong in
+  the training distribution. Suite 62 green.

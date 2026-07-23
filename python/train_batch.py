@@ -98,7 +98,7 @@ def parse_args():
     p.add_argument("--note-speed-max", type=float, default=None)
     p.add_argument("--continuous-dirs", action="store_true",
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
-    p.add_argument("--bomb-rate", type=float, default=0.0,
+    p.add_argument("--bomb-rate", type=float, default=0.25,
                    help="bombs per second in procedural charts")
     p.add_argument("--chain-prob", type=float, default=0.0,
                    help="P(a non-dot note becomes a chain)")

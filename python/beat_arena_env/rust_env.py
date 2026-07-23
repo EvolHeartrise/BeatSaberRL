@@ -30,7 +30,7 @@ class RustBeatEnv(gym.Env):
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, external_chart=None,
-                 bomb_rate=0.0, chain_prob=0.0, arc_prob=0.0,
+                 bomb_rate=0.25, chain_prob=0.0, arc_prob=0.0,
                  seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""

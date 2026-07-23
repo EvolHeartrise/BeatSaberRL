@@ -222,9 +222,11 @@ checkpoints/replays retire (hard replace).
 `dirs` (allowed subset of 0..7, default `[6]` = down-swings),
 `min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
 restricting them is a spatial curriculum dial), `note_speed` (m/s toward
-the plane, default 4.0), and the **env v7 object dials** (all default
-0): `bomb_rate` (bombs/s), `chain_prob` (P(non-dot note → chain)),
-`arc_prob` (P(consecutive same-color pair → arc)).
+the plane, default 4.0), and the **env v7 object dials**: `bomb_rate`
+(bombs/s, **default 0.25 since env v7.7, user-directed — bombs are part
+of the default random gym**, ~5 per 20 s chart), `chain_prob`
+(P(non-dot note → chain), default 0), `arc_prob` (P(consecutive
+same-color pair → arc), default 0).
 
 Generation: first note at `t = 1.0`; successive intervals
 `(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
