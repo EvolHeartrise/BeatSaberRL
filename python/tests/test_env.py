@@ -154,9 +154,10 @@ def test_obs_layout():
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
     base = OFF_NOTES
+    from beat_arena_env.constants import note_center as nc
     assert obs[base + 13] == 1.0                            # valid
-    assert obs[base + 0] == pytest.approx(col_x(n.col))
-    assert obs[base + 1] == pytest.approx((ROW_Y[n.row] - 1.40) / 0.75)
+    assert obs[base + 0] == pytest.approx(nc(n)[0], abs=1e-6)
+    assert obs[base + 1] == pytest.approx((nc(n)[1] - 1.40) / 0.75, abs=1e-6)
     z = min(n.hit_time * n.speed, 12.0)
     assert obs[base + 2] == pytest.approx(z / 8.0)
     assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
@@ -667,6 +668,27 @@ def test_chart_v7_object_dials():
         times = [n.hit_time for n in chart
                  if n.color == color and n.kind in (0, 2)]
         assert all(b - a >= 0.25 for a, b in zip(times, times[1:]))
+
+
+def test_chart_positions_are_continuous():
+    """Env v7.5: generated positions are continuous within the ranges
+    spanned by the allowed cols/rows; restricting to a single col/row
+    pins that axis exactly."""
+    from beat_arena_env.constants import note_center as nc
+    cfg = ChartConfig(note_rate=3.0, colors="both", chart_len_s=40.0,
+                      min_hand_gap_s=0.2)
+    chart = generate_chart(cfg, np.random.default_rng(23))
+    xs = [nc(n)[0] for n in chart]
+    ys = [nc(n)[1] for n in chart]
+    assert all(-0.9 - 1e-9 <= x <= 0.9 + 1e-9 for x in xs)
+    assert all(0.85 - 1e-9 <= y <= 1.9 + 1e-9 for y in ys)
+    assert len({round(x, 3) for x in xs}) > 20      # actually continuous
+    assert len({round(y, 3) for y in ys}) > 20
+    pinned = generate_chart(ChartConfig(note_rate=2.0, chart_len_s=20.0,
+                                        cols=(2,), rows=(0, 1, 2)),
+                            np.random.default_rng(5))
+    assert all(nc(n)[0] == pytest.approx(col_x(2)) for n in pinned)
+    assert len({round(nc(n)[1], 3) for n in pinned}) > 5
 
 
 def test_chain_links_layout():
