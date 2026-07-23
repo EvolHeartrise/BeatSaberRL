@@ -76,3 +76,67 @@ Score multipliers: SS slower 0.85× song (×0.70 score), FS 1.2× (×1.08), SF 1
 
 Web cross-checks used (qualitative confirmation of hitbox/scoring facts):
 [BSMG Ranking & Scoring Guide](https://bsmg.wiki/ranking-guide.html), [Beat Saber Fandom — Gameplay](https://beatsaber.fandom.com/wiki/Gameplay), [Steam scoring guide](https://steamcommunity.com/sharedfiles/filedetails/?id=2585074407), [official precise-scoring news post](https://store.steampowered.com/news/app/620980/view/4036870438631348235).
+
+---
+
+## Addendum (2026-07-22, session 2): note look-at-player rotation — exact formulas
+
+User-prompted deep-dive (both repos re-read at the code level). The
+mechanic: a note's full 3D orientation is a BLEND between its
+chart-defined orientation and a "face the player's head" orientation,
+with the blend weight growing linearly in jump progress (∝ distance
+covered) until it reaches FULL head-facing at the player plane, then
+freezing. Both repos implement it; formulas below.
+
+### ArcViewer (`ObjectManager.cs:113-123` + `NoteManager.cs:195-215`)
+
+```
+LookAtPlayer(objectPos, headPos, baseRotation, jumpProgress):
+  verticalLookStrength = 0.8
+  headPos.y = lerp(headPos.y, objectPos.y, 0.8)     # damp vertical 80%
+  headDir   = normalize(objectPos - headPos)         # head -> note ray
+  lookRot   = LookRotation(headDir, up = baseRotation * up)
+  return Lerp(baseRotation, lookRot, jumpProgress)   # linear in progress
+```
+- `baseRotation` = pure z-roll for the cut direction (`AngleAxis(angle, forward)`).
+- `jumpProgress = (now + RT - noteTime)/RT`: 0 at jump start, **1 when
+  the note reaches the play plane** -> full head-facing at the plane.
+- After passing (progress >= 1): rotation FROZEN using the head position
+  captured at plane-crossing (`EndHeadPosition`).
+- **Chain heads excluded** (`!n.IsChainHead`); bombs have no rotation.
+- Gated `doLookAnimation` = replays only (previews have no head).
+
+### BeatLeader (`beat.js:297-326, 470-500`)
+
+Same shape plus the spawn-rotation wobble, matching the game's NoteJump:
+- Three quaternions: `start` (identity for 0-rotation lanes), `middle` =
+  `end` + deterministic wobble (each Euler component
+  `RandomRotations[i]·20°`, `i = |round(time·10 + endX·2 + endY·2) % 10|`,
+  10-entry table of unit-ish vec3s), `end` = cut-direction z-roll.
+- Spawn anim: `t < 0.125: slerp(start, middle, sin(t·4π))`;
+  `t >= 0.125: slerp(middle, end, sin((t-0.125)·2π))` — settled by
+  t ~ 0.375 (t = jump progress on the 0..1-behind scale; 0.5 = head).
+- Look-at: `headPseudo.y = lerp(head.y, note.y, 0.8)`;
+  `up = (-sin ψ, cos ψ, 0)` (ψ = cut-direction z-roll — roll preserved);
+  `lookAt(headPseudo)`; final = `slerp(spawnAnimRot, lookRot, t·2)` —
+  full head-facing at t = 0.5 (the head), matching ArcViewer.
+- Applied for `t ∈ [0, 0.5]`, `type != 'mine'`; frozen after.
+
+### Gameplay relevance (assessment)
+
+1. **The colliders sit on the note transform** — so in the real game
+   the good/bad hitboxes TILT with this rotation: an outer-lane note at
+   the moment of cutting faces the head (yaw ~ atan(0.9 / (z+0.65)),
+   ~29° at z=1, ~54° at the plane; vertical tilt damped 80%). Our v7.4
+   hitboxes rotate only about z — edge-note hitboxes are increasingly
+   wrong as notes approach.
+2. The game's cut-direction check runs in the note's LOCAL frame
+   (saber velocity transformed by the note rotation) — the look-at
+   tilt slightly re-aims the required direction for off-center notes
+   (inference from game structure; the repos consume recorded
+   judgments and cannot confirm directly).
+3. The spawn wobble + settle is cosmetic for us (settled long before
+   contact) but IS the info-timeline item (D4): direction not readable
+   until ~30-37% of the approach.
+4. Head reference for our sim: fixed head anchor (0, ~1.70, -0.65)
+   (1.8 m player; shoulders 1.47).
