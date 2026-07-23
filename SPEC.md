@@ -215,9 +215,13 @@ Generation: first note at `t = 1.0`; successive intervals
 `(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
 is pushed later if its hand's previous note is closer than `min_hand_gap_s`
 (physical-feasibility guarantee — the same hand is never asked to be in two
-places at once faster than it can travel). Col/row uniform over the grid.
-Chains: sc ∈ 3..6 pieces, tail `U(0.10, 0.25)` s later, 1-2 cells along
-the head's direction; links laid on the real quadratic Bézier
+places at once faster than it can travel). **Positions (env v7.5) are
+CONTINUOUS**: x, y ~ U over the rectangle spanned by the allowed
+cols/rows (the cell dials survive as range clamps; a single allowed
+col/row pins that axis; real BeatSaver maps keep their grid cells;
+note col/row become nearest-cell metadata).
+Chains: sc ∈ 3..6 pieces, tail `U(0.10, 0.25)` s later, 0.6-1.2 m along
+the head's direction (clamped into range); links laid on the real quadratic Bézier
 (`chart.chain_links`: control point = head + dirVec·dist/2, link i at
 curve parameter `(i/(sc−1))·squish`, time lerped unsquished, angle =
 curve tangent — BeatLeader beat.js:424-463); the hand is busy until the

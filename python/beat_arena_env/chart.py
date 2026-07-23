@@ -7,6 +7,13 @@ main dial, colors/dirs widen the skill demanded, min_hand_gap_s
 guarantees physical feasibility, and bomb_rate / chain_prob / arc_prob
 mix in the v7 object types.
 
+Env v7.5: generated positions are CONTINUOUS — x, y ~ U over the
+rectangle spanned by the allowed cols/rows (the cell dials survive as
+range clamps; a single allowed col/row pins that axis). Real BeatSaver
+maps keep their grid cells; the sim has taken explicit positions since
+v7.0. Chain tails go 0.6-1.2 m along the head's direction, clamped
+into range; note col/row become nearest-cell metadata.
+
 Chain links follow the real Beat Saber layout: a quadratic Bezier from
 head to tail whose control point sits half the head-tail distance along
 the head's cut direction; link i of sc sits at curve parameter
@@ -110,17 +117,36 @@ def chain_links(head: Note, tail_x: float, tail_y: float, tail_time: float,
     return links
 
 
-def _chain_tail_cell(cfg, head: Note, rng) -> tuple[int, int]:
-    """A grid cell 1-2 steps from the head, biased along its direction."""
-    steps = int(rng.integers(1, 3))
-    dc = round(math.cos(head.angle)) * steps
-    dr = round(math.sin(head.angle)) * steps
-    col = int(np.clip(head.col + dc, 0, N_COLS - 1))
-    row = int(np.clip(head.row + dr, 0, N_ROWS - 1))
-    if (col, row) == (head.col, head.row):   # degenerate (clamped away)
-        col = int(np.clip(head.col + (1 if head.col < N_COLS - 1 else -1),
-                          0, N_COLS - 1))
+def _pos_ranges(cfg):
+    """Continuous (x_lo, x_hi, y_lo, y_hi) spanned by the allowed
+    cols/rows (env v7.5: generated positions are continuous WITHIN the
+    ranges the cell dials describe; a single allowed col/row degenerates
+    to that exact line — the spatial-curriculum dial survives)."""
+    xs = [col_x(c) for c in cfg.cols]
+    ys = [ROW_Y[r] for r in cfg.rows]
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def _nearest_cell(x, y):
+    """Nearest (col, row) metadata for a continuous position."""
+    col = int(np.clip(round(x / 0.6 + 1.5), 0, N_COLS - 1))
+    row = int(np.argmin([abs(y - ry) for ry in ROW_Y]))
     return col, row
+
+
+def _chain_tail(cfg, head: Note, rng) -> tuple[float, float]:
+    """A continuous tail 0.6-1.2 m from the head along its cut
+    direction, clamped into the allowed position ranges (nudged sideways
+    if the clamp collapses it onto the head)."""
+    x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
+    hx, hy = note_center(head)
+    d = float(rng.uniform(0.6, 1.2))
+    tx = float(np.clip(hx + math.cos(head.angle) * d, x_lo, x_hi))
+    ty = float(np.clip(hy + math.sin(head.angle) * d, y_lo, y_hi))
+    if math.hypot(tx - hx, ty - hy) < 0.3:   # degenerate (clamped back)
+        tx = float(np.clip(hx + (0.6 if hx < (x_lo + x_hi) / 2 else -0.6),
+                           x_lo, x_hi))
+    return tx, ty
 
 
 def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
@@ -144,10 +170,15 @@ def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
                 speed = float(rng.uniform(cfg.note_speed, cfg.note_speed_max))
             else:
                 speed = cfg.note_speed
+            # env v7.5: positions are CONTINUOUS within the allowed ranges
+            x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
+            x = float(rng.uniform(x_lo, x_hi))
+            y = float(rng.uniform(y_lo, y_hi))
+            col, row = _nearest_cell(x, y)
             head = Note(
                 hit_time=float(hit),
-                col=int(cfg.cols[rng.integers(0, len(cfg.cols))]),
-                row=int(cfg.rows[rng.integers(0, len(cfg.rows))]),
+                col=col, row=row,             # nearest-cell metadata only
+                x=x, y=y,
                 color=color,
                 angle=angle,
                 speed=speed,
@@ -156,38 +187,39 @@ def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
             if not any_dir and rng.random() < cfg.chain_prob:
                 sc = int(rng.integers(CHAIN_SC[0], CHAIN_SC[1] + 1))
                 tail_dt = float(rng.uniform(*CHAIN_TAIL_DT))
-                tc, tr = _chain_tail_cell(cfg, head, rng)
+                tx, ty = _chain_tail(cfg, head, rng)
                 head = replace(head, kind=KIND_CHAIN_HEAD)
                 notes.append(head)
-                notes.extend(chain_links(
-                    head, col_x(tc), ROW_Y[tr], hit + tail_dt, sc))
+                notes.extend(chain_links(head, tx, ty, hit + tail_dt, sc))
                 last_hand_time[color] = hit + tail_dt
             else:
                 notes.append(head)
                 last_hand_time[color] = hit
         t += (1.0 / cfg.note_rate) * rng.uniform(0.8, 1.2)
 
-    # bombs: independent stream; re-place (not reschedule) on cell clashes
+    # bombs: independent stream; re-place (not reschedule) on clashes
     if cfg.bomb_rate > 0:
+        x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
         tb = cfg.first_note_s + float(rng.uniform(0.0, 1.0 / cfg.bomb_rate))
         while tb <= cfg.chart_len_s:
-            col = int(cfg.cols[rng.integers(0, len(cfg.cols))])
-            row = int(cfg.rows[rng.integers(0, len(cfg.rows))])
+            bx = by = None
             for _ in range(4):
+                cx = float(rng.uniform(x_lo, x_hi))
+                cy = float(rng.uniform(y_lo, y_hi))
                 clash = any(abs(n.hit_time - tb) < 0.25
-                            and abs(note_center(n)[0] - col_x(col)) < 0.3
-                            and abs(note_center(n)[1] - ROW_Y[row]) < 0.3
+                            and abs(note_center(n)[0] - cx) < 0.3
+                            and abs(note_center(n)[1] - cy) < 0.3
                             for n in notes)
                 if not clash:
+                    bx, by = cx, cy
                     break
-                col = int(cfg.cols[rng.integers(0, len(cfg.cols))])
-                row = int(cfg.rows[rng.integers(0, len(cfg.rows))])
-            else:
+            if bx is None:
                 tb += (1.0 / cfg.bomb_rate) * rng.uniform(0.8, 1.2)
                 continue
-            notes.append(Note(hit_time=float(tb), col=col, row=row, color=0,
-                              angle=0.0, speed=cfg.note_speed, any_dir=True,
-                              kind=KIND_BOMB))
+            col, row = _nearest_cell(bx, by)
+            notes.append(Note(hit_time=float(tb), col=col, row=row, x=bx,
+                              y=by, color=0, angle=0.0, speed=cfg.note_speed,
+                              any_dir=True, kind=KIND_BOMB))
             tb += (1.0 / cfg.bomb_rate) * rng.uniform(0.8, 1.2)
 
     notes.sort(key=lambda n: n.hit_time)

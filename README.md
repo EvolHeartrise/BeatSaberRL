@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.4 scripted bot, 10 eps each): easy (rate 1.0,
-right hand only, down-swings) 87.3% good cuts / 59.4 pts per note; hard
-(both hands, 8 dirs) 74.6% / 54.9; dynamic gym 68.5% / 51.1. The real
+Reference points (env v7.5 scripted bot, 10 eps each): easy (rate 1.0,
+right hand only, down-swings) 86.5% good cuts / 50.4 pts per note; hard
+(both hands, 8 dirs) 80.3% / 56.9; dynamic gym 71.2% / 54.1. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -308,3 +308,13 @@ partially uses. Pre-v7 references are not comparable.
   The v7.3 record ckpt re-evals BETTER on the honest geometry:
   **98.6% / 97.8 / +40.16** — center-cutting generalizes, v5.3 pattern.
   Bot: 87.3 / 74.6 / 68.5.
+- **Env v7.5 (2026-07-22, user-directed): continuous generated
+  positions** — the procedural generator samples x, y ~ U over the
+  rectangle spanned by the allowed cols/rows (cell dials survive as
+  range clamps); chains go 0.6-1.2 m along the head's direction; real
+  maps keep their cells; sim/obs unchanged (explicit positions since
+  v7.0). **The cell-trained v7.3 record ckpt evals 98.9% / 98.8 /
+  +40.78 on the continuous gym — zero generalization gap**, its best
+  numbers on any geometry: spatial control, not cell memorization.
+  Bot: 86.5 / 80.3 / 71.2 (hard/dynamic UP — uniform-rectangle
+  sampling puts less mass on the extreme columns than uniform cells).
