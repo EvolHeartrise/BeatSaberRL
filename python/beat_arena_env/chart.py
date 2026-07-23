@@ -117,14 +117,23 @@ def chain_links(head: Note, tail_x: float, tail_y: float, tail_time: float,
     return links
 
 
+# env v7.5: the continuous sampling area extends 0.2 m past the
+# outermost allowed cell centers in every direction (user-specified) —
+# under uniform sampling the old edge CELLS (half the note mass) became
+# measure-zero extremes; the margin keeps outer-edge capability trained
+# instead of regressing. Defaults: x [-1.1, 1.1], y [0.65, 2.1].
+POS_PAD = 0.2
+
+
 def _pos_ranges(cfg):
-    """Continuous (x_lo, x_hi, y_lo, y_hi) spanned by the allowed
-    cols/rows (env v7.5: generated positions are continuous WITHIN the
-    ranges the cell dials describe; a single allowed col/row degenerates
-    to that exact line — the spatial-curriculum dial survives)."""
+    """Continuous (x_lo, x_hi, y_lo, y_hi): the span of the allowed
+    cols/rows padded by POS_PAD on every side (a single allowed col/row
+    becomes a +-POS_PAD band — the spatial-curriculum dial survives as
+    a narrow corridor)."""
     xs = [col_x(c) for c in cfg.cols]
     ys = [ROW_Y[r] for r in cfg.rows]
-    return min(xs), max(xs), min(ys), max(ys)
+    return (min(xs) - POS_PAD, max(xs) + POS_PAD,
+            min(ys) - POS_PAD, max(ys) + POS_PAD)
 
 
 def _nearest_cell(x, y):

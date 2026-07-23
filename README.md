@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.5 scripted bot, 10 eps each): easy (rate 1.0,
-right hand only, down-swings) 86.5% good cuts / 50.4 pts per note; hard
-(both hands, 8 dirs) 80.3% / 56.9; dynamic gym 71.2% / 54.1. The real
+Reference points (env v7.5 scripted bot, padded gym, 10 eps each): easy
+(rate 1.0, right hand only, down-swings) 88.6% good cuts / 57.5 pts per
+note; hard (both hands, 8 dirs) 81.3% / 58.4; dynamic gym 68.0% / 50.7. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -309,12 +309,14 @@ partially uses. Pre-v7 references are not comparable.
   **98.6% / 97.8 / +40.16** — center-cutting generalizes, v5.3 pattern.
   Bot: 87.3 / 74.6 / 68.5.
 - **Env v7.5 (2026-07-22, user-directed): continuous generated
-  positions** — the procedural generator samples x, y ~ U over the
-  rectangle spanned by the allowed cols/rows (cell dials survive as
-  range clamps); chains go 0.6-1.2 m along the head's direction; real
-  maps keep their cells; sim/obs unchanged (explicit positions since
-  v7.0). **The cell-trained v7.3 record ckpt evals 98.9% / 98.8 /
-  +40.78 on the continuous gym — zero generalization gap**, its best
-  numbers on any geometry: spatial control, not cell memorization.
-  Bot: 86.5 / 80.3 / 71.2 (hard/dynamic UP — uniform-rectangle
-  sampling puts less mass on the extreme columns than uniform cells).
+  positions with an outer margin** — the procedural generator samples
+  x, y ~ U over the allowed cols/rows span padded 0.2 m per side
+  (x ±1.1, y 0.65-2.1; user-specified margin so the old edge cells —
+  measure-zero under uniform sampling — don't atrophy); chains go
+  0.6-1.2 m along the head's direction; real maps keep their cells;
+  sim/obs unchanged (explicit positions since v7.0). **The
+  cell-trained v7.3 record ckpt evals 98.9% / 98.8 / +40.78 on the
+  unpadded continuous gym — zero generalization gap** (spatial
+  control, not cell memorization) — and 97.6 / 96.7 with the margin
+  (the padded extremes are genuinely new territory to train). Bot on
+  the padded gym: 88.6 / 81.3 / 68.0.

@@ -671,23 +671,24 @@ def test_chart_v7_object_dials():
 
 
 def test_chart_positions_are_continuous():
-    """Env v7.5: generated positions are continuous within the ranges
-    spanned by the allowed cols/rows; restricting to a single col/row
-    pins that axis exactly."""
+    """Env v7.5: generated positions are continuous over the allowed
+    cols/rows span padded by 0.2 m on every side (outer-edge coverage);
+    restricting to a single col narrows x to a +-0.2 m corridor."""
     from beat_arena_env.constants import note_center as nc
     cfg = ChartConfig(note_rate=3.0, colors="both", chart_len_s=40.0,
                       min_hand_gap_s=0.2)
     chart = generate_chart(cfg, np.random.default_rng(23))
     xs = [nc(n)[0] for n in chart]
     ys = [nc(n)[1] for n in chart]
-    assert all(-0.9 - 1e-9 <= x <= 0.9 + 1e-9 for x in xs)
-    assert all(0.85 - 1e-9 <= y <= 1.9 + 1e-9 for y in ys)
+    assert all(-1.1 - 1e-9 <= x <= 1.1 + 1e-9 for x in xs)
+    assert all(0.65 - 1e-9 <= y <= 2.1 + 1e-9 for y in ys)
     assert len({round(x, 3) for x in xs}) > 20      # actually continuous
     assert len({round(y, 3) for y in ys}) > 20
+    assert max(xs) > 0.9 or min(xs) < -0.9          # the margin gets used
     pinned = generate_chart(ChartConfig(note_rate=2.0, chart_len_s=20.0,
                                         cols=(2,), rows=(0, 1, 2)),
                             np.random.default_rng(5))
-    assert all(nc(n)[0] == pytest.approx(col_x(2)) for n in pinned)
+    assert all(abs(nc(n)[0] - col_x(2)) <= 0.2 + 1e-9 for n in pinned)
     assert len({round(nc(n)[1], 3) for n in pinned}) > 5
 
 
