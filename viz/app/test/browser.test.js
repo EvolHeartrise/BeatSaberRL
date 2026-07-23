@@ -63,16 +63,23 @@ try {
   await new Promise((r) => setTimeout(r, 1500)); // let it play a bit
   await page.screenshot({ path: "test/out/playing.png" });
 
-  // ---- v7.4 rotated hitboxes: toggle 'h', scrub to the diagonal-tangent
-  // chain-link cluster (t ~ 12.6 s in the fixture) and screenshot — the
-  // green boxes should visibly tilt with their notes
+  // ---- hitbox + orientation eyeball shots (both with 'h' on):
+  // tick 28 (t = 0.93 s): an edge-column stack of plain notes from the
+  // plane out to 8 m — the v7.6 look-at gradient (near notes yawed
+  // toward the head, far ones straight) with wireframes riding along;
+  // tick 377 (t = 12.57 s): the diagonal-tangent chain-link cluster —
+  // v7.4 rolled hitboxes fanning with the links
   await page.keyboard.press("h");
-  await page.evaluate(() => {
+  const scrub = (tick) => page.evaluate((tick) => {
     const r = document.querySelector("#bottom input[type=range]");
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
-      .set.call(r, 377); // tick 377 = 12.57 s
+      .set.call(r, tick);
     r.dispatchEvent(new Event("input", { bubbles: true }));
-  });
+  }, tick);
+  await scrub(28);
+  await new Promise((r) => setTimeout(r, 500));
+  await page.screenshot({ path: "test/out/lookat.png" });
+  await scrub(377);
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/hitboxes.png" });
 

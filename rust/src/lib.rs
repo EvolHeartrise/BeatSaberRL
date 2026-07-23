@@ -114,7 +114,8 @@ const CHAIN_LINK_PTS: f64 = 20.0;
 const SWING_BREAK: f64 = 0.005; // rad/tick below which the swing chain breaks
 const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 
-// object kinds (mirrors constants.py; 0 = plain note)
+// object kinds (mirrors constants.py)
+const KIND_NOTE: u8 = 0;
 const KIND_BOMB: u8 = 1;
 const KIND_CHAIN_HEAD: u8 = 2;
 const KIND_CHAIN_LINK: u8 = 3;
@@ -357,28 +358,60 @@ fn note_rot(angle: f64, rotates: bool) -> (f64, f64) {
     }
 }
 
-/// p relative to `center`, expressed in the box's rotated frame.
-fn to_box_frame(p: [f64; 3], center: [f64; 3], cos_r: f64, sin_r: f64) -> [f64; 3] {
+// --- env v7.6: look-at-player note orientation -------------------------------
+// Notes bias their FULL 3D orientation toward facing the player's head
+// as they approach (ArcViewer ObjectManager.LookAtPlayer / BeatLeader
+// beat.js lookAt): the head's y is damped 80% toward the note's y, the
+// forward axis blends from +z to the head->note ray with weight
+// lam = clamp(1 - z/LOOK_DIST, 0, 1) (our analog of jump progress —
+// the real game reaches full head-facing at the play plane), and the
+// cut-direction z-roll rides along as the frame's up. lam = 0
+// reproduces the v7.4 pure z-roll frame EXACTLY. Applies to plain
+// notes only (chain heads are excluded in ArcViewer; links keep their
+// tangent roll; bombs are spheres). The game's colliders AND its
+// local-frame direction check both live on this transform.
+const HEAD: [f64; 3] = [0.0, 1.70, -0.65]; // fixed head anchor (1.8 m player)
+const LOOK_VERT: f64 = 0.8; // verticalLookStrength: head.y 80% toward note.y
+const LOOK_DIST: f64 = 8.0; // full head-facing at z=0, none beyond 8 m
+
+/// Orthonormal note frame columns (x', y', z'): z' = the blended
+/// forward, up from the z-roll, x' = up x z'.
+fn note_frame(p: [f64; 3], cos_r: f64, sin_r: f64, lam: f64) -> [[f64; 3]; 3] {
+    let up = [-sin_r, cos_r, 0.0];
+    let hp = [HEAD[0], HEAD[1] + LOOK_VERT * (p[1] - HEAD[1]), HEAD[2]];
+    let d = sub(p, hp);
+    let dn = dot3(d, d).sqrt().max(1e-9);
+    let g = [
+        lam * d[0] / dn,
+        lam * d[1] / dn,
+        (1.0 - lam) + lam * d[2] / dn,
+    ];
+    let gn = dot3(g, g).sqrt().max(1e-9);
+    let fz = [g[0] / gn, g[1] / gn, g[2] / gn];
+    let cx = cross3(up, fz);
+    let cn = dot3(cx, cx).sqrt().max(1e-9);
+    let fx = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
+    let fy = cross3(fz, fx);
+    [fx, fy, fz]
+}
+
+/// p relative to `center`, expressed in the note frame.
+fn to_frame(p: [f64; 3], center: [f64; 3], f: &[[f64; 3]; 3]) -> [f64; 3] {
     let q = sub(p, center);
-    [
-        cos_r * q[0] + sin_r * q[1],
-        -sin_r * q[0] + cos_r * q[1],
-        q[2],
-    ]
+    [dot3(q, f[0]), dot3(q, f[1]), dot3(q, f[2])]
 }
 
 fn sweep_hits_box(
     tris: &[[[f64; 3]; 3]; 2],
     center: [f64; 3],
     h: [f64; 3],
-    cos_r: f64,
-    sin_r: f64,
+    frame: &[[f64; 3]; 3],
 ) -> bool {
     for t in tris {
         let rel = [
-            to_box_frame(t[0], center, cos_r, sin_r),
-            to_box_frame(t[1], center, cos_r, sin_r),
-            to_box_frame(t[2], center, cos_r, sin_r),
+            to_frame(t[0], center, frame),
+            to_frame(t[1], center, frame),
+            to_frame(t[2], center, frame),
         ];
         if tri_box_overlap(rel, h) {
             return true;
@@ -716,14 +749,28 @@ impl Core {
             } else {
                 GOOD_HALF_Y
             };
-            let good_center = [n.x, n.y, z + GOOD_Z_SHIFT];
             let good_h = [GOOD_HALF_X, good_hy, GOOD_HALF_Z];
-            // arrow notes/heads and chain links (tangent) rotate their
-            // hitboxes; plain dots stay axis-aligned
+            // arrow notes/heads and chain links (tangent) roll their
+            // hitboxes; plain dots stay roll-free
             let rotates = n.kind == KIND_CHAIN_LINK || !n.any_dir;
             let (cos_r, sin_r) = note_rot(n.angle, rotates);
+            // env v7.6: plain notes additionally billboard toward the
+            // head as they approach; heads/links keep the pure z-roll
+            let lam = if n.kind == KIND_NOTE {
+                (1.0 - z / LOOK_DIST).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let frame = note_frame(center, cos_r, sin_r, lam);
+            // the good box's 0.25 m shift is along the note's LOCAL z
+            // (it rides the transform, extending toward the head)
+            let good_center = [
+                center[0] + GOOD_Z_SHIFT * frame[2][0],
+                center[1] + GOOD_Z_SHIFT * frame[2][1],
+                center[2] + GOOD_Z_SHIFT * frame[2][2],
+            ];
 
-            if sweep_hits_box(&tris[m], good_center, good_h, cos_r, sin_r) {
+            if sweep_hits_box(&tris[m], good_center, good_h, &frame) {
                 // contact point: the blade sample whose displacement
                 // segment passes closest to the note center; its
                 // finite-difference velocity is the contact velocity
@@ -765,10 +812,15 @@ impl Core {
                 } else if n.any_dir {
                     0 // dot note / chain link: any direction scores
                 } else {
-                    // direction check on the IN-PLANE contact velocity
-                    let d2 = [n.angle.cos(), n.angle.sin()];
-                    let v2_mag = (vc[0].powi(2) + vc[1].powi(2)).sqrt();
-                    let cosv = (vc[0] * d2[0] + vc[1] * d2[1]) / v2_mag.max(1e-9);
+                    // env v7.6: direction check in the NOTE'S LOCAL
+                    // frame (the game transforms the cut velocity by
+                    // the note rotation) — required direction is local
+                    // -y'; at lam = 0 this is exactly the old world
+                    // in-plane check
+                    let vlx = dot3(vc, frame[0]);
+                    let vly = dot3(vc, frame[1]);
+                    let v2_mag = (vlx * vlx + vly * vly).sqrt();
+                    let cosv = -vly / v2_mag.max(1e-9);
                     if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
                 };
                 if code == 0 {
@@ -815,7 +867,7 @@ impl Core {
                     BAD_HALF
                 };
                 if sweep_hits_box(&tris[1 - m], center, [BAD_HALF, bad_hy, BAD_HALF],
-                                  cos_r, sin_r) {
+                                  &frame) {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;

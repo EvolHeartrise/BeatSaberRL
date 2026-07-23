@@ -87,9 +87,9 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.5 scripted bot, padded gym, 10 eps each): easy
-(rate 1.0, right hand only, down-swings) 88.6% good cuts / 57.5 pts per
-note; hard (both hands, 8 dirs) 81.3% / 58.4; dynamic gym 68.0% / 50.7. The real
+Reference points (env v7.6 scripted bot, padded gym, 10 eps each): easy
+(rate 1.0, right hand only, down-swings) 82.9% good cuts / 51.4 pts per
+note; hard (both hands, 8 dirs) 77.7% / 55.6; dynamic gym 68.9% / 51.3. The real
 hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
 the bot whips through the contact angle 0.10 s early, like real
 players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
@@ -320,3 +320,16 @@ partially uses. Pre-v7 references are not comparable.
   control, not cell memorization) — and 97.6 / 96.7 with the margin
   (the padded extremes are genuinely new territory to train). Bot on
   the padded gym: 88.6 / 81.3 / 68.0.
+- **Env v7.6 (2026-07-22, user-directed after a formula deep-dive):
+  look-at-player note orientation.** Plain notes blend their full 3D
+  frame toward facing the head (anchor (0, 1.70, −0.65), vertical 80%
+  damped, weight λ = 1 − z/8 clamped — full billboard at the plane;
+  ArcViewer/BeatLeader formulas in the research addendum). Applied to
+  BOTH hitbox orientation (the good box's 0.25 m shift rides local z,
+  extending toward the head at the edges) and the DIRECTION CHECK,
+  which now runs in the note's local frame (forward-heavy swings at
+  edge notes lose direction credit — real-game behavior). Chain
+  heads/links keep pure z-roll; freeze-after-pass and the
+  spawn-settle info timeline deliberately skipped. λ = 0 reproduces
+  v7.4 exactly. Record ckpt on v7.6: **98.3 / 97.3 / +40.02** — still
+  rising. Bot: 82.9 / 77.7 / 68.9.

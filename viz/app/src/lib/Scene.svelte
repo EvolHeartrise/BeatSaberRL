@@ -9,7 +9,7 @@
   import { pb, pose, lastTick, setPlaying } from "./state.svelte.js";
   import {
     BLOCK, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES, ROW_Y,
-    SHOULDER, Z_FAR, Z_MISS,
+    SHOULDER, Z_FAR, Z_MISS, frameQuatScene, noteFrame,
   } from "./replay.js";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
@@ -64,9 +64,10 @@
   const SH_Y = SHOULDER[1][1], SH_Z = -SHOULDER[1][2]; // scene z = +0.65
 
   // pose-mode reference note: a static cube at a chosen cell, z = 0.
-  // It is a canonical down-swing note (rot = 0), so the v7.4 rotated
-  // hitboxes coincide with these axis-aligned wireframes; rotate them
-  // with hitboxRot if this reference ever grows an angle control.
+  // A canonical down-swing note (roll 0); at z = 0 the v7.6 look-at
+  // frame is FULLY billboarded (lam = 1) — a nice way to eyeball the
+  // mechanic — so cube and hitboxes ride noteFrame(p, 0, 1). Pass
+  // hitboxRot as psi if this reference ever grows an angle control.
   const refEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
   const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
@@ -114,21 +115,24 @@
   <!-- static reference note at a chosen cell, z = 0, for eyeballing reach -->
   {@const rx = LANE_X[pose.ref.col]}
   {@const ry = ROW_Y[pose.ref.row]}
-  <T.Mesh position={[rx, ry, 0]}>
-    <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
-    <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />
-  </T.Mesh>
-  <T.LineSegments geometry={refEdgesGeo} position={[rx, ry, 0]}>
-    <T.LineBasicMaterial color="#e8eaf0" />
-  </T.LineSegments>
-  {#if pb.hitboxes}
-    <T.LineSegments geometry={refGoodHbGeo} position={[rx, ry, -HB.goodZShift]}>
-      <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+  {@const refQ = frameQuatScene(noteFrame([rx, ry, 0], 0, 1))}
+  <T.Group position={[rx, ry, 0]} quaternion={refQ}>
+    <T.Mesh>
+      <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
+      <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />
+    </T.Mesh>
+    <T.LineSegments geometry={refEdgesGeo}>
+      <T.LineBasicMaterial color="#e8eaf0" />
     </T.LineSegments>
-    <T.LineSegments geometry={refBadHbGeo} position={[rx, ry, 0]}>
-      <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
-    </T.LineSegments>
-  {/if}
+    {#if pb.hitboxes}
+      <T.LineSegments geometry={refGoodHbGeo} position={[0, 0, -HB.goodZShift]}>
+        <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+      </T.LineSegments>
+      <T.LineSegments geometry={refBadHbGeo}>
+        <T.LineBasicMaterial color="#f0a35e" transparent opacity={0.5} />
+      </T.LineSegments>
+    {/if}
+  </T.Group>
 {/if}
 
 {#if pb.rep || pose.on}

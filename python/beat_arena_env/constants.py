@@ -96,6 +96,17 @@ def joint_limits(hand):
             (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM)]
 
 
+# --- look-at-player (env v7.6) -----------------------------------------------
+# Plain notes bias their full 3D orientation toward facing the player's
+# head as they approach (ArcViewer/BeatLeader look-at): forward blends
+# from +z to the (vertically 80%-damped) head->note ray with weight
+# lam = clamp(1 - z/LOOK_DIST, 0, 1); the cut-direction z-roll rides as
+# the frame's up. Hitboxes AND the direction check live in this frame.
+# lam = 0 (heads, links, far notes) = the pure v7.4 z-roll frame.
+HEAD = (0.0, 1.70, -0.65)   # fixed head anchor (1.8 m player)
+LOOK_VERT = 0.8             # verticalLookStrength (head.y toward note.y)
+LOOK_DIST = 8.0             # full head-facing at z=0, none beyond 8 m
+
 N_BLADE_SAMPLES = 8   # contact-point/velocity samples along the blade
 # broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm 0.65) +
 # blade 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
