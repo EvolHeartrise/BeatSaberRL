@@ -450,52 +450,9 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 `--num-envs --horizon --minibatches --epochs --total-steps --time-cap
 --ent-coef --seed --ckpt-every --run-dir --init-from --bench` + env
 config (`--note-rate --colors --dirs --cols --rows --chart-len
---min-hand-gap --note-speed`) + curriculum mode
-(`--curriculum` + friends, see §Curriculum training). Batch = num_envs×horizon;
+--min-hand-gap --note-speed`). Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
-
-## Curriculum training (`train_batch.py --curriculum`, 2026-07-20)
-
-Alternative to the procedural generator: a **ladder of real BeatSaver
-maps ordered by ScoreSaber star rating** (the community difficulty
-scale; each ranked (map, difficulty) leaderboard carries a `stars`
-value). Flow:
-
-1. Start: one random ranked map near `--start-star` (default 1.0★),
-   found via the ScoreSaber API (`beat_arena_env/scoresaber.py`,
-   stdlib urllib only), downloaded from BeatSaver by song hash into
-   `--map-dir` (default `maps/curriculum/`, a shared cache), parsed by
-   `beatsaver.py` with `--speed-scale` (default 0.3, same as sightread).
-   Unparseable maps (v4 schema, no Standard set) and maps longer than
-   `--max-song-s` (default 400 s, which also sets the sim tick cap) are
-   skipped; sparse star bands auto-widen ±0.1★ at a time (0.9–1.1★
-   holds only ~5 ranked leaderboards).
-2. Every episode's chart is drawn from the ladder: the newest (un-FC'd)
-   map with probability `--new-map-weight` (default 0.5), the remainder
-   uniform over the FC'd rungs — old maps stay in the mix so they don't
-   regress, without the newest map's gradient share shrinking as the
-   ladder grows.
-3. Every `--fc-eval-every` updates (default 10) the newest map is played
-   once **greedy** (argmax both heads — deterministic sim + fixed chart
-   ⇒ one rollout is the exact answer), aborting on the first combo
-   break. **Full combo** (= every note a good cut: zero bad cuts, zero
-   misses) ⇒ checkpoint `fc_<stars>star.pt`, mark the rung FC'd, fetch a
-   new random map `--star-step` (default 0.2) harder, keep training.
-4. Ladder state (stages, hashes, FC flags) persists as JSON
-   (`--curriculum-state`, default `<run-dir>/curriculum.json`); pointing
-   a new run at an old state file resumes the ladder (zips re-download
-   by hash if the cache was purged). Promotion failing on network error
-   is retried at the next FC check.
-
-Implementation: `beat_arena_env/curriculum.py` (`Curriculum` — ladder
-state, weighted `sample(i, rng)` hook, per-stage rolling stats printed
-at each FC check) + `BeatVecEnv(chart_sampler=..., max_steps=...)`
-(sampler replaces `generate_chart` at auto-reset; the tick cap must
-cover the longest map). Known limits: star ratings measure *human*
-difficulty (NJS/nps patterns), which correlates only loosely with what
-the agent finds hard at 30 Hz point-mass control; ultra-short ranked
-memes (e.g. Dogbass, 17 notes / 4 s, 0.99★) are legitimate rungs.
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
@@ -586,13 +543,7 @@ Further gains need a GPU or a cheaper policy, not more envs.
 5. Policy junk-leak: garbage in masked note slots changes no
    logprob/entropy/value (key-masking).
 6. Scripted bot ≥ 80% good cuts on default easy chart (solvability).
-7. Curriculum (offline, network monkeypatched): state save/load
-   round-trip, newest-map sample weighting, per-stage episode
-   bookkeeping, promotion appends the next rung, `chart_sampler` path
-   through `BeatVecEnv`, `greedy_fc_eval` counters (bombs break FC).
-   NOTE: the ladder tests skip when the local (gitignored) fixture zips
-   are absent.
-8. BeatSaver parser fixtures: v2 (notes + bombs + dots), v3 (chains
+7. BeatSaver parser fixtures: v2 (notes + bombs + dots), v3 (chains
    with the link Bézier, arcs as grants, precision angles, BPM change
    events), v4 (index-indirected arrays, dot chain heads), and the
    paired-note ANGLE SNAP rule (snapped diagonal pair; same-column

@@ -30,8 +30,8 @@ Design notes (why it looks the way it does):
   on-device ring buffer fetched with pop_stats() once per PPO update: the
   step loop performs ZERO host<->device synchronizations.
 
-Limits vs BeatVecEnv: no curriculum sampler, no per-step info dicts, no
-event stream (rewards/counters/score only).
+Limits vs BeatVecEnv: no per-step info dicts, no event stream
+(rewards/counters/score only).
 """
 
 from __future__ import annotations

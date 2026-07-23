@@ -23,7 +23,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from beat_arena_env.rust_env import RustBeatEnv
 from beat_arena_env.vec_env import BeatVecEnv
 from policy import HEAD_SIZES, NotePolicy, OBS_DIM, load_policy
 
@@ -76,8 +75,7 @@ def parse_args():
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
     p.add_argument("--env", choices=["rust", "torch"], default="rust",
-                   help="torch = GPU-resident sim (obs born on device; "
-                        "procedural charts only, no curriculum)")
+                   help="torch = GPU-resident sim (obs born on device)")
     p.add_argument("--chart-pool", type=int, default=1024,
                    help="pregenerated chart pool size for --env torch")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
@@ -104,63 +102,12 @@ def parse_args():
                    help="P(a non-dot note becomes a chain)")
     p.add_argument("--arc-prob", type=float, default=0.0,
                    help="P(consecutive same-color pair gets an arc)")
-    # curriculum mode (SPEC §Curriculum): real ScoreSaber-ranked maps on a
-    # star ladder instead of the procedural generator
-    c = p.add_argument_group("curriculum")
-    c.add_argument("--curriculum", action="store_true",
-                   help="train on a ScoreSaber map ladder (ignores the "
-                        "procedural chart flags above)")
-    c.add_argument("--map-dir", type=str, default="maps/curriculum",
-                   help="shared zip cache for downloaded maps")
-    c.add_argument("--curriculum-state", type=str, default=None,
-                   help="ladder state JSON (default <run-dir>/curriculum.json; "
-                        "point at a previous run's file to resume its ladder)")
-    c.add_argument("--start-star", type=float, default=1.0)
-    c.add_argument("--star-step", type=float, default=0.2)
-    c.add_argument("--star-band", type=float, default=0.1,
-                   help="accept maps within ±band of the target star")
-    c.add_argument("--speed-scale", type=float, default=0.3,
-                   help="note speed = NJS * this (matches sightread.py)")
-    c.add_argument("--new-map-weight", type=float, default=0.5,
-                   help="fraction of episodes on the newest (un-FC'd) map; "
-                        "the rest spread uniformly over the FC'd rungs")
-    c.add_argument("--fc-eval-every", type=int, default=10,
-                   help="updates between greedy full-combo checks")
-    c.add_argument("--max-song-s", type=float, default=400.0,
-                   help="skip maps longer than this; also sets the tick cap")
     return p.parse_args()
 
 
 def cpu_state(policy):
     """Checkpoint state_dict on CPU regardless of the training device."""
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
-
-
-def greedy_fc_eval(policy, notes):
-    """Play a fixed chart once with argmax actions (deterministic since the
-    sim is deterministic). Aborts on the first combo break — FC needs zero
-    (bomb hits break combo too; passed bombs are silent and free).
-    Returns (fc: bool, good, breaks, n_scoreable)."""
-    from beat_arena_env.constants import KIND_BOMB
-    dev = next(policy.parameters()).device
-    env = RustBeatEnv(external_chart=notes, seed=0)
-    obs, _ = env.reset()
-    n_scoreable = sum(n.kind != KIND_BOMB for n in notes)
-    good = breaks = 0
-    done = False
-    while not done and breaks == 0:
-        with torch.no_grad():
-            logits, _ = policy(
-                torch.as_tensor(obs, dtype=torch.float32,
-                                device=dev).unsqueeze(0))
-        act = tuple(int(l.argmax()) for l in logits)
-        obs, _, done, _, info = env.step(act)
-        for _, reason, _pts in info["events"]:
-            if reason == "ok":
-                good += 1
-            elif reason != "post":   # bad cut / miss / bomb hit all break
-                breaks += 1
-    return breaks == 0 and good == n_scoreable, good, breaks, n_scoreable
 
 
 def main():
@@ -181,25 +128,8 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
-    assert not (args.curriculum and args.env == "torch"), (
-        "--curriculum needs --env rust (real-map sampler is Python-side)")
     torch_env = args.env == "torch"
-    curriculum = None
-    if args.curriculum:
-        from beat_arena_env.curriculum import Curriculum
-        state_path = args.curriculum_state or os.path.join(
-            args.run_dir, "curriculum.json")
-        curriculum = Curriculum(
-            args.map_dir, state_path, start_star=args.start_star,
-            star_step=args.star_step, star_band=args.star_band,
-            speed_scale=args.speed_scale, new_map_weight=args.new_map_weight,
-            max_song_s=args.max_song_s,
-            acquire_rng=np.random.default_rng(args.seed))
-        venv = BeatVecEnv(
-            N, seed=args.seed,
-            chart_sampler=curriculum.sample,
-            max_steps=int(args.max_song_s * 30) + 90)
-    elif args.env == "torch":
+    if torch_env:
         from beat_arena_env.torch_env import TorchBeatVecEnv
         venv = TorchBeatVecEnv(
             N, note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
@@ -280,8 +210,6 @@ def main():
                 obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
             for info in infos:
                 ep_returns.append(info["episode_return"])
-                if curriculum is not None:
-                    curriculum.note_result(info)
             global_step += N
         if torch_env:
             ep_returns.extend(venv.pop_stats())
@@ -332,28 +260,6 @@ def main():
         print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
               f"ep_return(last100) {recent:8.3f}  ent {ent_loss.item():.3f}  "
               f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
-
-        if curriculum is not None and (update + 1) % args.fc_eval_every == 0:
-            newest = curriculum.stages[curriculum.newest]
-            fc, good, breaks, n = greedy_fc_eval(
-                policy, curriculum.charts[curriculum.newest])
-            print(f"[curriculum] FC check {newest['song']!r} "
-                  f"{newest['stars']:.2f}★: good {good}/{n}, "
-                  f"breaks {breaks}{'  *** FULL COMBO ***' if fc else ''}",
-                  flush=True)
-            print(curriculum.summary(), flush=True)
-            if fc:
-                torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
-                            "encoder": policy.encoder, "update": update + 1,
-                            "global_step": global_step,
-                            "fc_map": newest["song"], "stars": newest["stars"]},
-                           os.path.join(args.run_dir,
-                                        f"fc_{newest['stars']:.2f}star.pt"))
-                try:
-                    curriculum.promote()
-                except Exception as e:   # network down: retry next eval tick
-                    print(f"[curriculum] promote failed ({e}); "
-                          f"will retry next FC check", flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,

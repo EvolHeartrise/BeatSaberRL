@@ -49,23 +49,6 @@ cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`,
 plus the v7 object dials `--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
 
-## Curriculum training (real maps, ScoreSaber star ladder)
-
-Alternative to the procedural generator (SPEC §Curriculum training):
-
-```bash
-$VENV/bin/python train_batch.py --curriculum --num-envs 128 --epochs 1 \
-    --total-steps 50000000 --ckpt-every 50
-```
-
-Starts on a random ScoreSaber-ranked ~1.0★ map (fetched automatically
-into `maps/curriculum/`). Every `--fc-eval-every` updates the newest map
-is played once greedily; on a **full combo** (every note a good cut) a
-`fc_<stars>star.pt` checkpoint drops, a new random map 0.2★ harder joins
-the mix, and the old maps keep getting half the episodes so they don't
-regress. Ladder state lives in `<run-dir>/curriculum.json` — pass it as
-`--curriculum-state` to a later run to resume the ladder.
-
 ## Watching replays
 
 ```bash
