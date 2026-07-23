@@ -14,7 +14,8 @@
     BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB, HEAD_SQUASH,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
     MISS_COL, REACH_Z, SABER_COLORS, Z_FAR, Z_MISS, activeArcs, activePosts,
-    aftermaths, cutPlaneLocal, hitboxRot, noteCenter, noteRot, pendingNotes,
+    aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, noteCenter,
+    noteFrame, noteLam, noteRot, pendingNotes,
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -35,10 +36,12 @@
     new THREE.PlaneGeometry(BLOCK, BLOCK));
 
   // real hitboxes ('h' overlay): good box shifted toward the player; the
-  // small box is all the wrong-color saber can trigger. Env v7.4 rotates
+  // small box is all the wrong-color saber can trigger. Env v7.4 rolls
   // both about the approach axis with the note (hitboxRot) — v7.0's
   // axis-aligned boxes were a BeatLeader-viewer simplification mistaken
   // for game behavior; real colliders sit on the rotated note transform.
+  // Env v7.6 adds the look-at-player blend (noteFrame): boxes ride the
+  // full note frame, exactly like the sim's colliders.
   const hbGeo = (h) => new THREE.EdgesGeometry(
     new THREE.BoxGeometry(2 * h[0], 2 * h[1], 2 * h[2]));
   const goodHbGeo = hbGeo(HB.goodHalf);
@@ -163,7 +166,11 @@
 {#each pend as { n, z } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {@const alpha = fade(z)}
-  {@const rot = noteRot(n)}
+  <!-- env v7.6: plain notes (dots included) look at the player's head as
+       they approach (lam blends toward full head-facing at the plane);
+       heads/links keep the pure z-roll via lam = 0 -->
+  {@const lam = noteLam(n, z)}
+  {@const vq = frameQuatScene(noteFrame([cx, cy, z], noteRot(n), lam))}
   {#if n.kind === KIND_BOMB}
     <!-- bomb: black sphere with a faint emissive rim, no glyph -->
     <T.Mesh geometry={bombGeo} position={[cx, cy, -z]}>
@@ -181,34 +188,39 @@
       : n.kind === KIND_CHAIN_HEAD ? headGeo : boxGeo}
     {@const edges = n.kind === KIND_CHAIN_LINK ? linkEdgesGeo
       : n.kind === KIND_CHAIN_HEAD ? headEdgesGeo : edgesGeo}
-    <T.Mesh geometry={geo} position={[cx, cy, -z]} rotation={[0, 0, rot]}>
-      <T.MeshStandardMaterial
-        color={SABER_COLORS[n.color]}
-        transparent={alpha < 1}
-        opacity={alpha}
-      />
-    </T.Mesh>
-    {#if inReach(z)}
-      <T.LineSegments geometry={edges} position={[cx, cy, -z]}
-        rotation={[0, 0, rot]}>
-        <T.LineBasicMaterial color="#e8eaf0" />
-      </T.LineSegments>
-    {/if}
-    {#if n.kind !== KIND_CHAIN_LINK}
-      {#if n.any}
-        <T.Mesh geometry={dotGeo} position={[cx, cy, -z + HALF + 0.005]}>
-          <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
-        </T.Mesh>
-      {:else}
-        <T.Mesh
-          geometry={arrowGeo}
-          position={[cx, cy, -z + HALF + 0.005]}
-          rotation={[0, 0, n.angle]}
-        >
-          <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
-        </T.Mesh>
+    <!-- the whole visual (cube + glyph) rides the v7.6 note frame; the
+         glyph sits on the player-facing face along LOCAL z'. Inside the
+         frame the arrow's residual roll is the constant 270 deg (the
+         frame's up already carries angle - 270). -->
+    <T.Group position={[cx, cy, -z]} quaternion={vq}>
+      <T.Mesh geometry={geo}>
+        <T.MeshStandardMaterial
+          color={SABER_COLORS[n.color]}
+          transparent={alpha < 1}
+          opacity={alpha}
+        />
+      </T.Mesh>
+      {#if inReach(z)}
+        <T.LineSegments geometry={edges}>
+          <T.LineBasicMaterial color="#e8eaf0" />
+        </T.LineSegments>
       {/if}
-    {/if}
+      {#if n.kind !== KIND_CHAIN_LINK}
+        {#if n.any}
+          <T.Mesh geometry={dotGeo} position={[0, 0, HALF + 0.005]}>
+            <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+          </T.Mesh>
+        {:else}
+          <T.Mesh
+            geometry={arrowGeo}
+            position={[0, 0, HALF + 0.005]}
+            rotation={[0, 0, 1.5 * Math.PI]}
+          >
+            <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
+          </T.Mesh>
+        {/if}
+      {/if}
+    </T.Group>
   {/if}
   {#if n.fpre}
     <TextSprite text="free pre" color="#9ece6a" size={0.07} bold={false}
@@ -220,9 +232,11 @@
   {/if}
   {#if pb.hitboxes}
     {@const hb = hitboxFor(n)}
-    <!-- group rotates about the NOTE CENTER; the good box's z-shift is
-         along the rotation axis, so it lives inside the group -->
-    <T.Group position={[cx, cy, -z]} rotation={[0, 0, hitboxRot(n)]}>
+    <!-- hitboxes live on the same v7.6 frame (with the hitbox roll —
+         links roll by their tangent), centered on the NOTE CENTER; the
+         good box's -0.25 shift is along LOCAL z' inside the group -->
+    {@const hq = frameQuatScene(noteFrame([cx, cy, z], hitboxRot(n), lam))}
+    <T.Group position={[cx, cy, -z]} quaternion={hq}>
       <T.LineSegments geometry={hb.good} position={[0, 0, -HB.goodZShift]}>
         <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
       </T.LineSegments>

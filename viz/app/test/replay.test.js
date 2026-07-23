@@ -3,9 +3,10 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  JOINT_NAMES, KIND_BOMB, KIND_CHAIN_LINK, activeArcs, activePosts,
-  aftermaths, armFK, clampQ, counts, cutPlaneLocal, hitboxRot,
-  jointLimits, maxScore, mirrorQ, noteRot, parseReplay, pendingNotes,
+  HEAD, JOINT_NAMES, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK,
+  LOOK_VERT, activeArcs, activePosts, aftermaths, armFK, clampQ, counts,
+  cutPlaneLocal, frameQuatScene, hitboxRot, jointLimits, maxScore,
+  mirrorQ, noteFrame, noteLam, noteRot, parseReplay, pendingNotes,
   poseSaber, saberAt, tipOf, tipSpeed, DT, Z_MISS,
 } from "../src/lib/replay.js";
 
@@ -160,6 +161,56 @@ for (const n of [{ kind: 0, any: false, angle: 200 * deg },
                  { kind: 2, any: false, angle: 45 * deg },
                  { kind: 0, any: true, angle: 0 }])
   assert.equal(hitboxRot(n), noteRot(n), "hitboxRot/noteRot mismatch");
+
+// env v7.6 look-at-player note frame (mirror of lib.rs note_frame)
+const close = (a, b, m) => a.forEach((v, i) =>
+  assert.ok(Math.abs(v - b[i]) < 1e-12, `${m}: [${a}] vs [${b}]`));
+// lam = 0 reproduces the v7.4 pure z-roll frame exactly
+for (const psi of [0, 45 * deg, -120 * deg, Math.PI]) {
+  const f = noteFrame([0.3, 1.9, 6], psi, 0);
+  close(f[0], [Math.cos(psi), Math.sin(psi), 0], "lam=0 x'");
+  close(f[1], [-Math.sin(psi), Math.cos(psi), 0], "lam=0 y'");
+  close(f[2], [0, 0, 1], "lam=0 z'");
+  // ...and its scene quaternion is the plain z-roll quaternion
+  // (compared up to the q ~ -q double cover)
+  const qa = frameQuatScene(f);
+  const qe = [0, 0, Math.sin(psi / 2), Math.cos(psi / 2)];
+  const qd = Math.abs(qa.reduce((s, v, i) => s + v * qe[i], 0));
+  assert.ok(Math.abs(qd - 1) < 1e-12, `lam=0 quat: [${qa}] vs [${qe}]`);
+}
+// lam = 1 at an edge note: fully billboarded — forward = the ray from
+// the y-damped head pseudo-anchor to the note, so it yaws outward
+{
+  const p = [0.9, 1.4, 0];
+  const f = noteFrame(p, 0, 1);
+  const hp = [HEAD[0], HEAD[1] + LOOK_VERT * (p[1] - HEAD[1]), HEAD[2]];
+  const d = [p[0] - hp[0], p[1] - hp[1], p[2] - hp[2]];
+  const dn = Math.hypot(...d);
+  close(f[2], d.map((v) => v / dn), "lam=1 forward = head->note ray");
+  assert.ok(f[2][0] > 0.5, "edge note yaws toward the head");
+}
+// any frame is right-handed orthonormal (spot-check a mid-blend)
+{
+  const f = noteFrame([-0.9, 0.85, 3.1], 30 * deg, 0.61);
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++)
+      assert.ok(Math.abs(dot(f[i], f[j]) - (i === j ? 1 : 0)) < 1e-12,
+        "frame not orthonormal");
+  const cx = [f[0][1] * f[1][2] - f[0][2] * f[1][1],
+              f[0][2] * f[1][0] - f[0][0] * f[1][2],
+              f[0][0] * f[1][1] - f[0][1] * f[1][0]];
+  close(cx, f[2], "frame not right-handed");
+}
+// lam: plain notes (dots included) billboard by proximity; heads,
+// links and bombs stay at the pure z-roll
+assert.equal(noteLam({ kind: 0 }, 0), 1);
+assert.equal(noteLam({ kind: 0 }, 4), 0.5);
+assert.equal(noteLam({ kind: 0 }, 8), 0);
+assert.equal(noteLam({ kind: 0 }, 11), 0);
+assert.equal(noteLam({ kind: 0 }, -0.5), 1);
+for (const kind of [KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK])
+  assert.equal(noteLam({ kind }, 1), 0, "lam leaks past plain notes");
 
 // replays from retired parameterizations are rejected with the friendly
 // "re-record" message

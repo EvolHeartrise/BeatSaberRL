@@ -66,6 +66,68 @@ export const hitboxRot = (n) =>
   n.kind !== KIND_BOMB && (n.kind === KIND_CHAIN_LINK || !n.any)
     ? n.angle - 1.5 * Math.PI
     : 0;
+
+// --- env v7.6: look-at-player note orientation (mirror of lib.rs
+// note_frame). Plain notes (kind 0, dots included) bias their FULL 3D
+// orientation toward facing the player's head as they approach: the
+// head's y is damped 80% toward the note's y, the forward axis blends
+// from +z to the head->note ray with weight lam = clamp(1 - z/8, 0, 1)
+// — our analog of the game's jump progress (full head-facing at the
+// plane) — and the cut-direction z-roll rides along as the frame's up.
+// lam = 0 reproduces the v7.4 pure z-roll frame EXACTLY (chain heads
+// and links stay there; bombs are spheres). Both the visuals and the
+// hitboxes live on this transform, exactly as in the sim.
+export const HEAD = [0, 1.7, -0.65]; // fixed head anchor (1.8 m player)
+export const LOOK_VERT = 0.8; // head.y damped 80% toward note.y
+export const LOOK_DIST = 8.0; // full head-facing at z=0, none beyond 8 m
+
+/** Look-at blend weight for an object at world z. */
+export const noteLam = (n, z) =>
+  n.kind === KIND_NOTE ? Math.min(1, Math.max(0, 1 - z / LOOK_DIST)) : 0;
+
+/** Orthonormal note frame [x', y', z'] (world-coord columns) at world
+ * position p with z-roll psi: z' = the blended forward, up = the rolled
+ * (-sin psi, cos psi, 0), x' = up x z', y' = z' x x'. */
+export function noteFrame(p, psi, lam) {
+  const up = [-Math.sin(psi), Math.cos(psi), 0];
+  const hp = [HEAD[0], HEAD[1] + LOOK_VERT * (p[1] - HEAD[1]), HEAD[2]];
+  const d = [p[0] - hp[0], p[1] - hp[1], p[2] - hp[2]];
+  const dn = Math.max(Math.hypot(...d), 1e-9);
+  const g = [
+    (lam * d[0]) / dn,
+    (lam * d[1]) / dn,
+    1 - lam + (lam * d[2]) / dn,
+  ];
+  const gn = Math.max(Math.hypot(...g), 1e-9);
+  const fz = g.map((v) => v / gn);
+  const cx = _cross(up, fz);
+  const cn = Math.max(_len(cx), 1e-9);
+  const fx = cx.map((v) => v / cn);
+  return [fx, _cross(fz, fx), fz];
+}
+
+/** Scene quaternion [x, y, z, w] of a world note frame. The scene maps
+ * world (x, y, z) -> (x, y, -z), so the orientation is CONJUGATED by
+ * S = diag(1, 1, -1): M' = S M S (entries with exactly one z index flip
+ * sign), which stays a proper rotation. */
+export function frameQuatScene(f) {
+  const m00 = f[0][0], m01 = f[1][0], m02 = -f[2][0];
+  const m10 = f[0][1], m11 = f[1][1], m12 = -f[2][1];
+  const m20 = -f[0][2], m21 = -f[1][2], m22 = f[2][2];
+  const tr = m00 + m11 + m22;
+  if (tr > 0) {
+    const s = 2 * Math.sqrt(tr + 1);
+    return [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, s / 4];
+  } else if (m00 > m11 && m00 > m22) {
+    const s = 2 * Math.sqrt(1 + m00 - m11 - m22);
+    return [s / 4, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s];
+  } else if (m11 > m22) {
+    const s = 2 * Math.sqrt(1 + m11 - m00 - m22);
+    return [(m01 + m10) / s, s / 4, (m12 + m21) / s, (m02 - m20) / s];
+  }
+  const s = 2 * Math.sqrt(1 + m22 - m00 - m11);
+  return [(m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s];
+}
 export const V_MIN = 1, DT = 1 / 30;
 // env v6 body (v7 placement) + anatomical joint limits (mirror the sim)
 const RAD = Math.PI / 180;

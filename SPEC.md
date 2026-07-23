@@ -125,13 +125,22 @@ checkpoints/replays retire (hard replace).
   - otherwise `swing_acc += Δ`; axis stored. `swing_acc` therefore holds
     the arc of the current continuous same-direction swing, INCLUDING
     the current tick.
-- **Hitboxes** (env v7 dims, **env v7.4 orientation**): the real boxes,
-  NOT the visual cube, and they **ROTATE with the object about the
-  approach (z) axis** by `rot = angle − 270°` — the game's colliders
-  sit on the rotated note transform (v7.0 shipped them axis-aligned,
-  misreading a BeatLeader-viewer simplification; user-caught). Arrow
-  notes/chain heads rotate by their angle, chain links by their
-  tangent, plain dot notes stay axis-aligned, bombs are spheres:
+- **Hitboxes** (env v7 dims, **env v7.6 orientation**): the real boxes,
+  NOT the visual cube, on the note's FULL transform. The frame = the
+  cut-direction z-roll (`rot = angle − 270°`; arrow notes/chain heads
+  by their angle, chain links by their tangent, dots roll-free —
+  env v7.4, user-caught) **blended toward FACING THE PLAYER'S HEAD as
+  the note approaches (env v7.6, the ArcViewer/BeatLeader look-at)**:
+  head anchor `HEAD = (0, 1.70, −0.65)`, head.y damped 80% toward the
+  note's y (`LOOK_VERT`), forward nlerped from +z to the head→note ray
+  with weight `λ = clamp(1 − z/LOOK_DIST(8), 0, 1)` (our analog of
+  jump progress — full head-facing at the plane), roll riding as the
+  frame's up. λ = 0 (chain heads/links, far notes) is exactly the
+  v7.4 z-roll frame. Plain notes only (dots billboard too, roll-free);
+  bombs are spheres. The good box's 0.25 m shift is along the note's
+  LOCAL z (it extends toward the head for edge notes — early cuts
+  reach farther there). No freeze-after-pass (moot at Z_MISS 0.65)
+  and no spawn-settle info timeline (deliberately skipped). Boxes:
   - **Good-cut box** (matching saber only): `0.8 × 0.5 × 1.0` m,
     center shifted `0.25` m toward the player — spans z
     `[note_z − 0.75, note_z + 0.25]`, so early and off-center swings
@@ -151,8 +160,14 @@ checkpoints/replays retire (hard replace).
 - **Contact point & velocity**: `s*` = the blade sample
   (`N_BLADE_SAMPLES = 8`) whose displacement segment passes closest to
   the object center; `v_c = (p1(s*) − p0(s*)) / DT`. `|v_c| ≥ V_MIN =
-  1` m/s or the cut is `slow`; in-plane direction check
-  `cos∠((v_c.x, v_c.y), dir_vec) ≥ 0.5` (dots and chain links exempt).
+  1` m/s or the cut is `slow`. **Direction check in the NOTE'S LOCAL
+  frame (env v7.6)** — the game transforms the cut velocity by the
+  note rotation: `cosv = −v_ly / ‖(v_lx, v_ly)‖ ≥ 0.5` where
+  `v_l = frameᵀ·v_c` (required direction ≡ local −y'); at λ = 0 this
+  is exactly the old world in-plane check. Dots and chain links
+  exempt. Near the plane the billboarded frame folds forward velocity
+  into local x — forward-heavy swings at edge notes lose direction
+  credit, as in the real game.
 - **Judgment order** per pending object: bombs — either saber's sweep
   within `0.18` of center → **bomb hit** (event code 6). Notes/heads/
   links — matching saber vs good box → judged (slow/angle/good);

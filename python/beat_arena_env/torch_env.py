@@ -44,8 +44,9 @@ from .constants import (
     ACC_NORM, BAD_HALF, BAD_HALF_Y_LINK, BEND_LIM, BOMB_RADIUS,
     CHAIN_LINK_PTS, COS_TOL, DRAG, DT, ELBOW_HI, FOLLOW_TIMEOUT,
     GOOD_HALF_X, GOOD_HALF_Y, GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK,
-    GOOD_HALF_Z, GOOD_Z_SHIFT, JOINT_ALPHA, JOINT_OMEGA, KIND_BOMB,
-    KIND_CHAIN_HEAD, KIND_CHAIN_LINK, L_FORE, L_UPPER, N_BLADE_SAMPLES,
+    GOOD_HALF_Z, GOOD_Z_SHIFT, HEAD, JOINT_ALPHA, JOINT_OMEGA, KIND_BOMB,
+    KIND_CHAIN_HEAD, KIND_CHAIN_LINK, L_FORE, L_UPPER, LOOK_DIST,
+    LOOK_VERT, N_BLADE_SAMPLES,
     N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT, OBS_DIM, OFF_NOTE_MASK, OFF_NOTES,
     PITCH_LIM, POST_FULL, PRE_FULL, PTS_ACC, PTS_POST, PTS_PRE, REACH_Z,
     PITCH_HI, PITCH_LO,
@@ -145,14 +146,42 @@ def _tri_point_dist(a, b, c, p):
             + d[..., 2] * d[..., 2]).sqrt()
 
 
-def _to_box_frame(p, center, cos_r, sin_r):
-    """p relative to `center`, expressed in the box's rotated frame
-    (lib.rs to_box_frame — env v7.4 rotating hitboxes)."""
-    q = p - center
+def _cross(a, b):
+    """cross3: exact component formulas (matches lib.rs)."""
     return torch.stack([
-        cos_r * q[..., 0] + sin_r * q[..., 1],
-        -sin_r * q[..., 0] + cos_r * q[..., 1],
-        q[..., 2]], -1)
+        a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
+        a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
+        a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]], -1)
+
+
+def _note_frame(p, cos_r, sin_r, lam):
+    """Orthonormal note frame columns (fx, fy, fz) — lib.rs note_frame
+    (env v7.6 look-at-player): z' blends +z toward the (damped-y) head->
+    note ray with weight lam; the cut-direction z-roll rides as up;
+    x' = up x z', y' = z' x x'. lam = 0 reproduces the v7.4 pure z-roll
+    frame EXACTLY."""
+    zero = torch.zeros_like(cos_r)
+    up = torch.stack([-sin_r, cos_r, zero], -1)
+    hp_y = HEAD[1] + LOOK_VERT * (p[..., 1] - HEAD[1])
+    d = torch.stack([p[..., 0] - HEAD[0], p[..., 1] - hp_y,
+                     p[..., 2] - HEAD[2]], -1)
+    dn = _dot(d, d).sqrt().clamp_min(1e-9)
+    g = torch.stack([lam * d[..., 0] / dn, lam * d[..., 1] / dn,
+                     (1.0 - lam) + lam * d[..., 2] / dn], -1)
+    gn = _dot(g, g).sqrt().clamp_min(1e-9)
+    fz = g / gn.unsqueeze(-1)
+    cx = _cross(up, fz)
+    cn = _dot(cx, cx).sqrt().clamp_min(1e-9)
+    fx = cx / cn.unsqueeze(-1)
+    fy = _cross(fz, fx)
+    return fx, fy, fz
+
+
+def _to_frame(p, center, fx, fy, fz):
+    """p relative to `center`, expressed in the note frame
+    (lib.rs to_frame)."""
+    q = p - center
+    return torch.stack([_dot(q, fx), _dot(q, fy), _dot(q, fz)], -1)
 
 
 def _seg_point_dist(a, b, c):
@@ -485,27 +514,32 @@ class TorchBeatVecEnv:
         w0 = prev_pos.unsqueeze(2); t0 = tip_prev.unsqueeze(2)      # (N,2,1,3)
         t1 = tip_new.unsqueeze(2); w1 = self.wrist.unsqueeze(2)
         bc = center3.unsqueeze(1)                                   # (N,1,C,3)
-        gc = torch.cat([self.c_center,
-                        (z + GOOD_Z_SHIFT).unsqueeze(-1)], -1).unsqueeze(1)
         ghy = self.c_good_hy.unsqueeze(1)                           # (N,1,C)
         bhy = self.c_bad_hy.unsqueeze(1)
-        # env v7.4: both boxes rotate about z with the note (same cos_r/
-        # sin_r); the good box's z shift is along the rotation axis, so
-        # it is unaffected. d_min / s* / contact velocity stay world-space.
-        cr = self.c_rot[..., 0].unsqueeze(1)                        # (N,1,C)
-        sr = self.c_rot[..., 1].unsqueeze(1)
-        w0g = _to_box_frame(w0, gc, cr, sr)
-        t0g = _to_box_frame(t0, gc, cr, sr)
-        t1g = _to_box_frame(t1, gc, cr, sr)
-        w1g = _to_box_frame(w1, gc, cr, sr)
+        # env v7.6: per-tick note frame — the z-roll (cos_r, sin_r) as up,
+        # plus plain notes billboarding toward the head with weight
+        # lam = clamp(1 - z/LOOK_DIST, 0, 1); heads/links/bombs lam = 0.
+        # Both boxes use the SAME frame; the good box's -0.25 shift rides
+        # the note's LOCAL z. d_min / s* / contact velocity stay world-space.
+        is_plain = ~(self.c_is_bomb | self.c_is_head | self.c_is_link)
+        lam = torch.where(is_plain, (1.0 - z / LOOK_DIST).clamp(0.0, 1.0),
+                          torch.zeros_like(z))                      # (N,C)
+        fx, fy, fz = _note_frame(center3, self.c_rot[..., 0],
+                                 self.c_rot[..., 1], lam)           # (N,C,3)
+        gc = (center3 + GOOD_Z_SHIFT * fz).unsqueeze(1)             # (N,1,C,3)
+        fx1, fy1, fz1 = fx.unsqueeze(1), fy.unsqueeze(1), fz.unsqueeze(1)
+        w0g = _to_frame(w0, gc, fx1, fy1, fz1)
+        t0g = _to_frame(t0, gc, fx1, fy1, fz1)
+        t1g = _to_frame(t1, gc, fx1, fy1, fz1)
+        w1g = _to_frame(w1, gc, fx1, fy1, fz1)
         good_hit = (
             _tri_box_overlap(w0g, t0g, t1g, GOOD_HALF_X, ghy, GOOD_HALF_Z)
             | _tri_box_overlap(w0g, t1g, w1g,
                                GOOD_HALF_X, ghy, GOOD_HALF_Z))      # (N,2,C)
-        w0b = _to_box_frame(w0, bc, cr, sr)
-        t0b = _to_box_frame(t0, bc, cr, sr)
-        t1b = _to_box_frame(t1, bc, cr, sr)
-        w1b = _to_box_frame(w1, bc, cr, sr)
+        w0b = _to_frame(w0, bc, fx1, fy1, fz1)
+        t0b = _to_frame(t0, bc, fx1, fy1, fz1)
+        t1b = _to_frame(t1, bc, fx1, fy1, fz1)
+        w1b = _to_frame(w1, bc, fx1, fy1, fz1)
         bad_hit = (
             _tri_box_overlap(w0b, t0b, t1b, BAD_HALF, bhy, BAD_HALF)
             | _tri_box_overlap(w0b, t1b, w1b, BAD_HALF, bhy, BAD_HALF))
@@ -545,9 +579,13 @@ class TorchBeatVecEnv:
         vc_mag = (vc[..., 0] * vc[..., 0] + vc[..., 1] * vc[..., 1]
                   + vc[..., 2] * vc[..., 2]).sqrt()
         slow = vc_mag < V_MIN_CUT
-        v2_mag = (vc[..., 0] * vc[..., 0] + vc[..., 1] * vc[..., 1]).sqrt()
-        cosv = ((vc[..., 0] * self.c_dvec[..., 0]
-                 + vc[..., 1] * self.c_dvec[..., 1]) / v2_mag.clamp_min(1e-9))
+        # env v7.6: direction check in the NOTE'S LOCAL frame — required
+        # direction is local -y'; at lam = 0 this equals the old world
+        # in-plane check exactly
+        vlx = _dot(vc, fx)
+        vly = _dot(vc, fy)
+        v2_mag = (vlx * vlx + vly * vly).sqrt()
+        cosv = -vly / v2_mag.clamp_min(1e-9)
         angle_ok = self.c_any_dir | (cosv >= COS_TOL)
 
         note_cut = cuttable & ~self.c_is_bomb

@@ -301,16 +301,18 @@ def test_wrong_direction_swing_is_bad():
 def test_wrong_hand_only_triggers_small_box():
     """The wrong-color saber only interacts with the SMALL (0.35^3) box:
     at note_z = 0 the flat blade plane (z -0.195) is outside it, but a
-    note just past the plane (z ~ -0.13) reaches it -> wrong_hand."""
+    note just past the plane (z ~ -0.13) reaches it -> wrong_hand.
+    Probes sit at x = 0 (the head column) since env v7.6 — the box
+    dimensions are what's under test, not the look-at tilt."""
     # hit_time = 0: after one tick the note sits at z = -0.133
-    sim = _sim_with_note(_note(0.0, 1, 1, color=0))   # LEFT note at (-0.3, 1.4)
+    sim = _sim_with_note(_note(0.0, 1, 1, color=0, x=0.0))
     _park(sim, 0)                                     # matching arm far away
     _set_flat(sim, 1, np.pi)                          # right blade points -x
     ev, _ = _coast(sim)
     assert _codes(ev) == [(0, 3)]
     # same geometry but note still AT the plane: small box (+-0.175 z)
     # doesn't reach the blade plane -> no contact at all
-    sim = _sim_with_note(_note(DT, 1, 1, color=0))
+    sim = _sim_with_note(_note(DT, 1, 1, color=0, x=0.0))
     _park(sim, 0)
     _set_flat(sim, 1, np.pi)
     ev, _ = _coast(sim)
@@ -322,12 +324,13 @@ def test_good_box_is_bigger_than_bad_box():
     hand but OUTSIDE the small box for the wrong hand: the blade plane
     0.195 m behind the note center clears the small box's 0.175 but not
     the good box's 1.0 m depth (a static probe keeps the sweep from
-    tilting into the small box)."""
-    sim = _sim_with_note(_note(DT, 3, 1))
+    tilting into the small box; x = 0 keeps the v7.6 look-at tilt out
+    of the picture)."""
+    sim = _sim_with_note(_note(DT, 3, 1, x=0.0))
     _set_flat(sim, 1, 0.0)                     # static matching blade
     ev, _ = _coast(sim)
     assert _codes(ev) == [(0, 1)]              # inside good box -> slow
-    sim = _sim_with_note(_note(DT, 3, 1, color=0))
+    sim = _sim_with_note(_note(DT, 3, 1, color=0, x=0.0))
     _park(sim, 0)
     _set_flat(sim, 1, 0.0)                     # static wrong-color blade
     ev, _ = _coast(sim)
@@ -337,14 +340,33 @@ def test_good_box_is_bigger_than_bad_box():
 def test_early_cut_through_the_deep_box():
     """The good box extends 0.75 m toward the player: a fast swing
     connects while the note is still ~0.5 m out (a real-BS early cut),
-    but not at ~0.8 m."""
-    for t_hit, hit in ((0.13 + DT, True), (0.21 + DT, False)):
-        sim = _sim_with_note(_note(t_hit, 3, 1))    # z after 1 tick: 4*t
+    but not at ~0.8 m — at the head column (x = 0, no look-at tilt).
+    At the EDGE column the v7.6 billboard swings the deep box toward
+    the head, so the same ~0.8 m timing DOES connect there."""
+    for t_hit, x, hit in ((0.13 + DT, 0.0, True), (0.21 + DT, 0.0, False),
+                          (0.21 + DT, 0.9, True)):
+        sim = _sim_with_note(_note(t_hit, 3, 1, x=x))  # z after 1 tick: 4*t
         _set_flat(sim, 1, 0.0, om_roll=-15.0)
         ev, _ = _coast(sim)
-        assert bool(ev) == hit, f"hit_time {t_hit}"
+        assert bool(ev) == hit, f"hit_time {t_hit} x {x}"
         if hit:
             assert _codes(ev) == [(0, 0)]
+
+
+def test_lookat_direction_check_is_local():
+    """Env v7.6: the direction check runs in the note's LOCAL frame.
+    The same down+forward swing (FLAT delta = 1.19: contact velocity
+    (0, -cos d, +sin d)*w*r, forward/down ratio 2.5) is a clean 'ok'
+    at the head column but judges 'angle' at the edge column, where
+    the billboarded frame folds the forward component into local x
+    (cosv ~ 0.44 < 0.5). Note y = 1.618 sits on the delta = 1.19
+    blade plane."""
+    for x, code in ((0.0, 0), (0.9, 2)):
+        sim = _sim_with_note(_note(DT, 3, 1, x=x, y=1.618))
+        _park(sim, 0)
+        _set_flat(sim, 1, 0.0, om_roll=-15.0, delta=1.19)
+        ev, _ = _coast(sim)
+        assert _codes(ev) == [(0, code)], f"x {x}"
 
 
 def test_hitboxes_rotate_with_cut_direction():
