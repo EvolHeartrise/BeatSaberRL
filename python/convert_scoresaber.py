@@ -11,8 +11,13 @@ repo (mirrored at projects/beat-arena/research/vendor/scoresaber-watch):
 
   "ScoreSaber Replay 👌🤠\\r\\n" magic (28 bytes) + LZMA-alone body.
   Body = 9-int pointer table (metadata, poses, heights, notes, scores,
-  combo, multiplier, energy, fps/extension) + blocks. We write replay
-  format v2.0.0 (no v3 extension fields).
+  combo, multiplier, energy, extensions) + blocks. We write replay
+  format v3.1.0 — the same version the game's recorder writes today
+  (per-note gameplay/scoring types + angle offset, timeDeviation +
+  note transform tail, ImmediateMaxPossibleScore on score keyframes,
+  game/plugin/platform metadata strings) — with real cut kinematics
+  (contact point, cut-plane normal, tip speed, swing-direction
+  deviation) recomputed from the recorded joint state via FK.
 
 Fidelity notes:
 - Pose frames are exact: wrist positions from the recorded joint state,
@@ -161,7 +166,7 @@ def align_charts(header, map_dir, difficulty, speed_scale):
 
 def metadata_block(song_hash, difficulty):
     b = bytearray()
-    b = w_str(b, "2.0.0")
+    b = w_str(b, "3.1.0")
     b = w_str(b, f"custom_level_{song_hash.upper()}")
     b = w_int(b, DIFF_RAW[difficulty])
     b = w_str(b, "Standard")
@@ -169,9 +174,12 @@ def metadata_block(song_hash, difficulty):
     b = w_int(b, 0)                                # modifiers: empty array
     b = w_float(b, 0.0)                            # NoteSpawnOffset
     b = w_bool(b, False)                           # leftHanded
-    b = w_float(b, 1.8)                            # initialHeight
+    b = w_float(b, 1.70)                           # initialHeight (v7 anchor)
     b += b"\x00" * 16                              # RoomRotation + RoomCenter
     b = w_float(b, 0.0)                            # failTime
+    b = w_str(b, "beat-arena env v7")              # GameVersion (>=3.1.0)
+    b = w_str(b, "convert_scoresaber/1.0")         # PluginVersion
+    b = w_str(b, "PC")                             # Platform
     return bytes(b)
 
 
@@ -208,16 +216,53 @@ def pose_block(ticks, offset):
     return bytes(b)
 
 
-def tip_speed(ticks, tick_idx, hand):
-    """Blade-tip speed (m/s) at a tick from neighboring recorded states."""
-    def tip(i):
+GAMEPLAY_TYPE = {KIND_NOTE: 0, KIND_BOMB: 1, KIND_CHAIN_HEAD: 2,
+                 KIND_CHAIN_LINK: 3}                 # game NoteData enum
+
+# swing angle (radians, 0 = +x CCW) of each map cutDirection int
+_DIR_ANGLE_DEG = {0: 90.0, 1: 270.0, 2: 180.0, 3: 0.0,
+                  4: 135.0, 5: 45.0, 6: 225.0, 7: 315.0}
+
+
+def cut_geometry(ticks, tick_idx, hand, note):
+    """Real cut kinematics at a tick from the recorded joint state:
+    blade dir, tip speed, contact point (closest blade point to the
+    note), geometric center distance, cut-plane normal (unit, spans the
+    blade and its motion — |normal.z| is the time-dependency stat), and
+    the swing's xy motion angle."""
+    def state(i):
         s = ticks[i]["sabers"][hand]
         _, _, blade = fk(hand, s[0:6])
-        w = s[12:15]
-        return tuple(w[j] + blade[j] for j in range(3))
-    i = max(tick_idx, 1)
-    a, c = tip(i - 1), tip(i)
-    return math.dist(a, c) * 30.0
+        wrist = s[12:15]
+        return wrist, blade
+    wrist, blade = state(tick_idx)
+    p_wrist, p_blade = state(max(tick_idx - 1, 0))
+    tip = [wrist[j] + blade[j] for j in range(3)]
+    p_tip = [p_wrist[j] + p_blade[j] for j in range(3)]
+    motion = [(tip[j] - p_tip[j]) * 30.0 for j in range(3)]
+    speed = math.sqrt(sum(m * m for m in motion))
+
+    center = (note_tuple(note)[1], note_tuple(note)[2], 0.0)
+    s = sum((center[j] - wrist[j]) * blade[j] for j in range(3))
+    s = min(max(s, 0.0), 1.0)                      # blade is 1 m long
+    contact = tuple(wrist[j] + s * blade[j] for j in range(3))
+    center_dist = math.dist(contact, center)
+
+    normal = (blade[1] * motion[2] - blade[2] * motion[1],
+              blade[2] * motion[0] - blade[0] * motion[2],
+              blade[0] * motion[1] - blade[1] * motion[0])
+    n = math.sqrt(sum(c * c for c in normal))
+    if n < 1e-9:                                   # stationary blade
+        normal, n = (-blade[1], blade[0], 0.0), math.hypot(blade[0], blade[1])
+    normal = tuple(c / (n or 1.0) for c in normal)
+    swing_angle = math.degrees(math.atan2(motion[1], motion[0]))
+    return {"blade": tuple(blade), "speed": speed, "contact": contact,
+            "center_dist": center_dist, "normal": normal,
+            "swing_angle": swing_angle}
+
+
+def wrap_deg(a):
+    return (a + 180.0) % 360.0 - 180.0
 
 
 def build_events(ticks, real_notes, offset):
@@ -230,11 +275,18 @@ def build_events(ticks, real_notes, offset):
     """
     sts = [scoring_type(n) for n in real_notes]
     walk = scoresaber.ComboTracker()
-    events, timeline = [], []
+    max_walk = scoresaber.ComboTracker()           # perfect-so-far walk:
+    events, timeline = [], []                      # ImmediateMaxPossibleScore
     combo_tl, mult_tl = [], []
     energy_tl = [(0.5, 0.0)]
     energy = 0.5
     by_note = {}
+
+    def emit_score(t):
+        # change-only, like the game's scoreDidChangeEvent
+        score = round(walk.score)
+        if not timeline or timeline[-1][0] != score:
+            timeline.append((score, t, round(max_walk.score)))
 
     def hud(t, i, outcome):
         # Change-only keyframes, mirroring the game's recorder (real
@@ -267,60 +319,91 @@ def build_events(ticks, real_notes, offset):
             n = real_notes[i]
             if kind == "post":
                 walk.on_points(i, body["points"])
-                timeline.append((round(walk.score), t))
+                emit_score(t)
                 if i in by_note:
                     by_note[i]["after"] = body["points"] / 30.0
                 continue
-            e = {"note": i, "st": sts[i], "line": n.col, "layer": n.row,
+            raw_dir = (8 if n.any_dir
+                       else (n.raw_dir if n.raw_dir is not None else 8))
+            # precision-angle offset: how far the note's actual swing
+            # angle deviates from its cutDirection's canonical angle
+            angle_off = 0.0 if raw_dir == 8 else wrap_deg(
+                math.degrees(n.angle) - _DIR_ANGLE_DEG[raw_dir])
+            if n.kind != KIND_BOMB:                # a scoreable was presented
+                max_walk.on_cut(i)
+                max_walk.on_points(i, scoresaber.MAX_UNIT_POINTS[n.kind])
+            e = {"note": i, "st": sts[i], "gt": GAMEPLAY_TYPE[n.kind],
+                 "line": n.col, "layer": n.row,
                  "color": 3 if n.kind == KIND_BOMB else n.color,
-                 "dir": 3 if n.kind == KIND_BOMB else
-                        (8 if n.any_dir else (n.raw_dir
-                                              if n.raw_dir is not None else 8)),
-                 "spawn": n.hit_time, "time": t,
+                 "dir": 3 if n.kind == KIND_BOMB else raw_dir,
+                 "angle_off": 0.0 if n.kind == KIND_BOMB else angle_off,
+                 "spawn": n.hit_time, "time": t, "time_dev": 0.0,
                  "before": 0.0, "after": 0.0, "dist": 0.3,
                  "speed": 0.0, "dir_ok": False, "saber": n.color,
+                 "cut_angle": 0.0, "dir_dev": 0.0,
+                 "note_pos": (note_tuple(n)[1], note_tuple(n)[2], 0.0),
+                 "note_angle": 0.0 if n.any_dir else
+                               math.radians(math.degrees(n.angle) - 270.0),
                  "cut_pos": (note_tuple(n)[1], note_tuple(n)[2], 0.0),
-                 "saber_dir": (0.0, 1.0, 0.0)}
+                 "normal": (0.0, 0.0, 0.0), "saber_dir": (0.0, 1.0, 0.0)}
             if kind == "miss":
                 e["type"] = 3
                 walk.on_break()
                 hud(t, i, "miss")
             elif kind == "bomb":
                 e["type"] = 4
-                e["saber"] = 0
+                g = cut_geometry(ticks, tick_idx, 0, n)
+                g2 = cut_geometry(ticks, tick_idx, 1, n)
+                if g2["center_dist"] < g["center_dist"]:   # closer saber
+                    g, e["saber"] = g2, 1
+                else:
+                    e["saber"] = 0
+                e.update(saber_dir=g["blade"], speed=g["speed"],
+                         cut_pos=g["contact"], normal=g["normal"],
+                         time_dev=n.hit_time - t)
                 walk.on_break()
-                timeline.append((round(walk.score), t))
                 hud(t, i, "bomb")
             else:                                  # cut: good or bad
                 good = body["good"]
                 reason = body["reason"]
                 hand = n.color if reason != "wrong_hand" else 1 - n.color
-                s = ticks[tick_idx]["sabers"][hand]
-                _, _, blade = fk(hand, s[0:6])
-                e["saber"] = hand
-                e["saber_dir"] = tuple(blade)
-                e["speed"] = max(tip_speed(ticks, tick_idx, hand),
-                                 2.5 if reason != "slow" else 0.0)
+                g = cut_geometry(ticks, tick_idx, hand, n)
+                dir_dev = 0.0 if n.any_dir else wrap_deg(
+                    g["swing_angle"] - math.degrees(n.angle))
+                e.update(saber=hand, saber_dir=g["blade"],
+                         cut_pos=g["contact"], normal=g["normal"],
+                         dir_dev=dir_dev, cut_angle=90.0 + dir_dev,
+                         time_dev=n.hit_time - t,
+                         speed=max(g["speed"],
+                                   2.01 if reason != "slow" else 0.0))
                 e["dir_ok"] = reason not in ("angle",)
                 if good:
                     e["type"] = 1
                     walk.on_cut(i)
                     walk.on_points(i, body["points"])
-                    timeline.append((round(walk.score), t))
+                    emit_score(t)
                     hud(t, i, "good")
                     pts = round(body["points"])
-                    if sts[i] in (ST_CHAINLINK, ST_CHAINLINKARCHEAD):
-                        pass                       # flat 20, ratings unused
-                    else:
-                        pre = min(pts, 70)
-                        acc = max(0, min(pts - pre, 15))
+                    if sts[i] not in (ST_CHAINLINK, ST_CHAINLINKARCHEAD):
+                        # split cut points into pre-swing + accuracy:
+                        # prefer the split whose accuracy matches the
+                        # GEOMETRIC center distance, fall back to
+                        # full-pre-swing-first; either way the encoded
+                        # ratings round-trip the total exactly
+                        acc_geo = round(15 * (1 - min(
+                            g["center_dist"] / 0.3, 1.0)))
+                        if 0 <= pts - acc_geo <= 70:
+                            pre, acc = pts - acc_geo, acc_geo
+                        else:
+                            pre = min(pts, 70)
+                            acc = max(0, min(pts - pre, 15))
                         e["before"] = pre / 70.0
                         e["dist"] = 0.3 * (1.0 - acc / 15.0)
                     by_note[i] = e
                 else:
                     e["type"] = 2
                     walk.on_break()
-                    timeline.append((round(walk.score), t))
+                    emit_score(t)
                     hud(t, i, "bad")
             events.append(e)
     events.sort(key=lambda e: e["time"])
@@ -328,40 +411,52 @@ def build_events(ticks, real_notes, offset):
 
 
 def note_block(events):
+    """v3 note events (layout: plugin WriteNoteEvent / watch ReadNoteEvent)."""
     b = bytearray()
     b = w_int(b, len(events))
+    identity = (0.0, 0.0, 0.0, 1.0)
     for e in events:
         b = w_float(b, e["spawn"])                 # noteTime (their spawnTime)
         b = w_int(b, e["layer"])
         b = w_int(b, e["line"])
         b = w_int(b, e["color"])
         b = w_int(b, e["dir"])
+        b = w_int(b, e["gt"])                      # gameplayType (v3)
+        b = w_int(b, e["st"])                      # scoringType (v3)
+        b = w_float(b, e["angle_off"])             # cutDirAngleOffset (v3)
         b = w_int(b, e["type"])                    # 1 good 2 bad 3 miss 4 bomb
-        b = w_vec3(b, e["cut_pos"])                # cutPoint
-        normal = (-e["saber_dir"][1], e["saber_dir"][0], 0.0)
-        nn = math.sqrt(sum(c * c for c in normal)) or 1.0
-        b = w_vec3(b, tuple(c / nn for c in normal))   # cutNormal (z=0)
+        b = w_vec3(b, e["cut_pos"])                # cutPoint (blade contact)
+        b = w_vec3(b, e["normal"])                 # cutNormal (cut plane)
         b = w_vec3(b, e["saber_dir"])
         b = w_int(b, e["saber"])
         b = w_bool(b, e["dir_ok"])
         b = w_float(b, e["speed"])
-        b = w_float(b, 100.0)                      # cutAngle (display only)
+        b = w_float(b, e["cut_angle"])             # 90 deg = ideal swing
         b = w_float(b, e["dist"])
-        b = w_float(b, 0.0)                        # cutDirectionDeviation
+        b = w_float(b, e["dir_dev"])               # cutDirectionDeviation
         b = w_float(b, e["before"])
         b = w_float(b, e["after"])
         b = w_float(b, e["time"])                  # eventTime
         b = w_float(b, 1.0)                        # unityTimescale
         b = w_float(b, 1.0)                        # timeSyncTimescale
+        # v3 64-byte tail
+        b = w_float(b, e["time_dev"])              # timeDeviation (early > 0)
+        b += struct.pack("<4f", *identity)         # WorldRotation
+        b += struct.pack("<4f", *identity)         # InverseWorldRotation
+        half = e["note_angle"] / 2.0               # NoteRotation: z-roll,
+        b += struct.pack("<4f", 0.0, 0.0,          # down-swing = identity
+                         math.sin(half), math.cos(half))
+        b = w_vec3(b, e["note_pos"])               # NotePosition
     return bytes(b)
 
 
 def score_block(timeline):
     b = bytearray()
     b = w_int(b, len(timeline))
-    for score, t in timeline:
+    for score, t, immediate_max in timeline:
         b = w_int(b, score)
         b = w_float(b, t)
+        b = w_int(b, immediate_max)                # v3: perfect-so-far max
     return bytes(b)
 
 

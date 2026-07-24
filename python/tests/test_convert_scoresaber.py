@@ -53,6 +53,7 @@ def decode_dat(path):
 
     off = meta_p
     version, off = _r_str(data, off)
+    is_v3 = version.split(".")[0] >= "3"
     level_id, off = _r_str(data, off)
     (difficulty,), off = _r("i", data, off)
     characteristic, off = _r_str(data, off)
@@ -65,6 +66,11 @@ def decode_dat(path):
     (height,), off = _r("f", data, off)
     off += 16                                    # RoomRotation + RoomCenter
     (fail_time,), off = _r("f", data, off)
+    game_version = platform = ""
+    if version >= "3.1":
+        game_version, off = _r_str(data, off)    # GameVersion
+        _, off = _r_str(data, off)               # PluginVersion
+        platform, off = _r_str(data, off)
 
     off = pose_p
     (n_frames,), off = _r("i", data, off)
@@ -83,7 +89,13 @@ def decode_dat(path):
     notes = []
     for _ in range(n_notes):
         (spawn,), off = _r("f", data, off)
-        (layer, line, color, cut_dir, ev_type), off = _r("5i", data, off)
+        (layer, line, color, cut_dir), off = _r("4i", data, off)
+        gameplay_type = st = -1
+        angle_off = 0.0
+        if is_v3:
+            (gameplay_type, st), off = _r("2i", data, off)
+            (angle_off,), off = _r("f", data, off)
+        (ev_type,), off = _r("i", data, off)
         cut_point, off = _r("3f", data, off)
         cut_normal, off = _r("3f", data, off)
         saber_dir, off = _r("3f", data, off)
@@ -92,18 +104,35 @@ def decode_dat(path):
         (speed, angle, dist, dev, before, after, ev_time), off = _r(
             "7f", data, off)
         off += 8                                 # timescales
+        time_dev = 0.0
+        note_rot = (0.0, 0.0, 0.0, 1.0)
+        note_pos = (0.0, 0.0, 0.0)
+        if is_v3:                                # 64-byte tail
+            (time_dev,), off = _r("f", data, off)
+            off += 32                            # World + InverseWorld rot
+            note_rot, off = _r("4f", data, off)
+            note_pos, off = _r("3f", data, off)
         notes.append({"spawn": spawn, "layer": layer, "line": line,
                       "color": color, "dir": cut_dir, "type": ev_type,
-                      "saber": saber, "dir_ok": dir_ok, "speed": speed,
-                      "dist": dist, "before": before, "after": after,
-                      "time": ev_time, "saber_dir": saber_dir})
+                      "gameplay_type": gameplay_type, "scoring_type": st,
+                      "angle_off": angle_off, "saber": saber,
+                      "dir_ok": dir_ok, "speed": speed, "angle": angle,
+                      "dist": dist, "dev": dev, "before": before,
+                      "after": after, "time": ev_time,
+                      "time_dev": time_dev, "cut_point": cut_point,
+                      "cut_normal": cut_normal, "saber_dir": saber_dir,
+                      "note_rot": note_rot, "note_pos": note_pos})
 
     off = score_p
     (n_scores,), off = _r("i", data, off)
-    final = 0
+    final, scores = 0, []
     for _ in range(n_scores):
         (final,), off = _r("i", data, off)
-        (_, ), off = _r("f", data, off)
+        (st_t,), off = _r("f", data, off)
+        imm_max = None
+        if is_v3:
+            (imm_max,), off = _r("i", data, off)
+        scores.append((final, st_t, imm_max))
 
     # HUD keyframe blocks (layouts from ScoreSaber's plugin writer)
     off = ptrs[5]
@@ -129,7 +158,9 @@ def decode_dat(path):
             "difficulty": difficulty, "characteristic": characteristic,
             "left_handed": left, "height": height, "frames": frames,
             "notes": notes, "final_score": final, "n_heights": n_heights,
-            "combos": combos, "multipliers": mults, "energies": energies}
+            "combos": combos, "multipliers": mults, "energies": energies,
+            "scores": scores, "game_version": game_version,
+            "platform": platform}
 
 
 # --- fixture map + recorded episode -----------------------------------------
@@ -181,10 +212,46 @@ def converted(tmp_path_factory):
 
 def test_metadata_and_magic(converted):
     d = converted["decoded"]
-    assert d["version"] == "2.0.0"
+    assert d["version"] == "3.1.0"
     assert d["level_id"] == "custom_level_" + "AB" * 20
     assert d["difficulty"] == 7 and d["characteristic"] == "Standard"
     assert not d["left_handed"] and d["n_heights"] == 0
+    assert d["height"] == pytest.approx(1.70)
+    assert d["platform"] == "PC" and d["game_version"]
+
+
+def test_v3_fields(converted):
+    """v3 additions: gameplay/scoring types, timeDeviation, note
+    transforms, real cut geometry, ImmediateMaxPossibleScore."""
+    d = converted["decoded"]
+    for e in d["notes"]:
+        if e["type"] == 4:
+            assert e["gameplay_type"] == 1 and e["scoring_type"] == 0
+        else:
+            assert e["gameplay_type"] == 0 and e["scoring_type"] == 1
+        if e["type"] in (1, 2):                     # actual cuts
+            # timeDeviation = note time - cut time (early positive)
+            assert e["time_dev"] == pytest.approx(
+                e["spawn"] - e["time"], abs=1e-4)
+            n = math.fsum(c * c for c in e["cut_normal"])
+            assert n == pytest.approx(1.0, abs=1e-4)
+            assert e["angle"] == pytest.approx(90.0 + e["dev"], abs=1e-3)
+            assert e["speed"] > 0.0
+        else:                                       # misses: zeroed cut info
+            assert e["speed"] == 0.0 and e["before"] == 0.0
+        q = e["note_rot"]
+        assert math.fsum(c * c for c in q) == pytest.approx(1.0, abs=1e-4)
+        assert e["note_pos"][2] == 0.0
+
+    scores = d["scores"]
+    assert scores, "score block empty"
+    imm = [s[2] for s in scores]
+    assert all(v is not None for v in imm)
+    assert all(b >= a for a, b in zip(imm, imm[1:]))        # monotone
+    assert all(s[0] <= s[2] for s in scores)                # score <= max
+    # change-only: consecutive scores always differ
+    vals = [s[0] for s in scores]
+    assert all(b != a for a, b in zip(vals, vals[1:]))
 
 
 def test_frames_wellformed(converted):
