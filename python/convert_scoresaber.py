@@ -231,13 +231,34 @@ def build_events(ticks, real_notes, offset):
     sts = [scoring_type(n) for n in real_notes]
     walk = scoresaber.ComboTracker()
     events, timeline = [], []
-    combo_tl = [(0, 0.0)]
-    mult_tl = [(1, 0.0, 0.0)]
+    combo_tl, mult_tl = [], []
+    energy_tl = [(0.5, 0.0)]
+    energy = 0.5
     by_note = {}
 
-    def hud(t):
-        combo_tl.append((walk.combo, t))
-        mult_tl.append((walk.multiplier, walk.progress_fraction, t))
+    def hud(t, i, outcome):
+        # Change-only keyframes, mirroring the game's recorder (real
+        # replays emit combo/multiplier/energy events only when the value
+        # changes — e.g. the multiplier stream goes silent at a held 8x,
+        # the energy stream once capped at 1.0).
+        if not combo_tl or combo_tl[-1][0] != walk.combo:
+            combo_tl.append((walk.combo, t))
+        mult_state = (walk.multiplier, walk.progress_fraction)
+        if not mult_tl or mult_tl[-1][:2] != mult_state:
+            mult_tl.append((*mult_state, t))
+        nonlocal energy
+        link = sts[i] in (ST_CHAINLINK, ST_CHAINLINKARCHEAD)
+        delta = {"good": 0.002 if link else 0.01,
+                 "bad": -0.025 if link else -0.1,
+                 "miss": -0.03 if link else -0.15,
+                 "bomb": -0.15}[outcome]
+        # floor above zero: at zero the game FAILS and the run would end;
+        # our agent plays on regardless (No-Fail-like, without the
+        # modifier flag), so never let the viewer see a fail
+        new_energy = min(max(energy + delta, 0.001), 1.0)
+        if new_energy != energy:
+            energy = new_energy
+            energy_tl.append((energy, t))
     for tick_idx, line in enumerate(ticks):
         t = line["time"] + offset
         for ev in line["events"]:
@@ -263,13 +284,13 @@ def build_events(ticks, real_notes, offset):
             if kind == "miss":
                 e["type"] = 3
                 walk.on_break()
-                hud(t)
+                hud(t, i, "miss")
             elif kind == "bomb":
                 e["type"] = 4
                 e["saber"] = 0
                 walk.on_break()
                 timeline.append((round(walk.score), t))
-                hud(t)
+                hud(t, i, "bomb")
             else:                                  # cut: good or bad
                 good = body["good"]
                 reason = body["reason"]
@@ -286,7 +307,7 @@ def build_events(ticks, real_notes, offset):
                     walk.on_cut(i)
                     walk.on_points(i, body["points"])
                     timeline.append((round(walk.score), t))
-                    hud(t)
+                    hud(t, i, "good")
                     pts = round(body["points"])
                     if sts[i] in (ST_CHAINLINK, ST_CHAINLINKARCHEAD):
                         pass                       # flat 20, ratings unused
@@ -300,10 +321,10 @@ def build_events(ticks, real_notes, offset):
                     e["type"] = 2
                     walk.on_break()
                     timeline.append((round(walk.score), t))
-                    hud(t)
+                    hud(t, i, "bad")
             events.append(e)
     events.sort(key=lambda e: e["time"])
-    return events, timeline, combo_tl, mult_tl, round(walk.score)
+    return events, timeline, combo_tl, mult_tl, energy_tl, round(walk.score)
 
 
 def note_block(events):
@@ -363,11 +384,11 @@ def multiplier_block(mult_tl):
     return bytes(b)
 
 
-def energy_block(end_time):
-    b = bytearray()                      # no energy/fail in our sim:
-    b = w_int(b, 2)                      # full bar for the whole song
-    for t in (0.0, end_time):
-        b = w_float(b, 1.0)
+def energy_block(energy_tl):
+    b = bytearray()
+    b = w_int(b, len(energy_tl))
+    for energy, t in energy_tl:
+        b = w_float(b, energy)
         b = w_float(b, t)
     return bytes(b)
 
@@ -408,7 +429,7 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
             speed_scale=0.3):
     header, ticks = read_replay(replay_path)
     real_notes, offset = align_charts(header, map_dir, difficulty, speed_scale)
-    events, timeline, combo_tl, mult_tl, final = build_events(
+    events, timeline, combo_tl, mult_tl, energy_tl, final = build_events(
         ticks, real_notes, offset)
     blocks = [
         metadata_block(song_hash, difficulty),
@@ -418,7 +439,7 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
         score_block(timeline),
         combo_block(combo_tl),
         multiplier_block(mult_tl),
-        energy_block(ticks[-1]["time"] + offset),
+        energy_block(energy_tl),
         EMPTY,                                     # fps / extensions
     ]
     data = assemble(blocks)
