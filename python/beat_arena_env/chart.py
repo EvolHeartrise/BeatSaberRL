@@ -1,8 +1,12 @@
 """Procedural chart generation (SPEC.md §Chart generation).
 
 Generator v2 (2026-07-24, user-designed): notes come from a jittered
-tick lattice (~0.15 s) driven by three independent paths — left hand,
-right hand, bombs — replacing the old rate-scheduled uniform stream.
+tick lattice driven by three independent paths — left hand, right
+hand, bombs — replacing the old rate-scheduled uniform stream. The
+base interval (~0.15 s) holds at top speed and stretches by
+note_speed_max / walk speed as the shared speed walk slows — slow
+sections are sparse, fast sections dense (the tick-to-tick z-gap is
+speed-invariant, ~1.2 m of approach distance).
 Each path keeps PARITY FLOW: a spawned note's direction is the path's
 previous ORIGINAL direction flipped 180° plus a normal offset
 (σ = 45°), so consecutive swings mostly oppose like real maps but can
@@ -229,7 +233,13 @@ def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
                 # the path angle steered placement; the emitted bomb is
                 # directionless (parser convention: any_dir, angle 0)
                 notes.append(replace(b, any_dir=True, angle=0.0))
-        t += TICK_DT + float(rng.uniform(-TICK_JITTER, TICK_JITTER))
+        # slow sections spread out (user-directed): the interval scales
+        # by note_speed_max / current walk speed — top speed keeps the
+        # base 0.15 s lattice, 2 m/s spaces ticks 4x. Equivalently the
+        # z-gap between ticks is speed-invariant (~1.2 m of approach).
+        pace = cfg.note_speed_max / (prev_speed if prev_speed is not None
+                                     else cfg.note_speed_max)
+        t += (TICK_DT + float(rng.uniform(-TICK_JITTER, TICK_JITTER))) * pace
 
     notes.sort(key=lambda n: n.hit_time)
     return notes

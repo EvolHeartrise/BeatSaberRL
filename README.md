@@ -117,16 +117,16 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (generator-v2 scripted bot, default dials, 5 eps
-each): right-only 60.5% good cuts / 47.3 pts per note; both hands
-62.7% / 46.4, ~5 bombs hit/ep (the bot ignores bombs as targets and
-clips some incidentally). Generator v2's parity-flow angles, extra
-notes, and 2-8 m/s speed walk cost the bot ~20 points vs the old
-rate-1.0 down-swing easy gym (82.9%); the real hitboxes stay FORGIVING
-(the good box extends 0.75 m toward the player — the bot whips through
-the contact angle 0.10 s early, like real players). Pre-v2-generator
-references (all of the Status section's env-v7.x bot numbers) are not
-comparable.
+Reference points (generator-v2 scripted bot with the speed-paced
+lattice, default dials, 5 eps each): right-only 59.1% good cuts /
+47.2 pts per note; both hands 66.2% / 51.3, ~3 bombs hit/ep (the bot
+ignores bombs as targets and clips some incidentally). Generator v2's
+parity-flow angles, extra notes, and 2-8 m/s speed walk cost the bot
+~20 points vs the old rate-1.0 down-swing easy gym (82.9%); the real
+hitboxes stay FORGIVING (the good box extends 0.75 m toward the player
+— the bot whips through the contact angle 0.10 s early, like real
+players). Pre-v2-generator references (all of the Status section's
+env-v7.x bot numbers) are not comparable.
 
 ## Status
 
@@ -378,8 +378,13 @@ comparable.
   independent paths (left, right, bombs) with 180°-flip parity angles
   (+ N(0, 45°)), a shared ±0.4 m/s speed random walk clamped to
   2-8 m/s, swing-line EXTRA notes (1/8), and a 1/10 dot roll. Chains
-  and arcs come only from real maps now. Default gym density roughly
-  doubles (~3.5 notes/s both-hands + ~0.8 bombs/s); scripted bot drops
-  to 60.5 / 62.7 (right / both) — new baseline, old bot references not
-  comparable. Suite 83 green (f64 + f32 parity unchanged); viewer
-  config summary updated + rebuilt. Fresh training run pending.
+  and arcs come only from real maps now. Same day (user-directed): the
+  lattice is SPEED-PACED — the tick interval scales by
+  note_speed_max/walk_speed (top speed keeps the 0.15 s base; the
+  tick-to-tick z-gap is speed-invariant ~1.2 m), so slow sections are
+  sparse and fast sections dense like real maps (measured ~1.4 vs
+  ~3.2 local notes/s; ~2.3 notes/s + ~0.6 bombs/s overall both-hands).
+  Scripted bot 59.1 / 66.2 (right / both) — new baseline, old bot
+  references not comparable. Suite 83 green (f64 + f32 parity
+  unchanged); viewer config summary updated + rebuilt. Fresh training
+  run pending.

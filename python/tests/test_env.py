@@ -654,9 +654,10 @@ def test_chart_tick_lattice_and_counts():
     chart = generate_chart(cfg, np.random.default_rng(11))
     notes = [n for n in chart if n.kind == KIND_NOTE]
     bombs = [n for n in chart if n.kind == KIND_BOMB]
-    # ~393 ticks over 59 s: E[notes] ~ 2 * 0.25 * 393 (+ surviving extras)
-    assert 150 <= len(notes) <= 290
-    assert 25 <= len(bombs) <= 90               # E ~ 0.125 * 393
+    # tick count follows the speed walk (interval stretches by
+    # note_speed_max/speed): ~2.3 notes/s both-hands at the defaults
+    assert 90 <= len(notes) <= 250
+    assert 15 <= len(bombs) <= 70
     # extras can precede their original by <= EXTRA_DZ / speed_min
     from beat_arena_env.chart import EXTRA_DZ
     assert all(n.hit_time >= cfg.first_note_s - EXTRA_DZ / cfg.note_speed_min
@@ -669,6 +670,20 @@ def test_chart_tick_lattice_and_counts():
     none = generate_chart(ChartConfig(note_prob=0.0, bomb_prob=0.0),
                           np.random.default_rng(11))
     assert none == []
+    # speed-paced lattice: slow sections are sparser than fast ones
+    long = generate_chart(ChartConfig(colors="both", chart_len_s=120.0),
+                          np.random.default_rng(2))
+    lnotes = [n for n in long if n.kind == KIND_NOTE]
+    ts = np.array([n.hit_time for n in lnotes])
+
+    def local_nps(subset):
+        return np.mean([(np.abs(ts - n.hit_time) < 2.0).sum() - 1
+                        for n in subset]) / 4.0
+
+    slow = [n for n in lnotes if n.speed < 4.0]
+    fast = [n for n in lnotes if n.speed > 6.0]
+    assert len(slow) > 10 and len(fast) > 10
+    assert local_nps(fast) > 1.5 * local_nps(slow)
 
 
 def test_chart_parity_flow_angles():
