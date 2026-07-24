@@ -74,6 +74,26 @@ error. The ranked catalog caches at `maps/scoresaber_catalog.json`
 (audio stripped, ~100 KB/song). `--limit N` for smoke runs;
 `--num-envs` maps play in parallel through one batched policy.
 
+## Exporting to ScoreSaber's replay viewer
+
+```bash
+$VENV/bin/python convert_scoresaber.py --replay replays/<x>.jsonl \
+    --hash <song-hash> --difficulty Hard
+```
+
+Converts a JSONL v7 replay of a REAL map into a ScoreSaber replay
+`.dat` that loads on watch.scoresaber.com (open/drag the file onto the
+page; the viewer fetches the map from BeatSaver by the embedded hash).
+Format reverse-engineered from the viewer's own source — vendored
+snapshot + annotated format notes in
+`research/vendor/scoresaber-watch/` (full clone: `D:\Git\scoresaber-watch`).
+Pose frames come from the recorded joint state via the FK mirror; the
+final score reproduces the ScoreSaber bench's multiplied score exactly
+(per-note totals exact; the pre/acc split of a cut is reconstructed
+assuming full pre-swing, so per-component popups can differ on
+partial-swing cuts). Procedural-chart replays can't be converted — the
+viewer needs a real BeatSaver map to render.
+
 ## Watching replays
 
 ```bash

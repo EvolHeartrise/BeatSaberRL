@@ -237,7 +237,7 @@ def load_beatmap(map_path, difficulty="Normal", speed_scale=0.3,
             % (2 * math.pi)
         n = Note(hit_time=clock.time(beat), col=int(x), row=int(y),
                  color=int(color), angle=angle, speed=speed,
-                 any_dir=d == 8, kind=kind)
+                 any_dir=d == 8, kind=kind, raw_dir=int(d))
         notes.append(n)
         return n
 
