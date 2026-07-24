@@ -101,10 +101,12 @@ def test_vec_matches_single():
     done1 = False
     while not done1:
         a = rng.integers(0, ACTION_NVEC, size=(1, 12))
-        o1, r1, done1, _ = single.step([int(x) for x in a[0]])
-        ov, rv, dv = vec.step(a)
+        o1, r1, done1, ev1 = single.step([int(x) for x in a[0]])
+        ov, rv, dv, evv = vec.step(a)
         np.testing.assert_array_equal(ov, o1)
         assert rv[0] == np.float32(r1) and bool(dv[0]) == done1
+        # vectorized events == the single sim's, env-tagged, order kept
+        assert evv == [(0, n, c, p) for n, c, p in ev1]
     assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
                                single.misses, single.n_notes, single.score,
                                single.bombs_hit)

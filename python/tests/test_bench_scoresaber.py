@@ -267,3 +267,60 @@ def test_greedy_rollout_smoke():
     assert r["good_cuts"] + r["bad_cuts"] + r["misses"] == r["n_notes"]
     assert r["highest_combo"] <= r["n_notes"]
     assert isinstance(r["full_combo"], bool)
+
+
+def test_vectorized_events_match_serial():
+    """The vec bench path (VecBeatSim.step's per-env ordered events)
+    reproduces the serial RustBeatEnv rollout exactly: same events in
+    the same order, same combo-walk score, same counters — the property
+    the ScoreSaber multiplier walk depends on."""
+    import beat_arena_rs
+    from beat_arena_env.chart import note_tuple
+    from beat_arena_env.constants import EVENT_REASONS
+    from beat_arena_env.rust_env import RustBeatEnv
+
+    charts = [generate_chart(ChartConfig(chart_len_s=6.0, colors="both",
+                                         bomb_prob=0.25),
+                             np.random.default_rng(s)) for s in (3, 4)]
+    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 12))
+
+    serial = []
+    for ci, chart in enumerate(charts):
+        env = RustBeatEnv(external_chart=chart, seed=0)
+        env.reset()
+        walk, evs, done, t = scoresaber.ComboTracker(), [], False, 0
+        while not done:
+            _, _, done, _, info = env.step(acts[t, ci])
+            walk.consume(info["events"])
+            evs.extend(info["events"])
+            t += 1
+        serial.append((evs, walk, info))
+
+    vec = beat_arena_rs.VecBeatSim(2, max_steps=100_000_000)
+    for i, chart in enumerate(charts):
+        vec.set_chart(i, [note_tuple(n) for n in chart])
+    walks = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
+    vec_evs = [[], []]
+    counters, t = [None, None], 0
+    while not all(c is not None for c in counters):
+        _, _, dones, events = vec.step(
+            np.ascontiguousarray(acts[t], dtype=np.int64))
+        for i, note, code, pts in events:
+            if counters[i] is None:
+                ev = (int(note), EVENT_REASONS[code], float(pts))
+                walks[i].consume([ev])
+                vec_evs[i].append(ev)
+        for i in range(2):
+            if bool(dones[i]) and counters[i] is None:
+                counters[i] = vec.counters(i)
+                vec.set_chart(i, [])        # idle, as the bench does
+        t += 1
+
+    for i, (evs, walk, info) in enumerate(serial):
+        assert vec_evs[i] == evs
+        assert walks[i].score == walk.score
+        assert walks[i].max_combo == walk.max_combo
+        g, b, m, n, _, bombs = counters[i]
+        assert (g, b, m, n, bombs) == (info["good_cuts"], info["bad_cuts"],
+                                       info["misses"], info["n_notes"],
+                                       info["bombs_hit"])

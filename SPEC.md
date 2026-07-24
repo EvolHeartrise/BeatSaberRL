@@ -531,19 +531,24 @@ max_score, api_max_score, accuracy, pp, good_cuts, bad_cuts, misses,
 bombs_hit, highest_combo, full_combo (skipped levels carry a `skipped`
 reason instead of scores).
 
-Throughput ceiling (measured 2026-07-23, GTX 1080 box, cached maps):
-~38-39k ticks/s ≈ 445 maps/min ≈ **14 min for the full 6.1k catalog**;
-`--num-envs` knees at ~512 (256→28k, 512→37.2k, 1024→38.6k ticks/s).
-The wall is the serial Python loop over per-env `RustBeatEnv.step()` +
-event consumption, not the GPU (forward is amortized and near-idle).
-FUTURE UNLOCK if 14 min ever isn't fast enough: the bench cannot use
-`VecBeatSim`'s one-FFI-call stepping because it returns counters only
-— the combo/multiplier walk needs each env's ORDERED event stream.
-Exposing vectorized per-env events from Rust (e.g. `step()` also
-returning a flat `(env_idx, note_idx, code, points)` array per vector
-step) would collapse the Python loop and likely buy 3-5×. Cruder
-alternative: multi-process sharding by star range (the merge logic
-already tolerates it). Neither is worth building at the current cost.
+**Vectorized rollout (2026-07-24, the former "future unlock", built):**
+`VecBeatSim.step` now also returns the flat per-env ORDERED event
+stream `(env_idx, note_idx, code, points)` per vector step (order
+within an env preserved — the combo/multiplier walk depends on it;
+vec ≡ serial pinned by tests), so the bench steps every active map in
+ONE FFI call. Idle slots hold an empty chart (done every step,
+eventless, ~free); a done env's counters are read before its slot is
+recycled. Measured (GTX 1080, cached maps, steady-state): **~60k
+ticks/s ≈ 800 maps/min ≈ ~8 min for the full 6.1k catalog** at
+`--num-envs 512` (256 ≈ 520/min; 1024 is SLOWER on partial runs — the
+idle tail wastes fixed-N forwards). Was 38-39k / 445/min / 14 min on
+the old serial per-env loop; the wall is now the per-step policy
+forward, not Python. Fixed-N forwards also make results run-to-run
+deterministic (the old variable-batch forward could flip near-tie
+argmaxes — observed once in 200 maps vs old recorded results, same cut
+counts, Δscore 0.45%). Next rungs if ever needed: skip-idle-row
+forwards, CUDA graphs, or multi-process star-range sharding (merge
+logic already tolerates it).
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
@@ -560,8 +565,10 @@ blade dirs), `status()` (0 pending / 1 good / 2 bad·bomb-hit / 3 missed
 / 4 bomb passed), `bombs_hit`, `n_notes` (scoreable, bombs excluded),
 `time/score` and a `set_joints(s, q, om)` test hook (FK cache refreshes
 immediately). `VecBeatSim` steps N sims per FFI call (actions `(N, 12)`
-i64); `counters(i)` = `(good, bad, miss, n_scoreable, score,
-bombs_hit)`. The scenario tests in `tests/test_env.py` gate every rule
+i64) returning `(obs, rewards, dones, events)` — events = flat
+`(env_idx, note_idx, code, points)` with per-env order preserved
+(2026-07-24, for the vectorized bench); `counters(i)` = `(good, bad,
+miss, n_scoreable, score, bombs_hit)`. The scenario tests in `tests/test_env.py` gate every rule
 change.
 
 Measured 2026-07-20 (8-core CPU): Python `env.step` 137 µs vs Rust
