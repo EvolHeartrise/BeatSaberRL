@@ -1,0 +1,331 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+public class EnvironmentManager : MonoBehaviour
+{
+    private static EnvironmentManager _instance;
+    private static bool _loading;
+    public static bool Loading
+    {
+        get => _loading;
+        private set
+        {
+            _loading = value;
+        }
+    }
+
+    private static int _currentSceneIndex = -1;
+    public static int CurrentSceneIndex
+    {
+        get => _currentSceneIndex;
+        private set
+        {
+            _currentSceneIndex = value;
+        }
+    }
+
+    public static event Action<int> OnEnvironmentUpdated;
+
+
+    public static bool TryLoadEnvironmentForDifficulty(Difficulty difficulty)
+    {
+        if(_instance == null || difficulty == null)
+        {
+            return false;
+        }
+
+        _instance.LoadEnvironmentForDifficulty(difficulty);
+        return true;
+    }
+
+    public static readonly string[] V2Environments = new string[]
+    {
+        "DefaultEnvironment",
+        "OriginsEnvironment",
+        "TriangleEnvironment",
+        "NiceEnvironment",
+        "BigMirrorEnvironment",
+        "DragonsEnvironment",
+        "KDAEnvironment",
+        "MonstercatEnvironment",
+        "CrabRaveEnvironment",
+        "PanicEnvironment",
+        "RocketEnvironment",
+        "GreenDayEnvironment",
+        "GreenDayGrenadeEnvironment",
+        "TimbalandEnvironment",
+        "FitBeatEnvironment",
+        "LinkinParkEnvironment",
+        "BTSEnvironment",
+        "KaleidoscopeEnvironment",
+        "InterscopeEnvironment",
+        "SkrillexEnvironment",
+        "BillieEnvironment",
+        "HalloweenEnvironment",
+        "GagaEnvironment"
+    };
+
+    public static readonly string[] V3Environments = new string[]
+    {
+        "WeaveEnvironment",
+        "PyroEnvironment",
+        "EDMEnvironment",
+        "TheSecondEnvironment",
+        "LizzoEnvironment",
+        "TheWeekndEnvironment",
+        "RockMixtapeEnvironment",
+        "Dragons2Environment",
+        "Panic2Environment",
+        "QueenEnvironment",
+        "LinkinPark2Environment",
+        "TheRollingStonesEnvironment",
+        "LatticeEnvironment",
+        "DaftPunkEnvironment",
+        "HipHopEnvironment",
+        "ColliderEnvironment",
+        "BritneyEnvironment",
+        "Monstercat2Environment",
+        "MetallicaEnvironment",
+        "GridEnvironment",
+        "ColdplayEnvironment"
+    };
+
+    private static readonly string[] supportedEnvironments = new string[]
+    {
+        "DefaultEnvironment",
+        "OriginsEnvironment",
+        "TriangleEnvironment",
+        "NiceEnvironment",
+        "BigMirrorEnvironment",
+        "DragonsEnvironment",
+        "KDAEnvironment",
+        "MonstercatEnvironment",
+        "PanicEnvironment",
+        "TimbalandEnvironment",
+        "FitBeatEnvironment",
+        "LinkinParkEnvironment",
+        "KaleidoscopeEnvironment"
+    };
+
+    private static readonly Dictionary<string, string> duplicateEnvironments = new Dictionary<string, string>
+    {
+        {"CrabRaveEnvironment", "MonstercatEnvironment"}
+    };
+
+    public static EnvironmentLightParameters CurrentEnvironmentParameters = new EnvironmentLightParameters();
+    public static EnvironmentLightParameters DefaultEnvironmentParameters = new EnvironmentLightParameters();
+
+    [SerializeField] private EnvironmentLightParameters[] EnvironmentParameters;
+
+    private const int defaultSceneIndex = 1;
+
+    private int targetSceneIndex = -1;
+
+
+    private IEnumerator LoadEnvironment()
+    {
+        Loading = true;
+        
+        while(CurrentSceneIndex != targetSceneIndex)
+        {
+            if(CurrentSceneIndex >= 0)
+            {
+                Debug.Log("Unloading old scene.");
+                AsyncOperation unloadTask = SceneManager.UnloadSceneAsync(CurrentSceneIndex);
+
+                while(!unloadTask.isDone)
+                {
+                    yield return null;
+                }
+            }
+
+            int sceneIndex = targetSceneIndex;
+            Debug.Log($"Loading new environment scene: {targetSceneIndex}");
+            AsyncOperation loadTask = SceneManager.LoadSceneAsync(sceneIndex, LoadSceneMode.Additive);
+
+            while(!loadTask.isDone)
+            {
+                yield return null;
+            }
+
+            CurrentSceneIndex = sceneIndex;
+            if(CurrentSceneIndex != targetSceneIndex)
+            {
+                Debug.Log($"Target scene was changed from {CurrentSceneIndex} to {targetSceneIndex} while loading.");
+            }
+        }
+
+        //Set the bloomfog settings
+        Shader.SetGlobalFloat("_CustomFogAttenuation", 1f / CurrentEnvironmentParameters.FogAttenuation);
+        Shader.SetGlobalFloat("_CustomFogOffset", CurrentEnvironmentParameters.FogOffset);
+        Shader.SetGlobalFloat("_CustomFogHeightFogHeight", CurrentEnvironmentParameters.FogHeight);
+        Shader.SetGlobalFloat("_CustomFogHeightFogStartY", CurrentEnvironmentParameters.FogStartY);
+
+        Debug.Log("Environment loaded.");
+        Loading = false;
+
+        OnEnvironmentUpdated?.Invoke(CurrentSceneIndex);
+    }
+
+
+    private void SetEnvironment(string environmentName)
+    {
+        if(SettingsManager.GetBool("environmentoverride"))
+        {
+            int customIndex = Mathf.Clamp(SettingsManager.GetInt("customenvironment"), 0, supportedEnvironments.Length - 1);
+            environmentName = supportedEnvironments[customIndex];
+        }
+
+        if(duplicateEnvironments.ContainsKey(environmentName))
+        {
+            //Some environments look identical, so the same scene gets loaded for them
+            environmentName = duplicateEnvironments[environmentName];
+        }
+
+        Debug.Log($"Setting new environment: {environmentName}");
+        int sceneIndex = SceneUtility.GetBuildIndexByScenePath(environmentName);
+        if(sceneIndex < 0)
+        {
+            Debug.Log($"Found no scene match for {environmentName}, using default.");
+            sceneIndex = defaultSceneIndex;
+            environmentName = supportedEnvironments[0];
+        }
+
+        if(sceneIndex == targetSceneIndex && sceneIndex == CurrentSceneIndex)
+        {
+            Debug.Log($"Correct scene is already loaded.");
+            return;
+        }
+
+        targetSceneIndex = sceneIndex;
+        try
+        {
+            CurrentEnvironmentParameters = EnvironmentParameters.First(x => x.EnvironmentName == environmentName);
+        }
+        catch(InvalidOperationException)
+        {
+            //Missing parameters for this environment
+            Debug.LogWarning($"Missing environment parameters for {environmentName}!");
+            CurrentEnvironmentParameters = new EnvironmentLightParameters();
+        }
+
+        if(!Loading)
+        {
+            StartCoroutine(LoadEnvironment());
+        }
+    }
+
+
+    private static string GetEnvironmentName(Difficulty difficulty)
+    {
+        if(difficulty == BeatmapManager.CurrentDifficulty)
+        {
+            return BeatmapManager.EnvironmentName;
+        }
+
+        return difficulty.environmentName;
+    }
+
+
+    private void LoadEnvironmentForDifficulty(Difficulty difficulty)
+    {
+        string environmentName = GetEnvironmentName(difficulty);
+        Debug.Log($"Map has environment: {environmentName}");
+
+        if(duplicateEnvironments.ContainsKey(environmentName))
+        {
+            //Some environments look identical, so the same scene gets loaded for them
+            environmentName = duplicateEnvironments[environmentName];
+        }
+
+        try
+        {
+            DefaultEnvironmentParameters = EnvironmentParameters.First(x => x.EnvironmentName == environmentName);
+        }
+        catch(InvalidOperationException)
+        {
+            //Missing parameters for this environment
+            DefaultEnvironmentParameters = new EnvironmentLightParameters();
+        }
+
+        SetEnvironment(environmentName);
+    }
+
+
+    private void UpdateDifficulty(Difficulty difficulty)
+    {
+        LoadEnvironmentForDifficulty(difficulty);
+    }
+
+
+    private void UpdateSettings(string setting)
+    {
+        if(setting == "all" || setting == "environmentoverride" || setting == "customenvironment")
+        {
+            SetEnvironment(BeatmapManager.EnvironmentName);
+        }
+    }
+
+
+    private void Awake()
+    {
+        _instance = this;
+    }
+
+
+    private void Start()
+    {
+        BeatmapManager.OnBeatmapDifficultyChanged += UpdateDifficulty;
+        SettingsManager.OnSettingsUpdated += UpdateSettings;
+        
+        UpdateDifficulty(BeatmapManager.CurrentDifficulty);
+    }
+}
+
+
+[Serializable]
+public class EnvironmentLightParameters
+{
+    public string EnvironmentName = "DefaultEnvironment";
+
+    [Space]
+    public float FogAttenuation = 1000f;
+    public float FogOffset = 0f;
+    public float FogHeight = 25f;
+    public float FogStartY = -80f;
+
+    [Space]
+    public int RotatingLaserCount = 4;
+    public bool RandomizeRotatingLasers = true;
+    public float RotatingLaserStep = 0f;
+
+    [Space]
+    public float SmallRingRotationSpeed = 2f;
+    public float SmallRingRotationAmount = 90f;
+    public float SmallRingRotationProp = 1f;
+    public float SmallRingMaxStep = 5f;
+    public float SmallRingStartAngle = -45f;
+    public float SmallRingStartStep = 3f;
+
+    [Space]
+    public float BigRingRotationSpeed = 2f;
+    public float BigRingRotationAmount = 45f;
+    public float BigRingRotationProp = 1f;
+    public float BigRingMaxStep = 5f;
+    public float BigRingStartAngle = -45f;
+    public float BigRingStartStep = 0f;
+
+    [Space]
+    public float ZoomSpeed = 2f;
+    public float CloseZoomStep = 2f;
+    public float FarZoomStep = 5f;
+    public bool StartRingZoomParity = true;
+
+    [Space]
+    public string[] SmallRingNameFilters = {"SmallTrackLaneRings"};
+    public string[] BigRingNameFilters = {"BigTrackLaneRings"};
+}

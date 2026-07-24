@@ -1,0 +1,576 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Web;
+using System.Linq;
+using System.Runtime.InteropServices;
+using UnityEngine;
+
+public class UrlArgHandler : MonoBehaviour
+{
+    public const string ArcViewerName = "ScoreSaber Replay";
+    private const string DefaultArcViewerURL = "https://scoresaber.com/";
+    private const string ArcViewerURLEnv = "ARCVIEWER_BASE_URL";
+    public const string OldBeatLeaderViewerURL = "https://replay.beatleader.xyz/";
+    public const string BeatLeaderViewerURL = "https://replay.beatleader.com/";
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+    [DllImport("__Internal")]
+    private static extern string GetArcViewerEnv(string name);
+#endif
+
+    [DllImport("__Internal")]
+    public static extern string GetParameters();
+
+    [DllImport("__Internal")]
+    public static extern void SetPageTitle(string title);
+
+    private static string _loadedMapID;
+    public static string LoadedMapID
+    {
+        get => _loadedMapID;
+
+        set
+        {
+            _loadedMapID = value;
+            _loadedMapURL = null;
+        }
+    }
+
+    private static string _loadedMapURL;
+    public static string LoadedMapURL
+    {
+        get => _loadedMapURL;
+
+        set
+        {
+            _loadedMapURL = value;
+            _loadedMapID = null;
+        }
+    }
+
+    private static string _loadedBLReplayID;
+    public static string LoadedBLReplayID
+    {
+        get => _loadedBLReplayID;
+
+        set
+        {
+            _loadedBLReplayID = value;
+            _loadedReplayURL = null;
+            _loadedSSScoreId = null;
+        }
+    }
+
+    private static string _loadedReplayURL;
+    public static string LoadedReplayURL
+    {
+        get => _loadedReplayURL;
+
+        set
+        {
+            _loadedReplayURL = value;
+            _loadedBLReplayID = null;
+            _loadedSSScoreId = null;
+        }
+    }
+
+    private static string _loadedSSScoreId;
+    public static string LoadedSSScoreId
+    {
+        get => _loadedSSScoreId;
+
+        set
+        {
+            _loadedSSScoreId = value;
+            _loadedBLReplayID = null;
+            _loadedReplayURL = null;
+        }
+    }
+
+    public static bool IsScoreSaberReplay => !string.IsNullOrEmpty(_loadedSSScoreId);
+
+    public static DifficultyCharacteristic? LoadedCharacteristic;
+    public static DifficultyRank? LoadedDiffRank;
+    public static bool ignoreMapForSharing;
+
+    private static string mapID;
+    private static string mapURL;
+#if !UNITY_WEBGL || UNITY_EDITOR
+    private static string mapPath;
+#endif
+    private static string replayID;
+    private static string replayURL;
+    private static string ssScoreId;
+    private static float startTime;
+    private static DifficultyCharacteristic? mode;
+    private static DifficultyRank? diffRank;
+    private static bool noProxy;
+
+    private static bool uiOff;
+    private static bool autoPlay;
+    private static bool loop;
+
+    private static string settingsOverride;
+
+    [SerializeField] private MapLoader mapLoader;
+    private Coroutine autoPlayCoroutine;
+
+    public static string ArcViewerURL => GetArcViewerURL();
+
+
+    public static bool IsArcViewerURL(string url)
+    {
+        return !string.IsNullOrEmpty(url)
+            && (url.StartsWith(ArcViewerURL, StringComparison.InvariantCultureIgnoreCase)
+                || url.StartsWith(DefaultArcViewerURL, StringComparison.InvariantCultureIgnoreCase));
+    }
+
+
+    private static string GetArcViewerURL()
+    {
+        string url = null;
+#if UNITY_WEBGL && !UNITY_EDITOR
+        url = GetArcViewerEnv(ArcViewerURLEnv);
+#else
+        url = Environment.GetEnvironmentVariable(ArcViewerURLEnv);
+#endif
+
+        if(string.IsNullOrWhiteSpace(url))
+        {
+            url = DefaultArcViewerURL;
+        }
+
+        return url.EndsWith("/") ? url : $"{url}/";
+    }
+
+
+    private void ParseParameter(string name, string value)
+    {
+        if(string.IsNullOrEmpty(name) || string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+
+        switch(name)
+        {
+            case "id":
+                mapID = value;
+                break;
+            case "url":
+                mapURL = value;
+                break;
+            case "scoreID":
+                replayID = value;
+                break;
+            case "replayURL":
+                replayURL = value;
+                break;
+            case "ssScoreId":
+            case "ssScoreID":
+                ssScoreId = value;
+                break;
+            case "t":
+                if(!float.TryParse(value, out startTime)) startTime = 0;
+                break;
+            case "mode":
+                DifficultyCharacteristic parsedMode;
+                mode = Enum.TryParse(value, true, out parsedMode) ? parsedMode : null;
+                break;
+            case "difficulty":
+                DifficultyRank parsedRank;
+                diffRank = Enum.TryParse(value, true, out parsedRank) ? parsedRank : null;
+                break;
+#if UNITY_WEBGL && !UNITY_EDITOR
+            case "noProxy":
+                noProxy = bool.TryParse(value, out noProxy) ? noProxy : false;
+                break;
+#else
+            case "path":
+                mapPath = value;
+                break;
+#endif
+            case "uiOff":
+                uiOff = bool.TryParse(value, out uiOff) ? uiOff : false;
+                break;
+            case "autoPlay":
+                autoPlay = bool.TryParse(value, out autoPlay) ? autoPlay : false;
+                break;
+            case "loop":
+                loop = bool.TryParse(value, out loop) ? loop : false;
+                break;
+
+            case "settingsOverride":
+                settingsOverride = value;
+                break;
+        }
+    }
+
+
+    private void ApplyArguments()
+    {
+        bool setTime = false;
+        bool setDiff = false;
+
+        if(!string.IsNullOrEmpty(mapURL) && !string.IsNullOrEmpty(mapID))
+        {
+            mapURL = null;
+        }
+
+        if(!string.IsNullOrEmpty(replayURL) && !string.IsNullOrEmpty(replayID))
+        {
+            replayURL = null;
+        }
+
+        if(!string.IsNullOrEmpty(ssScoreId))
+        {
+            mapLoader.LoadReplayFromScore(ReplaySources.ScoreSaber, ssScoreId, mapURL, mapID, noProxy);
+            LoadedSSScoreId = ssScoreId;
+
+            setTime = true;
+        }
+        else if(!string.IsNullOrEmpty(replayID))
+        {
+            mapLoader.LoadReplayFromScore(ReplaySources.BeatLeader, replayID, mapURL, mapID, noProxy);
+            LoadedBLReplayID = replayID;
+
+            //Don't set the diff cause that depends on the replay
+            setTime = true;
+        }
+        else if(!string.IsNullOrEmpty(replayURL))
+        {
+            mapLoader.LoadReplayURL(replayURL, null, mapURL, mapID, noProxy);
+            LoadedReplayURL = replayURL;
+
+            setTime = true;
+        }
+        else if(!string.IsNullOrEmpty(mapID))
+        {
+            mapLoader.LoadMapID(mapID);
+            LoadedMapID = mapID;
+
+            setTime = true;
+            setDiff = true;
+        }
+        else if(!string.IsNullOrEmpty(mapURL))
+        {
+            mapLoader.LoadMapURL(mapURL, noProxy: noProxy);
+            LoadedMapURL = mapURL;
+
+            setTime = true;
+            setDiff = true;
+        }
+#if !UNITY_WEBGL || UNITY_EDITOR
+        else if(!string.IsNullOrEmpty(mapPath))
+        {
+            mapLoader.LoadMapDirectory(mapPath);
+            setTime = true;
+            setDiff = true;
+        }
+#endif
+
+        if(uiOff)
+        {
+            UIHideInput.SetUIVisible(false);
+        }
+
+        if(loop)
+        {
+            TimeManager.Loop = true;
+        }
+
+        if(autoPlay)
+        {
+            BeatmapManager.OnBeatmapDifficultyChanged += StartPlaying;
+        }
+
+        //Only apply start time and diff when a map is also included in the arguments
+        if(setTime && startTime > 0)
+        {
+            MapLoader.OnMapLoaded += SetTime;
+        }
+
+        if(setDiff && (mode != null || diffRank != null))
+        {
+            MapLoader.OnMapLoaded += SetDifficulty;
+        }
+
+        if(!string.IsNullOrEmpty(settingsOverride))
+        {
+            try
+            {
+                //Parse the overrides and send them to SettingsManager
+                Settings newOverrides = JsonReader.DeserializeObject<Settings>(settingsOverride);
+                SettingsManager.Overrides = newOverrides;
+            }
+            catch(Exception err)
+            {
+                Debug.LogWarning($"Failed to parse settings override with error: {err.Message}, {err.StackTrace}");
+                SettingsManager.Overrides = null;
+            }
+        }
+    }
+
+
+    public void LoadMapFromShareableURL(string url)
+    {
+        if(MapLoader.Loading)
+        {
+            Debug.LogWarning("Tried to load from url parameters while already loading!");
+            return;
+        }
+
+        if(string.IsNullOrEmpty(url))
+        {
+            Debug.LogWarning("Shareable link is null or empty!");
+            ErrorHandler.Instance.ShowPopup(ErrorType.Error, "Empty shareable link!");
+            return;
+        }
+
+        ResetArguments();
+
+        List<KeyValuePair<string, string>> parameters = UrlUtility.ParseUrlParams(url);
+        if(parameters.Count == 0)
+        {
+            Debug.LogWarning($"Invalid sharing URL: {url}");
+            ErrorHandler.Instance.ShowPopup(ErrorType.Error, "Invalid sharing URL!");
+        }
+
+        foreach(KeyValuePair<string, string> parameter in parameters)
+        {
+            ParseParameter(parameter.Key, parameter.Value);
+        }
+
+        ApplyArguments();
+    }
+
+
+    private void LoadMapFromCommandLineParameters(string[] parameters)
+    {
+        if(MapLoader.Loading)
+        {
+            Debug.LogWarning("Tried to load from command line args while already loading!");
+            return;
+        }
+
+        ResetArguments();
+
+        if(parameters.Length <= 1)
+        {
+            //The first parameter is always the app name, so it shouldn't be counted
+            return;
+        }
+
+        for(int i = 1; i < parameters.Length; i++)
+        {
+            string[] args = parameters[i].Split('=');
+            if(args.Length != 2)
+            {
+                //A parameter should always have a single `=`, leading to two args
+                continue;
+            }
+
+            ParseParameter(args[0], args[1]);
+        }
+
+        ApplyArguments();
+    }
+
+
+    private void StartPlaying(Difficulty difficulty)
+    {
+        BeatmapManager.OnBeatmapDifficultyChanged -= StartPlaying;
+        if(autoPlayCoroutine != null)
+        {
+            StopCoroutine(autoPlayCoroutine);
+        }
+
+        autoPlayCoroutine = StartCoroutine(StartPlayingWhenReady());
+    }
+
+
+    private IEnumerator StartPlayingWhenReady()
+    {
+        // Let map-loaded subscriptions finish before starting the replay clock.
+        yield return null;
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+        while(!WebSongController.SongAudioReady)
+        {
+            bool needsAudio = !SettingsManager.Loaded;
+            if(!needsAudio)
+            {
+                needsAudio = (SettingsManager.GetBool("enablemusic") && SettingsManager.GetFloat("musicvolume") > Mathf.Epsilon)
+                    || (SettingsManager.GetBool("enablehitsound") && SettingsManager.GetFloat("hitsoundvolume") > Mathf.Epsilon);
+            }
+
+            if(!needsAudio)
+            {
+                break;
+            }
+
+            WebSongController.RequestAudioUnlock();
+            yield return null;
+        }
+#endif
+
+        TimeManager.SetPlaying(true);
+        autoPlayCoroutine = null;
+    }
+
+
+    private void SetTime()
+    {
+        TimeManager.CurrentTime = startTime;
+        MapLoader.OnMapLoaded -= SetTime;
+    }
+
+
+    public void SetDifficulty()
+    {
+        if(mode != null)
+        {
+            //Since mode is nullable I have to cast it (cringe)
+            DifficultyCharacteristic characteristic = (DifficultyCharacteristic)mode;
+
+            List<Difficulty> difficulties = BeatmapManager.GetDifficultiesByCharacteristic(characteristic);
+            Difficulty difficulty = null;
+
+            if(diffRank != null)
+            {
+                difficulty = difficulties.FirstOrDefault(x => x.difficultyRank == diffRank);
+            }
+            BeatmapManager.CurrentDifficulty = difficulty ?? difficulties.Last();
+        }
+        else if(diffRank != null)
+        {
+            DifficultyCharacteristic defaultCharacteristic = BeatmapManager.GetDefaultDifficulty().characteristic;
+            List<Difficulty> difficulties = BeatmapManager.GetDifficultiesByCharacteristic(defaultCharacteristic);
+
+            Difficulty difficulty = difficulties.FirstOrDefault(x => x.difficultyRank == diffRank);
+            BeatmapManager.CurrentDifficulty = difficulty ?? difficulties.Last();
+        }
+        MapLoader.OnMapLoaded -= SetDifficulty;
+    }
+
+
+    public void ResetArguments()
+    {
+        mapID = "";
+        mapURL = "";
+#if !UNITY_WEBGL || UNITY_EDITOR
+        mapPath = "";
+#endif
+        startTime = 0;
+        mode = null;
+        diffRank = null;
+        noProxy = false;
+        replayURL = "";
+        replayID = "";
+        ssScoreId = "";
+
+        uiOff = false;
+        autoPlay = false;
+        loop = false;
+
+        settingsOverride = null;
+    }
+
+
+    public void ClearSubscriptions()
+    {
+        BeatmapManager.OnBeatmapDifficultyChanged -= StartPlaying;
+        MapLoader.OnMapLoaded -= SetTime;
+        MapLoader.OnMapLoaded -= SetDifficulty;
+        if(autoPlayCoroutine != null)
+        {
+            StopCoroutine(autoPlayCoroutine);
+            autoPlayCoroutine = null;
+        }
+    }
+
+
+    public void UpdateLoadedDifficulty(Difficulty newDifficulty)
+    {
+        Difficulty defaultDifficulty = BeatmapManager.GetDefaultDifficulty();
+        if(newDifficulty == defaultDifficulty)
+        {
+            //No need to specify for the default difficulty
+            LoadedCharacteristic = null;
+            LoadedDiffRank = null;
+            return;
+        }
+
+        LoadedCharacteristic = newDifficulty.characteristic;
+        LoadedDiffRank = newDifficulty.difficultyRank;
+    }
+
+
+    public void UpdateUIState(UIState newState)
+    {
+        if(newState == UIState.MapSelection)
+        {
+            ClearSubscriptions();
+        }
+    }
+
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+    public void UpdateMapTitle(BeatmapInfo info)
+    {
+        string mapTitle = "";
+
+        if(UIStateManager.CurrentState == UIState.Previewer)
+        {
+            string authorName = info.song.author;
+            string songName = info.song.title;
+            if(!string.IsNullOrEmpty(authorName))
+            {
+                mapTitle += authorName;
+                if(!string.IsNullOrEmpty(songName))
+                {
+                    //Add a separator when there's an author and and song name
+                    //(This will be the case 99% of the time)
+                    mapTitle += " - ";
+                }
+            }
+            mapTitle += songName;
+
+            if(!string.IsNullOrEmpty(mapTitle))
+            {
+                //Add a separator between the webpage title and map title
+                mapTitle = " | " + mapTitle;
+            }
+        }
+
+        SetPageTitle($"{ArcViewerName}{mapTitle}");
+    }
+#endif
+
+
+    private void Start()
+    {
+#if UNITY_WEBGL && !UNITY_EDITOR
+        string parameters = GetParameters();
+
+        if(!string.IsNullOrEmpty(parameters))
+        {
+            LoadMapFromShareableURL(ArcViewerURL + parameters);
+        }
+
+        BeatmapManager.OnBeatmapInfoChanged += UpdateMapTitle;
+#else
+        try
+        {
+            LoadMapFromCommandLineParameters(Environment.GetCommandLineArgs());
+        }
+        catch(NotSupportedException)
+        {
+            Debug.LogWarning("The system doesn't support command-line arguments!");
+        }
+#endif
+        UIStateManager.OnUIStateChanged += UpdateUIState;
+        MapLoader.OnLoadingFailed += ClearSubscriptions;
+        BeatmapManager.OnBeatmapDifficultyChanged += UpdateLoadedDifficulty;
+    }
+}

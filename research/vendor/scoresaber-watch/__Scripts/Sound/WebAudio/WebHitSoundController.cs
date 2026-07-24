@@ -1,0 +1,147 @@
+#if UNITY_WEBGL && !UNITY_EDITOR
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
+using UnityEngine;
+
+public class WebHitSoundController : MonoBehaviour
+{
+    [DllImport("__Internal")]
+    public static extern void SetHitSoundVolume(float volume);
+
+    [DllImport("__Internal")]
+    public static extern void SetChainSoundVolume(float volume);
+
+    [DllImport("__Internal")]
+    public static extern void SetHitSound(int hitSound);
+
+    [DllImport("__Internal")]
+    public static extern void SetBadHitSound(int badHitSound);
+
+    [DllImport("__Internal")]
+    public static extern void InitHitSoundController();
+
+    [DllImport("__Internal")]
+    public static extern void ScheduleHitSound(int id, float songTime, float songPlaybackSpeed);
+
+    [DllImport("__Internal")]
+    public static extern void RemakeHitSound(int id);
+
+    [DllImport("__Internal")]
+    public static extern void DisposeHitSound(int id);
+
+    [DllImport("__Internal")]
+    public static extern void AddHitSound(int id, bool badCut, bool chainLink, float playTime, float pitch);
+
+    public static float CurrentHitSoundVolume;
+    public static float CurrentChainSoundVolume;
+
+    private static WebHitSoundController instance;
+    private static HashSet<int> soundIDs = new HashSet<int>();
+    private static Dictionary<int, HitSoundMetadata> soundMetadata = new Dictionary<int, HitSoundMetadata>();
+    private static int lowestOpenID = 0;
+
+
+    private struct HitSoundMetadata
+    {
+        public float time;
+        public bool badCut;
+
+
+        public HitSoundMetadata(float time, bool badCut)
+        {
+            this.time = time;
+            this.badCut = badCut;
+        }
+    }
+
+
+    public static void Init()
+    {
+        // If an instance exists, don't create others
+        if (instance != null) return;
+
+        instance = new GameObject("Web Hit Sound Controller")
+            .AddComponent<WebHitSoundController>();
+
+        // This just keeps the inspector sane
+        instance.gameObject.hideFlags = HideFlags.HideAndDontSave;
+
+        CurrentHitSoundVolume = 1f;
+        CurrentChainSoundVolume = 0.8f;
+
+        InitHitSoundController();
+    }
+
+
+    private static int GetNextOpenID()
+    {
+        int i = lowestOpenID;
+        while(soundIDs.Contains(i))
+        {
+            i++;
+        }
+        return i;
+    }
+
+
+    public static void CreateHitSound(bool badCut, bool chainLink, float playTime, float pitch)
+    {
+        foreach(HitSoundMetadata metadata in soundMetadata.Values)
+        {
+            if(ObjectManager.CheckSameTime(metadata.time, playTime) && metadata.badCut == badCut)
+            {
+                //Don't schedule stacked hitsounds
+                return;
+            }
+        }
+
+        int newID = lowestOpenID;
+
+        AddHitSound(newID, badCut, chainLink, playTime, pitch);
+        soundIDs.Add(newID);
+        soundMetadata.Add(newID, new HitSoundMetadata(playTime, badCut));
+
+        ScheduleHitSound(newID, SongManager.GetSongTime(), TimeSyncHandler.TimeScale);
+        lowestOpenID = GetNextOpenID();
+    }
+
+
+    public static void RescheduleHitsounds()
+    {
+        int[] idArray = soundIDs.ToArray();
+        float songTime = SongManager.GetSongTime();
+        foreach(int id in idArray)
+        {
+            RemakeHitSound(id);
+            ScheduleHitSound(id, songTime, TimeSyncHandler.TimeScale);
+        }
+    }
+
+
+    public static void ClearScheduledSounds()
+    {
+        int[] idArray = soundIDs.ToArray();
+        foreach(int id in idArray)
+        {
+            DisposeHitSound(id);
+        }
+
+        soundIDs.Clear();
+        soundMetadata.Clear();
+        lowestOpenID = 0;
+    }
+
+
+    public void DeleteHitSound(int id)
+    {
+        DisposeHitSound(id);
+        soundIDs.Remove(id);
+        soundMetadata.Remove(id);
+        if(id < lowestOpenID)
+        {
+            lowestOpenID = id;
+        }
+    }
+}
+#endif

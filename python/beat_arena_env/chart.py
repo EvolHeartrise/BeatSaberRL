@@ -54,6 +54,9 @@ class Note:
     y: float = None
     free_pre: bool = False   # arc tail: full 70 pre-swing granted
     free_post: bool = False  # arc head: full 30 follow-through granted
+    raw_dir: int = None    # original map cutDirection int (0-8), real maps
+    # only — `angle` may deviate from it (precision offsets, paired-note
+    # snap), but external tools (ScoreSaber replay export) need the int
 
 
 @dataclass
