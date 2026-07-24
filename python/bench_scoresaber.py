@@ -38,7 +38,9 @@ import torch
 
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
-from beat_arena_env.rust_env import RustBeatEnv
+from beat_arena_env.chart import note_tuple
+from beat_arena_env.constants import EVENT_REASONS, OBS_DIM
+from beat_arena_rs import VecBeatSim
 from policy import load_policy
 
 
@@ -230,12 +232,25 @@ def main():
                            args.max_song_s, q, stop),
                      daemon=True).start()
 
-    slots, feed_done, n_done, n_new_skip = [], False, 0, 0
+    # Vectorized rollout (2026-07-24, the SPEC "future unlock"): ONE
+    # VecBeatSim steps every active map per FFI call and returns the
+    # per-env ORDERED event stream (env_idx, note_idx, code, points) —
+    # order feeds each slot's combo/multiplier walk exactly as the old
+    # serial per-env loop did. Idle slots hold an empty chart (done on
+    # every step, eventless, ~free) so the vector call is always valid.
+    N = args.num_envs
+    sim = VecBeatSim(N, max_steps=100_000_000)   # natural time-based ends
+    for i in range(N):
+        sim.set_chart(i, [])
+    obs_buf = np.zeros((N, OBS_DIM), dtype=np.float32)
+    slots = [None] * N
+    free = list(range(N))
+    n_active, feed_done, n_done, n_new_skip = 0, False, 0, 0
     try:
         while True:
-            while not feed_done and len(slots) < args.num_envs:
+            while not feed_done and free:
                 try:
-                    item = q.get(block=not slots)
+                    item = q.get(block=n_active == 0)
                 except queue.Empty:
                     break
                 if item is None:
@@ -253,46 +268,57 @@ def main():
                         "difficulty": entry["difficulty"],
                         "stars": entry["stars"], "skipped": skip}
                     continue
-                env = RustBeatEnv(external_chart=notes, seed=0)
-                obs, _ = env.reset()
-                slots.append({
-                    "env": env, "obs": obs, "entry": entry,
+                i = free.pop()
+                sim.set_chart(i, [note_tuple(n) for n in notes])
+                obs_buf[i] = sim.obs_one(i)
+                slots[i] = {
+                    "entry": entry,
                     "walk": scoresaber.ComboTracker(),
                     "max_score": scoresaber.max_multiplied_score(notes),
-                    "duration_s": meta["duration_s"]})
-            if not slots:
+                    "duration_s": meta["duration_s"]}
+                n_active += 1
+            if n_active == 0:
                 if feed_done:
                     break
                 continue
 
-            batch = torch.as_tensor(
-                np.stack([s["obs"] for s in slots]), dtype=torch.float32,
-                device=device)
+            batch = torch.as_tensor(obs_buf, device=device)
             with torch.no_grad():
                 logits, _ = policy(batch)
-            actions = torch.stack([l.argmax(-1) for l in logits],
-                                  dim=1).cpu().numpy()
-            finished = []
-            for s, act in zip(slots, actions):
-                obs, _, done, _, info = s["env"].step(act)
-                s["obs"] = obs
-                s["walk"].consume(info["events"])
-                if done:
-                    result = finish_slot(s, info)
-                    levels[result["leaderboard_id"]] = result
-                    n_done += 1
-                    print(f"[{n_done}/{len(tasks)}] {result['stars']:.2f}* "
-                          f"{result['song']!r} [{result['difficulty']}] "
-                          f"acc {100 * result['accuracy']:.2f}% "
-                          f"pp {result['pp']:.1f}"
-                          f"{'  FC' if result['full_combo'] else ''}",
-                          flush=True)
-                    finished.append(s)
-            if finished:
-                gone = {id(s) for s in finished}
-                slots = [s for s in slots if id(s) not in gone]
-                if n_done % 25 < len(finished):
-                    save_results(out_path, data, levels)
+            # one stacked argmax kernel over all 12 heads, one D2H sync
+            actions = torch.stack(logits, dim=1).argmax(-1).cpu().numpy()
+            obs_flat, _, dones, events = sim.step(
+                np.ascontiguousarray(actions, dtype=np.int64))
+            obs_buf = np.asarray(obs_flat).reshape(N, OBS_DIM)
+            for i, note, code, pts in events:
+                s = slots[i]
+                if s is not None:
+                    s["walk"].consume([(note, EVENT_REASONS[code], pts)])
+            n_finished = 0
+            for i in np.flatnonzero(np.asarray(dones)):
+                i = int(i)
+                s = slots[i]
+                if s is None:                    # idle empty-chart slot
+                    continue
+                g, b, m, n_scoreable, _, bombs = sim.counters(i)
+                result = finish_slot(s, {
+                    "good_cuts": g, "bad_cuts": b, "misses": m,
+                    "n_notes": n_scoreable, "bombs_hit": bombs})
+                levels[result["leaderboard_id"]] = result
+                n_done += 1
+                n_finished += 1
+                print(f"[{n_done}/{len(tasks)}] {result['stars']:.2f}* "
+                      f"{result['song']!r} [{result['difficulty']}] "
+                      f"acc {100 * result['accuracy']:.2f}% "
+                      f"pp {result['pp']:.1f}"
+                      f"{'  FC' if result['full_combo'] else ''}",
+                      flush=True)
+                slots[i] = None
+                sim.set_chart(i, [])
+                free.append(i)
+                n_active -= 1
+            if n_finished and n_done % 25 < n_finished:
+                save_results(out_path, data, levels)
     finally:
         stop.set()
         save_results(out_path, data, levels)

@@ -1065,9 +1065,13 @@ impl VecBeatSim {
 
     /// actions: (N, 12) int64 — per hand (pitch, yaw, twist, elbow, roll,
     /// bend), left first. Returns (obs flat (N*286,) f32 — reshape
-    /// Python-side, rewards (N,) f32, dones (N,) bool). Done envs must get
-    /// a fresh set_chart before the next step; their returned obs row is
-    /// the terminal obs.
+    /// Python-side, rewards (N,) f32, dones (N,) bool, events). events =
+    /// [(env_idx, note_idx, code, points)] concatenated in env order with
+    /// each env's own event ORDER preserved — order matters to consumers
+    /// like the ScoreSaber combo/multiplier walk (a cut commits at its
+    /// cut-time multiplier). Codes as in RawBeatSim::step. Done envs must
+    /// get a fresh set_chart before the next step; their returned obs row
+    /// is the terminal obs.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -1076,6 +1080,7 @@ impl VecBeatSim {
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<bool>>,
+        Vec<(u32, u32, u8, f32)>,
     ) {
         let acts = actions.as_array();
         let n = self.sims.len();
@@ -1083,6 +1088,7 @@ impl VecBeatSim {
         let mut flat = vec![0.0f32; n * OBS_DIM];
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
+        let mut all_events: Vec<(u32, u32, u8, f32)> = Vec::new();
         for (i, sim) in self.sims.iter_mut().enumerate() {
             let mut a = [[0u8; N_JOINTS]; 2];
             for s in 0..2 {
@@ -1090,15 +1096,19 @@ impl VecBeatSim {
                     a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
                 }
             }
-            let (r, d, _events) = sim.step_inner(a);
+            let (r, d, events) = sim.step_inner(a);
             flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
             rewards[i] = r as f32;
             dones[i] = d;
+            for (note, code, pts) in events {
+                all_events.push((i as u32, note, code, pts));
+            }
         }
         (
             PyArray1::from_vec_bound(py, flat),
             PyArray1::from_vec_bound(py, rewards),
             PyArray1::from_vec_bound(py, dones),
+            all_events,
         )
     }
 

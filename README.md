@@ -74,7 +74,9 @@ re-evaluates, and a different model writing to the same file is an
 error. The ranked catalog caches at `maps/scoresaber_catalog.json`
 (`--refresh-catalog` to refetch) and chart data at `maps/scoresaber/`
 (audio stripped, ~100 KB/song). `--limit N` for smoke runs;
-`--num-envs` maps play in parallel through one batched policy.
+`--num-envs` maps play in parallel — one `VecBeatSim` FFI call per
+vector step (vectorized per-env events, 2026-07-24): ~800 maps/min at
+`--num-envs 512`, full catalog ~8 min on the GTX 1080 box.
 
 ## Exporting to ScoreSaber's replay viewer
 
