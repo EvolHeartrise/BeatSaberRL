@@ -73,13 +73,25 @@ class _BeatClock:
     """Piecewise-linear beat -> seconds under BPM changes."""
 
     def __init__(self, base_bpm: float, changes=()):
-        # changes: sorted [(beat, bpm)]; implicit (0, base_bpm) start
+        # changes: sorted [(beat, bpm)]; implicit (0, base_bpm) start.
+        # A change at an existing anchor's beat REPLACES that anchor's
+        # tempo — maps routinely open with a beat-0 bpmEvent whose value
+        # differs slightly from Info.dat's (e.g. 171.79 vs 172), and
+        # dropping it desyncs every exported time by a few ms (found via
+        # watch.scoresaber.com note-matching, which allows only 1 ms).
         self.anchors = [(0.0, 0.0, 60.0 / base_bpm)]
         for beat, bpm in sorted(changes):
-            if beat <= self.anchors[-1][0] or bpm <= 0:
+            if bpm <= 0:
                 continue
-            b0, t0, spb = self.anchors[-1]
-            self.anchors.append((beat, t0 + (beat - b0) * spb, 60.0 / bpm))
+            b_last, t_last, _ = self.anchors[-1]
+            if beat < b_last:
+                continue
+            if beat == b_last:
+                self.anchors[-1] = (b_last, t_last, 60.0 / bpm)
+                continue
+            self.anchors.append(
+                (beat, t_last + (beat - b_last) * self.anchors[-1][2],
+                 60.0 / bpm))
 
     def time(self, beat: float) -> float:
         b0, t0, spb = self.anchors[0]
