@@ -231,8 +231,11 @@ dials `note_prob` (P(note) per hand path per tick, 0.25), `extra_prob`
 clamp `note_speed_min`/`note_speed_max` (2.0 / 8.0 m/s, user-picked).
 
 Generation, per tick (first at `t = first_note_s`, then
-`t += 0.15 + U(−0.03, 0.03)` — `TICK_DT`/`TICK_JITTER` — until
-`chart_len_s`):
+`t += (0.15 + U(−0.03, 0.03)) · (note_speed_max / walk_speed)` —
+`TICK_DT`/`TICK_JITTER` scaled by the shared speed walk's current
+value (user-directed: top speed keeps the base lattice, slow sections
+spread out — equivalently the tick-to-tick z-gap is speed-invariant,
+~1.2 m of approach distance) — until `chart_len_s`):
 
 - **Each hand path** independently spawns a note with P = `note_prob`.
   Direction keeps **parity flow**: the path's previous ORIGINAL angle
@@ -271,8 +274,11 @@ extras land essentially on their original's tick: one swing can take
 both). Chains and arcs are NOT generated procedurally — real BeatSaver
 maps are their only source; `chart.chain_links` (real quadratic Bézier,
 BeatLeader beat.js:424-463) survives for the parser. Reference density
-(defaults, 20 s chart): right-only ≈ 35 notes + 16 bombs (~1.8 notes/s);
-both ≈ 67 notes + 16 bombs (~3.5 notes/s), ~9% dots.
+(defaults, 20 s chart): right-only ≈ 26 notes + 11 bombs
+(~1.3 notes/s); both ≈ 43 notes + 11 bombs (~2.3 notes/s), ~9% dots —
+and it varies WITHIN a chart with the speed walk: measured local
+density ~1.4 notes/s around sub-4 m/s notes vs ~3.2 around 6+ m/s
+notes (pinned by test).
 
 ## Observation layout (exact, all f32) — order is a contract
 
