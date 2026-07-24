@@ -21,25 +21,20 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--episodes", type=int, default=30)
     p.add_argument("--seed0", type=int, default=9000)
-    p.add_argument("--note-rate", type=float, default=2.5)
     p.add_argument("--colors", default="both")
-    p.add_argument("--discrete-dirs", action="store_true",
-                   help="use --dirs instead of continuous angles")
-    p.add_argument("--dirs", type=int, nargs="+", default=[6])
-    p.add_argument("--note-speed", type=float, default=3.0)
-    p.add_argument("--note-speed-max", type=float, default=6.0)
-    p.add_argument("--bomb-rate", type=float, default=0.25)
-    p.add_argument("--dot-prob", type=float, default=0.0)
-    p.add_argument("--chain-prob", type=float, default=0.0)
-    p.add_argument("--arc-prob", type=float, default=0.0)
+    p.add_argument("--note-speed-min", type=float, default=2.0)
+    p.add_argument("--note-speed-max", type=float, default=8.0)
+    p.add_argument("--note-prob", type=float, default=0.25)
+    p.add_argument("--extra-prob", type=float, default=0.125)
+    p.add_argument("--dot-prob", type=float, default=0.1)
+    p.add_argument("--bomb-prob", type=float, default=0.125)
     args = p.parse_args()
 
-    cfg = ChartConfig(note_rate=args.note_rate, colors=args.colors,
-                      continuous_dirs=not args.discrete_dirs,
-                      dirs=tuple(args.dirs), note_speed=args.note_speed,
+    cfg = ChartConfig(colors=args.colors,
+                      note_speed_min=args.note_speed_min,
                       note_speed_max=args.note_speed_max,
-                      bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
-                      chain_prob=args.chain_prob, arc_prob=args.arc_prob)
+                      note_prob=args.note_prob, extra_prob=args.extra_prob,
+                      dot_prob=args.dot_prob, bomb_prob=args.bomb_prob)
     pol = load_policy(torch.load(args.ckpt, map_location="cpu",
                                  weights_only=True))
     pol.eval()

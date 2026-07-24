@@ -6,7 +6,7 @@ built from the sim's event stream). Logged rewards are the raw
 interpretable ones (score/115 per good cut, -0.5 bad/miss).
 
   python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
-  python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
+  python record_replay.py --scripted --colors both --note-prob 0.35
   python record_replay.py --random
 """
 
@@ -33,35 +33,28 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="replays")
     p.add_argument("--tag", type=str, default=None,
                    help="filename prefix (default: run-dir name / scripted / random)")
-    p.add_argument("--note-rate", type=float, default=1.0)
     p.add_argument("--colors", choices=["right", "both"], default="right")
-    p.add_argument("--dirs", type=int, nargs="+", default=[6])
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3])
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
-    p.add_argument("--min-hand-gap", type=float, default=0.5)
-    p.add_argument("--note-speed", type=float, default=4.0,
-                   help="approach speed; MIN of the range if --note-speed-max set")
-    p.add_argument("--note-speed-max", type=float, default=None)
-    p.add_argument("--continuous-dirs", action="store_true",
-                   help="angles ~ U(0, 2pi) instead of the --dirs subset")
-    p.add_argument("--bomb-rate", type=float, default=0.25)
-    p.add_argument("--dot-prob", type=float, default=0.0)
-    p.add_argument("--chain-prob", type=float, default=0.0)
-    p.add_argument("--arc-prob", type=float, default=0.0)
+    p.add_argument("--note-speed-min", type=float, default=2.0)
+    p.add_argument("--note-speed-max", type=float, default=8.0)
+    p.add_argument("--note-prob", type=float, default=0.25)
+    p.add_argument("--extra-prob", type=float, default=0.125)
+    p.add_argument("--dot-prob", type=float, default=0.1)
+    p.add_argument("--bomb-prob", type=float, default=0.125)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    kw = dict(note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
-              cols=tuple(args.cols), rows=tuple(args.rows),
-              chart_len_s=args.chart_len, min_hand_gap_s=args.min_hand_gap,
-              note_speed=args.note_speed, note_speed_max=args.note_speed_max,
-              continuous_dirs=args.continuous_dirs, bomb_rate=args.bomb_rate,
-              dot_prob=args.dot_prob, chain_prob=args.chain_prob,
-              arc_prob=args.arc_prob)
+    kw = dict(colors=args.colors, cols=tuple(args.cols),
+              rows=tuple(args.rows), chart_len_s=args.chart_len,
+              note_speed_min=args.note_speed_min,
+              note_speed_max=args.note_speed_max,
+              note_prob=args.note_prob, extra_prob=args.extra_prob,
+              dot_prob=args.dot_prob, bomb_prob=args.bomb_prob)
 
     policy = None
     if args.ckpt:

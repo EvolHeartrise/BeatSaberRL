@@ -215,43 +215,64 @@ checkpoints/replays retire (hard replace).
 - **RNG**: `numpy.random.Generator(PCG64(seed))`; all randomness (chart
   gen) flows from it. Same seed + same action sequence ⇒ identical episode.
 
-## Chart generation (`beat_arena_env/chart.py`)
+## Chart generation (`beat_arena_env/chart.py`) — generator v2
 
-`ChartConfig`: `note_rate` (notes/s, default 1.0), `chart_len_s` (default
-20.0), `colors` (`"right"` = all blue, `"both"`, default `"right"`),
-`dirs` (allowed subset of 0..7, default `[6]` = down-swings),
-`min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
-restricting them is a spatial curriculum dial), `note_speed` (m/s toward
-the plane, default 4.0), `dot_prob` (P(a plain note is a dot —
-`any_dir`, parser-convention angle 0; dots never become chain heads;
-default 0; the RNG draw is skipped entirely at 0 so existing seeds'
-charts are unchanged), and the **env v7 object dials**: `bomb_rate`
-(bombs/s, **default 0.25 since env v7.7, user-directed — bombs are part
-of the default random gym**, ~5 per 20 s chart), `chain_prob`
-(P(non-dot note → chain), default 0), `arc_prob` (P(consecutive
-same-color pair → arc), default 0).
+**Generator v2 (2026-07-24, user-designed, hard replace):** the old
+rate-scheduled uniform stream (note_rate/dirs/continuous_dirs/
+min_hand_gap_s/bomb_rate/chain_prob/arc_prob) is GONE. Notes now come
+from a **jittered tick lattice** walked by **three independent paths**
+— left hand, right hand, bombs.
 
-Generation: first note at `t = 1.0`; successive intervals
-`(1/note_rate)·U(0.8, 1.2)`; color drawn 50/50 in `"both"` mode but a note
-is pushed later if its hand's previous note is closer than `min_hand_gap_s`
-(physical-feasibility guarantee — the same hand is never asked to be in two
-places at once faster than it can travel). **Positions (env v7.5) are
-CONTINUOUS**: x, y ~ U over the rectangle spanned by the allowed
-cols/rows **padded by `POS_PAD = 0.2` m on every side** (defaults:
-x [−1.1, 1.1], y [0.65, 2.1] — under uniform sampling the old edge
-cells became measure-zero extremes; the margin keeps outer-edge
-capability trained). The cell dials survive as range clamps (a single
-allowed col/row → a ±0.2 m corridor); real BeatSaver maps keep their
-grid cells; note col/row become nearest-cell metadata.
-Chains: sc ∈ 3..6 pieces, tail `U(0.10, 0.25)` s later, 0.6-1.2 m along
-the head's direction (clamped into range); links laid on the real quadratic Bézier
-(`chart.chain_links`: control point = head + dirVec·dist/2, link i at
-curve parameter `(i/(sc−1))·squish`, time lerped unsquished, angle =
-curve tangent — BeatLeader beat.js:424-463); the hand is busy until the
-tail. Bombs: an independent `(1/bomb_rate)·U(0.8, 1.2)` stream, cell
-re-rolled up to 4× to avoid sitting within 0.3 m / 0.25 s of a note.
-Arcs: consecutive same-color plain-note pairs ≤ 2 s apart get
-`free_post` (head) + `free_pre` (tail).
+`ChartConfig`: `chart_len_s` (default 20.0), `colors` (`"right"` = all
+blue, `"both"`, default `"right"`), `first_note_s` (1.0), `cols`/`rows`
+(allowed positions — still the spatial-curriculum dial), and per-tick
+dials `note_prob` (P(note) per hand path per tick, 0.25), `extra_prob`
+(0.125), `dot_prob` (0.1), `bomb_prob` (0.125), plus the speed-walk
+clamp `note_speed_min`/`note_speed_max` (2.0 / 8.0 m/s, user-picked).
+
+Generation, per tick (first at `t = first_note_s`, then
+`t += 0.15 + U(−0.03, 0.03)` — `TICK_DT`/`TICK_JITTER` — until
+`chart_len_s`):
+
+- **Each hand path** independently spawns a note with P = `note_prob`.
+  Direction keeps **parity flow**: the path's previous ORIGINAL angle
+  flipped 180° plus `N(0, ANGLE_SIGMA = 45°)` (user-picked σ) — mostly
+  clean opposing swings, occasional big reversals; the path's first
+  note draws `U(0, 2π)`. Position: x, y ~ U over the allowed-cols/rows
+  rectangle padded by `POS_PAD = 0.2` m (env v7.5 semantics unchanged;
+  defaults x [−1.1, 1.1], y [0.65, 2.1]; real BeatSaver maps keep grid
+  cells; col/row are nearest-cell metadata). Speed: ONE shared random
+  walk across ALL paths — previous spawned object's speed
+  `+ U(−0.4, 0.4)` (`SPEED_DEV`), clamped to
+  [`note_speed_min`, `note_speed_max`]; first draw uniform in the range
+  (shared lookback regardless of color keeps the hands' speeds
+  similar).
+- **Extra note** (P = `extra_prob` after each spawn): starts as an
+  exact replica; placed `d ~ U(−1.5, 1.5)` m (`EXTRA_PATH`) along the
+  original's swing line (ahead/behind on the swing path); DISCARDED if
+  that along-line point leaves the spawn rectangle; survivors then get
+  a `U(−45°, 45°)` rotation offset (`EXTRA_ROT`), a `U(−0.5, 0.5)` m
+  offset perpendicular to the line (`EXTRA_PERP` — the final position
+  may overhang the rectangle by ≤ 0.5 m), and a `U(−0.1, 0.1)` m z
+  offset (`EXTRA_DZ`, implemented as the equivalent arrival-time shift
+  `dz/speed`). Extras NEVER feed the parity chain (originals only) and
+  never roll their own extras.
+- **Dot roll**: at the end of each tick every generated note (originals
+  and extras) independently becomes a dot with P = `dot_prob`
+  (`any_dir`, parser-convention angle 0; the parity chain keeps the
+  pre-dot angle).
+- **Bomb path**: same spawn logic (its own parity chain steers extra
+  placement, shared speed walk) at P = `bomb_prob` per tick; emitted
+  objects become directionless bombs (`any_dir`, angle 0); no dot roll.
+
+There is NO min-hand-gap guarantee anymore — pacing is emergent from
+the lattice and spawn odds (same-hand originals are ≥ 1 tick apart;
+extras land essentially on their original's tick: one swing can take
+both). Chains and arcs are NOT generated procedurally — real BeatSaver
+maps are their only source; `chart.chain_links` (real quadratic Bézier,
+BeatLeader beat.js:424-463) survives for the parser. Reference density
+(defaults, 20 s chart): right-only ≈ 35 notes + 16 bombs (~1.8 notes/s);
+both ≈ 67 notes + 16 bombs (~3.5 notes/s), ~9% dots.
 
 ## Observation layout (exact, all f32) — order is a contract
 
@@ -294,9 +315,8 @@ statistic for arrival). Both properties are pinned by tests.
 
 ## Gymnasium env (`beat_arena_env/rust_env.py`)
 
-`RustBeatEnv(note_rate, colors, dirs, continuous_dirs, chart_len_s,
-min_hand_gap_s, cols, rows, note_speed, note_speed_max, bomb_rate,
-chain_prob, arc_prob, seed)`:
+`RustBeatEnv(colors, chart_len_s, cols, rows, note_speed_min,
+note_speed_max, note_prob, extra_prob, dot_prob, bomb_prob, seed)`:
 `observation_space = Box(-2, 2, (286,))` (bounds loose),
 `action_space = MultiDiscrete([3]×12)` (per hand: pitch, yaw, twist,
 elbow, roll, bend; left first). New chart every `reset(seed)` (chart
@@ -321,7 +341,7 @@ events; the action is the 12-int vector. v6 replays and older are
 rejected.
 
 ```json
-{"header": {"version": 7, "config": {..., "note_speed": 4.0, "bomb_rate": 0.0, "chain_prob": 0.0, "arc_prob": 0.0},
+{"header": {"version": 7, "config": {..., "note_speed_min": 2.0, "note_speed_max": 8.0, "note_prob": 0.25, "extra_prob": 0.125, "dot_prob": 0.1, "bomb_prob": 0.125},
  "chart": [{"t":1.0,"x":0.3,"y":1.4,"color":1,"angle":4.712,"speed":4.0,"any":false,"kind":0,"fpre":false,"fpost":false}, ...]}}
 {"t": 0, "time": 0.0, "sabers": [[pitch,yaw,twist,elbow,roll,bend, om...6, wx,wy,wz],[...]], "action": [0,1,0,2,1,0, 0,0,1,0,2,0],
  "reward": 0.0, "events": [{"cut": {"note": 3, "good": true, "reason": "ok", "points": 78}} | {"cut": {"note": 4, "good": false, "reason": "slow|angle|wrong_hand", "points": 0}} | {"post": {"note": 3, "points": 26}} | {"miss": {"note": 5}} | {"bomb": {"note": 6}}]}
@@ -418,7 +438,9 @@ through; the leftover rotation is the follow-through):
    `α/Ω` physics so the blade sweeps THROUGH `θ_aim` at contact.
 
 Stateless per tick; solvability proof and eyeball baseline, not
-optimal. Must land ≥ 80% good cuts on the default easy chart (tested),
+optimal. Must land ≥ 50% good cuts on the default (right-only) chart
+(tested; **generator v2 dropped it from 82.9% to ~60%** — parity-flow
+angles, extras, and the 2-8 m/s speed walk tax its flat-blade whip),
 with mean score well above the 15-point stab ceiling. Its flat-blade
 technique caps accuracy (~5 of 15 — the blade plane sits ~0.2 m behind
 the note center; forward-TILTED blades sweeping through the box depth
@@ -452,8 +474,9 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 (ε=0.2, c=3), ent 0.01, vf 0.5, Adam 3e-4, grad clip 0.5. Flags:
 `--num-envs --horizon --minibatches --epochs --total-steps --time-cap
 --ent-coef --seed --ckpt-every --run-dir --init-from --bench` + env
-config (`--note-rate --colors --dirs --cols --rows --chart-len
---min-hand-gap --note-speed`). Batch = num_envs×horizon;
+config (`--colors --cols --rows --chart-len --note-speed-min
+--note-speed-max --note-prob --extra-prob --dot-prob --bomb-prob`).
+Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
 
@@ -599,12 +622,20 @@ Further gains need a GPU or a cheaper policy, not more envs.
    flat blade can't reach; every joint's limit clamps and kills its ω.
    Recording round-trip (JSONL v7 counters + score match the sim) and
    VecBeatSim(1) ≡ RawBeatSim (6-tuple counters).
-4. Chart gen: respects `min_hand_gap_s` per hand and the `dirs` subset;
-   the v7 dials produce their kinds; chain-link Bézier layout (times
-   strictly increasing to the tail, positions marching along the curve).
+4. Chart gen (generator v2): tick-lattice spawn counts track the
+   per-tick probabilities; parity flow (consecutive same-hand originals
+   mostly oppose, offsets real and continuous); the speed walk stays in
+   its clamp and steps ≤ 0.4 m/s across colors AND bombs (shared
+   walk); extra notes are same-speed replicas along the swing line
+   (rotation ≤ 45°, perpendicular ≤ 0.5 m, along-line point inside the
+   rectangle) and discards happen; dot fraction ~1/10 with angle 0;
+   positions continuous inside the padded rectangle; chain-link Bézier
+   layout (parser-only now: times strictly increasing to the tail,
+   positions marching along the curve).
 5. Policy junk-leak: garbage in masked note slots changes no
    logprob/entropy/value (key-masking).
-6. Scripted bot ≥ 80% good cuts on default easy chart (solvability).
+6. Scripted bot ≥ 50% good cuts on the default chart (solvability;
+   ~60% measured on generator v2).
 7. ScoreSaber bench (offline, network monkeypatched): PP-curve anchors
    (0.95→1, 1.0→5.367…, interpolation, monotonicity), 0.965-weighted
    totals, the multiplier walk vs ScoreSaber's 115·(8n−63) formula,

@@ -13,6 +13,8 @@ parks the right wrist at (0.2, ~1.396, ~-0.195): flat-blade geometry at
 row-1 height (y 1.40), just behind the hit plane.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -125,9 +127,9 @@ def test_flat_pose_geometry():
 # --- obs layout --------------------------------------------------------------
 
 def test_obs_layout():
-    # bomb_rate 0: this test pins slot/feature offsets against chart[0],
-    # which must be a plain note for the color/dir assertions
-    env = RustBeatEnv(seed=3, bomb_rate=0.0)
+    # bombs/dots/extras off: this test pins slot/feature offsets against
+    # chart[0], which must be a plain arrow note for the color/dir asserts
+    env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (286,)
     assert OFF_NOTES == 2 * SABER_FEAT == 46
@@ -241,8 +243,8 @@ def test_z_is_time_times_speed():
 
 def test_determinism():
     def run():
-        env = RustBeatEnv(colors="both", note_rate=1.5, bomb_rate=0.3,
-                          chain_prob=0.3, arc_prob=0.3, seed=7)
+        env = RustBeatEnv(colors="both", bomb_prob=0.3, extra_prob=0.3,
+                          seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
         out = []
@@ -644,90 +646,128 @@ def test_note_speed_scales_the_time_window():
 
 # --- chart generation --------------------------------------------------------
 
-def test_chart_respects_hand_gap_and_dirs():
-    cfg = ChartConfig(note_rate=3.0, colors="both", dirs=(2, 6),
-                      min_hand_gap_s=0.5, chart_len_s=30.0)
+def test_chart_tick_lattice_and_counts():
+    """Generator v2: spawn counts track the per-tick probabilities, the
+    chart is time-sorted, dots run ~1 in 10 with parser-convention
+    angle 0, and bombs are directionless."""
+    cfg = ChartConfig(colors="both", chart_len_s=60.0)
     chart = generate_chart(cfg, np.random.default_rng(11))
-    notes = [n for n in chart if n.kind == 0]        # bombs are default now
+    notes = [n for n in chart if n.kind == KIND_NOTE]
     bombs = [n for n in chart if n.kind == KIND_BOMB]
-    assert len(notes) > 20
-    assert len(bombs) >= 4                            # ~0.25/s over 30 s
-    assert all(n.angle in (2 * np.pi / 4, 6 * np.pi / 4) for n in notes)
-    for color in (0, 1):
-        times = [n.hit_time for n in notes if n.color == color]
-        assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:]))
+    # ~393 ticks over 59 s: E[notes] ~ 2 * 0.25 * 393 (+ surviving extras)
+    assert 150 <= len(notes) <= 290
+    assert 25 <= len(bombs) <= 90               # E ~ 0.125 * 393
+    # extras can precede their original by <= EXTRA_DZ / speed_min
+    from beat_arena_env.chart import EXTRA_DZ
+    assert all(n.hit_time >= cfg.first_note_s - EXTRA_DZ / cfg.note_speed_min
+               for n in chart)
     assert all(a.hit_time <= b.hit_time for a, b in zip(chart, chart[1:]))
-
-
-def test_chart_continuous_dirs_and_speed_range():
-    cfg = ChartConfig(note_rate=2.0, colors="both", continuous_dirs=True,
-                      note_speed=3.0, note_speed_max=6.0, chart_len_s=30.0)
-    chart = generate_chart(cfg, np.random.default_rng(13))
-    notes = [n for n in chart if n.kind == 0]
-    assert len(notes) > 20
-    assert all(0.0 <= n.angle < 2 * np.pi for n in chart)
-    assert all(3.0 <= n.speed <= 6.0 for n in chart)
-    assert len({round(n.angle, 3) for n in notes}) > 10   # actually continuous
-    assert len({round(n.speed, 3) for n in notes}) > 10
-
-
-def test_chart_v7_object_dials():
-    """bomb_rate / chain_prob / arc_prob produce their object kinds;
-    chains follow the real link layout (times strictly between head and
-    tail, positions on the Bezier); arcs pair head free_post with a later
-    same-color free_pre."""
-    cfg = ChartConfig(note_rate=2.0, colors="both", dirs=(0, 2, 4, 6),
-                      chart_len_s=40.0, bomb_rate=0.5, chain_prob=0.4,
-                      arc_prob=0.5)
-    chart = generate_chart(cfg, np.random.default_rng(17))
-    kinds = [n.kind for n in chart]
-    assert kinds.count(KIND_BOMB) >= 5
-    assert kinds.count(KIND_CHAIN_HEAD) >= 3
-    assert kinds.count(KIND_CHAIN_LINK) > kinds.count(KIND_CHAIN_HEAD)
-    assert sum(n.free_pre for n in chart) >= 2
-    assert sum(n.free_pre for n in chart) == sum(n.free_post for n in chart)
-    for n in chart:
-        if n.kind == KIND_CHAIN_LINK:
-            assert n.any_dir and n.x is not None and n.y is not None
-        if n.kind == KIND_BOMB:
-            assert n.any_dir
-    # same-hand feasibility still holds for non-link objects
-    for color in (0, 1):
-        times = [n.hit_time for n in chart
-                 if n.color == color and n.kind in (0, 2)]
-        assert all(b - a >= 0.25 for a, b in zip(times, times[1:]))
-
-
-def test_chart_dot_prob():
-    """dot_prob turns plain notes into dots (any_dir, parser-convention
-    angle 0); dots never become chain heads; default stays dot-free."""
-    cfg = ChartConfig(note_rate=2.0, colors="both", dirs=(0, 2, 4, 6),
-                      chart_len_s=40.0, dot_prob=0.5, chain_prob=0.4,
-                      bomb_rate=0.0)
-    chart = generate_chart(cfg, np.random.default_rng(19))
-    plain = [n for n in chart if n.kind == KIND_NOTE]
-    dots = [n for n in plain if n.any_dir]
-    arrows = [n for n in plain if not n.any_dir]
-    assert len(dots) >= 5 and len(arrows) >= 5     # mixture, not all-or-none
+    dots = [n for n in notes if n.any_dir]
+    assert 0.03 <= len(dots) / len(notes) <= 0.25
     assert all(n.angle == 0.0 for n in dots)
-    assert all(not n.any_dir for n in chart if n.kind == KIND_CHAIN_HEAD)
-    all_dots = generate_chart(
-        ChartConfig(note_rate=2.0, chart_len_s=20.0, dot_prob=1.0,
-                    bomb_rate=0.0), np.random.default_rng(19))
-    assert all(n.any_dir for n in all_dots)
-    default = generate_chart(ChartConfig(note_rate=2.0, chart_len_s=20.0,
-                                         bomb_rate=0.0),
-                             np.random.default_rng(19))
-    assert not any(n.any_dir for n in default)
+    assert all(b.any_dir and b.angle == 0.0 for b in bombs)
+    none = generate_chart(ChartConfig(note_prob=0.0, bomb_prob=0.0),
+                          np.random.default_rng(11))
+    assert none == []
+
+
+def test_chart_parity_flow_angles():
+    """Consecutive same-hand originals mostly oppose: flip 180 deg +
+    N(0, 45 deg) puts ~68% within 45 deg of perfect parity and makes
+    big reversals rare but possible."""
+    cfg = ChartConfig(colors="both", chart_len_s=120.0, extra_prob=0.0,
+                      dot_prob=0.0, bomb_prob=0.0)
+    chart = generate_chart(cfg, np.random.default_rng(13))
+    devs = []
+    for color in (0, 1):
+        angs = [n.angle for n in chart if n.color == color]
+        assert len(angs) > 80
+        for a, b in zip(angs, angs[1:]):
+            d = (b - (a + np.pi)) % (2 * np.pi)
+            devs.append(min(d, 2 * np.pi - d))
+    devs = np.array(devs)
+    assert (devs <= np.pi / 4 + 1e-9).mean() > 0.55     # ~0.68 expected
+    assert (devs <= np.pi / 2 + 1e-9).mean() > 0.85     # ~0.955 expected
+    assert 0.2 < devs.mean() < 1.0                      # offsets are real
+    assert len({round(a, 3) for a in devs}) > 50        # and continuous
+
+
+def test_chart_speed_walk_shared():
+    """Speeds stay inside [note_speed_min, note_speed_max] and step at
+    most SPEED_DEV per spawn — across colors AND bombs (one shared
+    walk), which keeps the two hands' speeds similar."""
+    from beat_arena_env.chart import SPEED_DEV
+    cfg = ChartConfig(colors="both", chart_len_s=60.0, extra_prob=0.0,
+                      dot_prob=0.0)
+    chart = generate_chart(cfg, np.random.default_rng(17))
+    assert all(cfg.note_speed_min <= n.speed <= cfg.note_speed_max
+               for n in chart)
+    # no extras: time-sorted order == spawn order (stable sort on ties)
+    speeds = [n.speed for n in chart]
+    assert all(abs(b - a) <= SPEED_DEV + 1e-9
+               for a, b in zip(speeds, speeds[1:]))
+    assert len({round(s, 3) for s in speeds}) > 30      # a real walk
+    pinned = generate_chart(
+        ChartConfig(note_speed_min=3.0, note_speed_max=3.0),
+        np.random.default_rng(3))
+    assert all(n.speed == 3.0 for n in pinned)
+
+
+def test_chart_extra_notes():
+    """extra_prob: a replica along the original's swing line — same
+    speed/color, near-same time (+-0.1 m of z), <= 45 deg rotation
+    offset, <= 0.5 m perpendicular offset, and the along-line point
+    inside the spawn rectangle (the discard rule)."""
+    from beat_arena_env.chart import (EXTRA_DZ, EXTRA_PATH, EXTRA_PERP,
+                                      EXTRA_ROT, _pos_ranges)
+    from beat_arena_env.constants import note_center as nc
+    cfg = ChartConfig(colors="right", chart_len_s=120.0, extra_prob=1.0,
+                      dot_prob=0.0, bomb_prob=0.0)
+    chart = generate_chart(cfg, np.random.default_rng(29))
+    x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
+    # pair members share an exact speed (replica) and sit within the z
+    # shift of each other; distinct spawns differ in speed almost surely
+    pairs, singles, used = [], [], set()
+    for i, n in enumerate(chart):
+        if i in used:
+            continue
+        if (i + 1 < len(chart) and chart[i + 1].speed == n.speed
+                and abs(chart[i + 1].hit_time - n.hit_time)
+                <= EXTRA_DZ / cfg.note_speed_min + 1e-9):
+            pairs.append((n, chart[i + 1]))
+            used.add(i + 1)
+        else:
+            singles.append(n)
+    assert len(pairs) >= 20                     # extras actually survive
+    assert len(singles) >= 20                   # and discards actually happen
+
+    def is_valid_pair(orig, extra):
+        d_ang = abs((extra.angle - orig.angle + np.pi) % (2 * np.pi) - np.pi)
+        if d_ang > EXTRA_ROT + 1e-9:
+            return False
+        ox, oy = nc(orig)
+        expos = np.array(nc(extra)) - np.array([ox, oy])
+        u = np.array([math.cos(orig.angle), math.sin(orig.angle)])
+        along = float(expos @ u)
+        perp = float(expos @ np.array([-u[1], u[0]]))
+        if not (abs(along) <= EXTRA_PATH + 1e-9
+                and abs(perp) <= EXTRA_PERP + 1e-9):
+            return False
+        return (x_lo - 1e-9 <= ox + along * u[0] <= x_hi + 1e-9
+                and y_lo - 1e-9 <= oy + along * u[1] <= y_hi + 1e-9)
+
+    for a, b in pairs:
+        assert a.color == b.color and a.kind == b.kind
+        assert is_valid_pair(a, b) or is_valid_pair(b, a)
 
 
 def test_chart_positions_are_continuous():
     """Env v7.5: generated positions are continuous over the allowed
     cols/rows span padded by 0.2 m on every side (outer-edge coverage);
-    restricting to a single col narrows x to a +-0.2 m corridor."""
+    restricting to a single col narrows x to a +-0.2 m corridor.
+    (extra_prob 0: extras may overhang the rectangle by <= 0.5 m.)"""
     from beat_arena_env.constants import note_center as nc
-    cfg = ChartConfig(note_rate=3.0, colors="both", chart_len_s=40.0,
-                      min_hand_gap_s=0.2)
+    cfg = ChartConfig(colors="both", chart_len_s=60.0, extra_prob=0.0)
     chart = generate_chart(cfg, np.random.default_rng(23))
     xs = [nc(n)[0] for n in chart]
     ys = [nc(n)[1] for n in chart]
@@ -736,8 +776,8 @@ def test_chart_positions_are_continuous():
     assert len({round(x, 3) for x in xs}) > 20      # actually continuous
     assert len({round(y, 3) for y in ys}) > 20
     assert max(xs) > 0.9 or min(xs) < -0.9          # the margin gets used
-    pinned = generate_chart(ChartConfig(note_rate=2.0, chart_len_s=20.0,
-                                        cols=(2,), rows=(0, 1, 2)),
+    pinned = generate_chart(ChartConfig(chart_len_s=40.0, cols=(2,),
+                                        rows=(0, 1, 2), extra_prob=0.0),
                             np.random.default_rng(5))
     assert all(abs(nc(n)[0] - col_x(2)) <= 0.2 + 1e-9 for n in pinned)
     assert len({round(nc(n)[1], 3) for n in pinned}) > 5
@@ -759,6 +799,10 @@ def test_chain_links_layout():
 # --- scripted bot solvability ------------------------------------------------
 
 def test_scripted_bot_solves_easy():
+    # generator v2 gate: the bot lands ~60% good on the new default gym
+    # (parity flow + extras + the 2-8 m/s speed walk tax its flat-blade
+    # whip; it was 82.9% on the old rate-1.0 down-swing gym) — the gate
+    # pins solvability, not mastery
     good, total, score = 0, 0, 0.0
     env = RustBeatEnv(seed=0)
     for seed in range(5):
@@ -769,7 +813,7 @@ def test_scripted_bot_solves_easy():
         good += info["good_cuts"]
         total += info["n_notes"]
         score += info["score"]
-    assert good / total >= 0.8
+    assert good / total >= 0.5
     # real swings, not stabs: mean points per note well above the 15-point
     # stab ceiling
     assert score / total >= 40.0
@@ -780,8 +824,8 @@ def test_scripted_bot_solves_easy():
 def test_recording_roundtrip(tmp_path):
     import json
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_rate=0.3, chain_prob=0.3,
-                      arc_prob=0.3, colors="both", note_rate=1.5)
+    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
+                      colors="both")
     env.set_record(path)
     env.reset(seed=5)
     done = False
@@ -790,7 +834,7 @@ def test_recording_roundtrip(tmp_path):
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
     assert head["header"]["version"] == 7
-    assert head["header"]["config"]["note_speed"] == 4.0
+    assert head["header"]["config"]["note_speed_min"] == 2.0
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c
                for c in head["header"]["chart"])

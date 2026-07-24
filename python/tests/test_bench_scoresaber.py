@@ -243,7 +243,7 @@ def test_greedy_rollout_smoke():
     from beat_arena_env.rust_env import RustBeatEnv
     from policy import NotePolicy
 
-    cfg = ChartConfig(note_rate=1.0, chart_len_s=6.0, bomb_rate=0.5)
+    cfg = ChartConfig(chart_len_s=6.0, bomb_prob=0.25)
     notes = generate_chart(cfg, np.random.default_rng(3))
     env = RustBeatEnv(external_chart=notes, seed=0)
     obs, _ = env.reset()

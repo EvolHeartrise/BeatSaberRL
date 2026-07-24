@@ -46,9 +46,10 @@ envs) builds once with:
 cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
-Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`,
-plus `--dot-prob 0.2` (dot-note chance) and the v7 object dials
-`--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
+Difficulty dials (generator v2, SPEC §Chart generation): `--colors both`
+doubles the note stream; per-tick probabilities `--note-prob 0.25
+--extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
+the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`.
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
 
@@ -99,7 +100,7 @@ viewer needs a real BeatSaver map to render.
 
 ```bash
 $VENV/bin/python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
-$VENV/bin/python record_replay.py --scripted --note-rate 2.5 --colors both --dirs 0 1 2 3 4 5 6 7
+$VENV/bin/python record_replay.py --scripted --colors both
 ```
 
 then open `viz/replay.html` in a browser and drop a
@@ -116,17 +117,16 @@ faint tubes; green split = good cut; orange/red flash = bad cut / miss,
 labeled with the reason. Pre-v7 replays are rejected — re-record from a
 current checkpoint.
 
-Reference points (env v7.7 scripted bot, padded gym with default bombs,
-10 eps each): easy (rate 1.0, right hand only, down-swings) 82.9% good
-cuts / 51.4 pts per note, ~1.2 bombs hit/ep; hard (both hands, 8 dirs)
-77.7% / 55.6; dynamic gym 68.9% / 51.3 (the bot ignores bombs as
-targets and clips some incidentally). The real
-hitboxes are FORGIVING (the good box extends 0.75 m toward the player —
-the bot whips through the contact angle 0.10 s early, like real
-players), but v7.1's tightened wrist (roll 180° arcs, twist −70/90)
-taxes its roll-whip technique hard (v7.0 numbers were 95.4 / 88.6 on
-easy): full wind-ups now belong to the arm, which the bot only
-partially uses. Pre-v7 references are not comparable.
+Reference points (generator-v2 scripted bot, default dials, 5 eps
+each): right-only 60.5% good cuts / 47.3 pts per note; both hands
+62.7% / 46.4, ~5 bombs hit/ep (the bot ignores bombs as targets and
+clips some incidentally). Generator v2's parity-flow angles, extra
+notes, and 2-8 m/s speed walk cost the bot ~20 points vs the old
+rate-1.0 down-swing easy gym (82.9%); the real hitboxes stay FORGIVING
+(the good box extends 0.75 m toward the player — the bot whips through
+the contact angle 0.10 s early, like real players). Pre-v2-generator
+references (all of the Status section's env-v7.x bot numbers) are not
+comparable.
 
 ## Status
 
@@ -371,3 +371,15 @@ partially uses. Pre-v7 references are not comparable.
   ~2/3 of bombs (61 hits / 30 eps → 92.7 / 89.5 / +34.44) — the first
   v7.x change requiring retraining, i.e. the reason bombs belong in
   the training distribution. Suite 62 green.
+- **Generator v2 (2026-07-24, user-designed, hard replace): parity-flow
+  tick-lattice chart generation.** The rate-scheduled uniform stream
+  (note_rate/dirs/continuous_dirs/min_hand_gap/chain_prob/arc_prob) is
+  gone; notes now spawn on a jittered ~0.15 s lattice from three
+  independent paths (left, right, bombs) with 180°-flip parity angles
+  (+ N(0, 45°)), a shared ±0.4 m/s speed random walk clamped to
+  2-8 m/s, swing-line EXTRA notes (1/8), and a 1/10 dot roll. Chains
+  and arcs come only from real maps now. Default gym density roughly
+  doubles (~3.5 notes/s both-hands + ~0.8 bombs/s); scripted bot drops
+  to 60.5 / 62.7 (right / both) — new baseline, old bot references not
+  comparable. Suite 83 green (f64 + f32 parity unchanged); viewer
+  config summary updated + rebuilt. Fresh training run pending.

@@ -1,24 +1,31 @@
 """Procedural chart generation (SPEC.md §Chart generation).
 
-A chart is a time-sorted list of Note objects — since env v7 "note" means
-any gameplay object: color notes, bombs, chain heads, and chain links
-(`kind`). Difficulty is controlled by the config knobs: note_rate is the
-main dial, colors/dirs widen the skill demanded, min_hand_gap_s
-guarantees physical feasibility, dot_prob mixes in dot notes, and
-bomb_rate / chain_prob / arc_prob mix in the v7 object types.
+Generator v2 (2026-07-24, user-designed): notes come from a jittered
+tick lattice (~0.15 s) driven by three independent paths — left hand,
+right hand, bombs — replacing the old rate-scheduled uniform stream.
+Each path keeps PARITY FLOW: a spawned note's direction is the path's
+previous ORIGINAL direction flipped 180° plus a normal offset
+(σ = 45°), so consecutive swings mostly oppose like real maps but can
+occasionally reverse outright. Note speed is one shared random walk
+(±0.4 m/s per note, clamped to [note_speed_min, note_speed_max]) across
+ALL paths, so the two hands' speeds never drift far apart. A spawned
+note may bring an EXTRA note: a replica placed along the original's
+swing line (±1.5 m; discarded if that point leaves the spawn
+rectangle), then given a ±45° rotation offset, a ±0.5 m perpendicular
+offset, and a ±0.1 m z offset (implemented as an arrival-time shift) —
+stacks/windows in spirit: one swing can take both. Extras never feed
+the parity chain and never roll their own extras. At the end of each
+tick every generated note independently becomes a dot (P = dot_prob).
+The bomb path follows the exact note logic (its parity angle steers
+extra placement) at a lower spawn chance, then emits directionless
+bombs. Chains and arcs are no longer generated procedurally — real
+BeatSaver maps are their only source (`chain_links` below serves the
+parser).
 
-Env v7.5: generated positions are CONTINUOUS — x, y ~ U over the
-rectangle spanned by the allowed cols/rows (the cell dials survive as
-range clamps; a single allowed col/row pins that axis). Real BeatSaver
-maps keep their grid cells; the sim has taken explicit positions since
-v7.0. Chain tails go 0.6-1.2 m along the head's direction, clamped
-into range; note col/row become nearest-cell metadata.
-
-Chain links follow the real Beat Saber layout: a quadratic Bezier from
-head to tail whose control point sits half the head-tail distance along
-the head's cut direction; link i of sc sits at curve parameter
-t = (i/(sc-1)) * squish with its time lerped (unsquished) head->tail
-and its angle from the curve tangent (BeatLeader beat.js:424-463).
+Positions stay continuous (env v7.5): x, y ~ U over the rectangle
+spanned by the allowed cols/rows padded by POS_PAD (the cell dials
+survive as range clamps); real BeatSaver maps keep their grid cells;
+note col/row are nearest-cell metadata.
 """
 
 from __future__ import annotations
@@ -28,16 +35,23 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .constants import (KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK,
-                        KIND_NOTE, ROW_Y, col_x, note_center)
+from .constants import (KIND_BOMB, KIND_CHAIN_LINK, KIND_NOTE, ROW_Y,
+                        col_x, note_center)
 
 N_COLS = 4
 N_ROWS = 3
 LEFT, RIGHT = 0, 1
+_BOMB_PATH = 2                # parity-chain key for the bomb path
 
-CHAIN_SC = (3, 6)             # link count range (inclusive), incl. head
-CHAIN_TAIL_DT = (0.10, 0.25)  # head->tail seconds
-ARC_MAX_GAP_S = 2.0           # max head->tail gap for a generated arc
+# generator v2 lattice + path constants (user-specified 2026-07-24)
+TICK_DT = 0.15                # mean generation-tick interval (s)
+TICK_JITTER = 0.03            # per-tick uniform jitter (± s)
+ANGLE_SIGMA = math.radians(45.0)  # parity-offset spread (user-picked σ)
+SPEED_DEV = 0.4               # speed random-walk step (± m/s per note)
+EXTRA_PATH = 1.5              # extra note: ± range along the swing line (m)
+EXTRA_ROT = math.radians(45.0)    # extra note rotation offset (±)
+EXTRA_PERP = 0.5              # extra note perpendicular offset (± m)
+EXTRA_DZ = 0.1                # extra note z offset (± m, as a time shift)
 
 
 @dataclass(frozen=True)
@@ -61,33 +75,24 @@ class Note:
 
 @dataclass
 class ChartConfig:
-    note_rate: float = 1.0        # notes per second (overall)
     chart_len_s: float = 20.0
     colors: str = "right"         # "right" (all blue) or "both"
-    dirs: tuple = (6,)            # allowed cut directions (6 = down-swing)
-    continuous_dirs: bool = False # True: angle ~ U(0, 2pi), ignores `dirs`
-    note_speed_max: float = None  # if set: per-note speed ~ U(note_speed, max)
-    min_hand_gap_s: float = 0.5   # min spacing between same-hand notes
-    first_note_s: float = 1.0
+    first_note_s: float = 1.0     # first generation tick (s)
     cols: tuple = (0, 1, 2, 3)    # allowed columns (curriculum: restrict)
     rows: tuple = (0, 1, 2)       # allowed rows
-    note_speed: float = 4.0       # m/s toward the plane; z(t) = (hit_time - t) * speed
-    # bombs are part of the DEFAULT random gym since env v7.7
-    # (user-directed): ~5 per 20 s chart, ~1:10 vs dynamic-gym notes
-    bomb_rate: float = 0.25       # bombs per second (0 = none)
-    dot_prob: float = 0.0         # P(a plain note is a dot: any direction)
-    chain_prob: float = 0.0       # P(a non-dot note becomes a chain)
-    arc_prob: float = 0.0         # P(consecutive same-color pair gets an arc)
+    note_speed_min: float = 2.0   # speed random-walk clamp (m/s)
+    note_speed_max: float = 8.0
+    note_prob: float = 0.25       # P(note) per hand path per tick
+    extra_prob: float = 0.125     # P(a spawned note brings an extra)
+    dot_prob: float = 0.1         # P(a generated note turns into a dot)
+    bomb_prob: float = 0.125      # P(bomb) per tick
 
     def __post_init__(self):
         assert self.colors in ("right", "both"), self.colors
-        assert len(self.dirs) > 0 and all(0 <= d <= 7 for d in self.dirs)
-        if self.note_speed_max is not None:
-            assert self.note_speed_max >= self.note_speed
-        assert self.note_rate > 0
-        assert self.note_speed > 0
-        assert 0.0 <= self.chain_prob <= 1.0 and 0.0 <= self.arc_prob <= 1.0
-        assert 0.0 <= self.dot_prob <= 1.0
+        assert self.note_speed_max >= self.note_speed_min > 0
+        for p in (self.note_prob, self.extra_prob, self.dot_prob,
+                  self.bomb_prob):
+            assert 0.0 <= p <= 1.0
 
 
 def note_tuple(n: Note):
@@ -100,7 +105,11 @@ def note_tuple(n: Note):
 
 def chain_links(head: Note, tail_x: float, tail_y: float, tail_time: float,
                 sc: int, squish: float = 1.0) -> list[Note]:
-    """The sc-1 link Notes of a chain (head excluded), real-BS layout."""
+    """The sc-1 link Notes of a chain (head excluded), real-BS layout:
+    quadratic Bezier whose control point sits half the head-tail
+    distance along the head's cut direction; link i at curve parameter
+    (i/(sc-1))*squish, time lerped unsquished, angle = curve tangent
+    (BeatLeader beat.js:424-463). Parser-only since generator v2."""
     if squish < 1e-3:
         squish = 1.0                       # BS sanitizes degenerate squish
     x0, y0 = note_center(head)
@@ -150,115 +159,77 @@ def _nearest_cell(x, y):
     return col, row
 
 
-def _chain_tail(cfg, head: Note, rng) -> tuple[float, float]:
-    """A continuous tail 0.6-1.2 m from the head along its cut
-    direction, clamped into the allowed position ranges (nudged sideways
-    if the clamp collapses it onto the head)."""
-    x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
-    hx, hy = note_center(head)
-    d = float(rng.uniform(0.6, 1.2))
-    tx = float(np.clip(hx + math.cos(head.angle) * d, x_lo, x_hi))
-    ty = float(np.clip(hy + math.sin(head.angle) * d, y_lo, y_hi))
-    if math.hypot(tx - hx, ty - hy) < 0.3:   # degenerate (clamped back)
-        tx = float(np.clip(hx + (0.6 if hx < (x_lo + x_hi) / 2 else -0.6),
-                           x_lo, x_hi))
-    return tx, ty
-
-
 def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
+    x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
+    hands = (RIGHT,) if cfg.colors == "right" else (LEFT, RIGHT)
+    prev_angle = {}       # per path: last ORIGINAL angle (extras excluded)
+    prev_speed = None     # ONE walk shared by all paths (hands stay similar)
     notes: list[Note] = []
-    last_hand_time = {LEFT: -1e9, RIGHT: -1e9}
+
+    def walk_speed():
+        nonlocal prev_speed
+        if prev_speed is None:
+            s = float(rng.uniform(cfg.note_speed_min, cfg.note_speed_max))
+        else:
+            s = float(np.clip(
+                prev_speed + rng.uniform(-SPEED_DEV, SPEED_DEV),
+                cfg.note_speed_min, cfg.note_speed_max))
+        prev_speed = s
+        return s
+
+    def spawn(t, path, color, kind):
+        """One original (+ maybe its extra) on a path; the caller applies
+        kind-specific finishing (dot roll / bomb conversion)."""
+        pa = prev_angle.get(path)
+        if pa is None:
+            angle = float(rng.uniform(0.0, 2.0 * np.pi))
+        else:
+            angle = float((pa + np.pi + rng.normal(0.0, ANGLE_SIGMA))
+                          % (2.0 * np.pi))
+        prev_angle[path] = angle
+        speed = walk_speed()
+        x = float(rng.uniform(x_lo, x_hi))
+        y = float(rng.uniform(y_lo, y_hi))
+        col, row = _nearest_cell(x, y)
+        out = [Note(hit_time=float(t), col=col, row=row, x=x, y=y,
+                    color=color, angle=angle, speed=speed, kind=kind)]
+        if rng.random() < cfg.extra_prob:
+            # replica along the swing line; the discard check runs on the
+            # along-line point BEFORE the perpendicular/z offsets, so the
+            # final position may overhang the rectangle by <= EXTRA_PERP
+            d = float(rng.uniform(-EXTRA_PATH, EXTRA_PATH))
+            ex = x + math.cos(angle) * d
+            ey = y + math.sin(angle) * d
+            if x_lo <= ex <= x_hi and y_lo <= ey <= y_hi:
+                ea = float((angle + rng.uniform(-EXTRA_ROT, EXTRA_ROT))
+                           % (2.0 * np.pi))
+                p = float(rng.uniform(-EXTRA_PERP, EXTRA_PERP))
+                ex += -math.sin(angle) * p
+                ey += math.cos(angle) * p
+                dz = float(rng.uniform(-EXTRA_DZ, EXTRA_DZ))
+                ecol, erow = _nearest_cell(ex, ey)
+                # z(t) = (hit_time - t)*speed: +dz m of z at any moment
+                # == arriving dz/speed s later
+                out.append(Note(hit_time=float(t + dz / speed), col=ecol,
+                                row=erow, x=ex, y=ey, color=color,
+                                angle=ea, speed=speed, kind=kind))
+        return out
+
     t = cfg.first_note_s
     while t <= cfg.chart_len_s:
-        color = RIGHT if cfg.colors == "right" else int(rng.integers(0, 2))
-        # feasibility: never schedule a hand faster than it can recover
-        earliest = last_hand_time[color] + cfg.min_hand_gap_s
-        hit = max(t, earliest)
-        if hit <= cfg.chart_len_s:
-            # the dot_prob > 0 gate keeps the RNG stream (and thus every
-            # existing seed's chart) untouched when the dial is off
-            if cfg.dot_prob > 0 and rng.random() < cfg.dot_prob:
-                # dot note: parser convention (any_dir, angle 0). Dots
-                # never chain here (the chain gate below is `not any_dir`)
-                angle = 0.0
-                any_dir = True
-            elif cfg.continuous_dirs:
-                angle = float(rng.uniform(0.0, 2.0 * np.pi))
-                any_dir = False
-            else:
-                d = int(cfg.dirs[rng.integers(0, len(cfg.dirs))])
-                angle = d * np.pi / 4
-                any_dir = False
-            if cfg.note_speed_max is not None:
-                speed = float(rng.uniform(cfg.note_speed, cfg.note_speed_max))
-            else:
-                speed = cfg.note_speed
-            # env v7.5: positions are CONTINUOUS within the allowed ranges
-            x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
-            x = float(rng.uniform(x_lo, x_hi))
-            y = float(rng.uniform(y_lo, y_hi))
-            col, row = _nearest_cell(x, y)
-            head = Note(
-                hit_time=float(hit),
-                col=col, row=row,             # nearest-cell metadata only
-                x=x, y=y,
-                color=color,
-                angle=angle,
-                speed=speed,
-                any_dir=any_dir,
-            )
-            if not any_dir and rng.random() < cfg.chain_prob:
-                sc = int(rng.integers(CHAIN_SC[0], CHAIN_SC[1] + 1))
-                tail_dt = float(rng.uniform(*CHAIN_TAIL_DT))
-                tx, ty = _chain_tail(cfg, head, rng)
-                head = replace(head, kind=KIND_CHAIN_HEAD)
-                notes.append(head)
-                notes.extend(chain_links(head, tx, ty, hit + tail_dt, sc))
-                last_hand_time[color] = hit + tail_dt
-            else:
-                notes.append(head)
-                last_hand_time[color] = hit
-        t += (1.0 / cfg.note_rate) * rng.uniform(0.8, 1.2)
-
-    # bombs: independent stream; re-place (not reschedule) on clashes
-    if cfg.bomb_rate > 0:
-        x_lo, x_hi, y_lo, y_hi = _pos_ranges(cfg)
-        tb = cfg.first_note_s + float(rng.uniform(0.0, 1.0 / cfg.bomb_rate))
-        while tb <= cfg.chart_len_s:
-            bx = by = None
-            for _ in range(4):
-                cx = float(rng.uniform(x_lo, x_hi))
-                cy = float(rng.uniform(y_lo, y_hi))
-                clash = any(abs(n.hit_time - tb) < 0.25
-                            and abs(note_center(n)[0] - cx) < 0.3
-                            and abs(note_center(n)[1] - cy) < 0.3
-                            for n in notes)
-                if not clash:
-                    bx, by = cx, cy
-                    break
-            if bx is None:
-                tb += (1.0 / cfg.bomb_rate) * rng.uniform(0.8, 1.2)
-                continue
-            col, row = _nearest_cell(bx, by)
-            notes.append(Note(hit_time=float(tb), col=col, row=row, x=bx,
-                              y=by, color=0, angle=0.0, speed=cfg.note_speed,
-                              any_dir=True, kind=KIND_BOMB))
-            tb += (1.0 / cfg.bomb_rate) * rng.uniform(0.8, 1.2)
+        for color in hands:
+            if rng.random() < cfg.note_prob:
+                for n in spawn(t, color, color, KIND_NOTE):
+                    # end-of-tick dot roll, originals and extras alike
+                    if rng.random() < cfg.dot_prob:
+                        n = replace(n, any_dir=True, angle=0.0)
+                    notes.append(n)
+        if rng.random() < cfg.bomb_prob:
+            for b in spawn(t, _BOMB_PATH, 0, KIND_BOMB):
+                # the path angle steered placement; the emitted bomb is
+                # directionless (parser convention: any_dir, angle 0)
+                notes.append(replace(b, any_dir=True, angle=0.0))
+        t += TICK_DT + float(rng.uniform(-TICK_JITTER, TICK_JITTER))
 
     notes.sort(key=lambda n: n.hit_time)
-
-    # arcs: flag consecutive same-color PLAIN-note pairs (head gets the
-    # follow-through grant, tail the pre-swing grant — real BS semantics)
-    if cfg.arc_prob > 0:
-        last_idx = {LEFT: None, RIGHT: None}
-        for i, n in enumerate(notes):
-            if n.kind != KIND_NOTE:
-                continue
-            j = last_idx[n.color]
-            if (j is not None
-                    and n.hit_time - notes[j].hit_time <= ARC_MAX_GAP_S
-                    and rng.random() < cfg.arc_prob):
-                notes[j] = replace(notes[j], free_post=True)
-                notes[i] = replace(notes[i], free_pre=True)
-            last_idx[n.color] = i
     return notes

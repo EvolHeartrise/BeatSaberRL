@@ -26,22 +26,19 @@ from beat_arena_rs import RawBeatSim
 class RustBeatEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, note_rate=1.0, colors="right", dirs=(6,),
-                 continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
+    def __init__(self, colors="right", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
-                 note_speed=4.0, note_speed_max=None, external_chart=None,
-                 bomb_rate=0.25, dot_prob=0.0, chain_prob=0.0, arc_prob=0.0,
-                 seed=0):
+                 note_speed_min=2.0, note_speed_max=8.0,
+                 note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
+                 bomb_prob=0.125, external_chart=None, seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
         self.cfg = ChartConfig(
-            note_rate=note_rate, colors=colors, dirs=tuple(dirs),
-            continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
-            min_hand_gap_s=min_hand_gap_s,
-            cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
-            note_speed_max=note_speed_max,
-            bomb_rate=bomb_rate, dot_prob=dot_prob, chain_prob=chain_prob,
-            arc_prob=arc_prob,
+            chart_len_s=chart_len_s, colors=colors,
+            cols=tuple(cols), rows=tuple(rows),
+            note_speed_min=note_speed_min, note_speed_max=note_speed_max,
+            note_prob=note_prob, extra_prob=extra_prob, dot_prob=dot_prob,
+            bomb_prob=bomb_prob,
         )
         self._base_seed = seed
         self._episode = 0
@@ -72,18 +69,14 @@ class RustBeatEnv(gym.Env):
         header = {"header": {
             "version": 7,
             "config": {
-                "note_rate": self.cfg.note_rate,
                 "chart_len_s": self.cfg.chart_len_s,
                 "colors": self.cfg.colors,
-                "dirs": list(self.cfg.dirs),
-                "min_hand_gap_s": self.cfg.min_hand_gap_s,
-                "note_speed": self.cfg.note_speed,
+                "note_speed_min": self.cfg.note_speed_min,
                 "note_speed_max": self.cfg.note_speed_max,
-                "continuous_dirs": self.cfg.continuous_dirs,
-                "bomb_rate": self.cfg.bomb_rate,
+                "note_prob": self.cfg.note_prob,
+                "extra_prob": self.cfg.extra_prob,
                 "dot_prob": self.cfg.dot_prob,
-                "chain_prob": self.cfg.chain_prob,
-                "arc_prob": self.cfg.arc_prob,
+                "bomb_prob": self.cfg.bomb_prob,
             },
             # env v7: explicit world positions (meters), object kinds and
             # arc grants; the viewer derives everything from these

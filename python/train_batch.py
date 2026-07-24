@@ -83,27 +83,22 @@ def parse_args():
     p.add_argument("--trunk-dim", type=int, default=128)
     p.add_argument("--n-blocks", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=1)
-    # env config (mirrors train_smoke)
-    p.add_argument("--note-rate", type=float, default=1.0)
+    # env config (generator v2 dials, SPEC.md §Chart generation)
     p.add_argument("--colors", choices=["right", "both"], default="right")
-    p.add_argument("--dirs", type=int, nargs="+", default=[6])
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3])
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
-    p.add_argument("--min-hand-gap", type=float, default=0.5)
-    p.add_argument("--note-speed", type=float, default=4.0,
-                   help="approach speed; MIN of the range if --note-speed-max set")
-    p.add_argument("--note-speed-max", type=float, default=None)
-    p.add_argument("--continuous-dirs", action="store_true",
-                   help="angles ~ U(0, 2pi) instead of the --dirs subset")
-    p.add_argument("--bomb-rate", type=float, default=0.25,
-                   help="bombs per second in procedural charts")
-    p.add_argument("--dot-prob", type=float, default=0.0,
-                   help="P(a plain note is a dot: any swing direction scores)")
-    p.add_argument("--chain-prob", type=float, default=0.0,
-                   help="P(a non-dot note becomes a chain)")
-    p.add_argument("--arc-prob", type=float, default=0.0,
-                   help="P(consecutive same-color pair gets an arc)")
+    p.add_argument("--note-speed-min", type=float, default=2.0,
+                   help="speed random-walk clamp (m/s)")
+    p.add_argument("--note-speed-max", type=float, default=8.0)
+    p.add_argument("--note-prob", type=float, default=0.25,
+                   help="P(note) per hand path per ~0.15 s generation tick")
+    p.add_argument("--extra-prob", type=float, default=0.125,
+                   help="P(a spawned note brings an extra along its swing line)")
+    p.add_argument("--dot-prob", type=float, default=0.1,
+                   help="P(a generated note turns into a dot)")
+    p.add_argument("--bomb-prob", type=float, default=0.125,
+                   help="P(bomb) per generation tick")
     return p.parse_args()
 
 
@@ -134,23 +129,22 @@ def main():
     if torch_env:
         from beat_arena_env.torch_env import TorchBeatVecEnv
         venv = TorchBeatVecEnv(
-            N, note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
-            cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
-            min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
+            N, colors=args.colors, cols=tuple(args.cols),
+            rows=tuple(args.rows), chart_len_s=args.chart_len,
+            note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
-            continuous_dirs=args.continuous_dirs, seed=args.seed,
-            bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
-            chain_prob=args.chain_prob, arc_prob=args.arc_prob,
-            chart_pool=args.chart_pool, device=device)
+            note_prob=args.note_prob, extra_prob=args.extra_prob,
+            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
+            seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
-            N, note_rate=args.note_rate, colors=args.colors, dirs=tuple(args.dirs),
-            cols=tuple(args.cols), rows=tuple(args.rows), chart_len_s=args.chart_len,
-            min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
+            N, colors=args.colors, cols=tuple(args.cols),
+            rows=tuple(args.rows), chart_len_s=args.chart_len,
+            note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
-            continuous_dirs=args.continuous_dirs, seed=args.seed,
-            bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
-            chain_prob=args.chain_prob, arc_prob=args.arc_prob)
+            note_prob=args.note_prob, extra_prob=args.extra_prob,
+            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
+            seed=args.seed)
 
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
