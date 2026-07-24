@@ -913,3 +913,23 @@ def test_beatsaver_angle_snap(tmp_path):
     c, d = notes[2], notes[3]
     assert c.angle == pytest.approx(3 * np.pi / 2)
     assert d.angle == pytest.approx(3 * np.pi / 2)
+
+
+def test_beatclock_beat_zero_bpm_event_replaces_base(tmp_path):
+    """A beat-0 bpmEvent overrides Info.dat's BPM (maps often restate a
+    slightly different value, e.g. 171.79 vs 172) and mapper alignment
+    spikes (one beat at ~2199 BPM) must integrate exactly — found via
+    watch.scoresaber.com's 1 ms note matching on the top03 export."""
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)                      # Info says 120 bpm
+    v3 = {"version": "3.3.0",
+          "bpmEvents": [{"b": 0, "m": 60.0},   # beat 0: actually 60 bpm
+                        {"b": 2, "m": 2400.0},  # alignment spike
+                        {"b": 3, "m": 60.0}],
+          "colorNotes": [{"b": 3, "x": 1, "y": 0, "c": 1, "d": 1}]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal", speed_scale=0.3,
+                            first_note_s=None)
+    # 2 beats @60 (2.0s) + 1 beat @2400 (0.025s)
+    assert notes[0].hit_time == pytest.approx(2.025, abs=1e-6)
