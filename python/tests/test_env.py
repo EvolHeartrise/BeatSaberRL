@@ -21,8 +21,8 @@ from beat_arena_env import (
     ChartConfig, Note, RustBeatEnv, generate_chart, scripted_action,
 )
 from beat_arena_env.constants import (
-    DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, ROW_Y, SABER_FEAT,
-    Z_MISS, col_x, joint_limits,
+    DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, KIND_NOTE, ROW_Y,
+    SABER_FEAT, Z_MISS, col_x, joint_limits,
 )
 from beat_arena_env.kinematics import fk
 
@@ -696,6 +696,29 @@ def test_chart_v7_object_dials():
         times = [n.hit_time for n in chart
                  if n.color == color and n.kind in (0, 2)]
         assert all(b - a >= 0.25 for a, b in zip(times, times[1:]))
+
+
+def test_chart_dot_prob():
+    """dot_prob turns plain notes into dots (any_dir, parser-convention
+    angle 0); dots never become chain heads; default stays dot-free."""
+    cfg = ChartConfig(note_rate=2.0, colors="both", dirs=(0, 2, 4, 6),
+                      chart_len_s=40.0, dot_prob=0.5, chain_prob=0.4,
+                      bomb_rate=0.0)
+    chart = generate_chart(cfg, np.random.default_rng(19))
+    plain = [n for n in chart if n.kind == KIND_NOTE]
+    dots = [n for n in plain if n.any_dir]
+    arrows = [n for n in plain if not n.any_dir]
+    assert len(dots) >= 5 and len(arrows) >= 5     # mixture, not all-or-none
+    assert all(n.angle == 0.0 for n in dots)
+    assert all(not n.any_dir for n in chart if n.kind == KIND_CHAIN_HEAD)
+    all_dots = generate_chart(
+        ChartConfig(note_rate=2.0, chart_len_s=20.0, dot_prob=1.0,
+                    bomb_rate=0.0), np.random.default_rng(19))
+    assert all(n.any_dir for n in all_dots)
+    default = generate_chart(ChartConfig(note_rate=2.0, chart_len_s=20.0,
+                                         bomb_rate=0.0),
+                             np.random.default_rng(19))
+    assert not any(n.any_dir for n in default)
 
 
 def test_chart_positions_are_continuous():

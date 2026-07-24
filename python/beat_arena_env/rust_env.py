@@ -30,7 +30,7 @@ class RustBeatEnv(gym.Env):
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, external_chart=None,
-                 bomb_rate=0.25, chain_prob=0.0, arc_prob=0.0,
+                 bomb_rate=0.25, dot_prob=0.0, chain_prob=0.0, arc_prob=0.0,
                  seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
@@ -40,7 +40,8 @@ class RustBeatEnv(gym.Env):
             min_hand_gap_s=min_hand_gap_s,
             cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
             note_speed_max=note_speed_max,
-            bomb_rate=bomb_rate, chain_prob=chain_prob, arc_prob=arc_prob,
+            bomb_rate=bomb_rate, dot_prob=dot_prob, chain_prob=chain_prob,
+            arc_prob=arc_prob,
         )
         self._base_seed = seed
         self._episode = 0
@@ -80,6 +81,7 @@ class RustBeatEnv(gym.Env):
                 "note_speed_max": self.cfg.note_speed_max,
                 "continuous_dirs": self.cfg.continuous_dirs,
                 "bomb_rate": self.cfg.bomb_rate,
+                "dot_prob": self.cfg.dot_prob,
                 "chain_prob": self.cfg.chain_prob,
                 "arc_prob": self.cfg.arc_prob,
             },

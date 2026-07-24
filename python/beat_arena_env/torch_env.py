@@ -273,7 +273,7 @@ class TorchBeatVecEnv:
                  continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed=4.0, note_speed_max=None, seed=0,
-                 bomb_rate=0.25, chain_prob=0.0, arc_prob=0.0,
+                 bomb_rate=0.25, dot_prob=0.0, chain_prob=0.0, arc_prob=0.0,
                  charts=None, chart_pool=1024, max_steps=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
@@ -288,7 +288,7 @@ class TorchBeatVecEnv:
                 min_hand_gap_s=min_hand_gap_s, cols=tuple(cols),
                 rows=tuple(rows), note_speed=note_speed,
                 note_speed_max=note_speed_max, bomb_rate=bomb_rate,
-                chain_prob=chain_prob, arc_prob=arc_prob)
+                dot_prob=dot_prob, chain_prob=chain_prob, arc_prob=arc_prob)
             rng = np.random.default_rng(seed)
             charts = [generate_chart(cfg, rng) for _ in range(chart_pool)]
         self.pool = _charts_to_tensors(charts, self.device, dtype)
