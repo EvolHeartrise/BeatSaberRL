@@ -16,13 +16,9 @@ from beat_arena_env.chart import ChartConfig, generate_chart
 from beat_arena_env.constants import OBS_DIM, Z_MISS
 from beat_arena_env.torch_env import TorchBeatVecEnv
 
-EASY = dict(note_rate=1.0, colors="right", dirs=(6,))
-DYN = dict(note_rate=2.5, colors="both", continuous_dirs=True,
-           note_speed=3.0, note_speed_max=6.0)
-# env v7 object zoo: bombs, chains (head + links), arc grants
-V7 = dict(note_rate=2.0, colors="both", continuous_dirs=True,
-          note_speed=3.0, note_speed_max=6.0,
-          bomb_rate=0.5, chain_prob=0.35, arc_prob=0.5)
+EASY = dict(colors="right", bomb_prob=0.0, extra_prob=0.0)
+FULL = dict(colors="both")     # the generator-v2 default gym
+DENSE = dict(colors="both", note_prob=0.5, extra_prob=0.4, bomb_prob=0.25)
 ACTION_NVEC = [3] * 12
 
 
@@ -80,9 +76,9 @@ def _scripted_policy():
 
 
 @pytest.mark.parametrize("cfg_kw,pol,seed", [
-    (EASY, "scripted", 11), (DYN, "scripted", 12),
-    (EASY, "random", 13), (DYN, "random", 14),
-    (V7, "scripted", 15), (V7, "random", 16),
+    (EASY, "scripted", 11), (FULL, "scripted", 12),
+    (EASY, "random", 13), (FULL, "random", 14),
+    (DENSE, "scripted", 15), (DENSE, "random", 16),
 ])
 def test_parity_exact_f64(cfg_kw, pol, seed):
     chart = _chart(cfg_kw, seed)
@@ -100,7 +96,7 @@ def test_parity_exact_f64(cfg_kw, pol, seed):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("cfg_kw,seed", [(EASY, 21), (DYN, 22), (V7, 23)])
+@pytest.mark.parametrize("cfg_kw,seed", [(EASY, 21), (FULL, 22), (DENSE, 23)])
 def test_parity_f32_gpu(cfg_kw, seed):
     chart = _chart(cfg_kw, seed)
     acts, r_obs, r_rews, r_cnt = _rust_episode(chart, _scripted_policy())
@@ -117,12 +113,13 @@ def test_parity_f32_gpu(cfg_kw, seed):
 
 def test_auto_reset_and_stats():
     env = TorchBeatVecEnv(4, seed=3, chart_pool=8, device="cpu",
-                          dtype=torch.float32, **V7)
+                          dtype=torch.float32, **DENSE)
     obs = env.reset()
     assert obs.shape == (4, OBS_DIM)
     rng = np.random.default_rng(0)
-    # two episode lengths (chart 20 s + tail 0.5 + Z_MISS/3): every env cycles
-    n_steps = 2 * (int((20.0 + 0.5 + Z_MISS / 3.0) * 30) + 5)
+    # two episode lengths (chart 20 s + tail 0.5 + Z_MISS/speed_min):
+    # every env cycles
+    n_steps = 2 * (int((20.0 + 0.5 + Z_MISS / 2.0) * 30) + 5)
     dones = 0
     for _ in range(n_steps):
         a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 12)))
@@ -139,7 +136,7 @@ def test_auto_reset_and_stats():
 def test_same_seed_reproduces():
     def run(seed):
         env = TorchBeatVecEnv(2, seed=seed, chart_pool=4, device="cpu",
-                              dtype=torch.float32, **V7)
+                              dtype=torch.float32, **DENSE)
         obs = env.reset()
         rng = np.random.default_rng(1)
         tot = torch.zeros(2)

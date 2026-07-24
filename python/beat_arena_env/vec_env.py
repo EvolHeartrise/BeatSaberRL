@@ -17,20 +17,18 @@ from beat_arena_rs import VecBeatSim
 
 
 class BeatVecEnv:
-    def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
-                 continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
+    def __init__(self, num_envs, colors="right", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
-                 note_speed=4.0, note_speed_max=None, seed=0,
-                 bomb_rate=0.25, dot_prob=0.0, chain_prob=0.0, arc_prob=0.0):
+                 note_speed_min=2.0, note_speed_max=8.0,
+                 note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
+                 bomb_prob=0.125, seed=0):
         self.num_envs = num_envs
         self.cfg = ChartConfig(
-            note_rate=note_rate, colors=colors, dirs=tuple(dirs),
-            continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
-            min_hand_gap_s=min_hand_gap_s,
-            cols=tuple(cols), rows=tuple(rows), note_speed=note_speed,
-            note_speed_max=note_speed_max,
-            bomb_rate=bomb_rate, dot_prob=dot_prob, chain_prob=chain_prob,
-            arc_prob=arc_prob,
+            chart_len_s=chart_len_s, colors=colors,
+            cols=tuple(cols), rows=tuple(rows),
+            note_speed_min=note_speed_min, note_speed_max=note_speed_max,
+            note_prob=note_prob, extra_prob=extra_prob, dot_prob=dot_prob,
+            bomb_prob=bomb_prob,
         )
         # +90: the episode tail must cover the miss boundary trip
         # (Z_MISS 2.65 m at the slowest speeds) past the last note

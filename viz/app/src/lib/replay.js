@@ -250,17 +250,18 @@ export function maxScore(chart) {
 
 export function configSummary(rep) {
   const c = rep.config;
-  const spd = c.note_speed_max
-    ? `${c.note_speed}-${c.note_speed_max} m/s`
-    : `${c.note_speed} m/s`;
-  const dirs = c.continuous_dirs ? "360°" : `dirs [${c.dirs}]`;
-  const extras = [];
-  if (c.bomb_rate) extras.push(`bombs ${c.bomb_rate}`);
-  if (c.chain_prob) extras.push(`chains ${c.chain_prob}`);
-  if (c.arc_prob) extras.push(`arcs ${c.arc_prob}`);
+  // generator v2 headers carry note_speed_min/prob dials; real-map and
+  // pre-v2 headers may lack them — show what exists
+  const spd = c.note_speed_min != null
+    ? `${c.note_speed_min}-${c.note_speed_max} m/s`
+    : (c.note_speed != null ? `${c.note_speed} m/s` : null);
+  const parts = [c.colors, spd];
+  if (c.note_prob != null) parts.push(`p ${c.note_prob}`);
+  if (c.extra_prob) parts.push(`extras ${c.extra_prob}`);
+  if (c.dot_prob) parts.push(`dots ${c.dot_prob}`);
+  if (c.bomb_prob) parts.push(`bombs ${c.bomb_prob}`);
   return `${rep.chart.length} objects, ${rep.ticks.length} ticks ` +
-    `(rate ${c.note_rate}, ${c.colors}, ${dirs}, ${spd}` +
-    (extras.length ? `, ${extras.join(", ")}` : "") + `)`;
+    `(${parts.filter(Boolean).join(", ")})`;
 }
 
 /** In-plane world (x, y) — explicit in the v7 chart. */

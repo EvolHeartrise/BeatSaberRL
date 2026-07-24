@@ -70,7 +70,7 @@ def test_pool_encoder_removed():
 
 
 def test_vec_env_auto_reset():
-    venv = BeatVecEnv(4, colors="both", dirs=tuple(range(8)), chart_len_s=5.0, seed=3)
+    venv = BeatVecEnv(4, colors="both", chart_len_s=5.0, seed=3)
     obs = venv.reset()
     assert obs.shape == (4, 286)
     rng = np.random.default_rng(0)
@@ -88,7 +88,7 @@ def test_vec_matches_single():
     """VecBeatSim(1) must step identically to RawBeatSim."""
     import beat_arena_rs
     from beat_arena_env import ChartConfig, generate_chart
-    chart_notes = generate_chart(ChartConfig(colors="both", dirs=tuple(range(8))),
+    chart_notes = generate_chart(ChartConfig(colors="both"),
                                  np.random.default_rng(21))
     from beat_arena_env.chart import note_tuple
     chart = [note_tuple(n) for n in chart_notes]

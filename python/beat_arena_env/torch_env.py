@@ -269,11 +269,11 @@ class TorchBeatVecEnv:
     _F_NC2 = ("center", "dvec", "rot")
     _F_N = ("last_hit", "tail", "n_notes", "n_scoreable")
 
-    def __init__(self, num_envs, note_rate=1.0, colors="right", dirs=(6,),
-                 continuous_dirs=False, chart_len_s=20.0, min_hand_gap_s=0.5,
+    def __init__(self, num_envs, colors="right", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
-                 note_speed=4.0, note_speed_max=None, seed=0,
-                 bomb_rate=0.25, dot_prob=0.0, chain_prob=0.0, arc_prob=0.0,
+                 note_speed_min=2.0, note_speed_max=8.0,
+                 note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
+                 bomb_prob=0.125, seed=0,
                  charts=None, chart_pool=1024, max_steps=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
@@ -283,12 +283,12 @@ class TorchBeatVecEnv:
         self._test_charts = charts is not None
         if charts is None:
             cfg = ChartConfig(
-                note_rate=note_rate, colors=colors, dirs=tuple(dirs),
-                continuous_dirs=continuous_dirs, chart_len_s=chart_len_s,
-                min_hand_gap_s=min_hand_gap_s, cols=tuple(cols),
-                rows=tuple(rows), note_speed=note_speed,
-                note_speed_max=note_speed_max, bomb_rate=bomb_rate,
-                dot_prob=dot_prob, chain_prob=chain_prob, arc_prob=arc_prob)
+                chart_len_s=chart_len_s, colors=colors,
+                cols=tuple(cols), rows=tuple(rows),
+                note_speed_min=note_speed_min,
+                note_speed_max=note_speed_max,
+                note_prob=note_prob, extra_prob=extra_prob,
+                dot_prob=dot_prob, bomb_prob=bomb_prob)
             rng = np.random.default_rng(seed)
             charts = [generate_chart(cfg, rng) for _ in range(chart_pool)]
         self.pool = _charts_to_tensors(charts, self.device, dtype)
