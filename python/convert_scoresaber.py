@@ -336,10 +336,25 @@ def assemble(blocks):
         ptrs.append(off)
         off += len(blk)
     body = struct.pack("<9i", *ptrs) + b"".join(blocks)
-    # python writes the LZMA-alone size field as "unknown" (-1) + an
-    # end-of-stream marker; their SDK decoder casts -1 to UInt64.MaxValue,
-    # decodes until the marker, and breaks — verified in LzmaDecoder.cs
-    return MAGIC + lzma.compress(body, format=lzma.FORMAT_ALONE, preset=6)
+    # The LZMA-alone header MUST carry the real uncompressed size:
+    # python's own encoder writes "unknown" (-1), which the vendored
+    # decoder snapshot tolerates (grows until the end marker) but the
+    # LIVE watch.scoresaber.com build rejects as "replay is too large"
+    # (a WebGL sanity guard on the declared size). liblzma refuses to
+    # ENCODE a known size, so build the container by hand: props byte +
+    # dict size + real size + a raw LZMA1 stream. Their decoder reads
+    # exactly `size` output bytes, so any trailing marker goes unread.
+    return MAGIC + _lzma_alone(body)
+
+
+_LZMA1 = [{"id": lzma.FILTER_LZMA1, "dict_size": 1 << 23,
+           "lc": 3, "lp": 0, "pb": 2}]
+
+
+def _lzma_alone(body: bytes) -> bytes:
+    props = bytes([(2 * 5 + 0) * 9 + 3])           # pb=2 lp=0 lc=3 -> 0x5D
+    header = props + struct.pack("<I", 1 << 23) + struct.pack("<Q", len(body))
+    return header + lzma.compress(body, format=lzma.FORMAT_RAW, filters=_LZMA1)
 
 
 EMPTY = struct.pack("<i", 0)

@@ -35,8 +35,19 @@ def _r_str(data, off):
 def decode_dat(path):
     raw = open(path, "rb").read()
     assert raw[:28] == conv.MAGIC, "bad magic"
-    dec = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-    data = dec.decompress(raw[28:])
+    # their reader: 5-byte props, 8-byte uncompressed size, LZMA stream.
+    # The size MUST be real (not the -1 "unknown" python writes) — the
+    # live viewer rejects unknown sizes as "replay is too large".
+    props, dict_size = raw[28], struct.unpack_from("<I", raw, 29)[0]
+    size = struct.unpack_from("<Q", raw, 33)[0]
+    assert props == 0x5D and size < (1 << 31), "bad LZMA-alone header"
+    dec = lzma.LZMADecompressor(
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_LZMA1, "dict_size": dict_size,
+                  "lc": props % 9, "lp": (props // 9) % 5,
+                  "pb": props // 45}])
+    data = dec.decompress(raw[41:])
+    assert len(data) == size, "size field does not match decoded length"
     ptrs = struct.unpack_from("<9i", data, 0)
     meta_p, pose_p, height_p, note_p, score_p = ptrs[:5]
 
