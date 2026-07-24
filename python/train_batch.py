@@ -98,6 +98,8 @@ def parse_args():
                    help="angles ~ U(0, 2pi) instead of the --dirs subset")
     p.add_argument("--bomb-rate", type=float, default=0.25,
                    help="bombs per second in procedural charts")
+    p.add_argument("--dot-prob", type=float, default=0.0,
+                   help="P(a plain note is a dot: any swing direction scores)")
     p.add_argument("--chain-prob", type=float, default=0.0,
                    help="P(a non-dot note becomes a chain)")
     p.add_argument("--arc-prob", type=float, default=0.0,
@@ -137,8 +139,8 @@ def main():
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
             continuous_dirs=args.continuous_dirs, seed=args.seed,
-            bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
-            arc_prob=args.arc_prob,
+            bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
+            chain_prob=args.chain_prob, arc_prob=args.arc_prob,
             chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -147,8 +149,8 @@ def main():
             min_hand_gap_s=args.min_hand_gap, note_speed=args.note_speed,
             note_speed_max=args.note_speed_max,
             continuous_dirs=args.continuous_dirs, seed=args.seed,
-            bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
-            arc_prob=args.arc_prob)
+            bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
+            chain_prob=args.chain_prob, arc_prob=args.arc_prob)
 
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)

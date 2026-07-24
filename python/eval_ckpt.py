@@ -29,6 +29,7 @@ def main():
     p.add_argument("--note-speed", type=float, default=3.0)
     p.add_argument("--note-speed-max", type=float, default=6.0)
     p.add_argument("--bomb-rate", type=float, default=0.25)
+    p.add_argument("--dot-prob", type=float, default=0.0)
     p.add_argument("--chain-prob", type=float, default=0.0)
     p.add_argument("--arc-prob", type=float, default=0.0)
     args = p.parse_args()
@@ -37,8 +38,8 @@ def main():
                       continuous_dirs=not args.discrete_dirs,
                       dirs=tuple(args.dirs), note_speed=args.note_speed,
                       note_speed_max=args.note_speed_max,
-                      bomb_rate=args.bomb_rate, chain_prob=args.chain_prob,
-                      arc_prob=args.arc_prob)
+                      bomb_rate=args.bomb_rate, dot_prob=args.dot_prob,
+                      chain_prob=args.chain_prob, arc_prob=args.arc_prob)
     pol = load_policy(torch.load(args.ckpt, map_location="cpu",
                                  weights_only=True))
     pol.eval()

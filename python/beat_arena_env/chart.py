@@ -4,8 +4,8 @@ A chart is a time-sorted list of Note objects — since env v7 "note" means
 any gameplay object: color notes, bombs, chain heads, and chain links
 (`kind`). Difficulty is controlled by the config knobs: note_rate is the
 main dial, colors/dirs widen the skill demanded, min_hand_gap_s
-guarantees physical feasibility, and bomb_rate / chain_prob / arc_prob
-mix in the v7 object types.
+guarantees physical feasibility, dot_prob mixes in dot notes, and
+bomb_rate / chain_prob / arc_prob mix in the v7 object types.
 
 Env v7.5: generated positions are CONTINUOUS — x, y ~ U over the
 rectangle spanned by the allowed cols/rows (the cell dials survive as
@@ -75,6 +75,7 @@ class ChartConfig:
     # bombs are part of the DEFAULT random gym since env v7.7
     # (user-directed): ~5 per 20 s chart, ~1:10 vs dynamic-gym notes
     bomb_rate: float = 0.25       # bombs per second (0 = none)
+    dot_prob: float = 0.0         # P(a plain note is a dot: any direction)
     chain_prob: float = 0.0       # P(a non-dot note becomes a chain)
     arc_prob: float = 0.0         # P(consecutive same-color pair gets an arc)
 
@@ -86,6 +87,7 @@ class ChartConfig:
         assert self.note_rate > 0
         assert self.note_speed > 0
         assert 0.0 <= self.chain_prob <= 1.0 and 0.0 <= self.arc_prob <= 1.0
+        assert 0.0 <= self.dot_prob <= 1.0
 
 
 def note_tuple(n: Note):
@@ -173,7 +175,14 @@ def generate_chart(cfg: ChartConfig, rng: np.random.Generator) -> list[Note]:
         earliest = last_hand_time[color] + cfg.min_hand_gap_s
         hit = max(t, earliest)
         if hit <= cfg.chart_len_s:
-            if cfg.continuous_dirs:
+            # the dot_prob > 0 gate keeps the RNG stream (and thus every
+            # existing seed's chart) untouched when the dial is off
+            if cfg.dot_prob > 0 and rng.random() < cfg.dot_prob:
+                # dot note: parser convention (any_dir, angle 0). Dots
+                # never chain here (the chain gate below is `not any_dir`)
+                angle = 0.0
+                any_dir = True
+            elif cfg.continuous_dirs:
                 angle = float(rng.uniform(0.0, 2.0 * np.pi))
                 any_dir = False
             else:

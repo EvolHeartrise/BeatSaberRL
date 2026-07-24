@@ -47,7 +47,8 @@ cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
 Difficulty dials: `--note-rate 1.5 --colors both --dirs 0 2 4 6 --min-hand-gap 0.4`,
-plus the v7 object dials `--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
+plus `--dot-prob 0.2` (dot-note chance) and the v7 object dials
+`--bomb-rate 0.3 --chain-prob 0.2 --arc-prob 0.3`.
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
 

@@ -222,7 +222,10 @@ checkpoints/replays retire (hard replace).
 `dirs` (allowed subset of 0..7, default `[6]` = down-swings),
 `min_hand_gap_s` (default 0.5), `cols`/`rows` (allowed positions —
 restricting them is a spatial curriculum dial), `note_speed` (m/s toward
-the plane, default 4.0), and the **env v7 object dials**: `bomb_rate`
+the plane, default 4.0), `dot_prob` (P(a plain note is a dot —
+`any_dir`, parser-convention angle 0; dots never become chain heads;
+default 0; the RNG draw is skipped entirely at 0 so existing seeds'
+charts are unchanged), and the **env v7 object dials**: `bomb_rate`
 (bombs/s, **default 0.25 since env v7.7, user-directed — bombs are part
 of the default random gym**, ~5 per 20 s chart), `chain_prob`
 (P(non-dot note → chain), default 0), `arc_prob` (P(consecutive
