@@ -266,30 +266,46 @@ def test_score_reproduction(converted):
 
 
 def test_hud_timelines(converted):
-    """Combo/multiplier/energy keyframes mirror the ComboTracker walk —
-    a keyframe per scoring event, zeros after breaks, sane multipliers."""
+    """Combo/multiplier/energy keyframes mirror the game recorder's
+    CHANGE-ONLY emission, verified against a real ScoreSaber replay:
+    no t=0 combo/multiplier seeds, the multiplier stream goes silent at
+    a held 8x, energy starts (0.5, 0) and follows the real damage/heal
+    constants (viewer's own recompute: +0.01 good, -0.1 bad,
+    -0.15 miss/bomb; chain links 0.002/0.025/0.03), capped at 1.0."""
     d = converted["decoded"]
     walk = scoresaber.ComboTracker()
     walk.consume(converted["events"])
 
     combos = d["combos"]
-    assert combos[0] == (0, 0.0)
-    n_outcomes = sum(1 for _, r, _p in converted["events"]
-                     if r not in ("post",))
-    assert len(combos) == 1 + n_outcomes
+    assert combos, "combo block empty"
+    assert combos[0][1] > 0.0                    # no t=0 seed, like real files
     assert combos[-1][0] == walk.combo
-    times = [t for _, t in combos]
-    assert all(b >= a for a, b in zip(times, times[1:]))
+    for (c0, t0), (c1, t1) in zip(combos, combos[1:]):
+        assert c1 != c0 and t1 >= t0             # change-only, ordered
     if walk.breaks:
-        assert any(c == 0 for c, t in combos[1:])
+        assert any(c == 0 for c, _ in combos)
 
     mults = d["multipliers"]
-    assert mults[0] == (1, 0.0, 0.0) and len(mults) == len(combos)
     assert all(m in (1, 2, 4, 8) and 0.0 <= p <= 1.0 for m, p, _ in mults)
+    for a, b in zip(mults, mults[1:]):
+        assert a[:2] != b[:2]                    # change-only
     assert mults[-1][0] == walk.multiplier
 
     energies = d["energies"]
-    assert len(energies) == 2 and all(e == 1.0 for e, _ in energies)
+    assert energies[0] == (0.5, 0.0)             # real-replay convention
+    e = 0.5
+    good = bad = 0
+    for _, r, _p in converted["events"]:
+        if r == "ok":
+            e = min(e + 0.01, 1.0)
+        elif r in ("slow", "angle", "wrong_hand"):
+            e = max(e - 0.1, 0.001)
+        elif r in ("miss", "bomb"):
+            e = max(e - 0.15, 0.001)
+    assert energies[-1][0] == pytest.approx(e, abs=1e-5)
+    assert all(0.0 < v <= 1.0 for v, _ in energies)
+    for (a, _), (b, _) in zip(energies, energies[1:]):
+        assert a != b                            # change-only
 
 
 def test_quat_from_forward():
