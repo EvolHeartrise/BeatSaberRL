@@ -221,11 +221,23 @@ def tip_speed(ticks, tick_idx, hand):
 
 
 def build_events(ticks, real_notes, offset):
-    """Note-event dicts + the multiplied score timeline."""
+    """Note-event dicts + the score/combo/multiplier HUD timelines.
+
+    The live viewer drives its HUD from the combo/multiplier keyframe
+    blocks (layouts from ScoreSaber's own plugin writer: ComboEvent =
+    int combo + float time; MultiplierEvent = int multiplier + float
+    bar-progress + float time), so every scoring event emits keyframes.
+    """
     sts = [scoring_type(n) for n in real_notes]
     walk = scoresaber.ComboTracker()
     events, timeline = [], []
+    combo_tl = [(0, 0.0)]
+    mult_tl = [(1, 0.0, 0.0)]
     by_note = {}
+
+    def hud(t):
+        combo_tl.append((walk.combo, t))
+        mult_tl.append((walk.multiplier, walk.progress_fraction, t))
     for tick_idx, line in enumerate(ticks):
         t = line["time"] + offset
         for ev in line["events"]:
@@ -251,11 +263,13 @@ def build_events(ticks, real_notes, offset):
             if kind == "miss":
                 e["type"] = 3
                 walk.on_break()
+                hud(t)
             elif kind == "bomb":
                 e["type"] = 4
                 e["saber"] = 0
                 walk.on_break()
                 timeline.append((round(walk.score), t))
+                hud(t)
             else:                                  # cut: good or bad
                 good = body["good"]
                 reason = body["reason"]
@@ -272,6 +286,7 @@ def build_events(ticks, real_notes, offset):
                     walk.on_cut(i)
                     walk.on_points(i, body["points"])
                     timeline.append((round(walk.score), t))
+                    hud(t)
                     pts = round(body["points"])
                     if sts[i] in (ST_CHAINLINK, ST_CHAINLINKARCHEAD):
                         pass                       # flat 20, ratings unused
@@ -285,9 +300,10 @@ def build_events(ticks, real_notes, offset):
                     e["type"] = 2
                     walk.on_break()
                     timeline.append((round(walk.score), t))
+                    hud(t)
             events.append(e)
     events.sort(key=lambda e: e["time"])
-    return events, timeline, round(walk.score)
+    return events, timeline, combo_tl, mult_tl, round(walk.score)
 
 
 def note_block(events):
@@ -328,6 +344,34 @@ def score_block(timeline):
     return bytes(b)
 
 
+def combo_block(combo_tl):
+    b = bytearray()
+    b = w_int(b, len(combo_tl))
+    for combo, t in combo_tl:
+        b = w_int(b, combo)
+        b = w_float(b, t)
+    return bytes(b)
+
+
+def multiplier_block(mult_tl):
+    b = bytearray()
+    b = w_int(b, len(mult_tl))
+    for mult, progress, t in mult_tl:
+        b = w_int(b, mult)
+        b = w_float(b, progress)
+        b = w_float(b, t)
+    return bytes(b)
+
+
+def energy_block(end_time):
+    b = bytearray()                      # no energy/fail in our sim:
+    b = w_int(b, 2)                      # full bar for the whole song
+    for t in (0.0, end_time):
+        b = w_float(b, 1.0)
+        b = w_float(b, t)
+    return bytes(b)
+
+
 def assemble(blocks):
     """blocks: 9 block byte-strings in pointer-table order."""
     table_len = 9 * 4
@@ -364,14 +408,17 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
             speed_scale=0.3):
     header, ticks = read_replay(replay_path)
     real_notes, offset = align_charts(header, map_dir, difficulty, speed_scale)
-    events, timeline, final = build_events(ticks, real_notes, offset)
+    events, timeline, combo_tl, mult_tl, final = build_events(
+        ticks, real_notes, offset)
     blocks = [
         metadata_block(song_hash, difficulty),
         pose_block(ticks, offset),
         EMPTY,                                     # heights
         note_block(events),
         score_block(timeline),
-        EMPTY, EMPTY, EMPTY,                       # combo, multiplier, energy
+        combo_block(combo_tl),
+        multiplier_block(mult_tl),
+        energy_block(ticks[-1]["time"] + offset),
         EMPTY,                                     # fps / extensions
     ]
     data = assemble(blocks)

@@ -105,10 +105,31 @@ def decode_dat(path):
         (final,), off = _r("i", data, off)
         (_, ), off = _r("f", data, off)
 
+    # HUD keyframe blocks (layouts from ScoreSaber's plugin writer)
+    off = ptrs[5]
+    (n_combo,), off = _r("i", data, off)
+    combos = []
+    for _ in range(n_combo):
+        (c, t), off = _r("if", data, off)
+        combos.append((c, t))
+    off = ptrs[6]
+    (n_mult,), off = _r("i", data, off)
+    mults = []
+    for _ in range(n_mult):
+        (m, p, t), off = _r("iff", data, off)
+        mults.append((m, p, t))
+    off = ptrs[7]
+    (n_energy,), off = _r("i", data, off)
+    energies = []
+    for _ in range(n_energy):
+        (e, t), off = _r("ff", data, off)
+        energies.append((e, t))
+
     return {"version": version, "level_id": level_id,
             "difficulty": difficulty, "characteristic": characteristic,
             "left_handed": left, "height": height, "frames": frames,
-            "notes": notes, "final_score": final, "n_heights": n_heights}
+            "notes": notes, "final_score": final, "n_heights": n_heights,
+            "combos": combos, "multipliers": mults, "energies": energies}
 
 
 # --- fixture map + recorded episode -----------------------------------------
@@ -242,6 +263,33 @@ def test_score_reproduction(converted):
         # exactly one good note per spawn in this fixture
         want = [round(v) for k, v in cut_pts.items()]
         assert recomputed in want
+
+
+def test_hud_timelines(converted):
+    """Combo/multiplier/energy keyframes mirror the ComboTracker walk —
+    a keyframe per scoring event, zeros after breaks, sane multipliers."""
+    d = converted["decoded"]
+    walk = scoresaber.ComboTracker()
+    walk.consume(converted["events"])
+
+    combos = d["combos"]
+    assert combos[0] == (0, 0.0)
+    n_outcomes = sum(1 for _, r, _p in converted["events"]
+                     if r not in ("post",))
+    assert len(combos) == 1 + n_outcomes
+    assert combos[-1][0] == walk.combo
+    times = [t for _, t in combos]
+    assert all(b >= a for a, b in zip(times, times[1:]))
+    if walk.breaks:
+        assert any(c == 0 for c, t in combos[1:])
+
+    mults = d["multipliers"]
+    assert mults[0] == (1, 0.0, 0.0) and len(mults) == len(combos)
+    assert all(m in (1, 2, 4, 8) and 0.0 <= p <= 1.0 for m, p, _ in mults)
+    assert mults[-1][0] == walk.multiplier
+
+    energies = d["energies"]
+    assert len(energies) == 2 and all(e == 1.0 for e, _ in energies)
 
 
 def test_quat_from_forward():

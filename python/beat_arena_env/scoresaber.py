@@ -158,6 +158,12 @@ class ComboTracker:
         self.multiplier = max(1, self.multiplier // 2)
         self._progress = 0
 
+    @property
+    def progress_fraction(self) -> float:
+        """Fill of the bar toward the next tier (1.0 at the 8x cap)."""
+        need = _PROGRESS_NEEDED.get(self.multiplier)
+        return 1.0 if need is None else self._progress / need
+
     def consume(self, events):
         """Feed one step's info["events"] (reason-string form)."""
         for note_idx, reason, pts in events:
