@@ -24,6 +24,7 @@
 
 use numpy::{PyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 const DT: f64 = 1.0 / 30.0;
 const DRAG: f64 = 0.02;
@@ -1231,25 +1232,56 @@ impl VecBeatSim {
         let acts = actions.as_array();
         let n = self.sims.len();
         assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
+        let acts_vec: Vec<[[u8; N_JOINTS]; 2]> = (0..n)
+            .map(|i| {
+                let mut a = [[0u8; N_JOINTS]; 2];
+                for s in 0..2 {
+                    for j in 0..N_JOINTS {
+                        a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
+                    }
+                }
+                a
+            })
+            .collect();
         let mut flat = vec![0.0f32; n * OBS_DIM];
+        let sims = &mut self.sims;
+        let walks = &mut self.walks;
+        // Rayon over envs (2026-07-25): envs are independent, each env's
+        // combo walk is its own, and each env's event ORDER is kept in
+        // its own vec — the index-order concatenation below makes the
+        // output identical to the old serial loop (pinned by the
+        // vec-matches-single and Rust==Python-walk tests). The GIL is
+        // released for the span (plain Rust data only), so Python
+        // threads — the bench's parse/download producer — truly overlap.
+        let per_env: Vec<(f32, bool, Vec<(u32, u8, f32, f32, f32)>)> = py
+            .allow_threads(|| {
+                let walk_opts: Vec<Option<&mut ComboWalk>> = match walks {
+                    Some(ws) => ws.iter_mut().map(Some).collect(),
+                    None => (0..n).map(|_| None).collect(),
+                };
+                sims.par_iter_mut()
+                    .zip_eq(walk_opts)
+                    .zip_eq(flat.par_chunks_mut(OBS_DIM))
+                    .zip_eq(&acts_vec)
+                    .map(|(((sim, mut walk), obs_chunk), a)| {
+                        let (r, d, events) = sim.step_inner(*a);
+                        obs_chunk.copy_from_slice(&sim.build_obs());
+                        if let Some(w) = walk.as_mut() {
+                            for &(note, code, pts, _, _) in &events {
+                                w.consume(note, code, pts);
+                            }
+                        }
+                        (r as f32, d, events)
+                    })
+                    .collect()
+            });
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
         let mut all_events: Vec<(u32, u32, u8, f32, f32, f32)> = Vec::new();
-        for (i, sim) in self.sims.iter_mut().enumerate() {
-            let mut a = [[0u8; N_JOINTS]; 2];
-            for s in 0..2 {
-                for j in 0..N_JOINTS {
-                    a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
-                }
-            }
-            let (r, d, events) = sim.step_inner(a);
-            flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
-            rewards[i] = r as f32;
+        for (i, (r, d, events)) in per_env.into_iter().enumerate() {
+            rewards[i] = r;
             dones[i] = d;
             for (note, code, pts, pre, acc) in events {
-                if let Some(walks) = &mut self.walks {
-                    walks[i].consume(note, code, pts);
-                }
                 all_events.push((i as u32, note, code, pts, pre, acc));
             }
         }

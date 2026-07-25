@@ -486,6 +486,22 @@ record `encoder: "transformer"`):
   `pitch, yaw, twist, elbow, roll, bend`, left first — plus `value(1)`.
   All heads always execute; `logprob = Σ` over the twelve factored heads
   (pure independent factorization, as before).
+- **Fused head + last-block pruning (2026-07-25, exact-math rewrites of
+  the forward — the four-agent optimization survey's top find):**
+  (a) the 12 head Linears + value head run as ONE concatenated
+  `128 → 37` GEMM (`forward_stacked` → logits `(B,12,3)` + value; the
+  13 modules stay separate in the state_dict — weights are `torch.cat`'d
+  per call — so checkpoints are untouched), and sampling/logprob/entropy
+  are computed from one `log_softmax` + `multinomial` instead of 12
+  `Categorical`s (~120 tiny kernels gone; the sampling RNG STREAM
+  changed — same distribution, the caveat the old graphed rollout
+  already carried). (b) The FINAL transformer block computes only the
+  2 readout tokens' outputs (`Block(..., n_queries=2)`): the attention
+  mask is key-side only, so this is exactly the full block restricted
+  to those rows (−29% forward MACs). Verified ≤5e-6 vs the old math on
+  the record checkpoint; `forward()` still returns the 12-logit list
+  (views) for existing callers. Measured on the GTX 1080: e2
+  production training 39.6k → **62.5k steps/s (1.58×)**.
 
 ## Training (`python/train_batch.py` — the only trainer)
 
@@ -502,14 +518,17 @@ moments, schedule position — lr/lr-final/lr-decay/num_updates come from
 the checkpoint, CLI values ignored; the env/chart stream restarts
 fresh, so only the optimization state is exact). `--init-from` remains
 the weights-only warm-start with a fresh schedule; older checkpoints
-without optimizer state are --init-from only. `--cuda-graphs` captures
-the whole minibatch update (fwd+bwd+clip+Adam, capturable Adam with a
-tensor lr) as one CUDA graph, `--cuda-graphs-rollout` additionally the
-rollout forward+sampling (graph-safe Philox RNG) — measured on the
-GTX 1080: **+6% at the production config N=4096** (32k minibatches are
-compute-bound, not launch-bound — wide batches already amortize
-launches) but **+14/+26% at N=512**; checkpoints normalize to the
-eager form and load either way. **`--env cuda` (2026-07-25,
+without optimizer state are --init-from only. **`--cuda-graphs` REMOVED
+(2026-07-25)**: capture existed to hide the 12-head/12-Categorical
+launch storm; the fused head + last-block pruning (§Policy) removed
+the storm at the source, after which graphs measured as pure overhead
+(static-buffer copies + capturable Adam) at every shape tried. The
+capture driver survives in `cuda_graphs.py` for the bench's argmax
+fallback + the forward microbench; graphs-era checkpoints load
+unchanged (they saved the normalized eager Adam form). Production
+throughput after the rewrite: **62.5k steps/s** at
+`--env cuda --num-envs 4096 --minibatches 16 --epochs 2` (was 39.6k
+eager / 46.2k fused+graphs best-ever). **`--env cuda` (2026-07-25,
 user-ordered, subagent-built): a custom CUDA-kernel sim**
 (`beat_arena_env/cuda_env.py` + `csrc/beat_arena_cuda.cu`, JIT-built
 via torch cpp_extension for sm_61; needs the CUDA 12.6 toolkit —
@@ -521,9 +540,10 @@ implementation: Rust stays the reference; parity suite mirrors the
 torch env's (f64 EXACT on all six config×policy cases, f32 bounded;
 `tests/test_cuda_env.py`; suite 97 green). Measured: env step
 **~170× the torch env** (5.8M steps/s at N=4096), end-to-end
-**1.65×** (13.6k → 22.5k steps/s; 24.6k with --cuda-graphs) — the
-Amdahl cap: rollout share fell 49% → 14% (10% with graphs) and the
-env is now ~3% of rollout; the wall is the update path (86-90%).
+**1.65×** (13.6k → 22.5k steps/s; 24.6k with the then-extant
+--cuda-graphs; all pre-fused-head numbers) — the Amdahl cap: rollout
+share fell 49% → 14% and the env is now ~3% of rollout; the wall is
+the update path (82% after the fused-head rewrite).
 Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
@@ -589,9 +609,10 @@ forward, not Python. Fixed-N forwards also make results run-to-run
 deterministic (the old variable-batch forward could flip near-tie
 argmaxes — observed once in 200 maps vs old recorded results, same cut
 counts, Δscore 0.45%). **2026-07-25 rungs harvested**: the argmax
-forward is CUDA-graph captured (`_GraphedArgmax`, trainer's capture
-driver, eager fallback + `--no-graphs`) — ~20% steady-state, 800
-cached maps 67.2 s → **57.3 s**, full catalog **~7 min**; and the
+forward is CUDA-graph captured (`_GraphedArgmax`, capture driver now
+in `cuda_graphs.py`, eager fallback + `--no-graphs`) — ~20%
+steady-state, 800 cached maps 67.2 s → **57.3 s**, full catalog
+**~7 min**; and the
 combo/multiplier walk moved INTO Rust (`ComboWalk` in `VecBeatSim`,
 `combo_walk=True`, the ONLY walk — the Python event loop is gone;
 Python `ComboTracker` survives for `max_multiplied_score` and as the
@@ -611,8 +632,27 @@ inertness (`tests/test_policy_cuda.py`); 800-map bench 64.0 → 45.3 s
 agent's controlled µs benchmark found graphed ≈ eager for this forward
 — it is small-GEMM EXECUTION-bound, so cuBLAS was the real incumbent;
 the earlier 67→57 s attribution to graphs is partly superseded.
-Remaining rungs if ever needed: a sampling variant for the training
-rollout, skip-idle-row forwards, star-range sharding.
+**Bench pipeline pass (2026-07-25 evening, from the four-agent
+optimization survey — the wall was PYTHON PARSING, ~50% of a warm run,
+GIL-serialized against the loop despite the producer thread):**
+(a) **parsed-chart cache** — the producer caches
+`(note tuples, max_multiplied_score, duration_s, last_hit_s)` per
+`(hash, difficulty, speed_scale, parser-source-hash)` as pickles under
+`--chart-cache` (default `maps/chart_cache/`, ~380 MB full catalog);
+the source hash (beatsaver+chart+scoresaber .py bytes) auto-invalidates
+on any parser edit. (b) **longest-first task ordering** off a
+`durations.json` sidecar the producer fills — long maps can no longer
+straggle at the tail on near-empty slot vectors (unknown durations
+sort first). (c) **timed saves** — `save_results` every ~30 s wall
+instead of every 25 finishes (the rewrite is linear in levels-on-file,
+so every-25 was quadratic in catalog size). (d) **rayon in
+`VecBeatSim::step`** (see §Rust sim core). Measured on the 4.0-4.5★
+band (731 levels, N=512, `--fused-forward`): cold 34.6 s → warm
+**20.2 s (~36 maps/s ⇒ full catalog ~3-4 min warm)**; cold==warm
+per-level EXACT, and diffs vs the pre-fused-forward committed catalog
+are only the known ~4e-7 argmax near-tie flips of `--fused-forward`
+itself. Remaining rungs if ever needed: skip-idle-row forwards,
+star-range sharding (top-300 carries 99.998% of weighted pp).
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
@@ -640,8 +680,13 @@ immediately). `VecBeatSim` steps N sims per FFI call (actions `(N, 12)`
 i64) returning `(obs, rewards, dones, events)` — events = flat
 `(env_idx, note_idx, code, points)` with per-env order preserved
 (2026-07-24, for the vectorized bench); `counters(i)` = `(good, bad,
-miss, n_scoreable, score, bombs_hit)`. The scenario tests in `tests/test_env.py` gate every rule
-change.
+miss, n_scoreable, score, bombs_hit)`. **`VecBeatSim::step` is
+rayon-parallel over envs since 2026-07-25** (envs are independent;
+per-env event vecs concatenate in index order, so the output is
+IDENTICAL to the old serial loop — pinned by the vec≡serial and
+Rust≡Python-walk tests) and releases the GIL for the span, so Python
+threads (the bench's parse/download producer) genuinely overlap. The
+scenario tests in `tests/test_env.py` gate every rule change.
 
 Measured 2026-07-20 (8-core CPU): Python `env.step` 137 µs vs Rust
 2.18 µs (**63×**; raw sim call 1.19 µs — the difference is gym-wrapper

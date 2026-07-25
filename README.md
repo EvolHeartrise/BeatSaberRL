@@ -78,8 +78,11 @@ error. The ranked catalog caches at `maps/scoresaber_catalog.json`
 (`--refresh-catalog` to refetch) and chart data at `maps/scoresaber/`
 (audio stripped, ~100 KB/song). `--limit N` for smoke runs;
 `--num-envs` maps play in parallel — one `VecBeatSim` FFI call per
-vector step (vectorized per-env events, 2026-07-24): ~800 maps/min at
-`--num-envs 512`, full catalog ~8 min on the GTX 1080 box.
+vector step (vectorized per-env events, 2026-07-24). Since 2026-07-25
+(parsed-chart cache + rayon sim step + longest-first ordering + fused
+forward): **~36 maps/s warm at `--num-envs 512`, full catalog ~3-4
+min** on the GTX 1080 box (first run parses + warms the cache under
+`maps/chart_cache/`, ~380 MB).
 
 ## Exporting to ScoreSaber's replay viewer
 

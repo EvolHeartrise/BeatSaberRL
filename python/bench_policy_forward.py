@@ -25,7 +25,7 @@ import torch
 
 from policy import NotePolicy, OBS_DIM, load_policy
 from policy_cuda import FusedNotePolicy
-from train_batch import _Graphed
+from cuda_graphs import _Graphed
 
 
 class _GraphedForward(_Graphed):

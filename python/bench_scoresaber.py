@@ -20,6 +20,19 @@ The ranked catalog (~6.1k leaderboards) is cached at
 maps/scoresaber_catalog.json (--refresh-catalog to refetch) and map
 chart data at maps/scoresaber/<hash>/ (audio stripped, ~100 KB/song).
 Downloads run on a background thread while evaluation proceeds.
+
+Parsed-chart cache (2026-07-25): beatmap parsing (JSON + dataclass
+churn, ~39 ms/level catalog-wide) was measured as ~50% of a warm bench
+run and, being pure Python, it holds the GIL — the producer thread
+overlaps network only, not parsing. The producer therefore caches the
+parsed result (note tuples + max score + duration) per
+(hash, difficulty, speed_scale, parser-source-hash) as pickles under
+--chart-cache; any edit to the parser/scoring sources invalidates the
+cache automatically via the source hash. Also from the same session:
+tasks run LONGEST-FIRST (durations sidecar, populated as maps are
+parsed) so long maps can't straggle at the tail with mostly-idle
+slots, and results are saved on a wall-clock timer instead of every 25
+finishes (the every-25 rewrite was quadratic in catalog size).
 """
 
 from __future__ import annotations
@@ -28,9 +41,11 @@ import argparse
 import hashlib
 import json
 import os
+import pickle
 import queue
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -41,8 +56,8 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import OBS_DIM
 from beat_arena_rs import VecBeatSim
+from cuda_graphs import _Graphed
 from policy import load_policy
-from train_batch import _Graphed
 
 
 class _GraphedArgmax(_Graphed):
@@ -103,6 +118,9 @@ def parse_args():
     p.add_argument("--max-song-s", type=float, default=0.0,
                    help="skip maps longer than this (0 = play everything)")
     p.add_argument("--map-cache", type=str, default="maps/scoresaber")
+    p.add_argument("--chart-cache", type=str, default="maps/chart_cache",
+                   help="parsed-chart pickle cache (auto-invalidated by a "
+                        "parser-source hash); empty string disables")
     p.add_argument("--catalog", type=str, default="maps/scoresaber_catalog.json")
     p.add_argument("--refresh-catalog", action="store_true")
     p.add_argument("--no-graphs", action="store_true",
@@ -161,25 +179,81 @@ def save_results(path, data, levels):
     os.replace(tmp, path)
 
 
-def producer(tasks, cache_dir, speed_scale, max_song_s, q, stop):
+def parser_version():
+    """Chart-cache version: hash of the parser + scoring sources. Any
+    edit to them invalidates every cached chart automatically (the
+    parser has changed repeatedly — chains, arcs, angle snap)."""
+    from beat_arena_env import beatsaver, chart
+    h = hashlib.sha256()
+    for mod in (beatsaver, chart, scoresaber):
+        with open(mod.__file__, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()[:10]
+
+
+def dur_key(entry):
+    return f"{entry['hash']}_{entry['difficulty']}"
+
+
+def load_or_parse(entry, cache_dir, chart_cache, ver, speed_scale):
+    """The cacheable unit: (note tuples, max multiplied score, duration,
+    last hit time) for one level. duration/hit times come from the song
+    clock, so they are speed_scale-independent; the tuples are not —
+    speed_scale is part of the cache key."""
+    cpath = None
+    if chart_cache:
+        cpath = os.path.join(
+            chart_cache,
+            f"{entry['hash']}_{entry['difficulty']}_{speed_scale:g}"
+            f"_{ver}.pkl")
+        if os.path.exists(cpath):
+            try:
+                with open(cpath, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass                    # corrupt/partial file: reparse
+    map_dir = scoresaber.ensure_map_dats(entry["hash"], cache_dir)
+    notes, meta = load_beatmap(map_dir, entry["difficulty"],
+                               speed_scale=speed_scale, first_note_s=2.0)
+    payload = {
+        "tuples": [note_tuple(n) for n in notes],
+        "max_score": scoresaber.max_multiplied_score(notes) if notes else 0,
+        "duration_s": meta["duration_s"] if notes else 0.0,
+        "last_hit_s": notes[-1].hit_time if notes else 0.0,
+    }
+    if cpath:
+        tmp = cpath + f".tmp{os.getpid()}"
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f, protocol=5)
+        os.replace(tmp, cpath)
+    return payload
+
+
+def producer(tasks, cache_dir, chart_cache, speed_scale, max_song_s, q, stop,
+             durations):
     """Download + parse maps ahead of the eval loop (network overlaps
-    compute). Emits (entry, notes, meta, skip_reason) then a sentinel."""
+    compute; parsing is served from the chart cache when warm). Emits
+    (entry, tuples, payload, skip_reason) then a sentinel, and records
+    each level's duration into the shared `durations` dict (the
+    longest-first sidecar)."""
+    ver = parser_version()
+    if chart_cache:
+        os.makedirs(chart_cache, exist_ok=True)
     try:
         for entry in tasks:
             if stop.is_set():
                 break
             try:
-                map_dir = scoresaber.ensure_map_dats(entry["hash"], cache_dir)
-                notes, meta = load_beatmap(map_dir, entry["difficulty"],
-                                           speed_scale=speed_scale,
-                                           first_note_s=2.0)
-                if not notes:
+                p = load_or_parse(entry, cache_dir, chart_cache, ver,
+                                  speed_scale)
+                durations[dur_key(entry)] = round(p["duration_s"], 1)
+                if not p["tuples"]:
                     q.put((entry, None, None, "no notes parsed"))
-                elif max_song_s > 0 and notes[-1].hit_time > max_song_s:
+                elif max_song_s > 0 and p["last_hit_s"] > max_song_s:
                     q.put((entry, None, None,
-                           f"{notes[-1].hit_time:.0f}s > --max-song-s"))
+                           f"{p['last_hit_s']:.0f}s > --max-song-s"))
                 else:
-                    q.put((entry, notes, meta, None))
+                    q.put((entry, p["tuples"], p, None))
             except Exception as e:      # v4 quirks, no Standard set, network
                 q.put((entry, None, None, f"{type(e).__name__}: {e}"))
     finally:
@@ -266,6 +340,16 @@ def main():
                  or "skipped" in levels[e["leaderboard_id"]]]
     if args.limit > 0:
         tasks = tasks[:args.limit]
+    # longest-first (durations sidecar, filled in as maps get parsed):
+    # long maps started last would hold near-empty slot vectors at the
+    # tail. Unknown durations sort FIRST — they could be long.
+    dur_path = os.path.join(args.chart_cache or "maps", "durations.json")
+    durations = {}
+    if os.path.exists(dur_path):
+        with open(dur_path) as f:
+            durations = json.load(f)
+    tasks.sort(key=lambda e: durations.get(dur_key(e), float("inf")),
+               reverse=True)
     print(f"=== ScoreSaber bench: {ckpt_name} ({mhash[:19]}...) on {device}\n"
           f"    {in_range} leaderboards in range, {len(tasks)} to play, "
           f"{len(levels)} already on file -> {out_path}", flush=True)
@@ -278,8 +362,9 @@ def main():
     q = queue.Queue(maxsize=max(64, 2 * args.num_envs))
     stop = threading.Event()
     threading.Thread(target=producer,
-                     args=(tasks, args.map_cache, args.speed_scale,
-                           args.max_song_s, q, stop),
+                     args=(tasks, args.map_cache, args.chart_cache,
+                           args.speed_scale, args.max_song_s, q, stop,
+                           durations),
                      daemon=True).start()
 
     # Vectorized rollout (2026-07-24, the SPEC "future unlock"): ONE
@@ -310,6 +395,7 @@ def main():
     slots = [None] * N
     free = list(range(N))
     n_active, feed_done, n_done, n_new_skip = 0, False, 0, 0
+    last_save = time.monotonic()
     try:
         while True:
             while not feed_done and free:
@@ -320,7 +406,7 @@ def main():
                 if item is None:
                     feed_done = True
                     break
-                entry, notes, meta, skip = item
+                entry, tuples, payload, skip = item
                 if skip is not None:
                     n_done += 1
                     n_new_skip += 1
@@ -333,12 +419,12 @@ def main():
                         "stars": entry["stars"], "skipped": skip}
                     continue
                 i = free.pop()
-                sim.set_chart(i, [note_tuple(n) for n in notes])
+                sim.set_chart(i, tuples)
                 obs_buf[i] = sim.obs_one(i)
                 slots[i] = {
                     "entry": entry,
-                    "max_score": scoresaber.max_multiplied_score(notes),
-                    "duration_s": meta["duration_s"]}
+                    "max_score": payload["max_score"],
+                    "duration_s": payload["duration_s"]}
                 n_active += 1
             if n_active == 0:
                 if feed_done:
@@ -388,11 +474,18 @@ def main():
                 sim.set_chart(i, [])
                 free.append(i)
                 n_active -= 1
-            if n_finished and n_done % 25 < n_finished:
+            if n_finished and time.monotonic() - last_save > 30.0:
                 save_results(out_path, data, levels)
+                last_save = time.monotonic()
     finally:
         stop.set()
         save_results(out_path, data, levels)
+        if args.chart_cache:            # longest-first sidecar for next run
+            os.makedirs(args.chart_cache, exist_ok=True)
+            tmp = dur_path + f".tmp{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(durations, f)
+            os.replace(tmp, dur_path)
 
     print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
