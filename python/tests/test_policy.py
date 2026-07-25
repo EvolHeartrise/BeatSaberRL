@@ -106,7 +106,7 @@ def test_vec_matches_single():
         np.testing.assert_array_equal(ov, o1)
         assert rv[0] == np.float32(r1) and bool(dv[0]) == done1
         # vectorized events == the single sim's, env-tagged, order kept
-        assert evv == [(0, n, c, p) for n, c, p in ev1]
+        assert evv == [(0, *e) for e in ev1]
     assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
                                single.misses, single.n_notes, single.score,
                                single.bombs_hit)

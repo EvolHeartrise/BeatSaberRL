@@ -41,6 +41,7 @@ def main():
     pol.eval()
     G = B = M = BOMB = 0
     score = notes = 0.0
+    pre = acc = post = 0.0
     rets = []
     for ep in range(args.episodes):
         rng = np.random.default_rng(args.seed0 + ep)
@@ -65,12 +66,19 @@ def main():
                 elif reason != "post":
                     B += 1
         score += info["score"]
+        pre += info["score_pre"]
+        acc += info["score_acc"]
+        post += info["score_post"]
         notes += info["n_notes"]
         rets.append(ret)
     tot = G + B + M
     print(f"{args.ckpt}: good {100 * G / tot:.1f}%  bad {B}  miss {M}  "
           f"bombs_hit {BOMB}  score {score / notes:.1f}/115  "
           f"return {np.mean(rets):+.2f}", flush=True)
+    # score decomposition (per scoreable object; link flat-20s are the
+    # remainder): where the points actually come from
+    print(f"  components/note: pre {pre / notes:.1f}/70  "
+          f"acc {acc / notes:.1f}/15  post {post / notes:.1f}/30", flush=True)
 
 
 if __name__ == "__main__":

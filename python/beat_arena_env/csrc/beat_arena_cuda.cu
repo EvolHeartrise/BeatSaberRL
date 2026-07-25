@@ -344,6 +344,8 @@ struct Sim {
   T* ep_return;
   int *good, *bad, *miss, *bombs;
   T* score;
+  // score decomposition (2026-07-25): pre/acc/post point totals
+  T *score_pre, *score_acc, *score_post;
   int64_t* chart_idx;
   // chart pool (P, C), read-only
   const T *p_hit, *p_speed, *p_center, *p_dvec, *p_rot, *p_good_hy, *p_bad_hy;
@@ -380,6 +382,7 @@ __global__ void step_kernel(Sim<T> P) {
   __shared__ int sh_nnew[2];
   __shared__ int sh_good, sh_bad, sh_miss, sh_bomb;
   __shared__ T sh_score, sh_rew;
+  __shared__ T sh_pre, sh_acc, sh_post;
   __shared__ bool sh_doreset;
   __shared__ int64_t sh_chart;
   __shared__ int sh_slots[N_NOTE_SLOTS];
@@ -393,6 +396,7 @@ __global__ void step_kernel(Sim<T> P) {
       sh_good = sh_bad = sh_miss = sh_bomb = 0;
       sh_nnew[0] = sh_nnew[1] = 0;
       sh_score = T(0);
+      sh_pre = sh_acc = sh_post = T(0);
     }
     for (int i = tid; i < C; i += blockDim.x) scratch[i] = T(0);
 
@@ -504,6 +508,7 @@ __global__ void step_kernel(Sim<T> P) {
             const T tot = pts * T(P.tr_cnt[b]);
             rew += tot / T(SCORE_MAX);
             sh_score += tot;
+            sh_post += tot;
             P.tr_active[b] = false;
           }
         }
@@ -614,10 +619,13 @@ __global__ void step_kernel(Sim<T> P) {
             const T acc = round_pts(
                 T(PTS_ACC) * (T(1) - tclamp(d_min / T(ACC_NORM), T(0), T(1))));
             pts = pre + acc;
+            atomicAdd(&sh_pre, pre);
+            atomicAdd(&sh_acc, acc);
             if (is_head) {
               // chain heads: no follow-through (max 85)
             } else if (P.p_free_post[cb]) {
               pts += T(PTS_POST);  // arc head: granted in full
+              atomicAdd(&sh_post, T(PTS_POST));
             } else {
               atomicAdd(&sh_nnew[m], 1);  // spawn a follow-through tracker
             }
@@ -680,6 +688,7 @@ __global__ void step_kernel(Sim<T> P) {
       T rew = sh_rew;
       for (int i = 0; i < C; i++) rew += scratch[i];  // Rust's note order
       T score_add = sh_score;
+      T post_add = sh_post;
       if (done) {  // hard ends force-resolve pending follow-throughs
         for (int b = (e * 2) * N_TRACKERS; b < (e * 2 + 2) * N_TRACKERS;
              b++) {
@@ -689,6 +698,7 @@ __global__ void step_kernel(Sim<T> P) {
           const T tot = pts * T(P.tr_cnt[b]);
           rew += tot / T(SCORE_MAX);
           score_add += tot;
+          post_add += tot;
           P.tr_active[b] = false;
         }
       }
@@ -697,6 +707,9 @@ __global__ void step_kernel(Sim<T> P) {
       P.miss[e] += sh_miss;
       P.bombs[e] += sh_bomb;
       P.score[e] += score_add;
+      P.score_pre[e] += sh_pre;
+      P.score_acc[e] += sh_acc;
+      P.score_post[e] += post_add;
       const T ep = P.ep_return[e] + rew;
       P.ep_return[e] = ep;
       P.reward[e] = rew;
@@ -729,6 +742,9 @@ __global__ void step_kernel(Sim<T> P) {
       P.miss[e] = 0;
       P.bombs[e] = 0;
       P.score[e] = T(0);
+      P.score_pre[e] = T(0);
+      P.score_acc[e] = T(0);
+      P.score_post[e] = T(0);
       P.tr_ptr[e * 2] = 0;
       P.tr_ptr[e * 2 + 1] = 0;
     }
@@ -824,7 +840,7 @@ __global__ void step_kernel(Sim<T> P) {
 enum {
   TQ = 0, TOM, TWRIST, TBLADE, TWVEL, TSWING, TAXIS, TAXV,
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR, TTICK, TSTATUS, TEPRET,
-  TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TCIDX,
+  TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL,
@@ -866,6 +882,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.miss = ts[TMISS].data_ptr<int>();
     P.bombs = ts[TBOMBS].data_ptr<int>();
     P.score = ts[TSCORE].data_ptr<scalar_t>();
+    P.score_pre = ts[TSPRE].data_ptr<scalar_t>();
+    P.score_acc = ts[TSACC].data_ptr<scalar_t>();
+    P.score_post = ts[TSPOST].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

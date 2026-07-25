@@ -326,6 +326,10 @@ class TorchBeatVecEnv:
         self.miss = zeros(N, dt=torch.long)
         self.bombs = zeros(N, dt=torch.long)
         self.score = zeros(N)
+        # score decomposition (2026-07-25): pre/acc/post point totals
+        self.score_pre = zeros(N)
+        self.score_acc = zeros(N)
+        self.score_post = zeros(N)
         # per-env chart fields (rows copied from the pool at reset)
         for k in self._F_NC:
             setattr(self, "c_" + k, zeros(N, C, dt=self.pool[k].dtype))
@@ -436,6 +440,9 @@ class TorchBeatVecEnv:
         self.miss = torch.where(mask, zl, self.miss)
         self.bombs = torch.where(mask, zl, self.bombs)
         self.score = torch.where(mask, torch.zeros_like(self.score), self.score)
+        for name in ("score_pre", "score_acc", "score_post"):
+            t = getattr(self, name)
+            setattr(self, name, torch.where(mask, torch.zeros_like(t), t))
 
     def reset(self):
         ones = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -498,6 +505,7 @@ class TorchBeatVecEnv:
         post_paid = (post_pts * resolve.to(self.dtype)).sum((1, 2))  # (N,)
         reward = post_paid / SCORE_MAX - effort
         self.score = self.score + post_paid
+        self.score_post = self.score_post + post_paid
         self.tr_acc, self.tr_age = acc_new, age_new
         self.tr_active = self.tr_active & ~resolve
 
@@ -621,6 +629,13 @@ class TorchBeatVecEnv:
         cut_pts = (pts * good.to(self.dtype)).sum(1)                # (N,)
         reward = reward + cut_pts / SCORE_MAX
         self.score = self.score + cut_pts
+        # component split: pre/acc for graded objects (notes + heads;
+        # links pay flat 20 outside all components), post_now = the
+        # arc-headed free_post grant paid at the cut tick
+        graded = (good & ~self.c_is_link).to(self.dtype)
+        self.score_pre = self.score_pre + (pre * graded).sum(1)
+        self.score_acc = self.score_acc + (acc_pts * graded).sum(1)
+        self.score_post = self.score_post + (post_now * graded).sum(1)
 
         st = self.status
         st = torch.where(good, torch.ones_like(st), st)
@@ -672,6 +687,7 @@ class TorchBeatVecEnv:
         end_paid = (end_pts * end_resolve.to(self.dtype)).sum((1, 2))
         reward = reward + end_paid / SCORE_MAX
         self.score = self.score + end_paid
+        self.score_post = self.score_post + end_paid
         self.tr_active = self.tr_active & ~end_resolve
 
         self.ep_return = self.ep_return + reward

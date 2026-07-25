@@ -491,6 +491,12 @@ struct Core {
     bombs_hit: u32,
     n_scoreable: u32, // chart objects that are not bombs
     score: f64,       // summed points; max = 115*notes + 85*heads + 20*links
+    // score decomposition (2026-07-25, user-directed): the three graded
+    // components tracked independently — links' flat 20s are in none
+    // (score - pre - acc - post = link points)
+    score_pre: f64,
+    score_acc: f64,
+    score_post: f64,
 }
 
 impl Core {
@@ -511,6 +517,9 @@ impl Core {
             bombs_hit: 0,
             n_scoreable: 0,
             score: 0.0,
+            score_pre: 0.0,
+            score_acc: 0.0,
+            score_post: 0.0,
         }
     }
 
@@ -557,6 +566,9 @@ impl Core {
         self.bombs_hit = 0;
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.score = 0.0;
+        self.score_pre = 0.0;
+        self.score_acc = 0.0;
+        self.score_post = 0.0;
     }
 
     fn build_obs(&self) -> [f32; OBS_DIM] {
@@ -625,12 +637,15 @@ impl Core {
 
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
     // (follow-through resolution), 6 bomb hit. The f32 is points awarded.
-    fn step_inner(&mut self, actions: [[u8; N_JOINTS]; 2]) -> (f64, bool, Vec<(u32, u8, f32)>) {
+    fn step_inner(
+        &mut self,
+        actions: [[u8; N_JOINTS]; 2],
+    ) -> (f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
         let prev_pos = [self.arms[0].wrist, self.arms[1].wrist];
         let prev_dir = [self.arms[0].blade, self.arms[1].blade];
 
         let mut reward = 0.0;
-        let mut events: Vec<(u32, u8, f32)> = Vec::new();
+        let mut events: Vec<(u32, u8, f32, f32, f32)> = Vec::new();
         // per arm this tick: (swing delta, did the chain continue)
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
@@ -715,7 +730,8 @@ impl Core {
                     let pts = round_pts(PTS_POST * (tr.acc / POST_FULL).min(1.0));
                     reward += pts / SCORE_MAX;
                     self.score += pts;
-                    events.push((tr.note, 5, pts as f32));
+                    self.score_post += pts;
+                    events.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 } else {
                     kept.push(tr);
                 }
@@ -744,7 +760,7 @@ impl Core {
                     self.status[i] = 3;
                     self.misses += 1;
                     reward += REWARD_MISS;
-                    events.push((i as u32, 4, 0.0));
+                    events.push((i as u32, 4, 0.0, 0.0, 0.0));
                 }
                 continue;
             }
@@ -759,7 +775,7 @@ impl Core {
                         self.status[i] = 2;
                         self.bombs_hit += 1;
                         reward += REWARD_BOMB;
-                        events.push((i as u32, 6, 0.0));
+                        events.push((i as u32, 6, 0.0, 0.0, 0.0));
                         break;
                     }
                 }
@@ -851,8 +867,8 @@ impl Core {
                 if code == 0 {
                     self.status[i] = 1;
                     self.good_cuts += 1;
-                    let pts = if n.kind == KIND_CHAIN_LINK {
-                        CHAIN_LINK_PTS // flat, regardless of swing
+                    let (pts, pre_pts, acc_pts) = if n.kind == KIND_CHAIN_LINK {
+                        (CHAIN_LINK_PTS, 0.0, 0.0) // flat, regardless of swing
                     } else {
                         let pre = if n.free_pre {
                             PTS_PRE
@@ -866,6 +882,7 @@ impl Core {
                             // chain heads have no follow-through (max 85)
                         } else if n.free_post {
                             p += PTS_POST; // arc head: granted in full
+                            self.score_post += PTS_POST;
                         } else {
                             self.trackers[m].push(Tracker {
                                 note: i as u32,
@@ -873,16 +890,19 @@ impl Core {
                                 age: 0,
                             });
                         }
-                        p
+                        (p, pre, acc)
                     };
                     reward += pts / SCORE_MAX;
                     self.score += pts;
-                    events.push((i as u32, 0, pts as f32));
+                    self.score_pre += pre_pts;
+                    self.score_acc += acc_pts;
+                    events.push((i as u32, 0, pts as f32, pre_pts as f32,
+                                 acc_pts as f32));
                 } else {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
-                    events.push((i as u32, code, 0.0));
+                    events.push((i as u32, code, 0.0, 0.0, 0.0));
                 }
             } else {
                 // wrong-color saber only triggers the SMALL box
@@ -896,7 +916,7 @@ impl Core {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
-                    events.push((i as u32, 3, 0.0)); // wrong_hand
+                    events.push((i as u32, 3, 0.0, 0.0, 0.0)); // wrong_hand
                 }
             }
         }
@@ -921,7 +941,8 @@ impl Core {
                     let pts = round_pts(PTS_POST * (tr.acc / POST_FULL).min(1.0));
                     reward += pts / SCORE_MAX;
                     self.score += pts;
-                    events.push((tr.note, 5, pts as f32));
+                    self.score_post += pts;
+                    events.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 }
             }
         }
@@ -959,13 +980,17 @@ impl RawBeatSim {
 
     /// actions: 12 ints in 0..2 — per hand (pitch, yaw, twist, elbow,
     /// roll, bend), left hand first; 0 = coast, 1 = +alpha, 2 = -alpha.
-    /// Returns (obs, reward, done, events); events = [(note_idx, code, points)]
-    /// with codes 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post, 6 bomb.
+    /// Returns (obs, reward, done, events); events = [(note_idx, code,
+    /// points, pre_pts, acc_pts)] with codes 0 ok, 1 slow, 2 angle,
+    /// 3 wrong_hand, 4 miss, 5 post, 6 bomb. The component split
+    /// (2026-07-25, user-directed): a good cut's points = pre + acc
+    /// (+ 30 for arc-headed free_post grants); post/link/error events
+    /// carry (0, 0).
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         actions: Vec<u8>,
-    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32)>) {
+    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
         assert_eq!(actions.len(), 2 * N_JOINTS);
         assert!(actions.iter().all(|&a| a <= 2));
         let mut acts = [[0u8; N_JOINTS]; 2];
@@ -1053,6 +1078,11 @@ impl RawBeatSim {
     #[getter]
     fn score(&self) -> f64 {
         self.core.score
+    }
+    /// (pre_swing, accuracy, follow_through) point totals — the score
+    /// decomposition; score − sum = chain-link flat points.
+    fn score_components(&self) -> (f64, f64, f64) {
+        (self.core.score_pre, self.core.score_acc, self.core.score_post)
     }
 }
 
@@ -1196,7 +1226,7 @@ impl VecBeatSim {
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<bool>>,
-        Vec<(u32, u32, u8, f32)>,
+        Vec<(u32, u32, u8, f32, f32, f32)>,
     ) {
         let acts = actions.as_array();
         let n = self.sims.len();
@@ -1204,7 +1234,7 @@ impl VecBeatSim {
         let mut flat = vec![0.0f32; n * OBS_DIM];
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
-        let mut all_events: Vec<(u32, u32, u8, f32)> = Vec::new();
+        let mut all_events: Vec<(u32, u32, u8, f32, f32, f32)> = Vec::new();
         for (i, sim) in self.sims.iter_mut().enumerate() {
             let mut a = [[0u8; N_JOINTS]; 2];
             for s in 0..2 {
@@ -1216,11 +1246,11 @@ impl VecBeatSim {
             flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
             rewards[i] = r as f32;
             dones[i] = d;
-            for (note, code, pts) in events {
+            for (note, code, pts, pre, acc) in events {
                 if let Some(walks) = &mut self.walks {
                     walks[i].consume(note, code, pts);
                 }
-                all_events.push((i as u32, note, code, pts));
+                all_events.push((i as u32, note, code, pts, pre, acc));
             }
         }
         (
@@ -1247,6 +1277,12 @@ impl VecBeatSim {
             s.score,
             s.bombs_hit,
         )
+    }
+
+    /// (pre_swing, accuracy, follow_through) point totals for env i.
+    fn components(&self, i: usize) -> (f64, f64, f64) {
+        let s = &self.sims[i];
+        (s.score_pre, s.score_acc, s.score_post)
     }
 }
 

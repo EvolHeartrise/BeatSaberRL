@@ -107,10 +107,14 @@ class RustBeatEnv(gym.Env):
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}
                 if code == 5 else
                 {"bomb": {"note": int(i)}} if code == 6 else
+                # good cuts carry the component split (2026-07-25):
+                # points = pre + acc (+30 on arc-headed free_post grants)
                 {"cut": {"note": int(i), "good": code == 0,
                          "reason": EVENT_REASONS[code],
-                         "points": round(float(pts), 2)}}
-                for i, code, pts in events
+                         "points": round(float(pts), 2),
+                         "pre": round(float(pre), 2),
+                         "acc": round(float(acc), 2)}}
+                for i, code, pts, pre, acc in events
             ],
         }))
 
@@ -137,8 +141,10 @@ class RustBeatEnv(gym.Env):
                     f.write("\n".join(self._record_lines) + "\n")
                 self._record_lines = None
         info = {"events": [(int(i), EVENT_REASONS[c], float(p))
-                           for i, c, p in events]}
+                           for i, c, p, _pre, _acc in events]}
         if done:
+            pre, acc, post = self.sim.score_components()
+            info.update(score_pre=pre, score_acc=acc, score_post=post)
             info.update(good_cuts=self.sim.good_cuts, bad_cuts=self.sim.bad_cuts,
                         misses=self.sim.misses, n_notes=self.sim.n_notes,
                         score=self.sim.score, bombs_hit=self.sim.bombs_hit)
