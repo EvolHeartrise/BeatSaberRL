@@ -29,6 +29,9 @@ def parse_args():
     src.add_argument("--scripted", action="store_true", help="play the scripted bot")
     src.add_argument("--random", action="store_true", help="play uniform-random actions")
     p.add_argument("--episodes", type=int, default=3)
+    p.add_argument("--greedy", action="store_true",
+                   help="argmax actions (bench/eval protocol) instead of "
+                        "sampling from the policy distribution")
     p.add_argument("--seed", type=int, default=7000, help="base episode seed")
     p.add_argument("--out-dir", type=str, default="replays")
     p.add_argument("--tag", type=str, default=None,
@@ -81,9 +84,15 @@ def main():
                 act = scripted_action(env)
             elif policy is not None:
                 with torch.no_grad():
-                    a, _, _, _ = policy.get_action_and_value(
-                        torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
-                act = a[0].numpy()
+                    if args.greedy:
+                        logits, _ = policy(torch.as_tensor(
+                            obs, dtype=torch.float32).unsqueeze(0))
+                        act = [int(l.argmax()) for l in logits]
+                    else:
+                        a, _, _, _ = policy.get_action_and_value(
+                            torch.as_tensor(obs,
+                                            dtype=torch.float32).unsqueeze(0))
+                        act = a[0].numpy()
             else:
                 act = rng.integers(0, [3] * 12)
             obs, r, done, _, info = env.step(act)
