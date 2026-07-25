@@ -39,9 +39,31 @@ import torch
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple
-from beat_arena_env.constants import EVENT_REASONS, OBS_DIM
+from beat_arena_env.constants import OBS_DIM
 from beat_arena_rs import VecBeatSim
 from policy import load_policy
+from train_batch import _Graphed
+
+
+class _GraphedArgmax(_Graphed):
+    """Bench forward — policy logits + stacked argmax over the fixed
+    (N, 286) batch as ONE CUDA graph (2026-07-25: N=512 forwards are
+    launch-bound; same capture protocol as the trainer's rollout
+    capture). Falls back to eager on any capture failure."""
+
+    def __init__(self, policy, n, device):
+        super().__init__()
+        self.policy = policy
+        self.s_obs = torch.zeros(n, OBS_DIM, device=device)
+
+    def _compute(self):
+        with torch.no_grad():
+            logits, _ = self.policy(self.s_obs)
+        return torch.stack(logits, dim=1).argmax(-1)
+
+    def __call__(self, obs_np):
+        self.s_obs.copy_(torch.from_numpy(obs_np))
+        return self._run()
 
 
 def parse_args():
@@ -68,6 +90,8 @@ def parse_args():
     p.add_argument("--map-cache", type=str, default="maps/scoresaber")
     p.add_argument("--catalog", type=str, default="maps/scoresaber_catalog.json")
     p.add_argument("--refresh-catalog", action="store_true")
+    p.add_argument("--no-graphs", action="store_true",
+                   help="disable CUDA-graph capture of the argmax forward")
     return p.parse_args()
 
 
@@ -142,10 +166,12 @@ def producer(tasks, cache_dir, speed_scale, max_song_s, q, stop):
         q.put(None)                     # sentinel, unconditionally
 
 
-def finish_slot(slot, info):
-    """Level-result entry from a finished rollout + its combo walk."""
-    entry, walk = slot["entry"], slot["walk"]
-    score = round(walk.score)
+def finish_slot(slot, info, combo):
+    """Level-result entry from a finished rollout; combo =
+    (multiplied_score, max_combo, breaks) from whichever walk ran."""
+    entry = slot["entry"]
+    c_score, max_combo, breaks = combo
+    score = round(c_score)
     acc = score / slot["max_score"] if slot["max_score"] else 0.0
     return {
         "leaderboard_id": entry["leaderboard_id"],
@@ -160,8 +186,8 @@ def finish_slot(slot, info):
         "pp": round(scoresaber.pp_value(acc, entry["max_pp"]), 2),
         "good_cuts": info["good_cuts"], "bad_cuts": info["bad_cuts"],
         "misses": info["misses"], "bombs_hit": info["bombs_hit"],
-        "highest_combo": walk.max_combo,
-        "full_combo": walk.breaks == 0 and info["good_cuts"] == info["n_notes"],
+        "highest_combo": max_combo,
+        "full_combo": breaks == 0 and info["good_cuts"] == info["n_notes"],
     }
 
 
@@ -239,9 +265,13 @@ def main():
     # serial per-env loop did. Idle slots hold an empty chart (done on
     # every step, eventless, ~free) so the vector call is always valid.
     N = args.num_envs
-    sim = VecBeatSim(N, max_steps=100_000_000)   # natural time-based ends
+    # Rust-side combo walk (2026-07-25, the ONLY walk since same day):
+    # each env's ordered events feed its walk inside the step call
+    sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True)
     for i in range(N):
         sim.set_chart(i, [])
+    fwd = (None if args.no_graphs or device.type != "cuda"
+           else _GraphedArgmax(policy, N, device))
     obs_buf = np.zeros((N, OBS_DIM), dtype=np.float32)
     slots = [None] * N
     free = list(range(N))
@@ -273,7 +303,6 @@ def main():
                 obs_buf[i] = sim.obs_one(i)
                 slots[i] = {
                     "entry": entry,
-                    "walk": scoresaber.ComboTracker(),
                     "max_score": scoresaber.max_multiplied_score(notes),
                     "duration_s": meta["duration_s"]}
                 n_active += 1
@@ -282,28 +311,33 @@ def main():
                     break
                 continue
 
-            batch = torch.as_tensor(obs_buf, device=device)
-            with torch.no_grad():
-                logits, _ = policy(batch)
-            # one stacked argmax kernel over all 12 heads, one D2H sync
-            actions = torch.stack(logits, dim=1).argmax(-1).cpu().numpy()
-            obs_flat, _, dones, events = sim.step(
+            if fwd is not None:
+                try:
+                    actions = fwd(obs_buf).cpu().numpy()
+                except Exception as e:       # capture failed: go eager
+                    print(f"[cuda-graphs] falling back to eager: {e}",
+                          flush=True)
+                    fwd = None
+            if fwd is None:
+                batch = torch.as_tensor(obs_buf, device=device)
+                with torch.no_grad():
+                    logits, _ = policy(batch)
+                # one stacked argmax kernel over the 12 heads, one D2H sync
+                actions = torch.stack(logits, dim=1).argmax(-1).cpu().numpy()
+            obs_flat, _, dones, _events = sim.step(
                 np.ascontiguousarray(actions, dtype=np.int64))
             obs_buf = np.asarray(obs_flat).reshape(N, OBS_DIM)
-            for i, note, code, pts in events:
-                s = slots[i]
-                if s is not None:
-                    s["walk"].consume([(note, EVENT_REASONS[code], pts)])
             n_finished = 0
             for i in np.flatnonzero(np.asarray(dones)):
                 i = int(i)
                 s = slots[i]
                 if s is None:                    # idle empty-chart slot
                     continue
+                combo = sim.combo(i)             # BEFORE set_chart resets it
                 g, b, m, n_scoreable, _, bombs = sim.counters(i)
                 result = finish_slot(s, {
                     "good_cuts": g, "bad_cuts": b, "misses": m,
-                    "n_notes": n_scoreable, "bombs_hit": bombs})
+                    "n_notes": n_scoreable, "bombs_hit": bombs}, combo)
                 levels[result["leaderboard_id"]] = result
                 n_done += 1
                 n_finished += 1

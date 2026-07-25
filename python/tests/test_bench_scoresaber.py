@@ -261,7 +261,9 @@ def test_greedy_rollout_smoke():
         act = [int(l.argmax()) for l in logits]
         obs, _, done, _, info = env.step(act)
         slot["walk"].consume(info["events"])
-    r = bench_scoresaber.finish_slot(slot, info)
+    w = slot["walk"]
+    r = bench_scoresaber.finish_slot(slot, info,
+                                     (w.score, w.max_combo, w.breaks))
     assert r["max_score"] > 0 and 0 <= r["score"] <= r["max_score"]
     assert 0.0 <= r["accuracy"] <= 1.0 and r["pp"] >= 0.0
     assert r["good_cuts"] + r["bad_cuts"] + r["misses"] == r["n_notes"]
@@ -324,3 +326,43 @@ def test_vectorized_events_match_serial():
         assert (g, b, m, n, bombs) == (info["good_cuts"], info["bad_cuts"],
                                        info["misses"], info["n_notes"],
                                        info["bombs_hit"])
+
+
+def test_rust_combo_walk_matches_python():
+    """The Rust-side combo walk (VecBeatSim combo_walk=True, 2026-07-25)
+    reproduces the Python ComboTracker exactly over the same episodes:
+    multiplied score, max combo, and break count."""
+    import beat_arena_rs
+    from beat_arena_env.chart import note_tuple
+    from beat_arena_env.constants import EVENT_REASONS
+
+    try:
+        vec = beat_arena_rs.VecBeatSim(2, max_steps=100_000_000,
+                                       combo_walk=True)
+    except TypeError:
+        pytest.skip("extension predates combo_walk (rebuild pending)")
+    charts = [generate_chart(ChartConfig(chart_len_s=6.0, colors="both",
+                                         bomb_prob=0.25),
+                             np.random.default_rng(s)) for s in (3, 4)]
+    for i, chart in enumerate(charts):
+        vec.set_chart(i, [note_tuple(n) for n in chart])
+    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 12))
+    py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
+    rust_result, t = [None, None], 0
+    while not all(r is not None for r in rust_result):
+        _, _, dones, events = vec.step(
+            np.ascontiguousarray(acts[t], dtype=np.int64))
+        for i, note, code, pts in events:
+            if rust_result[i] is None:
+                py[i].consume([(note, EVENT_REASONS[code], pts)])
+        for i in range(2):
+            if bool(dones[i]) and rust_result[i] is None:
+                rust_result[i] = vec.combo(i)   # before set_chart resets
+                vec.set_chart(i, [])
+        t += 1
+    for i in range(2):
+        score, max_combo, breaks = rust_result[i]
+        assert score == pytest.approx(py[i].score, abs=1e-9)
+        assert max_combo == py[i].max_combo
+        assert breaks == py[i].breaks
+        assert py[i].score > 0                  # episodes actually scored

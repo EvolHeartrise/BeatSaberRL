@@ -588,9 +588,17 @@ the old serial per-env loop; the wall is now the per-step policy
 forward, not Python. Fixed-N forwards also make results run-to-run
 deterministic (the old variable-batch forward could flip near-tie
 argmaxes — observed once in 200 maps vs old recorded results, same cut
-counts, Δscore 0.45%). Next rungs if ever needed: skip-idle-row
-forwards, CUDA graphs, or multi-process star-range sharding (merge
-logic already tolerates it).
+counts, Δscore 0.45%). **2026-07-25 rungs harvested**: the argmax
+forward is CUDA-graph captured (`_GraphedArgmax`, trainer's capture
+driver, eager fallback + `--no-graphs`) — ~20% steady-state, 800
+cached maps 67.2 s → **57.3 s**, full catalog **~7 min**; and the
+combo/multiplier walk moved INTO Rust (`ComboWalk` in `VecBeatSim`,
+`combo_walk=True`, the ONLY walk — the Python event loop is gone;
+Python `ComboTracker` survives for `max_multiplied_score` and as the
+pinned test reference; Rust ≡ Python pinned by test, identical
+results verified on 800 maps). The walk itself bought ~0.3% — the
+forward was the wall, as Amdahl said. Remaining rungs if ever needed:
+skip-idle-row forwards, star-range sharding.
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
