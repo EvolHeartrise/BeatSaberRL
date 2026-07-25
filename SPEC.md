@@ -597,8 +597,22 @@ combo/multiplier walk moved INTO Rust (`ComboWalk` in `VecBeatSim`,
 Python `ComboTracker` survives for `max_multiplied_score` and as the
 pinned test reference; Rust ≡ Python pinned by test, identical
 results verified on 800 maps). The walk itself bought ~0.3% — the
-forward was the wall, as Amdahl said. Remaining rungs if ever needed:
-skip-idle-row forwards, star-range sharding.
+forward was the wall, as Amdahl said. **Fused single-kernel forward
+(2026-07-25, subagent-built, `--fused-forward`)**: the whole 107k-param
+policy inference as ONE 128-thread-block-per-sample launch
+(`csrc/policy_forward.cu` + `policy_cuda.py`; weights packed/pre-
+transposed into one L2-resident buffer, 13 heads fused to a 128→37
+matmul, LN/attention/masking fused, in-kernel argmax; fp32,
+arch-pinned to embed64/trunk128/1-head, JIT-built, graceful fallback)
+— **3.4× the graphed forward at N=512** (620 µs vs 2,130), 3.0× at
+N=4096, parity at ~4e-7 max logit delta with bitwise mask-junk
+inertness (`tests/test_policy_cuda.py`); 800-map bench 64.0 → 45.3 s
+(**1.41×**; the forward was ~40% of the loop). Measurement note: the
+agent's controlled µs benchmark found graphed ≈ eager for this forward
+— it is small-GEMM EXECUTION-bound, so cuBLAS was the real incumbent;
+the earlier 67→57 s attribution to graphs is partly superseded.
+Remaining rungs if ever needed: a sampling variant for the training
+rollout, skip-idle-row forwards, star-range sharding.
 
 ## Rust sim core (`rust/`, crate `beat-arena-rs`)
 
