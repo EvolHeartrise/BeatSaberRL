@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+import torch.nn.functional as F
 
 # Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
 # env v7 — 16 object slots x 14 features incl. kind flags (bomb, chain
@@ -78,23 +78,37 @@ class Block(nn.Module):
         self.n_heads = n_heads
         self.dh = d // n_heads
 
-    def forward(self, x: torch.Tensor, key_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
+                n_queries: int = 0) -> torch.Tensor:
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
+        #
+        # n_queries > 0 computes the block's output for only the first
+        # n_queries tokens (keys/values still span all T). Because the
+        # attention mask is applied on the KEY dim only, token i's output
+        # never depends on any other token's q/FFN path — so this is
+        # EXACTLY the full block restricted to those rows, not an
+        # approximation. Used by the readout (tokens[:, :2]) to skip the
+        # 16 note tokens' final-block compute (~29% of forward MACs).
         B, T, _ = x.shape
         h = self.ln_attn(x)
-        q, k, v = self.q_proj(h), self.k_proj(h), self.v_proj(h)
+        k, v = self.k_proj(h), self.v_proj(h)
+        if n_queries:
+            x = x[:, :n_queries]
+            h = h[:, :n_queries]
+        q = self.q_proj(h)
+        Tq = q.shape[1]
         if self.n_heads == 1:
-            scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, T, T)
+            scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, Tq, T)
             scores = scores + (key_mask.unsqueeze(1) - 1.0) * 1e9
             x = x + torch.softmax(scores, dim=-1) @ v
         else:
-            q = q.view(B, T, self.n_heads, self.dh).transpose(1, 2)  # (B,H,T,dh)
+            q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
             v = v.view(B, T, self.n_heads, self.dh).transpose(1, 2)
-            scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)      # (B,H,T,T)
+            scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)   # (B,H,Tq,T)
             scores = scores + (key_mask[:, None, None, :] - 1.0) * 1e9
-            att = torch.softmax(scores, dim=-1) @ v                  # (B,H,T,dh)
-            att = att.transpose(1, 2).reshape(B, T, self.d)
+            att = torch.softmax(scores, dim=-1) @ v               # (B,H,Tq,dh)
+            att = att.transpose(1, 2).reshape(B, Tq, self.d)
             x = x + self.out_proj(att)
         x = x + self.ffn(self.ln_ffn(x))
         return x
@@ -129,7 +143,12 @@ class NotePolicy(nn.Module):
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, notes, note_mask
 
-    def forward(self, obs: torch.Tensor):
+    def forward_stacked(self, obs: torch.Tensor):
+        """Trunk + ONE fused (trunk_dim -> 37) head GEMM: stacked logits
+        (B, 12, 3) + value (B,). The 12 per-head Linears + value head
+        stay separate modules (state_dict unchanged); their weights are
+        concatenated per call (13 tiny tensors — negligible next to the
+        13 skinny GEMMs and ~120 Categorical kernels this replaces)."""
         sabers, notes, note_mask = self._split(obs)
         emb = self.note_mlp(notes)                                   # (B, 16, 64)
         B = obs.shape[0]
@@ -139,18 +158,33 @@ class NotePolicy(nn.Module):
         tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 18, 64)
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
-        for blk in self.blocks:
+        for blk in self.blocks[:-1]:
             tokens = blk(tokens, key_mask)
-        h = self.trunk(tokens[:, :2].reshape(B, -1))                 # saber readout
-        return [head(h) for head in self.heads], self.value_head(h).squeeze(-1)
+        # final block: only the 2 readout tokens' outputs are consumed
+        tokens = self.blocks[-1](tokens, key_mask, n_queries=2)
+        h = self.trunk(tokens.reshape(B, -1))                        # saber readout
+        w = torch.cat([hd.weight for hd in self.heads]
+                      + [self.value_head.weight])
+        b = torch.cat([hd.bias for hd in self.heads]
+                      + [self.value_head.bias])
+        out = F.linear(h, w, b)                                      # (B, 37)
+        return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
+
+    def forward(self, obs: torch.Tensor):
+        logits, value = self.forward_stacked(obs)
+        return list(logits.unbind(1)), value
 
     def get_action_and_value(self, obs, action=None):
-        logits, value = self.forward(obs)
-        dists = [Categorical(logits=l) for l in logits]
+        logits, value = self.forward_stacked(obs)                # (B, 12, 3)
+        logsm = torch.log_softmax(logits, dim=-1)
         if action is None:
-            action = torch.stack([d.sample() for d in dists], dim=1)
-        logprob = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
-        entropy = sum(d.entropy() for d in dists)
+            # one multinomial over all B*12 rows — same distribution as 12
+            # per-head Categorical.sample()s, different RNG STREAM (the
+            # same caveat the graphed-rollout capture carried)
+            action = torch.multinomial(
+                logsm.exp().reshape(-1, 3), 1).view(-1, len(HEAD_SIZES))
+        logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
+        entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
         return action, logprob, entropy, value
 
 

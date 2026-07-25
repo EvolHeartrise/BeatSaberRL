@@ -1,15 +1,13 @@
 """Benchmark the PPO minibatch UPDATE (fwd + losses + bwd + clip + Adam)
-across the three update paths, plus peak-memory probes.
+across the update paths, plus peak-memory probes.
 
     python bench_policy_update.py [--mbs 16384 32768] [--ckpt runs/...]
 
-Paths:
+Paths (the graphed columns died with the trainer's CUDA-graphs removal,
+2026-07-25):
   eager    the train_batch.py eager minibatch body (torch autograd)
-  graphed  the same body captured as one CUDA graph (GraphedMinibatchStep
-           — the honest incumbent at production shape)
   fused    --fused-update body: fused fwd/bwd kernels + torch losses +
            Adam over the packed param (policy_cuda.FusedPolicyTrainer)
-  fused+g  the fused body captured as one CUDA graph
 
 Timing: warmup, then best of --reps timed loops of --iters updates
 (cuda-synchronized), reported as ms/update. The updates REALLY step Adam
@@ -35,8 +33,7 @@ import torch.nn as nn
 
 from policy import NotePolicy, OBS_DIM, load_policy
 from policy_cuda import FusedPolicyTrainer
-from train_batch import (GraphedFusedMinibatchStep, GraphedMinibatchStep,
-                         MAX_GRAD_NORM, VF_COEF, fused_minibatch_losses,
+from train_batch import (MAX_GRAD_NORM, VF_COEF, fused_minibatch_losses,
                          pg_loss_fn)
 
 ENT_COEF = 0.01
@@ -129,8 +126,7 @@ def main():
     print(f"best of {args.reps} x {args.iters} updates, ms/update "
           f"(update = fwd + losses + bwd + clip + Adam)\n")
 
-    hdr = (f"{'mb':>7}{'eager':>10}{'graphed':>10}{'fused':>10}"
-           f"{'fused+g':>10}{'vs eager':>10}{'vs graphed':>12}")
+    hdr = f"{'mb':>7}{'eager':>10}{'fused':>10}{'vs eager':>10}"
     print(hdr)
     print("-" * len(hdr))
     mem_rows = []
@@ -143,30 +139,14 @@ def main():
                         args.iters, args.reps)
         mem_eager = peak_mem_mb(lambda: eager_update(pol_e, opt_e, *data))
 
-        pol_g = fresh_policy(src, device)
-        opt_g = torch.optim.Adam(pol_g.parameters(),
-                                 lr=torch.tensor(LR, device=device),
-                                 capturable=True)
-        gstep = GraphedMinibatchStep(pol_g, opt_g, ENT_COEF, n, device)
-        t_graphed = bench(lambda: gstep.step(*data), args.iters, args.reps)
-
         tr = FusedPolicyTrainer(fresh_policy(src, device))
         opt_f = torch.optim.Adam(tr.parameters(), lr=LR)
         t_fused = bench(lambda: fused_update(tr, opt_f, *data),
                         args.iters, args.reps)
         mem_fused = peak_mem_mb(lambda: fused_update(tr, opt_f, *data))
 
-        tr2 = FusedPolicyTrainer(fresh_policy(src, device))
-        opt_f2 = torch.optim.Adam(tr2.parameters(),
-                                  lr=torch.tensor(LR, device=device),
-                                  capturable=True)
-        fgstep = GraphedFusedMinibatchStep(tr2, opt_f2, ENT_COEF, n, device)
-        t_fgraph = bench(lambda: fgstep.step(*data), args.iters, args.reps)
-
-        best_fused = min(t_fused, t_fgraph)
-        print(f"{n:>7}{t_eager:>10.2f}{t_graphed:>10.2f}{t_fused:>10.2f}"
-              f"{t_fgraph:>10.2f}{t_eager / best_fused:>9.2f}x"
-              f"{t_graphed / best_fused:>11.2f}x")
+        print(f"{n:>7}{t_eager:>10.2f}{t_fused:>10.2f}"
+              f"{t_eager / t_fused:>9.2f}x")
         mem_rows.append((n, mem_eager, mem_fused))
 
     print("\npeak memory over resting footprint during ONE update (MB):")
