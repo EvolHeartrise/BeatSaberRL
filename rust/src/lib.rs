@@ -1056,26 +1056,117 @@ impl RawBeatSim {
     }
 }
 
+/// ScoreSaber multiplied-score combo walk (bench-only; the training gym
+/// stays multiplier-free). Mirrors beat_arena_env/scoresaber.py's
+/// ComboTracker exactly — pinned by a cross-implementation test:
+/// promotion (1x/2x/4x/8x, bar 2/4/8 hits) applies to the hit that
+/// fills the bar; a note's cut AND its later post points commit at its
+/// cut-time multiplier; any break (bad cut / miss / bomb) zeroes the
+/// combo, halves the multiplier, resets the bar.
+struct ComboWalk {
+    multiplier: u32,
+    progress: u32,
+    combo: u32,
+    max_combo: u32,
+    breaks: u32,
+    score: f64,
+    note_mult: Vec<u32>, // 0 = not cut yet
+}
+
+impl ComboWalk {
+    fn new(n_objects: usize) -> Self {
+        ComboWalk {
+            multiplier: 1,
+            progress: 0,
+            combo: 0,
+            max_combo: 0,
+            breaks: 0,
+            score: 0.0,
+            note_mult: vec![0; n_objects],
+        }
+    }
+
+    fn progress_needed(m: u32) -> Option<u32> {
+        match m {
+            1 => Some(2),
+            2 => Some(4),
+            4 => Some(8),
+            _ => None, // 8x cap
+        }
+    }
+
+    fn consume(&mut self, note: u32, code: u8, pts: f32) {
+        let i = note as usize;
+        match code {
+            0 => {
+                // good cut: promote-before-commit, pin the multiplier
+                if let Some(need) = Self::progress_needed(self.multiplier) {
+                    self.progress += 1;
+                    if self.progress >= need {
+                        self.multiplier *= 2;
+                        self.progress = 0;
+                    }
+                }
+                self.note_mult[i] = self.multiplier;
+                self.combo += 1;
+                self.max_combo = self.max_combo.max(self.combo);
+                self.score += pts as f64 * self.multiplier as f64;
+            }
+            5 => {
+                // follow-through: the note's cut-time multiplier
+                let m = if self.note_mult[i] == 0 {
+                    self.multiplier
+                } else {
+                    self.note_mult[i]
+                };
+                self.score += pts as f64 * m as f64;
+            }
+            _ => {
+                // slow / angle / wrong_hand / miss / bomb: combo break
+                self.combo = 0;
+                self.breaks += 1;
+                self.multiplier = (self.multiplier / 2).max(1);
+                self.progress = 0;
+            }
+        }
+    }
+}
+
 /// N sims stepped in ONE FFI call per vector step. Chart generation stays
 /// in Python: after any done env, call `set_chart(i, chart)` before the
 /// next `step` (the wrapper in beat_arena_env/vec_env.py handles this).
+/// `combo_walk=True` (bench): each env additionally runs the ScoreSaber
+/// multiplied-score walk over its own ordered events; read with
+/// `combo(i)` BEFORE recycling the env's chart (set_chart resets it).
 #[pyclass]
 struct VecBeatSim {
     sims: Vec<Core>,
+    walks: Option<Vec<ComboWalk>>,
 }
 
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0))]
-    fn new(n: usize, max_steps: u32, effort_coef: f64) -> Self {
+    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false))]
+    fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool) -> Self {
         VecBeatSim {
             sims: (0..n).map(|_| Core::new_core(max_steps, effort_coef)).collect(),
+            walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
         }
     }
 
     fn set_chart(&mut self, i: usize, chart: Vec<ChartTuple>) {
+        let n_objects = chart.len();
         self.sims[i].set_chart_notes(chart);
+        if let Some(walks) = &mut self.walks {
+            walks[i] = ComboWalk::new(n_objects);
+        }
+    }
+
+    /// (multiplied_score, max_combo, breaks) of env i's combo walk.
+    fn combo(&self, i: usize) -> (f64, u32, u32) {
+        let w = &self.walks.as_ref().expect("combo_walk not enabled")[i];
+        (w.score, w.max_combo, w.breaks)
     }
 
     /// Current observation of every env, flat (N*286,) — reshape Python-side.
@@ -1126,6 +1217,9 @@ impl VecBeatSim {
             rewards[i] = r as f32;
             dones[i] = d;
             for (note, code, pts) in events {
+                if let Some(walks) = &mut self.walks {
+                    walks[i].consume(note, code, pts);
+                }
                 all_events.push((i as u32, note, code, pts));
             }
         }
