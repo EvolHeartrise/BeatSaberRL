@@ -37,11 +37,13 @@ def main():
     p.add_argument("--bench", required=True, help="bench results JSON")
     p.add_argument("--tag", required=True, help="replay filename prefix")
     p.add_argument("--top", type=int, default=10)
+    p.add_argument("--sort", choices=["pp", "accuracy"], default="pp",
+                   help="rank plays by pp (default) or by accuracy")
     args = p.parse_args()
 
     bench = json.load(open(args.bench, encoding="utf-8"))
     top = sorted((e for e in bench["levels"] if "skipped" not in e),
-                 key=lambda e: -e["pp"])[:args.top]
+                 key=lambda e: -e[args.sort])[:args.top]
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     policy = load_policy(ckpt).eval()
     made = []

@@ -66,6 +66,21 @@ class _GraphedArgmax(_Graphed):
         return self._run()
 
 
+class _FusedArgmax:
+    """Bench forward via the fused single-launch CUDA kernel
+    (policy_cuda.FusedNotePolicy): logits + stacked argmax in ONE launch,
+    no graph capture needed. Same call contract as _GraphedArgmax."""
+
+    def __init__(self, policy, n, device):
+        from policy_cuda import FusedNotePolicy
+        self.fused = FusedNotePolicy(policy, device)
+        self.s_obs = torch.zeros(n, OBS_DIM, device=device)
+
+    def __call__(self, obs_np):
+        self.s_obs.copy_(torch.from_numpy(obs_np))
+        return self.fused.argmax(self.s_obs)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--ckpt", required=True, help="checkpoint .pt to bench")
@@ -92,6 +107,11 @@ def parse_args():
     p.add_argument("--refresh-catalog", action="store_true")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
+    p.add_argument("--fused-forward", action="store_true",
+                   help="use the fused single-kernel CUDA forward "
+                        "(policy_cuda, JIT-built) for the argmax rollout; "
+                        "falls back to the graphed/eager path if the kernel "
+                        "is unavailable")
     return p.parse_args()
 
 
@@ -274,8 +294,18 @@ def main():
     sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True)
     for i in range(N):
         sim.set_chart(i, [])
-    fwd = (None if args.no_graphs or device.type != "cuda"
-           else _GraphedArgmax(policy, N, device))
+    fwd = None
+    if args.fused_forward and device.type == "cuda":
+        try:                             # JIT build/arch may fail: fall back
+            fwd = _FusedArgmax(policy, N, device)
+            print("[fused-forward] single-launch CUDA forward active",
+                  flush=True)
+        except Exception as e:
+            print(f"[fused-forward] unavailable, falling back: {e}",
+                  flush=True)
+    if fwd is None:
+        fwd = (None if args.no_graphs or device.type != "cuda"
+               else _GraphedArgmax(policy, N, device))
     obs_buf = np.zeros((N, OBS_DIM), dtype=np.float32)
     slots = [None] * N
     free = list(range(N))
