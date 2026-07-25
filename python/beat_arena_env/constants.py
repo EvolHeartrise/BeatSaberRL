@@ -30,7 +30,9 @@ ROW_Y = (0.85, 1.40, 1.90)   # real at-player row centers (m above floor)
 Y_CENTER = 1.40       # obs y normalization: (y - Y_CENTER) / Y_NORM
 REWARD_BAD = -0.5     # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
-REWARD_BOMB = -0.5    # hitting a bomb (passing one is free)
+REWARD_BOMB = -1.5    # hitting a bomb (passing one is free) — env v7.8,
+# user-priced: proxy for the unmodeled combo-multiplier break; -0.5 made
+# bombs the cheapest gym error (12%-eaten equilibrium at any budget)
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 # Good-cut box (matching saber): 0.8 wide x 0.5 tall x 1.0 deep, center

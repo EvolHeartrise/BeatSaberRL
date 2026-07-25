@@ -560,7 +560,8 @@ def test_bomb_hit_and_bomb_pass():
     _set_flat(sim, 1, 0.0, om_roll=-15.0)
     ev, r = _coast(sim)
     assert _codes(ev) == [(0, 6)]
-    assert r == pytest.approx(-0.5)
+    # env v7.8: bombs cost 3x a bad cut/miss (combo-break repricing)
+    assert r == pytest.approx(-1.5)
     assert sim.bombs_hit == 1 and sim.bad_cuts == 0 and sim.n_notes == 0
     # pass: park both arms, let it fly through the miss boundary
     sim = _sim_with_note(bomb)
