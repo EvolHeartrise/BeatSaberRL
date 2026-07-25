@@ -577,6 +577,30 @@ def test_bomb_hit_and_bomb_pass():
     assert sim.status()[0] == 4               # passed clean
 
 
+def test_effort_penalty_tiers():
+    """Env v7.9: each non-coast joint action costs its tier per tick
+    (shoulder > elbow > wrist); coasting is free; effort_coef scales."""
+    from beat_arena_env.constants import EFFORT_COST
+    far = _note(5.0, 3, 1)                      # nothing cuttable this tick
+    sim = _sim_with_note(far)
+    _, r, _, _ = sim.step(list(COAST))
+    assert r == 0.0                             # coast is free
+    a = list(COAST); a[0] = 1                   # left shoulder pitch
+    _, r, _, _ = sim.step(a)
+    assert r == pytest.approx(-EFFORT_COST[0])
+    a = list(COAST); a[10] = 2                  # right wrist roll
+    _, r, _, _ = sim.step(a)
+    assert r == pytest.approx(-EFFORT_COST[4])
+    _, r, _, _ = sim.step([1] * 12)             # everything at once
+    assert r == pytest.approx(-2 * sum(EFFORT_COST))
+    from beat_arena_rs import RawBeatSim
+    from beat_arena_env.chart import note_tuple
+    free = RawBeatSim(max_steps=690, effort_coef=0.0)
+    free.set_chart([note_tuple(far)])
+    _, r, _, _ = free.step([1] * 12)
+    assert r == 0.0                             # coef 0 = free movement
+
+
 def test_bomb_ignores_wide_flat_blade():
     """The bomb hitbox is a small r=0.18 sphere at the center: a blade
     passing 0.38 m above it doesn't trigger."""

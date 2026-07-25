@@ -42,6 +42,13 @@ const REWARD_MISS: f64 = -0.5;
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
 const REWARD_BOMB: f64 = -1.5;
+// env v7.9 (2026-07-24, user-designed): tiered effort cost per non-coast
+// joint action per tick (metabolic proxy — proximal joints move more
+// mass), scaled by effort_coef. Calibrated so one accuracy point
+// (1/115 ~ 0.0087) dwarfs the effort of earning it: a typical played
+// episode's total effort bill is ~0.5-1.0 of a ~+40 return.
+// Per-hand joint order (pitch, yaw, twist, elbow, roll, bend):
+const EFFORT_COST: [f64; N_JOINTS] = [2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4];
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;
@@ -469,6 +476,7 @@ type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
 
 struct Core {
     max_steps: u32,
+    effort_coef: f64, // scales EFFORT_COST (0 = free movement)
     chart: Vec<Note>,
     tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
     // state
@@ -486,9 +494,10 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32) -> Self {
+    fn new_core(max_steps: u32, effort_coef: f64) -> Self {
         Core {
             max_steps,
+            effort_coef,
             chart: Vec::new(),
             tail_s: 0.5,
             tick: 0,
@@ -625,6 +634,17 @@ impl Core {
         // per arm this tick: (swing delta, did the chain continue)
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
+
+        // env v7.9: tiered effort — every non-coast action costs
+        let mut effort = 0.0;
+        for s in 0..2 {
+            for j in 0..N_JOINTS {
+                if actions[s][j] != 0 {
+                    effort += EFFORT_COST[j];
+                }
+            }
+        }
+        reward -= self.effort_coef * effort;
 
         for s in 0..2 {
             let arm = &mut self.arms[s];
@@ -918,10 +938,10 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (max_steps=690))]
-    fn new(max_steps: u32) -> Self {
+    #[pyo3(signature = (max_steps=690, effort_coef=1.0))]
+    fn new(max_steps: u32, effort_coef: f64) -> Self {
         RawBeatSim {
-            core: Core::new_core(max_steps),
+            core: Core::new_core(max_steps, effort_coef),
         }
     }
 
@@ -1047,10 +1067,10 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, max_steps=690))]
-    fn new(n: usize, max_steps: u32) -> Self {
+    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0))]
+    fn new(n: usize, max_steps: u32, effort_coef: f64) -> Self {
         VecBeatSim {
-            sims: (0..n).map(|_| Core::new_core(max_steps)).collect(),
+            sims: (0..n).map(|_| Core::new_core(max_steps, effort_coef)).collect(),
         }
     }
 

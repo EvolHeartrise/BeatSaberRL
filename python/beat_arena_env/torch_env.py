@@ -50,6 +50,7 @@ from .constants import (
     N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT, OBS_DIM, OFF_NOTE_MASK, OFF_NOTES,
     PITCH_LIM, POST_FULL, PRE_FULL, PTS_ACC, PTS_POST, PTS_PRE, REACH_Z,
     PITCH_HI, PITCH_LO,
+    EFFORT_COST,
     REWARD_BAD, REWARD_BOMB, REWARD_MISS, ROLL_HI, ROLL_LO, SABER_LEN,
     SCORE_MAX, SHOULDER, SWING_BREAK, TWIST_HI, TWIST_LIM, TWIST_LO,
     V_MIN_CUT, V_NORM,
@@ -273,7 +274,7 @@ class TorchBeatVecEnv:
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, seed=0,
+                 bomb_prob=0.125, seed=0, effort_coef=1.0,
                  charts=None, chart_pool=1024, max_steps=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
@@ -338,6 +339,9 @@ class TorchBeatVecEnv:
                                  device=self.device, dtype=dtype)
         self._alpha = torch.tensor(JOINT_ALPHA, device=self.device, dtype=dtype)
         self._omega = torch.tensor(JOINT_OMEGA, device=self.device, dtype=dtype)
+        # env v7.9: tiered effort cost per non-coast action, pre-scaled
+        self._effort = effort_coef * torch.tensor(
+            EFFORT_COST, device=self.device, dtype=dtype)
         # per-hand per-joint limits, broadcast over (N, 2, 6)
         self._q_lo = torch.tensor(
             [[PITCH_LO, YAW_LO[h], TWIST_LO[h], 0.0, ROLL_LO[h], -BEND_LIM]
@@ -446,6 +450,8 @@ class TorchBeatVecEnv:
             actions = torch.as_tensor(np.asarray(actions), device=self.device)
         actions = actions.to(self.device).long().view(
             self.num_envs, 2, N_JOINTS)
+        # env v7.9: tiered effort — every non-coast action costs
+        effort = ((actions != 0).to(self.dtype) * self._effort).sum((1, 2))
         prev_pos = self.wrist.clone()
         prev_dir = self.blade.clone()
 
@@ -490,7 +496,7 @@ class TorchBeatVecEnv:
             PTS_POST * (acc_new / POST_FULL).clamp(max=1.0) + 0.5)
             * self.tr_cnt.to(self.dtype))
         post_paid = (post_pts * resolve.to(self.dtype)).sum((1, 2))  # (N,)
-        reward = post_paid / SCORE_MAX
+        reward = post_paid / SCORE_MAX - effort
         self.score = self.score + post_paid
         self.tr_acc, self.tr_age = acc_new, age_new
         self.tr_active = self.tr_active & ~resolve

@@ -28,6 +28,7 @@ def main():
     p.add_argument("--extra-prob", type=float, default=0.125)
     p.add_argument("--dot-prob", type=float, default=0.1)
     p.add_argument("--bomb-prob", type=float, default=0.125)
+    p.add_argument("--effort-coef", type=float, default=1.0)
     args = p.parse_args()
 
     cfg = ChartConfig(colors=args.colors,
@@ -44,7 +45,7 @@ def main():
     for ep in range(args.episodes):
         rng = np.random.default_rng(args.seed0 + ep)
         env = RustBeatEnv(external_chart=generate_chart(cfg, rng),
-                          seed=args.seed0 + ep)
+                          effort_coef=args.effort_coef, seed=args.seed0 + ep)
         obs, _ = env.reset()
         done, ret = False, 0.0
         while not done:

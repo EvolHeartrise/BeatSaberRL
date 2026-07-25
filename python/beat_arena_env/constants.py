@@ -33,6 +33,10 @@ REWARD_MISS = -0.5
 REWARD_BOMB = -1.5    # hitting a bomb (passing one is free) — env v7.8,
 # user-priced: proxy for the unmodeled combo-multiplier break; -0.5 made
 # bombs the cheapest gym error (12%-eaten equilibrium at any budget)
+# env v7.9 (user-designed): tiered effort cost per non-coast joint action
+# per tick (metabolic proxy — proximal joints move more mass), scaled by
+# the env's effort_coef. Per-hand joint order (pitch..bend):
+EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4)
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 # Good-cut box (matching saber): 0.8 wide x 0.5 tall x 1.0 deep, center
