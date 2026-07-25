@@ -49,7 +49,8 @@ def _rust_episode(chart, policy):
         rews.append(r)
     return acts, obs_l, rews, (info["good_cuts"], info["bad_cuts"],
                                info["misses"], info["bombs_hit"],
-                               info["score"])
+                               info["score"], info["score_pre"],
+                               info["score_acc"], info["score_post"])
 
 
 def _cuda_episode(chart, actions, dtype):
@@ -65,7 +66,9 @@ def _cuda_episode(chart, actions, dtype):
             done_at = i
             break
     counters = (int(env.good[0]), int(env.bad[0]), int(env.miss[0]),
-                int(env.bombs[0]), float(env.score[0]))
+                int(env.bombs[0]), float(env.score[0]),
+                float(env.score_pre[0]), float(env.score_acc[0]),
+                float(env.score_post[0]))
     return obs_l, rews, done_at, counters
 
 
@@ -91,6 +94,9 @@ def test_parity_exact_f64(cfg_kw, pol, seed):
     assert done_at == len(acts) - 1, "episode length differs"
     assert t_cnt[:4] == r_cnt[:4], f"counters differ: cuda {t_cnt} rust {r_cnt}"
     assert t_cnt[4] == pytest.approx(r_cnt[4], abs=1e-6)
+    # score decomposition (pre/acc/post) must agree exactly too
+    for k in (5, 6, 7):
+        assert t_cnt[k] == pytest.approx(r_cnt[k], abs=1e-6)
     np.testing.assert_allclose(t_rews, r_rews, atol=1e-9)
     for k, (to, ro) in enumerate(zip(t_obs[:-1], r_obs[:-1])):
         np.testing.assert_allclose(to, ro, atol=1e-6,

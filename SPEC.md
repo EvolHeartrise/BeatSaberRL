@@ -608,8 +608,16 @@ injected per episode via `set_chart` (env v7 tuples: `(t, x, y, color,
 angle, speed, any_dir, kind, free_pre, free_post)`).
 `RawBeatSim.step(actions)` (12 ints, per hand pitch/yaw/twist/elbow/
 roll/bend) returns `(obs, reward, done, events)` — events = `(note_idx,
-code, points)` with codes 0 ok / 1 slow / 2 angle / 3 wrong_hand /
-4 miss / 5 post (follow-through resolution) / 6 bomb hit — plus getters
+code, points, pre_pts, acc_pts)` with codes 0 ok / 1 slow / 2 angle /
+3 wrong_hand / 4 miss / 5 post (follow-through resolution) / 6 bomb
+hit; **the component split (2026-07-25, user-directed)**: a good cut's
+points = pre + acc (+30 on arc-headed free_post grants; links/posts/
+errors carry zeros), and all three sims track per-episode
+`score_pre/score_acc/score_post` totals (Rust `score_components()` /
+`VecBeatSim.components(i)`; torch/CUDA env tensors; f64-parity-pinned
+across all three; replay cut events carry `pre`/`acc`; eval_ckpt
+prints the per-note decomposition; bench level entries carry the
+totals) — plus getters
 `sabers()` (per hand `q(6) ++ om(6) ++ wrist(3)`), `blades()` (unit
 blade dirs), `status()` (0 pending / 1 good / 2 bad·bomb-hit / 3 missed
 / 4 bomb passed), `bombs_hit`, `n_notes` (scoreable, bombs excluded),

@@ -159,6 +159,10 @@ class CudaBeatVecEnv:
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
         self.miss = z(N, dt=torch.int32); self.bombs = z(N, dt=torch.int32)
         self.score = z(N)
+        # score decomposition (2026-07-25): pre/acc/post point totals
+        self.score_pre = z(N)
+        self.score_acc = z(N)
+        self.score_post = z(N)
         self.chart_idx = z(N, dt=torch.int64)
         # episode-return ring buffer (device-side)
         self._cap = 4096
@@ -178,6 +182,7 @@ class CudaBeatVecEnv:
             self.tr_acc, self.tr_age, self.tr_cnt, self.tr_active,
             self.tr_ptr, self.tick, self.status, self.ep_return,
             self.good, self.bad, self.miss, self.bombs, self.score,
+            self.score_pre, self.score_acc, self.score_post,
             self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],

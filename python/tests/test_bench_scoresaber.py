@@ -307,7 +307,7 @@ def test_vectorized_events_match_serial():
     while not all(c is not None for c in counters):
         _, _, dones, events = vec.step(
             np.ascontiguousarray(acts[t], dtype=np.int64))
-        for i, note, code, pts in events:
+        for i, note, code, pts, _pre, _acc in events:
             if counters[i] is None:
                 ev = (int(note), EVENT_REASONS[code], float(pts))
                 walks[i].consume([ev])
@@ -352,7 +352,7 @@ def test_rust_combo_walk_matches_python():
     while not all(r is not None for r in rust_result):
         _, _, dones, events = vec.step(
             np.ascontiguousarray(acts[t], dtype=np.int64))
-        for i, note, code, pts in events:
+        for i, note, code, pts, _pre, _acc in events:
             if rust_result[i] is None:
                 py[i].consume([(note, EVENT_REASONS[code], pts)])
         for i in range(2):

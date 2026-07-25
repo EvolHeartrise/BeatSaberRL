@@ -89,7 +89,7 @@ def _coast(sim):
 
 
 def _codes(events):
-    return [(i, c) for i, c, _ in events]
+    return [(i, c) for i, c, *_ in events]
 
 
 # --- kinematics mirror -------------------------------------------------------
@@ -456,6 +456,14 @@ def test_full_swing_scores_full_pre_and_post():
     assert cuts[0][2] >= 70.0            # full pre-swing banked
     assert posts[0][2] == pytest.approx(30.0)  # full follow-through
     assert sim.score >= 100.0
+    # component split (2026-07-25): event carries (points, pre, acc);
+    # the sim's decomposition getters agree with the events
+    assert cuts[0][3] == pytest.approx(70.0)         # pre component
+    assert cuts[0][2] == cuts[0][3] + cuts[0][4]     # points = pre + acc
+    pre, acc, post = sim.score_components()
+    assert pre == pytest.approx(70.0)
+    assert post == pytest.approx(30.0)
+    assert pre + acc + post == pytest.approx(sim.score)
 
 
 def test_dot_note_scores_from_any_direction():
@@ -881,6 +889,13 @@ def test_recording_roundtrip(tmp_path):
     goods = sum(1 for t in ticks for e in t["events"]
                 if "cut" in e and e["cut"]["good"])
     assert goods == info["good_cuts"]
+    # good cuts carry the component split; points = pre + acc except
+    # arc-headed free_post grants (+30 paid at the cut tick)
+    for t in ticks:
+        for e in t["events"]:
+            if "cut" in e and e["cut"]["good"]:
+                c = e["cut"]
+                assert c["points"] - (c["pre"] + c["acc"]) in (0.0, 20.0, 30.0)
     assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 15
                for t in ticks)
     assert all(len(t["action"]) == 12 for t in ticks)

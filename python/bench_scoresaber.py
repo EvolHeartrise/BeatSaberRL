@@ -188,6 +188,10 @@ def finish_slot(slot, info, combo):
         "misses": info["misses"], "bombs_hit": info["bombs_hit"],
         "highest_combo": max_combo,
         "full_combo": breaks == 0 and info["good_cuts"] == info["n_notes"],
+        # unmultiplied score decomposition (2026-07-25): per-band
+        # component analyses come free from the results file
+        "score_pre": info["score_pre"], "score_acc": info["score_acc"],
+        "score_post": info["score_post"],
     }
 
 
@@ -335,9 +339,12 @@ def main():
                     continue
                 combo = sim.combo(i)             # BEFORE set_chart resets it
                 g, b, m, n_scoreable, _, bombs = sim.counters(i)
+                c_pre, c_acc, c_post = sim.components(i)
                 result = finish_slot(s, {
                     "good_cuts": g, "bad_cuts": b, "misses": m,
-                    "n_notes": n_scoreable, "bombs_hit": bombs}, combo)
+                    "n_notes": n_scoreable, "bombs_hit": bombs,
+                    "score_pre": c_pre, "score_acc": c_acc,
+                    "score_post": c_post}, combo)
                 levels[result["leaderboard_id"]] = result
                 n_done += 1
                 n_finished += 1
