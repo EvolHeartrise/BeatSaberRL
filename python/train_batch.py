@@ -69,7 +69,15 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
     p.add_argument("--run-dir", type=str, default=None)
-    p.add_argument("--init-from", type=str, default=None)
+    p.add_argument("--init-from", type=str, default=None,
+                   help="warm-start WEIGHTS only; fresh optimizer + schedule")
+    p.add_argument("--resume", type=str, default=None,
+                   help="EXACT resume from a checkpoint of this trainer: "
+                        "restores weights, Adam state, and the original LR "
+                        "schedule position (lr/lr-final/lr-decay/total-steps "
+                        "come from the checkpoint, CLI values ignored). The "
+                        "env/chart stream restarts fresh — only the "
+                        "optimization state is exact.")
     p.add_argument("--bench", action="store_true",
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
@@ -107,10 +115,35 @@ def cpu_state(policy):
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
 
 
+def cpu_opt_state(opt):
+    """Adam state_dict with tensors on CPU (load_state_dict moves them
+    back to the params' device on resume)."""
+    s = opt.state_dict()
+    s["state"] = {k: {kk: (vv.detach().cpu() if torch.is_tensor(vv) else vv)
+                      for kk, vv in st.items()}
+                  for k, st in s["state"].items()}
+    return s
+
+
 def main():
     args = parse_args()
     if args.bench:
         args.total_steps = args.num_envs * args.horizon * 4
+    resume_ckpt = None
+    if args.resume:
+        assert not args.init_from, "--resume and --init-from are exclusive"
+        resume_ckpt = torch.load(args.resume, map_location="cpu",
+                                 weights_only=True)
+        if "optimizer" not in resume_ckpt:
+            raise SystemExit(
+                "--resume needs a checkpoint carrying optimizer + schedule "
+                "state (saved by this trainer version); older checkpoints "
+                "can only be --init-from warm-starts")
+        sched = resume_ckpt["schedule"]
+        args.lr, args.lr_final = sched["lr"], sched["lr_final"]
+        args.lr_decay = sched["lr_decay"]
+        if args.run_dir is None:      # continue in the checkpoint's run dir
+            args.run_dir = os.path.dirname(os.path.abspath(args.resume))
     if args.run_dir is None:
         args.run_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -146,7 +179,9 @@ def main():
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             seed=args.seed)
 
-    if args.init_from:
+    if resume_ckpt is not None:
+        policy = load_policy(resume_ckpt)
+    elif args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
         policy = load_policy(ckpt)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",
@@ -158,6 +193,8 @@ def main():
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    if resume_ckpt is not None:
+        opt.load_state_dict(resume_ckpt["optimizer"])
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
@@ -169,15 +206,25 @@ def main():
     b_val = torch.zeros((T, N), device=device)
 
     ep_returns = []
-    num_updates = max(1, args.total_steps // batch)
-    global_step = 0
+    if resume_ckpt is not None:
+        num_updates = resume_ckpt["schedule"]["num_updates"]
+        start_update = resume_ckpt["update"]
+        global_step = resume_ckpt["global_step"]
+        print(f"RESUMED {args.resume} at update {start_update}/{num_updates} "
+              f"(step {global_step:,}; lr/schedule/Adam state restored; "
+              f"env stream fresh)", flush=True)
+    else:
+        num_updates = max(1, args.total_steps // batch)
+        start_update = 0
+        global_step = 0
+    steps_before = global_step
     t_rollout = t_update = 0.0
     start = time.time()
 
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
           f"minibatch {mb_size}, device {device} ===", flush=True)
 
-    for update in range(num_updates):
+    for update in range(start_update, num_updates):
         if args.lr_decay != "none":
             frac = update / max(1, num_updates - 1)
             if args.lr_decay == "cosine":
@@ -252,7 +299,7 @@ def main():
 
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
         elapsed = time.time() - start
-        rate = global_step / elapsed
+        rate = (global_step - steps_before) / elapsed
         print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
               f"ep_return(last100) {recent:8.3f}  ent {ent_loss.item():.3f}  "
               f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
@@ -261,7 +308,11 @@ def main():
             torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                         "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
-                        "recent_return": float(recent)},
+                        "recent_return": float(recent),
+                        "optimizer": cpu_opt_state(opt),
+                        "schedule": {"lr": args.lr, "lr_final": args.lr_final,
+                                     "lr_decay": args.lr_decay,
+                                     "num_updates": num_updates}},
                        os.path.join(args.run_dir, f"ckpt_upd{update+1:04d}.pt"))
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)
@@ -271,10 +322,14 @@ def main():
     torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                 "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
-                "recent_return": float(recent)},
+                "recent_return": float(recent),
+                "optimizer": cpu_opt_state(opt),
+                "schedule": {"lr": args.lr, "lr_final": args.lr_final,
+                             "lr_decay": args.lr_decay,
+                             "num_updates": num_updates}},
                os.path.join(args.run_dir, "final.pt"))
     tot = t_rollout + t_update
-    print(f"THROUGHPUT: {global_step / (time.time() - start):,.0f} steps/s total | "
+    print(f"THROUGHPUT: {(global_step - steps_before) / (time.time() - start):,.0f} steps/s total | "
           f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% | "
           f"N={N} T={T}", flush=True)
 
