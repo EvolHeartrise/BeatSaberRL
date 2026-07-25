@@ -509,7 +509,22 @@ rollout forward+sampling (graph-safe Philox RNG) — measured on the
 GTX 1080: **+6% at the production config N=4096** (32k minibatches are
 compute-bound, not launch-bound — wide batches already amortize
 launches) but **+14/+26% at N=512**; checkpoints normalize to the
-eager form and load either way. Batch = num_envs×horizon;
+eager form and load either way. **`--env cuda` (2026-07-25,
+user-ordered, subagent-built): a custom CUDA-kernel sim**
+(`beat_arena_env/cuda_env.py` + `csrc/beat_arena_cuda.cu`, JIT-built
+via torch cpp_extension for sm_61; needs the CUDA 12.6 toolkit —
+found at `D:\Cuda-12-6` — and VS2022) — ONE kernel launch per vector
+step (block per env, 64 threads; note-ordered reward accumulation for
+bitwise reproducibility; the torch env's aggregated tracker ring;
+chart-pool indices so reset copies nothing). A deliberate THIRD sim
+implementation: Rust stays the reference; parity suite mirrors the
+torch env's (f64 EXACT on all six config×policy cases, f32 bounded;
+`tests/test_cuda_env.py`; suite 97 green). Measured: env step
+**~170× the torch env** (5.8M steps/s at N=4096), end-to-end
+**1.65×** (13.6k → 22.5k steps/s; 24.6k with --cuda-graphs) — the
+Amdahl cap: rollout share fell 49% → 14% (10% with graphs) and the
+env is now ~3% of rollout; the wall is the update path (86-90%).
+Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
 
