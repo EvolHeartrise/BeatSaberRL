@@ -502,7 +502,14 @@ moments, schedule position — lr/lr-final/lr-decay/num_updates come from
 the checkpoint, CLI values ignored; the env/chart stream restarts
 fresh, so only the optimization state is exact). `--init-from` remains
 the weights-only warm-start with a fresh schedule; older checkpoints
-without optimizer state are --init-from only. Batch = num_envs×horizon;
+without optimizer state are --init-from only. `--cuda-graphs` captures
+the whole minibatch update (fwd+bwd+clip+Adam, capturable Adam with a
+tensor lr) as one CUDA graph, `--cuda-graphs-rollout` additionally the
+rollout forward+sampling (graph-safe Philox RNG) — measured on the
+GTX 1080: **+6% at the production config N=4096** (32k minibatches are
+compute-bound, not launch-bound — wide batches already amortize
+launches) but **+14/+26% at N=512**; checkpoints normalize to the
+eager form and load either way. Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
 

@@ -9,6 +9,12 @@ NOTE on science: changing num_envs changes the optimization regime
 (updates-per-sample, minibatch size). Throughput comparisons are clean;
 learning-curve comparisons across different batch shapes are NOT
 apples-to-apples without retuning (LR, epochs).
+
+On GPU both halves are LAUNCH-overhead-bound (107k-param policy, ~100
+tiny kernels per forward): --cuda-graphs captures the whole minibatch
+update (fwd+bwd+clip+Adam) as one CUDA graph, and --cuda-graphs-rollout
+additionally captures the rollout forward + sampling. Runtime feature,
+Pascal-safe (no Triton/compile); flag off = the eager path unchanged.
 """
 
 from __future__ import annotations
@@ -49,6 +55,112 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     return loss.mean(), frac_active
 
 
+_GRAPH_WARMUP = 3  # eager iterations before capture (torch's documented recipe)
+
+
+class _Graphed:
+    """CUDA-graph capture driver (the torch.cuda.graphs protocol):
+    subclasses copy their inputs into static buffers and call _run(),
+    which runs _GRAPH_WARMUP eager iterations on a side stream, then
+    captures _compute() into a CUDAGraph, then replays it forever.
+    _out holds the outputs (static tensors once captured)."""
+
+    def __init__(self):
+        self.graph = None
+        self._out = None
+        self._iters = 0
+        self._side = torch.cuda.Stream()
+
+    def _compute(self):
+        raise NotImplementedError
+
+    def _run(self):
+        if self.graph is not None:
+            self.graph.replay()
+        elif self._iters < _GRAPH_WARMUP:
+            self._side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._side):
+                self._out = self._compute()
+            torch.cuda.current_stream().wait_stream(self._side)
+            self._iters += 1
+        else:
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):  # records, does NOT execute
+                self._out = self._compute()
+            self.graph.replay()
+        return self._out
+
+
+class GraphedMinibatchStep(_Graphed):
+    """The whole PPO minibatch update — forward + losses + backward +
+    grad clip + Adam step — as ONE CUDA graph. Warmup iterations are
+    REAL optimization steps on the real minibatches (same math, side
+    stream), so training semantics match the eager path throughout.
+    Requires Adam(capturable=True) with a tensor lr the schedule mutates
+    in place. Returns the entropy loss (static tensor after capture)."""
+
+    def __init__(self, policy, opt, ent_coef, mb_size, device):
+        super().__init__()
+        self.policy, self.opt, self.ent_coef = policy, opt, ent_coef
+        self.s_obs = torch.zeros(mb_size, OBS_DIM, device=device)
+        self.s_act = torch.zeros(mb_size, A_DIM, dtype=torch.long,
+                                 device=device)
+        self.s_logp = torch.zeros(mb_size, device=device)
+        self.s_adv = torch.zeros(mb_size, device=device)
+        self.s_ret = torch.zeros(mb_size, device=device)
+
+    def _compute(self):
+        # the eager minibatch body, verbatim, over the static buffers
+        # (set_to_none=False keeps .grad tensors at fixed addresses)
+        self.opt.zero_grad(set_to_none=False)
+        _, newlogp, entropy, newval = self.policy.get_action_and_value(
+            self.s_obs, self.s_act)
+        ratio = (newlogp - self.s_logp).exp()
+        a_mb = (self.s_adv - self.s_adv.mean()) / (self.s_adv.std() + 1e-8)
+        pg_loss, _ = pg_loss_fn(ratio, a_mb)
+        v_loss = 0.5 * ((newval - self.s_ret) ** 2).mean()
+        ent_loss = entropy.mean()
+        loss = pg_loss - self.ent_coef * ent_loss + VF_COEF * v_loss
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), MAX_GRAD_NORM)
+        self.opt.step()
+        # detach: returning ent_loss with its grad_fn would keep each
+        # warmup iteration's autograd graph (and its side-stream
+        # AccumulateGrad nodes) alive into capture — a stream mismatch
+        return ent_loss.detach()
+
+    def step(self, obs, act, logp, adv, ret):
+        self.s_obs.copy_(obs)
+        self.s_act.copy_(act)
+        self.s_logp.copy_(logp)
+        self.s_adv.copy_(adv)
+        self.s_ret.copy_(ret)
+        return self._run()
+
+
+class GraphedRolloutForward(_Graphed):
+    """policy.get_action_and_value (forward + per-head multinomial
+    sampling) over the fixed (N, obs) rollout batch as one CUDA graph.
+    Sampling captures via torch's graph-safe Philox RNG: each replay
+    advances the generator offset, so replays draw fresh actions (the
+    random STREAM differs from eager sampling; the distribution and the
+    on-policy math do not)."""
+
+    def __init__(self, policy, num_envs, device):
+        super().__init__()
+        self.policy = policy
+        self.s_obs = torch.zeros(num_envs, OBS_DIM, device=device)
+
+    def _compute(self):
+        with torch.no_grad():
+            a, logp, _, v = self.policy.get_action_and_value(self.s_obs)
+        return a, logp, v
+
+    def __call__(self, obs):
+        self.s_obs.copy_(obs)
+        return self._run()
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--num-envs", type=int, default=128)
@@ -86,6 +198,14 @@ def parse_args():
                    help="torch = GPU-resident sim (obs born on device)")
     p.add_argument("--chart-pool", type=int, default=1024,
                    help="pregenerated chart pool size for --env torch")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="capture the PPO minibatch update (fwd+bwd+clip+Adam) "
+                        "as one CUDA graph — kills per-kernel launch overhead "
+                        "(the 107k-param update is launch-bound). Runtime "
+                        "feature, Pascal-safe; off = the eager path unchanged")
+    p.add_argument("--cuda-graphs-rollout", action="store_true",
+                   help="with --cuda-graphs: also capture the rollout "
+                        "forward + action sampling (graph-safe Philox RNG)")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
     p.add_argument("--embed", type=int, default=64)
     p.add_argument("--trunk-dim", type=int, default=128)
@@ -120,11 +240,18 @@ def cpu_state(policy):
 
 def cpu_opt_state(opt):
     """Adam state_dict with tensors on CPU (load_state_dict moves them
-    back to the params' device on resume)."""
+    back to the params' device on resume). --cuda-graphs runs use a
+    capturable Adam with a tensor lr; normalize both back to the plain
+    eager form so checkpoints stay loadable either way (no-op for eager
+    runs — lr is already a float and capturable already False)."""
     s = opt.state_dict()
     s["state"] = {k: {kk: (vv.detach().cpu() if torch.is_tensor(vv) else vv)
                       for kk, vv in st.items()}
                   for k, st in s["state"].items()}
+    s["param_groups"] = [
+        {**g, "lr": (float(g["lr"]) if torch.is_tensor(g["lr"]) else g["lr"]),
+         "capturable": False}
+        for g in s["param_groups"]]
     return s
 
 
@@ -161,6 +288,17 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
+    if args.cuda_graphs_rollout:
+        assert args.cuda_graphs, "--cuda-graphs-rollout needs --cuda-graphs"
+    if args.cuda_graphs:
+        assert device.type == "cuda", "--cuda-graphs needs a CUDA device"
+        assert batch % args.minibatches == 0, (
+            "--cuda-graphs captures a fixed minibatch shape: num_envs x "
+            "horizon must divide evenly by --minibatches")
+        # distributions arg validation host-syncs (support checks) — illegal
+        # inside graph capture; the math is unchanged without it
+        torch.distributions.Distribution.set_default_validate_args(False)
+
     torch_env = args.env == "torch"
     if torch_env:
         from beat_arena_env.torch_env import TorchBeatVecEnv
@@ -196,9 +334,23 @@ def main():
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
-    opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    if args.cuda_graphs:
+        # graph replay re-runs recorded kernels, so Adam must READ its
+        # hyperparams from device memory: capturable Adam + a tensor lr
+        # the schedule fills in place (never rebinds)
+        opt = torch.optim.Adam(policy.parameters(),
+                               lr=torch.tensor(args.lr, device=device),
+                               capturable=True)
+    else:
+        opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
     if resume_ckpt is not None:
         opt.load_state_dict(resume_ckpt["optimizer"])
+        if args.cuda_graphs:  # checkpoints store the plain eager form
+            for g in opt.param_groups:
+                g["capturable"] = True
+                g["lr"] = torch.tensor(float(g["lr"]), device=device)
+            for st in opt.state.values():
+                st["step"] = st["step"].to(device)
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
@@ -208,6 +360,13 @@ def main():
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
     b_val = torch.zeros((T, N), device=device)
+
+    g_update = g_rollout = None
+    if args.cuda_graphs:
+        g_update = GraphedMinibatchStep(policy, opt, args.ent_coef,
+                                        mb_size, device)
+        if args.cuda_graphs_rollout:
+            g_rollout = GraphedRolloutForward(policy, N, device)
 
     ep_returns = []
     if resume_ckpt is not None:
@@ -236,13 +395,20 @@ def main():
                     1.0 + math.cos(math.pi * frac))
             else:
                 lr_now = args.lr + (args.lr_final - args.lr) * frac
-            for g in opt.param_groups:
-                g["lr"] = lr_now
+            if args.cuda_graphs:
+                for g in opt.param_groups:
+                    g["lr"].fill_(lr_now)  # in place: captured kernels read it
+            else:
+                for g in opt.param_groups:
+                    g["lr"] = lr_now
         t0 = time.perf_counter()
         for t in range(T):
             b_obs[t] = obs
-            with torch.no_grad():
-                a, logp, _, v = policy.get_action_and_value(obs)
+            if g_rollout is not None:
+                a, logp, v = g_rollout(obs)
+            else:
+                with torch.no_grad():
+                    a, logp, _, v = policy.get_action_and_value(obs)
             b_act[t], b_logp[t], b_val[t] = a, logp, v
             if torch_env:
                 nobs, rew, done, infos = venv.step(a)
@@ -264,7 +430,10 @@ def main():
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            _, _, _, next_val = policy.get_action_and_value(obs)
+            if g_rollout is not None:
+                _, _, next_val = g_rollout(obs)
+            else:
+                _, _, _, next_val = policy.get_action_and_value(obs)
             adv = torch.zeros((T, N), device=device)
             lastgae = torch.zeros(N, device=device)
             for t in reversed(range(T)):
@@ -286,6 +455,10 @@ def main():
             np.random.shuffle(idx)
             for s in range(0, batch, mb_size):
                 mb = torch.as_tensor(idx[s:s + mb_size], device=device)
+                if g_update is not None:
+                    ent_loss = g_update.step(
+                        f_obs[mb], f_act[mb], f_logp[mb], f_adv[mb], f_ret[mb])
+                    continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     f_obs[mb], f_act[mb])
                 ratio = (newlogp - f_logp[mb]).exp()
