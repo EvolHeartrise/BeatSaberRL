@@ -479,10 +479,16 @@ Batched PPO: `BeatVecEnv` (N Rust envs, one FFI call per vector step),
 one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 (ε=0.2, c=3), ent 0.01, vf 0.5, Adam 3e-4, grad clip 0.5. Flags:
 `--num-envs --horizon --minibatches --epochs --total-steps --time-cap
---ent-coef --seed --ckpt-every --run-dir --init-from --bench` + env
-config (`--colors --cols --rows --chart-len --note-speed-min
+--ent-coef --seed --ckpt-every --run-dir --init-from --resume --bench`
++ env config (`--colors --cols --rows --chart-len --note-speed-min
 --note-speed-max --note-prob --extra-prob --dot-prob --bomb-prob`).
-Batch = num_envs×horizon;
+Checkpoints since 2026-07-24 carry Adam state + the LR-schedule anchors:
+`--resume <ckpt>` continues a stopped run EXACTLY (weights, optimizer
+moments, schedule position — lr/lr-final/lr-decay/num_updates come from
+the checkpoint, CLI values ignored; the env/chart stream restarts
+fresh, so only the optimization state is exact). `--init-from` remains
+the weights-only warm-start with a fresh schedule; older checkpoints
+without optimizer state are --init-from only. Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
 
