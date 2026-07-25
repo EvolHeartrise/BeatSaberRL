@@ -196,7 +196,15 @@ checkpoints/replays retire (hard replace).
   two very different policies equilibrated at ~12% bombs eaten,
   budget-invariant). A bomb passing by is free and silent. A
   rotation-free "stab" scores only accuracy (≤ 15/115) — swinging is
-  the game.
+  the game. **Effort cost (env v7.9, 2026-07-24, user-designed)**:
+  every non-coast joint action costs its tier per tick — shoulder
+  pitch/yaw/twist `2e-4`, elbow `1.3e-4`, wrist roll/bend `0.7e-4`
+  (`EFFORT_COST`), scaled by the env's `effort_coef` (default 1.0;
+  0 = free movement). A metabolic proxy (proximal joints move more
+  mass): calibrated so one accuracy point (1/115 ≈ 0.0087) dwarfs the
+  effort of earning it — a typical played episode's total effort is
+  ~0.5-1.0 against a ~+40 return; stillness becomes the cheap default
+  once scoring saturates.
 - **Miss**: the object passes `z < −Z_MISS = 0.65` m uncut — the HEAD
   plane. **DELIBERATE DEVIATION from the real game** (which judges
   misses at despawn ~2 m behind the head; v7.0-v7.2 used 2.65),

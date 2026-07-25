@@ -30,7 +30,8 @@ class RustBeatEnv(gym.Env):
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, external_chart=None, seed=0):
+                 bomb_prob=0.125, effort_coef=1.0, external_chart=None,
+                 seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
         self.cfg = ChartConfig(
@@ -52,7 +53,8 @@ class RustBeatEnv(gym.Env):
             max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 90
         else:
             max_steps = int(chart_len_s * 30) + 90
-        self.sim = RawBeatSim(max_steps=max_steps)
+        self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef)
+        self.effort_coef = effort_coef
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )
@@ -77,6 +79,7 @@ class RustBeatEnv(gym.Env):
                 "extra_prob": self.cfg.extra_prob,
                 "dot_prob": self.cfg.dot_prob,
                 "bomb_prob": self.cfg.bomb_prob,
+                "effort_coef": self.effort_coef,
             },
             # env v7: explicit world positions (meters), object kinds and
             # arc grants; the viewer derives everything from these

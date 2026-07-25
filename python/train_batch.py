@@ -107,6 +107,9 @@ def parse_args():
                    help="P(a generated note turns into a dot)")
     p.add_argument("--bomb-prob", type=float, default=0.125,
                    help="P(bomb) per generation tick")
+    p.add_argument("--effort-coef", type=float, default=1.0,
+                   help="scales the tiered per-joint effort cost "
+                        "(EFFORT_COST; 0 = free movement)")
     return p.parse_args()
 
 
@@ -168,6 +171,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
+            effort_coef=args.effort_coef,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -177,7 +181,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            seed=args.seed)
+            effort_coef=args.effort_coef, seed=args.seed)
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt)

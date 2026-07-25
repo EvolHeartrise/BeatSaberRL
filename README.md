@@ -50,7 +50,9 @@ cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 Difficulty dials (generator v2, SPEC §Chart generation): `--colors both`
 doubles the note stream; per-tick probabilities `--note-prob 0.25
 --extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
-the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`.
+the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. Since env
+v7.9 non-coast joint actions pay a tiny tiered effort cost
+(`--effort-coef` scales it; 0 = off).
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
 

@@ -46,6 +46,7 @@ def parse_args():
     p.add_argument("--extra-prob", type=float, default=0.125)
     p.add_argument("--dot-prob", type=float, default=0.1)
     p.add_argument("--bomb-prob", type=float, default=0.125)
+    p.add_argument("--effort-coef", type=float, default=1.0)
     return p.parse_args()
 
 
@@ -57,7 +58,8 @@ def main():
               note_speed_min=args.note_speed_min,
               note_speed_max=args.note_speed_max,
               note_prob=args.note_prob, extra_prob=args.extra_prob,
-              dot_prob=args.dot_prob, bomb_prob=args.bomb_prob)
+              dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
+              effort_coef=args.effort_coef)
 
     policy = None
     if args.ckpt:
