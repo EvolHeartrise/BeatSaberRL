@@ -194,10 +194,12 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
-    p.add_argument("--env", choices=["rust", "torch"], default="rust",
-                   help="torch = GPU-resident sim (obs born on device)")
+    p.add_argument("--env", choices=["rust", "torch", "cuda"], default="rust",
+                   help="torch = GPU-resident tensor sim; cuda = custom "
+                        "CUDA-kernel sim (one launch per step); both keep "
+                        "obs on device")
     p.add_argument("--chart-pool", type=int, default=1024,
-                   help="pregenerated chart pool size for --env torch")
+                   help="pregenerated chart pool size for --env torch/cuda")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="capture the PPO minibatch update (fwd+bwd+clip+Adam) "
                         "as one CUDA graph — kills per-kernel launch overhead "
@@ -299,10 +301,13 @@ def main():
         # inside graph capture; the math is unchanged without it
         torch.distributions.Distribution.set_default_validate_args(False)
 
-    torch_env = args.env == "torch"
-    if torch_env:
-        from beat_arena_env.torch_env import TorchBeatVecEnv
-        venv = TorchBeatVecEnv(
+    tensor_env = args.env in ("torch", "cuda")
+    if tensor_env:
+        if args.env == "cuda":
+            from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
+        else:
+            from beat_arena_env.torch_env import TorchBeatVecEnv as VecCls
+        venv = VecCls(
             N, colors=args.colors, cols=tuple(args.cols),
             rows=tuple(args.rows), chart_len_s=args.chart_len,
             note_speed_min=args.note_speed_min,
@@ -410,7 +415,7 @@ def main():
                 with torch.no_grad():
                     a, logp, _, v = policy.get_action_and_value(obs)
             b_act[t], b_logp[t], b_val[t] = a, logp, v
-            if torch_env:
+            if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
                 b_rew[t] = rew.to(b_rew.dtype)
                 b_done[t] = done.to(b_done.dtype)
@@ -424,7 +429,7 @@ def main():
             for info in infos:
                 ep_returns.append(info["episode_return"])
             global_step += N
-        if torch_env:
+        if tensor_env:
             ep_returns.extend(venv.pop_stats())
         t_rollout += time.perf_counter() - t0
 
