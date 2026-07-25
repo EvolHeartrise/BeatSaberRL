@@ -188,9 +188,15 @@ checkpoints/replays retire (hard replace).
   - **Chain links**: flat 20 on any valid cut (color + speed;
     direction exempt) — no pre/acc/post.
 - **Reward per tick**: good cut pays `pts/115` (so a link is +20/115, a
-  head ≤ 85/115); bad cut `−0.5`; miss `−0.5`; **bomb hit `−0.5`**;
-  a bomb passing by is free and silent. A rotation-free "stab" scores
-  only accuracy (≤ 15/115) — swinging is the game.
+  head ≤ 85/115); bad cut `−0.5`; miss `−0.5`; **bomb hit `−1.5` (env
+  v7.8, 2026-07-24, user-priced)** — a deliberate proxy for the
+  UNMODELED combo-multiplier break (a break costs ~4 notes of
+  multiplier on ScoreSaber; at `−0.5` a bomb was the CHEAPEST gym error
+  — miss = penalty + ~1.0 forgone points, bomb = penalty only — and
+  two very different policies equilibrated at ~12% bombs eaten,
+  budget-invariant). A bomb passing by is free and silent. A
+  rotation-free "stab" scores only accuracy (≤ 15/115) — swinging is
+  the game.
 - **Miss**: the object passes `z < −Z_MISS = 0.65` m uncut — the HEAD
   plane. **DELIBERATE DEVIATION from the real game** (which judges
   misses at despawn ~2 m behind the head; v7.0-v7.2 used 2.65),

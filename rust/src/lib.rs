@@ -36,7 +36,12 @@ const COS_TOL: f64 = 0.5;
 const Y_CENTER: f64 = 1.40; // obs y normalization
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
-const REWARD_BOMB: f64 = -0.5;
+// env v7.8 (2026-07-24, user-priced): a combo break on ScoreSaber costs
+// ~4 notes of multiplier; -0.5 made bombs the CHEAPEST error in the gym
+// (miss = -0.5 + ~1.0 forgone points) while the referee prices all
+// breaks equally — both the 598M and gen2 policies equilibrated at
+// ~12% bombs eaten under -0.5, flat across budget and distribution
+const REWARD_BOMB: f64 = -1.5;
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;

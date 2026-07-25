@@ -16,7 +16,8 @@ shifted 0.25 m toward the player — early cuts are real; wrong-color
 small box 0.35³) with full swept-surface saber tests. Scoring is the
 real integer 115 — round(70·pre) + round(30·post) + round(15·acc)
 with the real 0.3 m accuracy normalizer — paid as reward/115. New
-object types: bombs (r 0.18, hit = −0.5, pass = free), chains (head
+object types: bombs (r 0.18, hit = −1.5 since env v7.8, pass = free),
+chains (head
 max 85, links flat 20 on the real Bézier layout), and arcs as
 pre/post-swing grants. Per-tick discrete control at 30 Hz: 12 ternary
 joint heads (per hand: pitch, yaw, twist, elbow, roll, bend).
