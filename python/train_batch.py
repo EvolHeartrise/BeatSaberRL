@@ -15,6 +15,18 @@ tiny kernels per forward): --cuda-graphs captures the whole minibatch
 update (fwd+bwd+clip+Adam) as one CUDA graph, and --cuda-graphs-rollout
 additionally captures the rollout forward + sampling. Runtime feature,
 Pascal-safe (no Triton/compile); flag off = the eager path unchanged.
+
+--fused-update replaces the minibatch forward+backward with the fused
+CUDA kernels (policy_cuda.FusedPolicyTrainer): one launch each way,
+recompute-based backward (activation memory O(obs minibatch)), packed
+weights as the single Adam leaf; PPO loss math stays in torch on the
+tiny (mb,12,3)/(mb,) outputs, so semantics cannot drift. d64/1-head
+archs only; composes with --cuda-graphs (the fused minibatch body is
+captured like the eager one). Weights are mirrored back into the torch
+policy once per PPO update for rollout sampling and checkpoints.
+Checkpoints remain load-compatible EXCEPT the Adam state (one packed
+param vs ~50): --resume of a --fused-update checkpoint needs
+--fused-update again, and vice versa.
 """
 
 from __future__ import annotations
@@ -53,6 +65,24 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     loss = torch.where(adv < 0, dual, standard)
     frac_active = ((adv < 0) & (ceiling < standard)).float().mean()
     return loss.mean(), frac_active
+
+
+def fused_minibatch_losses(trainer, ent_coef, obs, act, logp, adv, ret):
+    """The PPO minibatch losses over the fused forward. Identical math
+    to the eager body: log_softmax gather == Categorical.log_prob,
+    -(p * log p).sum == Categorical.entropy (policy.py's factored
+    heads), then the same dual-clip PPO + value + entropy losses."""
+    logits, value = trainer(obs)                    # (mb,12,3), (mb,)
+    logsm = torch.log_softmax(logits, dim=-1)
+    newlogp = logsm.gather(-1, act.unsqueeze(-1)).squeeze(-1).sum(-1)
+    entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
+    ratio = (newlogp - logp).exp()
+    a_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
+    pg_loss, _ = pg_loss_fn(ratio, a_mb)
+    v_loss = 0.5 * ((value - ret) ** 2).mean()
+    ent_loss = entropy.mean()
+    loss = pg_loss - ent_coef * ent_loss + VF_COEF * v_loss
+    return loss, ent_loss
 
 
 _GRAPH_WARMUP = 3  # eager iterations before capture (torch's documented recipe)
@@ -138,6 +168,26 @@ class GraphedMinibatchStep(_Graphed):
         return self._run()
 
 
+class GraphedFusedMinibatchStep(GraphedMinibatchStep):
+    """--fused-update x --cuda-graphs: the fused minibatch body (fused
+    fwd kernel + torch losses + fused bwd kernels + clip + Adam over the
+    single packed param) captured exactly like the eager one."""
+
+    def __init__(self, trainer, opt, ent_coef, mb_size, device):
+        super().__init__(None, opt, ent_coef, mb_size, device)
+        self.trainer = trainer
+
+    def _compute(self):
+        self.opt.zero_grad(set_to_none=False)
+        loss, ent_loss = fused_minibatch_losses(
+            self.trainer, self.ent_coef, self.s_obs, self.s_act,
+            self.s_logp, self.s_adv, self.s_ret)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.trainer.parameters(), MAX_GRAD_NORM)
+        self.opt.step()
+        return ent_loss.detach()
+
+
 class GraphedRolloutForward(_Graphed):
     """policy.get_action_and_value (forward + per-head multinomial
     sampling) over the fixed (N, obs) rollout batch as one CUDA graph.
@@ -208,6 +258,13 @@ def parse_args():
     p.add_argument("--cuda-graphs-rollout", action="store_true",
                    help="with --cuda-graphs: also capture the rollout "
                         "forward + action sampling (graph-safe Philox RNG)")
+    p.add_argument("--fused-update", action="store_true",
+                   help="run the minibatch forward+backward as fused CUDA "
+                        "kernels (policy_cuda) with a recompute-based "
+                        "backward — activation memory O(obs minibatch) — "
+                        "and Adam over the packed weights. d64/1-head arch "
+                        "only; composes with --cuda-graphs; --resume only "
+                        "onto another --fused-update checkpoint")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
     p.add_argument("--embed", type=int, default=64)
     p.add_argument("--trunk-dim", type=int, default=128)
@@ -339,17 +396,33 @@ def main():
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
+    trainer = None
+    if args.fused_update:
+        assert device.type == "cuda", "--fused-update needs a CUDA device"
+        from policy_cuda import FusedPolicyTrainer
+        trainer = FusedPolicyTrainer(policy)  # raises on unsupported arch
+        print("--fused-update: packed 107k-param leaf, fused fwd/bwd kernels",
+              flush=True)
+    params = trainer.parameters() if trainer is not None \
+        else policy.parameters()
     if args.cuda_graphs:
         # graph replay re-runs recorded kernels, so Adam must READ its
         # hyperparams from device memory: capturable Adam + a tensor lr
         # the schedule fills in place (never rebinds)
-        opt = torch.optim.Adam(policy.parameters(),
+        opt = torch.optim.Adam(params,
                                lr=torch.tensor(args.lr, device=device),
                                capturable=True)
     else:
-        opt = torch.optim.Adam(policy.parameters(), lr=args.lr)
+        opt = torch.optim.Adam(params, lr=args.lr)
     if resume_ckpt is not None:
-        opt.load_state_dict(resume_ckpt["optimizer"])
+        try:
+            opt.load_state_dict(resume_ckpt["optimizer"])
+        except ValueError as e:
+            raise SystemExit(
+                "--resume optimizer state does not match this update path "
+                "(a --fused-update checkpoint stores Adam state over ONE "
+                "packed param; the eager path over per-module params). "
+                f"Re-run with the matching flag. [{e}]")
         if args.cuda_graphs:  # checkpoints store the plain eager form
             for g in opt.param_groups:
                 g["capturable"] = True
@@ -368,8 +441,12 @@ def main():
 
     g_update = g_rollout = None
     if args.cuda_graphs:
-        g_update = GraphedMinibatchStep(policy, opt, args.ent_coef,
-                                        mb_size, device)
+        if trainer is not None:
+            g_update = GraphedFusedMinibatchStep(trainer, opt, args.ent_coef,
+                                                 mb_size, device)
+        else:
+            g_update = GraphedMinibatchStep(policy, opt, args.ent_coef,
+                                            mb_size, device)
         if args.cuda_graphs_rollout:
             g_rollout = GraphedRolloutForward(policy, N, device)
 
@@ -464,6 +541,16 @@ def main():
                     ent_loss = g_update.step(
                         f_obs[mb], f_act[mb], f_logp[mb], f_adv[mb], f_ret[mb])
                     continue
+                if trainer is not None:  # eager fused minibatch body
+                    loss, ent_loss = fused_minibatch_losses(
+                        trainer, args.ent_coef, f_obs[mb], f_act[mb],
+                        f_logp[mb], f_adv[mb], f_ret[mb])
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(trainer.parameters(),
+                                             MAX_GRAD_NORM)
+                    opt.step()
+                    continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     f_obs[mb], f_act[mb])
                 ratio = (newlogp - f_logp[mb]).exp()
@@ -477,6 +564,11 @@ def main():
                 loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
                 opt.step()
+        if trainer is not None:
+            # mirror the packed weights into the torch policy: the next
+            # rollout (eager or graphed — copies land in-place) and any
+            # checkpoint below read the module's params
+            trainer.unpack_to(policy)
         t_update += time.perf_counter() - t0
 
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
