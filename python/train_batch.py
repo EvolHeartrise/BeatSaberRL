@@ -129,6 +129,19 @@ def parse_args():
                         "torch, the tensor-op sim, was removed 2026-07-25)")
     p.add_argument("--chart-pool", type=int, default=1024,
                    help="pregenerated chart pool size for --env cuda")
+    p.add_argument("--fp16", choices=["off", "update", "all"],
+                   default="off",
+                   help="fp16-storage activations (fp32 cuBLAS compute, "
+                        "fp32 master weights, fp32 PPO math; 2026-07-25). "
+                        "'update' = minibatch fwd+bwd only; 'all' = "
+                        "rollout too (keeps the PPO ratio's old/new "
+                        "logprobs in the SAME precision — preferred once "
+                        "landed). Checkpoints stay fp32 either way")
+    p.add_argument("--fp16-scale", type=float, default=131072.0,
+                   help="static loss scale for --fp16 (2^17 from the "
+                        "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
+                        "grad elements below fp16 normal range unscaled). "
+                        "Halves automatically on overflow, never grows")
     p.add_argument("--fused-update", action="store_true",
                    help="run the minibatch forward+backward as fused CUDA "
                         "kernels (policy_cuda) with a recompute-based "
@@ -221,6 +234,20 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
+    if args.fp16 != "off":
+        assert device.type == "cuda", "--fp16 needs a CUDA device"
+        assert not args.fused_update, \
+            "--fp16 and --fused-update are mutually exclusive"
+    fp16_update = args.fp16 in ("update", "all")
+    fp16_scale = args.fp16_scale
+    # device-side loss-scaling state: NO host syncs in the minibatch
+    # loop (an overflow zeroes the grads device-side; the audit rides
+    # the existing once-per-update print sync)
+    found_inf = torch.zeros(1, device=device)
+    inv_scale = torch.zeros(1, device=device)
+    inf_count = torch.zeros(1, device=device)
+    ratio_diag = torch.zeros((), device=device)
+
     tensor_env = args.env == "cuda"
     if tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -256,6 +283,10 @@ def main():
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)
+    policy.fp16 = args.fp16 == "all"
+    if args.fp16 != "off":
+        print(f"--fp16 {args.fp16}: fp16-storage activations, fp32 "
+              f"masters, static loss scale {fp16_scale:.0f}", flush=True)
     trainer = None
     if args.fused_update:
         assert device.type == "cuda", "--fused-update needs a CUDA device"
@@ -383,7 +414,10 @@ def main():
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
 
-        for _ in range(args.epochs):
+        if fp16_update:
+            policy.fp16 = True  # 'update' mode: rollout stayed fp32
+            inv_scale.fill_(1.0 / fp16_scale)
+        for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
             # synchronizing pageable H2D copy per minibatch (~26 ms/update
             # measured on WDDM)
@@ -403,16 +437,41 @@ def main():
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     f_obs[mb], f_act[mb])
                 ratio = (newlogp - f_logp[mb]).exp()
+                if fp16_update and ep_i == 0 and s == 0:
+                    # "same policy" fixed point: |ratio-1| at epoch 1
+                    # measures rollout/update precision consistency
+                    # (device-side; read at the per-update print sync)
+                    ratio_diag = (ratio - 1.0).abs().mean().detach()
                 a_mb = f_adv[mb]
                 a_mb = (a_mb - a_mb.mean()) / (a_mb.std() + 1e-8)
                 pg_loss, dual_frac = pg_loss_fn(ratio, a_mb)
                 v_loss = 0.5 * ((newval - f_ret[mb]) ** 2).mean()
                 ent_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * ent_loss + VF_COEF * v_loss
-                opt.zero_grad()
-                loss.backward()
+                opt.zero_grad(set_to_none=True)
+                if fp16_update:
+                    # static loss scale, ZERO host syncs: unscale + flag
+                    # non-finites in one multi-tensor kernel, then zero
+                    # every grad on overflow device-side. MUST run
+                    # before clip_grad_norm_ (an inf grad would turn
+                    # clip's 0.5/inf coef into 0*inf = NaN everywhere).
+                    # Overflow steps become momentum-only Adam steps —
+                    # bounded by lr, audited at the print.
+                    (loss * fp16_scale).backward()
+                    grads = [p.grad for p in policy.parameters()
+                             if p.grad is not None]
+                    torch._amp_foreach_non_finite_check_and_unscale_(
+                        grads, found_inf, inv_scale)
+                    ok = 1.0 - found_inf[0].clamp(max=1.0)  # 0-dim
+                    torch._foreach_mul_(grads, ok)
+                    inf_count += found_inf
+                    found_inf.zero_()
+                else:
+                    loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
                 opt.step()
+        if fp16_update:
+            policy.fp16 = args.fp16 == "all"
         if trainer is not None:
             # mirror the packed weights into the torch policy: the next
             # rollout and any checkpoint below read the module's params
@@ -424,9 +483,25 @@ def main():
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
         elapsed = time.time() - start
         rate = (global_step - steps_before) / elapsed
-        print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
-              f"ep_return(last100) {recent:8.3f}  ent {ent_loss.item():.3f}  "
-              f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
+        if fp16_update:
+            # ONE host sync (same as the .item() it replaces) reads the
+            # loss, the overflow audit, and the ratio diagnostic together
+            ent_v, inf_v, r1_v = torch.stack(
+                [ent_loss.detach(), inf_count[0], ratio_diag]).tolist()
+            extra = f"  r1 {r1_v:.1e}"
+            if inf_v > 0:
+                fp16_scale = max(fp16_scale / 2, 1.0)  # halve, never grow
+                inf_count.zero_()
+                extra += (f"  [fp16] {int(inf_v)} overflow step(s) "
+                          f"zeroed; scale -> {fp16_scale:.0f}")
+            print(f"update {update+1:>3}/{num_updates}  steps "
+                  f"{global_step:>9}  ep_return(last100) {recent:8.3f}  "
+                  f"ent {ent_v:.3f}  {rate:8,.0f} steps/s  "
+                  f"{elapsed:6.1f}s{extra}", flush=True)
+        else:
+            print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
+                  f"ep_return(last100) {recent:8.3f}  ent {ent_loss.item():.3f}  "
+                  f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
