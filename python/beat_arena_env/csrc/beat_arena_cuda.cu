@@ -362,7 +362,7 @@ struct Sim {
   const bool *p_valid, *p_is_right, *p_any_dir, *p_is_bomb, *p_is_head,
       *p_is_link, *p_show_dir, *p_free_pre, *p_free_post;
   const int64_t* p_n_notes;
-  const T *p_last_hit, *p_tail;
+  const T *p_last_hit, *p_tail, *p_min_speed;
   // io
   const int64_t *actions, *cand;
   T* ret_buf;
@@ -400,6 +400,25 @@ __global__ void step_kernel(Sim<T> P) {
 
   const int64_t c0 = P.chart_idx[e];
   const bool stepping = (P.mode == 0);
+  // chart-scan window [fp0, hw): fp0 is the low-water cursor (everything
+  // below is resolved or padding); hw is the high-water bound — hit_time
+  // is sorted, so once (hit - t) * min_speed > REACH_Z every later note
+  // has z > REACH_Z and takes the not-yet-reachable `continue`. Exact:
+  // notes outside the window touch neither status nor scratch. Every
+  // thread runs the same O(log C) search on the same values (uniform).
+  int fp0 = 0, hw = 0;
+  if (stepping) {
+    const T time_new = T(P.tick[e] + 1) * T(DT);
+    fp0 = P.first_pending[e];
+    int lo = fp0, hi = (int)P.p_n_notes[c0];
+    const T ms = P.p_min_speed[c0];
+    while (lo < hi) {
+      const int mid = (lo + hi) >> 1;
+      if ((P.p_hit[c0 * C + mid] - time_new) * ms > T(REACH_Z)) hi = mid;
+      else lo = mid + 1;
+    }
+    hw = lo;
+  }
 
   if (stepping) {
     if (tid == 0) {
@@ -408,7 +427,7 @@ __global__ void step_kernel(Sim<T> P) {
       sh_score = T(0);
       sh_pre = sh_acc = sh_post = T(0);
     }
-    for (int i = tid; i < C; i += blockDim.x) scratch[i] = T(0);
+    for (int i = fp0 + tid; i < hw; i += blockDim.x) scratch[i] = T(0);
 
     // Phase A (threads 0/1, one hand each): joint integrator, FK, swept
     // quad, swing-chain update (lib.rs per-arm loop)
@@ -527,14 +546,12 @@ __global__ void step_kernel(Sim<T> P) {
     }
     __syncthreads();
 
-    // Phase C (all threads stride the chart): per-object judgment — the
-    // expensive swept-surface SAT stage. Each object is independent;
-    // reward terms land in scratch[i] for the ordered sum in phase D.
+    // Phase C (all threads stride the [fp0, hw) window): per-object
+    // judgment — the expensive swept-surface SAT stage. Each object is
+    // independent; reward terms land in scratch[i] for the ordered sum
+    // in phase D.
     const T time_new = T(P.tick[e] + 1) * T(DT);
-    // everything below the low-water cursor is resolved (or padding):
-    // skip the prefix instead of loading and branching over it
-    const int fp0 = P.first_pending[e];
-    for (int i = fp0 + tid; i < C; i += blockDim.x) {
+    for (int i = fp0 + tid; i < hw; i += blockDim.x) {
       const int64_t cb = c0 * C + i;
       if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
       const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb];
@@ -703,7 +720,8 @@ __global__ void step_kernel(Sim<T> P) {
           (!pending && no_trk && (nn == 0 || time_now > last_hit))
           || time_now > last_hit + P.p_tail[c0] || tick_new >= P.max_steps;
       T rew = sh_rew;
-      for (int i = 0; i < C; i++) rew += scratch[i];  // Rust's note order
+      // Rust's note order; scratch outside [fp0, hw) is untouched-zero
+      for (int i = fp0; i < hw; i++) rew += scratch[i];
       T score_add = sh_score;
       T post_add = sh_post;
       if (done) {  // hard ends force-resolve pending follow-throughs
@@ -863,7 +881,7 @@ enum {
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
-  PNNOTES, PLASTHIT, PTAIL,
+  PNNOTES, PLASTHIT, PTAIL, PMINSP,
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
@@ -926,6 +944,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.p_n_notes = ts[PNNOTES].data_ptr<int64_t>();
     P.p_last_hit = ts[PLASTHIT].data_ptr<scalar_t>();
     P.p_tail = ts[PTAIL].data_ptr<scalar_t>();
+    P.p_min_speed = ts[PMINSP].data_ptr<scalar_t>();
     P.actions = actions.data_ptr<int64_t>();
     P.cand = cand.data_ptr<int64_t>();
     P.ret_buf = ts[RBUF].data_ptr<scalar_t>();

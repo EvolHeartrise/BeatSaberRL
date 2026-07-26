@@ -138,11 +138,14 @@ def _charts_to_tensors(charts, device, dtype):
     rotates = is_link | ~any_dir
     rot_c = np.where(rotates, -np.sin(angle), 1.0)
     rot_s = np.where(rotates, np.cos(angle), 0.0)
-    # episode tail: 0.5 + Z_MISS / min speed (lib.rs set_chart_notes)
+    # episode tail: 0.5 + Z_MISS / min speed (lib.rs set_chart_notes);
+    # min_speed is also exported per chart — the kernel's high-water
+    # bound ((hit - t) * min_speed > REACH_Z => note not yet reachable)
+    # needs it, mirroring the Rust-side sorted-hit_time break
     min_speed = np.where(valid, speed, np.inf).min(1)
     finite = np.isfinite(min_speed)
-    tail = np.where(finite, 0.5 + Z_MISS / np.where(finite, min_speed, 1.0),
-                    0.5)
+    min_speed = np.where(finite, min_speed, 1.0)
+    tail = np.where(finite, 0.5 + Z_MISS / min_speed, 0.5)
     t = lambda a, dt=dtype: torch.as_tensor(a, device=device, dtype=dt)
     return {
         "hit": t(hit), "speed": t(speed),
@@ -160,6 +163,7 @@ def _charts_to_tensors(charts, device, dtype):
         "n_scoreable": t((valid & ~is_bomb).sum(1), torch.long),
         "last_hit": t(np.where(valid.any(1), (hit * valid).max(1), 0.0)),
         "tail": t(tail),
+        "min_speed": t(min_speed),
     }
 
 
@@ -263,7 +267,7 @@ class CudaBeatVecEnv:
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
             p["is_head"], p["is_link"], p["show_dir"], p["free_pre"],
             p["free_post"],
-            p["n_notes"], p["last_hit"], p["tail"],
+            p["n_notes"], p["last_hit"], p["tail"], p["min_speed"],
             self._ret_buf, self._ret_total, self._obs, self._reward,
             self._done,
         ]
