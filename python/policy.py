@@ -45,7 +45,13 @@ OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 286
 # bend) — twelve factored heads, left hand first
 HEAD_SIZES = (3,) * 12
 
-NEG_INF = -1e9
+# Additive attention-mask magnitude. 2^14: exactly representable in fp16
+# (the fp16-storage path needs the bias to survive an fp16 round trip;
+# 1e9 is inf in fp16), cannot overflow the score epilogue (|score| < ~30,
+# fp16 max 65504), and lands in expf's exact-zero regime after row-max
+# subtraction just like 1e9 did — masked softmax weights are bitwise 0.0
+# under either constant.
+MASK_BIAS = 16384.0
 
 
 def _mlp(sizes, act=nn.ReLU):
@@ -95,7 +101,7 @@ class Block(nn.Module):
         # approximation. Used by the readout (tokens[:, :2]) to skip the
         # 16 note tokens' final-block compute (~29% of forward MACs).
         #
-        # attn_bias: the additive key mask (key_mask - 1) * 1e9, (B, 1, T)
+        # attn_bias: the additive key mask (key_mask - 1) * MASK_BIAS, (B, 1, T)
         # — block-invariant, so the caller hoists it out of the loop.
         # delta: the previous block's un-added FFN output; its residual
         # add rides this block's ln_attn pass (FusedLayerNorm.forward_add)
@@ -115,7 +121,7 @@ class Block(nn.Module):
         q = self.q_proj(h)
         Tq = q.shape[1]
         if attn_bias is None:
-            attn_bias = (key_mask.unsqueeze(1) - 1.0) * 1e9       # (B, 1, T)
+            attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
         if self.n_heads == 1:
             # scale + mask ride the GEMM epilogue: one kernel instead of
             # three (matmul, div, add). Bitwise-identical here because
@@ -184,7 +190,7 @@ class NotePolicy(nn.Module):
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
         # additive attention mask is block-invariant: build it once
-        attn_bias = (key_mask.unsqueeze(1) - 1.0) * 1e9
+        attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS
         delta = None
         for blk in self.blocks[:-1]:
             tokens, delta = blk(tokens, key_mask, attn_bias=attn_bias,

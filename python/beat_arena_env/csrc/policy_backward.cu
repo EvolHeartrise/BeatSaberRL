@@ -111,7 +111,7 @@ constexpr int expected_numel(int n_blocks) {
 
 struct BSmem {
   float obs[OBS_DIM];
-  float madd[TT];                 // (key_mask - 1) * 1e9
+  float madd[TT];                 // (key_mask - 1) * 16384
   float xin[MAXB][TT][SROW];      // saved block INPUT token streams
   float stats[MAXB][2][TT][2];    // [block][ln1/ln2][token][mean, rstd]
   float dx[TT][SROW];             // token-grad stream (backprops in place)
@@ -705,7 +705,7 @@ policy_bwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
   __syncthreads();
   if (tid < TT)
     s.madd[tid] =
-        (tid < 2) ? 0.f : (s.obs[OFF_NOTE_MASK + tid - 2] - 1.f) * 1e9f;
+        (tid < 2) ? 0.f : (s.obs[OFF_NOTE_MASK + tid - 2] - 1.f) * 16384.f;
   __syncthreads();
 
   // ---- phase A: forward recompute, saving block inputs + LN stats --------

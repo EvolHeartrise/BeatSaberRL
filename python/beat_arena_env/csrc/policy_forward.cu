@@ -29,7 +29,7 @@
 //   weight element is loaded once (twice for split-token layers) and
 //   feeds 9-18 FMAs off shared-memory broadcasts.
 // - Attention: scores (18x18) computed by 324 flat dot products over
-//   all threads; key masking adds (mask-1)*1e9 exactly as policy.py;
+//   all threads; key masking adds (mask-1)*16384 exactly as policy.py;
 //   softmax per row by one thread (18 rows, 18 wide — trivial);
 //   att @ v accumulates straight into the residual x rows.
 // - LayerNorm: one warp per token, shuffle reductions, biased variance,
@@ -109,7 +109,7 @@ struct Smem {
   float x[TT][SROW];     // residual stream
   float h[TT][SROW];     // post-LN / MLP hidden scratch
   float obs[OBS_DIM];
-  float madd[TT];        // (key_mask - 1) * 1e9 additive score mask
+  float madd[TT];        // (key_mask - 1) * 16384 additive score mask
   union {
     struct { float q[TT][SROW], k[TT][SROW], v[TT][SROW];
              float att[TT][TT + 2]; } a;
@@ -157,7 +157,7 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
   __syncthreads();
   if (tid < TT)
     s.madd[tid] =
-        (tid < 2) ? 0.f : (s.obs[OFF_NOTE_MASK + tid - 2] - 1.f) * 1e9f;
+        (tid < 2) ? 0.f : (s.obs[OFF_NOTE_MASK + tid - 2] - 1.f) * 16384.f;
 
   // ---- front MLPs: 16 note tokens + 2 saber tokens -> x -------------------
   {  // note layer 1 (14 -> 64, ReLU): each half owns 8 note slots
