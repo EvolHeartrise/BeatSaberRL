@@ -24,6 +24,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <vector>
@@ -118,6 +119,191 @@ __global__ void ln_fwd_add_kernel(const float* __restrict__ a,
   }
 }
 
+// ---- fp16-storage variants (2026-07-25 fp16 project, stage 1) --------------
+// __half2 I/O, ALL arithmetic in fp32 (GP104 native half math is 1/64
+// rate and never used): stats, affine, and dw/db partials accumulate in
+// fp32; activations round exactly once on store. Lane-owns-one-half2
+// keeps warp transactions at a full 128 B sector (scalar half loads
+// would halve effective bandwidth). COLS2_C counts half2 columns per
+// lane: 1 -> d=64, 2 -> d=128, 0 -> runtime d.
+// The fp32 kernels above are UNTOUCHED — the seed-0 bit-exactness of
+// the fp32 path is a regression detector this file must not disturb.
+
+template <int COLS2_C>
+__global__ void ln_fwd_h_kernel(const __half2* __restrict__ x,
+                                const float2* __restrict__ w,
+                                const float2* __restrict__ b,
+                                __half2* __restrict__ y,
+                                float* __restrict__ mean,
+                                float* __restrict__ rstd,
+                                int64_t rows, int d2, float eps) {
+  if (COLS2_C > 0) d2 = COLS2_C * WARP;
+  const float inv_d = 1.f / (2 * d2);
+  const int lane = threadIdx.x % WARP;
+  const int wid = threadIdx.x / WARP;
+  int64_t row = (int64_t)blockIdx.x * WPB + wid;
+  const int64_t stride = (int64_t)gridDim.x * WPB;
+  for (; row < rows; row += stride) {
+    const __half2* xr = x + row * d2;
+    float s = 0.f, ss = 0.f;
+#pragma unroll
+    for (int c = lane; c < d2; c += WARP) {
+      const float2 v = __half22float2(xr[c]);
+      s += v.x + v.y;
+      ss += v.x * v.x + v.y * v.y;
+    }
+    s = warp_allsum(s);
+    ss = warp_allsum(ss);
+    const float mu = s * inv_d;
+    const float r = rsqrtf(fmaxf(ss * inv_d - mu * mu, 0.f) + eps);
+    if (lane == 0) {
+      mean[row] = mu;
+      rstd[row] = r;
+    }
+    __half2* yr = y + row * d2;
+#pragma unroll
+    for (int c = lane; c < d2; c += WARP) {
+      const float2 v = __half22float2(xr[c]);
+      const float2 wv = w[c], bv = b[c];
+      float2 o;
+      o.x = (v.x - mu) * r * wv.x + bv.x;
+      o.y = (v.y - mu) * r * wv.y + bv.y;
+      yr[c] = __float22half2_rn(o);
+    }
+  }
+}
+
+// x = round_h(a + b) written out; stats computed on the ROUNDED value so
+// forward normalization and the backward's xh reconstruction (from the
+// saved fp16 x) see the identical tensor.
+template <int COLS2_C>
+__global__ void ln_fwd_add_h_kernel(const __half2* __restrict__ a,
+                                    const __half2* __restrict__ b_in,
+                                    const float2* __restrict__ w,
+                                    const float2* __restrict__ b,
+                                    __half2* __restrict__ x,
+                                    __half2* __restrict__ y,
+                                    float* __restrict__ mean,
+                                    float* __restrict__ rstd,
+                                    int64_t rows, int d2, float eps) {
+  if (COLS2_C > 0) d2 = COLS2_C * WARP;
+  const float inv_d = 1.f / (2 * d2);
+  const int lane = threadIdx.x % WARP;
+  const int wid = threadIdx.x / WARP;
+  int64_t row = (int64_t)blockIdx.x * WPB + wid;
+  const int64_t stride = (int64_t)gridDim.x * WPB;
+  for (; row < rows; row += stride) {
+    const __half2* ar = a + row * d2;
+    const __half2* br = b_in + row * d2;
+    __half2* xr = x + row * d2;
+    float s = 0.f, ss = 0.f;
+#pragma unroll
+    for (int c = lane; c < d2; c += WARP) {
+      const float2 va = __half22float2(ar[c]);
+      const float2 vb = __half22float2(br[c]);
+      float2 v;
+      v.x = va.x + vb.x;
+      v.y = va.y + vb.y;
+      const __half2 hv = __float22half2_rn(v);
+      xr[c] = hv;
+      const float2 vr = __half22float2(hv);  // the value everyone else sees
+      s += vr.x + vr.y;
+      ss += vr.x * vr.x + vr.y * vr.y;
+    }
+    s = warp_allsum(s);
+    ss = warp_allsum(ss);
+    const float mu = s * inv_d;
+    const float r = rsqrtf(fmaxf(ss * inv_d - mu * mu, 0.f) + eps);
+    if (lane == 0) {
+      mean[row] = mu;
+      rstd[row] = r;
+    }
+    __half2* yr = y + row * d2;
+#pragma unroll
+    for (int c = lane; c < d2; c += WARP) {
+      const float2 v = __half22float2(xr[c]);
+      const float2 wv = w[c], bv = b[c];
+      float2 o;
+      o.x = (v.x - mu) * r * wv.x + bv.x;
+      o.y = (v.y - mu) * r * wv.y + bv.y;
+      yr[c] = __float22half2_rn(o);
+    }
+  }
+}
+
+template <int COLS2_C>
+__global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
+                                const __half2* __restrict__ dy,
+                                const float2* __restrict__ w,
+                                const float* __restrict__ mean,
+                                const float* __restrict__ rstd,
+                                __half2* __restrict__ dx,
+                                float* __restrict__ pdw,  // (gridDim.x, d)
+                                float* __restrict__ pdb,  // (gridDim.x, d)
+                                int64_t rows, int d2) {
+  extern __shared__ float sm[];  // [2][WPB][d]
+  if (COLS2_C > 0) d2 = COLS2_C * WARP;
+  const int d = 2 * d2;
+  const float inv_d = 1.f / d;
+  const int lane = threadIdx.x % WARP;
+  const int wid = threadIdx.x / WARP;
+  float acc_dw[COLS2_C > 0 ? 2 * COLS2_C : MAX_COLS] = {};
+  float acc_db[COLS2_C > 0 ? 2 * COLS2_C : MAX_COLS] = {};
+  int64_t row = (int64_t)blockIdx.x * WPB + wid;
+  const int64_t stride = (int64_t)gridDim.x * WPB;
+  for (; row < rows; row += stride) {
+    const __half2* xr = x + row * d2;
+    const __half2* gr = dy + row * d2;
+    const float mu = mean[row];
+    const float r = rstd[row];
+    float s1 = 0.f, s2 = 0.f;
+#pragma unroll
+    for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+      const float2 xv = __half22float2(xr[c]);
+      const float2 gv = __half22float2(gr[c]);
+      const float2 wv = w[c];
+      const float xh0 = (xv.x - mu) * r, xh1 = (xv.y - mu) * r;
+      const float gw0 = gv.x * wv.x, gw1 = gv.y * wv.y;
+      s1 += gw0 + gw1;
+      s2 += gw0 * xh0 + gw1 * xh1;
+      acc_dw[2 * k] += gv.x * xh0;
+      acc_dw[2 * k + 1] += gv.y * xh1;
+      acc_db[2 * k] += gv.x;
+      acc_db[2 * k + 1] += gv.y;
+    }
+    s1 = warp_allsum(s1) * inv_d;
+    s2 = warp_allsum(s2) * inv_d;
+    __half2* dxr = dx + row * d2;
+#pragma unroll
+    for (int c = lane; c < d2; c += WARP) {
+      const float2 xv = __half22float2(xr[c]);
+      const float2 gv = __half22float2(gr[c]);
+      const float2 wv = w[c];
+      float2 o;
+      o.x = (gv.x * wv.x - s1 - (xv.x - mu) * r * s2) * r;
+      o.y = (gv.y * wv.y - s1 - (xv.y - mu) * r * s2) * r;
+      dxr[c] = __float22half2_rn(o);
+    }
+  }
+#pragma unroll
+  for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+    sm[wid * d + 2 * c] = acc_dw[2 * k];
+    sm[wid * d + 2 * c + 1] = acc_dw[2 * k + 1];
+    sm[(WPB + wid) * d + 2 * c] = acc_db[2 * k];
+    sm[(WPB + wid) * d + 2 * c + 1] = acc_db[2 * k + 1];
+  }
+  __syncthreads();
+  for (int c = threadIdx.x; c < d; c += blockDim.x) {
+    float tdw = 0.f, tdb = 0.f;
+    for (int i = 0; i < WPB; i++) {
+      tdw += sm[i * d + c];
+      tdb += sm[(WPB + i) * d + c];
+    }
+    pdw[(int64_t)blockIdx.x * d + c] = tdw;
+    pdb[(int64_t)blockIdx.x * d + c] = tdb;
+  }
+}
+
 // COLS_C > 0 pins d = COLS_C * WARP at compile time: the column loops
 // fully unroll and acc_dw/acc_db live in REGISTERS. With runtime d
 // (COLS_C == 0, the generic fallback) the runtime-indexed accumulators
@@ -190,25 +376,53 @@ int grid_for(int64_t rows, int cap) {
   return (int)std::min<int64_t>((rows + WPB - 1) / WPB, cap);
 }
 
+bool half_ok(const at::Tensor& x, int d) {
+  return x.scalar_type() == at::kHalf && d % 2 == 0
+      && (reinterpret_cast<uintptr_t>(x.data_ptr()) % 4) == 0;
+}
+
 std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
                                double eps) {
   const c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(x.is_cuda() && x.is_contiguous()
-              && x.scalar_type() == at::kFloat, "x: contiguous CUDA f32");
+              && (x.scalar_type() == at::kFloat
+                  || x.scalar_type() == at::kHalf),
+              "x: contiguous CUDA f32/f16");
   const int d = (int)x.size(-1);
   TORCH_CHECK(d <= MAX_D, "d > ", MAX_D, " unsupported");
   TORCH_CHECK(w.is_contiguous() && b.is_contiguous()
-              && w.numel() == d && b.numel() == d);
+              && w.numel() == d && b.numel() == d
+              && w.scalar_type() == at::kFloat
+              && b.scalar_type() == at::kFloat, "w/b: fp32 contiguous");
   const int64_t rows = x.numel() / d;
+  // stats are ALWAYS fp32, regardless of x dtype
   auto y = at::empty_like(x);
-  auto mean = at::empty({rows}, x.options());
-  auto rstd = at::empty({rows}, x.options());
+  auto mean = at::empty({rows}, x.options().dtype(at::kFloat));
+  auto rstd = at::empty({rows}, x.options().dtype(at::kFloat));
   if (rows == 0) return {y, mean, rstd};
-  ln_fwd_kernel<<<grid_for(rows, 4096), THREADS, 0,
-                  at::cuda::getCurrentCUDAStream()>>>(
-      x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(),
-      y.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
-      rows, d, (float)eps);
+  if (x.scalar_type() == at::kFloat) {
+    ln_fwd_kernel<<<grid_for(rows, 4096), THREADS, 0,
+                    at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(),
+        y.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
+        rows, d, (float)eps);
+  } else {
+    TORCH_CHECK(half_ok(x, d), "half path: even d, 4B-aligned");
+    const int d2 = d / 2;
+    auto launch = [&](auto kernel) {
+      kernel<<<grid_for(rows, 4096), THREADS, 0,
+               at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const __half2*>(x.data_ptr<at::Half>()),
+          reinterpret_cast<const float2*>(w.data_ptr<float>()),
+          reinterpret_cast<const float2*>(b.data_ptr<float>()),
+          reinterpret_cast<__half2*>(y.data_ptr<at::Half>()),
+          mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d2,
+          (float)eps);
+    };
+    if (d == 64) launch(ln_fwd_h_kernel<1>);
+    else if (d == 128) launch(ln_fwd_h_kernel<2>);
+    else launch(ln_fwd_h_kernel<0>);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {y, mean, rstd};
 }
@@ -217,24 +431,50 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
                                    at::Tensor bias, double eps) {
   const c10::cuda::CUDAGuard guard(a.device());
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && b.is_contiguous()
-              && a.scalar_type() == at::kFloat
-              && b.scalar_type() == at::kFloat && a.sizes() == b.sizes(),
-              "a/b: same-shape contiguous CUDA f32");
+              && (a.scalar_type() == at::kFloat
+                  || a.scalar_type() == at::kHalf)
+              && b.scalar_type() == a.scalar_type()
+              && a.sizes() == b.sizes(),
+              "a/b: same-shape same-dtype contiguous CUDA f32/f16");
   const int d = (int)a.size(-1);
   TORCH_CHECK(d <= MAX_D, "d > ", MAX_D, " unsupported");
   TORCH_CHECK(w.is_contiguous() && bias.is_contiguous()
-              && w.numel() == d && bias.numel() == d);
+              && w.numel() == d && bias.numel() == d
+              && w.scalar_type() == at::kFloat
+              && bias.scalar_type() == at::kFloat, "w/b: fp32 contiguous");
   const int64_t rows = a.numel() / d;
   auto x = at::empty_like(a);
   auto y = at::empty_like(a);
-  auto mean = at::empty({rows}, a.options());
-  auto rstd = at::empty({rows}, a.options());
+  auto mean = at::empty({rows}, a.options().dtype(at::kFloat));
+  auto rstd = at::empty({rows}, a.options().dtype(at::kFloat));
   if (rows == 0) return {x, y, mean, rstd};
-  ln_fwd_add_kernel<<<grid_for(rows, 4096), THREADS, 0,
-                      at::cuda::getCurrentCUDAStream()>>>(
-      a.data_ptr<float>(), b.data_ptr<float>(), w.data_ptr<float>(),
-      bias.data_ptr<float>(), x.data_ptr<float>(), y.data_ptr<float>(),
-      mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d, (float)eps);
+  if (a.scalar_type() == at::kFloat) {
+    ln_fwd_add_kernel<<<grid_for(rows, 4096), THREADS, 0,
+                        at::cuda::getCurrentCUDAStream()>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), w.data_ptr<float>(),
+        bias.data_ptr<float>(), x.data_ptr<float>(), y.data_ptr<float>(),
+        mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d,
+        (float)eps);
+  } else {
+    TORCH_CHECK(half_ok(a, d) && half_ok(b, d),
+                "half path: even d, 4B-aligned");
+    const int d2 = d / 2;
+    auto launch = [&](auto kernel) {
+      kernel<<<grid_for(rows, 4096), THREADS, 0,
+               at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const __half2*>(a.data_ptr<at::Half>()),
+          reinterpret_cast<const __half2*>(b.data_ptr<at::Half>()),
+          reinterpret_cast<const float2*>(w.data_ptr<float>()),
+          reinterpret_cast<const float2*>(bias.data_ptr<float>()),
+          reinterpret_cast<__half2*>(x.data_ptr<at::Half>()),
+          reinterpret_cast<__half2*>(y.data_ptr<at::Half>()),
+          mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d2,
+          (float)eps);
+    };
+    if (d == 64) launch(ln_fwd_add_h_kernel<1>);
+    else if (d == 128) launch(ln_fwd_add_h_kernel<2>);
+    else launch(ln_fwd_add_h_kernel<0>);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {x, y, mean, rstd};
 }
@@ -243,29 +483,51 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
                                at::Tensor mean, at::Tensor rstd) {
   const c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(x.is_contiguous() && dy.is_contiguous()
-              && x.scalar_type() == at::kFloat
-              && dy.scalar_type() == at::kFloat);
+              && (x.scalar_type() == at::kFloat
+                  || x.scalar_type() == at::kHalf)
+              && dy.scalar_type() == x.scalar_type());
+  TORCH_CHECK(mean.scalar_type() == at::kFloat
+              && rstd.scalar_type() == at::kFloat);
   const int d = (int)x.size(-1);
   const int64_t rows = x.numel() / d;
   auto dx = at::empty_like(x);
-  // fixed-size partials + deterministic torch sum: bit-reproducible
-  // gradients (no cross-block float atomics)
+  // fixed-size fp32 partials + deterministic torch sum: bit-reproducible
+  // gradients (no cross-block float atomics); dw/db land in fp32 and
+  // feed the fp32 LN leaves with no cast
   const int blocks = std::max(grid_for(rows, 1024), 1);
-  auto pdw = at::empty({blocks, d}, x.options());
-  auto pdb = at::empty({blocks, d}, x.options());
+  auto pdw = at::empty({blocks, d}, x.options().dtype(at::kFloat));
+  auto pdb = at::empty({blocks, d}, x.options().dtype(at::kFloat));
   if (rows > 0) {
     const size_t smem = 2 * WPB * d * sizeof(float);
-    auto launch = [&](auto kernel) {
-      kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
-          x.data_ptr<float>(), dy.data_ptr<float>(), w.data_ptr<float>(),
-          mean.data_ptr<float>(), rstd.data_ptr<float>(),
-          dx.data_ptr<float>(), pdw.data_ptr<float>(),
-          pdb.data_ptr<float>(), rows, d);
-    };
-    // compile-time-cols variants for the policy's real widths
-    if (d == 2 * WARP) launch(ln_bwd_kernel<2>);        // d = 64
-    else if (d == 4 * WARP) launch(ln_bwd_kernel<4>);   // d = 128
-    else launch(ln_bwd_kernel<0>);                      // runtime d
+    if (x.scalar_type() == at::kFloat) {
+      auto launch = [&](auto kernel) {
+        kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+            x.data_ptr<float>(), dy.data_ptr<float>(), w.data_ptr<float>(),
+            mean.data_ptr<float>(), rstd.data_ptr<float>(),
+            dx.data_ptr<float>(), pdw.data_ptr<float>(),
+            pdb.data_ptr<float>(), rows, d);
+      };
+      // compile-time-cols variants for the policy's real widths
+      if (d == 2 * WARP) launch(ln_bwd_kernel<2>);        // d = 64
+      else if (d == 4 * WARP) launch(ln_bwd_kernel<4>);   // d = 128
+      else launch(ln_bwd_kernel<0>);                      // runtime d
+    } else {
+      TORCH_CHECK(half_ok(x, d) && half_ok(dy, d),
+                  "half path: even d, 4B-aligned");
+      const int d2 = d / 2;
+      auto launch = [&](auto kernel) {
+        kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half2*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half2*>(dy.data_ptr<at::Half>()),
+            reinterpret_cast<const float2*>(w.data_ptr<float>()),
+            mean.data_ptr<float>(), rstd.data_ptr<float>(),
+            reinterpret_cast<__half2*>(dx.data_ptr<at::Half>()),
+            pdw.data_ptr<float>(), pdb.data_ptr<float>(), rows, d2);
+      };
+      if (d == 64) launch(ln_bwd_h_kernel<1>);
+      else if (d == 128) launch(ln_bwd_h_kernel<2>);
+      else launch(ln_bwd_h_kernel<0>);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     pdw.zero_();

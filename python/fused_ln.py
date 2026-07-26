@@ -82,8 +82,13 @@ class _LnAddFn(torch.autograd.Function):
 
 
 class FusedLayerNorm(nn.LayerNorm):
+    """Params (weight/bias) are ALWAYS fp32; the kernels accept fp32 or
+    fp16 activations (fp16 I/O with fp32 stats/affine — the fp16-storage
+    path, 2026-07-25). LN statistics come back fp32 in both cases."""
+
     def _eligible(self, x):
-        return (x.is_cuda and x.dtype is torch.float32 and x.is_contiguous()
+        return (x.is_cuda and x.dtype in (torch.float32, torch.float16)
+                and x.is_contiguous()
                 and len(self.normalized_shape) == 1
                 and self.normalized_shape[0] <= 256
                 and self.elementwise_affine and _load() is not None)
@@ -91,6 +96,10 @@ class FusedLayerNorm(nn.LayerNorm):
     def forward(self, x):
         if self._eligible(x):
             return _LnFn.apply(x, self.weight, self.bias, self.eps)
+        if x.dtype is torch.float16:
+            # stock nn.LayerNorm with fp32 params: compute in fp32,
+            # round once — mirrors the kernel's precision contract
+            return super().forward(x.float()).to(x.dtype)
         return super().forward(x)
 
     def forward_add(self, a, b):
@@ -99,7 +108,10 @@ class FusedLayerNorm(nn.LayerNorm):
         fusion absorbs). Fallback computes the same bits unfused; the
         contiguous sum re-enters forward()'s kernel eligibility."""
         if (self._eligible(a) and b.is_contiguous() and a.shape == b.shape
-                and b.dtype is torch.float32):
+                and b.dtype is a.dtype):
             return _LnAddFn.apply(a, b, self.weight, self.bias, self.eps)
-        x = a + b
+        if a.dtype is torch.float16:
+            x = (a.float() + b.float()).to(a.dtype)
+        else:
+            x = a + b
         return x, self.forward(x)
