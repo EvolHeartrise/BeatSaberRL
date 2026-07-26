@@ -93,8 +93,14 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--num-envs", type=int, default=128)
     p.add_argument("--horizon", type=int, default=128)
-    p.add_argument("--minibatches", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=3)
+    # e1/mb8 DEFAULT since 2026-07-26 (user decision after the paired
+    # 50M gate): same 8 gradient steps/update as the old e2/mb4 at HALF
+    # the update compute — measured +110.9 wpp (dAcc t=+12.88,
+    # score_acc +32.5%) AND 1.61x wall (249.5k steps/s). The 07-21
+    # "single-pass fails" study conflated sample reuse with
+    # gradient-step density; density was what mattered.
+    p.add_argument("--minibatches", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=LR)
