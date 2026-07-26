@@ -65,7 +65,13 @@ def _read_json(root, name):
     for cand in (name, name.lower(), name.capitalize()):
         path = os.path.join(root, cand)
         if os.path.exists(path):
-            return json.load(open(path))
+            # explicit utf-8: beatmap .dat files are UTF-8 JSON; the
+            # platform default (cp1252 on Windows) silently skipped 80
+            # of 6101 catalog leaderboards with UnicodeDecodeError —
+            # 76 of them inside the pp-relevant 4.18-11.61* band
+            # (2026-07-25 round-4 finding)
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
     raise FileNotFoundError(f"{name} not found in {root}")
 
 
@@ -317,16 +323,23 @@ def load_beatmap(map_path, difficulty="Normal", speed_scale=0.3,
             add_arc(a["hb"], hd.get("x", 0), hd.get("y", 0), hd.get("c", 0),
                     a["tb"], td.get("x", 0), td.get("y", 0), td.get("c", 0))
     elif "colorNotes" in data:                        # v3 schema
+        # .get(..., 0) throughout: some serializers omit zero-valued
+        # fields (KeyError 'y'/'c' skipped 6 catalog levels; the v4
+        # branch above already guards the same way)
         for n in data["colorNotes"]:
-            add_note(n["b"], n["x"], n["y"], n["c"], n["d"], n.get("a", 0))
+            add_note(n["b"], n.get("x", 0), n.get("y", 0), n.get("c", 0),
+                     n.get("d", 0), n.get("a", 0))
         for n in data.get("bombNotes", []):
-            add_bomb(n["b"], n["x"], n["y"])
+            add_bomb(n["b"], n.get("x", 0), n.get("y", 0))
         for c in data.get("burstSliders", []):
-            add_chain(c["b"], c["x"], c["y"], c["c"], c["d"], c["tb"],
-                      c["tx"], c["ty"], c.get("sc", 3), c.get("s", 1.0))
+            add_chain(c["b"], c.get("x", 0), c.get("y", 0), c.get("c", 0),
+                      c.get("d", 0), c["tb"],
+                      c.get("tx", 0), c.get("ty", 0), c.get("sc", 3),
+                      c.get("s", 1.0))
         for a in data.get("sliders", []):
-            add_arc(a["b"], a["x"], a["y"], a["c"],
-                    a["tb"], a["tx"], a["ty"], a.get("tc", a["c"]))
+            add_arc(a["b"], a.get("x", 0), a.get("y", 0), a.get("c", 0),
+                    a["tb"], a.get("tx", 0), a.get("ty", 0),
+                    a.get("tc", a.get("c", 0)))
     else:                                             # v2 schema
         for n in data["_notes"]:
             if n["_type"] in (0, 1):
