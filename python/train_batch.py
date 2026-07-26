@@ -35,8 +35,10 @@ reduction (large-arch / large-minibatch headroom).
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -295,6 +297,20 @@ def main():
         print("--graph-rollout: incompatible with --fused-update, "
               "forcing off", flush=True)
         args.graph_rollout = False
+
+    # Config provenance (2026-07-26, after the gen3 postmortem: a
+    # missing --colors flag survived a 5B run and a 4-arm bisect because
+    # nothing recorded what any run was launched with). Written AFTER
+    # every downgrade above so it records the RESOLVED config, not the
+    # requested one; the same snapshot is embedded in every checkpoint.
+    args_snapshot = {k: v for k, v in sorted(vars(args).items())}
+    with open(os.path.join(args.run_dir, "args.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"argv": sys.argv[1:], "resolved": args_snapshot},
+                  f, indent=1, default=str)
+    print(f"argv: {' '.join(sys.argv[1:]) or '(bare)'}", flush=True)
+    print(f"config: {args_snapshot}", flush=True)
+
     if tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
@@ -590,6 +606,7 @@ def main():
                         "update": update + 1, "global_step": global_step,
                         "recent_return": float(recent),
                         "optimizer": cpu_opt_state(opt),
+                        "args": args_snapshot,
                         "schedule": {"lr": args.lr, "lr_final": args.lr_final,
                                      "lr_decay": args.lr_decay,
                                      "num_updates": num_updates}},
@@ -604,6 +621,7 @@ def main():
                 "update": update + 1, "global_step": global_step,
                 "recent_return": float(recent),
                 "optimizer": cpu_opt_state(opt),
+                "args": args_snapshot,
                 "schedule": {"lr": args.lr, "lr_final": args.lr_final,
                              "lr_decay": args.lr_decay,
                              "num_updates": num_updates}},
