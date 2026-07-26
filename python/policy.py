@@ -83,7 +83,8 @@ class Block(nn.Module):
         self.dh = d // n_heads
 
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
-                n_queries: int = 0) -> torch.Tensor:
+                n_queries: int = 0, attn_bias: torch.Tensor | None = None,
+                delta: torch.Tensor | None = None):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -93,29 +94,46 @@ class Block(nn.Module):
         # EXACTLY the full block restricted to those rows, not an
         # approximation. Used by the readout (tokens[:, :2]) to skip the
         # 16 note tokens' final-block compute (~29% of forward MACs).
+        #
+        # attn_bias: the additive key mask (key_mask - 1) * 1e9, (B, 1, T)
+        # — block-invariant, so the caller hoists it out of the loop.
+        # delta: the previous block's un-added FFN output; its residual
+        # add rides this block's ln_attn pass (FusedLayerNorm.forward_add)
+        # instead of being a separate full-size kernel. Both fusions are
+        # bit-exact. Blocks called with n_queries == 0 return
+        # (x_without_ffn, ffn_out) for the next block's delta; the final
+        # block (n_queries > 0) returns the resolved output rows.
         B, T, _ = x.shape
-        h = self.ln_attn(x)
+        if delta is not None:
+            x, h = self.ln_attn.forward_add(x, delta)
+        else:
+            h = self.ln_attn(x)
         k, v = self.k_proj(h), self.v_proj(h)
         if n_queries:
             x = x[:, :n_queries]
             h = h[:, :n_queries]
         q = self.q_proj(h)
         Tq = q.shape[1]
+        if attn_bias is None:
+            attn_bias = (key_mask.unsqueeze(1) - 1.0) * 1e9       # (B, 1, T)
         if self.n_heads == 1:
             scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, Tq, T)
-            scores = scores + (key_mask.unsqueeze(1) - 1.0) * 1e9
-            x = x + torch.softmax(scores, dim=-1) @ v
+            scores = scores + attn_bias
+            att = torch.softmax(scores, dim=-1) @ v
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
             v = v.view(B, T, self.n_heads, self.dh).transpose(1, 2)
             scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)   # (B,H,Tq,T)
-            scores = scores + (key_mask[:, None, None, :] - 1.0) * 1e9
+            scores = scores + attn_bias.unsqueeze(1)              # (B,1,1,T)
             att = torch.softmax(scores, dim=-1) @ v               # (B,H,Tq,dh)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
-            x = x + self.out_proj(att)
-        x = x + self.ffn(self.ln_ffn(x))
-        return x
+            att = self.out_proj(att)
+        x, h2 = self.ln_ffn.forward_add(x, att)
+        ffn_out = self.ffn(h2)
+        if n_queries:
+            return x + ffn_out
+        return x, ffn_out
 
 
 class NotePolicy(nn.Module):
@@ -162,10 +180,15 @@ class NotePolicy(nn.Module):
         tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 18, 64)
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
+        # additive attention mask is block-invariant: build it once
+        attn_bias = (key_mask.unsqueeze(1) - 1.0) * 1e9
+        delta = None
         for blk in self.blocks[:-1]:
-            tokens = blk(tokens, key_mask)
+            tokens, delta = blk(tokens, key_mask, attn_bias=attn_bias,
+                                delta=delta)
         # final block: only the 2 readout tokens' outputs are consumed
-        tokens = self.blocks[-1](tokens, key_mask, n_queries=2)
+        tokens = self.blocks[-1](tokens, key_mask, n_queries=2,
+                                 attn_bias=attn_bias, delta=delta)
         h = self.trunk(tokens.reshape(B, -1))                        # saber readout
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])

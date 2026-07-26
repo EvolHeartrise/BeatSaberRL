@@ -75,6 +75,49 @@ __global__ void ln_fwd_kernel(const float* __restrict__ x,
   }
 }
 
+// Fused residual-add + LayerNorm: x = a + b (written out — it stays the
+// residual stream AND the saved backward input), y = LN(x). Saves the
+// separate add kernel's full read+read+write pass at the policy's three
+// residual->LN sites. The second column pass re-reads xr[c] the same
+// thread just wrote (L1/L2-hot) — bit-identical to re-adding a+b.
+__global__ void ln_fwd_add_kernel(const float* __restrict__ a,
+                                  const float* __restrict__ b,
+                                  const float* __restrict__ w,
+                                  const float* __restrict__ bias,
+                                  float* __restrict__ x,
+                                  float* __restrict__ y,
+                                  float* __restrict__ mean,
+                                  float* __restrict__ rstd,
+                                  int64_t rows, int d, float eps) {
+  const int lane = threadIdx.x % WARP;
+  const int wid = threadIdx.x / WARP;
+  int64_t row = (int64_t)blockIdx.x * WPB + wid;
+  const int64_t stride = (int64_t)gridDim.x * WPB;
+  for (; row < rows; row += stride) {
+    const float* ar = a + row * d;
+    const float* br = b + row * d;
+    float* xr = x + row * d;
+    float s = 0.f, ss = 0.f;
+    for (int c = lane; c < d; c += WARP) {
+      const float v = ar[c] + br[c];
+      xr[c] = v;
+      s += v;
+      ss += v * v;
+    }
+    s = warp_allsum(s);
+    ss = warp_allsum(ss);
+    const float mu = s / d;
+    const float r = rsqrtf(fmaxf(ss / d - mu * mu, 0.f) + eps);
+    if (lane == 0) {
+      mean[row] = mu;
+      rstd[row] = r;
+    }
+    float* yr = y + row * d;
+    for (int c = lane; c < d; c += WARP)
+      yr[c] = (xr[c] - mu) * r * w[c] + bias[c];
+  }
+}
+
 __global__ void ln_bwd_kernel(const float* __restrict__ x,
                               const float* __restrict__ dy,
                               const float* __restrict__ w,
@@ -160,6 +203,32 @@ std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
   return {y, mean, rstd};
 }
 
+std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
+                                   at::Tensor bias, double eps) {
+  const c10::cuda::CUDAGuard guard(a.device());
+  TORCH_CHECK(a.is_cuda() && a.is_contiguous() && b.is_contiguous()
+              && a.scalar_type() == at::kFloat
+              && b.scalar_type() == at::kFloat && a.sizes() == b.sizes(),
+              "a/b: same-shape contiguous CUDA f32");
+  const int d = (int)a.size(-1);
+  TORCH_CHECK(d <= MAX_D, "d > ", MAX_D, " unsupported");
+  TORCH_CHECK(w.is_contiguous() && bias.is_contiguous()
+              && w.numel() == d && bias.numel() == d);
+  const int64_t rows = a.numel() / d;
+  auto x = at::empty_like(a);
+  auto y = at::empty_like(a);
+  auto mean = at::empty({rows}, a.options());
+  auto rstd = at::empty({rows}, a.options());
+  if (rows == 0) return {x, y, mean, rstd};
+  ln_fwd_add_kernel<<<grid_for(rows, 4096), THREADS, 0,
+                      at::cuda::getCurrentCUDAStream()>>>(
+      a.data_ptr<float>(), b.data_ptr<float>(), w.data_ptr<float>(),
+      bias.data_ptr<float>(), x.data_ptr<float>(), y.data_ptr<float>(),
+      mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d, (float)eps);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {x, y, mean, rstd};
+}
+
 std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
                                at::Tensor mean, at::Tensor rstd) {
   const c10::cuda::CUDAGuard guard(x.device());
@@ -194,5 +263,7 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ln_fwd", &ln_fwd, "LayerNorm forward -> (y, mean, rstd)");
+  m.def("ln_fwd_add", &ln_fwd_add,
+        "Residual add + LayerNorm -> (x = a + b, y = LN(x), mean, rstd)");
   m.def("ln_bwd", &ln_bwd, "LayerNorm backward -> (dx, dw, db)");
 }
