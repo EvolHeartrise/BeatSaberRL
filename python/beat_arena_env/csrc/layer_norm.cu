@@ -231,12 +231,18 @@ __global__ void ln_fwd_add_h_kernel(const __half2* __restrict__ a,
   }
 }
 
+// gx (nullable): residual gradient added into dx in the store loop —
+// the fused form of _LnAddFn.backward's `dx = dx + gx`. fp32: bitwise
+// identical to the unfused add (same two operands, same order). fp16:
+// the sum is formed in fp32 and rounded ONCE instead of round(dx) then
+// a second rounded add — strictly more accurate on the residual path.
 template <int COLS2_C>
 __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
                                 const __half2* __restrict__ dy,
                                 const float2* __restrict__ w,
                                 const float* __restrict__ mean,
                                 const float* __restrict__ rstd,
+                                const __half2* __restrict__ gx,
                                 __half2* __restrict__ dx,
                                 float* __restrict__ pdw,  // (gridDim.x, d)
                                 float* __restrict__ pdb,  // (gridDim.x, d)
@@ -274,6 +280,7 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
     s1 = warp_allsum(s1) * inv_d;
     s2 = warp_allsum(s2) * inv_d;
     __half2* dxr = dx + row * d2;
+    const __half2* gxr = gx ? gx + row * d2 : nullptr;
 #pragma unroll
     for (int c = lane; c < d2; c += WARP) {
       const float2 xv = __half22float2(xr[c]);
@@ -282,6 +289,11 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
       float2 o;
       o.x = (gv.x * wv.x - s1 - (xv.x - mu) * r * s2) * r;
       o.y = (gv.y * wv.y - s1 - (xv.y - mu) * r * s2) * r;
+      if (gxr) {
+        const float2 gxv = __half22float2(gxr[c]);
+        o.x += gxv.x;
+        o.y += gxv.y;
+      }
       dxr[c] = __float22half2_rn(o);
     }
   }
@@ -316,6 +328,7 @@ __global__ void ln_bwd_kernel(const float* __restrict__ x,
                               const float* __restrict__ w,
                               const float* __restrict__ mean,
                               const float* __restrict__ rstd,
+                              const float* __restrict__ gx,
                               float* __restrict__ dx,
                               float* __restrict__ pdw,  // (gridDim.x, d)
                               float* __restrict__ pdb,  // (gridDim.x, d)
@@ -347,9 +360,11 @@ __global__ void ln_bwd_kernel(const float* __restrict__ x,
     s1 = warp_allsum(s1) / d;
     s2 = warp_allsum(s2) / d;
     float* dxr = dx + row * d;
+    const float* gxr = gx ? gx + row * d : nullptr;
     for (int c = lane; c < d; c += WARP) {
       const float xh = (xr[c] - mu) * r;
-      dxr[c] = (gr[c] * w[c] - s1 - xh * s2) * r;
+      const float o = (gr[c] * w[c] - s1 - xh * s2) * r;
+      dxr[c] = gxr ? o + gxr[c] : o;
     }
   }
   // block reduction of the weight/bias partials: each warp stages its
@@ -480,15 +495,23 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
 }
 
 std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
-                               at::Tensor mean, at::Tensor rstd) {
+                               at::Tensor mean, at::Tensor rstd,
+                               c10::optional<at::Tensor> gx_opt) {
+  const at::Tensor gx = gx_opt.value_or(at::Tensor());
   const c10::cuda::CUDAGuard guard(x.device());
-  TORCH_CHECK(x.is_contiguous() && dy.is_contiguous()
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && dy.is_contiguous()
               && (x.scalar_type() == at::kFloat
                   || x.scalar_type() == at::kHalf)
               && dy.scalar_type() == x.scalar_type());
   TORCH_CHECK(mean.scalar_type() == at::kFloat
               && rstd.scalar_type() == at::kFloat);
   const int d = (int)x.size(-1);
+  TORCH_CHECK(d <= MAX_D, "d > ", MAX_D, " unsupported");
+  if (gx.defined()) {
+    TORCH_CHECK(gx.is_contiguous() && gx.scalar_type() == x.scalar_type()
+                && gx.sizes() == x.sizes(),
+                "gx: contiguous, same shape/dtype as x");
+  }
   const int64_t rows = x.numel() / d;
   auto dx = at::empty_like(x);
   // fixed-size fp32 partials + deterministic torch sum: bit-reproducible
@@ -504,6 +527,7 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
         kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
             x.data_ptr<float>(), dy.data_ptr<float>(), w.data_ptr<float>(),
             mean.data_ptr<float>(), rstd.data_ptr<float>(),
+            gx.defined() ? gx.data_ptr<float>() : nullptr,
             dx.data_ptr<float>(), pdw.data_ptr<float>(),
             pdb.data_ptr<float>(), rows, d);
       };
@@ -512,7 +536,8 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
       else if (d == 4 * WARP) launch(ln_bwd_kernel<4>);   // d = 128
       else launch(ln_bwd_kernel<0>);                      // runtime d
     } else {
-      TORCH_CHECK(half_ok(x, d) && half_ok(dy, d),
+      TORCH_CHECK(half_ok(x, d) && half_ok(dy, d)
+                  && (!gx.defined() || half_ok(gx, d)),
                   "half path: even d, 4B-aligned");
       const int d2 = d / 2;
       auto launch = [&](auto kernel) {
@@ -521,6 +546,9 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
             reinterpret_cast<const __half2*>(dy.data_ptr<at::Half>()),
             reinterpret_cast<const float2*>(w.data_ptr<float>()),
             mean.data_ptr<float>(), rstd.data_ptr<float>(),
+            gx.defined()
+                ? reinterpret_cast<const __half2*>(gx.data_ptr<at::Half>())
+                : nullptr,
             reinterpret_cast<__half2*>(dx.data_ptr<at::Half>()),
             pdw.data_ptr<float>(), pdb.data_ptr<float>(), rows, d2);
       };
@@ -542,5 +570,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ln_fwd", &ln_fwd, "LayerNorm forward -> (y, mean, rstd)");
   m.def("ln_fwd_add", &ln_fwd_add,
         "Residual add + LayerNorm -> (x = a + b, y = LN(x), mean, rstd)");
-  m.def("ln_bwd", &ln_bwd, "LayerNorm backward -> (dx, dw, db)");
+  m.def("ln_bwd", &ln_bwd,
+        "LayerNorm backward -> (dx, dw, db); optional gx is a residual "
+        "gradient fused into the dx store (dx += gx)",
+        py::arg("x"), py::arg("dy"), py::arg("w"), py::arg("mean"),
+        py::arg("rstd"), py::arg("gx") = py::none());
 }

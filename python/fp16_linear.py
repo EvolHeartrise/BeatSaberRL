@@ -110,4 +110,13 @@ class _Fp16Linear(torch.autograd.Function):
 
 def fp16_linear(x, w, b):
     """Linear on an fp16 stream against fp32 master weights."""
+    if not torch.is_grad_enabled():
+        # rollout fast path: same ops as _Fp16Linear.forward, minus the
+        # autograd.Function.apply dispatch — measured 2026-07-25 as the
+        # bulk of the --fp16 all rollout regression (49 of 65 ms/update
+        # at N=1024 was Function dispatch across the 13 Linear + 4 LN
+        # sites, not the input casts the ledger blamed)
+        wh, bh = _half_params(w, b)
+        x2 = x.reshape(-1, x.shape[-1])
+        return torch.addmm(bh, x2, wh.t()).view(*x.shape[:-1], w.shape[0])
     return _Fp16Linear.apply(x, w, b)

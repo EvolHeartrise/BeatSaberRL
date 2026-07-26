@@ -75,9 +75,16 @@ class _LnAddFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gx, gy):
         x, weight, mean, rstd = ctx.saved_tensors
-        dx, dw, db = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd)
-        if gx is not None:
-            dx = dx + gx
+        # gx rides ln_bwd's dx store loop (fp32: bitwise-identical to the
+        # old separate `dx = dx + gx` kernel; fp16: one rounding instead
+        # of two). materialize_grads means gx is never None, but keep the
+        # guard for safety — an undefined gx just skips the fused add.
+        if gx is not None and not gx.is_contiguous():
+            gx = gx.contiguous()
+        dx, dw, db = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd, gx)
+        # NOTE (load-bearing): dx is returned for BOTH a and b as the
+        # SAME tensor object — valid because autograd only reads these
+        # edges; a .clone() would cost a full-size copy for nothing.
         return dx, dx, dw, db, None
 
 
@@ -95,6 +102,11 @@ class FusedLayerNorm(nn.LayerNorm):
 
     def forward(self, x):
         if self._eligible(x):
+            if not torch.is_grad_enabled():
+                # rollout fast path: skip the Function.apply dispatch
+                # (ctx/bookkeeping cost real CPU in the enqueue-bound
+                # rollout; same kernel, bit-identical)
+                return _ext.ln_fwd(x, self.weight, self.bias, self.eps)[0]
             return _LnFn.apply(x, self.weight, self.bias, self.eps)
         if x.dtype is torch.float16:
             # stock nn.LayerNorm with fp32 params: compute in fp32,
@@ -109,6 +121,10 @@ class FusedLayerNorm(nn.LayerNorm):
         contiguous sum re-enters forward()'s kernel eligibility."""
         if (self._eligible(a) and b.is_contiguous() and a.shape == b.shape
                 and b.dtype is a.dtype):
+            if not torch.is_grad_enabled():
+                x, y, _, _ = _ext.ln_fwd_add(a, b, self.weight, self.bias,
+                                             self.eps)
+                return x, y
             return _LnAddFn.apply(a, b, self.weight, self.bias, self.eps)
         if a.dtype is torch.float16:
             x = (a.float() + b.float()).to(a.dtype)
