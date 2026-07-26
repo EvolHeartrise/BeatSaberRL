@@ -1,5 +1,5 @@
 """Parity tests: CudaBeatVecEnv (custom CUDA kernel) vs the Rust sim (THE
-reference), env v7.9 — the same two tiers as test_torch_env.py.
+reference), env v7.9.
 
 Tier 1 (float64, on-GPU double kernels): exact agreement — same chart +
 same actions must give identical rewards, done timing, event counters,
@@ -154,25 +154,3 @@ def test_same_seed_reproduces():
     o1, t1 = run(5)
     o2, t2 = run(5)
     assert torch.equal(o1, o2) and torch.equal(t1, t2)
-
-
-def test_matches_torch_env_f32():
-    """Cross-check the two GPU backends on the SAME pool + action stream:
-    counters must agree closely (both are f32 ports of the same rules)."""
-    from beat_arena_env.torch_env import TorchBeatVecEnv
-    chart = _chart(FULL, 31)
-    kw = dict(charts=[chart], max_steps=_max_steps(chart),
-              dtype=torch.float32, auto_reset=False)
-    ce = CudaBeatVecEnv(1, device="cuda", **kw)
-    te = TorchBeatVecEnv(1, device="cuda", **kw)
-    ce.reset(); te.reset()
-    rng = np.random.default_rng(2)
-    for _ in range(200):
-        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(1, 12)))
-        _, _, dc, _ = ce.step(a)
-        _, _, dt, _ = te.step(a)
-        if bool(dc[0]) or bool(dt[0]):
-            break
-    assert abs(int(ce.good[0]) - int(te.good[0])) <= 1
-    assert abs(int(ce.bad[0]) - int(te.bad[0])) <= 1
-    assert abs(int(ce.miss[0]) - int(te.miss[0])) <= 1

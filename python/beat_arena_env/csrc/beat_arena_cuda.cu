@@ -4,8 +4,7 @@
 // Rust crate remains THE reference; this kernel exists so training
 // rollouts run wide (N in the thousands) with the whole step (integrate +
 // judge + auto-reset + obs) in a single launch. Parity is pinned by
-// tests/test_cuda_env.py (f64 exact vs Rust, f32 bounded drift), mirroring
-// the torch_env.py port's test tiers.
+// tests/test_cuda_env.py (f64 exact vs Rust, f32 bounded drift).
 //
 // Kernel architecture:
 // - One thread block (64 threads) per env. Threads 0/1 each own a hand for
@@ -20,12 +19,13 @@
 //   bitwise-deterministic across runs — no float atomics in the reward
 //   path). Counters use integer atomics; score adds integer-valued floats
 //   (exact at any order).
-// - Follow-through trackers use the torch port's aggregated ring: same-tick
-//   trackers share (arc, age) forever, so one slot with a note count is
-//   EXACT; K = FOLLOW_TIMEOUT + 1 slots makes slot reuse provably safe.
-// - Expression trees mirror lib.rs term for term (the torch port proved
-//   this is what makes f64 parity exact); Rust's early returns stay real
-//   branches here (no side effects, same booleans).
+// - Follow-through trackers use an aggregated ring (design note at
+//   cuda_env.py N_TRACKERS): same-tick trackers share (arc, age) forever,
+//   so one slot with a note count is EXACT; K = FOLLOW_TIMEOUT + 1 slots
+//   makes slot reuse provably safe.
+// - Expression trees mirror lib.rs term for term (the since-removed torch
+//   port proved this is what makes f64 parity exact); Rust's early returns
+//   stay real branches here (no side effects, same booleans).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -38,7 +38,7 @@
 namespace {
 
 constexpr int N_JOINTS = 6;
-constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (ring; see torch_env)
+constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (ring; see cuda_env)
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int NOTE_FEAT = 14;
 constexpr int SABER_FEAT = 23;

@@ -121,14 +121,14 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
-    p.add_argument("--env", choices=["rust", "torch", "cuda"], default=None,
-                   help="torch = GPU-resident tensor sim; cuda = custom "
-                        "CUDA-kernel sim (one launch per step); both keep "
-                        "obs on device. Default: cuda when training on a "
-                        "CUDA device (the production path; rust is ~4.6x "
-                        "slower there), else rust")
+    p.add_argument("--env", choices=["rust", "cuda"], default=None,
+                   help="cuda = custom CUDA-kernel sim (one launch per "
+                        "step, obs stay on device). Default: cuda when "
+                        "training on a CUDA device (the production path; "
+                        "rust is ~4.6x slower there), else rust. (--env "
+                        "torch, the tensor-op sim, was removed 2026-07-25)")
     p.add_argument("--chart-pool", type=int, default=1024,
-                   help="pregenerated chart pool size for --env torch/cuda")
+                   help="pregenerated chart pool size for --env cuda")
     p.add_argument("--fused-update", action="store_true",
                    help="run the minibatch forward+backward as fused CUDA "
                         "kernels (policy_cuda) with a recompute-based "
@@ -221,12 +221,9 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
-    tensor_env = args.env in ("torch", "cuda")
+    tensor_env = args.env == "cuda"
     if tensor_env:
-        if args.env == "cuda":
-            from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
-        else:
-            from beat_arena_env.torch_env import TorchBeatVecEnv as VecCls
+        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
             N, colors=args.colors, cols=tuple(args.cols),
             rows=tuple(args.rows), chart_len_s=args.chart_len,

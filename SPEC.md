@@ -538,7 +538,11 @@ bitwise reproducibility; the torch env's aggregated tracker ring;
 chart-pool indices so reset copies nothing). A deliberate THIRD sim
 implementation: Rust stays the reference; parity suite mirrors the
 torch env's (f64 EXACT on all six config×policy cases, f32 bounded;
-`tests/test_cuda_env.py`; suite 97 green). Measured: env step
+`tests/test_cuda_env.py`; suite 97 green). **The torch env itself
+(`--env torch`, torch_env.py) was REMOVED 2026-07-25** — surface-area
+reduction once the CUDA kernel became the production backend;
+`_charts_to_tensors` (the single chart-tensorization source) moved to
+cuda_env.py. Measured at removal time: env step
 **~170× the torch env** (5.8M steps/s at N=4096), end-to-end
 **1.65×** (13.6k → 22.5k steps/s; 24.6k with the then-extant
 --cuda-graphs; all pre-fused-head numbers) — the Amdahl cap: rollout
