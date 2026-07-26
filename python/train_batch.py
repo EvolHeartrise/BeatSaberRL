@@ -140,6 +140,13 @@ def parse_args():
                         "'off' = full fp32 (record-attempt fallback). "
                         "Checkpoints stay fp32 in every mode. Forced "
                         "off on CPU devices")
+    p.add_argument("--graph-rollout", action="store_true",
+                   help="capture the rollout step (policy fwd + sample + "
+                        "env kernel) as ONE CUDA graph (round-4 #9). "
+                        "Worth it only with --fp16 all (1.20x rollout "
+                        "measured at N=1024; fp32 graph is 1.03x — "
+                        "exec-bound). Changes the sampling RNG stream. "
+                        "EXPERIMENTAL: no learning gate yet")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="static loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -337,6 +344,18 @@ def main():
     b_done = torch.zeros((T, N), device=device)
     b_val = torch.zeros((T, N), device=device)
 
+    graph_roll = None
+    if args.graph_rollout:
+        assert tensor_env and device.type == "cuda", \
+            "--graph-rollout needs --env cuda"
+        assert trainer is None, \
+            "--graph-rollout is incompatible with --fused-update"
+        from rollout_graph import GraphedRollout
+        graph_roll = GraphedRollout(policy, venv)
+        print(f"--graph-rollout: rollout step captured as one CUDA graph "
+              f"({'fp16' if policy.fp16 else 'fp32'} rollout; sampling "
+              f"RNG stream differs from eager)", flush=True)
+
     ep_returns = []
     if resume_ckpt is not None:
         num_updates = resume_ckpt["schedule"]["num_updates"]
@@ -367,7 +386,17 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = lr_now
         t0 = time.perf_counter()
-        for t in range(T):
+        if graph_roll is not None:
+            graph_roll.refresh()  # in-place fp16 caches after opt.steps
+            for t in range(T):
+                b_obs[t] = venv._obs
+                a, logp, v, rew, done = graph_roll.step()
+                b_act[t], b_logp[t], b_val[t] = a, logp, v
+                b_rew[t] = rew
+                b_done[t] = done.to(b_done.dtype)
+                global_step += N
+            obs = venv._obs
+        for t in range(T if graph_roll is None else 0):
             b_obs[t] = obs
             with torch.no_grad():
                 a, logp, _, v = policy.get_action_and_value(obs)

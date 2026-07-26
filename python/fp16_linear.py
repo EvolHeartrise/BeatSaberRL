@@ -72,8 +72,18 @@ def _half_params(w, b):
     launches each — measured as --fp16 all regressing below
     update-only without the cache)."""
     cache = getattr(w, "_fp16_cache", None)
-    if cache is None or cache[0] != _weights_version:
+    if cache is None:
         cache = (_weights_version, w.detach().half(), b.detach().half())
+        w._fp16_cache = cache
+    elif cache[0] != _weights_version:
+        # refresh IN PLACE: the replica storages never move, so a CUDA
+        # graph that captured them keeps reading fresh weights after
+        # every opt.step (a reallocating rebuild would silently freeze
+        # the graphed rollout's weights — the r1-diagnostic failure
+        # class from the first _version-keyed cut)
+        cache[1].copy_(w.detach())
+        cache[2].copy_(b.detach())
+        cache = (_weights_version, cache[1], cache[2])
         w._fp16_cache = cache
     return cache[1], cache[2]
 
