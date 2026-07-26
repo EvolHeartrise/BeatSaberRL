@@ -22,7 +22,7 @@
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
 
-use numpy::{PyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyReadonlyArray2, PyReadwriteArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
@@ -480,9 +480,12 @@ struct Core {
     effort_coef: f64, // scales EFFORT_COST (0 = free movement)
     chart: Vec<Note>,
     tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
+    min_speed: f64, // slowest object; (hit_time-t)*min_speed > REACH_Z is a
+                    // conservative exact "beyond reach" bound for a sorted chart
     // state
     tick: u32,
     time: f64,
+    first_pending: usize, // smallest index with status 0 (monotone per episode)
     arms: [Arm; 2],
     trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed
@@ -507,8 +510,10 @@ impl Core {
             effort_coef,
             chart: Vec::new(),
             tail_s: 0.5,
+            min_speed: f64::INFINITY,
             tick: 0,
             time: 0.0,
+            first_pending: 0,
             arms: [Arm::start(0), Arm::start(1)],
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
@@ -540,6 +545,12 @@ impl Core {
                 free_post: fpost,
             })
             .collect();
+        // the scan cursors assume hit_time order (chart.py/beatsaver.py
+        // both sort); an unsorted chart would silently change behavior
+        assert!(
+            self.chart.windows(2).all(|w| w[0].hit_time <= w[1].hit_time),
+            "chart must be sorted by hit_time"
+        );
         // the episode tail must cover the slowest object's trip from the
         // plane to the miss boundary, or final misses never register
         let min_speed = self
@@ -547,6 +558,7 @@ impl Core {
             .iter()
             .map(|n| n.speed)
             .fold(f64::INFINITY, f64::min);
+        self.min_speed = min_speed;
         self.tail_s = if min_speed.is_finite() {
             0.5 + Z_MISS / min_speed
         } else {
@@ -558,6 +570,7 @@ impl Core {
     fn reset_state(&mut self) {
         self.tick = 0;
         self.time = 0.0;
+        self.first_pending = 0;
         self.arms = [Arm::start(0), Arm::start(1)];
         self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
@@ -600,7 +613,11 @@ impl Core {
             obs[b + 22] = (arm.swing_acc / PRE_FULL).min(2.0) as f32;
         }
         let mut slot = 0usize;
-        for (i, n) in self.chart.iter().enumerate() {
+        // start past the resolved prefix (everything before first_pending
+        // has status != 0 by construction) — the loop then typically
+        // terminates within ~N_NOTE_SLOTS iterations instead of O(chart)
+        for i in self.first_pending..self.chart.len() {
+            let n = &self.chart[i];
             if self.status[i] != 0 {
                 continue;
             }
@@ -748,11 +765,16 @@ impl Core {
             sweep_tris(prev_pos[1], prev_dir[1], self.arms[1].wrist, self.arms[1].blade),
         ];
 
-        for i in 0..self.chart.len() {
+        for i in self.first_pending..self.chart.len() {
             if self.status[i] != 0 {
                 continue;
             }
             let n = self.chart[i];
+            // sorted by hit_time, and speed >= min_speed for every note:
+            // once this bound clears REACH_Z, so does every later note's z
+            if (n.hit_time - self.time) * self.min_speed > REACH_Z {
+                break;
+            }
             let z = (n.hit_time - self.time) * n.speed;
             if z < -Z_MISS {
                 if n.kind == KIND_BOMB {
@@ -923,8 +945,16 @@ impl Core {
         }
 
         self.tick += 1;
+        // advance the low-water cursor past the newly resolved prefix;
+        // "smallest pending index" is monotone within an episode because
+        // status only ever goes 0 -> nonzero between resets
+        while self.first_pending < self.chart.len()
+            && self.status[self.first_pending] != 0
+        {
+            self.first_pending += 1;
+        }
         let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
-        let pending = self.status.iter().any(|&s| s == 0);
+        let pending = self.first_pending < self.chart.len();
         // natural completion waits for pending follow-throughs so the last
         // note's post-swing isn't truncated; the time/tick caps still end
         // the episode hard (trackers force-resolve below).
@@ -1173,16 +1203,24 @@ impl ComboWalk {
 struct VecBeatSim {
     sims: Vec<Core>,
     walks: Option<Vec<ComboWalk>>,
+    return_events: bool,
 }
 
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false))]
-    fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool) -> Self {
+    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false,
+                        return_events=true))]
+    fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
+           return_events: bool) -> Self {
         VecBeatSim {
             sims: (0..n).map(|_| Core::new_core(max_steps, effort_coef)).collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
+            // return_events=false skips materializing the per-step event
+            // list into Python objects (~2 events per scoreable object);
+            // the in-Rust combo walk still consumes every event. Both
+            // vectorized consumers (bench, BeatVecEnv) discard the list.
+            return_events,
         }
     }
 
@@ -1229,64 +1267,40 @@ impl VecBeatSim {
         Bound<'py, PyArray1<bool>>,
         Vec<(u32, u32, u8, f32, f32, f32)>,
     ) {
-        let acts = actions.as_array();
         let n = self.sims.len();
-        assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
-        let acts_vec: Vec<[[u8; N_JOINTS]; 2]> = (0..n)
-            .map(|i| {
-                let mut a = [[0u8; N_JOINTS]; 2];
-                for s in 0..2 {
-                    for j in 0..N_JOINTS {
-                        a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
-                    }
-                }
-                a
-            })
-            .collect();
         let mut flat = vec![0.0f32; n * OBS_DIM];
-        let sims = &mut self.sims;
-        let walks = &mut self.walks;
-        // Rayon over envs (2026-07-25): envs are independent, each env's
-        // combo walk is its own, and each env's event ORDER is kept in
-        // its own vec — the index-order concatenation below makes the
-        // output identical to the old serial loop (pinned by the
-        // vec-matches-single and Rust==Python-walk tests). The GIL is
-        // released for the span (plain Rust data only), so Python
-        // threads — the bench's parse/download producer — truly overlap.
-        let per_env: Vec<(f32, bool, Vec<(u32, u8, f32, f32, f32)>)> = py
-            .allow_threads(|| {
-                let walk_opts: Vec<Option<&mut ComboWalk>> = match walks {
-                    Some(ws) => ws.iter_mut().map(Some).collect(),
-                    None => (0..n).map(|_| None).collect(),
-                };
-                sims.par_iter_mut()
-                    .zip_eq(walk_opts)
-                    .zip_eq(flat.par_chunks_mut(OBS_DIM))
-                    .zip_eq(&acts_vec)
-                    .map(|(((sim, mut walk), obs_chunk), a)| {
-                        let (r, d, events) = sim.step_inner(*a);
-                        obs_chunk.copy_from_slice(&sim.build_obs());
-                        if let Some(w) = walk.as_mut() {
-                            for &(note, code, pts, _, _) in &events {
-                                w.consume(note, code, pts);
-                            }
-                        }
-                        (r as f32, d, events)
-                    })
-                    .collect()
-            });
-        let mut rewards = vec![0.0f32; n];
-        let mut dones = vec![false; n];
-        let mut all_events: Vec<(u32, u32, u8, f32, f32, f32)> = Vec::new();
-        for (i, (r, d, events)) in per_env.into_iter().enumerate() {
-            rewards[i] = r;
-            dones[i] = d;
-            for (note, code, pts, pre, acc) in events {
-                all_events.push((i as u32, note, code, pts, pre, acc));
-            }
-        }
+        let (rewards, dones, all_events) = self.step_core(py, actions, &mut flat);
         (
             PyArray1::from_vec_bound(py, flat),
+            PyArray1::from_vec_bound(py, rewards),
+            PyArray1::from_vec_bound(py, dones),
+            all_events,
+        )
+    }
+
+    /// Like `step`, but writes the obs into a caller-owned C-contiguous
+    /// (N, 286) f32 array instead of allocating a fresh 586 KB buffer per
+    /// step — the buffer stays cache-resident, and a pinned torch buffer
+    /// makes the following H2D copy an async DMA. Returns
+    /// (rewards, dones, events).
+    fn step_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray2<'py, i64>,
+        mut out_obs: PyReadwriteArray2<'py, f32>,
+    ) -> (
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Vec<(u32, u32, u8, f32, f32, f32)>,
+    ) {
+        let n = self.sims.len();
+        assert_eq!(out_obs.shape(), &[n, OBS_DIM], "out_obs must be (N, OBS_DIM)");
+        let mut out = out_obs.as_array_mut();
+        let flat = out
+            .as_slice_mut()
+            .expect("out_obs must be C-contiguous");
+        let (rewards, dones, all_events) = self.step_core(py, actions, flat);
+        (
             PyArray1::from_vec_bound(py, rewards),
             PyArray1::from_vec_bound(py, dones),
             all_events,
@@ -1296,6 +1310,21 @@ impl VecBeatSim {
     /// Single env's current obs (286,) — used for cheap post-reset reads.
     fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
         PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
+    }
+
+    /// Single env's current obs written into row i of a caller-owned
+    /// (N, 286) f32 array (the `step_into` buffer) — post-reset refresh
+    /// without a per-call allocation.
+    fn obs_one_into<'py>(
+        &self,
+        i: usize,
+        mut out_obs: PyReadwriteArray2<'py, f32>,
+    ) {
+        assert_eq!(out_obs.shape(), &[self.sims.len(), OBS_DIM]);
+        let mut out = out_obs.as_array_mut();
+        let flat = out.as_slice_mut().expect("out_obs must be C-contiguous");
+        flat[i * OBS_DIM..(i + 1) * OBS_DIM]
+            .copy_from_slice(&self.sims[i].build_obs());
     }
 
     /// (good, bad, miss, n_scoreable, score, bombs_hit) for env i.
@@ -1315,6 +1344,82 @@ impl VecBeatSim {
     fn components(&self, i: usize) -> (f64, f64, f64) {
         let s = &self.sims[i];
         (s.score_pre, s.score_acc, s.score_post)
+    }
+}
+
+impl VecBeatSim {
+    /// Shared body of `step`/`step_into`: rayon-step every env, write obs
+    /// rows into `flat`, and concatenate per-env events in index order.
+    fn step_core(
+        &mut self,
+        py: Python<'_>,
+        actions: PyReadonlyArray2<'_, i64>,
+        flat: &mut [f32],
+    ) -> (Vec<f32>, Vec<bool>, Vec<(u32, u32, u8, f32, f32, f32)>) {
+        let acts = actions.as_array();
+        let n = self.sims.len();
+        assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
+        assert_eq!(flat.len(), n * OBS_DIM);
+        let acts_vec: Vec<[[u8; N_JOINTS]; 2]> = (0..n)
+            .map(|i| {
+                let mut a = [[0u8; N_JOINTS]; 2];
+                for s in 0..2 {
+                    for j in 0..N_JOINTS {
+                        a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
+                    }
+                }
+                a
+            })
+            .collect();
+        let sims = &mut self.sims;
+        let walks = &mut self.walks;
+        // Rayon over envs (2026-07-25): envs are independent, each env's
+        // combo walk is its own, and each env's event ORDER is kept in
+        // its own vec — the index-order concatenation below makes the
+        // output identical to the old serial loop (pinned by the
+        // vec-matches-single and Rust==Python-walk tests). The GIL is
+        // released for the span (plain Rust data only), so Python
+        // threads — the bench's parse/download producer — truly overlap.
+        // with_min_len: per-env work is ~1-3 us; without a floor rayon's
+        // adaptive splitter can split toward single items, paying job +
+        // atomic overhead and false-sharing obs rows (1144 B, not
+        // line-aligned) across threads.
+        let per_env: Vec<(f32, bool, Vec<(u32, u8, f32, f32, f32)>)> = py
+            .allow_threads(|| {
+                let walk_opts: Vec<Option<&mut ComboWalk>> = match walks {
+                    Some(ws) => ws.iter_mut().map(Some).collect(),
+                    None => (0..n).map(|_| None).collect(),
+                };
+                sims.par_iter_mut()
+                    .zip_eq(walk_opts)
+                    .zip_eq(flat.par_chunks_mut(OBS_DIM))
+                    .zip_eq(&acts_vec)
+                    .with_min_len(16)
+                    .map(|(((sim, mut walk), obs_chunk), a)| {
+                        let (r, d, events) = sim.step_inner(*a);
+                        obs_chunk.copy_from_slice(&sim.build_obs());
+                        if let Some(w) = walk.as_mut() {
+                            for &(note, code, pts, _, _) in &events {
+                                w.consume(note, code, pts);
+                            }
+                        }
+                        (r as f32, d, events)
+                    })
+                    .collect()
+            });
+        let mut rewards = vec![0.0f32; n];
+        let mut dones = vec![false; n];
+        let mut all_events: Vec<(u32, u32, u8, f32, f32, f32)> = Vec::new();
+        for (i, (r, d, events)) in per_env.into_iter().enumerate() {
+            rewards[i] = r;
+            dones[i] = d;
+            if self.return_events {
+                for (note, code, pts, pre, acc) in events {
+                    all_events.push((i as u32, note, code, pts, pre, acc));
+                }
+            }
+        }
+        (rewards, dones, all_events)
     }
 }
 

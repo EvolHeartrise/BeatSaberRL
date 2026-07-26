@@ -121,10 +121,12 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
-    p.add_argument("--env", choices=["rust", "torch", "cuda"], default="rust",
+    p.add_argument("--env", choices=["rust", "torch", "cuda"], default=None,
                    help="torch = GPU-resident tensor sim; cuda = custom "
                         "CUDA-kernel sim (one launch per step); both keep "
-                        "obs on device")
+                        "obs on device. Default: cuda when training on a "
+                        "CUDA device (the production path; rust is ~4.6x "
+                        "slower there), else rust")
     p.add_argument("--chart-pool", type=int, default=1024,
                    help="pregenerated chart pool size for --env torch/cuda")
     p.add_argument("--fused-update", action="store_true",
@@ -211,6 +213,9 @@ def main():
     np.random.seed(args.seed)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if args.env is None:
+        args.env = "cuda" if device.type == "cuda" else "rust"
+        print(f"--env not given: defaulting to '{args.env}'", flush=True)
 
     N, T = args.num_envs, args.horizon
     batch = N * T
@@ -339,13 +344,17 @@ def main():
         t0 = time.perf_counter()
         with torch.no_grad():
             _, _, _, next_val = policy.get_action_and_value(obs)
+            # everything non-recursive hoisted out of the T-loop (same
+            # elementwise op order as the per-t version, so bit-exact);
+            # only the scan itself stays sequential
+            nonterm = 1.0 - b_done
+            nextv = torch.cat([b_val[1:], next_val.unsqueeze(0)])
+            deltas = b_rew + GAMMA * nextv * nonterm - b_val
+            coef = (GAMMA * GAE_LAMBDA) * nonterm
             adv = torch.zeros((T, N), device=device)
             lastgae = torch.zeros(N, device=device)
             for t in reversed(range(T)):
-                nonterminal = 1.0 - b_done[t]
-                nextvalue = next_val if t == T - 1 else b_val[t + 1]
-                delta = b_rew[t] + GAMMA * nextvalue * nonterminal - b_val[t]
-                lastgae = delta + GAMMA * GAE_LAMBDA * nonterminal * lastgae
+                lastgae = deltas[t] + coef[t] * lastgae
                 adv[t] = lastgae
             returns = adv + b_val
 
@@ -355,11 +364,13 @@ def main():
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
 
-        idx = np.arange(batch)
         for _ in range(args.epochs):
-            np.random.shuffle(idx)
+            # device-side shuffle: a host-side index array costs a
+            # synchronizing pageable H2D copy per minibatch (~26 ms/update
+            # measured on WDDM)
+            perm = torch.randperm(batch, device=device)
             for s in range(0, batch, mb_size):
-                mb = torch.as_tensor(idx[s:s + mb_size], device=device)
+                mb = perm[s:s + mb_size]
                 if trainer is not None:  # fused minibatch body
                     loss, ent_loss = fused_minibatch_losses(
                         trainer, args.ent_coef, f_obs[mb], f_act[mb],

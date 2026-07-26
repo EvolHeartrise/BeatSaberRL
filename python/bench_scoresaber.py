@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import pickle
@@ -76,8 +77,11 @@ class _GraphedArgmax(_Graphed):
             logits, _ = self.policy(self.s_obs)
         return torch.stack(logits, dim=1).argmax(-1)
 
-    def __call__(self, obs_np):
-        self.s_obs.copy_(torch.from_numpy(obs_np))
+    def __call__(self, obs_t):
+        # obs_t is the loop's persistent (pinned) host buffer, so this
+        # H2D is an async DMA; the .cpu() on the result syncs before the
+        # sim overwrites the buffer
+        self.s_obs.copy_(obs_t, non_blocking=True)
         return self._run()
 
 
@@ -91,8 +95,8 @@ class _FusedArgmax:
         self.fused = FusedNotePolicy(policy, device)
         self.s_obs = torch.zeros(n, OBS_DIM, device=device)
 
-    def __call__(self, obs_np):
-        self.s_obs.copy_(torch.from_numpy(obs_np))
+    def __call__(self, obs_t):
+        self.s_obs.copy_(obs_t, non_blocking=True)
         return self.fused.argmax(self.s_obs)
 
 
@@ -180,14 +184,20 @@ def save_results(path, data, levels):
 
 
 def parser_version():
-    """Chart-cache version: hash of the parser + scoring sources. Any
-    edit to them invalidates every cached chart automatically (the
-    parser has changed repeatedly — chains, arcs, angle snap)."""
+    """Chart-cache version: hash of the code the cached payload actually
+    depends on. beatsaver.py is hashed whole (it IS the parser); from
+    chart.py and scoresaber.py only the payload-relevant symbols are
+    hashed — hashing those modules whole (pre-2026-07-25) meant every
+    procedural-GENERATOR edit silently invalidated the entire cache,
+    turning the next bench into a full cold re-parse."""
     from beat_arena_env import beatsaver, chart
     h = hashlib.sha256()
-    for mod in (beatsaver, chart, scoresaber):
-        with open(mod.__file__, "rb") as f:
-            h.update(f.read())
+    with open(beatsaver.__file__, "rb") as f:
+        h.update(f.read())
+    for sym in (chart.Note, chart.note_tuple, chart.chain_links,
+                scoresaber.ComboTracker, scoresaber.max_multiplied_score):
+        h.update(inspect.getsource(sym).encode())
+    h.update(repr(sorted(scoresaber.MAX_UNIT_POINTS.items())).encode())
     return h.hexdigest()[:10]
 
 
@@ -376,7 +386,8 @@ def main():
     N = args.num_envs
     # Rust-side combo walk (2026-07-25, the ONLY walk since same day):
     # each env's ordered events feed its walk inside the step call
-    sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True)
+    sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True,
+                     return_events=False)
     for i in range(N):
         sim.set_chart(i, [])
     fwd = None
@@ -391,7 +402,13 @@ def main():
     if fwd is None:
         fwd = (None if args.no_graphs or device.type != "cuda"
                else _GraphedArgmax(policy, N, device))
-    obs_buf = np.zeros((N, OBS_DIM), dtype=np.float32)
+    # persistent obs buffer (2026-07-25): sim.step_into writes the rows
+    # in place — no fresh 586 KB Rust allocation per vector step, and the
+    # buffer stays cache-resident; pinned memory turns the H2D copy into
+    # an async DMA on CUDA
+    obs_t = torch.empty((N, OBS_DIM), dtype=torch.float32,
+                        pin_memory=device.type == "cuda")
+    obs_buf = obs_t.numpy()
     slots = [None] * N
     free = list(range(N))
     n_active, feed_done, n_done, n_new_skip = 0, False, 0, 0
@@ -433,20 +450,19 @@ def main():
 
             if fwd is not None:
                 try:
-                    actions = fwd(obs_buf).cpu().numpy()
+                    actions = fwd(obs_t).cpu().numpy()
                 except Exception as e:       # capture failed: go eager
                     print(f"[cuda-graphs] falling back to eager: {e}",
                           flush=True)
                     fwd = None
             if fwd is None:
-                batch = torch.as_tensor(obs_buf, device=device)
+                batch = obs_t.to(device, non_blocking=True)
                 with torch.no_grad():
                     logits, _ = policy(batch)
                 # one stacked argmax kernel over the 12 heads, one D2H sync
                 actions = torch.stack(logits, dim=1).argmax(-1).cpu().numpy()
-            obs_flat, _, dones, _events = sim.step(
-                np.ascontiguousarray(actions, dtype=np.int64))
-            obs_buf = np.asarray(obs_flat).reshape(N, OBS_DIM)
+            _, dones, _events = sim.step_into(
+                np.ascontiguousarray(actions, dtype=np.int64), obs_buf)
             n_finished = 0
             for i in np.flatnonzero(np.asarray(dones)):
                 i = int(i)

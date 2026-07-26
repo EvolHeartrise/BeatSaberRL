@@ -32,8 +32,10 @@ class BeatVecEnv:
         )
         # +90: the episode tail must cover the miss boundary trip
         # (Z_MISS 2.65 m at the slowest speeds) past the last note
+        # return_events=False: the event list is discarded below; skip
+        # materializing it into Python tuples every step
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
-                              effort_coef=effort_coef)
+                              effort_coef=effort_coef, return_events=False)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
 
@@ -51,7 +53,7 @@ class BeatVecEnv:
         """actions: (N, 12) int array — per hand (pitch, yaw, twist,
         elbow, roll, bend), left first. Returns (obs, rewards, dones,
         infos); infos = list of dicts for envs that finished THIS step."""
-        obs, rew, done, _events = self.sim.step(
+        obs, rew, done, _events = self.sim.step(  # events empty (ctor flag)
             np.ascontiguousarray(actions, dtype=np.int64))
         obs = obs.reshape(self.num_envs, OBS_DIM)
         self._returns += rew
