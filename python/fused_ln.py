@@ -61,11 +61,45 @@ class _LnFn(torch.autograd.Function):
         return dx, dw, db, None
 
 
+class _LnAddFn(torch.autograd.Function):
+    """x = a + b fused into the LN pass; returns (x, ln(x)). Backward:
+    d/da == d/db == (grad flowing to x) + (LN's dx from grad on y) — the
+    two-term sum is commutative bitwise, so this matches the unfused
+    autograd accumulation exactly."""
+    @staticmethod
+    def forward(ctx, a, b, weight, bias, eps):
+        x, y, mean, rstd = _ext.ln_fwd_add(a, b, weight, bias, eps)
+        ctx.save_for_backward(x, weight, mean, rstd)
+        return x, y
+
+    @staticmethod
+    def backward(ctx, gx, gy):
+        x, weight, mean, rstd = ctx.saved_tensors
+        dx, dw, db = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd)
+        if gx is not None:
+            dx = dx + gx
+        return dx, dx, dw, db, None
+
+
 class FusedLayerNorm(nn.LayerNorm):
-    def forward(self, x):
-        if (x.is_cuda and x.dtype is torch.float32 and x.is_contiguous()
+    def _eligible(self, x):
+        return (x.is_cuda and x.dtype is torch.float32 and x.is_contiguous()
                 and len(self.normalized_shape) == 1
                 and self.normalized_shape[0] <= 256
-                and self.elementwise_affine and _load() is not None):
+                and self.elementwise_affine and _load() is not None)
+
+    def forward(self, x):
+        if self._eligible(x):
             return _LnFn.apply(x, self.weight, self.bias, self.eps)
         return super().forward(x)
+
+    def forward_add(self, a, b):
+        """(a + b, LayerNorm(a + b)) — one fused pass on the CUDA path
+        (the residual sum a + b is a full-size elementwise kernel the
+        fusion absorbs). Fallback computes the same bits unfused; the
+        contiguous sum re-enters forward()'s kernel eligibility."""
+        if (self._eligible(a) and b.is_contiguous() and a.shape == b.shape
+                and b.dtype is torch.float32):
+            return _LnAddFn.apply(a, b, self.weight, self.bias, self.eps)
+        x = a + b
+        return x, self.forward(x)
