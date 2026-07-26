@@ -36,7 +36,7 @@ $VENV/bin/python -m pytest tests/
 # (~140k steps/s vs the 78k fp32 era; fp32 masters/checkpoints; see
 # sessions/2026-07-25-opt-round4-landings.md and
 # sessions/2026-07-26-graph-rollout-gate.md for the gate results)
-$VENV/bin/python train_batch.py --env cuda --epochs 2 --num-envs 1024
+$VENV/bin/python train_batch.py --env cuda --num-envs 1024
 ```
 
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim

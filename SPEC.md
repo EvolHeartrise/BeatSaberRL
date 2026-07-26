@@ -551,6 +551,12 @@ the update path (82% after the fused-head rewrite).
 Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
+**`--epochs 1 --minibatches 8` is the DEFAULT (2026-07-26, user
+decision)**: same 8 gradient steps/update as the old e2/mb4 at half the
+update compute — the paired 50M gate measured **+110.9 wpp (dAcc
+t=+12.88, score_acc +32.5%) AND 1.61x wall** (~250k steps/s at the
+production config). Overturns the 07-21 "single-pass fails" study,
+which conflated sample reuse with gradient-step density.
 **`--fp16 all --graph-rollout` is the production DEFAULT for training
 legs (2026-07-26, user decision)**: fp16-storage activations everywhere
 (fp32 cuBLAS compute, fp32 master weights/checkpoints, static loss
