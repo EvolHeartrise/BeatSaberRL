@@ -136,22 +136,26 @@ def parse_args():
                         "1024 — diversity was binding, concentrated in "
                         "score_acc (+9.1%%). Costs ~13 s pool gen per leg)")
     p.add_argument("--fp16", choices=["off", "update", "all"],
-                   default="update",
+                   default="all",
                    help="fp16-storage activations (fp32 cuBLAS compute, "
                         "fp32 master weights, fp32 PPO math; 2026-07-25). "
-                        "'update' (the DEFAULT since 2026-07-25, +41%% "
-                        "wall) = minibatch fwd+bwd only; 'all' = rollout "
-                        "too (loses ~6%% at N=1024 — launch-bound); "
-                        "'off' = full fp32 (record-attempt fallback). "
-                        "Checkpoints stay fp32 in every mode. Forced "
-                        "off on CPU devices")
-    p.add_argument("--graph-rollout", action="store_true",
+                        "'all' (the DEFAULT since 2026-07-26, user "
+                        "decision after the graph gate: +72.4 wpp over "
+                        "'update', r1 2.0e-3 -> 6.7e-4 — rollout/update "
+                        "consistency beats rollout precision) = rollout "
+                        "AND update; 'update' = minibatch fwd+bwd only "
+                        "(the pre-gate default); 'off' = full fp32 "
+                        "(record-attempt fallback). Checkpoints stay "
+                        "fp32 in every mode. Forced off on CPU devices")
+    p.add_argument("--graph-rollout", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="capture the rollout step (policy fwd + sample + "
-                        "env kernel) as ONE CUDA graph (round-4 #9). "
-                        "Worth it only with --fp16 all (1.20x rollout "
-                        "measured at N=1024; fp32 graph is 1.03x — "
-                        "exec-bound). Changes the sampling RNG stream. "
-                        "EXPERIMENTAL: no learning gate yet")
+                        "env kernel) as ONE CUDA graph (round-4 #9; "
+                        "DEFAULT since 2026-07-26 — gate-cleared with "
+                        "--fp16 all: 1.20x rollout, +72.4 wpp paired). "
+                        "Changes the sampling RNG stream vs eager. "
+                        "Auto-downgrades (with a note) on CPU/rust env, "
+                        "--fused-update, or capture failure")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="static loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -269,6 +273,16 @@ def main():
     ratio_diag = torch.zeros((), device=device)
 
     tensor_env = args.env == "cuda"
+    # --graph-rollout is the DEFAULT (2026-07-26); downgrade with a note
+    # where it cannot apply (same policy as the fp16 default above)
+    if args.graph_rollout and (not tensor_env or device.type != "cuda"):
+        print("--graph-rollout: needs --env cuda on a CUDA device, "
+              "forcing off", flush=True)
+        args.graph_rollout = False
+    if args.graph_rollout and args.fused_update:
+        print("--graph-rollout: incompatible with --fused-update, "
+              "forcing off", flush=True)
+        args.graph_rollout = False
     if tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
@@ -351,15 +365,16 @@ def main():
 
     graph_roll = None
     if args.graph_rollout:
-        assert tensor_env and device.type == "cuda", \
-            "--graph-rollout needs --env cuda"
-        assert trainer is None, \
-            "--graph-rollout is incompatible with --fused-update"
-        from rollout_graph import GraphedRollout
-        graph_roll = GraphedRollout(policy, venv)
-        print(f"--graph-rollout: rollout step captured as one CUDA graph "
-              f"({'fp16' if policy.fp16 else 'fp32'} rollout; sampling "
-              f"RNG stream differs from eager)", flush=True)
+        try:
+            from rollout_graph import GraphedRollout
+            graph_roll = GraphedRollout(policy, venv)
+            print(f"--graph-rollout: rollout step captured as one CUDA "
+                  f"graph ({'fp16' if policy.fp16 else 'fp32'} rollout; "
+                  f"sampling RNG stream differs from eager)", flush=True)
+        except Exception as e:  # driver/WDDM capture failure: eager fallback
+            graph_roll = None
+            print(f"--graph-rollout: capture failed, falling back to the "
+                  f"eager rollout [{type(e).__name__}: {e}]", flush=True)
 
     ep_returns = []
     if resume_ckpt is not None:
