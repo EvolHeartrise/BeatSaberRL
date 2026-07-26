@@ -80,7 +80,9 @@ class Note:
 @dataclass
 class ChartConfig:
     chart_len_s: float = 20.0
-    colors: str = "right"         # "right" (all blue) or "both"
+    colors: str = "both"          # "both" (default since 2026-07-26 —
+    # the old right-only default silently trained one-handed policies;
+    # "right" remains for tests/curricula only)
     first_note_s: float = 1.0     # first generation tick (s)
     cols: tuple = (0, 1, 2, 3)    # allowed columns (curriculum: restrict)
     rows: tuple = (0, 1, 2)       # allowed rows

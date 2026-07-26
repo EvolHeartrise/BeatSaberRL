@@ -56,7 +56,8 @@ envs) builds once with:
 cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
-Difficulty dials (generator v2, SPEC §Chart generation): `--colors both`
+Difficulty dials (generator v2, SPEC §Chart generation — colors is
+always both since 2026-07-26; the `--colors` flag is gone):
 doubles the note stream; per-tick probabilities `--note-prob 0.25
 --extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
 the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. Since env
@@ -117,7 +118,7 @@ viewer needs a real BeatSaver map to render.
 
 ```bash
 $VENV/bin/python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
-$VENV/bin/python record_replay.py --scripted --colors both
+$VENV/bin/python record_replay.py --scripted
 ```
 
 then open `viz/replay.html` in a browser and drop a

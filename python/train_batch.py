@@ -182,7 +182,11 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=1)
     # env config (generator v2 dials, SPEC.md §Chart generation)
-    p.add_argument("--colors", choices=["right", "both"], default="right")
+    # --colors REMOVED (2026-07-26, user decision): the right-only
+    # default silently trained gen3's 5B run one-handed (49.9% of
+    # real-map notes uncuttable — the whole transfer regression).
+    # Training is always both-hands now; ChartConfig still accepts
+    # colors="right" programmatically for tests/curricula.
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3])
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
@@ -294,7 +298,7 @@ def main():
     if tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
-            N, colors=args.colors, cols=tuple(args.cols),
+            N, cols=tuple(args.cols),
             rows=tuple(args.rows), chart_len_s=args.chart_len,
             note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
@@ -304,7 +308,7 @@ def main():
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
-            N, colors=args.colors, cols=tuple(args.cols),
+            N, cols=tuple(args.cols),
             rows=tuple(args.rows), chart_len_s=args.chart_len,
             note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,

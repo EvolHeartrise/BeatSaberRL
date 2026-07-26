@@ -6,7 +6,7 @@ built from the sim's event stream). Logged rewards are the raw
 interpretable ones (score/115 per good cut, -0.5 bad/miss).
 
   python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
-  python record_replay.py --scripted --colors both --note-prob 0.35
+  python record_replay.py --scripted --note-prob 0.35
   python record_replay.py --random
 """
 
@@ -36,7 +36,6 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="replays")
     p.add_argument("--tag", type=str, default=None,
                    help="filename prefix (default: run-dir name / scripted / random)")
-    p.add_argument("--colors", choices=["right", "both"], default="right")
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3])
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
@@ -53,7 +52,7 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    kw = dict(colors=args.colors, cols=tuple(args.cols),
+    kw = dict(cols=tuple(args.cols),
               rows=tuple(args.rows), chart_len_s=args.chart_len,
               note_speed_min=args.note_speed_min,
               note_speed_max=args.note_speed_max,
