@@ -232,16 +232,7 @@ class NotePolicy(nn.Module):
             # so the 13-tensor cat + fp16 cast is cached per weight
             # EPOCH (fp16_linear.bump_weights_version — tensor _version
             # is not bumped by fused Adam) instead of rebuilt 128 times
-            import fp16_linear as _fl
-            vers = _fl._weights_version
-            c = getattr(self, "_head_cache", None)
-            if c is None or c[0] != vers:
-                w = torch.cat([hd.weight for hd in self.heads]
-                              + [self.value_head.weight])
-                b = torch.cat([hd.bias for hd in self.heads]
-                              + [self.value_head.bias])
-                c = (vers, w.half(), b.half())
-                self._head_cache = c
+            c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
             return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
         w = torch.cat([hd.weight for hd in self.heads]
@@ -255,6 +246,38 @@ class NotePolicy(nn.Module):
         else:
             out = F.linear(h, w, b)                                  # (B, 37)
         return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
+
+    def _refresh_head_cache(self):
+        """Version-keyed fused-head weight cache, refreshed IN PLACE so
+        the storages never move (CUDA-graph contract — see
+        fp16_linear._half_params)."""
+        import fp16_linear as _fl
+        vers = _fl._weights_version
+        c = getattr(self, "_head_cache", None)
+        if c is None or c[0] != vers:
+            w = torch.cat([hd.weight for hd in self.heads]
+                          + [self.value_head.weight])
+            b = torch.cat([hd.bias for hd in self.heads]
+                          + [self.value_head.bias])
+            if c is None:
+                c = [vers, w.half(), b.half()]
+                self._head_cache = c
+            else:
+                c[1].copy_(w)
+                c[2].copy_(b)
+                c[0] = vers
+        return c
+
+    def refresh_fp16_caches(self):
+        """Force-refresh every fp16 replica cache (13 Linears + fused
+        head) for the current weights version. A graphed rollout MUST
+        call this after opt.steps — its captured kernels read the cache
+        storages directly and never run the lazy rebuild logic."""
+        import fp16_linear as _fl
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                _fl._half_params(m.weight, m.bias)
+        self._refresh_head_cache()
 
     def forward(self, obs: torch.Tensor):
         logits, value = self.forward_stacked(obs)
