@@ -227,6 +227,23 @@ class NotePolicy(nn.Module):
         tokens = self.blocks[-1](tokens, key_mask, n_queries=2,
                                  attn_bias=attn_bias, delta=delta)
         h = _seq(self.trunk, tokens.reshape(B, -1))                  # saber readout
+        if fp16 and not torch.is_grad_enabled():
+            # rollout fast path: weights are frozen between opt.steps,
+            # so the 13-tensor cat + fp16 cast is cached per weight
+            # EPOCH (fp16_linear.bump_weights_version — tensor _version
+            # is not bumped by fused Adam) instead of rebuilt 128 times
+            import fp16_linear as _fl
+            vers = _fl._weights_version
+            c = getattr(self, "_head_cache", None)
+            if c is None or c[0] != vers:
+                w = torch.cat([hd.weight for hd in self.heads]
+                              + [self.value_head.weight])
+                b = torch.cat([hd.bias for hd in self.heads]
+                              + [self.value_head.bias])
+                c = (vers, w.half(), b.half())
+                self._head_cache = c
+            out = F.linear(h, c[1], c[2]).float()
+            return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
