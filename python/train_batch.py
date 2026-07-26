@@ -336,6 +336,15 @@ def main():
             global_step += N
         if tensor_env:
             ep_returns.extend(venv.pop_stats())
+        # drain before reading the phase timer: kernel launches are
+        # async, so without this the section boundary charges queued
+        # work to whichever section blocks next (the 2026-07-25
+        # attribution found the printed split ~inverted: real
+        # production split is ~16% rollout / ~84% update). --bench only:
+        # the drain serializes CPU enqueue with GPU execution and costs
+        # ~2-8% wall, so production keeps async timers (and says so)
+        if args.bench and device.type == "cuda":
+            torch.cuda.synchronize()
         t_rollout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -395,6 +404,8 @@ def main():
             # mirror the packed weights into the torch policy: the next
             # rollout and any checkpoint below read the module's params
             trainer.unpack_to(policy)
+        if args.bench and device.type == "cuda":
+            torch.cuda.synchronize()  # see rollout-timer note
         t_update += time.perf_counter() - t0
 
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
@@ -429,9 +440,11 @@ def main():
                              "num_updates": num_updates}},
                os.path.join(args.run_dir, "final.pt"))
     tot = t_rollout + t_update
+    split_kind = "exec-true" if args.bench else \
+        "enqueue-attributed, NOT execution time — use --bench"
     print(f"THROUGHPUT: {(global_step - steps_before) / (time.time() - start):,.0f} steps/s total | "
-          f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% | "
-          f"N={N} T={T}", flush=True)
+          f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% "
+          f"({split_kind}) | N={N} T={T}", flush=True)
 
 
 if __name__ == "__main__":
