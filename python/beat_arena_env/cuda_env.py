@@ -167,6 +167,29 @@ def _charts_to_tensors(charts, device, dtype):
     }
 
 
+def _pool_cache_path(cfg, seed, pool_size, dtype):
+    """Cache file for a procedural chart pool. Keyed on the FULL chart
+    config + seed + pool size + dtype + a hash of chart.py (the
+    generator algorithm) — any generator edit invalidates every cached
+    pool, mirroring the bench's parser_version() contract."""
+    import hashlib
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "chart.py"), "rb").read()
+    blob = repr((repr(cfg), seed, pool_size, str(dtype))).encode()
+    key = hashlib.sha1(src + blob).hexdigest()[:16]
+    cdir = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "pool_cache")
+    os.makedirs(cdir, exist_ok=True)
+    return os.path.join(cdir, f"pool_{pool_size}_{key}.npz")
+
+
+def _load_pool_cache(path, device):
+    if not os.path.exists(path):
+        return None
+    data = np.load(path)
+    return {k: torch.as_tensor(data[k], device=device) for k in data.files}
+
+
 class CudaBeatVecEnv:
     """BeatVecEnv-alike backed by the CUDA kernel. step() takes an
     (N, 12) long action tensor (per hand: pitch, yaw, twist, elbow, roll,
@@ -197,9 +220,27 @@ class CudaBeatVecEnv:
                 note_speed_max=note_speed_max,
                 note_prob=note_prob, extra_prob=extra_prob,
                 dot_prob=dot_prob, bomb_prob=bomb_prob)
-            rng = np.random.default_rng(seed)
-            charts = [generate_chart(cfg, rng) for _ in range(chart_pool)]
-        self.pool = _charts_to_tensors(charts, self.device, dtype)
+            # pool cache (2026-07-26): serialized (P, C) tensors, keyed
+            # on config+seed+size+generator hash — chart gen is serial
+            # Python at ~1.5 s per 1024 charts, so a 65536 pool costs
+            # ~96 s fresh but ~1 s from cache. Bit-identical round trip
+            # (validated: cached load == fresh gen, torch.equal).
+            cpath = _pool_cache_path(cfg, seed, chart_pool, dtype)
+            self.pool = _load_pool_cache(cpath, self.device)
+            if self.pool is None:
+                rng = np.random.default_rng(seed)
+                charts = [generate_chart(cfg, rng)
+                          for _ in range(chart_pool)]
+                self.pool = _charts_to_tensors(charts, self.device, dtype)
+                np.savez(cpath, **{k: v.cpu().numpy()
+                                   for k, v in self.pool.items()})
+                print(f"[pool-cache] generated {chart_pool} charts -> "
+                      f"{os.path.basename(cpath)}", flush=True)
+            else:
+                print(f"[pool-cache] hit: {os.path.basename(cpath)}",
+                      flush=True)
+        else:
+            self.pool = _charts_to_tensors(charts, self.device, dtype)
         self.pool_size, self.C = self.pool["hit"].shape
         if max_steps is None:
             max_steps = int(chart_len_s * 30) + 90
