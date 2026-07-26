@@ -377,8 +377,14 @@ struct Sim {
 
 // One block per env; the whole step (integrate, judge, done, auto-reset,
 // obs) in one launch. Mirrors lib.rs step_inner's phase order exactly.
+// __launch_bounds__(64, 16) caps the f32 instantiation at 64 regs for 16
+// resident blocks/SM (was 83 regs -> 12 blocks/SM; at production N=1024
+// on 20 SMs that is 3.2 waves vs 4.3 — the round-2 sweep unroll's
+// REG 63->80 trade was justified at N=128, where the grid was resident
+// either way). The f64 instantiation (parity tests only) spills instead;
+// correctness is unaffected and its speed does not matter.
 template <typename T>
-__global__ void step_kernel(Sim<T> P) {
+__global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
   const int e = blockIdx.x;
   const int tid = threadIdx.x;
   const int C = P.C;
