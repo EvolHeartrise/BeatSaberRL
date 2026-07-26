@@ -175,6 +175,11 @@ def save_results(path, data, levels):
     data["n_skipped"] = len(levels) - len(evaluated)
     data["total_weighted_pp"] = round(
         scoresaber.weighted_total_pp([e["pp"] for e in evaluated]), 2)
+    # unweighted sum (2026-07-26, user request): wpp saturates once the
+    # top-300 dominate the 0.965^rank series; the raw sum keeps
+    # measuring breadth across the whole evaluated set
+    data["total_unweighted_pp"] = round(
+        sum(e["pp"] for e in evaluated), 2)
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -366,7 +371,8 @@ def main():
     if not tasks:
         save_results(out_path, data, levels)
         print(f"nothing to do; totals refreshed "
-              f"(weighted PP {data['total_weighted_pp']})", flush=True)
+              f"(weighted PP {data['total_weighted_pp']}, unweighted "
+              f"{data['total_unweighted_pp']})", flush=True)
         return
 
     q = queue.Queue(maxsize=max(64, 2 * args.num_envs))
@@ -505,7 +511,8 @@ def main():
 
     print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
-          f"total weighted PP {data['total_weighted_pp']} -> {out_path}",
+          f"total weighted PP {data['total_weighted_pp']} | "
+          f"unweighted PP {data['total_unweighted_pp']} -> {out_path}",
           flush=True)
 
 
