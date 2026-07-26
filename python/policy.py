@@ -117,8 +117,11 @@ class Block(nn.Module):
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * 1e9       # (B, 1, T)
         if self.n_heads == 1:
-            scores = q @ k.transpose(1, 2) / (self.d ** 0.5)      # (B, Tq, T)
-            scores = scores + attn_bias
+            # scale + mask ride the GEMM epilogue: one kernel instead of
+            # three (matmul, div, add). Bitwise-identical here because
+            # d ** -0.5 is a power of two at d = 64/128 (exact multiply)
+            scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
+                                   alpha=self.d ** -0.5)          # (B, Tq, T)
             att = torch.softmax(scores, dim=-1) @ v
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
