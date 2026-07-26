@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fused_ln import FusedLayerNorm
+
 # Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
 # env v7 — 16 object slots x 14 features incl. kind flags (bomb, chain
 # head/link) and arc pre/post-swing grants; sabers unchanged from v6).
@@ -67,12 +69,14 @@ class Block(nn.Module):
     def __init__(self, d: int, n_heads: int = 1):
         super().__init__()
         assert d % n_heads == 0, f"embed {d} not divisible by {n_heads} heads"
-        self.ln_attn = nn.LayerNorm(d)
+        # FusedLayerNorm == nn.LayerNorm in state_dict/params; on CUDA
+        # fp32 it runs the warp-per-row kernel (csrc/layer_norm.cu)
+        self.ln_attn = FusedLayerNorm(d)
         self.q_proj = nn.Linear(d, d)
         self.k_proj = nn.Linear(d, d)
         self.v_proj = nn.Linear(d, d)
         self.out_proj = nn.Linear(d, d) if n_heads > 1 else None
-        self.ln_ffn = nn.LayerNorm(d)
+        self.ln_ffn = FusedLayerNorm(d)
         self.ffn = _mlp([d, 2 * d, d])
         self.d = d
         self.n_heads = n_heads
