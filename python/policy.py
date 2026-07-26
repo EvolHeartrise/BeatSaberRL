@@ -31,7 +31,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fp16_linear import fp16_linear
+from fused_attn import eligible as _fused_attn_ok, fused_attn as _fused_attn
 from fused_ln import FusedLayerNorm
+
+# Fused single-head attention on the fp16 update path (round-4 #15,
+# default ON since 2026-07-25: 1.76x on the attention slice fwd+bwd,
+# grads closer to fp64 than eager's on every input). Module-level switch
+# so experiment arms can pin it; near-tie numerics class (never touches
+# the fp32 record path).
+USE_FUSED_ATTN = True
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -139,12 +147,21 @@ class Block(nn.Module):
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
         if self.n_heads == 1:
-            # scale + mask ride the GEMM epilogue: one kernel instead of
-            # three (matmul, div, add). Bitwise-identical here because
-            # d ** -0.5 is a power of two at d = 64/128 (exact multiply)
-            scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
-                                   alpha=self.d ** -0.5)          # (B, Tq, T)
-            att = torch.softmax(scores, dim=-1) @ v
+            if (USE_FUSED_ATTN and x.dtype is torch.float16
+                    and _fused_attn_ok(q, k, v, attn_bias)):
+                # fp16 path: one fused kernel per direction (round-4
+                # #15) — the scores tensor never touches global memory.
+                # Near-tie tolerance class, so fp16-only: the fp32
+                # update path below stays bitwise for the record runs.
+                att = _fused_attn(q, k, v, attn_bias, self.d ** -0.5)
+            else:
+                # scale + mask ride the GEMM epilogue: one kernel
+                # instead of three (matmul, div, add). Bitwise-identical
+                # here because d ** -0.5 is a power of two at d = 64/128
+                # (exact multiply)
+                scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
+                                       alpha=self.d ** -0.5)      # (B, Tq, T)
+                att = torch.softmax(scores, dim=-1) @ v
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
