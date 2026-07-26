@@ -46,35 +46,49 @@ def _load():
     return _ext
 
 
-def eligible(q, k, v, attn_bias):
-    return (q.dtype is torch.float16 and q.is_cuda and q.size(-1) == 64
-            and k.size(1) <= 32 and k.size(1) % 2 == 0
-            and q.size(1) <= k.size(1)
-            and q.is_contiguous() and k.is_contiguous()
-            and v.is_contiguous() and attn_bias.is_contiguous()
+def eligible(h, attn_bias):
+    """Shape-level eligibility, checkable BEFORE the q/k/v projections
+    run (the bias-folding path must decide first whether to emit
+    bias-free mms). h: the (B, T, d) LN output feeding the projections."""
+    return (h.dtype is torch.float16 and h.is_cuda and h.size(-1) == 64
+            and h.size(1) <= 32 and h.size(1) % 2 == 0
+            and attn_bias is not None
             and attn_bias.dtype is torch.float16
+            and attn_bias.is_contiguous()
             and _load() is not None)
 
 
 class _AttnFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, bias, alpha):
-        out, p = _ext.attn_fwd(q, k, v, bias, alpha)
-        ctx.save_for_backward(p, q, k, v)
+    def forward(ctx, q, k, v, bias, alpha, bq, bk, bv):
+        out, p = _ext.attn_fwd(q, k, v, bias, alpha, bq, bk, bv)
+        ctx.save_for_backward(p, q, k, v, bq, bk, bv)
         ctx.alpha = alpha
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        p, q, k, v = ctx.saved_tensors
-        dq, dk, dv = _ext.attn_bwd(dout.contiguous(), p, q, k, v, ctx.alpha)
-        return dq, dk, dv, None, None
+        p, q, k, v, bq, bk, bv = ctx.saved_tensors
+        dq, dk, dv = _ext.attn_bwd(dout.contiguous(), p, q, k, v,
+                                   ctx.alpha, bq, bk, bv)
+        # bias grads: d(b*) = channel-sum of d(*) — the same reduction
+        # _Fp16Linear's db used to run on the same tensor, relocated
+        # here (deterministic torch sum, fp32 out for the fp32 masters)
+        dbq = (dq.sum((0, 1), dtype=torch.float32)
+               if bq is not None and ctx.needs_input_grad[5] else None)
+        dbk = (dk.sum((0, 1), dtype=torch.float32)
+               if bk is not None and ctx.needs_input_grad[6] else None)
+        dbv = (dv.sum((0, 1), dtype=torch.float32)
+               if bv is not None and ctx.needs_input_grad[7] else None)
+        return dq, dk, dv, None, None, dbq, dbk, dbv
 
 
-def fused_attn(q, k, v, attn_bias, alpha):
-    """softmax(alpha * q @ k^T + attn_bias) @ v, one kernel per
-    direction. attn_bias: (B, 1, T) additive key mask."""
+def fused_attn(q, k, v, attn_bias, alpha, bq=None, bk=None, bv=None):
+    """softmax(alpha * (q+bq) @ (k+bk)^T + attn_bias) @ (v+bv), one
+    kernel per direction. attn_bias: (B, 1, T) additive key mask;
+    bq/bk/bv: optional fp32 projection biases folded into the loads
+    (pass bias-free q/k/v mms when using them)."""
     if not torch.is_grad_enabled():
-        out, _ = _ext.attn_fwd(q, k, v, attn_bias, alpha)
+        out, _ = _ext.attn_fwd(q, k, v, attn_bias, alpha, bq, bk, bv)
         return out
-    return _AttnFn.apply(q, k, v, attn_bias, alpha)
+    return _AttnFn.apply(q, k, v, attn_bias, alpha, bq, bk, bv)

@@ -39,9 +39,18 @@ constexpr int MAX_T = 32;
 //   smem: sq (Tq*D) | sk (T*D) | sv (T*D) | sp (Tq*T) | sbias (T)
 // phases: load -> scores (pair per thread) -> softmax (row per thread)
 //         -> out (output element per thread)
+// bq/bk/bv (nullable, fp32 (D,)): the q/k/v projection BIASES, folded
+// into the smem load (round-4 #2: the cuBLAS bias epilogue on sm_61
+// costs 33-59%% of each addmm — the projections run bias-free mm and
+// the bias rides these loads for free). fp32 masters are read directly:
+// no fp16 replica cache, and the storages are stable so a captured
+// CUDA graph keeps reading fresh values after every opt.step.
 __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
                                 const __half2* __restrict__ k,
                                 const __half2* __restrict__ v,
+                                const float2* __restrict__ bq,
+                                const float2* __restrict__ bk,
+                                const float2* __restrict__ bv,
                                 const __half2* __restrict__ bias,  // (B, T/2)
                                 __half* __restrict__ p_out,        // (B,Tq,T)
                                 __half2* __restrict__ out,         // (B,Tq,D2)
@@ -61,16 +70,20 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
   const __half2* vb = v + b * (T * D2);
   for (int i = tid; i < Tq * D2; i += THREADS) {
     const float2 f = __half22float2(qb[i]);
-    sq[2 * i] = f.x;
-    sq[2 * i + 1] = f.y;
+    const float2 bb2 = bq ? bq[i % D2] : make_float2(0.f, 0.f);
+    sq[2 * i] = f.x + bb2.x;
+    sq[2 * i + 1] = f.y + bb2.y;
   }
   for (int i = tid; i < T * D2; i += THREADS) {
+    const int c2 = i % D2;
     const float2 fk = __half22float2(kb[i]);
-    sk[2 * i] = fk.x;
-    sk[2 * i + 1] = fk.y;
+    const float2 bk2 = bk ? bk[c2] : make_float2(0.f, 0.f);
+    sk[2 * i] = fk.x + bk2.x;
+    sk[2 * i + 1] = fk.y + bk2.y;
     const float2 fv = __half22float2(vb[i]);
-    sv[2 * i] = fv.x;
-    sv[2 * i + 1] = fv.y;
+    const float2 bv2 = bv ? bv[c2] : make_float2(0.f, 0.f);
+    sv[2 * i] = fv.x + bv2.x;
+    sv[2 * i + 1] = fv.y + bv2.y;
   }
   const __half2* bb = bias + b * (T / 2);
   for (int i = tid; i < T / 2; i += THREADS) {
@@ -132,11 +145,17 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
 //       | sp (Tq*T) | sds (Tq*T)
 // phases: load p,dout,v -> dp -> dv -> ds(=alpha*softmax_bwd)
 //         -> load k -> dq -> load q -> dk
+// bq/bk/bv reconstruct the BIASED q/k/v the forward attended with (the
+// saved inputs are the bias-free mm outputs). dbq/dbk/dbv are computed
+// python-side as deterministic torch channel-sums of dq/dk/dv.
 __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
                                 const __half* __restrict__ p,   // (B,Tq,T)
                                 const __half2* __restrict__ q,
                                 const __half2* __restrict__ k,
                                 const __half2* __restrict__ v,
+                                const float2* __restrict__ bq,
+                                const float2* __restrict__ bk,
+                                const float2* __restrict__ bv,
                                 __half2* __restrict__ dq,
                                 __half2* __restrict__ dk,
                                 __half2* __restrict__ dv,
@@ -160,8 +179,9 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   }
   for (int i = tid; i < T * D2; i += THREADS) {
     const float2 f = __half22float2(vb[i]);
-    sB[2 * i] = f.x;
-    sB[2 * i + 1] = f.y;
+    const float2 b2 = bv ? bv[i % D2] : make_float2(0.f, 0.f);
+    sB[2 * i] = f.x + b2.x;
+    sB[2 * i + 1] = f.y + b2.y;
   }
   for (int i = tid; i < Tq * T; i += THREADS) sp[i] = __half2float(pb[i]);
   __syncthreads();
@@ -206,8 +226,9 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   const __half2* kb = k + b * (T * D2);
   for (int i = tid; i < T * D2; i += THREADS) {
     const float2 f = __half22float2(kb[i]);
-    sB[2 * i] = f.x;
-    sB[2 * i + 1] = f.y;
+    const float2 b2 = bk ? bk[i % D2] : make_float2(0.f, 0.f);
+    sB[2 * i] = f.x + b2.x;
+    sB[2 * i + 1] = f.y + b2.y;
   }
   __syncthreads();
   __half2* dqb = dq + b * (Tq * D2);
@@ -228,8 +249,9 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   const __half2* qb = q + b * (Tq * D2);
   for (int i = tid; i < Tq * D2; i += THREADS) {
     const float2 f = __half22float2(qb[i]);
-    sA[2 * i] = f.x;
-    sA[2 * i + 1] = f.y;
+    const float2 b2 = bq ? bq[i % D2] : make_float2(0.f, 0.f);
+    sA[2 * i] = f.x + b2.x;
+    sA[2 * i + 1] = f.y + b2.y;
   }
   __syncthreads();
   __half2* dkb = dk + b * (T * D2);
@@ -254,8 +276,19 @@ void check_in(const at::Tensor& t, const char* name, int64_t B, int rows) {
               D, "), got ", t.sizes());
 }
 
+const float2* bias_ptr(const c10::optional<at::Tensor>& b) {
+  if (!b.has_value() || !b->defined()) return nullptr;
+  TORCH_CHECK(b->is_cuda() && b->is_contiguous()
+              && b->scalar_type() == at::kFloat && b->numel() == D,
+              "proj bias: contiguous fp32 (", D, ",)");
+  return reinterpret_cast<const float2*>(b->data_ptr<float>());
+}
+
 std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
-                                 at::Tensor bias, double alpha) {
+                                 at::Tensor bias, double alpha,
+                                 c10::optional<at::Tensor> bq,
+                                 c10::optional<at::Tensor> bk,
+                                 c10::optional<at::Tensor> bv) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0);
   const int Tq = (int)q.size(1);
@@ -278,6 +311,7 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
       reinterpret_cast<const __half2*>(q.data_ptr<at::Half>()),
       reinterpret_cast<const __half2*>(k.data_ptr<at::Half>()),
       reinterpret_cast<const __half2*>(v.data_ptr<at::Half>()),
+      bias_ptr(bq), bias_ptr(bk), bias_ptr(bv),
       reinterpret_cast<const __half2*>(bias.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(p.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(out.data_ptr<at::Half>()),
@@ -287,7 +321,10 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
 }
 
 std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
-                                 at::Tensor k, at::Tensor v, double alpha) {
+                                 at::Tensor k, at::Tensor v, double alpha,
+                                 c10::optional<at::Tensor> bq,
+                                 c10::optional<at::Tensor> bk,
+                                 c10::optional<at::Tensor> bv) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0);
   const int Tq = (int)q.size(1);
@@ -313,6 +350,7 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
       reinterpret_cast<const __half2*>(q.data_ptr<at::Half>()),
       reinterpret_cast<const __half2*>(k.data_ptr<at::Half>()),
       reinterpret_cast<const __half2*>(v.data_ptr<at::Half>()),
+      bias_ptr(bq), bias_ptr(bk), bias_ptr(bv),
       reinterpret_cast<__half2*>(dq.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(dk.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(dv.data_ptr<at::Half>()),
@@ -325,7 +363,14 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_fwd", &attn_fwd,
-        "fused single-head attention forward -> (out, p)");
+        "fused single-head attention forward -> (out, p); optional "
+        "bq/bk/bv fold the projection biases into the load",
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("bias"),
+        py::arg("alpha"), py::arg("bq") = py::none(),
+        py::arg("bk") = py::none(), py::arg("bv") = py::none());
   m.def("attn_bwd", &attn_bwd,
-        "fused single-head attention backward -> (dq, dk, dv)");
+        "fused single-head attention backward -> (dq, dk, dv)",
+        py::arg("dout"), py::arg("p"), py::arg("q"), py::arg("k"),
+        py::arg("v"), py::arg("alpha"), py::arg("bq") = py::none(),
+        py::arg("bk") = py::none(), py::arg("bv") = py::none());
 }

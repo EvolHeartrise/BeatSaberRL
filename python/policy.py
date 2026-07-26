@@ -30,7 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fp16_linear import fp16_linear
+import fp16_linear as _fl
+from fp16_linear import fp16_linear, fp16_linear_nobias, fp16_linear_relu
 from fused_attn import eligible as _fused_attn_ok, fused_attn as _fused_attn
 from fused_ln import FusedLayerNorm
 
@@ -52,8 +53,22 @@ def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
 
 
 def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-    for m in seq:
-        x = _lin(m, x) if isinstance(m, nn.Linear) else m(x)
+    ms = list(seq)
+    i = 0
+    while i < len(ms):
+        m = ms[i]
+        if isinstance(m, nn.Linear):
+            # fp16 Linear+ReLU pairs take the bias_relu epilogue path
+            # (bias-free mm + in-place relu(y + b_fp32)) — round-4 #2
+            if (x.dtype is torch.float16 and i + 1 < len(ms)
+                    and isinstance(ms[i + 1], nn.ReLU) and _fl.ext_ok()):
+                x = fp16_linear_relu(x, m.weight, m.bias)
+                i += 2
+                continue
+            x = _lin(m, x)
+        else:
+            x = m(x)
+        i += 1
     return x
 
 # Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
@@ -138,22 +153,35 @@ class Block(nn.Module):
             x, h = self.ln_attn.forward_add(x, delta)
         else:
             h = self.ln_attn(x)
-        k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
+        # fused-attn eligibility decides the PROJECTION form too: the
+        # fused path runs bias-free mms and folds the q/k/v biases into
+        # the attention kernel's loads (round-4 #2: the sm_61 addmm
+        # bias epilogue costs 33-59% of each GEMM)
+        use_fused = (USE_FUSED_ATTN and self.n_heads == 1
+                     and h.dtype is torch.float16
+                     and _fused_attn_ok(h, attn_bias))
+        if use_fused:
+            k = fp16_linear_nobias(h, self.k_proj.weight, self.k_proj.bias)
+            v = fp16_linear_nobias(h, self.v_proj.weight, self.v_proj.bias)
+        else:
+            k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         if n_queries:
             x = x[:, :n_queries]
             h = h[:, :n_queries]
-        q = _lin(self.q_proj, h)
+        q = (fp16_linear_nobias(h, self.q_proj.weight, self.q_proj.bias)
+             if use_fused else _lin(self.q_proj, h))
         Tq = q.shape[1]
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
         if self.n_heads == 1:
-            if (USE_FUSED_ATTN and x.dtype is torch.float16
-                    and _fused_attn_ok(q, k, v, attn_bias)):
+            if use_fused:
                 # fp16 path: one fused kernel per direction (round-4
                 # #15) — the scores tensor never touches global memory.
                 # Near-tie tolerance class, so fp16-only: the fp32
                 # update path below stays bitwise for the record runs.
-                att = _fused_attn(q, k, v, attn_bias, self.d ** -0.5)
+                att = _fused_attn(q, k, v, attn_bias, self.d ** -0.5,
+                                  self.q_proj.bias, self.k_proj.bias,
+                                  self.v_proj.bias)
             else:
                 # scale + mask ride the GEMM epilogue: one kernel
                 # instead of three (matmul, div, add). Bitwise-identical

@@ -13,9 +13,50 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 
 namespace {
+
+// In-place bias + ReLU epilogue: y = relu(y + b), fp32 math, one
+// rounding on store (round-4 #2: the cuBLAS bias epilogue costs 33-59%
+// of each addmm on sm_61, so Linear+ReLU pairs run a bias-FREE mm and
+// this replaces the standalone ReLU pass at identical traffic). b is
+// the fp32 MASTER bias — no fp16 replica, stable storage for graphs.
+__global__ void bias_relu_kernel(__half2* __restrict__ y,
+                                 const float2* __restrict__ b,
+                                 int64_t n2, int d2) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n2) return;
+  const float2 v = __half22float2(y[i]);
+  const float2 bb = b[i % d2];
+  float2 o;
+  o.x = fmaxf(v.x + bb.x, 0.f);
+  o.y = fmaxf(v.y + bb.y, 0.f);
+  y[i] = __float22half2_rn(o);
+}
+
+void bias_relu_(at::Tensor y, at::Tensor b) {
+  const c10::cuda::CUDAGuard guard(y.device());
+  const int d = (int)y.size(-1);
+  TORCH_CHECK(y.is_cuda() && y.is_contiguous()
+              && y.scalar_type() == at::kHalf && d % 2 == 0,
+              "y: contiguous CUDA fp16, even last dim");
+  TORCH_CHECK(b.is_cuda() && b.is_contiguous()
+              && b.scalar_type() == at::kFloat && b.numel() == d,
+              "b: contiguous fp32 (", d, ",)");
+  const int64_t n2 = y.numel() / 2;
+  if (n2 == 0) return;
+  const int threads = 256;
+  const int64_t blocks = (n2 + threads - 1) / threads;
+  bias_relu_kernel<<<(unsigned)blocks, threads, 0,
+                     at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<__half2*>(y.data_ptr<at::Half>()),
+      reinterpret_cast<const float2*>(b.data_ptr<float>()),
+      n2, d / 2);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 at::Tensor wgrad(at::Tensor dy, at::Tensor x) {
   // dy: (R, M) fp16, x: (R, K) fp16  ->  dW = dy^T x : (M, K) fp32
@@ -51,4 +92,6 @@ at::Tensor wgrad(at::Tensor dy, at::Tensor x) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("wgrad", &wgrad,
         "dW = dY^T X, fp16 inputs, fp32 compute + output (cublasGemmEx)");
+  m.def("bias_relu_", &bias_relu_,
+        "in-place y = relu(y + b): fp16 y, fp32 master bias");
 }

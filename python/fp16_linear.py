@@ -118,6 +118,91 @@ class _Fp16Linear(torch.autograd.Function):
         return dx, dw, db
 
 
+class _Fp16LinearNoBias(torch.autograd.Function):
+    """Bias-free half mm (round-4 #2: the cuBLAS bias epilogue costs
+    33-59% of each addmm on sm_61). The bias VALUE is consumed by the
+    downstream fused-attention kernel, whose backward supplies the bias
+    grad — this Function deliberately returns None for it."""
+    @staticmethod
+    def forward(ctx, x, w, b):
+        wh, _ = _half_params(w, b)
+        x2 = x.reshape(-1, x.shape[-1])
+        y = torch.mm(x2, wh.t())
+        ctx.save_for_backward(x2, wh)
+        return y.view(*x.shape[:-1], w.shape[0])
+
+    @staticmethod
+    def backward(ctx, gy):
+        x2, wh = ctx.saved_tensors
+        g2 = gy.reshape(-1, gy.shape[-1])
+        if not g2.is_contiguous():
+            g2 = g2.contiguous()
+        dx = dw = None
+        if ctx.needs_input_grad[0]:
+            dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
+        if ctx.needs_input_grad[1]:
+            ext = _load()
+            dw = (ext.wgrad(g2, x2) if ext is not None
+                  else g2.float().t() @ x2.float())
+        return dx, dw, None
+
+
+def fp16_linear_nobias(x, w, b):
+    """mm-only Linear; bias rides the downstream kernel (fused attn)."""
+    if not torch.is_grad_enabled():
+        wh, _ = _half_params(w, b)
+        x2 = x.reshape(-1, x.shape[-1])
+        return torch.mm(x2, wh.t()).view(*x.shape[:-1], w.shape[0])
+    return _Fp16LinearNoBias.apply(x, w, b)
+
+
+class _Fp16LinearReLU(torch.autograd.Function):
+    """Linear + ReLU with the bias in a custom epilogue: bias-free mm,
+    then in-place y = relu(y + b_fp32) (csrc/fp16_gemm.cu bias_relu_).
+    Replaces the standalone ReLU pass at identical traffic while
+    dodging the slow sm_61 addmm bias epilogue."""
+    @staticmethod
+    def forward(ctx, x, w, b):
+        wh, _ = _half_params(w, b)
+        x2 = x.reshape(-1, x.shape[-1])
+        y = torch.mm(x2, wh.t())
+        _load().bias_relu_(y, b.detach())
+        ctx.save_for_backward(x2, wh, y)
+        return y.view(*x.shape[:-1], w.shape[0])
+
+    @staticmethod
+    def backward(ctx, gy):
+        x2, wh, y = ctx.saved_tensors
+        g2 = gy.reshape(-1, gy.shape[-1])
+        if not g2.is_contiguous():
+            g2 = g2.contiguous()
+        gm = torch.ops.aten.threshold_backward(g2, y, 0)
+        dx = dw = db = None
+        if ctx.needs_input_grad[0]:
+            dx = (gm @ wh).view(*gy.shape[:-1], wh.shape[1])
+        if ctx.needs_input_grad[1]:
+            dw = _load().wgrad(gm, x2)
+        if ctx.needs_input_grad[2]:
+            db = gm.sum(0, dtype=torch.float32)
+        return dx, dw, db
+
+
+def fp16_linear_relu(x, w, b):
+    """relu(x @ w.T + b) on the fp16 stream; requires the extension
+    (callers gate on ext_ok())."""
+    if not torch.is_grad_enabled():
+        wh, _ = _half_params(w, b)
+        x2 = x.reshape(-1, x.shape[-1])
+        y = torch.mm(x2, wh.t())
+        _load().bias_relu_(y, b.detach())
+        return y.view(*x.shape[:-1], w.shape[0])
+    return _Fp16LinearReLU.apply(x, w, b)
+
+
+def ext_ok():
+    return _load() is not None
+
+
 def fp16_linear(x, w, b):
     """Linear on an fp16 stream against fp32 master weights."""
     if not torch.is_grad_enabled():
