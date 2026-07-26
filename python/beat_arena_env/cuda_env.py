@@ -155,6 +155,9 @@ class CudaBeatVecEnv:
         self.tick = z(N, dt=torch.int32)
         # 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed clean
         self.status = z(N, C, dt=torch.uint8)
+        # low-water cursor: smallest pending chart index per env (the
+        # kernel's chart scans start here instead of 0)
+        self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
         self.miss = z(N, dt=torch.int32); self.bombs = z(N, dt=torch.int32)
@@ -180,7 +183,8 @@ class CudaBeatVecEnv:
             self.q, self.om, self.wrist, self.blade, self.wrist_vel,
             self.swing_acc, self.axis, self.axis_valid,
             self.tr_acc, self.tr_age, self.tr_cnt, self.tr_active,
-            self.tr_ptr, self.tick, self.status, self.ep_return,
+            self.tr_ptr, self.tick, self.status, self.first_pending,
+            self.ep_return,
             self.good, self.bad, self.miss, self.bombs, self.score,
             self.score_pre, self.score_acc, self.score_post,
             self.chart_idx,

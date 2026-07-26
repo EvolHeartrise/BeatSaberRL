@@ -8,8 +8,9 @@ them — the combo multiplier would add overhead for no training benefit):
    (~6.1k difficulties over ~2.5k songs, 2026-07); per-leaderboard star
    rating and maxPP come straight from the API. Map data is downloaded
    from BeatSaver by song hash and cached as EXTRACTED chart files only
-   (Info.dat + difficulty .dats — audio/cover art discarded, ~100 KB vs
-   ~10 MB per song). stdlib urllib only.
+   (.dat/.json allowlist: Info.dat + difficulty .dats — audio, art, and
+   any other zip payload discarded; typically a few MB per song, chart
+   .dats dominating). stdlib urllib only.
 
 2. The real combo score multiplier (1x/2x/4x/8x). Progression decoded
    from ScoreSaber's own max-score formula, 115·(8n−63) for n ≥ 14
@@ -252,15 +253,17 @@ def fetch_ranked_catalog(log=None):
     return out
 
 
-# extensions that are NOT chart data (audio, art, video) — never cached
-_MEDIA_EXT = (".egg", ".ogg", ".wav", ".mp3", ".jpg", ".jpeg", ".png",
-              ".gif", ".mp4", ".webm")
+# chart data is ONLY .dat/.json — allowlist, not blocklist (2026-07-25):
+# BeatSaver zips are untrusted user uploads and have shipped .exe, .db,
+# .srt, ... alongside the audio; extract nothing but chart files
+_CHART_EXT = (".dat", ".json")
 
 
 def ensure_map_dats(song_hash, cache_dir):
     """Chart files for song_hash, downloading from BeatSaver on a cache
     miss. Returns the map directory (feed it to load_beatmap). Only
-    non-media files are kept (~100 KB/song instead of ~10 MB)."""
+    .dat/.json chart files are kept (the zip's audio/art/video and any
+    other payload are dropped)."""
     song_hash = song_hash.lower()
     dest = os.path.join(cache_dir, song_hash)
     if os.path.isdir(dest):
@@ -283,7 +286,7 @@ def ensure_map_dats(song_hash, cache_dir):
         with zipfile.ZipFile(os.path.join(tmp, "map.zip")) as z:
             for name in z.namelist():
                 base = os.path.basename(name)
-                if not base or base.lower().endswith(_MEDIA_EXT):
+                if not base or not base.lower().endswith(_CHART_EXT):
                     continue
                 with z.open(name) as src, open(os.path.join(tmp, base), "wb") as f:
                     shutil.copyfileobj(src, f)

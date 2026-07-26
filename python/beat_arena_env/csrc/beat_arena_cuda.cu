@@ -302,25 +302,34 @@ __device__ void note_frame(const T p[3], T cos_r, T sin_r, T lam, T f[3][3]) {
   cross3(f[2], f[0], f[1]);
 }
 
+/// One point into the note frame (translate to c, project on f's rows).
+template <typename T>
+__device__ void to_note_frame(const T p[3], const T c[3], const T f[3][3],
+                              T out[3]) {
+  T q[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]};
+  out[0] = dot3(q, f[0]);
+  out[1] = dot3(q, f[1]);
+  out[2] = dot3(q, f[2]);
+}
+
 /// The swept blade surface = quad (w0->t0, w1->t1) as triangles
-/// (w0, t0, t1) and (w0, t1, w1) — box test in the note frame.
+/// (w0, t0, t1) and (w0, t1, w1) — box test in the note frame. The two
+/// triangles are unrolled explicitly: an indexed pointer array here
+/// spills to local memory (48 B stack) and taxes every vertex fetch in
+/// the per-object judgment loop.
 template <typename T>
 __device__ bool sweep_hits_box(const T w0[3], const T t0[3], const T t1[3],
                                const T w1[3], const T c[3], const T h[3],
                                const T f[3][3]) {
-  const T* tris[2][3] = {{w0, t0, t1}, {w0, t1, w1}};
-  for (int t = 0; t < 2; t++) {
-    T rel[3][3];
-    for (int v = 0; v < 3; v++) {
-      T q[3] = {tris[t][v][0] - c[0], tris[t][v][1] - c[1],
-                tris[t][v][2] - c[2]};
-      rel[v][0] = dot3(q, f[0]);
-      rel[v][1] = dot3(q, f[1]);
-      rel[v][2] = dot3(q, f[2]);
-    }
-    if (tri_box_overlap(rel, h)) return true;
-  }
-  return false;
+  T rel[3][3];
+  to_note_frame(w0, c, f, rel[0]);
+  to_note_frame(t0, c, f, rel[1]);
+  to_note_frame(t1, c, f, rel[2]);
+  if (tri_box_overlap(rel, h)) return true;
+  // second triangle (w0, t1, w1): rel[0] (w0) is already in place
+  to_note_frame(t1, c, f, rel[1]);
+  to_note_frame(w1, c, f, rel[2]);
+  return tri_box_overlap(rel, h);
 }
 
 template <typename T>
@@ -341,6 +350,7 @@ struct Sim {
   int* tr_ptr;
   int* tick;
   uint8_t* status;
+  int* first_pending;  // per-env low-water cursor over status (monotone)
   T* ep_return;
   int *good, *bad, *miss, *bombs;
   T* score;
@@ -521,7 +531,10 @@ __global__ void step_kernel(Sim<T> P) {
     // expensive swept-surface SAT stage. Each object is independent;
     // reward terms land in scratch[i] for the ordered sum in phase D.
     const T time_new = T(P.tick[e] + 1) * T(DT);
-    for (int i = tid; i < C; i += blockDim.x) {
+    // everything below the low-water cursor is resolved (or padding):
+    // skip the prefix instead of loading and branching over it
+    const int fp0 = P.first_pending[e];
+    for (int i = fp0 + tid; i < C; i += blockDim.x) {
       const int64_t cb = c0 * C + i;
       if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
       const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb];
@@ -668,12 +681,16 @@ __global__ void step_kernel(Sim<T> P) {
       const int tick_new = P.tick[e] + 1;
       P.tick[e] = tick_new;
       const T time_now = T(tick_new) * T(DT);
-      bool pending = false;
-      for (int i = 0; i < C; i++)
-        if (P.p_valid[c0 * C + i] && P.status[e * C + i] == 0) {
-          pending = true;
-          break;
-        }
+      // advance the low-water cursor: "smallest pending index" is
+      // monotone within an episode (status only goes 0 -> nonzero
+      // between resets); padding (p_valid false) counts as resolved.
+      // Amortized O(1) per tick, and the pending test becomes free.
+      int fp = P.first_pending[e];
+      while (fp < C
+             && !(P.p_valid[c0 * C + fp] && P.status[e * C + fp] == 0))
+        fp++;
+      P.first_pending[e] = fp;
+      const bool pending = fp < C;
       bool no_trk = true;
       for (int b = e * 2 * N_TRACKERS; b < (e + 1) * 2 * N_TRACKERS; b++)
         if (P.tr_active[b]) {
@@ -747,6 +764,7 @@ __global__ void step_kernel(Sim<T> P) {
       P.score_post[e] = T(0);
       P.tr_ptr[e * 2] = 0;
       P.tr_ptr[e * 2 + 1] = 0;
+      P.first_pending[e] = 0;
     }
     if (tid < 2) {
       const int h = tid;
@@ -803,8 +821,10 @@ __global__ void step_kernel(Sim<T> P) {
         (float)tmin(P.swing_acc[e * 2 + h] / T(PRE_FULL), T(2));
   }
   if (tid == 0) {  // next 16 pending objects in chart (arrival) order
+    // start at the low-water cursor (fresh 0 after a phase-E reset):
+    // typically terminates within ~N_NOTE_SLOTS iterations, not O(C)
     int ns = 0;
-    for (int i = 0; i < C && ns < N_NOTE_SLOTS; i++)
+    for (int i = P.first_pending[e]; i < C && ns < N_NOTE_SLOTS; i++)
       if (P.p_valid[cc * C + i] && P.status[e * C + i] == 0)
         sh_slots[ns++] = i;
     sh_nslots = ns;
@@ -839,7 +859,7 @@ __global__ void step_kernel(Sim<T> P) {
 // tensor-list slots (order is a contract with cuda_env.py _tensors)
 enum {
   TQ = 0, TOM, TWRIST, TBLADE, TWVEL, TSWING, TAXIS, TAXV,
-  TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR, TTICK, TSTATUS, TEPRET,
+  TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR, TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
@@ -876,6 +896,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.tr_ptr = ts[TTRPTR].data_ptr<int>();
     P.tick = ts[TTICK].data_ptr<int>();
     P.status = ts[TSTATUS].data_ptr<uint8_t>();
+    P.first_pending = ts[TFIRSTP].data_ptr<int>();
     P.ep_return = ts[TEPRET].data_ptr<scalar_t>();
     P.good = ts[TGOOD].data_ptr<int>();
     P.bad = ts[TBAD].data_ptr<int>();

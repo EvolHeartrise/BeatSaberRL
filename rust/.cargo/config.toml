@@ -1,0 +1,13 @@
+# target-cpu=native: the sim is dense scalar f64; AVX2 availability is
+# worth ~5-15% here. Bit-safe: Rust emits no fast-math flags, so LLVM
+# neither contracts a*b+c into FMA nor reassociates FP reductions — the
+# f64-exact parity with the torch/CUDA envs survives. The artifact is
+# machine-specific, which is fine for a locally-built maturin extension.
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# bare `cargo check`/`cargo build` otherwise picks the PATH python
+# (3.14, above pyo3 0.22's max supported 3.13) and fails to configure;
+# maturin builds already use the venv interpreter.
+[env]
+PYO3_PYTHON = "D:\\Git\\claude-teaches\\projects\\kiting-arena\\python\\.venv\\Scripts\\python.exe"
