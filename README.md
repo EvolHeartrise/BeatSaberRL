@@ -31,7 +31,10 @@ cd python
 VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
-$VENV/bin/python train_batch.py --num-envs 128 --epochs 1   # the trainer
+# the trainer — production protocol (2026-07-25): --fp16 update is the
+# DEFAULT for training legs (+41% wall, fp32 masters/checkpoints;
+# see sessions/2026-07-25-fp16-storage.md for the gate results)
+$VENV/bin/python train_batch.py --env cuda --epochs 2 --num-envs 1024 --fp16 update
 ```
 
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
