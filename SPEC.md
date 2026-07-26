@@ -551,6 +551,15 @@ the update path (82% after the fused-head rewrite).
 Batch = num_envs×horizon;
 NOTE: batch shape changes the optimization regime (gradient passes per
 env step) — cross-shape learning comparisons need retuning.
+**`--fp16 update` is the production DEFAULT for training legs
+(2026-07-25, user decision)**: fp16-storage activations with fp32
+cuBLAS compute, fp32 master weights/checkpoints, static loss scale
+2^17 — 110k steps/s vs 78k fp32 (1.41x) at the production config.
+50M-gate caveat on file: a borderline −0.8% wpp deficit concentrated
+in the score_acc channel (−12%); fp32 (or an fp16+fp32-polish tail)
+remains the fallback for record attempts if it reproduces at other
+seeds. Rollout stays fp32 in this mode ('all' loses ~6% at N=1024 —
+launch-bound). Mutually exclusive with --fused-update.
 
 ## ScoreSaber bench (`python/bench_scoresaber.py`, 2026-07-23)
 
