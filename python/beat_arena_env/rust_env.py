@@ -26,7 +26,7 @@ from beat_arena_rs import RawBeatSim
 class RustBeatEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, colors="right", chart_len_s=20.0,
+    def __init__(self, colors="both", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,

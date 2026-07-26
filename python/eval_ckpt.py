@@ -21,7 +21,6 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--episodes", type=int, default=30)
     p.add_argument("--seed0", type=int, default=9000)
-    p.add_argument("--colors", default="both")
     p.add_argument("--note-speed-min", type=float, default=2.0)
     p.add_argument("--note-speed-max", type=float, default=8.0)
     p.add_argument("--note-prob", type=float, default=0.25)
@@ -31,7 +30,7 @@ def main():
     p.add_argument("--effort-coef", type=float, default=1.0)
     args = p.parse_args()
 
-    cfg = ChartConfig(colors=args.colors,
+    cfg = ChartConfig(
                       note_speed_min=args.note_speed_min,
                       note_speed_max=args.note_speed_max,
                       note_prob=args.note_prob, extra_prob=args.extra_prob,

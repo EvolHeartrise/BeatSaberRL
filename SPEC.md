@@ -237,7 +237,9 @@ min_hand_gap_s/bomb_rate/chain_prob/arc_prob) is GONE. Notes now come
 from a **jittered tick lattice** walked by **three independent paths**
 — left hand, right hand, bombs.
 
-`ChartConfig`: `chart_len_s` (default 20.0), `colors` (`"right"` = all
+`ChartConfig`: `chart_len_s` (default 20.0), `colors` (default `"both"`
+since 2026-07-26 — the old `"right"` default silently trained gen3's 5B
+run one-handed, the whole real-map transfer regression; `"right"` = all
 blue, `"both"`, default `"right"`), `first_note_s` (1.0), `cols`/`rows`
 (allowed positions — still the spatial-curriculum dial), and per-tick
 dials `note_prob` (P(note) per hand path per tick, 0.25), `extra_prob`
@@ -288,7 +290,7 @@ extras land essentially on their original's tick: one swing can take
 both). Chains and arcs are NOT generated procedurally — real BeatSaver
 maps are their only source; `chart.chain_links` (real quadratic Bézier,
 BeatLeader beat.js:424-463) survives for the parser. Reference density
-(defaults, 20 s chart): right-only ≈ 26 notes + 11 bombs
+(20 s chart): right-only ≈ 26 notes + 11 bombs (tests/curricula only)
 (~1.3 notes/s); both ≈ 43 notes + 11 bombs (~2.3 notes/s), ~9% dots —
 and it varies WITHIN a chart with the speed walk: measured local
 density ~1.4 notes/s around sub-4 m/s notes vs ~3.2 around 6+ m/s

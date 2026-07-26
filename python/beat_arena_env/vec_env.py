@@ -17,7 +17,7 @@ from beat_arena_rs import VecBeatSim
 
 
 class BeatVecEnv:
-    def __init__(self, num_envs, colors="right", chart_len_s=20.0,
+    def __init__(self, num_envs, colors="both", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
