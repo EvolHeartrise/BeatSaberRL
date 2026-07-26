@@ -45,6 +45,7 @@ import torch
 import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
+from fp16_linear import bump_weights_version
 from policy import HEAD_SIZES, NotePolicy, OBS_DIM, load_policy
 
 A_DIM = len(HEAD_SIZES)  # 12 factored joint heads (env v6)
@@ -433,6 +434,7 @@ def main():
                     nn.utils.clip_grad_norm_(trainer.parameters(),
                                              MAX_GRAD_NORM)
                     opt.step()
+                    bump_weights_version()
                     continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     f_obs[mb], f_act[mb])
@@ -470,6 +472,7 @@ def main():
                     loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
                 opt.step()
+                bump_weights_version()  # invalidate fp16 replica caches
         if fp16_update:
             policy.fp16 = args.fp16 == "all"
         if trainer is not None:
