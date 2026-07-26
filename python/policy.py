@@ -39,8 +39,13 @@ from fused_ln import FusedLayerNorm
 # default ON since 2026-07-25: 1.76x on the attention slice fwd+bwd,
 # grads closer to fp64 than eager's on every input). Module-level switch
 # so experiment arms can pin it; near-tie numerics class (never touches
-# the fp32 record path).
-USE_FUSED_ATTN = True
+# the fp32 record path). Env toggles (debug/bisect):
+#   BEAT_NO_FUSED_ATTN=1  -> eager attention (also disables qkv bias
+#                            folding, which rides the fused kernel)
+#   BEAT_NO_BIAS_RELU=1   -> eager addmm+ReLU in _seq
+import os as _os
+USE_FUSED_ATTN = _os.environ.get("BEAT_NO_FUSED_ATTN", "0") != "1"
+_NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -61,7 +66,8 @@ def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
             # fp16 Linear+ReLU pairs take the bias_relu epilogue path
             # (bias-free mm + in-place relu(y + b_fp32)) — round-4 #2
             if (x.dtype is torch.float16 and i + 1 < len(ms)
-                    and isinstance(ms[i + 1], nn.ReLU) and _fl.ext_ok()):
+                    and isinstance(ms[i + 1], nn.ReLU)
+                    and not _NO_BIAS_RELU and _fl.ext_ok()):
                 x = fp16_linear_relu(x, m.weight, m.bias)
                 i += 2
                 continue
