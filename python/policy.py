@@ -30,7 +30,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from fp16_linear import fp16_linear
 from fused_ln import FusedLayerNorm
+
+
+def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """Linear that follows the stream dtype: fp16 activations route to
+    the fp16-storage path (half addmm forward, GemmEx fp32-accumulated
+    weight grads against the fp32 masters); fp32 runs the module as-is."""
+    if x.dtype is torch.float16:
+        return fp16_linear(x, m.weight, m.bias)
+    return m(x)
+
+
+def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+    for m in seq:
+        x = _lin(m, x) if isinstance(m, nn.Linear) else m(x)
+    return x
 
 # Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
 # env v7 — 16 object slots x 14 features incl. kind flags (bomb, chain
@@ -114,11 +130,11 @@ class Block(nn.Module):
             x, h = self.ln_attn.forward_add(x, delta)
         else:
             h = self.ln_attn(x)
-        k, v = self.k_proj(h), self.v_proj(h)
+        k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         if n_queries:
             x = x[:, :n_queries]
             h = h[:, :n_queries]
-        q = self.q_proj(h)
+        q = _lin(self.q_proj, h)
         Tq = q.shape[1]
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
@@ -137,9 +153,9 @@ class Block(nn.Module):
             scores = scores + attn_bias.unsqueeze(1)              # (B,1,1,T)
             att = torch.softmax(scores, dim=-1) @ v               # (B,H,Tq,dh)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
-            att = self.out_proj(att)
+            att = _lin(self.out_proj, att)
         x, h2 = self.ln_ffn.forward_add(x, att)
-        ffn_out = self.ffn(h2)
+        ffn_out = _seq(self.ffn, h2)
         if n_queries:
             return x + ffn_out
         return x, ffn_out
@@ -166,6 +182,12 @@ class NotePolicy(nn.Module):
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in HEAD_SIZES)
         self.value_head = nn.Linear(trunk_dim, 1)
+        # fp16-storage mode (2026-07-25): activations flow fp16 between
+        # the obs split and the head output; GEMMs are fp16-in with fp32
+        # cuBLAS compute; LN/softmax stats, log_softmax, sampling, and
+        # all PPO math stay fp32. Weights stay fp32 masters (state_dict
+        # unchanged). Plain attribute, NOT in state_dict.
+        self.fp16 = False
 
     def _split(self, obs: torch.Tensor):
         sabers = obs[:, :OFF_NOTES]                                  # (B, 46)
@@ -180,17 +202,23 @@ class NotePolicy(nn.Module):
         stay separate modules (state_dict unchanged); their weights are
         concatenated per call (13 tiny tensors — negligible next to the
         13 skinny GEMMs and ~120 Categorical kernels this replaces)."""
+        fp16 = self.fp16 and obs.is_cuda
         sabers, notes, note_mask = self._split(obs)
-        emb = self.note_mlp(notes)                                   # (B, 16, 64)
+        if fp16:
+            notes = notes.half()   # C1: the cast IS the copy F.linear
+        emb = _seq(self.note_mlp, notes)                             # (B, 16, 64)
         B = obs.shape[0]
-        hand_id = torch.eye(2, device=obs.device).expand(B, 2, 2)
+        dt = torch.float16 if fp16 else obs.dtype
+        hand_id = torch.eye(2, device=obs.device, dtype=dt).expand(B, 2, 2)
         saber_feat = torch.cat(
-            [sabers.reshape(B, 2, SABER_FEAT), hand_id], dim=-1)
-        tokens = torch.cat([self.saber_mlp(saber_feat), emb], dim=1)  # (B, 18, 64)
+            [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
+        tokens = torch.cat([_seq(self.saber_mlp, saber_feat), emb], dim=1)
         key_mask = torch.cat(
             [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
         # additive attention mask is block-invariant: build it once
         attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS
+        if fp16:
+            attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
         delta = None
         for blk in self.blocks[:-1]:
             tokens, delta = blk(tokens, key_mask, attn_bias=attn_bias,
@@ -198,12 +226,17 @@ class NotePolicy(nn.Module):
         # final block: only the 2 readout tokens' outputs are consumed
         tokens = self.blocks[-1](tokens, key_mask, n_queries=2,
                                  attn_bias=attn_bias, delta=delta)
-        h = self.trunk(tokens.reshape(B, -1))                        # saber readout
+        h = _seq(self.trunk, tokens.reshape(B, -1))                  # saber readout
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
                       + [self.value_head.bias])
-        out = F.linear(h, w, b)                                      # (B, 37)
+        if fp16:
+            # C5: the hard fp32 boundary — everything after (log_softmax,
+            # sampling, PPO math) is exactly today's fp32 code
+            out = fp16_linear(h, w, b).float()
+        else:
+            out = F.linear(h, w, b)                                  # (B, 37)
         return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
 
     def forward(self, obs: torch.Tensor):
