@@ -265,10 +265,23 @@ def main():
               flush=True)
     params = trainer.parameters() if trainer is not None \
         else policy.parameters()
-    opt = torch.optim.Adam(params, lr=args.lr)
+    # fused=True: one multi-tensor kernel instead of the foreach path's
+    # ~10 launches per step (77 elementwise calls/minibatch measured in
+    # the 2026-07-25 profile). Same per-element math, not guaranteed
+    # bitwise vs foreach.
+    fused_adam = device.type == "cuda"
+    opt = torch.optim.Adam(params, lr=args.lr, fused=fused_adam)
     if resume_ckpt is not None:
         try:
-            opt.load_state_dict(resume_ckpt["optimizer"])
+            # stamp the fused flag into the SAVED groups before loading:
+            # load_state_dict places the 'step' state tensors by the
+            # saved group's fused/capturable flags, and fused Adam needs
+            # them on the param device (a foreach-era checkpoint would
+            # otherwise leave them on CPU and crash the first step)
+            opt_sd = resume_ckpt["optimizer"]
+            for g in opt_sd["param_groups"]:
+                g["fused"] = fused_adam
+            opt.load_state_dict(opt_sd)
         except ValueError as e:
             raise SystemExit(
                 "--resume optimizer state does not match this update path "
