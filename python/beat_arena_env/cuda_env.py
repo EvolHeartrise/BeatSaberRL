@@ -1,19 +1,21 @@
 """CUDA-kernel vectorized Beat Arena sim — one kernel launch per step.
 
-The THIRD implementation of env v7.9 (user's explicit call, reversing the
-single-implementation policy): rust/src/lib.rs remains THE reference,
-torch_env.py the tensor-form port, and this backend runs the whole step
-(joint integration, swept-surface judgment, auto-reset, obs build) inside
-one custom CUDA kernel (csrc/beat_arena_cuda.cu) for rollout throughput.
-Parity is pinned by tests/test_cuda_env.py: f64 exact vs Rust on identical
-charts + actions, f32 bounded drift — the same two tiers as the torch env.
+rust/src/lib.rs remains THE reference implementation; this backend runs
+the whole step (joint integration, swept-surface judgment, auto-reset,
+obs build) inside one custom CUDA kernel (csrc/beat_arena_cuda.cu) for
+rollout throughput. Parity is pinned by tests/test_cuda_env.py: f64 exact
+vs Rust on identical charts + actions, f32 bounded drift. (The
+intermediate tensor-op port, torch_env.py, was REMOVED 2026-07-25 —
+surface-area reduction once this kernel became the production backend;
+its chart tensorization and aggregated tracker-ring design live on
+here.)
 
 State is a structure-of-arrays of torch tensors mutated in place by the
-kernel; charts live in a padded (P, C) device pool (built by torch_env's
-_charts_to_tensors — single source for chart tensorization) and each env
-holds only a pool index, so reset never copies chart data. The step loop
-performs ZERO host<->device syncs; episode returns go to a device ring
-buffer drained by pop_stats() once per PPO update.
+kernel; charts live in a padded (P, C) device pool (built by
+_charts_to_tensors below — single source for chart tensorization) and
+each env holds only a pool index, so reset never copies chart data. The
+step loop performs ZERO host<->device syncs; episode returns go to a
+device ring buffer drained by pop_stats() once per PPO update.
 
 The extension is built on first use via torch.utils.cpp_extension.load
 (ninja-cached under csrc/build; -arch=sm_61). Windows toolchain quirks
@@ -33,10 +35,18 @@ import numpy as np
 import torch
 
 from .chart import ChartConfig, generate_chart
-from .constants import FOLLOW_TIMEOUT, N_JOINTS, OBS_DIM
-from .torch_env import _charts_to_tensors
+from .constants import (
+    BAD_HALF, BAD_HALF_Y_LINK, FOLLOW_TIMEOUT, GOOD_HALF_Y,
+    GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BOMB, KIND_CHAIN_HEAD,
+    KIND_CHAIN_LINK, N_JOINTS, OBS_DIM, Z_MISS, note_center,
+)
 
-N_TRACKERS = FOLLOW_TIMEOUT + 1  # aggregated tracker ring (see torch_env)
+# Follow-through tracker ring: trackers spawned by the same saber in the
+# same tick share identical (arc, age) forever, so they aggregate into
+# ONE slot with a note COUNT. A surviving tracker lives <= FOLLOW_TIMEOUT
+# ticks and the ring has FOLLOW_TIMEOUT + 1 slots, so slot reuse is
+# provably safe: the ring is EXACT, not an approximation.
+N_TRACKERS = FOLLOW_TIMEOUT + 1
 
 _ext = None
 
@@ -93,8 +103,68 @@ def _load_ext():
     return _ext
 
 
+def _charts_to_tensors(charts, device, dtype):
+    """Pad a list[list[Note]] into per-field (P, C) tensors (env v7:
+    explicit world x/y via note_center, object kinds, arc grants, per-note
+    hitbox half-heights, per-chart episode tail)."""
+    P = len(charts)
+    C = max(1, max(len(ch) for ch in charts))
+    hit = np.zeros((P, C)); x = np.zeros((P, C)); y = np.zeros((P, C))
+    color = np.zeros((P, C)); angle = np.zeros((P, C)); speed = np.ones((P, C))
+    any_dir = np.zeros((P, C), dtype=bool); kind = np.zeros((P, C), np.int64)
+    fpre = np.zeros((P, C), dtype=bool); fpost = np.zeros((P, C), dtype=bool)
+    valid = np.zeros((P, C), dtype=bool)
+    for p, ch in enumerate(charts):
+        for j, n in enumerate(ch):
+            hit[p, j] = n.hit_time
+            x[p, j], y[p, j] = note_center(n)
+            color[p, j] = n.color; angle[p, j] = n.angle; speed[p, j] = n.speed
+            any_dir[p, j] = n.any_dir; kind[p, j] = n.kind
+            fpre[p, j] = n.free_pre; fpost[p, j] = n.free_post
+            valid[p, j] = True
+    is_bomb = valid & (kind == KIND_BOMB)
+    is_head = valid & (kind == KIND_CHAIN_HEAD)
+    is_link = valid & (kind == KIND_CHAIN_LINK)
+    # dot notes encode obs direction as the ZERO vector; chain links carry
+    # their tangent despite judging any-direction (lib.rs build_obs)
+    show_dir = ~is_bomb & (~any_dir | is_link)
+    good_hy = np.where(is_link, GOOD_HALF_Y_LINK,
+                       np.where(any_dir, GOOD_HALF_Y_DOT, GOOD_HALF_Y))
+    bad_hy = np.where(is_link, BAD_HALF_Y_LINK, BAD_HALF)
+    # env v7.4: hitboxes rotate about z by rot = angle - 270 deg —
+    # (cos_r, sin_r) = (-sin a, cos a), from the angle's own sin/cos
+    # (lib.rs note_rot). Arrow notes/heads and chain links (tangent)
+    # rotate; plain dots stay axis-aligned; bombs are spheres (unused).
+    rotates = is_link | ~any_dir
+    rot_c = np.where(rotates, -np.sin(angle), 1.0)
+    rot_s = np.where(rotates, np.cos(angle), 0.0)
+    # episode tail: 0.5 + Z_MISS / min speed (lib.rs set_chart_notes)
+    min_speed = np.where(valid, speed, np.inf).min(1)
+    finite = np.isfinite(min_speed)
+    tail = np.where(finite, 0.5 + Z_MISS / np.where(finite, min_speed, 1.0),
+                    0.5)
+    t = lambda a, dt=dtype: torch.as_tensor(a, device=device, dtype=dt)
+    return {
+        "hit": t(hit), "speed": t(speed),
+        "center": torch.stack([t(x), t(y)], -1),
+        "dvec": torch.stack([t(np.cos(angle)), t(np.sin(angle))], -1),
+        "rot": torch.stack([t(rot_c), t(rot_s)], -1),
+        "is_right": t(color, torch.bool),
+        "any_dir": t(any_dir, torch.bool), "valid": t(valid, torch.bool),
+        "is_bomb": t(is_bomb, torch.bool), "is_head": t(is_head, torch.bool),
+        "is_link": t(is_link, torch.bool),
+        "show_dir": t(show_dir, torch.bool),
+        "free_pre": t(fpre, torch.bool), "free_post": t(fpost, torch.bool),
+        "good_hy": t(good_hy), "bad_hy": t(bad_hy),
+        "n_notes": t(valid.sum(1), torch.long),
+        "n_scoreable": t((valid & ~is_bomb).sum(1), torch.long),
+        "last_hit": t(np.where(valid.any(1), (hit * valid).max(1), 0.0)),
+        "tail": t(tail),
+    }
+
+
 class CudaBeatVecEnv:
-    """TorchBeatVecEnv-alike backed by the CUDA kernel. step() takes an
+    """BeatVecEnv-alike backed by the CUDA kernel. step() takes an
     (N, 12) long action tensor (per hand: pitch, yaw, twist, elbow, roll,
     bend; left first) and returns (obs, reward, done, []) — all tensors on
     the CUDA device, infos always empty (use pop_stats() once per update).

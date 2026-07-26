@@ -1,0 +1,37 @@
+ninja_required_version = 1.3
+cxx = cl
+nvcc = D:\Cuda-12-6\bin\nvcc
+
+cflags = -DTORCH_EXTENSION_NAME=layer_norm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -ID:\Git\claude-teaches\projects\kiting-arena\python\.venv\Lib\site-packages\torch\include -ID:\Git\claude-teaches\projects\kiting-arena\python\.venv\Lib\site-packages\torch\include\torch\csrc\api\include -ID:\Cuda-12-6\include -IC:\Python312\Include /std:c++20 /MD /wd4819 /wd4251 /wd4244 /wd4267 /wd4275 /wd4018 /wd4190 /wd4624 /wd4067 /wd4068 /EHsc
+post_cflags = 
+cuda_cflags = -Xcudafe --diag_suppress=dll_interface_conflict_dllexport_assumed -Xcudafe --diag_suppress=dll_interface_conflict_none_assumed -Xcudafe --diag_suppress=field_without_dll_interface -Xcudafe --diag_suppress=base_class_has_different_dll_interface -Xcompiler /EHsc -Xcompiler /wd4068 -Xcompiler /wd4067 -Xcompiler /wd4624 -Xcompiler /wd4190 -Xcompiler /wd4018 -Xcompiler /wd4275 -Xcompiler /wd4267 -Xcompiler /wd4244 -Xcompiler /wd4251 -Xcompiler /wd4819 -Xcompiler /MD -DTORCH_EXTENSION_NAME=layer_norm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -ID:\Git\claude-teaches\projects\kiting-arena\python\.venv\Lib\site-packages\torch\include -ID:\Git\claude-teaches\projects\kiting-arena\python\.venv\Lib\site-packages\torch\include\torch\csrc\api\include -ID:\Cuda-12-6\include -IC:\Python312\Include -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -std=c++20 -arch=sm_61
+cuda_post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = /DLL c10.lib c10_cuda.lib torch_cpu.lib torch_cuda.lib -INCLUDE:?warp_size@cuda@at@@YAHXZ torch.lib /LIBPATH:D:\Git\claude-teaches\projects\kiting-arena\python\.venv\Lib\site-packages\torch\lib torch_python.lib /LIBPATH:C:\Python312\libs /LIBPATH:D:\Cuda-12-6\lib\x64 cudart.lib
+
+rule compile
+  command = cl /showIncludes $cflags -c $in /Fo$out $post_cflags
+  deps = msvc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+rule link
+  command = "C$:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.39.33519\bin\Hostx64\x64/link.exe" $in /nologo $ldflags /out:$out
+
+build layer_norm.cuda.o: cuda_compile D$:\Git\claude-teaches\projects\beat-arena\python\beat_arena_env\csrc\layer_norm.cu
+
+
+
+
+
+build layer_norm_cuda.pyd: link layer_norm.cuda.o
+
+default layer_norm_cuda.pyd

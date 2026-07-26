@@ -34,9 +34,13 @@ $VENV/bin/python -m pytest tests/
 $VENV/bin/python train_batch.py --num-envs 128 --epochs 1   # the trainer
 ```
 
-Since 2026-07-20 the Rust crate (`rust/`) is the ONLY sim implementation
+Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
 and the transformer the only policy — the Python sim, pool encoder, and
-serial trainer were deleted (surface-area reduction). Batched training
+serial trainer were deleted (surface-area reduction). The custom CUDA
+kernel (`--env cuda`, the production trainer backend) is the only other
+sim implementation: the intermediate tensor-op port (`--env torch`,
+torch_env.py) was removed 2026-07-25 once the kernel superseded it
+(chart tensorization moved to cuda_env.py). Batched training
 reaches ~4.5k steps/s (transformer, 8 CPU cores, --epochs 1); the
 ceiling is the torch update, not the env (SPEC §Batched rollouts).
 
