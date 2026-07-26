@@ -128,13 +128,15 @@ def parse_args():
                         "training on a CUDA device (the production path; "
                         "rust is ~4.6x slower there), else rust. (--env "
                         "torch, the tensor-op sim, was removed 2026-07-25)")
-    p.add_argument("--chart-pool", type=int, default=8192,
+    p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
-                        "(default 8192 since 2026-07-25, user decision: "
-                        "the round-4 paired 50M gate measured pool 8192 "
-                        "at +91.3 wpp / paired dAcc t=+8.31 over the old "
-                        "1024 — diversity was binding, concentrated in "
-                        "score_acc (+9.1%%). Costs ~13 s pool gen per leg)")
+                        "(default 65536 since 2026-07-26, user decision "
+                        "after two paired 50M gates: 1024->8192 +91.3 "
+                        "wpp (t=+8.31), 8192->65536 +80.9 wpp (t=+12.55, "
+                        "score_acc +21%%, bad_cuts -31%%, FCs +38%%) — "
+                        "chart diversity was the binding constraint. "
+                        "Costs ~96 s pool gen + ~242 MB VRAM per leg; "
+                        "~1.2 repeats/chart on a 50M leg, ~16 on 700M)")
     p.add_argument("--fp16", choices=["off", "update", "all"],
                    default="all",
                    help="fp16-storage activations (fp32 cuBLAS compute, "

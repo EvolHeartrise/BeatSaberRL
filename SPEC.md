@@ -555,7 +555,7 @@ env step) — cross-shape learning comparisons need retuning.
 legs (2026-07-26, user decision)**: fp16-storage activations everywhere
 (fp32 cuBLAS compute, fp32 master weights/checkpoints, static loss
 scale 2^17), the rollout step captured as ONE CUDA graph, fused
-single-head attention on the fp16 path, chart pool 8192 — ~140k
+single-head attention on the fp16 path, chart pool 65536 — ~140k
 steps/s vs 78k fp32-era (1.8x) at the production config. The 2026-07-26
 graph gate measured the all-fp16 graphed arm at **+72.4 wpp (paired
 dAcc t=+6.63, score_acc +8.7%)** over fp32-rollout 'update' mode — the

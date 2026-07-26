@@ -32,7 +32,7 @@ VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
 # the trainer — production protocol (2026-07-26): --fp16 all
-# --graph-rollout --chart-pool 8192 + fused attention are the DEFAULTS
+# --graph-rollout --chart-pool 65536 + fused attention are the DEFAULTS
 # (~140k steps/s vs the 78k fp32 era; fp32 masters/checkpoints; see
 # sessions/2026-07-25-opt-round4-landings.md and
 # sessions/2026-07-26-graph-rollout-gate.md for the gate results)
