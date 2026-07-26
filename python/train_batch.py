@@ -131,13 +131,15 @@ def parse_args():
     p.add_argument("--chart-pool", type=int, default=1024,
                    help="pregenerated chart pool size for --env cuda")
     p.add_argument("--fp16", choices=["off", "update", "all"],
-                   default="off",
+                   default="update",
                    help="fp16-storage activations (fp32 cuBLAS compute, "
                         "fp32 master weights, fp32 PPO math; 2026-07-25). "
-                        "'update' = minibatch fwd+bwd only; 'all' = "
-                        "rollout too (keeps the PPO ratio's old/new "
-                        "logprobs in the SAME precision — preferred once "
-                        "landed). Checkpoints stay fp32 either way")
+                        "'update' (the DEFAULT since 2026-07-25, +41%% "
+                        "wall) = minibatch fwd+bwd only; 'all' = rollout "
+                        "too (loses ~6%% at N=1024 — launch-bound); "
+                        "'off' = full fp32 (record-attempt fallback). "
+                        "Checkpoints stay fp32 in every mode. Forced "
+                        "off on CPU devices")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="static loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -235,10 +237,15 @@ def main():
     batch = N * T
     mb_size = batch // args.minibatches
 
-    if args.fp16 != "off":
-        assert device.type == "cuda", "--fp16 needs a CUDA device"
-        assert not args.fused_update, \
-            "--fp16 and --fused-update are mutually exclusive"
+    # --fp16 update is the DEFAULT (2026-07-25); downgrade quietly where
+    # it cannot apply instead of crashing paths that never asked for it
+    if args.fp16 != "off" and device.type != "cuda":
+        print("--fp16: CPU device, forcing off", flush=True)
+        args.fp16 = "off"
+    if args.fp16 != "off" and args.fused_update:
+        print("--fp16: incompatible with --fused-update (fp32 packed "
+              "kernels), forcing off", flush=True)
+        args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
     fp16_scale = args.fp16_scale
     # device-side loss-scaling state: NO host syncs in the minibatch
