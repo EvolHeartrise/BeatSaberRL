@@ -118,6 +118,13 @@ __global__ void ln_fwd_add_kernel(const float* __restrict__ a,
   }
 }
 
+// COLS_C > 0 pins d = COLS_C * WARP at compile time: the column loops
+// fully unroll and acc_dw/acc_db live in REGISTERS. With runtime d
+// (COLS_C == 0, the generic fallback) the runtime-indexed accumulators
+// are forced to local memory — read-modify-written twice per column per
+// row (~576 local accesses/thread at production shapes; the 2026-07-25
+// profile put ln_bwd at 4.3% of the update).
+template <int COLS_C>
 __global__ void ln_bwd_kernel(const float* __restrict__ x,
                               const float* __restrict__ dy,
                               const float* __restrict__ w,
@@ -128,10 +135,11 @@ __global__ void ln_bwd_kernel(const float* __restrict__ x,
                               float* __restrict__ pdb,  // (gridDim.x, d)
                               int64_t rows, int d) {
   extern __shared__ float sm[];  // [2][WPB][d]
+  if (COLS_C > 0) d = COLS_C * WARP;  // constant-folds every loop below
   const int lane = threadIdx.x % WARP;
   const int wid = threadIdx.x / WARP;
-  float acc_dw[MAX_COLS] = {};
-  float acc_db[MAX_COLS] = {};
+  float acc_dw[COLS_C > 0 ? COLS_C : MAX_COLS] = {};
+  float acc_db[COLS_C > 0 ? COLS_C : MAX_COLS] = {};
   int64_t row = (int64_t)blockIdx.x * WPB + wid;
   const int64_t stride = (int64_t)gridDim.x * WPB;
   for (; row < rows; row += stride) {
@@ -140,6 +148,7 @@ __global__ void ln_bwd_kernel(const float* __restrict__ x,
     const float mu = mean[row];
     const float r = rstd[row];
     float s1 = 0.f, s2 = 0.f;
+#pragma unroll
     for (int c = lane, k = 0; c < d; c += WARP, k++) {
       const float xh = (xr[c] - mu) * r;
       const float g = gr[c];
@@ -160,6 +169,7 @@ __global__ void ln_bwd_kernel(const float* __restrict__ x,
   // block reduction of the weight/bias partials: each warp stages its
   // lane-owned columns, then the block sums across warps into this
   // block's row of the (blocks, d) partial buffers
+#pragma unroll
   for (int c = lane, k = 0; c < d; c += WARP, k++) {
     sm[wid * d + c] = acc_dw[k];
     sm[(WPB + wid) * d + c] = acc_db[k];
@@ -245,12 +255,17 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
   auto pdb = at::empty({blocks, d}, x.options());
   if (rows > 0) {
     const size_t smem = 2 * WPB * d * sizeof(float);
-    ln_bwd_kernel<<<blocks, THREADS, smem,
-                    at::cuda::getCurrentCUDAStream()>>>(
-        x.data_ptr<float>(), dy.data_ptr<float>(), w.data_ptr<float>(),
-        mean.data_ptr<float>(), rstd.data_ptr<float>(),
-        dx.data_ptr<float>(), pdw.data_ptr<float>(), pdb.data_ptr<float>(),
-        rows, d);
+    auto launch = [&](auto kernel) {
+      kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+          x.data_ptr<float>(), dy.data_ptr<float>(), w.data_ptr<float>(),
+          mean.data_ptr<float>(), rstd.data_ptr<float>(),
+          dx.data_ptr<float>(), pdw.data_ptr<float>(),
+          pdb.data_ptr<float>(), rows, d);
+    };
+    // compile-time-cols variants for the policy's real widths
+    if (d == 2 * WARP) launch(ln_bwd_kernel<2>);        // d = 64
+    else if (d == 4 * WARP) launch(ln_bwd_kernel<4>);   // d = 128
+    else launch(ln_bwd_kernel<0>);                      // runtime d
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     pdw.zero_();
