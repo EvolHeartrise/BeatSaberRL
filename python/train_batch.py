@@ -530,6 +530,16 @@ def main():
                         grads, found_inf, inv_scale)
                     ok = 1.0 - found_inf[0].clamp(max=1.0)  # 0-dim
                     torch._foreach_mul_(grads, ok)
+                    # mul-by-0 is NOT zeroing for non-finite grads:
+                    # inf*0 = NaN, which then rode fused Adam into the
+                    # weights and killed BOTH gen3 5B attempts at ~3.8B
+                    # (2026-07-26: ent nan -> overflow cascade ->
+                    # multinomial device assert -> segfault under the
+                    # graphed rollout). nan_to_num_ makes the zeroing
+                    # actually zero; no-op on finite grads, no syncs.
+                    for g in grads:
+                        torch.nan_to_num_(g, nan=0.0, posinf=0.0,
+                                          neginf=0.0)
                     inf_count += found_inf
                     found_inf.zero_()
                 else:
