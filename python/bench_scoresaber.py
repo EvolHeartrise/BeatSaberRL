@@ -38,6 +38,7 @@ finishes (the every-25 rewrite was quadratic in catalog size).
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import inspect
 import json
@@ -74,8 +75,8 @@ class _GraphedArgmax(_Graphed):
 
     def _compute(self):
         with torch.no_grad():
-            logits, _ = self.policy(self.s_obs)
-        return torch.stack(logits, dim=1).argmax(-1)
+            logits, _ = self.policy.forward_stacked(self.s_obs)
+        return logits.argmax(-1)
 
     def __call__(self, obs_t):
         # obs_t is the loop's persistent (pinned) host buffer, so this
@@ -114,8 +115,15 @@ def parse_args():
                    help="re-evaluate levels already in the results file")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N levels (0 = no limit; for smoke runs)")
-    p.add_argument("--num-envs", type=int, default=512,
-                   help="maps evaluated in parallel (policy is batched)")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress per-level result lines (6.1k prints cost "
+                        "real time on a Windows console; skips and the "
+                        "summary still print)")
+    p.add_argument("--num-envs", type=int, default=1024,
+                   help="maps evaluated in parallel (policy is batched); "
+                        "on the fused path the effective width is capped "
+                        "at ~tasks/3 so small banded runs don't pay for "
+                        "idle rows")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--speed-scale", type=float, default=0.3,
                    help="note speed = NJS * this (sightread convention)")
@@ -377,7 +385,10 @@ def main():
               f"{data['total_unweighted_pp']})", flush=True)
         return
 
-    q = queue.Queue(maxsize=max(64, 2 * args.num_envs))
+    # small lookahead (2026-07-27): the warm producer is ~70x faster than
+    # consumer demand, so 2*N slots just parked ~290 MB of live note
+    # tuples (~1.1M containers) for every gen2 GC pass to walk
+    q = queue.Queue(maxsize=min(2 * args.num_envs, 128))
     stop = threading.Event()
     threading.Thread(target=producer,
                      args=(tasks, args.map_cache, args.chart_cache,
@@ -392,6 +403,15 @@ def main():
     # serial per-env loop did. Idle slots hold an empty chart (done on
     # every step, eventless, ~free) so the vector call is always valid.
     N = args.num_envs
+    if args.fused_forward:
+        # adaptive width (2026-07-27): wide N amortizes the per-step sync
+        # drain (full catalog 81.6s@512 -> 74.1s@1024) and is score-free on
+        # the fused path — the kernel is per-sample with no cross-sample
+        # reduction, VERIFIED bitwise N=512 vs N=1024 over all 6101 levels.
+        # Banded runs cap at ~tasks/3 so slots still refill a few times.
+        # (Torch paths keep the fixed width: cuBLAS retiles with N, so an
+        # adaptive width could flip near-ties between resumes there.)
+        N = max(1, min(N, -(-len(tasks) // 3)))
     # Rust-side combo walk (2026-07-25, the ONLY walk since same day):
     # each env's ordered events feed its walk inside the step call
     sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True,
@@ -439,17 +459,32 @@ def main():
     obs_t = torch.empty((N, OBS_DIM), dtype=torch.float32,
                         pin_memory=device.type == "cuda")
     obs_buf = obs_t.numpy()
+    # pinned action return leg (2026-07-27): `.cpu()` per step was a fresh
+    # PAGEABLE alloc + driver-staged copy; a persistent pinned buffer makes
+    # the D2H a direct DMA. The blocking copy_ is ALSO the stream sync that
+    # keeps step_into from overwriting obs_buf while this step's H2D is
+    # still in flight — do not make it non_blocking without an event sync.
+    act_t = torch.empty((N, 12), dtype=torch.int64,     # 12 action heads
+                        pin_memory=device.type == "cuda")
+    act_np = act_t.numpy()
     slots = [None] * N
     free = list(range(N))
     n_active, feed_done, n_done, n_new_skip = 0, False, 0, 0
     last_save = time.monotonic()
+    # GC off for the loop (2026-07-27): the hot path allocates no cycles
+    # that matter, and gen2 passes were walking the whole startup graph +
+    # the queued note tuples. Bounded run; freeze then disable.
+    gc.collect()
+    gc.freeze()
+    gc.disable()
     try:
         while True:
             while not feed_done and free:
-                try:
-                    item = q.get(block=n_active == 0)
-                except queue.Empty:
-                    break
+                # single consumer: qsize>0 guarantees a non-blocking get,
+                # so the per-step queue.Empty raise/catch churn is gone
+                if n_active and not q.qsize():
+                    break               # nothing parsed yet; keep stepping
+                item = q.get()
                 if item is None:
                     feed_done = True
                     break
@@ -467,7 +502,7 @@ def main():
                     continue
                 i = free.pop()
                 sim.set_chart(i, tuples)
-                obs_buf[i] = sim.obs_one(i)
+                sim.obs_one_into(i, obs_buf)   # row write, no fresh alloc
                 slots[i] = {
                     "entry": entry,
                     "max_score": payload["max_score"],
@@ -480,7 +515,7 @@ def main():
 
             if fwd is not None:
                 try:
-                    actions = fwd(obs_t).cpu().numpy()
+                    act_t.copy_(fwd(obs_t))  # blocking pinned D2H == sync
                 except Exception as e:       # capture failed: go eager
                     print(f"[cuda-graphs] falling back to eager: {e}",
                           flush=True)
@@ -490,11 +525,10 @@ def main():
             if fwd is None:
                 batch = obs_t.to(device, non_blocking=True)
                 with torch.no_grad():
-                    logits, _ = policy(batch)
-                # one stacked argmax kernel over the 12 heads, one D2H sync
-                actions = torch.stack(logits, dim=1).argmax(-1).cpu().numpy()
-            _, dones, _events = sim.step_into(
-                np.ascontiguousarray(actions, dtype=np.int64), obs_buf)
+                    logits, _ = policy.forward_stacked(batch)
+                # one stacked argmax over the 12 heads, one pinned D2H sync
+                act_t.copy_(logits.argmax(-1))
+            _, dones, _events = sim.step_into(act_np, obs_buf)
             n_finished = 0
             for i in np.flatnonzero(np.asarray(dones)):
                 i = int(i)
@@ -512,12 +546,13 @@ def main():
                 levels[result["leaderboard_id"]] = result
                 n_done += 1
                 n_finished += 1
-                print(f"[{n_done}/{len(tasks)}] {result['stars']:.2f}* "
-                      f"{result['song']!r} [{result['difficulty']}] "
-                      f"acc {100 * result['accuracy']:.2f}% "
-                      f"pp {result['pp']:.1f}"
-                      f"{'  FC' if result['full_combo'] else ''}",
-                      flush=True)
+                if not args.quiet:
+                    print(f"[{n_done}/{len(tasks)}] {result['stars']:.2f}* "
+                          f"{result['song']!r} [{result['difficulty']}] "
+                          f"acc {100 * result['accuracy']:.2f}% "
+                          f"pp {result['pp']:.1f}"
+                          f"{'  FC' if result['full_combo'] else ''}",
+                          flush=True)
                 slots[i] = None
                 sim.set_chart(i, [])
                 free.append(i)

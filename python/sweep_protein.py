@@ -85,7 +85,7 @@ def run_leg(idx, h, run_dir):
                         "--out", out,
                         # explicit best path (2026-07-27): don't let a future
                         # default change silently slow or re-class the sweep
-                        "--num-envs", "512", "--fused-forward"],
+                        "--num-envs", "1024", "--fused-forward"],
                        capture_output=True, text=True, timeout=3000)
     if b.returncode != 0 or not os.path.exists(out):
         print(f"[run {idx:03d}] BENCH FAILED: {(b.stderr or '')[-300:]}",
