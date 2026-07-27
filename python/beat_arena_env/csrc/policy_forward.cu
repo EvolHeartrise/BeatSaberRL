@@ -190,18 +190,31 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
     s.h[half][lane] = fmaxf(a, 0.f);
   }
   __syncthreads();
-  {  // note layer 2 (64 -> 64, linear)
-    float acc[8];
-    const float b2 = __ldg(W + O_NOTE_B2 + lane);
+  {  // note layer 2 (64 -> 64, linear): 2 outputs x 4 tokens per thread
+     // (2026-07-27 FMA:load blocking — one h[t][k] smem load feeds two
+     // FMAs; each (t, out) accumulator keeps its own ascending-k chain,
+     // so results are bit-identical to the 1-output x 8-token layout)
+    float acc[4], acc2[4];
+    const int g = tid >> 5;             // token group: 4 tokens each
+    const int o = tid & 31;             // output pair (o, o+32)
+    const float b2a = __ldg(W + O_NOTE_B2 + o);
+    const float b2b = __ldg(W + O_NOTE_B2 + o + 32);
     #pragma unroll
-    for (int i = 0; i < 8; ++i) acc[i] = b2;
+    for (int i = 0; i < 4; ++i) { acc[i] = b2a; acc2[i] = b2b; }
     for (int k = 0; k < D; ++k) {
-      const float w = __ldg(W + O_NOTE_W2 + k * D + lane);
+      const float wa = __ldg(W + O_NOTE_W2 + k * D + o);
+      const float wb = __ldg(W + O_NOTE_W2 + k * D + o + 32);
       #pragma unroll
-      for (int i = 0; i < 8; ++i) acc[i] += s.h[2 + half * 8 + i][k] * w;
+      for (int i = 0; i < 4; ++i) {
+        const float hv = s.h[2 + g * 4 + i][k];
+        acc[i] += hv * wa; acc2[i] += hv * wb;
+      }
     }
     #pragma unroll
-    for (int i = 0; i < 8; ++i) s.x[2 + half * 8 + i][lane] = acc[i];
+    for (int i = 0; i < 4; ++i) {
+      s.x[2 + g * 4 + i][o] = acc[i];
+      s.x[2 + g * 4 + i][o + 32] = acc2[i];
+    }
   }
   {  // saber layer 2
     float a = __ldg(W + O_SAB_B2 + lane);
@@ -244,12 +257,26 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       }
     }
     __syncthreads();
-    // scores: q @ k^T / sqrt(64) + key mask — 324 flat dot products
-    for (int idx = tid; idx < TT * TT; idx += THREADS) {
-      const int t = idx / TT, u = idx % TT;
-      float a = 0.f;
-      for (int k = 0; k < D; ++k) a += s.u.a.q[t][k] * s.u.a.k[u][k];
-      s.u.a.att[t][u] = a * 0.125f + s.madd[u];
+    // scores: q @ k^T / sqrt(64) + key mask — 324 flat dot products.
+    // Each thread's 2-3 dots interleave their k-loops (2026-07-27):
+    // independent accumulators in the same k order are bit-identical to
+    // the back-to-back version but give the scheduler 2-3 FMA chains to
+    // hide latency with instead of one 64-long dependent chain.
+    {
+      const int i1 = tid + THREADS, i2 = tid + 2 * THREADS;
+      const bool has2 = i2 < TT * TT;   // 324 dots: threads 0-67 own 3
+      const int t0 = tid / TT, u0 = tid % TT;
+      const int t1 = i1 / TT, u1 = i1 % TT;
+      const int t2 = has2 ? i2 / TT : 0, u2 = has2 ? i2 % TT : 0;
+      float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+      for (int k = 0; k < D; ++k) {
+        a0 += s.u.a.q[t0][k] * s.u.a.k[u0][k];
+        a1 += s.u.a.q[t1][k] * s.u.a.k[u1][k];
+        if (has2) a2 += s.u.a.q[t2][k] * s.u.a.k[u2][k];
+      }
+      s.u.a.att[t0][u0] = a0 * 0.125f + s.madd[u0];
+      s.u.a.att[t1][u1] = a1 * 0.125f + s.madd[u1];
+      if (has2) s.u.a.att[t2][u2] = a2 * 0.125f + s.madd[u2];
     }
     __syncthreads();
     if (tid < TT) {  // softmax per query row (18-wide: one thread each)
@@ -265,32 +292,48 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       for (int u = 0; u < TT; ++u) s.u.a.att[tid][u] *= inv;
     }
     __syncthreads();
-    {  // residual add: x += att @ v (each half owns 9 tokens)
+    {  // residual add: x += att @ v (each half owns 9 tokens). u-outer
+       // (2026-07-27): one v[u][lane] load feeds 9 FMAs instead of 1;
+       // each token's accumulator still sums u ascending -> bit-identical.
+      float a[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
       #pragma unroll
-      for (int i = 0; i < 9; ++i) {
-        const int t = half * 9 + i;
-        float a = 0.f;
+      for (int u = 0; u < TT; ++u) {
+        const float vu = s.u.a.v[u][lane];
         #pragma unroll
-        for (int u = 0; u < TT; ++u) a += s.u.a.att[t][u] * s.u.a.v[u][lane];
-        s.x[t][lane] += a;
+        for (int i = 0; i < 9; ++i)
+          a[i] += s.u.a.att[half * 9 + i][u] * vu;
       }
+      #pragma unroll
+      for (int i = 0; i < 9; ++i) s.x[half * 9 + i][lane] += a[i];
     }
     __syncthreads();
     ln_tokens(s.x, s.h, B + B_LN2_G, B + B_LN2_B, tid);
     __syncthreads();
-    {  // FFN layer 1 (64 -> 128, ReLU): thread tid owns output tid for
-       // ALL 18 tokens — each weight element loaded once
-      float acc[TT];
-      const float b1 = __ldg(B + B_FFB1 + tid);
+    {  // FFN layer 1 (64 -> 128, ReLU): 2 outputs x 9 tokens per thread
+       // (2026-07-27 FMA:load blocking, was 1 output x 18 tokens): same
+       // 18 accumulators, but one h[t][k] smem load now feeds two FMAs
+       // (11 LSU ops per 18 FMAs vs 19). Each (t, out) accumulator chain
+       // keeps the same ascending-k order -> bit-identical.
+      float acc[9], acc2[9];
+      const float b1a = __ldg(B + B_FFB1 + lane);
+      const float b1b = __ldg(B + B_FFB1 + lane + D);
       #pragma unroll
-      for (int t = 0; t < TT; ++t) acc[t] = b1;
+      for (int i = 0; i < 9; ++i) { acc[i] = b1a; acc2[i] = b1b; }
       for (int k = 0; k < D; ++k) {
-        const float w = __ldg(B + B_FFW1 + k * TRUNK + tid);
+        const float wa = __ldg(B + B_FFW1 + k * TRUNK + lane);
+        const float wb = __ldg(B + B_FFW1 + k * TRUNK + lane + D);
         #pragma unroll
-        for (int t = 0; t < TT; ++t) acc[t] += s.h[t][k] * w;
+        for (int i = 0; i < 9; ++i) {
+          const float hv = s.h[half * 9 + i][k];
+          acc[i] += hv * wa; acc2[i] += hv * wb;
+        }
       }
       #pragma unroll
-      for (int t = 0; t < TT; ++t) s.u.f.f1[t][tid] = fmaxf(acc[t], 0.f);
+      for (int i = 0; i < 9; ++i) {
+        const int t = half * 9 + i;
+        s.u.f.f1[t][lane] = fmaxf(acc[i], 0.f);
+        s.u.f.f1[t][lane + D] = fmaxf(acc2[i], 0.f);
+      }
     }
     __syncthreads();
     {  // FFN layer 2 (128 -> 64) + residual
@@ -375,14 +418,17 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       for (int u = 0; u < TT; ++u) s.u.a.att[tid][u] *= inv;
     }
     __syncthreads();
-    if (half == 0) {  // residual add: x += att @ v, tokens 0-1
+    if (half == 0) {  // residual add: x += att @ v, tokens 0-1 (u-outer,
+                      // shared v load; ascending-u chains -> bit-identical)
+      float a0 = 0.f, a1 = 0.f;
       #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        float a = 0.f;
-        #pragma unroll
-        for (int u = 0; u < TT; ++u) a += s.u.a.att[i][u] * s.u.a.v[u][lane];
-        s.x[i][lane] += a;
+      for (int u = 0; u < TT; ++u) {
+        const float vu = s.u.a.v[u][lane];
+        a0 += s.u.a.att[0][u] * vu;
+        a1 += s.u.a.att[1][u] * vu;
       }
+      s.x[0][lane] += a0;
+      s.x[1][lane] += a1;
     }
     __syncthreads();
     {  // LN2 on tokens 0-1 only: same math as ln_tokens rows 0-1 (there
