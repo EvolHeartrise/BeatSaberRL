@@ -114,6 +114,17 @@ def parse_args():
     p.add_argument("--lr-final", type=float, default=1e-4,
                    help="end-of-run lr for --lr-decay")
     p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--ent-final", type=float, default=None,
+                   help="linearly anneal the entropy coef from --ent-coef "
+                        "to this over the run (default: constant). Added "
+                        "2026-07-27 for the Protein sweep — the best gen2 "
+                        "arm was 'lowent', so late-run entropy pressure "
+                        "is a live tuning axis")
+    p.add_argument("--gamma", type=float, default=GAMMA,
+                   help="discount (default 0.99 ~ 3.3 s effective horizon "
+                        "at 30 Hz; swept 2026-07-27 — user hypothesis: "
+                        "Beat Saber decisions live ~1 s ahead, gamma "
+                        "~0.967)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
     p.add_argument("--run-dir", type=str, default=None)
@@ -433,6 +444,10 @@ def main():
                 lr_now = args.lr + (args.lr_final - args.lr) * frac
             for g in opt.param_groups:
                 g["lr"] = lr_now
+        ent_now = args.ent_coef
+        if args.ent_final is not None:
+            ent_now = args.ent_coef + (args.ent_final - args.ent_coef) * (
+                update / max(1, num_updates - 1))
         t0 = time.perf_counter()
         if graph_roll is not None:
             graph_roll.refresh()  # in-place fp16 caches after opt.steps
@@ -484,8 +499,8 @@ def main():
             # only the scan itself stays sequential
             nonterm = 1.0 - b_done
             nextv = torch.cat([b_val[1:], next_val.unsqueeze(0)])
-            deltas = b_rew + GAMMA * nextv * nonterm - b_val
-            coef = (GAMMA * GAE_LAMBDA) * nonterm
+            deltas = b_rew + args.gamma * nextv * nonterm - b_val
+            coef = (args.gamma * GAE_LAMBDA) * nonterm
             adv = torch.zeros((T, N), device=device)
             lastgae = torch.zeros(N, device=device)
             for t in reversed(range(T)):
@@ -511,7 +526,7 @@ def main():
                 mb = perm[s:s + mb_size]
                 if trainer is not None:  # fused minibatch body
                     loss, ent_loss = fused_minibatch_losses(
-                        trainer, args.ent_coef, f_obs[mb], f_act[mb],
+                        trainer, ent_now, f_obs[mb], f_act[mb],
                         f_logp[mb], f_adv[mb], f_ret[mb])
                     opt.zero_grad()
                     loss.backward()
@@ -533,7 +548,7 @@ def main():
                 pg_loss, dual_frac = pg_loss_fn(ratio, a_mb)
                 v_loss = 0.5 * ((newval - f_ret[mb]) ** 2).mean()
                 ent_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * ent_loss + VF_COEF * v_loss
+                loss = pg_loss - ent_now * ent_loss + VF_COEF * v_loss
                 opt.zero_grad(set_to_none=True)
                 if fp16_update:
                     # static loss scale, ZERO host syncs: unscale + flag
