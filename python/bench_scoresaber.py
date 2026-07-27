@@ -114,7 +114,7 @@ def parse_args():
                    help="re-evaluate levels already in the results file")
     p.add_argument("--limit", type=int, default=0,
                    help="stop after N levels (0 = no limit; for smoke runs)")
-    p.add_argument("--num-envs", type=int, default=256,
+    p.add_argument("--num-envs", type=int, default=512,
                    help="maps evaluated in parallel (policy is batched)")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--speed-scale", type=float, default=0.3,
@@ -129,11 +129,13 @@ def parse_args():
     p.add_argument("--refresh-catalog", action="store_true")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
-    p.add_argument("--fused-forward", action="store_true",
+    p.add_argument("--fused-forward", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="use the fused single-kernel CUDA forward "
                         "(policy_cuda, JIT-built) for the argmax rollout; "
                         "falls back to the graphed/eager path if the kernel "
-                        "is unavailable")
+                        "is unavailable (2026-07-27: default ON — it is both "
+                        "the fast path and the batch-size-invariant one)")
     return p.parse_args()
 
 
@@ -408,6 +410,28 @@ def main():
     if fwd is None:
         fwd = (None if args.no_graphs or device.type != "cuda"
                else _GraphedArgmax(policy, N, device))
+    # Forward-path provenance (2026-07-27): fused vs torch forwards differ
+    # by ~4e-7 in the logits, enough to flip near-tie argmaxes — per-level
+    # results are only comparable within one path. Same weights + different
+    # path must therefore NOT silently merge into one file.
+    fwd_path = ("fused" if isinstance(fwd, _FusedArgmax) else
+                "graphed" if isinstance(fwd, _GraphedArgmax) else "eager")
+    prev_path = data.get("forward")
+    if prev_path is not None and prev_path != fwd_path:
+        sys.exit(f"error: {out_path} holds {prev_path!r}-forward results but "
+                 f"this run would use {fwd_path!r}. Matching flag "
+                 f"(--fused-forward/--no-fused-forward/--no-graphs) or a "
+                 f"fresh --out required; --force with the matching flag "
+                 f"re-evaluates everything on one path.")
+    full_force = args.force and args.stars is None and args.limit == 0
+    if (prev_path is None and not full_force
+            and any("skipped" not in e for e in levels.values())):
+        print(f"[forward] warning: {out_path} predates forward-path "
+              f"stamping; its levels' provenance is unverifiable and the "
+              f"file stays unstamped (full-range --force re-bench adopts "
+              f"{fwd_path!r})", flush=True)
+    else:
+        data["forward"] = fwd_path
     # persistent obs buffer (2026-07-25): sim.step_into writes the rows
     # in place — no fresh 586 KB Rust allocation per vector step, and the
     # buffer stays cache-resident; pinned memory turns the H2D copy into
@@ -461,6 +485,8 @@ def main():
                     print(f"[cuda-graphs] falling back to eager: {e}",
                           flush=True)
                     fwd = None
+                    if data.get("forward") is not None:
+                        data["forward"] = "eager"  # keep the stamp honest
             if fwd is None:
                 batch = obs_t.to(device, non_blocking=True)
                 with torch.no_grad():
