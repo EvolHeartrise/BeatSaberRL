@@ -57,12 +57,19 @@ _CUDA_CANDIDATES = (
 )
 
 
+_toolchain_done = False
+
+
 def _toolchain_env():
     """Make torch.utils.cpp_extension work from a bare venv on Windows:
     locate nvcc (CUDA_HOME), cl.exe (newest VS2022 Hostx64/x64), and ninja
-    (venv Scripts) if they are not already reachable."""
-    if os.name != "nt":
+    (venv Scripts) if they are not already reachable. Memoized
+    (2026-07-27): env mutations are idempotent, the VS glob scan is not
+    free, and one process may build several extensions."""
+    global _toolchain_done
+    if os.name != "nt" or _toolchain_done:
         return
+    _toolchain_done = True
     scripts = os.path.dirname(sys.executable)
     if shutil.which("ninja") is None:
         os.environ["PATH"] = scripts + os.pathsep + os.environ["PATH"]
@@ -90,16 +97,22 @@ def _load_ext():
     change; a warm cache loads in ~1 s)."""
     global _ext
     if _ext is None:
-        _toolchain_env()
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
-        from torch.utils.cpp_extension import load
+        from beat_arena_env.jit_cache import fast_load
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
         bdir = os.path.join(src, "build")
         os.makedirs(bdir, exist_ok=True)
-        _ext = load(name="beat_arena_cuda",
-                    sources=[os.path.join(src, "beat_arena_cuda.cu")],
-                    build_directory=bdir,
-                    extra_cuda_cflags=["-arch=sm_61"])
+        srcs = [os.path.join(src, "beat_arena_cuda.cu")]
+
+        def _full():
+            _toolchain_env()
+            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+            from torch.utils.cpp_extension import load
+            return load(name="beat_arena_cuda", sources=srcs,
+                        build_directory=bdir,
+                        extra_cuda_cflags=["-arch=sm_61"])
+
+        _ext = fast_load("beat_arena_cuda", srcs, bdir,
+                         ["-arch=sm_61"], _full)
     return _ext
 
 

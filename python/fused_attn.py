@@ -27,18 +27,24 @@ def _load():
     if _ext is None and not _ext_failed:
         try:
             import os
-            from beat_arena_env.cuda_env import _toolchain_env
-            _toolchain_env()
-            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
-            from torch.utils.cpp_extension import load
+            from beat_arena_env.jit_cache import fast_load
             src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "beat_arena_env", "csrc")
             bdir = os.path.join(src, "build_attn")
             os.makedirs(bdir, exist_ok=True)
-            _ext = load(name="fused_attn_cuda",
-                        sources=[os.path.join(src, "fused_attn.cu")],
-                        build_directory=bdir,
-                        extra_cuda_cflags=["-arch=sm_61"])
+            srcs = [os.path.join(src, "fused_attn.cu")]
+
+            def _full():
+                from beat_arena_env.cuda_env import _toolchain_env
+                _toolchain_env()
+                os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+                from torch.utils.cpp_extension import load
+                return load(name="fused_attn_cuda", sources=srcs,
+                            build_directory=bdir,
+                            extra_cuda_cflags=["-arch=sm_61"])
+
+            _ext = fast_load("fused_attn_cuda", srcs, bdir,
+                             ["-arch=sm_61"], _full)
         except Exception as e:
             _ext_failed = True
             print(f"[fused-attn] unavailable, eager attention: {e}",

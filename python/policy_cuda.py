@@ -70,15 +70,21 @@ _ext_bwd = None
 
 
 def _load_one(name, src_file, build_subdir):
-    _toolchain_env()
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
-    from torch.utils.cpp_extension import load
+    from beat_arena_env.jit_cache import fast_load
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "beat_arena_env", "csrc")
     bdir = os.path.join(src, build_subdir)
     os.makedirs(bdir, exist_ok=True)
-    return load(name=name, sources=[os.path.join(src, src_file)],
-                build_directory=bdir, extra_cuda_cflags=["-arch=sm_61"])
+    srcs = [os.path.join(src, src_file)]
+
+    def _full():
+        _toolchain_env()
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+        from torch.utils.cpp_extension import load
+        return load(name=name, sources=srcs, build_directory=bdir,
+                    extra_cuda_cflags=["-arch=sm_61"])
+
+    return fast_load(name, srcs, bdir, ["-arch=sm_61"], _full)
 
 
 def _load_ext():
