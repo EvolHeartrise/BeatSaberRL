@@ -125,6 +125,11 @@ def parse_args():
                         "at 30 Hz; swept 2026-07-27 — user hypothesis: "
                         "Beat Saber decisions live ~1 s ahead, gamma "
                         "~0.967)")
+    p.add_argument("--gae-lambda", type=float, default=GAE_LAMBDA,
+                   help="GAE trace decay (default 0.95; swept 2026-07-27 "
+                        "jointly with --gamma — gamma*lambda sets the "
+                        "policy-gradient credit window, gamma alone the "
+                        "value-target horizon)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
     p.add_argument("--run-dir", type=str, default=None)
@@ -500,7 +505,7 @@ def main():
             nonterm = 1.0 - b_done
             nextv = torch.cat([b_val[1:], next_val.unsqueeze(0)])
             deltas = b_rew + args.gamma * nextv * nonterm - b_val
-            coef = (args.gamma * GAE_LAMBDA) * nonterm
+            coef = (args.gamma * args.gae_lambda) * nonterm
             adv = torch.zeros((T, N), device=device)
             lastgae = torch.zeros(N, device=device)
             for t in reversed(range(T)):
