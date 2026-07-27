@@ -9,11 +9,15 @@ scaling-law trick); cost signal = wall seconds of the training leg.
 downsample=1 (one bench per leg) which also enables Protein's
 success-probability classifier.
 
-Space (7 dims):
+Space (8 dims; gae_lambda added 2026-07-27 before resuming — gamma and
+lambda jointly set the credit window, so sweeping gamma alone against a
+fixed lambda 0.95 would under/over-state its effect; the three pre-add
+observations are replayed with the implicit lambda 0.95 they ran with):
   lr          log     1e-4 .. 3e-3   (cosine to 1e-4 fixed)
   ent_coef    log     1e-4 .. 0.1    initial entropy coef
   ent_final   log     1e-5 .. 0.1    linear anneal target (new flag)
   gamma       logit   0.90 .. 0.997  user hypothesis: ~1 s horizon (~0.967)
+  gae_lambda  logit   0.80 .. 0.99   trace decay (gamma*lambda = PG window)
   effort_coef log     0.01 .. 8      flailing tax (log cannot express 0)
   bomb_prob   log     0.01 .. 0.4    bomb density (72%-of-reward question)
   total_steps log     5e7  .. 4e8    THE COST AXIS (3.3-27 min at ~250k/s)
@@ -51,6 +55,7 @@ SPACE = {
         "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.1, scale=0.5),
         "ent_final":   dict(distribution="log_normal", min=1e-5, max=0.1, scale=0.5),
         "gamma":       dict(distribution="logit_normal", min=0.90, max=0.997, scale=0.5),
+        "gae_lambda":  dict(distribution="logit_normal", min=0.80, max=0.99, scale=0.5),
         "effort_coef": dict(distribution="log_normal", min=0.01, max=8.0, scale=0.5),
         "bomb_prob":   dict(distribution="log_normal", min=0.01, max=0.4, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
@@ -67,6 +72,7 @@ def run_leg(idx, h, run_dir):
            "--ent-coef", f"{h['ent_coef']:.6g}",
            "--ent-final", f"{h['ent_final']:.6g}",
            "--gamma", f"{h['gamma']:.6g}",
+           "--gae-lambda", f"{h['gae_lambda']:.6g}",
            "--effort-coef", f"{h['effort_coef']:.6g}",
            "--bomb-prob", f"{h['bomb_prob']:.6g}",
            "--total-steps", str(int(h["total_steps"])),
@@ -109,6 +115,9 @@ def main():
     if os.path.exists(log_path):
         for line in open(log_path, encoding="utf-8"):
             o = json.loads(line)
+            # observations logged before a dim was added ran the
+            # then-hardcoded default; from_dict asserts on missing keys
+            o["hypers"]["train"].setdefault("gae_lambda", 0.95)
             protein.observe(o["hypers"], o["score"], o["cost"],
                             o["is_failure"])
             protein.suggestion_idx += 1  # keep Sobol phase consumed
@@ -121,6 +130,7 @@ def main():
         run_dir = os.path.join(args.dir, f"run_{idx:03d}")
         print(f"[run {idx:03d}] lr {h['lr']:.2e} ent {h['ent_coef']:.2e}"
               f"->{h['ent_final']:.2e} gamma {h['gamma']:.4f} "
+              f"lam {h['gae_lambda']:.4f} "
               f"effort {h['effort_coef']:.2f} bomb {h['bomb_prob']:.3f} "
               f"steps {h['total_steps']/1e6:.0f}M", flush=True)
         res = run_leg(idx, h, run_dir)
