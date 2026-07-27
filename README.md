@@ -93,11 +93,15 @@ the defaults ARE the fast path (`--num-envs 512`, fused forward on;
 `--no-fused-forward` to opt out) and the results JSON records which
 forward path produced it — fused/graphed near-tie argmax flips mean
 per-level results only compare within one path, so cross-path merges
-are refused. With the last-block-pruned fused kernel + pinned action D2H + N=1024
-default (2026-07-27, all bitwise-exact; fused per-sample kernel is
-batch-size-invariant, verified N=512 vs N=1024 over the full catalog):
-**~82 maps/s warm, full catalog ~1m14s** on the GTX 1080 box (first
-run parses + warms the cache under `maps/chart_cache/`, ~380 MB).
+are refused. Since 2026-07-27 the loop is a two-group software pipeline on the fused
+path (one group's forward+D2H in flight on the GPU while the CPU runs
+the other group's Rust sim; a `query()` after each issue flushes WDDM's
+submission batch, without which nothing overlaps) — plus the
+last-block-pruned, register-blocked, smem-dieted kernel, pinned action
+D2H, and a JIT trust-the-cache startup. All bitwise-exact (the fused
+per-sample kernel is batch-size-invariant, verified over the full
+catalog): **~128 maps/s warm, full catalog ~48s** on the GTX 1080 box
+(first run parses + warms the cache under `maps/chart_cache/`, ~380 MB).
 
 ## Exporting to ScoreSaber's replay viewer
 

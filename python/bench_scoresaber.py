@@ -101,6 +101,37 @@ class _FusedArgmax:
         return self.fused.argmax(self.s_obs)
 
 
+class _Group:
+    """One pipeline group: its own sim, forward, pinned obs/act buffers,
+    slot bookkeeping, and a CUDA event fencing its in-flight GPU chain
+    (H2D + kernel + async D2H). `issued` means actions are in flight; the
+    event sync is what makes act_np safe to read AND obs_buf safe for
+    step_into to overwrite (the H2D precedes the D2H in stream order)."""
+
+    __slots__ = ("n", "sim", "fwd", "obs_t", "obs_buf", "act_t", "act_np",
+                 "slots", "free", "n_active", "ev", "issued")
+
+    def __init__(self, n, fwd, device):
+        self.n = n
+        self.sim = VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
+                              return_events=False)
+        for i in range(n):
+            self.sim.set_chart(i, [])
+        self.fwd = fwd
+        pin = device.type == "cuda"
+        self.obs_t = torch.empty((n, OBS_DIM), dtype=torch.float32,
+                                 pin_memory=pin)
+        self.obs_buf = self.obs_t.numpy()
+        self.act_t = torch.empty((n, 12), dtype=torch.int64,  # 12 heads
+                                 pin_memory=pin)
+        self.act_np = self.act_t.numpy()
+        self.slots = [None] * n
+        self.free = list(range(n))
+        self.n_active = 0
+        self.ev = torch.cuda.Event() if pin else None
+        self.issued = False
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--ckpt", required=True, help="checkpoint .pt to bench")
@@ -121,12 +152,22 @@ def parse_args():
                         "summary still print)")
     p.add_argument("--timing", action="store_true",
                    help="print a per-phase wall-clock decomposition of the "
-                        "eval loop (feed/forward/step/finish) at the end")
-    p.add_argument("--num-envs", type=int, default=1024,
+                        "eval loop (feed/issue/sync/step/finish) at the end")
+    p.add_argument("--pipeline", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="two-group software pipeline: while one half's "
+                        "forward+D2H is in flight on the GPU, the CPU runs "
+                        "the other half's Rust sim (2026-07-27). Engages "
+                        "only on the fused path — its per-sample kernel is "
+                        "batch-size-invariant (verified bitwise), so two "
+                        "groups of N/2 score identically to one batch of N")
+    p.add_argument("--num-envs", type=int, default=2048,
                    help="maps evaluated in parallel (policy is batched); "
                         "on the fused path the effective width is capped "
                         "at ~tasks/3 so small banded runs don't pay for "
-                        "idle rows")
+                        "idle rows, and the pipeline splits it into two "
+                        "groups (2048 -> 2x1024, the measured kernel "
+                        "sweet spot)")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--speed-scale", type=float, default=0.3,
                    help="note speed = NJS * this (sightread convention)")
@@ -415,24 +456,40 @@ def main():
         # (Torch paths keep the fixed width: cuBLAS retiles with N, so an
         # adaptive width could flip near-ties between resumes there.)
         N = max(1, min(N, -(-len(tasks) // 3)))
-    # Rust-side combo walk (2026-07-25, the ONLY walk since same day):
-    # each env's ordered events feed its walk inside the step call
-    sim = VecBeatSim(N, max_steps=100_000_000, combo_walk=True,
-                     return_events=False)
-    for i in range(N):
-        sim.set_chart(i, [])
-    fwd = None
+    # Two-group pipeline (2026-07-27): with a single group the loop is a
+    # strict serial chain — GPU idles during the Rust sim, CPU idles
+    # during the forward. Two half-size groups alternate: while group A's
+    # H2D+kernel+async-D2H chain runs on the (single) stream, the CPU
+    # syncs B's event and runs B's sim + bookkeeping. Fused path only:
+    # the kernel's per-sample batch invariance (verified bitwise 512 vs
+    # 1024) is what makes N/2 groups score-identical; cuBLAS is not.
+    use_fused = False
     if args.fused_forward and device.type == "cuda":
         try:                             # JIT build/arch may fail: fall back
-            fwd = _FusedArgmax(policy, N, device)
+            _FusedArgmax(policy, 1, device)   # availability probe
+            use_fused = True
             print("[fused-forward] single-launch CUDA forward active",
                   flush=True)
         except Exception as e:
             print(f"[fused-forward] unavailable, falling back: {e}",
                   flush=True)
-    if fwd is None:
-        fwd = (None if args.no_graphs or device.type != "cuda"
-               else _GraphedArgmax(policy, N, device))
+    pipelined = args.pipeline and use_fused and N >= 2
+    if pipelined:
+        n_a = (N + 1) // 2
+        sizes = [n_a, N - n_a]
+        print(f"[pipeline] two groups of {sizes[0]}/{sizes[1]} envs",
+              flush=True)
+    else:
+        sizes = [N]
+    groups = []
+    for n_g in sizes:
+        if use_fused:
+            fwd_g = _FusedArgmax(policy, n_g, device)
+        else:
+            fwd_g = (None if args.no_graphs or device.type != "cuda"
+                     else _GraphedArgmax(policy, n_g, device))
+        groups.append(_Group(n_g, fwd_g, device))
+    fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): fused vs torch forwards differ
     # by ~4e-7 in the logits, enough to flip near-tie argmaxes — per-level
     # results are only comparable within one path. Same weights + different
@@ -455,24 +512,10 @@ def main():
               f"{fwd_path!r})", flush=True)
     else:
         data["forward"] = fwd_path
-    # persistent obs buffer (2026-07-25): sim.step_into writes the rows
-    # in place — no fresh 586 KB Rust allocation per vector step, and the
-    # buffer stays cache-resident; pinned memory turns the H2D copy into
-    # an async DMA on CUDA
-    obs_t = torch.empty((N, OBS_DIM), dtype=torch.float32,
-                        pin_memory=device.type == "cuda")
-    obs_buf = obs_t.numpy()
-    # pinned action return leg (2026-07-27): `.cpu()` per step was a fresh
-    # PAGEABLE alloc + driver-staged copy; a persistent pinned buffer makes
-    # the D2H a direct DMA. The blocking copy_ is ALSO the stream sync that
-    # keeps step_into from overwriting obs_buf while this step's H2D is
-    # still in flight — do not make it non_blocking without an event sync.
-    act_t = torch.empty((N, 12), dtype=torch.int64,     # 12 action heads
-                        pin_memory=device.type == "cuda")
-    act_np = act_t.numpy()
-    slots = [None] * N
-    free = list(range(N))
-    n_active, feed_done, n_done, n_new_skip = 0, False, 0, 0
+    # (persistent pinned obs/act buffers live in each _Group: step_into
+    # writes obs rows in place, the async D2H lands in pinned act memory,
+    # and the group's event is the sync that makes both safe to touch)
+    feed_done, n_done, n_new_skip = False, 0, 0
     last_save = time.monotonic()
     # GC off for the loop (2026-07-27): the hot path allocates no cycles
     # that matter, and gen2 passes were walking the whole startup graph +
@@ -480,106 +523,133 @@ def main():
     gc.collect()
     gc.freeze()
     gc.disable()
-    # per-phase wall clock (--timing): feed/refill, forward+pinned D2H,
-    # step_into (Rust sim), finish/save. perf_counter is ~100 ns — always
-    # accumulated, printed only on request.
-    ph = [0.0, 0.0, 0.0, 0.0]
+    # per-phase wall clock (--timing): feed/refill, issue (forward launch
+    # + async D2H enqueue), sync (event wait — under the pipeline this is
+    # GPU time NOT hidden by the other group's CPU work), step_into,
+    # finish/save. perf_counter is ~100 ns — always accumulated.
+    ph = [0.0, 0.0, 0.0, 0.0, 0.0]
     n_steps = 0
     pc = time.perf_counter
     try:
         while True:
-            t0 = pc()
-            while not feed_done and free:
-                # single consumer: qsize>0 guarantees a non-blocking get,
-                # so the per-step queue.Empty raise/catch churn is gone
-                if n_active and not q.qsize():
-                    break               # nothing parsed yet; keep stepping
-                item = q.get()
-                if item is None:
-                    feed_done = True
-                    break
-                entry, tuples, payload, skip = item
-                if skip is not None:
-                    n_done += 1
-                    n_new_skip += 1
-                    print(f"[{n_done}/{len(tasks)}] skip {entry['song']!r} "
-                          f"[{entry['difficulty']}]: {skip}", flush=True)
-                    levels[entry["leaderboard_id"]] = {
-                        "leaderboard_id": entry["leaderboard_id"],
-                        "song_hash": entry["hash"], "song": entry["song"],
-                        "difficulty": entry["difficulty"],
-                        "stars": entry["stars"], "skipped": skip}
-                    continue
-                i = free.pop()
-                sim.set_chart(i, tuples)
-                sim.obs_one_into(i, obs_buf)   # row write, no fresh alloc
-                slots[i] = {
-                    "entry": entry,
-                    "max_score": payload["max_score"],
-                    "duration_s": payload["duration_s"]}
-                n_active += 1
-            if n_active == 0:
+            progressed = False
+            for gr in groups:
+                t0 = pc()
+                if gr.issued:
+                    if gr.ev is not None:
+                        gr.ev.synchronize()  # actions landed; obs H2D done
+                    gr.issued = False
+                    t1 = pc()
+                    _, dones, _events = gr.sim.step_into(gr.act_np,
+                                                         gr.obs_buf)
+                    t2 = pc()
+                    n_finished = 0
+                    for i in np.flatnonzero(np.asarray(dones)):
+                        i = int(i)
+                        s = gr.slots[i]
+                        if s is None:            # idle empty-chart slot
+                            continue
+                        combo = gr.sim.combo(i)  # BEFORE set_chart resets
+                        g, b, m, n_scoreable, _, bombs = gr.sim.counters(i)
+                        c_pre, c_acc, c_post = gr.sim.components(i)
+                        result = finish_slot(s, {
+                            "good_cuts": g, "bad_cuts": b, "misses": m,
+                            "n_notes": n_scoreable, "bombs_hit": bombs,
+                            "score_pre": c_pre, "score_acc": c_acc,
+                            "score_post": c_post}, combo)
+                        levels[result["leaderboard_id"]] = result
+                        n_done += 1
+                        n_finished += 1
+                        if not args.quiet:
+                            print(f"[{n_done}/{len(tasks)}] "
+                                  f"{result['stars']:.2f}* "
+                                  f"{result['song']!r} "
+                                  f"[{result['difficulty']}] "
+                                  f"acc {100 * result['accuracy']:.2f}% "
+                                  f"pp {result['pp']:.1f}"
+                                  f"{'  FC' if result['full_combo'] else ''}",
+                                  flush=True)
+                        gr.slots[i] = None
+                        gr.sim.set_chart(i, [])
+                        gr.free.append(i)
+                        gr.n_active -= 1
+                    if n_finished and time.monotonic() - last_save > 30.0:
+                        save_results(out_path, data, levels)
+                        last_save = time.monotonic()
+                    t3 = pc()
+                    ph[2] += t1 - t0
+                    ph[3] += t2 - t1
+                    ph[4] += t3 - t2
+                    n_steps += 1
+                t4 = pc()
+                while not feed_done and gr.free:
+                    # single consumer: qsize>0 guarantees a non-blocking
+                    # get. Block only when nothing is active or in flight
+                    # ANYWHERE — a blocking wait with the other group's
+                    # forward in flight would stall the pipeline.
+                    busy = any(x.n_active or x.issued for x in groups)
+                    if busy and not q.qsize():
+                        break           # nothing parsed yet; keep stepping
+                    item = q.get()
+                    if item is None:
+                        feed_done = True
+                        break
+                    entry, tuples, payload, skip = item
+                    if skip is not None:
+                        n_done += 1
+                        n_new_skip += 1
+                        print(f"[{n_done}/{len(tasks)}] skip "
+                              f"{entry['song']!r} "
+                              f"[{entry['difficulty']}]: {skip}", flush=True)
+                        levels[entry["leaderboard_id"]] = {
+                            "leaderboard_id": entry["leaderboard_id"],
+                            "song_hash": entry["hash"], "song": entry["song"],
+                            "difficulty": entry["difficulty"],
+                            "stars": entry["stars"], "skipped": skip}
+                        continue
+                    i = gr.free.pop()
+                    gr.sim.set_chart(i, tuples)
+                    gr.sim.obs_one_into(i, gr.obs_buf)  # in-place row write
+                    gr.slots[i] = {
+                        "entry": entry,
+                        "max_score": payload["max_score"],
+                        "duration_s": payload["duration_s"]}
+                    gr.n_active += 1
+                t5 = pc()
+                ph[0] += t5 - t4
+                if gr.n_active > 0:
+                    act_dev = None
+                    if gr.fwd is not None:
+                        try:
+                            act_dev = gr.fwd(gr.obs_t)
+                        except Exception as e:   # capture failed: go eager
+                            print(f"[cuda-graphs] falling back to eager: "
+                                  f"{e}", flush=True)
+                            gr.fwd = None
+                            if data.get("forward") is not None:
+                                data["forward"] = "eager"
+                    if gr.fwd is None:
+                        batch = gr.obs_t.to(device, non_blocking=True)
+                        with torch.no_grad():
+                            logits, _ = policy.forward_stacked(batch)
+                        act_dev = logits.argmax(-1)
+                    # async D2H into pinned memory; the event fences it
+                    gr.act_t.copy_(act_dev, non_blocking=True)
+                    if gr.ev is not None:
+                        gr.ev.record()
+                        # WDDM batches user-mode submissions: without a
+                        # flush the chain sits unsubmitted until the next
+                        # blocking sync and NOTHING overlaps (measured:
+                        # sync == full chain time). query() flushes.
+                        gr.ev.query()
+                    gr.issued = True
+                    progressed = True
+                    ph[1] += pc() - t5
+            if not progressed and not any(x.issued for x in groups):
                 if feed_done:
                     break
-                ph[0] += pc() - t0      # blocked on producer, nothing active
-                continue
-            t1 = pc()
-
-            if fwd is not None:
-                try:
-                    act_t.copy_(fwd(obs_t))  # blocking pinned D2H == sync
-                except Exception as e:       # capture failed: go eager
-                    print(f"[cuda-graphs] falling back to eager: {e}",
-                          flush=True)
-                    fwd = None
-                    if data.get("forward") is not None:
-                        data["forward"] = "eager"  # keep the stamp honest
-            if fwd is None:
-                batch = obs_t.to(device, non_blocking=True)
-                with torch.no_grad():
-                    logits, _ = policy.forward_stacked(batch)
-                # one stacked argmax over the 12 heads, one pinned D2H sync
-                act_t.copy_(logits.argmax(-1))
-            t2 = pc()
-            _, dones, _events = sim.step_into(act_np, obs_buf)
-            t3 = pc()
-            n_finished = 0
-            for i in np.flatnonzero(np.asarray(dones)):
-                i = int(i)
-                s = slots[i]
-                if s is None:                    # idle empty-chart slot
-                    continue
-                combo = sim.combo(i)             # BEFORE set_chart resets it
-                g, b, m, n_scoreable, _, bombs = sim.counters(i)
-                c_pre, c_acc, c_post = sim.components(i)
-                result = finish_slot(s, {
-                    "good_cuts": g, "bad_cuts": b, "misses": m,
-                    "n_notes": n_scoreable, "bombs_hit": bombs,
-                    "score_pre": c_pre, "score_acc": c_acc,
-                    "score_post": c_post}, combo)
-                levels[result["leaderboard_id"]] = result
-                n_done += 1
-                n_finished += 1
-                if not args.quiet:
-                    print(f"[{n_done}/{len(tasks)}] {result['stars']:.2f}* "
-                          f"{result['song']!r} [{result['difficulty']}] "
-                          f"acc {100 * result['accuracy']:.2f}% "
-                          f"pp {result['pp']:.1f}"
-                          f"{'  FC' if result['full_combo'] else ''}",
-                          flush=True)
-                slots[i] = None
-                sim.set_chart(i, [])
-                free.append(i)
-                n_active -= 1
-            if n_finished and time.monotonic() - last_save > 30.0:
-                save_results(out_path, data, levels)
-                last_save = time.monotonic()
-            t4 = pc()
-            ph[0] += t1 - t0
-            ph[1] += t2 - t1
-            ph[2] += t3 - t2
-            ph[3] += t4 - t3
-            n_steps += 1
+                # nothing active or in flight anywhere: the next feed
+                # pass blocks on q.get() until the producer delivers
     finally:
         stop.set()
         save_results(out_path, data, levels)
@@ -593,12 +663,14 @@ def main():
     if args.timing:
         tot = sum(ph)
         ms = 1000.0 / max(n_steps, 1)
-        print(f"\n[timing] {n_steps} vector steps @ N={N} | "
-              f"loop {tot:.1f}s ({tot * ms:.2f} ms/step) | "
+        mode = "x".join(str(x.n) for x in groups)
+        print(f"\n[timing] {n_steps} group-steps @ {mode} | "
+              f"loop {tot:.1f}s ({tot * ms:.2f} ms/group-step) | "
               f"feed {ph[0]:.1f}s ({ph[0] * ms:.2f}) | "
-              f"forward+D2H {ph[1]:.1f}s ({ph[1] * ms:.2f}) | "
-              f"step_into {ph[2]:.1f}s ({ph[2] * ms:.2f}) | "
-              f"finish/save {ph[3]:.1f}s ({ph[3] * ms:.2f})", flush=True)
+              f"issue {ph[1]:.1f}s ({ph[1] * ms:.2f}) | "
+              f"sync {ph[2]:.1f}s ({ph[2] * ms:.2f}) | "
+              f"step_into {ph[3]:.1f}s ({ph[3] * ms:.2f}) | "
+              f"finish/save {ph[4]:.1f}s ({ph[4] * ms:.2f})", flush=True)
     print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
