@@ -159,7 +159,11 @@ struct Note {
     x: f64, // world position at the hit plane (meters)
     y: f64,
     color: u8,
-    angle: f64,     // required swing direction in radians (0 = +x, CCW)
+    // required swing direction (0 = +x, CCW), stored as its sin/cos pair
+    // (2026-07-27): the angle is episode-constant, yet build_obs + the
+    // hitbox roll used to evaluate sin/cos per visible note per tick
+    sin_a: f64,
+    cos_a: f64,
     speed: f64,     // approach speed toward the plane (m/s)
     any_dir: bool,  // dot note / chain link: any swing direction scores
     kind: u8,       // KIND_NOTE / _BOMB / _CHAIN_HEAD / _CHAIN_LINK
@@ -177,7 +181,13 @@ struct Note {
 /// M_f = M · R_x(−elbow):  d(roll, bend) = (−sinψ·sinφ, cosψ·sinφ, cosφ)
 /// — the neutral blade is the forearm's extension, exactly v5.2's law
 /// generalized to a moving forearm.
-fn fk(hand: usize, q: &[f64; N_JOINTS]) -> ([f64; 3], [f64; 3], [f64; 3]) {
+/// Returns (elbow, wrist, blade dir, (cos roll, sin roll)) — the roll
+/// pair is computed here anyway (2026-07-27) and build_obs needs it, so
+/// exporting it saves recomputing the two transcendentals per arm-tick.
+fn fk(
+    hand: usize,
+    q: &[f64; N_JOINTS],
+) -> ([f64; 3], [f64; 3], [f64; 3], (f64, f64)) {
     let (sp, cp) = q[0].sin_cos();
     let (sy, cy) = q[1].sin_cos();
     let (st, ct) = q[2].sin_cos();
@@ -207,7 +217,7 @@ fn fk(hand: usize, q: &[f64; N_JOINTS]) -> ([f64; 3], [f64; 3], [f64; 3]) {
         m[1][0] * d[0] + (m[1][1] * ce - m[1][2] * se) * d[1] + f[1] * d[2],
         m[2][0] * d[0] + (m[2][1] * ce - m[2][2] * se) * d[1] + f[2] * d[2],
     ];
-    (e, w, b)
+    (e, w, b, (cr, sr))
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -355,21 +365,13 @@ fn sweep_tris(
     [[w0, t0, t1], [w0, t1, w1]]
 }
 
-/// Env v7.4: hitboxes ROTATE with the object about the approach (z)
-/// axis by rot = angle - 270 deg — the real game's colliders sit on the
-/// rotated note transform (v7.0's axis-aligned reading was a
-/// BeatLeader-viewer simplification). Down-swing notes are axis-aligned
-/// (rot = 0); dot notes never rotate; chain links rotate with their
-/// tangent. (cos_r, sin_r) derived exactly from the angle's own
-/// sin/cos: cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a.
-fn note_rot(angle: f64, rotates: bool) -> (f64, f64) {
-    if rotates {
-        let (sa, ca) = angle.sin_cos();
-        (-sa, ca)
-    } else {
-        (1.0, 0.0)
-    }
-}
+// Env v7.4: hitboxes ROTATE with the object about the approach (z)
+// axis by rot = angle - 270 deg — the real game's colliders sit on the
+// rotated note transform (v7.0's axis-aligned reading was a
+// BeatLeader-viewer simplification). Down-swing notes are axis-aligned
+// (rot = 0); dot notes never rotate; chain links rotate with their
+// tangent. (cos_r, sin_r) derived exactly from the angle's own sin/cos —
+// since 2026-07-27 read from the Note's precomputed pair at the use site.
 
 // --- env v7.6: look-at-player note orientation -------------------------------
 // Notes bias their FULL 3D orientation toward facing the player's head
@@ -444,6 +446,7 @@ struct Arm {
     om: [f64; N_JOINTS], // angular velocities
     wrist: [f64; 3],     // FK cache (updated whenever q changes)
     blade: [f64; 3],     // FK cache, unit blade direction
+    roll_cs: (f64, f64), // FK cache: (cos, sin) of q[4] for build_obs
     wrist_vel: [f64; 3], // finite difference across the last tick
     swing_acc: f64,      // arc of the current continuous swing (rad)
     axis: Option<[f64; 3]>, // last tick's rotation axis (unit)
@@ -452,12 +455,13 @@ struct Arm {
 impl Arm {
     fn start(hand: usize) -> Self {
         // all joints zero: arm straight forward, blade its extension
-        let (_, w, b) = fk(hand, &[0.0; N_JOINTS]);
+        let (_, w, b, rcs) = fk(hand, &[0.0; N_JOINTS]);
         Arm {
             q: [0.0; N_JOINTS],
             om: [0.0; N_JOINTS],
             wrist: w,
             blade: b,
+            roll_cs: rcs,
             wrist_vel: [0.0; 3],
             swing_acc: 0.0,
             axis: None,
@@ -501,6 +505,10 @@ struct Core {
     score_pre: f64,
     score_acc: f64,
     score_post: f64,
+    // reusable event buffer (2026-07-27): step_inner used to allocate a
+    // fresh Vec per tick; cleared and refilled in place instead. Read it
+    // right after step_inner — the next tick clears it.
+    events_buf: Vec<(u32, u8, f32, f32, f32)>,
 }
 
 impl Core {
@@ -526,6 +534,7 @@ impl Core {
             score_pre: 0.0,
             score_acc: 0.0,
             score_post: 0.0,
+            events_buf: Vec::new(),
         }
     }
 
@@ -537,7 +546,8 @@ impl Core {
                 x,
                 y,
                 color,
-                angle,
+                sin_a: angle.sin(),
+                cos_a: angle.cos(),
                 speed,
                 any_dir,
                 kind,
@@ -585,8 +595,12 @@ impl Core {
         self.score_post = 0.0;
     }
 
-    fn build_obs(&self) -> [f32; OBS_DIM] {
-        let mut obs = [0.0f32; OBS_DIM];
+    /// Obs written into a caller-owned 286-lane slice (2026-07-27): the
+    /// return-by-value build_obs paid a 1144 B stack array + a second
+    /// memcpy at every caller; the vector step writes rows in place.
+    fn write_obs(&self, obs: &mut [f32]) {
+        debug_assert_eq!(obs.len(), OBS_DIM);
+        obs.fill(0.0);
         for (s, arm) in self.arms.iter().enumerate() {
             let b = s * SABER_FEAT;
             // joint pose: bounded scalars normalized to their ranges,
@@ -595,8 +609,8 @@ impl Core {
             obs[b + 1] = (arm.q[1] / YAW_HI[1]) as f32;
             obs[b + 2] = (arm.q[2] / TWIST_LIM) as f32;
             obs[b + 3] = ((2.0 * arm.q[3] - ELBOW_HI) / ELBOW_HI) as f32;
-            obs[b + 4] = arm.q[4].cos() as f32;
-            obs[b + 5] = arm.q[4].sin() as f32;
+            obs[b + 4] = arm.roll_cs.0 as f32;
+            obs[b + 5] = arm.roll_cs.1 as f32;
             obs[b + 6] = (arm.q[5] / BEND_LIM) as f32;
             for j in 0..N_JOINTS {
                 obs[b + 7 + j] = (arm.om[j] / JOINT_OMEGA[j]) as f32;
@@ -638,8 +652,8 @@ impl Core {
             // any-direction — is_chain_link disambiguates
             let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
             if n.kind != KIND_BOMB && show_dir {
-                obs[base + 6] = n.angle.cos() as f32;
-                obs[base + 7] = n.angle.sin() as f32;
+                obs[base + 6] = n.cos_a as f32;
+                obs[base + 7] = n.sin_a as f32;
             }
             obs[base + 8] = (n.kind == KIND_BOMB) as u8 as f32;
             obs[base + 9] = (n.kind == KIND_CHAIN_HEAD) as u8 as f32;
@@ -650,20 +664,24 @@ impl Core {
             obs[OFF_NOTE_MASK + slot] = 1.0;
             slot += 1;
         }
+    }
+
+    fn build_obs(&self) -> [f32; OBS_DIM] {
+        let mut obs = [0.0f32; OBS_DIM];
+        self.write_obs(&mut obs);
         obs
     }
 
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
     // (follow-through resolution), 6 bomb hit. The f32 is points awarded.
-    fn step_inner(
-        &mut self,
-        actions: [[u8; N_JOINTS]; 2],
-    ) -> (f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
+    // Events land in self.events_buf (cleared here), in the same order the
+    // old per-tick Vec produced them — order is the ComboWalk contract.
+    fn step_inner(&mut self, actions: [[u8; N_JOINTS]; 2]) -> (f64, bool) {
         let prev_pos = [self.arms[0].wrist, self.arms[1].wrist];
         let prev_dir = [self.arms[0].blade, self.arms[1].blade];
 
         let mut reward = 0.0;
-        let mut events: Vec<(u32, u8, f32, f32, f32)> = Vec::new();
+        self.events_buf.clear();
         // per arm this tick: (swing delta, did the chain continue)
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
@@ -698,9 +716,10 @@ impl Core {
                     arm.om[j] = 0.0;
                 }
             }
-            let (_, w, d_new) = fk(s, &arm.q);
+            let (_, w, d_new, rcs) = fk(s, &arm.q);
             arm.wrist = w;
             arm.blade = d_new;
+            arm.roll_cs = rcs;
             for k in 0..3 {
                 arm.wrist_vel[k] = (w[k] - prev_pos[s][k]) / DT;
             }
@@ -735,8 +754,13 @@ impl Core {
         // chain broke/reversed -> resolve; else accumulate and resolve on
         // reaching 60 deg or timing out.
         for s in 0..2 {
-            let mut kept: Vec<Tracker> = Vec::new();
-            for mut tr in self.trackers[s].drain(..) {
+            // in-place retain (2026-07-27): the drain-into-fresh-Vec
+            // rebuild paid ~2 malloc/free per env-tick whenever a tracker
+            // survived; retain_mut visits in the same order, so events
+            // and arithmetic are unchanged. (mem::take dodges the twin
+            // &mut self borrow; it swaps in an alloc-free empty Vec.)
+            let mut trs = std::mem::take(&mut self.trackers[s]);
+            trs.retain_mut(|tr| {
                 let resolve = if !continued[s] {
                     true
                 } else {
@@ -749,12 +773,11 @@ impl Core {
                     reward += pts / SCORE_MAX;
                     self.score += pts;
                     self.score_post += pts;
-                    events.push((tr.note, 5, pts as f32, 0.0, 0.0));
-                } else {
-                    kept.push(tr);
+                    self.events_buf.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 }
-            }
-            self.trackers[s] = kept;
+                !resolve
+            });
+            self.trackers[s] = trs;
         }
 
         self.time = (self.tick + 1) as f64 * DT;
@@ -769,7 +792,7 @@ impl Core {
             if self.status[i] != 0 {
                 continue;
             }
-            let n = self.chart[i];
+            let n = &self.chart[i];   // by ref: Note is 80 B post-sin/cos
             // sorted by hit_time, and speed >= min_speed for every note:
             // once this bound clears REACH_Z, so does every later note's z
             if (n.hit_time - self.time) * self.min_speed > REACH_Z {
@@ -783,7 +806,7 @@ impl Core {
                     self.status[i] = 3;
                     self.misses += 1;
                     reward += REWARD_MISS;
-                    events.push((i as u32, 4, 0.0, 0.0, 0.0));
+                    self.events_buf.push((i as u32, 4, 0.0, 0.0, 0.0));
                 }
                 continue;
             }
@@ -798,7 +821,7 @@ impl Core {
                         self.status[i] = 2;
                         self.bombs_hit += 1;
                         reward += REWARD_BOMB;
-                        events.push((i as u32, 6, 0.0, 0.0, 0.0));
+                        self.events_buf.push((i as u32, 6, 0.0, 0.0, 0.0));
                         break;
                     }
                 }
@@ -817,7 +840,10 @@ impl Core {
             // arrow notes/heads and chain links (tangent) roll their
             // hitboxes; plain dots stay roll-free
             let rotates = n.kind == KIND_CHAIN_LINK || !n.any_dir;
-            let (cos_r, sin_r) = note_rot(n.angle, rotates);
+            // rot = angle - 270 deg (see the v7.4 note above note_frame):
+            // cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a — read from
+            // the precomputed chart-constant pair
+            let (cos_r, sin_r) = if rotates { (-n.sin_a, n.cos_a) } else { (1.0, 0.0) };
             // env v7.6: plain notes additionally billboard toward the
             // head as they approach; heads/links keep the pure z-roll
             let lam = if n.kind == KIND_NOTE {
@@ -919,13 +945,13 @@ impl Core {
                     self.score += pts;
                     self.score_pre += pre_pts;
                     self.score_acc += acc_pts;
-                    events.push((i as u32, 0, pts as f32, pre_pts as f32,
+                    self.events_buf.push((i as u32, 0, pts as f32, pre_pts as f32,
                                  acc_pts as f32));
                 } else {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
-                    events.push((i as u32, code, 0.0, 0.0, 0.0));
+                    self.events_buf.push((i as u32, code, 0.0, 0.0, 0.0));
                 }
             } else {
                 // wrong-color saber only triggers the SMALL box
@@ -939,7 +965,7 @@ impl Core {
                     self.status[i] = 2;
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
-                    events.push((i as u32, 3, 0.0, 0.0, 0.0)); // wrong_hand
+                    self.events_buf.push((i as u32, 3, 0.0, 0.0, 0.0)); // wrong_hand
                 }
             }
         }
@@ -973,12 +999,12 @@ impl Core {
                     reward += pts / SCORE_MAX;
                     self.score += pts;
                     self.score_post += pts;
-                    events.push((tr.note, 5, pts as f32, 0.0, 0.0));
+                    self.events_buf.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 }
             }
         }
 
-        (reward, done, events)
+        (reward, done)
     }
 }
 
@@ -1028,12 +1054,12 @@ impl RawBeatSim {
         for s in 0..2 {
             acts[s].copy_from_slice(&actions[s * N_JOINTS..(s + 1) * N_JOINTS]);
         }
-        let (reward, done, events) = self.core.step_inner(acts);
+        let (reward, done) = self.core.step_inner(acts);
         (
             PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
             done,
-            events,
+            self.core.events_buf.clone(),
         )
     }
 
@@ -1070,9 +1096,10 @@ impl RawBeatSim {
         let arm = &mut self.core.arms[s];
         arm.q.copy_from_slice(&q);
         arm.om.copy_from_slice(&om);
-        let (_, w, b) = fk(s, &arm.q);
+        let (_, w, b, rcs) = fk(s, &arm.q);
         arm.wrist = w;
         arm.blade = b;
+        arm.roll_cs = rcs;
         arm.wrist_vel = [0.0; 3];
     }
 
@@ -1243,7 +1270,7 @@ impl VecBeatSim {
         let n = self.sims.len();
         let mut flat = vec![0.0f32; n * OBS_DIM];
         for (i, sim) in self.sims.iter().enumerate() {
-            flat[i * OBS_DIM..(i + 1) * OBS_DIM].copy_from_slice(&sim.build_obs());
+            sim.write_obs(&mut flat[i * OBS_DIM..(i + 1) * OBS_DIM]);
         }
         PyArray1::from_vec_bound(py, flat)
     }
@@ -1323,8 +1350,7 @@ impl VecBeatSim {
         assert_eq!(out_obs.shape(), &[self.sims.len(), OBS_DIM]);
         let mut out = out_obs.as_array_mut();
         let flat = out.as_slice_mut().expect("out_obs must be C-contiguous");
-        flat[i * OBS_DIM..(i + 1) * OBS_DIM]
-            .copy_from_slice(&self.sims[i].build_obs());
+        self.sims[i].write_obs(&mut flat[i * OBS_DIM..(i + 1) * OBS_DIM]);
     }
 
     /// (good, bad, miss, n_scoreable, score, bombs_hit) for env i.
@@ -1360,17 +1386,14 @@ impl VecBeatSim {
         let n = self.sims.len();
         assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
         assert_eq!(flat.len(), n * OBS_DIM);
-        let acts_vec: Vec<[[u8; N_JOINTS]; 2]> = (0..n)
-            .map(|i| {
-                let mut a = [[0u8; N_JOINTS]; 2];
-                for s in 0..2 {
-                    for j in 0..N_JOINTS {
-                        a[s][j] = acts[[i, s * N_JOINTS + j]] as u8;
-                    }
-                }
-                a
-            })
-            .collect();
+        // one flat memcpy (2026-07-27): the per-element ndarray indexing
+        // built the per-env action arrays with ~12N bounds-checked reads
+        // under the GIL; the u8 unpack now runs inside the parallel span
+        let flat_acts: Vec<i64> = match acts.as_slice() {
+            Some(s) => s.to_vec(),
+            None => acts.iter().copied().collect(),
+        };
+        let ret_ev = self.return_events;
         let sims = &mut self.sims;
         let walks = &mut self.walks;
         // Rayon over envs (2026-07-25): envs are independent, each env's
@@ -1393,17 +1416,26 @@ impl VecBeatSim {
                 sims.par_iter_mut()
                     .zip_eq(walk_opts)
                     .zip_eq(flat.par_chunks_mut(OBS_DIM))
-                    .zip_eq(&acts_vec)
+                    .zip_eq(flat_acts.par_chunks(2 * N_JOINTS))
                     .with_min_len(16)
                     .map(|(((sim, mut walk), obs_chunk), a)| {
-                        let (r, d, events) = sim.step_inner(*a);
-                        obs_chunk.copy_from_slice(&sim.build_obs());
+                        let mut acts_e = [[0u8; N_JOINTS]; 2];
+                        for s in 0..2 {
+                            for j in 0..N_JOINTS {
+                                acts_e[s][j] = a[s * N_JOINTS + j] as u8;
+                            }
+                        }
+                        let (r, d) = sim.step_inner(acts_e);
+                        sim.write_obs(obs_chunk);
                         if let Some(w) = walk.as_mut() {
-                            for &(note, code, pts, _, _) in &events {
+                            for &(note, code, pts, _, _) in &sim.events_buf {
                                 w.consume(note, code, pts);
                             }
                         }
-                        (r as f32, d, events)
+                        // return_events=false (the bench): Vec::new() is
+                        // alloc-free — the per-tick event Vec is gone
+                        let ev = if ret_ev { sim.events_buf.clone() } else { Vec::new() };
+                        (r as f32, d, ev)
                     })
                     .collect()
             });
