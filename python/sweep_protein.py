@@ -1,10 +1,13 @@
 """Protein hyperparameter sweep runner for train_batch.py (2026-07-27).
 
 Sweep 1 ("entropy/effort/gamma"): the flailing + bomb-economics + horizon
-cluster, from scratch, judged on the 4.0-4.5* real-map band bench.
-Cost axis = total_steps (Protein's multi-budget scaling-law trick);
-cost signal = wall seconds of the training leg. downsample=1 (one bench
-per leg) which also enables Protein's success-probability classifier.
+cluster, from scratch, judged on TOTAL UNWEIGHTED PP over the FULL
+ScoreSaber catalog (user decision 2026-07-27 — smoother low-end
+gradient than band wpp and measures breadth; costs ~3-4 min/bench warm
+vs ~40 s for the band). Cost axis = total_steps (Protein's multi-budget
+scaling-law trick); cost signal = wall seconds of the training leg.
+downsample=1 (one bench per leg) which also enables Protein's
+success-probability classifier.
 
 Space (7 dims):
   lr          log     1e-4 .. 3e-3   (cosine to 1e-4 fixed)
@@ -36,7 +39,7 @@ from protein_sweep import Protein
 
 PY = sys.executable
 SPACE = {
-    "metric": "band_wpp",
+    "metric": "catalog_unweighted_pp",
     "goal": "maximize",
     "metric_distribution": "linear",   # wpp is unbounded
     "downsample": 1,                   # one bench per leg
@@ -79,20 +82,20 @@ def run_leg(idx, h, run_dir):
         return None
     out = os.path.join(run_dir, "bench.json")
     b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                        "--stars", "4.0", "4.5", "--out", out],
-                       capture_output=True, text=True, timeout=1800)
+                        "--out", out],
+                       capture_output=True, text=True, timeout=3000)
     if b.returncode != 0 or not os.path.exists(out):
         print(f"[run {idx:03d}] BENCH FAILED: {(b.stderr or '')[-300:]}",
               flush=True)
         return None
-    wpp = json.load(open(out))["total_weighted_pp"]
-    return wpp, wall
+    upp = json.load(open(out))["total_unweighted_pp"]
+    return upp, wall
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--max-runs", type=int, default=100)
-    p.add_argument("--dir", type=str, default="sweeps/s1_entropy_gamma")
+    p.add_argument("--dir", type=str, default="sweeps/s1_upp")
     args = p.parse_args()
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "observations.jsonl")
@@ -128,7 +131,7 @@ def main():
             f.write(json.dumps({"idx": idx, "hypers": hypers,
                                 "score": score, "cost": cost,
                                 "is_failure": fail}) + "\n")
-        print(f"[run {idx:03d}] -> band wpp {score:.1f} "
+        print(f"[run {idx:03d}] -> catalog upp {score:,.0f} "
               f"({cost/60:.1f} min){' FAILED' if fail else ''}", flush=True)
 
     print("SWEEP DONE", flush=True)
