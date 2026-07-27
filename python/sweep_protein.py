@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -66,6 +67,10 @@ FILL = {"train": {k: None for k in SPACE["train"]}}
 
 def run_leg(idx, h, run_dir):
     """One training leg + band bench. Returns (band_wpp, wall_s) or None."""
+    # a leg is always a fresh model — a stale dir (e.g. from a run that
+    # was in-flight at a pause) would make the bench refuse the
+    # different-model overwrite and record a spurious failure
+    shutil.rmtree(run_dir, ignore_errors=True)
     cmd = [PY, "train_batch.py", "--num-envs", "1024",
            "--lr-decay", "cosine", "--seed", "0",
            "--lr", f"{h['lr']:.6g}",
