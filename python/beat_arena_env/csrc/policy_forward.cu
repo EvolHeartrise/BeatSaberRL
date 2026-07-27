@@ -19,7 +19,7 @@
 //   token accumulators. Offsets below are a contract with _pack().
 //   Total = 107,365 floats (429 KB): L2-resident, so all N blocks after
 //   the first read it at L2 bandwidth.
-// - Shared memory (~26 KB/block): obs row (286), residual stream
+// - Shared memory (~21 KB/block, 4 blocks/SM): obs row (286), residual stream
 //   x[18][65] (row stride 65 kills bank conflicts in the score phase,
 //   where threads read different token rows at the same column),
 //   post-LN scratch h[18][65], and a phase union overlaying
@@ -111,13 +111,20 @@ constexpr int expected_numel(int n_blocks) {
   return FRONT + n_blocks * BLK + TRUNK_SZ + HEAD_SZ;
 }
 
+// Shared-memory diet (2026-07-27): q has no union slot — after the qkv
+// phase's register accumulation, LN1's content in `h` is dead, so q is
+// stored INTO `h` (same SROW padding, so the score phase's addressing is
+// unchanged). 26,056 -> 21,376 B/block lifts residency from 3 to 4
+// blocks/SM on GP104 — the kernel measured latency-bound, so warps are
+// the scarce resource. Bit-identical: pure storage relocation.
 struct Smem {
   float x[TT][SROW];     // residual stream
-  float h[TT][SROW];     // post-LN / MLP hidden scratch
+  float h[TT][SROW];     // post-LN / MLP hidden scratch; q lives here
+                         // between the qkv store and LN2's overwrite
   float obs[OBS_DIM];
   float madd[TT];        // (key_mask - 1) * 16384 additive score mask
   union {
-    struct { float q[TT][SROW], k[TT][SROW], v[TT][SROW];
+    struct { float k[TT][SROW], v[TT][SROW];
              float att[TT][TT + 2]; } a;
     struct { float f1[TT][TRUNK + 1]; } f;
     struct { float t1[TRUNK], t2[TRUNK], out[NOUT]; } t;
@@ -146,7 +153,7 @@ __device__ __forceinline__ void ln_tokens(
   }
 }
 
-__global__ void __launch_bounds__(THREADS)
+__global__ void __launch_bounds__(THREADS, 4)
 policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
                   float* __restrict__ logits, float* __restrict__ value,
                   int64_t* __restrict__ actions, int n_blocks, int N) {
@@ -251,10 +258,14 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       #pragma unroll
       for (int i = 0; i < 9; ++i) {
         const int t = half * 9 + i;
-        s.u.a.q[t][lane] = aq[i];
         s.u.a.k[t][lane] = ak[i];
         s.u.a.v[t][lane] = av[i];
       }
+      // h's LN1 content is dead once every thread's k-loop is done; the
+      // barrier makes that true, then q reuses h's storage (smem diet)
+      __syncthreads();
+      #pragma unroll
+      for (int i = 0; i < 9; ++i) s.h[half * 9 + i][lane] = aq[i];
     }
     __syncthreads();
     // scores: q @ k^T / sqrt(64) + key mask — 324 flat dot products.
@@ -269,10 +280,10 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       const int t1 = i1 / TT, u1 = i1 % TT;
       const int t2 = has2 ? i2 / TT : 0, u2 = has2 ? i2 % TT : 0;
       float a0 = 0.f, a1 = 0.f, a2 = 0.f;
-      for (int k = 0; k < D; ++k) {
-        a0 += s.u.a.q[t0][k] * s.u.a.k[u0][k];
-        a1 += s.u.a.q[t1][k] * s.u.a.k[u1][k];
-        if (has2) a2 += s.u.a.q[t2][k] * s.u.a.k[u2][k];
+      for (int k = 0; k < D; ++k) {   // q lives in h (smem diet)
+        a0 += s.h[t0][k] * s.u.a.k[u0][k];
+        a1 += s.h[t1][k] * s.u.a.k[u1][k];
+        if (has2) a2 += s.h[t2][k] * s.u.a.k[u2][k];
       }
       s.u.a.att[t0][u0] = a0 * 0.125f + s.madd[u0];
       s.u.a.att[t1][u1] = a1 * 0.125f + s.madd[u1];
@@ -394,14 +405,16 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
         s.u.a.k[t][lane] = ak[i];
         s.u.a.v[t][lane] = av[i];
       }
-      if (half == 0) { s.u.a.q[0][lane] = aq[0]; s.u.a.q[1][lane] = aq[1]; }
+      // barrier, then q rows 0-1 reuse h's dead storage (smem diet)
+      __syncthreads();
+      if (half == 0) { s.h[0][lane] = aq[0]; s.h[1][lane] = aq[1]; }
     }
     __syncthreads();
-    // scores for query rows 0-1 only (36 of the 324 dots)
+    // scores for query rows 0-1 only (36 of the 324 dots); q lives in h
     for (int idx = tid; idx < 2 * TT; idx += THREADS) {
       const int t = idx / TT, u = idx % TT;
       float a = 0.f;
-      for (int k = 0; k < D; ++k) a += s.u.a.q[t][k] * s.u.a.k[u][k];
+      for (int k = 0; k < D; ++k) a += s.h[t][k] * s.u.a.k[u][k];
       s.u.a.att[t][u] = a * 0.125f + s.madd[u];
     }
     __syncthreads();
