@@ -13,14 +13,21 @@ Space (8 dims; gae_lambda added 2026-07-27 before resuming — gamma and
 lambda jointly set the credit window, so sweeping gamma alone against a
 fixed lambda 0.95 would under/over-state its effect; the three pre-add
 observations are replayed with the implicit lambda 0.95 they ran with):
-  lr          log     1e-4 .. 3e-3   (cosine to 1e-4 fixed)
-  ent_coef    log     1e-4 .. 0.1    initial entropy coef
+  lr          log     1e-4 .. 8e-3   (cosine to 1e-4 fixed)
+  ent_coef    log     1e-4 .. 0.3    initial entropy coef
   ent_final   log     1e-5 .. 0.1    linear anneal target (new flag)
-  gamma       logit   0.90 .. 0.997  user hypothesis: ~1 s horizon (~0.967)
-  gae_lambda  logit   0.80 .. 0.99   trace decay (gamma*lambda = PG window)
-  effort_coef log     0.01 .. 8      flailing tax (log cannot express 0)
-  bomb_prob   log     0.01 .. 0.4    bomb density (72%-of-reward question)
+  gamma       logit   0.87 .. 0.997  user hypothesis: ~1 s horizon (~0.967)
+  gae_lambda  logit   0.65 .. 0.99   trace decay (gamma*lambda = PG window)
+  effort_coef log     0.002 .. 8     flailing tax (log cannot express 0)
+  bomb_prob   log     0.003 .. 0.4   bomb density (72%-of-reward question)
   total_steps log     5e7  .. 4e8    THE COST AXIS (3.3-27 min at ~250k/s)
+
+Bounds widened 2026-07-27 after runs 010-020: the GP pinned lr and
+ent_coef at their ceilings and gae_lambda/effort/bomb at their floors
+WITH the winners sitting there (run 018, 778k upp: lam exactly 0.80,
+lr 3e-3, ent 0.1); gamma got margin too (best runs 0.908-0.918, just
+above the old 0.90 floor). Observations replay fine — raw values
+re-normalize into the wider box.
 
 State: every observation appended to <dir>/observations.jsonl and
 replayed through observe() on restart (observe() is pure, so this fully
@@ -52,13 +59,13 @@ SPACE = {
     "use_gpu": False,                  # GP on CPU; the 1080 belongs to training
     "max_suggestion_cost": 2200,       # ~4e8 steps + startup, seconds
     "train": {
-        "lr":          dict(distribution="log_normal", min=1e-4, max=3e-3, scale=0.5),
-        "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.1, scale=0.5),
+        "lr":          dict(distribution="log_normal", min=1e-4, max=8e-3, scale=0.5),
+        "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.3, scale=0.5),
         "ent_final":   dict(distribution="log_normal", min=1e-5, max=0.1, scale=0.5),
-        "gamma":       dict(distribution="logit_normal", min=0.90, max=0.997, scale=0.5),
-        "gae_lambda":  dict(distribution="logit_normal", min=0.80, max=0.99, scale=0.5),
-        "effort_coef": dict(distribution="log_normal", min=0.01, max=8.0, scale=0.5),
-        "bomb_prob":   dict(distribution="log_normal", min=0.01, max=0.4, scale=0.5),
+        "gamma":       dict(distribution="logit_normal", min=0.87, max=0.997, scale=0.5),
+        "gae_lambda":  dict(distribution="logit_normal", min=0.65, max=0.99, scale=0.5),
+        "effort_coef": dict(distribution="log_normal", min=0.002, max=8.0, scale=0.5),
+        "bomb_prob":   dict(distribution="log_normal", min=0.003, max=0.4, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
     },
 }
