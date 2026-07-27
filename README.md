@@ -93,10 +93,11 @@ the defaults ARE the fast path (`--num-envs 512`, fused forward on;
 `--no-fused-forward` to opt out) and the results JSON records which
 forward path produced it — fused/graphed near-tie argmax flips mean
 per-level results only compare within one path, so cross-path merges
-are refused. With the last-block-pruned fused kernel (2026-07-27,
-bitwise-exact): **~72 maps/s warm, full catalog ~1m25s** on the GTX
-1080 box (first run parses + warms the cache under `maps/chart_cache/`,
-~380 MB).
+are refused. With the last-block-pruned fused kernel + pinned action D2H + N=1024
+default (2026-07-27, all bitwise-exact; fused per-sample kernel is
+batch-size-invariant, verified N=512 vs N=1024 over the full catalog):
+**~82 maps/s warm, full catalog ~1m14s** on the GTX 1080 box (first
+run parses + warms the cache under `maps/chart_cache/`, ~380 MB).
 
 ## Exporting to ScoreSaber's replay viewer
 
