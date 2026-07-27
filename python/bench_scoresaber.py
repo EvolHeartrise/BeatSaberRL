@@ -119,6 +119,9 @@ def parse_args():
                    help="suppress per-level result lines (6.1k prints cost "
                         "real time on a Windows console; skips and the "
                         "summary still print)")
+    p.add_argument("--timing", action="store_true",
+                   help="print a per-phase wall-clock decomposition of the "
+                        "eval loop (feed/forward/step/finish) at the end")
     p.add_argument("--num-envs", type=int, default=1024,
                    help="maps evaluated in parallel (policy is batched); "
                         "on the fused path the effective width is capped "
@@ -477,8 +480,15 @@ def main():
     gc.collect()
     gc.freeze()
     gc.disable()
+    # per-phase wall clock (--timing): feed/refill, forward+pinned D2H,
+    # step_into (Rust sim), finish/save. perf_counter is ~100 ns — always
+    # accumulated, printed only on request.
+    ph = [0.0, 0.0, 0.0, 0.0]
+    n_steps = 0
+    pc = time.perf_counter
     try:
         while True:
+            t0 = pc()
             while not feed_done and free:
                 # single consumer: qsize>0 guarantees a non-blocking get,
                 # so the per-step queue.Empty raise/catch churn is gone
@@ -511,7 +521,9 @@ def main():
             if n_active == 0:
                 if feed_done:
                     break
+                ph[0] += pc() - t0      # blocked on producer, nothing active
                 continue
+            t1 = pc()
 
             if fwd is not None:
                 try:
@@ -528,7 +540,9 @@ def main():
                     logits, _ = policy.forward_stacked(batch)
                 # one stacked argmax over the 12 heads, one pinned D2H sync
                 act_t.copy_(logits.argmax(-1))
+            t2 = pc()
             _, dones, _events = sim.step_into(act_np, obs_buf)
+            t3 = pc()
             n_finished = 0
             for i in np.flatnonzero(np.asarray(dones)):
                 i = int(i)
@@ -560,6 +574,12 @@ def main():
             if n_finished and time.monotonic() - last_save > 30.0:
                 save_results(out_path, data, levels)
                 last_save = time.monotonic()
+            t4 = pc()
+            ph[0] += t1 - t0
+            ph[1] += t2 - t1
+            ph[2] += t3 - t2
+            ph[3] += t4 - t3
+            n_steps += 1
     finally:
         stop.set()
         save_results(out_path, data, levels)
@@ -570,6 +590,15 @@ def main():
                 json.dump(durations, f)
             os.replace(tmp, dur_path)
 
+    if args.timing:
+        tot = sum(ph)
+        ms = 1000.0 / max(n_steps, 1)
+        print(f"\n[timing] {n_steps} vector steps @ N={N} | "
+              f"loop {tot:.1f}s ({tot * ms:.2f} ms/step) | "
+              f"feed {ph[0]:.1f}s ({ph[0] * ms:.2f}) | "
+              f"forward+D2H {ph[1]:.1f}s ({ph[1] * ms:.2f}) | "
+              f"step_into {ph[2]:.1f}s ({ph[2] * ms:.2f}) | "
+              f"finish/save {ph[3]:.1f}s ({ph[3] * ms:.2f})", flush=True)
     print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
