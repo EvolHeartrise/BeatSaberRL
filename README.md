@@ -88,11 +88,15 @@ error. The ranked catalog caches at `maps/scoresaber_catalog.json`
 (`--refresh-catalog` to refetch) and chart data at `maps/scoresaber/`
 (audio stripped, ~100 KB/song). `--limit N` for smoke runs;
 `--num-envs` maps play in parallel — one `VecBeatSim` FFI call per
-vector step (vectorized per-env events, 2026-07-24). Since 2026-07-25
-(parsed-chart cache + rayon sim step + longest-first ordering + fused
-forward): **~36 maps/s warm at `--num-envs 512`, full catalog ~3-4
-min** on the GTX 1080 box (first run parses + warms the cache under
-`maps/chart_cache/`, ~380 MB).
+vector step (vectorized per-env events, 2026-07-24). Since 2026-07-27
+the defaults ARE the fast path (`--num-envs 512`, fused forward on;
+`--no-fused-forward` to opt out) and the results JSON records which
+forward path produced it — fused/graphed near-tie argmax flips mean
+per-level results only compare within one path, so cross-path merges
+are refused. With the last-block-pruned fused kernel (2026-07-27,
+bitwise-exact): **~72 maps/s warm, full catalog ~1m25s** on the GTX
+1080 box (first run parses + warms the cache under `maps/chart_cache/`,
+~380 MB).
 
 ## Exporting to ScoreSaber's replay viewer
 

@@ -37,6 +37,12 @@
 // - Argmax: strict-greater scan per head (torch.argmax returns the
 //   first maximal index) — written as int64 actions alongside logits.
 //
+// - Last-block pruning (2026-07-27, mirrors policy.py's exact pruning):
+//   only the two saber tokens feed the trunk, so the final block computes
+//   q/scores/softmax/att@v/LN2/FFN for tokens 0-1 only (k/v stay
+//   full-width). Bitwise identical to the unpruned kernel — surviving
+//   tokens keep the same FP ops in the same order.
+//
 // No backward, fp32 only, arch fixed at embed=64 / trunk=128 / 1 head
 // (both production checkpoints); n_blocks is a runtime loop.
 
@@ -206,7 +212,9 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
   __syncthreads();
 
   // ---- transformer blocks -------------------------------------------------
-  for (int bi = 0; bi < n_blocks; ++bi) {
+  // All but the last run full-width; the last block is pruned to the two
+  // saber tokens (see below).
+  for (int bi = 0; bi + 1 < n_blocks; ++bi) {
     const float* B = W + FRONT + (size_t)bi * BLK;
     ln_tokens(s.x, s.h, B + B_LN1_G, B + B_LN1_B, tid);
     __syncthreads();
@@ -297,6 +305,133 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       }
       #pragma unroll
       for (int i = 0; i < 9; ++i) s.x[half * 9 + i][lane] += acc[i];
+    }
+    __syncthreads();
+  }
+
+  // ---- last transformer block, pruned (2026-07-27) ------------------------
+  // Only x[0]|x[1] feed the trunk readout, so tokens 2-17 are dead after
+  // this block. Mirror of policy.py's exact last-block pruning: k/v (and
+  // LN1 feeding them) stay full-width — every kept token attends over all
+  // 18 keys — while q, score rows, softmax, att@v, LN2 and both FFN layers
+  // run for tokens 0-1 only. Bitwise identical to the full block for the
+  // surviving tokens: per-token accumulator chains keep the same FP ops in
+  // the same order; dropped work wrote only rows never read again.
+  if (n_blocks > 0) {
+    const float* B = W + FRONT + (size_t)(n_blocks - 1) * BLK;
+    ln_tokens(s.x, s.h, B + B_LN1_G, B + B_LN1_B, tid);
+    __syncthreads();
+    {  // k/v for all 18 tokens; q for tokens 0-1 (both live in half 0)
+      float aq[2], ak[9], av[9];
+      const float bk = __ldg(B + B_BK + lane);
+      const float bv = __ldg(B + B_BV + lane);
+      #pragma unroll
+      for (int i = 0; i < 9; ++i) { ak[i] = bk; av[i] = bv; }
+      if (half == 0) {
+        const float bq = __ldg(B + B_BQ + lane);
+        aq[0] = bq; aq[1] = bq;
+      }
+      for (int k = 0; k < D; ++k) {
+        const float wk = __ldg(B + B_WK + k * D + lane);
+        const float wv = __ldg(B + B_WV + k * D + lane);
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+          const float hv = s.h[half * 9 + i][k];
+          ak[i] += hv * wk; av[i] += hv * wv;
+        }
+        if (half == 0) {
+          const float wq = __ldg(B + B_WQ + k * D + lane);
+          aq[0] += s.h[0][k] * wq;
+          aq[1] += s.h[1][k] * wq;
+        }
+      }
+      #pragma unroll
+      for (int i = 0; i < 9; ++i) {
+        const int t = half * 9 + i;
+        s.u.a.k[t][lane] = ak[i];
+        s.u.a.v[t][lane] = av[i];
+      }
+      if (half == 0) { s.u.a.q[0][lane] = aq[0]; s.u.a.q[1][lane] = aq[1]; }
+    }
+    __syncthreads();
+    // scores for query rows 0-1 only (36 of the 324 dots)
+    for (int idx = tid; idx < 2 * TT; idx += THREADS) {
+      const int t = idx / TT, u = idx % TT;
+      float a = 0.f;
+      for (int k = 0; k < D; ++k) a += s.u.a.q[t][k] * s.u.a.k[u][k];
+      s.u.a.att[t][u] = a * 0.125f + s.madd[u];
+    }
+    __syncthreads();
+    if (tid < 2) {  // softmax, query rows 0-1
+      float m = -3.4e38f;
+      for (int u = 0; u < TT; ++u) m = fmaxf(m, s.u.a.att[tid][u]);
+      float den = 0.f;
+      for (int u = 0; u < TT; ++u) {
+        const float e = expf(s.u.a.att[tid][u] - m);
+        s.u.a.att[tid][u] = e;
+        den += e;
+      }
+      const float inv = 1.f / den;
+      for (int u = 0; u < TT; ++u) s.u.a.att[tid][u] *= inv;
+    }
+    __syncthreads();
+    if (half == 0) {  // residual add: x += att @ v, tokens 0-1
+      #pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        float a = 0.f;
+        #pragma unroll
+        for (int u = 0; u < TT; ++u) a += s.u.a.att[i][u] * s.u.a.v[u][lane];
+        s.x[i][lane] += a;
+      }
+    }
+    __syncthreads();
+    {  // LN2 on tokens 0-1 only: same math as ln_tokens rows 0-1 (there
+       // warp 0 owns t=0 and warp 1 owns t=1 on their first iteration)
+      const int warp = tid >> 5, wl = tid & 31;
+      if (warp < 2) {
+        const int t = warp;
+        const float v0 = s.x[t][wl], v1 = s.x[t][wl + 32];
+        float sum = v0 + v1;
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) sum += __shfl_down_sync(~0u, sum, o);
+        const float mean = __shfl_sync(~0u, sum, 0) * (1.f / D);
+        const float d0 = v0 - mean, d1 = v1 - mean;
+        float sq = d0 * d0 + d1 * d1;
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) sq += __shfl_down_sync(~0u, sq, o);
+        const float rstd =
+            rsqrtf(__shfl_sync(~0u, sq, 0) * (1.f / D) + 1e-5f);
+        const float* g = B + B_LN2_G;
+        const float* b = B + B_LN2_B;
+        s.h[t][wl] = d0 * rstd * __ldg(g + wl) + __ldg(b + wl);
+        s.h[t][wl + 32] = d1 * rstd * __ldg(g + wl + 32) + __ldg(b + wl + 32);
+      }
+    }
+    __syncthreads();
+    {  // FFN layer 1 (64 -> 128, ReLU), tokens 0-1
+      float acc[2];
+      const float b1 = __ldg(B + B_FFB1 + tid);
+      acc[0] = b1; acc[1] = b1;
+      for (int k = 0; k < D; ++k) {
+        const float w = __ldg(B + B_FFW1 + k * TRUNK + tid);
+        acc[0] += s.h[0][k] * w;
+        acc[1] += s.h[1][k] * w;
+      }
+      s.u.f.f1[0][tid] = fmaxf(acc[0], 0.f);
+      s.u.f.f1[1][tid] = fmaxf(acc[1], 0.f);
+    }
+    __syncthreads();
+    if (half == 0) {  // FFN layer 2 (128 -> 64) + residual, tokens 0-1
+      float acc[2];
+      const float b2 = __ldg(B + B_FFB2 + lane);
+      acc[0] = b2; acc[1] = b2;
+      for (int k = 0; k < TRUNK; ++k) {
+        const float w = __ldg(B + B_FFW2 + k * D + lane);
+        acc[0] += s.u.f.f1[0][k] * w;
+        acc[1] += s.u.f.f1[1][k] * w;
+      }
+      s.x[0][lane] += acc[0];
+      s.x[1][lane] += acc[1];
     }
     __syncthreads();
   }
