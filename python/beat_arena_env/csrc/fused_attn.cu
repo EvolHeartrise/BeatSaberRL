@@ -32,11 +32,17 @@ namespace {
 
 constexpr int D = 64;        // head dim (embed); d != 64 falls back in python
 constexpr int D2 = D / 2;
+// Padded token-row stride for the q/k/v smem tiles. The score/dp phases
+// read different token ROWS at the same column across a warp; with a
+// row stride of 64 every lane hits the same bank (~18-way replay). The
+// odd stride spreads rows across banks (policy_forward.cu:70 pattern).
+// Bit-identical: addressing only, arithmetic order unchanged.
+constexpr int SROW = D + 1;
 constexpr int THREADS = 128;
 constexpr int MAX_T = 32;
 
 // forward: one block per sample.
-//   smem: sq (Tq*D) | sk (T*D) | sv (T*D) | sp (Tq*T) | sbias (T)
+//   smem: sq (Tq*SROW) | sk (T*SROW) | sv (T*SROW) | sp (Tq*T) | sbias (T)
 // phases: load -> scores (pair per thread) -> softmax (row per thread)
 //         -> out (output element per thread)
 // bq/bk/bv (nullable, fp32 (D,)): the q/k/v projection BIASES, folded
@@ -56,10 +62,10 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
                                 __half2* __restrict__ out,         // (B,Tq,D2)
                                 int Tq, int T, float alpha) {
   extern __shared__ float sm[];
-  float* sq = sm;                    // Tq * D
-  float* sk = sq + Tq * D;           // T * D
-  float* sv = sk + T * D;            // T * D
-  float* sp = sv + T * D;            // Tq * T
+  float* sq = sm;                    // Tq * SROW
+  float* sk = sq + Tq * SROW;        // T * SROW
+  float* sv = sk + T * SROW;         // T * SROW
+  float* sp = sv + T * SROW;         // Tq * T
   float* sbias = sp + Tq * T;        // T
   const int64_t b = blockIdx.x;
   const int tid = threadIdx.x;
@@ -69,21 +75,22 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
   const __half2* kb = k + b * (T * D2);
   const __half2* vb = v + b * (T * D2);
   for (int i = tid; i < Tq * D2; i += THREADS) {
+    const int r = i / D2, c2 = i % D2;
     const float2 f = __half22float2(qb[i]);
-    const float2 bb2 = bq ? bq[i % D2] : make_float2(0.f, 0.f);
-    sq[2 * i] = f.x + bb2.x;
-    sq[2 * i + 1] = f.y + bb2.y;
+    const float2 bb2 = bq ? bq[c2] : make_float2(0.f, 0.f);
+    sq[r * SROW + 2 * c2] = f.x + bb2.x;
+    sq[r * SROW + 2 * c2 + 1] = f.y + bb2.y;
   }
   for (int i = tid; i < T * D2; i += THREADS) {
-    const int c2 = i % D2;
+    const int r = i / D2, c2 = i % D2;
     const float2 fk = __half22float2(kb[i]);
     const float2 bk2 = bk ? bk[c2] : make_float2(0.f, 0.f);
-    sk[2 * i] = fk.x + bk2.x;
-    sk[2 * i + 1] = fk.y + bk2.y;
+    sk[r * SROW + 2 * c2] = fk.x + bk2.x;
+    sk[r * SROW + 2 * c2 + 1] = fk.y + bk2.y;
     const float2 fv = __half22float2(vb[i]);
     const float2 bv2 = bv ? bv[c2] : make_float2(0.f, 0.f);
-    sv[2 * i] = fv.x + bv2.x;
-    sv[2 * i + 1] = fv.y + bv2.y;
+    sv[r * SROW + 2 * c2] = fv.x + bv2.x;
+    sv[r * SROW + 2 * c2 + 1] = fv.y + bv2.y;
   }
   const __half2* bb = bias + b * (T / 2);
   for (int i = tid; i < T / 2; i += THREADS) {
@@ -93,11 +100,15 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
   }
   __syncthreads();
 
-  // scores: pair (i, j) per thread
+  // scores: pair (i, j) per thread. (A 3-chain accumulator interleave
+  // — policy_forward.cu:271 pattern — was tried 2026-07-28 and
+  // REGRESSED here: fwd b0 2204 -> 2409 us, Tq=2 651 -> 931 us. With
+  // SROW padding in place this phase is no longer load-stalled, and at
+  // 6 blocks/SM the warp supply already hides the FMA chain.)
   for (int p = tid; p < Tq * T; p += THREADS) {
     const int i = p / T, j = p % T;
-    const float* qi = sq + i * D;
-    const float* kj = sk + j * D;
+    const float* qi = sq + i * SROW;
+    const float* kj = sk + j * SROW;
     float acc = 0.f;
 #pragma unroll
     for (int c = 0; c < D; c++) acc += qi[c] * kj[c];
@@ -123,6 +134,9 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
       pr[j] = __float2half_rn(row[j]);
     }
   }
+  // (A cooperative coalesced p_out store after the barrier was tried
+  // 2026-07-28: bit-identical but ~1.3% SLOWER on the b0 shape — the
+  // strided store is already hidden once SROW padding landed.)
   __syncthreads();
 
   // out[i][c] = sum_j p[i][j] * v[j][c]; element per thread, half2 store
@@ -133,15 +147,15 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
     float ax = 0.f, ay = 0.f;
     for (int j = 0; j < T; j++) {
       const float pj = pi[j];
-      ax += pj * sv[j * D + 2 * c2];
-      ay += pj * sv[j * D + 2 * c2 + 1];
+      ax += pj * sv[j * SROW + 2 * c2];
+      ay += pj * sv[j * SROW + 2 * c2 + 1];
     }
     ob[p] = __float22half2_rn(make_float2(ax, ay));
   }
 }
 
 // backward: one block per sample.
-//   smem: sA (max(Tq,T)*D: dout -> q) | sB (T*D: v -> k)
+//   smem: sA (max(Tq,T)*SROW: dout -> q) | sB (T*SROW: v -> k)
 //       | sp (Tq*T) | sds (Tq*T)
 // phases: load p,dout,v -> dp -> dv -> ds(=alpha*softmax_bwd)
 //         -> load k -> dq -> load q -> dk
@@ -162,9 +176,9 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
                                 int Tq, int T, float alpha) {
   extern __shared__ float sm[];
   const int A_rows = Tq > T ? Tq : T;
-  float* sA = sm;                    // A_rows * D (dout, later q)
-  float* sB = sA + A_rows * D;       // T * D     (v, later k)
-  float* sp = sB + T * D;            // Tq * T
+  float* sA = sm;                    // A_rows * SROW (dout, later q)
+  float* sB = sA + A_rows * SROW;    // T * SROW     (v, later k)
+  float* sp = sB + T * SROW;         // Tq * T
   float* sds = sp + Tq * T;          // Tq * T
   const int64_t b = blockIdx.x;
   const int tid = threadIdx.x;
@@ -173,24 +187,28 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   const __half2* vb = v + b * (T * D2);
   const __half* pb = p + b * (Tq * T);
   for (int i = tid; i < Tq * D2; i += THREADS) {
+    const int r = i / D2, c2 = i % D2;
     const float2 f = __half22float2(db[i]);
-    sA[2 * i] = f.x;
-    sA[2 * i + 1] = f.y;
+    sA[r * SROW + 2 * c2] = f.x;
+    sA[r * SROW + 2 * c2 + 1] = f.y;
   }
   for (int i = tid; i < T * D2; i += THREADS) {
+    const int r = i / D2, c2 = i % D2;
     const float2 f = __half22float2(vb[i]);
-    const float2 b2 = bv ? bv[i % D2] : make_float2(0.f, 0.f);
-    sB[2 * i] = f.x + b2.x;
-    sB[2 * i + 1] = f.y + b2.y;
+    const float2 b2 = bv ? bv[c2] : make_float2(0.f, 0.f);
+    sB[r * SROW + 2 * c2] = f.x + b2.x;
+    sB[r * SROW + 2 * c2 + 1] = f.y + b2.y;
   }
   for (int i = tid; i < Tq * T; i += THREADS) sp[i] = __half2float(pb[i]);
   __syncthreads();
 
-  // dp[i][j] = dot(dout_i, v_j)  (stored into sds)
+  // dp[i][j] = dot(dout_i, v_j)  (stored into sds). (Same note as the
+  // forward score phase: the 3-chain interleave regressed post-padding,
+  // bwd b0 3459 -> 4013 us.)
   for (int e = tid; e < Tq * T; e += THREADS) {
     const int i = e / T, j = e % T;
-    const float* di = sA + i * D;
-    const float* vj = sB + j * D;
+    const float* di = sA + i * SROW;
+    const float* vj = sB + j * SROW;
     float acc = 0.f;
 #pragma unroll
     for (int c = 0; c < D; c++) acc += di[c] * vj[c];
@@ -205,8 +223,8 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
     float ax = 0.f, ay = 0.f;
     for (int i = 0; i < Tq; i++) {
       const float pij = sp[i * T + j];
-      ax += pij * sA[i * D + 2 * c2];
-      ay += pij * sA[i * D + 2 * c2 + 1];
+      ax += pij * sA[i * SROW + 2 * c2];
+      ay += pij * sA[i * SROW + 2 * c2 + 1];
     }
     dvb[e] = __float22half2_rn(make_float2(ax, ay));
   }
@@ -225,10 +243,11 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   // load k over v (v dead), then dq[i][c] = sum_j ds[i][j] * k[j][c]
   const __half2* kb = k + b * (T * D2);
   for (int i = tid; i < T * D2; i += THREADS) {
+    const int r = i / D2, c2 = i % D2;
     const float2 f = __half22float2(kb[i]);
-    const float2 b2 = bk ? bk[i % D2] : make_float2(0.f, 0.f);
-    sB[2 * i] = f.x + b2.x;
-    sB[2 * i + 1] = f.y + b2.y;
+    const float2 b2 = bk ? bk[c2] : make_float2(0.f, 0.f);
+    sB[r * SROW + 2 * c2] = f.x + b2.x;
+    sB[r * SROW + 2 * c2 + 1] = f.y + b2.y;
   }
   __syncthreads();
   __half2* dqb = dq + b * (Tq * D2);
@@ -238,8 +257,8 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
     float ax = 0.f, ay = 0.f;
     for (int j = 0; j < T; j++) {
       const float d = dsi[j];
-      ax += d * sB[j * D + 2 * c2];
-      ay += d * sB[j * D + 2 * c2 + 1];
+      ax += d * sB[j * SROW + 2 * c2];
+      ay += d * sB[j * SROW + 2 * c2 + 1];
     }
     dqb[e] = __float22half2_rn(make_float2(ax, ay));
   }
@@ -248,10 +267,11 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   // load q over dout (dout dead), then dk[j][c] = sum_i ds[i][j] * q[i][c]
   const __half2* qb = q + b * (Tq * D2);
   for (int i = tid; i < Tq * D2; i += THREADS) {
+    const int r = i / D2, c2 = i % D2;
     const float2 f = __half22float2(qb[i]);
-    const float2 b2 = bq ? bq[i % D2] : make_float2(0.f, 0.f);
-    sA[2 * i] = f.x + b2.x;
-    sA[2 * i + 1] = f.y + b2.y;
+    const float2 b2 = bq ? bq[c2] : make_float2(0.f, 0.f);
+    sA[r * SROW + 2 * c2] = f.x + b2.x;
+    sA[r * SROW + 2 * c2 + 1] = f.y + b2.y;
   }
   __syncthreads();
   __half2* dkb = dk + b * (T * D2);
@@ -260,8 +280,8 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
     float ax = 0.f, ay = 0.f;
     for (int i = 0; i < Tq; i++) {
       const float d = sds[i * T + j];
-      ax += d * sA[i * D + 2 * c2];
-      ay += d * sA[i * D + 2 * c2 + 1];
+      ax += d * sA[i * SROW + 2 * c2];
+      ay += d * sA[i * SROW + 2 * c2 + 1];
     }
     dkb[e] = __float22half2_rn(make_float2(ax, ay));
   }
@@ -304,7 +324,7 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
   auto out = at::empty_like(q);
   auto p = at::empty({B, Tq, T}, q.options());
   if (B == 0) return {out, p};
-  const size_t smem = (size_t)(Tq * D + 2 * T * D + Tq * T + T)
+  const size_t smem = (size_t)(Tq * SROW + 2 * T * SROW + Tq * T + T)
                       * sizeof(float);
   attn_fwd_kernel<<<(unsigned)B, THREADS, smem,
                     at::cuda::getCurrentCUDAStream()>>>(
@@ -341,7 +361,7 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
   auto dv = at::empty_like(v);
   if (B == 0) return {dq, dk, dv};
   const int A_rows = Tq > T ? Tq : T;
-  const size_t smem = (size_t)(A_rows * D + T * D + 2 * Tq * T)
+  const size_t smem = (size_t)(A_rows * SROW + T * SROW + 2 * Tq * T)
                       * sizeof(float);
   attn_bwd_kernel<<<(unsigned)B, THREADS, smem,
                     at::cuda::getCurrentCUDAStream()>>>(

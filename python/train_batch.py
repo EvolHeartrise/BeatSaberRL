@@ -62,15 +62,17 @@ MAX_GRAD_NORM = 0.5
 
 
 def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
-    """Dual-clip PPO policy loss (arXiv:1912.09729)."""
+    """Dual-clip PPO policy loss (arXiv:1912.09729). (A frac_active
+    diagnostic — how often the dual-clip ceiling binds — was computed
+    here per minibatch and never read by any caller; removed
+    2026-07-28, 5 kernels/minibatch.)"""
     pg1 = -adv * ratio
     pg2 = -adv * torch.clamp(ratio, 1 - clip, 1 + clip)
     standard = torch.max(pg1, pg2)
     ceiling = -dual_clip_c * adv
     dual = torch.min(standard, ceiling)
     loss = torch.where(adv < 0, dual, standard)
-    frac_active = ((adv < 0) & (ceiling < standard)).float().mean()
-    return loss.mean(), frac_active
+    return loss.mean()
 
 
 def fused_minibatch_losses(trainer, ent_coef, obs, act, logp, adv, ret):
@@ -84,7 +86,7 @@ def fused_minibatch_losses(trainer, ent_coef, obs, act, logp, adv, ret):
     entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
     ratio = (newlogp - logp).exp()
     a_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
-    pg_loss, _ = pg_loss_fn(ratio, a_mb)
+    pg_loss = pg_loss_fn(ratio, a_mb)
     v_loss = 0.5 * ((value - ret) ** 2).mean()
     ent_loss = entropy.mean()
     loss = pg_loss - ent_coef * ent_loss + VF_COEF * v_loss
@@ -400,12 +402,26 @@ def main():
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
-    b_obs = torch.zeros((T, N, OBS_DIM), device=device)
+    # --fp16 all stores the rollout obs buffer half: every consumer
+    # casts obs to fp16 anyway (policy.py notes.half()/sabers.to(dt)),
+    # and fp32->fp16 round-to-nearest at the buffer store produces the
+    # SAME BITS as the same cast at use — so this halves the biggest
+    # tensor in the pipeline (150 MB at N=4096) for free (2026-07-28).
+    # 'update'/'off' keep fp32 (the fp32 rollout forward reads b_obs's
+    # source values at full precision there).
+    obs_dt = torch.float16 if args.fp16 == "all" else torch.float32
+    b_obs = torch.zeros((T, N, OBS_DIM), device=device, dtype=obs_dt)
     b_act = torch.zeros((T, N, A_DIM), dtype=torch.long, device=device)
     b_logp = torch.zeros((T, N), device=device)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
-    b_val = torch.zeros((T, N), device=device)
+    # row T holds the bootstrap value: b_val[1:] IS the shifted value
+    # view the GAE deltas need, killing the per-update torch.cat
+    # (2026-07-28; bit-identical, values unchanged)
+    b_val = torch.zeros((T + 1, N), device=device)
+    b_adv = torch.zeros((T, N), device=device)
+    b_ret = torch.zeros((T, N), device=device)
+    gae_zero = torch.zeros(N, device=device)  # t = T-1 scan seed
 
     graph_roll = None
     if args.graph_rollout:
@@ -461,18 +477,21 @@ def main():
                 a, logp, v, rew, done = graph_roll.step()
                 b_act[t], b_logp[t], b_val[t] = a, logp, v
                 b_rew[t] = rew
-                b_done[t] = done.to(b_done.dtype)
+                # copy_ does the bool->float conversion in one kernel
+                # with no temp (done.to() allocated one per step)
+                b_done[t].copy_(done)
                 global_step += N
             obs = venv._obs
         for t in range(T if graph_roll is None else 0):
             b_obs[t] = obs
             with torch.no_grad():
-                a, logp, _, v = policy.get_action_and_value(obs)
+                a, logp, _, v = policy.get_action_and_value(
+                    obs, need_entropy=False)
             b_act[t], b_logp[t], b_val[t] = a, logp, v
             if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
                 b_rew[t] = rew.to(b_rew.dtype)
-                b_done[t] = done.to(b_done.dtype)
+                b_done[t].copy_(done)
                 obs = nobs
             else:
                 nobs, rew, done, infos = venv.step(a.cpu().numpy())
@@ -483,8 +502,10 @@ def main():
             for info in infos:
                 ep_returns.append(info["episode_return"])
             global_step += N
-        if tensor_env:
-            ep_returns.extend(venv.pop_stats())
+        # (pop_stats moved to the per-update print block 2026-07-28: its
+        # two .item()/.tolist() syncs sat exactly at the rollout->GAE
+        # boundary, draining the queue right before the most launch-
+        # latency-sensitive region; the print block already syncs)
         # drain before reading the phase timer: kernel launches are
         # async, so without this the section boundary charges queued
         # work to whichever section blocks next (the 2026-07-25
@@ -498,20 +519,32 @@ def main():
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            _, _, _, next_val = policy.get_action_and_value(obs)
+            # NOTE: the full get_action_and_value (multinomial included)
+            # runs here for ONE value read — the sample is discarded,
+            # but it consumes default-generator RNG that every later
+            # rollout replay sees. Replacing it with forward_stacked
+            # would shift the RNG stream and break byte-identical
+            # resume of paused runs; revisit only at a natural
+            # trajectory break (fresh run).
+            _, _, _, next_val = policy.get_action_and_value(
+                obs, need_entropy=False)
+            b_val[T] = next_val
             # everything non-recursive hoisted out of the T-loop (same
             # elementwise op order as the per-t version, so bit-exact);
-            # only the scan itself stays sequential
+            # only the scan itself stays sequential. The scan writes
+            # coef[t]*prev then adds deltas[t] in place: IEEE addition
+            # is commutative, so prod+delta == delta+prod bitwise —
+            # 2 launches/step, zero allocations (was 3 + 2 allocs).
             nonterm = 1.0 - b_done
-            nextv = torch.cat([b_val[1:], next_val.unsqueeze(0)])
-            deltas = b_rew + args.gamma * nextv * nonterm - b_val
+            deltas = b_rew + args.gamma * b_val[1:] * nonterm - b_val[:T]
             coef = (args.gamma * args.gae_lambda) * nonterm
-            adv = torch.zeros((T, N), device=device)
-            lastgae = torch.zeros(N, device=device)
-            for t in reversed(range(T)):
-                lastgae = deltas[t] + coef[t] * lastgae
-                adv[t] = lastgae
-            returns = adv + b_val
+            adv = b_adv
+            torch.mul(coef[T - 1], gae_zero, out=adv[T - 1])
+            adv[T - 1].add_(deltas[T - 1])
+            for t in reversed(range(T - 1)):
+                torch.mul(coef[t], adv[t + 1], out=adv[t])
+                adv[t].add_(deltas[t])
+            returns = torch.add(adv, b_val[:T], out=b_ret)
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, A_DIM)
@@ -525,14 +558,19 @@ def main():
         for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
             # synchronizing pageable H2D copy per minibatch (~26 ms/update
-            # measured on WDDM)
+            # measured on WDDM). Permute each flat tensor ONCE per epoch
+            # and hand minibatches contiguous slices: 5 gathers instead
+            # of 40, identical rows in identical order per minibatch, so
+            # every downstream op sees the same values (2026-07-28)
             perm = torch.randperm(batch, device=device)
+            p_obs, p_act = f_obs[perm], f_act[perm]
+            p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
             for s in range(0, batch, mb_size):
-                mb = perm[s:s + mb_size]
+                sl = slice(s, s + mb_size)
                 if trainer is not None:  # fused minibatch body
                     loss, ent_loss = fused_minibatch_losses(
-                        trainer, ent_now, f_obs[mb], f_act[mb],
-                        f_logp[mb], f_adv[mb], f_ret[mb])
+                        trainer, ent_now, p_obs[sl], p_act[sl],
+                        p_logp[sl], p_adv[sl], p_ret[sl])
                     opt.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(trainer.parameters(),
@@ -541,17 +579,17 @@ def main():
                     bump_weights_version()
                     continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
-                    f_obs[mb], f_act[mb])
-                ratio = (newlogp - f_logp[mb]).exp()
+                    p_obs[sl], p_act[sl])
+                ratio = (newlogp - p_logp[sl]).exp()
                 if fp16_update and ep_i == 0 and s == 0:
                     # "same policy" fixed point: |ratio-1| at epoch 1
                     # measures rollout/update precision consistency
                     # (device-side; read at the per-update print sync)
                     ratio_diag = (ratio - 1.0).abs().mean().detach()
-                a_mb = f_adv[mb]
+                a_mb = p_adv[sl]
                 a_mb = (a_mb - a_mb.mean()) / (a_mb.std() + 1e-8)
-                pg_loss, dual_frac = pg_loss_fn(ratio, a_mb)
-                v_loss = 0.5 * ((newval - f_ret[mb]) ** 2).mean()
+                pg_loss = pg_loss_fn(ratio, a_mb)
+                v_loss = 0.5 * ((newval - p_ret[sl]) ** 2).mean()
                 ent_loss = entropy.mean()
                 loss = pg_loss - ent_now * ent_loss + VF_COEF * v_loss
                 opt.zero_grad(set_to_none=True)
@@ -597,6 +635,10 @@ def main():
             torch.cuda.synchronize()  # see rollout-timer note
         t_update += time.perf_counter() - t0
 
+        if tensor_env:
+            # deferred from the rollout->GAE boundary: this is the one
+            # place per update the host reads the device anyway
+            ep_returns.extend(venv.pop_stats())
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
         elapsed = time.time() - start
         rate = (global_step - steps_before) / elapsed

@@ -225,3 +225,44 @@ parallelism correct; no fp64 in production.
 
 Full agent transcripts: session task outputs 2026-07-28 (PPO loop, CUDA kernels, env, sweep
 orchestration, pipeline).
+
+---
+
+## Implementation results (2026-07-28, byte-identical pass)
+
+Constraint discovered at implementation time: gen5_5b is paused at 0.5B awaiting
+BYTE-IDENTICAL optimizations, so only the bit-exact subset of Tiers 2+3 landed.
+Gate: 100-update production-shape run (N=1024, seed 123) — weights AND Adam-state
+sha256 must equal baseline (run-to-run determinism verified first: two baseline
+runs hashed identical).
+
+| stage | steps/s | vs baseline | weights hash |
+|---|---|---|---|
+| baseline | 209,416 | — | b37b54ba… |
+| + fused_attn SROW padding + bias_relu p2 kernel | 227,153 | +8.5% | identical |
+| + Tier 3 batch A (GAE out= scan, (T+1,N) b_val, dead diag, eye cache, F.pad bias, copy_ done) | 229,025 | +9.4% | identical |
+| + batch B (need_entropy=False, permute-once slices, pop_stats deferral) | 229,153 | +9.4% | identical |
+| + fp16 b_obs | 229,533 | **+9.6%** | identical |
+
+Kernel-level (best-of-5, 16384-row update shapes): attn fwd b0 3946→2158 µs
+(1.83×), bwd b0 5285→3420 µs (1.55×), rollout fwd 270→148 µs (1.83×);
+bias_relu ~3% (memory-bound — the s64 modulo was ALU shadow, not the roofline).
+
+Measured NEGATIVE results (reverted, documented in fused_attn.cu):
+- 2.2 score-dot accumulator interleave: fwd b0 +9%, Tq=2 +43% SLOWER post-padding
+  (6 blocks/SM already hides the FMA chain; policy_forward.cu's 4-block context
+  doesn't transfer).
+- 2.3 cooperative coalesced p_out store: ~1.3% slower on b0; strided store was
+  already hidden.
+
+Validation: 123/123 tests pass; gen5 ckpt_upd3815 re-bench reproduces
+bench/gen5_5b_ckpt_upd3815.json exactly (model hash, all 6101 per-level results,
+both pp totals; levels-array order differs only among equal-stars ties — the
+bench's stable sort keeps completion order, pre-existing nondeterminism).
+
+Deferred (NOT landed — would change bits; revisit at a natural trajectory break):
+2.4 in-kernel attention bias-grads; 2.6 fused ReLU-bwd+bias-sum; 2.7 warp softmax
++ __expf; 2.8 Tq=2 sample batching; 3.4 flat grad/replica buffers (a byte-safe
+subset exists: flat nan_to_num + single replica copy while keeping per-tensor
+clip_grad_norm_); 3.8 Gumbel-max; bootstrap via forward_stacked (drops an RNG
+consumer — shifts the sampling stream).
