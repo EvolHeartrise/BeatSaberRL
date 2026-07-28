@@ -37,6 +37,26 @@ __global__ void bias_relu_kernel(__half2* __restrict__ y,
   y[i] = __float22half2_rn(o);
 }
 
+// Power-of-two d2 specialization (all the policy's Linear widths: 64
+// and 128 -> d2 32/64). The generic kernel's `i % d2` is a SIGNED
+// 64-BIT remainder — Pascal has no s64 divide, nvcc emits tens of
+// instructions per element in a kernel whose real work is 2 loads +
+// 2 FMA + 1 store. Here the index is int32 and the remainder is a
+// compile-time mask. Bit-identical: index math only.
+template <int D2C>
+__global__ void bias_relu_kernel_p2(__half2* __restrict__ y,
+                                    const float2* __restrict__ b,
+                                    int n2) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n2) return;
+  const float2 v = __half22float2(y[i]);
+  const float2 bb = b[i & (D2C - 1)];
+  float2 o;
+  o.x = fmaxf(v.x + bb.x, 0.f);
+  o.y = fmaxf(v.y + bb.y, 0.f);
+  y[i] = __float22half2_rn(o);
+}
+
 void bias_relu_(at::Tensor y, at::Tensor b) {
   const c10::cuda::CUDAGuard guard(y.device());
   const int d = (int)y.size(-1);
@@ -50,11 +70,20 @@ void bias_relu_(at::Tensor y, at::Tensor b) {
   if (n2 == 0) return;
   const int threads = 256;
   const int64_t blocks = (n2 + threads - 1) / threads;
-  bias_relu_kernel<<<(unsigned)blocks, threads, 0,
-                     at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<__half2*>(y.data_ptr<at::Half>()),
-      reinterpret_cast<const float2*>(b.data_ptr<float>()),
-      n2, d / 2);
+  const int d2 = d / 2;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* yp = reinterpret_cast<__half2*>(y.data_ptr<at::Half>());
+  auto* bp = reinterpret_cast<const float2*>(b.data_ptr<float>());
+  if (n2 <= INT32_MAX && d2 == 64) {
+    bias_relu_kernel_p2<64><<<(unsigned)blocks, threads, 0, stream>>>(
+        yp, bp, (int)n2);
+  } else if (n2 <= INT32_MAX && d2 == 32) {
+    bias_relu_kernel_p2<32><<<(unsigned)blocks, threads, 0, stream>>>(
+        yp, bp, (int)n2);
+  } else {
+    bias_relu_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
+        yp, bp, n2, d2);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

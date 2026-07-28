@@ -260,22 +260,32 @@ class NotePolicy(nn.Module):
         emb = _seq(self.note_mlp, notes)                             # (B, 16, 64)
         B = obs.shape[0]
         dt = torch.float16 if fp16 else obs.dtype
-        hand_id = torch.eye(2, device=obs.device, dtype=dt).expand(B, 2, 2)
+        # hand-id one-hot is a constant: cached per (device, dtype)
+        # instead of a fresh eye() alloc every forward (2026-07-28)
+        hid = self.__dict__.get("_hand_id_cache")
+        if hid is None or hid[0] != (obs.device, dt):
+            hid = ((obs.device, dt),
+                   torch.eye(2, device=obs.device, dtype=dt))
+            self._hand_id_cache = hid
+        hand_id = hid[1].expand(B, 2, 2)
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
         tokens = torch.cat([_seq(self.saber_mlp, saber_feat), emb], dim=1)
-        key_mask = torch.cat(
-            [torch.ones(B, 2, device=obs.device), note_mask], dim=1)
-        # additive attention mask is block-invariant: build it once
-        attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS
+        # additive attention mask is block-invariant: build it once.
+        # The 2 saber lanes are always attendable -> bias exactly +0.0,
+        # which is what F.pad's zero fill writes — so the ones+cat
+        # key_mask build is skipped entirely (blocks only consume
+        # key_mask when attn_bias is None; bit-identical, 2026-07-28)
+        attn_bias = F.pad((note_mask.unsqueeze(1) - 1.0) * MASK_BIAS,
+                          (2, 0))
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
         delta = None
         for blk in self.blocks[:-1]:
-            tokens, delta = blk(tokens, key_mask, attn_bias=attn_bias,
+            tokens, delta = blk(tokens, None, attn_bias=attn_bias,
                                 delta=delta)
         # final block: only the 2 readout tokens' outputs are consumed
-        tokens = self.blocks[-1](tokens, key_mask, n_queries=2,
+        tokens = self.blocks[-1](tokens, None, n_queries=2,
                                  attn_bias=attn_bias, delta=delta)
         h = _seq(self.trunk, tokens.reshape(B, -1))                  # saber readout
         if fp16 and not torch.is_grad_enabled():
@@ -302,7 +312,6 @@ class NotePolicy(nn.Module):
         """Version-keyed fused-head weight cache, refreshed IN PLACE so
         the storages never move (CUDA-graph contract — see
         fp16_linear._half_params)."""
-        import fp16_linear as _fl
         vers = _fl._weights_version
         c = getattr(self, "_head_cache", None)
         if c is None or c[0] != vers:
@@ -324,7 +333,6 @@ class NotePolicy(nn.Module):
         head) for the current weights version. A graphed rollout MUST
         call this after opt.steps — its captured kernels read the cache
         storages directly and never run the lazy rebuild logic."""
-        import fp16_linear as _fl
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 _fl._half_params(m.weight, m.bias)
@@ -334,17 +342,27 @@ class NotePolicy(nn.Module):
         logits, value = self.forward_stacked(obs)
         return list(logits.unbind(1)), value
 
-    def get_action_and_value(self, obs, action=None):
+    def get_action_and_value(self, obs, action=None, need_entropy=True):
+        """need_entropy=False skips the entropy reduction (~5 kernels)
+        for callers that discard it — the rollout and the GAE bootstrap.
+        No RNG is consumed by entropy, so the sampling stream is
+        untouched either way (2026-07-28)."""
         logits, value = self.forward_stacked(obs)                # (B, 12, 3)
         logsm = torch.log_softmax(logits, dim=-1)
+        probs = None
         if action is None:
             # one multinomial over all B*12 rows — same distribution as 12
             # per-head Categorical.sample()s, different RNG STREAM (the
             # same caveat the graphed-rollout capture carried)
+            probs = logsm.exp()
             action = torch.multinomial(
-                logsm.exp().reshape(-1, 3), 1).view(-1, len(HEAD_SIZES))
+                probs.reshape(-1, 3), 1).view(-1, len(HEAD_SIZES))
         logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
-        entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
+        entropy = None
+        if need_entropy:
+            if probs is None:
+                probs = logsm.exp()
+            entropy = -(probs * logsm).sum(-1).sum(-1)
         return action, logprob, entropy, value
 
 

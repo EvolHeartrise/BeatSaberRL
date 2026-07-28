@@ -55,7 +55,7 @@ def eager_update(policy, opt, obs, act, logp, adv, ret):
     _, newlogp, entropy, newval = policy.get_action_and_value(obs, act)
     ratio = (newlogp - logp).exp()
     a_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
-    pg_loss, _ = pg_loss_fn(ratio, a_mb)
+    pg_loss = pg_loss_fn(ratio, a_mb)
     v_loss = 0.5 * ((newval - ret) ** 2).mean()
     loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
     opt.zero_grad()
