@@ -70,13 +70,105 @@ def bump_weights_version():
     _weights_version += 1
 
 
+# Flat replica state (2026-07-28): [version, flat16, flat32]. When a
+# module is flattened (flatten_fp16_replicas), every Linear's fp32
+# master becomes a view into flat32 and its fp16 replica a view into
+# flat16 — a version bump then costs ONE flat16.copy_(flat32) cast
+# kernel instead of ~26 per-tensor copies per refresh site.
+_flat = None
+
+
+def flat_refresh():
+    """Recast the whole flat fp16 replica buffer if stale. One kernel;
+    in-place, so storages captured by a CUDA graph stay live."""
+    if _flat is not None and _flat[0] != _weights_version:
+        _flat[1].copy_(_flat[2])
+        _flat[0] = _weights_version
+
+
+def flatten_fp16_replicas(module, tail_group=None):
+    """Repack every nn.Linear master (w, b) of `module` into ONE
+    contiguous fp32 buffer (p.data become views — Adam keeps mutating
+    them in place, state_dict/checkpoints unchanged) with a parallel
+    flat fp16 replica buffer. `tail_group` (optional, ordered list of
+    Linears) is laid out LAST as [w0..wn | b0..bn] so the caller can
+    view the group's concatenated weights/biases as single contiguous
+    tensors (the policy's fused action head). Returns (w16, b16) views
+    for the tail group, or None.
+
+    MUST run before any CUDA-graph capture, and never again after —
+    p.data pointers move exactly once, here."""
+    import torch.nn as nn
+    linears = [m for m in module.modules() if isinstance(m, nn.Linear)]
+    tail = list(tail_group or [])
+    others = [m for m in linears if m not in tail]
+    # Alignment contract: fused_attn casts master biases to float2* and
+    # replicas to __half2* (needs 8 B), and cuBLAS selects vectorized
+    # GEMM paths by pointer alignment — so every independently-consumed
+    # slice starts on a 16-ELEMENT boundary (64 B fp32 / 32 B fp16,
+    # comfortably past every kernel's preference). The tail BIAS group
+    # is the one exception — its members stay back-to-back (unaligned)
+    # so the concatenated (rows,) view exists; it is only ever consumed
+    # by torch ops, which take any alignment.
+    ALIGN = 16
+    plan = []                      # (param, offset)
+    off = 0
+    for m in others:
+        for p_ in (m.weight, m.bias):
+            off = (off + ALIGN - 1) & ~(ALIGN - 1)
+            plan.append((p_, off))
+            off += p_.numel()
+    off = (off + ALIGN - 1) & ~(ALIGN - 1)
+    assert all(m.weight.numel() % ALIGN == 0 for m in tail), \
+        "tail weights must keep alignment back-to-back"
+    for m in tail:
+        plan.append((m.weight, off))
+        off += m.weight.numel()
+    off = (off + ALIGN - 1) & ~(ALIGN - 1)
+    for m in tail:                 # biases: contiguous, no padding
+        plan.append((m.bias, off))
+        off += m.bias.numel()
+    dev = plan[0][0].device
+    flat32 = torch.zeros(off, device=dev)
+    offs = {}
+    for p, o in plan:
+        n = p.numel()
+        flat32[o:o + n].copy_(p.data.reshape(-1))
+        p.data = flat32[o:o + n].view_as(p)
+        offs[id(p)] = o
+    flat16 = flat32.half()
+    global _flat
+    _flat = [_weights_version, flat16, flat32]
+    for m in linears:
+        wo, bo = offs[id(m.weight)], offs[id(m.bias)]
+        m.weight._flat_views = (
+            flat16[wo:wo + m.weight.numel()].view_as(m.weight),
+            flat16[bo:bo + m.bias.numel()].view_as(m.bias))
+    if not tail:
+        return None
+    tw0 = offs[id(tail[0].weight)]
+    tb0 = offs[id(tail[0].bias)]
+    n_w = sum(m.weight.numel() for m in tail)
+    n_b = sum(m.bias.numel() for m in tail)
+    rows = sum(m.weight.shape[0] for m in tail)
+    w16 = flat16[tw0:tw0 + n_w].view(rows, tail[0].weight.shape[1])
+    b16 = flat16[tb0:tb0 + n_b]
+    return w16, b16
+
+
 def _half_params(w, b):
     """Epoch-checked fp16 replica cache. The replicas are detached
     constants (the custom Function computes dw itself), so caching is
     valid in grad mode too. The win is the ROLLOUT: 128 forwards per
     update on frozen weights pay ONE cast set instead of 128 (34
     launches each — measured as --fp16 all regressing below
-    update-only without the cache)."""
+    update-only without the cache). Flat-registered weights (see
+    flatten_fp16_replicas) resolve to views and share one global
+    refresh."""
+    fv = getattr(w, "_flat_views", None)
+    if fv is not None:
+        flat_refresh()
+        return fv
     cache = getattr(w, "_fp16_cache", None)
     if cache is None:
         cache = (_weights_version, w.detach().half(), b.detach().half())

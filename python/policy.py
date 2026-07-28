@@ -308,10 +308,26 @@ class NotePolicy(nn.Module):
             out = F.linear(h, w, b)                                  # (B, 37)
         return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
 
+    def flatten_fp16(self):
+        """Repack all Linear masters into one flat fp32 buffer with a
+        flat fp16 replica mirror (fp16_linear.flatten_fp16_replicas).
+        The heads + value head are laid out LAST in cat order, so the
+        fused-head cache becomes a pair of static VIEWS — never
+        rebuilt, refreshed by the same single flat cast as everything
+        else. Trainer-only; MUST run before CUDA-graph capture."""
+        tail = list(self.heads) + [self.value_head]
+        w16, b16 = _fl.flatten_fp16_replicas(self, tail_group=tail)
+        self._head_cache = [None, w16, b16]
+        self._flat_fp16 = True
+
     def _refresh_head_cache(self):
         """Version-keyed fused-head weight cache, refreshed IN PLACE so
         the storages never move (CUDA-graph contract — see
-        fp16_linear._half_params)."""
+        fp16_linear._half_params). Flat mode: the cache IS a view pair
+        into the flat fp16 buffer; only the global refresh runs."""
+        if getattr(self, "_flat_fp16", False):
+            _fl.flat_refresh()
+            return self._head_cache
         vers = _fl._weights_version
         c = getattr(self, "_head_cache", None)
         if c is None or c[0] != vers:
@@ -332,7 +348,11 @@ class NotePolicy(nn.Module):
         """Force-refresh every fp16 replica cache (13 Linears + fused
         head) for the current weights version. A graphed rollout MUST
         call this after opt.steps — its captured kernels read the cache
-        storages directly and never run the lazy rebuild logic."""
+        storages directly and never run the lazy rebuild logic. Flat
+        mode collapses the whole refresh to ONE cast kernel."""
+        if getattr(self, "_flat_fp16", False):
+            _fl.flat_refresh()
+            return
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 _fl._half_params(m.weight, m.bias)

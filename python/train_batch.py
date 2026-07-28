@@ -367,6 +367,17 @@ def main():
     if args.fp16 != "off":
         print(f"--fp16 {args.fp16}: fp16-storage activations, fp32 "
               f"masters, static loss scale {fp16_scale:.0f}", flush=True)
+        # flat fp32 masters + flat fp16 replica mirror (2026-07-28):
+        # every replica refresh (once per update for the graphed
+        # rollout, once per minibatch after opt.step) becomes ONE cast
+        # kernel, and the fused-head cache becomes a static view. Must
+        # precede graph capture; p.data views never move afterward
+        # (checkpoints/Adam unchanged — Adam mutates the views in
+        # place). --fused-update never reaches here (fp16 forced off).
+        if device.type == "cuda":
+            policy.flatten_fp16()
+            print("--fp16: flat master/replica buffers (1-kernel "
+                  "refresh)", flush=True)
     trainer = None
     if args.fused_update:
         assert device.type == "cuda", "--fused-update needs a CUDA device"
