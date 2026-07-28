@@ -303,5 +303,27 @@ Design notes that mattered:
   at n=200k (0.7842/0.1758/0.0400 vs target 0.7856/0.1753/0.0391).
 - Validation: 123/123 tests; r1 diagnostic 2.2-3.1e-4 throughout (same
   band as before); trajectory now legitimately differs from gen5's.
-Still open (measured-out or unattempted): 2.8 Tq=2 sample batching (untried);
-flat MASTER/replica buffers (34-launch refresh remains, 8x/update).
+Still open (measured-out or unattempted): 2.8 Tq=2 sample batching (untried).
+
+## Implementation results, pass 3 (2026-07-28): flat fp16 master/replica buffers
+
+Landed: all Linear fp32 masters repacked into ONE contiguous buffer (p.data =
+views; Adam/checkpoints/state_dict unchanged) with a flat fp16 mirror —
+replica refresh is ONE cast kernel (was ~26 copies x 9 refresh sites/update),
+and the heads+value are laid out LAST in cat order so the fused-head rollout
+cache is a pair of static views, never rebuilt. 16-element slice alignment
+(64 B fp32 / 32 B fp16) — fused_attn/bias_relu reinterpret masters as
+float2*/__half2*, and cuBLAS selects GEMM paths by pointer alignment (the
+first 4-element cut measured ~0.2% slower; alignment bump recovered it).
+Tail-bias group stays internally contiguous (torch-only consumers) so the
+(37,) view exists. Trainer-only (flatten runs before graph capture; bench and
+tests keep the per-tensor path).
+
+Speed: statistically neutral — baseline samples {242.9k, 242.0k} vs flat
+{242.3k, 242.5k, 242.6k} steps/s (update is GPU-bound; the removed ~230
+launches/update were CPU-side and already hidden). Kept for the structural
+wins: 1-kernel refresh, static head views, less WDDM launch pressure, and the
+fragile per-tensor version-keyed cache retired from the trainer path.
+Correctness: forward bit-identical pre/post-flatten, refresh verified, grads
+flow to all 66 params, same-seed trajectory identical to pass-2 head,
+123/123 tests.
