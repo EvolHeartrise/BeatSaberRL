@@ -351,12 +351,16 @@ class NotePolicy(nn.Module):
         logsm = torch.log_softmax(logits, dim=-1)
         probs = None
         if action is None:
-            # one multinomial over all B*12 rows — same distribution as 12
-            # per-head Categorical.sample()s, different RNG STREAM (the
-            # same caveat the graphed-rollout capture carried)
-            probs = logsm.exp()
-            action = torch.multinomial(
-                probs.reshape(-1, 3), 1).view(-1, len(HEAD_SIZES))
+            # Gumbel-max (2026-07-28): argmax(logp - log E), E~Exp(1),
+            # samples the same categorical distribution as the previous
+            # multinomial at a fraction of the kernel cost (no
+            # renormalize pass, no block-per-row kernel), rides the
+            # same default philox generator (graph-safe), and skips
+            # the probs exp() entirely. Different RNG STREAM than
+            # multinomial — the same accepted caveat the graphed
+            # rollout capture already carried.
+            g = torch.empty_like(logsm).exponential_()
+            action = (logsm - g.log()).argmax(-1)
         logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
         entropy = None
         if need_entropy:

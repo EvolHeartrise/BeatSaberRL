@@ -17,6 +17,8 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
+
 namespace {
 
 // In-place bias + ReLU epilogue: y = relu(y + b), fp32 math, one
@@ -87,6 +89,80 @@ void bias_relu_(at::Tensor y, at::Tensor b) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Fused ReLU backward + bias-grad partials (2026-07-28): gm = gy
+// masked by (y > 0) in ONE pass that also accumulates per-column fp32
+// sums of gm — replacing aten::threshold_backward + a separate
+// full-tensor gm.sum(0) re-read (~75 MB per ffn site per minibatch).
+// Deterministic: fixed grid, each thread owns one column pair (the
+// grid stride is a multiple of D2C) and walks its elements ascending;
+// block groups combine in fixed order; the (grid, d) partials finish
+// with a torch sum(0).
+template <int D2C>
+__global__ void relu_bwd_kernel(const __half2* __restrict__ gy,
+                                const __half2* __restrict__ y,
+                                __half2* __restrict__ gm,
+                                float* __restrict__ part, int n2) {
+  const int stride = gridDim.x * blockDim.x;
+  float ax = 0.f, ay = 0.f;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += stride) {
+    const float2 gf = __half22float2(gy[i]);
+    const float2 yf = __half22float2(y[i]);
+    float2 o;
+    o.x = yf.x > 0.f ? gf.x : 0.f;
+    o.y = yf.y > 0.f ? gf.y : 0.f;
+    gm[i] = __float22half2_rn(o);   // exact: each value is gy or 0
+    ax += o.x;
+    ay += o.y;
+  }
+  __shared__ float sm[512];         // (blockDim/D2C) groups x 2*D2C
+  const int grp = threadIdx.x / D2C, col = threadIdx.x % D2C;
+  sm[grp * 2 * D2C + 2 * col] = ax;
+  sm[grp * 2 * D2C + 2 * col + 1] = ay;
+  __syncthreads();
+  if (threadIdx.x < D2C) {
+    float bx = 0.f, by = 0.f;
+    for (int g = 0; g < (int)blockDim.x / D2C; g++) {
+      bx += sm[g * 2 * D2C + 2 * threadIdx.x];
+      by += sm[g * 2 * D2C + 2 * threadIdx.x + 1];
+    }
+    part[blockIdx.x * 2 * D2C + 2 * threadIdx.x] = bx;
+    part[blockIdx.x * 2 * D2C + 2 * threadIdx.x + 1] = by;
+  }
+}
+
+std::vector<at::Tensor> relu_bwd(at::Tensor gy, at::Tensor y) {
+  const c10::cuda::CUDAGuard guard(gy.device());
+  const int d = (int)gy.size(-1);
+  TORCH_CHECK(gy.is_cuda() && gy.is_contiguous()
+              && gy.scalar_type() == at::kHalf, "gy: contiguous CUDA fp16");
+  TORCH_CHECK(y.is_cuda() && y.is_contiguous()
+              && y.scalar_type() == at::kHalf && y.sizes() == gy.sizes(),
+              "y: contiguous CUDA fp16, same shape as gy");
+  TORCH_CHECK(d == 64 || d == 128, "relu_bwd: last dim must be 64/128");
+  const int64_t n2 = gy.numel() / 2;
+  TORCH_CHECK(n2 <= INT32_MAX, "relu_bwd: tensor too large");
+  auto gm = at::empty_like(gy);
+  const int threads = 256;
+  const int blocks = (int)std::min<int64_t>(
+      512, (n2 + threads - 1) / threads);
+  auto part = at::zeros({blocks, d}, gy.options().dtype(at::kFloat));
+  if (n2 == 0) return {gm, part};
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* gp = reinterpret_cast<const __half2*>(gy.data_ptr<at::Half>());
+  auto* yp = reinterpret_cast<const __half2*>(y.data_ptr<at::Half>());
+  auto* mp = reinterpret_cast<__half2*>(gm.data_ptr<at::Half>());
+  auto* pp = part.data_ptr<float>();
+  if (d == 128) {
+    relu_bwd_kernel<64><<<blocks, threads, 0, stream>>>(gp, yp, mp, pp,
+                                                        (int)n2);
+  } else {
+    relu_bwd_kernel<32><<<blocks, threads, 0, stream>>>(gp, yp, mp, pp,
+                                                        (int)n2);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {gm, part};
+}
+
 at::Tensor wgrad(at::Tensor dy, at::Tensor x) {
   // dy: (R, M) fp16, x: (R, K) fp16  ->  dW = dy^T x : (M, K) fp32
   TORCH_CHECK(dy.is_cuda() && dy.scalar_type() == at::kHalf
@@ -123,4 +199,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "dW = dY^T X, fp16 inputs, fp32 compute + output (cublasGemmEx)");
   m.def("bias_relu_", &bias_relu_,
         "in-place y = relu(y + b): fp16 y, fp32 master bias");
+  m.def("relu_bwd", &relu_bwd,
+        "fused ReLU backward -> (gm, part): gm = gy * (y > 0), part = "
+        "(grid, d) fp32 column-sum partials of gm (db = part.sum(0))");
 }
