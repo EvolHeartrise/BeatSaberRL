@@ -75,17 +75,28 @@ class _AttnFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         p, q, k, v, bq, bk, bv = ctx.saved_tensors
-        dq, dk, dv = _ext.attn_bwd(dout.contiguous(), p, q, k, v,
-                                   ctx.alpha, bq, bk, bv)
-        # bias grads: d(b*) = channel-sum of d(*) — the same reduction
-        # _Fp16Linear's db used to run on the same tensor, relocated
-        # here (deterministic torch sum, fp32 out for the fp32 masters)
-        dbq = (dq.sum((0, 1), dtype=torch.float32)
-               if bq is not None and ctx.needs_input_grad[5] else None)
-        dbk = (dk.sum((0, 1), dtype=torch.float32)
-               if bk is not None and ctx.needs_input_grad[6] else None)
-        dbv = (dv.sum((0, 1), dtype=torch.float32)
-               if bv is not None and ctx.needs_input_grad[7] else None)
+        want_db = (bq is not None
+                   and any(ctx.needs_input_grad[5:8]))
+        dq, dk, dv, dbp = _ext.attn_bwd(dout.contiguous(), p, q, k, v,
+                                        ctx.alpha, bq, bk, bv, want_db)
+        # bias grads: d(b*) = channel-sum of d(*). The kernel emits
+        # per-sample (3, D) fp32 partials (each block sums its own
+        # L2-hot rows); one deterministic torch sum(0) finishes the
+        # job — replaces three full-tensor fp16 re-reads (2026-07-28)
+        dbq = dbk = dbv = None
+        if want_db:
+            if dbp.numel():
+                s = dbp.sum(0)                   # (3, D) fp32
+                dbq = s[0] if ctx.needs_input_grad[5] else None
+                dbk = s[1] if ctx.needs_input_grad[6] else None
+                dbv = s[2] if ctx.needs_input_grad[7] else None
+            else:                                # T < 4: kernel opted out
+                dbq = (dq.sum((0, 1), dtype=torch.float32)
+                       if ctx.needs_input_grad[5] else None)
+                dbk = (dk.sum((0, 1), dtype=torch.float32)
+                       if ctx.needs_input_grad[6] else None)
+                dbv = (dv.sum((0, 1), dtype=torch.float32)
+                       if ctx.needs_input_grad[7] else None)
         return dq, dk, dv, None, None, dbq, dbk, dbv
 
 

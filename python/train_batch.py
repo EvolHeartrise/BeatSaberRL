@@ -400,6 +400,23 @@ def main():
                 "packed param; the eager path over per-module params). "
                 f"Re-run with the matching flag. [{e}]")
 
+    # Flat grad buffer (2026-07-28): every p.grad is a view into ONE
+    # contiguous buffer, so zero/unscale/overflow-mul/nan_to_num/clip
+    # run as single-tensor kernels instead of 66-tensor loops (~880
+    # launches/update -> ~30). Autograd accumulates in place into
+    # existing grads, so the views persist; a one-time guard below
+    # verifies that. Eager path only (the fused trainer packs its own).
+    flat_grad = None
+    if trainer is None and device.type == "cuda":
+        f_params = list(policy.parameters())
+        flat_grad = torch.zeros(sum(p.numel() for p in f_params),
+                                device=device)
+        off = 0
+        for p_ in f_params:
+            p_.grad = flat_grad[off:off + p_.numel()].view_as(p_)
+            off += p_.numel()
+        flat_guard = True
+
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
     # --fp16 all stores the rollout obs buffer half: every consumer
@@ -519,16 +536,11 @@ def main():
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            # NOTE: the full get_action_and_value (multinomial included)
-            # runs here for ONE value read — the sample is discarded,
-            # but it consumes default-generator RNG that every later
-            # rollout replay sees. Replacing it with forward_stacked
-            # would shift the RNG stream and break byte-identical
-            # resume of paused runs; revisit only at a natural
-            # trajectory break (fresh run).
-            _, _, _, next_val = policy.get_action_and_value(
-                obs, need_entropy=False)
-            b_val[T] = next_val
+            # bootstrap value only: no sample, no logprob (2026-07-28;
+            # the discarded sample also consumed RNG — dropping it
+            # shifts the sampling stream, accepted at the same time as
+            # the Gumbel-max switch)
+            b_val[T] = policy.forward_stacked(obs)[1]
             # everything non-recursive hoisted out of the T-loop (same
             # elementwise op order as the per-t version, so bit-exact);
             # only the scan itself stays sequential. The scan writes
@@ -592,18 +604,23 @@ def main():
                 v_loss = 0.5 * ((newval - p_ret[sl]) ** 2).mean()
                 ent_loss = entropy.mean()
                 loss = pg_loss - ent_now * ent_loss + VF_COEF * v_loss
-                opt.zero_grad(set_to_none=True)
+                if flat_grad is not None:
+                    flat_grad.zero_()
+                else:
+                    opt.zero_grad(set_to_none=True)
                 if fp16_update:
                     # static loss scale, ZERO host syncs: unscale + flag
-                    # non-finites in one multi-tensor kernel, then zero
-                    # every grad on overflow device-side. MUST run
-                    # before clip_grad_norm_ (an inf grad would turn
-                    # clip's 0.5/inf coef into 0*inf = NaN everywhere).
-                    # Overflow steps become momentum-only Adam steps —
-                    # bounded by lr, audited at the print.
+                    # non-finites in one kernel over the FLAT grad
+                    # buffer, then zero every grad on overflow
+                    # device-side. MUST run before the clip (an inf
+                    # grad would turn clip's 0.5/inf coef into 0*inf =
+                    # NaN everywhere). Overflow steps become
+                    # momentum-only Adam steps — bounded by lr, audited
+                    # at the print.
                     (loss * fp16_scale).backward()
-                    grads = [p.grad for p in policy.parameters()
-                             if p.grad is not None]
+                    grads = ([flat_grad] if flat_grad is not None else
+                             [p.grad for p in policy.parameters()
+                              if p.grad is not None])
                     torch._amp_foreach_non_finite_check_and_unscale_(
                         grads, found_inf, inv_scale)
                     ok = 1.0 - found_inf[0].clamp(max=1.0)  # 0-dim
@@ -622,7 +639,28 @@ def main():
                     found_inf.zero_()
                 else:
                     loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
+                if flat_grad is not None:
+                    if flat_guard:
+                        # one-time: autograd must have accumulated INTO
+                        # the views (in place), not replaced them
+                        bad = [p_ for p_ in f_params
+                               if p_.grad is None
+                               or p_.grad._base is not flat_grad]
+                        if bad:
+                            raise RuntimeError(
+                                "flat-grad views were detached by "
+                                f"autograd ({len(bad)} params)")
+                        flat_guard = False
+                    # flat global-norm clip: same math as
+                    # clip_grad_norm_ (norm of per-tensor norms == norm
+                    # of the concatenation), one kernel each
+                    total_norm = torch.linalg.vector_norm(flat_grad)
+                    clip_coef = (MAX_GRAD_NORM / (total_norm + 1e-6)
+                                 ).clamp(max=1.0)
+                    flat_grad.mul_(clip_coef)
+                else:
+                    nn.utils.clip_grad_norm_(policy.parameters(),
+                                             MAX_GRAD_NORM)
                 opt.step()
                 bump_weights_version()  # invalidate fp16 replica caches
         if fp16_update:

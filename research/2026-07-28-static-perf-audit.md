@@ -266,3 +266,42 @@ Deferred (NOT landed — would change bits; revisit at a natural trajectory brea
 subset exists: flat nan_to_num + single replica copy while keeping per-tensor
 clip_grad_norm_); 3.8 Gumbel-max; bootstrap via forward_stacked (drops an RNG
 consumer — shifts the sampling stream).
+
+## Implementation results, pass 2 (2026-07-28, bits-allowed)
+
+User released the byte-identity constraint (gen5 restarts fresh; the 0.5B is
+written off). The deferred set landed, each E2E-gated (same 100-update run,
+speed-only gate now) + tolerance-checked (near-tie class) + deterministic
+run-to-run (no atomics anywhere).
+
+| stage | steps/s | delta |
+|---|---|---|
+| pass-1 head | 229,533 | — |
+| 2.4 in-kernel attention bias-grad partials | 233,032 | +1.5% |
+| 2.7 __expf softmax + warp-reduced bwd ds | 233,467 | +0.2% |
+| 2.6 fused ReLU-bwd + bias-sum partials | 237,826 | +1.9% |
+| 3.4 flat grad buffer (zero/unscale/nan_to_num/clip as 1-tensor ops) | 237,696 | ~0 (kept: CPU-side headroom, no regression) |
+| 3.8 Gumbel-max sampling + bootstrap forward_stacked | 242,883 | +2.2% |
+
+**Cumulative: 209.4k -> 242.9k steps/s = +16.0% over the session baseline.**
+
+Design notes that mattered:
+- 2.4 v1 (post-hoc global readback, 1 warp) regressed the bwd kernel 48%;
+  the landed v2 accumulates channel partials in REGISTERS inside the
+  dv/dq/dk loops (THREADS % D2 == 0 makes each lane's channel
+  loop-invariant), stages 4 warps' partials in dead smem (sB), combines in
+  fixed warp order, and finishes with one torch sum(0) over (B,3,64).
+  System-level: 834+672 us of python sums -> ~190 us kernel + 150 us
+  partial-sum, ~7.8 ms/update.
+- 2.7: warp-per-row softmax in the FORWARD measured slower (+2.7% b0,
+  +11% rollout shape) — kept serial rows + __expf there; the warp version
+  survives only in the backward's ds phase. dbk is mathematically zero
+  (softmax shift-invariance), so its "error" vs torch sums is noise ~0.05.
+- 2.6: relu_bwd kernel 1.43-1.50x over threshold_backward+sum, gm bitwise
+  exact, db within 1.2e-4.
+- 3.8: exponential-race form argmax(logp - log E); distribution verified
+  at n=200k (0.7842/0.1758/0.0400 vs target 0.7856/0.1753/0.0391).
+- Validation: 123/123 tests; r1 diagnostic 2.2-3.1e-4 throughout (same
+  band as before); trajectory now legitimately differs from gen5's.
+Still open (measured-out or unattempted): 2.8 Tq=2 sample batching (untried);
+flat MASTER/replica buffers (34-launch refresh remains, 8x/update).

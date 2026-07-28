@@ -182,14 +182,23 @@ class _Fp16LinearReLU(torch.autograd.Function):
         g2 = gy.reshape(-1, gy.shape[-1])
         if not g2.is_contiguous():
             g2 = g2.contiguous()
-        gm = torch.ops.aten.threshold_backward(g2, y, 0)
+        ext = _load()
+        part = None
+        if hasattr(ext, "relu_bwd") and g2.shape[-1] in (64, 128):
+            # one pass: mask + fp32 column-sum partials — replaces
+            # threshold_backward + a separate full-tensor gm.sum(0)
+            # re-read (2026-07-28)
+            gm, part = ext.relu_bwd(g2, y)
+        else:
+            gm = torch.ops.aten.threshold_backward(g2, y, 0)
         dx = dw = db = None
         if ctx.needs_input_grad[0]:
             dx = (gm @ wh).view(*gy.shape[:-1], wh.shape[1])
         if ctx.needs_input_grad[1]:
-            dw = _load().wgrad(gm, x2)
+            dw = ext.wgrad(gm, x2)
         if ctx.needs_input_grad[2]:
-            db = gm.sum(0, dtype=torch.float32)
+            db = (part.sum(0) if part is not None
+                  else gm.sum(0, dtype=torch.float32))
         return dx, dw, db
 
 

@@ -116,14 +116,21 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
   }
   __syncthreads();
 
-  // softmax: row per thread (Tq <= 32 rows; serial over T in registers)
+  // softmax: row per thread (Tq <= 32 rows; serial over T in
+  // registers) with __expf — MUFU.EX2 instead of the ~20-instruction
+  // expf sequence; max-subtracted args lie in [-30, 0], inside its
+  // accurate range, and the -16384 mask still lands in the exact-zero
+  // regime. (A warp-per-row shfl softmax was tried 2026-07-28: helped
+  // the backward's ds phase but measured +2.7% on the b0 FORWARD and
+  // +11% on the rollout shape — the shuffle waves cost more than this
+  // serial section, which the padded score phase already hides.)
   if (tid < Tq) {
     float* row = sp + tid * T;
     float mx = row[0];
     for (int j = 1; j < T; j++) mx = fmaxf(mx, row[j]);
     float s = 0.f;
     for (int j = 0; j < T; j++) {
-      const float e = expf(row[j] - mx);
+      const float e = __expf(row[j] - mx);
       row[j] = e;
       s += e;
     }
@@ -134,9 +141,6 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
       pr[j] = __float2half_rn(row[j]);
     }
   }
-  // (A cooperative coalesced p_out store after the barrier was tried
-  // 2026-07-28: bit-identical but ~1.3% SLOWER on the b0 shape — the
-  // strided store is already hidden once SROW padding landed.)
   __syncthreads();
 
   // out[i][c] = sum_j p[i][j] * v[j][c]; element per thread, half2 store
@@ -160,8 +164,12 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
 // phases: load p,dout,v -> dp -> dv -> ds(=alpha*softmax_bwd)
 //         -> load k -> dq -> load q -> dk
 // bq/bk/bv reconstruct the BIASED q/k/v the forward attended with (the
-// saved inputs are the bias-free mm outputs). dbq/dbk/dbv are computed
-// python-side as deterministic torch channel-sums of dq/dk/dv.
+// saved inputs are the bias-free mm outputs). dbp (nullable, (B,3,D)
+// fp32 = [dq|dk|dv] channel sums) replaces the python-side
+// dq.sum((0,1)) reductions, which re-read ~1.5 GB/update of fp16 grads
+// purely to make six 64-float vectors (2026-07-28). Each block sums
+// its own just-written rows back from L2 (rows ascending per thread,
+// then a fixed cross-block torch sum(0) — deterministic, no atomics).
 __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
                                 const __half* __restrict__ p,   // (B,Tq,T)
                                 const __half2* __restrict__ q,
@@ -173,6 +181,7 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
                                 __half2* __restrict__ dq,
                                 __half2* __restrict__ dk,
                                 __half2* __restrict__ dv,
+                                float* __restrict__ dbp,
                                 int Tq, int T, float alpha) {
   extern __shared__ float sm[];
   const int A_rows = Tq > T ? Tq : T;
@@ -217,6 +226,12 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   __syncthreads();
 
   // dv[j][c] = sum_i p[i][j] * dout[i][c]
+  // Channel partials for the bias grads ride the compute loops in
+  // registers: THREADS is a multiple of D2, so e % D2 is loop-invariant
+  // per thread — each thread owns ONE channel pair and a fixed row
+  // subset (rows ascending; quarters combined in fixed order below:
+  // deterministic, no atomics, no global re-read).
+  float pvx = 0.f, pvy = 0.f;
   __half2* dvb = dv + b * (T * D2);
   for (int e = tid; e < T * D2; e += THREADS) {
     const int j = e / D2, c2 = e % D2;
@@ -227,18 +242,44 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
       ay += pij * sA[i * SROW + 2 * c2 + 1];
     }
     dvb[e] = __float22half2_rn(make_float2(ax, ay));
+    pvx += ax;
+    pvy += ay;
   }
 
-  // ds[i][j] = alpha * p[i][j] * (dp[i][j] - sum_j dp*p); row per thread
-  if (tid < Tq) {
-    const float* prow = sp + tid * T;
-    float* drow = sds + tid * T;
-    float s = 0.f;
-    for (int j = 0; j < T; j++) s += drow[j] * prow[j];
-    for (int j = 0; j < T; j++)
-      drow[j] = alpha * prow[j] * (drow[j] - s);
+  // ds[i][j] = alpha * p[i][j] * (dp[i][j] - sum_j dp*p); warp per row
+  // (same shfl tree as the forward softmax, 2026-07-28)
+  {
+    const int wid = tid >> 5, lane = tid & 31;
+    for (int r = wid; r < Tq; r += THREADS / 32) {
+      const float* prow = sp + r * T;
+      float* drow = sds + r * T;
+      float s = lane < T ? drow[lane] * prow[lane] : 0.f;
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+      if (lane < T)
+        drow[lane] = alpha * prow[lane] * (drow[lane] - s);
+    }
   }
   __syncthreads();
+
+  // dv channel sums: stage the 4 warps' register partials in sB (v is
+  // dead — k overwrites it next; host guarantees T*SROW >= 4*D) and
+  // combine in fixed warp order; sync again before k reclaims sB
+  if (dbp) {
+    sB[(tid >> 5) * D + 2 * (tid & 31)] = pvx;
+    sB[(tid >> 5) * D + 2 * (tid & 31) + 1] = pvy;
+    __syncthreads();
+    if (tid < D2) {
+      float ax = 0.f, ay = 0.f;
+      for (int w = 0; w < THREADS / 32; w++) {
+        ax += sB[w * D + 2 * tid];
+        ay += sB[w * D + 2 * tid + 1];
+      }
+      float* o = dbp + b * (3 * D) + 2 * D;
+      o[2 * tid] = ax;
+      o[2 * tid + 1] = ay;
+    }
+    __syncthreads();
+  }
 
   // load k over v (v dead), then dq[i][c] = sum_j ds[i][j] * k[j][c]
   const __half2* kb = k + b * (T * D2);
@@ -251,6 +292,7 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   }
   __syncthreads();
   __half2* dqb = dq + b * (Tq * D2);
+  float pqx = 0.f, pqy = 0.f;
   for (int e = tid; e < Tq * D2; e += THREADS) {
     const int i = e / D2, c2 = e % D2;
     const float* dsi = sds + i * T;
@@ -261,8 +303,29 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
       ay += d * sB[j * SROW + 2 * c2 + 1];
     }
     dqb[e] = __float22half2_rn(make_float2(ax, ay));
+    pqx += ax;
+    pqy += ay;
   }
   __syncthreads();
+
+  // dq channel sums (k in sB is dead after the dq loop; the following
+  // q load only touches sA, so no extra barrier is needed after the
+  // combine — the pre-dk barrier below already covers it)
+  if (dbp) {
+    sB[(tid >> 5) * D + 2 * (tid & 31)] = pqx;
+    sB[(tid >> 5) * D + 2 * (tid & 31) + 1] = pqy;
+    __syncthreads();
+    if (tid < D2) {
+      float ax = 0.f, ay = 0.f;
+      for (int w = 0; w < THREADS / 32; w++) {
+        ax += sB[w * D + 2 * tid];
+        ay += sB[w * D + 2 * tid + 1];
+      }
+      float* o = dbp + b * (3 * D);
+      o[2 * tid] = ax;
+      o[2 * tid + 1] = ay;
+    }
+  }
 
   // load q over dout (dout dead), then dk[j][c] = sum_i ds[i][j] * q[i][c]
   const __half2* qb = q + b * (Tq * D2);
@@ -275,6 +338,7 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
   }
   __syncthreads();
   __half2* dkb = dk + b * (T * D2);
+  float pkx = 0.f, pky = 0.f;
   for (int e = tid; e < T * D2; e += THREADS) {
     const int j = e / D2, c2 = e % D2;
     float ax = 0.f, ay = 0.f;
@@ -284,6 +348,26 @@ __global__ void attn_bwd_kernel(const __half2* __restrict__ dout,
       ay += d * sA[i * SROW + 2 * c2 + 1];
     }
     dkb[e] = __float22half2_rn(make_float2(ax, ay));
+    pkx += ax;
+    pky += ay;
+  }
+
+  // dk channel sums (sB is free; kernel ends after the combine)
+  if (dbp) {
+    __syncthreads();
+    sB[(tid >> 5) * D + 2 * (tid & 31)] = pkx;
+    sB[(tid >> 5) * D + 2 * (tid & 31) + 1] = pky;
+    __syncthreads();
+    if (tid < D2) {
+      float ax = 0.f, ay = 0.f;
+      for (int w = 0; w < THREADS / 32; w++) {
+        ax += sB[w * D + 2 * tid];
+        ay += sB[w * D + 2 * tid + 1];
+      }
+      float* o = dbp + b * (3 * D) + D;
+      o[2 * tid] = ax;
+      o[2 * tid + 1] = ay;
+    }
   }
 }
 
@@ -344,7 +428,8 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
                                  at::Tensor k, at::Tensor v, double alpha,
                                  c10::optional<at::Tensor> bq,
                                  c10::optional<at::Tensor> bk,
-                                 c10::optional<at::Tensor> bv) {
+                                 c10::optional<at::Tensor> bv,
+                                 bool want_db) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0);
   const int Tq = (int)q.size(1);
@@ -359,7 +444,14 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
   auto dq = at::empty_like(q);
   auto dk = at::empty_like(k);
   auto dv = at::empty_like(v);
-  if (B == 0) return {dq, dk, dv};
+  // partials stage in sB (T * SROW floats), which must hold the 4
+  // warps' D-float partial rows: T >= 4. Below that (never in
+  // production; T is 18) the caller falls back to torch sums.
+  const bool emit_db = want_db && T >= 4;
+  auto dbp = emit_db
+      ? at::empty({B, 3, D}, q.options().dtype(at::kFloat))
+      : at::empty({0}, q.options().dtype(at::kFloat));
+  if (B == 0) return {dq, dk, dv, dbp};
   const int A_rows = Tq > T ? Tq : T;
   const size_t smem = (size_t)(A_rows * SROW + T * SROW + 2 * Tq * T)
                       * sizeof(float);
@@ -374,9 +466,10 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
       reinterpret_cast<__half2*>(dq.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(dk.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(dv.data_ptr<at::Half>()),
+      emit_db ? dbp.data_ptr<float>() : nullptr,
       Tq, T, (float)alpha);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {dq, dk, dv};
+  return {dq, dk, dv, dbp};
 }
 
 }  // namespace
@@ -389,8 +482,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("alpha"), py::arg("bq") = py::none(),
         py::arg("bk") = py::none(), py::arg("bv") = py::none());
   m.def("attn_bwd", &attn_bwd,
-        "fused single-head attention backward -> (dq, dk, dv)",
+        "fused single-head attention backward -> (dq, dk, dv, dbp); "
+        "dbp = per-sample (3, D) channel sums of dq/dk/dv (bias grads "
+        "after a .sum(0)), empty when want_db is false",
         py::arg("dout"), py::arg("p"), py::arg("q"), py::arg("k"),
         py::arg("v"), py::arg("alpha"), py::arg("bq") = py::none(),
-        py::arg("bk") = py::none(), py::arg("bv") = py::none());
+        py::arg("bk") = py::none(), py::arg("bv") = py::none(),
+        py::arg("want_db") = true);
 }
