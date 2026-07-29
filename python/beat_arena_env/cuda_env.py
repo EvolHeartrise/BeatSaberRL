@@ -216,7 +216,7 @@ class CudaBeatVecEnv:
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, seed=0, effort_coef=1.0,
                  charts=None, chart_pool=1024, max_steps=None,
-                 pool=None,
+                 pool=None, wide_acc=False,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
         self.device = torch.device(device)
@@ -225,6 +225,10 @@ class CudaBeatVecEnv:
         self.dtype = dtype
         self.auto_reset = auto_reset  # False: terminal envs freeze (tests)
         self.effort_coef = float(effort_coef)
+        # wide-acc TRAINING reward (2026-07-29): 30*clamp(1 - d/0.6),
+        # unrounded — effectively doubles the acc component's range and
+        # reward vs the real round(15*(1 - d/0.3)). Bench/eval stay real.
+        self.wide_acc = bool(wide_acc)
         # pool=: prebuilt (P, C) tensor dict (ranked_pool.py) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is
         # the deterministic-sequential test mode, which a captured
@@ -344,7 +348,8 @@ class CudaBeatVecEnv:
 
     def reset(self):
         self._ext.step(self._tensors, self._zero_act, self._cand(), 1,
-                       self.max_steps, self.effort_coef, True)
+                       self.max_steps, self.effort_coef, self.wide_acc,
+                       True)
         self._episode += 1
         return self._obs
 
@@ -355,7 +360,8 @@ class CudaBeatVecEnv:
             self.num_envs, 2 * N_JOINTS).contiguous()
         cand = self._cand() if self.auto_reset else self._zero_cand
         self._ext.step(self._tensors, actions, cand, 0,
-                       self.max_steps, self.effort_coef, self.auto_reset)
+                       self.max_steps, self.effort_coef, self.wide_acc,
+                       self.auto_reset)
         if self.auto_reset:
             self._episode += 1
         return self._obs, self._reward, self._done, []

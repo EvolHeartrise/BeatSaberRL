@@ -224,6 +224,17 @@ def parse_args():
     p.add_argument("--effort-coef", type=float, default=1.0,
                    help="scales the tiered per-joint effort cost "
                         "(EFFORT_COST; 0 = free movement)")
+    # wide-acc training reward (2026-07-29, user-directed): acc_train =
+    # 30*clamp(1 - d/0.6), unrounded — effectively DOUBLING the acc
+    # component's range and reward vs the real round(15*(1 - d/0.3)),
+    # so centering has gradient where current cuts land (~0.3 m
+    # off-center; the 0.870-accuracy ceiling = pre+post maxed, acc 0).
+    # Training gym only: bench/eval/replays keep real scoring.
+    p.add_argument("--wide-acc", default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help="train with the wide accuracy reward "
+                        "(30*clamp(1 - d/0.6), unrounded); "
+                        "--no-wide-acc restores the real formula")
     p.add_argument("--ranked-maps", action="store_true",
                    help="train on SEGMENTS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
@@ -350,6 +361,7 @@ def main():
         venv = VecCls(N, pool=pool,
                       max_steps=int(args.seg_len * 30) + 90,
                       effort_coef=args.effort_coef,
+                      wide_acc=args.wide_acc,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -360,7 +372,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            effort_coef=args.effort_coef,
+            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -370,7 +382,8 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            effort_coef=args.effort_coef, seed=args.seed)
+            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
+            seed=args.seed)
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt)

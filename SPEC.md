@@ -181,6 +181,17 @@ checkpoints/replays retire (hard replace).
     `d_min` = closest approach of the swept surface to the object
     center (the real 0.3 m normalizer; a cut far from the center plane
     — including EARLY cuts through the deep box — floors at 0).
+    **Wide-acc TRAINING mode (2026-07-29, user-directed)**: with
+    `wide_acc=true` (a sim-construction flag, default false) the
+    component becomes `30 · clamp(1 − d_min / 0.6, 0, 1)`, UNROUNDED —
+    effectively doubling both the range and the reward of the acc
+    component, so the reward surface has slope where trained policies
+    actually cut (~0.3 m off-center; the 0.870-accuracy ceiling =
+    pre+post maxed, acc ≈ 0). Training-gym only: `train_batch.py`
+    defaults it ON (`--no-wide-acc` to opt out); the ScoreSaber bench,
+    eval_ckpt, replays, and every other consumer construct sims with
+    the real formula. Implemented identically in lib.rs and the CUDA
+    kernel (f64 parity-gated: `test_parity_exact_f64_wide_acc`).
   - **follow-through** `round(30 · min(post_arc / 60°, 1))` — tracker
     unchanged (break/reversal ends it, `FOLLOW_TIMEOUT = 15`);
     `free_post` (arc head) → flat 30 paid at the cut tick, no tracker.

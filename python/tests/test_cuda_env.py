@@ -35,9 +35,9 @@ def _max_steps(chart):
     return int((chart[-1].hit_time + 0.5) * 30) + 90
 
 
-def _rust_episode(chart, policy):
+def _rust_episode(chart, policy, wide_acc=False):
     """Run one Rust episode; returns (actions, obs_list, rewards, counters)."""
-    env = RustBeatEnv(external_chart=chart, seed=0)
+    env = RustBeatEnv(external_chart=chart, seed=0, wide_acc=wide_acc)
     obs, _ = env.reset()
     acts, obs_l, rews = [], [obs.copy()], []
     done = False
@@ -53,9 +53,10 @@ def _rust_episode(chart, policy):
                                info["score_acc"], info["score_post"])
 
 
-def _cuda_episode(chart, actions, dtype):
+def _cuda_episode(chart, actions, dtype, wide_acc=False):
     env = CudaBeatVecEnv(1, charts=[chart], max_steps=_max_steps(chart),
-                         device="cuda", dtype=dtype, auto_reset=False)
+                         device="cuda", dtype=dtype, auto_reset=False,
+                         wide_acc=wide_acc)
     obs_l = [env.reset()[0].cpu().numpy().copy()]
     rews, done_at = [], None
     for i, a in enumerate(actions):
@@ -101,6 +102,23 @@ def test_parity_exact_f64(cfg_kw, pol, seed):
     for k, (to, ro) in enumerate(zip(t_obs[:-1], r_obs[:-1])):
         np.testing.assert_allclose(to, ro, atol=1e-6,
                                    err_msg=f"obs diverge at tick {k}")
+
+
+def test_parity_exact_f64_wide_acc():
+    """The TRAINING-ONLY wide-acc reward (30*(1 - d/0.6), unrounded —
+    2026-07-29) must agree exactly between the two implementations, same
+    as the real formula."""
+    chart = _chart(FULL, 17)
+    acts, r_obs, r_rews, r_cnt = _rust_episode(chart, _scripted_policy(),
+                                               wide_acc=True)
+    t_obs, t_rews, done_at, t_cnt = _cuda_episode(chart, acts, torch.float64,
+                                                  wide_acc=True)
+    assert done_at == len(acts) - 1, "episode length differs"
+    assert t_cnt[:4] == r_cnt[:4], f"counters differ: cuda {t_cnt} rust {r_cnt}"
+    for k in (4, 5, 6, 7):
+        assert t_cnt[k] == pytest.approx(r_cnt[k], abs=1e-6)
+    np.testing.assert_allclose(t_rews, r_rews, atol=1e-9)
+    assert r_cnt[6] > 0, "scripted episode paid no accuracy at all"
 
 
 @pytest.mark.parametrize("cfg_kw,seed", [(EASY, 21), (FULL, 22), (DENSE, 23)])
