@@ -216,6 +216,7 @@ class CudaBeatVecEnv:
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, seed=0, effort_coef=1.0,
                  charts=None, chart_pool=1024, max_steps=None,
+                 pool=None,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
         self.device = torch.device(device)
@@ -224,8 +225,14 @@ class CudaBeatVecEnv:
         self.dtype = dtype
         self.auto_reset = auto_reset  # False: terminal envs freeze (tests)
         self.effort_coef = float(effort_coef)
-        self._test_charts = charts is not None
-        if charts is None:
+        # pool=: prebuilt (P, C) tensor dict (ranked_pool.py) — unlike
+        # charts=, resets keep the normal RANDOM chart draw (charts= is
+        # the deterministic-sequential test mode, which a captured
+        # rollout graph would freeze into constant assignments)
+        self._test_charts = charts is not None and pool is None
+        if pool is not None:
+            self.pool = {k: v.to(self.device) for k, v in pool.items()}
+        elif charts is None:
             cfg = ChartConfig(
                 chart_len_s=chart_len_s, colors=colors,
                 cols=tuple(cols), rows=tuple(rows),
