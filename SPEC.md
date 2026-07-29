@@ -177,21 +177,34 @@ checkpoints/replays retire (hard replace).
   component `floor(x + 0.5)`-rounded:
   - **pre-swing** `round(70 · min(swing_acc / 100°, 1))`; `free_pre`
     (arc tail) → flat 70.
-  - **accuracy** `round(15 · (1 − clamp(d_min / 0.3, 0, 1)))` where
-    `d_min` = closest approach of the swept surface to the object
-    center (the real 0.3 m normalizer; a cut far from the center plane
-    — including EARLY cuts through the deep box — floors at 0).
+  - **accuracy** `round(15 · (1 − clamp(d / 0.3, 0, 1)))` where `d` =
+    distance from the object center to the **infinite cutting plane**
+    — the plane through the blade spanned by the blade direction and
+    the tip's tick movement (`|n̂·(center − wrist)|`,
+    `n̂ = blade × tip_move` normalized), the real game's
+    `cutDistanceToCenter` (replays record `cutPoint` + `cutNormal`:
+    the plane is the primitive). Timing-independent: an EARLY cut
+    through the deep box still scores full accuracy if the swing
+    plane is laterally centered. Degenerate stab (tip motion
+    ~parallel to the blade, `‖n‖ ≤ 1e-9`): distance to the blade LINE
+    instead. **Corrected 2026-07-29 (user-caught, v7.4-class)**:
+    v7.0–v7.10 measured the closest approach of the one-tick swept
+    surface, which conflated depth/timing with lateral error and
+    floored early cuts at ~0 — the source of the 0.870 (= 100/115)
+    accuracy ceiling. Bench results carry `scoring_version` (2 since
+    this fix); versions never merge.
     **Wide-acc TRAINING mode (2026-07-29, user-directed)**: with
     `wide_acc=true` (a sim-construction flag, default false) the
-    component becomes `30 · clamp(1 − d_min / 0.6, 0, 1)`, UNROUNDED —
-    effectively doubling both the range and the reward of the acc
-    component, so the reward surface has slope where trained policies
-    actually cut (~0.3 m off-center; the 0.870-accuracy ceiling =
-    pre+post maxed, acc ≈ 0). Training-gym only: `train_batch.py`
-    defaults it ON (`--no-wide-acc` to opt out); the ScoreSaber bench,
-    eval_ckpt, replays, and every other consumer construct sims with
-    the real formula. Implemented identically in lib.rs and the CUDA
-    kernel (f64 parity-gated: `test_parity_exact_f64_wide_acc`).
+    component becomes `30 · clamp(1 − d / 0.6, 0, 1)`, UNROUNDED —
+    double the range and reward (applies to the same cut-plane `d`).
+    Training-gym only; `train_batch.py` default OFF since the
+    cut-plane fix (a 400M head-to-head lost to real scoring on every
+    bench metric, but wide is the best takeoff accelerator measured —
+    +46% upp at 50M, crossover ~200M; opt in for short legs). The
+    ScoreSaber bench, eval_ckpt, replays, and every other consumer
+    construct sims with the real formula. Implemented identically in
+    lib.rs and the CUDA kernel (f64 parity-gated:
+    `test_parity_exact_f64_wide_acc`).
   - **follow-through** `round(30 · min(post_arc / 60°, 1))` — tracker
     unchanged (break/reversal ends it, `FOLLOW_TIMEOUT = 15`);
     `free_post` (arc head) → flat 30 paid at the cut tick, no tracker.

@@ -112,6 +112,16 @@ def main():
         if b["checkpoint_name"] != "final.pt":
             sys.exit(f"REFUSED: bench.json is for {b['checkpoint_name']}, "
                      "not final.pt (sweep scores FINAL only)")
+        # s2 is an OLD-RULES dataset: every observation was scored under
+        # swept-surface accuracy (scoring v1). The 2026-07-29 cut-plane
+        # fix changed both the bench scale AND the training reward, so
+        # post-fix runs are a different objective with incomparable
+        # scores — they need a fresh sweep namespace (s3), not s2.
+        if b.get("scoring_version", 1) != 1:
+            sys.exit(f"REFUSED: {OBS} is a scoring-v1 (pre-cut-plane) "
+                     f"dataset but this bench is scoring-v"
+                     f"{b['scoring_version']}. s2 is frozen; start a new "
+                     f"sweep namespace for cut-plane-rule observations.")
         score = b["total_unweighted_pp"]
 
     cost = args.cost

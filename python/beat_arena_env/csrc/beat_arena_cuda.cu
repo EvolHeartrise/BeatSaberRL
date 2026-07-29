@@ -626,8 +626,28 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
           vc[k] = (sh_w[m][k] + s_star * sh_d[m][k] - sh_pw[m][k]
                    - s_star * sh_pd[m][k]) / T(DT);
         const T vc_mag = sqrt(vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]);
-        const T d_min = sweep_dist(sh_pw[m], sh_t0[m], sh_t1[m], sh_w[m],
-                                   center);
+        // accuracy distance (2026-07-29, user-caught v7.4-class fix):
+        // point-to-INFINITE-CUT-PLANE (blade direction x tip movement),
+        // as the real game computes cutDistanceToCenter — NOT the
+        // one-tick swept surface, which conflated depth/timing with
+        // lateral error and floored early cuts through the deep box at
+        // ~0. Mirrors lib.rs; degenerate stab (tip motion ~parallel to
+        // the blade) falls back to distance-to-blade-line.
+        T tip_move[3], cw[3], pn[3];
+        for (int k = 0; k < 3; k++) {
+          tip_move[k] = sh_w[m][k] + T(SABER_LEN) * sh_d[m][k]
+                        - sh_pw[m][k] - T(SABER_LEN) * sh_pd[m][k];
+          cw[k] = center[k] - sh_w[m][k];
+        }
+        cross3(sh_d[m], tip_move, pn);
+        const T pn_mag = sqrt(dot3(pn, pn));
+        T d_min;
+        if (pn_mag > T(1e-9)) {
+          d_min = fabs(dot3(cw, pn) / pn_mag);
+        } else {
+          const T along = dot3(cw, sh_d[m]);
+          d_min = sqrt(tmax(dot3(cw, cw) - along * along, T(0)));
+        }
         int code;
         if (vc_mag < T(V_MIN_CUT)) {
           code = 1;  // slow

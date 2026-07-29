@@ -61,6 +61,12 @@ from beat_arena_rs import VecBeatSim
 from cuda_graphs import _Graphed
 from policy import load_policy
 
+# Scoring-rule version stamped into every results file. 1 = swept-surface
+# accuracy distance (v7.0-2026-07-29); 2 = the real game's infinite-
+# cut-plane accuracy (user-caught fix, 2026-07-29). Results never merge
+# across versions.
+SCORING_VERSION = 2
+
 
 class _GraphedArgmax(_Graphed):
     """Bench forward — policy logits + stacked argmax over the fixed
@@ -512,6 +518,23 @@ def main():
               f"{fwd_path!r})", flush=True)
     else:
         data["forward"] = fwd_path
+    # Scoring-rule provenance (2026-07-29): the cut-plane accuracy fix
+    # changed every level's score, so old-rule (swept-surface acc, v1)
+    # results must NOT merge with new-rule (infinite-cut-plane, v2) ones.
+    # Files that predate the stamp but hold results are v1 by definition.
+    prev_rules = data.get("scoring_version")
+    if prev_rules is None and any("skipped" not in e
+                                  for e in levels.values()):
+        prev_rules = 1
+    if (prev_rules is not None and prev_rules != SCORING_VERSION
+            and not full_force):
+        sys.exit(f"error: {out_path} holds scoring-version {prev_rules} "
+                 f"results but the sim now scores version "
+                 f"{SCORING_VERSION} (2026-07-29 cut-plane accuracy fix) "
+                 f"— results cannot merge across scoring rules. Use a "
+                 f"fresh --out, or full-range --force to re-evaluate "
+                 f"everything under the current rules.")
+    data["scoring_version"] = SCORING_VERSION
     # (persistent pinned obs/act buffers live in each _Group: step_into
     # writes obs rows in place, the async D2H lands in pinned act memory,
     # and the group's event is the sync that makes both safe to touch)
