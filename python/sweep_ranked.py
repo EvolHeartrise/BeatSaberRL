@@ -25,7 +25,18 @@ artifact. Logged observations replay fine into the wider box. NOTE: with no hold
 distribution — cross-check any winner on procedural charts / old
 gens before claiming generalization.
 
-  python sweep_ranked.py --max-runs 100 [--dir sweeps/s2_ranked_upp]
+**s3 (2026-07-29): fresh sweep under the CUT-PLANE accuracy rules**
+(scoring v2 — the user-caught fix that unlocked the acc component;
+sessions/2026-07-29-cut-plane-accuracy-fix.md). The fix changed both
+the bench scale and the training reward, so s2's observations are a
+different objective: sweeps/s2_ranked_upp is FROZEN (103 v1-scored
+observations, never extend), the default --dir now points at
+sweeps/s3_cutplane_upp, and this driver refuses the s2 dir outright.
+Space/bounds/protocol unchanged from s2 — its widened box is the
+prior; the GP restarts from Sobol on the new objective. First sweep
+where policies train with reachable accuracy gradient.
+
+  python sweep_ranked.py --max-runs 100 [--dir sweeps/s3_cutplane_upp]
 """
 
 from __future__ import annotations
@@ -107,8 +118,13 @@ def run_leg(idx, h, run_dir):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--max-runs", type=int, default=100)
-    p.add_argument("--dir", type=str, default="sweeps/s2_ranked_upp")
+    p.add_argument("--dir", type=str, default="sweeps/s3_cutplane_upp")
     args = p.parse_args()
+    if os.path.normpath(args.dir).replace("\\", "/").endswith(
+            "sweeps/s2_ranked_upp"):
+        sys.exit("sweeps/s2_ranked_upp is FROZEN: scoring-v1 observations "
+                 "(pre-cut-plane-fix objective) must not mix with v2 legs. "
+                 "Use the s3 default or a fresh dir.")
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "observations.jsonl")
 
