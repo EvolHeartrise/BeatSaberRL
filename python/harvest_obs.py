@@ -36,6 +36,11 @@ OBS = os.path.join("sweeps", "s2_ranked_upp", "observations.jsonl")
 REF = os.path.join("sweeps", "s2_ranked_upp", "run_085", "args.json")
 SWEPT = list(SPACE["train"].keys())          # the 7 GP dimensions
 IGNORE = SWEPT + ["run_dir", "ckpt_every"]   # allowed to differ
+# trainer args added AFTER the reference leg: a run still matches the
+# protocol iff the new key holds the value that reproduces the
+# reference-era behavior (e.g. wide_acc=True is a DIFFERENT objective —
+# refused; wide_acc=False is the old scoring — accepted)
+NEW_KEY_DEFAULTS = {"wide_acc": False}
 
 
 def close(a, b):
@@ -63,8 +68,9 @@ def main():
     for k in sorted(set(run) | set(ref)):
         if k in IGNORE:
             continue
-        if run.get(k) != ref.get(k):
-            bad.append(f"  {k}: run={run.get(k)!r} protocol={ref.get(k)!r}")
+        ref_v = ref[k] if k in ref else NEW_KEY_DEFAULTS.get(k)
+        if run.get(k) != ref_v:
+            bad.append(f"  {k}: run={run.get(k)!r} protocol={ref_v!r}")
     if bad:
         sys.exit("REFUSED: run deviates from the sweep protocol on non-"
                  "swept keys:\n" + "\n".join(bad))

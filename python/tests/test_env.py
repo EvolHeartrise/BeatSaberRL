@@ -424,6 +424,51 @@ def test_arm_swing_cuts_and_accuracy_decreases_off_center():
     assert aligned[0][2] > offset[0][2] > 0.0
 
 
+def test_wide_acc_training_reward():
+    """wide_acc=True (TRAINING-ONLY, 2026-07-29): acc = 30·(1 − d/0.6),
+    unrounded — effectively double the real component's range and reward.
+    Scoring never feeds back into physics, so the same pendulum in a real
+    and a wide sim shares one trajectory and one cut distance d; the wide
+    event therefore reconstructs d exactly, and the real event must be a
+    rounding of 15·(1 − d/0.3) floored at 0. The sweep must also produce
+    at least one DEAD-ZONE cut (0.3 < d < 0.6): real pays 0, wide still
+    has slope — the reason the mode exists."""
+    from beat_arena_env.chart import note_tuple
+
+    def pendulum(yaw, wide):
+        sim = RawBeatSim(max_steps=690, wide_acc=wide)
+        sim.set_chart([note_tuple(_note(0.24, 2, 2))])
+        _park(sim, 0)
+        sim.set_joints(1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0],
+                       [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        for _ in range(6):
+            ev, _ = _coast(sim)
+            if ev:
+                return ev[0]
+        return None
+
+    hits = dead_zone = 0
+    for yaw in (0.0485, -0.05, -0.10, -0.16, -0.22, -0.28, -0.34, -0.40):
+        real, wide = pendulum(yaw, False), pendulum(yaw, True)
+        if real is None or real[1] != 0:
+            # scoring can't change the cut verdict either
+            assert (wide is None) == (real is None)
+            if wide is not None:
+                assert wide[1] == real[1]
+            continue
+        hits += 1
+        acc_r, acc_w = real[4], wide[4]
+        assert wide[1] == 0 and wide[3] == real[3]  # verdict + pre agree
+        d = 0.6 * (1.0 - acc_w / 30.0)     # invert the wide formula
+        unrounded = 15.0 * max(0.0, 1.0 - d / 0.3)
+        assert abs(acc_r - unrounded) <= 0.5 + 1e-3  # valid rounding of real
+        assert acc_w >= acc_r - 1e-4
+        if acc_r == 0.0 and acc_w > 0.0:
+            dead_zone += 1
+    assert hits >= 3, f"pendulum sweep only landed {hits} good cuts"
+    assert dead_zone >= 1, "no dead-zone cut (0.3 < d < 0.6) sampled"
+
+
 def _pitch_pendulum_events(kind=0, ticks=20):
     """A full-arm swing: right arm straight, pitch falling from the
     +65 deg v7.2 cap at full omega WITH the bend joint sweeping down

@@ -372,6 +372,7 @@ struct Sim {
   bool* done;
   int C, max_steps, cap, mode;  // mode: 0 = step, 1 = reset-all
   T effort_coef;
+  bool wide_acc;  // TRAINING-ONLY wide accuracy reward (see cut scoring)
   bool auto_reset;
 };
 
@@ -652,8 +653,22 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
                 ? T(PTS_PRE)
                 : round_pts(T(PTS_PRE)
                             * tmin(sh_swing[m] / T(PRE_FULL), T(1)));
-            const T acc = round_pts(
-                T(PTS_ACC) * (T(1) - tclamp(d_min / T(ACC_NORM), T(0), T(1))));
+            // wide_acc (2026-07-29, user-directed, TRAINING ONLY):
+            // effectively DOUBLES the acc component's range and reward —
+            // 30*(1-d/0.6), unrounded, vs the real round(15*(1-d/0.3)) —
+            // so the reward surface has slope where current cuts land
+            // (~0.3 m off-center). Mirrors lib.rs; bench/eval/replay
+            // paths stay on the real formula (wide_acc=false).
+            const T acc =
+                P.wide_acc
+                    ? T(2) * T(PTS_ACC)
+                          * (T(1)
+                             - tclamp(d_min / (T(2) * T(ACC_NORM)), T(0),
+                                      T(1)))
+                    : round_pts(T(PTS_ACC)
+                                * (T(1)
+                                   - tclamp(d_min / T(ACC_NORM), T(0),
+                                            T(1))));
             pts = pre + acc;
             atomicAdd(&sh_pre, pre);
             atomicAdd(&sh_acc, acc);
@@ -893,7 +908,7 @@ enum {
 
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
-          bool auto_reset) {
+          bool wide_acc, bool auto_reset) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -963,6 +978,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.cap = (int)cap;
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
+    P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
     const size_t shmem = (size_t)C * sizeof(scalar_t);
     step_kernel<scalar_t><<<(unsigned)N, THREADS, shmem,

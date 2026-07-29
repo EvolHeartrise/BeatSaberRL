@@ -31,7 +31,7 @@ class RustBeatEnv(gym.Env):
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=1.0, external_chart=None,
-                 seed=0):
+                 wide_acc=False, seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
         self.cfg = ChartConfig(
@@ -53,8 +53,13 @@ class RustBeatEnv(gym.Env):
             max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 90
         else:
             max_steps = int(chart_len_s * 30) + 90
-        self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef)
+        # wide_acc: TRAINING-ONLY wide accuracy reward (30*clamp(1-d/0.6),
+        # unrounded — double the real range and reward); default False so
+        # bench/eval/replay paths keep real scoring
+        self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef,
+                              wide_acc=wide_acc)
         self.effort_coef = effort_coef
+        self.wide_acc = wide_acc
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )

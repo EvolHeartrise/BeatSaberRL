@@ -482,6 +482,7 @@ type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
 struct Core {
     max_steps: u32,
     effort_coef: f64, // scales EFFORT_COST (0 = free movement)
+    wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
     tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
     min_speed: f64, // slowest object; (hit_time-t)*min_speed > REACH_Z is a
@@ -512,10 +513,11 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32, effort_coef: f64) -> Self {
+    fn new_core(max_steps: u32, effort_coef: f64, wide_acc: bool) -> Self {
         Core {
             max_steps,
             effort_coef,
+            wide_acc,
             chart: Vec::new(),
             tail_s: 0.5,
             min_speed: f64::INFINITY,
@@ -924,8 +926,20 @@ impl Core {
                         } else {
                             round_pts(PTS_PRE * (self.arms[m].swing_acc / PRE_FULL).min(1.0))
                         };
-                        let acc =
-                            round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)));
+                        // wide_acc (2026-07-29, user-directed, TRAINING
+                        // ONLY): effectively DOUBLES the acc component's
+                        // range and reward — 30·(1−d/0.6), unrounded, vs
+                        // the real round(15·(1−d/0.3)) — so the reward
+                        // surface has slope out where current cuts land
+                        // (~0.3 m off-center) and exploration toward the
+                        // note center pays. Bench, eval, and replay paths
+                        // construct sims with wide_acc=false (real rules).
+                        let acc = if self.wide_acc {
+                            2.0 * PTS_ACC
+                                * (1.0 - (d_min / (2.0 * ACC_NORM)).clamp(0.0, 1.0))
+                        } else {
+                            round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)))
+                        };
                         let mut p = pre + acc;
                         if n.kind == KIND_CHAIN_HEAD {
                             // chain heads have no follow-through (max 85)
@@ -1016,10 +1030,10 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (max_steps=690, effort_coef=1.0))]
-    fn new(max_steps: u32, effort_coef: f64) -> Self {
+    #[pyo3(signature = (max_steps=690, effort_coef=1.0, wide_acc=false))]
+    fn new(max_steps: u32, effort_coef: f64, wide_acc: bool) -> Self {
         RawBeatSim {
-            core: Core::new_core(max_steps, effort_coef),
+            core: Core::new_core(max_steps, effort_coef, wide_acc),
         }
     }
 
@@ -1237,11 +1251,13 @@ struct VecBeatSim {
 impl VecBeatSim {
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false,
-                        return_events=true))]
+                        return_events=true, wide_acc=false))]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
-           return_events: bool) -> Self {
+           return_events: bool, wide_acc: bool) -> Self {
         VecBeatSim {
-            sims: (0..n).map(|_| Core::new_core(max_steps, effort_coef)).collect(),
+            sims: (0..n)
+                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc))
+                .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             // return_events=false skips materializing the per-step event
             // list into Python objects (~2 events per scoreable object);
