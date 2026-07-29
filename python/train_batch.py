@@ -226,15 +226,17 @@ def parse_args():
                         "(EFFORT_COST; 0 = free movement)")
     # wide-acc training reward (2026-07-29, user-directed): acc_train =
     # 30*clamp(1 - d/0.6), unrounded — effectively DOUBLING the acc
-    # component's range and reward vs the real round(15*(1 - d/0.3)),
-    # so centering has gradient where current cuts land (~0.3 m
-    # off-center; the 0.870-accuracy ceiling = pre+post maxed, acc 0).
-    # Training gym only: bench/eval/replays keep real scoring.
-    p.add_argument("--wide-acc", default=True,
+    # component's range and reward vs the real round(15*(1 - d/0.3)).
+    # Head-to-head at 400M it LOST to real scoring on every bench metric
+    # but was the best takeoff accelerator measured (+46% upp at 50M,
+    # crossover ~200M) — default OFF since the cut-plane accuracy fix
+    # (same day: the real formula now has reachable lateral gradient);
+    # opt in for short-budget legs. Training gym only either way.
+    p.add_argument("--wide-acc", default=False,
                    action=argparse.BooleanOptionalAction,
                    help="train with the wide accuracy reward "
-                        "(30*clamp(1 - d/0.6), unrounded); "
-                        "--no-wide-acc restores the real formula")
+                        "(30*clamp(1 - d/0.6), unrounded; best for short "
+                        "50-150M legs, loses at 400M)")
     p.add_argument("--ranked-maps", action="store_true",
                    help="train on SEGMENTS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "

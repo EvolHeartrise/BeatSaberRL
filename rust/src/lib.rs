@@ -896,9 +896,41 @@ impl Core {
                         - prev_pos[m][2] - s_star * prev_dir[m][2]) / DT,
                 ];
                 let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
-                // accuracy: closest approach of the swept surface to the
-                // note center, normalized by the real 0.3 m
-                let d_min = sweep_dist(&tris[m], center);
+                // accuracy distance (2026-07-29, user-caught v7.4-class
+                // research fix): the real game's cutDistanceToCenter is
+                // the distance from the note center to the INFINITE
+                // cutting plane — the plane through the blade spanned by
+                // the blade direction and the tip's movement (replays
+                // record cutPoint + cutNormal: the plane IS the
+                // primitive). v7.0-v7.10 measured the closest approach of
+                // the one-tick swept surface instead, which conflated
+                // depth/timing with lateral error: early cuts through the
+                // 0.75 m-deep good box floored acc at ~0 (the 0.870 =
+                // 100/115 accuracy ceiling; even the deliberate-aim
+                // scripted bot scored 0.1/15). Timing-independent by
+                // design. Degenerate stab (tip motion ~parallel to the
+                // blade): distance to the blade LINE instead.
+                let tip_move = [
+                    arm.wrist[0] + SABER_LEN * arm.blade[0]
+                        - prev_pos[m][0] - SABER_LEN * prev_dir[m][0],
+                    arm.wrist[1] + SABER_LEN * arm.blade[1]
+                        - prev_pos[m][1] - SABER_LEN * prev_dir[m][1],
+                    arm.wrist[2] + SABER_LEN * arm.blade[2]
+                        - prev_pos[m][2] - SABER_LEN * prev_dir[m][2],
+                ];
+                let cw = [
+                    center[0] - arm.wrist[0],
+                    center[1] - arm.wrist[1],
+                    center[2] - arm.wrist[2],
+                ];
+                let pn = cross3(arm.blade, tip_move);
+                let pn_mag = dot3(pn, pn).sqrt();
+                let d_min = if pn_mag > 1e-9 {
+                    (dot3(cw, pn) / pn_mag).abs()
+                } else {
+                    let along = dot3(cw, arm.blade);
+                    (dot3(cw, cw) - along * along).max(0.0).sqrt()
+                };
                 let code: u8 = if vc_mag < V_MIN_CUT {
                     1 // slow
                 } else if n.any_dir {

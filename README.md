@@ -62,11 +62,14 @@ doubles the note stream; per-tick probabilities `--note-prob 0.25
 --extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
 the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. Since env
 v7.9 non-coast joint actions pay a tiny tiered effort cost
-(`--effort-coef` scales it; 0 = off). Since 2026-07-29 training uses
-the **wide-acc reward** by default — `30·clamp(1 − d/0.6)`, unrounded,
-effectively doubling the acc component's range and reward so centering
-has gradient where cuts actually land (`--no-wide-acc` restores real
-scoring; bench/eval/replays always score real).
+(`--effort-coef` scales it; 0 = off). **Accuracy is judged against the
+infinite cutting plane since 2026-07-29** (user-caught v7.4-class fix:
+the swept-surface distance used before conflated timing with lateral
+error and capped accuracy at 0.870 = 100/115; bench results stamp
+`scoring_version: 2` and never merge across rules — pre-fix numbers are
+not comparable). `--wide-acc` (30·clamp(1 − d/0.6), unrounded, training
+only) is opt-in: it loses at 400M but is the strongest takeoff
+accelerator measured for short legs.
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
 

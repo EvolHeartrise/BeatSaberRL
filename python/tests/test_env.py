@@ -469,6 +469,38 @@ def test_wide_acc_training_reward():
     assert dead_zone >= 1, "no dead-zone cut (0.3 < d < 0.6) sampled"
 
 
+def test_accuracy_is_timing_independent():
+    """The cut-plane rule (2026-07-29): accuracy measures the offset of
+    the INFINITE swing plane from the note center, so where along the
+    approach the cut lands (note speed => first-contact depth) must not
+    change the score. Same aligned shoulder pendulum, three approach
+    speeds: all cuts score the same accuracy to within integer rounding.
+    Under the old swept-surface rule the faster note's earlier/deeper
+    first contact changed the measured distance by tens of centimeters
+    (near-zero acc for every early cut). Residual 1-2 pt spread is
+    physical: different speeds cut on different TICKS, and the rotating
+    arm's plane orientation shifts slightly between ticks — the real
+    game samples the plane at the cut moment too."""
+    def pendulum_acc(speed):
+        sim = _sim_with_note(_note(0.24, 2, 2, speed=speed))
+        _park(sim, 0)
+        sim.set_joints(1, [0.35, 0.0485, 0.0, 0.0, 0.0, 0.0],
+                       [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        for _ in range(12):
+            ev, _ = _coast(sim)
+            if ev:
+                assert ev[0][1] == 0, f"speed {speed}: cut code {ev[0][1]}"
+                return ev[0][4]
+        raise AssertionError(f"no cut at speed {speed}")
+
+    accs = [pendulum_acc(s) for s in (3.0, 4.0, 6.0)]
+    assert max(accs) - min(accs) <= 2.0, f"acc varies with speed: {accs}"
+    # early cuts through the deep box now score near-full accuracy when
+    # the swing plane is centered — THE point of the rule fix (old rule:
+    # ~0 for all of these)
+    assert min(accs) >= 12.0, f"aligned early cuts should score high: {accs}"
+
+
 def _pitch_pendulum_events(kind=0, ticks=20):
     """A full-arm swing: right arm straight, pitch falling from the
     +65 deg v7.2 cap at full omega WITH the bend joint sweeping down
