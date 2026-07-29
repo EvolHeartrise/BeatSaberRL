@@ -39,6 +39,10 @@ def main():
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--sort", choices=["pp", "accuracy"], default="pp",
                    help="rank plays by pp (default) or by accuracy")
+    p.add_argument("--bottom", action="store_true",
+                   help="take the WORST N by the sort key instead of "
+                        "the best (2026-07-29: bottom-acc failure-mode "
+                        "review)")
     p.add_argument("--device", type=str, default=None,
                    help="forward device (default: cuda if available). "
                         "Matching the bench's device maximizes exact "
@@ -49,8 +53,10 @@ def main():
     args = p.parse_args()
 
     bench = json.load(open(args.bench, encoding="utf-8"))
+    sgn = 1.0 if args.bottom else -1.0
     top = sorted((e for e in bench["levels"] if "skipped" not in e),
-                 key=lambda e: -e[args.sort])[:args.top]
+                 key=lambda e: sgn * e[args.sort])[:args.top]
+    label = "bot" if args.bottom else "top"
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     dev = torch.device(args.device
                        or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -60,7 +66,7 @@ def main():
         map_dir = f"maps/scoresaber/{entry['song_hash']}"
         notes, _ = load_beatmap(map_dir, entry["difficulty"],
                                 speed_scale=0.3, first_note_s=2.0)
-        base = (f"replays/{args.tag}_top{rank:02d}_"
+        base = (f"replays/{args.tag}_{label}{rank:02d}_"
                 f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
         env = RustBeatEnv(external_chart=notes, seed=0)
         env.set_record(base + ".jsonl")
