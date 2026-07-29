@@ -224,6 +224,16 @@ def parse_args():
     p.add_argument("--effort-coef", type=float, default=1.0,
                    help="scales the tiered per-joint effort cost "
                         "(EFFORT_COST; 0 = free movement)")
+    p.add_argument("--ranked-maps", action="store_true",
+                   help="train on SEGMENTS of the real ranked ScoreSaber "
+                        "catalog (beat_arena_env/ranked_pool.py; bench "
+                        "parsing protocol, speed_scale 0.3) instead of "
+                        "the procedural generator. --chart-pool becomes "
+                        "the segment subsample size; generator dials "
+                        "(--note-prob/--bomb-prob/...) are ignored. "
+                        "Requires --env cuda. (sweep s2, 2026-07-29)")
+    p.add_argument("--seg-len", type=float, default=25.0,
+                   help="ranked-maps segment length in song seconds")
     return p.parse_args()
 
 
@@ -329,7 +339,19 @@ def main():
     print(f"argv: {' '.join(sys.argv[1:]) or '(bare)'}", flush=True)
     print(f"config: {args_snapshot}", flush=True)
 
-    if tensor_env:
+    if args.ranked_maps and not tensor_env:
+        raise SystemExit("--ranked-maps requires --env cuda")
+    if tensor_env and args.ranked_maps:
+        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
+        from beat_arena_env.ranked_pool import load_ranked_pool
+        pool = load_ranked_pool(seg_len=args.seg_len,
+                                sample=args.chart_pool, seed=args.seed,
+                                device=device)
+        venv = VecCls(N, pool=pool,
+                      max_steps=int(args.seg_len * 30) + 90,
+                      effort_coef=args.effort_coef,
+                      seed=args.seed, device=device)
+    elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
             N, cols=tuple(args.cols),
