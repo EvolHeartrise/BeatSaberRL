@@ -15,7 +15,12 @@ started as s1's widened box; widened AGAIN 2026-07-29 after legs
 010-019 (gamma floor 0.87 -> 0.80, gae_lambda ceiling 0.99 -> 0.995):
 the GP pinned gamma at the old floor with BOTH front-runners sitting
 on it (run 017 692k, run 019 738k) — the exact s1 run-018 pattern.
-Logged observations replay fine into the wider box. NOTE: with no holdout (user decision
+Widened a SECOND time 2026-07-29 (gamma floor 0.80 -> 0.72) after run
+045 set the sweep best (969k, 128M) EXACTLY on the 0.80 floor with
+048 (957k) beside it. gamma 0.72 at 30 Hz is a ~3-step credit
+half-life — approaching the physical limit where credit cannot span
+note approach time, so a floor THERE would be a finding, not a bounds
+artifact. Logged observations replay fine into the wider box. NOTE: with no holdout (user decision
 2026-07-29), the bench measures performance on the training
 distribution — cross-check any winner on procedural charts / old
 gens before claiming generalization.
@@ -52,7 +57,7 @@ SPACE = {
         "lr":          dict(distribution="log_normal", min=1e-4, max=8e-3, scale=0.5),
         "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.3, scale=0.5),
         "ent_final":   dict(distribution="log_normal", min=1e-5, max=0.1, scale=0.5),
-        "gamma":       dict(distribution="logit_normal", min=0.80, max=0.997, scale=0.5),
+        "gamma":       dict(distribution="logit_normal", min=0.72, max=0.997, scale=0.5),
         "gae_lambda":  dict(distribution="logit_normal", min=0.65, max=0.995, scale=0.5),
         "effort_coef": dict(distribution="log_normal", min=0.002, max=8.0, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
