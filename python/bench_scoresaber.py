@@ -118,10 +118,10 @@ class _Group:
     __slots__ = ("n", "sim", "fwd", "obs_t", "obs_buf", "act_t", "act_np",
                  "slots", "free", "n_active", "ev", "issued")
 
-    def __init__(self, n, fwd, device):
+    def __init__(self, n, fwd, device, gears=3):
         self.n = n
         self.sim = VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
-                              return_events=False)
+                              return_events=False, gears=gears)
         for i in range(n):
             self.sim.set_chart(i, [])
         self.fwd = fwd
@@ -487,7 +487,7 @@ def main():
         else:
             fwd_g = (None if args.no_graphs or device.type != "cuda"
                      else _GraphedArgmax(policy, n_g, device))
-        groups.append(_Group(n_g, fwd_g, device))
+        groups.append(_Group(n_g, fwd_g, device, policy.n_gears))
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): fused vs torch forwards differ
     # by ~4e-7 in the logits, enough to flip near-tie argmaxes — per-level

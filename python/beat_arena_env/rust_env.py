@@ -31,7 +31,7 @@ class RustBeatEnv(gym.Env):
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=1.0, external_chart=None,
-                 wide_acc=False, seed=0):
+                 wide_acc=False, gears=3, seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
         self.cfg = ChartConfig(
@@ -56,16 +56,19 @@ class RustBeatEnv(gym.Env):
         # wide_acc: TRAINING-ONLY wide accuracy reward (30*clamp(1-d/0.6),
         # unrounded — double the real range and reward); default False so
         # bench/eval/replay paths keep real scoring
+        assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef,
-                              wide_acc=wide_acc)
+                              wide_acc=wide_acc, gears=gears)
         self.effort_coef = effort_coef
         self.wide_acc = wide_acc
+        self.gears = gears
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )
-        # env v6: per hand 6 ternary joint heads (pitch, yaw, twist,
-        # elbow, roll, bend); left hand first
-        self.action_space = gym.spaces.MultiDiscrete([3] * 12)
+        # env v6: per hand 6 joint heads (pitch, yaw, twist, elbow, roll,
+        # bend), left hand first; env v8: K options per head (id 0 coast,
+        # 1/2 = +/-full, finer +/- gear pairs append — constants.gear_table)
+        self.action_space = gym.spaces.MultiDiscrete([gears] * 12)
 
     # -- recording (JSONL v6, same format the 3D viewer reads) ---------------
     def set_record(self, path: str):
@@ -85,6 +88,7 @@ class RustBeatEnv(gym.Env):
                 "dot_prob": self.cfg.dot_prob,
                 "bomb_prob": self.cfg.bomb_prob,
                 "effort_coef": self.effort_coef,
+                "gears": self.gears,       # env v8 action-table size
             },
             # env v7: explicit world positions (meters), object kinds and
             # arc grants; the viewer derives everything from these

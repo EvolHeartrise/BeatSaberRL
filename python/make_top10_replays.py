@@ -71,7 +71,8 @@ def main():
                                 first_note_s=2.0)
         base = (f"replays/{args.tag}_{label}{rank:02d}_"
                 f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
-        env = RustBeatEnv(external_chart=notes, seed=0)
+        env = RustBeatEnv(external_chart=notes, seed=0,
+                          gears=policy.n_gears)
         env.set_record(base + ".jsonl")
         obs, _ = env.reset()
         walk = scoresaber.ComboTracker()

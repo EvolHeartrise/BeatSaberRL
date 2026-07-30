@@ -22,6 +22,14 @@ max 85, links flat 20 on the real Bézier layout), and arcs as
 pre/post-swing grants. Per-tick discrete control at 30 Hz: 12 ternary
 joint heads (per hand: pitch, yaw, twist, elbow, roll, bend).
 
+Env v8 (2026-07-30, user-directed): joint α and ω caps DOUBLED (arm
+160 rad/s² / 16 rad/s, wrist 400 / 40 — effective in-game hand motion,
+not biomechanics: tracking prediction lets real players beat physics)
+with **gear-table actions** restoring fine control: `--gears 5` adds
+±¼-torque options per joint head, `--gears 7` adds ±⅓ and ±⅛; id
+0/1/2 stay coast/±full at every K. Effort scales by |fraction|.
+Pre-v8 checkpoints and references are a different body.
+
 ## Quick start
 
 Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.

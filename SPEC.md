@@ -100,15 +100,22 @@ checkpoints/replays retire (hard replace).
     (local +z = upper arm); elbow `E = S + L_UPPER·M·e_z`; forearm dir
     `f = M·(0, sin e, cos e)`; wrist `W = E + L_FORE·f`; wrist frame
     `M_f = M·R_x(−elbow)`.
-- **Tiered anatomical dynamics** (user-picked): shoulder + elbow
-  `α = 80` rad/s², `|ω| ≤ 8` rad/s; wrist roll + bend keep v5's
-  `α = 200`, `|ω| ≤ 20`. Per joint per tick: `ω += ±α·DT`,
+- **Tiered dynamics** (env v8, 2026-07-30, user-directed — the v6
+  anatomical values DOUBLED on both axes): shoulder + elbow `α = 160`
+  rad/s², `|ω| ≤ 16` rad/s; wrist roll + bend `α = 400`, `|ω| ≤ 40`
+  (was 80/8 and 200/20 — calibrated to EFFECTIVE in-game hand motion:
+  real players beat biomechanics via controller-tracking prediction).
+  Per joint per tick: `ω += frac·α·DT` (frac from the gear table),
   `ω *= (1 − DRAG)` (`DRAG = 0.02`), clamp, `q += ω·DT`, limit-clamp
   (zeroing ω). Start pose: all zeros, at rest.
-- **Action** per tick, per hand: 6 ternary joint heads (0 = coast,
-  1 = `+α`, 2 = `−α`). Full action = `MultiDiscrete([3]×12)`, left hand
-  first, joint order as above. No action masks. The 9-way translation
-  head is GONE — all motion is joint-driven.
+- **Action** per tick, per hand: 6 joint heads with K = `gears` options
+  each (env v8; `MultiDiscrete([K]×12)`, left hand first, joint order as
+  above, no masks). Gear table (`constants.gear_table`): id 0 = coast,
+  1/2 = `±α` at EVERY K (the ternary era is the K=3 prefix — old action
+  streams and the scripted bot stay valid); finer ± pairs append:
+  K=5 adds `±α/4`, K=7 adds `±α/3` and `±α/8`. Effort cost scales by
+  |fraction|. Checkpoints stamp `n_gears` in `arch`; env and policy
+  tables must match (trainer enforces).
 - **Objects** (env v7): chart = list of `(hit_time, x, y, color, angle,
   speed, any_dir, kind, free_pre, free_post)` sorted by `hit_time`;
   positions in meters; **`z(t) = (hit_time − t) · speed`**. `kind`:

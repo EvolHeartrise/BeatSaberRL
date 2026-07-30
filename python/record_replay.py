@@ -65,6 +65,7 @@ def main():
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         policy = load_policy(ckpt)
         policy.eval()
+        kw["gears"] = policy.n_gears       # env action table must match
         tag = os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))
         print(f"loaded {args.ckpt} (update {ckpt.get('update', '?')})")
     else:
