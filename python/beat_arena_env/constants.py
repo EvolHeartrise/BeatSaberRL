@@ -24,7 +24,8 @@ V_NORM = 6.0          # wrist-velocity obs normalizer (m/s)
 V_MIN_CUT = 1.0       # min contact-point speed for a good cut (m/s)
 ACC_NORM = 0.3        # accuracy normalizer (m) — real BS value (was 0.28)
 COS_TOL = 0.5
-BLOCK = 0.4           # visual block edge (m) — rendering only since v7
+BLOCK = 0.5           # visual block edge (m) — rendering only since v7;
+# 0.5 = the real game's cube (matched to the ScoreSaber viewer 2026-07-30)
 CELL_X = 0.6          # real lane pitch (m); columns at x = -0.9 .. 0.9
 ROW_Y = (0.85, 1.40, 1.90)   # real at-player row centers (m above floor)
 Y_CENTER = 1.40       # obs y normalization: (y - Y_CENTER) / Y_NORM

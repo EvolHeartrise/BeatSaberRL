@@ -1055,6 +1055,31 @@ def test_beatsaver_parser_v3_chains_arcs_bpm(tmp_path):
     assert t8 == pytest.approx(8 * 0.5)             # pre-change beats @120
 
 
+def test_beatsaver_parser_reversed_arc(tmp_path):
+    """A slider with tailBeat < beat attaches grants with the EARLIER end
+    as the head (game + ScoreSaber-viewer behavior): the early note gets
+    free_post (arc head), the late one free_pre (arc tail). Unswapped,
+    the derived ArcHead/ArcTail scoring types invert and the viewer's
+    note-event ID match fails for both ends."""
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    v3 = {"version": "3.3.0",
+          "colorNotes": [
+              {"b": 4, "x": 0, "y": 1, "c": 0, "d": 1},
+              {"b": 6, "x": 3, "y": 1, "c": 0, "d": 0},
+          ],
+          "sliders": [                    # written tail-first: tb 4 < b 6
+              {"b": 6, "x": 3, "y": 1, "c": 0, "d": 0, "mu": 1.0,
+               "tb": 4, "tx": 0, "ty": 1, "tc": 0, "tmu": 1.0, "m": 0}]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal")
+    early = min(notes, key=lambda n: n.hit_time)
+    late = max(notes, key=lambda n: n.hit_time)
+    assert early.free_post and not early.free_pre   # true arc head
+    assert late.free_pre and not late.free_post     # true arc tail
+
+
 def test_beatsaver_parser_v4(tmp_path):
     import json
     from beat_arena_env.beatsaver import load_beatmap

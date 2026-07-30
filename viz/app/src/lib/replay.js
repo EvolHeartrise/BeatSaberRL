@@ -15,7 +15,10 @@
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
 
-export const CELL = 0.6, BLOCK = 0.4, HALF = BLOCK / 2;
+// BLOCK 0.5: the real game's visual cube (verified against the
+// ScoreSaber viewer's note mesh, 2026-07-30 — 0.4 under-drew notes 20%
+// and exaggerated the hitbox-vs-visual overhang in the 'h' overlay)
+export const CELL = 0.6, BLOCK = 0.5, HALF = BLOCK / 2;
 export const LANE_X = [-0.9, -0.3, 0.3, 0.9];
 export const ROW_Y = [0.85, 1.4, 1.9];
 // grid frame: lane cell edges; row edges midway between the non-uniform

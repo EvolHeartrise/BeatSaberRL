@@ -178,7 +178,13 @@ def align_charts(header, map_dir, difficulty, speed_scale):
                              f"map ({t:.3f},{x:.2f},{y:.2f}) kind {n.kind} vs "
                              f"replay ({c['t']:.3f},{c['x']:.2f},{c['y']:.2f}) "
                              f"kind {c['kind']}")
-    offset = real_notes[0].hit_time - sim_notes[0].hit_time
+    # +DT: a JSONL tick line's `time` labels the tick START, but its
+    # saber state and events are END-of-tick (rust_env.py stamps the
+    # post-step state with sim.time - DT; viz/replay.html compensates by
+    # placing outcomes at (tick+1)*DT). Without the shift every pose and
+    # event leads the song by one tick — 33 ms, 0.3-0.8 m of note travel
+    # at real NJS in the ScoreSaber viewer.
+    offset = real_notes[0].hit_time - sim_notes[0].hit_time + 1.0 / 30.0
     return real_notes, offset
 
 
@@ -288,10 +294,15 @@ def wrap_deg(a):
 def build_events(ticks, real_notes, offset):
     """Note-event dicts + the score/combo/multiplier HUD timelines.
 
-    The live viewer drives its HUD from the combo/multiplier keyframe
-    blocks (layouts from ScoreSaber's own plugin writer: ComboEvent =
+    The keyframe blocks use the game recorder's layouts (ComboEvent =
     int combo + float time; MultiplierEvent = int multiplier + float
-    bar-progress + float time), so every scoring event emits keyframes.
+    bar-progress + float time), emitted change-only like real replays.
+    NOTE: the live watch.scoresaber.com decoder SKIPS the combo/
+    multiplier/energy pointers (ScoreSaberDecoder reads five pointers,
+    then only the extensions one) and recomputes score/combo from the
+    note events and energy from the damage/heal constants — so for that
+    viewer these blocks only keep the 9-pointer table valid. They are
+    still written faithfully for other format consumers.
     """
     sts = [scoring_type(n) for n in real_notes]
     walk = scoresaber.ComboTracker()
@@ -326,7 +337,10 @@ def build_events(ticks, real_notes, offset):
                  "bomb": -0.15}[outcome]
         # floor above zero: at zero the game FAILS and the run would end;
         # our agent plays on regardless (No-Fail-like, without the
-        # modifier flag), so never let the viewer see a fail
+        # modifier flag). The live watch viewer IGNORES this block and
+        # re-simulates energy from the note events, so it may still
+        # display a fail — the floor keeps the written stream honest for
+        # decoders that do read it
         new_energy = min(max(energy + delta, 0.001), 1.0)
         if new_energy != energy:
             energy = new_energy

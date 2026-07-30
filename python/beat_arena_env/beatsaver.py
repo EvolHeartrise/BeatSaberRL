@@ -292,6 +292,14 @@ def load_beatmap(map_path, difficulty="Normal", speed_scale=0.3,
                                  float(squish)))
 
     def add_arc(head_beat, x, y, color, tail_beat, tx, ty, tcolor):
+        # reversed arc (tailBeat < beat): the game — and the ScoreSaber
+        # viewer's ObjectManager — treat the earlier end as the head.
+        # Without the swap free_post/free_pre invert, the derived
+        # ArcHead/ArcTail scoring types flip, and the viewer's note-event
+        # ID match fails for both ends (notes render as never hit)
+        if tail_beat < head_beat:
+            head_beat, x, y, color, tail_beat, tx, ty, tcolor = \
+                tail_beat, tx, ty, tcolor, head_beat, x, y, color
         i = find_note(head_beat, x, y, color)
         if i is not None:
             notes[i] = replace(notes[i], free_post=True)
