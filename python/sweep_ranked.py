@@ -77,7 +77,14 @@ SPACE = {
         # tax flipped: centering adjustments pay for themselves (s2's
         # optimum was ~0.2-0.7 with 5+ catastrophic). s1/s2 protocol:
         # stop, widen, relaunch (observations replay into the wider box).
-        "effort_coef": dict(distribution="log_normal", min=0.002, max=32.0, scale=0.5),
+        # s3 widening #2 (2026-07-29, legs 049-075): 32.0 -> 128.0 — the
+        # new best 075 (1,648,925, first leg past the 400M reference)
+        # sat EXACTLY on 32.0 with two more of the top six, rest at
+        # 20-30. Economy-of-motion is a live regularizer under
+        # cut-plane scoring; keep widening until the optimum is
+        # interior. At 128 a full-motion tick costs ~4x a note's
+        # reward, so a floor above that would be physics, not bounds.
+        "effort_coef": dict(distribution="log_normal", min=0.002, max=128.0, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
     },
 }
