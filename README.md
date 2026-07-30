@@ -65,9 +65,11 @@ v7.9 non-coast joint actions pay a tiny tiered effort cost
 (`--effort-coef` scales it; 0 = off). **Accuracy is judged against the
 infinite cutting plane since 2026-07-29** (user-caught v7.4-class fix:
 the swept-surface distance used before conflated timing with lateral
-error and capped accuracy at 0.870 = 100/115; bench results stamp
-`scoring_version: 2` and never merge across rules — pre-fix numbers are
-not comparable). `--wide-acc` (30·clamp(1 − d/0.6), unrounded, training
+error and capped accuracy at 0.870 = 100/115). **Real maps play at
+their real NJS since 2026-07-30** — the speed_scale rescale (NJS×0.3)
+is removed. Bench results stamp `scoring_version` (2 = cut-plane acc
+at 0.3× speeds, 3 = real speeds) and never merge across rules —
+pre-v3 numbers are a different physics regime. `--wide-acc` (30·clamp(1 − d/0.6), unrounded, training
 only) is opt-in: it loses at 400M but is the strongest takeoff
 accelerator measured for short legs.
 
