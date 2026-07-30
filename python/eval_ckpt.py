@@ -45,7 +45,8 @@ def main():
     for ep in range(args.episodes):
         rng = np.random.default_rng(args.seed0 + ep)
         env = RustBeatEnv(external_chart=generate_chart(cfg, rng),
-                          effort_coef=args.effort_coef, seed=args.seed0 + ep)
+                          effort_coef=args.effort_coef, gears=pol.n_gears,
+                          seed=args.seed0 + ep)
         obs, _ = env.reset()
         done, ret = False, 0.0
         while not done:

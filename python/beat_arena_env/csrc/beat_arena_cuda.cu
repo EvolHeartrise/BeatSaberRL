@@ -86,10 +86,23 @@ constexpr double ELBOW_HI = 2.6179938779914944;
 __device__ constexpr double ROLL_LO[2] = {0.0, -3.141592653589793};
 __device__ constexpr double ROLL_HI[2] = {3.141592653589793, 0.0};
 constexpr double BEND_LIM = 1.6580627893946132;
-__device__ constexpr double JOINT_ALPHA[N_JOINTS] = {80.0, 80.0, 80.0, 80.0,
-                                                     200.0, 200.0};
-__device__ constexpr double JOINT_OMEGA[N_JOINTS] = {8.0, 8.0, 8.0, 8.0,
-                                                     20.0, 20.0};
+// env v8 (2026-07-30): alpha AND omega doubled (was 80/8, 200/20) —
+// effective in-game hand motion, not biomechanics; gears restore
+// fine control (mirror of lib.rs / constants.py)
+__device__ constexpr double JOINT_ALPHA[N_JOINTS] = {160.0, 160.0, 160.0,
+                                                     160.0, 400.0, 400.0};
+__device__ constexpr double JOINT_OMEGA[N_JOINTS] = {16.0, 16.0, 16.0, 16.0,
+                                                     40.0, 40.0};
+// env v8 gears: action id -> signed torque fraction (id 0 coast,
+// 1/2 = +/-full at every K; finer +/- pairs append). Selected by
+// P.gears at launch; K=3 is the ternary prefix.
+__device__ constexpr double GEAR_TAB[3][7] = {
+    {0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0},              // K=3
+    {0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0},           // K=5
+    {0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0, 0.125, -0.125}};  // K=7
+__device__ __forceinline__ const double* gear_row(int gears) {
+  return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
+}
 constexpr int N_BLADE_SAMPLES = 8;
 constexpr double REACH_Z = 1.75;
 constexpr double Z_MISS = 0.65;
@@ -372,6 +385,7 @@ struct Sim {
   bool* done;
   int C, max_steps, cap, mode;  // mode: 0 = step, 1 = reset-all
   T effort_coef;
+  int gears;      // env v8: action-table size (3 / 5 / 7)
   bool wide_acc;  // TRAINING-ONLY wide accuracy reward (see cut scoring)
   bool auto_reset;
 };
@@ -453,10 +467,11 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
         sh_pw[h][k] = pw[k];
         sh_pd[h][k] = pd[k];
       }
+      const double* gr = gear_row(P.gears);
       for (int j = 0; j < N_JOINTS; j++) {
         const int a = (int)P.actions[e * 12 + h * N_JOINTS + j];
         const T al = T(JOINT_ALPHA[j]);
-        om[j] += a == 1 ? al * T(DT) : (a == 2 ? -al * T(DT) : T(0));
+        om[j] += T(gr[a < 7 ? a : 0]) * al * T(DT);
         const T omax = T(JOINT_OMEGA[j]);
         om[j] = tclamp(om[j] * (T(1) - T(DRAG)), -omax, omax);
         q[j] += om[j] * T(DT);
@@ -518,10 +533,13 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
     if (tid == 0) {
       T rew = T(0);
       T eff = T(0);
+      const double* gr = gear_row(P.gears);
       for (int h = 0; h < 2; h++)
-        for (int j = 0; j < N_JOINTS; j++)
-          if (P.actions[e * 12 + h * N_JOINTS + j] != 0)
-            eff += T(EFFORT_COST[j]);
+        for (int j = 0; j < N_JOINTS; j++) {
+          const int a = (int)P.actions[e * 12 + h * N_JOINTS + j];
+          if (a != 0 && a < 7)
+            eff += T(EFFORT_COST[j]) * T(fabs(gr[a]));
+        }
       rew -= P.effort_coef * eff;
       for (int h = 0; h < 2; h++) {
         for (int s = 0; s < N_TRACKERS; s++) {
@@ -928,7 +946,7 @@ enum {
 
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
-          bool wide_acc, bool auto_reset) {
+          bool wide_acc, bool auto_reset, int64_t gears) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -998,6 +1016,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.cap = (int)cap;
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
+    P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
     const size_t shmem = (size_t)C * sizeof(scalar_t);

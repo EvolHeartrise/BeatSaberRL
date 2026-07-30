@@ -86,8 +86,11 @@ N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
 OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 270
 OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 286
-# env v6: per hand 6 ternary joint heads (pitch, yaw, twist, elbow, roll,
-# bend) — twelve factored heads, left hand first
+# env v6: per hand 6 joint heads (pitch, yaw, twist, elbow, roll, bend)
+# — twelve factored heads, left hand first. Env v8: heads have K =
+# n_gears options (3/5/7); this module constant is the K=3 DEFAULT
+# (legacy imports use it for the head count / ternary-era shapes) —
+# a policy's real sizes live in policy.head_sizes / arch["n_gears"].
 HEAD_SIZES = (3,) * 12
 
 # Additive attention-mask magnitude. 2^14: exactly representable in fp16
@@ -215,23 +218,27 @@ class Block(nn.Module):
 class NotePolicy(nn.Module):
     def __init__(self, embed: int = 64, trunk_dim: int = 128,
                  encoder: str = "transformer", n_blocks: int = 2,
-                 n_heads: int = 1):
+                 n_heads: int = 1, n_gears: int = 3):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
+        assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
         self.encoder = encoder
         self.embed = embed
+        self.n_gears = n_gears
+        self.head_sizes = (n_gears,) * 12
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
-                     "n_blocks": n_blocks, "n_heads": n_heads}
+                     "n_blocks": n_blocks, "n_heads": n_heads,
+                     "n_gears": n_gears}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
         # saber token features: the 10 obs-v4 features + [is_left, is_right]
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
         self.blocks = nn.ModuleList(
             Block(embed, n_heads) for _ in range(n_blocks))
         self.trunk = _mlp([2 * embed, trunk_dim, trunk_dim])
-        # six factored heads (env v5): per hand move(9), rot(3), tilt(3)
+        # 12 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
-            nn.Linear(trunk_dim, n) for n in HEAD_SIZES)
+            nn.Linear(trunk_dim, n) for n in self.head_sizes)
         self.value_head = nn.Linear(trunk_dim, 1)
         # fp16-storage mode (2026-07-25): activations flow fp16 between
         # the obs split and the head output; GEMMs are fp16-in with fp32
@@ -295,7 +302,7 @@ class NotePolicy(nn.Module):
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
-            return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
+            return out[:, :-1].view(B, 12, self.n_gears), out[:, -1]
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
@@ -305,8 +312,8 @@ class NotePolicy(nn.Module):
             # sampling, PPO math) is exactly today's fp32 code
             out = fp16_linear(h, w, b).float()
         else:
-            out = F.linear(h, w, b)                                  # (B, 37)
-        return out[:, :-1].view(B, len(HEAD_SIZES), 3), out[:, -1]
+            out = F.linear(h, w, b)                          # (B, 12K + 1)
+        return out[:, :-1].view(B, 12, self.n_gears), out[:, -1]
 
     def flatten_fp16(self):
         """Repack all Linear masters into one flat fp32 buffer with a
@@ -397,6 +404,7 @@ def load_policy(ckpt) -> NotePolicy:
     arch = ckpt.get("arch", {})
     policy = NotePolicy(
         embed=arch.get("embed", 64), trunk_dim=arch.get("trunk_dim", 128),
-        n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1))
+        n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1),
+        n_gears=arch.get("n_gears", 3))
     policy.load_state_dict(ckpt["state_dict"])
     return policy

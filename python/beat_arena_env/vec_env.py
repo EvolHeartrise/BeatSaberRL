@@ -21,7 +21,8 @@ class BeatVecEnv:
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, effort_coef=1.0, wide_acc=False, seed=0):
+                 bomb_prob=0.125, effort_coef=1.0, wide_acc=False,
+                 gears=3, seed=0):
         self.num_envs = num_envs
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
@@ -36,7 +37,7 @@ class BeatVecEnv:
         # materializing it into Python tuples every step
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
                               effort_coef=effort_coef, return_events=False,
-                              wide_acc=wide_acc)
+                              wide_acc=wide_acc, gears=gears)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
 

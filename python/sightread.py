@@ -50,7 +50,8 @@ def main():
         policy = load_policy(ckpt)
         policy.eval()
 
-    env = RustBeatEnv(external_chart=notes, seed=1)
+    env = RustBeatEnv(external_chart=notes, seed=1,
+                      gears=policy.n_gears if policy is not None else 3)
     if args.replay:
         env.set_record(args.replay)
     rng = np.random.default_rng(0)

@@ -115,6 +115,11 @@ def _validate(sd) -> int:
     """Check the arch the kernel hard-codes; return n_blocks."""
     def shape(k):
         return tuple(sd[k].shape)
+    if shape("heads.0.weight")[0] != 3:
+        raise NotImplementedError(
+            "fused kernels support the ternary (n_gears=3) heads only, "
+            f"got {shape('heads.0.weight')[0]} logits/head — use the "
+            "torch paths (--no-fused-forward / no --fused-update)")
     if shape("note_mlp.0.weight") != (EMBED, NOTE_FEAT):
         raise NotImplementedError(
             f"fused kernel supports embed={EMBED} only, got "

@@ -70,11 +70,33 @@ SHOULDER = ((-0.2, 1.47, -0.65), (0.2, 1.47, -0.65))    # (left, right)
 L_UPPER = 0.35        # m
 L_FORE = 0.30         # m
 N_JOINTS = 6
-# tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
-ALPHA_ARM, OMEGA_ARM = 80.0, 8.0        # shoulder pitch/yaw/twist + elbow
-ALPHA_WRIST, OMEGA_WRIST = 200.0, 20.0  # roll + bend (v5 values)
+# tiered dynamics: ponderous shoulder/elbow, snappy wrists. Env v8
+# (2026-07-30, user-directed): alpha AND omega doubled from the v6
+# anatomical values (arm 80/8, wrist 200/20) — deliberately beyond
+# biomechanics, calibrated to EFFECTIVE in-game hand motion (real
+# players exceed physical speeds via controller-tracking prediction);
+# the gear table below restores fine control under the stronger body.
+ALPHA_ARM, OMEGA_ARM = 160.0, 16.0      # shoulder pitch/yaw/twist + elbow
+ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # roll + bend
 JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 2
 JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
+
+# --- action gears (env v8) ---------------------------------------------------
+# Per-joint action id -> signed torque fraction of JOINT_ALPHA. Id 0 is
+# coast and ids 1/2 are +full/-full at EVERY K (the ternary era is the
+# K=3 prefix — scripted bot and old action streams stay valid); finer
+# gears append as +/- pairs in decreasing magnitude. Effort cost scales
+# by |fraction| (a feather touch is priced like one).
+GEAR_MAGS = {3: (1.0,), 5: (1.0, 0.25), 7: (1.0, 1.0 / 3.0, 0.125)}
+
+
+def gear_table(n_gears):
+    """Signed fraction per action id, length n_gears: (0, +1, -1, ...)."""
+    mags = GEAR_MAGS[n_gears]
+    out = [0.0]
+    for m in mags:
+        out += [m, -m]
+    return tuple(out)
 # env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up) —
 # straight-overhead arms are gone; -90 (straight down) unchanged.
 PITCH_LIM = math.radians(90.0)          # obs normalizer only

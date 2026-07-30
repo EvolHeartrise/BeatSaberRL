@@ -237,6 +237,12 @@ def parse_args():
                    help="train with the wide accuracy reward "
                         "(30*clamp(1 - d/0.6), unrounded; best for short "
                         "50-150M legs, loses at 400M)")
+    p.add_argument("--gears", type=int, default=3, choices=[3, 5, 7],
+                   help="env v8 action-table size per joint head: 3 = "
+                        "ternary coast/+full/-full; 5 adds +/-1/4-torque "
+                        "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
+                        "under the doubled alpha/omega body). Resuming a "
+                        "geared checkpoint needs the matching --gears")
     p.add_argument("--ranked-maps", action="store_true",
                    help="train on SEGMENTS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
@@ -364,7 +370,7 @@ def main():
         venv = VecCls(N, pool=pool,
                       max_steps=int(args.seg_len * 30) + 90,
                       effort_coef=args.effort_coef,
-                      wide_acc=args.wide_acc,
+                      wide_acc=args.wide_acc, gears=args.gears,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -376,10 +382,11 @@ def main():
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
+            gears=args.gears,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
-            N, cols=tuple(args.cols),
+            N, gears=args.gears, cols=tuple(args.cols),
             rows=tuple(args.rows), chart_len_s=args.chart_len,
             note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
@@ -397,7 +404,12 @@ def main():
               flush=True)
     else:
         policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
-                            n_blocks=args.n_blocks, n_heads=args.n_heads)
+                            n_blocks=args.n_blocks, n_heads=args.n_heads,
+                            n_gears=args.gears)
+    if policy.n_gears != args.gears:
+        raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
+                         f"are n_gears={policy.n_gears} — the env and "
+                         f"policy action tables must match")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     policy = policy.to(device)

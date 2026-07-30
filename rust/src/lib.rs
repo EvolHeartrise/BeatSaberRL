@@ -68,10 +68,31 @@ const SHOULDER: [[f64; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
 const L_UPPER: f64 = 0.35; // m
 const L_FORE: f64 = 0.30; // m
 // tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
-const ALPHA_ARM: f64 = 80.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
-const OMEGA_ARM: f64 = 8.0; // rad/s
-const ALPHA_WRIST: f64 = 200.0; // rad/s^2 (roll, bend — v5 values)
-const OMEGA_WRIST: f64 = 20.0; // rad/s
+// env v8 (2026-07-30, user-directed): alpha AND omega doubled from the
+// v6 anatomical values (80/8, 200/20) — calibrated to EFFECTIVE
+// in-game hand motion (tracking prediction beats biomechanics); the
+// gear table restores fine control under the stronger body.
+const ALPHA_ARM: f64 = 160.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
+const OMEGA_ARM: f64 = 16.0; // rad/s
+const ALPHA_WRIST: f64 = 400.0; // rad/s^2 (roll, bend)
+const OMEGA_WRIST: f64 = 40.0; // rad/s
+
+// env v8 gears: action id -> signed torque fraction of JOINT_ALPHA.
+// Id 0 = coast, 1/2 = +/-full at EVERY table size (K=3 is the ternary
+// era's prefix); finer gears append as +/- pairs. MIRROR of
+// constants.gear_table — the max table (K=7) is stored, a sim's
+// `gears` field bounds the valid ids.
+const GEAR_SIGNED: [f64; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
+                               0.125, -0.125];
+const GEAR_SIGNED_5: [f64; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
+
+fn gear_signed(gears: u8) -> [f64; 7] {
+    match gears {
+        5 => GEAR_SIGNED_5,
+        7 => GEAR_SIGNED,
+        _ => [0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0], // ternary (K=3)
+    }
+}
 // env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up)
 const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg — obs normalizer only
 const PITCH_LO: f64 = -1.5707963267948966;
@@ -482,6 +503,7 @@ type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
 struct Core {
     max_steps: u32,
     effort_coef: f64, // scales EFFORT_COST (0 = free movement)
+    gear: [f64; 7],   // env v8: action id -> signed torque fraction
     wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
     tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
@@ -513,10 +535,12 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32, effort_coef: f64, wide_acc: bool) -> Self {
+    fn new_core(max_steps: u32, effort_coef: f64, wide_acc: bool,
+                gears: u8) -> Self {
         Core {
             max_steps,
             effort_coef,
+            gear: gear_signed(gears),
             wide_acc,
             chart: Vec::new(),
             tail_s: 0.5,
@@ -688,12 +712,14 @@ impl Core {
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
 
-        // env v7.9: tiered effort — every non-coast action costs
+        // env v7.9 tiered effort, v8 gear-scaled: a non-coast action
+        // costs EFFORT_COST[j] * |torque fraction| (feather = cheap)
         let mut effort = 0.0;
         for s in 0..2 {
             for j in 0..N_JOINTS {
-                if actions[s][j] != 0 {
-                    effort += EFFORT_COST[j];
+                let a = actions[s][j] as usize;
+                if a != 0 && a < 7 {
+                    effort += EFFORT_COST[j] * self.gear[a].abs();
                 }
             }
         }
@@ -705,11 +731,9 @@ impl Core {
             // angle step, limit clamp (hitting a limit kills the omega)
             let lims = joint_limits(s);
             for j in 0..N_JOINTS {
-                arm.om[j] += match actions[s][j] {
-                    1 => JOINT_ALPHA[j] * DT,
-                    2 => -JOINT_ALPHA[j] * DT,
-                    _ => 0.0,
-                };
+                let a = actions[s][j] as usize;
+                let frac = if a < 7 { self.gear[a] } else { 0.0 };
+                arm.om[j] += frac * JOINT_ALPHA[j] * DT;
                 arm.om[j] =
                     (arm.om[j] * (1.0 - DRAG)).clamp(-JOINT_OMEGA[j], JOINT_OMEGA[j]);
                 arm.q[j] += arm.om[j] * DT;
@@ -1062,10 +1086,12 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (max_steps=690, effort_coef=1.0, wide_acc=false))]
-    fn new(max_steps: u32, effort_coef: f64, wide_acc: bool) -> Self {
+    #[pyo3(signature = (max_steps=690, effort_coef=1.0, wide_acc=false,
+                        gears=3))]
+    fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
+           gears: u8) -> Self {
         RawBeatSim {
-            core: Core::new_core(max_steps, effort_coef, wide_acc),
+            core: Core::new_core(max_steps, effort_coef, wide_acc, gears),
         }
     }
 
@@ -1095,7 +1121,7 @@ impl RawBeatSim {
         actions: Vec<u8>,
     ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
         assert_eq!(actions.len(), 2 * N_JOINTS);
-        assert!(actions.iter().all(|&a| a <= 2));
+        assert!(actions.iter().all(|&a| a <= 6)); // env v8 gear ids 0..=6
         let mut acts = [[0u8; N_JOINTS]; 2];
         for s in 0..2 {
             acts[s].copy_from_slice(&actions[s * N_JOINTS..(s + 1) * N_JOINTS]);
@@ -1283,12 +1309,12 @@ struct VecBeatSim {
 impl VecBeatSim {
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false,
-                        return_events=true, wide_acc=false))]
+                        return_events=true, wide_acc=false, gears=3))]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
-           return_events: bool, wide_acc: bool) -> Self {
+           return_events: bool, wide_acc: bool, gears: u8) -> Self {
         VecBeatSim {
             sims: (0..n)
-                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc))
+                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc, gears))
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             // return_events=false skips materializing the per-step event

@@ -216,7 +216,7 @@ class CudaBeatVecEnv:
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, seed=0, effort_coef=1.0,
                  charts=None, chart_pool=1024, max_steps=None,
-                 pool=None, wide_acc=False,
+                 pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True):
         self.num_envs = num_envs
         self.device = torch.device(device)
@@ -229,6 +229,9 @@ class CudaBeatVecEnv:
         # unrounded — effectively doubles the acc component's range and
         # reward vs the real round(15*(1 - d/0.3)). Bench/eval stay real.
         self.wide_acc = bool(wide_acc)
+        # env v8 gear table size (3 / 5 / 7) — see constants.gear_table
+        assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
+        self.gears = int(gears)
         # pool=: prebuilt (P, C) tensor dict (ranked_pool.py) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is
         # the deterministic-sequential test mode, which a captured
@@ -349,7 +352,7 @@ class CudaBeatVecEnv:
     def reset(self):
         self._ext.step(self._tensors, self._zero_act, self._cand(), 1,
                        self.max_steps, self.effort_coef, self.wide_acc,
-                       True)
+                       True, self.gears)
         self._episode += 1
         return self._obs
 
@@ -361,7 +364,7 @@ class CudaBeatVecEnv:
         cand = self._cand() if self.auto_reset else self._zero_cand
         self._ext.step(self._tensors, actions, cand, 0,
                        self.max_steps, self.effort_coef, self.wide_acc,
-                       self.auto_reset)
+                       self.auto_reset, self.gears)
         if self.auto_reset:
             self._episode += 1
         return self._obs, self._reward, self._done, []
