@@ -25,9 +25,11 @@ filtered), one-saber characteristic, left-hand mirroring.
 Grid conventions match ours (x/lineIndex 0-3 left->right, y/lineLayer
 0-2 bottom->top; world positions via constants.col_x / ROW_Y). Cut
 direction is the direction you SWING; direction 8 is a dot note ->
-`any_dir`. Per-note speed = NJS * speed_scale: real note-jump speeds
-(10-19+ m/s) would give sub-tick contact windows at 30 Hz, so we
-rescale into the sim's trained regime (default 0.3).
+`any_dir`. Per-note speed = the map's real NJS since 2026-07-30 (user
+decision): the historical speed_scale rescale (0.3, chosen because
+real note-jump speeds give 1-2-tick contact windows at 30 Hz) is
+REMOVED — everything trains, benches, and replays at real speed;
+pre-removal results and checkpoints are a different physics regime.
 """
 
 from __future__ import annotations
@@ -205,8 +207,7 @@ def _in_grid(x, y):
     return 0 <= x <= 3 and 0 <= y <= 2
 
 
-def load_beatmap(map_path, difficulty="Normal", speed_scale=0.3,
-                 first_note_s=None):
+def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
     """Parse one difficulty of a BeatSaver map -> (notes, meta dict).
 
     map_path: map directory or .zip. first_note_s: if set, shift the whole
@@ -224,7 +225,7 @@ def load_beatmap(map_path, difficulty="Normal", speed_scale=0.3,
                          f"{[d[0] for d in list_difficulties(map_path)]}")
 
     data = _read_json(root, fname)
-    speed = njs * speed_scale
+    speed = float(njs)                 # real NJS; speed_scale removed
     dropped = 0
 
     if is_v4:

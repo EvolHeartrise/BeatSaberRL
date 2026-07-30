@@ -1007,8 +1007,7 @@ def test_beatsaver_parser_v2_bombs_and_dots(tmp_path):
         {"_time": 6, "_lineIndex": 3, "_lineLayer": 2, "_type": 1, "_cutDirection": 8},
     ]}
     (tmp_path / "Normal.dat").write_text(json.dumps(v2))
-    notes, meta = load_beatmap(str(tmp_path), "Normal", speed_scale=0.3,
-                               first_note_s=2.0)
+    notes, meta = load_beatmap(str(tmp_path), "Normal", first_note_s=2.0)
     assert len(notes) == 3                       # bomb now PARSED
     assert meta["n_notes"] == 2 and meta["n_bombs"] == 1
     assert notes[0].hit_time == pytest.approx(2.0)          # shifted
@@ -1016,7 +1015,7 @@ def test_beatsaver_parser_v2_bombs_and_dots(tmp_path):
     assert notes[2].hit_time == pytest.approx(3.0)          # 2 beats @120 = 1s
     assert notes[0].angle == pytest.approx(3 * np.pi / 2)   # down
     assert notes[2].any_dir                                  # dot
-    assert notes[0].speed == pytest.approx(3.0)              # njs 10 * 0.3
+    assert notes[0].speed == pytest.approx(10.0)             # real NJS
 
 
 def test_beatsaver_parser_v3_chains_arcs_bpm(tmp_path):
@@ -1153,7 +1152,6 @@ def test_beatclock_beat_zero_bpm_event_replaces_base(tmp_path):
                         {"b": 3, "m": 60.0}],
           "colorNotes": [{"b": 3, "x": 1, "y": 0, "c": 1, "d": 1}]}
     (tmp_path / "Normal.dat").write_text(json.dumps(v3))
-    notes, _ = load_beatmap(str(tmp_path), "Normal", speed_scale=0.3,
-                            first_note_s=None)
+    notes, _ = load_beatmap(str(tmp_path), "Normal", first_note_s=None)
     # 2 beats @60 (2.0s) + 1 beat @2400 (0.025s)
     assert notes[0].hit_time == pytest.approx(2.025, abs=1e-6)

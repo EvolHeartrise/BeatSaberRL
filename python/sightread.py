@@ -25,8 +25,6 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--map", required=True, help="map .zip or directory")
     p.add_argument("--difficulty", default="Normal")
-    p.add_argument("--speed-scale", type=float, default=0.3,
-                   help="note speed = NJS * this (default 0.3)")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--ckpt", type=str)
     src.add_argument("--scripted", action="store_true")
@@ -38,8 +36,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    notes, meta = load_beatmap(args.map, args.difficulty,
-                               speed_scale=args.speed_scale, first_note_s=2.0)
+    notes, meta = load_beatmap(args.map, args.difficulty, first_note_s=2.0)
     print(f"map: {meta['song_name']} [{meta['difficulty']}]  "
           f"bpm {meta['bpm']}  njs {meta['njs']} -> {meta['speed']:.2f} m/s  "
           f"{meta['n_notes']} notes + {meta['n_bombs']} bombs over "

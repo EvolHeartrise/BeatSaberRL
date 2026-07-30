@@ -26,7 +26,7 @@ churn, ~39 ms/level catalog-wide) was measured as ~50% of a warm bench
 run and, being pure Python, it holds the GIL — the producer thread
 overlaps network only, not parsing. The producer therefore caches the
 parsed result (note tuples + max score + duration) per
-(hash, difficulty, speed_scale, parser-source-hash) as pickles under
+(hash, difficulty, parser-source-hash) as pickles under
 --chart-cache; any edit to the parser/scoring sources invalidates the
 cache automatically via the source hash. Also from the same session:
 tasks run LONGEST-FIRST (durations sidecar, populated as maps are
@@ -63,9 +63,10 @@ from policy import load_policy
 
 # Scoring-rule version stamped into every results file. 1 = swept-surface
 # accuracy distance (v7.0-2026-07-29); 2 = the real game's infinite-
-# cut-plane accuracy (user-caught fix, 2026-07-29). Results never merge
-# across versions.
-SCORING_VERSION = 2
+# cut-plane accuracy (user-caught fix, 2026-07-29); 3 = REAL note speeds
+# (speed_scale removed 2026-07-30 — v1/v2 played maps at NJS*0.3, a
+# different physics regime). Results never merge across versions.
+SCORING_VERSION = 3
 
 
 class _GraphedArgmax(_Graphed):
@@ -175,8 +176,6 @@ def parse_args():
                         "groups (2048 -> 2x1024, the measured kernel "
                         "sweet spot)")
     p.add_argument("--device", type=str, default=None)
-    p.add_argument("--speed-scale", type=float, default=0.3,
-                   help="note speed = NJS * this (sightread convention)")
     p.add_argument("--max-song-s", type=float, default=0.0,
                    help="skip maps longer than this (0 = play everything)")
     p.add_argument("--map-cache", type=str, default="maps/scoresaber")
@@ -270,17 +269,14 @@ def dur_key(entry):
     return f"{entry['hash']}_{entry['difficulty']}"
 
 
-def load_or_parse(entry, cache_dir, chart_cache, ver, speed_scale):
+def load_or_parse(entry, cache_dir, chart_cache, ver):
     """The cacheable unit: (note tuples, max multiplied score, duration,
-    last hit time) for one level. duration/hit times come from the song
-    clock, so they are speed_scale-independent; the tuples are not —
-    speed_scale is part of the cache key."""
+    last hit time) for one level, at the map's real NJS."""
     cpath = None
     if chart_cache:
         cpath = os.path.join(
             chart_cache,
-            f"{entry['hash']}_{entry['difficulty']}_{speed_scale:g}"
-            f"_{ver}.pkl")
+            f"{entry['hash']}_{entry['difficulty']}_{ver}.pkl")
         if os.path.exists(cpath):
             try:
                 with open(cpath, "rb") as f:
@@ -289,7 +285,7 @@ def load_or_parse(entry, cache_dir, chart_cache, ver, speed_scale):
                 pass                    # corrupt/partial file: reparse
     map_dir = scoresaber.ensure_map_dats(entry["hash"], cache_dir)
     notes, meta = load_beatmap(map_dir, entry["difficulty"],
-                               speed_scale=speed_scale, first_note_s=2.0)
+                               first_note_s=2.0)
     payload = {
         "tuples": [note_tuple(n) for n in notes],
         "max_score": scoresaber.max_multiplied_score(notes) if notes else 0,
@@ -304,7 +300,7 @@ def load_or_parse(entry, cache_dir, chart_cache, ver, speed_scale):
     return payload
 
 
-def producer(tasks, cache_dir, chart_cache, speed_scale, max_song_s, q, stop,
+def producer(tasks, cache_dir, chart_cache, max_song_s, q, stop,
              durations):
     """Download + parse maps ahead of the eval loop (network overlaps
     compute; parsing is served from the chart cache when warm). Emits
@@ -319,8 +315,7 @@ def producer(tasks, cache_dir, chart_cache, speed_scale, max_song_s, q, stop,
             if stop.is_set():
                 break
             try:
-                p = load_or_parse(entry, cache_dir, chart_cache, ver,
-                                  speed_scale)
+                p = load_or_parse(entry, cache_dir, chart_cache, ver)
                 durations[dur_key(entry)] = round(p["duration_s"], 1)
                 if not p["tuples"]:
                     q.put((entry, None, None, "no notes parsed"))
@@ -388,7 +383,6 @@ def main():
         "checkpoint": args.ckpt, "checkpoint_name": ckpt_name,
         "model_hash": mhash, "arch": ckpt.get("arch"),
         "global_step": ckpt.get("global_step"),
-        "speed_scale": args.speed_scale,
     }
     levels = {e["leaderboard_id"]: e for e in data.get("levels", [])}
 
@@ -442,8 +436,7 @@ def main():
     stop = threading.Event()
     threading.Thread(target=producer,
                      args=(tasks, args.map_cache, args.chart_cache,
-                           args.speed_scale, args.max_song_s, q, stop,
-                           durations),
+                           args.max_song_s, q, stop, durations),
                      daemon=True).start()
 
     # Vectorized rollout (2026-07-24, the SPEC "future unlock"): ONE
@@ -530,10 +523,11 @@ def main():
             and not full_force):
         sys.exit(f"error: {out_path} holds scoring-version {prev_rules} "
                  f"results but the sim now scores version "
-                 f"{SCORING_VERSION} (2026-07-29 cut-plane accuracy fix) "
-                 f"— results cannot merge across scoring rules. Use a "
-                 f"fresh --out, or full-range --force to re-evaluate "
-                 f"everything under the current rules.")
+                 f"{SCORING_VERSION} (v2: 2026-07-29 cut-plane accuracy "
+                 f"fix; v3: 2026-07-30 real note speeds) — results "
+                 f"cannot merge across scoring rules. Use a fresh --out, "
+                 f"or full-range --force to re-evaluate everything under "
+                 f"the current rules.")
     data["scoring_version"] = SCORING_VERSION
     # (persistent pinned obs/act buffers live in each _Group: step_into
     # writes obs rows in place, the async D2H lands in pinned act memory,

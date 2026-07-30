@@ -157,13 +157,11 @@ def read_replay(path):
     return header, lines[1:]
 
 
-def align_charts(header, map_dir, difficulty, speed_scale):
+def align_charts(header, map_dir, difficulty):
     """Re-parse the original map and align its notes 1:1 (by order) with
     the replay's chart. Returns (real_notes, time_offset sim->song)."""
-    sim_notes, _ = load_beatmap(map_dir, difficulty,
-                                speed_scale=speed_scale, first_note_s=2.0)
-    real_notes, _ = load_beatmap(map_dir, difficulty,
-                                 speed_scale=speed_scale, first_note_s=None)
+    sim_notes, _ = load_beatmap(map_dir, difficulty, first_note_s=2.0)
+    real_notes, _ = load_beatmap(map_dir, difficulty, first_note_s=None)
     chart = header["chart"]
     if len(sim_notes) != len(chart):
         raise SystemExit(
@@ -554,10 +552,9 @@ def _lzma_alone(body: bytes) -> bytes:
 EMPTY = struct.pack("<i", 0)
 
 
-def convert(replay_path, map_dir, song_hash, difficulty, out_path,
-            speed_scale=0.3):
+def convert(replay_path, map_dir, song_hash, difficulty, out_path):
     header, ticks = read_replay(replay_path)
-    real_notes, offset = align_charts(header, map_dir, difficulty, speed_scale)
+    real_notes, offset = align_charts(header, map_dir, difficulty)
     events, timeline, combo_tl, mult_tl, energy_tl, final = build_events(
         ticks, real_notes, offset)
     blocks = [
@@ -588,14 +585,13 @@ def main():
                    help="map dir/zip (default maps/scoresaber/<hash>)")
     p.add_argument("--out", default=None,
                    help="output .dat (default: replay path with .dat)")
-    p.add_argument("--speed-scale", type=float, default=0.3)
     args = p.parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
     map_dir = args.map or os.path.join(here, "maps", "scoresaber",
                                        args.hash.lower())
     out = args.out or os.path.splitext(args.replay)[0] + ".dat"
     r = convert(args.replay, map_dir, args.hash.lower(), args.difficulty,
-                out, args.speed_scale)
+                out)
     print(f"wrote {r['out']} ({r['bytes']:,} bytes): {r['frames']} frames, "
           f"{r['note_events']} note events, final score {r['final_score']}")
 

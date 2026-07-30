@@ -240,9 +240,10 @@ def parse_args():
     p.add_argument("--ranked-maps", action="store_true",
                    help="train on SEGMENTS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
-                        "parsing protocol, speed_scale 0.3) instead of "
-                        "the procedural generator. --chart-pool becomes "
-                        "the segment subsample size; generator dials "
+                        "parsing protocol, real NJS speeds since "
+                        "2026-07-30) instead of the procedural "
+                        "generator. --chart-pool becomes the segment "
+                        "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
     p.add_argument("--seg-len", type=float, default=25.0,

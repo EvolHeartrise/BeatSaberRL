@@ -1,11 +1,11 @@
 """Ranked-map segment pool for CUDA-env training (sweep s2, 2026-07-29).
 
 Slices every ranked ScoreSaber level (maps/scoresaber_catalog.json via
-the bench's warm chart_cache pickles, speed_scale 0.3 protocol) into
-fixed-length windows and packs them into the (P, C) tensor dict
-CudaBeatVecEnv eats — training on the real catalog directly, no
-procedural generator, to probe the procedural->real gap behind the
-~87% accuracy ceiling.
+the bench's warm chart_cache pickles; real-NJS speeds since 2026-07-30,
+speed_scale removed) into fixed-length windows and packs them into the
+(P, C) tensor dict CudaBeatVecEnv eats — training on the real catalog
+directly, no procedural generator, to probe the procedural->real gap
+behind the ~87% accuracy ceiling.
 
 SEGMENTS, not whole maps, by design (user decision 2026-07-29): median
 ranked map is 884 notes / 173 s vs the env's ~90-object / 690-step
@@ -18,8 +18,8 @@ to window start; for k > 0 the first LEAD_S seconds are dropped (those
 notes were mid-flight at the cut). Windows with < MIN_SCOREABLE
 scoreable objects or > MAX_OBJECTS total are dropped (the latter is
 the smem guard; counts are reported). Built once and cached as npz
-keyed on (parser version, seg_len, speed_scale, catalog bytes) —
-every sweep leg then pays only the npz load + a seeded subsample.
+keyed on (parser version, seg_len, catalog bytes) — every sweep leg
+then pays only the npz load + a seeded subsample.
 """
 
 from __future__ import annotations
@@ -40,11 +40,11 @@ MAX_OBJECTS = 512     # smem guard: C*4B must stay well under 6 KB/block
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _cache_path(seg_len, speed_scale, ver, catalog_path):
+def _cache_path(seg_len, ver, catalog_path):
     with open(catalog_path, "rb") as f:
         cat = f.read()
     key = hashlib.sha1(
-        f"{seg_len:g}_{speed_scale:g}_{ver}_v1".encode() + cat
+        f"{seg_len:g}_{ver}_v2".encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
     os.makedirs(cdir, exist_ok=True)
@@ -60,7 +60,7 @@ def _tuple_note(t):
                 free_pre=bool(t[8]), free_post=bool(t[9]))
 
 
-def _build_segments(seg_len, speed_scale, catalog_path, log):
+def _build_segments(seg_len, catalog_path, log):
     import json
     import sys
     sys.path.insert(0, _BASE)
@@ -74,8 +74,7 @@ def _build_segments(seg_len, speed_scale, catalog_path, log):
         payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
                                                        "scoresaber"),
                                    os.path.join(_BASE, "maps",
-                                                "chart_cache"),
-                                   ver, speed_scale)
+                                                "chart_cache"), ver)
         tup = sorted(payload["tuples"], key=lambda t: t[0])
         if not tup:
             continue
@@ -102,7 +101,7 @@ def _build_segments(seg_len, speed_scale, catalog_path, log):
     return segments
 
 
-def load_ranked_pool(seg_len=25.0, speed_scale=0.3, sample=None, seed=0,
+def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
                      device="cuda", dtype=torch.float32,
                      catalog=None, log=print):
     """(P, C) pool dict on `device`. First call builds + caches the full
@@ -114,10 +113,10 @@ def load_ranked_pool(seg_len=25.0, speed_scale=0.3, sample=None, seed=0,
     import sys
     sys.path.insert(0, _BASE)
     import bench_scoresaber as bs
-    cpath = _cache_path(seg_len, speed_scale, bs.parser_version(), catalog)
+    cpath = _cache_path(seg_len, bs.parser_version(), catalog)
     if not os.path.exists(cpath):
         from .cuda_env import _charts_to_tensors
-        segs = _build_segments(seg_len, speed_scale, catalog, log)
+        segs = _build_segments(seg_len, catalog, log)
         pool = _charts_to_tensors(segs, "cpu", dtype)
         np.savez(cpath, **{k: v.numpy() for k, v in pool.items()})
         log(f"[ranked-pool] cached -> {os.path.basename(cpath)}",

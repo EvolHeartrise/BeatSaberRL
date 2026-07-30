@@ -4,7 +4,7 @@
         --tag gen2_429m [--top 10]
 
 For each top play: greedy re-rollout with the bench protocol (cached
-map, speed_scale 0.3, seed 0) recording JSONL v7, verify the outcome
+map, real NJS speeds, seed 0) recording JSONL v7, verify the outcome
 counters and multiplied score against the bench entry, then convert to
 a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
 (Was a 598M one-off; parameterized 2026-07-24.)
@@ -68,7 +68,7 @@ def main():
     for rank, entry in enumerate(top, 1):
         map_dir = f"maps/scoresaber/{entry['song_hash']}"
         notes, _ = load_beatmap(map_dir, entry["difficulty"],
-                                speed_scale=0.3, first_note_s=2.0)
+                                first_note_s=2.0)
         base = (f"replays/{args.tag}_{label}{rank:02d}_"
                 f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
         env = RustBeatEnv(external_chart=notes, seed=0)
