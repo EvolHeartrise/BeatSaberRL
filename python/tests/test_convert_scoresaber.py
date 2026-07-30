@@ -192,8 +192,7 @@ def converted(tmp_path_factory):
               "_type": 3, "_cutDirection": 0}]}
     (tmp / "Expert.dat").write_text(json.dumps(v2))
 
-    notes, _ = load_beatmap(str(tmp), "Expert", speed_scale=0.3,
-                            first_note_s=2.0)
+    notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=2.0)
     env = RustBeatEnv(external_chart=notes, seed=0)
     replay_path = str(tmp / "ep.jsonl")
     env.set_record(replay_path)

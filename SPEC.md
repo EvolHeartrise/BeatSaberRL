@@ -638,7 +638,7 @@ Machinery (`beat_arena_env/scoresaber.py`):
   best first (wiki.scoresaber.com/ranking-system).
 
 Result JSON: checkpoint path/name, model_hash, arch, global_step,
-speed_scale, updated timestamp, total_weighted_pp, n_evaluated,
+scoring_version, updated timestamp, total_weighted_pp, n_evaluated,
 n_skipped, and `levels[]` — per level: leaderboard_id, song_hash, song,
 mapper, difficulty, stars, max_pp, duration_s, n_notes, score,
 max_score, api_max_score, accuracy, pp, good_cuts, bad_cuts, misses,
@@ -689,7 +689,7 @@ optimization survey — the wall was PYTHON PARSING, ~50% of a warm run,
 GIL-serialized against the loop despite the producer thread):**
 (a) **parsed-chart cache** — the producer caches
 `(note tuples, max_multiplied_score, duration_s, last_hit_s)` per
-`(hash, difficulty, speed_scale, parser-source-hash)` as pickles under
+`(hash, difficulty, parser-source-hash)` as pickles under
 `--chart-cache` (default `maps/chart_cache/`, ~380 MB full catalog);
 the source hash (beatsaver+chart+scoresaber .py bytes) auto-invalidates
 on any parser edit. (b) **longest-first task ordering** off a
