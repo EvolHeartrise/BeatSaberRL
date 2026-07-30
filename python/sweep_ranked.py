@@ -70,7 +70,14 @@ SPACE = {
         "ent_final":   dict(distribution="log_normal", min=1e-5, max=0.1, scale=0.5),
         "gamma":       dict(distribution="logit_normal", min=0.72, max=0.997, scale=0.5),
         "gae_lambda":  dict(distribution="logit_normal", min=0.65, max=0.995, scale=0.5),
-        "effort_coef": dict(distribution="log_normal", min=0.002, max=8.0, scale=0.5),
+        # s3 widening #1 (2026-07-29, after legs 000-048): effort ceiling
+        # 8.0 -> 32.0 — three of the top five (incl. best run 048 at
+        # 1,305,759) sat EXACTLY on the 8.0 bound, and the in-flight 049
+        # suggestion was there too. Under cut-plane scoring the effort
+        # tax flipped: centering adjustments pay for themselves (s2's
+        # optimum was ~0.2-0.7 with 5+ catastrophic). s1/s2 protocol:
+        # stop, widen, relaunch (observations replay into the wider box).
+        "effort_coef": dict(distribution="log_normal", min=0.002, max=32.0, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
     },
 }
