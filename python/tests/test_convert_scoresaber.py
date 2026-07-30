@@ -206,8 +206,10 @@ def converted(tmp_path_factory):
 
     out = str(tmp / "ep.dat")
     r = conv.convert(replay_path, str(tmp), "ab" * 20, "Expert", out)
+    with open(replay_path) as f:
+        ticks = [json.loads(l) for l in f][1:]
     return {"map_dir": str(tmp), "events": events, "result": r,
-            "decoded": decode_dat(out)}
+            "ticks": ticks, "decoded": decode_dat(out)}
 
 
 def test_metadata_and_magic(converted):
@@ -216,7 +218,9 @@ def test_metadata_and_magic(converted):
     assert d["level_id"] == "custom_level_" + "AB" * 20
     assert d["difficulty"] == 7 and d["characteristic"] == "Standard"
     assert not d["left_handed"] and d["n_heights"] == 0
-    assert d["height"] == pytest.approx(1.70)
+    # BODY height (viewer lowers all objects by (height - 1.8)/2, so the
+    # env's 1.8 m player must write 1.80 here, not the 1.70 head anchor)
+    assert d["height"] == pytest.approx(1.80)
     assert d["platform"] == "PC" and d["game_version"]
 
 
@@ -241,7 +245,8 @@ def test_v3_fields(converted):
             assert e["speed"] == 0.0 and e["before"] == 0.0
         q = e["note_rot"]
         assert math.fsum(c * c for c in q) == pytest.approx(1.0, abs=1e-4)
-        assert e["note_pos"][2] == 0.0
+        # player space: the note-arrival plane sits at +0.65, not 0
+        assert e["note_pos"][2] == pytest.approx(0.65)
 
     scores = d["scores"]
     assert scores, "score block empty"
@@ -266,7 +271,17 @@ def test_frames_wellformed(converted):
         for key in ("head", "left", "right"):
             q = f[key][3:7]
             assert math.fsum(c * c for c in q) == pytest.approx(1.0, abs=1e-4)
-    assert frames[0]["head"][:3] == pytest.approx((0.0, 1.70, -0.65))
+    # PLAYER SPACE: head at z = 0 (the viewer parents poses under a rig
+    # 0.65 m back and expects notes to arrive at head.z + 0.65; writing
+    # env world coords here shifted the whole avatar behind the platform)
+    assert frames[0]["head"][:3] == pytest.approx((0.0, 1.70, 0.0))
+    # saber frames = recorded wrists shifted env world -> player space
+    ticks = converted["ticks"]
+    for i in (0, len(ticks) // 2, len(ticks) - 1):
+        for hand, key in ((0, "left"), (1, "right")):
+            wrist = ticks[i]["sabers"][hand][12:15]
+            want = (wrist[0], wrist[1], wrist[2] + 0.65)
+            assert frames[i][key][:3] == pytest.approx(want, abs=1e-5)
 
 
 def test_note_events_match_their_rules(converted):
