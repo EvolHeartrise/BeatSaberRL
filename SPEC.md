@@ -67,8 +67,8 @@ checkpoints/replays retire (hard replace).
   at the real **non-uniform at-player heights** y = 0.85 / 1.40 / 1.90.
   Notes spawn at their final heights (the real rise-in-flight gravity
   arc is documented in the research doc, deliberately not modeled yet).
-  `BLOCK = 0.4` m is now VISUAL only — collision uses the real hitboxes
-  below. Objects carry explicit world positions `(x, y)` in the chart
+  `BLOCK = 0.5` m is now VISUAL only (the real game's cube; 0.4 until
+  2026-07-30) — collision uses the real hitboxes below. Objects carry explicit world positions `(x, y)` in the chart
   (chain links sit off-grid on their Bézier).
 - **Body (v6 chains, real placement)**: a 1.8 m player — shoulder
   anchors at `(∓0.2, 1.47, −0.65)` (0.4 m shoulder width, head at the

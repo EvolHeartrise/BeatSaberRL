@@ -265,7 +265,8 @@ def test_frames_wellformed(converted):
     times = [f["time"] for f in frames]
     assert times[0] > 0 and all(b > a for a, b in zip(times, times[1:]))
     # fixture first note: 3 beats @120 = 1.5 s real vs 2.0 s sim -> -0.5 s
-    # offset; the last frame must land near (episode_len - 0.5)
+    # offset, +1/30 for the start-of-tick labeling (see
+    # test_times_are_end_of_tick)
     for f in frames:
         assert f["fps"] == 30
         for key in ("head", "left", "right"):
@@ -282,6 +283,27 @@ def test_frames_wellformed(converted):
             wrist = ticks[i]["sabers"][hand][12:15]
             want = (wrist[0], wrist[1], wrist[2] + 0.65)
             assert frames[i][key][:3] == pytest.approx(want, abs=1e-5)
+
+
+def test_times_are_end_of_tick(converted):
+    """A JSONL tick line's `time` labels the tick START while its saber
+    state and events are END-of-tick (the recorder stamps post-step
+    state with sim.time - DT; viz compensates with (tick+1)*DT). The
+    converter folds +DT into the sim->song offset, so every decoded
+    event/pose time = tick_time + (first_real_hit - 2.0) + 1/30."""
+    offset = 1.5 - 2.0 + 1.0 / 30.0
+    ticks = converted["ticks"]
+    want = sorted(t["time"] + offset for t in ticks
+                  for ev in t["events"] if "post" not in ev)
+    got = sorted(e["time"] for e in converted["decoded"]["notes"])
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        assert a == pytest.approx(b, abs=1e-4)
+    frames = converted["decoded"]["frames"]
+    for f, t in zip(frames, ticks):
+        expect = t["time"] + offset
+        if expect > 1e-3:                  # below: clamped by the t<=0 rule
+            assert f["time"] == pytest.approx(expect, abs=1e-4)
 
 
 def test_note_events_match_their_rules(converted):
