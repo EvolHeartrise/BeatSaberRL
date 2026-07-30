@@ -56,7 +56,10 @@ def main():
     sgn = 1.0 if args.bottom else -1.0
     top = sorted((e for e in bench["levels"] if "skipped" not in e),
                  key=lambda e: sgn * e[args.sort])[:args.top]
-    label = "bot" if args.bottom else "top"
+    # label carries the sort key too (2026-07-30, user request): the pp
+    # and accuracy "top" sets used to collide on topNN names
+    label = ("bot" if args.bottom else "top") + (
+        "acc" if args.sort == "accuracy" else "pp")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     dev = torch.device(args.device
                        or ("cuda" if torch.cuda.is_available() else "cpu"))
