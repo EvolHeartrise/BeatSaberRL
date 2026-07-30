@@ -22,6 +22,16 @@ repo (mirrored at projects/beat-arena/research/vendor/scoresaber-watch):
 Fidelity notes:
 - Pose frames are exact: wrist positions from the recorded joint state,
   blade orientation via the kinematics FK mirror, 30 fps.
+- Coordinates are the game's PLAYER SPACE: player at z = 0, notes
+  arriving at z = +0.65 (the viewer's PlayerCutPlaneDistance — it
+  parents all replay poses under a rig 0.65 m behind the world origin
+  and puts the note-arrival plane at head.z + 0.65). The env world
+  (head -0.65, cut plane 0) IS the viewer's world frame, so positions
+  shift +0.65 in z at write time; x/y agree (floor-based, same rows).
+  Metadata initialHeight is the player's BODY height (1.80 for the
+  env's 1.8 m player, head anchor 1.70) — the viewer lowers every
+  object by (height - 1.8)/2, so writing the head y there sank all
+  notes 5 cm.
 - The viewer matches events to map notes by ID = scoringType*10000 +
   lineIndex*1000 + lineLayer*100 + color*10 + cutDirection, grouped by
   note time with a 1 ms epsilon — so line/layer/direction come from
@@ -60,6 +70,16 @@ assert len(MAGIC) == 28
 
 DIFF_RAW = {"Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9}
 HEAD_POS = (0.0, 1.70, -0.65)          # env v7 look-at anchor
+PLAYER_HEIGHT = 1.80                   # env body height (NOT the head y)
+
+# env world -> replay player space: the file wants the player at z = 0
+# with notes arriving at +0.65; the env's z = 0 cut plane / z = -0.65
+# head is the viewer's WORLD frame, one PlayerCutPlaneDistance behind
+CUT_PLANE_DIST = 0.65
+
+
+def player_space(p):
+    return (p[0], p[1], p[2] + CUT_PLANE_DIST)
 
 # their ScoringType enum (ObjectManager/ScoringEvent)
 ST_NOSCORE, ST_NOTE, ST_ARCHEAD, ST_ARCTAIL = 0, 1, 2, 3
@@ -174,7 +194,7 @@ def metadata_block(song_hash, difficulty):
     b = w_int(b, 0)                                # modifiers: empty array
     b = w_float(b, 0.0)                            # NoteSpawnOffset
     b = w_bool(b, False)                           # leftHanded
-    b = w_float(b, 1.70)                           # initialHeight (v7 anchor)
+    b = w_float(b, PLAYER_HEIGHT)                  # initialHeight (body height)
     b += b"\x00" * 16                              # RoomRotation + RoomCenter
     b = w_float(b, 0.0)                            # failTime
     b = w_str(b, "beat-arena env v7")              # GameVersion (>=3.1.0)
@@ -206,10 +226,10 @@ def pose_block(ticks, offset):
         if last_t is not None and t <= last_t:     # and duplicate times
             t = last_t + eps
         last_t = t
-        b = w_vec3(b, HEAD_POS)
+        b = w_vec3(b, player_space(HEAD_POS))
         b += struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)
         for pos, quat in hands:
-            b = w_vec3(b, pos)
+            b = w_vec3(b, player_space(pos))
             b += struct.pack("<4f", *quat)
         b = w_int(b, 30)                           # fps
         b = w_float(b, t)
@@ -425,7 +445,7 @@ def note_block(events):
         b = w_int(b, e["st"])                      # scoringType (v3)
         b = w_float(b, e["angle_off"])             # cutDirAngleOffset (v3)
         b = w_int(b, e["type"])                    # 1 good 2 bad 3 miss 4 bomb
-        b = w_vec3(b, e["cut_pos"])                # cutPoint (blade contact)
+        b = w_vec3(b, player_space(e["cut_pos"]))  # cutPoint (blade contact)
         b = w_vec3(b, e["normal"])                 # cutNormal (cut plane)
         b = w_vec3(b, e["saber_dir"])
         b = w_int(b, e["saber"])
@@ -446,7 +466,7 @@ def note_block(events):
         half = e["note_angle"] / 2.0               # NoteRotation: z-roll,
         b += struct.pack("<4f", 0.0, 0.0,          # down-swing = identity
                          math.sin(half), math.cos(half))
-        b = w_vec3(b, e["note_pos"])               # NotePosition
+        b = w_vec3(b, player_space(e["note_pos"]))  # NotePosition
     return bytes(b)
 
 
