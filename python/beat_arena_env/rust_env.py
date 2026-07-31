@@ -112,6 +112,12 @@ class RustBeatEnv(gym.Env):
         # joints), root twist, omega29, per-hand FK sabers [w3 + b3],
         # contact events (pair id, world point, tick-summed impulse),
         # score events unchanged from v7+.
+        # P6 ADDITIVE fields (version stays "v10"; readers must treat
+        # them as optional): "feet" = per-foot [L, R] tick-summed weld
+        # impulses [jx, jy, jz, jax, jay, jaz] (N·s; ground reaction —
+        # vertical force ≈ jy/DT), "effort" = the tick's positive
+        # mechanical work (J). τ per joint is NOT logged: it is exactly
+        # gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
         self._record_lines.append(json.dumps({
             "t": self.sim.tick - 1,
             "time": round(self.sim.time - 1.0 / 30.0, 5),
@@ -125,6 +131,9 @@ class RustBeatEnv(gym.Env):
                                                 round(z, 4)],
                           "j": round(imp, 4)}
                          for p, x, y, z, imp in self.sim.contacts()],
+            "feet": [[round(v, 4) for v in f]
+                     for f in self.sim.weld_impulses()],
+            "effort": round(self.sim.last_effort(), 4),
             "events": [
                 {"miss": {"note": int(i)}} if code == 4 else
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}

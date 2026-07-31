@@ -1,5 +1,5 @@
 // Playback state shared by the DOM shell and the 3D scene (Svelte 5 runes).
-import { clampQ, mirrorQ, parseReplay } from "./replay.js";
+import { clampQ29, mirrorQ29, parseReplay } from "./replay.js";
 
 export const pb = $state({
   rep: null,
@@ -8,15 +8,20 @@ export const pb = $state({
   playing: false,
   speed: 1.0,
   exporting: false,
-  gauges: true, // per-hand wrist/joint angle dials
+  gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
 });
 
-// Manual pose mode: slider-driven joint angles take over the body
-// (works with or without a replay loaded; omegas are zero).
+// Manual pose mode (env v10): slider-driven FULL-BODY pose — 29 joint
+// angles (§1.4 actuated order) + the free root (position + yaw/pitch/
+// roll). Drives the same bodyFK preview path as replay playback; no
+// sim roundtrip. Works with or without a replay loaded.
+export const ROOT0 = { x: 0, y: 0.94, z: -0.65, yaw: 0, pitch: 0, roll: 0 };
+
 export const pose = $state({
   on: false,
-  q: [[0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0]], // per hand, 7 joints (v9)
+  q: Array(29).fill(0),
+  root: { ...ROOT0 },
   ref: null, // static reference note {col, row} at z = 0, or null (off)
 });
 
@@ -25,17 +30,21 @@ export function togglePose() {
   if (pose.on) pb.playing = false; // posing pauses playback
 }
 
-export function setPoseJoint(hand, j, rad) {
-  pose.q[hand] = clampQ(hand,
-    pose.q[hand].map((v, k) => (k === j ? rad : v)));
+export function setPoseJoint(j, rad) {
+  pose.q = clampQ29(pose.q.map((v, k) => (k === j ? rad : v)));
 }
 
-export function resetPoseHand(hand) {
-  pose.q[hand] = [0, 0, 0, 0, 0, 0, 0];
+export function setPoseRoot(key, val) {
+  pose.root = { ...pose.root, [key]: val };
+}
+
+export function resetPose() {
+  pose.q = Array(29).fill(0);
+  pose.root = { ...ROOT0 };
 }
 
 export function mirrorPoseLR() {
-  pose.q[1] = clampQ(1, mirrorQ(pose.q[0]));
+  pose.q = clampQ29(mirrorQ29(pose.q));
 }
 
 export function lastTick() {

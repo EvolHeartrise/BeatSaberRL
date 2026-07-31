@@ -1,23 +1,25 @@
-// Replay format v7 (SPEC.md §Replay log): env v7 real-BS geometry.
+// Replay format v10 (SPEC-v10 §6): env v10 full-body dynamics.
 // Pure logic only (no three/svelte imports) — unit-tested in node.
 //
-// World (env v7): floor-based coordinates, y = 0 is the floor. Lanes at
+// World: floor-based coordinates, y = 0 is the floor. Lanes at
 // x = -0.9, -0.3, 0.3, 0.9 (0.6 m pitch); row centers y = 0.85, 1.40,
-// 1.90. Hit plane z = 0; objects approach from +z; misses register at
-// z = -0.65 (the head plane). Chart entries carry EXPLICIT world
-// (x, y) plus a kind: 0 note, 1 bomb, 2 chain head, 3 chain link, and
-// arc grants fpre/fpost. Sabers = 15 numbers per hand:
-// [q(6) = pitch, yaw, twist, elbow, roll, bend | om(6) | wrist x, y, z].
-// Each hand is a chain from a fixed shoulder (±0.2, 1.47, -0.65):
-// upper arm -> elbow -> forearm -> wrist (roll + bend) -> 1 m blade;
-// armFK mirrors the sim's forward kinematics exactly.
+// 1.90. Hit plane z = 0; objects approach from +z. Per-tick records
+// carry the FULL body state: q(36) = root pos + root quat (wxyz) + 29
+// joint angles (§1.4 actuated order), root twist(6), omega(29), the
+// per-hand FK sabers [wrist(3), blade(3)] (viewer convenience — the
+// skeleton is drawn from full-body FK over q), 29 gear-id actions,
+// contact events {pair, p, j} (§2 pair ids, tick-summed impulse), and
+// the P6 ADDITIVE fields "feet" (per-foot tick-summed weld impulses
+// [jx,jy,jz,jax,jay,jaz]; vertical reaction N ≈ jy/DT) and "effort"
+// (positive mechanical work, J) — additive: readers must tolerate
+// their absence. Applied torque is NOT logged; it is exactly
+// gearTable(config.gears)[action[j]] * TAU_MAX29[j].
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
 
 // BLOCK 0.5: the real game's visual cube (verified against the
-// ScoreSaber viewer's note mesh, 2026-07-30 — 0.4 under-drew notes 20%
-// and exaggerated the hitbox-vs-visual overhang in the 'h' overlay)
+// ScoreSaber viewer's note mesh, 2026-07-30)
 export const CELL = 0.6, BLOCK = 0.5, HALF = BLOCK / 2;
 export const LANE_X = [-0.9, -0.3, 0.3, 0.9];
 export const ROW_Y = [0.85, 1.4, 1.9];
@@ -27,9 +29,8 @@ export const GX0 = -1.2, GX1 = 1.2;
 export const GY0 = 0.575, GY1 = 2.15;
 export const ROW_EDGES = [GY0, 1.125, 1.65, GY1];
 export const Z_FAR = 12.0;
-// env v7.3: the miss plane is the HEAD plane (z = -0.65) — a deliberate
-// deviation from the real game's despawn (~2 m behind the head) to
-// tighten credit assignment; mirrors constants.py / lib.rs
+// env v10: REACH/miss are LIVE-POSE gates in the sim; the viewer keeps
+// the reference-pose planes (1.75 / -0.65) for the static scenery only
 export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 0.65;
 export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 
@@ -58,29 +59,17 @@ export const HB = {
 export const noteRot = (n) => (n.any ? 0 : n.angle - 1.5 * Math.PI);
 
 // env v7.4: hitboxes rotate about the approach (z) axis by
-// rot = angle - 270° too, mirroring lib.rs note_rot. (v7.0 drew/judged
-// them axis-aligned — a BeatLeader-viewer simplification mistaken for
-// game behavior; the real colliders sit on the rotated note transform.)
-// Arrow notes and chain heads rotate by their angle; chain links by
-// their tangent (their `angle` field) even though links judge
-// any-direction; plain dots and bombs stay unrotated. Differs from
-// noteRot only for links (any=true but still rotating).
+// rot = angle - 270° too, mirroring lib.rs note_rot.
 export const hitboxRot = (n) =>
   n.kind !== KIND_BOMB && (n.kind === KIND_CHAIN_LINK || !n.any)
     ? n.angle - 1.5 * Math.PI
     : 0;
 
-// --- env v7.6: look-at-player note orientation (mirror of lib.rs
-// note_frame). Plain notes (kind 0, dots included) bias their FULL 3D
-// orientation toward facing the player's head as they approach: the
-// head's y is damped 80% toward the note's y, the forward axis blends
-// from +z to the head->note ray with weight lam = clamp(1 - z/8, 0, 1)
-// — our analog of the game's jump progress (full head-facing at the
-// plane) — and the cut-direction z-roll rides along as the frame's up.
-// lam = 0 reproduces the v7.4 pure z-roll frame EXACTLY (chain heads
-// and links stay there; bombs are spheres). Both the visuals and the
-// hitboxes live on this transform, exactly as in the sim.
-export const HEAD = [0, 1.7, -0.65]; // fixed head anchor (1.8 m player)
+// --- env v7.6 look-at-player note orientation (mirror of lib.rs
+// note_frame). Env v10: the sim billboards to the LIVE head; the viewer
+// uses the replayed head position via noteFrame's `head` argument
+// (defaults to the reference anchor for callers without a pose).
+export const HEAD = [0, 1.7, -0.65]; // reference head anchor
 export const LOOK_VERT = 0.8; // head.y damped 80% toward note.y
 export const LOOK_DIST = 8.0; // full head-facing at z=0, none beyond 8 m
 
@@ -90,10 +79,10 @@ export const noteLam = (n, z) =>
 
 /** Orthonormal note frame [x', y', z'] (world-coord columns) at world
  * position p with z-roll psi: z' = the blended forward, up = the rolled
- * (-sin psi, cos psi, 0), x' = up x z', y' = z' x x'. */
-export function noteFrame(p, psi, lam) {
+ * (-sin psi, cos psi, 0), x' = up x z'. `head` = live head position. */
+export function noteFrame(p, psi, lam, head = HEAD) {
   const up = [-Math.sin(psi), Math.cos(psi), 0];
-  const hp = [HEAD[0], HEAD[1] + LOOK_VERT * (p[1] - HEAD[1]), HEAD[2]];
+  const hp = [head[0], head[1] + LOOK_VERT * (p[1] - head[1]), head[2]];
   const d = [p[0] - hp[0], p[1] - hp[1], p[2] - hp[2]];
   const dn = Math.max(Math.hypot(...d), 1e-9);
   const g = [
@@ -132,60 +121,276 @@ export function frameQuatScene(f) {
   return [(m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s];
 }
 export const V_MIN = 1, DT = 1 / 30;
-// env v6 body (v7 placement) + anatomical joint limits (mirror the sim)
+
+// ============================================================================
+// v10 body model — MIRROR of rust/src/dynamics/model.rs (SPEC-v10 §1).
+// Actuated order (§1.4): spine[pitch,yaw,roll], arm_l[pitch,yaw,twist,
+// elbow,roll,bend,dev], arm_r[same], leg_l[hp,hy,hr,knee,ap,ar], leg_r.
+// ============================================================================
 const RAD = Math.PI / 180;
-export const SHOULDER = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
-export const L_UPPER = 0.35, L_FORE = 0.3;
-// env v7.2: pitch capped at +65 deg (up); -90 straight-down unchanged
-export const PITCH_LO = -90 * RAD, PITCH_HI = 65 * RAD;
-export const YAW_LO = [-100 * RAD, -45 * RAD]; // left, right
-export const YAW_HI = [45 * RAD, 100 * RAD];
-// env v7.1: twist and roll tightened, per-hand mirrored ranges
-export const TWIST_LO = [-90 * RAD, -70 * RAD]; // left, right
-export const TWIST_HI = [70 * RAD, 90 * RAD];
-export const ELBOW_HI = 150 * RAD;
-export const ROLL_LO = [0 * RAD, -180 * RAD];   // left, right
-export const ROLL_HI = [180 * RAD, 0 * RAD];
-export const BEND_LIM = 95 * RAD;
-export const DEV_LO = [-30 * RAD, -15 * RAD]; // env v9 dev (L, R):
-export const DEV_HI = [15 * RAD, 30 * RAD]; // right [-15,+30], L mirrored
-export const OMEGA_ARM = 16, OMEGA_WRIST = 40; // env v8 doubled caps
+export const N_JOINTS = 29;
+export const JOINT_NAMES = [
+  "sp_pitch", "sp_yaw", "sp_roll",
+  "pitch", "yaw", "twist", "elbow", "roll", "bend", "dev",
+  "pitch", "yaw", "twist", "elbow", "roll", "bend", "dev",
+  "hip_p", "hip_y", "hip_r", "knee", "ank_p", "ank_r",
+  "hip_p", "hip_y", "hip_r", "knee", "ank_p", "ank_r",
+];
+// exact limit literals (model.rs HUMANOID_LIMITS)
+export const JOINT_LIMITS = [
+  [-20 * RAD, 45 * RAD], [-40 * RAD, 40 * RAD], [-30 * RAD, 30 * RAD],
+  [-90 * RAD, 65 * RAD], [-100 * RAD, 45 * RAD], [-90 * RAD, 70 * RAD],
+  [0, 150 * RAD], [0, Math.PI], [-95 * RAD, 95 * RAD], [-30 * RAD, 15 * RAD],
+  [-90 * RAD, 65 * RAD], [-45 * RAD, 100 * RAD], [-70 * RAD, 90 * RAD],
+  [0, 150 * RAD], [-Math.PI, 0], [-95 * RAD, 95 * RAD], [-15 * RAD, 30 * RAD],
+  [-20 * RAD, 120 * RAD], [-45 * RAD, 40 * RAD], [-45 * RAD, 30 * RAD],
+  [0, 150 * RAD], [-50 * RAD, 20 * RAD], [-20 * RAD, 20 * RAD],
+  [-20 * RAD, 120 * RAD], [-40 * RAD, 45 * RAD], [-30 * RAD, 45 * RAD],
+  [0, 150 * RAD], [-50 * RAD, 20 * RAD], [-20 * RAD, 20 * RAD],
+];
+export const TAU_MAX = [
+  800.00, 319.93, 500.00,
+  113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+  113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+  484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
+  484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
+];
+export const OMEGA_CAP = JOINT_LIMITS.map((_, j) =>
+  j === 7 || j === 8 || j === 9 || j === 14 || j === 15 || j === 16 ? 40 : 16);
+// gauge grouping (§1.4 blocks)
+export const GROUPS = [
+  { name: "spine", joints: [0, 1, 2] },
+  { name: "L arm", joints: [3, 4, 5, 6, 7, 8, 9] },
+  { name: "R arm", joints: [10, 11, 12, 13, 14, 15, 16] },
+  { name: "L leg", joints: [17, 18, 19, 20, 21, 22] },
+  { name: "R leg", joints: [23, 24, 25, 26, 27, 28] },
+];
 
-// ---- manual pose mode (pure helpers; UI in PosePanel.svelte) ---------------
-export const JOINT_NAMES =
-  ["pitch", "yaw", "twist", "elbow", "roll", "bend", "dev"];
+// env v8 gear tables (constants.gear_table mirror): id 0 coast,
+// 1/2 = ±full at every K; K=5 appends ±1/4; K=7 appends ±1/3, ±1/8.
+export function gearTable(n) {
+  const mags = { 3: [1], 5: [1, 0.25], 7: [1, 1 / 3, 0.125] }[n] ?? [1];
+  const out = [0];
+  for (const m of mags) out.push(m, -m);
+  return out;
+}
 
-/** [(lo, hi)] x 7 for one hand, in joint order (mirror of constants.py). */
-export function jointLimits(hand) {
+/** Applied torque per joint this tick: gear fraction × τ_max. */
+export function tauOf(action, gears) {
+  const table = gearTable(gears);
+  return action.map((a, j) => (table[a] ?? 0) * TAU_MAX[j]);
+}
+
+// Kinematic frame table (model.rs HUMANOID_FRAMES): [parent, anchor,
+// axis, coord] in chain (stacking) order; parent -1 = the free root
+// (pelvis). Stacking order != actuated order for the shoulder
+// (yaw→pitch→twist) and wrist (roll→dev→bend) clusters.
+const AX = [1, 0, 0], AXN = [-1, 0, 0], AY = [0, 1, 0], AZ = [0, 0, 1];
+const Z3 = [0, 0, 0];
+export const FRAMES = [
+  [-1, [0, 0.10, 0], AX, 0],           //  0 spine_pitch
+  [0, Z3, AY, 1],                      //  1 spine_yaw
+  [1, Z3, AZ, 2],                      //  2 spine_roll + chest
+  [2, [0, 0.66, 0], AZ, -1],           //  3 head (WELD)
+  [2, [-0.20, 0.43, 0], AY, 4],        //  4 l_sh_yaw
+  [4, Z3, AXN, 3],                     //  5 l_sh_pitch
+  [5, Z3, AZ, 5],                      //  6 l_sh_twist + uarm_l
+  [6, [0, 0, 0.35], AXN, 6],           //  7 l_elbow + farm_l
+  [7, [0, 0, 0.30], AZ, 7],            //  8 l_wr_roll
+  [8, Z3, AY, 9],                      //  9 l_wr_dev
+  [9, Z3, AXN, 8],                     // 10 l_wr_bend + hand_l
+  [2, [0.20, 0.43, 0], AY, 11],        // 11 r_sh_yaw
+  [11, Z3, AXN, 10],                   // 12 r_sh_pitch
+  [12, Z3, AZ, 12],                    // 13 r_sh_twist + uarm_r
+  [13, [0, 0, 0.35], AXN, 13],         // 14 r_elbow + farm_r
+  [14, [0, 0, 0.30], AZ, 14],          // 15 r_wr_roll
+  [15, Z3, AY, 16],                    // 16 r_wr_dev
+  [16, Z3, AXN, 15],                   // 17 r_wr_bend + hand_r
+  [-1, [-0.10, 0, 0], AXN, 17],        // 18 l_hip_pitch
+  [18, Z3, AY, 18],                    // 19 l_hip_yaw
+  [19, Z3, AZ, 19],                    // 20 l_hip_roll + thigh_l
+  [20, [0, -0.44, 0], AX, 20],         // 21 l_knee + shank_l
+  [21, [0, -0.43, 0], AXN, 21],        // 22 l_ankle_pitch
+  [22, Z3, AZ, 22],                    // 23 l_ankle_roll + foot_l
+  [-1, [0.10, 0, 0], AXN, 23],         // 24 r_hip_pitch
+  [24, Z3, AY, 24],                    // 25 r_hip_yaw
+  [25, Z3, AZ, 25],                    // 26 r_hip_roll + thigh_r
+  [26, [0, -0.44, 0], AX, 26],         // 27 r_knee + shank_r
+  [27, [0, -0.43, 0], AXN, 27],        // 28 r_ankle_pitch
+  [28, Z3, AZ, 28],                    // 29 r_ankle_roll + foot_r
+];
+export const F_CHEST = 2, F_HEAD = 3;
+export const F_L_SHOULDER = 4, F_L_ELBOW = 7, F_L_WRIST = 8, F_L_HAND = 10;
+export const F_R_SHOULDER = 11, F_R_ELBOW = 14, F_R_WRIST = 15,
+  F_R_HAND = 17;
+export const F_L_THIGH = 20, F_L_SHANK = 21, F_L_FOOT = 23;
+export const F_R_THIGH = 26, F_R_SHANK = 27, F_R_FOOT = 29;
+export const ROOT_POS0 = [0, 0.94, -0.65];
+
+// collider-carrying frames per SPEC-v10 §2 pair ids 0-11 (for contact
+// markers the point comes from the replay; this maps id -> label)
+export const COLLIDER_NAMES = [
+  "torso", "head", "uarm_l", "uarm_r", "farm_l", "farm_r",
+  "fist_l", "fist_r", "thigh_l", "thigh_r", "shank_l", "shank_r",
+];
+export const PAIRS = (() => {
+  const excluded = new Set(["0,1", "0,2", "0,3", "0,8", "0,9", "2,4",
+    "3,5", "4,6", "5,7", "8,10", "9,11"]);
+  const out = [];
+  for (let i = 0; i < 12; i++)
+    for (let j = i + 1; j < 12; j++)
+      if (!excluded.has(`${i},${j}`)) out.push([i, j]);
+  return out; // 55 pairs, index = normative pair id
+})();
+
+function rotAxis(axis, angle) {
+  const s = Math.sin(angle), c = Math.cos(angle), k = 1 - c;
+  const [x, y, z] = axis;
   return [
-    [PITCH_LO, PITCH_HI],
-    [YAW_LO[hand], YAW_HI[hand]],
-    [TWIST_LO[hand], TWIST_HI[hand]],
-    [0, ELBOW_HI],
-    [ROLL_LO[hand], ROLL_HI[hand]],
-    [-BEND_LIM, BEND_LIM],
-    [DEV_LO[hand], DEV_HI[hand]],
+    [c + k * x * x, k * x * y - s * z, k * x * z + s * y],
+    [k * x * y + s * z, c + k * y * y, k * y * z - s * x],
+    [k * x * z - s * y, k * y * z + s * x, c + k * z * z],
   ];
 }
 
-/** Clamp a 7-joint pose into the hand's anatomical ranges. */
-export function clampQ(hand, q) {
-  const lims = jointLimits(hand);
-  return q.map((v, j) => Math.min(lims[j][1], Math.max(lims[j][0], v)));
+/** World-from-body rotation of a wxyz (scalar-first) quaternion. */
+export function quatToRot(q) {
+  const [w, x, y, z] = q;
+  return [
+    [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+    [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+    [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+  ];
 }
 
-/** Mirror a pose across the body midplane (left <-> right): yaw, twist
- * and roll flip sign; pitch, elbow and bend are symmetric. The hands'
- * joint ranges are exact mirrors, so a legal pose mirrors to a legal one. */
-export const mirrorQ = (q) =>
-  [q[0], -q[1], -q[2], q[3], -q[4], q[5], -(q[6] ?? 0)]; // dev flips too
+const matMul = (a, b) => {
+  const o = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++)
+      o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+  return o;
+};
+const matVec = (m, v) => [
+  m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+  m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+  m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+];
 
-/** Synthetic 15-field arm state from a static pose: q(6) | omegas all
- * zero | FK wrist(3). Drives the same rendering path as replay ticks. */
-export function poseSaber(hand, q) {
-  const { wrist } = armFK(hand, q);
-  return [...q, ...Array(7).fill(0), ...wrist]; // q(7) | om(7)=0 | wrist
+/** Full-body FK from a replay q36 = [root pos(3), root quat wxyz(4),
+ * 29 joint angles]. Returns { r, p }: per-frame world rotation and
+ * origin in FRAMES order (30 entries, welded head included) — the JS
+ * mirror of rust/src/dynamics/fk.rs fk_all. */
+export function bodyFK(q36) {
+  const p0 = [q36[0], q36[1], q36[2]];
+  const r0 = quatToRot([q36[3], q36[4], q36[5], q36[6]]);
+  const r = [], p = [];
+  for (const [parent, anchor, axis, coord] of FRAMES) {
+    const rl = parent < 0 ? r0 : r[parent];
+    const pl = parent < 0 ? p0 : p[parent];
+    const av = matVec(rl, anchor);
+    p.push([pl[0] + av[0], pl[1] + av[1], pl[2] + av[2]]);
+    r.push(coord >= 0 ? matMul(rl, rotAxis(axis, q36[7 + coord])) : rl);
+  }
+  return { r, p, r0, p0 };
 }
+
+/** World point `local` expressed in frame k of an FK result. */
+export function framePoint(fk, k, local) {
+  const v = matVec(fk.r[k], local);
+  return [fk.p[k][0] + v[0], fk.p[k][1] + v[1], fk.p[k][2] + v[2]];
+}
+
+/** Wrist position + unit blade dir per hand from an FK result:
+ * [wx, wy, wz, bx, by, bz] — the replay `sabers` layout. */
+export function fkSaber(fk, hand) {
+  const w = fk.p[hand === 0 ? F_L_WRIST : F_R_WRIST];
+  const r = fk.r[hand === 0 ? F_L_HAND : F_R_HAND];
+  return [w[0], w[1], w[2], r[0][2], r[1][2], r[2][2]];
+}
+
+/** Interpolated q36 at (tickIdx + u): root position and joints lerp,
+ * root quaternion nlerp (short arc). */
+export function qAt(rep, tickIdx, u) {
+  const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].q;
+  const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].q;
+  const out = new Array(36);
+  for (let i = 0; i < 3; i++) out[i] = lerp(a[i], b[i], u);
+  // nlerp with sign fix (short arc)
+  let dot = 0;
+  for (let i = 3; i < 7; i++) dot += a[i] * b[i];
+  const s = dot < 0 ? -1 : 1;
+  let n = 0;
+  for (let i = 3; i < 7; i++) {
+    out[i] = lerp(a[i], s * b[i], u);
+    n += out[i] * out[i];
+  }
+  n = Math.sqrt(n) || 1;
+  for (let i = 3; i < 7; i++) out[i] /= n;
+  for (let i = 7; i < 36; i++) out[i] = lerp(a[i], b[i], u);
+  return out;
+}
+
+// ---- manual pose mode (pure helpers; UI in PosePanel.svelte) ---------------
+// Pose state: 29 joint angles (§1.4 order) + root {pos, yaw, pitch,
+// roll}. The preview runs entirely through bodyFK (no sim roundtrip).
+
+/** q36 from a pose { q: [29], root: {x, y, z, yaw, pitch, roll} } —
+ * root orientation composed yaw(Y)·pitch(X)·roll(Z), intrinsic. */
+export function poseQ36(pose) {
+  const { x, y, z, yaw, pitch, roll } = pose.root;
+  const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2);
+  const cp = Math.cos(pitch / 2), sp = Math.sin(pitch / 2);
+  const cr = Math.cos(roll / 2), sr = Math.sin(roll / 2);
+  // q = qy ⊗ qx ⊗ qz (wxyz)
+  const qy = [cy, 0, sy, 0], qx = [cp, sp, 0, 0], qz = [cr, 0, 0, sr];
+  const mul = (a, b) => [
+    a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+    a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+    a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+    a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+  ];
+  const q = mul(mul(qy, qx), qz);
+  return [x, y, z, ...q, ...pose.q];
+}
+
+/** Clamp a 29-joint pose into the anatomical ranges. */
+export function clampQ29(q) {
+  return q.map((v, j) =>
+    Math.min(JOINT_LIMITS[j][1], Math.max(JOINT_LIMITS[j][0], v)));
+}
+
+/** Mirror a full 29-joint pose across the body midplane: arm blocks
+ * swap L<->R (yaw/twist/roll/dev flip sign; pitch/elbow/bend keep),
+ * leg blocks swap (hip_yaw/hip_roll/ankle_roll flip), spine yaw/roll
+ * flip. The per-side ranges are exact mirrors, so legal poses mirror
+ * to legal poses. */
+export function mirrorQ29(q) {
+  const out = new Array(29);
+  [out[0], out[1], out[2]] = [q[0], -q[1], -q[2]];
+  const arm = (s, d) => {
+    out[d] = q[s];           // pitch
+    out[d + 1] = -q[s + 1];  // yaw
+    out[d + 2] = -q[s + 2];  // twist
+    out[d + 3] = q[s + 3];   // elbow
+    out[d + 4] = -q[s + 4];  // roll
+    out[d + 5] = q[s + 5];   // bend
+    out[d + 6] = -q[s + 6];  // dev
+  };
+  arm(3, 10);
+  arm(10, 3);
+  const leg = (s, d) => {
+    out[d] = q[s];           // hip_pitch
+    out[d + 1] = -q[s + 1];  // hip_yaw
+    out[d + 2] = -q[s + 2];  // hip_roll
+    out[d + 3] = q[s + 3];   // knee
+    out[d + 4] = q[s + 4];   // ankle_pitch
+    out[d + 5] = -q[s + 5];  // ankle_roll
+  };
+  leg(17, 23);
+  leg(23, 17);
+  return out;
+}
+
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
@@ -198,10 +403,10 @@ export function parseReplay(text) {
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 8)
+  if (v !== "v10")
     throw new Error(
-      "replay version " + v + " — this viewer reads v8 (env v9 7-joint " +
-      "body with wrist deviation); re-record from a current checkpoint",
+      "replay version " + v + " — this viewer reads v10 (env v10 " +
+      "full-body dynamics); re-record from a current checkpoint",
     );
   const ticks = lines.slice(1).map((l) => JSON.parse(l));
   const chart = head.header.chart;
@@ -258,12 +463,11 @@ export function maxScore(chart) {
 
 export function configSummary(rep) {
   const c = rep.config;
-  // generator v2 headers carry note_speed_min/prob dials; real-map and
-  // pre-v2 headers may lack them — show what exists
   const spd = c.note_speed_min != null
     ? `${c.note_speed_min}-${c.note_speed_max} m/s`
     : (c.note_speed != null ? `${c.note_speed} m/s` : null);
   const parts = [c.colors, spd];
+  if (c.gears != null) parts.push(`${c.gears} gears`);
   if (c.note_prob != null) parts.push(`p ${c.note_prob}`);
   if (c.extra_prob) parts.push(`extras ${c.extra_prob}`);
   if (c.dot_prob) parts.push(`dots ${c.dot_prob}`);
@@ -272,7 +476,7 @@ export function configSummary(rep) {
     `(${parts.filter(Boolean).join(", ")})`;
 }
 
-/** In-plane world (x, y) — explicit in the v7 chart. */
+/** In-plane world (x, y) — explicit in the v7+ chart. */
 export function noteCenter(n) {
   return [n.x, n.y];
 }
@@ -286,49 +490,29 @@ export function lerpAng(a, b, u) {
   return a + d * u;
 }
 
-/** Forward kinematics — MIRROR of the sim's fk() (SPEC §Sim rules).
- * q = [pitch, yaw, twist, elbow, roll, bend, dev] (world coords, z
- * toward the notes; env v9 adds wrist radial/ulnar deviation — blade =
- * Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the forearm frame, dev=0 == v8).
- * Returns {elbow, wrist, blade} — blade is a unit vector. */
-export function armFK(hand, q) {
-  const sp = Math.sin(q[0]), cp = Math.cos(q[0]);
-  const sy = Math.sin(q[1]), cy = Math.cos(q[1]);
-  const st = Math.sin(q[2]), ct = Math.cos(q[2]);
-  const se = Math.sin(q[3]), ce = Math.cos(q[3]);
-  const m = [
-    [cy * ct - sy * sp * st, -cy * st - sy * sp * ct, sy * cp],
-    [cp * st, cp * ct, sp],
-    [-sy * ct - cy * sp * st, sy * st - cy * sp * ct, cy * cp],
-  ];
-  const sh = SHOULDER[hand];
-  const elbow = [0, 1, 2].map((i) => sh[i] + L_UPPER * m[i][2]);
-  const f = [0, 1, 2].map((i) => m[i][1] * se + m[i][2] * ce);
-  const wrist = [0, 1, 2].map((i) => elbow[i] + L_FORE * f[i]);
-  const sr = Math.sin(q[4]), cr = Math.cos(q[4]);
-  const sb = Math.sin(q[5]), cb = Math.cos(q[5]);
-  const sv = Math.sin(q[6] ?? 0), cv = Math.cos(q[6] ?? 0);
-  const d = [cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb];
-  const blade = [0, 1, 2].map(
-    (i) => m[i][0] * d[0] + (m[i][1] * ce - m[i][2] * se) * d[1] + f[i] * d[2]);
-  return { elbow, wrist, blade };
-}
-
-/** Interpolated 17-field arm state at (tickIdx + u): joint angles lerped
- * (all joints are bounded, no wrap), omegas + wrist from the later tick. */
+/** Interpolated 6-field saber [wx,wy,wz,bx,by,bz] at (tickIdx + u):
+ * wrist lerped, blade lerp-normalized — from the LOGGED sabers (the
+ * sim's own FK; the skeleton uses bodyFK(qAt(...)) instead, and the
+ * two agree because the logged fields ARE that FK's outputs). */
 export function saberAt(rep, tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
   const out = [];
-  for (let j = 0; j < 7; j++) out.push(lerp(a[j], b[j], u));
-  for (let j = 7; j < 17; j++) out.push(b[j]);
+  for (let i = 0; i < 3; i++) out.push(lerp(a[i], b[i], u));
+  let bx = lerp(a[3], b[3], u), by = lerp(a[4], b[4], u),
+    bz = lerp(a[5], b[5], u);
+  const n = Math.hypot(bx, by, bz) || 1;
+  out.push(bx / n, by / n, bz / n);
   return out;
 }
 
-/** Blade tip in WORLD coords [x, y, z] from a 17-field arm state. */
-export function tipOf(hand, sab) {
-  const { wrist, blade } = armFK(hand, sab);
-  return [0, 1, 2].map((i) => wrist[i] + SABER_LEN * blade[i]);
+/** Blade tip in WORLD coords [x, y, z] from a 6-field saber. */
+export function tipOf(sab) {
+  return [
+    sab[0] + SABER_LEN * sab[3],
+    sab[1] + SABER_LEN * sab[4],
+    sab[2] + SABER_LEN * sab[5],
+  ];
 }
 
 const _dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -341,30 +525,27 @@ const _cross = (a, b) => [
 const _len = (a) => Math.hypot(a[0], a[1], a[2]);
 
 /** The ACTUAL cut plane of a good cut, reconstructed from the cutting
- * hand's blade sweep at the cut tick, in NOTE-LOCAL coords (the frame
- * the cube is drawn in: rotated by noteRot, origin at the note center,
- * z toward the notes). Returns { p (point on plane, clamped into the
- * cube), n (unit normal), v (unit sweep dir), b (unit blade dir) } or
- * null when the sweep is degenerate (pure stab: sweep parallel to the
- * blade) — callers fall back to the canonical center split. */
+ * hand's blade sweep at the cut tick, in NOTE-LOCAL coords. Returns
+ * { p, n, v, b } or null when the sweep is degenerate (pure stab). */
 export function cutPlaneLocal(rep, noteIdx) {
   const n = rep.chart[noteIdx], o = rep.outcomes[noteIdx];
   if (!o || o.kind !== "good") return null;
   const k = Math.min(o.tick, rep.ticks.length - 1);
   const k0 = Math.max(0, k - 1);
   const hand = n.color; // good cuts are matching-hand by rule
-  const prev = armFK(hand, rep.ticks[k0].sabers[hand]);
-  const cur = armFK(hand, rep.ticks[k].sabers[hand]);
+  const prev = rep.ticks[k0].sabers[hand];
+  const cur = rep.ticks[k].sabers[hand];
+  const pw = [prev[0], prev[1], prev[2]], pd = [prev[3], prev[4], prev[5]];
+  const cw = [cur[0], cur[1], cur[2]], cd = [cur[3], cur[4], cur[5]];
   const zCut = (n.t - (k + 1) * DT) * n.speed;
   const [cx, cy] = noteCenter(n);
   const center = [cx, cy, zCut];
   // contact fraction: closest point of the tick-k blade line to center
-  const s = Math.min(Math.max(_dot(_sub(center, cur.wrist), cur.blade), 0),
-    SABER_LEN);
-  const p1 = [0, 1, 2].map((i) => cur.wrist[i] + s * cur.blade[i]);
-  const p0 = [0, 1, 2].map((i) => prev.wrist[i] + s * prev.blade[i]);
+  const s = Math.min(Math.max(_dot(_sub(center, cw), cd), 0), SABER_LEN);
+  const p1 = [0, 1, 2].map((i) => cw[i] + s * cd[i]);
+  const p0 = [0, 1, 2].map((i) => pw[i] + s * pd[i]);
   const sweep = _sub(p1, p0);
-  const nrm = _cross(cur.blade, sweep);
+  const nrm = _cross(cd, sweep);
   const nl = _len(nrm), vl = _len(sweep);
   if (nl < 1e-6 || vl < 1e-9) return null;
   // world -> note-local: R(-rot) about z, origin at the note center
@@ -377,17 +558,17 @@ export function cutPlaneLocal(rep, noteIdx) {
     p,
     n: loc(nrm.map((x) => x / nl)),
     v: loc(sweep.map((x) => x / vl)),
-    b: loc(cur.blade),
+    b: loc(cd),
   };
 }
 
 /** Contact-capability: tip speed via finite difference across one tick
- * (env v6 contact-velocity semantics). */
+ * (contact-velocity semantics). */
 export function tipSpeed(rep, tickIdx, s) {
   const k = Math.min(tickIdx, rep.ticks.length - 1);
   const k0 = Math.max(0, k - 1);
-  const t1 = tipOf(s, rep.ticks[k].sabers[s]);
-  const t0 = tipOf(s, rep.ticks[k0].sabers[s]);
+  const t1 = tipOf(rep.ticks[k].sabers[s]);
+  const t0 = tipOf(rep.ticks[k0].sabers[s]);
   if (k === k0) return 0;
   return Math.hypot(t1[0] - t0[0], t1[1] - t0[1], t1[2] - t0[2]) / DT;
 }
@@ -408,6 +589,45 @@ export function counts(rep, uptoTick) {
     });
   }
   return c;
+}
+
+/** Self-collision contact markers visible at `time` (0.4 s flash):
+ * world point, tick-summed impulse (N·s), age-based alpha, radius
+ * scaled by impulse. Reads the replay `contacts` events. */
+export const CONTACT_FADE_S = 0.4;
+export function activeContacts(rep, time) {
+  const out = [];
+  const t0 = Math.max(0, Math.floor(time / DT) - Math.ceil(CONTACT_FADE_S / DT));
+  const t1 = Math.min(rep.ticks.length - 1, Math.floor(time / DT));
+  for (let k = t0; k <= t1; k++) {
+    const tk = rep.ticks[k];
+    if (!tk.contacts) continue;
+    const age = time - (tk.t + 1) * DT;
+    if (age < 0 || age > CONTACT_FADE_S) continue;
+    for (const c of tk.contacts) {
+      out.push({
+        pair: c.pair, p: c.p, j: c.j, age,
+        alpha: 1 - age / CONTACT_FADE_S,
+        // radius: 2 cm at tiny impulses -> 8 cm at ~5 N·s
+        radius: 0.02 + 0.06 * Math.min(1, Math.abs(c.j) / 5),
+      });
+    }
+  }
+  return out;
+}
+
+/** Per-foot vertical ground reaction (N) at a tick, from the additive
+ * "feet" weld-impulse field; null when the replay predates it. */
+export function footForces(rep, tickIdx) {
+  const t = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)];
+  if (!t.feet) return null;
+  return [t.feet[0][1] / DT, t.feet[1][1] / DT];
+}
+
+/** Effort (J of positive work) at a tick; null when absent. */
+export function effortAt(rep, tickIdx) {
+  const t = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)];
+  return t.effort ?? null;
 }
 
 /** Objects still flying at `time`, with their world z. Bombs that were

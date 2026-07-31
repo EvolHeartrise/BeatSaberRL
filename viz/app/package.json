@@ -1,9 +1,9 @@
 {
   "name": "beat-arena-viewer",
   "private": true,
-  "version": "7.0.0",
+  "version": "10.0.0",
   "type": "module",
-  "description": "Beat Arena 3D replay viewer (env v7 real Beat Saber geometry: floor-based world, bombs, chains, arcs) — Svelte + Threlte SPA, built to a single static HTML file",
+  "description": "Beat Arena 3D replay viewer (env v10 full-body dynamics: articulated 29-joint skeleton via full-body FK, contact markers, per-joint torque/omega gauges, foot reaction forces) — Svelte + Threlte SPA, built to a single static HTML file",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

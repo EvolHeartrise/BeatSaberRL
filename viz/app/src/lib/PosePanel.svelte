@@ -1,21 +1,49 @@
 <script>
-  // Manual pose mode panel: 12 sliders (per hand: pitch, yaw, twist,
-  // elbow, roll, bend) clamped to the anatomical ranges, per-hand reset,
-  // mirror L->R, live FK readout (wrist + blade unit dir — the numbers a
-  // pose is usually checked against), and an optional static reference
-  // note at a chosen (col, row) cell. Pure DOM overlay; the 3D body is
-  // driven from the shared pose state through the normal armFK path.
+  // Manual pose mode panel (env v10): the FULL body — root pose
+  // (position + yaw/pitch/roll) and all 29 joints (§1.4 actuated
+  // order), grouped spine / arms / legs, clamped to the anatomical
+  // ranges. Live FK readout (wrists + blades + head — the numbers a
+  // pose is checked against), mirror L<->R, reset, an optional static
+  // reference note, and a copy-as-set_joints export: the q36 array the
+  // sim's full-state hook (and the scenario tests) consume. Pure DOM
+  // overlay; the 3D body is driven from the shared pose state through
+  // the normal bodyFK path.
   import {
-    pose, mirrorPoseLR, resetPoseHand, setPoseJoint,
+    pose, mirrorPoseLR, resetPose, setPoseJoint, setPoseRoot,
   } from "./state.svelte.js";
   import {
-    JOINT_NAMES, LANE_X, ROW_Y, SABER_COLORS, armFK, jointLimits,
+    F_HEAD, GROUPS, JOINT_LIMITS, JOINT_NAMES, LANE_X, ROW_Y,
+    SABER_COLORS, bodyFK, fkSaber, poseQ36,
   } from "./replay.js";
 
   const DEG = 180 / Math.PI;
-  const HANDS = ["Left", "Right"];
-  const fk = $derived([0, 1].map((h) => armFK(h, pose.q[h])));
+  const q36 = $derived(poseQ36(pose));
+  const fk = $derived(bodyFK(q36));
+  const sabers = $derived([0, 1].map((h) => fkSaber(fk, h)));
   const v3 = (v) => v.map((x) => x.toFixed(3)).join(", ");
+
+  const groupColor = (g) =>
+    g === 1 || g === 3 ? SABER_COLORS[0]
+    : g === 2 || g === 4 ? SABER_COLORS[1]
+    : "#c5b3f0";
+
+  // root controls: [key, label, lo, hi, step, isAngle]
+  const ROOT_CTLS = [
+    ["x", "x", -1.5, 1.5, 0.01, false],
+    ["y", "y", 0.0, 2.0, 0.01, false],
+    ["z", "z", -2.0, 1.0, 0.01, false],
+    ["yaw", "yaw", -180, 180, 1, true],
+    ["pitch", "pitch", -180, 180, 1, true],
+    ["roll", "roll", -180, 180, 1, true],
+  ];
+
+  let copied = $state(false);
+  function copyQ36() {
+    const txt = JSON.stringify(q36.map((v) => +v.toFixed(6)));
+    navigator.clipboard?.writeText(txt);
+    copied = true;
+    setTimeout(() => (copied = false), 1200);
+  }
 
   const refValue = $derived(
     pose.ref ? `${pose.ref.col},${pose.ref.row}` : "off");
@@ -30,35 +58,71 @@
   <div class="pp">
     <div class="head">
       <b>manual pose</b> <span class="dim">ω = 0 · p = exit</span>
-      <button onclick={mirrorPoseLR}>mirror L→R</button>
+      <button onclick={mirrorPoseLR}>mirror L↔R</button>
+      <button onclick={resetPose}>reset</button>
     </div>
     <div class="cols">
-      {#each [0, 1] as hand (hand)}
-        <div class="hand">
-          <div class="ht" style="color: {SABER_COLORS[hand]}">
-            {HANDS[hand]}
-            <button onclick={() => resetPoseHand(hand)}>reset</button>
-          </div>
-          {#each JOINT_NAMES as name, j (name)}
-            {@const [lo, hi] = jointLimits(hand)[j]}
+      <div class="col">
+        <div class="gt" style="color: #7aa2f7">root</div>
+        {#each ROOT_CTLS as [key, name, lo, hi, st, isAngle] (key)}
+          {@const val = isAngle ? pose.root[key] * DEG : pose.root[key]}
+          <label>
+            <span>{name} {val.toFixed(isAngle ? 0 : 2)}{isAngle ? "°" : ""}</span>
+            <input
+              type="range"
+              min={lo}
+              max={hi}
+              step={st}
+              value={val}
+              oninput={(e) => setPoseRoot(key,
+                isAngle ? +e.target.value / DEG : +e.target.value)}
+            />
+          </label>
+        {/each}
+        {#each [0] as g (g)}
+          <div class="gt" style="color: {groupColor(0)}">spine</div>
+          {#each GROUPS[0].joints as j (j)}
+            {@const [lo, hi] = JOINT_LIMITS[j]}
             <label>
-              <span>{name} {(pose.q[hand][j] * DEG).toFixed(1)}°</span>
+              <span>{JOINT_NAMES[j]} {(pose.q[j] * DEG).toFixed(1)}°</span>
               <input
                 type="range"
                 min={lo * DEG}
                 max={hi * DEG}
                 step="0.5"
-                value={pose.q[hand][j] * DEG}
-                oninput={(e) => setPoseJoint(hand, j, +e.target.value / DEG)}
+                value={pose.q[j] * DEG}
+                oninput={(e) => setPoseJoint(j, +e.target.value / DEG)}
               />
             </label>
           {/each}
-          <div class="fk">
-            wrist ({v3(fk[hand].wrist)})<br />
-            blade ({v3(fk[hand].blade)})
-          </div>
+        {/each}
+      </div>
+      {#each [[1, 3], [2, 4]] as pair (pair[0])}
+        <div class="col">
+          {#each pair as g (g)}
+            <div class="gt" style="color: {groupColor(g)}">{GROUPS[g].name}</div>
+            {#each GROUPS[g].joints as j (j)}
+              {@const [lo, hi] = JOINT_LIMITS[j]}
+              <label>
+                <span>{JOINT_NAMES[j]} {(pose.q[j] * DEG).toFixed(1)}°</span>
+                <input
+                  type="range"
+                  min={lo * DEG}
+                  max={hi * DEG}
+                  step="0.5"
+                  value={pose.q[j] * DEG}
+                  oninput={(e) => setPoseJoint(j, +e.target.value / DEG)}
+                />
+              </label>
+            {/each}
+          {/each}
         </div>
       {/each}
+    </div>
+    <div class="fk">
+      wrist L ({v3(sabers[0].slice(0, 3))}) · blade L ({v3(sabers[0].slice(3))})<br />
+      wrist R ({v3(sabers[1].slice(0, 3))}) · blade R ({v3(sabers[1].slice(3))})<br />
+      head ({v3(fk.p[F_HEAD])})
     </div>
     <div class="ref">
       <span class="dim">reference note (z = 0):</span>
@@ -75,6 +139,9 @@
           {/each}
         {/each}
       </select>
+      <button onclick={copyQ36}>
+        {copied ? "copied!" : "copy q36 (set_joints)"}
+      </button>
     </div>
   </div>
 </div>
@@ -84,6 +151,7 @@
   #pose {
     position: absolute; top: 64px; left: 12px; z-index: 3;
     pointer-events: none;
+    max-height: calc(100vh - 220px);
   }
   .pp {
     pointer-events: auto;
@@ -94,34 +162,35 @@
     padding: 10px 12px;
     font-size: 12px;
     color: #9aa0ae;
-    width: 340px;
+    width: 520px;
+    max-height: inherit;
+    overflow-y: auto;
   }
   .head {
     display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
     color: #e8eaf0;
   }
-  .head button, .ht button {
+  .head button, .ref button {
     margin-left: auto;
     background: #232733; color: #cfd3dc; border: 1px solid #3a4050;
     border-radius: 6px; padding: 1px 8px; cursor: pointer; font: inherit;
   }
-  .head button:hover, .ht button:hover { background: #2d3342; }
+  .head button:hover, .ref button:hover { background: #2d3342; }
+  .head button + button { margin-left: 0; }
   .dim { color: #6b7180; }
   .cols { display: flex; gap: 12px; }
-  .hand { flex: 1; min-width: 0; }
-  .ht {
-    display: flex; align-items: center; font-weight: 600;
-    margin-bottom: 4px;
-  }
-  label { display: block; margin: 2px 0; }
+  .col { flex: 1; min-width: 0; }
+  .gt { font-weight: 600; margin: 6px 0 2px; }
+  label { display: block; margin: 1px 0; }
   label span {
     display: block; font-variant-numeric: tabular-nums; color: #9aa0ae;
+    font-size: 11px;
   }
-  input[type="range"] { width: 100%; margin: 0; height: 14px; }
+  input[type="range"] { width: 100%; margin: 0; height: 12px; }
   .fk {
-    margin-top: 6px; font-size: 11px; color: #7dd3a0;
+    margin-top: 8px; font-size: 11px; color: #7dd3a0;
     font-variant-numeric: tabular-nums; line-height: 1.5;
-    word-break: keep-all; white-space: nowrap;
+    word-break: keep-all; white-space: nowrap; overflow-x: auto;
   }
   .ref { margin-top: 8px; display: flex; align-items: center; gap: 6px; }
   .ref select {
