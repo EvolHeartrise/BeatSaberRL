@@ -81,6 +81,13 @@ pub const F_R_WRIST: usize = 15;
 pub const F_R_HAND: usize = 17;
 pub const F_L_FOOT: usize = 23;
 pub const F_R_FOOT: usize = 29;
+// collider-carrying body frames (P2, collide.rs roster)
+pub const F_L_UARM: usize = 6; // l_sh_twist — upper-arm body frame
+pub const F_R_UARM: usize = 13;
+pub const F_L_THIGH: usize = 20; // l_hip_roll — thigh body frame
+pub const F_R_THIGH: usize = 26;
+pub const F_L_SHANK: usize = 21; // l_knee — shank body frame
+pub const F_R_SHANK: usize = 27;
 
 // Actuated coordinate indices (§1.4 order).
 pub const A_L_ARM_PITCH: usize = 3;

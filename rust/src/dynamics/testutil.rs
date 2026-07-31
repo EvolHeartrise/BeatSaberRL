@@ -1,8 +1,59 @@
-//! Shared test helpers: a seeded splitmix64 RNG (no external deps) and
-//! random in-limit humanoid states.
+//! Shared test helpers: a seeded splitmix64 RNG (no external deps),
+//! random in-limit humanoid states, and the P2 "muscle tone" stabilized
+//! body (the oracle protocol's spring-damper stance — oracle README:
+//! kd REPLACES the spec damping b_j, so the muscle model zeroes b).
 
-use super::model::Model;
-use super::State;
+use super::algo::{crba, rnea};
+use super::fk::fk_all;
+use super::model::{Model, HUMANOID, NQ};
+use super::{State, Workspace};
+
+pub static ZERO_DAMP29: [f64; NQ] = [0.0; NQ];
+
+/// HUMANOID with joint damping removed — the muscle-tone kd is the
+/// TOTAL dof damping and is applied as part of the actuated torque.
+pub fn muscle_model() -> Model {
+    let mut m = HUMANOID;
+    m.damping = &ZERO_DAMP29;
+    m
+}
+
+/// Oracle-protocol stabilizer gains: kp = τ_max/0.2, kd = max(b_j,
+/// 2·√(kp·M_jj)) with M_jj from our CRBA at the neutral pose (the
+/// refdata JSONs carry MuJoCo's values of the same formula).
+pub fn muscle_gains() -> ([f64; NQ], [f64; NQ]) {
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let st = State::neutral(m);
+    fk_all(m, &st, &mut ws);
+    crba(m, &mut ws);
+    let nv = m.nv();
+    let mut kp = [0.0; NQ];
+    let mut kd = [0.0; NQ];
+    for j in 0..NQ {
+        kp[j] = m.tau_max[j] / 0.2;
+        let mjj = ws.m[(6 + j) * nv + (6 + j)];
+        kd[j] = m.damping[j].max(2.0 * (kp[j] * mjj).sqrt());
+    }
+    (kp, kd)
+}
+
+/// Full 35-DoF gravity-compensation force at pose `q29` (v = 0):
+/// (root wrench, joint torques) = RNEA(q, 0, 0) split.
+pub fn gravity_comp(q29: &[f64; NQ]) -> ([f64; 6], [f64; NQ]) {
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    st.q.copy_from_slice(q29);
+    fk_all(m, &st, &mut ws);
+    let v0 = vec![0.0; m.nv()];
+    rnea(m, &mut ws, &v0, None);
+    let mut w = [0.0; 6];
+    let mut t = [0.0; NQ];
+    w.copy_from_slice(&ws.c[..6]);
+    t.copy_from_slice(&ws.c[6..]);
+    (w, t)
+}
 
 pub struct Rng(pub u64);
 

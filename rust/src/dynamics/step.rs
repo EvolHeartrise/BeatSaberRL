@@ -2,12 +2,13 @@
 //! ordering below is NORMATIVE; f64 cross-implementation parity depends
 //! on every step happening in exactly this order.
 //!
-//! P1 scope: steps 7–9 (collision detection + PGS constraint solve) are
-//! NOT implemented — the `constraints` hook is the marked P2 seam. It
-//! runs between the unconstrained-velocity solve and position
-//! integration, and receives the Workspace (ws.l holds the Cholesky
+//! Steps 7–9 (collision detection + PGS constraint solve) plug in via
+//! the `constraints` hook between the unconstrained-velocity solve and
+//! position integration — solver.rs `ConstraintSet::solve` is the P2
+//! implementation (use `solver::substep_constrained` for the full v10
+//! substep). The hook receives the Workspace (ws.l holds the Cholesky
 //! factor for the J·M⁻¹·Jᵀ effective-mass solves) plus the mutable
-//! velocity to project. P1 callers pass None.
+//! velocity to project. Unconstrained callers (P1 tests) pass None.
 
 use super::algo::{chol_factor, chol_solve, crba, rnea};
 use super::fk::{fk_all, quat_mul};
@@ -20,9 +21,14 @@ pub const N_SUB: usize = 8;
 /// Gauss-Seidel passes of the step-11 clamp solve (see below).
 pub const CLAMP_PASSES: usize = 8;
 
-/// P2 constraint-stage hook (§3 steps 7–9): (model, workspace, v*) →
-/// projected velocity written in place.
-pub type ConstraintHook<'a> = &'a mut dyn FnMut(&Model, &mut Workspace, &mut [f64]);
+/// P2 constraint-stage hook (§3 steps 7–9): (model, workspace, q₂₉,
+/// v*) → projected velocity written in place. q (pre-integration) is
+/// needed for the joint-limit rows folded into the main solver
+/// (SPEC-v10 Divergences §15).
+pub type ConstraintHook<'a> = &'a mut dyn FnMut(&Model, &mut Workspace, &[f64], &mut [f64]);
+
+/// Zero root wrench — `substep`'s §3 step 4 ("root rows 0").
+pub const ZERO_WRENCH: [f64; 6] = [0.0; 6];
 
 /// One substep. `tau_act`: applied actuated torques (nq, §1.4 order;
 /// constant across a control tick — the caller holds them). Joint
@@ -37,6 +43,50 @@ pub fn substep(
     ws: &mut Workspace,
     constraints: Option<ConstraintHook>,
 ) {
+    substep_wrench(model, st, tau_act, &ZERO_WRENCH, h, ws, constraints);
+}
+
+/// `substep` with an applied 6-DoF root wrench [force (world), moment
+/// about the root origin] added on the free-base rows in step 4. The
+/// env never applies one (§3: root rows 0) — this exists for the P2
+/// static-stance protocol (full 35-DoF RNEA compensation including the
+/// root rows) and oracle harnesses.
+pub fn substep_wrench(
+    model: &Model,
+    st: &mut State,
+    tau_act: &[f64],
+    root_wrench: &[f64; 6],
+    h: f64,
+    ws: &mut Workspace,
+    constraints: Option<ConstraintHook>,
+) {
+    substep_opts(model, st, tau_act, root_wrench, None, h, ws, constraints);
+}
+
+/// Test-harness variant with OPTIONAL per-joint implicit damping
+/// (MuJoCo-Euler semantics: v⁺ = v + h·(M + h·diag(d))⁻¹(τ − C − d∘q̇);
+/// d enters M's diagonal before the Cholesky, so the constraint stage
+/// works against the same damped operator). The env NEVER uses this —
+/// the §3 pipeline's own damping b is explicit (b·h/I ≈ 0.0025, stable)
+/// and `substep` passes None, leaving the normative expression tree
+/// untouched. It exists because the ORACLE-protocol muscle-tone
+/// stabilizer (kd near-critical against the DIAGONAL M_jj) is not
+/// explicitly integrable at h = 1/240: at the straight-arm neutral
+/// pose shoulder-twist/wrist-roll are collinear, (M⁻¹)_jj ~ 1/armature,
+/// and h·kd·(M⁻¹)_jj ≫ 2 — the wrists rattle at the ±40 rad/s cap
+/// (measured) exactly as the oracle README describes for the cap-less
+/// MuJoCo run. MuJoCo's Euler integrator makes dof damping implicit for
+/// the same reason; band comparisons must match that semantics.
+pub fn substep_opts(
+    model: &Model,
+    st: &mut State,
+    tau_act: &[f64],
+    root_wrench: &[f64; 6],
+    implicit_damp: Option<&[f64]>,
+    h: f64,
+    ws: &mut Workspace,
+    constraints: Option<ConstraintHook>,
+) {
     let nv = model.nv();
     let voff = model.voff();
     debug_assert_eq!(tau_act.len(), model.nq);
@@ -46,13 +96,27 @@ pub fn substep(
     crba(model, ws);
     rnea(model, ws, &st.v, None);
 
-    // 4. applied generalized force τ = τ_gear − b∘q̇ (root rows 0),
-    //    assembled directly as the solve RHS τ − C
+    // 2b (harness only): implicit joint damping onto M's diagonal
+    if let Some(d) = implicit_damp {
+        for j in 0..model.nq {
+            ws.m[(voff + j) * nv + (voff + j)] += h * d[j];
+        }
+    }
+
+    // 4. applied generalized force τ = τ_gear − b∘q̇ (root rows: the
+    //    applied wrench — 0 in the env), assembled directly as the
+    //    solve RHS τ − C
     for i in 0..voff {
-        ws.rhs[i] = -ws.c[i];
+        ws.rhs[i] = root_wrench[i] - ws.c[i];
     }
     for j in 0..model.nq {
         ws.rhs[voff + j] = tau_act[j] - model.damping[j] * st.v[voff + j] - ws.c[voff + j];
+    }
+    // 4b (harness only): current-velocity part of the implicit damping
+    if let Some(d) = implicit_damp {
+        for j in 0..model.nq {
+            ws.rhs[voff + j] -= d[j] * st.v[voff + j];
+        }
     }
 
     // 5. dense Cholesky (lower, no pivoting)
@@ -67,13 +131,15 @@ pub fn substep(
         ws.vstar[i] = st.v[i] + h * ws.rhs[i];
     }
 
-    // ── P2 SEAM ─ §3 steps 7–9 insert HERE ─────────────────────────
+    // ── constraint stage (§3 steps 7–9) via the hook ───────────────
     // 7. collision detection (55-pair table, margin 0.01)
     // 8. PGS, 12 iterations, fixed row order (welds then contacts)
     // 9. v ← v* + M⁻¹Jᵀλ
+    // Implemented by solver::ConstraintSet::solve (P2); None = the
+    // unconstrained pipeline.
     if let Some(hook) = constraints {
         let mut v = std::mem::take(&mut ws.vstar);
-        hook(model, ws, &mut v);
+        hook(model, ws, &st.q, &mut v);
         ws.vstar = v;
     }
     st.v.copy_from_slice(&ws.vstar);
