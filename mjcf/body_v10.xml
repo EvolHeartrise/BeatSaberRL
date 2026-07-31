@@ -33,6 +33,10 @@
     <joint limited="true"/>
     <geom contype="0" conaffinity="0"/>
     <motor ctrllimited="true" ctrlrange="-1 1"/>
+    <!-- P2b harness fix: default pair solref/solimp are too soft for the
+         spec's stiff-Baumgarte contact semantics - transient presses
+         punched 2 cm deep (> 2x slop). solref = 2*h, high impedance. -->
+    <pair solref="0.008333 1" solimp="0.95 0.99 0.001 0.5 2"/>
   </default>
 
   <worldbody>
@@ -234,11 +238,19 @@
     </body>
   </worldbody>
 
-  <!-- feet welded to world at the qpos0 (reference) pose: MuJoCo's
-       default all-zero relpose means "use the qpos0 relative pose" -->
+  <!-- feet welded to world at the qpos0 (reference) pose (all-zero relpose
+       = "use the qpos0 relative pose"). P2b harness fixes (check_static
+       diagnosis): anchor MUST be the foot's world position - the default
+       anchor (0,0,0) is in body2(world) frame, i.e. the WORLD ORIGIN,
+       putting the translational rows on a 0.66 m lever through the soft
+       rotational rows (welds went mushy, feet tore out). solref = 2*h with
+       high solimp impedance keeps the weld stiff enough to carry the 75 kg
+       body (default solref/solimp let the rotation rows slip). -->
   <equality>
-    <weld name="weld_foot_l" body1="foot_l"/>
-    <weld name="weld_foot_r" body1="foot_r"/>
+    <weld name="weld_foot_l" body1="foot_l" anchor="-0.10 0.07 -0.65"
+          solref="0.008333 1" solimp="0.99 0.999 0.001 0.5 2"/>
+    <weld name="weld_foot_r" body1="foot_r" anchor="0.10 0.07 -0.65"
+          solref="0.008333 1" solimp="0.99 0.999 0.001 0.5 2"/>
   </equality>
 
   <!-- the 55 live pairs of SPEC-v10 par.2, in pair-id order (0-54).
