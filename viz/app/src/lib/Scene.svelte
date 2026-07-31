@@ -1,19 +1,22 @@
 <script>
   // The 3D scene: camera + orbit controls, lights, static floor/tunnel/grid/
-  // reach geometry, playback clock, notes and sabers. World -> scene: (x, y, -z).
-  // Env v7: floor-based world — the floor plane is at y = 0; the 4x3 cell
-  // grid uses the real 0.6 m lanes and non-uniform row heights.
+  // reach geometry, playback clock, notes, the ARTICULATED v10 skeleton +
+  // blades, and self-collision contact markers. World -> scene: (x, y, -z).
+  // Env v7 world geometry: floor plane at y = 0; the 4x3 cell grid uses the
+  // real 0.6 m lanes and non-uniform row heights.
   import { T, useTask } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
   import { pb, pose, lastTick, setPlaying } from "./state.svelte.js";
   import {
-    BLOCK, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES, ROW_Y,
-    SHOULDER, Z_FAR, Z_MISS, frameQuatScene, noteFrame,
+    BLOCK, DT, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES,
+    ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK, frameQuatScene,
+    noteFrame, poseQ36, qAt,
   } from "./replay.js";
+  import Body from "./Body.svelte";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
-  import WristGauges from "./WristGauges.svelte";
+  import BodyGauges from "./BodyGauges.svelte";
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {
@@ -24,6 +27,19 @@
       setPlaying(false);
     }
   });
+
+  // ---- the body pose this frame (replay q36 interpolated, or manual) ------
+  const tickIdx = $derived(pb.rep
+    ? Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1) : 0);
+  const u = $derived(pb.rep ? pb.cur - tickIdx : 0);
+  const q36 = $derived(pose.on
+    ? poseQ36(pose)
+    : (pb.rep ? qAt(pb.rep, tickIdx, u) : null));
+  const fkAll = $derived(q36 ? bodyFK(q36) : null);
+
+  // self-collision contact markers (replay contact events, flash 0.4 s)
+  const contacts = $derived(
+    !pose.on && pb.rep ? activeContacts(pb.rep, pb.cur * DT) : []);
 
   // ---- static scenery, built once ------------------------------------------
   function segs(pairs) {
@@ -55,19 +71,12 @@
   for (const y of ROW_EDGES) gridPairs.push([[GX0, y, 0], [GX1, y, 0]]);
   const gridGeo = segs(gridPairs);
 
-  // blade-reach region: miss plane (z = -0.65, the head plane since
-  // env v7.3) to max reach (z = 1.75)
+  // blade-reach region: reference-pose miss plane (z = -0.65) to
+  // reference max reach (z = 1.75) — the sim's live gates move with the
+  // pose; these lines are the static scenery datum
   const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
 
-  // torso (env v7 placement): shoulders at (±0.2, 1.47, -0.65); the trunk
-  // reaches down toward the floor to suggest a 1.8 m player
-  const SH_Y = SHOULDER[1][1], SH_Z = -SHOULDER[1][2]; // scene z = +0.65
-
   // pose-mode reference note: a static cube at a chosen cell, z = 0.
-  // A canonical down-swing note (roll 0); at z = 0 the v7.6 look-at
-  // frame is FULLY billboarded (lam = 1) — a nice way to eyeball the
-  // mechanic — so cube and hitboxes ride noteFrame(p, 0, 1). Pass
-  // hitboxRot as psi if this reference ever grows an angle control.
   const refEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
   const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
@@ -84,7 +93,7 @@
     maxDistance={25}
   />
   {#if (pb.rep || pose.on) && pb.gauges}
-    <WristGauges />
+    <BodyGauges />
   {/if}
 </T.PerspectiveCamera>
 
@@ -135,25 +144,23 @@
   </T.Group>
 {/if}
 
-{#if pb.rep || pose.on}
-  <!-- body: head + shoulder crossbar + trunk down toward the floor -->
-  <T.Mesh position={[0, SH_Y + 0.24, SH_Z]}>
-    <T.SphereGeometry args={[0.11, 16, 12]} />
-    <T.MeshStandardMaterial color="#2a2f3b" />
-  </T.Mesh>
-  <T.Mesh position={[0, SH_Y, SH_Z]} rotation={[0, 0, Math.PI / 2]}>
-    <T.CylinderGeometry args={[0.045, 0.045, 0.4, 10]} />
-    <T.MeshStandardMaterial color="#2a2f3b" />
-  </T.Mesh>
-  <T.Mesh position={[0, 1.12, SH_Z]}>
-    <T.BoxGeometry args={[0.34, 0.62, 0.16]} />
-    <T.MeshStandardMaterial color="#20242e" />
-  </T.Mesh>
-  <!-- legs hint: trunk continues to the floor -->
-  <T.Mesh position={[0, 0.41, SH_Z]}>
-    <T.BoxGeometry args={[0.24, 0.82, 0.13]} />
-    <T.MeshStandardMaterial color="#1a1e26" />
-  </T.Mesh>
-  <Saber s={0} />
-  <Saber s={1} />
+{#if fkAll}
+  <!-- the articulated v10 body + blades -->
+  <Body fk={fkAll} />
+  <Saber s={0} fk={fkAll} />
+  <Saber s={1} fk={fkAll} />
 {/if}
+
+<!-- self-collision contact markers: flash a sphere at the contact
+     point, sized by the tick-summed impulse -->
+{#each contacts as c, i (i)}
+  <T.Mesh position={[c.p[0], c.p[1], -c.p[2]]}>
+    <T.SphereGeometry args={[c.radius, 12, 8]} />
+    <T.MeshBasicMaterial
+      color="#f0d35e"
+      transparent
+      opacity={0.85 * c.alpha}
+      depthTest={false}
+    />
+  </T.Mesh>
+{/each}

@@ -46,6 +46,9 @@ def parse_args():
     p.add_argument("--dot-prob", type=float, default=0.1)
     p.add_argument("--bomb-prob", type=float, default=0.125)
     p.add_argument("--effort-coef", type=float, default=1.0)
+    p.add_argument("--gears", type=int, default=5, choices=(3, 5, 7),
+                   help="action-table size for --scripted/--random "
+                        "(checkpoints force their own)")
     return p.parse_args()
 
 
@@ -69,6 +72,7 @@ def main():
         tag = os.path.basename(os.path.dirname(os.path.abspath(args.ckpt)))
         print(f"loaded {args.ckpt} (update {ckpt.get('update', '?')})")
     else:
+        kw["gears"] = args.gears
         tag = "scripted" if args.scripted else "random"
     if args.tag:
         tag = args.tag
@@ -96,7 +100,8 @@ def main():
                                             dtype=torch.float32).unsqueeze(0))
                         act = a[0].numpy()
             else:
-                act = rng.integers(0, [3] * 14)
+                # v10: 29 gear heads bounded by the env's action table
+                act = rng.integers(0, env.gears, 29)
             obs, r, done, _, info = env.step(act)
             tot += r
         print(f"  {path}: return {tot:6.2f} | good {info['good_cuts']}/{info['n_notes']} "

@@ -474,6 +474,11 @@ struct Body {
     contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
     contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
     effort_j: f64,                   // last tick's positive work (J)
+    // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
+    // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
+    // λ is the constraint impulse ON the body (world frame): the ground
+    // reaction; vertical force ≈ weld_imp[1 or 7] / DT.
+    weld_imp: [f64; 12],
 }
 
 const MODEL: &Model = &HUMANOID;
@@ -499,6 +504,7 @@ impl Body {
             contact_imp: [0.0; NUM_PAIRS],
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             effort_j: 0.0,
+            weld_imp: [0.0; 12],
         };
         b.refresh_fk();
         b
@@ -513,6 +519,7 @@ impl Body {
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.effort_j = 0.0;
+        self.weld_imp = [0.0; 12];
         self.refresh_fk();
     }
 
@@ -545,6 +552,7 @@ impl Body {
         let prev_wrist = self.wrist;
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
+        self.weld_imp = [0.0; 12];
         let mut effort = 0.0;
         for _ in 0..N_SUB {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
@@ -560,6 +568,10 @@ impl Body {
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
             let nweld = self.cs.weld_rows();
+            // P6: tick-summed foot-weld impulses (ground reaction)
+            for r in 0..nweld {
+                self.weld_imp[r] += self.cs.lambda[r];
+            }
             for (i, c) in self.cs.contacts.iter().enumerate() {
                 let lam = self.cs.lambda[nweld + i];
                 self.contact_imp[c.pair] += lam;
@@ -1246,6 +1258,18 @@ impl RawBeatSim {
                 (p as u32, pt[0], pt[1], pt[2], b.contact_imp[p])
             })
             .collect()
+    }
+
+    /// P6 (additive): tick-summed foot-weld impulses of the LAST tick,
+    /// per foot [L, R]: [jx, jy, jz, jax, jay, jaz] (N·s / N·m·s, world
+    /// frame) — the ground reaction through each welded foot. Vertical
+    /// reaction force ≈ j[1] / DT.
+    fn weld_impulses(&self) -> [[f64; 6]; 2] {
+        let w = &self.core.body.weld_imp;
+        [
+            [w[0], w[1], w[2], w[3], w[4], w[5]],
+            [w[6], w[7], w[8], w[9], w[10], w[11]],
+        ]
     }
 
     /// Per-note status: 0 pending, 1 good, 2 bad/bomb-hit, 3 missed,

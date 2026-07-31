@@ -51,11 +51,12 @@ hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
 are **29 gear heads** (τ = gear_fraction × τ_max); effort is positive
 mechanical work (4e-4/J); the reach/miss gates and note look-at follow
 the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
-root twist + ω29 + contact events). Gravity is real and nothing holds
-the body up — posture is the policy's problem now. ALL v9 checkpoints,
-replays, and records are retired. The torch mirror (P4), CUDA kernel
-(P5), and viewer/bot (P6) are pending: until P5, `--env cuda` is a
-hard error.
+root twist + ω29 + contact events; since P6 additive per-tick "feet"
+weld impulses + "effort"). Gravity is real and nothing holds the body
+up — posture is the policy's problem now. ALL v9 checkpoints,
+replays, and records are retired. The viewer and scripted bot are v10
+(P6); the torch mirror (P4) and CUDA kernel (P5) are pending: until
+P5, `--env cuda` is a hard error.
 
 ## Quick start
 
@@ -182,19 +183,31 @@ ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
 heads half-height cubes, links thin slabs ("+20" pops), arc grants
 faint tubes; green split = good cut; orange/red flash = bad cut / miss,
-labeled with the reason. Pre-v7 replays are rejected — re-record from a
-current checkpoint.
+labeled with the reason. Env v10 (P6): the viewer draws the REAL
+articulated skeleton (full-body FK from the replayed q36 — capsules at
+the SPEC-v10 collider dims, feet on their weld anchors), flashes
+yellow contact markers sized by impulse at self-collision events, and
+the `g` gauges are per-joint dials for all 29 joints (grouped spine /
+arms / legs: limit arcs, ω, near-limit orange, applied-τ bars derived
+from the logged gear actions) plus per-foot vertical ground-reaction
+N and the effort-per-tick meter (from the additive replay fields).
+Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
+q36 export. Non-"v10" replays are rejected — re-record from a current
+checkpoint.
 
-Reference points (generator-v2 scripted bot with the speed-paced
-lattice, default dials, 5 eps each): right-only 59.1% good cuts /
-47.2 pts per note; both hands 66.2% / 51.3, ~3 bombs hit/ep (the bot
-ignores bombs as targets and clips some incidentally). Generator v2's
-parity-flow angles, extra notes, and 2-8 m/s speed walk cost the bot
-~20 points vs the old rate-1.0 down-swing easy gym (82.9%); the real
-hitboxes stay FORGIVING (the good box extends 0.75 m toward the player
-— the bot whips through the contact angle 0.10 s early, like real
-players). Pre-v2-generator references (all of the Status section's
-env-v7.x bot numbers) are not comparable.
+Reference points (env v10 P6 scripted bot — gravity-compensated
+PD-over-IK on the dynamic body; 5 eps each, gears 5, seeds 0-4,
+2026-07-31): easy (right-only, default dials) **36.4%** good cuts /
+25.7 pts per note; hard (both hands, default dials) **36.9% / 28.3**,
+~4 bombs hit/ep; dynamic (both hands, note_prob 0.35) **33.0% /
+24.2**. Random actions land 5-7% / ~5 on the same gyms. The retired
+v9 kinematic bot's 59.1/66.2% are NOT comparable — the physics jump
+(gravity, free-root reaction coupling, ≥¼-τ_max gear quanta) costs
+the scripted referee roughly half its rate, the v6-precedent drop;
+13 tuning iterations are documented in `beat_arena_env/scripted.py`
+(measured apparent inertias, constrained-stance feedforward,
+COM-over-ankles balance, pelvis righting, chest-frame IK, endgame
+plan latch).
 
 ## Status
 
