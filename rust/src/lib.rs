@@ -49,7 +49,8 @@ const REWARD_BOMB: f64 = -1.5;
 // (1/115 ~ 0.0087) dwarfs the effort of earning it: a typical played
 // episode's total effort bill is ~0.5-1.0 of a ~+40 return.
 // Per-hand joint order (pitch, yaw, twist, elbow, roll, bend):
-const EFFORT_COST: [f64; N_JOINTS] = [2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4];
+const EFFORT_COST: [f64; N_JOINTS] =
+    [2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4];
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;
@@ -109,11 +110,16 @@ const ELBOW_HI: f64 = 2.6179938779914944; // 150 deg (lo = 0)
 const ROLL_LO: [f64; 2] = [0.0, -3.141592653589793]; // L, R
 const ROLL_HI: [f64; 2] = [3.141592653589793, 0.0];
 const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
-const N_JOINTS: usize = 6;
-const JOINT_ALPHA: [f64; N_JOINTS] =
-    [ALPHA_ARM, ALPHA_ARM, ALPHA_ARM, ALPHA_ARM, ALPHA_WRIST, ALPHA_WRIST];
-const JOINT_OMEGA: [f64; N_JOINTS] =
-    [OMEGA_ARM, OMEGA_ARM, OMEGA_ARM, OMEGA_ARM, OMEGA_WRIST, OMEGA_WRIST];
+// env v9 (2026-07-30, user-caught gap): wrist radial/ulnar DEVIATION —
+// the orthogonal bending axis roll+bend lacked. Symmetric +/-45 deg
+// both hands (real ~20 radial / 45 ulnar; the roll DOF spins the
+// anatomical labels, and v8's effective-motion stance rounds up).
+const DEV_LIM: f64 = 0.7853981633974483; // 45 deg
+const N_JOINTS: usize = 7; // pitch, yaw, twist, elbow, roll, bend, dev
+const JOINT_ALPHA: [f64; N_JOINTS] = [ALPHA_ARM, ALPHA_ARM, ALPHA_ARM,
+    ALPHA_ARM, ALPHA_WRIST, ALPHA_WRIST, ALPHA_WRIST];
+const JOINT_OMEGA: [f64; N_JOINTS] = [OMEGA_ARM, OMEGA_ARM, OMEGA_ARM,
+    OMEGA_ARM, OMEGA_WRIST, OMEGA_WRIST, OMEGA_WRIST];
 
 fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
     [
@@ -123,6 +129,7 @@ fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
         (0.0, ELBOW_HI),
         (ROLL_LO[hand], ROLL_HI[hand]),
         (-BEND_LIM, BEND_LIM),
+        (-DEV_LIM, DEV_LIM),
     ]
 }
 const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
@@ -159,10 +166,10 @@ const NOTE_FEAT: usize = 14;
 // obs v6: per hand 23 features — 6 joint angles (roll as cos/sin -> 7
 // numbers), 6 angular velocities, derived wrist pos (3) + finite-diff
 // wrist vel (3) + blade unit dir (3), and the live pre-swing meter
-const SABER_FEAT: usize = 23;
-const OFF_NOTES: usize = 2 * SABER_FEAT; // 46
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 270
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 286
+const SABER_FEAT: usize = 25; // v9: +dev angle, +dev omega
+const OFF_NOTES: usize = 2 * SABER_FEAT; // 50
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 274
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 290
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
@@ -232,7 +239,12 @@ fn fk(
     let w = [e[0] + L_FORE * f[0], e[1] + L_FORE * f[1], e[2] + L_FORE * f[2]];
     let (sr, cr) = q[4].sin_cos();
     let (sb, cb) = q[5].sin_cos();
-    let d = [-sr * sb, cr * sb, cb];
+    // env v9: blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the forearm
+    // frame — dev = 0 reproduces the v5.2-v8 wrist exactly; at bend = 0
+    // deviation moves the blade at full rate (kills the pole
+    // singularity where out-of-plane speed was roll_rate*sin(bend))
+    let (sv, cv) = q[6].sin_cos();
+    let d = [cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb];
     let b = [
         m[0][0] * d[0] + (m[0][1] * ce - m[0][2] * se) * d[1] + f[0] * d[2],
         m[1][0] * d[0] + (m[1][1] * ce - m[1][2] * se) * d[1] + f[1] * d[2],
@@ -638,19 +650,20 @@ impl Core {
             obs[b + 4] = arm.roll_cs.0 as f32;
             obs[b + 5] = arm.roll_cs.1 as f32;
             obs[b + 6] = (arm.q[5] / BEND_LIM) as f32;
+            obs[b + 7] = (arm.q[6] / DEV_LIM) as f32; // v9 deviation
             for j in 0..N_JOINTS {
-                obs[b + 7 + j] = (arm.om[j] / JOINT_OMEGA[j]) as f32;
+                obs[b + 8 + j] = (arm.om[j] / JOINT_OMEGA[j]) as f32;
             }
             // derived hand state: FK wrist, finite-diff velocity, blade dir
-            obs[b + 13] = (arm.wrist[0] / X_NORM) as f32;
-            obs[b + 14] = ((arm.wrist[1] - Y_CENTER) / Y_NORM) as f32;
-            obs[b + 15] = arm.wrist[2] as f32;
+            obs[b + 15] = (arm.wrist[0] / X_NORM) as f32;
+            obs[b + 16] = ((arm.wrist[1] - Y_CENTER) / Y_NORM) as f32;
+            obs[b + 17] = arm.wrist[2] as f32;
             for k in 0..3 {
-                obs[b + 16 + k] = (arm.wrist_vel[k] / V_NORM) as f32;
-                obs[b + 19 + k] = arm.blade[k] as f32;
+                obs[b + 18 + k] = (arm.wrist_vel[k] / V_NORM) as f32;
+                obs[b + 21 + k] = arm.blade[k] as f32;
             }
             // live pre-swing meter: 1.0 = full pre-swing credit banked
-            obs[b + 22] = (arm.swing_acc / PRE_FULL).min(2.0) as f32;
+            obs[b + 24] = (arm.swing_acc / PRE_FULL).min(2.0) as f32;
         }
         let mut slot = 0usize;
         // start past the resolved prefix (everything before first_pending
@@ -1135,16 +1148,16 @@ impl RawBeatSim {
         )
     }
 
-    /// Arm state [[q(6) ++ om(6) ++ wrist(3)]; 2] — joint angles
-    /// (pitch, yaw, twist, elbow, roll, bend), angular velocities, and
-    /// the FK wrist position.
-    fn sabers(&self) -> [[f64; 15]; 2] {
+    /// Arm state [[q(7) ++ om(7) ++ wrist(3)]; 2] — joint angles
+    /// (pitch, yaw, twist, elbow, roll, bend, dev — env v9), angular
+    /// velocities, and the FK wrist position.
+    fn sabers(&self) -> [[f64; 17]; 2] {
         [0, 1].map(|s| {
             let a = self.core.arms[s];
-            let mut out = [0.0; 15];
-            out[..6].copy_from_slice(&a.q);
-            out[6..12].copy_from_slice(&a.om);
-            out[12..].copy_from_slice(&a.wrist);
+            let mut out = [0.0; 17];
+            out[..N_JOINTS].copy_from_slice(&a.q);
+            out[N_JOINTS..2 * N_JOINTS].copy_from_slice(&a.om);
+            out[2 * N_JOINTS..].copy_from_slice(&a.wrist);
             out
         })
     }
@@ -1162,12 +1175,16 @@ impl RawBeatSim {
 
     /// TEST HOOK: overwrite one arm's joint state before a step (FK cache
     /// refreshes immediately; the finite-diff wrist velocity resets).
+    /// Accepts 6-joint vectors (env v8-era poses) and zero-pads the v9
+    /// deviation joint — the scenario tests' pose family is dev = 0.
     fn set_joints(&mut self, s: usize, q: Vec<f64>, om: Vec<f64>) {
-        assert_eq!(q.len(), N_JOINTS);
-        assert_eq!(om.len(), N_JOINTS);
+        assert!(q.len() == N_JOINTS || q.len() == N_JOINTS - 1);
+        assert_eq!(om.len(), q.len());
         let arm = &mut self.core.arms[s];
-        arm.q.copy_from_slice(&q);
-        arm.om.copy_from_slice(&om);
+        arm.q = [0.0; N_JOINTS];
+        arm.om = [0.0; N_JOINTS];
+        arm.q[..q.len()].copy_from_slice(&q);
+        arm.om[..om.len()].copy_from_slice(&om);
         let (_, w, b, rcs) = fk(s, &arm.q);
         arm.wrist = w;
         arm.blade = b;

@@ -55,7 +55,7 @@
     const { hand, ctx } = g;
     const [lo, hi] = [ROLL_LO[hand], ROLL_HI[hand]];
     // env v6 arm state: q(6) | om(6) | wrist(3)
-    const th = sab[4], ph = sab[5], wt = sab[10], wp = sab[11];
+    const th = sab[4], ph = sab[5], wt = sab[11], wp = sab[12];  // v9: om at 7..
     const col = SABER_COLORS[hand];
 
     ctx.clearRect(0, 0, W, H);

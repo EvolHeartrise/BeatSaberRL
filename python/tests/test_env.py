@@ -32,8 +32,8 @@ from beat_arena_rs import RawBeatSim
 
 
 DOWN = 6 * np.pi / 4  # downward swing angle
-COAST = (0,) * 12
-ACTION_NVEC = [3] * 12
+COAST = (0,) * 14
+ACTION_NVEC = [3] * 14
 DELTA = 0.7
 FLAT_ARM = [-np.pi / 2 + DELTA, 0.0, 0.0, np.pi / 2]
 FLAT_WRIST = (0.2, 1.3955705, -0.1950711)   # right-hand wrist FK of FLAT_ARM
@@ -102,9 +102,9 @@ def test_python_fk_matches_rust():
     for _ in range(20):
         hand = int(rng.integers(0, 2))
         q = [float(rng.uniform(lo, hi)) for lo, hi in joint_limits(hand)]
-        sim.set_joints(hand, q, [0.0] * 6)
+        sim.set_joints(hand, q, [0.0] * 7)
         _, w, b = fk(hand, q)
-        assert np.allclose(sim.sabers()[hand][12:], w, atol=1e-12)
+        assert np.allclose(sim.sabers()[hand][14:], w, atol=1e-12)
         assert np.allclose(sim.blades()[hand], b, atol=1e-12)
 
 
@@ -131,9 +131,9 @@ def test_obs_layout():
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (286,)
-    assert OFF_NOTES == 2 * SABER_FEAT == 46
-    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 270
+    assert obs.shape == (OBS_DIM,) == (290,)
+    assert OFF_NOTES == 2 * SABER_FEAT == 50
+    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 274
     # arm block at reset: all joints zero (arm straight forward), so the
     # wrist sits at (+-0.2, 1.47, 0.0) and the blade points +z
     for s, x in ((0, -0.2), (1, 0.2)):
@@ -145,15 +145,16 @@ def test_obs_layout():
         assert obs[b + 4] == pytest.approx(1.0)             # cos(roll)
         assert obs[b + 5] == pytest.approx(0.0, abs=1e-6)   # sin(roll)
         assert obs[b + 6] == 0.0                            # bend
-        assert not obs[b + 7:b + 13].any()                  # omegas
-        assert obs[b + 13] == pytest.approx(x / 1.0)        # wrist x
-        assert obs[b + 14] == pytest.approx((1.47 - 1.40) / 0.75)  # wrist y
-        assert obs[b + 15] == pytest.approx(0.0, abs=1e-6)  # wrist z
-        assert not obs[b + 16:b + 19].any()                 # wrist vel
-        assert obs[b + 19] == pytest.approx(0.0, abs=1e-6)  # blade x
-        assert obs[b + 20] == pytest.approx(0.0, abs=1e-6)  # blade y
-        assert obs[b + 21] == pytest.approx(1.0)            # blade z
-        assert obs[b + 22] == 0.0                           # pre-swing meter
+        assert obs[b + 7] == 0.0                            # dev (v9)
+        assert not obs[b + 8:b + 15].any()                  # omegas (7)
+        assert obs[b + 15] == pytest.approx(x / 1.0)        # wrist x
+        assert obs[b + 16] == pytest.approx((1.47 - 1.40) / 0.75)  # wrist y
+        assert obs[b + 17] == pytest.approx(0.0, abs=1e-6)  # wrist z
+        assert not obs[b + 18:b + 21].any()                 # wrist vel
+        assert obs[b + 21] == pytest.approx(0.0, abs=1e-6)  # blade x
+        assert obs[b + 22] == pytest.approx(0.0, abs=1e-6)  # blade y
+        assert obs[b + 23] == pytest.approx(1.0)            # blade z
+        assert obs[b + 24] == 0.0                           # pre-swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
@@ -203,12 +204,12 @@ def test_obs_kind_flags():
 
 def test_swing_meter_tracks_rotation():
     """The pre-swing obs feature rises while swinging, resets on reversal.
-    Uses the right BEND joint (action index 11)."""
+    Uses the right BEND joint (action index 12, env v9)."""
     env = RustBeatEnv(seed=3)
     env.reset()
-    b = 1 * SABER_FEAT + 22   # right arm's swing meter
-    bend_plus = (0,) * 11 + (1,)
-    bend_minus = (0,) * 11 + (2,)
+    b = 1 * SABER_FEAT + 24   # right arm's swing meter
+    bend_plus = (0,) * 12 + (1, 0)
+    bend_minus = (0,) * 12 + (2, 0)
     obs, _, _, _, _ = env.step(bend_plus)
     m1 = obs[b]
     obs, _, _, _, _ = env.step(bend_plus)
@@ -673,16 +674,16 @@ def test_effort_penalty_tiers():
     a = list(COAST); a[0] = 1                   # left shoulder pitch
     _, r, _, _ = sim.step(a)
     assert r == pytest.approx(-EFFORT_COST[0])
-    a = list(COAST); a[10] = 2                  # right wrist roll
+    a = list(COAST); a[11] = 2                  # right wrist roll (v9 idx)
     _, r, _, _ = sim.step(a)
     assert r == pytest.approx(-EFFORT_COST[4])
-    _, r, _, _ = sim.step([1] * 12)             # everything at once
+    _, r, _, _ = sim.step([1] * 14)             # everything at once
     assert r == pytest.approx(-2 * sum(EFFORT_COST))
     from beat_arena_rs import RawBeatSim
     from beat_arena_env.chart import note_tuple
     free = RawBeatSim(max_steps=690, effort_coef=0.0)
     free.set_chart([note_tuple(far)])
-    _, r, _, _ = free.step([1] * 12)
+    _, r, _, _ = free.step([1] * 14)
     assert r == 0.0                             # coef 0 = free movement
 
 
@@ -958,7 +959,7 @@ def test_recording_roundtrip(tmp_path):
         _, _, done, _, info = env.step(scripted_action(env))
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 7
+    assert head["header"]["version"] == 8      # env v9 replay format
     assert head["header"]["config"]["note_speed_min"] == 2.0
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c
@@ -973,9 +974,9 @@ def test_recording_roundtrip(tmp_path):
             if "cut" in e and e["cut"]["good"]:
                 c = e["cut"]
                 assert c["points"] - (c["pre"] + c["acc"]) in (0.0, 20.0, 30.0)
-    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 15
+    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 17
                for t in ticks)
-    assert all(len(t["action"]) == 12 for t in ticks)
+    assert all(len(t["action"]) == 14 for t in ticks)
     pts = sum(e["cut"].get("points", 0.0) for t in ticks for e in t["events"]
               if "cut" in e)
     pts += sum(e["post"]["points"] for t in ticks for e in t["events"]

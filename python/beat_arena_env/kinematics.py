@@ -1,14 +1,22 @@
-"""Arm forward/inverse kinematics (env v6) — MIRROR of rust/src/lib.rs fk().
+"""Arm forward/inverse kinematics (env v9) — MIRROR of rust/src/lib.rs fk().
 
-Joint order per hand: q = [pitch, yaw, twist, elbow, roll, bend].
+Joint order per hand: q = [pitch, yaw, twist, elbow, roll, bend, dev].
 All-zero = arm straight forward (+z), blade the forearm's extension.
 
 Frames: arm frame M = R_y(yaw) . R_x(-pitch) . R_z(twist) (local +z =
 upper arm; pitch + = up, yaw + = toward +x). Elbow flexion rotates about
 the twist-oriented local x and curls toward local +y:
-forearm = M . (0, sin e, cos e). The blade is the v5.2 wrist in the
-forearm frame M_f = M . R_x(-elbow): d(roll, bend) =
-(-sin(roll) sin(bend), cos(roll) sin(bend), cos(bend)).
+forearm = M . (0, sin e, cos e). The blade lives in the forearm frame
+M_f = M . R_x(-elbow); env v9 (user-caught gap) adds radial/ulnar
+DEVIATION as the second wrist bending axis:
+d(roll, bend, dev) = Rz(roll) . Ry(dev) . Rx(-bend) . e_z =
+(cos r sin v cos b - sin r sin b,
+ sin r sin v cos b + cos r sin b,
+ cos v cos b).
+dev = 0 reproduces the v5.2-v8 wrist exactly; at bend = 0 deviation
+moves the blade at full rate (the old roll+bend parametrization had
+out-of-plane speed roll_rate*sin(bend) — a pole singularity at a
+straight wrist).
 
 Used by the scripted bot, the scenario tests, and the viewer mirror.
 """
@@ -45,7 +53,9 @@ def fk(hand, q):
     w = tuple(e[i] + L_FORE * f[i] for i in range(3))
     sr, cr = math.sin(q[4]), math.cos(q[4])
     sb, cb = math.sin(q[5]), math.cos(q[5])
-    d = (-sr * sb, cr * sb, cb)
+    sv, cv = ((math.sin(q[6]), math.cos(q[6])) if len(q) > 6
+              else (0.0, 1.0))
+    d = (cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb)
     b = tuple(
         m[i][0] * d[0] + (m[i][1] * ce - m[i][2] * se) * d[1] + f[i] * d[2]
         for i in range(3))
@@ -124,8 +134,10 @@ def ik_arm(hand, wrist_target, swivel=0.0):
 
 def wrist_for_blade(hand, q_arm, blade_target):
     """(roll, bend) pointing the blade along world `blade_target` (unit),
-    given the arm pose. Inverts d(roll, bend) in the forearm frame; the
-    caller clamps to the roll/bend limits."""
+    given the arm pose — with dev = 0 (the v9 deviation joint is the
+    redundant DOF here; the bot leaves it at zero and the roll/bend
+    solution stays exact). Inverts d(roll, bend, 0) in the forearm
+    frame; the caller clamps to the roll/bend limits."""
     m = arm_matrix(q_arm[0], q_arm[1], q_arm[2])
     se, ce = math.sin(q_arm[3]), math.cos(q_arm[3])
     # forearm frame columns: c0 = M col0, c1 = ce*Mcol1 - se*Mcol2, c2 = f

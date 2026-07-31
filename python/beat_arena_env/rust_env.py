@@ -18,7 +18,7 @@ import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import EVENT_REASONS, OBS_DIM, note_center
+from .constants import EVENT_REASONS, N_JOINTS, OBS_DIM, note_center
 
 from beat_arena_rs import RawBeatSim
 
@@ -65,10 +65,10 @@ class RustBeatEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
         )
-        # env v6: per hand 6 joint heads (pitch, yaw, twist, elbow, roll,
-        # bend), left hand first; env v8: K options per head (id 0 coast,
+        # env v9: per hand 7 joint heads (pitch, yaw, twist, elbow, roll,
+        # bend, dev), left hand first; K options per head (id 0 coast,
         # 1/2 = +/-full, finer +/- gear pairs append — constants.gear_table)
-        self.action_space = gym.spaces.MultiDiscrete([gears] * 12)
+        self.action_space = gym.spaces.MultiDiscrete([gears] * (2 * N_JOINTS))
 
     # -- recording (JSONL v6, same format the 3D viewer reads) ---------------
     def set_record(self, path: str):
@@ -77,7 +77,7 @@ class RustBeatEnv(gym.Env):
 
     def _start_record(self):
         header = {"header": {
-            "version": 7,
+            "version": 8,      # env v9 body: 7 joints/hand (dev added)
             "config": {
                 "chart_len_s": self.cfg.chart_len_s,
                 "colors": self.cfg.colors,

@@ -77,21 +77,22 @@ def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
         i += 1
     return x
 
-# Observation layout (contract; mirrors beat_arena_env/constants.py, obs v6:
-# env v7 — 16 object slots x 14 features incl. kind flags (bomb, chain
-# head/link) and arc pre/post-swing grants; sabers unchanged from v6).
-SABER_FEAT = 23
-OFF_NOTES = 2 * SABER_FEAT                            # 46
+# Observation layout (contract; mirrors beat_arena_env/constants.py, obs
+# v9: env v7's 16 object slots x 14 features incl. kind flags and arc
+# grants; saber block gains the v9 wrist-deviation angle + omega -> 25).
+SABER_FEAT = 25
+OFF_NOTES = 2 * SABER_FEAT                            # 50
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 270
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 286
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 274
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 290
 # env v6: per hand 6 joint heads (pitch, yaw, twist, elbow, roll, bend)
 # — twelve factored heads, left hand first. Env v8: heads have K =
 # n_gears options (3/5/7); this module constant is the K=3 DEFAULT
 # (legacy imports use it for the head count / ternary-era shapes) —
 # a policy's real sizes live in policy.head_sizes / arch["n_gears"].
-HEAD_SIZES = (3,) * 12
+# Env v9: 14 heads (7 joints/hand — wrist deviation added).
+HEAD_SIZES = (3,) * 14
 
 # Additive attention-mask magnitude. 2^14: exactly representable in fp16
 # (the fp16-storage path needs the bias to survive an fp16 round trip;
@@ -226,7 +227,7 @@ class NotePolicy(nn.Module):
         self.encoder = encoder
         self.embed = embed
         self.n_gears = n_gears
-        self.head_sizes = (n_gears,) * 12
+        self.head_sizes = (n_gears,) * 14
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads,
                      "n_gears": n_gears}
@@ -302,7 +303,7 @@ class NotePolicy(nn.Module):
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
-            return out[:, :-1].view(B, 12, self.n_gears), out[:, -1]
+            return out[:, :-1].view(B, 14, self.n_gears), out[:, -1]
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
@@ -313,7 +314,7 @@ class NotePolicy(nn.Module):
             out = fp16_linear(h, w, b).float()
         else:
             out = F.linear(h, w, b)                          # (B, 12K + 1)
-        return out[:, :-1].view(B, 12, self.n_gears), out[:, -1]
+        return out[:, :-1].view(B, 14, self.n_gears), out[:, -1]
 
     def flatten_fp16(self):
         """Repack all Linear masters into one flat fp32 buffer with a

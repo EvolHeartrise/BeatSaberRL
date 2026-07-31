@@ -284,7 +284,7 @@ def test_vectorized_events_match_serial():
     charts = [generate_chart(ChartConfig(chart_len_s=6.0, colors="both",
                                          bomb_prob=0.25),
                              np.random.default_rng(s)) for s in (3, 4)]
-    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 12))
+    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 14))
 
     serial = []
     for ci, chart in enumerate(charts):
@@ -346,7 +346,7 @@ def test_rust_combo_walk_matches_python():
                              np.random.default_rng(s)) for s in (3, 4)]
     for i, chart in enumerate(charts):
         vec.set_chart(i, [note_tuple(n) for n in chart])
-    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 12))
+    acts = np.random.default_rng(7).integers(0, 3, size=(400, 2, 14))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
     while not all(r is not None for r in rust_result):

@@ -17,7 +17,7 @@ from beat_arena_env.constants import (DRAG, DT, EFFORT_COST, GEAR_MAGS,
                                       gear_table)
 from beat_arena_rs import RawBeatSim
 
-COAST = [0] * 12
+COAST = [0] * 14  # env v9: 7 joints/hand
 
 
 def _sim(gears, effort_coef=0.0):
@@ -30,8 +30,8 @@ def _sim(gears, effort_coef=0.0):
 
 def _om_obs(obs, head):
     """Normalized joint velocity (om / JOINT_OMEGA) for action head 0-11."""
-    hand, j = divmod(head, 6)
-    return float(np.asarray(obs)[hand * SABER_FEAT + 7 + j])
+    hand, j = divmod(head, 7)
+    return float(np.asarray(obs)[hand * SABER_FEAT + 8 + j])
 
 
 def test_gear_tables():
@@ -54,14 +54,14 @@ def test_gear_tables():
 ])
 def test_gear_torque_scaling(gears, aid, frac):
     """One tick of gear `aid` from rest: om = frac * alpha * DT * (1-DRAG)
-    — checked on the right wrist bend (head 11, the snappy tier) and the
+    — checked on the right wrist bend (head 12, the snappy tier) and the
     left shoulder pitch (head 0, the slow tier)."""
-    for head in (11, 0):
+    for head in (12, 0):
         sim = _sim(gears)
         act = list(COAST)
         act[head] = aid
         obs, _, _, _ = sim.step(act)
-        j = head % 6
+        j = head % 7
         want = frac * JOINT_ALPHA[j] * DT * (1.0 - DRAG) / JOINT_OMEGA[j]
         assert _om_obs(obs, head) == pytest.approx(want, abs=1e-6)
 
@@ -75,11 +75,11 @@ def test_doubled_body_limits():
     assert JOINT_ALPHA[0] == 160.0 and JOINT_OMEGA[0] == 16.0
     sim = _sim(3)
     act = list(COAST)
-    act[9] = 1                              # right elbow, 0..150 deg range
+    act[10] = 1                             # right elbow, 0..150 deg range
     peak = 0.0
     for _ in range(10):
         obs, _, _, _ = sim.step(act)
-        peak = max(peak, _om_obs(obs, 9))
+        peak = max(peak, _om_obs(obs, 10))
     assert peak == pytest.approx(1.0, abs=1e-6)  # clamped AT the cap
 
 
@@ -87,7 +87,7 @@ def test_ternary_prefix_identical_across_k():
     """A 0-2 action stream produces bit-identical trajectories at K=3,
     K=5, and K=7 (same full-torque semantics, same effort)."""
     rng = np.random.default_rng(7)
-    acts = rng.integers(0, 3, size=(90, 12))
+    acts = rng.integers(0, 3, size=(90, 14))
     streams = {}
     for k in (3, 5, 7):
         sim = _sim(k, effort_coef=1.0)
@@ -105,7 +105,7 @@ def test_ternary_prefix_identical_across_k():
 def test_effort_scales_with_gear():
     """Effort = EFFORT_COST[j] * |torque fraction|: a quarter-gear tick
     costs a quarter of a full-gear tick; coast is free."""
-    def one_tick_reward(gears, aid, head=11):
+    def one_tick_reward(gears, aid, head=12):
         sim = _sim(gears, effort_coef=1.0)
         act = list(COAST)
         act[head] = aid
@@ -124,7 +124,7 @@ def test_effort_scales_with_gear():
 
 def test_env_action_space_and_header():
     env = RustBeatEnv(gears=5, seed=0)
-    assert list(env.action_space.nvec) == [5] * 12
+    assert list(env.action_space.nvec) == [5] * 14
     with pytest.raises(AssertionError):
         RustBeatEnv(gears=4)
 
@@ -132,14 +132,14 @@ def test_env_action_space_and_header():
 def test_policy_head_width_roundtrip():
     from policy import NotePolicy, load_policy
     pol = NotePolicy(n_gears=7)
-    obs = torch.randn(4, 286)
+    obs = torch.randn(4, 290)
     logits, value = pol.forward_stacked(obs)
-    assert logits.shape == (4, 12, 7) and value.shape == (4,)
+    assert logits.shape == (4, 14, 7) and value.shape == (4,)
     act, logp, ent, _ = pol.get_action_and_value(obs)
-    assert act.shape == (4, 12) and int(act.max()) < 7
+    assert act.shape == (4, 14) and int(act.max()) < 7
     ckpt = {"state_dict": pol.state_dict(), "arch": pol.arch}
     re = load_policy(ckpt)
-    assert re.n_gears == 7 and re.head_sizes == (7,) * 12
+    assert re.n_gears == 7 and re.head_sizes == (7,) * 14
     # legacy checkpoints (no n_gears in arch) stay ternary
     old = NotePolicy()
     legacy = {"state_dict": old.state_dict(),
@@ -164,7 +164,7 @@ def test_gears_cuda_parity():
     acts, r_obs, r_rews = [], [obs.copy()], []
     done = False
     while not done:
-        a = rng.integers(0, 5, size=12)
+        a = rng.integers(0, 5, size=14)
         acts.append(a)
         obs, r, done, _, info = r_env.step(a)
         r_obs.append(obs.copy())
@@ -190,3 +190,35 @@ def test_gears_cuda_parity():
     for k, (co, ro) in enumerate(zip(c_obs[:-1], r_obs[:-1])):
         np.testing.assert_allclose(co, ro, atol=1e-6,
                                    err_msg=f"obs diverge at tick {k}")
+
+
+def test_deviation_joint():
+    """Env v9: dev is a real orthogonal bending axis — at bend = 0 one
+    tick of deviation moves the blade laterally at full rate (the old
+    roll+bend wrist had out-of-plane speed roll_rate*sin(bend) = 0
+    there), dev = 0 reproduces the v8 blade exactly, and the +/-45 deg
+    limits clamp."""
+    from beat_arena_env.constants import DEV_LIM
+    from beat_arena_env.kinematics import fk
+
+    # dev = 0 reproduces the 6-joint blade
+    q6 = [0.2, -0.1, 0.3, 0.9, -1.0, 0.7]
+    _, w6, b6 = fk(1, q6)
+    _, w7, b7 = fk(1, q6 + [0.0])
+    assert np.allclose(w6, w7) and np.allclose(b6, b7)
+
+    # straight wrist: deviation tilts the blade off the forearm axis
+    _, _, b0 = fk(1, [0.0] * 7)
+    _, _, bd = fk(1, [0.0] * 6 + [0.3])
+    assert np.allclose(b0, (0.0, 0.0, 1.0), atol=1e-12)
+    assert abs(np.dot(b0, bd) - np.cos(0.3)) < 1e-9  # full-rate tilt
+
+    # sim: dev action moves the joint; limits clamp at +/-45 deg
+    sim = _sim(3)
+    act = list(COAST)
+    act[13] = 1                             # right dev, +full
+    for _ in range(30):
+        obs, _, _, _ = sim.step(act)
+    q_dev = float(np.asarray(obs)[1 * SABER_FEAT + 7])  # dev_n obs
+    assert q_dev == pytest.approx(1.0, abs=1e-9)        # at +DEV_LIM
+    assert DEV_LIM == pytest.approx(np.radians(45.0))

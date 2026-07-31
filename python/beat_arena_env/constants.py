@@ -36,8 +36,9 @@ REWARD_BOMB = -1.5    # hitting a bomb (passing one is free) — env v7.8,
 # bombs the cheapest gym error (12%-eaten equilibrium at any budget)
 # env v7.9 (user-designed): tiered effort cost per non-coast joint action
 # per tick (metabolic proxy — proximal joints move more mass), scaled by
-# the env's effort_coef. Per-hand joint order (pitch..bend):
-EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4)
+# the env's effort_coef; since v8 also scaled by the gear |fraction|.
+# Per-hand joint order (pitch..bend, dev):
+EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4)
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 # Good-cut box (matching saber): 0.8 wide x 0.5 tall x 1.0 deep, center
@@ -69,7 +70,15 @@ SABER_LEN = 1.0       # m (real Beat Saber)
 SHOULDER = ((-0.2, 1.47, -0.65), (0.2, 1.47, -0.65))    # (left, right)
 L_UPPER = 0.35        # m
 L_FORE = 0.30         # m
-N_JOINTS = 6
+# env v9 (2026-07-30, user-caught gap): 7th joint per hand — wrist
+# radial/ulnar DEVIATION delta, the orthogonal bending axis the v5.2
+# roll+bend wrist lacked (spherical roll/bend can POINT anywhere but
+# out-of-plane blade speed was roll_rate*sin(bend): a pole singularity
+# at straight wrists). Blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the
+# forearm frame — dev=0 reproduces v8 exactly; at bend=0 deviation
+# moves the blade at full rate. Joint order: (pitch, yaw, twist,
+# elbow, roll, bend, dev).
+N_JOINTS = 7
 # tiered dynamics: ponderous shoulder/elbow, snappy wrists. Env v8
 # (2026-07-30, user-directed): alpha AND omega doubled from the v6
 # anatomical values (arm 80/8, wrist 200/20) — deliberately beyond
@@ -77,9 +86,9 @@ N_JOINTS = 6
 # players exceed physical speeds via controller-tracking prediction);
 # the gear table below restores fine control under the stronger body.
 ALPHA_ARM, OMEGA_ARM = 160.0, 16.0      # shoulder pitch/yaw/twist + elbow
-ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # roll + bend
-JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 2
-JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 2
+ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # roll + bend + dev (v9)
+JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
+JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
 
 # --- action gears (env v8) ---------------------------------------------------
 # Per-joint action id -> signed torque fraction of JOINT_ALPHA. Id 0 is
@@ -116,13 +125,19 @@ ELBOW_HI = math.radians(150.0)          # flexion 0..150 deg
 ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
 ROLL_HI = (math.radians(180.0), 0.0)
 BEND_LIM = math.radians(95.0)
+# env v9: radial/ulnar deviation range, symmetric both hands (real
+# wrists do ~20 deg radial / 45 ulnar; rounded up per the v8
+# effective-motion stance — the roll DOF spins the anatomical labels
+# anyway, so a symmetric cone is the honest model)
+DEV_LIM = math.radians(45.0)
 
 
 def joint_limits(hand):
-    """[(lo, hi)] x 6 for one hand, in joint order."""
+    """[(lo, hi)] x 7 for one hand, in joint order."""
     return [(PITCH_LO, PITCH_HI), (YAW_LO[hand], YAW_HI[hand]),
             (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
-            (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM)]
+            (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM),
+            (-DEV_LIM, DEV_LIM)]
 
 
 # --- look-at-player (env v7.6) -----------------------------------------------
@@ -166,10 +181,10 @@ KIND_BOMB = 1
 KIND_CHAIN_HEAD = 2
 KIND_CHAIN_LINK = 3
 
-# obs layout v6 (order is a contract; mirrored in policy.py):
+# obs layout v9 (order is a contract; mirrored in policy.py):
 # per hand [pitch_n, yaw_n, twist_n, elbow_n, cos_roll, sin_roll, bend_n,
-#           om(6)/JOINT_OMEGA, wrist x/1 (y-1.4)/0.75 z/1, wrist_vel(3)/6,
-#           blade dir(3), swing_meter]  -> 23
+#           dev_n, om(7)/JOINT_OMEGA, wrist x/1 (y-1.4)/0.75 z/1,
+#           wrist_vel(3)/6, blade dir(3), swing_meter]  -> 25
 # per note  [x, y_n, z, vz, is_left, is_right, dir_cos, dir_sin,
 #            is_bomb, is_chain_head, is_chain_link, free_pre, free_post,
 #            valid]  -> 14   (bombs: colorless — is_left = is_right = 0,
@@ -177,10 +192,10 @@ KIND_CHAIN_LINK = 3
 #            judge as any-direction)
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
-SABER_FEAT = 23
-OFF_NOTES = 2 * SABER_FEAT                             # 46
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 270
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                 # 286
+SABER_FEAT = 25
+OFF_NOTES = 2 * SABER_FEAT                             # 50
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 274
+OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                 # 290
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-3.0, 12.0)

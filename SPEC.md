@@ -95,6 +95,13 @@ checkpoints/replays retire (hard replace).
     `M_f · d(ψ, φ)` with `d(ψ, φ) = (−sinψ·sinφ, cosψ·sinφ, cosφ)`:
     the neutral blade is the forearm's extension (v5.2's law
     generalized to a moving forearm).
+  - `dev` (env v9, user-caught gap): **wrist radial/ulnar deviation**,
+    ±45° symmetric both hands — the orthogonal bending axis roll+bend
+    lacked. Blade dir = `M_f · Rz(ψ)·Ry(v)·Rx(−φ)·e_z`; dev = 0
+    reproduces the v5.2-v8 wrist exactly, and at bend = 0 deviation
+    moves the blade at full rate (the roll/bend spherical
+    parametrization had out-of-plane speed `roll_rate·sin(bend)` — a
+    pole singularity at straight wrists).
   - **Forward kinematics** (the contract; `kinematics.py` and the
     viewer mirror it): arm frame `M = R_y(yaw)·R_x(−pitch)·R_z(twist)`
     (local +z = upper arm); elbow `E = S + L_UPPER·M·e_z`; forearm dir
@@ -108,8 +115,8 @@ checkpoints/replays retire (hard replace).
   Per joint per tick: `ω += frac·α·DT` (frac from the gear table),
   `ω *= (1 − DRAG)` (`DRAG = 0.02`), clamp, `q += ω·DT`, limit-clamp
   (zeroing ω). Start pose: all zeros, at rest.
-- **Action** per tick, per hand: 6 joint heads with K = `gears` options
-  each (env v8; `MultiDiscrete([K]×12)`, left hand first, joint order as
+- **Action** per tick, per hand: 7 joint heads with K = `gears` options
+  each (env v9; `MultiDiscrete([K]×14)`, left hand first, joint order as
   above, no masks). Gear table (`constants.gear_table`): id 0 = coast,
   1/2 = `±α` at EVERY K (the ternary era is the K=3 prefix — old action
   streams and the scripted bot stay valid); finer ± pairs append:
@@ -355,10 +362,11 @@ obs v5 except y normalization):
   a chain burst doesn't evict upcoming notes).
 - `note_mask: [f32; 16]` — 1.0 = slot holds a pending object.
 
-**Flat vector:** `sabers(46) ++ notes row-major(224) ++ note_mask(16)` →
-**length 286**. Offsets: notes at 46, mask at 270. Checkpoints from all
-earlier obs versions (incl. the 166-dim v6 lineage and its 99.5%
-record) are incompatible.
+**Flat vector:** `sabers(50) ++ notes row-major(224) ++ note_mask(16)` →
+**length 290** (env v9: the saber block gains the wrist-deviation angle
++ omega → 25/hand). Offsets: notes at 50, mask at 274. Checkpoints
+from all earlier obs versions (incl. 286-dim v7/v8 and the 166-dim v6
+lineage) are incompatible.
 
 There is deliberately NO time feature: with constant speed,
 `time_until = z/|vz|` — the approach axis carries the temporal ordering
@@ -370,9 +378,9 @@ statistic for arrival). Both properties are pinned by tests.
 
 `RustBeatEnv(colors, chart_len_s, cols, rows, note_speed_min,
 note_speed_max, note_prob, extra_prob, dot_prob, bomb_prob, seed)`:
-`observation_space = Box(-2, 2, (286,))` (bounds loose),
-`action_space = MultiDiscrete([3]×12)` (per hand: pitch, yaw, twist,
-elbow, roll, bend; left first). New chart every `reset(seed)` (chart
+`observation_space = Box(-2, 2, (290,))` (bounds loose),
+`action_space = MultiDiscrete([K]×14)` (per hand: pitch, yaw, twist,
+elbow, roll, bend, dev; left first; K = `gears`). New chart every `reset(seed)` (chart
 gen stays in Python — single source for charts). Per-step `info["events"]` =
 (note_idx, reason, points) from the Rust event stream (reason `post` =
 follow-through resolution, note already counted; `bomb` = bomb hit);
@@ -785,7 +793,7 @@ Further gains need a GPU or a cheaper policy, not more envs.
 
 ## Tests (`python/tests/`, pytest)
 
-1. Obs layout: length 286, offsets, arm-state block, kind/arc flags,
+1. Obs layout: length 290, offsets, arm-state block, kind/arc flags,
    mask semantics; the Python FK/IK mirror (`kinematics.py`) pinned
    against the sim's getters on random poses.
 2. Determinism: same seed + fixed action stream (all object kinds in

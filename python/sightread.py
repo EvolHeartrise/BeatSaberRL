@@ -68,7 +68,7 @@ def main():
                         torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
                 act = a[0].numpy()
             else:
-                act = rng.integers(0, [3] * 12)
+                act = rng.integers(0, [3] * 14)
             obs, r, done, _, info = env.step(act)
             tot += r
             for _, reason, _pts in info["events"]:

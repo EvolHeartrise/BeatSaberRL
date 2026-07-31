@@ -200,7 +200,7 @@ def converted(tmp_path_factory):
     rng = np.random.default_rng(5)
     events, done = [], False
     while not done:
-        _, _, done, _, info_d = env.step(rng.integers(0, 3, size=12))
+        _, _, done, _, info_d = env.step(rng.integers(0, 3, size=14))
         events.extend(info_d["events"])
 
     out = str(tmp / "ep.dat")
@@ -279,7 +279,7 @@ def test_frames_wellformed(converted):
     ticks = converted["ticks"]
     for i in (0, len(ticks) // 2, len(ticks) - 1):
         for hand, key in ((0, "left"), (1, "right")):
-            wrist = ticks[i]["sabers"][hand][12:15]
+            wrist = ticks[i]["sabers"][hand][14:17]
             want = (wrist[0], wrist[1], wrist[2] + 0.65)
             assert frames[i][key][:3] == pytest.approx(want, abs=1e-5)
 

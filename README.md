@@ -30,6 +30,16 @@ with **gear-table actions** restoring fine control: `--gears 5` adds
 0/1/2 stay coast/±full at every K. Effort scales by |fraction|.
 Pre-v8 checkpoints and references are a different body.
 
+Env v9 (2026-07-30, user-caught modeling gap): 7th joint per hand —
+**wrist radial/ulnar deviation** (±45°, wrist tier). The v5.2 roll+bend
+wrist could POINT anywhere but had out-of-plane blade speed
+`roll_rate·sin(bend)` — a pole singularity at straight wrists; blade is
+now `Rz(roll)·Ry(dev)·Rx(−bend)·e_z` (dev = 0 reproduces v8 exactly).
+Obs 286 → 290, actions 12 → 14 heads, replay v8 — ALL v8 checkpoints,
+replays, and records retired. Fused policy kernels (bench
+`--fused-forward`, `--fused-update`) are v8-baked and guard out until
+ported; the production torch paths are shape-driven and unaffected.
+
 ## Quick start
 
 Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.
