@@ -215,6 +215,15 @@ dynamics, with `b_j = (DRAG/DT)·I_ref[j] = 0.6·I_ref[j]` (table §1.4;
 I_ref pre-clamp). At the reference pose this reproduces v9's 2 %-per-tick
 velocity decay exactly; `b·h/I ≈ 0.0025` so explicit integration is stable.
 
+**Armature** (ADDED at P1 — Divergences §12): per-DoF reflected rotor
+inertia `armature[j] = I_ref[j]/100` (pre-clamp, same column as the
+damping rule), added to M's diagonal in CRBA and as `armature·q̈_j` in
+RNEA (MuJoCo semantics; the MJCF twin MUST declare it via the
+`armature` attribute — P2b). Required for positive definiteness: the
+shoulder stack yaw→pitch→twist gimbal-locks at pitch ±90°, and the
+arm-pitch limit is exactly −90° — at the clamp the mass matrix is
+exactly singular without it.
+
 ## 2. Collision spec
 
 Colliders (12), fixed normative ids — capsule radii as §1.2:
@@ -313,12 +322,21 @@ happening in exactly this order:**
     `p ← p + h·v_lin`; root quaternion via exp map of the WORLD angular
     velocity: `q_root ← normalize(exp(ω·h/2) ⊗ q_root)` with
     `exp(u) = (cos|u|, sin|u|·û)`, Taylor guard `|u| < 1e-12 → identity`.
-11. **Post-solve clamps, in joint-index order 0..28** (v9-style,
-    dissipative):
-    a. `q̇_j ← clamp(q̇_j, −ω_cap[j], +ω_cap[j])`;
-    b. if `q_j < lo_j` or `q_j > hi_j`: `q_j ← clamp(q_j, lo_j, hi_j)` and
-    `q̇_j ← 0`.
-    The root is never clamped.
+11. **Post-solve clamps as momentum-consistent impulses** (REVISED at
+    P1 — Divergences §13; the v9-style direct coordinate write is
+    NORMATIVELY RETIRED, it detonates the free-floating body):
+    a. position pass, joint order 0..28: if `q_j` is outside
+    `[lo_j, hi_j]`, clamp it and mark the joint LIMIT-HIT;
+    b. **8 Gauss-Seidel passes** over joints 0..28 (early-out when a
+    pass changes nothing): target = 0 for limit-hit joints, else
+    `clamp(q̇_j, ±ω_cap[j])`; when `q̇_j ≠ target`, apply the internal
+    impulse `v ← v + M⁻¹e_j·(target − q̇_j)/(M⁻¹)_jj`, then
+    `q̇_j ← target` exactly. `M⁻¹e_j` columns use THIS substep's
+    Cholesky factor, solved lazily once per joint and cached;
+    c. guarantee pass, joint order 0..28: `q̇_j ← clamp(q̇_j, ±ω_cap)`,
+    then `q̇_j ← 0` for limit-hit joints (direct write — residuals at
+    this point are near-null-mode noise with negligible momentum).
+    The root is never clamped. Dissipative as before.
 
 Feet weld definition: foot body frames held at their reference-pose world
 poses — foot_l at (−0.10, 0.07, −0.65), foot_r at (+0.10, 0.07, −0.65),
@@ -449,8 +467,13 @@ is green plus all previous gates stay green. f64 parity = EXACT equality
   elliptic-integral closed form at h, h/2, h/4 shrinks at O(h).
 - Double pendulum energy (gravity on, damping/clamps off):
   |E(t) − E(0)|/|E(0)| ≤ 1e-3 over 1 s at h = 1/240, and halves with h/2.
-- Momentum (gravity off, free base, no constraints): linear momentum
-  relative drift ≤ 1e-10 over 1 s; angular ≤ 1e-4 with O(h) convergence.
+- Momentum (gravity off, free base, no constraints; REVISED at P1 —
+  Divergences §14): symplectic Euler in these coordinates conserves
+  neither linear nor angular momentum exactly (the momentum map A(q)v
+  has q-dependent coefficients; per-step error O(h²), fixed-horizon
+  drift O(h)). Gate:
+  linear + angular relative drift ≤ 2e-2 over 2 s of tumbling at
+  h = 1/240 (measured 1.32e-2), halving with h (measured ratio 2.20).
 
 **P2 — constraints + contacts** (`python/tests/test_v10_contacts.py`):
 - Capsule–capsule distance vs brute-force sampling ≤ 1e-9 on 10k random
@@ -558,3 +581,34 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
 11. **Stance width = hip width (feet at x ±0.10)** — the proposal left
     stance unspecified; matching the hip anchors keeps thigh/shank capsules
     vertical at neutral.
+12. **Armature added (P1, 2026-07-31)**: `armature[j] = I_ref[j]/100`
+    on every actuated DoF (§1.5). The P0 spec's "M symmetric PD,
+    no-pivot Cholesky" is FALSE without it: the shoulder's
+    yaw→pitch→twist stack gimbal-locks at pitch ±90°, arm-pitch's lower
+    limit is exactly −90°, and the limit clamp parks joints exactly
+    there (first blow-up observed after 849 substeps of constant
+    torque; failing pivot −4.3e-18). Armature enters CRBA's diagonal
+    and RNEA's q̈ term identically in every mirror; the MJCF twin adds
+    the `armature` attribute (P2b re-check).
+13. **Step-11 clamps are impulses, not coordinate writes (P1)**: the
+    v9-style `q̇_j ← 0` at a torque-pinned limit discards the joint's
+    momentum share while the solve's reaction stays in the root — a
+    measured pump of ~0.5 rad/s root spin per substep under 1 N·m on
+    every joint, driving the free body past the explicit-Coriolis
+    stability bound (h·ω ≈ 1, ~240 rad/s at h = 1/240) in under a
+    second of ordinary bang-bang actuation. Replaced by internal
+    impulses `Δv = M⁻¹e_j·λ` (zero root rows ⇒ momentum map intact),
+    8 Gauss-Seidel passes + a direct guarantee pass (§3.11). One pass
+    is not enough: near-collinear axis pairs (straight arm:
+    twist/roll) ping-pong the violation. With welds (P2) the same
+    rows may fold into the main PGS; row order 0..28 is the contract.
+14. **P1 momentum gate re-read (like Divergence §4)**: exact discrete
+    momentum conservation is not a property of symplectic Euler in
+    root-frame coordinates — the P0 gate's 1e-10 was aspirational.
+    Replaced by an O(h)-convergence gate with a measured band (§7 P1).
+    Sustained net free moments in unsupported free fall (e.g. constant
+    τ_max on all 29 joints for seconds) legitimately spin the root
+    past h·ω ≈ 1 where NO fixed-step explicit integrator can follow;
+    the welded v10 env cannot produce that input, and the P1 stability
+    test uses per-tick random full gears instead (10 s clean, root ω
+    settling ~15–25 rad/s).

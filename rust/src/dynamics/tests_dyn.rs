@@ -1,0 +1,335 @@
+//! P1 dynamics gates: mass-matrix identities (symmetry, PD, CRBA vs
+//! RNEA columns), RNEA gravity sanity against hand-computed torques,
+//! momentum conservation of the free-floating unconstrained body,
+//! bitwise determinism, clamp behavior, and the substep wall-time
+//! probe.
+
+use super::algo::{chol_factor, crba, momentum, rnea};
+use super::fk::fk_all;
+use super::model::{Model, HUMANOID, NQ, NV};
+use super::step::substep;
+use super::testutil::{random_state, Rng};
+use super::{State, Workspace};
+
+#[test]
+fn mass_matrix_identities() {
+    let m = &HUMANOID;
+    let nv = m.nv();
+    let mut ws = Workspace::new(m);
+    let mut rng = Rng(0x5EED_0000_0000_0002);
+    let mut worst_col = 0.0f64;
+    for pose in 0..200 {
+        let st = random_state(m, &mut rng, false);
+        fk_all(m, &st, &mut ws);
+        crba(m, &mut ws);
+        // exact symmetry: both triangles are written from one value
+        for i in 0..nv {
+            for j in 0..i {
+                assert_eq!(
+                    ws.m[i * nv + j].to_bits(),
+                    ws.m[j * nv + i].to_bits(),
+                    "M not bitwise symmetric at ({i},{j}), pose {pose}"
+                );
+            }
+        }
+        // positive definite: Cholesky (no pivoting) succeeds
+        let mm = ws.m.clone();
+        assert!(
+            chol_factor(nv, &mm, &mut ws.l),
+            "Cholesky failed at pose {pose}"
+        );
+        // CRBA column j == RNEA(q, 0, e_j) − RNEA(q, 0, 0): the
+        // standard cross-check (run on every 8th pose — 36 RNEA calls
+        // per pose)
+        if pose % 8 == 0 {
+            let v0 = vec![0.0; nv];
+            rnea(m, &mut ws, &v0, None);
+            let c0 = ws.c.clone();
+            let mut ej = vec![0.0; nv];
+            for j in 0..nv {
+                ej[j] = 1.0;
+                rnea(m, &mut ws, &v0, Some(&ej));
+                for i in 0..nv {
+                    let d = (ws.c[i] - c0[i] - mm[i * nv + j]).abs();
+                    worst_col = worst_col.max(d);
+                    assert!(d <= 1e-9, "CRBA/RNEA mismatch ({i},{j}) pose {pose}: {d:e}");
+                }
+                ej[j] = 0.0;
+            }
+        }
+    }
+    println!("worst CRBA-vs-RNEA column error: {worst_col:e}");
+}
+
+/// RNEA(q, 0, 0) at the neutral pose == hand-computed gravity holding
+/// torques. Left shoulder pitch, arm horizontal along +z at neutral:
+///   lever arms from the shoulder (z, m): uarm COM 0.175, forearm COM
+///   0.35 + 0.15 = 0.50, hand COM 0.35 + 0.30 + 0.06 = 0.71
+///   τ = g·Σ mᵢ·zᵢ = 9.81·(2.0·0.175 + 1.2·0.50 + 0.61·0.71)
+///     = 9.81·(0.35 + 0.6 + 0.4331) = 9.81·1.3831 = 13.5682110 N·m
+/// (+pitch raises the arm — axis (−1,0,0) maps +z toward +y — so the
+/// holding torque is positive). Elbow, same reasoning from the elbow
+/// point: τ = 9.81·(1.2·0.15 + 0.61·0.36) = 9.81·0.3996 = 3.9200760.
+#[test]
+fn rnea_gravity_holding_torques() {
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let st = State::neutral(m);
+    fk_all(m, &st, &mut ws);
+    let v0 = vec![0.0; m.nv()];
+    rnea(m, &mut ws, &v0, None);
+    let tau_pitch = 9.81 * (2.0 * 0.175 + 1.2 * 0.50 + 0.61 * 0.71);
+    let tau_elbow = 9.81 * (1.2 * 0.15 + 0.61 * 0.36);
+    assert!(
+        (ws.c[6 + 3] - tau_pitch).abs() <= 1e-9,
+        "l_arm_pitch: got {} want {tau_pitch}",
+        ws.c[6 + 3]
+    );
+    assert!(
+        (ws.c[6 + 6] - tau_elbow).abs() <= 1e-9,
+        "l_elbow: got {} want {tau_elbow}",
+        ws.c[6 + 6]
+    );
+    // mirror symmetry at the (symmetric) neutral pose
+    assert!((ws.c[6 + 10] - ws.c[6 + 3]).abs() <= 1e-9, "r_arm_pitch mirror");
+    assert!((ws.c[6 + 13] - ws.c[6 + 6]).abs() <= 1e-9, "r_elbow mirror");
+    // root force rows: required external force = +mg upward (RNEA's
+    // F = m(a_c − g) convention — the force that HOLDS the body)
+    let w = 75.02 * 9.81;
+    assert!((ws.c[0]).abs() <= 1e-9 && (ws.c[2]).abs() <= 1e-9);
+    assert!((ws.c[1] - w).abs() <= 1e-9, "root y force {} vs {w}", ws.c[1]);
+}
+
+// Unconstrained-conservation variant: gravity off, damping off, clamps
+// disabled (limits/caps infinite — a tumbling body would otherwise hit
+// them and the clamps are deliberately dissipative).
+static FREE_LIMITS: [(f64, f64); NQ] = [(f64::NEG_INFINITY, f64::INFINITY); NQ];
+static INF_CAP: [f64; NQ] = [f64::INFINITY; NQ];
+static ZERO_DAMP: [f64; NQ] = [0.0; NQ];
+
+fn free_model() -> Model {
+    let mut m = HUMANOID;
+    m.gravity = [0.0, 0.0, 0.0];
+    m.limits = &FREE_LIMITS;
+    m.omega_cap = &INF_CAP;
+    m.damping = &ZERO_DAMP;
+    // armature KEPT: its ½aq̇² term is invariant under global rotation/
+    // translation, so the conserved Noether momentum is still the BODY
+    // momentum — and without it the limit-free wander goes near the
+    // shoulder gimbal singularity and the Cholesky dies.
+    m
+}
+
+/// Gravity off, no torques, free base: total linear + angular momentum
+/// of the tumbling body. Semi-implicit Euler is symplectic, not
+/// momentum-exact — per-step error is O(h²), so drift over a fixed
+/// horizon is O(h) (SPEC-v10 §7 frames the angular gate exactly that
+/// way). Gate: measured drift bound at h = 1/240 over 2 s, plus the
+/// O(h) halving check.
+#[test]
+fn momentum_conservation() {
+    let m = free_model();
+    let mut rng = Rng(0x5EED_0000_0000_0003);
+    let mut st0 = State::neutral(&m);
+    for i in 0..3 {
+        st0.v[i] = rng.range(-0.5, 0.5); // root linear
+        st0.v[3 + i] = rng.range(-1.5, 1.5); // root angular (tumble)
+    }
+    for j in 0..NQ {
+        st0.v[6 + j] = rng.range(-1.0, 1.0);
+    }
+    let tau = vec![0.0; NQ];
+
+    let mut drift = [0.0f64; 2]; // rel drift at h, h/2
+    for (pass, h) in [1.0f64 / 240.0, 1.0 / 480.0].into_iter().enumerate() {
+        let n = (2.0 / h).round() as usize;
+        let mut st = st0.clone();
+        let mut ws = Workspace::new(&m);
+        fk_all(&m, &st, &mut ws);
+        let (p0, l0) = momentum(&m, &mut ws, &st.v);
+        let scale = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let (pn, ln) = (scale(p0), scale(l0));
+        let mut worst = 0.0f64;
+        for _ in 0..n {
+            substep(&m, &mut st, &tau, h, &mut ws, None);
+            fk_all(&m, &st, &mut ws);
+            let (p, l) = momentum(&m, &mut ws, &st.v);
+            let dp = scale([p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]) / pn;
+            let dl = scale([l[0] - l0[0], l[1] - l0[1], l[2] - l0[2]]) / ln;
+            worst = worst.max(dp).max(dl);
+        }
+        drift[pass] = worst;
+    }
+    println!("momentum rel drift: h=1/240 {:e}, h=1/480 {:e}", drift[0], drift[1]);
+    // measured: 1.32e-2 / 6.02e-3 (ratio 2.20). SPEC-v10 §7's 1e-10
+    // linear gate is unattainable for symplectic Euler in these
+    // coordinates (momentum is not a discrete invariant — Divergences
+    // §14); the real gate is the O(h) convergence plus this band.
+    assert!(drift[0] <= 2e-2, "momentum drift at h=1/240: {:e}", drift[0]);
+    let ratio = drift[0] / drift[1];
+    assert!(
+        ratio > 1.5,
+        "momentum drift not O(h): {:e} -> {:e} (ratio {ratio})",
+        drift[0],
+        drift[1]
+    );
+}
+
+/// Same inputs → bitwise-identical trajectories (gravity on, clamps
+/// on, a seeded gear-like torque schedule held constant per 8-substep
+/// tick — the §3 actuation pattern).
+#[test]
+fn determinism_bitwise() {
+    let m = &HUMANOID;
+    let h = 1.0 / 240.0;
+    let run = || {
+        let mut st = State::neutral(m);
+        let mut ws = Workspace::new(m);
+        let mut rng = Rng(0x5EED_0000_0000_0004);
+        let mut tau = vec![0.0; NQ];
+        for _ in 0..30 {
+            for j in 0..NQ {
+                let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
+                tau[j] = g * m.tau_max[j];
+            }
+            for _ in 0..8 {
+                substep(m, &mut st, &tau, h, &mut ws, None);
+            }
+        }
+        st
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(a.p.map(f64::to_bits), b.p.map(f64::to_bits));
+    assert_eq!(a.quat.map(f64::to_bits), b.quat.map(f64::to_bits));
+    for j in 0..NQ {
+        assert_eq!(a.q[j].to_bits(), b.q[j].to_bits(), "q[{j}]");
+    }
+    for i in 0..NV {
+        assert_eq!(a.v[i].to_bits(), b.v[i].to_bits(), "v[{i}]");
+    }
+}
+
+/// Post-solve clamps (§3 step 11): angles stay inside limits, rates
+/// inside caps, and a limit hit zeroes the joint rate.
+#[test]
+fn clamps_hold_limits() {
+    let m = &HUMANOID;
+    let h = 1.0 / 240.0;
+    let mut st = State::neutral(m);
+    let mut ws = Workspace::new(m);
+    let mut tau = vec![0.0; NQ];
+    tau[7] = m.tau_max[7]; // l_wrist_roll toward its +π stop
+    tau[6] = -m.tau_max[6]; // l_elbow against its 0 stop
+    for _ in 0..480 {
+        substep(m, &mut st, &tau, h, &mut ws, None);
+        for j in 0..NQ {
+            let (lo, hi) = m.limits[j];
+            assert!(st.q[j] >= lo && st.q[j] <= hi, "q[{j}] out of limits");
+            assert!(st.v[6 + j].abs() <= m.omega_cap[j], "v[{j}] over cap");
+        }
+    }
+    let (lo6, _) = m.limits[6];
+    assert_eq!(st.q[6], lo6, "elbow pinned at its stop");
+    assert_eq!(st.v[6 + 6], 0.0, "limit hit zeroes the rate");
+}
+
+/// Crude wall-time probe for the orchestrator's throughput projection:
+/// run `cargo test --release bench_substep -- --nocapture`. Two
+/// regimes: free fall with no active clamps (pure pipeline: FK + CRBA
+/// + RNEA + Cholesky + integrate), and the worst case with every
+/// joint torque-pinned at a limit (clamp solves every substep).
+#[test]
+fn bench_substep_walltime() {
+    let m = &HUMANOID;
+    let h = 1.0 / 240.0;
+    let n = 5000;
+    let mut ws = Workspace::new(m);
+
+    let mut st = State::neutral(m);
+    let tau0 = vec![0.0; NQ];
+    for _ in 0..100 {
+        substep(m, &mut st, &tau0, h, &mut ws, None);
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        substep(m, &mut st, &tau0, h, &mut ws, None);
+    }
+    let free = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+    let mut st = State::neutral(m);
+    let tau1 = vec![1.0; NQ]; // pins every joint at a stop
+    for _ in 0..200 {
+        substep(m, &mut st, &tau1, h, &mut ws, None);
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        substep(m, &mut st, &tau1, h, &mut ws, None);
+    }
+    let pinned = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+    println!("35-DoF substep: {free:.2} us free-fall, {pinned:.2} us all-pinned ({n} iters)");
+}
+
+/// Regression: the shoulder stack (yaw→pitch→twist) gimbal-locks at
+/// pitch ±90°, and l_arm_pitch's LOWER LIMIT is exactly −90° — at the
+/// clamp the yaw and twist world axes are anti-parallel through the
+/// same point, so the body-inertia mass matrix is exactly singular
+/// there (found at P1: pivot −4.3e-18 after 849 substeps of constant
+/// torque). The armature term (model.rs, SPEC-v10 Divergences §12)
+/// must keep the no-pivot Cholesky alive at that pose.
+#[test]
+fn pd_at_shoulder_gimbal_lock() {
+    let m = &HUMANOID;
+    let nv = m.nv();
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    st.q[3] = m.limits[3].0; // l_arm_pitch = −π/2 exactly
+    st.q[10] = m.limits[10].0; // r_arm_pitch = −π/2 exactly
+    st.q[4] = 0.3; // arbitrary yaw/twist — the lock is pitch-only
+    st.q[5] = -0.2;
+    fk_all(m, &st, &mut ws);
+    crba(m, &mut ws);
+    let mm = ws.m.clone();
+    assert!(
+        chol_factor(nv, &mm, &mut ws.l),
+        "Cholesky must survive the gimbal-lock pose"
+    );
+}
+
+/// Long-horizon health under the actuation the trainer will actually
+/// emit: seeded random FULL gears on every joint, re-drawn each 30 Hz
+/// tick, 10 s free-floating (no welds — the P1 worst case; from P2 on
+/// the foot welds ground net moments). The state must stay finite and
+/// substep's internal PD assert must never fire.
+///
+/// Deliberately NOT tested: constant tau_max on all 29 joints for
+/// many seconds of unsupported free fall. That input sign-sustains a
+/// net free moment of O(1000 N·m) on the whole body, which spins the
+/// root past the explicit-Coriolis stability bound h·omega ~ 1 (~240
+/// rad/s at h = 1/240) — a fixed-step explicit integrator cannot
+/// follow it (MuJoCo included), and the welded v10 env can never
+/// produce it.
+#[test]
+fn pd_under_random_full_gears() {
+    let m = &HUMANOID;
+    let h = 1.0 / 240.0;
+    let mut st = State::neutral(m);
+    let mut ws = Workspace::new(m);
+    let mut rng = Rng(0x5EED_0000_0000_0005);
+    let mut tau = vec![0.0; NQ];
+    for _tick in 0..300 {
+        for j in 0..NQ {
+            let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
+            tau[j] = g * m.tau_max[j];
+        }
+        for _ in 0..8 {
+            substep(m, &mut st, &tau, h, &mut ws, None);
+        }
+    }
+    assert!(st.q.iter().all(|q| q.is_finite()));
+    assert!(st.v.iter().all(|v| v.is_finite()));
+    let wroot = (st.v[3] * st.v[3] + st.v[4] * st.v[4] + st.v[5] * st.v[5]).sqrt();
+    println!("root |omega| after 10 s of random full gears: {wroot:.2} rad/s");
+    assert!(wroot < 120.0, "root spin left the stability envelope: {wroot}");
+}
+

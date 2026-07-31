@@ -26,6 +26,11 @@ use numpy::{PyArray1, PyReadonlyArray2, PyReadwriteArray2, PyUntypedArrayMethods
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+// env v10 (P1): full-body rigid-body dynamics core — SPEC-v10.md. Pure
+// Rust (no Python surface yet; the env integration is P3). The v9 sim
+// above is untouched and stays the live env until v10 lands whole.
+pub mod dynamics;
+
 const DT: f64 = 1.0 / 30.0;
 const DRAG: f64 = 0.02;
 const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
