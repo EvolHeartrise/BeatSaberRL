@@ -1,9 +1,10 @@
 <script>
   // Per-hand wrist/joint readouts: a roll dial (needle = forearm roll,
-  // allowed arc bright — 180 degrees since env v7.1 — forbidden zone dark) and
+  // allowed arc bright — 180 degrees since env v7.1 — forbidden zone dark),
   // a bend dial (0 = pointing at the notes, +-90 = blade flat in the hit
-  // plane, +-95 = limit), plus numeric angles and angular velocities.
-  // Needles turn orange within 10 degrees of a limit.
+  // plane, +-95 = limit), and the env v9 DEV dial (radial/ulnar
+  // deviation, +-45 = limit), plus numeric angles and angular
+  // velocities. Needles turn orange within 10 degrees of a limit.
   //
   // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
   // screen-fixed under orbiting, show up in exported videos, and need no
@@ -12,11 +13,11 @@
   import * as THREE from "three";
   import { pb, pose } from "./state.svelte.js";
   import {
-    BEND_LIM, ELBOW_HI, PITCH_HI, PITCH_LO, ROLL_HI, ROLL_LO, SABER_COLORS,
-    TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber, saberAt,
+    BEND_LIM, DEV_LIM, ELBOW_HI, PITCH_HI, PITCH_LO, ROLL_HI, ROLL_LO,
+    SABER_COLORS, TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber, saberAt,
   } from "./replay.js";
 
-  const W = 256, H = 412;
+  const W = 256, H = 520;
   const NEAR = 10 * Math.PI / 180; // limit-proximity warning band
   const deg = (r) => (r * 180 / Math.PI);
 
@@ -54,8 +55,9 @@
   function draw(g, sab) {
     const { hand, ctx } = g;
     const [lo, hi] = [ROLL_LO[hand], ROLL_HI[hand]];
-    // env v6 arm state: q(6) | om(6) | wrist(3)
-    const th = sab[4], ph = sab[5], wt = sab[11], wp = sab[12];  // v9: om at 7..
+    // env v9 arm state: q(7) | om(7) | wrist(3)
+    const th = sab[4], ph = sab[5], dv = sab[6];
+    const wt = sab[11], wp = sab[12], wd = sab[13];
     const col = SABER_COLORS[hand];
 
     ctx.clearRect(0, 0, W, H);
@@ -123,6 +125,27 @@
     label(ctx, `bend ${deg(ph).toFixed(0)}°  ·  ω ${wp.toFixed(1)}`,
       W / 2, 344);
 
+    // ---- dev dial (env v9): radial/ulnar deviation — up = neutral,
+    // +-45 = the limit; the blade's SECOND bending axis
+    const dx = W / 2, dy = 404, dr = 34;
+    ctx.lineWidth = 9;
+    ctx.strokeStyle = "#3a4050";
+    ctx.beginPath();
+    ctx.arc(dx, dy, dr, cAng(-DEV_LIM), cAng(DEV_LIM));
+    ctx.stroke();
+    for (const b of [-DEV_LIM, DEV_LIM]) {
+      ctx.strokeStyle = "#f0a35e";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(dx + (dr - 8) * Math.cos(cAng(b)), dy + (dr - 8) * Math.sin(cAng(b)));
+      ctx.lineTo(dx + (dr + 8) * Math.cos(cAng(b)), dy + (dr + 8) * Math.sin(cAng(b)));
+      ctx.stroke();
+    }
+    const devHot = DEV_LIM - Math.abs(dv) < NEAR;
+    needle(ctx, dx, dy, dr - 6, cAng(dv), devHot ? "#f0a35e" : col);
+    label(ctx, `dev ${deg(dv).toFixed(0)}°  ·  ω ${wd.toFixed(1)}`,
+      W / 2, 456);
+
     // ---- arm-joint bars (env v6): angle within its anatomical range ------
     const bars = [
       ["pitch", sab[0], PITCH_LO, PITCH_HI],
@@ -131,7 +154,7 @@
       ["elbow", sab[3], 0, ELBOW_HI],
     ];
     bars.forEach(([name, v, blo, bhi], i) => {
-      const y = 364 + i * 13;
+      const y = 472 + i * 13;
       const x0 = 62, x1 = W - 52;
       ctx.textAlign = "right";
       ctx.fillStyle = "#6b7180";

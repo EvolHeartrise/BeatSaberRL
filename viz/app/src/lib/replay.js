@@ -147,12 +147,14 @@ export const ELBOW_HI = 150 * RAD;
 export const ROLL_LO = [0 * RAD, -180 * RAD];   // left, right
 export const ROLL_HI = [180 * RAD, 0 * RAD];
 export const BEND_LIM = 95 * RAD;
-export const OMEGA_ARM = 8, OMEGA_WRIST = 20;
+export const DEV_LIM = 45 * RAD; // env v9 wrist deviation
+export const OMEGA_ARM = 16, OMEGA_WRIST = 40; // env v8 doubled caps
 
 // ---- manual pose mode (pure helpers; UI in PosePanel.svelte) ---------------
-export const JOINT_NAMES = ["pitch", "yaw", "twist", "elbow", "roll", "bend"];
+export const JOINT_NAMES =
+  ["pitch", "yaw", "twist", "elbow", "roll", "bend", "dev"];
 
-/** [(lo, hi)] x 6 for one hand, in joint order (mirror of constants.py). */
+/** [(lo, hi)] x 7 for one hand, in joint order (mirror of constants.py). */
 export function jointLimits(hand) {
   return [
     [PITCH_LO, PITCH_HI],
@@ -161,10 +163,11 @@ export function jointLimits(hand) {
     [0, ELBOW_HI],
     [ROLL_LO[hand], ROLL_HI[hand]],
     [-BEND_LIM, BEND_LIM],
+    [-DEV_LIM, DEV_LIM],
   ];
 }
 
-/** Clamp a 6-joint pose into the hand's anatomical ranges. */
+/** Clamp a 7-joint pose into the hand's anatomical ranges. */
 export function clampQ(hand, q) {
   const lims = jointLimits(hand);
   return q.map((v, j) => Math.min(lims[j][1], Math.max(lims[j][0], v)));
@@ -180,7 +183,7 @@ export const mirrorQ = (q) =>
  * zero | FK wrist(3). Drives the same rendering path as replay ticks. */
 export function poseSaber(hand, q) {
   const { wrist } = armFK(hand, q);
-  return [...q, 0, 0, 0, 0, 0, 0, ...wrist];
+  return [...q, ...Array(7).fill(0), ...wrist]; // q(7) | om(7)=0 | wrist
 }
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
