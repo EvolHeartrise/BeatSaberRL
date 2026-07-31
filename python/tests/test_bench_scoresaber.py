@@ -236,9 +236,6 @@ def test_save_and_merge_results(tmp_path):
         bench_scoresaber.load_results(out, "sha256:bb")
 
 
-@pytest.mark.skip(reason="pending P4 torch mirror: the policy is still "
-                  "v9-shaped (obs 290 / 14 heads) and cannot drive the "
-                  "v10 env (obs 340 / 29 heads); P4 restores this")
 def test_greedy_rollout_smoke():
     """Full finish_slot path on a tiny procedural chart, offline, random
     policy: result well-formed and internally consistent."""

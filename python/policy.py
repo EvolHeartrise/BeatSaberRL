@@ -4,9 +4,10 @@ Two encoder arms over the 12-slot upcoming-note window:
 
 - ``transformer`` (the only encoder since 2026-07-20 — the pool
   baseline was deleted at user direction after the easy-config studies
-  concluded): the notes AND two saber tokens form a 14-token
-  sequence run through 2 full pre-LN transformer blocks (LayerNorm ->
-  single-head self-attention -> residual; LayerNorm -> FFN -> residual).
+  concluded): the notes, two saber tokens AND (env v10) one body token
+  form a 19-token sequence run through 2 full pre-LN transformer blocks
+  (LayerNorm -> single-head self-attention -> residual; LayerNorm ->
+  FFN -> residual).
   Each note token carries its z position along the approach axis (obs v2)
   — with constant note speed that IS the temporal ordering, expressed
   spatially (time_until = z / |vz|), so no separate positional encoding
@@ -19,9 +20,9 @@ here gets its standard optimization aids (LayerNorm, FFN, residuals) —
 that A/B's live hypothesis (b) was that stripping them handicaps training.
 
 No action masks exist in this env: every action is always legal, so the
-logprob is the unconditional sum over the twelve factored heads (per
-hand: pitch, yaw, twist, elbow, roll, bend — env v6 joint control, all
-ternary; pure independent factorization, no kind-gating like kiting).
+logprob is the unconditional sum over the 29 factored heads (env v10
+full-body gear control, SPEC-v10 §1.4 joint order; pure independent
+factorization, no kind-gating like kiting).
 """
 
 from __future__ import annotations
@@ -77,22 +78,35 @@ def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
         i += 1
     return x
 
-# Observation layout (contract; mirrors beat_arena_env/constants.py, obs
-# v9: env v7's 16 object slots x 14 features incl. kind flags and arc
-# grants; saber block gains the v9 wrist-deviation angle + omega -> 25).
-SABER_FEAT = 25
-OFF_NOTES = 2 * SABER_FEAT                            # 50
+# Observation layout (contract; mirrors beat_arena_env/constants.py,
+# obs v10 = SPEC-v10 §5: 340 lanes — root pose/vel (15), q block (31,
+# wrist rolls cos/sin), qd (29), two 10-lane derived hand blocks, head
+# (3), contact bits (2), then the v9-verbatim 16x14 note block + mask).
+OBS_DIM = 340
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 274
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                # 290
-# env v6: per hand 6 joint heads (pitch, yaw, twist, elbow, roll, bend)
-# — twelve factored heads, left hand first. Env v8: heads have K =
-# n_gears options (3/5/7); this module constant is the K=3 DEFAULT
-# (legacy imports use it for the head count / ternary-era shapes) —
-# a policy's real sizes live in policy.head_sizes / arch["n_gears"].
-# Env v9: 14 heads (7 joints/hand — wrist deviation added).
-HEAD_SIZES = (3,) * 14
+OFF_NOTES = 100
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 324
+# Token layout (SPEC-v10 §5 "informative", finalized here at P4):
+# [saber_L, saber_R, body, note_0..15] = 19 tokens. Each saber token =
+# that hand's q lanes (8, incl. the cos/sin roll pair) + qd lanes (7) +
+# derived block (10) = 25 features + the 2-lane hand one-hot; the ONE
+# body token = root pose/vel block (15) + spine/leg q (15) + spine/leg
+# qd (15) + head (3) + contact bits (2) = 50 features.
+SABER_FEAT = 25
+BODY_FEAT = 50
+_SABER_L_IDX = tuple(range(18, 26)) + tuple(range(49, 56)) + tuple(range(75, 85))
+_SABER_R_IDX = tuple(range(26, 34)) + tuple(range(56, 63)) + tuple(range(85, 95))
+_BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
+             + tuple(range(63, 75)) + tuple(range(95, 100)))
+assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
+assert len(_BODY_IDX) == BODY_FEAT
+# env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —
+# spine 3, arm_l 7, arm_r 7, leg_l 6, leg_r 6); K = n_gears options
+# per head (env v8 gear tables). This module constant is the K=3
+# default; a policy's real sizes live in policy.head_sizes.
+N_ACTION_HEADS = 29
+HEAD_SIZES = (3,) * N_ACTION_HEADS
 
 # Additive attention-mask magnitude. 2^14: exactly representable in fp16
 # (the fp16-storage path needs the bias to survive an fp16 round trip;
@@ -227,20 +241,33 @@ class NotePolicy(nn.Module):
         self.encoder = encoder
         self.embed = embed
         self.n_gears = n_gears
-        self.head_sizes = (n_gears,) * 14
+        self.head_sizes = (n_gears,) * N_ACTION_HEADS
+        # v10 arch record: obs 340, 29 heads, body token — load_policy
+        # REFUSES checkpoints without these markers (v9 and earlier).
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads,
-                     "n_gears": n_gears}
+                     "n_gears": n_gears, "obs_dim": OBS_DIM,
+                     "n_action_heads": N_ACTION_HEADS, "body_token": True}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
-        # saber token features: the 10 obs-v4 features + [is_left, is_right]
+        # saber token features: the 25 obs-v10 hand features + [is_left,
+        # is_right]; the body token gets its own encoder
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
+        self.body_mlp = _mlp([BODY_FEAT, embed, embed])
         self.blocks = nn.ModuleList(
             Block(embed, n_heads) for _ in range(n_blocks))
-        self.trunk = _mlp([2 * embed, trunk_dim, trunk_dim])
-        # 12 factored joint heads, K = n_gears options each (env v8)
+        # readout = [saber_L, saber_R, body] output embeddings
+        self.trunk = _mlp([3 * embed, trunk_dim, trunk_dim])
+        # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
         self.value_head = nn.Linear(trunk_dim, 1)
+        # token-slice index buffers (device-tracked, not in state_dict)
+        self.register_buffer(
+            "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
+                                       dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "_body_idx", torch.tensor(_BODY_IDX, dtype=torch.long),
+            persistent=False)
         # fp16-storage mode (2026-07-25): activations flow fp16 between
         # the obs split and the head output; GEMMs are fp16-in with fp32
         # cuBLAS compute; LN/softmax stats, log_softmax, sampling, and
@@ -249,20 +276,20 @@ class NotePolicy(nn.Module):
         self.fp16 = False
 
     def _split(self, obs: torch.Tensor):
-        sabers = obs[:, :OFF_NOTES]                                  # (B, 46)
+        sabers = obs.index_select(1, self._saber_idx)                # (B, 50)
+        body = obs.index_select(1, self._body_idx)                   # (B, 50)
         notes = obs[:, OFF_NOTES:OFF_NOTE_MASK].reshape(
             -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 16, 14)
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
-        return sabers, notes, note_mask
+        return sabers, body, notes, note_mask
 
     def forward_stacked(self, obs: torch.Tensor):
-        """Trunk + ONE fused (trunk_dim -> 37) head GEMM: stacked logits
-        (B, 12, 3) + value (B,). The 12 per-head Linears + value head
-        stay separate modules (state_dict unchanged); their weights are
-        concatenated per call (13 tiny tensors — negligible next to the
-        13 skinny GEMMs and ~120 Categorical kernels this replaces)."""
+        """Trunk + ONE fused (trunk_dim -> 29K + 1) head GEMM: stacked
+        logits (B, 29, K) + value (B,). The 29 per-head Linears + value
+        head stay separate modules (state_dict unchanged); their weights
+        are concatenated per call."""
         fp16 = self.fp16 and obs.is_cuda
-        sabers, notes, note_mask = self._split(obs)
+        sabers, body, notes, note_mask = self._split(obs)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
         emb = _seq(self.note_mlp, notes)                             # (B, 16, 64)
@@ -278,32 +305,36 @@ class NotePolicy(nn.Module):
         hand_id = hid[1].expand(B, 2, 2)
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
-        tokens = torch.cat([_seq(self.saber_mlp, saber_feat), emb], dim=1)
+        body_tok = _seq(self.body_mlp, body.to(dt)).unsqueeze(1)     # (B, 1, 64)
+        tokens = torch.cat([_seq(self.saber_mlp, saber_feat), body_tok, emb],
+                           dim=1)                                    # (B, 19, 64)
         # additive attention mask is block-invariant: build it once.
-        # The 2 saber lanes are always attendable -> bias exactly +0.0,
-        # which is what F.pad's zero fill writes — so the ones+cat
-        # key_mask build is skipped entirely (blocks only consume
-        # key_mask when attn_bias is None; bit-identical, 2026-07-28)
+        # The 3 lead lanes (2 sabers + body) are always attendable ->
+        # bias exactly +0.0 = F.pad's zero fill (bit-identical).
+        # NOTE: T = 19 is odd, so the fused fp16 attention kernel is
+        # ineligible (it requires even T) — fp16 falls back to eager
+        # attention until P5 revisits the kernel for the v10 layout.
         attn_bias = F.pad((note_mask.unsqueeze(1) - 1.0) * MASK_BIAS,
-                          (2, 0))
+                          (3, 0))
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
         delta = None
         for blk in self.blocks[:-1]:
             tokens, delta = blk(tokens, None, attn_bias=attn_bias,
                                 delta=delta)
-        # final block: only the 2 readout tokens' outputs are consumed
-        tokens = self.blocks[-1](tokens, None, n_queries=2,
+        # final block: only the 3 readout tokens' outputs are consumed
+        tokens = self.blocks[-1](tokens, None, n_queries=3,
                                  attn_bias=attn_bias, delta=delta)
-        h = _seq(self.trunk, tokens.reshape(B, -1))                  # saber readout
+        h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
         if fp16 and not torch.is_grad_enabled():
             # rollout fast path: weights are frozen between opt.steps,
-            # so the 13-tensor cat + fp16 cast is cached per weight
+            # so the 30-tensor cat + fp16 cast is cached per weight
             # EPOCH (fp16_linear.bump_weights_version — tensor _version
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
-            return out[:, :-1].view(B, 14, self.n_gears), out[:, -1]
+            return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
+                    out[:, -1])
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
@@ -313,8 +344,8 @@ class NotePolicy(nn.Module):
             # sampling, PPO math) is exactly today's fp32 code
             out = fp16_linear(h, w, b).float()
         else:
-            out = F.linear(h, w, b)                          # (B, 12K + 1)
-        return out[:, :-1].view(B, 14, self.n_gears), out[:, -1]
+            out = F.linear(h, w, b)                          # (B, 29K + 1)
+        return out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears), out[:, -1]
 
     def flatten_fp16(self):
         """Repack all Linear masters into one flat fp32 buffer with a
@@ -399,10 +430,19 @@ class NotePolicy(nn.Module):
 
 
 def load_policy(ckpt) -> NotePolicy:
-    """Rebuild a NotePolicy from a checkpoint dict. Checkpoints since
-    2026-07-21 carry an "arch" dict; older ones fall back to the original
-    d64/1-head/2-block defaults."""
+    """Rebuild a NotePolicy from a checkpoint dict. v10 checkpoints
+    carry obs_dim/n_action_heads/body_token arch markers; anything else
+    (v9 and earlier: obs 290 / 14 heads, no body token) is REFUSED —
+    the v10 body retired every earlier checkpoint (house pattern)."""
     arch = ckpt.get("arch", {})
+    if (arch.get("obs_dim") != OBS_DIM
+            or arch.get("n_action_heads") != N_ACTION_HEADS
+            or not arch.get("body_token", False)):
+        raise SystemExit(
+            "checkpoint is not env v10 (needs arch obs_dim=340, "
+            f"n_action_heads=29, body_token=True; got {dict(arch)}). "
+            "v9 and earlier checkpoints were retired with the v10 body — "
+            "retrain, there is no conversion.")
     policy = NotePolicy(
         embed=arch.get("embed", 64), trunk_dim=arch.get("trunk_dim", 128),
         n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1),

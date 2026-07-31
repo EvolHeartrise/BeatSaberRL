@@ -1,18 +1,16 @@
-"""Policy + vec-env tests (transformer-only since 2026-07-20)."""
+"""Policy + vec-env tests (transformer-only since 2026-07-20; env v10
+shapes since P4: obs 340, 19 tokens incl. the body token, 29 gear heads)."""
 
 import numpy as np
 import pytest
-pytest.skip("pending P4 torch mirror: the policy is v9-shaped (obs 290 / "
-            "14 ternary heads) and the v10 env serves obs 340 / 29 heads; "
-            "P4 rebuilds the policy and restores this module",
-            allow_module_level=True)
 import torch
 
 from beat_arena_env import RustBeatEnv, OFF_NOTES, OFF_NOTE_MASK, NOTE_FEAT
+from beat_arena_env.constants import N_JOINTS
 from beat_arena_env.vec_env import BeatVecEnv
-from policy import HEAD_SIZES, NotePolicy, OBS_DIM
+from policy import HEAD_SIZES, N_ACTION_HEADS, NotePolicy, OBS_DIM
 
-ACTION_NVEC = [3] * 14
+ACTION_NVEC = [3] * N_JOINTS
 
 
 def _obs_batch(n=6):
@@ -37,7 +35,7 @@ def test_output_shapes():
     assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]
     assert value.shape == (6,)
     a, logp, ent, v = policy.get_action_and_value(obs)
-    assert a.shape == (6, 14) and logp.shape == (6,)
+    assert a.shape == (6, N_ACTION_HEADS) and logp.shape == (6,)
 
 
 def test_junk_in_masked_slots_cannot_leak():
@@ -65,7 +63,8 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 290
+    assert OBS_DIM == 340
+    assert N_ACTION_HEADS == N_JOINTS == 29
 
 
 def test_pool_encoder_removed():
@@ -76,11 +75,12 @@ def test_pool_encoder_removed():
 def test_vec_env_auto_reset():
     venv = BeatVecEnv(4, colors="both", chart_len_s=5.0, seed=3)
     obs = venv.reset()
-    assert obs.shape == (4, 290)
+    assert obs.shape == (4, OBS_DIM)
     rng = np.random.default_rng(0)
     finished = 0
     for _ in range(400):
-        obs, rew, done, infos = venv.step(rng.integers(0, ACTION_NVEC, size=(4, 14)))
+        obs, rew, done, infos = venv.step(
+            rng.integers(0, ACTION_NVEC, size=(4, N_JOINTS)))
         finished += len(infos)
         for info in infos:
             assert info["n_notes"] > 0
@@ -104,7 +104,7 @@ def test_vec_matches_single():
     rng = np.random.default_rng(4)
     done1 = False
     while not done1:
-        a = rng.integers(0, ACTION_NVEC, size=(1, 14))
+        a = rng.integers(0, ACTION_NVEC, size=(1, N_JOINTS))
         o1, r1, done1, ev1 = single.step([int(x) for x in a[0]])
         ov, rv, dv, evv = vec.step(a)
         np.testing.assert_array_equal(ov, o1)

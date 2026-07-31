@@ -809,3 +809,46 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        only ever removes non-physical velocity. Regression state
        baked in `dynamics/tests_soak.rs`; 2000 × 512 random-gear soak
        clean after both fixes.
+20. **P4 torch-mirror notes (2026-07-31)** — the f64 CPU parity bar was
+    met EXACTLY (bitwise obs/reward/done/status/state/effort/contact
+    impulses across the gears 3/5/7 matrix, trajectories and full
+    episodes); the transcription discipline required two measured
+    torch-CPU deviations to be engineered around, and one Rust
+    observable is represented differently:
+    a. **torch CPU f64 `scalar / tensor` division is not correctly
+       rounded** (reciprocal path; 28 % of random inputs 1 ulp off,
+       measured) — the mirror materializes numerator tensors
+       (tensor/tensor division IS IEEE). torch's CPU f64
+       sin/cos/acos/**sqrt** kernels (SLEEF) differ from the platform
+       CRT libm by 1 ulp on ~1.5–7 % of inputs; the f64 CPU path
+       routes them through numpy, which defers to the same CRT libm
+       Rust's f64 methods call (verified bitwise on 2 000 points).
+       f32/GPU paths use native torch ops (tolerance class).
+    b. **Post events carry no note ids in the torch mirror**: the
+       follow-through trackers are aggregated ring slots (same-tick
+       same-saber trackers share their arc, hence their points), and
+       reward pays each tracker individually in spawn order — bitwise
+       — but WHICH note a post belonged to is not represented. The
+       parity gate pins post totals via reward + score_post + status;
+       replay/bench event streams stay on the Rust sim.
+    c. **Sign-of-exact-zero relaxation**: multiplications by the model
+       tables' exact 0.0/±1.0 constants are constant-folded, and the
+       fixed 8 clamp passes skip Rust's early-out, so ±0.0 values may
+       differ in sign from Rust's. IEEE equality (the comparison the
+       gate uses) treats them equal, and no expression in the pipeline
+       is zero-sign-sensitive (no divisions or sign extractions of
+       exact zeros).
+    d. **Fused fp16 attention is ineligible at 19 tokens** (the kernel
+       requires an even token count); the v10 policy's body token makes
+       T = 19, so fp16 rollouts fall back to eager attention until the
+       P5 kernel pass revisits the layout.
+    e. **f32 Cholesky pivot floor (training path only)**: M(q)'s
+       condition reaches ~3e5 at gimbal-adjacent poses (min eigenvalue
+       ≈ the wrist armature 2.7e-5), so f32 factorization pivots go
+       non-positive under contorted random-gear poses where f64 stays
+       PD (first observed within 4 ticks of full-random gears at
+       N = 1024). The f32 path floors pivots at 1e-8 and counts
+       engagements (`pd_net_hits`); the caps + step-11 clamps +
+       step-12 envelope bound the resulting velocities — the same
+       stability-net role §19 assigns them. The f64 parity path keeps
+       the strict Rust semantics (raise = Rust's panic).
