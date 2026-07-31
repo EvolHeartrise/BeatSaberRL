@@ -1,54 +1,45 @@
 """World and observation constants.
 
-MIRROR of rust/src/lib.rs — the Rust crate is THE sim implementation
-(single source of truth since 2026-07-20; the Python sim was deleted to
-cut maintenance surface). Any rule change lands in lib.rs first and is
-mirrored here for the scripted bot, tests, and tooling. SPEC.md remains
+MIRROR of rust/src/lib.rs (+ rust/src/dynamics/model.rs) — the Rust
+crate is THE sim implementation. Any rule change lands in lib.rs first
+and is mirrored here for tests and tooling. SPEC.md + SPEC-v10.md are
 the written contract.
 
-Env v7 (2026-07-22, research-driven): real Beat Saber geometry and
-judgment, sourced from the ArcViewer + BeatLeader code inventory
-(../research/2026-07-22-bs-mechanics-inventory.md). Floor-based world
-(y = 0 is the floor), 0.6 m lanes, real non-uniform row heights, real
-axis-aligned hitboxes (good box elongated toward the player, small
-wrong-color box), swept-surface saber collision, integer-rounded
-115-point scoring with the real 0.3 m accuracy normalizer, bombs,
-chains (head 85 / links flat 20), and arc pre/post-swing grants.
+Env v10 (P3, 2026-07-31): the v9 kinematic body is RETIRED — the body
+is the SPEC-v10 full humanoid (floating pelvis + 29 actuated revolute
+DoF, foot welds, self-collision) integrated at 8 × 1/240 s per 30 Hz
+control tick. Actions are 29 gear heads (tau_j = gear_fraction ×
+TAU_MAX[j]); effort is positive mechanical work × EFFORT_COEF (the
+v7.9 EFFORT_COST table is gone). Obs is the SPEC-v10 §5 340-lane
+layout. World geometry, judgment, scoring, chart generation are
+UNCHANGED from env v7-v9.
 """
 
 import math
 
 DT = 1.0 / 30.0
-DRAG = 0.02           # per-tick multiplicative velocity decay (all joints)
-V_NORM = 6.0          # wrist-velocity obs normalizer (m/s)
-V_MIN_CUT = 1.0       # min contact-point speed for a good cut (m/s)
-ACC_NORM = 0.3        # accuracy normalizer (m) — real BS value (was 0.28)
+N_SUB = 8              # physics substeps per control tick (SPEC-v10 §3)
+H_SUB = 1.0 / 240.0    # substep length
+V_NORM = 6.0           # wrist-velocity obs normalizer (m/s)
+V_MIN_CUT = 1.0        # min contact-point speed for a good cut (m/s)
+ACC_NORM = 0.3         # accuracy normalizer (m) — real BS value
 COS_TOL = 0.5
-BLOCK = 0.5           # visual block edge (m) — rendering only since v7;
-# 0.5 = the real game's cube (matched to the ScoreSaber viewer 2026-07-30)
-CELL_X = 0.6          # real lane pitch (m); columns at x = -0.9 .. 0.9
+BLOCK = 0.5            # visual block edge (m) — rendering only since v7
+CELL_X = 0.6           # real lane pitch (m); columns at x = -0.9 .. 0.9
 ROW_Y = (0.85, 1.40, 1.90)   # real at-player row centers (m above floor)
-Y_CENTER = 1.40       # obs y normalization: (y - Y_CENTER) / Y_NORM
-REWARD_BAD = -0.5     # = miss since 2026-07-20 (real-BS severity parity)
+Y_CENTER = 1.40        # obs y normalization: (y - Y_CENTER) / Y_NORM
+REWARD_BAD = -0.5      # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
-REWARD_BOMB = -1.5    # hitting a bomb (passing one is free) — env v7.8,
-# user-priced: proxy for the unmodeled combo-multiplier break; -0.5 made
-# bombs the cheapest gym error (12%-eaten equilibrium at any budget)
-# env v7.9 (user-designed): tiered effort cost per non-coast joint action
-# per tick (metabolic proxy — proximal joints move more mass), scaled by
-# the env's effort_coef; since v8 also scaled by the gear |fraction|.
-# Per-hand joint order (pitch..bend, dev):
-EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4)
+REWARD_BOMB = -1.5     # hitting a bomb (passing one is free) — env v7.8
+
+# env v10 effort (SPEC-v10 §4): reward -= EFFORT_COEF * positive
+# mechanical work sum_substeps sum_j max(tau_j*qdot_j, 0)*h (post-solve
+# substep velocities; tau constant over the tick). 4e-4 per joule —
+# derived calibration against the v9 per-swing bill; flagged for P7
+# re-tune (the gravity/work economy is a known behavioral break).
+EFFORT_COEF = 4e-4
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
-# Good-cut box (matching saber): 0.8 wide x 0.5 tall x 1.0 deep, center
-# shifted 0.25 m toward the player (box spans z in [note_z - 0.75,
-# note_z + 0.25]) — early and off-center swings still connect. Dot notes
-# are 0.8 tall (modern "new dots"); chain links 0.2 tall. The wrong-color
-# saber only triggers the SMALL box (0.35^3; links 0.35 x 0.1 x 0.35) —
-# smaller than the visual cube, so corner grazes with the off hand are
-# forgiven. Hitboxes do NOT rotate with the cut direction (v5.3's rotated
-# collision cube is retired — the real game is axis-aligned and forgiving).
 GOOD_HALF_X = 0.4
 GOOD_HALF_Y = 0.25
 GOOD_HALF_Y_DOT = 0.4
@@ -59,43 +50,63 @@ BAD_HALF = 0.175
 BAD_HALF_Y_LINK = 0.05
 BOMB_RADIUS = 0.18
 
-# --- upper body (env v6 body, v7 placement) ----------------------------------
-# Kinematic chain per hand: fixed shoulder -> upper arm -> elbow (hinge)
-# -> forearm -> the v5.2 wrist (roll + bend) -> blade. Joint order per
-# hand: (pitch, yaw, twist, elbow, roll, bend); all-zero = arm straight
-# forward (+z), blade its extension. See kinematics.py for FK/IK.
-# v7 placement: a 1.8 m player — shoulders 1.47 m above the floor,
-# 0.65 m behind the hit plane (head at the real BS cut-plane distance).
-SABER_LEN = 1.0       # m (real Beat Saber)
-SHOULDER = ((-0.2, 1.47, -0.65), (0.2, 1.47, -0.65))    # (left, right)
-L_UPPER = 0.35        # m
-L_FORE = 0.30         # m
-# env v9 (2026-07-30, user-caught gap): 7th joint per hand — wrist
-# radial/ulnar DEVIATION delta, the orthogonal bending axis the v5.2
-# roll+bend wrist lacked (spherical roll/bend can POINT anywhere but
-# out-of-plane blade speed was roll_rate*sin(bend): a pole singularity
-# at straight wrists). Blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the
-# forearm frame — dev=0 reproduces v8 exactly; at bend=0 deviation
-# moves the blade at full rate. Joint order: (pitch, yaw, twist,
-# elbow, roll, bend, dev).
-N_JOINTS = 7
-# tiered dynamics: ponderous shoulder/elbow, snappy wrists. Env v8
-# (2026-07-30, user-directed): alpha AND omega doubled from the v6
-# anatomical values (arm 80/8, wrist 200/20) — deliberately beyond
-# biomechanics, calibrated to EFFECTIVE in-game hand motion (real
-# players exceed physical speeds via controller-tracking prediction);
-# the gear table below restores fine control under the stronger body.
-ALPHA_ARM, OMEGA_ARM = 160.0, 16.0      # shoulder pitch/yaw/twist + elbow
-ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # roll + bend + dev (v9)
-JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
-JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
+SABER_LEN = 1.0       # m (real Beat Saber); blade = hand frame +z
 
-# --- action gears (env v8) ---------------------------------------------------
-# Per-joint action id -> signed torque fraction of JOINT_ALPHA. Id 0 is
+# --- v10 body (SPEC-v10 §1; mirror of rust/src/dynamics/model.rs) ------------
+N_JOINTS = 29          # actuated DoF = action heads (was 14 = 2×7 in v9)
+NV = 35                # velocity coords (root 6 + 29)
+NQPOS = 36             # position coords (root pos 3 + quat 4 + 29)
+ROOT_POS0 = (0.0, 0.94, -0.65)   # reference root (pelvis) position
+HEAD0 = (0.0, 1.70, -0.65)       # reference head center (v9 HEAD verbatim)
+SHOULDER0 = ((-0.2, 1.47, -0.65), (0.2, 1.47, -0.65))  # reference anchors
+
+# actuated order (SPEC-v10 §1.4) — the action/q/omega index contract
+JOINT_NAMES = (
+    "spine_pitch", "spine_yaw", "spine_roll",
+    "l_arm_pitch", "l_arm_yaw", "l_arm_twist", "l_elbow",
+    "l_wrist_roll", "l_wrist_bend", "l_wrist_dev",
+    "r_arm_pitch", "r_arm_yaw", "r_arm_twist", "r_elbow",
+    "r_wrist_roll", "r_wrist_bend", "r_wrist_dev",
+    "l_hip_pitch", "l_hip_yaw", "l_hip_roll", "l_knee",
+    "l_ankle_pitch", "l_ankle_roll",
+    "r_hip_pitch", "r_hip_yaw", "r_hip_roll", "r_knee",
+    "r_ankle_pitch", "r_ankle_roll",
+)
+A_SPINE = 0            # block starts in the actuated order
+A_L_ARM = 3
+A_R_ARM = 10
+A_L_LEG = 17
+A_R_LEG = 23
+
+_D = math.radians      # limits below are the SPEC-v10 §1.4 literals
+JOINT_LIMITS = (
+    (_D(-20), _D(45)), (_D(-40), _D(40)), (_D(-30), _D(30)),          # spine
+    (_D(-90), _D(65)), (_D(-100), _D(45)), (_D(-90), _D(70)),         # l arm
+    (0.0, _D(150)), (0.0, math.pi), (_D(-95), _D(95)), (_D(-30), _D(15)),
+    (_D(-90), _D(65)), (_D(-45), _D(100)), (_D(-70), _D(90)),         # r arm
+    (0.0, _D(150)), (-math.pi, 0.0), (_D(-95), _D(95)), (_D(-15), _D(30)),
+    (_D(-20), _D(120)), (_D(-45), _D(40)), (_D(-45), _D(30)),         # l leg
+    (0.0, _D(150)), (_D(-50), _D(20)), (_D(-20), _D(20)),
+    (_D(-20), _D(120)), (_D(-40), _D(45)), (_D(-30), _D(45)),         # r leg
+    (0.0, _D(150)), (_D(-50), _D(20)), (_D(-20), _D(20)),
+)
+TAU_MAX = (
+    800.00, 319.93, 500.00,
+    113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+    113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+    484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
+    484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
+)
+OMEGA_CAP = (16.0,) * 7 + (40.0,) * 3 + (16.0,) * 4 + (40.0,) * 3 + (16.0,) * 12
+# one-way joints (elbow/knee): obs codes (2q - hi)/hi; wrist rolls wrap:
+# obs codes cos/sin (2 lanes); everything else q / max(|lo|, |hi|)
+ONE_WAY_JOINTS = (6, 13, 20, 26)
+WRAP_JOINTS = (7, 14)
+
+# --- action gears (env v8, unchanged tables — v10 scales TORQUE) -------------
+# Per-joint action id -> signed torque fraction of TAU_MAX. Id 0 is
 # coast and ids 1/2 are +full/-full at EVERY K (the ternary era is the
-# K=3 prefix — scripted bot and old action streams stay valid); finer
-# gears append as +/- pairs in decreasing magnitude. Effort cost scales
-# by |fraction| (a feather touch is priced like one).
+# K=3 prefix); finer gears append as +/- pairs in decreasing magnitude.
 GEAR_MAGS = {3: (1.0,), 5: (1.0, 0.25), 7: (1.0, 1.0 / 3.0, 0.125)}
 
 
@@ -106,63 +117,21 @@ def gear_table(n_gears):
     for m in mags:
         out += [m, -m]
     return tuple(out)
-# env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up) —
-# straight-overhead arms are gone; -90 (straight down) unchanged.
-PITCH_LIM = math.radians(90.0)          # obs normalizer only
-PITCH_LO = math.radians(-90.0)
-PITCH_HI = math.radians(65.0)
-YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
-YAW_HI = (math.radians(45.0), math.radians(100.0))
-# env v7.1 (user-specified, via the pose tool): the v5-era wrist roll
-# range was compensation for missing joints; with the full arm chain it
-# let training cheat. Right roll [-180, 0], twist [-70, 90] (outward
-# humeral rotation keeps its full range, inward is capped); left
-# mirrored. Big swing arcs must now come from the arm, not the wrist.
-TWIST_LIM = math.radians(90.0)          # obs normalizer only
-TWIST_LO = (math.radians(-90.0), math.radians(-70.0))   # (left, right)
-TWIST_HI = (math.radians(70.0), math.radians(90.0))
-ELBOW_HI = math.radians(150.0)          # flexion 0..150 deg
-ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
-ROLL_HI = (math.radians(180.0), 0.0)
-BEND_LIM = math.radians(95.0)
-# env v9 deviation range (user-specified 2026-07-30, in RIGHT-hand
-# terms): [-15 deg, +30 deg]; left mirrored [-30, +15] — deviation is
-# antisymmetric under the body-midplane mirror (like yaw/twist/roll).
-DEV_LIM = math.radians(30.0)            # obs normalizer only
-DEV_LO = (math.radians(-30.0), math.radians(-15.0))     # (left, right)
-DEV_HI = (math.radians(15.0), math.radians(30.0))
 
 
-def joint_limits(hand):
-    """[(lo, hi)] x 7 for one hand, in joint order."""
-    return [(PITCH_LO, PITCH_HI), (YAW_LO[hand], YAW_HI[hand]),
-            (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
-            (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM),
-            (DEV_LO[hand], DEV_HI[hand])]
-
-
-# --- look-at-player (env v7.6) -----------------------------------------------
-# Plain notes bias their full 3D orientation toward facing the player's
-# head as they approach (ArcViewer/BeatLeader look-at): forward blends
-# from +z to the (vertically 80%-damped) head->note ray with weight
-# lam = clamp(1 - z/LOOK_DIST, 0, 1); the cut-direction z-roll rides as
-# the frame's up. Hitboxes AND the direction check live in this frame.
-# lam = 0 (heads, links, far notes) = the pure v7.4 z-roll frame.
-HEAD = (0.0, 1.70, -0.65)   # fixed head anchor (1.8 m player)
+# --- look-at-player (env v7.6; v10 head anchor is the LIVE FK head) ----------
 LOOK_VERT = 0.8             # verticalLookStrength (head.y toward note.y)
 LOOK_DIST = 8.0             # full head-facing at z=0, none beyond 8 m
 
 N_BLADE_SAMPLES = 8   # contact-point/velocity samples along the blade
-# broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm 0.65) +
-# blade 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
-REACH_Z = 1.75
-# note consumed as missed past this — the HEAD plane (0 m behind the
-# head at z = -0.65). DELIBERATE DEVIATION from the real game (despawn
-# ~2 m behind the head, v7.0-v7.2's 2.65): tightens miss credit
-# assignment — the -0.5 lands ~5 ticks after the plane instead of ~20,
-# and a passed note is certainly lost, never ambiguously rescuable
-# (env v7.3, user-specified 2026-07-22).
-Z_MISS = 0.65
+# env v10 live gates (SPEC-v10 §4): the broad-phase reach and the miss
+# boundary are POSE FUNCTIONS now —
+#   reach_z(t) = max_hand(shoulder_z(t)) + REACH_PAST_SHOULDER
+#   miss when note z < head_z(t)
+# reproducing v9's REACH_Z 1.75 and -Z_MISS -0.65 at the reference pose.
+REACH_PAST_SHOULDER = 0.65 + 1.0 + 0.75
+REACH_Z0 = SHOULDER0[0][2] + REACH_PAST_SHOULDER    # 1.75 at reference
+Z_MISS0 = -HEAD0[2]                                 # 0.65 at reference
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------
 PRE_FULL = math.radians(100.0)   # full pre-swing arc
@@ -173,8 +142,6 @@ CHAIN_HEAD_MAX = 85.0            # 70 pre + 15 acc, no follow-through
 CHAIN_LINK_PTS = 20.0            # flat, any direction, speed still required
 SWING_BREAK = 0.005   # rad/tick below which the swing chain breaks
 FOLLOW_TIMEOUT = 15   # ticks a follow-through may keep accumulating
-# every component is floor(x + 0.5)-rounded to an integer (real BS scores
-# are integers; explicit floor+0.5 so Rust and Python agree on halves)
 
 # --- object kinds (chart + obs) ----------------------------------------------
 KIND_NOTE = 0
@@ -182,24 +149,71 @@ KIND_BOMB = 1
 KIND_CHAIN_HEAD = 2
 KIND_CHAIN_LINK = 3
 
-# obs layout v9 (order is a contract; mirrored in policy.py):
-# per hand [pitch_n, yaw_n, twist_n, elbow_n, cos_roll, sin_roll, bend_n,
-#           dev_n, om(7)/JOINT_OMEGA, wrist x/1 (y-1.4)/0.75 z/1,
-#           wrist_vel(3)/6, blade dir(3), swing_meter]  -> 25
-# per note  [x, y_n, z, vz, is_left, is_right, dir_cos, dir_sin,
-#            is_bomb, is_chain_head, is_chain_link, free_pre, free_post,
-#            valid]  -> 14   (bombs: colorless — is_left = is_right = 0,
-#            dir = zero vector; chain links carry their tangent dir but
-#            judge as any-direction)
+# --- obs layout v10 (SPEC-v10 §5; offsets DERIVED from the block table) ------
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
-SABER_FEAT = 25
-OFF_NOTES = 2 * SABER_FEAT                             # 50
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT   # 274
-OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS                 # 290
+HAND_FEAT = 10        # wrist pos(3), wrist vel(3), blade dir(3), swing meter
+Q_LANES = N_JOINTS + len(WRAP_JOINTS)   # 31: wrist rolls code as cos/sin
+
+_OBS_BLOCKS = (
+    ("root_pos", 3),          # x/1, (y-0.94)/0.75, (z+0.65)/1
+    ("root_rot6", 6),         # [R00,R10,R20, R01,R11,R21] world-from-body
+    ("root_vlin", 3),         # /6
+    ("root_vang", 3),         # world, /16
+    ("q", Q_LANES),           # per-joint normalized angle, §1.4 order
+    ("qd", N_JOINTS),         # qdot_j / OMEGA_CAP[j]
+    ("hand_l", HAND_FEAT),    # v9 derived-hand semantics on the v10 FK
+    ("hand_r", HAND_FEAT),
+    ("head", 3),              # x/1, (y-1.70)/0.75, (z+0.65)/1
+    ("contact", 2),           # contact bits [L, R]
+    ("notes", N_NOTE_SLOTS * NOTE_FEAT),   # v9 NOTE_FEAT verbatim
+    ("note_mask", N_NOTE_SLOTS),
+)
+OBS_OFF = {}
+_off = 0
+for _name, _len in _OBS_BLOCKS:
+    OBS_OFF[_name] = _off
+    _off += _len
+OBS_DIM = _off
+OFF_ROOT_POS = OBS_OFF["root_pos"]      # 0
+OFF_ROOT_ROT = OBS_OFF["root_rot6"]     # 3
+OFF_ROOT_VLIN = OBS_OFF["root_vlin"]    # 9
+OFF_ROOT_VANG = OBS_OFF["root_vang"]    # 12
+OFF_Q = OBS_OFF["q"]                    # 15
+OFF_QD = OBS_OFF["qd"]                  # 46
+OFF_HAND_L = OBS_OFF["hand_l"]          # 75
+OFF_HAND_R = OBS_OFF["hand_r"]          # 85
+OFF_HEAD = OBS_OFF["head"]              # 95
+OFF_CONTACT = OBS_OFF["contact"]        # 98
+OFF_NOTES = OBS_OFF["notes"]            # 100
+OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 324
+assert OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340"
+
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-3.0, 12.0)
+ROOT_VLIN_NORM = 6.0
+ROOT_VANG_NORM = 16.0
+
+
+def q_lane(j):
+    """First obs lane of joint j inside the q block (wrist rolls own 2)."""
+    lane = OFF_Q
+    for k in range(j):
+        lane += 2 if k in WRAP_JOINTS else 1
+    return lane
+
+
+def q_normalizer(j):
+    """Obs normalizer of joint j per the SPEC-v10 §5 rule (None for the
+    cos/sin wrist rolls; one-way joints return ('one_way', hi))."""
+    if j in WRAP_JOINTS:
+        return None
+    lo, hi = JOINT_LIMITS[j]
+    if j in ONE_WAY_JOINTS:
+        return ("one_way", hi)
+    return max(abs(lo), abs(hi))
+
 
 # event codes returned by the Rust sim's step(); "post" = follow-through
 # resolution for an already-counted good cut (carries points only)
@@ -219,3 +233,48 @@ def note_center(n):
     x = n.x if getattr(n, "x", None) is not None else col_x(n.col)
     y = n.y if getattr(n, "y", None) is not None else ROW_Y[n.row]
     return (x, y)
+
+
+# =============================================================================
+# v9-LEGACY SECTION (retired with the kinematic body at P3, 2026-07-31).
+# Kept ONLY because kinematics.py (v9 arm FK/IK mirror — P6 rebuilds the
+# bot on the dynamic body) and scripted.py (v9 bot, broken against the
+# v10 sim API, P6 re-authors) still import these names. Nothing in the
+# live sim reads them. DO NOT use in new code.
+# =============================================================================
+DRAG = 0.02           # v9 per-tick velocity decay (now physical damping b)
+EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4)  # v7.9 table
+SHOULDER = SHOULDER0
+L_UPPER = 0.35        # m
+L_FORE = 0.30         # m
+HEAD = HEAD0
+N_HAND_JOINTS = 7     # v9 per-hand joint count (pitch..dev)
+ALPHA_ARM, OMEGA_ARM = 160.0, 16.0
+ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0
+JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
+JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
+PITCH_LIM = math.radians(90.0)
+PITCH_LO = math.radians(-90.0)
+PITCH_HI = math.radians(65.0)
+YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
+YAW_HI = (math.radians(45.0), math.radians(100.0))
+TWIST_LIM = math.radians(90.0)
+TWIST_LO = (math.radians(-90.0), math.radians(-70.0))   # (left, right)
+TWIST_HI = (math.radians(70.0), math.radians(90.0))
+ELBOW_HI = math.radians(150.0)
+ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
+ROLL_HI = (math.radians(180.0), 0.0)
+BEND_LIM = math.radians(95.0)
+DEV_LIM = math.radians(30.0)
+DEV_LO = (math.radians(-30.0), math.radians(-15.0))     # (left, right)
+DEV_HI = (math.radians(15.0), math.radians(30.0))
+REACH_Z = 1.75        # v9 constant gate (now live: REACH_PAST_SHOULDER)
+Z_MISS = 0.65         # v9 constant miss boundary (now live: head_z(t))
+
+
+def joint_limits(hand):
+    """v9-LEGACY: [(lo, hi)] x 7 for one hand, in v9 joint order."""
+    return [(PITCH_LO, PITCH_HI), (YAW_LO[hand], YAW_HI[hand]),
+            (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
+            (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM),
+            (DEV_LO[hand], DEV_HI[hand])]

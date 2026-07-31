@@ -218,6 +218,11 @@ class CudaBeatVecEnv:
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True):
+        # env v10 (P3): the kernel bakes the v9 kinematic body — hard
+        # error at every selection surface until the P5 port
+        raise RuntimeError(
+            "v10: CUDA path pending P5, use --env torch|rust "
+            "(CudaBeatVecEnv's kernel bakes the v9 kinematic body)")
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type != "cuda":

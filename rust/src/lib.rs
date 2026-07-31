@@ -1,23 +1,27 @@
-//! Beat Arena sim core in Rust — THE physics implementation (SPEC.md is
-//! the contract; `python/beat_arena_env/constants.py` mirrors constants).
+//! Beat Arena sim core in Rust — THE physics implementation (SPEC.md +
+//! SPEC-v10.md are the contract; `python/beat_arena_env/constants.py`
+//! mirrors constants).
 //!
-//! Env v7 (2026-07-22, research-driven): real Beat Saber geometry and
-//! judgment on the v6 kinematic upper body. Floor-based world (y = 0 is
-//! the floor), 0.6 m lanes, real non-uniform row heights; the good-cut
-//! hitbox is the real elongated axis-aligned box (0.8 x 0.5 x 1.0,
-//! shifted 0.25 m toward the player; dots 0.8 tall), the wrong-color
-//! hitbox the real small box (0.35^3) — v5.3's rotated visual-cube
-//! collision is retired. The saber sweep is the full swept surface
-//! between the previous and current blade segments (two triangles), not
-//! sampled points. Scoring is the real integer 115: floor(x+0.5)-rounded
-//! components, accuracy normalized by 0.3 m. New object kinds: bombs
-//! (r 0.18 sphere, hit = penalty, pass = free), chain heads (max 85, no
-//! follow-through), chain links (flat 20, any direction, speed still
-//! required), and arc pre/post-swing grants on anchoring notes.
+//! Env v10 (P3, 2026-07-31): the v9 per-joint kinematic integrator and
+//! 2-arm FK are RETIRED — the body is the SPEC-v10 full humanoid
+//! (floating pelvis + 29 actuated revolutes, foot welds, self-collision)
+//! stepped by the P1/P2 dynamics engine in `dynamics/`
+//! (`solver::substep_constrained`, 8 × h = 1/240 per 30 Hz control
+//! tick). Actions are 29 gear heads; τ_j = gear_fraction × τ_max[j],
+//! held across the tick's substeps. Effort is positive mechanical work
+//! (SPEC-v10 §4), replacing the v7.9 EFFORT_COST table.
 //!
-//! Body: the v6 arm chains, shoulders at (+-0.2, 1.47, -0.65) — a 1.8 m
-//! player with the head 0.65 m behind the hit plane. Notes stay cuttable
-//! until ~2 m behind the head (Z_MISS 2.65), where misses register.
+//! Blade segments come from the dynamics FK (hand frame +z, 1 m); the
+//! swept-segment cut detection, 115-pt scoring, swing accumulator, and
+//! miss/bomb logic are UNCHANGED in mechanism — only their inputs moved.
+//! REACH/miss gates are live-pose functions (SPEC-v10 §4): reach =
+//! max_hand(shoulder_z) + 0.65 + 1.0 + 0.75, miss boundary = head_z(t)
+//! (both reproduce the v9 constants 1.75 / −0.65 at the reference pose).
+//! Note look-at billboards to the LIVE head position.
+//!
+//! Obs is the SPEC-v10 §5 340-lane layout (offsets derived from the
+//! block table below — no magic numbers). Replay is v10 (q36 + root
+//! twist + ω29 + contact events with pair ids).
 //!
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
@@ -26,13 +30,20 @@ use numpy::{PyArray1, PyReadonlyArray2, PyReadwriteArray2, PyUntypedArrayMethods
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-// env v10 (P1): full-body rigid-body dynamics core — SPEC-v10.md. Pure
-// Rust (no Python surface yet; the env integration is P3). The v9 sim
-// above is untouched and stays the live env until v10 lands whole.
+// env v10 dynamics core — SPEC-v10.md §1–3 (P1 math, P2 constraints).
 pub mod dynamics;
 
+use dynamics::collide::{NUM_PAIRS, PAIRS};
+use dynamics::fk::quat_to_rot;
+use dynamics::model::{
+    Model, F_HEAD, F_L_HAND, F_L_SHOULDER, F_L_WRIST, F_R_HAND, F_R_SHOULDER,
+    F_R_WRIST, HUMANOID, NQ, NV,
+};
+use dynamics::solver::{substep_constrained, ConstraintSet};
+use dynamics::step::{H_SUB, N_SUB};
+use dynamics::{State, Workspace};
+
 const DT: f64 = 1.0 / 30.0;
-const DRAG: f64 = 0.02;
 const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
 const V_MIN_CUT: f64 = 1.0;
 const ACC_NORM: f64 = 0.3; // real BS accuracy normalizer (m)
@@ -48,14 +59,12 @@ const REWARD_MISS: f64 = -0.5;
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
 const REWARD_BOMB: f64 = -1.5;
-// env v7.9 (2026-07-24, user-designed): tiered effort cost per non-coast
-// joint action per tick (metabolic proxy — proximal joints move more
-// mass), scaled by effort_coef. Calibrated so one accuracy point
-// (1/115 ~ 0.0087) dwarfs the effort of earning it: a typical played
-// episode's total effort bill is ~0.5-1.0 of a ~+40 return.
-// Per-hand joint order (pitch, yaw, twist, elbow, roll, bend):
-const EFFORT_COST: [f64; N_JOINTS] =
-    [2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4];
+// env v10 effort (SPEC-v10 §4): positive mechanical work,
+//   effort_tick = effort_coef * sum_substeps sum_j max(tau_j*qd_j, 0)*h
+// with the POST-SOLVE substep velocity (end of the substep, after the
+// clamp passes). Replaces the v7.9 EFFORT_COST table. Default coef
+// 4e-4 per joule (SPEC-v10 §4 calibration; flagged for P7 re-tune).
+const EFFORT_COEF_DEFAULT: f64 = 4e-4;
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;
@@ -68,26 +77,13 @@ const BAD_HALF: f64 = 0.175;
 const BAD_HALF_Y_LINK: f64 = 0.05;
 const BOMB_RADIUS: f64 = 0.18;
 
-// --- upper body (env v6 chains, v7 placement) --------------------------------
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
-const SHOULDER: [[f64; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
-const L_UPPER: f64 = 0.35; // m
-const L_FORE: f64 = 0.30; // m
-// tiered anatomical dynamics: ponderous shoulder/elbow, snappy wrists
-// env v8 (2026-07-30, user-directed): alpha AND omega doubled from the
-// v6 anatomical values (80/8, 200/20) — calibrated to EFFECTIVE
-// in-game hand motion (tracking prediction beats biomechanics); the
-// gear table restores fine control under the stronger body.
-const ALPHA_ARM: f64 = 160.0; // rad/s^2 (shoulder pitch/yaw/twist, elbow)
-const OMEGA_ARM: f64 = 16.0; // rad/s
-const ALPHA_WRIST: f64 = 400.0; // rad/s^2 (roll, bend)
-const OMEGA_WRIST: f64 = 40.0; // rad/s
 
-// env v8 gears: action id -> signed torque fraction of JOINT_ALPHA.
-// Id 0 = coast, 1/2 = +/-full at EVERY table size (K=3 is the ternary
-// era's prefix); finer gears append as +/- pairs. MIRROR of
-// constants.gear_table — the max table (K=7) is stored, a sim's
-// `gears` field bounds the valid ids.
+// env v8 gears: action id -> signed torque fraction of tau_max (v10:
+// the gear scales TORQUE, SPEC-v10 §4). Id 0 = coast, 1/2 = +/-full at
+// EVERY table size (K=3 is the ternary era's prefix); finer gears
+// append as +/- pairs. MIRROR of constants.gear_table — the max table
+// (K=7) is stored, a sim's `gears` field bounds the valid ids.
 const GEAR_SIGNED: [f64; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
                                0.125, -0.125];
 const GEAR_SIGNED_5: [f64; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
@@ -99,57 +95,21 @@ fn gear_signed(gears: u8) -> [f64; 7] {
         _ => [0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0], // ternary (K=3)
     }
 }
-// env v7.2 (user-specified): shoulder pitch capped at +65 deg (arm up)
-const PITCH_LIM: f64 = 1.5707963267948966; // 90 deg — obs normalizer only
-const PITCH_LO: f64 = -1.5707963267948966;
-const PITCH_HI: f64 = 1.1344640137963142; // 65 deg
-const YAW_LO: [f64; 2] = [-1.7453292519943295, -0.7853981633974483]; // L, R
-const YAW_HI: [f64; 2] = [0.7853981633974483, 1.7453292519943295];
-// env v7.1 (user-specified): tightened wrist roll + twist — the v5-era
-// roll range was compensation for missing joints and let training
-// cheat. Right roll [-180, 0] deg, twist [-70, 90]; left mirrored.
-const TWIST_LIM: f64 = 1.5707963267948966; // 90 deg — obs normalizer only
-const TWIST_LO: [f64; 2] = [-1.5707963267948966, -1.2217304763960306]; // L, R
-const TWIST_HI: [f64; 2] = [1.2217304763960306, 1.5707963267948966];
-const ELBOW_HI: f64 = 2.6179938779914944; // 150 deg (lo = 0)
-const ROLL_LO: [f64; 2] = [0.0, -3.141592653589793]; // L, R
-const ROLL_HI: [f64; 2] = [3.141592653589793, 0.0];
-const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
-// env v9 (2026-07-30, user-caught gap): wrist radial/ulnar DEVIATION —
-// the orthogonal bending axis roll+bend lacked. Range user-specified
-// in RIGHT-hand terms [-15, +30] deg; left mirrored (deviation is
-// antisymmetric under the body-midplane mirror, like yaw/twist/roll).
-const DEV_LIM: f64 = 0.5235987755982988; // 30 deg — obs normalizer only
-const DEV_LO: [f64; 2] = [-0.5235987755982988, -0.2617993877991494]; // L, R
-const DEV_HI: [f64; 2] = [0.2617993877991494, 0.5235987755982988];
-const N_JOINTS: usize = 7; // pitch, yaw, twist, elbow, roll, bend, dev
-const JOINT_ALPHA: [f64; N_JOINTS] = [ALPHA_ARM, ALPHA_ARM, ALPHA_ARM,
-    ALPHA_ARM, ALPHA_WRIST, ALPHA_WRIST, ALPHA_WRIST];
-const JOINT_OMEGA: [f64; N_JOINTS] = [OMEGA_ARM, OMEGA_ARM, OMEGA_ARM,
-    OMEGA_ARM, OMEGA_WRIST, OMEGA_WRIST, OMEGA_WRIST];
 
-fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
-    [
-        (PITCH_LO, PITCH_HI),
-        (YAW_LO[hand], YAW_HI[hand]),
-        (TWIST_LO[hand], TWIST_HI[hand]),
-        (0.0, ELBOW_HI),
-        (ROLL_LO[hand], ROLL_HI[hand]),
-        (-BEND_LIM, BEND_LIM),
-        (DEV_LO[hand], DEV_HI[hand]),
-    ]
-}
 const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
-// broad-phase gate: max wrist z 0.0 (shoulder -0.65 + full arm) + blade
-// 1.0 >= good-box near face at note_z - 0.75 -> note_z <= 1.75
-const REACH_Z: f64 = 1.75;
-// note consumed as missed past this — the HEAD plane (0 m behind the
-// head at z = -0.65). DELIBERATE DEVIATION from the real game (which
-// judges misses at despawn ~2 m behind the head, env v7.0-v7.2's 2.65):
-// the late boundary paid the -0.5 up to ~20 ticks after the plane and
-// kept "lost" notes ambiguous with "rescuable" ones — this tightens
-// miss credit assignment (env v7.3, user-specified 2026-07-22).
-const Z_MISS: f64 = 0.65;
+// live broad-phase reach gate (SPEC-v10 §4): note_z <=
+// max_hand(shoulder_z(t)) + 0.65 + 1.0 + 0.75 — the arm span past the
+// shoulder (0.65) + blade (1.0) + good-box near-face reach (0.75).
+// At the reference pose (shoulder_z = -0.65) this is v9's REACH_Z 1.75.
+const REACH_PAST_SHOULDER: f64 = 0.65 + 1.0 + 0.75;
+// miss boundary: note consumed as missed past the LIVE head plane
+// z < head_z(t) (v9's -Z_MISS = -0.65 at the reference pose). The
+// episode tail must cover the slowest object's trip from the hit plane
+// to the WORST-CASE head plane; the head cannot physically reach
+// z < -1.5 on the welded-feet body (waist z -0.65, head lever 1.09 m
+// fully folded back still > -1.8, and the spine/hip limits stop far
+// short) — P3 divergence note, SPEC-v10 Divergences §18.
+const Z_MISS_TAIL: f64 = 1.5;
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
@@ -168,19 +128,36 @@ const KIND_BOMB: u8 = 1;
 const KIND_CHAIN_HEAD: u8 = 2;
 const KIND_CHAIN_LINK: u8 = 3;
 
+// --- obs layout v10 (SPEC-v10 §5; offsets DERIVED, order is a contract) ------
 const N_NOTE_SLOTS: usize = 16;
 const NOTE_FEAT: usize = 14;
-// obs v6: per hand 23 features — 6 joint angles (roll as cos/sin -> 7
-// numbers), 6 angular velocities, derived wrist pos (3) + finite-diff
-// wrist vel (3) + blade unit dir (3), and the live pre-swing meter
-const SABER_FEAT: usize = 25; // v9: +dev angle, +dev omega
-const OFF_NOTES: usize = 2 * SABER_FEAT; // 50
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 274
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 290
+const HAND_FEAT: usize = 10; // wrist pos(3) + wrist vel(3) + blade(3) + meter
+const Q_LANES: usize = NQ + 2; // 31: the two wrist rolls code as cos/sin
+const OFF_ROOT_POS: usize = 0; // x/1, (y-0.94)/0.75, (z+0.65)/1
+const OFF_ROOT_ROT: usize = OFF_ROOT_POS + 3; // 6D two-column rotation
+const OFF_ROOT_VLIN: usize = OFF_ROOT_ROT + 6; // /6
+const OFF_ROOT_VANG: usize = OFF_ROOT_VLIN + 3; // world, /16
+const OFF_Q: usize = OFF_ROOT_VANG + 3; // 15
+const OFF_QD: usize = OFF_Q + Q_LANES; // 46: qd_j / omega_cap[j]
+const OFF_HAND_L: usize = OFF_QD + NQ; // 75
+const OFF_HAND_R: usize = OFF_HAND_L + HAND_FEAT; // 85
+const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 95
+const OFF_CONTACT: usize = OFF_HEAD + 3; // 98: contact bits [L, R]
+const OFF_NOTES: usize = OFF_CONTACT + 2; // 100
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 324
+const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
+const _: () = assert!(OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340");
+const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 100);
+
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
 const Z_CLIP: (f64, f64) = (-3.0, 12.0);
+const ROOT_Y0: f64 = 0.94; // reference root height (obs centering)
+const HEAD_Y0: f64 = 1.70; // reference head height (obs centering)
+const PLANE_Z0: f64 = -0.65; // reference body plane (obs centering)
+const ROOT_VLIN_NORM: f64 = 6.0;
+const ROOT_VANG_NORM: f64 = 16.0;
 
 /// Real BS scores are integers; explicit floor(x + 0.5) so every
 /// implementation (Rust, torch, Python tools) agrees on halves.
@@ -195,8 +172,6 @@ struct Note {
     y: f64,
     color: u8,
     // required swing direction (0 = +x, CCW), stored as its sin/cos pair
-    // (2026-07-27): the angle is episode-constant, yet build_obs + the
-    // hitbox roll used to evaluate sin/cos per visible note per tick
     sin_a: f64,
     cos_a: f64,
     speed: f64,     // approach speed toward the plane (m/s)
@@ -206,23 +181,25 @@ struct Note {
     free_post: bool, // arc head: full 30 follow-through granted
 }
 
-/// Forward kinematics: (elbow, wrist, blade unit dir) from the six joint
-/// angles q = [pitch, yaw, twist, elbow, roll, bend].
-///
-/// Arm frame  M = R_y(yaw) · R_x(−pitch) · R_z(twist)  (local +z = upper
-/// arm; at zero everything points at the notes). Elbow flexion rotates
-/// about the twist-oriented local x: forearm = M · (0, sin e, cos e).
-/// The blade is the v5.2 wrist in the FOREARM frame
-/// M_f = M · R_x(−elbow):  d(roll, bend) = (−sinψ·sinφ, cosψ·sinφ, cosφ)
-/// — the neutral blade is the forearm's extension, exactly v5.2's law
-/// generalized to a moving forearm.
-/// Returns (elbow, wrist, blade dir, (cos roll, sin roll)) — the roll
-/// pair is computed here anyway (2026-07-27) and build_obs needs it, so
-/// exporting it saves recomputing the two transcendentals per arm-tick.
-fn fk(
-    hand: usize,
-    q: &[f64; N_JOINTS],
-) -> ([f64; 3], [f64; 3], [f64; 3], (f64, f64)) {
+// --- v9 reference arm FK (TEST-ONLY since P3) --------------------------------
+// The v10 continuity gate (dynamics/tests_fk.rs `v9_fk_continuity`)
+// pins the dynamics tree against the retired v9 arm chains; the v9
+// `fk()` survives as a #[cfg(test)] reference implementation for that
+// gate (SPEC-v10 Divergences §18). Nothing in the live env calls it.
+#[cfg(test)]
+const SHOULDER: [[f64; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
+#[cfg(test)]
+const L_UPPER: f64 = 0.35;
+#[cfg(test)]
+const L_FORE: f64 = 0.30;
+
+/// v9 forward kinematics: (elbow, wrist, blade unit dir, (cos, sin) of
+/// roll) from q = [pitch, yaw, twist, elbow, roll, bend, dev].
+/// Arm frame M = R_y(yaw)·R_x(−pitch)·R_z(twist); forearm =
+/// M·(0, sin e, cos e); blade = Rz(roll)·Ry(dev)·Rx(−bend)·e_z in the
+/// forearm frame M_f = M·R_x(−elbow).
+#[cfg(test)]
+pub fn fk(hand: usize, q: &[f64; 7]) -> ([f64; 3], [f64; 3], [f64; 3], (f64, f64)) {
     let (sp, cp) = q[0].sin_cos();
     let (sy, cy) = q[1].sin_cos();
     let (st, ct) = q[2].sin_cos();
@@ -246,10 +223,6 @@ fn fk(
     let w = [e[0] + L_FORE * f[0], e[1] + L_FORE * f[1], e[2] + L_FORE * f[2]];
     let (sr, cr) = q[4].sin_cos();
     let (sb, cb) = q[5].sin_cos();
-    // env v9: blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the forearm
-    // frame — dev = 0 reproduces the v5.2-v8 wrist exactly; at bend = 0
-    // deviation moves the blade at full rate (kills the pole
-    // singularity where out-of-plane speed was roll_rate*sin(bend))
     let (sv, cv) = q[6].sin_cos();
     let d = [cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb];
     let b = [
@@ -406,34 +379,24 @@ fn sweep_tris(
 }
 
 // Env v7.4: hitboxes ROTATE with the object about the approach (z)
-// axis by rot = angle - 270 deg — the real game's colliders sit on the
-// rotated note transform (v7.0's axis-aligned reading was a
-// BeatLeader-viewer simplification). Down-swing notes are axis-aligned
-// (rot = 0); dot notes never rotate; chain links rotate with their
-// tangent. (cos_r, sin_r) derived exactly from the angle's own sin/cos —
-// since 2026-07-27 read from the Note's precomputed pair at the use site.
-
-// --- env v7.6: look-at-player note orientation -------------------------------
-// Notes bias their FULL 3D orientation toward facing the player's head
-// as they approach (ArcViewer ObjectManager.LookAtPlayer / BeatLeader
-// beat.js lookAt): the head's y is damped 80% toward the note's y, the
-// forward axis blends from +z to the head->note ray with weight
-// lam = clamp(1 - z/LOOK_DIST, 0, 1) (our analog of jump progress —
-// the real game reaches full head-facing at the play plane), and the
-// cut-direction z-roll rides along as the frame's up. lam = 0
-// reproduces the v7.4 pure z-roll frame EXACTLY. Applies to plain
-// notes only (chain heads are excluded in ArcViewer; links keep their
-// tangent roll; bombs are spheres). The game's colliders AND its
-// local-frame direction check both live on this transform.
-const HEAD: [f64; 3] = [0.0, 1.70, -0.65]; // fixed head anchor (1.8 m player)
+// axis by rot = angle - 270 deg. Env v7.6: plain notes additionally
+// billboard toward the player's head as they approach; env v10 the
+// head anchor is the LIVE FK head position (SPEC-v10 §4).
 const LOOK_VERT: f64 = 0.8; // verticalLookStrength: head.y 80% toward note.y
 const LOOK_DIST: f64 = 8.0; // full head-facing at z=0, none beyond 8 m
 
 /// Orthonormal note frame columns (x', y', z'): z' = the blended
-/// forward, up from the z-roll, x' = up x z'.
-fn note_frame(p: [f64; 3], cos_r: f64, sin_r: f64, lam: f64) -> [[f64; 3]; 3] {
+/// forward, up from the z-roll, x' = up x z'. `head` is the live FK
+/// head position (env v10).
+fn note_frame(
+    p: [f64; 3],
+    cos_r: f64,
+    sin_r: f64,
+    lam: f64,
+    head: [f64; 3],
+) -> [[f64; 3]; 3] {
     let up = [-sin_r, cos_r, 0.0];
-    let hp = [HEAD[0], HEAD[1] + LOOK_VERT * (p[1] - HEAD[1]), HEAD[2]];
+    let hp = [head[0], head[1] + LOOK_VERT * (p[1] - head[1]), head[2]];
     let d = sub(p, hp);
     let dn = dot3(d, d).sqrt().max(1e-9);
     let g = [
@@ -480,35 +443,6 @@ fn sweep_dist(tris: &[[[f64; 3]; 3]; 2], p: [f64; 3]) -> f64 {
         .min(tri_point_dist(tris[1][0], tris[1][1], tris[1][2], p))
 }
 
-#[derive(Clone, Copy)]
-struct Arm {
-    q: [f64; N_JOINTS],  // pitch, yaw, twist, elbow, roll, bend
-    om: [f64; N_JOINTS], // angular velocities
-    wrist: [f64; 3],     // FK cache (updated whenever q changes)
-    blade: [f64; 3],     // FK cache, unit blade direction
-    roll_cs: (f64, f64), // FK cache: (cos, sin) of q[4] for build_obs
-    wrist_vel: [f64; 3], // finite difference across the last tick
-    swing_acc: f64,      // arc of the current continuous swing (rad)
-    axis: Option<[f64; 3]>, // last tick's rotation axis (unit)
-}
-
-impl Arm {
-    fn start(hand: usize) -> Self {
-        // all joints zero: arm straight forward, blade its extension
-        let (_, w, b, rcs) = fk(hand, &[0.0; N_JOINTS]);
-        Arm {
-            q: [0.0; N_JOINTS],
-            om: [0.0; N_JOINTS],
-            wrist: w,
-            blade: b,
-            roll_cs: rcs,
-            wrist_vel: [0.0; 3],
-            swing_acc: 0.0,
-            axis: None,
-        }
-    }
-}
-
 /// A good cut's pending follow-through meter.
 #[derive(Clone, Copy)]
 struct Tracker {
@@ -519,20 +453,156 @@ struct Tracker {
 
 type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
 
+/// The v10 physical body: dynamics state + solver buffers + the derived
+/// per-tick caches the judgment/obs layers consume. One per env.
+struct Body {
+    st: State,
+    ws: Workspace,
+    cs: ConstraintSet,
+    tau: [f64; NQ], // this tick's applied torques (constant across substeps)
+    // FK caches (refreshed after every tick / state write)
+    wrist: [[f64; 3]; 2],
+    blade: [[f64; 3]; 2],
+    head: [f64; 3],
+    shoulder_z: [f64; 2],
+    // judgment caches
+    wrist_vel: [[f64; 3]; 2], // finite difference across the last tick
+    swing_acc: [f64; 2],      // arc of the current continuous swing (rad)
+    axis: [Option<[f64; 3]>; 2], // last tick's rotation axis (unit)
+    // per-tick contact aggregation (obs bits + replay events)
+    contact_arm: [bool; 2],          // any active contact row touching the arm
+    contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
+    contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
+    effort_j: f64,                   // last tick's positive work (J)
+}
+
+const MODEL: &Model = &HUMANOID;
+
+impl Body {
+    fn new() -> Body {
+        let st = State::neutral(MODEL);
+        let ws = Workspace::new(MODEL);
+        let cs = ConstraintSet::new(MODEL, true, true);
+        let mut b = Body {
+            st,
+            ws,
+            cs,
+            tau: [0.0; NQ],
+            wrist: [[0.0; 3]; 2],
+            blade: [[0.0; 3]; 2],
+            head: [0.0; 3],
+            shoulder_z: [0.0; 2],
+            wrist_vel: [[0.0; 3]; 2],
+            swing_acc: [0.0; 2],
+            axis: [None; 2],
+            contact_arm: [false; 2],
+            contact_imp: [0.0; NUM_PAIRS],
+            contact_pt: [[0.0; 3]; NUM_PAIRS],
+            effort_j: 0.0,
+        };
+        b.refresh_fk();
+        b
+    }
+
+    fn reset(&mut self) {
+        self.st = State::neutral(MODEL);
+        self.tau = [0.0; NQ];
+        self.wrist_vel = [[0.0; 3]; 2];
+        self.swing_acc = [0.0; 2];
+        self.axis = [None; 2];
+        self.contact_arm = [false; 2];
+        self.contact_imp = [0.0; NUM_PAIRS];
+        self.effort_j = 0.0;
+        self.refresh_fk();
+    }
+
+    /// FK caches from the current state: wrist = hand-frame origin,
+    /// blade = hand-frame +z column (SPEC-v10 §1.3), live head +
+    /// shoulder anchors for the reach/miss gates.
+    fn refresh_fk(&mut self) {
+        dynamics::fk::fk_all(MODEL, &self.st, &mut self.ws);
+        for (s, (fw, fh)) in [(F_L_WRIST, F_L_HAND), (F_R_WRIST, F_R_HAND)]
+            .into_iter()
+            .enumerate()
+        {
+            self.wrist[s] = self.ws.p[fw];
+            let r = &self.ws.r[fh];
+            self.blade[s] = [r[0][2], r[1][2], r[2][2]];
+        }
+        self.head = self.ws.p[F_HEAD];
+        self.shoulder_z = [self.ws.p[F_L_SHOULDER][2], self.ws.p[F_R_SHOULDER][2]];
+    }
+
+    /// One 30 Hz control tick: gear ids -> torques, 8 × substep at
+    /// h = 1/240 (SPEC-v10 §3/§4), accumulating positive work and
+    /// contact impulses, then FK-cache refresh + finite-diff wrist vel.
+    fn tick(&mut self, actions: &[u8; NQ], gear: &[f64; 7]) {
+        for j in 0..NQ {
+            let a = actions[j] as usize;
+            let frac = if a < 7 { gear[a] } else { 0.0 };
+            self.tau[j] = frac * MODEL.tau_max[j];
+        }
+        let prev_wrist = self.wrist;
+        self.contact_arm = [false; 2];
+        self.contact_imp = [0.0; NUM_PAIRS];
+        let mut effort = 0.0;
+        for _ in 0..N_SUB {
+            substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
+                                &mut self.ws, &mut self.cs);
+            // SPEC-v10 §4: positive mechanical work at the post-solve
+            // substep velocity (tau constant over the tick)
+            for j in 0..NQ {
+                let p = self.tau[j] * self.st.v[6 + j];
+                if p > 0.0 {
+                    effort += p * H_SUB;
+                }
+            }
+            // contact aggregation: obs bits see every ACTIVE row this
+            // substep; replay impulses sum the row lambdas (N·s)
+            let nweld = self.cs.weld_rows();
+            for (i, c) in self.cs.contacts.iter().enumerate() {
+                let lam = self.cs.lambda[nweld + i];
+                self.contact_imp[c.pair] += lam;
+                self.contact_pt[c.pair] = c.point;
+                let (ia, ib) = PAIRS[c.pair];
+                for id in [ia, ib] {
+                    match id {
+                        2 | 4 | 6 => self.contact_arm[0] = true,
+                        3 | 5 | 7 => self.contact_arm[1] = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.effort_j = effort;
+        self.refresh_fk();
+        for s in 0..2 {
+            for k in 0..3 {
+                self.wrist_vel[s][k] = (self.wrist[s][k] - prev_wrist[s][k]) / DT;
+            }
+        }
+    }
+
+    /// Live broad-phase reach gate (SPEC-v10 §4).
+    fn reach_z(&self) -> f64 {
+        self.shoulder_z[0].max(self.shoulder_z[1]) + REACH_PAST_SHOULDER
+    }
+}
+
 struct Core {
     max_steps: u32,
-    effort_coef: f64, // scales EFFORT_COST (0 = free movement)
+    effort_coef: f64, // per-joule work price (0 = free movement)
     gear: [f64; 7],   // env v8: action id -> signed torque fraction
     wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
-    tail_s: f64, // episode tail after the last hit_time (covers Z_MISS exit)
-    min_speed: f64, // slowest object; (hit_time-t)*min_speed > REACH_Z is a
+    tail_s: f64, // episode tail after the last hit_time (covers miss exit)
+    min_speed: f64, // slowest object; (hit_time-t)*min_speed > reach_z is a
                     // conservative exact "beyond reach" bound for a sorted chart
     // state
     tick: u32,
     time: f64,
     first_pending: usize, // smallest index with status 0 (monotone per episode)
-    arms: [Arm; 2],
+    body: Body,
     trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed
     good_cuts: u32,
@@ -541,15 +611,10 @@ struct Core {
     bombs_hit: u32,
     n_scoreable: u32, // chart objects that are not bombs
     score: f64,       // summed points; max = 115*notes + 85*heads + 20*links
-    // score decomposition (2026-07-25, user-directed): the three graded
-    // components tracked independently — links' flat 20s are in none
-    // (score - pre - acc - post = link points)
     score_pre: f64,
     score_acc: f64,
     score_post: f64,
-    // reusable event buffer (2026-07-27): step_inner used to allocate a
-    // fresh Vec per tick; cleared and refilled in place instead. Read it
-    // right after step_inner — the next tick clears it.
+    // reusable event buffer: cleared and refilled in place each tick.
     events_buf: Vec<(u32, u8, f32, f32, f32)>,
 }
 
@@ -567,7 +632,7 @@ impl Core {
             tick: 0,
             time: 0.0,
             first_pending: 0,
-            arms: [Arm::start(0), Arm::start(1)],
+            body: Body::new(),
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
             good_cuts: 0,
@@ -607,7 +672,8 @@ impl Core {
             "chart must be sorted by hit_time"
         );
         // the episode tail must cover the slowest object's trip from the
-        // plane to the miss boundary, or final misses never register
+        // plane to the WORST-CASE miss boundary (live head plane, env
+        // v10), or final misses never register
         let min_speed = self
             .chart
             .iter()
@@ -615,7 +681,7 @@ impl Core {
             .fold(f64::INFINITY, f64::min);
         self.min_speed = min_speed;
         self.tail_s = if min_speed.is_finite() {
-            0.5 + Z_MISS / min_speed
+            0.5 + Z_MISS_TAIL / min_speed
         } else {
             0.5
         };
@@ -626,7 +692,7 @@ impl Core {
         self.tick = 0;
         self.time = 0.0;
         self.first_pending = 0;
-        self.arms = [Arm::start(0), Arm::start(1)];
+        self.body.reset();
         self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
         self.good_cuts = 0;
@@ -640,42 +706,79 @@ impl Core {
         self.score_post = 0.0;
     }
 
-    /// Obs written into a caller-owned 286-lane slice (2026-07-27): the
-    /// return-by-value build_obs paid a 1144 B stack array + a second
-    /// memcpy at every caller; the vector step writes rows in place.
+    /// Obs written into a caller-owned OBS_DIM slice — SPEC-v10 §5
+    /// layout, offsets from the derived consts above.
     fn write_obs(&self, obs: &mut [f32]) {
         debug_assert_eq!(obs.len(), OBS_DIM);
         obs.fill(0.0);
-        for (s, arm) in self.arms.iter().enumerate() {
-            let b = s * SABER_FEAT;
-            // joint pose: bounded scalars normalized to their ranges,
-            // except roll (280 deg arc) which keeps its v5 cos/sin coding
-            obs[b] = (arm.q[0] / PITCH_LIM) as f32;
-            obs[b + 1] = (arm.q[1] / YAW_HI[1]) as f32;
-            obs[b + 2] = (arm.q[2] / TWIST_LIM) as f32;
-            obs[b + 3] = ((2.0 * arm.q[3] - ELBOW_HI) / ELBOW_HI) as f32;
-            obs[b + 4] = arm.roll_cs.0 as f32;
-            obs[b + 5] = arm.roll_cs.1 as f32;
-            obs[b + 6] = (arm.q[5] / BEND_LIM) as f32;
-            obs[b + 7] = (arm.q[6] / DEV_LIM) as f32; // v9 deviation
-            for j in 0..N_JOINTS {
-                obs[b + 8 + j] = (arm.om[j] / JOINT_OMEGA[j]) as f32;
-            }
-            // derived hand state: FK wrist, finite-diff velocity, blade dir
-            obs[b + 15] = (arm.wrist[0] / X_NORM) as f32;
-            obs[b + 16] = ((arm.wrist[1] - Y_CENTER) / Y_NORM) as f32;
-            obs[b + 17] = arm.wrist[2] as f32;
-            for k in 0..3 {
-                obs[b + 18 + k] = (arm.wrist_vel[k] / V_NORM) as f32;
-                obs[b + 21 + k] = arm.blade[k] as f32;
-            }
-            // live pre-swing meter: 1.0 = full pre-swing credit banked
-            obs[b + 24] = (arm.swing_acc / PRE_FULL).min(2.0) as f32;
+        let st = &self.body.st;
+        // root position (centered on the reference pose)
+        obs[OFF_ROOT_POS] = (st.p[0] / X_NORM) as f32;
+        obs[OFF_ROOT_POS + 1] = ((st.p[1] - ROOT_Y0) / Y_NORM) as f32;
+        obs[OFF_ROOT_POS + 2] = ((st.p[2] - PLANE_Z0) / X_NORM) as f32;
+        // root orientation, 6D two-column: [R00,R10,R20, R01,R11,R21]
+        let r = quat_to_rot(st.quat);
+        for i in 0..3 {
+            obs[OFF_ROOT_ROT + i] = (r[i][0]) as f32;
+            obs[OFF_ROOT_ROT + 3 + i] = (r[i][1]) as f32;
         }
+        for k in 0..3 {
+            obs[OFF_ROOT_VLIN + k] = (st.v[k] / ROOT_VLIN_NORM) as f32;
+            obs[OFF_ROOT_VANG + k] = (st.v[3 + k] / ROOT_VANG_NORM) as f32;
+        }
+        // q block (31 lanes): per-joint normalized angle in §1.4 order;
+        // the two wrist rolls keep the v9 cos/sin coding; the one-way
+        // elbows/knees keep the elbow-style (2q − hi)/hi; everything
+        // else is q / max(|lo|, |hi|) — all derived from model.limits
+        let mut lane = OFF_Q;
+        for j in 0..NQ {
+            let q = st.q[j];
+            match j {
+                7 | 14 => {
+                    // l/r wrist roll: cos/sin (the only wrapping joints)
+                    let (s, c) = q.sin_cos();
+                    obs[lane] = c as f32;
+                    obs[lane + 1] = s as f32;
+                    lane += 2;
+                }
+                6 | 13 | 20 | 26 => {
+                    // l/r elbow, l/r knee: one-way (2q − hi)/hi
+                    let hi = MODEL.limits[j].1;
+                    obs[lane] = ((2.0 * q - hi) / hi) as f32;
+                    lane += 1;
+                }
+                _ => {
+                    let (lo, hi) = MODEL.limits[j];
+                    obs[lane] = (q / lo.abs().max(hi.abs())) as f32;
+                    lane += 1;
+                }
+            }
+        }
+        debug_assert_eq!(lane, OFF_QD);
+        for j in 0..NQ {
+            obs[OFF_QD + j] = (st.v[6 + j] / MODEL.omega_cap[j]) as f32;
+        }
+        // hand derived blocks (v9 semantics on the v10 FK)
+        for (s, base) in [(0usize, OFF_HAND_L), (1usize, OFF_HAND_R)] {
+            let b = &self.body;
+            obs[base] = (b.wrist[s][0] / X_NORM) as f32;
+            obs[base + 1] = ((b.wrist[s][1] - Y_CENTER) / Y_NORM) as f32;
+            obs[base + 2] = b.wrist[s][2] as f32;
+            for k in 0..3 {
+                obs[base + 3 + k] = (b.wrist_vel[s][k] / V_NORM) as f32;
+                obs[base + 6 + k] = b.blade[s][k] as f32;
+            }
+            obs[base + 9] = (b.swing_acc[s] / PRE_FULL).min(2.0) as f32;
+        }
+        // head position (FK, centered on the reference pose)
+        obs[OFF_HEAD] = (self.body.head[0] / X_NORM) as f32;
+        obs[OFF_HEAD + 1] = ((self.body.head[1] - HEAD_Y0) / Y_NORM) as f32;
+        obs[OFF_HEAD + 2] = ((self.body.head[2] - PLANE_Z0) / X_NORM) as f32;
+        // contact bits [L, R]
+        obs[OFF_CONTACT] = self.body.contact_arm[0] as u8 as f32;
+        obs[OFF_CONTACT + 1] = self.body.contact_arm[1] as u8 as f32;
+        // note block — v9 NOTE_FEAT verbatim
         let mut slot = 0usize;
-        // start past the resolved prefix (everything before first_pending
-        // has status != 0 by construction) — the loop then typically
-        // terminates within ~N_NOTE_SLOTS iterations instead of O(chart)
         for i in self.first_pending..self.chart.len() {
             let n = &self.chart[i];
             if self.status[i] != 0 {
@@ -693,9 +796,6 @@ impl Core {
             if n.kind != KIND_BOMB {
                 obs[base + 4 + n.color as usize] = 1.0;
             }
-            // dot notes encode direction as the ZERO vector; chain links
-            // carry their tangent (path information) despite judging as
-            // any-direction — is_chain_link disambiguates
             let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
             if n.kind != KIND_BOMB && show_dir {
                 obs[base + 6] = n.cos_a as f32;
@@ -721,10 +821,10 @@ impl Core {
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
     // (follow-through resolution), 6 bomb hit. The f32 is points awarded.
     // Events land in self.events_buf (cleared here), in the same order the
-    // old per-tick Vec produced them — order is the ComboWalk contract.
-    fn step_inner(&mut self, actions: [[u8; N_JOINTS]; 2]) -> (f64, bool) {
-        let prev_pos = [self.arms[0].wrist, self.arms[1].wrist];
-        let prev_dir = [self.arms[0].blade, self.arms[1].blade];
+    // v9 sim produced them — order is the ComboWalk contract.
+    fn step_inner(&mut self, actions: &[u8; NQ]) -> (f64, bool) {
+        let prev_pos = self.body.wrist;
+        let prev_dir = self.body.blade;
 
         let mut reward = 0.0;
         self.events_buf.clear();
@@ -732,79 +832,42 @@ impl Core {
         let mut deltas = [0.0f64; 2];
         let mut continued = [false; 2];
 
-        // env v7.9 tiered effort, v8 gear-scaled: a non-coast action
-        // costs EFFORT_COST[j] * |torque fraction| (feather = cheap)
-        let mut effort = 0.0;
-        for s in 0..2 {
-            for j in 0..N_JOINTS {
-                let a = actions[s][j] as usize;
-                if a != 0 && a < 7 {
-                    effort += EFFORT_COST[j] * self.gear[a].abs();
-                }
-            }
-        }
-        reward -= self.effort_coef * effort;
+        // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
+        let gear = self.gear;
+        self.body.tick(actions, &gear);
+        reward -= self.effort_coef * self.body.effort_j;
 
+        // swing chain update (feeds pre-swing + follow-through scores)
         for s in 0..2 {
-            let arm = &mut self.arms[s];
-            // one integrator for every joint: accel, drag, omega cap,
-            // angle step, limit clamp (hitting a limit kills the omega)
-            let lims = joint_limits(s);
-            for j in 0..N_JOINTS {
-                let a = actions[s][j] as usize;
-                let frac = if a < 7 { self.gear[a] } else { 0.0 };
-                arm.om[j] += frac * JOINT_ALPHA[j] * DT;
-                arm.om[j] =
-                    (arm.om[j] * (1.0 - DRAG)).clamp(-JOINT_OMEGA[j], JOINT_OMEGA[j]);
-                arm.q[j] += arm.om[j] * DT;
-                if arm.q[j] < lims[j].0 || arm.q[j] > lims[j].1 {
-                    arm.q[j] = arm.q[j].clamp(lims[j].0, lims[j].1);
-                    arm.om[j] = 0.0;
-                }
-            }
-            let (_, w, d_new, rcs) = fk(s, &arm.q);
-            arm.wrist = w;
-            arm.blade = d_new;
-            arm.roll_cs = rcs;
-            for k in 0..3 {
-                arm.wrist_vel[k] = (w[k] - prev_pos[s][k]) / DT;
-            }
-
-            // swing chain update (feeds pre-swing + follow-through scores)
             let d_old = prev_dir[s];
-            let dot = (d_old[0] * d_new[0] + d_old[1] * d_new[1] + d_old[2] * d_new[2])
+            let d_new = self.body.blade[s];
+            let dot = (d_old[0] * d_new[0] + d_old[1] * d_new[1]
+                + d_old[2] * d_new[2])
                 .clamp(-1.0, 1.0);
             let delta = dot.acos();
             deltas[s] = delta;
             if delta < SWING_BREAK {
-                arm.swing_acc = 0.0;
-                arm.axis = None;
+                self.body.swing_acc[s] = 0.0;
+                self.body.axis[s] = None;
             } else {
                 let cx = cross3(d_old, d_new);
                 let cn = (cx[0].powi(2) + cx[1].powi(2) + cx[2].powi(2)).sqrt();
                 let ax = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
-                match arm.axis {
+                match self.body.axis[s] {
                     Some(a0) if a0[0] * ax[0] + a0[1] * ax[1] + a0[2] * ax[2] < 0.0 => {
-                        arm.swing_acc = delta; // reversal: a new swing starts
+                        self.body.swing_acc[s] = delta; // reversal: new swing
                     }
                     _ => {
-                        arm.swing_acc += delta;
+                        self.body.swing_acc[s] += delta;
                         continued[s] = true;
                     }
                 }
-                arm.axis = Some(ax);
+                self.body.axis[s] = Some(ax);
             }
         }
 
-        // follow-through trackers (existing ones, BEFORE this tick's cuts):
-        // chain broke/reversed -> resolve; else accumulate and resolve on
-        // reaching 60 deg or timing out.
+        // follow-through trackers (existing ones, BEFORE this tick's cuts)
         for s in 0..2 {
-            // in-place retain (2026-07-27): the drain-into-fresh-Vec
-            // rebuild paid ~2 malloc/free per env-tick whenever a tracker
-            // survived; retain_mut visits in the same order, so events
-            // and arithmetic are unchanged. (mem::take dodges the twin
-            // &mut self borrow; it swaps in an alloc-free empty Vec.)
             let mut trs = std::mem::take(&mut self.trackers[s]);
             trs.retain_mut(|tr| {
                 let resolve = if !continued[s] {
@@ -830,22 +893,27 @@ impl Core {
 
         // both sabers' swept surfaces this tick
         let tris = [
-            sweep_tris(prev_pos[0], prev_dir[0], self.arms[0].wrist, self.arms[0].blade),
-            sweep_tris(prev_pos[1], prev_dir[1], self.arms[1].wrist, self.arms[1].blade),
+            sweep_tris(prev_pos[0], prev_dir[0], self.body.wrist[0], self.body.blade[0]),
+            sweep_tris(prev_pos[1], prev_dir[1], self.body.wrist[1], self.body.blade[1]),
         ];
+
+        // live gates (SPEC-v10 §4)
+        let reach_z = self.body.reach_z();
+        let head_z = self.body.head[2];
+        let head = self.body.head;
 
         for i in self.first_pending..self.chart.len() {
             if self.status[i] != 0 {
                 continue;
             }
-            let n = &self.chart[i];   // by ref: Note is 80 B post-sin/cos
+            let n = &self.chart[i]; // by ref: Note is 80 B post-sin/cos
             // sorted by hit_time, and speed >= min_speed for every note:
-            // once this bound clears REACH_Z, so does every later note's z
-            if (n.hit_time - self.time) * self.min_speed > REACH_Z {
+            // once this bound clears reach_z, so does every later note's z
+            if (n.hit_time - self.time) * self.min_speed > reach_z {
                 break;
             }
             let z = (n.hit_time - self.time) * n.speed;
-            if z < -Z_MISS {
+            if z < head_z {
                 if n.kind == KIND_BOMB {
                     self.status[i] = 4; // passed clean: no penalty, no event
                 } else {
@@ -856,7 +924,7 @@ impl Core {
                 }
                 continue;
             }
-            if z > REACH_Z {
+            if z > reach_z {
                 continue;
             }
             let center = [n.x, n.y, z];
@@ -883,23 +951,19 @@ impl Core {
                 GOOD_HALF_Y
             };
             let good_h = [GOOD_HALF_X, good_hy, GOOD_HALF_Z];
-            // arrow notes/heads and chain links (tangent) roll their
-            // hitboxes; plain dots stay roll-free
             let rotates = n.kind == KIND_CHAIN_LINK || !n.any_dir;
-            // rot = angle - 270 deg (see the v7.4 note above note_frame):
-            // cos(a - 3pi/2) = -sin a, sin(a - 3pi/2) = cos a — read from
-            // the precomputed chart-constant pair
+            // rot = angle - 270 deg: cos(a - 3pi/2) = -sin a,
+            // sin(a - 3pi/2) = cos a — from the precomputed pair
             let (cos_r, sin_r) = if rotates { (-n.sin_a, n.cos_a) } else { (1.0, 0.0) };
-            // env v7.6: plain notes additionally billboard toward the
-            // head as they approach; heads/links keep the pure z-roll
+            // env v7.6: plain notes billboard toward the LIVE head as
+            // they approach; heads/links keep the pure z-roll
             let lam = if n.kind == KIND_NOTE {
                 (1.0 - z / LOOK_DIST).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let frame = note_frame(center, cos_r, sin_r, lam);
+            let frame = note_frame(center, cos_r, sin_r, lam, head);
             // the good box's 0.25 m shift is along the note's LOCAL z
-            // (it rides the transform, extending toward the head)
             let good_center = [
                 center[0] + GOOD_Z_SHIFT * frame[2][0],
                 center[1] + GOOD_Z_SHIFT * frame[2][1],
@@ -910,7 +974,8 @@ impl Core {
                 // contact point: the blade sample whose displacement
                 // segment passes closest to the note center; its
                 // finite-difference velocity is the contact velocity
-                let arm = self.arms[m];
+                let wrist_m = self.body.wrist[m];
+                let blade_m = self.body.blade[m];
                 let mut d_seg = f64::INFINITY;
                 let mut s_star = 0.0;
                 for j in 1..=N_BLADE_SAMPLES {
@@ -921,9 +986,9 @@ impl Core {
                         prev_pos[m][2] + r * prev_dir[m][2],
                     ];
                     let p1 = [
-                        arm.wrist[0] + r * arm.blade[0],
-                        arm.wrist[1] + r * arm.blade[1],
-                        arm.wrist[2] + r * arm.blade[2],
+                        wrist_m[0] + r * blade_m[0],
+                        wrist_m[1] + r * blade_m[1],
+                        wrist_m[2] + r * blade_m[2],
                     ];
                     let d = seg_point_dist3(p0, p1, center);
                     if d < d_seg {
@@ -932,47 +997,36 @@ impl Core {
                     }
                 }
                 let vc = [
-                    (arm.wrist[0] + s_star * arm.blade[0]
+                    (wrist_m[0] + s_star * blade_m[0]
                         - prev_pos[m][0] - s_star * prev_dir[m][0]) / DT,
-                    (arm.wrist[1] + s_star * arm.blade[1]
+                    (wrist_m[1] + s_star * blade_m[1]
                         - prev_pos[m][1] - s_star * prev_dir[m][1]) / DT,
-                    (arm.wrist[2] + s_star * arm.blade[2]
+                    (wrist_m[2] + s_star * blade_m[2]
                         - prev_pos[m][2] - s_star * prev_dir[m][2]) / DT,
                 ];
                 let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
-                // accuracy distance (2026-07-29, user-caught v7.4-class
-                // research fix): the real game's cutDistanceToCenter is
-                // the distance from the note center to the INFINITE
-                // cutting plane — the plane through the blade spanned by
-                // the blade direction and the tip's movement (replays
-                // record cutPoint + cutNormal: the plane IS the
-                // primitive). v7.0-v7.10 measured the closest approach of
-                // the one-tick swept surface instead, which conflated
-                // depth/timing with lateral error: early cuts through the
-                // 0.75 m-deep good box floored acc at ~0 (the 0.870 =
-                // 100/115 accuracy ceiling; even the deliberate-aim
-                // scripted bot scored 0.1/15). Timing-independent by
-                // design. Degenerate stab (tip motion ~parallel to the
-                // blade): distance to the blade LINE instead.
+                // accuracy distance: note center to the INFINITE cutting
+                // plane (blade dir x tip movement; stab fallback = blade
+                // line) — the 2026-07-29 cut-plane rule, unchanged
                 let tip_move = [
-                    arm.wrist[0] + SABER_LEN * arm.blade[0]
+                    wrist_m[0] + SABER_LEN * blade_m[0]
                         - prev_pos[m][0] - SABER_LEN * prev_dir[m][0],
-                    arm.wrist[1] + SABER_LEN * arm.blade[1]
+                    wrist_m[1] + SABER_LEN * blade_m[1]
                         - prev_pos[m][1] - SABER_LEN * prev_dir[m][1],
-                    arm.wrist[2] + SABER_LEN * arm.blade[2]
+                    wrist_m[2] + SABER_LEN * blade_m[2]
                         - prev_pos[m][2] - SABER_LEN * prev_dir[m][2],
                 ];
                 let cw = [
-                    center[0] - arm.wrist[0],
-                    center[1] - arm.wrist[1],
-                    center[2] - arm.wrist[2],
+                    center[0] - wrist_m[0],
+                    center[1] - wrist_m[1],
+                    center[2] - wrist_m[2],
                 ];
-                let pn = cross3(arm.blade, tip_move);
+                let pn = cross3(blade_m, tip_move);
                 let pn_mag = dot3(pn, pn).sqrt();
                 let d_min = if pn_mag > 1e-9 {
                     (dot3(cw, pn) / pn_mag).abs()
                 } else {
-                    let along = dot3(cw, arm.blade);
+                    let along = dot3(cw, blade_m);
                     (dot3(cw, cw) - along * along).max(0.0).sqrt()
                 };
                 let code: u8 = if vc_mag < V_MIN_CUT {
@@ -980,11 +1034,8 @@ impl Core {
                 } else if n.any_dir {
                     0 // dot note / chain link: any direction scores
                 } else {
-                    // env v7.6: direction check in the NOTE'S LOCAL
-                    // frame (the game transforms the cut velocity by
-                    // the note rotation) — required direction is local
-                    // -y'; at lam = 0 this is exactly the old world
-                    // in-plane check
+                    // direction check in the NOTE'S LOCAL frame —
+                    // required direction is local -y'
                     let vlx = dot3(vc, frame[0]);
                     let vly = dot3(vc, frame[1]);
                     let v2_mag = (vlx * vlx + vly * vly).sqrt();
@@ -1000,16 +1051,10 @@ impl Core {
                         let pre = if n.free_pre {
                             PTS_PRE
                         } else {
-                            round_pts(PTS_PRE * (self.arms[m].swing_acc / PRE_FULL).min(1.0))
+                            round_pts(PTS_PRE
+                                * (self.body.swing_acc[m] / PRE_FULL).min(1.0))
                         };
-                        // wide_acc (2026-07-29, user-directed, TRAINING
-                        // ONLY): effectively DOUBLES the acc component's
-                        // range and reward — 30·(1−d/0.6), unrounded, vs
-                        // the real round(15·(1−d/0.3)) — so the reward
-                        // surface has slope out where current cuts land
-                        // (~0.3 m off-center) and exploration toward the
-                        // note center pays. Bench, eval, and replay paths
-                        // construct sims with wide_acc=false (real rules).
+                        // wide_acc (TRAINING ONLY): 30·(1−d/0.6), unrounded
                         let acc = if self.wide_acc {
                             2.0 * PTS_ACC
                                 * (1.0 - (d_min / (2.0 * ACC_NORM)).clamp(0.0, 1.0))
@@ -1061,9 +1106,7 @@ impl Core {
         }
 
         self.tick += 1;
-        // advance the low-water cursor past the newly resolved prefix;
-        // "smallest pending index" is monotone within an episode because
-        // status only ever goes 0 -> nonzero between resets
+        // advance the low-water cursor past the newly resolved prefix
         while self.first_pending < self.chart.len()
             && self.status[self.first_pending] != 0
         {
@@ -1071,9 +1114,6 @@ impl Core {
         }
         let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
         let pending = self.first_pending < self.chart.len();
-        // natural completion waits for pending follow-throughs so the last
-        // note's post-swing isn't truncated; the time/tick caps still end
-        // the episode hard (trackers force-resolve below).
         let no_trackers = self.trackers[0].is_empty() && self.trackers[1].is_empty();
         let done = (!pending
             && no_trackers
@@ -1106,8 +1146,8 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     #[new]
-    #[pyo3(signature = (max_steps=690, effort_coef=1.0, wide_acc=false,
-                        gears=3))]
+    #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
+                        wide_acc=false, gears=3))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8) -> Self {
         RawBeatSim {
@@ -1127,26 +1167,22 @@ impl RawBeatSim {
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
 
-    /// actions: 12 ints in 0..2 — per hand (pitch, yaw, twist, elbow,
-    /// roll, bend), left hand first; 0 = coast, 1 = +alpha, 2 = -alpha.
+    /// actions: 29 gear ids in SPEC-v10 §1.4 joint order — spine(3),
+    /// arm_l(7), arm_r(7), leg_l(6), leg_r(6); id 0 = coast, 1/2 =
+    /// +/-full torque, finer +/- gear pairs append (constants.gear_table).
     /// Returns (obs, reward, done, events); events = [(note_idx, code,
     /// points, pre_pts, acc_pts)] with codes 0 ok, 1 slow, 2 angle,
-    /// 3 wrong_hand, 4 miss, 5 post, 6 bomb. The component split
-    /// (2026-07-25, user-directed): a good cut's points = pre + acc
-    /// (+ 30 for arc-headed free_post grants); post/link/error events
-    /// carry (0, 0).
+    /// 3 wrong_hand, 4 miss, 5 post, 6 bomb.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         actions: Vec<u8>,
     ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
-        assert_eq!(actions.len(), 2 * N_JOINTS);
-        assert!(actions.iter().all(|&a| a <= 6)); // env v8 gear ids 0..=6
-        let mut acts = [[0u8; N_JOINTS]; 2];
-        for s in 0..2 {
-            acts[s].copy_from_slice(&actions[s * N_JOINTS..(s + 1) * N_JOINTS]);
-        }
-        let (reward, done) = self.core.step_inner(acts);
+        assert_eq!(actions.len(), NQ);
+        assert!(actions.iter().all(|&a| a <= 6)); // gear ids 0..=6
+        let mut acts = [0u8; NQ];
+        acts.copy_from_slice(&actions);
+        let (reward, done) = self.core.step_inner(&acts);
         (
             PyArray1::from_slice_bound(py, &self.core.build_obs()),
             reward,
@@ -1155,23 +1191,61 @@ impl RawBeatSim {
         )
     }
 
-    /// Arm state [[q(7) ++ om(7) ++ wrist(3)]; 2] — joint angles
-    /// (pitch, yaw, twist, elbow, roll, bend, dev — env v9), angular
-    /// velocities, and the FK wrist position.
-    fn sabers(&self) -> [[f64; 17]; 2] {
+    /// Current observation without stepping (state introspection after
+    /// `set_joints`; the obs the next step would be built FROM).
+    fn obs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        PyArray1::from_slice_bound(py, &self.core.build_obs())
+    }
+
+    /// Replay v10 `q`: the 36 position coordinates — root position (3),
+    /// root quaternion wxyz (4), then the 29 joint angles (§1.4 order).
+    fn qpos(&self) -> Vec<f64> {
+        let st = &self.core.body.st;
+        let mut out = Vec::with_capacity(36);
+        out.extend_from_slice(&st.p);
+        out.extend_from_slice(&st.quat);
+        out.extend_from_slice(&st.q);
+        out
+    }
+
+    /// Replay v10 `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
+    fn twist(&self) -> [f64; 6] {
+        let v = &self.core.body.st.v;
+        [v[0], v[1], v[2], v[3], v[4], v[5]]
+    }
+
+    /// Replay v10 `omega`: the 29 joint rates (§1.4 order).
+    fn omega(&self) -> Vec<f64> {
+        self.core.body.st.v[6..].to_vec()
+    }
+
+    /// Replay v10 `sabers`: per hand [L, R] the FK wrist position and
+    /// unit blade direction — [wx, wy, wz, bx, by, bz].
+    fn sabers(&self) -> [[f64; 6]; 2] {
         [0, 1].map(|s| {
-            let a = self.core.arms[s];
-            let mut out = [0.0; 17];
-            out[..N_JOINTS].copy_from_slice(&a.q);
-            out[N_JOINTS..2 * N_JOINTS].copy_from_slice(&a.om);
-            out[2 * N_JOINTS..].copy_from_slice(&a.wrist);
-            out
+            let w = self.core.body.wrist[s];
+            let b = self.core.body.blade[s];
+            [w[0], w[1], w[2], b[0], b[1], b[2]]
         })
     }
 
     /// Blade unit directions [[x, y, z]; 2] (FK cache).
     fn blades(&self) -> [[f64; 3]; 2] {
-        [0, 1].map(|s| self.core.arms[s].blade)
+        [0, 1].map(|s| self.core.body.blade[s])
+    }
+
+    /// Replay v10 `contacts` of the LAST tick: (pair_id, px, py, pz, j)
+    /// per live pair with nonzero tick-summed normal impulse (N·s);
+    /// the point is the last substep's world contact point.
+    fn contacts(&self) -> Vec<(u32, f64, f64, f64, f64)> {
+        let b = &self.core.body;
+        (0..NUM_PAIRS)
+            .filter(|&p| b.contact_imp[p] != 0.0)
+            .map(|p| {
+                let pt = b.contact_pt[p];
+                (p as u32, pt[0], pt[1], pt[2], b.contact_imp[p])
+            })
+            .collect()
     }
 
     /// Per-note status: 0 pending, 1 good, 2 bad/bomb-hit, 3 missed,
@@ -1180,23 +1254,29 @@ impl RawBeatSim {
         self.core.status.clone()
     }
 
-    /// TEST HOOK: overwrite one arm's joint state before a step (FK cache
-    /// refreshes immediately; the finite-diff wrist velocity resets).
-    /// Accepts 6-joint vectors (env v8-era poses) and zero-pads the v9
-    /// deviation joint — the scenario tests' pose family is dev = 0.
-    fn set_joints(&mut self, s: usize, q: Vec<f64>, om: Vec<f64>) {
-        assert!(q.len() == N_JOINTS || q.len() == N_JOINTS - 1);
-        assert_eq!(om.len(), q.len());
-        let arm = &mut self.core.arms[s];
-        arm.q = [0.0; N_JOINTS];
-        arm.om = [0.0; N_JOINTS];
-        arm.q[..q.len()].copy_from_slice(&q);
-        arm.om[..om.len()].copy_from_slice(&om);
-        let (_, w, b, rcs) = fk(s, &arm.q);
-        arm.wrist = w;
-        arm.blade = b;
-        arm.roll_cs = rcs;
-        arm.wrist_vel = [0.0; 3];
+    /// TEST/TOOLING HOOK (env v10): overwrite the FULL generalized
+    /// state — q: 36 position coords (root pos, root quat wxyz, 29
+    /// joints), v: 35 velocity coords (root linear world, root angular
+    /// world, 29 joint rates). FK caches refresh; the finite-diff wrist
+    /// velocity resets; swing accumulators are left untouched.
+    fn set_joints(&mut self, q: Vec<f64>, v: Vec<f64>) {
+        assert_eq!(q.len(), 3 + 4 + NQ, "q must be 36 (root pose + 29)");
+        assert_eq!(v.len(), NV, "v must be 35 (root twist + 29)");
+        let body = &mut self.core.body;
+        body.st.p = [q[0], q[1], q[2]];
+        let qn = (q[3] * q[3] + q[4] * q[4] + q[5] * q[5] + q[6] * q[6]).sqrt();
+        assert!(qn > 1e-9, "root quaternion must be nonzero");
+        body.st.quat = [q[3] / qn, q[4] / qn, q[5] / qn, q[6] / qn];
+        body.st.q.copy_from_slice(&q[7..]);
+        body.st.v.copy_from_slice(&v);
+        body.refresh_fk();
+        body.wrist_vel = [[0.0; 3]; 2];
+    }
+
+    /// Last tick's effort in JOULES (positive mechanical work, SPEC-v10
+    /// §4) — the reward charged effort_coef × this. Test introspection.
+    fn last_effort(&self) -> f64 {
+        self.core.body.effort_j
     }
 
     #[getter]
@@ -1332,8 +1412,9 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     #[new]
-    #[pyo3(signature = (n, max_steps=690, effort_coef=1.0, combo_walk=false,
-                        return_events=true, wide_acc=false, gears=3))]
+    #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
+                        combo_walk=false, return_events=true, wide_acc=false,
+                        gears=3))]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8) -> Self {
         VecBeatSim {
@@ -1341,10 +1422,6 @@ impl VecBeatSim {
                 .map(|_| Core::new_core(max_steps, effort_coef, wide_acc, gears))
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
-            // return_events=false skips materializing the per-step event
-            // list into Python objects (~2 events per scoreable object);
-            // the in-Rust combo walk still consumes every event. Both
-            // vectorized consumers (bench, BeatVecEnv) discard the list.
             return_events,
         }
     }
@@ -1363,7 +1440,7 @@ impl VecBeatSim {
         (w.score, w.max_combo, w.breaks)
     }
 
-    /// Current observation of every env, flat (N*286,) — reshape Python-side.
+    /// Current observation of every env, flat (N*340,) — reshape Python-side.
     fn obs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
         let n = self.sims.len();
         let mut flat = vec![0.0f32; n * OBS_DIM];
@@ -1373,15 +1450,13 @@ impl VecBeatSim {
         PyArray1::from_vec_bound(py, flat)
     }
 
-    /// actions: (N, 12) int64 — per hand (pitch, yaw, twist, elbow, roll,
-    /// bend), left first. Returns (obs flat (N*286,) f32 — reshape
-    /// Python-side, rewards (N,) f32, dones (N,) bool, events). events =
-    /// [(env_idx, note_idx, code, points)] concatenated in env order with
-    /// each env's own event ORDER preserved — order matters to consumers
-    /// like the ScoreSaber combo/multiplier walk (a cut commits at its
-    /// cut-time multiplier). Codes as in RawBeatSim::step. Done envs must
-    /// get a fresh set_chart before the next step; their returned obs row
-    /// is the terminal obs.
+    /// actions: (N, 29) int64 gear ids, SPEC-v10 §1.4 joint order.
+    /// Returns (obs flat (N*340,) f32 — reshape Python-side, rewards
+    /// (N,) f32, dones (N,) bool, events). events = [(env_idx, note_idx,
+    /// code, points, pre, acc)] concatenated in env order with each
+    /// env's own event ORDER preserved. Done envs must get a fresh
+    /// set_chart before the next step; their returned obs row is the
+    /// terminal obs.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -1404,10 +1479,8 @@ impl VecBeatSim {
     }
 
     /// Like `step`, but writes the obs into a caller-owned C-contiguous
-    /// (N, 286) f32 array instead of allocating a fresh 586 KB buffer per
-    /// step — the buffer stays cache-resident, and a pinned torch buffer
-    /// makes the following H2D copy an async DMA. Returns
-    /// (rewards, dones, events).
+    /// (N, 340) f32 array instead of allocating a fresh buffer per
+    /// step. Returns (rewards, dones, events).
     fn step_into<'py>(
         &mut self,
         py: Python<'py>,
@@ -1432,14 +1505,13 @@ impl VecBeatSim {
         )
     }
 
-    /// Single env's current obs (286,) — used for cheap post-reset reads.
+    /// Single env's current obs (340,) — used for cheap post-reset reads.
     fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
         PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
     }
 
     /// Single env's current obs written into row i of a caller-owned
-    /// (N, 286) f32 array (the `step_into` buffer) — post-reset refresh
-    /// without a per-call allocation.
+    /// (N, 340) f32 array (the `step_into` buffer).
     fn obs_one_into<'py>(
         &self,
         i: usize,
@@ -1482,11 +1554,8 @@ impl VecBeatSim {
     ) -> (Vec<f32>, Vec<bool>, Vec<(u32, u32, u8, f32, f32, f32)>) {
         let acts = actions.as_array();
         let n = self.sims.len();
-        assert_eq!(acts.shape(), &[n, 2 * N_JOINTS]);
+        assert_eq!(acts.shape(), &[n, NQ]);
         assert_eq!(flat.len(), n * OBS_DIM);
-        // one flat memcpy (2026-07-27): the per-element ndarray indexing
-        // built the per-env action arrays with ~12N bounds-checked reads
-        // under the GIL; the u8 unpack now runs inside the parallel span
         let flat_acts: Vec<i64> = match acts.as_slice() {
             Some(s) => s.to_vec(),
             None => acts.iter().copied().collect(),
@@ -1494,17 +1563,11 @@ impl VecBeatSim {
         let ret_ev = self.return_events;
         let sims = &mut self.sims;
         let walks = &mut self.walks;
-        // Rayon over envs (2026-07-25): envs are independent, each env's
-        // combo walk is its own, and each env's event ORDER is kept in
-        // its own vec — the index-order concatenation below makes the
-        // output identical to the old serial loop (pinned by the
-        // vec-matches-single and Rust==Python-walk tests). The GIL is
-        // released for the span (plain Rust data only), so Python
-        // threads — the bench's parse/download producer — truly overlap.
-        // with_min_len: per-env work is ~1-3 us; without a floor rayon's
-        // adaptive splitter can split toward single items, paying job +
-        // atomic overhead and false-sharing obs rows (1144 B, not
-        // line-aligned) across threads.
+        // Rayon over envs: envs are independent; the index-order
+        // concatenation keeps the output identical to a serial loop
+        // (pinned by the vec-matches-single test). The GIL is released
+        // for the span. v10: per-env work is ~0.5 ms (dynamics), so no
+        // with_min_len floor — full splitting is wanted now.
         let per_env: Vec<(f32, bool, Vec<(u32, u8, f32, f32, f32)>)> = py
             .allow_threads(|| {
                 let walk_opts: Vec<Option<&mut ComboWalk>> = match walks {
@@ -1514,24 +1577,19 @@ impl VecBeatSim {
                 sims.par_iter_mut()
                     .zip_eq(walk_opts)
                     .zip_eq(flat.par_chunks_mut(OBS_DIM))
-                    .zip_eq(flat_acts.par_chunks(2 * N_JOINTS))
-                    .with_min_len(16)
+                    .zip_eq(flat_acts.par_chunks(NQ))
                     .map(|(((sim, mut walk), obs_chunk), a)| {
-                        let mut acts_e = [[0u8; N_JOINTS]; 2];
-                        for s in 0..2 {
-                            for j in 0..N_JOINTS {
-                                acts_e[s][j] = a[s * N_JOINTS + j] as u8;
-                            }
+                        let mut acts_e = [0u8; NQ];
+                        for j in 0..NQ {
+                            acts_e[j] = a[j] as u8;
                         }
-                        let (r, d) = sim.step_inner(acts_e);
+                        let (r, d) = sim.step_inner(&acts_e);
                         sim.write_obs(obs_chunk);
                         if let Some(w) = walk.as_mut() {
                             for &(note, code, pts, _, _) in &sim.events_buf {
                                 w.consume(note, code, pts);
                             }
                         }
-                        // return_events=false (the bench): Vec::new() is
-                        // alloc-free — the per-tick event Vec is gone
                         let ev = if ret_ev { sim.events_buf.clone() } else { Vec::new() };
                         (r as f32, d, ev)
                     })
@@ -1558,4 +1616,61 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawBeatSim>()?;
     m.add_class::<VecBeatSim>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    /// SPEC-v10 §4 effort wiring: Body::tick's accumulated positive
+    /// work equals an independent loop over the same normative pipeline
+    /// BITWISE (identical expression tree), and coasting is exactly
+    /// free. (The P3 Python gate checks the reward identity
+    /// reward_effort = −coef × last_effort on top of this.)
+    #[test]
+    fn effort_is_positive_work() {
+        let gear = gear_signed(5);
+        let mut acts = [0u8; NQ];
+        acts[15] = 1; // r wrist bend, full +
+        acts[10] = 2; // r arm pitch, full −
+        acts[0] = 3; // spine pitch, +1/4
+        let mut tau = [0.0; NQ];
+        for j in 0..NQ {
+            tau[j] = gear[acts[j] as usize] * MODEL.tau_max[j];
+        }
+        // independent mirror of the tick loop
+        let mut st = State::neutral(MODEL);
+        let mut ws = Workspace::new(MODEL);
+        let mut cs = ConstraintSet::new(MODEL, true, true);
+        let mut effort = 0.0;
+        for _ in 0..N_SUB {
+            substep_constrained(MODEL, &mut st, &tau, H_SUB, &mut ws, &mut cs);
+            for j in 0..NQ {
+                let p = tau[j] * st.v[6 + j];
+                if p > 0.0 {
+                    effort += p * H_SUB;
+                }
+            }
+        }
+        let mut body = Body::new();
+        body.tick(&acts, &gear);
+        assert!(effort > 0.0, "driven joints must do positive work");
+        assert_eq!(body.effort_j, effort, "effort expression trees diverge");
+        // trajectory parity too (the mirror IS the pipeline)
+        for j in 0..NQ {
+            assert_eq!(body.st.q[j], st.q[j]);
+        }
+        let mut b2 = Body::new();
+        b2.tick(&[0u8; NQ], &gear);
+        assert_eq!(b2.effort_j, 0.0, "coast must be exactly free");
+    }
+
+    /// Live gates at the reference pose reproduce the v9 constants:
+    /// reach 1.75, miss boundary −0.65 (SPEC-v10 §4).
+    #[test]
+    fn live_gates_reference_values() {
+        let body = Body::new();
+        assert!((body.reach_z() - 1.75).abs() < 1e-12);
+        assert!((body.head[2] - (-0.65)).abs() < 1e-12);
+    }
 }

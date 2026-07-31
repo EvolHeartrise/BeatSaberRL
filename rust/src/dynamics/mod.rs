@@ -32,6 +32,8 @@ mod tests_fk;
 mod tests_oracle;
 #[cfg(test)]
 mod tests_pendulum;
+#[cfg(test)]
+mod tests_soak;
 
 use model::Model;
 

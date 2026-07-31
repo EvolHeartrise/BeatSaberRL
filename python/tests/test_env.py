@@ -1,16 +1,24 @@
 """Env tests against the Rust sim — THE implementation (SPEC.md §Tests).
 
-Env v7 (real geometry/judgment): the cut scenarios drive the Rust sim
-via its set_joints test hook (per-hand joint angles + angular
-velocities) and assert on the event stream (note_idx, code, points).
+Env v10 (P3 re-author, 2026-07-31): the cut scenarios drive the SPEC-v10
+dynamic body via the full-state `set_joints` hook (root pose + 29 joints
++ 35 velocities) and assert on the event stream. The v9 "aligned wrist
+frame" pose family carries over VERBATIM as initial conditions — the
+arm-chain geometry is v9-identical at the reference root (the §1.3
+continuity theorem) — but the body now evolves under gravity/dynamics
+during the tick, so point-value asserts are re-tuned where the v9
+literals assumed the kinematic integrator. The cut geometry contract
+(blade through box at speed/angle => score) is RE-PROVEN here on v10.
 
-Scenario poses use the "aligned wrist frame" family: with
-pitch = -elbow + delta, yaw = twist = 0, the wrist frame is a pure
-R_x(-delta), which FIXES the world x axis — so a blade along +-x with
-roll = azimuth - 90 deg, bend = 90 deg stays exactly in a z = const
-plane for ANY delta, and roll sweeps move it vertically. delta = 0.7
-parks the right wrist at (0.2, ~1.396, ~-0.195): flat-blade geometry at
-row-1 height (y 1.40), just behind the hit plane.
+Moved tests (re-authored in tests/test_v10_env.py, the P3 gate file):
+  - test_obs_layout        -> test_obs_length_and_reset_layout (+ full
+                              §5 offset checks, q/qd normalizer table)
+  - test_recording_roundtrip -> test_replay_v10_roundtrip (JSONL v10)
+  - test_effort_penalty_tiers -> test_effort_is_priced_positive_work
+                              (the EFFORT_COST table is retired; effort
+                              is positive mechanical work, SPEC-v10 §4)
+Skipped pending P6 (bot re-author on the dynamic body):
+  - test_scripted_bot_solves_easy
 """
 
 import math
@@ -20,11 +28,12 @@ import pytest
 
 from beat_arena_env import (
     OBS_DIM, OFF_NOTES, OFF_NOTE_MASK, N_NOTE_SLOTS, NOTE_FEAT,
-    ChartConfig, Note, RustBeatEnv, generate_chart, scripted_action,
+    ChartConfig, Note, RustBeatEnv, generate_chart,
 )
 from beat_arena_env.constants import (
-    DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, KIND_NOTE, ROW_Y,
-    SABER_FEAT, Z_MISS, col_x, joint_limits,
+    A_L_ARM, A_R_ARM, DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK,
+    KIND_NOTE, N_JOINTS, NV, NQPOS, OFF_HAND_L, OFF_HAND_R, ROOT_POS0,
+    ROW_Y, col_x, joint_limits,
 )
 from beat_arena_env.kinematics import fk
 
@@ -32,8 +41,8 @@ from beat_arena_rs import RawBeatSim
 
 
 DOWN = 6 * np.pi / 4  # downward swing angle
-COAST = (0,) * 14
-ACTION_NVEC = [3] * 14
+COAST = (0,) * N_JOINTS
+ACTION_NVEC = [3] * N_JOINTS
 DELTA = 0.7
 FLAT_ARM = [-np.pi / 2 + DELTA, 0.0, 0.0, np.pi / 2]
 FLAT_WRIST = (0.2, 1.3955705, -0.1950711)   # right-hand wrist FK of FLAT_ARM
@@ -46,41 +55,55 @@ def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False,
                 x=x, y=y, free_pre=free_pre, free_post=free_post)
 
 
-def _sim_with_notes(notes, max_steps=690):
+def _sim_with_notes(notes, max_steps=690, **kw):
     from beat_arena_env.chart import note_tuple
-    sim = RawBeatSim(max_steps=max_steps)
+    sim = RawBeatSim(max_steps=max_steps, **kw)
     sim.set_chart([note_tuple(n) for n in notes])
     return sim
 
 
-def _sim_with_note(note, max_steps=690):
-    return _sim_with_notes([note], max_steps=max_steps)
+def _sim_with_note(note, max_steps=690, **kw):
+    return _sim_with_notes([note], max_steps=max_steps, **kw)
+
+
+def _set_arm(sim, hand, q7, om7):
+    """Overwrite ONE arm's 7-joint state, preserving everything else —
+    the v10 equivalent of the v9 per-arm set_joints hook (the root stays
+    wherever it is; velocities of other coords are preserved)."""
+    q = np.asarray(sim.qpos())
+    v = np.zeros(NV)
+    v[:6] = sim.twist()
+    v[6:] = sim.omega()
+    base = A_L_ARM if hand == 0 else A_R_ARM
+    q[7 + base:7 + base + 7] = q7
+    v[6 + base:6 + base + 7] = om7
+    sim.set_joints(list(q), list(v))
 
 
 def _park(sim, hand):
     """Swing the arm down and outward: blade far below/outside the grid."""
     yaw = -1.5 if hand == 0 else 1.5
-    sim.set_joints(hand, [-1.2, yaw, 0.0, 0.0, 0.0, 0.0], [0.0] * 6)
+    _set_arm(sim, hand, [-1.2, yaw, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0] * 7)
 
 
 def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=DELTA):
     """FLAT pose: blade along `azimuth` in a z = const plane (aligned
     wrist frame R_x(-delta) fixes +-x; primary rep roll = azimuth - 90
-    deg, bend = +90 deg). Since env v7.1 the roll ranges are 180-degree
-    arcs, so azimuths whose primary roll is out of range use the
-    equivalent representation (roll + 180 deg, bend flipped) — same
-    blade direction. For delta = DELTA the right wrist sits at
-    FLAT_WRIST; roll sweeps (om_roll) move the blade vertically."""
-    from beat_arena_env.constants import joint_limits as jl
-    lo, hi = jl(hand)[4]
+    deg, bend = +90 deg, dev = 0). For delta = DELTA the right wrist
+    sits at FLAT_WRIST at t = 0; roll sweeps (om_roll) move the blade
+    vertically. Under v10 dynamics this is the INITIAL condition — the
+    pose sags slightly within the tick."""
+    lo, hi = joint_limits(hand)[4]
     roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
     bend = np.pi / 2
     if not (lo <= roll <= hi):
         roll = (azimuth + np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
         bend = -np.pi / 2
         assert lo <= roll <= hi, f"azimuth {azimuth} unreachable for hand {hand}"
-    q = [-np.pi / 2 + delta, 0.0, 0.0, np.pi / 2, roll, bend]
-    sim.set_joints(hand, q, [0.0, 0.0, 0.0, 0.0, om_roll, om_bend])
+    q = FLAT_ARM[:1] if delta == DELTA else None  # (doc aid only)
+    _set_arm(sim, hand, [-np.pi / 2 + delta, 0.0, 0.0, np.pi / 2, roll,
+                         bend, 0.0],
+             [0.0, 0.0, 0.0, 0.0, om_roll, om_bend, 0.0])
 
 
 def _coast(sim):
@@ -92,19 +115,22 @@ def _codes(events):
     return [(i, c) for i, c, *_ in events]
 
 
-# --- kinematics mirror -------------------------------------------------------
+# --- kinematics mirror (v9 continuity at the env surface) --------------------
 
 def test_python_fk_matches_rust():
-    """kinematics.fk is the declared MIRROR of lib.rs fk() — pin it via the
-    sim's sabers()/blades() getters on a batch of random poses."""
+    """kinematics.fk (the v9 arm-chain mirror) still pins the v10 body's
+    ARM FK exactly at the reference root — the §1.3 continuity theorem
+    surfaced through the sim's sabers()/blades() getters."""
     sim = _sim_with_note(_note(5.0, 2, 1))
     rng = np.random.default_rng(4)
     for _ in range(20):
         hand = int(rng.integers(0, 2))
-        q = [float(rng.uniform(lo, hi)) for lo, hi in joint_limits(hand)]
-        sim.set_joints(hand, q, [0.0] * 7)
-        _, w, b = fk(hand, q)
-        assert np.allclose(sim.sabers()[hand][14:], w, atol=1e-12)
+        q7 = [float(rng.uniform(lo, hi)) for lo, hi in joint_limits(hand)]
+        _set_arm(sim, hand, q7, [0.0] * 7)
+        _, w, b = fk(hand, q7)
+        s = sim.sabers()[hand]
+        assert np.allclose(s[:3], w, atol=1e-12)
+        assert np.allclose(s[3:], b, atol=1e-12)
         assert np.allclose(sim.blades()[hand], b, atol=1e-12)
 
 
@@ -124,37 +150,24 @@ def test_flat_pose_geometry():
         assert abs(b[2]) < 1e-12
 
 
-# --- obs layout --------------------------------------------------------------
+# --- obs layout (full §5 table in tests/test_v10_env.py) ---------------------
 
-def test_obs_layout():
+def test_obs_reset_hands_and_notes():
     # bombs/dots/extras off: this test pins slot/feature offsets against
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (290,)
-    assert OFF_NOTES == 2 * SABER_FEAT == 50
-    assert OFF_NOTE_MASK == OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT == 274
-    # arm block at reset: all joints zero (arm straight forward), so the
-    # wrist sits at (+-0.2, 1.47, 0.0) and the blade points +z
-    for s, x in ((0, -0.2), (1, 0.2)):
-        b = s * SABER_FEAT
-        assert obs[b] == 0.0                                # pitch
-        assert obs[b + 1] == 0.0                            # yaw
-        assert obs[b + 2] == 0.0                            # twist
-        assert obs[b + 3] == pytest.approx(-1.0)            # elbow at 0
-        assert obs[b + 4] == pytest.approx(1.0)             # cos(roll)
-        assert obs[b + 5] == pytest.approx(0.0, abs=1e-6)   # sin(roll)
-        assert obs[b + 6] == 0.0                            # bend
-        assert obs[b + 7] == 0.0                            # dev (v9)
-        assert not obs[b + 8:b + 15].any()                  # omegas (7)
-        assert obs[b + 15] == pytest.approx(x / 1.0)        # wrist x
-        assert obs[b + 16] == pytest.approx((1.47 - 1.40) / 0.75)  # wrist y
-        assert obs[b + 17] == pytest.approx(0.0, abs=1e-6)  # wrist z
-        assert not obs[b + 18:b + 21].any()                 # wrist vel
-        assert obs[b + 21] == pytest.approx(0.0, abs=1e-6)  # blade x
-        assert obs[b + 22] == pytest.approx(0.0, abs=1e-6)  # blade y
-        assert obs[b + 23] == pytest.approx(1.0)            # blade z
-        assert obs[b + 24] == 0.0                           # pre-swing meter
+    assert obs.shape == (OBS_DIM,) == (340,)
+    assert OFF_NOTES == 100 and OFF_NOTE_MASK == 324
+    # hand blocks at reset: arms straight forward, wrists at
+    # (+-0.2, 1.47, 0.0), blades +z, meters zero
+    for base, x in ((OFF_HAND_L, -0.2), (OFF_HAND_R, 0.2)):
+        assert obs[base] == pytest.approx(x / 1.0)
+        assert obs[base + 1] == pytest.approx((1.47 - 1.40) / 0.75)
+        assert obs[base + 2] == pytest.approx(0.0, abs=1e-6)
+        assert not obs[base + 3:base + 6].any()             # wrist vel
+        assert obs[base + 8] == pytest.approx(1.0)          # blade z
+        assert obs[base + 9] == 0.0                         # swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:].sum() == n_pending
     n = env.chart[0]
@@ -204,22 +217,29 @@ def test_obs_kind_flags():
 
 def test_swing_meter_tracks_rotation():
     """The pre-swing obs feature rises while swinging, resets on reversal.
-    Uses the right BEND joint (action index 12, env v9)."""
+    Uses the right BEND joint torque (action index 15, env v10)."""
     env = RustBeatEnv(seed=3)
     env.reset()
-    b = 1 * SABER_FEAT + 24   # right arm's swing meter
-    bend_plus = (0,) * 12 + (1, 0)
-    bend_minus = (0,) * 12 + (2, 0)
+    b = OFF_HAND_R + 9   # right hand's swing meter
+    bend_plus = [0] * N_JOINTS
+    bend_plus[15] = 1
+    bend_minus = [0] * N_JOINTS
+    bend_minus[15] = 2
     obs, _, _, _, _ = env.step(bend_plus)
     m1 = obs[b]
     obs, _, _, _, _ = env.step(bend_plus)
     m2 = obs[b]
     assert 0.0 < m1 < m2
-    meters = []
+    meters = [m2]
     for _ in range(6):        # reverse hard until omega flips sign
         obs, _, _, _, _ = env.step(bend_minus)
         meters.append(obs[b])
-    assert min(meters) < m1
+    # v10: gravity keeps the falling arm rotating fast, so the post-reset
+    # meter restarts from that tick's (large) delta rather than near zero
+    # — the RESET itself shows as a strict drop in the sequence while the
+    # blade never stops rotating
+    drops = np.diff(np.asarray(meters))
+    assert drops.min() < -0.1, f"no reversal reset: {meters}"
 
 
 def test_z_is_time_times_speed():
@@ -258,12 +278,13 @@ def test_determinism():
     assert run() == run()
 
 
-# --- cut detection scenarios (Rust sim, via set_joints hook) -----------------
+# --- cut detection scenarios (v10 dynamics via the set_joints hook) ----------
 # Standard geometry: note at cell (3,1) = center (0.9, 1.40), hit_time =
-# DT (z = 0 at the end of the first step). The right arm holds the FLAT
-# pose (wrist ~(0.2, 1.396, -0.195), blade along +x at row-1 height); CW
-# roll (om_roll < 0) sweeps the contact region DOWNWARD through the
-# note's good box (0.8 x 0.5 x 1.0, shifted 0.25 toward the player).
+# DT (z = 0 at the end of the first step). The right arm STARTS in the
+# FLAT pose (wrist ~(0.2, 1.396, -0.195), blade along +x at row-1
+# height); CW roll (om_roll < 0) sweeps the contact region DOWNWARD
+# through the note's good box. Physics evolves the pose within the tick
+# (gravity sag ~cm-scale), so point asserts carry v10-tuned bands.
 
 def test_good_swing_cut_scores_integer_points():
     sim = _sim_with_note(_note(DT, 3, 1))
@@ -273,10 +294,11 @@ def test_good_swing_cut_scores_integer_points():
     assert sim.good_cuts == 1
     pts = ev[0][2]
     # ~28 deg of pre-swing (-> ~20) + a few accuracy points (the flat
-    # blade plane sits 0.195 m behind the note center)
+    # blade plane sits ~0.2 m behind the note center); v10 measured 26
     assert 15.0 <= pts <= 45.0
     assert pts == int(pts)                    # real BS scores are integers
-    assert r == pytest.approx(pts / 115.0, abs=1e-5)
+    # coast tick: zero torque => zero effort, reward is exactly pts/115
+    assert r == pytest.approx(pts / 115.0, abs=1e-9)
 
 
 def test_gentle_swing_is_good():
@@ -305,10 +327,8 @@ def test_wrong_direction_swing_is_bad():
 
 def test_wrong_hand_only_triggers_small_box():
     """The wrong-color saber only interacts with the SMALL (0.35^3) box:
-    at note_z = 0 the flat blade plane (z -0.195) is outside it, but a
-    note just past the plane (z ~ -0.13) reaches it -> wrong_hand.
-    Probes sit at x = 0 (the head column) since env v7.6 — the box
-    dimensions are what's under test, not the look-at tilt."""
+    at note_z = 0 the flat blade plane (z ~-0.195) is outside it, but a
+    note just past the plane (z ~ -0.13) reaches it -> wrong_hand."""
     # hit_time = 0: after one tick the note sits at z = -0.133
     sim = _sim_with_note(_note(0.0, 1, 1, color=0, x=0.0))
     _park(sim, 0)                                     # matching arm far away
@@ -327,10 +347,10 @@ def test_wrong_hand_only_triggers_small_box():
 def test_good_box_is_bigger_than_bad_box():
     """The same blade placement is INSIDE the good box for the matching
     hand but OUTSIDE the small box for the wrong hand: the blade plane
-    0.195 m behind the note center clears the small box's 0.175 but not
-    the good box's 1.0 m depth (a static probe keeps the sweep from
-    tilting into the small box; x = 0 keeps the v7.6 look-at tilt out
-    of the picture)."""
+    ~0.195 m behind the note center clears the small box's 0.175 but not
+    the good box's 1.0 m depth (the near-static probe's cm-scale sag
+    keeps it clear of the small box; x = 0 keeps the v7.6 look-at tilt
+    out of the picture)."""
     sim = _sim_with_note(_note(DT, 3, 1, x=0.0))
     _set_flat(sim, 1, 0.0)                     # static matching blade
     ev, _ = _coast(sim)
@@ -360,12 +380,12 @@ def test_early_cut_through_the_deep_box():
 
 def test_lookat_direction_check_is_local():
     """Env v7.6: the direction check runs in the note's LOCAL frame.
-    The same down+forward swing (FLAT delta = 1.19: contact velocity
-    (0, -cos d, +sin d)*w*r, forward/down ratio 2.5) is a clean 'ok'
+    The same down+forward swing (FLAT delta = 1.19) is a clean 'ok'
     at the head column but judges 'angle' at the edge column, where
-    the billboarded frame folds the forward component into local x
-    (cosv ~ 0.44 < 0.5). Note y = 1.618 sits on the delta = 1.19
-    blade plane."""
+    the billboarded frame folds the forward component into local x.
+    Note y = 1.618 sits on the delta = 1.19 blade plane. (v10: the
+    billboard anchors on the LIVE head — at these single-tick horizons
+    it is within mm of the reference head.)"""
     for x, code in ((0.0, 0), (0.9, 2)):
         sim = _sim_with_note(_note(DT, 3, 1, x=x, y=1.618))
         _park(sim, 0)
@@ -376,13 +396,11 @@ def test_lookat_direction_check_is_local():
 
 def test_hitboxes_rotate_with_cut_direction():
     """Env v7.4: hitboxes sit on the rotated note transform. A blade
-    passing 0.38 m above the center clears an axis-aligned (down-swing)
+    passing ~0.38 m above the center clears an axis-aligned (down-swing)
     good box (half-height 0.25) but is caught by the raised corner of a
-    57-degree-rotated one (angle 327 deg: vertical extent
-    0.4 sin57 + 0.25 cos57 ~ 0.47) — the contact is then judged
-    normally (here the tilted-frame sweep's in-plane velocity misses
-    the 60-degree tolerance -> 'angle', which is fine: the test pins
-    the COLLISION volume, not the judgment)."""
+    57-degree-rotated one — the contact is then judged normally (the
+    tilted-frame sweep misses the 60-degree tolerance -> 'angle', which
+    is fine: the test pins the COLLISION volume, not the judgment)."""
     for angle, hit in ((DOWN, False), (np.radians(327.0), True)):
         sim = _sim_with_note(_note(0.0, 3, 1, angle=angle))
         _park(sim, 0)
@@ -393,7 +411,7 @@ def test_hitboxes_rotate_with_cut_direction():
 
 def test_dot_note_has_taller_hitbox():
     """Modern dots are 0.8 m tall vs 0.5 for arrow notes: a blade passing
-    0.38 m above the row-1 center clips the dot box only (delta = 1.6
+    ~0.38 m above the row-1 center clips the dot box only (delta = 1.6
     parks the wrist at y ~1.78, z ~ -0.31)."""
     for any_dir, hit in ((False, False), (True, True)):
         sim = _sim_with_note(_note(0.0, 3, 1, any_dir=any_dir))
@@ -404,14 +422,15 @@ def test_dot_note_has_taller_hitbox():
 
 
 def test_arm_swing_cuts_and_accuracy_decreases_off_center():
-    """A pure SHOULDER-pitch pendulum (wrist joints untouched) swings the
-    whole arm+blade through a note and scores. Yawing the arm off the
-    note's column keeps the hit but costs accuracy points."""
+    """A pure SHOULDER-pitch pendulum (wrist joints untouched, gravity
+    now assists the down-swing) sweeps the whole arm+blade through a
+    note and scores. Yawing the arm off the note's column keeps the hit
+    but costs accuracy points."""
     def pendulum(yaw):
         sim = _sim_with_note(_note(0.24, 2, 2))       # center (0.3, 1.9)
         _park(sim, 0)
-        sim.set_joints(1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0],
-                       [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        _set_arm(sim, 1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0, 0.0],
+                 [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         for _ in range(6):
             ev, _ = _coast(sim)
             if ev:
@@ -426,22 +445,18 @@ def test_arm_swing_cuts_and_accuracy_decreases_off_center():
 
 
 def test_wide_acc_training_reward():
-    """wide_acc=True (TRAINING-ONLY, 2026-07-29): acc = 30·(1 − d/0.6),
-    unrounded — effectively double the real component's range and reward.
-    Scoring never feeds back into physics, so the same pendulum in a real
-    and a wide sim shares one trajectory and one cut distance d; the wide
-    event therefore reconstructs d exactly, and the real event must be a
-    rounding of 15·(1 − d/0.3) floored at 0. The sweep must also produce
-    at least one DEAD-ZONE cut (0.3 < d < 0.6): real pays 0, wide still
-    has slope — the reason the mode exists."""
-    from beat_arena_env.chart import note_tuple
-
+    """wide_acc=True (TRAINING-ONLY): acc = 30·(1 − d/0.6), unrounded —
+    effectively double the real component's range and reward. Scoring
+    never feeds back into physics, so the same pendulum in a real and a
+    wide sim shares one trajectory and one cut distance d; the wide
+    event therefore reconstructs d exactly, and the real event must be
+    a rounding of 15·(1 − d/0.3) floored at 0. The sweep must also
+    produce at least one DEAD-ZONE cut (0.3 < d < 0.6)."""
     def pendulum(yaw, wide):
-        sim = RawBeatSim(max_steps=690, wide_acc=wide)
-        sim.set_chart([note_tuple(_note(0.24, 2, 2))])
+        sim = _sim_with_note(_note(0.24, 2, 2), wide_acc=wide)
         _park(sim, 0)
-        sim.set_joints(1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0],
-                       [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        _set_arm(sim, 1, [0.35, yaw, 0.0, 0.0, 0.0, 0.0, 0.0],
+                 [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         for _ in range(6):
             ev, _ = _coast(sim)
             if ev:
@@ -475,18 +490,14 @@ def test_accuracy_is_timing_independent():
     the INFINITE swing plane from the note center, so where along the
     approach the cut lands (note speed => first-contact depth) must not
     change the score. Same aligned shoulder pendulum, three approach
-    speeds: all cuts score the same accuracy to within integer rounding.
-    Under the old swept-surface rule the faster note's earlier/deeper
-    first contact changed the measured distance by tens of centimeters
-    (near-zero acc for every early cut). Residual 1-2 pt spread is
-    physical: different speeds cut on different TICKS, and the rotating
-    arm's plane orientation shifts slightly between ticks — the real
-    game samples the plane at the cut moment too."""
+    speeds: all cuts score the same accuracy to within integer rounding
+    (residual 1-2 pt spread is physical: different speeds cut on
+    different TICKS of the rotating arm)."""
     def pendulum_acc(speed):
         sim = _sim_with_note(_note(0.24, 2, 2, speed=speed))
         _park(sim, 0)
-        sim.set_joints(1, [0.35, 0.0485, 0.0, 0.0, 0.0, 0.0],
-                       [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        _set_arm(sim, 1, [0.35, 0.0485, 0.0, 0.0, 0.0, 0.0, 0.0],
+                 [-8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         for _ in range(12):
             ev, _ = _coast(sim)
             if ev:
@@ -496,30 +507,27 @@ def test_accuracy_is_timing_independent():
 
     accs = [pendulum_acc(s) for s in (3.0, 4.0, 6.0)]
     assert max(accs) - min(accs) <= 2.0, f"acc varies with speed: {accs}"
-    # early cuts through the deep box now score near-full accuracy when
-    # the swing plane is centered — THE point of the rule fix (old rule:
-    # ~0 for all of these)
+    # early cuts through the deep box score near-full accuracy when the
+    # swing plane is centered — THE point of the cut-plane rule
     assert min(accs) >= 12.0, f"aligned early cuts should score high: {accs}"
 
 
-def _pitch_pendulum_events(kind=0, ticks=20):
-    """A full-arm swing: right arm straight, pitch falling from the
-    +65 deg v7.2 cap at full omega WITH the bend joint sweeping down
-    from +95 in the same world-x rotation plane — the swing chain
-    accumulates their sum (blade elevation starts at 160 deg), so the
-    100 deg pre-swing arc is banked before contact with a row-0 note.
-    Since env v7.1/v7.2 neither the wrist roll (180 deg fan) nor pitch
-    alone (155 deg range) can do this — combined-joint arm swings are
-    the mechanism the restrictions force."""
-    sim = _sim_with_note(_note(9 * DT, 2, 0, kind=kind), max_steps=60)
-    _park(sim, 0)
-    sim.set_joints(1, [np.radians(65.0), 0.0, 0.0, 0.0, 0.0,
-                       np.radians(95.0)],
-                   [-8.0, 0.0, 0.0, 0.0, 0.0, -14.0])
+def _whip_events(kind=0, ticks=60):
+    """A TORQUE-DRIVEN full-arm swing (v10 re-author of the v9 free
+    pendulum, which gravity + the -90 deg pitch stop now truncate):
+    wind the right arm up to the +65 deg pitch stop while the note is
+    beyond reach, then whip down at full gear through a note — > 100
+    deg of blade arc banks the full 70 pre-swing, and the follow-through
+    keeps sweeping for the full 30."""
+    sim = _sim_with_note(_note(0.9, 2, 1, kind=kind), max_steps=300)
     events = []
-    for _ in range(ticks):
-        ev, _ = _coast(sim)
+    for t in range(ticks):
+        a = [0] * N_JOINTS
+        a[A_R_ARM] = 1 if t < 15 else 2
+        _, _, done, ev = sim.step(a)
         events.extend(ev)
+        if done:
+            break
     return sim, events
 
 
@@ -527,15 +535,15 @@ def test_full_swing_scores_full_pre_and_post():
     """A wound-up ARM swing (>100 deg) earns the full 70 pre-swing and
     the full 30 follow-through (pendulum geometry costs accuracy — by
     design; forward-tilted precise blades are the high-acc technique)."""
-    sim, events = _pitch_pendulum_events()
+    sim, events = _whip_events()
     cuts = [e for e in events if e[1] == 0]
     posts = [e for e in events if e[1] == 5]
     assert len(cuts) == 1 and len(posts) == 1
     assert cuts[0][2] >= 70.0            # full pre-swing banked
     assert posts[0][2] == pytest.approx(30.0)  # full follow-through
     assert sim.score >= 100.0
-    # component split (2026-07-25): event carries (points, pre, acc);
-    # the sim's decomposition getters agree with the events
+    # component split: event carries (points, pre, acc); the sim's
+    # decomposition getters agree with the events
     assert cuts[0][3] == pytest.approx(70.0)         # pre component
     assert cuts[0][2] == cuts[0][3] + cuts[0][4]     # points = pre + acc
     pre, acc, post = sim.score_components()
@@ -568,7 +576,7 @@ def test_forward_blade_reaches_early_note():
     sim = _sim_with_note(_note(0.3, 2, 1))
     _park(sim, 0)
     ev, _ = _coast(sim)                    # right arm still at start pose
-    assert _codes(ev) == [(0, 1)]          # touched it (stationary -> slow)
+    assert _codes(ev) == [(0, 1)]          # touched it (near-static -> slow)
     # same note, blade flat at z ~ -0.195: the box front (z ~ 0.32) is
     # still 0.5 m short of the blade plane -> nothing within reach
     sim = _sim_with_note(_note(0.3, 2, 1))
@@ -598,10 +606,10 @@ def test_chain_link_pays_flat_20_any_direction():
     ev, r = _coast(sim)
     assert _codes(ev) == [(0, 0)]
     assert ev[0][2] == 20.0
-    assert r == pytest.approx(20.0 / 115.0, abs=1e-5)
+    assert r == pytest.approx(20.0 / 115.0, abs=1e-9)
     for _ in range(6):                        # no post event ever
         ev, _ = _coast(sim)
-        assert all(c != 5 for _, c, _p in ev)
+        assert all(c != 5 for _, c, *_ in ev)
     assert sim.score == 20.0
 
 
@@ -616,7 +624,7 @@ def test_chain_link_still_requires_speed():
 def test_chain_head_has_no_follow_through():
     """Chain heads score pre + accuracy (max 85) and never open a
     follow-through tracker."""
-    sim, events = _pitch_pendulum_events(kind=KIND_CHAIN_HEAD)
+    sim, events = _whip_events(kind=KIND_CHAIN_HEAD)
     cuts = [e for e in events if e[1] == 0]
     posts = [e for e in events if e[1] == 5]
     assert len(cuts) == 1 and posts == []
@@ -635,7 +643,7 @@ def test_arc_grants_free_pre_and_post():
     assert ev[0][2] >= 100.0                  # 70 + acc + 30, one event
     for _ in range(6):
         ev, _ = _coast(sim)
-        assert all(c != 5 for _, c, _p in ev)
+        assert all(c != 5 for _, c, *_ in ev)
 
 
 def test_bomb_hit_and_bomb_pass():
@@ -663,33 +671,9 @@ def test_bomb_hit_and_bomb_pass():
     assert sim.status()[0] == 4               # passed clean
 
 
-def test_effort_penalty_tiers():
-    """Env v7.9: each non-coast joint action costs its tier per tick
-    (shoulder > elbow > wrist); coasting is free; effort_coef scales."""
-    from beat_arena_env.constants import EFFORT_COST
-    far = _note(5.0, 3, 1)                      # nothing cuttable this tick
-    sim = _sim_with_note(far)
-    _, r, _, _ = sim.step(list(COAST))
-    assert r == 0.0                             # coast is free
-    a = list(COAST); a[0] = 1                   # left shoulder pitch
-    _, r, _, _ = sim.step(a)
-    assert r == pytest.approx(-EFFORT_COST[0])
-    a = list(COAST); a[11] = 2                  # right wrist roll (v9 idx)
-    _, r, _, _ = sim.step(a)
-    assert r == pytest.approx(-EFFORT_COST[4])
-    _, r, _, _ = sim.step([1] * 14)             # everything at once
-    assert r == pytest.approx(-2 * sum(EFFORT_COST))
-    from beat_arena_rs import RawBeatSim
-    from beat_arena_env.chart import note_tuple
-    free = RawBeatSim(max_steps=690, effort_coef=0.0)
-    free.set_chart([note_tuple(far)])
-    _, r, _, _ = free.step([1] * 14)
-    assert r == 0.0                             # coef 0 = free movement
-
-
 def test_bomb_ignores_wide_flat_blade():
     """The bomb hitbox is a small r=0.18 sphere at the center: a blade
-    passing 0.38 m above it doesn't trigger."""
+    passing ~0.38 m above it doesn't trigger."""
     bomb = _note(0.0, 3, 1, kind=KIND_BOMB, any_dir=True, color=0)
     sim = _sim_with_note(bomb)
     _park(sim, 0)
@@ -699,32 +683,43 @@ def test_bomb_ignores_wide_flat_blade():
 
 
 def test_joint_limits_clamp_and_kill_omega():
-    """Every joint is bounded; hitting a limit zeroes its omega.
-    Spot-check pitch (+90), right yaw (+100), elbow (0 floor), right roll
-    (+90) and bend (+95) — arm-tier and wrist-tier joints both."""
-    sim = _sim_with_note(_note(5.0, 2, 1))   # far note: no interference
+    """Every joint is bounded; driving one INTO its stop parks it there
+    (the limit rows + step-11 clamps). v10: gravity may pull a parked
+    joint marginally off the stop within the same tick, so the asserts
+    carry a small band instead of the v9 exact equality. Spot-checks
+    arm-tier and wrist-tier joints on the right side."""
+    sim = _sim_with_note(_note(50.0, 2, 1))   # far note: no interference
     checks = [
-        (0, 1.10, 8.0, np.radians(65.0)),             # pitch into +65 (v7.2)
-        (1, 1.70, 8.0, np.radians(100.0)),            # right yaw into +100
-        (2, -1.15, -8.0, np.radians(-70.0)),          # right twist into -70
-        (3, 0.05, -8.0, 0.0),                         # elbow into its floor
-        (4, -0.05, 15.0, 0.0),                        # right roll into 0 (v7.1)
-        (5, 1.60, 15.0, np.radians(95.0)),            # bend into +95
+        (A_R_ARM + 0, 1.10, 8.0, np.radians(65.0)),    # pitch into +65
+        (A_R_ARM + 1, 1.70, 8.0, np.radians(100.0)),   # r yaw into +100
+        (A_R_ARM + 2, -1.15, -8.0, np.radians(-70.0)), # r twist into -70
+        (A_R_ARM + 3, 0.05, -8.0, 0.0),                # elbow into its floor
+        (A_R_ARM + 5, 1.60, 15.0, np.radians(95.0)),   # bend into +95
+        (A_R_ARM + 6, 0.50, 15.0, np.radians(30.0)),   # r dev into +30
     ]
     for j, q0, om0, lim in checks:
-        q = [0.0] * 6
-        om = [0.0] * 6
-        q[j], om[j] = q0, om0
-        sim.set_joints(1, q, om)
+        joints = np.zeros(N_JOINTS)
+        joints[j] = q0
+        q = np.zeros(NQPOS)
+        q[:3] = ROOT_POS0
+        q[3] = 1.0
+        q[7:] = joints
+        v = np.zeros(NV)
+        v[6 + j] = om0
+        sim.set_joints(list(q), list(v))
         sim.step(list(COAST))
-        s = sim.sabers()[1]
-        assert s[j] == pytest.approx(lim), f"joint {j} not clamped"
-        assert s[6 + j] == 0.0, f"joint {j} omega not killed"
+        qq = np.asarray(sim.qpos())[7:]
+        om = np.asarray(sim.omega())
+        lo_j, hi_j = (lim, np.inf) if om0 < 0 else (-np.inf, lim)
+        assert lo_j - 1e-9 <= qq[j] <= hi_j + 1e-9, f"joint {j} crossed"
+        assert abs(qq[j] - lim) <= 0.02, f"joint {j} not at its stop"
+        assert abs(om[j]) <= 0.5, f"joint {j} omega not killed"
 
 
 def test_miss_fires_exactly_at_exit():
-    """Misses register when the note crosses z = -Z_MISS (2.65 m — about
-    2 m behind the head), not at the plane."""
+    """Misses register when the note crosses the LIVE head plane (env
+    v10: z < head_z(t), ~-0.65 near the reference pose) — exactly once,
+    a few ticks after the hit plane."""
     sim = _sim_with_note(_note(DT, 0, 2))
     _park(sim, 0)
     _park(sim, 1)
@@ -734,9 +729,12 @@ def test_miss_fires_exactly_at_exit():
         events.append(ev)
     miss_ticks = [i for i, ev in enumerate(events) if (0, 4) in _codes(ev)]
     assert len(miss_ticks) == 1
+    # head plane trip at speed 4 from the reference head: 0.65/4 s ~ 4.9
+    # ticks after the plane; the sagging body moves the head by < ~0.15 m
+    # inside this window (+-1 tick band)
     t_miss = (miss_ticks[0] + 1) * DT
-    w = Z_MISS / 4.0
-    assert w < t_miss - DT <= w + DT + 1e-9
+    w = 0.65 / 4.0
+    assert w - DT <= t_miss - DT <= w + 2 * DT + 1e-9
     assert sim.misses == 1
 
 
@@ -924,64 +922,12 @@ def test_chain_links_layout():
 
 # --- scripted bot solvability ------------------------------------------------
 
+@pytest.mark.skip(reason="pending P6: the v9 scripted bot drove per-hand "
+                  "kinematic joints; P6 re-authors it as gravity-"
+                  "compensated PD-over-IK on the v10 dynamic body "
+                  "(SPEC-v10 §7 P6 gate: >= 50% good cuts)")
 def test_scripted_bot_solves_easy():
-    # generator v2 gate: the bot lands ~60% good on the new default gym
-    # (parity flow + extras + the 2-8 m/s speed walk tax its flat-blade
-    # whip; it was 82.9% on the old rate-1.0 down-swing gym) — the gate
-    # pins solvability, not mastery
-    good, total, score = 0, 0, 0.0
-    env = RustBeatEnv(seed=0)
-    for seed in range(5):
-        env.reset(seed=seed)
-        done = False
-        while not done:
-            _, _, done, _, info = env.step(scripted_action(env))
-        good += info["good_cuts"]
-        total += info["n_notes"]
-        score += info["score"]
-    assert good / total >= 0.5
-    # real swings, not stabs: mean points per note well above the 15-point
-    # stab ceiling
-    assert score / total >= 40.0
-
-
-# --- recording (JSONL v7 from the Rust event stream) ------------------------
-
-def test_recording_roundtrip(tmp_path):
-    import json
-    path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
-                      colors="both")
-    env.set_record(path)
-    env.reset(seed=5)
-    done = False
-    while not done:
-        _, _, done, _, info = env.step(scripted_action(env))
-    lines = [json.loads(l) for l in open(path) if l.strip()]
-    head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == 8      # env v9 replay format
-    assert head["header"]["config"]["note_speed_min"] == 2.0
-    assert len(head["header"]["chart"]) == len(env.chart)
-    assert all("x" in c and "y" in c and "kind" in c
-               for c in head["header"]["chart"])
-    goods = sum(1 for t in ticks for e in t["events"]
-                if "cut" in e and e["cut"]["good"])
-    assert goods == info["good_cuts"]
-    # good cuts carry the component split; points = pre + acc except
-    # arc-headed free_post grants (+30 paid at the cut tick)
-    for t in ticks:
-        for e in t["events"]:
-            if "cut" in e and e["cut"]["good"]:
-                c = e["cut"]
-                assert c["points"] - (c["pre"] + c["acc"]) in (0.0, 20.0, 30.0)
-    assert all(len(t["sabers"]) == 2 and len(t["sabers"][0]) == 17
-               for t in ticks)
-    assert all(len(t["action"]) == 14 for t in ticks)
-    pts = sum(e["cut"].get("points", 0.0) for t in ticks for e in t["events"]
-              if "cut" in e)
-    pts += sum(e["post"]["points"] for t in ticks for e in t["events"]
-               if "post" in e)
-    assert pts == pytest.approx(info["score"], abs=0.5)
+    pass
 
 
 # --- BeatSaver parser (fixtures cover all three schemas + v7 objects) --------
@@ -1058,9 +1004,7 @@ def test_beatsaver_parser_v3_chains_arcs_bpm(tmp_path):
 def test_beatsaver_parser_reversed_arc(tmp_path):
     """A slider with tailBeat < beat attaches grants with the EARLIER end
     as the head (game + ScoreSaber-viewer behavior): the early note gets
-    free_post (arc head), the late one free_pre (arc tail). Unswapped,
-    the derived ArcHead/ArcTail scoring types invert and the viewer's
-    note-event ID match fails for both ends."""
+    free_post (arc head), the late one free_pre (arc tail)."""
     import json
     from beat_arena_env.beatsaver import load_beatmap
     _write_info(tmp_path)
