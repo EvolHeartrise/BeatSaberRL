@@ -327,8 +327,10 @@ happening in exactly this order:**
    projected into the WELD NULL SPACE:
    `c_j = M⁻¹e_j − M⁻¹J_wᵀ·A_ww⁻¹·(J_w M⁻¹ e_j)` (so `J_w·c_j = 0` —
    limit/cap impulses can never break the welds); a direction whose
-   composite mobility ≤ 1e-10 × its plain `(M⁻¹)_jj` is immobile given
-   the welds and its row is inert.
+   composite mobility ≤ **1e-4** × its plain `(M⁻¹)_jj` is immobile
+   given the welds and its row is inert (REVISED at P3 from 1e-10 —
+   Divergences §19a: the threshold is an impulse-amplification bound,
+   not a numerical-noise floor).
    **Right-hand sides** (`J·v = b` welds; `J·v ≥ b`, λ ≥ 0 unilaterals):
    - welds: `b = −(β_weld/h)·C_pose`, β_weld = **0.2** (position error
      3-vector; orientation error via the log map, 3-vector),
@@ -355,7 +357,15 @@ happening in exactly this order:**
     c. guarantee pass, joint order 0..28: `q̇_j ← clamp(q̇_j, ±ω_cap)`,
     then `q̇_j ← 0` for limit-hit joints (direct write — residuals at
     this point are near-null-mode noise with negligible momentum).
-    The root is never clamped. Dissipative as before.
+    Dissipative as before.
+12. **Root velocity envelope guarantee (ADDED at P3 — Divergences
+    §19b; supersedes step 11's "the root is never clamped")**: if
+    `|ω_root| > 96` rad/s, rescale the root angular 3-vector onto 96;
+    if `|v_root| > 48` m/s, rescale the linear 3-vector onto 48. The
+    welded feet + capped joints kinematically bound the true root
+    velocity (6-joint leg chain × 16 rad/s; ≤ ~0.5 m root–foot
+    levers) — beyond the envelope is integrator/solver artifact, not
+    physics; ordinary motion never approaches it.
 
 Feet weld definition: foot body frames held at their reference-pose world
 poses — foot_l at (−0.10, 0.07, −0.65), foot_r at (+0.10, 0.07, −0.65),
@@ -729,3 +739,73 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        (no widening): 0.0068–0.0484 rad.
     e. P2 gates are cargo tests in the Rust crate until P3 exposes the
        engine to Python (`test_v10_contacts.py` then wraps them).
+18. **P3 env-integration surface (2026-07-31)** — the hard-replace of
+    the v9 body in `rust/src/lib.rs`, decisions made at integration:
+    a. **v9 `fk()` survives as a `#[cfg(test)]` reference
+       implementation** in lib.rs (with its SHOULDER/L_UPPER/L_FORE
+       literals) solely for the P1 continuity gate
+       (`tests_fk::v9_fk_continuity` references `crate::fk`); nothing
+       live calls it. `kinematics.py` remains its Python mirror,
+       banner-marked v9-legacy (its IK feeds the P6 bot rebuild).
+    b. **Effort's "post-solve substep velocity" = the END-of-substep
+       velocity** (after the step-11 clamps and step-12 envelope) —
+       the velocity that integrates positions next substep. Pinned
+       bitwise against an independent pipeline mirror in
+       `lib.rs env_tests::effort_is_positive_work`; the Python gate
+       checks the reward identity `r_effort = −coef × last_effort`.
+    c. **Obs contact bits count ASSEMBLED rows** (gap < margin, λ may
+       be 0 — the §5 "active contact row" as the solver defines
+       active); replay `contacts` keep the stricter nonzero
+       tick-summed-λ rule (§6).
+    d. **Episode tail**: v9's `0.5 + Z_MISS/min_speed` becomes
+       `0.5 + 1.5/min_speed` — the miss boundary is the LIVE head
+       plane now, and head_z ≥ −1.5 bounds every reachable pose (the
+       welded body cannot fold the head further back), so final
+       misses always register inside the tail.
+    e. **FFI surface**: `set_joints` is the FULL-state hook (q36 =
+       root pos + quat wxyz + 29 joints; v35), used by the pose
+       tooling and every re-authored scenario test. RawBeatSim gains
+       `obs()` (no-step introspection), `qpos()/twist()/omega()/
+       sabers()/contacts()/last_effort()`; `sabers()` returns the §6
+       viewer form `[wrist(3), blade(3)]` per hand (the v9 17-wide
+       joint-state form died with the kinematic body).
+    f. **effort_coef defaults to 4e-4** (the §4 literal) in the Rust
+       ctors and Python wrappers; 0 still = free movement (knob
+       semantics carried).
+    g. **P2 gates stay cargo tests** — P3 integrates the engine
+       BEHIND the env FFI without raw dynamics bindings, so the
+       planned `test_v10_contacts.py` wrapper (§17e) is dropped;
+       Python-side physics visibility arrives with P4's parity suite.
+       (P3 adds `tests_soak.rs`: baked wild-pose regression states
+       from 512-env random-gear soaks, §19.)
+    h. **Tooling**: `convert_scoresaber.py` consumes replay v10
+       (direct wrist+blade from `sabers`; version gate "v10"; head
+       pose frame stays the reference head until P6's full-body FK
+       mirror) and takes `first_note_s` as a parameter (default 2.0,
+       the bench convention).
+19. **P3 solver-stability revisions (2026-07-31)** — two measured
+    blow-ups from 512-env random-full-gear soaks (~10⁶ env-ticks),
+    both ending in a mass-matrix PD panic within one control tick:
+    a. **COMPOSITE_EPS 1e-10 → 1e-4** (§3 step 8). The projected
+       direction is `c_j = S·e_j` with
+       `S = M⁻¹ − M⁻¹J_wᵀA_ww⁻¹J_wM⁻¹` symmetric PSD, so enforcing a
+       cap/limit on joint j moves any other coordinate by
+       `Δv_i = S_ij·Δv_j/S_jj ≤ sqrt(S_ii/S_jj)·Δv_j`. At 1e-10,
+       joints in the near-immobile band (S_jj/plain ∈ (1e-10, 1e-4);
+       contorted poses reach it) amplified cap assignments into the
+       root by up to ~1e5× per application — measured |ω_root|
+       15 → 5.5e5 rad/s in one tick. At 1e-4 the amplification is
+       bounded by ~100; joints below the threshold are owned by the
+       welds and their bounds fall to the step-11 clamps (plain
+       momentum-consistent directions, always well-conditioned).
+    b. **Step 12 root envelope** (§3). Cap-riding contorted poses
+       spike the EXPLICIT Coriolis term (unconstrained Δv ≈ 150 per
+       substep at |q̇| pinned to the 16/40 caps — the §14 h·ω ≈ 1
+       instability, which P0 wrongly assumed the welded env could not
+       produce); the solve re-caps every joint but the root rows kept
+       the artifact velocity and the next substep's Coriolis fed on
+       it. The envelope (|ω_root| ≤ 96 = 6×16 chain bound, |v_root| ≤
+       48) is a kinematic consequence of welds + caps — the rescale
+       only ever removes non-physical velocity. Regression state
+       baked in `dynamics/tests_soak.rs`; 2000 × 512 random-gear soak
+       clean after both fixes.

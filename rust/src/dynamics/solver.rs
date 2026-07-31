@@ -110,7 +110,21 @@ pub struct ConstraintSet {
 /// A composite (weld-consistent) direction with mobility below this
 /// fraction of the joint's plain (M⁻¹)_jj is treated as immobile: the
 /// welds already forbid the motion, so the row/cap is skipped.
-const COMPOSITE_EPS: f64 = 1e-10;
+///
+/// REVISED at P3 (1e-10 → 1e-4, SPEC-v10 Divergences §18): the
+/// projected direction c_j = S·e_j with S = M⁻¹ − M⁻¹J_wᵀA_ww⁻¹J_wM⁻¹
+/// (symmetric PSD), so enforcing the cap/limit on joint j moves any
+/// other coordinate by Δv_i = S_ij·Δv_j/S_jj ≤ sqrt(S_ii/S_jj)·Δv_j.
+/// At 1e-10 a joint in the near-immobile band (S_jj ∈ (1e-10, 1e-4)
+/// of plain mobility — contorted random-gear poses reach it) passed as
+/// "mobile" and its cap assignment amplified impulses into the root by
+/// up to ~1e5× per application — measured blow-up from |ω_root| ≈ 15
+/// to 5e5 rad/s within ONE control tick (512-env random-gear soak,
+/// env 391), ending in a Cholesky PD panic. At 1e-4 the worst-case
+/// amplification is ~sqrt(1/1e-4) = 100; joints below it are owned by
+/// the welds and their bounds fall to the step-11 clamp (plain
+/// momentum-consistent impulses, always well-conditioned).
+const COMPOSITE_EPS: f64 = 1e-4;
 
 impl ConstraintSet {
     pub fn new(model: &Model, welds: bool, contacts_enabled: bool) -> ConstraintSet {
@@ -160,6 +174,12 @@ impl ConstraintSet {
     /// Number of joint-limit rows assembled by the last solve.
     pub fn limit_rows(&self) -> usize {
         self.nrows - self.weld_rows() - self.contacts.len()
+    }
+
+    /// Effective mass (J M⁻¹ Jᵀ diagonal) of an assembled row —
+    /// post-solve introspection (tests).
+    pub fn row_diag(&self, row: usize) -> f64 {
+        self.diag[row]
     }
 
     /// §3 steps 7–9 against the FK + Cholesky factor already in `ws`

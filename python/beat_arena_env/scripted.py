@@ -1,4 +1,12 @@
-"""Scripted reference bot (SPEC.md §Scripted reference bot) — env v6.
+"""Scripted reference bot — v9-LEGACY (BROKEN against the v10 sim).
+
+Env v10 (P3, 2026-07-31) retired the kinematic body this bot drives:
+the sim's action space is now 29 gear heads and `sim.sabers()` returns
+FK wrist+blade only (no per-hand joint state). P6 re-authors the bot as
+gravity-compensated PD-over-IK on the dynamic body; until then
+`scripted_action` raises, and its tests are skipped pending P6.
+
+--- original v6-v9 doc ---
 
 The blade-level plan is unchanged from v5.2: for its color's earliest
 pending note, plant so the blade lies in the hit plane perpendicular to
@@ -204,9 +212,16 @@ def _hand_action(hand, arm, time, target):
 
 
 def scripted_action(env):
-    """env: RustBeatEnv (needs .chart, .sim.status()/sabers()/time).
-    Returns the 14-int action (per hand: pitch, yaw, twist, elbow, roll,
-    bend, dev; left first — env v9)."""
+    """v9-LEGACY (raises): the v9 bot drove per-hand kinematic joints;
+    the v10 sim exposes neither the API nor the physics it assumed.
+    P6 replaces this with the PD-over-IK bot on the dynamic body."""
+    raise NotImplementedError(
+        "scripted_action is v9-legacy: the v10 dynamic body needs the "
+        "P6 gravity-compensated PD-over-IK bot")
+
+
+def _scripted_action_v9(env):
+    """The retired v9 implementation, kept for the P6 rewrite to mine."""
     status = env.sim.status()
     targets = {0: None, 1: None}
     for i, n in enumerate(env.chart):

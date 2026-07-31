@@ -33,7 +33,10 @@ import shutil
 
 import numpy as np
 import pytest
-pytest.skip("fused policy kernels bake the v8 12-head/286-obs layout; guarded out under env v9 (wrist deviation) until ported", allow_module_level=True)
+pytest.skip("v10: CUDA path pending P5 — the fused policy kernels bake a "
+            "pre-v10 layout (12 heads / 286 obs); P5 ports them to "
+            "29 heads / obs 340 and restores this module",
+            allow_module_level=True)
 
 import torch
 

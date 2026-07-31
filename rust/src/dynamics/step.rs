@@ -20,6 +20,13 @@ pub const H_SUB: f64 = 1.0 / 240.0;
 pub const N_SUB: usize = 8;
 /// Gauss-Seidel passes of the step-11 clamp solve (see below).
 pub const CLAMP_PASSES: usize = 8;
+/// Step-12 root velocity envelope (P3 — Divergences §19): the welded
+/// humanoid's root reaches the ground through a 6-revolute leg chain
+/// whose rates are capped at 16 rad/s each, so |ω_root| ≤ 96 rad/s and
+/// the linear velocity is bounded by the same rates × the ≤ ~0.5 m
+/// root–foot levers (48 m/s). Beyond = solver artifact (see step 12).
+pub const ROOT_W_MAX: f64 = 96.0;
+pub const ROOT_V_MAX: f64 = 48.0;
 
 /// P2 constraint-stage hook (§3 steps 7–9): (model, workspace, q₂₉,
 /// v*) → projected velocity written in place. q (pre-integration) is
@@ -236,6 +243,42 @@ pub fn substep_opts(
         st.v[vj] = st.v[vj].clamp(-cap, cap);
         if ws.hit[j] {
             st.v[vj] = 0.0;
+        }
+    }
+
+    // 12. root velocity envelope guarantee (ADDED at P3 — SPEC-v10
+    //     Divergences §19). With the feet welded and every joint rate
+    //     capped, the TRUE root velocity is kinematically bounded (the
+    //     root connects to the ground through a 6-joint leg chain:
+    //     |ω_root| ≤ 6×16 = 96 rad/s, and the linear velocity by the
+    //     same rates × the ≤ ~0.5 m root–foot levers). Sustained
+    //     random full gears reach contorted cap-riding poses where the
+    //     EXPLICIT Coriolis term spikes (h·M⁻¹C-level Δv ≈ 150 in one
+    //     substep — the §14 h·ω ≈ 1 instability, which P0 assumed the
+    //     welded env could not produce); the solve caps every joint
+    //     but the root rows are never clamped, so the root keeps the
+    //     artifact velocity, the next substep's Coriolis feeds on it,
+    //     and the state diverges to a Cholesky PD panic within a tick
+    //     (measured: |ω_root| 15 → 5.5e5 rad/s; 512-env soak). Any
+    //     root velocity beyond the envelope is therefore solver/
+    //     integrator ARTIFACT, not physics: rescale the root angular /
+    //     linear velocity vectors back onto the envelope (deterministic
+    //     two-scalar guard, direction-preserving; engages only in
+    //     artifact states — ordinary motion never comes near 96).
+    if model.free_base {
+        let w2 = st.v[3] * st.v[3] + st.v[4] * st.v[4] + st.v[5] * st.v[5];
+        if w2 > ROOT_W_MAX * ROOT_W_MAX {
+            let s = ROOT_W_MAX / w2.sqrt();
+            st.v[3] *= s;
+            st.v[4] *= s;
+            st.v[5] *= s;
+        }
+        let l2 = st.v[0] * st.v[0] + st.v[1] * st.v[1] + st.v[2] * st.v[2];
+        if l2 > ROOT_V_MAX * ROOT_V_MAX {
+            let s = ROOT_V_MAX / l2.sqrt();
+            st.v[0] *= s;
+            st.v[1] *= s;
+            st.v[2] *= s;
         }
     }
 }

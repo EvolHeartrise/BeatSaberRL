@@ -1,4 +1,15 @@
-"""Arm forward/inverse kinematics (env v9) — MIRROR of rust/src/lib.rs fk().
+"""Arm forward/inverse kinematics (env v9) — v9-LEGACY since P3.
+
+The v10 body (SPEC-v10) does full-tree FK in rust/src/dynamics/fk.rs;
+the v9 arm chains survive in Rust only as the #[cfg(test)] continuity
+reference. This module still MIRRORS that reference exactly (the arm
+anchors and stacking orders carried into v10 verbatim, §1.3), so the
+FK here remains valid for the ARM CHAINS at the reference root pose —
+the continuity tests and pose tooling use it. The IK is the v9 bot's;
+P6 rebuilds the bot (gravity-compensated PD-over-IK) on the dynamic
+body.
+
+--- original v9 doc ---
 
 Joint order per hand: q = [pitch, yaw, twist, elbow, roll, bend, dev].
 All-zero = arm straight forward (+z), blade the forearm's extension.

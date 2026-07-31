@@ -1,4 +1,4 @@
-"""Convert a beat-arena JSONL v7 replay to a ScoreSaber replay .dat.
+"""Convert a beat-arena JSONL v10 replay to a ScoreSaber replay .dat.
 
     python convert_scoresaber.py --replay replays/x.jsonl \\
         --hash <song-hash> --difficulty Hard [--out x.dat]
@@ -20,8 +20,11 @@ repo (mirrored at projects/beat-arena/research/vendor/scoresaber-watch):
   deviation) recomputed from the recorded joint state via FK.
 
 Fidelity notes:
-- Pose frames are exact: wrist positions from the recorded joint state,
-  blade orientation via the kinematics FK mirror, 30 fps.
+- Pose frames are exact: replay v10 `sabers` carries the FK wrist
+  position + unit blade direction per hand directly, 30 fps. The head
+  pose frame stays the REFERENCE head (the v10 body's live head is in
+  the replay's full q — exporting it awaits the P6 full-body FK mirror;
+  the viewer only uses the head frame cosmetically).
 - Coordinates are the game's PLAYER SPACE: player at z = 0, notes
   arriving at z = +0.65 (the viewer's PlayerCutPlaneDistance — it
   parents all replay poses under a rig 0.65 m behind the world origin
@@ -63,7 +66,6 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import (KIND_BOMB, KIND_CHAIN_HEAD,
                                       KIND_CHAIN_LINK, KIND_NOTE)
-from beat_arena_env.kinematics import fk
 
 MAGIC = (b"ScoreSaber Replay " + "\U0001F44C\U0001F920".encode() + b"\r\n")
 assert len(MAGIC) == 28
@@ -153,15 +155,17 @@ def read_replay(path):
         lines = [json.loads(l) for l in f if l.strip()]
     assert "header" in lines[0], "not a beat-arena replay"
     header = lines[0]["header"]
-    assert header.get("version") == 8, (
-        f"need replay v8 (env v9 7-joint body), got {header.get('version')}")
+    assert header.get("version") == "v10", (
+        f"need replay v10 (env v10 dynamic body), got {header.get('version')}")
     return header, lines[1:]
 
 
-def align_charts(header, map_dir, difficulty):
+def align_charts(header, map_dir, difficulty, first_note_s=2.0):
     """Re-parse the original map and align its notes 1:1 (by order) with
-    the replay's chart. Returns (real_notes, time_offset sim->song)."""
-    sim_notes, _ = load_beatmap(map_dir, difficulty, first_note_s=2.0)
+    the replay's chart. `first_note_s` must match the convention the
+    replay was recorded under (the bench plays maps shifted so the
+    first note lands at 2.0 s). Returns (real_notes, offset sim->song)."""
+    sim_notes, _ = load_beatmap(map_dir, difficulty, first_note_s=first_note_s)
     real_notes, _ = load_beatmap(map_dir, difficulty, first_note_s=None)
     chart = header["chart"]
     if len(sim_notes) != len(chart):
@@ -215,9 +219,9 @@ def pose_block(ticks, offset):
         t = line["time"] + offset
         hands = []
         for hand in (0, 1):
+            # replay v10 sabers: [wx, wy, wz, bx, by, bz] per hand
             s = line["sabers"][hand]
-            _, wrist, blade = fk(hand, s[0:7])
-            wrist = s[14:17]                       # recorded wrist is exact
+            wrist, blade = s[0:3], s[3:6]
             tip = tuple(wrist[i] + blade[i] for i in range(3))
             hands.append((tuple(wrist), quat_from_forward(blade)))
             prev_tips[hand] = tip
@@ -257,9 +261,7 @@ def cut_geometry(ticks, tick_idx, hand, note):
     the swing's xy motion angle."""
     def state(i):
         s = ticks[i]["sabers"][hand]
-        _, _, blade = fk(hand, s[0:7])
-        wrist = s[14:17]
-        return wrist, blade
+        return s[0:3], s[3:6]          # replay v10: wrist + blade direct
     wrist, blade = state(tick_idx)
     p_wrist, p_blade = state(max(tick_idx - 1, 0))
     tip = [wrist[j] + blade[j] for j in range(3)]
@@ -553,9 +555,11 @@ def _lzma_alone(body: bytes) -> bytes:
 EMPTY = struct.pack("<i", 0)
 
 
-def convert(replay_path, map_dir, song_hash, difficulty, out_path):
+def convert(replay_path, map_dir, song_hash, difficulty, out_path,
+            first_note_s=2.0):
     header, ticks = read_replay(replay_path)
-    real_notes, offset = align_charts(header, map_dir, difficulty)
+    real_notes, offset = align_charts(header, map_dir, difficulty,
+                                      first_note_s=first_note_s)
     events, timeline, combo_tl, mult_tl, energy_tl, final = build_events(
         ticks, real_notes, offset)
     blocks = [

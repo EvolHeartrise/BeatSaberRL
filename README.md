@@ -41,6 +41,22 @@ replays, and records retired. Fused policy kernels (bench
 `--fused-forward`, `--fused-update`) are v8-baked and guard out until
 ported; the production torch paths are shape-driven and unaffected.
 
+Env v10 (2026-07-31, P3 — SPEC-v10.md): the kinematic upper body is
+RETIRED. The body is a full **dynamic humanoid** — floating pelvis +
+29 actuated revolute DoF (spine 3, arms 2×7 with the v9 arm chains
+verbatim, legs 2×6), de Leva masses on the v9 anchor geometry, feet
+welded to the floor, 12-collider self-contact — integrated by a
+hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
+`rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
+are **29 gear heads** (τ = gear_fraction × τ_max); effort is positive
+mechanical work (4e-4/J); the reach/miss gates and note look-at follow
+the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
+root twist + ω29 + contact events). Gravity is real and nothing holds
+the body up — posture is the policy's problem now. ALL v9 checkpoints,
+replays, and records are retired. The torch mirror (P4), CUDA kernel
+(P5), and viewer/bot (P6) are pending: until P5, `--env cuda` is a
+hard error.
+
 ## Quick start
 
 Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.
@@ -50,12 +66,9 @@ cd python
 VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
-# the trainer — production protocol (2026-07-26): --fp16 all
-# --graph-rollout --chart-pool 65536 + fused attention are the DEFAULTS
-# (~140k steps/s vs the 78k fp32 era; fp32 masters/checkpoints; see
-# sessions/2026-07-25-opt-round4-landings.md and
-# sessions/2026-07-26-graph-rollout-gate.md for the gate results)
-$VENV/bin/python train_batch.py --env cuda --num-envs 1024
+# the trainer — v10 (P3): rust env only until the P4 torch mirror /
+# P5 CUDA port land; the policy rebuild (29 heads / obs 340) is P4
+$VENV/bin/python train_batch.py --env rust --num-envs 512
 ```
 
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim

@@ -4,6 +4,14 @@ the watch.scoresaber.com decoder, plus their note-matching rules.
 The decoder port mirrors ScoreSaberDecoder.cs (v2 path) from the
 ScoreSaber/watch repo — field-for-field. If the converter and this port
 disagree with each other, one of them diverged from the real format.
+
+Env v10 (P3 re-author): the fixture episode drives the DYNAMIC body —
+a deterministic wind-up/whip on the right arm cuts the first note (the
+P3 gate recipe; the unactuated body cannot hold a pose for the later
+notes, which resolve as misses/flails under a seeded random gear
+stream). The fixture plays at first_note_s = 0.9 so the cut happens
+while the body is still upright; the converter's align gets the same
+value. Replay v10: sabers carry [wrist(3), blade(3)] directly.
 """
 
 import json
@@ -167,12 +175,13 @@ def decode_dat(path):
 
 RAW_NOTES = [
     # (_time beats@120, line, layer, type(color), cutDirection)
-    (3.0, 1, 0, 1, 1),      # down-swing, right/blue
+    (3.0, 2, 1, 1, 1),      # down-swing, right/blue — the whipped cut
     (5.0, 2, 0, 1, 1),
     (7.0, 3, 2, 1, 8),      # dot
     (9.0, 0, 0, 0, 1),      # left/red
 ]
 BOMB = (6.0, 0, 2)
+FIRST_NOTE_S = 0.9          # sim time of the first note (whip window)
 
 
 @pytest.fixture(scope="module")
@@ -183,7 +192,7 @@ def converted(tmp_path_factory):
                 "_beatmapCharacteristicName": "Standard",
                 "_difficultyBeatmaps": [
                     {"_difficulty": "Expert", "_beatmapFilename": "Expert.dat",
-                     "_noteJumpMovementSpeed": 10.0}]}]}
+                     "_noteJumpMovementSpeed": 4.0}]}]}
     (tmp / "Info.dat").write_text(json.dumps(info))
     v2 = {"_version": "2.0.0", "_notes":
           [{"_time": t, "_lineIndex": x, "_lineLayer": y, "_type": c,
@@ -192,19 +201,31 @@ def converted(tmp_path_factory):
               "_type": 3, "_cutDirection": 0}]}
     (tmp / "Expert.dat").write_text(json.dumps(v2))
 
-    notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=2.0)
+    notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
     env = RustBeatEnv(external_chart=notes, seed=0)
     replay_path = str(tmp / "ep.jsonl")
     env.set_record(replay_path)
     obs, _ = env.reset()
     rng = np.random.default_rng(5)
-    events, done = [], False
+    events, done, t = [], False, 0
     while not done:
-        _, _, done, _, info_d = env.step(rng.integers(0, 3, size=14))
+        # ticks 0-14: raise/hold the right arm at the +65 pitch stop;
+        # 15-26: whip down through the first note (the P3 gate recipe);
+        # then seeded random gears (flail) for the rest of the episode
+        a = np.zeros(29, dtype=np.int64)
+        if t < 15:
+            a[10] = 1
+        elif t < 27:
+            a[10] = 2
+        else:
+            a = rng.integers(0, 3, size=29)
+        _, _, done, _, info_d = env.step(a)
         events.extend(info_d["events"])
+        t += 1
 
     out = str(tmp / "ep.dat")
-    r = conv.convert(replay_path, str(tmp), "ab" * 20, "Expert", out)
+    r = conv.convert(replay_path, str(tmp), "ab" * 20, "Expert", out,
+                     first_note_s=FIRST_NOTE_S)
     with open(replay_path) as f:
         ticks = [json.loads(l) for l in f][1:]
     return {"map_dir": str(tmp), "events": events, "result": r,
@@ -263,8 +284,8 @@ def test_frames_wellformed(converted):
     assert converted["result"]["frames"] == len(frames)
     times = [f["time"] for f in frames]
     assert times[0] > 0 and all(b > a for a, b in zip(times, times[1:]))
-    # fixture first note: 3 beats @120 = 1.5 s real vs 2.0 s sim -> -0.5 s
-    # offset, +1/30 for the start-of-tick labeling (see
+    # fixture first note: 3 beats @120 = 1.5 s real vs FIRST_NOTE_S sim
+    # -> +0.6 s offset, +1/30 for the start-of-tick labeling (see
     # test_times_are_end_of_tick)
     for f in frames:
         assert f["fps"] == 30
@@ -276,10 +297,11 @@ def test_frames_wellformed(converted):
     # env world coords here shifted the whole avatar behind the platform)
     assert frames[0]["head"][:3] == pytest.approx((0.0, 1.70, 0.0))
     # saber frames = recorded wrists shifted env world -> player space
+    # (replay v10 sabers: [wrist(3), blade(3)])
     ticks = converted["ticks"]
     for i in (0, len(ticks) // 2, len(ticks) - 1):
         for hand, key in ((0, "left"), (1, "right")):
-            wrist = ticks[i]["sabers"][hand][14:17]
+            wrist = ticks[i]["sabers"][hand][0:3]
             want = (wrist[0], wrist[1], wrist[2] + 0.65)
             assert frames[i][key][:3] == pytest.approx(want, abs=1e-5)
 
@@ -289,8 +311,8 @@ def test_times_are_end_of_tick(converted):
     state and events are END-of-tick (the recorder stamps post-step
     state with sim.time - DT; viz compensates with (tick+1)*DT). The
     converter folds +DT into the sim->song offset, so every decoded
-    event/pose time = tick_time + (first_real_hit - 2.0) + 1/30."""
-    offset = 1.5 - 2.0 + 1.0 / 30.0
+    event/pose time = tick_time + (first_real_hit - FIRST_NOTE_S) + 1/30."""
+    offset = 1.5 - FIRST_NOTE_S + 1.0 / 30.0
     ticks = converted["ticks"]
     want = sorted(t["time"] + offset for t in ticks
                   for ev in t["events"] if "post" not in ev)

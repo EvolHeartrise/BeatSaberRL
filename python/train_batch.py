@@ -308,8 +308,13 @@ def main():
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.env is None:
-        args.env = "cuda" if device.type == "cuda" else "rust"
-        print(f"--env not given: defaulting to '{args.env}'", flush=True)
+        # env v10 (P3): the CUDA env is v9-baked; default to rust until
+        # P5 ports the kernels (P4 lands the torch mirror first)
+        args.env = "rust"
+        print(f"--env not given: defaulting to '{args.env}' "
+              "(v10: CUDA path pending P5)", flush=True)
+    if args.env == "cuda":
+        raise SystemExit("v10: CUDA path pending P5, use --env torch|rust")
 
     N, T = args.num_envs, args.horizon
     batch = N * T

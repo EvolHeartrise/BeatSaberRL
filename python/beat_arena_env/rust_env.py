@@ -1,10 +1,12 @@
 """Gymnasium env over the Rust sim core — THE single-env implementation.
 
-Chart generation stays in Python (once per episode); physics, cut logic,
-scoring, and obs building live in rust/src/lib.rs. Per-step cut/miss
-events come back from Rust and are exposed in `info["events"]` as
-(note_idx, reason, points) tuples; replay recording (JSONL v6, SPEC.md)
-is built from them via `set_record`.
+Env v10 (P3): the body is the SPEC-v10 dynamic humanoid — 29 gear-id
+action heads (SPEC-v10 §1.4 joint order), obs 340 (§5), replay JSONL
+v10 (§6: q36 + root twist + omega29 + per-hand FK sabers + contact
+events with pair ids). Chart generation stays in Python (once per
+episode); physics, cut logic, scoring, and obs building live in
+rust/src/lib.rs. Per-step cut/miss events come back from Rust and are
+exposed in `info["events"]` as (note_idx, reason, points) tuples.
 
 Build the extension once with:
   VIRTUAL_ENV=<venv> <venv>/bin/maturin develop --release   (from rust/)
@@ -18,7 +20,9 @@ import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import EVENT_REASONS, N_JOINTS, OBS_DIM, note_center
+from .constants import (
+    EFFORT_COEF, EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
+)
 
 from beat_arena_rs import RawBeatSim
 
@@ -30,8 +34,8 @@ class RustBeatEnv(gym.Env):
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, effort_coef=1.0, external_chart=None,
-                 wide_acc=False, gears=3, seed=0):
+                 bomb_prob=0.125, effort_coef=EFFORT_COEF,
+                 external_chart=None, wide_acc=False, gears=3, seed=0):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation."""
         self.cfg = ChartConfig(
@@ -48,7 +52,7 @@ class RustBeatEnv(gym.Env):
         self.chart = []
         self._external = list(external_chart) if external_chart else None
         # +90 ticks: the episode tail must cover the miss-boundary trip
-        # (Z_MISS 2.65 m at the slowest speeds) past the last note
+        # (live head plane, env v10) past the last note
         if self._external:
             max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 90
         else:
@@ -63,21 +67,21 @@ class RustBeatEnv(gym.Env):
         self.wide_acc = wide_acc
         self.gears = gears
         self.observation_space = gym.spaces.Box(
-            low=-2.0, high=2.0, shape=(OBS_DIM,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
-        # env v9: per hand 7 joint heads (pitch, yaw, twist, elbow, roll,
-        # bend, dev), left hand first; K options per head (id 0 coast,
-        # 1/2 = +/-full, finer +/- gear pairs append — constants.gear_table)
-        self.action_space = gym.spaces.MultiDiscrete([gears] * (2 * N_JOINTS))
+        # env v10: 29 gear-id heads in SPEC-v10 §1.4 joint order —
+        # spine(3), arm_l(7), arm_r(7), leg_l(6), leg_r(6); id 0 coast,
+        # 1/2 = +/-full, finer +/- gear pairs append (constants.gear_table)
+        self.action_space = gym.spaces.MultiDiscrete([gears] * N_JOINTS)
 
-    # -- recording (JSONL v6, same format the 3D viewer reads) ---------------
+    # -- recording (JSONL v10 — SPEC-v10 §6, same format the viewer reads) ----
     def set_record(self, path: str):
         """Record the NEXT episode (and later ones) to JSONL at path."""
         self._record_path = path
 
     def _start_record(self):
         header = {"header": {
-            "version": 8,      # env v9 body: 7 joints/hand (dev added)
+            "version": "v10",     # env v10 body: viewers reject others
             "config": {
                 "chart_len_s": self.cfg.chart_len_s,
                 "colors": self.cfg.colors,
@@ -90,8 +94,8 @@ class RustBeatEnv(gym.Env):
                 "effort_coef": self.effort_coef,
                 "gears": self.gears,       # env v8 action-table size
             },
-            # env v7: explicit world positions (meters), object kinds and
-            # arc grants; the viewer derives everything from these
+            # explicit world positions (meters), object kinds and arc
+            # grants; the viewer derives everything from these
             "chart": [{"t": n.hit_time,
                        "x": round(note_center(n)[0], 4),
                        "y": round(note_center(n)[1], 4),
@@ -104,13 +108,23 @@ class RustBeatEnv(gym.Env):
         self._record_lines = [json.dumps(header)]
 
     def _record_tick(self, action, reward, events):
-        sabers = self.sim.sabers()
+        # SPEC-v10 §6 per-tick record: q36 (root pos + quat wxyz + 29
+        # joints), root twist, omega29, per-hand FK sabers [w3 + b3],
+        # contact events (pair id, world point, tick-summed impulse),
+        # score events unchanged from v7+.
         self._record_lines.append(json.dumps({
             "t": self.sim.tick - 1,
             "time": round(self.sim.time - 1.0 / 30.0, 5),
-            "sabers": [[round(v, 4) for v in s] for s in sabers],
+            "q": [round(v, 5) for v in self.sim.qpos()],
+            "twist": [round(v, 4) for v in self.sim.twist()],
+            "omega": [round(v, 4) for v in self.sim.omega()],
+            "sabers": [[round(v, 4) for v in s] for s in self.sim.sabers()],
             "action": [int(a) for a in action],
             "reward": round(float(reward), 4),
+            "contacts": [{"pair": int(p), "p": [round(x, 4), round(y, 4),
+                                                round(z, 4)],
+                          "j": round(imp, 4)}
+                         for p, x, y, z, imp in self.sim.contacts()],
             "events": [
                 {"miss": {"note": int(i)}} if code == 4 else
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}

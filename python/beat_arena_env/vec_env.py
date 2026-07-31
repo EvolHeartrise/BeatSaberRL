@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import OBS_DIM
+from .constants import EFFORT_COEF, OBS_DIM
 
 from beat_arena_rs import VecBeatSim
 
@@ -21,7 +21,7 @@ class BeatVecEnv:
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, effort_coef=1.0, wide_acc=False,
+                 bomb_prob=0.125, effort_coef=EFFORT_COEF, wide_acc=False,
                  gears=3, seed=0):
         self.num_envs = num_envs
         self.cfg = ChartConfig(
@@ -32,7 +32,7 @@ class BeatVecEnv:
             bomb_prob=bomb_prob,
         )
         # +90: the episode tail must cover the miss boundary trip
-        # (Z_MISS 2.65 m at the slowest speeds) past the last note
+        # (live head plane, env v10) past the last note
         # return_events=False: the event list is discarded below; skip
         # materializing it into Python tuples every step
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
@@ -52,9 +52,9 @@ class BeatVecEnv:
         return self.sim.obs().reshape(self.num_envs, OBS_DIM)
 
     def step(self, actions):
-        """actions: (N, 12) int array — per hand (pitch, yaw, twist,
-        elbow, roll, bend), left first. Returns (obs, rewards, dones,
-        infos); infos = list of dicts for envs that finished THIS step."""
+        """actions: (N, 29) int array — gear ids in SPEC-v10 §1.4 joint
+        order. Returns (obs, rewards, dones, infos); infos = list of
+        dicts for envs that finished THIS step."""
         obs, rew, done, _events = self.sim.step(  # events empty (ctor flag)
             np.ascontiguousarray(actions, dtype=np.int64))
         obs = obs.reshape(self.num_envs, OBS_DIM)
