@@ -148,12 +148,12 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
-    p.add_argument("--env", choices=["rust", "cuda"], default=None,
-                   help="cuda = custom CUDA-kernel sim (one launch per "
-                        "step, obs stay on device). Default: cuda when "
-                        "training on a CUDA device (the production path; "
-                        "rust is ~4.6x slower there), else rust. (--env "
-                        "torch, the tensor-op sim, was removed 2026-07-25)")
+    p.add_argument("--env", choices=["rust", "cuda", "torch"], default=None,
+                   help="torch = the v10 tensor-op sim (P4 torch mirror — "
+                        "the training home until P5 ports the CUDA "
+                        "kernels; obs born on device). rust = the "
+                        "reference sim over FFI. Default: torch on a CUDA "
+                        "device, else rust. cuda hard-errors until P5.")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -308,9 +308,9 @@ def main():
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.env is None:
-        # env v10 (P3): the CUDA env is v9-baked; default to rust until
-        # P5 ports the kernels (P4 lands the torch mirror first)
-        args.env = "rust"
+        # env v10 (P4): the torch mirror is the GPU training home until
+        # P5 ports the CUDA kernels; rust stays the CPU path
+        args.env = "torch" if device.type == "cuda" else "rust"
         print(f"--env not given: defaulting to '{args.env}' "
               "(v10: CUDA path pending P5)", flush=True)
     if args.env == "cuda":
@@ -339,10 +339,12 @@ def main():
     inf_count = torch.zeros(1, device=device)
     ratio_diag = torch.zeros((), device=device)
 
-    tensor_env = args.env == "cuda"
+    tensor_env = args.env in ("cuda", "torch")
     # --graph-rollout is the DEFAULT (2026-07-26); downgrade with a note
-    # where it cannot apply (same policy as the fp16 default above)
-    if args.graph_rollout and (not tensor_env or device.type != "cuda"):
+    # where it cannot apply (same policy as the fp16 default above).
+    # The torch env is NOT capturable (host-synced contact unions +
+    # Python substep loops), so graphs stay cuda-env-only.
+    if args.graph_rollout and (args.env != "cuda" or device.type != "cuda"):
         print("--graph-rollout: needs --env cuda on a CUDA device, "
               "forcing off", flush=True)
         args.graph_rollout = False
@@ -364,8 +366,8 @@ def main():
     print(f"argv: {' '.join(sys.argv[1:]) or '(bare)'}", flush=True)
     print(f"config: {args_snapshot}", flush=True)
 
-    if args.ranked_maps and not tensor_env:
-        raise SystemExit("--ranked-maps requires --env cuda")
+    if args.ranked_maps and args.env != "cuda":
+        raise SystemExit("--ranked-maps requires --env cuda (pending P5)")
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
@@ -377,6 +379,18 @@ def main():
                       effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
                       seed=args.seed, device=device)
+    elif args.env == "torch":
+        from beat_arena_env.torch_env import TorchBeatVecEnv
+        venv = TorchBeatVecEnv(
+            N, cols=tuple(args.cols),
+            rows=tuple(args.rows), chart_len_s=args.chart_len,
+            note_speed_min=args.note_speed_min,
+            note_speed_max=args.note_speed_max,
+            note_prob=args.note_prob, extra_prob=args.extra_prob,
+            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
+            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
+            gears=args.gears, seed=args.seed, chart_pool=args.chart_pool,
+            device=device, dtype=torch.float32)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(

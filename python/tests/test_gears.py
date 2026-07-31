@@ -147,11 +147,37 @@ def test_env_action_space_and_header():
         RustBeatEnv(gears=4)
 
 
-@pytest.mark.skip(reason="pending P4 torch mirror: the policy is still "
-                  "v9-shaped (14 heads / obs 290); P4 rebuilds it for "
-                  "29 heads / obs 340 and restores this round-trip")
 def test_policy_head_width_roundtrip():
-    pass
+    """v10 policy (29 heads, obs 340, body token) drives the env at
+    every K; checkpoint arch round-trips; env/policy K mismatch and v9
+    checkpoints are refused."""
+    import torch
+    from policy import NotePolicy, load_policy
+
+    env = RustBeatEnv(gears=5, seed=0, chart_len_s=6.0)
+    obs, _ = env.reset()
+    for k in (3, 5, 7):
+        torch.manual_seed(0)
+        policy = NotePolicy(n_gears=k)
+        assert policy.head_sizes == (k,) * N_JOINTS
+        with torch.no_grad():
+            logits, value = policy.forward_stacked(
+                torch.as_tensor(obs).unsqueeze(0))
+        assert logits.shape == (1, N_JOINTS, k) and value.shape == (1,)
+        ck = {"state_dict": policy.state_dict(), "arch": policy.arch}
+        p2 = load_policy(ck)
+        assert p2.n_gears == k and p2.arch == policy.arch
+    # a K=5 policy's greedy action stream is valid input for the env
+    torch.manual_seed(0)
+    policy = NotePolicy(n_gears=5)
+    with torch.no_grad():
+        a, _, _, _ = policy.get_action_and_value(
+            torch.as_tensor(obs).unsqueeze(0))
+    obs2, _r, _d, _t, _info = env.step([int(x) for x in a[0]])
+    assert obs2.shape == (340,)
+    # v9-shaped checkpoint (no v10 arch markers) is refused
+    with pytest.raises(SystemExit):
+        load_policy({"state_dict": {}, "arch": {"embed": 64, "n_gears": 5}})
 
 
 @pytest.mark.skip(reason="v10: CUDA path pending P5 (the CUDA env kernel "

@@ -55,8 +55,10 @@ root twist + ω29 + contact events; since P6 additive per-tick "feet"
 weld impulses + "effort"). Gravity is real and nothing holds the body
 up — posture is the policy's problem now. ALL v9 checkpoints,
 replays, and records are retired. The viewer and scripted bot are v10
-(P6); the torch mirror (P4) and CUDA kernel (P5) are pending: until
-P5, `--env cuda` is a hard error.
+(P6); the torch mirror (P4, `--env torch` — reborn as the GPU training
+home, f64-bitwise vs Rust) landed with the 29-head/obs-340/body-token
+policy rebuild; the CUDA kernel (P5) is pending: until P5, `--env
+cuda` is a hard error.
 
 ## Quick start
 
@@ -67,20 +69,22 @@ cd python
 VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
-# the trainer — v10 (P3): rust env only until the P4 torch mirror /
-# P5 CUDA port land; the policy rebuild (29 heads / obs 340) is P4
+# the trainer — v10 (P4): torch env on GPU (the training home until
+# the P5 CUDA port), rust env on CPU
+$VENV/bin/python train_batch.py --env torch --num-envs 1024
 $VENV/bin/python train_batch.py --env rust --num-envs 512
 ```
 
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
 and the transformer the only policy — the Python sim, pool encoder, and
-serial trainer were deleted (surface-area reduction). The custom CUDA
-kernel (`--env cuda`, the production trainer backend) is the only other
-sim implementation: the intermediate tensor-op port (`--env torch`,
-torch_env.py) was removed 2026-07-25 once the kernel superseded it
-(chart tensorization moved to cuda_env.py). Batched training
-reaches ~4.5k steps/s (transformer, 8 CPU cores, --epochs 1); the
-ceiling is the torch update, not the env (SPEC §Batched rollouts).
+serial trainer were deleted (surface-area reduction). The tensor-op
+port (`--env torch`, torch_env.py + torch_dynamics.py) — removed
+2026-07-25 in the kinematic era — was REBUILT at v10 P4 as a literal
+batched mirror of the dynamics engine (f64 CPU bitwise vs Rust, the
+parity gate; f32 GPU for training). It is Python-dispatch bound
+(~1 s/vector tick regardless of width — full-body dynamics is ~100k
+tensor ops/tick), so the env, not the update, is the v10 throughput
+wall until the P5 CUDA kernel lands.
 
 The Rust sim core (63x faster env.step; training 1.3-1.6x on 8 serial
 envs) builds once with:
