@@ -129,7 +129,7 @@ class _Group:
         self.obs_t = torch.empty((n, OBS_DIM), dtype=torch.float32,
                                  pin_memory=pin)
         self.obs_buf = self.obs_t.numpy()
-        self.act_t = torch.empty((n, 12), dtype=torch.int64,  # 12 heads
+        self.act_t = torch.empty((n, 14), dtype=torch.int64,  # 14 heads (v9)
                                  pin_memory=pin)
         self.act_np = self.act_t.numpy()
         self.slots = [None] * n
