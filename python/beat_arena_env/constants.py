@@ -125,11 +125,12 @@ ELBOW_HI = math.radians(150.0)          # flexion 0..150 deg
 ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
 ROLL_HI = (math.radians(180.0), 0.0)
 BEND_LIM = math.radians(95.0)
-# env v9: radial/ulnar deviation range, symmetric both hands (real
-# wrists do ~20 deg radial / 45 ulnar; rounded up per the v8
-# effective-motion stance — the roll DOF spins the anatomical labels
-# anyway, so a symmetric cone is the honest model)
-DEV_LIM = math.radians(45.0)
+# env v9 deviation range (user-specified 2026-07-30, in RIGHT-hand
+# terms): [-15 deg, +30 deg]; left mirrored [-30, +15] — deviation is
+# antisymmetric under the body-midplane mirror (like yaw/twist/roll).
+DEV_LIM = math.radians(30.0)            # obs normalizer only
+DEV_LO = (math.radians(-30.0), math.radians(-15.0))     # (left, right)
+DEV_HI = (math.radians(15.0), math.radians(30.0))
 
 
 def joint_limits(hand):
@@ -137,7 +138,7 @@ def joint_limits(hand):
     return [(PITCH_LO, PITCH_HI), (YAW_LO[hand], YAW_HI[hand]),
             (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
             (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM),
-            (-DEV_LIM, DEV_LIM)]
+            (DEV_LO[hand], DEV_HI[hand])]
 
 
 # --- look-at-player (env v7.6) -----------------------------------------------

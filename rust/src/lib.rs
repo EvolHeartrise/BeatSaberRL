@@ -111,10 +111,12 @@ const ROLL_LO: [f64; 2] = [0.0, -3.141592653589793]; // L, R
 const ROLL_HI: [f64; 2] = [3.141592653589793, 0.0];
 const BEND_LIM: f64 = 1.6580627893946132; // 95 deg from forward
 // env v9 (2026-07-30, user-caught gap): wrist radial/ulnar DEVIATION —
-// the orthogonal bending axis roll+bend lacked. Symmetric +/-45 deg
-// both hands (real ~20 radial / 45 ulnar; the roll DOF spins the
-// anatomical labels, and v8's effective-motion stance rounds up).
-const DEV_LIM: f64 = 0.7853981633974483; // 45 deg
+// the orthogonal bending axis roll+bend lacked. Range user-specified
+// in RIGHT-hand terms [-15, +30] deg; left mirrored (deviation is
+// antisymmetric under the body-midplane mirror, like yaw/twist/roll).
+const DEV_LIM: f64 = 0.5235987755982988; // 30 deg — obs normalizer only
+const DEV_LO: [f64; 2] = [-0.5235987755982988, -0.2617993877991494]; // L, R
+const DEV_HI: [f64; 2] = [0.2617993877991494, 0.5235987755982988];
 const N_JOINTS: usize = 7; // pitch, yaw, twist, elbow, roll, bend, dev
 const JOINT_ALPHA: [f64; N_JOINTS] = [ALPHA_ARM, ALPHA_ARM, ALPHA_ARM,
     ALPHA_ARM, ALPHA_WRIST, ALPHA_WRIST, ALPHA_WRIST];
@@ -129,7 +131,7 @@ fn joint_limits(hand: usize) -> [(f64, f64); N_JOINTS] {
         (0.0, ELBOW_HI),
         (ROLL_LO[hand], ROLL_HI[hand]),
         (-BEND_LIM, BEND_LIM),
-        (-DEV_LIM, DEV_LIM),
+        (DEV_LO[hand], DEV_HI[hand]),
     ]
 }
 const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples

@@ -86,8 +86,13 @@ constexpr double ELBOW_HI = 2.6179938779914944;
 __device__ constexpr double ROLL_LO[2] = {0.0, -3.141592653589793};
 __device__ constexpr double ROLL_HI[2] = {3.141592653589793, 0.0};
 constexpr double BEND_LIM = 1.6580627893946132;
-// env v9: wrist radial/ulnar deviation, symmetric +/-45 deg
-constexpr double DEV_LIM = 0.7853981633974483;
+// env v9 deviation: RIGHT [-15, +30] deg (user-specified), left
+// mirrored (antisymmetric under the midplane mirror, like roll)
+constexpr double DEV_LIM = 0.5235987755982988;  // obs normalizer only
+__device__ constexpr double DEV_LO[2] = {-0.5235987755982988,
+                                         -0.2617993877991494};  // L, R
+__device__ constexpr double DEV_HI[2] = {0.2617993877991494,
+                                         0.5235987755982988};
 // env v8 (2026-07-30): alpha AND omega doubled (was 80/8, 200/20) —
 // effective in-game hand motion, not biomechanics; gears restore
 // fine control (mirror of lib.rs / constants.py)
@@ -184,7 +189,7 @@ __device__ __forceinline__ void joint_lim(int h, int j, T& lo, T& hi) {
     case 3: lo = T(0); hi = T(ELBOW_HI); break;
     case 4: lo = T(ROLL_LO[h]); hi = T(ROLL_HI[h]); break;
     case 5: lo = T(-BEND_LIM); hi = T(BEND_LIM); break;
-    default: lo = T(-DEV_LIM); hi = T(DEV_LIM); break;  // v9 dev
+    default: lo = T(DEV_LO[h]); hi = T(DEV_HI[h]); break;  // v9 dev
   }
 }
 

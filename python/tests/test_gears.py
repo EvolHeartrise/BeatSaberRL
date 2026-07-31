@@ -213,12 +213,20 @@ def test_deviation_joint():
     assert np.allclose(b0, (0.0, 0.0, 1.0), atol=1e-12)
     assert abs(np.dot(b0, bd) - np.cos(0.3)) < 1e-9  # full-rate tilt
 
-    # sim: dev action moves the joint; limits clamp at +/-45 deg
-    sim = _sim(3)
-    act = list(COAST)
-    act[13] = 1                             # right dev, +full
-    for _ in range(30):
-        obs, _, _, _ = sim.step(act)
-    q_dev = float(np.asarray(obs)[1 * SABER_FEAT + 7])  # dev_n obs
-    assert q_dev == pytest.approx(1.0, abs=1e-9)        # at +DEV_LIM
-    assert DEV_LIM == pytest.approx(np.radians(45.0))
+    # sim: dev action moves the joint; ASYMMETRIC limits clamp (right
+    # [-15, +30] user-specified; left mirrored [-30, +15]; normalizer 30)
+    assert DEV_LIM == pytest.approx(np.radians(30.0))
+
+    def run_to_clamp(head, aid):
+        sim = _sim(3)
+        act = list(COAST)
+        act[head] = aid
+        for _ in range(30):
+            obs, _, _, _ = sim.step(act)
+        hand = head // 7
+        return float(np.asarray(obs)[hand * SABER_FEAT + 7])
+
+    assert run_to_clamp(13, 1) == pytest.approx(1.0, abs=1e-9)   # R +30
+    assert run_to_clamp(13, 2) == pytest.approx(-0.5, abs=1e-9)  # R -15
+    assert run_to_clamp(6, 1) == pytest.approx(0.5, abs=1e-9)    # L +15
+    assert run_to_clamp(6, 2) == pytest.approx(-1.0, abs=1e-9)   # L -30
