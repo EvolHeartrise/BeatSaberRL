@@ -16,7 +16,7 @@ export const pb = $state({
 // (works with or without a replay loaded; omegas are zero).
 export const pose = $state({
   on: false,
-  q: [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], // per hand, joint order
+  q: [[0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0]], // per hand, 7 joints (v9)
   ref: null, // static reference note {col, row} at z = 0, or null (off)
 });
 
@@ -31,7 +31,7 @@ export function setPoseJoint(hand, j, rad) {
 }
 
 export function resetPoseHand(hand) {
-  pose.q[hand] = [0, 0, 0, 0, 0, 0];
+  pose.q[hand] = [0, 0, 0, 0, 0, 0, 0];
 }
 
 export function mirrorPoseLR() {
