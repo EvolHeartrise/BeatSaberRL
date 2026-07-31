@@ -4,20 +4,32 @@
 //! (step.rs). f64 throughout; no external math deps; expression trees
 //! written for literal torch/CUDA mirroring (P4/P5).
 //!
-//! P1 scope: unconstrained dynamics only. The PGS constraint stage
-//! (SPEC-v10 §3 steps 7–9) is P2 — step.rs leaves a marked seam.
+//! P2 adds §2 collision (collide.rs: 12 colliders, 55-pair table,
+//! capsule narrow phase) and §3 steps 7–9 (solver.rs: foot welds +
+//! contact normal rows, PGS-12) plugged into step.rs's constraint seam
+//! — `solver::substep_constrained` is the full v10 substep.
 
 pub mod algo;
+pub mod collide;
 pub mod fk;
 pub mod model;
+pub mod solver;
 pub mod step;
 
 #[cfg(test)]
+mod testjson;
+#[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod tests_collide;
+#[cfg(test)]
+mod tests_constraints;
 #[cfg(test)]
 mod tests_dyn;
 #[cfg(test)]
 mod tests_fk;
+#[cfg(test)]
+mod tests_oracle;
 #[cfg(test)]
 mod tests_pendulum;
 

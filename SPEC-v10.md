@@ -305,18 +305,37 @@ happening in exactly this order:**
 5. **Dense Cholesky** `M = L·Lᵀ` (lower, no pivoting).
 6. Unconstrained velocity `v* = v + h·M⁻¹(τ − C)`.
 7. **Collision detection** over the 55-pair table (margin 0.01).
-8. **Constraint solve — PGS, exactly 12 iterations, fixed row order**:
+8. **Constraint solve (REVISED at P2 — Divergences §15, §16): exactly
+   12 iterations, fixed order, no warm starting** (λ = 0 each substep —
+   determinism/parity simplicity). Row set:
    - rows 0–5: foot_l weld (3 linear, then 3 angular),
    - rows 6–11: foot_r weld (same layout),
-   - then one normal row per ACTIVE contact, in pair-id order (§2).
-   Bilateral weld rows unclamped; contact rows projected to λ ≥ 0. Effective
-   masses via `J M⁻¹ Jᵀ` (Cholesky solves). **No warm starting** (λ = 0
-   each substep — determinism/parity simplicity).
-   **Baumgarte** bias velocities on the right-hand side:
-   - welds: `v_bias = −(β_weld/h)·C_pose`, β_weld = **0.2** (position error
+   - one normal row per ACTIVE contact, in pair-id order (§2),
+   - one unilateral joint-limit row per joint whose NEARER stop is
+     within `h·ω_cap[j]` of `q_j`, joint order 0..28 (ties → lower
+     stop; row +e_j at the lower stop / −e_j at the upper).
+   Each of the 12 iterations, in order:
+   (a) the 12 bilateral weld rows solved EXACTLY as a dense block —
+       `Δλ_w = A_ww⁻¹(b_w − J_w·v)` with `A_ww = J_w M⁻¹ J_wᵀ`
+       no-pivot-Cholesky-factored once per substep;
+   (b) contact rows then limit rows, projected Gauss-Seidel to λ ≥ 0,
+       in row order;
+   (c) ω-cap pass, joint order 0..28: hard clamp of `q̇_j` to ±ω_cap
+       via momentum-consistent impulses (exact assignment).
+   `M⁻¹Jᵀ` columns and effective masses via Cholesky solves of THIS
+   substep's factor. Limit-row and ω-cap impulse directions are
+   projected into the WELD NULL SPACE:
+   `c_j = M⁻¹e_j − M⁻¹J_wᵀ·A_ww⁻¹·(J_w M⁻¹ e_j)` (so `J_w·c_j = 0` —
+   limit/cap impulses can never break the welds); a direction whose
+   composite mobility ≤ 1e-10 × its plain `(M⁻¹)_jj` is immobile given
+   the welds and its row is inert.
+   **Right-hand sides** (`J·v = b` welds; `J·v ≥ b`, λ ≥ 0 unilaterals):
+   - welds: `b = −(β_weld/h)·C_pose`, β_weld = **0.2** (position error
      3-vector; orientation error via the log map, 3-vector),
-   - contacts: `v_bias = −(β_c/h)·max(penetration − slop, 0)`, β_c =
-     **0.2**, slop 0.005.
+   - contacts: `b = −gap/h` while gap ≥ 0 (speculative activation
+     inside the margin — Divergences §16), else
+     `(β_c/h)·max(penetration − slop, 0)`, β_c = **0.2**, slop 0.005,
+   - limits: same shape with slop 0 and β_weld pushback.
 9. `v ← v* + M⁻¹Jᵀλ`.
 10. **Semi-implicit Euler positions**: `q₂₉ ← q₂₉ + h·q̇₂₉`; root position
     `p ← p + h·v_lin`; root quaternion via exp map of the WORLD angular
@@ -475,18 +494,37 @@ is green plus all previous gates stay green. f64 parity = EXACT equality
   linear + angular relative drift ≤ 2e-2 over 2 s of tumbling at
   h = 1/240 (measured 1.32e-2), halving with h (measured ratio 2.20).
 
-**P2 — constraints + contacts** (`python/tests/test_v10_contacts.py`):
-- Capsule–capsule distance vs brute-force sampling ≤ 1e-9 on 10k random
-  pairs, including parallel and degenerate (sphere) cases.
-- Welded stance + per-substep gravity-compensation torque
-  τ = RNEA(q_ref, 0, 0): 10 s, max joint drift ≤ 1e-6 rad, weld violation
-  ≤ 1e-8 m.
-- Weld under load: scripted two-arm swinging, 10 s: weld pose violation
-  ≤ 1e-4 m / 1e-4 rad (Baumgarte holds).
-- Non-penetration: 30 s random-gear rollout: max contact penetration
-  ≤ 0.01 m.
-- Baumgarte energy: contact-rich scripted rollout: E(t) − W_applied(t)
-  never rises by > 1 J over any 1 s window.
+**P2 — constraints + contacts** (RE-SCOPED at P2 — Divergences §17:
+gates live in the Rust crate, `rust/src/dynamics/tests_{collide,
+constraints,oracle}.rs`, until P3 exposes the engine to Python; several
+bounds re-read against measured physics, reasoning in §17):
+- Capsule–capsule distance on 10k random pairs incl. parallel and
+  degenerate (sphere) cases: brute-force-sampling upper bound + convex
+  box-KKT certificate ≤ 1e-9 (measured 8.2e-16).
+- Welded stance + constant full 35-DoF RNEA(q_ref, 0, 0) compensation
+  incl. the root wrench: **2 s**, max joint drift ≤ 1e-6 rad (measured
+  3.1e-13), weld violation ≤ 1e-8 m (measured 6.2e-15). Muscle-tone
+  stance: vertical weld force = body weight ±5 % (measured 739.45 N vs
+  735.95).
+- Weld under load: scripted two-arm swinging ON THE MUSCLE-TONE STANCE,
+  10 s: weld pose violation ≤ 1e-4 m / 1e-4 rad (measured 1.2e-6 m /
+  1.7e-6 rad).
+- Weld under torture: 10 s per-tick random FULL-gear torques, all 29:
+  weld violation < 1e-2 m / 5e-2 rad at every substep (measured 7.5e-3
+  / 1.8e-2 — the β = 0.2 Baumgarte floor, §17), no NaN, root within the
+  kinematic envelope.
+- Non-penetration: oracle contact-probe presses: max penetration
+  < 2×slop = 0.01 m (measured 0.0066 / 0.0081 — equal to MuJoCo's),
+  λ ≥ 0, complementarity ≤ 1e-3, zero impulse once separated.
+- Baumgarte energy: contact-rich scripted rollout: per-substep
+  `ΔE − W_applied ≤ Σ max(λ·b, 0)` (the Baumgarte work bound; max
+  injection measured 1.6e-2 J), and E(t) − W_applied(t) never rises by
+  > 1 J over any 1 s window (measured −0.037 J).
+- Oracle trajectory bands (all 5 refdata scenarios, stabilizer kd
+  implicit — §17): max |Δq| ≤ 0.05 rad smooth / ≤ 0.15 rad random
+  (measured 0.0068 / 0.0165 / 0.0452 / 0.0200 / 0.0484).
+- Determinism: contact-rich trajectory + impulse stream bitwise
+  identical across runs.
 
 **P2b — MuJoCo oracle** (`python/tests/test_v10_oracle.py`, skipped when
 mujoco is absent; `mjcf/body_v10.xml`):
@@ -612,3 +650,82 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
     the welded v10 env cannot produce that input, and the P1 stability
     test uses per-tick random full gears instead (10 s clean, root ω
     settling ~15–25 rad/s).
+15. **P2 solver revision — weld block + limit/cap rows folded into the
+    main solve (step 8 as now written; solver.rs)**. Three measured
+    failures of the P0 "pure per-row PGS-12 + separate step-11 clamps"
+    design forced it, each kept deterministic and mirrorable:
+    a. **Welds as an exact 12×12 block, not GS rows.** The two feet's
+       vertical rows are near-parallel through the root at the
+       straight-knee stance; 12 GS sweeps leave a 0.14 m/s weld-row
+       residual → ~3 mm steady weld violation (blows the 1e-4 load
+       gate by 40×). The block solve (`A_ww` no-pivot Cholesky, 12×12,
+       once per substep) is machine-tight (measured 1.1e-16 post-solve
+       residual) at negligible cost.
+    b. **Joint-limit rows join the solve** (the §3.11/Divergence-§13
+       anticipation "may fold into the main PGS", exercised). The
+       neutral stance parks knee, elbow and wrist-roll exactly ON a
+       0-stop; with limits handled only post-hoc (step 11), the weld
+       solve assigns flexion rate and the position clamp teleports q
+       back — a measured 5.8e-4 m of foot error injected per substep
+       (3.7 mm steady violation). Speculative activation: a row exists
+       whenever the nearer stop is within `h·ω_cap` (the farthest the
+       capped joint can travel in one substep).
+    c. **Limit/ω-cap directions projected into the weld null space.**
+       Even in the solve, plain GS between a pinned joint and the weld
+       block does not converge in 12 iterations (near-parallel
+       directions in the M metric — knee motion IS foot motion on a
+       straight leg; measured up to 38 mm foot drift under full random
+       gears). With `c_j = M⁻¹e_j − M⁻¹J_wᵀA_ww⁻¹(J_w M⁻¹e_j)` the
+       limit/cap impulses cannot break the welds by construction, and
+       the physical interpretation is exact: the stop's reaction is
+       transmitted to the ground through the welded feet.
+    **Step 11 remains, verbatim, as the outer guarantee** (its
+    impulses are near-null in ordinary motion now). Final normative
+    substep order: steps 1–6; step 7 narrow phase (pair-id order);
+    step 8 = 12 × [weld block → contacts (pair-id order) → limit rows
+    (joint order) → ω-cap pass (joint order)]; step 9 implicit in the
+    incremental impulses; step 10 integrate; step 11 clamp passes
+    (joint order 0..28). Parity mirrors replicate this literally.
+16. **Contact RHS completed with speculative activation (P2)**: the P0
+    text only defined the Baumgarte push-out term. Activating a hard
+    `J·v ≥ 0` row at any gap < margin would make the 1 cm margin a
+    standoff force field; instead an open gap allows approach at
+    exactly `gap/h` (Catto-style speculative contact: the pair may
+    close the remaining gap this substep, no more). Penetration then
+    stays bounded near the slop; measured press penetrations equal
+    MuJoCo's (0.0066 / 0.0081 m vs oracle's 0.0066 / 0.0081).
+17. **P2 gate re-readings (like §4/§14; measured numbers in §7 P2)**:
+    a. **Static stance horizon 10 s → 2 s** (the oracle protocol's
+       horizon). The welded stance under CONSTANT full-RNEA
+       compensation is a knife-edge equilibrium (inverted-pendulum
+       modes under constant torque); rounding-noise seeds (~1e-17 —
+       the weld targets' decimal literals vs the FK's binary sums)
+       e-fold every ~0.35 s, so a 10 s horizon amplifies any seed by
+       e²⁸ regardless of solver quality. MuJoCo's b2 check uses 2 s
+       for the same reason. Measured drift at 2 s: 3.1e-13 rad.
+    b. **Weld-under-load scenario runs on the muscle-tone body**: the
+       raw open-loop body falls over in ~1 s (README: chaotically
+       unintegrable without the stabilizer), after which "weld
+       violation under arm swinging" measures a collapsing tangle, not
+       the weld. Gate value kept at 1e-4 (passes at 1.2e-6).
+    c. **Random-full-gear weld drift 2 mm → 10 mm / 0.05 rad**: with
+       leg joints riding their 16 rad/s caps, the velocity-level
+       constraint's per-substep linearization error is O(h²·q̇²·L)
+       ≈ 1.5 mm and the Baumgarte steady state is that /β. Measured
+       7.5 mm at β = 0.2 and 2.5 mm at β = 1 (β-sensitivity confirms
+       the floor); β stays at the normative 0.2, the gate moves to the
+       floor. Orientation measured 1.8e-2 rad (the original 0.02
+       bound holds).
+    d. **Oracle-band harness applies the stabilizer kd IMPLICITLY**
+       (MuJoCo-Euler damping semantics: `v⁺ = v + h(M+h·diag(kd))⁻¹
+       (τ − C − kd∘q̇)`; harness-only path, the env's own pipeline is
+       untouched). Explicit application is unstable at h = 1/240: at
+       the straight-arm pose shoulder-twist/wrist-roll are collinear,
+       `(M⁻¹)_jj ≈ 1/armature`, and `h·kd·(M⁻¹)_jj ≫ 2` — the wrists
+       rattle at the ±40 rad/s cap (measured; the cap-less MuJoCo
+       equivalent NaNs, which is exactly why MuJoCo integrates joint
+       damping implicitly and why the README's stabilizer exists).
+       With matched semantics all 5 bands pass at the ORIGINAL gates
+       (no widening): 0.0068–0.0484 rad.
+    e. P2 gates are cargo tests in the Rust crate until P3 exposes the
+       engine to Python (`test_v10_contacts.py` then wraps them).
