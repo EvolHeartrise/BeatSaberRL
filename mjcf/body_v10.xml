@@ -1,0 +1,340 @@
+<!--
+  body_v10.xml : MuJoCo ORACLE TWIN of SPEC-v10.md (env v10, frozen at P0
+  2026-07-31). Same tree, joint axes, limits, explicit masses/inertias
+  (inertiafromgeom=false - every <inertial> is the spec literal), capsule
+  radii, motor tau_max (gear, ctrl in [-1,1]), feet welded to world,
+  timestep 1/240, gravity 9.81 on -y (world is y-up; floor y=0; hit plane
+  z=0). Contact roster reproduced with explicit <pair> entries only (all
+  geoms contype=0 conaffinity=0): the 55 live pairs of SPEC-v10 par.2 in
+  pair-id order; excluded pairs are simply absent.
+
+  Caveats for the oracle harness (tolerance-band tests, never parity):
+  - MuJoCo has NO hard omega clamps: compare against our sim with clamps
+    disabled, or on low-speed trajectories (SPEC-v10 par.7 P2b).
+  - MuJoCo's constraint solver is soft/Newton, not our PGS-12+Baumgarte:
+    trajectories match in bands, not bitwise.
+  - qpos ordering follows MJCF declaration (tree) order, NOT the actuated
+    29-order: shoulders are (yaw, pitch, twist) and wrists (roll, dev,
+    bend) in qpos; the harness must map. Actuator/ctrl order below IS the
+    actuated 29-order of SPEC-v10 par.1.4.
+  - Stacked same-body joints are declared OUTER to INNER assuming MuJoCo
+    composes them in declaration order; the P2b FK cross-check vs v9 fk()
+    runs FIRST and catches a reversed convention.
+  - Controller mass (0.15 kg) is folded into each hand <inertial>
+    (0.61 kg total at the fist center); blades are massless ghost geoms
+    with no contacts.
+-->
+<mujoco model="beat_arena_body_v10">
+  <compiler angle="radian" inertiafromgeom="false"/>
+  <option timestep="0.004166666666666667" gravity="0 -9.81 0"
+          integrator="Euler"/>
+
+  <default>
+    <joint limited="true"/>
+    <geom contype="0" conaffinity="0"/>
+    <motor ctrllimited="true" ctrlrange="-1 1"/>
+  </default>
+
+  <worldbody>
+    <geom name="g_floor" type="plane" size="5 5 0.1" pos="0 0 0"
+          zaxis="0 1 0" rgba="0.3 0.3 0.35 1"/>
+
+    <body name="pelvis" pos="0 0.94 -0.65">
+      <freejoint name="root"/>
+      <inertial pos="0 0 0" mass="8.4"
+                diaginertia="0.038640 0.101640 0.101640"/>
+      <geom name="g_pelvis" type="capsule" fromto="-0.10 0 0  0.10 0 0"
+            size="0.10" rgba="0.5 0.5 0.6 1"/>
+
+      <body name="chest" pos="0 0.10 0">
+        <joint name="spine_pitch" type="hinge" axis="1 0 0"
+               range="-0.3490658503988659 0.7853981633974483"
+               damping="4.3140"/>
+        <joint name="spine_yaw" type="hinge" axis="0 1 0"
+               range="-0.6981317007977318 0.6981317007977318"
+               damping="1.1998"/>
+        <joint name="spine_roll" type="hinge" axis="0 0 1"
+               range="-0.5235987755982988 0.5235987755982988"
+               damping="3.6471"/>
+        <inertial pos="0 0.215 0" mass="24.2"
+                  diaginertia="0.957507 0.254964 0.957507"/>
+        <geom name="g_torso" type="capsule" fromto="0 0 0  0 0.43 0"
+              size="0.15" rgba="0.5 0.5 0.6 1"/>
+
+        <!-- head: WELDED (no joint) - neck fixed in v10 -->
+        <body name="head" pos="0 0.66 0">
+          <inertial pos="0 0 0" mass="5.2"
+                    diaginertia="0.016848 0.016848 0.016848"/>
+          <geom name="g_head" type="sphere" size="0.09"
+                rgba="0.6 0.55 0.5 1"/>
+        </body>
+
+        <!-- left arm: shoulder joints outer->inner yaw, pitch, twist
+             => R_y(yaw) R_x(-pitch) R_z(twist) = v9 arm frame M -->
+        <body name="uarm_l" pos="-0.20 0.43 0">
+          <joint name="l_arm_yaw" type="hinge" axis="0 1 0"
+                 range="-1.7453292519943295 0.7853981633974483"
+                 damping="0.42689"/>
+          <joint name="l_arm_pitch" type="hinge" axis="-1 0 0"
+                 range="-1.5707963267948966 1.1344640137963142"
+                 damping="0.42689"/>
+          <joint name="l_arm_twist" type="hinge" axis="0 0 1"
+                 range="-1.5707963267948966 1.2217304763960306"
+                 damping="0.07292"/>
+          <inertial pos="0 0 0.175" mass="2.0"
+                    diaginertia="0.029222 0.029222 0.001966"/>
+          <geom name="g_uarm_l" type="capsule" fromto="0 0 0  0 0 0.35"
+                size="0.045" rgba="0.8 0.42 0.46 1"/>
+          <body name="farm_l" pos="0 0 0.35">
+            <joint name="l_elbow" type="hinge" axis="-1 0 0"
+                   range="0 2.6179938779914944" damping="0.07174"/>
+            <inertial pos="0 0 0.15" mass="1.2"
+                      diaginertia="0.013056 0.013056 0.000931"/>
+            <geom name="g_farm_l" type="capsule" fromto="0 0 0  0 0 0.30"
+                  size="0.04" rgba="0.8 0.42 0.46 1"/>
+            <!-- wrist joints outer->inner roll, dev, bend
+                 => R_z(roll) R_y(dev) R_x(-bend); blade = hand +z -->
+            <body name="hand_l" pos="0 0 0.30">
+              <joint name="l_wrist_roll" type="hinge" axis="0 0 1"
+                     range="0 3.141592653589793" damping="0.00159"/>
+              <joint name="l_wrist_dev" type="hinge" axis="0 1 0"
+                     range="-0.5235987755982988 0.2617993877991494"
+                     damping="0.00159"/>
+              <joint name="l_wrist_bend" type="hinge" axis="-1 0 0"
+                     range="-1.6580627893946132 1.6580627893946132"
+                     damping="0.00159"/>
+              <inertial pos="0 0 0.06" mass="0.61"
+                        diaginertia="0.000460 0.000460 0.000460"/>
+              <geom name="g_fist_l" type="sphere" pos="0 0 0.06"
+                    size="0.05" rgba="0.8 0.42 0.46 1"/>
+              <geom name="g_blade_l" type="capsule"
+                    fromto="0 0 0  0 0 1.0" size="0.02"
+                    rgba="0.9 0.3 0.3 0.3"/>
+            </body>
+          </body>
+        </body>
+
+        <!-- right arm (limits mirrored per SPEC-v10 par.1.4) -->
+        <body name="uarm_r" pos="0.20 0.43 0">
+          <joint name="r_arm_yaw" type="hinge" axis="0 1 0"
+                 range="-0.7853981633974483 1.7453292519943295"
+                 damping="0.42689"/>
+          <joint name="r_arm_pitch" type="hinge" axis="-1 0 0"
+                 range="-1.5707963267948966 1.1344640137963142"
+                 damping="0.42689"/>
+          <joint name="r_arm_twist" type="hinge" axis="0 0 1"
+                 range="-1.2217304763960306 1.5707963267948966"
+                 damping="0.07292"/>
+          <inertial pos="0 0 0.175" mass="2.0"
+                    diaginertia="0.029222 0.029222 0.001966"/>
+          <geom name="g_uarm_r" type="capsule" fromto="0 0 0  0 0 0.35"
+                size="0.045" rgba="0.38 0.62 0.85 1"/>
+          <body name="farm_r" pos="0 0 0.35">
+            <joint name="r_elbow" type="hinge" axis="-1 0 0"
+                   range="0 2.6179938779914944" damping="0.07174"/>
+            <inertial pos="0 0 0.15" mass="1.2"
+                      diaginertia="0.013056 0.013056 0.000931"/>
+            <geom name="g_farm_r" type="capsule" fromto="0 0 0  0 0 0.30"
+                  size="0.04" rgba="0.38 0.62 0.85 1"/>
+            <body name="hand_r" pos="0 0 0.30">
+              <joint name="r_wrist_roll" type="hinge" axis="0 0 1"
+                     range="-3.141592653589793 0" damping="0.00159"/>
+              <joint name="r_wrist_dev" type="hinge" axis="0 1 0"
+                     range="-0.2617993877991494 0.5235987755982988"
+                     damping="0.00159"/>
+              <joint name="r_wrist_bend" type="hinge" axis="-1 0 0"
+                     range="-1.6580627893946132 1.6580627893946132"
+                     damping="0.00159"/>
+              <inertial pos="0 0 0.06" mass="0.61"
+                        diaginertia="0.000460 0.000460 0.000460"/>
+              <geom name="g_fist_r" type="sphere" pos="0 0 0.06"
+                    size="0.05" rgba="0.38 0.62 0.85 1"/>
+              <geom name="g_blade_r" type="capsule"
+                    fromto="0 0 0  0 0 1.0" size="0.02"
+                    rgba="0.3 0.5 0.9 0.3"/>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <!-- left leg: hip joints outer->inner pitch, yaw, roll
+           => R_x(-pitch) R_y(yaw) R_z(roll); thigh along local -y -->
+      <body name="thigh_l" pos="-0.10 0 0">
+        <joint name="l_hip_pitch" type="hinge" axis="-1 0 0"
+               range="-0.3490658503988659 2.0943951023931953"
+               damping="1.8175"/>
+        <joint name="l_hip_yaw" type="hinge" axis="0 1 0"
+               range="-0.7853981633974483 0.6981317007977318"
+               damping="0.28120"/>
+        <joint name="l_hip_roll" type="hinge" axis="0 0 1"
+               range="-0.7853981633974483 0.5235987755982988"
+               damping="1.8133"/>
+        <inertial pos="0 -0.22 0" mass="10.6"
+                  diaginertia="0.250198 0.018493 0.250198"/>
+        <geom name="g_thigh_l" type="capsule" fromto="0 0 0  0 -0.44 0"
+              size="0.06" rgba="0.5 0.5 0.6 1"/>
+        <body name="shank_l" pos="0 -0.44 0">
+          <joint name="l_knee" type="hinge" axis="1 0 0"
+                 range="0 2.6179938779914944" damping="0.26294"/>
+          <inertial pos="0 -0.215 0" mass="3.2"
+                    diaginertia="0.065964 0.003161 0.065964"/>
+          <geom name="g_shank_l" type="capsule" fromto="0 0 0  0 -0.43 0"
+                size="0.045" rgba="0.5 0.5 0.6 1"/>
+          <body name="foot_l" pos="0 -0.43 0">
+            <joint name="l_ankle_pitch" type="hinge" axis="-1 0 0"
+                   range="-0.8726646259971648 0.3490658503988659"
+                   damping="0.00561"/>
+            <joint name="l_ankle_roll" type="hinge" axis="0 0 1"
+                   range="-0.3490658503988659 0.3490658503988659"
+                   damping="0.00138"/>
+            <inertial pos="0 -0.035 0.05" mass="1.0"
+                      diaginertia="0.005617 0.005883 0.001083"/>
+            <geom name="g_foot_l" type="box" pos="0 -0.035 0.05"
+                  size="0.045 0.035 0.125" rgba="0.4 0.4 0.45 1"/>
+          </body>
+        </body>
+      </body>
+
+      <!-- right leg (hip yaw/roll limits mirrored) -->
+      <body name="thigh_r" pos="0.10 0 0">
+        <joint name="r_hip_pitch" type="hinge" axis="-1 0 0"
+               range="-0.3490658503988659 2.0943951023931953"
+               damping="1.8175"/>
+        <joint name="r_hip_yaw" type="hinge" axis="0 1 0"
+               range="-0.6981317007977318 0.7853981633974483"
+               damping="0.28120"/>
+        <joint name="r_hip_roll" type="hinge" axis="0 0 1"
+               range="-0.5235987755982988 0.7853981633974483"
+               damping="1.8133"/>
+        <inertial pos="0 -0.22 0" mass="10.6"
+                  diaginertia="0.250198 0.018493 0.250198"/>
+        <geom name="g_thigh_r" type="capsule" fromto="0 0 0  0 -0.44 0"
+              size="0.06" rgba="0.5 0.5 0.6 1"/>
+        <body name="shank_r" pos="0 -0.44 0">
+          <joint name="r_knee" type="hinge" axis="1 0 0"
+                 range="0 2.6179938779914944" damping="0.26294"/>
+          <inertial pos="0 -0.215 0" mass="3.2"
+                    diaginertia="0.065964 0.003161 0.065964"/>
+          <geom name="g_shank_r" type="capsule" fromto="0 0 0  0 -0.43 0"
+                size="0.045" rgba="0.5 0.5 0.6 1"/>
+          <body name="foot_r" pos="0 -0.43 0">
+            <joint name="r_ankle_pitch" type="hinge" axis="-1 0 0"
+                   range="-0.8726646259971648 0.3490658503988659"
+                   damping="0.00561"/>
+            <joint name="r_ankle_roll" type="hinge" axis="0 0 1"
+                   range="-0.3490658503988659 0.3490658503988659"
+                   damping="0.00138"/>
+            <inertial pos="0 -0.035 0.05" mass="1.0"
+                      diaginertia="0.005617 0.005883 0.001083"/>
+            <geom name="g_foot_r" type="box" pos="0 -0.035 0.05"
+                  size="0.045 0.035 0.125" rgba="0.4 0.4 0.45 1"/>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- feet welded to world at the qpos0 (reference) pose: MuJoCo's
+       default all-zero relpose means "use the qpos0 relative pose" -->
+  <equality>
+    <weld name="weld_foot_l" body1="foot_l"/>
+    <weld name="weld_foot_r" body1="foot_r"/>
+  </equality>
+
+  <!-- the 55 live pairs of SPEC-v10 par.2, in pair-id order (0-54).
+       collider ids: 0 torso, 1 head, 2 uarm_l, 3 uarm_r, 4 farm_l,
+       5 farm_r, 6 fist_l, 7 fist_r, 8 thigh_l, 9 thigh_r, 10 shank_l,
+       11 shank_r. Frictionless (condim 1), restitution 0 (default),
+       margin 0.01 / gap 0.005 approximates our activation margin+slop. -->
+  <contact>
+    <pair geom1="g_torso" geom2="g_farm_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_torso" geom2="g_farm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_torso" geom2="g_fist_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_torso" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_torso" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_torso" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_uarm_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_uarm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_farm_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_farm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_fist_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_head" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_uarm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_farm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_fist_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_l" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_farm_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_fist_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_uarm_r" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_farm_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_l" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_r" geom2="g_fist_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_r" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_r" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_r" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_farm_r" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_l" geom2="g_fist_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_l" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_l" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_l" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_l" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_r" geom2="g_thigh_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_r" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_r" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_fist_r" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_thigh_l" geom2="g_thigh_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_thigh_l" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_thigh_r" geom2="g_shank_l" condim="1" margin="0.01" gap="0.005"/>
+    <pair geom1="g_shank_l" geom2="g_shank_r" condim="1" margin="0.01" gap="0.005"/>
+  </contact>
+
+  <!-- actuators in the ACTUATED 29-order of SPEC-v10 par.1.4:
+       gear = tau_max, ctrl = signed gear fraction in [-1, 1] -->
+  <actuator>
+    <motor name="m_spine_pitch" joint="spine_pitch" gear="800.00"/>
+    <motor name="m_spine_yaw" joint="spine_yaw" gear="319.93"/>
+    <motor name="m_spine_roll" joint="spine_roll" gear="500.00"/>
+    <motor name="m_l_arm_pitch" joint="l_arm_pitch" gear="113.84"/>
+    <motor name="m_l_arm_yaw" joint="l_arm_yaw" gear="113.84"/>
+    <motor name="m_l_arm_twist" joint="l_arm_twist" gear="19.45"/>
+    <motor name="m_l_elbow" joint="l_elbow" gear="19.13"/>
+    <motor name="m_l_wrist_roll" joint="l_wrist_roll" gear="1.06"/>
+    <motor name="m_l_wrist_bend" joint="l_wrist_bend" gear="1.06"/>
+    <motor name="m_l_wrist_dev" joint="l_wrist_dev" gear="1.06"/>
+    <motor name="m_r_arm_pitch" joint="r_arm_pitch" gear="113.84"/>
+    <motor name="m_r_arm_yaw" joint="r_arm_yaw" gear="113.84"/>
+    <motor name="m_r_arm_twist" joint="r_arm_twist" gear="19.45"/>
+    <motor name="m_r_elbow" joint="r_elbow" gear="19.13"/>
+    <motor name="m_r_wrist_roll" joint="r_wrist_roll" gear="1.06"/>
+    <motor name="m_r_wrist_bend" joint="r_wrist_bend" gear="1.06"/>
+    <motor name="m_r_wrist_dev" joint="r_wrist_dev" gear="1.06"/>
+    <motor name="m_l_hip_pitch" joint="l_hip_pitch" gear="484.68"/>
+    <motor name="m_l_hip_yaw" joint="l_hip_yaw" gear="100.00"/>
+    <motor name="m_l_hip_roll" joint="l_hip_roll" gear="300.00"/>
+    <motor name="m_l_knee" joint="l_knee" gear="250.00"/>
+    <motor name="m_l_ankle_pitch" joint="l_ankle_pitch" gear="180.00"/>
+    <motor name="m_l_ankle_roll" joint="l_ankle_roll" gear="50.00"/>
+    <motor name="m_r_hip_pitch" joint="r_hip_pitch" gear="484.68"/>
+    <motor name="m_r_hip_yaw" joint="r_hip_yaw" gear="100.00"/>
+    <motor name="m_r_hip_roll" joint="r_hip_roll" gear="300.00"/>
+    <motor name="m_r_knee" joint="r_knee" gear="250.00"/>
+    <motor name="m_r_ankle_pitch" joint="r_ankle_pitch" gear="180.00"/>
+    <motor name="m_r_ankle_roll" joint="r_ankle_roll" gear="50.00"/>
+  </actuator>
+</mujoco>
