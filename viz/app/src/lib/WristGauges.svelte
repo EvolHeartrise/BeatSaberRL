@@ -13,8 +13,9 @@
   import * as THREE from "three";
   import { pb, pose } from "./state.svelte.js";
   import {
-    BEND_LIM, DEV_LIM, ELBOW_HI, PITCH_HI, PITCH_LO, ROLL_HI, ROLL_LO,
-    SABER_COLORS, TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber, saberAt,
+    BEND_LIM, DEV_HI, DEV_LO, ELBOW_HI, PITCH_HI, PITCH_LO, ROLL_HI,
+    ROLL_LO, SABER_COLORS, TWIST_HI, TWIST_LO, YAW_HI, YAW_LO, poseSaber,
+    saberAt,
   } from "./replay.js";
 
   const W = 256, H = 520;
@@ -125,15 +126,17 @@
     label(ctx, `bend ${deg(ph).toFixed(0)}°  ·  ω ${wp.toFixed(1)}`,
       W / 2, 344);
 
-    // ---- dev dial (env v9): radial/ulnar deviation — up = neutral,
-    // +-45 = the limit; the blade's SECOND bending axis
+    // ---- dev dial (env v9): radial/ulnar deviation — up = neutral;
+    // ASYMMETRIC range (right [-15, +30], left mirrored); the blade's
+    // SECOND bending axis
+    const [dlo, dhi] = [DEV_LO[hand], DEV_HI[hand]];
     const dx = W / 2, dy = 404, dr = 34;
     ctx.lineWidth = 9;
     ctx.strokeStyle = "#3a4050";
     ctx.beginPath();
-    ctx.arc(dx, dy, dr, cAng(-DEV_LIM), cAng(DEV_LIM));
+    ctx.arc(dx, dy, dr, cAng(dlo), cAng(dhi));
     ctx.stroke();
-    for (const b of [-DEV_LIM, DEV_LIM]) {
+    for (const b of [dlo, dhi]) {
       ctx.strokeStyle = "#f0a35e";
       ctx.lineWidth = 3;
       ctx.beginPath();
@@ -141,7 +144,7 @@
       ctx.lineTo(dx + (dr + 8) * Math.cos(cAng(b)), dy + (dr + 8) * Math.sin(cAng(b)));
       ctx.stroke();
     }
-    const devHot = DEV_LIM - Math.abs(dv) < NEAR;
+    const devHot = Math.min(dv - dlo, dhi - dv) < NEAR;
     needle(ctx, dx, dy, dr - 6, cAng(dv), devHot ? "#f0a35e" : col);
     label(ctx, `dev ${deg(dv).toFixed(0)}°  ·  ω ${wd.toFixed(1)}`,
       W / 2, 456);

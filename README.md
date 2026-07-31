@@ -31,7 +31,8 @@ with **gear-table actions** restoring fine control: `--gears 5` adds
 Pre-v8 checkpoints and references are a different body.
 
 Env v9 (2026-07-30, user-caught modeling gap): 7th joint per hand —
-**wrist radial/ulnar deviation** (±45°, wrist tier). The v5.2 roll+bend
+**wrist radial/ulnar deviation** (right [−15°, +30°], left mirrored;
+wrist tier). The v5.2 roll+bend
 wrist could POINT anywhere but had out-of-plane blade speed
 `roll_rate·sin(bend)` — a pole singularity at straight wrists; blade is
 now `Rz(roll)·Ry(dev)·Rx(−bend)·e_z` (dev = 0 reproduces v8 exactly).

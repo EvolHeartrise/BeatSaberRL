@@ -95,9 +95,11 @@ checkpoints/replays retire (hard replace).
     `M_f · d(ψ, φ)` with `d(ψ, φ) = (−sinψ·sinφ, cosψ·sinφ, cosφ)`:
     the neutral blade is the forearm's extension (v5.2's law
     generalized to a moving forearm).
-  - `dev` (env v9, user-caught gap): **wrist radial/ulnar deviation**,
-    ±45° symmetric both hands — the orthogonal bending axis roll+bend
-    lacked. Blade dir = `M_f · Rz(ψ)·Ry(v)·Rx(−φ)·e_z`; dev = 0
+  - `dev` (env v9, user-caught gap): **wrist radial/ulnar deviation**
+    — the orthogonal bending axis roll+bend lacked. Range
+    user-specified in RIGHT-hand terms: right `[−15°, +30°]`, left
+    mirrored `[−30°, +15°]` (deviation is antisymmetric under the
+    body-midplane mirror, like yaw/twist/roll; obs normalizer 30°). Blade dir = `M_f · Rz(ψ)·Ry(v)·Rx(−φ)·e_z`; dev = 0
     reproduces the v5.2-v8 wrist exactly, and at bend = 0 deviation
     moves the blade at full rate (the roll/bend spherical
     parametrization had out-of-plane speed `roll_rate·sin(bend)` — a

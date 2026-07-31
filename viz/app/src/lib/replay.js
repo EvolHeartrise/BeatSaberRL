@@ -147,7 +147,8 @@ export const ELBOW_HI = 150 * RAD;
 export const ROLL_LO = [0 * RAD, -180 * RAD];   // left, right
 export const ROLL_HI = [180 * RAD, 0 * RAD];
 export const BEND_LIM = 95 * RAD;
-export const DEV_LIM = 45 * RAD; // env v9 wrist deviation
+export const DEV_LO = [-30 * RAD, -15 * RAD]; // env v9 dev (L, R):
+export const DEV_HI = [15 * RAD, 30 * RAD]; // right [-15,+30], L mirrored
 export const OMEGA_ARM = 16, OMEGA_WRIST = 40; // env v8 doubled caps
 
 // ---- manual pose mode (pure helpers; UI in PosePanel.svelte) ---------------
@@ -163,7 +164,7 @@ export function jointLimits(hand) {
     [0, ELBOW_HI],
     [ROLL_LO[hand], ROLL_HI[hand]],
     [-BEND_LIM, BEND_LIM],
-    [-DEV_LIM, DEV_LIM],
+    [DEV_LO[hand], DEV_HI[hand]],
   ];
 }
 
@@ -177,7 +178,7 @@ export function clampQ(hand, q) {
  * and roll flip sign; pitch, elbow and bend are symmetric. The hands'
  * joint ranges are exact mirrors, so a legal pose mirrors to a legal one. */
 export const mirrorQ = (q) =>
-  [q[0], -q[1], -q[2], q[3], -q[4], q[5], q[6] ?? 0];
+  [q[0], -q[1], -q[2], q[3], -q[4], q[5], -(q[6] ?? 0)]; // dev flips too
 
 /** Synthetic 15-field arm state from a static pose: q(6) | omegas all
  * zero | FK wrist(3). Drives the same rendering path as replay ticks. */
