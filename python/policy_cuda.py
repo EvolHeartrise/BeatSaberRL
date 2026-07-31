@@ -57,12 +57,15 @@ import os
 import torch
 
 from beat_arena_env.cuda_env import _toolchain_env
-from policy import HEAD_SIZES, NOTE_FEAT, OBS_DIM, SABER_FEAT
+from policy import NOTE_FEAT, OBS_DIM, SABER_FEAT
 
 EMBED = 64
 TRUNK_DIM = 128
-N_ACTION_HEADS = len(HEAD_SIZES)      # 12, all ternary
-N_PARAMS_2BLK = 107365                # layout checksum for the default arch
+# Kernel-contract constants (the v8 12-head / 6-joint layout the .cu
+# files bake) — deliberately NOT derived from policy.HEAD_SIZES, which
+# is 14 since env v9; _validate refuses v9 state_dicts.
+N_ACTION_HEADS = 12
+N_PARAMS_2BLK = 107365                # layout checksum for the v8 arch
 NLOGITS = 3 * N_ACTION_HEADS          # 36
 
 _ext = None
@@ -120,6 +123,13 @@ def _validate(sd) -> int:
             "fused kernels support the ternary (n_gears=3) heads only, "
             f"got {shape('heads.0.weight')[0]} logits/head — use the "
             "torch paths (--no-fused-forward / no --fused-update)")
+    n_heads_sd = sum(1 for k in sd
+                     if k.startswith("heads.") and k.endswith(".weight"))
+    if n_heads_sd != 12:
+        raise NotImplementedError(
+            f"fused kernels bake the 12-head (v8 6-joint) layout; got "
+            f"{n_heads_sd} heads (env v9 adds wrist deviation) — use the "
+            "torch paths (--no-fused-forward / no --fused-update)")
     if shape("note_mlp.0.weight") != (EMBED, NOTE_FEAT):
         raise NotImplementedError(
             f"fused kernel supports embed={EMBED} only, got "
@@ -144,7 +154,7 @@ def _validate(sd) -> int:
                 f"{shape(f'blocks.{b}.ffn.0.weight')}")
     if len(sd["heads.0.bias"]) != 3 or not all(
             tuple(sd[f"heads.{i}.weight"].shape) == (3, TRUNK_DIM)
-            for i in range(N_ACTION_HEADS)):
+            for i in range(n_heads_sd)):
         raise NotImplementedError("unexpected head shapes")
     return n_blocks
 

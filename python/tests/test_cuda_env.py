@@ -22,7 +22,7 @@ from beat_arena_env.cuda_env import CudaBeatVecEnv
 EASY = dict(colors="right", bomb_prob=0.0, extra_prob=0.0)
 FULL = dict(colors="both")     # the generator-v2 default gym
 DENSE = dict(colors="both", note_prob=0.5, extra_prob=0.4, bomb_prob=0.25)
-ACTION_NVEC = [3] * 12
+ACTION_NVEC = [3] * 14
 
 
 def _chart(cfg_kw, seed):
@@ -146,7 +146,7 @@ def test_auto_reset_and_stats():
     n_steps = 2 * (int((20.0 + 0.5 + Z_MISS / 2.0) * 30) + 5)
     dones = 0
     for _ in range(n_steps):
-        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 12)))
+        a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(4, 14)))
         obs, r, done, infos = env.step(a)
         assert infos == []
         dones += int(done.sum())
@@ -165,7 +165,7 @@ def test_same_seed_reproduces():
         rng = np.random.default_rng(1)
         tot = torch.zeros(2, device="cuda")
         for _ in range(400):
-            a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(2, 12)))
+            a = torch.as_tensor(rng.integers(0, ACTION_NVEC, size=(2, 14)))
             obs, r, done, _ = env.step(a)
             tot += r
         return obs.clone(), tot.clone()

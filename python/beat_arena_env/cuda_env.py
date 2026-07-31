@@ -317,7 +317,7 @@ class CudaBeatVecEnv:
         self._obs = z(N, OBS_DIM, dt=torch.float32)
         self._reward = z(N)
         self._done = z(N, dt=torch.bool)
-        self._zero_act = z(N, 12, dt=torch.int64)
+        self._zero_act = z(N, 2 * N_JOINTS, dt=torch.int64)
         self._zero_cand = z(N, dt=torch.int64)
         p = self.pool
         # order is a contract with the kernel's tensor-list enum

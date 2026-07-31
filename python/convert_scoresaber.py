@@ -153,7 +153,8 @@ def read_replay(path):
         lines = [json.loads(l) for l in f if l.strip()]
     assert "header" in lines[0], "not a beat-arena replay"
     header = lines[0]["header"]
-    assert header.get("version") == 7, f"need replay v7, got {header.get('version')}"
+    assert header.get("version") == 8, (
+        f"need replay v8 (env v9 7-joint body), got {header.get('version')}")
     return header, lines[1:]
 
 
@@ -215,8 +216,8 @@ def pose_block(ticks, offset):
         hands = []
         for hand in (0, 1):
             s = line["sabers"][hand]
-            _, wrist, blade = fk(hand, s[0:6])
-            wrist = s[12:15]                       # recorded wrist is exact
+            _, wrist, blade = fk(hand, s[0:7])
+            wrist = s[14:17]                       # recorded wrist is exact
             tip = tuple(wrist[i] + blade[i] for i in range(3))
             hands.append((tuple(wrist), quat_from_forward(blade)))
             prev_tips[hand] = tip
@@ -256,8 +257,8 @@ def cut_geometry(ticks, tick_idx, hand, note):
     the swing's xy motion angle."""
     def state(i):
         s = ticks[i]["sabers"][hand]
-        _, _, blade = fk(hand, s[0:6])
-        wrist = s[12:15]
+        _, _, blade = fk(hand, s[0:7])
+        wrist = s[14:17]
         return wrist, blade
     wrist, blade = state(tick_idx)
     p_wrist, p_blade = state(max(tick_idx - 1, 0))

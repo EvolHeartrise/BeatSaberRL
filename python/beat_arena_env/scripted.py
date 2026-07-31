@@ -125,7 +125,9 @@ def _cut_config(hand, center3, angle):
 
 
 def _hand_action(hand, arm, time, target):
-    q, om = np.asarray(arm[:6]), np.asarray(arm[6:12])
+    # env v9: 7 joints/hand — the bot drives roll+bend and PARKS the
+    # deviation joint at 0 (its null DOF; wrist_for_blade solves dev=0)
+    q, om = np.asarray(arm[:7]), np.asarray(arm[7:14])
 
     if target is None:
         acts = [_steer(q[j], om[j], PARK_Q[hand][j], j) for j in range(4)]
@@ -133,6 +135,7 @@ def _hand_action(hand, arm, time, target):
             hand, q[:4], (0.0, 1.0, 0.0)))                    # blade up
         acts.append(_steer_wrist(q[4], om[4], r_t, 4))
         acts.append(_steer_wrist(q[5], om[5], b_t, 5))
+        acts.append(_steer_wrist(q[6], om[6], 0.0, 6))
         return acts
 
     center3 = np.array([*note_center(target), 0.0])
@@ -151,7 +154,7 @@ def _hand_action(hand, arm, time, target):
     # orientation = wrist -> note (exact when the plant is reachable,
     # best-effort otherwise); the 60-degree cut tolerance absorbs the
     # residual between this and the ideal perpendicular plant.
-    _, w_pred, _ = fk(hand, list(q_arm) + [0.0, 0.0])
+    _, w_pred, _ = fk(hand, list(q_arm) + [0.0, 0.0, 0.0])
     th_aim = float(np.arctan2(center3[1] - w_pred[1],
                               center3[0] - w_pred[0]))
     # swing plan: over BOTH wrist representations of the contact blade
@@ -185,6 +188,7 @@ def _hand_action(hand, arm, time, target):
         # target — same representative every tick)
         acts.append(_steer_wrist(q[4], om[4], r_c - sense * arc, 4))
         acts.append(_steer_wrist(q[5], om[5], b_c, 5))
+        acts.append(_steer_wrist(q[6], om[6], 0.0, 6))
         return acts
 
     # whip (v5.2 semantics): FULL roll accel in the swing sense until the
@@ -195,13 +199,14 @@ def _hand_action(hand, arm, time, target):
     # contact value.
     acts.append(1 if sense > 0 else 2)
     acts.append(_steer_wrist(q[5], om[5], b_c, 5))
+    acts.append(_steer_wrist(q[6], om[6], 0.0, 6))
     return acts
 
 
 def scripted_action(env):
     """env: RustBeatEnv (needs .chart, .sim.status()/sabers()/time).
-    Returns the 12-int action (per hand: pitch, yaw, twist, elbow, roll,
-    bend; left first)."""
+    Returns the 14-int action (per hand: pitch, yaw, twist, elbow, roll,
+    bend, dev; left first — env v9)."""
     status = env.sim.status()
     targets = {0: None, 1: None}
     for i, n in enumerate(env.chart):

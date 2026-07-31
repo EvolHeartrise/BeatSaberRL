@@ -37,14 +37,14 @@
 
 namespace {
 
-constexpr int N_JOINTS = 6;
+constexpr int N_JOINTS = 7;  // env v9: +wrist deviation
 constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (ring; see cuda_env)
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int NOTE_FEAT = 14;
-constexpr int SABER_FEAT = 23;
-constexpr int OFF_NOTES = 2 * SABER_FEAT;                    // 46
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 270
-constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS;        // 286
+constexpr int SABER_FEAT = 25;  // v9: +dev angle, +dev omega
+constexpr int OFF_NOTES = 2 * SABER_FEAT;                    // 50
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 274
+constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS;        // 290
 constexpr int THREADS = 64;
 
 // --- constants (exact f64 mirror of rust/src/lib.rs) -------------------------
@@ -58,8 +58,8 @@ constexpr double Y_CENTER = 1.40;
 constexpr double REWARD_BAD = -0.5;
 constexpr double REWARD_MISS = -0.5;
 constexpr double REWARD_BOMB = -1.5;
-__device__ constexpr double EFFORT_COST[N_JOINTS] = {2e-4, 2e-4, 2e-4,
-                                                     1.3e-4, 0.7e-4, 0.7e-4};
+__device__ constexpr double EFFORT_COST[N_JOINTS] = {
+    2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4};  // v9: +dev
 constexpr double GOOD_HALF_X = 0.4;
 constexpr double GOOD_HALF_Z = 0.5;
 constexpr double GOOD_Z_SHIFT = -0.25;
@@ -86,13 +86,15 @@ constexpr double ELBOW_HI = 2.6179938779914944;
 __device__ constexpr double ROLL_LO[2] = {0.0, -3.141592653589793};
 __device__ constexpr double ROLL_HI[2] = {3.141592653589793, 0.0};
 constexpr double BEND_LIM = 1.6580627893946132;
+// env v9: wrist radial/ulnar deviation, symmetric +/-45 deg
+constexpr double DEV_LIM = 0.7853981633974483;
 // env v8 (2026-07-30): alpha AND omega doubled (was 80/8, 200/20) —
 // effective in-game hand motion, not biomechanics; gears restore
 // fine control (mirror of lib.rs / constants.py)
-__device__ constexpr double JOINT_ALPHA[N_JOINTS] = {160.0, 160.0, 160.0,
-                                                     160.0, 400.0, 400.0};
-__device__ constexpr double JOINT_OMEGA[N_JOINTS] = {16.0, 16.0, 16.0, 16.0,
-                                                     40.0, 40.0};
+__device__ constexpr double JOINT_ALPHA[N_JOINTS] = {
+    160.0, 160.0, 160.0, 160.0, 400.0, 400.0, 400.0};  // v9: +dev (wrist tier)
+__device__ constexpr double JOINT_OMEGA[N_JOINTS] = {
+    16.0, 16.0, 16.0, 16.0, 40.0, 40.0, 40.0};
 // env v8 gears: action id -> signed torque fraction (id 0 coast,
 // 1/2 = +/-full at every K; finer +/- pairs append). Selected by
 // P.gears at launch; K=3 is the ternary prefix.
@@ -166,7 +168,9 @@ __device__ void fk(int hand, const T q[N_JOINTS], T w[3], T b[3]) {
     w[k] = T(SHOULDER[hand][k]) + T(L_UPPER) * m[k][2] + T(L_FORE) * f[k];
   T sr = sin(q[4]), cr = cos(q[4]);
   T sb = sin(q[5]), cb = cos(q[5]);
-  T d0 = -sr * sb, d1 = cr * sb, d2 = cb;
+  // env v9: blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z (dev=0 == v8)
+  T sv = sin(q[6]), cv = cos(q[6]);
+  T d0 = cr * sv * cb - sr * sb, d1 = sr * sv * cb + cr * sb, d2 = cv * cb;
   for (int k = 0; k < 3; k++)
     b[k] = m[k][0] * d0 + (m[k][1] * ce - m[k][2] * se) * d1 + f[k] * d2;
 }
@@ -179,7 +183,8 @@ __device__ __forceinline__ void joint_lim(int h, int j, T& lo, T& hi) {
     case 2: lo = T(TWIST_LO[h]); hi = T(TWIST_HI[h]); break;
     case 3: lo = T(0); hi = T(ELBOW_HI); break;
     case 4: lo = T(ROLL_LO[h]); hi = T(ROLL_HI[h]); break;
-    default: lo = T(-BEND_LIM); hi = T(BEND_LIM); break;
+    case 5: lo = T(-BEND_LIM); hi = T(BEND_LIM); break;
+    default: lo = T(-DEV_LIM); hi = T(DEV_LIM); break;  // v9 dev
   }
 }
 
@@ -469,7 +474,7 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
       }
       const double* gr = gear_row(P.gears);
       for (int j = 0; j < N_JOINTS; j++) {
-        const int a = (int)P.actions[e * 12 + h * N_JOINTS + j];
+        const int a = (int)P.actions[e * 2 * N_JOINTS + h * N_JOINTS + j];
         const T al = T(JOINT_ALPHA[j]);
         om[j] += T(gr[a < 7 ? a : 0]) * al * T(DT);
         const T omax = T(JOINT_OMEGA[j]);
@@ -536,7 +541,7 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
       const double* gr = gear_row(P.gears);
       for (int h = 0; h < 2; h++)
         for (int j = 0; j < N_JOINTS; j++) {
-          const int a = (int)P.actions[e * 12 + h * N_JOINTS + j];
+          const int a = (int)P.actions[e * 2 * N_JOINTS + h * N_JOINTS + j];
           if (a != 0 && a < 7)
             eff += T(EFFORT_COST[j]) * T(fabs(gr[a]));
         }
@@ -885,16 +890,17 @@ __global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
     obs[base + 4] = (float)cos(P.q[qb + 4]);
     obs[base + 5] = (float)sin(P.q[qb + 4]);
     obs[base + 6] = (float)(P.q[qb + 5] / T(BEND_LIM));
+    obs[base + 7] = (float)(P.q[qb + 6] / T(DEV_LIM));  // v9 deviation
     for (int j = 0; j < N_JOINTS; j++)
-      obs[base + 7 + j] = (float)(P.om[qb + j] / T(JOINT_OMEGA[j]));
-    obs[base + 13] = (float)(P.wrist[wb + 0] / T(X_NORM));
-    obs[base + 14] = (float)((P.wrist[wb + 1] - T(Y_CENTER)) / T(Y_NORM));
-    obs[base + 15] = (float)P.wrist[wb + 2];
+      obs[base + 8 + j] = (float)(P.om[qb + j] / T(JOINT_OMEGA[j]));
+    obs[base + 15] = (float)(P.wrist[wb + 0] / T(X_NORM));
+    obs[base + 16] = (float)((P.wrist[wb + 1] - T(Y_CENTER)) / T(Y_NORM));
+    obs[base + 17] = (float)P.wrist[wb + 2];
     for (int k = 0; k < 3; k++) {
-      obs[base + 16 + k] = (float)(P.wrist_vel[wb + k] / T(V_NORM));
-      obs[base + 19 + k] = (float)P.blade[wb + k];
+      obs[base + 18 + k] = (float)(P.wrist_vel[wb + k] / T(V_NORM));
+      obs[base + 21 + k] = (float)P.blade[wb + k];
     }
-    obs[base + 22] =
+    obs[base + 24] =
         (float)tmin(P.swing_acc[e * 2 + h] / T(PRE_FULL), T(2));
   }
   if (tid == 0) {  // next 16 pending objects in chart (arrival) order

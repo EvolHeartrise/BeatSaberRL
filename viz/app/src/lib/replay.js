@@ -173,7 +173,8 @@ export function clampQ(hand, q) {
 /** Mirror a pose across the body midplane (left <-> right): yaw, twist
  * and roll flip sign; pitch, elbow and bend are symmetric. The hands'
  * joint ranges are exact mirrors, so a legal pose mirrors to a legal one. */
-export const mirrorQ = (q) => [q[0], -q[1], -q[2], q[3], -q[4], q[5]];
+export const mirrorQ = (q) =>
+  [q[0], -q[1], -q[2], q[3], -q[4], q[5], q[6] ?? 0];
 
 /** Synthetic 15-field arm state from a static pose: q(6) | omegas all
  * zero | FK wrist(3). Drives the same rendering path as replay ticks. */
@@ -193,10 +194,10 @@ export function parseReplay(text) {
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
   const v = head.header.version;
-  if (v !== 7)
+  if (v !== 8)
     throw new Error(
-      "replay version " + v + " — this viewer reads v7 (env v7 real Beat " +
-      "Saber geometry); re-record from a current checkpoint",
+      "replay version " + v + " — this viewer reads v8 (env v9 7-joint " +
+      "body with wrist deviation); re-record from a current checkpoint",
     );
   const ticks = lines.slice(1).map((l) => JSON.parse(l));
   const chart = head.header.chart;
@@ -282,8 +283,10 @@ export function lerpAng(a, b, u) {
 }
 
 /** Forward kinematics — MIRROR of the sim's fk() (SPEC §Sim rules).
- * q = [pitch, yaw, twist, elbow, roll, bend] (world coords, z toward
- * the notes). Returns {elbow, wrist, blade} — blade is a unit vector. */
+ * q = [pitch, yaw, twist, elbow, roll, bend, dev] (world coords, z
+ * toward the notes; env v9 adds wrist radial/ulnar deviation — blade =
+ * Rz(roll)*Ry(dev)*Rx(-bend)*e_z in the forearm frame, dev=0 == v8).
+ * Returns {elbow, wrist, blade} — blade is a unit vector. */
 export function armFK(hand, q) {
   const sp = Math.sin(q[0]), cp = Math.cos(q[0]);
   const sy = Math.sin(q[1]), cy = Math.cos(q[1]);
@@ -300,24 +303,25 @@ export function armFK(hand, q) {
   const wrist = [0, 1, 2].map((i) => elbow[i] + L_FORE * f[i]);
   const sr = Math.sin(q[4]), cr = Math.cos(q[4]);
   const sb = Math.sin(q[5]), cb = Math.cos(q[5]);
-  const d = [-sr * sb, cr * sb, cb];
+  const sv = Math.sin(q[6] ?? 0), cv = Math.cos(q[6] ?? 0);
+  const d = [cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb];
   const blade = [0, 1, 2].map(
     (i) => m[i][0] * d[0] + (m[i][1] * ce - m[i][2] * se) * d[1] + f[i] * d[2]);
   return { elbow, wrist, blade };
 }
 
-/** Interpolated 15-field arm state at (tickIdx + u): joint angles lerped
+/** Interpolated 17-field arm state at (tickIdx + u): joint angles lerped
  * (all joints are bounded, no wrap), omegas + wrist from the later tick. */
 export function saberAt(rep, tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
   const out = [];
-  for (let j = 0; j < 6; j++) out.push(lerp(a[j], b[j], u));
-  for (let j = 6; j < 15; j++) out.push(b[j]);
+  for (let j = 0; j < 7; j++) out.push(lerp(a[j], b[j], u));
+  for (let j = 7; j < 17; j++) out.push(b[j]);
   return out;
 }
 
-/** Blade tip in WORLD coords [x, y, z] from a 15-field arm state. */
+/** Blade tip in WORLD coords [x, y, z] from a 17-field arm state. */
 export function tipOf(hand, sab) {
   const { wrist, blade } = armFK(hand, sab);
   return [0, 1, 2].map((i) => wrist[i] + SABER_LEN * blade[i]);
