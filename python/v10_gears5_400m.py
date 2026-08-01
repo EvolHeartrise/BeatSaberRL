@@ -1,0 +1,118 @@
+"""env v10 400M protocol run: first real training on the dynamic body
+(2026-08-01). Follows the 50M smoke (upp 2,763 / 0 FCs, accelerating
+2x per 12.5M in the back half — pre-surge signature, all stability
+gates green). Protocol = the v8/v9 record recipe (fall-entropy,
+ranked 25 s segments, gears 5, N=1024) with v10's work-based
+effort_coef 4e-4. ~23 h train at ~4.9k steps/s + ~8 h bench.
+
+Registered prediction (Claude, pre-run): surge onset 80-250M; final
+bench upp 300k-1.2M (center 600k), FCs 100-1,500, catalog acc
+0.35-0.70. Failure modes on watch: effort-economy mistune (low risk —
+smoke shows engagement growing), balance instability at high swing
+speeds (root envelope + caps are the net).
+
+  python v10_gears5_400m.py
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PY = sys.executable
+RUN_DIR = os.path.join("runs", "v10_gears5_400m")
+TOTAL_STEPS = 400_000_000
+CKPT_EVERY = 762  # updates; 762*131072 = 99.9M steps
+
+HYPERS = {"lr": 0.00296092,
+          "ent_coef": 0.0331038, "ent_final": 0.013929,
+          "gamma": 0.914958, "gae_lambda": 0.980024,
+          "effort_coef": 4e-4}
+
+
+def bench(ck, out):
+    r = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
+                        "--out", out, "--num-envs", "2048"],
+                       capture_output=True, text=True, timeout=10800)
+    if r.returncode != 0 or not os.path.exists(out):
+        print(f"BENCH FAILED {ck}: {(r.stderr or '')[-300:]}", flush=True)
+        return None
+    b = json.load(open(out, encoding="utf-8"))
+    fcs = sum(1 for lv in b["levels"] if lv["full_combo"])
+    acc = [lv["accuracy"] for lv in b["levels"] if "accuracy" in lv]
+    return dict(upp=b["total_unweighted_pp"], wpp=b["total_weighted_pp"],
+                fcs=fcs, acc=sum(acc) / len(acc) if acc else 0.0)
+
+
+def main():
+    h = HYPERS
+    os.makedirs(RUN_DIR, exist_ok=True)
+    ck = os.path.join(RUN_DIR, "final.pt")
+    if os.path.exists(ck):
+        print(f"{RUN_DIR}/final.pt exists — skipping train", flush=True)
+    else:
+        cmd = [PY, "train_batch.py", "--num-envs", "1024",
+               "--lr-decay", "cosine", "--seed", "0",
+               "--ranked-maps", "--seg-len", "25",
+               "--chart-pool", "24576",
+               "--gears", "5",
+               "--lr", f"{h['lr']:.6g}",
+               "--ent-coef", f"{h['ent_coef']:.6g}",
+               "--ent-final", f"{h['ent_final']:.6g}",
+               "--gamma", f"{h['gamma']:.6g}",
+               "--gae-lambda", f"{h['gae_lambda']:.6g}",
+               "--effort-coef", f"{h['effort_coef']:.6g}",
+               "--total-steps", str(TOTAL_STEPS),
+               "--ckpt-every", str(CKPT_EVERY),
+               "--run-dir", RUN_DIR]
+        print(f"[train] v10 400M -> {RUN_DIR}", flush=True)
+        t0 = time.time()
+        log = open(os.path.join(RUN_DIR, "train.log"), "w",
+                   encoding="utf-8")
+        r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                           text=True, timeout=129600)
+        log.close()
+        wall = time.time() - t0
+        if r.returncode != 0 or not os.path.exists(ck):
+            tail = open(os.path.join(RUN_DIR, "train.log"),
+                        encoding="utf-8").read()[-800:]
+            print(f"[train] FAILED ({wall:.0f}s): {tail}", flush=True)
+            return
+        print(f"[train] done in {wall/60:.1f} min", flush=True)
+
+    table = {}
+    res = bench(ck, os.path.join(RUN_DIR, "bench.json"))
+    if res is None:
+        return
+    table["final.pt"] = res
+    print(f"[final] upp {res['upp']:,.0f} / wpp {res['wpp']:,.2f} / "
+          f"FCs {res['fcs']} / acc {res['acc']:.4f}", flush=True)
+    for c in sorted(glob.glob(os.path.join(RUN_DIR, "ckpt_upd*.pt")),
+                    key=lambda p: int(re.search(r"upd(\d+)", p).group(1))):
+        name = os.path.basename(c)[:-3]
+        rr = bench(c, os.path.join("bench", f"v10_400m_{name}.json"))
+        if rr is None:
+            continue
+        upd = int(re.search(r"upd(\d+)", c).group(1))
+        table[name] = rr
+        print(f"[{name}] ({upd*131072/1e6:.1f}M) upp {rr['upp']:,.0f} / "
+              f"wpp {rr['wpp']:,.2f} / FCs {rr['fcs']} / "
+              f"acc {rr['acc']:.4f}", flush=True)
+
+    best = max(table.items(), key=lambda kv: kv[1]["upp"])
+    print(f"\nBEST upp: {best[0]} — {best[1]['upp']:,.0f}", flush=True)
+    print("\n=== v10 400M — checkpoint trajectory (both pp totals) ===",
+          flush=True)
+    for name, rr in table.items():
+        print(f"{name}: upp {rr['upp']:>12,.0f}  wpp {rr['wpp']:>9,.2f}"
+              f"  FCs {rr['fcs']}  acc {rr['acc']:.4f}", flush=True)
+    print("DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()
