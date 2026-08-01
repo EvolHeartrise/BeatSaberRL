@@ -1,31 +1,50 @@
-// Beat Arena sim step as ONE CUDA kernel launch (env v7.9).
+// Beat Arena env v10 sim step as ONE CUDA kernel launch (P5).
 //
-// A semantics-exact port of rust/src/lib.rs step_inner + build_obs — the
-// Rust crate remains THE reference; this kernel exists so training
-// rollouts run wide (N in the thousands) with the whole step (integrate +
-// judge + auto-reset + obs) in a single launch. Parity is pinned by
-// tests/test_cuda_env.py (f64 exact vs Rust, f32 bounded drift).
+// Full SPEC-v10 pipeline per env: 8 x substep (FK -> CRBA -> RNEA ->
+// dense Cholesky -> constraint solve [12 x weld-block / contacts /
+// limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
+// 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
+// + gear->tau, work-based effort, blade sweep/cut judgment, scoring,
+// obs 340 — a semantics-exact transcription of rust/src/lib.rs +
+// rust/src/dynamics/{model,fk,algo,collide,solver,step}.rs. The Rust
+// crate remains THE reference implementation.
 //
-// Kernel architecture:
-// - One thread block (64 threads) per env. Threads 0/1 each own a hand for
-//   the serial arm phase; all threads stride the chart for the expensive
-//   per-object swept-surface SAT phase; thread 0 runs the control logic
-//   (trackers, done, ordered reward sum) — Rust's loops verbatim.
-// - Env state is a structure-of-arrays of torch tensors mutated in place;
-//   charts live in a padded (P, C) pool, each env holds only a pool index
-//   (reset = swap the index; no chart copying).
-// - Per-object reward contributions go to a dynamic-shared scratch row and
-//   are summed by thread 0 IN NOTE ORDER (Rust's accumulation order, and
-//   bitwise-deterministic across runs — no float atomics in the reward
-//   path). Counters use integer atomics; score adds integer-valued floats
-//   (exact at any order).
-// - Follow-through trackers use an aggregated ring (design note at
-//   cuda_env.py N_TRACKERS): same-tick trackers share (arc, age) forever,
-//   so one slot with a note count is EXACT; K = FOLLOW_TIMEOUT + 1 slots
-//   makes slot reuse provably safe.
-// - Expression trees mirror lib.rs term for term (the since-removed torch
-//   port proved this is what makes f64 parity exact); Rust's early returns
-//   stay real branches here (no side effects, same booleans).
+// Parallelization (P5 decision, profiled — see the session note):
+// ONE THREAD PER ENV. The whole substep is a serial transcription of
+// Rust's loops in thread-local (local-memory) scratch — every
+// accumulation runs in Rust's exact order by construction, so there is
+// no reduction-order risk anywhere (candidate B's intra-env parallelism
+// was rejected: PGS is strictly ordered, the CRBA/RNEA tree passes are
+// sequential, and the only wide parallelism — multi-RHS triangular
+// solves — would buy ~2x at 3x the parity risk). Occupancy comes from
+// batch width: the production configs run N = 1024..8192 envs;
+// per-thread scratch (~50 KB f32) lives in local memory (coalesced
+// per-thread interleaving), so residency is register-bound, not
+// smem-bound.
+//
+// f64 parity tier (SPEC-v10 Divergences §21, measured in
+// tests/test_v10_parity_cuda.py): CUDA f64 sqrt and division are
+// IEEE-correctly-rounded and match Rust's CRT bitwise; CUDA f64
+// sin/cos/acos (libdevice) differ from the CRT libm by 1 ulp on a few
+// %% of inputs, and nvcc's default FMA contraction re-rounds
+// multiply-add chains — both are <=1-ulp-per-op seeds that the v10
+// chaotic dynamics amplify at the measured e-folding (~0.35 s), so the
+// CUDA f64 tier is HORIZON-BOUNDED tight-tolerance (the v9 CUDA-tier
+// house precedent), not bitwise like torch-CPU-f64. The bitwise gate
+// remains Rust<->torch (P4); this backend's job is f32 training
+// throughput.
+//
+// f32 training safety net (SPEC-v10 Divergences §20e mirrored):
+// Cholesky pivots floored at 1e-8, engagements counted per tick into
+// the pd_hits tensor (popped by the wrapper, reported not hidden).
+//
+// Env-layer judgment (swept-surface SAT, 115-pt scoring, tracker ring,
+// live REACH/miss gates, obs writer) carries the v9 kernel's design
+// with the v10 inputs: aggregated follow-through ring (same-tick
+// trackers share (arc, age) — one slot with a note count is EXACT; the
+// ring is walked from tr_ptr so resolution pays in Rust's spawn order),
+// chart pool with padded (P, C) tensors, auto-reset via the cand
+// tensor, zero host syncs in the step loop.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -37,19 +56,216 @@
 
 namespace {
 
-constexpr int N_JOINTS = 7;  // env v9: +wrist deviation
-constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (ring; see cuda_env)
+// ---- dimensions -------------------------------------------------------------
+constexpr int NQ = 29;
+constexpr int NV = 35;
+constexpr int VOFF = 6;
+constexpr int NF = 30;
+constexpr int NUM_COLLIDERS = 12;
+constexpr int NUM_PAIRS = 55;
+constexpr int N_WELD = 12;
+constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int NOTE_FEAT = 14;
-constexpr int SABER_FEAT = 25;  // v9: +dev angle, +dev omega
-constexpr int OFF_NOTES = 2 * SABER_FEAT;                    // 50
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 274
-constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS;        // 290
-constexpr int THREADS = 64;
+// One WARP per block: the grid is N/32 blocks, so small batches spread
+// over all 20 SMs. P5 profile note: throughput is INSENSITIVE to the
+// block size (128 vs 32: 216 vs 221 ms at N=1024) and to the register
+// budget (-maxrregcount=64 vs the natural 128: within noise) — the
+// kernel is bound by per-env serial latency + local-memory traffic
+// (51 KB stack/thread, working set far beyond L2), not by occupancy.
+// The identified next lever is candidate-B intra-env parallelism
+// (warp-per-env with the factor in shared memory) — out of P5 scope.
+constexpr int THREADS = 32;
 
-// --- constants (exact f64 mirror of rust/src/lib.rs) -------------------------
+// ---- obs layout (SPEC-v10 §5; mirrors constants.py) -------------------------
+constexpr int OFF_ROOT_POS = 0;
+constexpr int OFF_ROOT_ROT = 3;
+constexpr int OFF_ROOT_VLIN = 9;
+constexpr int OFF_ROOT_VANG = 12;
+constexpr int OFF_Q = 15;
+constexpr int OFF_QD = 46;
+constexpr int OFF_HAND_L = 75;
+constexpr int OFF_HAND_R = 85;
+constexpr int OFF_HEAD = 95;
+constexpr int OFF_CONTACT = 98;
+constexpr int OFF_NOTES = 100;
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
+constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS;                // 340
+static_assert(OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340");
+
+// ---- solver constants (step.rs / solver.rs / collide.rs) --------------------
 constexpr double DT = 1.0 / 30.0;
-constexpr double DRAG = 0.02;
+constexpr double H_SUB = 1.0 / 240.0;
+constexpr int N_SUB = 8;
+constexpr int CLAMP_PASSES = 8;
+constexpr int PGS_ITERS = 12;
+constexpr double BETA_WELD = 0.2;
+constexpr double BETA_CONTACT = 0.2;
+constexpr double COMPOSITE_EPS = 1e-4;
+constexpr double ROOT_W_MAX = 96.0;
+constexpr double ROOT_V_MAX = 48.0;
+constexpr double MARGIN = 0.01;
+constexpr double SLOP = 0.005;
+constexpr double SEG_EPS = 1e-12;
+constexpr double GRAV = 9.81;
+constexpr float PD_FLOOR_F32 = 1e-8f;  // Divergences §20e (f32 only)
+
+// ---- model tables (model.rs, verbatim) --------------------------------------
+constexpr double BASE_MASS = 8.40;
+__device__ constexpr double BASE_INERTIA[3] = {0.038640, 0.101640, 0.101640};
+__device__ constexpr double BASE_POS0[3] = {0.0, 0.94, -0.65};
+// base_com is exactly zero — the base COM terms simplify per Rust's
+// mat_vec with a zero vector (still computed generically below).
+__device__ constexpr double BASE_COM[3] = {0.0, 0.0, 0.0};
+
+__device__ constexpr int F_PARENT[NF] = {
+    -1, 0, 1, 2, 2, 4, 5, 6, 7, 8, 9, 2, 11, 12, 13, 14, 15, 16,
+    -1, 18, 19, 20, 21, 22, -1, 24, 25, 26, 27, 28};
+__device__ constexpr int F_COORD[NF] = {
+    0, 1, 2, -1, 4, 3, 5, 6, 7, 9, 8, 11, 10, 12, 13, 14, 16, 15,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28};
+__device__ constexpr double F_ANCHOR[NF][3] = {
+    {0.0, 0.10, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, 0.66, 0.0},
+    {-0.20, 0.43, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.35},
+    {0.0, 0.0, 0.30}, {0, 0, 0}, {0, 0, 0},
+    {0.20, 0.43, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.35},
+    {0.0, 0.0, 0.30}, {0, 0, 0}, {0, 0, 0},
+    {-0.10, 0.0, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, -0.44, 0.0},
+    {0.0, -0.43, 0.0}, {0, 0, 0},
+    {0.10, 0.0, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, -0.44, 0.0},
+    {0.0, -0.43, 0.0}, {0, 0, 0}};
+__device__ constexpr double F_AXIS[NF][3] = {
+    {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 1},
+    {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {-1, 0, 0},
+    {0, 0, 1}, {0, 1, 0}, {-1, 0, 0},
+    {0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {-1, 0, 0},
+    {0, 0, 1}, {0, 1, 0}, {-1, 0, 0},
+    {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1},
+    {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}};
+__device__ constexpr double F_MASS[NF] = {
+    0, 0, 24.20, 5.20, 0, 0, 2.00, 1.20, 0, 0, 0.61,
+    0, 0, 2.00, 1.20, 0, 0, 0.61,
+    0, 0, 10.60, 3.20, 0, 1.00,
+    0, 0, 10.60, 3.20, 0, 1.00};
+__device__ constexpr double F_COM[NF][3] = {
+    {0, 0, 0}, {0, 0, 0}, {0.0, 0.215, 0.0}, {0, 0, 0},
+    {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.175}, {0.0, 0.0, 0.15},
+    {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.06},
+    {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.175}, {0.0, 0.0, 0.15},
+    {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.06},
+    {0, 0, 0}, {0, 0, 0}, {0.0, -0.22, 0.0}, {0.0, -0.215, 0.0},
+    {0, 0, 0}, {0.0, -0.035, 0.05},
+    {0, 0, 0}, {0, 0, 0}, {0.0, -0.22, 0.0}, {0.0, -0.215, 0.0},
+    {0, 0, 0}, {0.0, -0.035, 0.05}};
+__device__ constexpr double F_INERTIA[NF][3] = {
+    {0, 0, 0}, {0, 0, 0}, {0.957507, 0.254964, 0.957507},
+    {0.016848, 0.016848, 0.016848},
+    {0, 0, 0}, {0, 0, 0}, {0.029222, 0.029222, 0.001966},
+    {0.013056, 0.013056, 0.000931},
+    {0, 0, 0}, {0, 0, 0}, {0.000460, 0.000460, 0.000460},
+    {0, 0, 0}, {0, 0, 0}, {0.029222, 0.029222, 0.001966},
+    {0.013056, 0.013056, 0.000931},
+    {0, 0, 0}, {0, 0, 0}, {0.000460, 0.000460, 0.000460},
+    {0, 0, 0}, {0, 0, 0}, {0.250198, 0.018493, 0.250198},
+    {0.065964, 0.003161, 0.065964}, {0, 0, 0},
+    {0.005617, 0.005883, 0.001083},
+    {0, 0, 0}, {0, 0, 0}, {0.250198, 0.018493, 0.250198},
+    {0.065964, 0.003161, 0.065964}, {0, 0, 0},
+    {0.005617, 0.005883, 0.001083}};
+
+// frame indices (model.rs)
+constexpr int F_HEAD = 3;
+constexpr int F_L_SHOULDER = 4, F_L_WRIST = 8, F_L_HAND = 10;
+constexpr int F_R_SHOULDER = 11, F_R_WRIST = 15, F_R_HAND = 17;
+constexpr int F_L_FOOT = 23, F_R_FOOT = 29;
+
+__device__ constexpr double LIMIT_LO[NQ] = {
+    -0.3490658503988659, -0.6981317007977318, -0.5235987755982988,
+    -1.5707963267948966, -1.7453292519943295, -1.5707963267948966,
+    0.0, 0.0, -1.6580627893946132, -0.5235987755982988,
+    -1.5707963267948966, -0.7853981633974483, -1.2217304763960306,
+    0.0, -3.141592653589793, -1.6580627893946132, -0.2617993877991494,
+    -0.3490658503988659, -0.7853981633974483, -0.7853981633974483,
+    0.0, -0.8726646259971648, -0.3490658503988659,
+    -0.3490658503988659, -0.6981317007977318, -0.5235987755982988,
+    0.0, -0.8726646259971648, -0.3490658503988659};
+__device__ constexpr double LIMIT_HI[NQ] = {
+    0.7853981633974483, 0.6981317007977318, 0.5235987755982988,
+    1.1344640137963142, 0.7853981633974483, 1.2217304763960306,
+    2.6179938779914944, 3.141592653589793, 1.6580627893946132,
+    0.2617993877991494,
+    1.1344640137963142, 1.7453292519943295, 1.5707963267948966,
+    2.6179938779914944, 0.0, 1.6580627893946132, 0.5235987755982988,
+    2.0943951023931953, 0.6981317007977318, 0.5235987755982988,
+    2.6179938779914944, 0.3490658503988659, 0.3490658503988659,
+    2.0943951023931953, 0.7853981633974483, 0.7853981633974483,
+    2.6179938779914944, 0.3490658503988659, 0.3490658503988659};
+__device__ constexpr double TAU_MAX[NQ] = {
+    800.00, 319.93, 500.00,
+    113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+    113.84, 113.84, 19.45, 19.13, 1.06, 1.06, 1.06,
+    484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
+    484.68, 100.00, 300.00, 250.00, 180.00, 50.00};
+__device__ constexpr double OMEGA_CAP[NQ] = {
+    16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 40.0, 40.0, 40.0,
+    16.0, 16.0, 16.0, 16.0, 40.0, 40.0, 40.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0};
+__device__ constexpr double DAMPING[NQ] = {
+    4.3140, 1.1998, 3.6471,
+    0.42689, 0.42689, 0.07292, 0.07174, 0.00159, 0.00159, 0.00159,
+    0.42689, 0.42689, 0.07292, 0.07174, 0.00159, 0.00159, 0.00159,
+    1.8175, 0.28120, 1.8133, 0.26294, 0.00561, 0.00138,
+    1.8175, 0.28120, 1.8133, 0.26294, 0.00561, 0.00138};
+__device__ constexpr double ARMATURE[NQ] = {
+    0.071900, 0.019996, 0.060786,
+    0.0071149, 0.0071149, 0.0012154, 0.0011957, 0.000026556, 0.000026556,
+    0.000026556,
+    0.0071149, 0.0071149, 0.0012154, 0.0011957, 0.000026556, 0.000026556,
+    0.000026556,
+    0.030292, 0.0046866, 0.030222, 0.0043823, 0.000093419, 0.000023083,
+    0.030292, 0.0046866, 0.030222, 0.0043823, 0.000093419, 0.000023083};
+
+// ---- collision spec (collide.rs, verbatim) ----------------------------------
+__device__ constexpr int COL_FRAME[NUM_COLLIDERS] = {
+    2, 3, 6, 13, 7, 14, 10, 17, 20, 26, 21, 27};
+__device__ constexpr double COL_A[NUM_COLLIDERS][3] = {
+    {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0},
+    {0.0, 0.0, 0.06}, {0.0, 0.0, 0.06}, {0, 0, 0}, {0, 0, 0},
+    {0, 0, 0}, {0, 0, 0}};
+__device__ constexpr double COL_B[NUM_COLLIDERS][3] = {
+    {0.0, 0.43, 0.0}, {0, 0, 0}, {0.0, 0.0, 0.35}, {0.0, 0.0, 0.35},
+    {0.0, 0.0, 0.30}, {0.0, 0.0, 0.30}, {0.0, 0.0, 0.06}, {0.0, 0.0, 0.06},
+    {0.0, -0.44, 0.0}, {0.0, -0.44, 0.0}, {0.0, -0.43, 0.0},
+    {0.0, -0.43, 0.0}};
+__device__ constexpr double COL_R[NUM_COLLIDERS] = {
+    0.15, 0.09, 0.045, 0.045, 0.04, 0.04, 0.05, 0.05,
+    0.06, 0.06, 0.045, 0.045};
+__device__ constexpr int PAIR_A[NUM_PAIRS] = {
+    0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 8, 8, 9, 10};
+__device__ constexpr int PAIR_B[NUM_PAIRS] = {
+    4, 5, 6, 7, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    3, 5, 6, 7, 8, 9, 10, 11, 4, 6, 7, 8, 9, 10, 11,
+    5, 7, 8, 9, 10, 11, 6, 8, 9, 10, 11, 7, 8, 9, 10, 11,
+    8, 9, 10, 11, 9, 11, 10, 11};
+// obs contact bits: collider ids 2/4/6 -> left arm, 3/5/7 -> right
+__device__ __forceinline__ bool is_arm_l(int id) {
+  return id == 2 || id == 4 || id == 6;
+}
+__device__ __forceinline__ bool is_arm_r(int id) {
+  return id == 3 || id == 5 || id == 7;
+}
+
+// feet weld (solver.rs)
+__device__ constexpr int WELD_FRAMES[2] = {F_L_FOOT, F_R_FOOT};
+__device__ constexpr double WELD_TARGET_P[2][3] = {
+    {-0.10, 0.07, -0.65}, {0.10, 0.07, -0.65}};
+
+// ---- env constants (lib.rs, verbatim) ---------------------------------------
 constexpr double V_NORM = 6.0;
 constexpr double V_MIN_CUT = 1.0;
 constexpr double ACC_NORM = 0.3;
@@ -58,61 +274,14 @@ constexpr double Y_CENTER = 1.40;
 constexpr double REWARD_BAD = -0.5;
 constexpr double REWARD_MISS = -0.5;
 constexpr double REWARD_BOMB = -1.5;
-__device__ constexpr double EFFORT_COST[N_JOINTS] = {
-    2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4};  // v9: +dev
 constexpr double GOOD_HALF_X = 0.4;
 constexpr double GOOD_HALF_Z = 0.5;
 constexpr double GOOD_Z_SHIFT = -0.25;
 constexpr double BAD_HALF = 0.175;
 constexpr double BOMB_RADIUS = 0.18;
 constexpr double SABER_LEN = 1.0;
-__device__ constexpr double SHOULDER[2][3] = {{-0.2, 1.47, -0.65},
-                                              {0.2, 1.47, -0.65}};
-constexpr double L_UPPER = 0.35;
-constexpr double L_FORE = 0.30;
-constexpr double PITCH_LIM = 1.5707963267948966;
-constexpr double PITCH_LO = -1.5707963267948966;
-constexpr double PITCH_HI = 1.1344640137963142;
-__device__ constexpr double YAW_LO[2] = {-1.7453292519943295,
-                                         -0.7853981633974483};
-__device__ constexpr double YAW_HI[2] = {0.7853981633974483,
-                                         1.7453292519943295};
-constexpr double TWIST_LIM = 1.5707963267948966;
-__device__ constexpr double TWIST_LO[2] = {-1.5707963267948966,
-                                           -1.2217304763960306};
-__device__ constexpr double TWIST_HI[2] = {1.2217304763960306,
-                                           1.5707963267948966};
-constexpr double ELBOW_HI = 2.6179938779914944;
-__device__ constexpr double ROLL_LO[2] = {0.0, -3.141592653589793};
-__device__ constexpr double ROLL_HI[2] = {3.141592653589793, 0.0};
-constexpr double BEND_LIM = 1.6580627893946132;
-// env v9 deviation: RIGHT [-15, +30] deg (user-specified), left
-// mirrored (antisymmetric under the midplane mirror, like roll)
-constexpr double DEV_LIM = 0.5235987755982988;  // obs normalizer only
-__device__ constexpr double DEV_LO[2] = {-0.5235987755982988,
-                                         -0.2617993877991494};  // L, R
-__device__ constexpr double DEV_HI[2] = {0.2617993877991494,
-                                         0.5235987755982988};
-// env v8 (2026-07-30): alpha AND omega doubled (was 80/8, 200/20) —
-// effective in-game hand motion, not biomechanics; gears restore
-// fine control (mirror of lib.rs / constants.py)
-__device__ constexpr double JOINT_ALPHA[N_JOINTS] = {
-    160.0, 160.0, 160.0, 160.0, 400.0, 400.0, 400.0};  // v9: +dev (wrist tier)
-__device__ constexpr double JOINT_OMEGA[N_JOINTS] = {
-    16.0, 16.0, 16.0, 16.0, 40.0, 40.0, 40.0};
-// env v8 gears: action id -> signed torque fraction (id 0 coast,
-// 1/2 = +/-full at every K; finer +/- pairs append). Selected by
-// P.gears at launch; K=3 is the ternary prefix.
-__device__ constexpr double GEAR_TAB[3][7] = {
-    {0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0},              // K=3
-    {0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0},           // K=5
-    {0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0, 0.125, -0.125}};  // K=7
-__device__ __forceinline__ const double* gear_row(int gears) {
-  return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
-}
 constexpr int N_BLADE_SAMPLES = 8;
-constexpr double REACH_Z = 1.75;
-constexpr double Z_MISS = 0.65;
+constexpr double REACH_PAST_SHOULDER = 0.65 + 1.0 + 0.75;
 constexpr double PRE_FULL = 1.7453292519943295;
 constexpr double POST_FULL = 1.0471975511965976;
 constexpr double PTS_PRE = 70.0;
@@ -122,7 +291,6 @@ constexpr double SCORE_MAX = 115.0;
 constexpr double CHAIN_LINK_PTS = 20.0;
 constexpr double SWING_BREAK = 0.005;
 constexpr int FOLLOW_TIMEOUT = 15;
-__device__ constexpr double HEAD[3] = {0.0, 1.70, -0.65};
 constexpr double LOOK_VERT = 0.8;
 constexpr double LOOK_DIST = 8.0;
 constexpr double X_NORM = 1.0;
@@ -130,8 +298,26 @@ constexpr double Y_NORM = 0.75;
 constexpr double Z_SCALE = 8.0;
 constexpr double Z_CLIP_LO = -3.0;
 constexpr double Z_CLIP_HI = 12.0;
+constexpr double ROOT_Y0 = 0.94;
+constexpr double HEAD_Y0 = 1.70;
+constexpr double PLANE_Z0 = -0.65;
+constexpr double ROOT_VLIN_NORM = 6.0;
+constexpr double ROOT_VANG_NORM = 16.0;
 
-// --- small device math (mirrors lib.rs helpers) ------------------------------
+// env v8 gears (lib.rs gear_signed)
+__device__ constexpr double GEAR_TAB[3][7] = {
+    {0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0},                     // K=3
+    {0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0},                  // K=5
+    {0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0, 0.125, -0.125}};  // K=7
+__device__ __forceinline__ const double* gear_row(int gears) {
+  return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
+}
+
+// note kinds (constants.py)
+// KIND_NOTE=0, KIND_BOMB=1, KIND_CHAIN_HEAD=2, KIND_CHAIN_LINK=3 —
+// pool tensors carry the derived booleans directly.
+
+// ---- small device math ------------------------------------------------------
 template <typename T>
 __device__ __forceinline__ T tmin(T a, T b) { return a < b ? a : b; }
 template <typename T>
@@ -140,7 +326,6 @@ template <typename T>
 __device__ __forceinline__ T tclamp(T x, T lo, T hi) {
   return x < lo ? lo : (x > hi ? hi : x);
 }
-// real BS scores are integers; explicit floor(x + 0.5) matches lib.rs
 template <typename T>
 __device__ __forceinline__ T round_pts(T x) { return floor(x + T(0.5)); }
 template <typename T>
@@ -153,48 +338,912 @@ __device__ __forceinline__ void cross3(const T a[3], const T b[3], T o[3]) {
   o[1] = a[2] * b[0] - a[0] * b[2];
   o[2] = a[0] * b[1] - a[1] * b[0];
 }
-
-/// Forward kinematics (lib.rs fk): wrist + unit blade dir from the six
-/// joint angles q = [pitch, yaw, twist, elbow, roll, bend].
 template <typename T>
-__device__ void fk(int hand, const T q[N_JOINTS], T w[3], T b[3]) {
-  T sp = sin(q[0]), cp = cos(q[0]);
-  T sy = sin(q[1]), cy = cos(q[1]);
-  T st = sin(q[2]), ct = cos(q[2]);
-  T se = sin(q[3]), ce = cos(q[3]);
-  T m[3][3] = {
-      {cy * ct - sy * sp * st, -cy * st - sy * sp * ct, sy * cp},
-      {cp * st, cp * ct, sp},
-      {-sy * ct - cy * sp * st, sy * st - cy * sp * ct, cy * cp},
-  };
-  T f[3];
-  for (int k = 0; k < 3; k++) f[k] = m[k][1] * se + m[k][2] * ce;
-  for (int k = 0; k < 3; k++)
-    w[k] = T(SHOULDER[hand][k]) + T(L_UPPER) * m[k][2] + T(L_FORE) * f[k];
-  T sr = sin(q[4]), cr = cos(q[4]);
-  T sb = sin(q[5]), cb = cos(q[5]);
-  // env v9: blade = Rz(roll)*Ry(dev)*Rx(-bend)*e_z (dev=0 == v8)
-  T sv = sin(q[6]), cv = cos(q[6]);
-  T d0 = cr * sv * cb - sr * sb, d1 = sr * sv * cb + cr * sb, d2 = cv * cb;
-  for (int k = 0; k < 3; k++)
-    b[k] = m[k][0] * d0 + (m[k][1] * ce - m[k][2] * se) * d1 + f[k] * d2;
+__device__ __forceinline__ void sub3v(const T a[3], const T b[3], T o[3]) {
+  o[0] = a[0] - b[0];
+  o[1] = a[1] - b[1];
+  o[2] = a[2] - b[2];
+}
+
+// ---- dynamics scratch (thread-local) ----------------------------------------
+template <typename T>
+struct Dyn {
+  // state
+  T p[3], quat[4], q[NQ], v[NV];
+  // FK
+  T r[NF][3][3], pos[NF][3], axw[NF][3];
+  T r0[3][3];
+  // dense
+  T m[NV * NV], l[NV * NV], c[NV], rhs[NV];
+  // CRBA composites
+  T cm[NF], cc[NF][3], ci[NF][3][3];
+  T bm, bc[3], bi[3][3];
+  // RNEA scratch
+  T om[NF][3], al[NF][3], vo[NF][3], ao[NF][3], fb[NF][3], nb[NF][3];
+  bool pd_bad;
+};
+
+template <typename T>
+struct Solver {
+  // weld rows
+  T jw[N_WELD][NV], mw[N_WELD][NV], bias_w[N_WELD];
+  T aww[N_WELD * N_WELD], lww[N_WELD * N_WELD], rw[N_WELD];
+  // contacts (compacted, pair-id order)
+  int nc;
+  int c_pair[NUM_PAIRS];
+  T c_J[NUM_PAIRS][NV], c_minv[NUM_PAIRS][NV];
+  T c_bias[NUM_PAIRS], c_diag[NUM_PAIRS], c_lam[NUM_PAIRS];
+  T c_pt[NUM_PAIRS][3];
+  // limit rows (joint order)
+  int nl;
+  int l_j[NQ];
+  T l_sign[NQ], l_bias[NQ], l_lam[NQ], l_diag[NQ];
+  // shared per-joint columns: ecol = M^-1 e_j (plain; step-8 lazy cap +
+  // step-11 clamps), pcol = weld-null-space-projected ecol (limit rows
+  // + cap pass), pdiag = composite mobility (INF = immobile given the
+  // welds). Bitwise identical to Rust's separately-computed
+  // minvjt/capcol/solcache columns (linear solves commute with the +-1
+  // row sign exactly; recomputation of the same expression tree is
+  // deterministic).
+  T ecol[NQ][NV], pcol[NQ][NV], pdiag[NQ];
+  bool ecomp[NQ], pcomp[NQ];
+  bool hit[NQ];
+};
+
+// ---- fk.rs ------------------------------------------------------------------
+template <typename T>
+__device__ void rot_axis(const double axis_d[3], T angle, T out[3][3]) {
+  T s = sin(angle), cth = cos(angle);
+  T k = T(1) - cth;
+  T x = T(axis_d[0]), y = T(axis_d[1]), z = T(axis_d[2]);
+  out[0][0] = cth + k * x * x;
+  out[0][1] = k * x * y - s * z;
+  out[0][2] = k * x * z + s * y;
+  out[1][0] = k * x * y + s * z;
+  out[1][1] = cth + k * y * y;
+  out[1][2] = k * y * z - s * x;
+  out[2][0] = k * x * z - s * y;
+  out[2][1] = k * y * z + s * x;
+  out[2][2] = cth + k * z * z;
 }
 
 template <typename T>
-__device__ __forceinline__ void joint_lim(int h, int j, T& lo, T& hi) {
-  switch (j) {
-    case 0: lo = T(PITCH_LO); hi = T(PITCH_HI); break;
-    case 1: lo = T(YAW_LO[h]); hi = T(YAW_HI[h]); break;
-    case 2: lo = T(TWIST_LO[h]); hi = T(TWIST_HI[h]); break;
-    case 3: lo = T(0); hi = T(ELBOW_HI); break;
-    case 4: lo = T(ROLL_LO[h]); hi = T(ROLL_HI[h]); break;
-    case 5: lo = T(-BEND_LIM); hi = T(BEND_LIM); break;
-    default: lo = T(DEV_LO[h]); hi = T(DEV_HI[h]); break;  // v9 dev
+__device__ void quat_to_rot(const T q[4], T r[3][3]) {
+  T w = q[0], x = q[1], y = q[2], z = q[3];
+  r[0][0] = T(1) - T(2) * (y * y + z * z);
+  r[0][1] = T(2) * (x * y - w * z);
+  r[0][2] = T(2) * (x * z + w * y);
+  r[1][0] = T(2) * (x * y + w * z);
+  r[1][1] = T(1) - T(2) * (x * x + z * z);
+  r[1][2] = T(2) * (y * z - w * x);
+  r[2][0] = T(2) * (x * z - w * y);
+  r[2][1] = T(2) * (y * z + w * x);
+  r[2][2] = T(1) - T(2) * (x * x + y * y);
+}
+
+template <typename T>
+__device__ void rot_log(const T r[3][3], T out[3]) {
+  T w0 = r[2][1] - r[1][2];
+  T w1 = r[0][2] - r[2][0];
+  T w2 = r[1][0] - r[0][1];
+  T tr = r[0][0] + r[1][1] + r[2][2];
+  T cth = tclamp((tr - T(1)) * T(0.5), T(-1), T(1));
+  T theta = acos(cth);
+  T factor = theta < T(1e-9) ? T(0.5) : theta / (T(2) * sin(theta));
+  out[0] = w0 * factor;
+  out[1] = w1 * factor;
+  out[2] = w2 * factor;
+}
+
+template <typename T>
+__device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
+  o[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+  o[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+  o[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+  o[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+
+// fk_all: world rotation/origin per frame + world revolute axes.
+template <typename T>
+__device__ void fk_all(Dyn<T>& d) {
+  quat_to_rot(d.quat, d.r0);
+  for (int k = 0; k < NF; k++) {
+    const int par = F_PARENT[k];
+    const T (*rl)[3] = par < 0 ? d.r0 : d.r[par];
+    const T* pl = par < 0 ? d.p : d.pos[par];
+    T av[3];
+    for (int i = 0; i < 3; i++) {
+      av[i] = rl[i][0] * T(F_ANCHOR[k][0]) + rl[i][1] * T(F_ANCHOR[k][1])
+              + rl[i][2] * T(F_ANCHOR[k][2]);
+      d.pos[k][i] = pl[i] + av[i];
+    }
+    if (F_COORD[k] >= 0) {
+      T rj[3][3];
+      rot_axis(F_AXIS[k], d.q[F_COORD[k]], rj);
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+          d.r[k][i][j] = rl[i][0] * rj[0][j] + rl[i][1] * rj[1][j]
+                         + rl[i][2] * rj[2][j];
+    } else {
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) d.r[k][i][j] = rl[i][j];
+    }
+    for (int i = 0; i < 3; i++)
+      d.axw[k][i] = d.r[k][i][0] * T(F_AXIS[k][0])
+                    + d.r[k][i][1] * T(F_AXIS[k][1])
+                    + d.r[k][i][2] * T(F_AXIS[k][2]);
   }
 }
 
-/// Triangle vs axis-aligned box, verts RELATIVE to the box center
-/// (Akenine-Möller SAT; lib.rs tri_box_overlap — early returns kept).
+// ---- algo.rs ---------------------------------------------------------------
+// I_world = R diag(i) R^T — upper computed, lower mirrored (bitwise
+// symmetric, algo.rs inertia_world).
+template <typename T>
+__device__ void inertia_world(const T r[3][3], const double idiag[3],
+                              T out[3][3]) {
+  for (int a = 0; a < 3; a++)
+    for (int b = a; b < 3; b++) {
+      T v = r[a][0] * T(idiag[0]) * r[b][0] + r[a][1] * T(idiag[1]) * r[b][1]
+            + r[a][2] * T(idiag[2]) * r[b][2];
+      out[a][b] = v;
+      out[b][a] = v;
+    }
+}
+
+template <typename T>
+__device__ void add_shift(T i[3][3], T m, const T d[3]) {
+  T dd = dot3(d, d);
+  for (int a = 0; a < 3; a++)
+    for (int b = 0; b < 3; b++)
+      i[a][b] += m * ((a == b ? dd : T(0)) - d[a] * d[b]);
+}
+
+template <typename T>
+__device__ void crba(Dyn<T>& d) {
+  for (int i = 0; i < NV * NV; i++) d.m[i] = T(0);
+  // composite seeds
+  for (int k = 0; k < NF; k++) {
+    const T mk = T(F_MASS[k]);
+    d.cm[k] = mk;
+    if (F_MASS[k] > 0.0) {
+      for (int i = 0; i < 3; i++)
+        d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * T(F_COM[k][0])
+                                    + d.r[k][i][1] * T(F_COM[k][1])
+                                    + d.r[k][i][2] * T(F_COM[k][2]));
+      inertia_world(d.r[k], F_INERTIA[k], d.ci[k]);
+    } else {
+      for (int i = 0; i < 3; i++) d.cc[k][i] = d.pos[k][i];
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) d.ci[k][i][j] = T(0);
+    }
+  }
+  // base composite (pelvis)
+  d.bm = T(BASE_MASS);
+  for (int i = 0; i < 3; i++)
+    d.bc[i] = d.p[i] + (d.r0[i][0] * T(BASE_COM[0])
+                        + d.r0[i][1] * T(BASE_COM[1])
+                        + d.r0[i][2] * T(BASE_COM[2]));
+  inertia_world(d.r0, BASE_INERTIA, d.bi);
+
+  // leaf->root accumulation with column fill before parent merge
+  for (int k = NF - 1; k >= 0; k--) {
+    const int coord = F_COORD[k];
+    const T m = d.cm[k];
+    T cvec[3] = {d.cc[k][0], d.cc[k][1], d.cc[k][2]};
+    if (coord >= 0 && m > T(0)) {
+      const int j = VOFF + coord;
+      const T* a = d.axw[k];
+      T rel[3], hl[3], ha[3];
+      sub3v(cvec, d.pos[k], rel);
+      T cr[3];
+      cross3(a, rel, cr);
+      for (int i = 0; i < 3; i++) hl[i] = cr[i] * m;
+      for (int i = 0; i < 3; i++)
+        ha[i] = d.ci[k][i][0] * a[0] + d.ci[k][i][1] * a[1]
+                + d.ci[k][i][2] * a[2];
+      T relxhl[3];
+      cross3(rel, hl, relxhl);
+      T tot[3] = {ha[0] + relxhl[0], ha[1] + relxhl[1], ha[2] + relxhl[2]};
+      d.m[j * NV + j] = dot3(a, tot);
+      int anc = F_PARENT[k];
+      while (anc >= 0) {
+        if (F_COORD[anc] >= 0) {
+          const int ia = VOFF + F_COORD[anc];
+          T rel2[3];
+          sub3v(cvec, d.pos[anc], rel2);
+          T r2xhl[3];
+          cross3(rel2, hl, r2xhl);
+          T tot2[3] = {ha[0] + r2xhl[0], ha[1] + r2xhl[1], ha[2] + r2xhl[2]};
+          const T val = dot3(d.axw[anc], tot2);
+          d.m[ia * NV + j] = val;
+          d.m[j * NV + ia] = val;
+        }
+        anc = F_PARENT[anc];
+      }
+      // root rows
+      T relr[3];
+      sub3v(cvec, d.p, relr);
+      T rrxhl[3];
+      cross3(relr, hl, rrxhl);
+      T lr[3] = {ha[0] + rrxhl[0], ha[1] + rrxhl[1], ha[2] + rrxhl[2]};
+      for (int t = 0; t < 3; t++) {
+        d.m[t * NV + j] = hl[t];
+        d.m[j * NV + t] = hl[t];
+        d.m[(3 + t) * NV + j] = lr[t];
+        d.m[j * NV + (3 + t)] = lr[t];
+      }
+    }
+    // merge composite k into parent (or base)
+    const int par = F_PARENT[k];
+    T* pm;
+    T* pc;
+    T (*pi)[3];
+    if (par < 0) {
+      pm = &d.bm;
+      pc = d.bc;
+      pi = d.bi;
+    } else {
+      pm = &d.cm[par];
+      pc = d.cc[par];
+      pi = d.ci[par];
+    }
+    const T tm = *pm + m;
+    if (tm > T(0)) {
+      const T inv = T(1) / tm;
+      T tc[3];
+      for (int i = 0; i < 3; i++) tc[i] = (pc[i] * *pm + cvec[i] * m) * inv;
+      T dp[3], dc[3];
+      sub3v(pc, tc, dp);
+      add_shift(pi, *pm, dp);
+      sub3v(cvec, tc, dc);
+      add_shift(pi, m, dc);
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) pi[i][j] += d.ci[k][i][j];
+      *pm = tm;
+      for (int i = 0; i < 3; i++) pc[i] = tc[i];
+    }
+  }
+
+  // armature diagonal (Divergences §12)
+  for (int k = 0; k < NF; k++)
+    if (F_COORD[k] >= 0) {
+      const int j = VOFF + F_COORD[k];
+      d.m[j * NV + j] += T(ARMATURE[F_COORD[k]]);
+    }
+
+  // root 6x6 from the total composite
+  T dd[3];
+  sub3v(d.bc, d.p, dd);
+  T rr[3][3];
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) rr[i][j] = d.bi[i][j];
+  add_shift(rr, d.bm, dd);
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      d.m[i * NV + j] = i == j ? d.bm : T(0);
+      d.m[(3 + i) * NV + (3 + j)] = rr[i][j];
+    }
+  const T sk[3][3] = {{T(0), -dd[2], dd[1]},
+                      {dd[2], T(0), -dd[0]},
+                      {-dd[1], dd[0], T(0)}};
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      const T val = d.bm * sk[i][j];
+      d.m[(3 + i) * NV + j] = val;
+      d.m[j * NV + (3 + i)] = val;
+    }
+}
+
+// RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
+template <typename T>
+__device__ void rnea_bias(Dyn<T>& d) {
+  const T g[3] = {T(0), T(-GRAV), T(0)};
+  T om0[3] = {d.v[3], d.v[4], d.v[5]};
+  T vo0[3] = {d.v[0], d.v[1], d.v[2]};
+  // forward pass (acc = 0 everywhere; al0/ao0 = 0)
+  for (int k = 0; k < NF; k++) {
+    const int par = F_PARENT[k];
+    const T* oml = par < 0 ? om0 : d.om[par];
+    const T* all = par < 0 ? nullptr : d.al[par];
+    const T* vol = par < 0 ? vo0 : d.vo[par];
+    const T* aol = par < 0 ? nullptr : d.ao[par];
+    const T* ol = par < 0 ? d.p : d.pos[par];
+    T dv[3];
+    sub3v(d.pos[k], ol, dv);
+    T oxd[3];
+    cross3(oml, dv, oxd);
+    T vok[3] = {vol[0] + oxd[0], vol[1] + oxd[1], vol[2] + oxd[2]};
+    T alxd[3] = {T(0), T(0), T(0)};
+    if (all != nullptr) cross3(all, dv, alxd);
+    T oxoxd[3];
+    cross3(oml, oxd, oxoxd);
+    T aok[3];
+    for (int i = 0; i < 3; i++)
+      aok[i] = ((aol != nullptr ? aol[i] : T(0)) + alxd[i]) + oxoxd[i];
+    T omk[3], alk[3];
+    if (F_COORD[k] >= 0) {
+      const T qd = d.v[VOFF + F_COORD[k]];
+      const T* aw = d.axw[k];
+      for (int i = 0; i < 3; i++) omk[i] = oml[i] + aw[i] * qd;
+      T oxa[3];
+      cross3(oml, aw, oxa);
+      for (int i = 0; i < 3; i++)
+        alk[i] = (all != nullptr ? all[i] : T(0)) + oxa[i] * qd;
+    } else {
+      for (int i = 0; i < 3; i++) {
+        omk[i] = oml[i];
+        alk[i] = all != nullptr ? all[i] : T(0);
+      }
+    }
+    for (int i = 0; i < 3; i++) {
+      d.om[k][i] = omk[i];
+      d.al[k][i] = alk[i];
+      d.vo[k][i] = vok[i];
+      d.ao[k][i] = aok[i];
+    }
+    if (F_MASS[k] > 0.0) {
+      T e[3];
+      for (int i = 0; i < 3; i++)
+        e[i] = d.r[k][i][0] * T(F_COM[k][0]) + d.r[k][i][1] * T(F_COM[k][1])
+               + d.r[k][i][2] * T(F_COM[k][2]);
+      T alxe[3], omxe[3], omxomxe[3];
+      cross3(alk, e, alxe);
+      cross3(omk, e, omxe);
+      cross3(omk, omxe, omxomxe);
+      T ac[3];
+      for (int i = 0; i < 3; i++) ac[i] = (aok[i] + alxe[i]) + omxomxe[i];
+      T iw[3][3];
+      inertia_world(d.r[k], F_INERTIA[k], iw);
+      T fbk[3];
+      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * T(F_MASS[k]);
+      T iwal[3], iwom[3];
+      for (int i = 0; i < 3; i++) {
+        iwal[i] = iw[i][0] * alk[0] + iw[i][1] * alk[1] + iw[i][2] * alk[2];
+        iwom[i] = iw[i][0] * omk[0] + iw[i][1] * omk[1] + iw[i][2] * omk[2];
+      }
+      T omxiw[3];
+      cross3(omk, iwom, omxiw);
+      T nbk[3];
+      for (int i = 0; i < 3; i++) nbk[i] = iwal[i] + omxiw[i];
+      T exf[3];
+      cross3(e, fbk, exf);
+      for (int i = 0; i < 3; i++) {
+        d.fb[k][i] = fbk[i];
+        d.nb[k][i] = nbk[i] + exf[i];
+      }
+    } else {
+      for (int i = 0; i < 3; i++) {
+        d.fb[k][i] = T(0);
+        d.nb[k][i] = T(0);
+      }
+    }
+  }
+  // base body inertial force/moment (al0 = ao0 = 0)
+  T f0[3], n0[3];
+  {
+    T e[3];
+    for (int i = 0; i < 3; i++)
+      e[i] = d.r0[i][0] * T(BASE_COM[0]) + d.r0[i][1] * T(BASE_COM[1])
+             + d.r0[i][2] * T(BASE_COM[2]);
+    T omxe[3], omxomxe[3];
+    cross3(om0, e, omxe);
+    cross3(om0, omxe, omxomxe);
+    T ac[3] = {omxomxe[0], omxomxe[1], omxomxe[2]};
+    T iw[3][3];
+    inertia_world(d.r0, BASE_INERTIA, iw);
+    for (int i = 0; i < 3; i++) f0[i] = (ac[i] - g[i]) * T(BASE_MASS);
+    T iwom[3];
+    for (int i = 0; i < 3; i++)
+      iwom[i] = iw[i][0] * om0[0] + iw[i][1] * om0[1] + iw[i][2] * om0[2];
+    T omxiw[3];
+    cross3(om0, iwom, omxiw);
+    T exf[3];
+    cross3(e, f0, exf);
+    for (int i = 0; i < 3; i++) n0[i] = omxiw[i] + exf[i];
+  }
+  // backward pass
+  for (int i = 0; i < NV; i++) d.c[i] = T(0);
+  for (int k = NF - 1; k >= 0; k--) {
+    if (F_COORD[k] >= 0)
+      d.c[VOFF + F_COORD[k]] = dot3(d.axw[k], d.nb[k]);
+    const int par = F_PARENT[k];
+    if (par < 0) {
+      T lever[3];
+      sub3v(d.pos[k], d.p, lever);
+      T lxf[3];
+      cross3(lever, d.fb[k], lxf);
+      for (int i = 0; i < 3; i++) {
+        f0[i] += d.fb[k][i];
+        n0[i] += d.nb[k][i] + lxf[i];
+      }
+    } else {
+      T lever[3];
+      sub3v(d.pos[k], d.pos[par], lever);
+      T lxf[3];
+      cross3(lever, d.fb[k], lxf);
+      for (int i = 0; i < 3; i++) {
+        d.fb[par][i] += d.fb[k][i];
+        d.nb[par][i] += d.nb[k][i] + lxf[i];
+      }
+    }
+  }
+  d.c[0] = f0[0];
+  d.c[1] = f0[1];
+  d.c[2] = f0[2];
+  d.c[3] = n0[0];
+  d.c[4] = n0[1];
+  d.c[5] = n0[2];
+}
+
+// Dense Cholesky (lower, no pivoting; algo.rs chol_factor) with the
+// parity/f32 guards of torch_dynamics.chol_factor: f64 latches bad and
+// proceeds with pivot 1 (Rust would panic — outside the parity domain);
+// f32 floors pivots at 1e-8 and latches bad only for d <= 0
+// (Divergences §20e).
+template <typename T>
+__device__ void chol_factor_n(int n, const T* m, T* l, bool* bad) {
+  for (int j = 0; j < n; j++) {
+    T dpiv = m[j * n + j];
+    for (int k = 0; k < j; k++) dpiv -= l[j * n + k] * l[j * n + k];
+    if (sizeof(T) == 8) {
+      if (dpiv <= T(0)) {
+        *bad = true;
+        dpiv = T(1);
+      }
+    } else {
+      if (dpiv <= T(0)) *bad = true;
+      dpiv = tmax(dpiv, T(PD_FLOOR_F32));
+    }
+    const T dj = sqrt(dpiv);
+    l[j * n + j] = dj;
+    for (int i = j + 1; i < n; i++) l[j * n + i] = T(0);
+    for (int i = j + 1; i < n; i++) {
+      T s = m[i * n + j];
+      for (int k = 0; k < j; k++) s -= l[i * n + k] * l[j * n + k];
+      l[i * n + j] = s / dj;
+    }
+  }
+}
+
+template <typename T>
+__device__ void chol_solve_n(int n, const T* l, T* x) {
+  for (int i = 0; i < n; i++) {
+    T s = x[i];
+    for (int k = 0; k < i; k++) s -= l[i * n + k] * x[k];
+    x[i] = s / l[i * n + i];
+  }
+  for (int i = n - 1; i >= 0; i--) {
+    T s = x[i];
+    for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
+    x[i] = s / l[i * n + i];
+  }
+}
+
+// ---- collide.rs seg_seg_closest (fixed branch order) ------------------------
+template <typename T>
+__device__ void seg_seg_closest(const T p1[3], const T q1[3], const T p2[3],
+                                const T q2[3], T c1[3], T c2[3], T* d2out) {
+  T d1[3], d2[3], r[3];
+  sub3v(q1, p1, d1);
+  sub3v(q2, p2, d2);
+  sub3v(p1, p2, r);
+  const T a = dot3(d1, d1);
+  const T e = dot3(d2, d2);
+  const T f = dot3(d2, r);
+  T s, t;
+  if (a <= T(SEG_EPS) && e <= T(SEG_EPS)) {
+    s = T(0);
+    t = T(0);
+  } else if (a <= T(SEG_EPS)) {
+    s = T(0);
+    t = tclamp(f / e, T(0), T(1));
+  } else {
+    const T c = dot3(d1, r);
+    if (e <= T(SEG_EPS)) {
+      t = T(0);
+      s = tclamp(-c / a, T(0), T(1));
+    } else {
+      const T b = dot3(d1, d2);
+      const T denom = a * e - b * b;
+      const T s0 = denom > T(SEG_EPS)
+                       ? tclamp((b * f - c * e) / denom, T(0), T(1))
+                       : T(0);
+      const T t0 = b * s0 + f;
+      if (t0 < T(0)) {
+        t = T(0);
+        s = tclamp(-c / a, T(0), T(1));
+      } else if (t0 > e) {
+        t = T(1);
+        s = tclamp((b - c) / a, T(0), T(1));
+      } else {
+        t = t0 / e;
+        s = s0;
+      }
+    }
+  }
+  for (int i = 0; i < 3; i++) {
+    c1[i] = p1[i] + d1[i] * s;
+    c2[i] = p2[i] + d2[i] * t;
+  }
+  T dd[3];
+  sub3v(c1, c2, dd);
+  *d2out = dot3(dd, dd);
+}
+
+// ---- solver.rs jacobians ----------------------------------------------------
+template <typename T>
+__device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
+                                   const T n[3], T sign, T* row) {
+  int k = frame;
+  while (k >= 0) {
+    if (F_COORD[k] >= 0) {
+      const int col = VOFF + F_COORD[k];
+      T rel[3], w[3];
+      sub3v(p, d.pos[k], rel);
+      cross3(d.axw[k], rel, w);
+      row[col] += sign * dot3(n, w);
+    }
+    k = F_PARENT[k];
+  }
+  for (int t = 0; t < 3; t++) row[t] += sign * n[t];
+  T rel0[3], rxn[3];
+  sub3v(p, d.p, rel0);
+  cross3(rel0, n, rxn);
+  for (int t = 0; t < 3; t++) row[3 + t] += sign * rxn[t];
+}
+
+template <typename T>
+__device__ void angular_jacobian_acc(const Dyn<T>& d, int frame, int axis_t,
+                                     T sign, T* row) {
+  int k = frame;
+  while (k >= 0) {
+    if (F_COORD[k] >= 0) row[VOFF + F_COORD[k]] += sign * d.axw[k][axis_t];
+    k = F_PARENT[k];
+  }
+  row[3 + axis_t] += sign;
+}
+
+// Lazily compute the plain M^-1 e_j column (shared by step-8 cap/limit
+// rows and the step-11 clamps — same expression tree as Rust's three
+// separate caches).
+template <typename T>
+__device__ void ensure_ecol(Dyn<T>& d, Solver<T>& s, int j) {
+  if (s.ecomp[j]) return;
+  T* col = s.ecol[j];
+  for (int i = 0; i < NV; i++) col[i] = T(0);
+  col[VOFF + j] = T(1);
+  chol_solve_n(NV, d.l, col);
+  s.ecomp[j] = true;
+}
+
+// Lazily compute the weld-null-space-projected column + composite
+// mobility (solver.rs capcol path; also the limit-row direction).
+template <typename T>
+__device__ void ensure_pcol(Dyn<T>& d, Solver<T>& s, int j) {
+  if (s.pcomp[j]) return;
+  ensure_ecol(d, s, j);
+  const T plain = s.ecol[j][VOFF + j];
+  T* col = s.pcol[j];
+  for (int i = 0; i < NV; i++) col[i] = s.ecol[j][i];
+  for (int w = 0; w < N_WELD; w++) {
+    T sum = T(0);
+    for (int i = 0; i < NV; i++) sum += s.jw[w][i] * col[i];
+    s.rw[w] = sum;
+  }
+  chol_solve_n(N_WELD, s.lww, s.rw);
+  for (int w = 0; w < N_WELD; w++) {
+    const T x = s.rw[w];
+    for (int i = 0; i < NV; i++) col[i] -= s.mw[w][i] * x;
+  }
+  const T dnew = col[VOFF + j];
+  s.pdiag[j] = dnew > T(COMPOSITE_EPS) * plain
+                   ? dnew
+                   : std::numeric_limits<T>::infinity();
+  s.pcomp[j] = true;
+}
+
+// ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
+template <typename T>
+__device__ void constraint_solve(Dyn<T>& d, Solver<T>& s, const T* qpre,
+                                 T* v) {
+  const T hinv = T(1) / T(H_SUB);
+
+  // -- assembly: weld rows 0-11 ----------------------------------------------
+  for (int widx = 0; widx < 2; widx++) {
+    const int frame = WELD_FRAMES[widx];
+    const T* pf = d.pos[frame];
+    for (int t = 0; t < 3; t++) {
+      T* jr = s.jw[6 * widx + t];
+      for (int i = 0; i < NV; i++) jr[i] = T(0);
+      T n[3] = {T(0), T(0), T(0)};
+      n[t] = T(1);
+      point_jacobian_acc(d, frame, pf, n, T(1), jr);
+      s.bias_w[6 * widx + t] =
+          -(T(BETA_WELD) * hinv) * (pf[t] - T(WELD_TARGET_P[widx][t]));
+    }
+    T phi[3];
+    rot_log(d.r[frame], phi);
+    for (int t = 0; t < 3; t++) {
+      T* jr = s.jw[6 * widx + 3 + t];
+      for (int i = 0; i < NV; i++) jr[i] = T(0);
+      angular_jacobian_acc(d, frame, t, T(1), jr);
+      s.bias_w[6 * widx + 3 + t] = -(T(BETA_WELD) * hinv) * phi[t];
+    }
+  }
+
+  // -- step 7: narrow phase + contact rows (pair-id order) --------------------
+  s.nc = 0;
+  for (int pid = 0; pid < NUM_PAIRS; pid++) {
+    const int ia = PAIR_A[pid], ib = PAIR_B[pid];
+    const int fa = COL_FRAME[ia], fbf = COL_FRAME[ib];
+    T p1[3], q1[3], p2[3], q2[3];
+    for (int i = 0; i < 3; i++) {
+      p1[i] = d.pos[fa][i] + (d.r[fa][i][0] * T(COL_A[ia][0])
+                              + d.r[fa][i][1] * T(COL_A[ia][1])
+                              + d.r[fa][i][2] * T(COL_A[ia][2]));
+      q1[i] = d.pos[fa][i] + (d.r[fa][i][0] * T(COL_B[ia][0])
+                              + d.r[fa][i][1] * T(COL_B[ia][1])
+                              + d.r[fa][i][2] * T(COL_B[ia][2]));
+      p2[i] = d.pos[fbf][i] + (d.r[fbf][i][0] * T(COL_A[ib][0])
+                               + d.r[fbf][i][1] * T(COL_A[ib][1])
+                               + d.r[fbf][i][2] * T(COL_A[ib][2]));
+      q2[i] = d.pos[fbf][i] + (d.r[fbf][i][0] * T(COL_B[ib][0])
+                               + d.r[fbf][i][1] * T(COL_B[ib][1])
+                               + d.r[fbf][i][2] * T(COL_B[ib][2]));
+    }
+    T c1[3], c2[3], dist2;
+    seg_seg_closest(p1, q1, p2, q2, c1, c2, &dist2);
+    const T dist = sqrt(dist2);
+    const T gap = dist - T(COL_R[ia] + COL_R[ib]);
+    if (gap < T(MARGIN)) {
+      T n[3];
+      if (dist > T(1e-9)) {
+        const T inv = T(1) / dist;
+        for (int i = 0; i < 3; i++) n[i] = (c2[i] - c1[i]) * inv;
+      } else {
+        n[0] = T(0);
+        n[1] = T(1);
+        n[2] = T(0);
+      }
+      const int ci = s.nc;
+      s.c_pair[ci] = pid;
+      for (int i = 0; i < 3; i++) {
+        const T s1 = c1[i] + n[i] * T(COL_R[ia]);
+        const T s2 = c2[i] - n[i] * T(COL_R[ib]);
+        s.c_pt[ci][i] = (s1 + s2) * T(0.5);
+      }
+      T* jr = s.c_J[ci];
+      for (int i = 0; i < NV; i++) jr[i] = T(0);
+      point_jacobian_acc(d, fa, s.c_pt[ci], n, T(-1), jr);
+      point_jacobian_acc(d, fbf, s.c_pt[ci], n, T(1), jr);
+      s.c_bias[ci] = gap >= T(0)
+                         ? -gap * hinv
+                         : (T(BETA_CONTACT) * hinv) * tmax(-gap - T(SLOP),
+                                                           T(0));
+      s.nc = ci + 1;
+    }
+  }
+
+  // -- assembly: joint-limit rows, joint order (Divergences §15) --------------
+  s.nl = 0;
+  for (int j = 0; j < NQ; j++) {
+    const T gl = qpre[j] - T(LIMIT_LO[j]);
+    const T gh = T(LIMIT_HI[j]) - qpre[j];
+    const T reach = T(H_SUB) * T(OMEGA_CAP[j]);
+    T sign, gap;
+    if (gl <= gh) {
+      sign = T(1);
+      gap = gl;
+    } else {
+      sign = T(-1);
+      gap = gh;
+    }
+    if (gap < reach) {
+      const int li = s.nl;
+      s.l_j[li] = j;
+      s.l_sign[li] = sign;
+      s.l_bias[li] =
+          gap >= T(0) ? -gap * hinv : (T(BETA_WELD) * hinv) * -gap;
+      s.nl = li + 1;
+    }
+  }
+
+  // -- effective masses (row order: welds, contacts, limits) ------------------
+  for (int w = 0; w < N_WELD; w++) {
+    for (int i = 0; i < NV; i++) s.mw[w][i] = s.jw[w][i];
+    chol_solve_n(NV, d.l, s.mw[w]);
+  }
+  for (int ci = 0; ci < s.nc; ci++) {
+    for (int i = 0; i < NV; i++) s.c_minv[ci][i] = s.c_J[ci][i];
+    chol_solve_n(NV, d.l, s.c_minv[ci]);
+    T diag = T(0);
+    for (int i = 0; i < NV; i++) diag += s.c_J[ci][i] * s.c_minv[ci][i];
+    s.c_diag[ci] = diag;
+  }
+  // limit rows' plain columns = M^-1 e_j (the +-1 row sign commutes
+  // exactly through the solve/projection — computed unsigned, applied
+  // signed; bitwise identical to Rust's signed-row solves)
+  for (int li = 0; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
+
+  // -- weld block A_ww = J_w M^-1 J_w^T, factored once ------------------------
+  // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]; both
+  // triangles from one value (bitwise symmetric, solver.rs)
+  for (int r = 0; r < N_WELD; r++)
+    for (int c = r; c < N_WELD; c++) {
+      T sum = T(0);
+      for (int i = 0; i < NV; i++) sum += s.jw[c][i] * s.mw[r][i];
+      s.aww[r * N_WELD + c] = sum;
+      s.aww[c * N_WELD + r] = sum;
+    }
+  chol_factor_n(N_WELD, s.aww, s.lww, &d.pd_bad);
+
+  // -- limit rows: project into the weld null space ---------------------------
+  for (int li = 0; li < s.nl; li++) {
+    ensure_pcol(d, s, s.l_j[li]);
+    s.l_diag[li] = s.pdiag[s.l_j[li]];
+    s.l_lam[li] = T(0);
+  }
+  for (int ci = 0; ci < s.nc; ci++) s.c_lam[ci] = T(0);
+
+  // -- step 8: exactly 12 iterations, fixed order -----------------------------
+  for (int iter = 0; iter < PGS_ITERS; iter++) {
+    // (a) weld block: exact solve of the current residual
+    for (int r = 0; r < N_WELD; r++) {
+      T jv = T(0);
+      for (int i = 0; i < NV; i++) jv += s.jw[r][i] * v[i];
+      s.rw[r] = s.bias_w[r] - jv;
+    }
+    chol_solve_n(N_WELD, s.lww, s.rw);
+    for (int r = 0; r < N_WELD; r++) {
+      const T dl = s.rw[r];
+      for (int i = 0; i < NV; i++) v[i] += s.mw[r][i] * dl;
+    }
+    // (b) contacts, pair-id order: projected GS, lambda >= 0
+    for (int ci = 0; ci < s.nc; ci++) {
+      T jv = T(0);
+      for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * v[i];
+      const T dl = (s.c_bias[ci] - jv) / s.c_diag[ci];
+      const T newl = tmax(s.c_lam[ci] + dl, T(0));
+      const T dd = newl - s.c_lam[ci];
+      s.c_lam[ci] = newl;
+      if (dd != T(0))
+        for (int i = 0; i < NV; i++) v[i] += s.c_minv[ci][i] * dd;
+    }
+    // (c) limit rows, joint order (J = sign * e_j: exact-zero terms
+    // dropped — Divergences §20c sign-of-zero class)
+    for (int li = 0; li < s.nl; li++) {
+      const int j = s.l_j[li];
+      const T jv = s.l_sign[li] * v[VOFF + j];
+      const T dl = (s.l_bias[li] - jv) / s.l_diag[li];
+      const T newl = tmax(s.l_lam[li] + dl, T(0));
+      const T dd = newl - s.l_lam[li];
+      s.l_lam[li] = newl;
+      if (dd != T(0)) {
+        const T sd = s.l_sign[li] * dd;
+        for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * sd;
+      }
+    }
+    // (d) omega-cap pass, joint order: weld-consistent impulses
+    for (int j = 0; j < NQ; j++) {
+      const int vj = VOFF + j;
+      const T cap = T(OMEGA_CAP[j]);
+      const T target = tclamp(v[vj], -cap, cap);
+      if (target != v[vj]) {
+        ensure_pcol(d, s, j);
+        if (!isinf(s.pdiag[j])) {
+          const T lam = (target - v[vj]) / s.pdiag[j];
+          for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * lam;
+          v[vj] = target;  // exact — the cap is a hard bound
+        }
+      }
+    }
+  }
+}
+
+// ---- step.rs substep (constrained) ------------------------------------------
+template <typename T>
+__device__ void substep(Dyn<T>& d, Solver<T>& s, const T tau[NQ]) {
+  // 1-3. FK, CRBA, RNEA bias
+  fk_all(d);
+  crba(d);
+  rnea_bias(d);
+  // 4. rhs = tau - b*qd - C (root rows 0 - C)
+  for (int i = 0; i < VOFF; i++) d.rhs[i] = T(0) - d.c[i];
+  for (int j = 0; j < NQ; j++)
+    d.rhs[VOFF + j] =
+        tau[j] - T(DAMPING[j]) * d.v[VOFF + j] - d.c[VOFF + j];
+  // 5. Cholesky
+  chol_factor_n(NV, d.m, d.l, &d.pd_bad);
+  // 6. v* = v + h M^-1 (tau - C)
+  chol_solve_n(NV, d.l, d.rhs);
+  T v[NV];
+  for (int i = 0; i < NV; i++) v[i] = d.v[i] + T(H_SUB) * d.rhs[i];
+  // shared per-joint column caches reset per substep (this factor)
+  for (int j = 0; j < NQ; j++) {
+    s.ecomp[j] = false;
+    s.pcomp[j] = false;
+  }
+  // 7-9. constraint stage
+  constraint_solve(d, s, d.q, v);
+  for (int i = 0; i < NV; i++) d.v[i] = v[i];
+  // 10. semi-implicit Euler positions + root exp-map quaternion
+  for (int j = 0; j < NQ; j++) d.q[j] += T(H_SUB) * d.v[VOFF + j];
+  for (int i = 0; i < 3; i++) d.p[i] += T(H_SUB) * d.v[i];
+  {
+    const T u0 = d.v[3] * T(H_SUB) * T(0.5);
+    const T u1 = d.v[4] * T(H_SUB) * T(0.5);
+    const T u2 = d.v[5] * T(H_SUB) * T(0.5);
+    const T un = sqrt(u0 * u0 + u1 * u1 + u2 * u2);
+    T qe[4];
+    if (un < T(1e-12)) {
+      qe[0] = T(1);
+      qe[1] = T(0);
+      qe[2] = T(0);
+      qe[3] = T(0);
+    } else {
+      const T su = sin(un), cu = cos(un);
+      qe[0] = cu;
+      qe[1] = su * u0 / un;
+      qe[2] = su * u1 / un;
+      qe[3] = su * u2 / un;
+    }
+    T qq[4];
+    quat_mul(qe, d.quat, qq);
+    const T qn =
+        sqrt(qq[0] * qq[0] + qq[1] * qq[1] + qq[2] * qq[2] + qq[3] * qq[3]);
+    for (int i = 0; i < 4; i++) d.quat[i] = qq[i] / qn;
+  }
+  // 11. post-solve clamps as momentum-consistent impulses (joint order,
+  //     CLAMP_PASSES Gauss-Seidel passes with Rust's early-out, then
+  //     the guarantee pass)
+  for (int j = 0; j < NQ; j++) {
+    const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+    s.hit[j] = d.q[j] < lo || d.q[j] > hi;
+    if (s.hit[j]) d.q[j] = tclamp(d.q[j], lo, hi);
+  }
+  for (int pass = 0; pass < CLAMP_PASSES; pass++) {
+    bool changed = false;
+    for (int j = 0; j < NQ; j++) {
+      const int vj = VOFF + j;
+      const T cap = T(OMEGA_CAP[j]);
+      const T target = s.hit[j] ? T(0) : tclamp(d.v[vj], -cap, cap);
+      if (target != d.v[vj]) {
+        ensure_ecol(d, s, j);
+        const T* col = s.ecol[j];
+        const T lam = (target - d.v[vj]) / col[vj];
+        for (int i = 0; i < NV; i++) d.v[i] += col[i] * lam;
+        d.v[vj] = target;  // exact — the clamp is a hard bound
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  for (int j = 0; j < NQ; j++) {
+    const int vj = VOFF + j;
+    const T cap = T(OMEGA_CAP[j]);
+    d.v[vj] = tclamp(d.v[vj], -cap, cap);
+    if (s.hit[j]) d.v[vj] = T(0);
+  }
+  // 12. root velocity envelope guarantee (Divergences §19b)
+  {
+    const T w2 = d.v[3] * d.v[3] + d.v[4] * d.v[4] + d.v[5] * d.v[5];
+    if (w2 > T(ROOT_W_MAX) * T(ROOT_W_MAX)) {
+      const T sc = T(ROOT_W_MAX) / sqrt(w2);
+      d.v[3] *= sc;
+      d.v[4] *= sc;
+      d.v[5] *= sc;
+    }
+    const T l2 = d.v[0] * d.v[0] + d.v[1] * d.v[1] + d.v[2] * d.v[2];
+    if (l2 > T(ROOT_V_MAX) * T(ROOT_V_MAX)) {
+      const T sc = T(ROOT_V_MAX) / sqrt(l2);
+      d.v[0] *= sc;
+      d.v[1] *= sc;
+      d.v[2] *= sc;
+    }
+  }
+}
+
+// ---- env-layer geometry (lib.rs; carried from the v9 kernel) ----------------
 template <typename T>
 __device__ bool tri_box_overlap(const T v[3][3], const T h[3]) {
   for (int k = 0; k < 3; k++) {
@@ -208,7 +1257,7 @@ __device__ bool tri_box_overlap(const T v[3][3], const T h[3]) {
     e[1][k] = v[2][k] - v[1][k];
     e[2][k] = v[0][k] - v[2][k];
   }
-  for (int j = 0; j < 3; j++) {  // 9 cross-axis tests: a = u_k x e_j
+  for (int j = 0; j < 3; j++) {
     T ax[3][3] = {{T(0), -e[j][2], e[j][1]},
                   {e[j][2], T(0), -e[j][0]},
                   {-e[j][1], e[j][0], T(0)}};
@@ -228,8 +1277,6 @@ __device__ bool tri_box_overlap(const T v[3][3], const T h[3]) {
   return fabs(dot3(n, v[0])) <= r;
 }
 
-/// Closest distance from point p to triangle (a, b, c) — Ericson's
-/// 7-region cascade (lib.rs tri_point_dist), early returns kept.
 template <typename T>
 __device__ T tri_point_dist(const T a[3], const T b[3], const T c[3],
                             const T p[3]) {
@@ -305,17 +1352,16 @@ __device__ T seg_point_dist3(const T a[3], const T b[3], const T c[3]) {
   return sqrt(px * px + py * py + pz * pz);
 }
 
-/// Orthonormal note frame columns (lib.rs note_frame, env v7.6 look-at):
-/// z' blends +z toward the (damped-y) head->note ray with weight lam; the
-/// cut-direction z-roll rides as up; x' = up x z'; y' = z' x x'.
+// note_frame — env v10: `head` is the LIVE FK head position.
 template <typename T>
-__device__ void note_frame(const T p[3], T cos_r, T sin_r, T lam, T f[3][3]) {
+__device__ void note_frame(const T p[3], T cos_r, T sin_r, T lam,
+                           const T head[3], T f[3][3]) {
   T up[3] = {-sin_r, cos_r, T(0)};
-  T hp1 = T(HEAD[1]) + T(LOOK_VERT) * (p[1] - T(HEAD[1]));
-  T d[3] = {p[0] - T(HEAD[0]), p[1] - hp1, p[2] - T(HEAD[2])};
-  T dn = tmax(sqrt(dot3(d, d)), T(1e-9));
-  T g[3] = {lam * d[0] / dn, lam * d[1] / dn,
-            (T(1) - lam) + lam * d[2] / dn};
+  T hp1 = head[1] + T(LOOK_VERT) * (p[1] - head[1]);
+  T dv[3] = {p[0] - head[0], p[1] - hp1, p[2] - head[2]};
+  T dn = tmax(sqrt(dot3(dv, dv)), T(1e-9));
+  T g[3] = {lam * dv[0] / dn, lam * dv[1] / dn,
+            (T(1) - lam) + lam * dv[2] / dn};
   T gn = tmax(sqrt(dot3(g, g)), T(1e-9));
   for (int k = 0; k < 3; k++) f[2][k] = g[k] / gn;
   T cx[3];
@@ -325,7 +1371,6 @@ __device__ void note_frame(const T p[3], T cos_r, T sin_r, T lam, T f[3][3]) {
   cross3(f[2], f[0], f[1]);
 }
 
-/// One point into the note frame (translate to c, project on f's rows).
 template <typename T>
 __device__ void to_note_frame(const T p[3], const T c[3], const T f[3][3],
                               T out[3]) {
@@ -335,11 +1380,6 @@ __device__ void to_note_frame(const T p[3], const T c[3], const T f[3][3],
   out[2] = dot3(q, f[2]);
 }
 
-/// The swept blade surface = quad (w0->t0, w1->t1) as triangles
-/// (w0, t0, t1) and (w0, t1, w1) — box test in the note frame. The two
-/// triangles are unrolled explicitly: an indexed pointer array here
-/// spills to local memory (48 B stack) and taxes every vertex fetch in
-/// the per-object judgment loop.
 template <typename T>
 __device__ bool sweep_hits_box(const T w0[3], const T t0[3], const T t1[3],
                                const T w1[3], const T c[3], const T h[3],
@@ -349,7 +1389,6 @@ __device__ bool sweep_hits_box(const T w0[3], const T t0[3], const T t1[3],
   to_note_frame(t0, c, f, rel[1]);
   to_note_frame(t1, c, f, rel[2]);
   if (tri_box_overlap(rel, h)) return true;
-  // second triangle (w0, t1, w1): rel[0] (w0) is already in place
   to_note_frame(t1, c, f, rel[1]);
   to_note_frame(w1, c, f, rel[2]);
   return tri_box_overlap(rel, h);
@@ -361,24 +1400,33 @@ __device__ T sweep_dist(const T w0[3], const T t0[3], const T t1[3],
   return tmin(tri_point_dist(w0, t0, t1, p), tri_point_dist(w0, t1, w1, p));
 }
 
-// --- kernel parameters (structure-of-arrays pointers) ------------------------
+// ---- kernel parameters ------------------------------------------------------
 template <typename T>
 struct Sim {
-  // per-env state (mutated in place)
-  T *q, *om, *wrist, *blade, *wrist_vel, *swing_acc, *axis;
+  // dynamics state (mutated in place)
+  T *p, *quat, *q, *v;
+  // FK caches
+  T *wrist, *blade, *wrist_vel, *head, *shoulder_z;
+  // swing chain
+  T *swing_acc, *axis;
   bool* axis_valid;
+  // follow-through tracker ring (aggregated)
   T* tr_acc;
   int *tr_age, *tr_cnt;
   bool* tr_active;
   int* tr_ptr;
+  // episode state
   int* tick;
   uint8_t* status;
-  int* first_pending;  // per-env low-water cursor over status (monotone)
+  int* first_pending;
   T* ep_return;
   int *good, *bad, *miss, *bombs;
-  T* score;
-  // score decomposition (2026-07-25): pre/acc/post point totals
-  T *score_pre, *score_acc, *score_post;
+  T *score, *score_pre, *score_acc, *score_post;
+  // contact aggregation (obs bits + parity introspection)
+  T *contact_imp, *contact_pt;
+  bool* contact_arm;
+  T* effort;
+  int* pd_hits;  // f32 pivot-floor engagements (Divergences §20e)
   int64_t* chart_idx;
   // chart pool (P, C), read-only
   const T *p_hit, *p_speed, *p_center, *p_dvec, *p_rot, *p_good_hy, *p_bad_hy;
@@ -393,562 +1441,583 @@ struct Sim {
   float* obs;
   T* reward;
   bool* done;
-  int C, max_steps, cap, mode;  // mode: 0 = step, 1 = reset-all
+  int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
-  int gears;      // env v8: action-table size (3 / 5 / 7)
-  bool wide_acc;  // TRAINING-ONLY wide accuracy reward (see cut scoring)
+  int gears;
+  bool wide_acc;
   bool auto_reset;
 };
 
-// One block per env; the whole step (integrate, judge, done, auto-reset,
-// obs) in one launch. Mirrors lib.rs step_inner's phase order exactly.
-// __launch_bounds__(64, 16) caps the f32 instantiation at 64 regs for 16
-// resident blocks/SM (was 83 regs -> 12 blocks/SM; at production N=1024
-// on 20 SMs that is 3.2 waves vs 4.3 — the round-2 sweep unroll's
-// REG 63->80 trade was justified at N=128, where the grid was resident
-// either way). The f64 instantiation (parity tests only) spills instead;
-// correctness is unaffected and its speed does not matter.
+// FK caches from the current state (lib.rs Body::refresh_fk): wrist =
+// hand-frame origin, blade = hand-frame +z column, live head/shoulders.
 template <typename T>
-__global__ void __launch_bounds__(THREADS, 16) step_kernel(Sim<T> P) {
-  const int e = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int C = P.C;
-  extern __shared__ unsigned char smem_raw[];
-  T* scratch = reinterpret_cast<T*>(smem_raw);  // per-object reward terms
-
-  __shared__ T sh_pw[2][3], sh_pd[2][3], sh_w[2][3], sh_d[2][3];
-  __shared__ T sh_t0[2][3], sh_t1[2][3];
-  __shared__ T sh_delta[2], sh_swing[2];
-  __shared__ bool sh_cont[2];
-  __shared__ int sh_nnew[2];
-  __shared__ int sh_good, sh_bad, sh_miss, sh_bomb;
-  __shared__ T sh_score, sh_rew;
-  __shared__ T sh_pre, sh_acc, sh_post;
-  __shared__ bool sh_doreset;
-  __shared__ int64_t sh_chart;
-  __shared__ int sh_slots[N_NOTE_SLOTS];
-  __shared__ int sh_nslots;
-
-  const int64_t c0 = P.chart_idx[e];
-  const bool stepping = (P.mode == 0);
-  // chart-scan window [fp0, hw): fp0 is the low-water cursor (everything
-  // below is resolved or padding); hw is the high-water bound — hit_time
-  // is sorted, so once (hit - t) * min_speed > REACH_Z every later note
-  // has z > REACH_Z and takes the not-yet-reachable `continue`. Exact:
-  // notes outside the window touch neither status nor scratch. Every
-  // thread runs the same O(log C) search on the same values (uniform).
-  int fp0 = 0, hw = 0;
-  if (stepping) {
-    const T time_new = T(P.tick[e] + 1) * T(DT);
-    fp0 = P.first_pending[e];
-    int lo = fp0, hi = (int)P.p_n_notes[c0];
-    const T ms = P.p_min_speed[c0];
-    while (lo < hi) {
-      const int mid = (lo + hi) >> 1;
-      if ((P.p_hit[c0 * C + mid] - time_new) * ms > T(REACH_Z)) hi = mid;
-      else lo = mid + 1;
-    }
-    hw = lo;
-  }
-
-  if (stepping) {
-    if (tid == 0) {
-      sh_good = sh_bad = sh_miss = sh_bomb = 0;
-      sh_nnew[0] = sh_nnew[1] = 0;
-      sh_score = T(0);
-      sh_pre = sh_acc = sh_post = T(0);
-    }
-    for (int i = fp0 + tid; i < hw; i += blockDim.x) scratch[i] = T(0);
-
-    // Phase A (threads 0/1, one hand each): joint integrator, FK, swept
-    // quad, swing-chain update (lib.rs per-arm loop)
-    if (tid < 2) {
-      const int h = tid;
-      const int qb = (e * 2 + h) * N_JOINTS;
-      const int wb = (e * 2 + h) * 3;
-      T q[N_JOINTS], om[N_JOINTS], pw[3], pd[3];
-      for (int j = 0; j < N_JOINTS; j++) {
-        q[j] = P.q[qb + j];
-        om[j] = P.om[qb + j];
-      }
-      for (int k = 0; k < 3; k++) {
-        pw[k] = P.wrist[wb + k];
-        pd[k] = P.blade[wb + k];
-        sh_pw[h][k] = pw[k];
-        sh_pd[h][k] = pd[k];
-      }
-      const double* gr = gear_row(P.gears);
-      for (int j = 0; j < N_JOINTS; j++) {
-        const int a = (int)P.actions[e * 2 * N_JOINTS + h * N_JOINTS + j];
-        const T al = T(JOINT_ALPHA[j]);
-        om[j] += T(gr[a < 7 ? a : 0]) * al * T(DT);
-        const T omax = T(JOINT_OMEGA[j]);
-        om[j] = tclamp(om[j] * (T(1) - T(DRAG)), -omax, omax);
-        q[j] += om[j] * T(DT);
-        T lo, hi;
-        joint_lim(h, j, lo, hi);
-        if (q[j] < lo || q[j] > hi) {  // hitting a limit kills omega
-          q[j] = tclamp(q[j], lo, hi);
-          om[j] = T(0);
-        }
-        P.q[qb + j] = q[j];
-        P.om[qb + j] = om[j];
-      }
-      T w[3], b[3];
-      fk(h, q, w, b);
-      for (int k = 0; k < 3; k++) {
-        P.wrist[wb + k] = w[k];
-        P.blade[wb + k] = b[k];
-        P.wrist_vel[wb + k] = (w[k] - pw[k]) / T(DT);
-        sh_w[h][k] = w[k];
-        sh_d[h][k] = b[k];
-        sh_t0[h][k] = pw[k] + T(SABER_LEN) * pd[k];
-        sh_t1[h][k] = w[k] + T(SABER_LEN) * b[k];
-      }
-      // swing chain (feeds pre-swing + follow-through)
-      const T dp = tclamp(dot3(pd, b), T(-1), T(1));
-      const T delta = acos(dp);
-      T sacc = P.swing_acc[e * 2 + h];
-      bool cont = false;
-      if (delta < T(SWING_BREAK)) {
-        sacc = T(0);
-        P.axis_valid[e * 2 + h] = false;
-      } else {
-        T cx[3];
-        cross3(pd, b, cx);
-        const T cn = sqrt(dot3(cx, cx));
-        const T ax[3] = {cx[0] / cn, cx[1] / cn, cx[2] / cn};
-        const int ab = (e * 2 + h) * 3;
-        const bool rev = P.axis_valid[e * 2 + h]
-            && (P.axis[ab] * ax[0] + P.axis[ab + 1] * ax[1]
-                + P.axis[ab + 2] * ax[2]) < T(0);
-        if (rev) {
-          sacc = delta;  // reversal: a new swing starts
-        } else {
-          sacc += delta;
-          cont = true;
-        }
-        for (int k = 0; k < 3; k++) P.axis[ab + k] = ax[k];
-        P.axis_valid[e * 2 + h] = true;
-      }
-      P.swing_acc[e * 2 + h] = sacc;
-      sh_swing[h] = sacc;
-      sh_delta[h] = delta;
-      sh_cont[h] = cont;
-    }
-    __syncthreads();
-
-    // Phase B (thread 0): effort cost + existing-tracker resolution
-    // (BEFORE this tick's cuts, lib.rs order)
-    if (tid == 0) {
-      T rew = T(0);
-      T eff = T(0);
-      const double* gr = gear_row(P.gears);
-      for (int h = 0; h < 2; h++)
-        for (int j = 0; j < N_JOINTS; j++) {
-          const int a = (int)P.actions[e * 2 * N_JOINTS + h * N_JOINTS + j];
-          if (a != 0 && a < 7)
-            eff += T(EFFORT_COST[j]) * T(fabs(gr[a]));
-        }
-      rew -= P.effort_coef * eff;
-      for (int h = 0; h < 2; h++) {
-        for (int s = 0; s < N_TRACKERS; s++) {
-          const int b = (e * 2 + h) * N_TRACKERS + s;
-          if (!P.tr_active[b]) continue;
-          T acc = P.tr_acc[b];
-          bool resolve;
-          if (!sh_cont[h]) {
-            resolve = true;  // chain broke or reversed
-          } else {
-            acc += sh_delta[h];
-            const int age = P.tr_age[b] + 1;
-            P.tr_acc[b] = acc;
-            P.tr_age[b] = age;
-            resolve = acc >= T(POST_FULL) || age >= FOLLOW_TIMEOUT;
-          }
-          if (resolve) {
-            const T pts = round_pts(T(PTS_POST)
-                                    * tmin(acc / T(POST_FULL), T(1)));
-            const T tot = pts * T(P.tr_cnt[b]);
-            rew += tot / T(SCORE_MAX);
-            sh_score += tot;
-            sh_post += tot;
-            P.tr_active[b] = false;
-          }
-        }
-      }
-      sh_rew = rew;
-    }
-    __syncthreads();
-
-    // Phase C (all threads stride the [fp0, hw) window): per-object
-    // judgment — the expensive swept-surface SAT stage. Each object is
-    // independent; reward terms land in scratch[i] for the ordered sum
-    // in phase D.
-    const T time_new = T(P.tick[e] + 1) * T(DT);
-    for (int i = fp0 + tid; i < hw; i += blockDim.x) {
-      const int64_t cb = c0 * C + i;
-      if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
-      const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb];
-      const bool bomb = P.p_is_bomb[cb];
-      if (z < T(-Z_MISS)) {
-        if (bomb) {
-          P.status[e * C + i] = 4;  // passed clean: silent
-        } else {
-          P.status[e * C + i] = 3;
-          atomicAdd(&sh_miss, 1);
-          scratch[i] = T(REWARD_MISS);
-        }
-        continue;
-      }
-      if (z > T(REACH_Z)) continue;
-      const T center[3] = {P.p_center[cb * 2], P.p_center[cb * 2 + 1], z};
-      if (bomb) {  // either saber's sweep within BOMB_RADIUS of center
-        for (int h = 0; h < 2; h++) {
-          if (sweep_dist(sh_pw[h], sh_t0[h], sh_t1[h], sh_w[h], center)
-              <= T(BOMB_RADIUS)) {
-            P.status[e * C + i] = 2;
-            atomicAdd(&sh_bomb, 1);
-            scratch[i] = T(REWARD_BOMB);
-            break;
-          }
-        }
-        continue;
-      }
-      const int m = P.p_is_right[cb] ? 1 : 0;  // matching saber
-      const bool is_head = P.p_is_head[cb];
-      const bool is_link = P.p_is_link[cb];
-      // env v7.6: plain notes billboard toward the head; heads/links keep
-      // the pure z-roll (lam = 0)
-      const T lam = (!is_head && !is_link)
-          ? tclamp(T(1) - z / T(LOOK_DIST), T(0), T(1))
-          : T(0);
-      T frame[3][3];
-      note_frame(center, P.p_rot[cb * 2], P.p_rot[cb * 2 + 1], lam, frame);
-      // the good box's 0.25 m shift rides the note's LOCAL z
-      const T gc[3] = {center[0] + T(GOOD_Z_SHIFT) * frame[2][0],
-                       center[1] + T(GOOD_Z_SHIFT) * frame[2][1],
-                       center[2] + T(GOOD_Z_SHIFT) * frame[2][2]};
-      const T good_h[3] = {T(GOOD_HALF_X), P.p_good_hy[cb], T(GOOD_HALF_Z)};
-      if (sweep_hits_box(sh_pw[m], sh_t0[m], sh_t1[m], sh_w[m], gc, good_h,
-                         frame)) {
-        // contact point: blade sample whose displacement segment passes
-        // closest to the center; first strict minimum wins (Rust's `<`)
-        T d_seg = std::numeric_limits<T>::infinity();
-        T s_star = T(0);
-        for (int j = 1; j <= N_BLADE_SAMPLES; j++) {
-          const T r = (T(j) / T(N_BLADE_SAMPLES)) * T(SABER_LEN);
-          T p0[3], p1[3];
-          for (int k = 0; k < 3; k++) {
-            p0[k] = sh_pw[m][k] + r * sh_pd[m][k];
-            p1[k] = sh_w[m][k] + r * sh_d[m][k];
-          }
-          const T d = seg_point_dist3(p0, p1, center);
-          if (d < d_seg) {
-            d_seg = d;
-            s_star = r;
-          }
-        }
-        T vc[3];
-        for (int k = 0; k < 3; k++)
-          vc[k] = (sh_w[m][k] + s_star * sh_d[m][k] - sh_pw[m][k]
-                   - s_star * sh_pd[m][k]) / T(DT);
-        const T vc_mag = sqrt(vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]);
-        // accuracy distance (2026-07-29, user-caught v7.4-class fix):
-        // point-to-INFINITE-CUT-PLANE (blade direction x tip movement),
-        // as the real game computes cutDistanceToCenter — NOT the
-        // one-tick swept surface, which conflated depth/timing with
-        // lateral error and floored early cuts through the deep box at
-        // ~0. Mirrors lib.rs; degenerate stab (tip motion ~parallel to
-        // the blade) falls back to distance-to-blade-line.
-        T tip_move[3], cw[3], pn[3];
-        for (int k = 0; k < 3; k++) {
-          tip_move[k] = sh_w[m][k] + T(SABER_LEN) * sh_d[m][k]
-                        - sh_pw[m][k] - T(SABER_LEN) * sh_pd[m][k];
-          cw[k] = center[k] - sh_w[m][k];
-        }
-        cross3(sh_d[m], tip_move, pn);
-        const T pn_mag = sqrt(dot3(pn, pn));
-        T d_min;
-        if (pn_mag > T(1e-9)) {
-          d_min = fabs(dot3(cw, pn) / pn_mag);
-        } else {
-          const T along = dot3(cw, sh_d[m]);
-          d_min = sqrt(tmax(dot3(cw, cw) - along * along, T(0)));
-        }
-        int code;
-        if (vc_mag < T(V_MIN_CUT)) {
-          code = 1;  // slow
-        } else if (P.p_any_dir[cb]) {
-          code = 0;  // dot / chain link: any direction
-        } else {
-          // env v7.6: direction check in the NOTE'S LOCAL frame —
-          // required direction is local -y'
-          const T vlx = dot3(vc, frame[0]);
-          const T vly = dot3(vc, frame[1]);
-          const T v2 = sqrt(vlx * vlx + vly * vly);
-          const T cosv = -vly / tmax(v2, T(1e-9));
-          code = cosv >= T(COS_TOL) ? 0 : 2;  // ok / angle
-        }
-        if (code == 0) {
-          P.status[e * C + i] = 1;
-          atomicAdd(&sh_good, 1);
-          T pts;
-          if (is_link) {
-            pts = T(CHAIN_LINK_PTS);  // flat, regardless of swing
-          } else {
-            const T pre = P.p_free_pre[cb]
-                ? T(PTS_PRE)
-                : round_pts(T(PTS_PRE)
-                            * tmin(sh_swing[m] / T(PRE_FULL), T(1)));
-            // wide_acc (2026-07-29, user-directed, TRAINING ONLY):
-            // effectively DOUBLES the acc component's range and reward —
-            // 30*(1-d/0.6), unrounded, vs the real round(15*(1-d/0.3)) —
-            // so the reward surface has slope where current cuts land
-            // (~0.3 m off-center). Mirrors lib.rs; bench/eval/replay
-            // paths stay on the real formula (wide_acc=false).
-            const T acc =
-                P.wide_acc
-                    ? T(2) * T(PTS_ACC)
-                          * (T(1)
-                             - tclamp(d_min / (T(2) * T(ACC_NORM)), T(0),
-                                      T(1)))
-                    : round_pts(T(PTS_ACC)
-                                * (T(1)
-                                   - tclamp(d_min / T(ACC_NORM), T(0),
-                                            T(1))));
-            pts = pre + acc;
-            atomicAdd(&sh_pre, pre);
-            atomicAdd(&sh_acc, acc);
-            if (is_head) {
-              // chain heads: no follow-through (max 85)
-            } else if (P.p_free_post[cb]) {
-              pts += T(PTS_POST);  // arc head: granted in full
-              atomicAdd(&sh_post, T(PTS_POST));
-            } else {
-              atomicAdd(&sh_nnew[m], 1);  // spawn a follow-through tracker
-            }
-          }
-          scratch[i] = pts / T(SCORE_MAX);
-          atomicAdd(&sh_score, pts);  // integer-valued: exact at any order
-        } else {
-          P.status[e * C + i] = 2;
-          atomicAdd(&sh_bad, 1);
-          scratch[i] = T(REWARD_BAD);
-        }
-      } else {
-        // wrong-color saber only triggers the SMALL box
-        const T bad_h[3] = {T(BAD_HALF), P.p_bad_hy[cb], T(BAD_HALF)};
-        if (sweep_hits_box(sh_pw[1 - m], sh_t0[1 - m], sh_t1[1 - m],
-                           sh_w[1 - m], center, bad_h, frame)) {
-          P.status[e * C + i] = 2;
-          atomicAdd(&sh_bad, 1);
-          scratch[i] = T(REWARD_BAD);
-        }
-      }
-    }
-    __syncthreads();
-
-    // Phase D (thread 0): tracker spawn (aggregated ring slot), done,
-    // ordered reward sum, episode bookkeeping
-    if (tid == 0) {
-      for (int h = 0; h < 2; h++) {
-        const int n = sh_nnew[h];
-        if (n > 0) {
-          const int ptr = P.tr_ptr[e * 2 + h];
-          const int b = (e * 2 + h) * N_TRACKERS + ptr;
-          P.tr_acc[b] = T(0);
-          P.tr_age[b] = 0;
-          P.tr_cnt[b] = n;
-          P.tr_active[b] = true;
-          P.tr_ptr[e * 2 + h] = (ptr + 1) % N_TRACKERS;
-        }
-      }
-      const int tick_new = P.tick[e] + 1;
-      P.tick[e] = tick_new;
-      const T time_now = T(tick_new) * T(DT);
-      // advance the low-water cursor: "smallest pending index" is
-      // monotone within an episode (status only goes 0 -> nonzero
-      // between resets); padding (p_valid false) counts as resolved.
-      // Amortized O(1) per tick, and the pending test becomes free.
-      int fp = P.first_pending[e];
-      while (fp < C
-             && !(P.p_valid[c0 * C + fp] && P.status[e * C + fp] == 0))
-        fp++;
-      P.first_pending[e] = fp;
-      const bool pending = fp < C;
-      bool no_trk = true;
-      for (int b = e * 2 * N_TRACKERS; b < (e + 1) * 2 * N_TRACKERS; b++)
-        if (P.tr_active[b]) {
-          no_trk = false;
-          break;
-        }
-      const int64_t nn = P.p_n_notes[c0];
-      const T last_hit = P.p_last_hit[c0];
-      const bool done =
-          (!pending && no_trk && (nn == 0 || time_now > last_hit))
-          || time_now > last_hit + P.p_tail[c0] || tick_new >= P.max_steps;
-      T rew = sh_rew;
-      // Rust's note order; scratch outside [fp0, hw) is untouched-zero
-      for (int i = fp0; i < hw; i++) rew += scratch[i];
-      T score_add = sh_score;
-      T post_add = sh_post;
-      if (done) {  // hard ends force-resolve pending follow-throughs
-        for (int b = (e * 2) * N_TRACKERS; b < (e * 2 + 2) * N_TRACKERS;
-             b++) {
-          if (!P.tr_active[b]) continue;
-          const T pts = round_pts(T(PTS_POST)
-                                  * tmin(P.tr_acc[b] / T(POST_FULL), T(1)));
-          const T tot = pts * T(P.tr_cnt[b]);
-          rew += tot / T(SCORE_MAX);
-          score_add += tot;
-          post_add += tot;
-          P.tr_active[b] = false;
-        }
-      }
-      P.good[e] += sh_good;
-      P.bad[e] += sh_bad;
-      P.miss[e] += sh_miss;
-      P.bombs[e] += sh_bomb;
-      P.score[e] += score_add;
-      P.score_pre[e] += sh_pre;
-      P.score_acc[e] += sh_acc;
-      P.score_post[e] += post_add;
-      const T ep = P.ep_return[e] + rew;
-      P.ep_return[e] = ep;
-      P.reward[e] = rew;
-      P.done[e] = done;
-      if (done) {  // episode-return ring buffer (order logging-grade)
-        const int pos = atomicAdd(P.ret_total, 1);
-        P.ret_buf[pos % P.cap] = ep;
-      }
-      sh_doreset = done && P.auto_reset;
-      sh_chart = c0;
-    }
-  } else {
-    if (tid == 0) {
-      sh_doreset = true;
-      sh_chart = c0;
-    }
-  }
-  __syncthreads();
-
-  // Phase E: reset (done envs under auto-reset, or everyone in mode 1) —
-  // start pose all-zero joints at rest, fresh chart from cand
-  if (sh_doreset) {
-    if (tid == 0) {
-      sh_chart = P.cand[e];
-      P.chart_idx[e] = sh_chart;
-      P.tick[e] = 0;
-      P.ep_return[e] = T(0);
-      P.good[e] = 0;
-      P.bad[e] = 0;
-      P.miss[e] = 0;
-      P.bombs[e] = 0;
-      P.score[e] = T(0);
-      P.score_pre[e] = T(0);
-      P.score_acc[e] = T(0);
-      P.score_post[e] = T(0);
-      P.tr_ptr[e * 2] = 0;
-      P.tr_ptr[e * 2 + 1] = 0;
-      P.first_pending[e] = 0;
-    }
-    if (tid < 2) {
-      const int h = tid;
-      const int qb = (e * 2 + h) * N_JOINTS;
-      const int wb = (e * 2 + h) * 3;
-      T q0[N_JOINTS] = {T(0), T(0), T(0), T(0), T(0), T(0)};
-      T w[3], b[3];
-      fk(h, q0, w, b);
-      for (int j = 0; j < N_JOINTS; j++) {
-        P.q[qb + j] = T(0);
-        P.om[qb + j] = T(0);
-      }
-      for (int k = 0; k < 3; k++) {
-        P.wrist[wb + k] = w[k];
-        P.blade[wb + k] = b[k];
-        P.wrist_vel[wb + k] = T(0);
-      }
-      P.swing_acc[e * 2 + h] = T(0);
-      P.axis_valid[e * 2 + h] = false;
-    }
-    for (int b = tid; b < 2 * N_TRACKERS; b += blockDim.x)
-      P.tr_active[e * 2 * N_TRACKERS + b] = false;
-    for (int i = tid; i < C; i += blockDim.x) P.status[e * C + i] = 0;
-  }
-  __syncthreads();
-
-  // Phase F: observation (mirrors lib.rs build_obs), written as f32
-  const int64_t cc = sh_chart;
-  float* obs = P.obs + (int64_t)e * OBS_DIM;
-  for (int k = tid; k < OBS_DIM; k += blockDim.x) obs[k] = 0.f;
-  __syncthreads();
-  if (tid < 2) {
-    const int h = tid;
-    const int base = h * SABER_FEAT;
-    const int qb = (e * 2 + h) * N_JOINTS;
-    const int wb = (e * 2 + h) * 3;
-    obs[base + 0] = (float)(P.q[qb + 0] / T(PITCH_LIM));
-    obs[base + 1] = (float)(P.q[qb + 1] / T(YAW_HI[1]));
-    obs[base + 2] = (float)(P.q[qb + 2] / T(TWIST_LIM));
-    obs[base + 3] = (float)((T(2) * P.q[qb + 3] - T(ELBOW_HI)) / T(ELBOW_HI));
-    obs[base + 4] = (float)cos(P.q[qb + 4]);
-    obs[base + 5] = (float)sin(P.q[qb + 4]);
-    obs[base + 6] = (float)(P.q[qb + 5] / T(BEND_LIM));
-    obs[base + 7] = (float)(P.q[qb + 6] / T(DEV_LIM));  // v9 deviation
-    for (int j = 0; j < N_JOINTS; j++)
-      obs[base + 8 + j] = (float)(P.om[qb + j] / T(JOINT_OMEGA[j]));
-    obs[base + 15] = (float)(P.wrist[wb + 0] / T(X_NORM));
-    obs[base + 16] = (float)((P.wrist[wb + 1] - T(Y_CENTER)) / T(Y_NORM));
-    obs[base + 17] = (float)P.wrist[wb + 2];
+__device__ void refresh_fk(Dyn<T>& d, const Sim<T>& P, int e) {
+  fk_all(d);
+  const int fw[2] = {F_L_WRIST, F_R_WRIST};
+  const int fh[2] = {F_L_HAND, F_R_HAND};
+  for (int s = 0; s < 2; s++) {
     for (int k = 0; k < 3; k++) {
-      obs[base + 18 + k] = (float)(P.wrist_vel[wb + k] / T(V_NORM));
-      obs[base + 21 + k] = (float)P.blade[wb + k];
+      P.wrist[(e * 2 + s) * 3 + k] = d.pos[fw[s]][k];
+      P.blade[(e * 2 + s) * 3 + k] = d.r[fh[s]][k][2];
     }
-    obs[base + 24] =
-        (float)tmin(P.swing_acc[e * 2 + h] / T(PRE_FULL), T(2));
   }
-  if (tid == 0) {  // next 16 pending objects in chart (arrival) order
-    // start at the low-water cursor (fresh 0 after a phase-E reset):
-    // typically terminates within ~N_NOTE_SLOTS iterations, not O(C)
-    int ns = 0;
-    for (int i = P.first_pending[e]; i < C && ns < N_NOTE_SLOTS; i++)
-      if (P.p_valid[cc * C + i] && P.status[e * C + i] == 0)
-        sh_slots[ns++] = i;
-    sh_nslots = ns;
+  for (int k = 0; k < 3; k++) P.head[e * 3 + k] = d.pos[F_HEAD][k];
+  P.shoulder_z[e * 2 + 0] = d.pos[F_L_SHOULDER][2];
+  P.shoulder_z[e * 2 + 1] = d.pos[F_R_SHOULDER][2];
+}
+
+template <typename T>
+__device__ void load_state(Dyn<T>& d, const Sim<T>& P, int e) {
+  for (int i = 0; i < 3; i++) d.p[i] = P.p[e * 3 + i];
+  for (int i = 0; i < 4; i++) d.quat[i] = P.quat[e * 4 + i];
+  for (int j = 0; j < NQ; j++) d.q[j] = P.q[e * NQ + j];
+  for (int i = 0; i < NV; i++) d.v[i] = P.v[e * NV + i];
+}
+
+template <typename T>
+__device__ void store_state(const Dyn<T>& d, const Sim<T>& P, int e) {
+  for (int i = 0; i < 3; i++) P.p[e * 3 + i] = d.p[i];
+  for (int i = 0; i < 4; i++) P.quat[e * 4 + i] = d.quat[i];
+  for (int j = 0; j < NQ; j++) P.q[e * NQ + j] = d.q[j];
+  for (int i = 0; i < NV; i++) P.v[e * NV + i] = d.v[i];
+}
+
+// Reset env e to the neutral state with a fresh chart (kernel phase E).
+template <typename T>
+__device__ void reset_env(Dyn<T>& d, const Sim<T>& P, int e,
+                          int64_t chart) {
+  d.p[0] = T(BASE_POS0[0]);
+  d.p[1] = T(BASE_POS0[1]);
+  d.p[2] = T(BASE_POS0[2]);
+  d.quat[0] = T(1);
+  d.quat[1] = T(0);
+  d.quat[2] = T(0);
+  d.quat[3] = T(0);
+  for (int j = 0; j < NQ; j++) d.q[j] = T(0);
+  for (int i = 0; i < NV; i++) d.v[i] = T(0);
+  store_state(d, P, e);
+  refresh_fk(d, P, e);
+  for (int s = 0; s < 2; s++) {
+    for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
+    P.swing_acc[e * 2 + s] = T(0);
+    P.axis_valid[e * 2 + s] = false;
+    P.tr_ptr[e * 2 + s] = 0;
+    for (int t = 0; t < N_TRACKERS; t++)
+      P.tr_active[(e * 2 + s) * N_TRACKERS + t] = false;
+    P.contact_arm[e * 2 + s] = false;
   }
-  __syncthreads();
+  for (int pr = 0; pr < NUM_PAIRS; pr++) P.contact_imp[e * NUM_PAIRS + pr] = T(0);
+  P.effort[e] = T(0);
+  P.chart_idx[e] = chart;
+  P.tick[e] = 0;
+  P.first_pending[e] = 0;
+  P.ep_return[e] = T(0);
+  P.good[e] = 0;
+  P.bad[e] = 0;
+  P.miss[e] = 0;
+  P.bombs[e] = 0;
+  P.score[e] = T(0);
+  P.score_pre[e] = T(0);
+  P.score_acc[e] = T(0);
+  P.score_post[e] = T(0);
+  for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
+}
+
+// Observation writer (lib.rs write_obs, SPEC-v10 §5) — from the CURRENT
+// tensors (post-reset state included).
+template <typename T>
+__device__ void write_obs(Dyn<T>& d, const Sim<T>& P, int e) {
+  float* obs = P.obs + (size_t)e * OBS_DIM;
+  for (int i = 0; i < OBS_DIM; i++) obs[i] = 0.f;
+  load_state(d, P, e);
+  // root position
+  obs[OFF_ROOT_POS] = (float)(d.p[0] / T(X_NORM));
+  obs[OFF_ROOT_POS + 1] = (float)((d.p[1] - T(ROOT_Y0)) / T(Y_NORM));
+  obs[OFF_ROOT_POS + 2] = (float)((d.p[2] - T(PLANE_Z0)) / T(X_NORM));
+  // 6D two-column rotation
+  T r0[3][3];
+  quat_to_rot(d.quat, r0);
+  for (int i = 0; i < 3; i++) {
+    obs[OFF_ROOT_ROT + i] = (float)r0[i][0];
+    obs[OFF_ROOT_ROT + 3 + i] = (float)r0[i][1];
+  }
+  for (int k = 0; k < 3; k++) {
+    obs[OFF_ROOT_VLIN + k] = (float)(d.v[k] / T(ROOT_VLIN_NORM));
+    obs[OFF_ROOT_VANG + k] = (float)(d.v[3 + k] / T(ROOT_VANG_NORM));
+  }
+  // q block (31 lanes; §1.4 order; wrist rolls cos/sin)
+  int lane = OFF_Q;
+  for (int j = 0; j < NQ; j++) {
+    const T qj = d.q[j];
+    if (j == 7 || j == 14) {
+      obs[lane] = (float)cos(qj);
+      obs[lane + 1] = (float)sin(qj);
+      lane += 2;
+    } else if (j == 6 || j == 13 || j == 20 || j == 26) {
+      const T hi = T(LIMIT_HI[j]);
+      obs[lane] = (float)((T(2) * qj - hi) / hi);
+      lane += 1;
+    } else {
+      const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+      obs[lane] = (float)(qj / tmax(fabs(lo), fabs(hi)));
+      lane += 1;
+    }
+  }
+  for (int j = 0; j < NQ; j++)
+    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / T(OMEGA_CAP[j]));
+  // hand derived blocks
+  const int bases[2] = {OFF_HAND_L, OFF_HAND_R};
+  for (int s = 0; s < 2; s++) {
+    const int base = bases[s];
+    const int wb = (e * 2 + s) * 3;
+    obs[base] = (float)(P.wrist[wb] / T(X_NORM));
+    obs[base + 1] = (float)((P.wrist[wb + 1] - T(Y_CENTER)) / T(Y_NORM));
+    obs[base + 2] = (float)P.wrist[wb + 2];
+    for (int k = 0; k < 3; k++) {
+      obs[base + 3 + k] = (float)(P.wrist_vel[wb + k] / T(V_NORM));
+      obs[base + 6 + k] = (float)P.blade[wb + k];
+    }
+    obs[base + 9] =
+        (float)tmin(P.swing_acc[e * 2 + s] / T(PRE_FULL), T(2));
+  }
+  // head + contact bits
+  obs[OFF_HEAD] = (float)(P.head[e * 3] / T(X_NORM));
+  obs[OFF_HEAD + 1] = (float)((P.head[e * 3 + 1] - T(HEAD_Y0)) / T(Y_NORM));
+  obs[OFF_HEAD + 2] = (float)((P.head[e * 3 + 2] - T(PLANE_Z0)) / T(X_NORM));
+  obs[OFF_CONTACT] = P.contact_arm[e * 2] ? 1.f : 0.f;
+  obs[OFF_CONTACT + 1] = P.contact_arm[e * 2 + 1] ? 1.f : 0.f;
+  // note block — v9 NOTE_FEAT verbatim
+  const int64_t cc = P.chart_idx[e];
+  const int C = P.C;
+  const int nn = (int)P.p_n_notes[cc];
   const T time_o = T(P.tick[e]) * T(DT);
-  for (int s = tid; s < sh_nslots; s += blockDim.x) {
-    const int i = sh_slots[s];
+  int slot = 0;
+  for (int i = P.first_pending[e]; i < nn && slot < N_NOTE_SLOTS; i++) {
     const int64_t cb = cc * C + i;
-    float* nb = obs + OFF_NOTES + s * NOTE_FEAT;
+    if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
+    float* nb2 = obs + OFF_NOTES + slot * NOTE_FEAT;
     const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb], T(Z_CLIP_LO),
                        T(Z_CLIP_HI));
     const bool bomb = P.p_is_bomb[cb];
-    nb[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
-    nb[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
-    nb[2] = (float)(z / T(Z_SCALE));
-    nb[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
-    nb[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
-    nb[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
-    nb[6] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2] : 0.f;
-    nb[7] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2 + 1] : 0.f;
-    nb[8] = bomb ? 1.f : 0.f;
-    nb[9] = P.p_is_head[cb] ? 1.f : 0.f;
-    nb[10] = P.p_is_link[cb] ? 1.f : 0.f;
-    nb[11] = P.p_free_pre[cb] ? 1.f : 0.f;
-    nb[12] = P.p_free_post[cb] ? 1.f : 0.f;
-    nb[13] = 1.f;  // valid
-    obs[OFF_NOTE_MASK + s] = 1.f;
+    nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
+    nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
+    nb2[2] = (float)(z / T(Z_SCALE));
+    nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
+    nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
+    nb2[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
+    nb2[6] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2] : 0.f;
+    nb2[7] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2 + 1] : 0.f;
+    nb2[8] = bomb ? 1.f : 0.f;
+    nb2[9] = P.p_is_head[cb] ? 1.f : 0.f;
+    nb2[10] = P.p_is_link[cb] ? 1.f : 0.f;
+    nb2[11] = P.p_free_pre[cb] ? 1.f : 0.f;
+    nb2[12] = P.p_free_post[cb] ? 1.f : 0.f;
+    nb2[13] = 1.f;
+    obs[OFF_NOTE_MASK + slot] = 1.f;
+    slot++;
   }
+}
+
+// One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
+// entirely per-thread.
+template <typename T>
+__device__ void step_env(Dyn<T>& d, Solver<T>& s, const Sim<T>& P, int e) {
+  const int C = P.C;
+  const int64_t c0 = P.chart_idx[e];
+
+  // previous FK caches
+  T prev_w[2][3], prev_d[2][3];
+  for (int h = 0; h < 2; h++)
+    for (int k = 0; k < 3; k++) {
+      prev_w[h][k] = P.wrist[(e * 2 + h) * 3 + k];
+      prev_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
+    }
+
+  // gear ids -> torques (lib.rs Body::tick)
+  T tau[NQ];
+  const double* gr = gear_row(P.gears);
+  for (int j = 0; j < NQ; j++) {
+    const int a = (int)P.actions[e * NQ + j];
+    const double frac = a < 7 ? gr[a] : 0.0;
+    tau[j] = T(frac) * T(TAU_MAX[j]);
+  }
+
+  // 8 substeps, accumulating positive work + contact aggregation
+  load_state(d, P, e);
+  d.pd_bad = false;
+  bool arm_l = false, arm_r = false;
+  for (int pr = 0; pr < NUM_PAIRS; pr++)
+    P.contact_imp[e * NUM_PAIRS + pr] = T(0);
+  T effort = T(0);
+  for (int sub = 0; sub < N_SUB; sub++) {
+    substep(d, s, tau);
+    // SPEC-v10 §4 effort: positive work at the END-of-substep velocity
+    for (int j = 0; j < NQ; j++) {
+      const T pw = tau[j] * d.v[VOFF + j];
+      if (pw > T(0)) effort += pw * T(H_SUB);
+    }
+    // contact aggregation: obs bits see every ACTIVE row; replay-grade
+    // impulses sum the row lambdas; point = last substep's
+    for (int ci = 0; ci < s.nc; ci++) {
+      const int pid = s.c_pair[ci];
+      P.contact_imp[e * NUM_PAIRS + pid] += s.c_lam[ci];
+      for (int k = 0; k < 3; k++)
+        P.contact_pt[(e * NUM_PAIRS + pid) * 3 + k] = s.c_pt[ci][k];
+      const int ia = PAIR_A[pid], ib = PAIR_B[pid];
+      if (is_arm_l(ia) || is_arm_l(ib)) arm_l = true;
+      if (is_arm_r(ia) || is_arm_r(ib)) arm_r = true;
+    }
+  }
+  if (d.pd_bad) atomicAdd(P.pd_hits, 1);
+  P.effort[e] = effort;
+  P.contact_arm[e * 2] = arm_l;
+  P.contact_arm[e * 2 + 1] = arm_r;
+  store_state(d, P, e);
+  refresh_fk(d, P, e);
+  T new_w[2][3], new_d[2][3];
+  for (int h = 0; h < 2; h++)
+    for (int k = 0; k < 3; k++) {
+      new_w[h][k] = P.wrist[(e * 2 + h) * 3 + k];
+      new_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
+      P.wrist_vel[(e * 2 + h) * 3 + k] =
+          (new_w[h][k] - prev_w[h][k]) / T(DT);
+    }
+
+  T reward = T(0);
+  reward -= P.effort_coef * effort;
+
+  // swing chain update
+  T deltas[2];
+  bool continued[2];
+  for (int h = 0; h < 2; h++) {
+    const T dp = tclamp(dot3(prev_d[h], new_d[h]), T(-1), T(1));
+    const T delta = acos(dp);
+    deltas[h] = delta;
+    continued[h] = false;
+    T sacc = P.swing_acc[e * 2 + h];
+    if (delta < T(SWING_BREAK)) {
+      sacc = T(0);
+      P.axis_valid[e * 2 + h] = false;
+    } else {
+      T cx[3];
+      cross3(prev_d[h], new_d[h], cx);
+      const T cn = sqrt(cx[0] * cx[0] + cx[1] * cx[1] + cx[2] * cx[2]);
+      const T ax[3] = {cx[0] / cn, cx[1] / cn, cx[2] / cn};
+      const int ab = (e * 2 + h) * 3;
+      const bool rev =
+          P.axis_valid[e * 2 + h]
+          && (P.axis[ab] * ax[0] + P.axis[ab + 1] * ax[1]
+              + P.axis[ab + 2] * ax[2]) < T(0);
+      if (rev) {
+        sacc = delta;
+      } else {
+        sacc += delta;
+        continued[h] = true;
+      }
+      for (int k = 0; k < 3; k++) P.axis[ab + k] = ax[k];
+      P.axis_valid[e * 2 + h] = true;
+    }
+    P.swing_acc[e * 2 + h] = sacc;
+  }
+
+  // follow-through trackers (existing, BEFORE this tick's cuts) — ring
+  // walked from tr_ptr so resolutions pay in Rust's spawn order
+  for (int h = 0; h < 2; h++) {
+    const int ptr = P.tr_ptr[e * 2 + h];
+    for (int kk = 0; kk < N_TRACKERS; kk++) {
+      const int slot = (ptr + kk) % N_TRACKERS;
+      const int b = (e * 2 + h) * N_TRACKERS + slot;
+      if (!P.tr_active[b]) continue;
+      T acc = P.tr_acc[b];
+      bool resolve;
+      if (!continued[h]) {
+        resolve = true;
+      } else {
+        acc += deltas[h];
+        const int age = P.tr_age[b] + 1;
+        P.tr_acc[b] = acc;
+        P.tr_age[b] = age;
+        resolve = acc >= T(POST_FULL) || age >= FOLLOW_TIMEOUT;
+      }
+      if (resolve) {
+        const T pts =
+            round_pts(T(PTS_POST) * tmin(acc / T(POST_FULL), T(1)));
+        const int cnt = P.tr_cnt[b];
+        for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
+        P.score[e] += pts * T(cnt);
+        P.score_post[e] += pts * T(cnt);
+        P.tr_active[b] = false;
+      }
+    }
+  }
+
+  const T time_new = T(P.tick[e] + 1) * T(DT);
+
+  // both sabers' swept surfaces this tick
+  T t0s[2][3], t1s[2][3];
+  for (int h = 0; h < 2; h++)
+    for (int k = 0; k < 3; k++) {
+      t0s[h][k] = prev_w[h][k] + T(SABER_LEN) * prev_d[h][k];
+      t1s[h][k] = new_w[h][k] + T(SABER_LEN) * new_d[h][k];
+    }
+
+  // live gates (SPEC-v10 §4)
+  const T reach_z = tmax(P.shoulder_z[e * 2], P.shoulder_z[e * 2 + 1])
+                    + T(REACH_PAST_SHOULDER);
+  const T head_pos[3] = {P.head[e * 3], P.head[e * 3 + 1],
+                         P.head[e * 3 + 2]};
+  const T head_z = head_pos[2];
+  const T min_speed = P.p_min_speed[c0];
+  const int nn = (int)P.p_n_notes[c0];
+  int n_new[2] = {0, 0};
+
+  for (int i = P.first_pending[e]; i < nn; i++) {
+    if (P.status[e * C + i] != 0) continue;
+    const int64_t cb = c0 * C + i;
+    if (!P.p_valid[cb]) continue;
+    // sorted hit_time + min_speed: beyond this bound so is every later
+    if ((P.p_hit[cb] - time_new) * min_speed > reach_z) break;
+    const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb];
+    const bool bomb = P.p_is_bomb[cb];
+    if (z < head_z) {
+      if (bomb) {
+        P.status[e * C + i] = 4;
+      } else {
+        P.status[e * C + i] = 3;
+        P.miss[e] += 1;
+        reward += T(REWARD_MISS);
+      }
+      continue;
+    }
+    if (z > reach_z) continue;
+    const T center[3] = {P.p_center[cb * 2], P.p_center[cb * 2 + 1], z};
+
+    if (bomb) {
+      for (int h = 0; h < 2; h++) {
+        if (sweep_dist(prev_w[h], t0s[h], t1s[h], new_w[h], center)
+            <= T(BOMB_RADIUS)) {
+          P.status[e * C + i] = 2;
+          P.bombs[e] += 1;
+          reward += T(REWARD_BOMB);
+          break;
+        }
+      }
+      continue;
+    }
+
+    const int m = P.p_is_right[cb] ? 1 : 0;
+    const bool is_head = P.p_is_head[cb];
+    const bool is_link = P.p_is_link[cb];
+    const bool any_dir = P.p_any_dir[cb];
+    const T lam = (!is_head && !is_link)
+                      ? tclamp(T(1) - z / T(LOOK_DIST), T(0), T(1))
+                      : T(0);
+    T frame[3][3];
+    note_frame(center, P.p_rot[cb * 2], P.p_rot[cb * 2 + 1], lam, head_pos,
+               frame);
+    const T gc[3] = {center[0] + T(GOOD_Z_SHIFT) * frame[2][0],
+                     center[1] + T(GOOD_Z_SHIFT) * frame[2][1],
+                     center[2] + T(GOOD_Z_SHIFT) * frame[2][2]};
+    const T good_h[3] = {T(GOOD_HALF_X), P.p_good_hy[cb], T(GOOD_HALF_Z)};
+    if (sweep_hits_box(prev_w[m], t0s[m], t1s[m], new_w[m], gc, good_h,
+                       frame)) {
+      // contact point: closest-passing blade sample; strict < like Rust
+      T d_seg = std::numeric_limits<T>::infinity();
+      T s_star = T(0);
+      for (int jj = 1; jj <= N_BLADE_SAMPLES; jj++) {
+        const T rr = (T(jj) / T(N_BLADE_SAMPLES)) * T(SABER_LEN);
+        T p0[3], p1[3];
+        for (int k = 0; k < 3; k++) {
+          p0[k] = prev_w[m][k] + rr * prev_d[m][k];
+          p1[k] = new_w[m][k] + rr * new_d[m][k];
+        }
+        const T dd = seg_point_dist3(p0, p1, center);
+        if (dd < d_seg) {
+          d_seg = dd;
+          s_star = rr;
+        }
+      }
+      T vc[3];
+      for (int k = 0; k < 3; k++)
+        vc[k] = (new_w[m][k] + s_star * new_d[m][k] - prev_w[m][k]
+                 - s_star * prev_d[m][k]) / T(DT);
+      const T vc_mag = sqrt(vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]);
+      // cut-plane accuracy (2026-07-29 rule)
+      T tip_move[3], cw[3], pn[3];
+      for (int k = 0; k < 3; k++) {
+        tip_move[k] = new_w[m][k] + T(SABER_LEN) * new_d[m][k]
+                      - prev_w[m][k] - T(SABER_LEN) * prev_d[m][k];
+        cw[k] = center[k] - new_w[m][k];
+      }
+      cross3(new_d[m], tip_move, pn);
+      const T pn_mag = sqrt(dot3(pn, pn));
+      T d_min;
+      if (pn_mag > T(1e-9)) {
+        d_min = fabs(dot3(cw, pn) / pn_mag);
+      } else {
+        const T along = dot3(cw, new_d[m]);
+        d_min = sqrt(tmax(dot3(cw, cw) - along * along, T(0)));
+      }
+      int code;
+      if (vc_mag < T(V_MIN_CUT)) {
+        code = 1;
+      } else if (any_dir) {
+        code = 0;
+      } else {
+        const T vlx = dot3(vc, frame[0]);
+        const T vly = dot3(vc, frame[1]);
+        const T v2 = sqrt(vlx * vlx + vly * vly);
+        const T cosv = -vly / tmax(v2, T(1e-9));
+        code = cosv >= T(COS_TOL) ? 0 : 2;
+      }
+      if (code == 0) {
+        P.status[e * C + i] = 1;
+        P.good[e] += 1;
+        T pts, pre_pts = T(0), acc_pts = T(0);
+        if (is_link) {
+          pts = T(CHAIN_LINK_PTS);
+        } else {
+          const T pre =
+              P.p_free_pre[cb]
+                  ? T(PTS_PRE)
+                  : round_pts(T(PTS_PRE)
+                              * tmin(P.swing_acc[e * 2 + m] / T(PRE_FULL),
+                                     T(1)));
+          const T acc =
+              P.wide_acc
+                  ? T(2) * T(PTS_ACC)
+                        * (T(1) - tclamp(d_min / (T(2) * T(ACC_NORM)),
+                                         T(0), T(1)))
+                  : round_pts(T(PTS_ACC)
+                              * (T(1)
+                                 - tclamp(d_min / T(ACC_NORM), T(0),
+                                          T(1))));
+          pts = pre + acc;
+          pre_pts = pre;
+          acc_pts = acc;
+          if (is_head) {
+            // chain heads: no follow-through (max 85)
+          } else if (P.p_free_post[cb]) {
+            pts += T(PTS_POST);
+            P.score_post[e] += T(PTS_POST);
+          } else {
+            n_new[m] += 1;  // spawn a follow-through tracker
+          }
+        }
+        reward += pts / T(SCORE_MAX);
+        P.score[e] += pts;
+        P.score_pre[e] += pre_pts;
+        P.score_acc[e] += acc_pts;
+      } else {
+        P.status[e * C + i] = 2;
+        P.bad[e] += 1;
+        reward += T(REWARD_BAD);
+      }
+    } else {
+      const T bad_h[3] = {T(BAD_HALF), P.p_bad_hy[cb], T(BAD_HALF)};
+      if (sweep_hits_box(prev_w[1 - m], t0s[1 - m], t1s[1 - m],
+                         new_w[1 - m], center, bad_h, frame)) {
+        P.status[e * C + i] = 2;
+        P.bad[e] += 1;
+        reward += T(REWARD_BAD);
+      }
+    }
+  }
+
+  // spawn aggregated trackers (same-tick spawns share (arc, age))
+  for (int h = 0; h < 2; h++) {
+    if (n_new[h] > 0) {
+      const int ptr = P.tr_ptr[e * 2 + h];
+      const int b = (e * 2 + h) * N_TRACKERS + ptr;
+      P.tr_acc[b] = T(0);
+      P.tr_age[b] = 0;
+      P.tr_cnt[b] = n_new[h];
+      P.tr_active[b] = true;
+      P.tr_ptr[e * 2 + h] = (ptr + 1) % N_TRACKERS;
+    }
+  }
+
+  const int tick_new = P.tick[e] + 1;
+  P.tick[e] = tick_new;
+  // advance the low-water cursor
+  int fp = P.first_pending[e];
+  while (fp < nn && P.status[e * C + fp] != 0) fp++;
+  P.first_pending[e] = fp;
+  const bool pending = fp < nn;
+  bool no_trk = true;
+  for (int b = e * 2 * N_TRACKERS; b < (e + 1) * 2 * N_TRACKERS; b++)
+    if (P.tr_active[b]) {
+      no_trk = false;
+      break;
+    }
+  const T last_hit = P.p_last_hit[c0];
+  const bool done =
+      (!pending && no_trk && (nn == 0 || time_new > last_hit))
+      || time_new > last_hit + P.p_tail[c0] || tick_new >= P.max_steps;
+
+  if (done) {  // resolve pending follow-throughs with partial arcs
+    for (int h = 0; h < 2; h++) {
+      const int ptr = P.tr_ptr[e * 2 + h];
+      for (int kk = 0; kk < N_TRACKERS; kk++) {
+        const int slot = (ptr + kk) % N_TRACKERS;
+        const int b = (e * 2 + h) * N_TRACKERS + slot;
+        if (!P.tr_active[b]) continue;
+        const T pts = round_pts(
+            T(PTS_POST) * tmin(P.tr_acc[b] / T(POST_FULL), T(1)));
+        const int cnt = P.tr_cnt[b];
+        for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
+        P.score[e] += pts * T(cnt);
+        P.score_post[e] += pts * T(cnt);
+        P.tr_active[b] = false;
+      }
+    }
+  }
+
+  const T ep = P.ep_return[e] + reward;
+  P.ep_return[e] = ep;
+  P.reward[e] = reward;
+  P.done[e] = done;
+  if (done) {
+    const int pos = atomicAdd(P.ret_total, 1);
+    P.ret_buf[pos % P.cap] = ep;
+  }
+  if (done && P.auto_reset) reset_env(d, P, e, P.cand[e]);
+}
+
+template <typename T>
+__global__ void __launch_bounds__(THREADS)
+step_kernel(Sim<T> P) {
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= P.N) return;
+  // thread-local scratch (local memory; per-thread interleaved =
+  // coalesced across the warp for same-index access)
+  Dyn<T> d;
+  Solver<T> s;
+  if (P.mode == 1) {
+    reset_env(d, P, e, P.cand[e]);
+  } else if (P.mode == 2) {
+    // set_state refresh (RawBeatSim.set_joints semantics): FK caches
+    // from the freshly written state; finite-diff wrist velocity reset;
+    // swing accumulators untouched
+    load_state(d, P, e);
+    refresh_fk(d, P, e);
+    for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
+  } else {
+    d.pd_bad = false;
+    step_env(d, s, P, e);
+  }
+  write_obs(d, P, e);
 }
 
 // tensor-list slots (order is a contract with cuda_env.py _tensors)
 enum {
-  TQ = 0, TOM, TWRIST, TBLADE, TWVEL, TSWING, TAXIS, TAXV,
-  TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR, TTICK, TSTATUS, TFIRSTP, TEPRET,
-  TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST, TCIDX,
+  TP = 0, TQUAT, TQ, TV,
+  TWRIST, TBLADE, TWVEL, THEAD, TSHZ,
+  TSWING, TAXIS, TAXV,
+  TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
+  TTICK, TSTATUS, TFIRSTP, TEPRET,
+  TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -967,13 +2036,17 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
   const int64_t N = q.size(0);
   const int64_t C = ts[TSTATUS].size(1);
   const int64_t cap = ts[RBUF].size(0);
-  AT_DISPATCH_FLOATING_TYPES(q.scalar_type(), "beat_arena_step", [&] {
+  AT_DISPATCH_FLOATING_TYPES(q.scalar_type(), "beat_arena_step_v10", [&] {
     Sim<scalar_t> P;
+    P.p = ts[TP].data_ptr<scalar_t>();
+    P.quat = ts[TQUAT].data_ptr<scalar_t>();
     P.q = ts[TQ].data_ptr<scalar_t>();
-    P.om = ts[TOM].data_ptr<scalar_t>();
+    P.v = ts[TV].data_ptr<scalar_t>();
     P.wrist = ts[TWRIST].data_ptr<scalar_t>();
     P.blade = ts[TBLADE].data_ptr<scalar_t>();
     P.wrist_vel = ts[TWVEL].data_ptr<scalar_t>();
+    P.head = ts[THEAD].data_ptr<scalar_t>();
+    P.shoulder_z = ts[TSHZ].data_ptr<scalar_t>();
     P.swing_acc = ts[TSWING].data_ptr<scalar_t>();
     P.axis = ts[TAXIS].data_ptr<scalar_t>();
     P.axis_valid = ts[TAXV].data_ptr<bool>();
@@ -994,6 +2067,11 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.score_pre = ts[TSPRE].data_ptr<scalar_t>();
     P.score_acc = ts[TSACC].data_ptr<scalar_t>();
     P.score_post = ts[TSPOST].data_ptr<scalar_t>();
+    P.contact_imp = ts[TCIMP].data_ptr<scalar_t>();
+    P.contact_pt = ts[TCPT].data_ptr<scalar_t>();
+    P.contact_arm = ts[TCARM].data_ptr<bool>();
+    P.effort = ts[TEFF].data_ptr<scalar_t>();
+    P.pd_hits = ts[TPD].data_ptr<int>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
@@ -1022,6 +2100,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.obs = ts[OOBS].data_ptr<float>();
     P.reward = ts[OREW].data_ptr<scalar_t>();
     P.done = ts[ODONE].data_ptr<bool>();
+    P.N = (int)N;
     P.C = (int)C;
     P.max_steps = (int)max_steps;
     P.cap = (int)cap;
@@ -1030,18 +2109,49 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
-    const size_t shmem = (size_t)C * sizeof(scalar_t);
-    step_kernel<scalar_t><<<(unsigned)N, THREADS, shmem,
+    const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
+    step_kernel<scalar_t><<<blocks, THREADS, 0,
                             at::cuda::getCurrentCUDAStream()>>>(P);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
+}
+
+// Transcendental-agreement probe (Divergences §21 measurement): apply
+// the named f64 op elementwise on the device so the parity suite can
+// compare bitwise against the CRT libm (numpy/Rust). op: 0 sin, 1 cos,
+// 2 acos, 3 sqrt, 4 recip.
+__global__ void transcend_kernel(const double* x, double* y, int n, int op) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const double v = x[i];
+  y[i] = op == 0 ? sin(v)
+         : op == 1 ? cos(v)
+         : op == 2 ? acos(v)
+         : op == 3 ? sqrt(v)
+                   : 1.0 / v;
+}
+
+void transcend(at::Tensor x, at::Tensor y, int64_t op) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kDouble
+              && x.is_contiguous());
+  TORCH_CHECK(y.is_cuda() && y.scalar_type() == at::kDouble
+              && y.is_contiguous() && y.numel() == x.numel());
+  const int n = (int)x.numel();
+  transcend_kernel<<<(unsigned)((n + 255) / 256), 256, 0,
+                     at::cuda::getCurrentCUDAStream()>>>(
+      x.data_ptr<double>(), y.data_ptr<double>(), n, (int)op);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("step", &step,
-        "One sim step (mode 0) or reset-all (mode 1) for every env; "
-        "state tensors are mutated in place, obs/reward/done written "
-        "into their output slots");
+        "One v10 sim step (mode 0), reset-all (mode 1) or FK-cache "
+        "refresh after a state write (mode 2) for every env; state "
+        "tensors mutated in place, obs/reward/done written into their "
+        "output slots");
+  m.def("transcend", &transcend,
+        "f64 transcendental probe: y = op(x) on the device (0 sin, "
+        "1 cos, 2 acos, 3 sqrt, 4 recip)");
 }

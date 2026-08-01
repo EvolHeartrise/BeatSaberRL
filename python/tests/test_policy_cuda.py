@@ -1,28 +1,27 @@
-"""Parity tests: FusedNotePolicy (single-launch CUDA forward) vs the
-PyTorch NotePolicy, on random weights AND the real gen2_ep2_50m
-checkpoint, over random obs and real env-rollout obs.
+"""Parity tests: FusedNotePolicy (single-launch CUDA forward, env v10:
+obs 340 / 19 tokens / 29xK heads) vs the PyTorch NotePolicy, on random
+weights across the K = 3/5/7 gear tables, over random obs and real
+env-rollout obs.
 
 Tolerance: the fused kernel reassociates every dot product (different
 summation order than cuBLAS), so bitwise equality is impossible in
-fp32. Measured max abs diff is ~4e-7 (random init) and ~1e-6 (trained
-checkpoint) — a few fp32 ulps at logit scale. The asserted atol of 5e-5
-gives ~50x headroom over that while staying far below any real defect:
-a wrong weight offset, mask, or LN detail moves logits by O(0.1+).
+fp32. Measured max abs diff is ~3e-7 (random init). The asserted atol
+of 5e-5 gives large headroom over that while staying far below any real
+defect: a wrong gather index, mask, or LN detail moves logits by
+O(0.1+).
+
+Checkpoint-weight parity re-arms at P7 (no v10 training checkpoints
+exist yet; every earlier checkpoint was retired with the v10 body and
+load_policy refuses them).
 
 Skipped without CUDA and without a CUDA toolkit (nvcc) — the kernel is
 JIT-built via cpp_extension like beat_arena_env/cuda_env.py.
 """
 
-import os
 import shutil
 
 import numpy as np
 import pytest
-pytest.skip("v10: CUDA path pending P5 — the fused policy kernels bake a "
-            "pre-v10 layout (12 heads / 286 obs); P5 ports them to "
-            "29 heads / obs 340 and restores this module",
-            allow_module_level=True)
-
 import torch
 
 if not torch.cuda.is_available():
@@ -34,12 +33,13 @@ _toolchain_env()
 if shutil.which("nvcc") is None:
     pytest.skip("no CUDA toolkit (nvcc) on PATH", allow_module_level=True)
 
-from beat_arena_env import RustBeatEnv, OFF_NOTES, OFF_NOTE_MASK, NOTE_FEAT
-from policy import HEAD_SIZES, N_NOTE_SLOTS, NotePolicy, OBS_DIM, load_policy
+from beat_arena_env import RustBeatEnv
+from policy import (
+    N_ACTION_HEADS, N_NOTE_SLOTS, NOTE_FEAT, NotePolicy, OBS_DIM,
+    OFF_NOTES, OFF_NOTE_MASK,
+)
 from policy_cuda import FusedNotePolicy
 
-CKPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "runs", "gen2_ep2_50m", "final.pt")
 ATOL = 5e-5
 DEV = "cuda"
 
@@ -60,7 +60,7 @@ def _real_obs(n, seed=1):
     rows = [obs]
     rng = np.random.default_rng(seed)
     while len(rows) < n:
-        obs, _, done, _, _ = env.step(rng.integers(0, [3] * 12))
+        obs, _, done, _, _ = env.step(rng.integers(0, [3] * N_ACTION_HEADS))
         if done:
             obs, _ = env.reset()
         rows.append(obs)
@@ -84,15 +84,7 @@ def _check(policy, fused, obs):
 @pytest.fixture(scope="module")
 def rand_policy():
     torch.manual_seed(0)
-    return NotePolicy().to(DEV).eval()
-
-
-@pytest.fixture(scope="module")
-def ckpt_policy():
-    if not os.path.exists(CKPT):
-        pytest.skip(f"checkpoint missing: {CKPT}")
-    ckpt = torch.load(CKPT, map_location="cpu", weights_only=True)
-    return load_policy(ckpt).to(DEV).eval()
+    return NotePolicy(n_gears=5).to(DEV).eval()
 
 
 @pytest.mark.parametrize("n", [1, 7, 64, 512])
@@ -101,22 +93,26 @@ def test_parity_random_weights(rand_policy, n):
     _check(rand_policy, fused, _rand_obs(n, 100 + n))
 
 
-def test_parity_checkpoint_random_obs(ckpt_policy):
-    fused = FusedNotePolicy(ckpt_policy)
-    for n, seed in ((3, 7), (256, 8)):
-        _check(ckpt_policy, fused, _rand_obs(n, seed))
+@pytest.mark.parametrize("n_gears", [3, 5, 7])
+def test_parity_gears_matrix(n_gears):
+    """Every gear-table head width through the same kernel."""
+    torch.manual_seed(10 + n_gears)
+    pol = NotePolicy(n_gears=n_gears).to(DEV).eval()
+    fused = FusedNotePolicy(pol)
+    assert fused.n_gears == n_gears
+    lg = _check(pol, fused, _rand_obs(64, n_gears))
+    assert lg.shape == (64, N_ACTION_HEADS, n_gears)
 
 
-def test_parity_checkpoint_real_obs(ckpt_policy):
+def test_parity_real_obs(rand_policy):
     """Real rollout obs: logits/value close AND greedy actions agree.
     fp32 reassociation can flip a head only at a near-exact logit tie;
-    any flip must be such a tie (gap below 1e-3), and flips must be
-    rare (<0.5% of heads). Observed in practice: zero flips."""
-    fused = FusedNotePolicy(ckpt_policy)
+    any flip must be such a tie, and flips must be rare."""
+    fused = FusedNotePolicy(rand_policy)
     obs = _real_obs(200)
-    lg = _check(ckpt_policy, fused, obs).clone()
+    lg = _check(rand_policy, fused, obs).clone()
     act = fused.argmax(obs).clone()
-    ref_act = _ref(ckpt_policy, obs)[0].argmax(-1)
+    ref_act = _ref(rand_policy, obs)[0].argmax(-1)
     mism = act != ref_act
     n_mism = int(mism.sum())
     assert n_mism <= 0.005 * act.numel(), f"{n_mism} argmax flips"
@@ -126,12 +122,12 @@ def test_parity_checkpoint_real_obs(ckpt_policy):
         assert float(gaps.max()) < 1e-3, "argmax flip beyond near-tie"
 
 
-def test_junk_in_masked_slots_cannot_leak(ckpt_policy):
+def test_junk_in_masked_slots_cannot_leak(rand_policy):
     """Mirror test_policy.py: garbage in invalid note slots must not
-    change fused outputs. In the kernel, masked keys score -1e9, whose
-    softmax weight underflows to exactly 0.0, so outputs are bitwise
-    identical for any finite junk — asserted at atol 1e-6."""
-    fused = FusedNotePolicy(ckpt_policy)
+    change fused outputs. Masked keys score -16384, whose softmax weight
+    underflows to exactly 0.0, so outputs are bitwise identical for any
+    finite junk — asserted at atol 1e-6."""
+    fused = FusedNotePolicy(rand_policy)
     obs = _real_obs(32)
     mask = obs[:, OFF_NOTE_MASK:]
     assert (mask == 0).any(), "test needs at least one empty slot"
@@ -155,7 +151,7 @@ def test_repack_tracks_new_weights(rand_policy):
     fused = FusedNotePolicy(rand_policy)
     obs = _rand_obs(16, 3)
     torch.manual_seed(123)
-    other = NotePolicy().to(DEV).eval()
+    other = NotePolicy(n_gears=5).to(DEV).eval()
     fused.repack(other)
     _check(other, fused, obs)
     fused.repack(rand_policy)  # and back
@@ -169,8 +165,20 @@ def test_argmax_matches_logits(rand_policy):
     assert torch.equal(fused.argmax(obs), lg.argmax(-1))
 
 
+def test_n_blocks_1_supported():
+    torch.manual_seed(7)
+    pol = NotePolicy(n_blocks=1, n_gears=3).to(DEV).eval()
+    fused = FusedNotePolicy(pol)
+    _check(pol, fused, _rand_obs(64, 77))
+
+
 def test_unsupported_arch_raises():
     with pytest.raises(NotImplementedError):
         FusedNotePolicy(NotePolicy(embed=32))
     with pytest.raises(NotImplementedError):
         FusedNotePolicy(NotePolicy(n_heads=2))  # out_proj present
+    # a pre-v10 (no body_mlp) state_dict is refused outright
+    sd = NotePolicy(n_gears=3).state_dict()
+    sd = {k: v for k, v in sd.items() if not k.startswith("body_mlp")}
+    with pytest.raises(NotImplementedError):
+        FusedNotePolicy(sd)

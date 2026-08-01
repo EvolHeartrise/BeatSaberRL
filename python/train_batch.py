@@ -308,13 +308,11 @@ def main():
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.env is None:
-        # env v10 (P4): the torch mirror is the GPU training home until
-        # P5 ports the CUDA kernels; rust stays the CPU path
-        args.env = "torch" if device.type == "cuda" else "rust"
-        print(f"--env not given: defaulting to '{args.env}' "
-              "(v10: CUDA path pending P5)", flush=True)
-    if args.env == "cuda":
-        raise SystemExit("v10: CUDA path pending P5, use --env torch|rust")
+        # env v10 (P5): the CUDA kernel is the training backend again;
+        # rust stays the CPU path (the torch mirror remains available
+        # as the parity/debug backend via --env torch)
+        args.env = "cuda" if device.type == "cuda" else "rust"
+        print(f"--env not given: defaulting to '{args.env}'", flush=True)
 
     N, T = args.num_envs, args.horizon
     batch = N * T
@@ -367,7 +365,7 @@ def main():
     print(f"config: {args_snapshot}", flush=True)
 
     if args.ranked_maps and args.env != "cuda":
-        raise SystemExit("--ranked-maps requires --env cuda (pending P5)")
+        raise SystemExit("--ranked-maps requires --env cuda")
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
@@ -757,6 +755,13 @@ def main():
             # deferred from the rollout->GAE boundary: this is the one
             # place per update the host reads the device anyway
             ep_returns.extend(venv.pop_stats())
+            # f32 Cholesky pivot-floor engagements (SPEC-v10 §20e):
+            # reported, never hidden
+            if hasattr(venv, "pop_pd_hits"):
+                pd = venv.pop_pd_hits()
+                if pd:
+                    print(f"[pd-net] {pd} f32 pivot-floor engagement(s) "
+                          "this update", flush=True)
         recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
         elapsed = time.time() - start
         rate = (global_step - steps_before) / elapsed
