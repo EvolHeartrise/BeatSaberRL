@@ -56,7 +56,7 @@ import torch
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple
-from beat_arena_env.constants import OBS_DIM
+from beat_arena_env.constants import N_JOINTS, OBS_DIM
 from beat_arena_rs import VecBeatSim
 from cuda_graphs import _Graphed
 from policy import load_policy
@@ -129,7 +129,7 @@ class _Group:
         self.obs_t = torch.empty((n, OBS_DIM), dtype=torch.float32,
                                  pin_memory=pin)
         self.obs_buf = self.obs_t.numpy()
-        self.act_t = torch.empty((n, 14), dtype=torch.int64,  # 14 heads (v9)
+        self.act_t = torch.empty((n, N_JOINTS), dtype=torch.int64,
                                  pin_memory=pin)
         self.act_np = self.act_t.numpy()
         self.slots = [None] * n
