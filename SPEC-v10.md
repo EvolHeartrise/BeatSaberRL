@@ -852,3 +852,52 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        step-12 envelope bound the resulting velocities — the same
        stability-net role §19 assigns them. The f64 parity path keeps
        the strict Rust semantics (raise = Rust's panic).
+21. **P5 CUDA-mirror notes (2026-07-31)** — the CUDA backend
+    (`csrc/beat_arena_cuda.cu`, one THREAD per env, the Rust loops
+    transcribed serially per thread so every accumulation keeps Rust's
+    order) meets a TOLERANCED f64 tier, not the P4 bitwise bar, for a
+    measured and fundamental reason:
+    a. **CUDA f64 transcendental provenance** (the §20a follow-up):
+       device sqrt and division are IEEE-correctly-rounded and match
+       the CRT libm BITWISE (measured over 10⁵ inputs); device
+       sin/cos/acos (libdevice) differ from the CRT by exactly 1 ulp
+       on 10.5 % / 14.0 % / 4.2 % of inputs, and nvcc's default FMA
+       contraction re-rounds multiply-add chains. There is no
+       practical way to reproduce the closed-source UCRT rounding in
+       device code, so the CUDA f64 path carries ≤1-ulp-per-op seeds.
+    b. **Seeds are chaotically amplified by design**: the v10 dynamics
+       e-fold perturbations every ~0.35 s (§17a) and the solver's
+       knife edges (contact margin, limit-row reach, the §19a
+       COMPOSITE_EPS band — the stance parks knee/elbow/wrist-roll ON
+       stops, permanently near-band) flip discretely. Measured: RUST
+       ITSELF, given a 1-ulp state perturbation, diverges to
+       macroscopic scale by ~tick 10–20 under gentle gears (t≈3 under
+       full random gears). No free-running full-episode tolerance can
+       therefore exist for ANY non-bitwise mirror; the v9 CUDA tier's
+       full-episode 1e-6 bounds relied on the v9 kinematic body being
+       contractive (DRAG), which died with it.
+    c. **The P5 gate** (`test_v10_parity_cuda.py`) is accordingly:
+       the transcendental measurement itself (a); reset/set_state
+       bitwise-or-1e-12; single-tick + short-horizon parity in the
+       seed band (obs 1e-5, reward 1e-9) with a small deterministic
+       quota of knife-edge envs; LOCKSTEP-RESYNC full episodes (the
+       CUDA env re-takes Rust's exact state each tick) with counters /
+       score decomposition / per-note status / done timing EXACT and
+       rewards inside the integer-rounding flip band; and the same f32
+       well-formedness tier as torch. The bitwise cross-implementation
+       gate remains Rust↔torch-CPU-f64 (P4); the CUDA backend's
+       charter is f32 training throughput with the §20e pivot-floor
+       net mirrored (`pop_pd_hits`, reported per update).
+    d. **Throughput** (GTX 1080, f32, kernel-only / full training):
+       ~4.7 k / ~4.5 k env-steps/s at N = 1024, plateauing at ~9 k /
+       ~9.7 k by N = 4096 (vs the torch mirror's 107 at N = 1024 —
+       42–90×). Profile: insensitive to block size and register
+       budget; bound by per-env serial latency + local-memory traffic
+       (51 KB stack/thread — working set ≫ L2). The identified next
+       lever is intra-env parallelism (warp per env, factor in shared
+       memory) if P7 needs more than ~25 h per 400 M at N = 1024.
+    e. **fp16-all loss scale**: at the v10 obs/reward scale the
+       default 131072 static loss scale overflows every minibatch
+       until the halving audit walks it down — fp32 and fp16-update
+       train cleanly. Flagged for the P7 re-tune alongside §8's
+       effort economy.

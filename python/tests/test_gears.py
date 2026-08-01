@@ -6,10 +6,8 @@ fractional TAU_MAX — SPEC-v10 §4), ternary-prefix compatibility (ids
 effort ordering, the wrist/arm omega caps, the v9 deviation-joint
 geometry (kinematics mirror) + its asymmetric limits on the v10 body.
 
-Moved/deferred:
-  - test_policy_head_width_roundtrip -> skipped pending P4 (the torch
-    policy is still v9-shaped: 14 heads / obs 290)
-  - test_gears_cuda_parity -> skipped pending P5 (CUDA env is v9-baked)
+P5 (2026-07-31): test_gears_cuda_parity restored on the v10 CUDA
+backend (skipped without CUDA, like the dedicated CUDA suites).
 """
 
 import numpy as np
@@ -180,10 +178,52 @@ def test_policy_head_width_roundtrip():
         load_policy({"state_dict": {}, "arch": {"embed": 64, "n_gears": 5}})
 
 
-@pytest.mark.skip(reason="v10: CUDA path pending P5 (the CUDA env kernel "
-                  "bakes the v9 body); P5 restores Rust<->CUDA parity")
 def test_gears_cuda_parity():
-    pass
+    """P5: the CUDA env honors the gear tables like Rust. (a) A 0-2
+    action stream is BITWISE identical across K=3/5/7 on the CUDA
+    backend (ids 1/2 are +/-full at every K); (b) short-horizon f64
+    CUDA-vs-Rust agreement holds at the transcendental-seed band for
+    every table (full free-running parity semantics live in
+    test_v10_parity_cuda.py)."""
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA env needs CUDA")
+    from beat_arena_env.cuda_env import CudaBeatVecEnv
+
+    n_far = Note(hit_time=200.0, col=2, row=1, color=1, angle=0.0, speed=4.0)
+    rng = np.random.default_rng(7)
+    acts = rng.integers(0, 3, size=(2, 1, N_JOINTS))
+
+    streams = {}
+    for k in (3, 5, 7):
+        env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
+                             device="cuda", dtype=torch.float64,
+                             auto_reset=False, gears=k)
+        env.reset()
+        obs_l = []
+        for t in range(2):
+            obs, r, _d, _ = env.step(torch.as_tensor(acts[t]))
+            obs_l.append(obs[0].cpu().numpy().copy())
+        streams[k] = obs_l
+    for k in (5, 7):
+        np.testing.assert_array_equal(streams[3], streams[k])
+
+    # (b) vs Rust, per table, 2 gentle ticks from neutral (same chart!)
+    for k in (3, 5, 7):
+        env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
+                             device="cuda", dtype=torch.float64,
+                             auto_reset=False, gears=k)
+        env.reset()
+        sim = RawBeatSim(max_steps=690, effort_coef=4e-4, gears=k)
+        sim.set_chart([note_tuple(n_far)])
+        a = list(COAST)
+        a[R_BEND] = 1
+        for t in range(2):
+            obs_c, _r, _d, _ = env.step(torch.as_tensor([a]))
+            obs_r, _rr, _dr, _ = sim.step(a)
+            np.testing.assert_allclose(
+                np.asarray(obs_r), obs_c[0].cpu().numpy(), atol=1e-6,
+                err_msg=f"gears={k} t{t}")
 
 
 def test_deviation_joint():
