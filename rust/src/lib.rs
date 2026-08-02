@@ -1303,6 +1303,16 @@ impl RawBeatSim {
         self.core.body.effort_j
     }
 
+    /// f64 Cholesky pivot-floor engagements since the last pop
+    /// (SPEC-v10 Divergences §22) — the CUDA backend's pop_pd_hits
+    /// mirror. Returns the count and zeroes it. ADDITIVE getter; 0 in
+    /// every state the strict pre-§22 factorization survived.
+    fn pop_pd_hits(&mut self) -> u64 {
+        let h = self.core.body.ws.pd_hits;
+        self.core.body.ws.pd_hits = 0;
+        h
+    }
+
     #[getter]
     fn good_cuts(&self) -> u32 {
         self.core.good_cuts
@@ -1564,6 +1574,22 @@ impl VecBeatSim {
     fn components(&self, i: usize) -> (f64, f64, f64) {
         let s = &self.sims[i];
         (s.score_pre, s.score_acc, s.score_post)
+    }
+
+    /// f64 Cholesky pivot-floor engagements summed over all envs since
+    /// the last pop (SPEC-v10 Divergences §22) — the CUDA backend's
+    /// pop_pd_hits mirror. Returns the count and zeroes the per-env
+    /// counters. ADDITIVE getter (no existing FFI shape changed); 0 in
+    /// every state the strict pre-§22 factorization survived.
+    fn pop_pd_hits(&mut self) -> u64 {
+        self.sims
+            .iter_mut()
+            .map(|s| {
+                let h = s.body.ws.pd_hits;
+                s.body.ws.pd_hits = 0;
+                h
+            })
+            .sum()
     }
 }
 

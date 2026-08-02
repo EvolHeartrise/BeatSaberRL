@@ -4,11 +4,13 @@
 //! bitwise determinism, clamp behavior, and the substep wall-time
 //! probe.
 
-use super::algo::{chol_factor, crba, momentum, rnea};
+use super::algo::{
+    chol_factor, chol_factor_floored, chol_solve, crba, momentum, rnea, PD_FLOOR_F64,
+};
 use super::fk::fk_all;
 use super::model::{Model, HUMANOID, NQ, NV};
 use super::step::substep;
-use super::testutil::{random_state, Rng};
+use super::testutil::{random_state, Rng, ZERO_DAMP29};
 use super::{State, Workspace};
 
 #[test]
@@ -296,11 +298,101 @@ fn pd_at_shoulder_gimbal_lock() {
     );
 }
 
+/// Regression (SPEC-v10 Divergences §22, found benching
+/// v10_gears5_400m ckpt_upd0762): a mid-surge flaily policy reached a
+/// contorted state whose f64 mass-matrix Cholesky lost a pivot and the
+/// old `assert!(chol_factor(..))` PANICKED the whole VecBeatSim bench.
+/// The singular family is the §12 gimbal-adjacent one (shoulder stack
+/// at pitch −90°, yaw/twist world axes anti-parallel through one
+/// point); the armature keeps the HUMANOID's pivots ≥ ~2.7e-5, so to
+/// drive a pivot under the 1e-17 floor deterministically the test
+/// removes the armature — reproducing the P1-measured exactly-singular
+/// matrix (pivot −4.3e-18). The floored factorization must clamp,
+/// count, and stay finite — never panic.
+#[test]
+fn pivot_floor_clamps_singular_gimbal_matrix() {
+    let m = &HUMANOID;
+    let nv = m.nv();
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    st.q[3] = m.limits[3].0; // l_arm_pitch = −π/2 exactly (gimbal lock)
+    st.q[10] = m.limits[10].0; // r_arm_pitch = −π/2 exactly
+    st.q[4] = 0.3;
+    st.q[5] = -0.2;
+    fk_all(m, &st, &mut ws);
+    crba(m, &mut ws);
+    let mut mm = ws.m.clone();
+    for j in 0..NQ {
+        mm[(6 + j) * nv + (6 + j)] -= m.armature[j]; // exactly singular now
+    }
+    // sanity: the strict factorization DOES reject this matrix
+    assert!(
+        !chol_factor(nv, &mm, &mut ws.l),
+        "armature-less gimbal matrix should not be PD"
+    );
+    let hits = chol_factor_floored(nv, &mm, &mut ws.l);
+    assert!(hits >= 1, "floor must engage on the singular matrix");
+    assert!(ws.l.iter().all(|x| x.is_finite()), "factor must stay finite");
+    // a solve through the floored factor stays finite too
+    let mut rhs: Vec<f64> = (0..nv).map(|i| 0.1 * (i as f64 + 1.0)).collect();
+    chol_solve(nv, &ws.l, &mut rhs);
+    assert!(rhs.iter().all(|x| x.is_finite()), "solve must stay finite");
+    // and a healthy matrix is untouched BITWISE (0 hits, same factor)
+    fk_all(m, &st, &mut ws);
+    crba(m, &mut ws);
+    let mm = ws.m.clone();
+    let mut l_strict = vec![0.0; nv * nv];
+    assert!(chol_factor(nv, &mm, &mut l_strict));
+    assert_eq!(chol_factor_floored(nv, &mm, &mut ws.l), 0);
+    for (a, b) in ws.l.iter().zip(l_strict.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "floored factor must be bitwise");
+    }
+}
+
+/// The same family end-to-end through `substep` (the old panic site):
+/// an armature-less model parked at the gimbal-lock pose with joint
+/// rates riding the caps must step WITHOUT panicking, increment
+/// ws.pd_hits, and keep the state finite. (With the armature the
+/// HUMANOID never engages the floor — pd_under_random_full_gears
+/// below doubles as the 0-hit guard.)
+#[test]
+fn substep_survives_pd_loss_and_counts() {
+    static ZERO_ARM: [f64; NQ] = [0.0; NQ];
+    let mut m = HUMANOID;
+    m.armature = &ZERO_ARM;
+    m.damping = &ZERO_DAMP29;
+    let m = &m;
+    let h = 1.0 / 240.0;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    st.q[3] = m.limits[3].0; // gimbal-locked shoulders
+    st.q[10] = m.limits[10].0;
+    st.q[4] = 0.3;
+    st.q[5] = -0.2;
+    for j in 0..NQ {
+        // high joint rates (the flaily-policy signature), inside caps
+        st.v[6 + j] = if j % 2 == 0 { 12.0 } else { -12.0 };
+    }
+    let tau = vec![0.0; NQ];
+    assert_eq!(ws.pd_hits, 0);
+    for _ in 0..8 {
+        substep(m, &mut st, &tau, h, &mut ws, None);
+    }
+    assert!(ws.pd_hits >= 1, "pivot floor must have engaged");
+    assert!(st.q.iter().all(|q| q.is_finite()));
+    assert!(st.v.iter().all(|v| v.is_finite()));
+    assert!(st.p.iter().all(|p| p.is_finite()));
+    assert!(st.quat.iter().all(|q| q.is_finite()));
+    // the floor constant itself is part of the §22 contract
+    assert_eq!(PD_FLOOR_F64.to_bits(), 1e-17f64.to_bits());
+}
+
 /// Long-horizon health under the actuation the trainer will actually
 /// emit: seeded random FULL gears on every joint, re-drawn each 30 Hz
 /// tick, 10 s free-floating (no welds — the P1 worst case; from P2 on
 /// the foot welds ground net moments). The state must stay finite and
-/// substep's internal PD assert must never fire.
+/// the §22 pivot floor must never engage (pd_hits stays 0 — the
+/// armature keeps every pivot 12 decades above the floor here).
 ///
 /// Deliberately NOT tested: constant tau_max on all 29 joints for
 /// many seconds of unsupported free fall. That input sign-sustains a
@@ -328,6 +420,7 @@ fn pd_under_random_full_gears() {
     }
     assert!(st.q.iter().all(|q| q.is_finite()));
     assert!(st.v.iter().all(|v| v.is_finite()));
+    assert_eq!(ws.pd_hits, 0, "pivot floor must not engage in-limit");
     let wroot = (st.v[3] * st.v[3] + st.v[4] * st.v[4] + st.v[5] * st.v[5]).sqrt();
     println!("root |omega| after 10 s of random full gears: {wroot:.2} rad/s");
     assert!(wroot < 120.0, "root spin left the stability envelope: {wroot}");

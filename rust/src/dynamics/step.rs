@@ -10,7 +10,7 @@
 //! factor for the J·M⁻¹·Jᵀ effective-mass solves) plus the mutable
 //! velocity to project. Unconstrained callers (P1 tests) pass None.
 
-use super::algo::{chol_factor, chol_solve, crba, rnea};
+use super::algo::{chol_factor_floored, chol_solve, crba, rnea};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
@@ -40,8 +40,12 @@ pub const ZERO_WRENCH: [f64; 6] = [0.0; 6];
 /// One substep. `tau_act`: applied actuated torques (nq, §1.4 order;
 /// constant across a control tick — the caller holds them). Joint
 /// damping −b∘q̇ is added here (§3 step 4); root rows carry no applied
-/// force. Panics if M(q) loses positive definiteness — that is a
-/// modeling bug, not a runtime condition.
+/// force. If M(q) loses positive definiteness the Cholesky pivot floor
+/// engages (SPEC-v10 Divergences §22): pivots are clamped at
+/// PD_FLOOR_F64 and counted into ws.pd_hits — the sim degrades
+/// gracefully instead of panicking (greedy contorted policies reach
+/// gimbal-adjacent states in long benches; §21's caps + clamps +
+/// envelope bound the resulting velocities).
 pub fn substep(
     model: &Model,
     st: &mut State,
@@ -126,11 +130,11 @@ pub fn substep_opts(
         }
     }
 
-    // 5. dense Cholesky (lower, no pivoting)
-    assert!(
-        chol_factor(nv, &ws.m, &mut ws.l),
-        "mass matrix not positive definite"
-    );
+    // 5. dense Cholesky (lower, no pivoting), pivots floored at
+    //    PD_FLOOR_F64 with engagements counted (Divergences §22 — the
+    //    f64 analogue of the CUDA f32 §20e net; 0 hits = bitwise the
+    //    old strict factorization)
+    ws.pd_hits += chol_factor_floored(nv, &ws.m, &mut ws.l) as u64;
 
     // 6. unconstrained velocity v* = v + h·M⁻¹(τ − C)
     chol_solve(nv, &ws.l, &mut ws.rhs);

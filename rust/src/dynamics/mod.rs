@@ -79,6 +79,9 @@ pub struct Workspace {
     pub vstar: Vec<f64>, // unconstrained post-solve velocity
     pub sol: Vec<f64>,      // M⁻¹e_j scratch (clamp impulses, P2 rows)
     pub hit: Vec<bool>,     // per-joint limit-hit flags (step 11)
+    // f64 Cholesky pivot-floor engagements (SPEC-v10 Divergences §22),
+    // cumulative until the owner pops it (lib.rs pop_pd_hits)
+    pub pd_hits: u64,
     pub cached: Vec<bool>,  // step 11: M⁻¹e_j column cached?
     pub solcache: Vec<f64>, // step 11: cached M⁻¹e_j columns (nq×nv)
     // RNEA / velocity-pass scratch, per frame
@@ -111,6 +114,7 @@ impl Workspace {
             vstar: vec![0.0; nv],
             sol: vec![0.0; nv],
             hit: vec![false; model.nq],
+            pd_hits: 0,
             cached: vec![false; model.nq],
             solcache: vec![0.0; model.nq * nv],
             om: vec![[0.0; 3]; nf],

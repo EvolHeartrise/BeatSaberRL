@@ -591,6 +591,13 @@ def main():
                         gr.free.append(i)
                         gr.n_active -= 1
                     if n_finished and time.monotonic() - last_save > 30.0:
+                        # accumulate §22 pd-floor engagements at every
+                        # periodic save (cheap FFI counter pop) so a
+                        # killed run cannot lose the count across a
+                        # resume
+                        data["pd_floor_hits"] = (
+                            data.get("pd_floor_hits", 0)
+                            + sum(g.sim.pop_pd_hits() for g in groups))
                         save_results(out_path, data, levels)
                         last_save = time.monotonic()
                     t3 = pc()
@@ -669,6 +676,14 @@ def main():
                 # pass blocks on q.get() until the producer delivers
     finally:
         stop.set()
+        # f64 Cholesky pivot-floor engagements (SPEC-v10 Divergences
+        # §22) across all sims — reported, not hidden (the §20e house
+        # rule): a nonzero count marks contorted gimbal-adjacent
+        # states the pre-§22 engine PANICKED on. Final pop of the
+        # tail since the last periodic save.
+        data["pd_floor_hits"] = (data.get("pd_floor_hits", 0)
+                                 + sum(gr.sim.pop_pd_hits() for gr in groups))
+        pd_hits = data["pd_floor_hits"]
         save_results(out_path, data, levels)
         if args.chart_cache:            # longest-first sidecar for next run
             os.makedirs(args.chart_cache, exist_ok=True)
@@ -691,8 +706,9 @@ def main():
     print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
-          f"unweighted PP {data['total_unweighted_pp']} -> {out_path}",
-          flush=True)
+          f"unweighted PP {data['total_unweighted_pp']} | "
+          f"pd-floor hits {pd_hits} (file total) "
+          f"-> {out_path}", flush=True)
 
 
 if __name__ == "__main__":

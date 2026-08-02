@@ -44,7 +44,7 @@
 //! Loop bounds and evaluation order are fixed throughout — the
 //! torch/CUDA mirrors replicate these expression trees literally.
 
-use super::algo::{chol_factor, chol_solve};
+use super::algo::{chol_factor_floored, chol_solve};
 use super::collide::{narrow_phase, Contact, NUM_PAIRS, SLOP};
 use super::fk::{cross3, dot3, rot_log, sub3};
 use super::model::{Model, F_L_FOOT, F_R_FOOT};
@@ -338,10 +338,11 @@ impl ConstraintSet {
                     self.aww[c * nweld + r] = s;
                 }
             }
-            assert!(
-                chol_factor(nweld, &self.aww, &mut self.lww),
-                "weld block J M^-1 J^T not positive definite"
-            );
+            // §22 pivot floor here too (second former panic site; the
+            // .cu chol_factor_n template serves both call sites): a
+            // healthy A_ww factors bitwise-identically (0 hits), a
+            // degenerate one is clamped + counted instead of panicking.
+            ws.pd_hits += chol_factor_floored(nweld, &self.aww, &mut self.lww) as u64;
         }
 
         // ── limit rows: project their update directions into the WELD

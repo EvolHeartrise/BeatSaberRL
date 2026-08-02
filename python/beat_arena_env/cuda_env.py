@@ -14,9 +14,9 @@ Parity is pinned by tests/test_v10_parity_cuda.py: the f64 tier is
 HORIZON-BOUNDED tight-tolerance (CUDA f64 sin/cos/acos differ from the
 CRT libm by 1 ulp on a few %% of inputs and nvcc contracts FMAs — both
 measured there; SPEC-v10 Divergences §21), f32 is the bounded
-well-formedness tier. The f32 training path carries the §20e safety
-net: Cholesky pivots floored at 1e-8 with engagements counted
-(`pop_pd_hits`).
+well-formedness tier. Both dtypes carry a Cholesky pivot-floor safety
+net with engagements counted (`pop_pd_hits`): f32 floors at 1e-8
+(§20e), f64 at 1e-17 (§22 — the same floor Rust/torch f64 now carry).
 
 State is a structure-of-arrays of torch tensors mutated in place by the
 kernel; charts live in a padded (P, C) device pool and each env holds
@@ -320,7 +320,7 @@ class CudaBeatVecEnv:
         self.contact_pt = z(N, NUM_PAIRS, 3)
         self.contact_arm = z(N, 2, dt=torch.bool)
         self.effort_j = z(N)
-        # f32 Cholesky pivot-floor engagements (Divergences §20e)
+        # Cholesky pivot-floor engagements (§20e f32 / §22 f64)
         self._pd_hits = z(1, dt=torch.int32)
         self._pd_popped = 0
         self.chart_idx = z(N, dt=torch.int64)
@@ -435,8 +435,9 @@ class CudaBeatVecEnv:
         return self.contact_imp, self.contact_pt
 
     def pop_pd_hits(self):
-        """f32 Cholesky pivot-floor engagements since the last pop
-        (Divergences §20e — reported, not hidden). One sync."""
+        """Cholesky pivot-floor engagements since the last pop
+        (Divergences §20e f32 / §22 f64 — reported, not hidden).
+        One sync."""
         total = int(self._pd_hits.item())
         new = total - self._pd_popped
         self._pd_popped = total
