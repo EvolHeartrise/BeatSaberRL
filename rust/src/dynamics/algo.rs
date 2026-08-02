@@ -306,6 +306,51 @@ pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
     }
 }
 
+/// f64 Cholesky pivot floor (SPEC-v10 Divergences §22) — the f64
+/// analogue of the CUDA f32 training net's 1e-8 (§20e), scaled by the
+/// machine-epsilon ratio (1e-8 · eps_f64/eps_f32 ≈ 1.9e-17, rounded
+/// down a decade). The smallest PHYSICAL pivot (the wrist armature,
+/// 2.7e-5) sits 12 decades above the floor, so any legitimate
+/// factorization is BIT-IDENTICAL to the unfloored one (max(d, FLOOR)
+/// returns d untouched); the floor only absorbs the singular-pose
+/// noise band (measured gimbal-lock pivots ~ −4.3e-18, §12).
+/// torch_dynamics.py PD_FLOOR_F64 and the .cu f64 path carry the SAME
+/// constant and clamp expression — Rust↔torch f64 bitwise parity is
+/// the binding constraint.
+pub const PD_FLOOR_F64: f64 = 1e-17;
+
+/// `chol_factor` with the §22 pivot floor: a pivot below PD_FLOOR_F64
+/// is clamped to it (simple max — exactly reproducible, no fastmath
+/// ambiguity) and counted. Returns the number of floored pivots (0 =
+/// bitwise-identical to `chol_factor` succeeding). The factor is
+/// always produced; the caller reports the count instead of panicking.
+pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
+    let mut hits = 0u32;
+    for j in 0..n {
+        let mut d = m[j * n + j];
+        for k in 0..j {
+            d -= l[j * n + k] * l[j * n + k];
+        }
+        if d < PD_FLOOR_F64 {
+            hits += 1;
+            d = PD_FLOOR_F64;
+        }
+        let dj = d.sqrt();
+        l[j * n + j] = dj;
+        for i in (j + 1)..n {
+            l[j * n + i] = 0.0; // keep the strict upper triangle clean
+        }
+        for i in (j + 1)..n {
+            let mut s = m[i * n + j];
+            for k in 0..j {
+                s -= l[i * n + k] * l[j * n + k];
+            }
+            l[i * n + j] = s / dj;
+        }
+    }
+    hits
+}
+
 /// Dense Cholesky M = L·Lᵀ (lower, no pivoting, fixed order — SPEC-v10
 /// §3 step 5). Returns false if a pivot is not strictly positive.
 pub fn chol_factor(n: usize, m: &[f64], l: &mut [f64]) -> bool {

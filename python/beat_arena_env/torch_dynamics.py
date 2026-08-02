@@ -761,7 +761,20 @@ class DynBatch:
     # smoke/bench report them rather than papering over.
     PD_FLOOR_F32 = 1e-8
 
-    # -- dense Cholesky (algo.rs chol_factor, right-looking — bitwise) --------
+    # f64 pivot floor (SPEC-v10 Divergences §22): the f64 analogue of
+    # the f32 net above, scaled by the machine-epsilon ratio (1e-8 *
+    # eps_f64/eps_f32 ~ 1.9e-17, rounded down a decade). The smallest
+    # PHYSICAL pivot (wrist armature 2.7e-5) is 12 decades above, so
+    # max(pivot, FLOOR) leaves every legitimate factorization BITWISE
+    # untouched — the Rust <-> torch f64 parity bar is preserved; the
+    # floor only absorbs the gimbal-adjacent singular noise band that
+    # used to raise here (and panic in Rust). Same constant, same
+    # simple-max clamp as algo.rs PD_FLOOR_F64 / the .cu f64 path.
+    PD_FLOOR_F64 = 1e-17
+
+    # -- dense Cholesky (algo.rs chol_factor_floored, right-looking —
+    # bitwise: the right-looking trailing update subtracts the same
+    # l_jk^2 terms in the same k order as Rust's left-looking dots) ----
     def chol_factor(self):
         W = self.M.clone()
         L = torch.zeros_like(W)
@@ -769,10 +782,13 @@ class DynBatch:
         bad = None
         for k in range(NV):
             dcol = W[:, k, k]
-            b = dcol <= 0.0
+            if exact:
+                b = dcol < self.PD_FLOOR_F64  # §22 engagement condition
+            else:
+                b = dcol <= 0.0
             bad = b if bad is None else (bad | b)
             if exact:
-                dj = tsqrt(torch.where(b, torch.ones_like(dcol), dcol))
+                dj = tsqrt(torch.clamp(dcol, min=self.PD_FLOOR_F64))
             else:
                 dj = tsqrt(torch.clamp(dcol, min=self.PD_FLOOR_F32))
             L[:, k, k] = dj
@@ -1152,7 +1168,9 @@ class DynBatch:
             v[:, i] = torch.where(lbad, v[:, i] * ls, v[:, i])
         self.v = v
 
-    # 12x12 weld-block Cholesky helpers (same bitwise forms as above)
+    # 12x12 weld-block Cholesky helpers (same bitwise forms as above;
+    # f64 uses the §22 floor too — bitwise no-op for healthy pivots,
+    # and the .cu chol_factor_n template serves both call sites)
     def _chol12(self, A):
         W = A.clone()
         L = torch.zeros_like(W)
@@ -1160,8 +1178,7 @@ class DynBatch:
         for k in range(N_WELD):
             dcol = W[:, k, k]
             if exact:
-                dj = tsqrt(torch.where(dcol <= 0.0, torch.ones_like(dcol),
-                                       dcol))
+                dj = tsqrt(torch.clamp(dcol, min=self.PD_FLOOR_F64))
             else:
                 dj = tsqrt(torch.clamp(dcol, min=self.PD_FLOOR_F32))
             L[:, k, k] = dj
@@ -1176,18 +1193,15 @@ class DynBatch:
     def _chol12_solve(L, B):
         return DynBatch.chol_solve_multi(L, B, N_WELD)
 
-    pd_net_hits = 0  # f32 pivot-floor engagements (reported, not hidden)
+    pd_net_hits = 0  # pivot-floor engagements (reported, not hidden)
 
     def check_pd(self):
-        """f64 (parity): raise if any env's mass matrix lost positive
-        definiteness this tick (Rust panics). f32 (training): the pivot
-        floor already absorbed it — count and continue. One host sync
-        per call."""
+        """The pivot floor (f32 §20e / f64 §22) already absorbed any PD
+        loss inside chol_factor — count engaged envs and continue, both
+        dtypes (Rust no longer panics either: algo.rs
+        chol_factor_floored counts into ws.pd_hits, popped via
+        pop_pd_hits). One host sync per call."""
         if bool(self._pd_bad.any().item()):
-            if self.dtype == torch.float64:
-                idx = torch.nonzero(self._pd_bad).flatten().tolist()
-                raise RuntimeError(
-                    f"mass matrix not positive definite (envs {idx})")
             self.pd_net_hits += int(self._pd_bad.sum().item())
             self._pd_bad.zero_()
 

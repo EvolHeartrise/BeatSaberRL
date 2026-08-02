@@ -850,8 +850,9 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        N = 1024). The f32 path floors pivots at 1e-8 and counts
        engagements (`pd_net_hits`); the caps + step-11 clamps +
        step-12 envelope bound the resulting velocities — the same
-       stability-net role §19 assigns them. The f64 parity path keeps
-       the strict Rust semantics (raise = Rust's panic).
+       stability-net role §19 assigns them. The f64 parity path kept
+       the strict Rust semantics (raise = Rust's panic) until §22
+       floored the f64 tier everywhere (same net, eps-scaled floor).
 21. **P5 CUDA-mirror notes (2026-07-31)** — the CUDA backend
     (`csrc/beat_arena_cuda.cu`, one THREAD per env, the Rust loops
     transcribed serially per thread so every accumulation keeps Rust's
@@ -901,3 +902,44 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        until the halving audit walks it down — fp32 and fp16-update
        train cleanly. Flagged for the P7 re-tune alongside §8's
        effort economy.
+22. **f64 Cholesky pivot floor (2026-08-02)** — found post-training:
+    benching v10_gears5_400m ckpt_upd0762 (a mid-surge, flaily greedy
+    policy) crashed VecBeatSim step_into with the Rust "mass matrix
+    not positive definite" PANIC — a contorted gimbal-adjacent state
+    (the §12/§21 conditioning family: shoulder stacks parked at the
+    pitch −90° lock under cap-riding rates, min pivot ≈ the wrist
+    armature 2.7e-5, cond(M) ~3e5) pushed an f64 pivot into the
+    rounding-noise band. A bench must degrade gracefully, never
+    panic; the panic is retired on every tier:
+    a. **`PD_FLOOR_F64 = 1e-17`** (algo.rs): the §20e CUDA f32 net's
+       1e-8 scaled by the machine-epsilon ratio (1e-8 · eps_f64 /
+       eps_f32 ≈ 1.9e-17, rounded down a decade). The smallest
+       PHYSICAL pivot is 12 decades above the floor, so a healthy
+       factorization is BITWISE identical to the strict one; the
+       floor only absorbs the singular-pose noise band (P1-measured
+       gimbal pivot −4.3e-18 clamps cleanly).
+    b. **Semantics**: `chol_factor_floored` clamps each pivot with a
+       simple `max(d, PD_FLOOR_F64)` (fixed expression, no fastmath
+       ambiguity — exactly reproducible) and counts engagements into
+       `Workspace::pd_hits`; both former panic sites use it (step 5
+       mass matrix AND the §15a weld block A_ww). Counts pop via the
+       additive FFI getter `pop_pd_hits()` on RawBeatSim/VecBeatSim
+       (the CUDA `pop_pd_hits` naming; no existing FFI shape
+       changed); bench_scoresaber reports run + file totals
+       (`pd_floor_hits` in the results JSON — reported, not hidden).
+    c. **Parity**: torch_dynamics f64 mirrors the identical constant
+       and clamp (`torch.clamp(dcol, min=PD_FLOOR_F64)` == max) in
+       `chol_factor` and `_chol12` and no longer raises (check_pd
+       counts `pd_net_hits` for both dtypes); the .cu f64 template
+       branch floors identically (its f32 branch keeps the §20e
+       1e-8). Because the floor is bit-transparent for healthy
+       pivots, the P4 Rust↔torch f64 BITWISE bar and the P5 CUDA
+       tier gates are unchanged and stay green.
+    d. **Post-floor safety**: the ω caps + step-11 clamps + step-12
+       envelope bound the velocities a floored (near-singular) solve
+       can emit — the same stability-net role §19/§20e assign them.
+       Regression: `tests_dyn::pivot_floor_clamps_singular_gimbal_matrix`,
+       `tests_dyn::substep_survives_pd_loss_and_counts` (armature-less
+       gimbal state — the exactly-singular §12 matrix — through the
+       full substep: no panic, counter increments, state finite), and
+       `tests/test_v10_pd_floor.py` on the torch mirror + FFI.
