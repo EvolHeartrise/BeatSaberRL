@@ -1589,6 +1589,12 @@ struct Sim {
   int gears;
   bool wide_acc;
   bool auto_reset;
+  // contact_imp/contact_pt are pure introspection (parity harness /
+  // CudaBeatVecEnv.contacts()); nothing in the kernel reads them back.
+  // Off by default so the training path skips the 55-wide zeroing and the
+  // uncoalesced per-contact read-modify-writes. Baked per instance at
+  // construction => constant across launches => CUDA-graph safe.
+  bool want_contacts;
 };
 
 // FK caches from the current state (lib.rs Body::refresh_fk): wrist =
@@ -1650,7 +1656,9 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
       P.tr_active[(e * 2 + s) * N_TRACKERS + t] = false;
     P.contact_arm[e * 2 + s] = false;
   }
-  for (int pr = 0; pr < NUM_PAIRS; pr++) P.contact_imp[e * NUM_PAIRS + pr] = T(0);
+  if (P.want_contacts)
+    for (int pr = 0; pr < NUM_PAIRS; pr++)
+      P.contact_imp[e * NUM_PAIRS + pr] = T(0);
   P.effort[e] = T(0);
   P.chart_idx[e] = chart;
   P.tick[e] = 0;
@@ -1791,8 +1799,9 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   load_state(d, P, e);
   d.pd_bad = false;
   bool arm_l = false, arm_r = false;
-  for (int pr = 0; pr < NUM_PAIRS; pr++)
-    P.contact_imp[e * NUM_PAIRS + pr] = T(0);
+  if (P.want_contacts)
+    for (int pr = 0; pr < NUM_PAIRS; pr++)
+      P.contact_imp[e * NUM_PAIRS + pr] = T(0);
   T effort = T(0);
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
@@ -1802,12 +1811,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       if (pw > T(0)) effort += pw * T(H_SUB);
     }
     // contact aggregation: obs bits see every ACTIVE row; replay-grade
-    // impulses sum the row lambdas; point = last substep's
+    // impulses sum the row lambdas; point = last substep's (introspection
+    // only — gated on want_contacts; the arm bits below always run)
     for (int ci = 0; ci < s.nc; ci++) {
       const int pid = s.c_pair[ci];
-      P.contact_imp[e * NUM_PAIRS + pid] += s.c_lam[ci];
-      for (int k = 0; k < 3; k++)
-        P.contact_pt[(e * NUM_PAIRS + pid) * 3 + k] = s.c_pt[ci][k];
+      if (P.want_contacts) {
+        P.contact_imp[e * NUM_PAIRS + pid] += s.c_lam[ci];
+        for (int k = 0; k < 3; k++)
+          P.contact_pt[(e * NUM_PAIRS + pid) * 3 + k] = s.c_pt[ci][k];
+      }
       const int ia = PAIR_A[pid], ib = PAIR_B[pid];
       if (is_arm_l(ia) || is_arm_l(ib)) arm_l = true;
       if (is_arm_r(ia) || is_arm_r(ib)) arm_r = true;
@@ -2174,7 +2186,8 @@ enum {
 
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
-          bool wide_acc, bool auto_reset, int64_t gears) {
+          bool wide_acc, bool auto_reset, int64_t gears,
+          bool want_contacts) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -2257,6 +2270,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
+    P.want_contacts = want_contacts;
     const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
     step_kernel<scalar_t><<<blocks, THREADS, 0,
                             at::cuda::getCurrentCUDAStream()>>>(P);

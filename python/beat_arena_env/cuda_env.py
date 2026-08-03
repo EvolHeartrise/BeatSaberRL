@@ -231,13 +231,21 @@ class CudaBeatVecEnv:
                  bomb_prob=0.125, seed=0, effort_coef=EFFORT_COEF,
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, wide_acc=False, gears=3,
-                 device="cuda", dtype=torch.float32, auto_reset=True):
+                 device="cuda", dtype=torch.float32, auto_reset=True,
+                 want_contacts=False):
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("CudaBeatVecEnv requires a CUDA device")
         self.dtype = dtype
         self.auto_reset = auto_reset  # False: terminal envs freeze (tests)
+        # contacts() introspection (per-pair impulses + points) costs a
+        # 55-wide zeroing plus uncoalesced RMWs per active contact row every
+        # tick and feeds NOTHING in the kernel (the obs contact bits come
+        # from contact_arm, which is always maintained). Off for training;
+        # the parity harnesses pass True. Baked here, never mutated =>
+        # constant per instance => safe under CUDA-graph capture.
+        self.want_contacts = bool(want_contacts)
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -360,7 +368,7 @@ class CudaBeatVecEnv:
     def _launch(self, actions, cand, mode):
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
-                       self.auto_reset, self.gears)
+                       self.auto_reset, self.gears, self.want_contacts)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
@@ -430,7 +438,14 @@ class CudaBeatVecEnv:
         return self.effort_j
 
     def contacts(self):
-        """(imp (N,55) tick-summed lambda, point (N,55,3) last substep)."""
+        """(imp (N,55) tick-summed lambda, point (N,55,3) last substep).
+        Requires want_contacts=True at construction — the kernel skips
+        these writes otherwise (they feed nothing; obs uses contact_arm)."""
+        if not self.want_contacts:
+            raise RuntimeError(
+                "contacts() needs CudaBeatVecEnv(..., want_contacts=True); "
+                "this env was built with it off, so contact_imp/contact_pt "
+                "are stale (never written by the kernel)")
         return self.contact_imp, self.contact_pt
 
     def pop_pd_hits(self):

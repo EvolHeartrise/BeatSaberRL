@@ -65,7 +65,8 @@ def _cenv(charts, gears, max_steps, dtype=torch.float64, wide_acc=False,
     return CudaBeatVecEnv(len(charts), charts=charts, max_steps=max_steps,
                           gears=gears, wide_acc=wide_acc,
                           effort_coef=effort_coef, device="cuda",
-                          dtype=dtype, auto_reset=False)
+                          dtype=dtype, auto_reset=False,
+                          want_contacts=True)
 
 
 def _rust_state(sim):
@@ -437,7 +438,8 @@ def test_parity_f32_bounded():
 def test_auto_reset_and_stats():
     env = CudaBeatVecEnv(4, seed=3, chart_pool=8, dtype=torch.float32,
                          colors="both", chart_len_s=6.0, note_prob=0.5,
-                         extra_prob=0.4, bomb_prob=0.25)
+                         extra_prob=0.4, bomb_prob=0.25,
+                         want_contacts=True)
     obs = env.reset()
     assert obs.shape == (4, OBS_DIM)
     rng = np.random.default_rng(0)
@@ -459,7 +461,8 @@ def test_same_seed_reproduces():
     def run(seed):
         env = CudaBeatVecEnv(2, seed=seed, chart_pool=4, dtype=torch.float32,
                              colors="both", chart_len_s=6.0, note_prob=0.5,
-                             extra_prob=0.4, bomb_prob=0.25)
+                             extra_prob=0.4, bomb_prob=0.25,
+                             want_contacts=True)
         obs = env.reset()
         rng = np.random.default_rng(1)
         tot = torch.zeros(2, device="cuda")
