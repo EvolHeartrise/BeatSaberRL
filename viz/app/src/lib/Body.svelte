@@ -7,8 +7,9 @@
   import * as THREE from "three";
   import {
     F_CHEST, F_HEAD, F_L_HAND, F_L_SHANK, F_L_THIGH, F_L_FOOT,
-    F_L_ELBOW, F_L_SHOULDER, F_R_ELBOW, F_R_SHOULDER,
-    F_R_HAND, F_R_SHANK, F_R_THIGH, F_R_FOOT, SABER_DARK, framePoint,
+    F_L_ELBOW, F_L_SHOULDER, F_L_WRIST, F_R_ELBOW, F_R_SHOULDER,
+    F_R_HAND, F_R_SHANK, F_R_THIGH, F_R_FOOT, F_R_WRIST,
+    SABER_DARK, framePoint,
   } from "./replay.js";
 
   let { fk } = $props();
@@ -50,14 +51,14 @@
   const segs = $derived([
     // [seg, radius, color]
     [chest, 0.15, TRUNK],
-    [seg(fk.p[F_L_SHOULDER], framePoint(fk, F_L_SHOULDER, [0, 0, 0.35])),
-      0.045, SABER_DARK[0]],
-    [seg(fk.p[F_L_ELBOW], framePoint(fk, F_L_ELBOW, [0, 0, 0.30])),
-      0.04, SABER_DARK[0]],
-    [seg(fk.p[F_R_SHOULDER], framePoint(fk, F_R_SHOULDER, [0, 0, 0.35])),
-      0.045, SABER_DARK[1]],
-    [seg(fk.p[F_R_ELBOW], framePoint(fk, F_R_ELBOW, [0, 0, 0.30])),
-      0.04, SABER_DARK[1]],
+    // arm bones joint-to-joint: the shoulder/wrist clusters are stacked
+    // co-located frames and F_*_SHOULDER is the FIRST (yaw) one — an
+    // extrusion along its local z ignores pitch/twist and misses the
+    // elbow whenever the arm is off neutral
+    [seg(fk.p[F_L_SHOULDER], fk.p[F_L_ELBOW]), 0.045, SABER_DARK[0]],
+    [seg(fk.p[F_L_ELBOW], fk.p[F_L_WRIST]), 0.04, SABER_DARK[0]],
+    [seg(fk.p[F_R_SHOULDER], fk.p[F_R_ELBOW]), 0.045, SABER_DARK[1]],
+    [seg(fk.p[F_R_ELBOW], fk.p[F_R_WRIST]), 0.04, SABER_DARK[1]],
     [seg(fk.p[F_L_THIGH], framePoint(fk, F_L_THIGH, [0, -0.44, 0])),
       0.06, LIMB],
     [seg(fk.p[F_L_SHANK], framePoint(fk, F_L_SHANK, [0, -0.43, 0])),
