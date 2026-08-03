@@ -68,13 +68,15 @@ class _LnFn(torch.autograd.Function):
 
 
 class _LnAddFn(torch.autograd.Function):
-    """x = a + b fused into the LN pass; returns (x, ln(x)). Backward:
-    d/da == d/db == (grad flowing to x) + (LN's dx from grad on y) — the
-    two-term sum is commutative bitwise, so this matches the unfused
-    autograd accumulation exactly."""
+    """x = a + b (+ b_bias) fused into the LN pass; returns (x, ln(x)).
+    Backward: d/da == d/db == (grad flowing to x) + (LN's dx from grad
+    on y) — the two-term sum is commutative bitwise, so this matches the
+    unfused autograd accumulation exactly. d/d(b_bias) is that same
+    tensor's channel sum — exactly the reduction the producer Linear's
+    own bias grad used to do, just moved."""
     @staticmethod
-    def forward(ctx, a, b, weight, bias, eps):
-        x, y, mean, rstd = _ext.ln_fwd_add(a, b, weight, bias, eps)
+    def forward(ctx, a, b, weight, bias, eps, b_bias=None):
+        x, y, mean, rstd = _ext.ln_fwd_add(a, b, weight, bias, eps, b_bias)
         ctx.save_for_backward(x, weight, mean, rstd)
         return x, y
 
@@ -88,10 +90,13 @@ class _LnAddFn(torch.autograd.Function):
         if gx is not None and not gx.is_contiguous():
             gx = gx.contiguous()
         dx, dw, db = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd, gx)
+        dbb = None
+        if ctx.needs_input_grad[5]:
+            dbb = dx.reshape(-1, dx.shape[-1]).sum(0, dtype=torch.float32)
         # NOTE (load-bearing): dx is returned for BOTH a and b as the
         # SAME tensor object — valid because autograd only reads these
         # edges; a .clone() would cost a full-size copy for nothing.
-        return dx, dx, dw, db, None
+        return dx, dx, dw, db, None, dbb
 
 
 class FusedLayerNorm(nn.LayerNorm):
@@ -120,20 +125,28 @@ class FusedLayerNorm(nn.LayerNorm):
             return super().forward(x.float()).to(x.dtype)
         return super().forward(x)
 
-    def forward_add(self, a, b):
+    def forward_add(self, a, b, b_bias=None):
         """(a + b, LayerNorm(a + b)) — one fused pass on the CUDA path
         (the residual sum a + b is a full-size elementwise kernel the
         fusion absorbs). Fallback computes the same bits unfused; the
-        contiguous sum re-enters forward()'s kernel eligibility."""
+        contiguous sum re-enters forward()'s kernel eligibility.
+
+        b_bias (fp32 (d,), fp16 stream only): a per-channel bias for b,
+        added as a + (b + b_bias) inside this pass's fp32 arithmetic so
+        the producer GEMM can run bias-free. Near-tie numerics — it
+        moves the bias's rounding out of the GEMM epilogue."""
         if (self._eligible(a) and b.is_contiguous() and a.shape == b.shape
                 and b.dtype is a.dtype):
             if not torch.is_grad_enabled():
                 x, y, _, _ = _ext.ln_fwd_add(a, b, self.weight, self.bias,
-                                             self.eps)
+                                             self.eps, b_bias)
                 return x, y
-            return _LnAddFn.apply(a, b, self.weight, self.bias, self.eps)
+            return _LnAddFn.apply(a, b, self.weight, self.bias, self.eps,
+                                  b_bias)
         if a.dtype is torch.float16:
-            x = (a.float() + b.float()).to(a.dtype)
+            bf = b.float() if b_bias is None else b.float() + b_bias
+            x = (a.float() + bf).to(a.dtype)
         else:
+            assert b_bias is None, "b_bias is fp16-path only"
             x = a + b
         return x, self.forward(x)
