@@ -58,7 +58,7 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM
 from beat_arena_rs import VecBeatSim
-from cuda_graphs import _Graphed
+from cuda_graphs import _Graphed, copy_static
 from policy import load_policy
 
 # Scoring-rule version stamped into every results file. 1 = swept-surface
@@ -104,7 +104,7 @@ class _FusedArgmax:
         self.s_obs = torch.zeros(n, OBS_DIM, device=device)
 
     def __call__(self, obs_t):
-        self.s_obs.copy_(obs_t, non_blocking=True)
+        copy_static(self.s_obs, obs_t, non_blocking=True)
         return self.fused.argmax(self.s_obs)
 
 

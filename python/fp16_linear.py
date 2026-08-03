@@ -31,7 +31,7 @@ def _load():
     if _ext is None and not _ext_failed:
         try:
             import os
-            from beat_arena_env.jit_cache import fast_load
+            from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
             src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "beat_arena_env", "csrc")
             bdir = os.path.join(src, "build_fp16")
@@ -45,11 +45,11 @@ def _load():
                 from torch.utils.cpp_extension import load
                 return load(name="fp16_gemm", sources=srcs,
                             build_directory=bdir,
-                            extra_cuda_cflags=["-arch=sm_61"],
-                            extra_ldflags=["cublas.lib"])
+                            extra_cuda_cflags=CUDA_FLAGS,
+                            extra_ldflags=["cublas.lib"], verbose=True)
 
             _ext = fast_load("fp16_gemm", srcs, bdir,
-                             ["-arch=sm_61", "cublas.lib"], _full)
+                             CUDA_FLAGS + ["cublas.lib"], _full)
         except Exception as e:
             _ext_failed = True
             print(f"[fp16-gemm] unavailable, torch fallback: {e}",

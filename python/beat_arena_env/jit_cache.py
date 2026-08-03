@@ -15,13 +15,66 @@ toolchain probing, no ninja. Hash differs (source edited, torch
 upgraded) -> fall back to the caller's full cpp_extension.load path,
 which rebuilds, then re-stamp. Same auto-invalidation guarantee, none
 of the re-verification cost.
+
+Real builds also tee their compiler output to <name>.build.log next to
+the .pyd, so the -Xptxas -v occupancy numbers survive the build that
+produced them (torch discards ninja's output on a successful load).
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import os
+import sys
+
+CUDA_FLAGS = ["-arch=sm_61", "-Xptxas", "-v"]
+"""nvcc flags shared by every extension in this repo. -Xptxas -v makes
+ptxas print per-kernel registers / stack frame / spill stores+loads /
+lmem, which fast_load captures into <name>.build.log (2026-08-02: the
+spill baseline for the fused policy kernels). The flag list is part of
+the srchash digest below, so editing it invalidates the stamp and
+forces the rebuild that regenerates the log."""
+
+
+@contextlib.contextmanager
+def _build_log(path):
+    """Point fds 1/2 at path for the duration of the build.
+
+    torch's cpp_extension hands ninja the raw fileno 1 when verbose=True
+    and throws the output away otherwise, so an fd-level redirect is the
+    only way to keep the compiler's stderr (where ptxas -v writes).
+    No-ops if fd 1/2 or the log path are unusable (pythonw, read-only
+    dir) — a build must never fail over its own logging."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        f = open(path, "w")
+        saved = os.dup(1), os.dup(2)
+    except OSError:
+        yield
+        return
+    try:
+        os.dup2(f.fileno(), 1)
+        os.dup2(f.fileno(), 2)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
+        f.close()
+
+
+def _tail(path, n=4000):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()[-n:]
+    except OSError:
+        return ""
 
 
 def _digest(sources, extra_flags) -> str:
@@ -54,7 +107,14 @@ def fast_load(name, sources, build_directory, extra_flags, full_load):
                     return mod
         except Exception:
             pass                        # stale/corrupt stamp: full path
-    mod = full_load()
+    log = os.path.join(build_directory, name + ".build.log")
+    try:
+        with _build_log(log):
+            mod = full_load()
+    except Exception as e:               # verbose=True moved the compiler
+        raise RuntimeError(              # output out of the exception
+            f"{type(e).__name__}: {e}\n--- {log} (tail) ---\n"
+            + _tail(log)) from e
     try:                                # stamp only after a good build
         with open(stamp, "w") as f:
             f.write(digest)

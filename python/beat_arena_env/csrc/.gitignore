@@ -2,3 +2,4 @@ build/
 build_ln/
 build_policy/
 build_policy_bwd/
+*.build.log
