@@ -675,6 +675,10 @@ def main():
                         data["pd_floor_hits"] = (
                             data.get("pd_floor_hits", 0)
                             + sum(g.sim.pop_pd_hits() for g in groups))
+                        data["envelope_hits"] = (
+                            data.get("envelope_hits", 0)
+                            + sum(g.sim.pop_envelope_hits()
+                                  for g in groups))
                         writer.submit(data, levels)   # B5: off-thread dump
                         last_save = time.monotonic()
                     t3 = pc()
@@ -764,6 +768,15 @@ def main():
         data["pd_floor_hits"] = (data.get("pd_floor_hits", 0)
                                  + sum(gr.sim.pop_pd_hits() for gr in groups))
         pd_hits = data["pd_floor_hits"]
+        # pre-integration root-envelope engagements (SPEC-v10 Divergences
+        # §23) across all sims — each one terminated that env's level
+        # EARLY with a zeroed tick reward, so a nonzero count is a caveat
+        # on the affected level's score. Expected 0 for any converged
+        # checkpoint (measured: 0 in 204,800 env-ticks).
+        data["envelope_hits"] = (data.get("envelope_hits", 0)
+                                 + sum(gr.sim.pop_envelope_hits()
+                                       for gr in groups))
+        env_hits = data["envelope_hits"]
         save_results(out_path, data, levels)
         if args.chart_cache:            # longest-first sidecar for next run
             os.makedirs(args.chart_cache, exist_ok=True)
@@ -788,6 +801,7 @@ def main():
           f"total weighted PP {data['total_weighted_pp']} | "
           f"unweighted PP {data['total_unweighted_pp']} | "
           f"pd-floor hits {pd_hits} (file total) "
+          f"| envelope hits {env_hits} (file total) "
           f"-> {out_path}", flush=True)
 
 

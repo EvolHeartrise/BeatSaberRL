@@ -330,6 +330,11 @@ class CudaBeatVecEnv:
         # Cholesky pivot-floor engagements (§20e f32 / §22 f64)
         self._pd_hits = z(1, dt=torch.int32)
         self._pd_popped = 0
+        # PRE-integration root-envelope engagements (§23), counted per
+        # (env, substep); an env that engages any of them terminates that
+        # tick with a zeroed reward (the C backstop)
+        self._env_hits = z(1, dt=torch.int32)
+        self._env_popped = 0
         self.chart_idx = z(N, dt=torch.int64)
         # episode-return ring buffer (device-side)
         self._cap = 4096
@@ -354,7 +359,7 @@ class CudaBeatVecEnv:
             self.good, self.bad, self.miss, self.bombs, self.score,
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
-            self.effort_j, self._pd_hits, self.chart_idx,
+            self.effort_j, self._pd_hits, self._env_hits, self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -455,6 +460,18 @@ class CudaBeatVecEnv:
         total = int(self._pd_hits.item())
         new = total - self._pd_popped
         self._pd_popped = total
+        return new
+
+    def pop_envelope_hits(self):
+        """PRE-integration root-velocity-envelope engagements since the
+        last pop (SPEC-v10 Divergences §23), counted per (env, substep) —
+        the Rust backend's pop_envelope_hits mirror. Nonzero means at
+        least one env's root left the kinematically reachable envelope
+        and its episode was terminated with a zeroed reward (the C
+        backstop). 0 on any healthy population. One sync."""
+        total = int(self._env_hits.item())
+        new = total - self._env_popped
+        self._env_popped = total
         return new
 
     def pop_stats(self):

@@ -121,7 +121,18 @@ def _assert_counters_exact(sim, env, e, tag):
                                                  (7, 67, 300)])
 def test_single_tick_parity_random_states(gears, n_states, seed):
     """One 30 Hz tick (8 constrained substeps) from random full states:
-    state/obs/effort/reward bitwise vs Rust, all gear tables."""
+    state/obs/effort/reward bitwise vs Rust, all gear tables.
+
+    These states are deliberately extreme (root orientation uniform, the
+    foot welds violated by up to 0.5 m, every DoF at ±4 rad/s), so most
+    of them trip the §23 root-escape backstop on the FIRST tick and the
+    episode ends there. The tiers agree exactly on WHICH envs and WHEN —
+    that agreement is asserted — but an env is not comparable after its
+    terminal tick with `auto_reset=False`: Rust's B4 `finished` latch
+    freezes a done env (it re-reports `(0.0, true)` without running
+    physics) while the batched mirror, which has no latch, keeps
+    integrating. So each env is compared up to and including the tick it
+    reports done, and dropped after."""
     q36s, v35s = _rand_states(n_states, seed)
     charts = [[FAR_NOTE]] * n_states
     env = _tenv(charts, gears, 6900)
@@ -133,14 +144,23 @@ def test_single_tick_parity_random_states(gears, n_states, seed):
     acts = rng.integers(0, gears, size=(2, n_states, N_JOINTS))
     for e, sim in enumerate(sims):
         sim.set_joints(q36s[e], v35s[e])
+    live = [True] * n_states
+    compared = 0
     for t in range(2):
-        tobs, trew, _td, _ = env.step(torch.as_tensor(acts[t]))
+        tobs, trew, td, _ = env.step(torch.as_tensor(acts[t]))
         for e, sim in enumerate(sims):
-            obs_r, rew_r, _d, _ev = sim.step([int(x) for x in acts[t, e]])
+            if not live[e]:
+                continue
+            obs_r, rew_r, d_r, _ev = sim.step([int(x) for x in acts[t, e]])
+            assert d_r == bool(td[e]), f"tick{t} env{e} done"
             assert rew_r == float(trew[e]), f"tick{t} env{e} reward"
             np.testing.assert_array_equal(np.asarray(obs_r), tobs[e].numpy(),
                                           err_msg=f"tick{t} env{e} obs")
             _assert_state_exact(sim, env, e, f"tick{t} env{e}")
+            compared += 1
+            if d_r:
+                live[e] = False
+    assert compared >= n_states, "every env must be compared at least once"
 
 
 # --- (b) multi-tick trajectory parity ----------------------------------------

@@ -359,13 +359,34 @@ happening in exactly this order:**
     this point are near-null-mode noise with negligible momentum).
     Dissipative as before.
 12. **Root velocity envelope guarantee (ADDED at P3 — Divergences
-    §19b; supersedes step 11's "the root is never clamped")**: if
+    §19b; supersedes step 11's "the root is never clamped"; AMENDED
+    2026-08-03 — Divergences §23)**: the envelope is applied **TWICE
+    per substep — immediately BEFORE step 10, and again after step
+    11** (both applications are the identical expression tree): if
     `|ω_root| > 96` rad/s, rescale the root angular 3-vector onto 96;
     if `|v_root| > 48` m/s, rescale the linear 3-vector onto 48. The
     welded feet + capped joints kinematically bound the true root
     velocity (6-joint leg chain × 16 rad/s; ≤ ~0.5 m root–foot
     levers) — beyond the envelope is integrator/solver artifact, not
     physics; ordinary motion never approaches it.
+    The **pre-step-10** application is what bounds the INTEGRATED root
+    motion: `‖Δp‖ ≤ h·48` and `|Δθ| ≤ h·96` per substep,
+    unconditionally, and hence the next substep's Baumgarte weld bias.
+    The **post-step-11** application is what bounds the STORED
+    velocity (step 11's momentum-consistent joint impulses
+    `Δv = M⁻¹e_j·λ` have non-zero ROOT rows and can re-exceed the
+    envelope after step 10 has already run). Both are no-ops on any
+    state ordinary motion reaches — a converged v10 policy measured
+    **0 engagements in 204,800 env-ticks** — so the amendment is
+    BITWISE transparent on healthy trajectories.
+    **Engagements of the pre-step-10 application are COUNTED** (per
+    (env, substep); `pop_envelope_hits()` on RawBeatSim / VecBeatSim /
+    CudaBeatVecEnv / TorchBeatVecEnv, the `pop_pd_hits` pattern) and an
+    env that engages it during a control tick **TERMINATES that tick**
+    with `done = true` and its **reward set to exactly 0** (§4): the
+    trajectory is bounded but no longer physical, so none of it may
+    reach the policy. The post-step-11 application is deliberately not
+    counted (it is the measured subset; see Divergences §23).
 
 Feet weld definition: foot body frames held at their reference-pose world
 poses — foot_l at (−0.10, 0.07, −0.65), foot_r at (+0.10, 0.07, −0.65),
@@ -394,6 +415,14 @@ identity orientation (6 bilateral rows each).
   3.7e-4 → frozen at 4e-4. Episode check: ~43 swings × 27.1 J × 4e-4 ≈
   0.47 — inside v9's 0.5–1.0 per-episode band. Flagged for P7 re-tune (the
   gravity/work economy is a known behavioral discontinuity).
+- **Root-escape termination (ADDED 2026-08-03 — §3 step 12, Divergences
+  §23)**: if the pre-step-10 root-velocity envelope engages on ANY of a
+  tick's 8 substeps, that tick's reward is **exactly 0** (it overrides
+  every other term — effort, cuts, misses, follow-through) and the
+  episode ends (`done = true`, auto-reset as usual). The state left the
+  kinematically reachable envelope, so the tick's observation and reward
+  are solver artifact, not play. Measured incidence: 0 on a converged
+  policy over 204,800 env-ticks.
 
 Env-layer geometry that was constant in v9 becomes live-pose-derived
 (judgment formulas otherwise unchanged): broad-phase reach gate
@@ -943,3 +972,99 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        gimbal state — the exactly-singular §12 matrix — through the
        full substep: no panic, counter increments, state finite), and
        `tests/test_v10_pd_floor.py` on the torch mirror + FFI.
+23. **§19b root envelope applied BEFORE integration; the escape
+    mechanism re-diagnosed (2026-08-03).** §19b attributed the root
+    escape to the explicit Coriolis term at `h·ω ≈ 1`. **That
+    attribution is wrong** (measured, research/2026-08-03-root-escape-
+    design.md): escapes are born at `h·|ω_root| = 0.005…0.11`, the
+    Coriolis contribution to the root's Δω at the birth substep is
+    0.07–0.3 rad/s against the solver's 1e4–1e5 rad/s, and deleting the
+    velocity-product bias term entirely does not prevent them (it makes
+    the gears-3 escape set worse: 339.7 m → 1.4e8 m).
+    a. **Mechanism.** The spike is born INSIDE step 8's ω-cap/limit
+       stage. The §15c weld-null-space projection makes that stage the
+       operator `Q_j = I − (S e_j)e_jᵀ/S_jj` with
+       `S = M⁻¹ − M⁻¹J_wᵀA_ww⁻¹J_w M⁻¹`. `Q_j` is idempotent but NOT
+       M-self-adjoint (`M S` is not symmetric), so it is an OBLIQUE
+       projector with `‖Q_j‖_M ≈ (S_jj/(M⁻¹)_jj)^{-1/2}` — measured
+       **90–116** for the four ankle joints when their mobility ratio
+       sits just above the §19a `COMPOSITE_EPS = 1e-4`. Twelve
+       iterations of a gain > 1 diverge geometrically: measured
+       ×2.2–4.7 per iteration; `|v|` inside the PGS 387 (2 iterations)
+       → 8.5e3 (6) → 9.3e5 (12) → 8.3e21 (24) on the same state, in
+       f64. §19a bounded the per-APPLICATION amplification; it did not
+       bound the LOOP. Trigger: a weld-owned joint riding its ω cap at
+       `r_j ∈ [1.1e-4, 1.6e-4]` — reached by contorted cap-riding
+       poses, i.e. random and mid-training policies, not converged ones
+       (measured incidence: 0.005–0.015 % of random-policy env-ticks,
+       0.00049 % at `ckpt_upd0762`, **0** at `final.pt`).
+    b. **The fix (A1).** The envelope is therefore ALSO applied
+       immediately before step 10 (§3 step 12). This bounds the
+       integrated root motion at `‖Δp‖ ≤ h·48 = 0.2 m` per substep and
+       hence the next substep's Baumgarte weld bias at `β/h·0.2 = 9.6`
+       m/s instead of the measured **1.9e3 m/s**, which kills the
+       cascade. Measured: the captured escape corpus goes from 339.7 m
+       (gears 3) / 34.07 m (gears 5) worst per-substep `|Δp|` to
+       **0.2 m exactly** in every configuration, and a 192-state ×
+       16-substep adversarial sweep (60 % of joints on a stop, all
+       rates saturated, welds pre-violated 0.10 m) that went NON-FINITE
+       in all six f32 configurations pre-fix stays finite and inside the
+       0.2 m bound post-fix. The alternative "rewind p on engagement"
+       form was rejected: its bound leaks by construction (29–33 % of
+       over-envelope integrations never reach the step-12 test; measured
+       `|Δp|` up to 0.975 m against the same 0.2 m bound).
+    c. **Bitwise transparency.** `torch.where`/`if` returns the input
+       unchanged when nothing engages, and nothing engages on healthy
+       play: a `ckpt_upd3048` rollout of 512 envs × 400 ticks = 204,800
+       env-ticks in the CUDA f32 env is **bitwise identical** (obs,
+       reward, done, state, score, contacts) before and after this
+       amendment, with `envelope_hits = 0`. Under a UNIFORM-RANDOM
+       policy the suites do contain escapes, and there the only rows
+       that change are exactly the escaping envs from exactly the tick
+       they escape (256-env × 200-tick f32/f64 suites: 1–4 envs differ,
+       every other env bitwise, all four suites).
+    d. **C backstop.** An engagement of the pre-step-10 application
+       terminates the env's episode that tick with the tick's reward
+       set to exactly 0. Rationale: A1 makes the trajectory BOUNDED, it
+       does not make it MEANINGFUL, and feeding a physically
+       meaningless observation/reward to the policy is the harm the
+       hunt started from (the fp16 loss-scale collapse and the §22
+       bench panic were both downstream of it). Auto-reset handles the
+       done exactly like any other. The trigger is "any engagement",
+       per the design doc: the cap itself is already a 4.41× margin over
+       the worst converged-policy `|ω_root|` (21.76 vs 96) and 2.91× in
+       `|v_root|`, and the measured healthy engagement rate is 0, so a
+       larger multiplier would only let more meaningless physics through
+       without protecting any real play.
+    e. **Counter.** `Workspace::env_hits` (Rust), `Dyn::env_n` +
+       the `env_hits` device tensor (CUDA), `DynBatch._env_hits`
+       (torch), popped by `pop_envelope_hits()` on every backend with
+       identical per-(env, substep) semantics (pinned bitwise
+       Rust↔torch and exactly Rust↔CUDA-f64 on the escape fixture).
+       The trainer prints it per update; bench_scoresaber writes
+       `envelope_hits` into the results JSON next to `pd_floor_hits` —
+       reported, never hidden.
+    f. **NOT fixed here.** The oblique projection itself. Making the
+       cap/limit rows use the plain (M-orthogonal, `‖Q‖_M = 1`) `M⁻¹e_j`
+       direction, or folding the saturated caps into the exact weld
+       block, would remove the geometric gain rather than bounding its
+       consequences — but the affected joints (the four ankles) are
+       engaged on **88 %** of healthy trained-policy substeps, so either
+       change alters every trajectory and belongs to a v11 body revision
+       with a full physics + recipe re-gate. Also declined there:
+       implicit/semi-implicit Coriolis (does not fix this bug, +30–60 %
+       substep cost, and it retires the symmetric-PD/no-pivot-Cholesky
+       invariant the tri-tier bitwise method rests on), raising
+       COMPOSITE_EPS (works — 339.7 m → 0.275 m — but silently
+       reclassifies the ankles on 88 % of healthy substeps), and
+       adaptive substepping (measured WORSE: the divergence lives inside
+       one substep's 12-iteration loop, and halving `h` doubles the
+       Baumgarte gain `β/h`).
+    g. **Regression**: `dynamics::tests_soak::{root_step_bounded_on_the
+       _escape_state, adversarial_states_stay_finite_and_bounded,
+       healthy_motion_never_engages_the_envelope,
+       soak_state_engages_the_envelope_and_stays_bounded}`,
+       `env_tests::{escaped_env_terminates_with_zero_reward,
+       healthy_env_never_escapes}` (Rust), and
+       `tests/test_v10_root_escape.py` (all three tiers, including the
+       Rust↔torch f64 BITWISE comparison ON the escape tick).

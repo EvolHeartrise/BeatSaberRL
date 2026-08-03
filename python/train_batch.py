@@ -823,6 +823,16 @@ def main():
                 if pd:
                     print(f"[pd-net] {pd} f32 pivot-floor engagement(s) "
                           "this update", flush=True)
+            # pre-integration root-envelope engagements (SPEC-v10
+            # Divergences §23): each one terminated an env's episode with
+            # a zeroed reward (the C backstop). Reported, never hidden —
+            # a converged policy measures 0.
+            if hasattr(venv, "pop_envelope_hits"):
+                eh = venv.pop_envelope_hits()
+                if eh:
+                    print(f"[envelope] {eh} root-escape engagement(s) "
+                          "this update (episodes terminated, reward 0)",
+                          flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start

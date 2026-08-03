@@ -156,6 +156,44 @@ pub fn substep_opts(
     st.v.copy_from_slice(&ws.vstar);
     // ───────────────────────────────────────────────────────────────
 
+    // 12-PRE. root velocity envelope, FIRST application (SPEC-v10 §3
+    //     step 12 as amended 2026-08-03 — Divergences §23). Identical
+    //     expression tree to the post-step-11 application at the bottom
+    //     of this function; run HERE it is the one that bounds what the
+    //     integrator consumes: ‖Δp‖ ≤ h·ROOT_V_MAX and |Δθ| ≤ h·ROOT_W_MAX
+    //     per substep, UNCONDITIONALLY, and hence the next substep's
+    //     Baumgarte weld bias (β/h·Δp ≤ 9.6 m/s instead of a measured
+    //     1.9e3 m/s). Without it a divergent step-8 solve (the §23
+    //     oblique-projector mechanism) teleports the body hundreds of
+    //     metres in one substep and the weld bias then feeds the
+    //     divergence. Engages ONLY on artifact states — a converged v10
+    //     policy measured 0 engagements in 204,800 env-ticks — so it is
+    //     bitwise transparent on healthy trajectories. Engagements are
+    //     counted (ws.env_hits): the env layer terminates the episode on
+    //     a nonzero per-tick count (the trajectory is no longer physics).
+    if model.free_base {
+        let mut engaged = false;
+        let w2 = st.v[3] * st.v[3] + st.v[4] * st.v[4] + st.v[5] * st.v[5];
+        if w2 > ROOT_W_MAX * ROOT_W_MAX {
+            let s = ROOT_W_MAX / w2.sqrt();
+            st.v[3] *= s;
+            st.v[4] *= s;
+            st.v[5] *= s;
+            engaged = true;
+        }
+        let l2 = st.v[0] * st.v[0] + st.v[1] * st.v[1] + st.v[2] * st.v[2];
+        if l2 > ROOT_V_MAX * ROOT_V_MAX {
+            let s = ROOT_V_MAX / l2.sqrt();
+            st.v[0] *= s;
+            st.v[1] *= s;
+            st.v[2] *= s;
+            engaged = true;
+        }
+        if engaged {
+            ws.env_hits += 1;
+        }
+    }
+
     // 10. semi-implicit Euler positions; root quaternion via exp map of
     //     the WORLD angular velocity (Taylor guard |u| < 1e-12)
     for j in 0..model.nq {
@@ -250,8 +288,16 @@ pub fn substep_opts(
         }
     }
 
-    // 12. root velocity envelope guarantee (ADDED at P3 — SPEC-v10
-    //     Divergences §19). With the feet welded and every joint rate
+    // 12. root velocity envelope guarantee, SECOND application (ADDED
+    //     at P3 — SPEC-v10 Divergences §19b; the first application is
+    //     the 12-PRE block above, Divergences §23). This one bounds the
+    //     STORED velocity: step 11's momentum-consistent joint impulses
+    //     Δv = M⁻¹e_j·λ have non-zero ROOT rows, so the root can be
+    //     back over the envelope after step 10 has already run. It is
+    //     deliberately NOT counted into ws.env_hits — the pre-integration
+    //     application is the escape signal (it is the superset in the
+    //     measured adversarial sweeps and the one whose consequences
+    //     are unbounded). With the feet welded and every joint rate
     //     capped, the TRUE root velocity is kinematically bounded (the
     //     root connects to the ground through a 6-joint leg chain:
     //     |ω_root| ≤ 6×16 = 96 rad/s, and the linear velocity by the
