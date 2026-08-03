@@ -4,6 +4,12 @@ step, auto-reset with Python-side chart generation.
 Semantics match the PufferLib Serial path used so far: when an env
 finishes, its returned obs row is replaced by the fresh reset obs, and
 episode stats (return + cut counters) are emitted in `infos`.
+
+Since 2026-08-02 reset()/step() return views of ONE persistent
+(N, OBS_DIM) buffer filled by the zero-copy `step_into` FFI (the
+bench_scoresaber pattern) instead of a fresh 696 KB-at-N=512 allocation
+per step — callers must consume/copy the obs before the next step()
+(the trainer and tests already do).
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ class BeatVecEnv:
                               wide_acc=wide_acc, gears=gears)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
+        self._obs = np.zeros((num_envs, OBS_DIM), dtype=np.float32)
 
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
@@ -49,15 +56,16 @@ class BeatVecEnv:
         for i in range(self.num_envs):
             self._new_chart(i)
         self._returns[:] = 0.0
-        return self.sim.obs().reshape(self.num_envs, OBS_DIM)
+        self._obs[:] = self.sim.obs().reshape(self.num_envs, OBS_DIM)
+        return self._obs
 
     def step(self, actions):
         """actions: (N, 29) int array — gear ids in SPEC-v10 §1.4 joint
         order. Returns (obs, rewards, dones, infos); infos = list of
-        dicts for envs that finished THIS step."""
-        obs, rew, done, _events = self.sim.step(  # events empty (ctor flag)
-            np.ascontiguousarray(actions, dtype=np.int64))
-        obs = obs.reshape(self.num_envs, OBS_DIM)
+        dicts for envs that finished THIS step. obs is a view of the
+        persistent buffer — consume before the next step()."""
+        rew, done, _events = self.sim.step_into(  # events empty (ctor flag)
+            np.ascontiguousarray(actions, dtype=np.int64), self._obs)
         self._returns += rew
         infos = []
         if done.any():
@@ -68,5 +76,5 @@ class BeatVecEnv:
                               "n_notes": n, "score": score, "bombs_hit": bombs})
                 self._returns[i] = 0.0
                 self._new_chart(i)
-                obs[i] = self.sim.obs_one(int(i))
-        return obs, rew, done, infos
+                self.sim.obs_one_into(int(i), self._obs)  # in-place row
+        return self._obs, rew, done, infos
