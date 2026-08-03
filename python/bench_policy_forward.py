@@ -40,7 +40,7 @@ class _GraphedForward(_Graphed):
             return self.policy.forward_stacked(self.s_obs)
 
     def __call__(self, obs):
-        self.s_obs.copy_(obs)
+        self._copy_static(self.s_obs, obs)
         return self._run()
 
 
