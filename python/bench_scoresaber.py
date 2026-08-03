@@ -247,6 +247,75 @@ def save_results(path, data, levels):
     os.replace(tmp, path)
 
 
+class _SaveWriter:
+    """Periodic result dumps OFF the eval loop's critical path (B5,
+    2026-08-03). Measured at full-catalog scale (6101 levels): one
+    save_results is ~300 ms — 1.4 ms sort, 125 ms json.dumps(indent=1),
+    the rest a 3.5 MB atomic write — and it was paid inline in the group
+    loop every 30 s.
+
+    A daemon thread now owns the dump. The loop hands it a SNAPSHOT (a
+    shallow data copy + a dict copy of levels, ~0.3 ms; level entries are
+    replaced wholesale, never mutated in place, so the shallow copies are
+    a consistent point-in-time view) and goes straight back to stepping —
+    and because json.dumps' GIL hold overlaps the Rust sim's
+    allow_threads window, the dump costs the loop nothing measurable.
+
+    Snapshots COALESCE: a newer one supersedes a pending one. That is
+    safe because every snapshot carries the full cumulative state,
+    including the running pd_floor_hits total (the FFI pop that feeds it
+    stays on the main thread — it is a stateful counter — so a dropped
+    snapshot never drops a popped count; the next one still has it).
+
+    The on-disk format is save_results' own, unchanged (same keys, same
+    sort, same indent, same tmp+os.replace). The FINAL save stays
+    synchronous on the main thread, after close(), so `data` itself ends
+    up holding the recomputed totals the summary line prints — and so no
+    in-flight older snapshot can land after it. close() DRAINS rather
+    than drops (a submit the worker had not picked up yet would
+    otherwise vanish, taking its popped pd_floor_hits with it).
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._pending = None
+        self._stop = False
+        self._cv = threading.Condition()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, data, levels):
+        with self._cv:
+            self._pending = (dict(data), dict(levels))
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while self._pending is None and not self._stop:
+                    self._cv.wait()
+                if self._pending is None:   # stopped AND drained
+                    return
+                data, levels = self._pending   # a stop still drains the
+                self._pending = None           # last snapshot to disk
+            try:
+                save_results(self.path, data, levels)
+            except Exception as e:      # a periodic save is best-effort;
+                print(f"[save] background save failed: {e!r}",  # the final
+                      flush=True)                               # one is not
+
+    def close(self):
+        """Stop accepting snapshots, DRAIN the last one, and join — so
+        nothing submitted is silently lost (a submit that the worker had
+        not picked up yet would otherwise vanish, and with it a
+        crash-resume's pd_floor_hits) and the caller's synchronous final
+        save is strictly the last writer of the file."""
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
+        self._thread.join()
+
+
 def parser_version():
     """Chart-cache version: hash of the code the cached payload actually
     depends on. beatsaver.py is hashed whole (it IS the parser); from
@@ -444,7 +513,12 @@ def main():
     # per-env ORDERED event stream (env_idx, note_idx, code, points) —
     # order feeds each slot's combo/multiplier walk exactly as the old
     # serial per-env loop did. Idle slots hold an empty chart (done on
-    # every step, eventless, ~free) so the vector call is always valid.
+    # every step, eventless) so the vector call is always valid. Those
+    # slots are ACTUALLY free since 2026-08-03 (B4): the old claim was
+    # wrong — Rust ran the full 8-substep dynamics tick for every idle
+    # slot on every step, then recomputed `done` from state and said
+    # yes. rust/src/lib.rs now latches `finished` and early-outs, so an
+    # idle slot costs exactly one tick per recycle.
     N = args.num_envs
     if args.fused_forward:
         # adaptive width (2026-07-27): wide N amortizes the per-step sync
@@ -534,6 +608,7 @@ def main():
     # and the group's event is the sync that makes both safe to touch)
     feed_done, n_done, n_new_skip = False, 0, 0
     last_save = time.monotonic()
+    writer = _SaveWriter(out_path)        # B5: periodic dumps off-thread
     # GC off for the loop (2026-07-27): the hot path allocates no cycles
     # that matter, and gen2 passes were walking the whole startup graph +
     # the queued note tuples. Bounded run; freeze then disable.
@@ -594,11 +669,13 @@ def main():
                         # accumulate §22 pd-floor engagements at every
                         # periodic save (cheap FFI counter pop) so a
                         # killed run cannot lose the count across a
-                        # resume
+                        # resume. The pop MUST stay here on the main
+                        # thread — it is a stateful counter — and it
+                        # rides the snapshot the writer dumps.
                         data["pd_floor_hits"] = (
                             data.get("pd_floor_hits", 0)
                             + sum(g.sim.pop_pd_hits() for g in groups))
-                        save_results(out_path, data, levels)
+                        writer.submit(data, levels)   # B5: off-thread dump
                         last_save = time.monotonic()
                     t3 = pc()
                     ph[2] += t1 - t0
@@ -676,6 +753,9 @@ def main():
                 # pass blocks on q.get() until the producer delivers
     finally:
         stop.set()
+        # any in-flight periodic dump finishes first, so the synchronous
+        # final save below is the last writer of out_path (B5)
+        writer.close()
         # f64 Cholesky pivot-floor engagements (SPEC-v10 Divergences
         # §22) across all sims — reported, not hidden (the §20e house
         # rule): a nonzero count marks contorted gimbal-adjacent
