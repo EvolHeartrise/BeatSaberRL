@@ -69,10 +69,24 @@ constexpr int N_NOTE_SLOTS = 16;
 constexpr int NOTE_FEAT = 14;
 // One WARP per block: the grid is N/32 blocks, so small batches spread
 // over all 20 SMs. P5 profile note: throughput is INSENSITIVE to the
-// block size (128 vs 32: 216 vs 221 ms at N=1024) and to the register
-// budget (-maxrregcount=64 vs the natural 128: within noise) — the
-// kernel is bound by per-env serial latency + local-memory traffic
-// (51 KB stack/thread, working set far beyond L2), not by occupancy.
+// block size (128 vs 32: 216 vs 221 ms at N=1024) — the kernel is bound
+// by per-env serial latency + local-memory traffic (45 KB stack/thread,
+// working set far beyond L2), not by occupancy.
+//
+// The register budget is NOT insensitive, correcting the earlier
+// "-maxrregcount=64 vs the natural 128: within noise" note (measured
+// 2026-08-03): left free, ptxas picks the target from a heuristic that
+// is unstable under unrelated frame changes — the in-place Cholesky
+// below flipped it 168 -> 64 regs with spills 8,220/6,820 ->
+// 12,672/13,708 and cost 2.9% wall. step_kernel therefore PINS the
+// budget via __launch_bounds__(THREADS, 1): minBlocksPerMultiprocessor
+// = 1 is the honest statement of this kernel's design (occupancy is not
+// the lever) and it lets ptxas take all 255 registers, which is where
+// the spills are lowest — f32 8,220/6,820 -> 6,948/4,744 and f64
+// 18,996/19,084 -> 16,160/13,676 vs the free-choice build, worth
+// +0.5% on its own and the difference between a 2.9% loss and a wash
+// for the in-place factor. Changing THREADS means re-measuring this.
+//
 // The identified next lever is candidate-B intra-env parallelism
 // (warp-per-env with the factor in shared memory) — out of P5 scope.
 constexpr int THREADS = 32;
@@ -356,8 +370,8 @@ struct Dyn {
   // FK
   T r[NF][3][3], pos[NF][3], axw[NF][3];
   T r0[3][3];
-  // dense
-  T m[NV * NV], l[NV * NV], c[NV], rhs[NV];
+  // dense — m holds M from crba, then its IN-PLACE Cholesky factor L
+  T m[NV * NV], c[NV], rhs[NV];
   // CRBA composites
   T cm[NF], cc[NF][3], ci[NF][3][3];
   T bm, bc[3], bi[3][3];
@@ -370,7 +384,7 @@ template <typename T>
 struct Solver {
   // weld rows
   T jw[N_WELD][NV], mw[N_WELD][NV], bias_w[N_WELD];
-  T aww[N_WELD * N_WELD], lww[N_WELD * N_WELD], rw[N_WELD];
+  T aww[N_WELD * N_WELD], rw[N_WELD];  // aww: A_ww, then in-place L
   // contacts (compacted, pair-id order)
   int nc;
   int c_pair[NUM_PAIRS];
@@ -453,7 +467,7 @@ __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
 // is legal and true. It matters because the kernel is local-memory-
 // traffic bound: without it, a store to any Solver field (s.jw, s.rw,
 // s.c_lam …) makes the compiler re-load the Dyn fields it was holding
-// — above all d.l, the Cholesky factor read by every solve.
+// — above all d.m, which holds the Cholesky factor read by every solve.
 // Read-only aliases are still permitted under restrict (only MODIFIED
 // objects must be reached through the one pointer), which is what keeps
 // `constraint_solve(d, s, d.q, v)` — qpre pointing into d — well
@@ -477,7 +491,11 @@ __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
 // NV=35 solves, the 12 PGS iterations); unrolling those is the
 // opposite trade in a kernel already at 128 regs + 8 KB of spills, so
 // it belongs with the algorithmic Cholesky work, not with a
-// mechanical pragma pass.
+// mechanical pragma pass. That Cholesky work has since landed (see
+// chol_factor_n): a hand-written unroll-and-JAM by 4 of the factor's
+// row loop — worth +2.0% because it cuts dependency-chain latency (4
+// independent accumulators) rather than branch overhead, which is
+// exactly what a bare `#pragma unroll` on the same loop cannot do.
 
 // fk_all: world rotation/origin per frame + world revolute axes.
 template <typename T>
@@ -818,16 +836,40 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // instead of panicking now), f32 floors at 1e-8 and latches bad only
 // for d <= 0 (Divergences §20e).
 //
-// DELIBERATELY NOT __restrict__ (2026-08-02): m and l are distinct
-// today (d.m/d.l, s.aww/s.lww), but factoring IN PLACE (l == m) is a
-// planned follow-up — a restrict qualifier here would silently become
-// a lie the moment that lands. The disambiguation this function needs
-// (l vs m vs bad) is structural once ptxas sees the concrete callers.
+// IN PLACE, one buffer (2026-08-03; supersedes the 2026-08-02 note that
+// deliberately withheld __restrict__ here pending exactly this change).
+// `a` enters as M and leaves as its lower Cholesky factor L. Legal by
+// inspection of the recurrence, and bitwise identical to the old
+// two-buffer form because it issues the SAME reads, the SAME writes, in
+// the SAME order — only the destination address changes:
+//   * column j reads a[j*n+j] (the M diagonal) as its FIRST statement
+//     and writes a[j*n+j] = dj only after the k-loop — read-before-
+//     write, and no later column ever re-reads a diagonal;
+//   * the row loop reads a[i*n+j] as the first statement of iteration i
+//     and writes exactly that one element as its last — read once,
+//     immediately before its own overwrite;
+//   * every other read is a[i*n+k] / a[j*n+k] with k < j, i.e. columns
+//     already converted to L by earlier j, and no write at column j
+//     touches a column < j.
+// Callers: d.m (written only by crba, which zeroes all NV*NV first) and
+// s.aww (fully rewritten, both triangles, before each factor) — neither
+// is read as M after its factor, so nothing needs the original matrix.
+// Frees Dyn::l (NV*NV) and Solver::lww (N_WELD*N_WELD) from the frame.
+//
+// The dead upper-triangle zeroing that used to run here (l[j*n+i],
+// i > j — 595 stores per NV=35 factor + 66 per weld factor, per
+// substep) is GONE: the only readers of a factor are this function
+// (a[i*n+k], a[j*n+k] with k < j <= i) and chol_solve_n (a[i*n+k] k<i;
+// a[k*n+i] k>i = row k, col i with k>i; a[i*n+i]) — strictly lower
+// triangle plus diagonal. Nothing reads above it, so it needs no value.
+// `a` and `bad` are distinct objects (the matrix buffer vs d.pd_bad),
+// so __restrict__ on both is true and lets the L row stay in registers
+// across the (rare) pivot-floor latch.
 template <typename T>
-__device__ void chol_factor_n(int n, const T* m, T* l, bool* bad) {
+__device__ void chol_factor_n(int n, T* a, bool* bad) {
   for (int j = 0; j < n; j++) {
-    T dpiv = m[j * n + j];
-    for (int k = 0; k < j; k++) dpiv -= l[j * n + k] * l[j * n + k];
+    T dpiv = a[j * n + j];
+    for (int k = 0; k < j; k++) dpiv -= a[j * n + k] * a[j * n + k];
     if (sizeof(T) == 8) {
       if (dpiv < T(PD_FLOOR_F64)) *bad = true;
       dpiv = tmax(dpiv, T(PD_FLOOR_F64));
@@ -836,19 +878,44 @@ __device__ void chol_factor_n(int n, const T* m, T* l, bool* bad) {
       dpiv = tmax(dpiv, T(PD_FLOOR_F32));
     }
     const T dj = sqrt(dpiv);
-    l[j * n + j] = dj;
-    for (int i = j + 1; i < n; i++) l[j * n + i] = T(0);
-    for (int i = j + 1; i < n; i++) {
-      T s = m[i * n + j];
-      for (int k = 0; k < j; k++) s -= l[i * n + k] * l[j * n + k];
-      l[i * n + j] = s / dj;
+    a[j * n + j] = dj;
+    // Row loop, UNROLLED AND JAMMED BY 4: the pivot row a[j*n+k] (k<j)
+    // used to be re-read once per i; jammed it is read once per FOUR i,
+    // and the four s_t carry independent dependency chains instead of
+    // one. Bitwise: each s_t accumulates over k in the same ascending
+    // order, over the same values, as its scalar counterpart — no
+    // reassociation, only interleaving. Deferring the four stores to
+    // the end of the block is safe under the in-place aliasing too: the
+    // inner loop only ever reads columns k < j, and the four deferred
+    // stores are all in column j.
+    int i = j + 1;
+    for (; i + 3 < n; i += 4) {
+      const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+      T s0 = a[r0 + j], s1 = a[r1 + j], s2 = a[r2 + j], s3 = a[r3 + j];
+      for (int k = 0; k < j; k++) {
+        const T ljk = a[j * n + k];
+        s0 -= a[r0 + k] * ljk;
+        s1 -= a[r1 + k] * ljk;
+        s2 -= a[r2 + k] * ljk;
+        s3 -= a[r3 + k] * ljk;
+      }
+      a[r0 + j] = s0 / dj;
+      a[r1 + j] = s1 / dj;
+      a[r2 + j] = s2 / dj;
+      a[r3 + j] = s3 / dj;
+    }
+    for (; i < n; i++) {
+      T s = a[i * n + j];
+      for (int k = 0; k < j; k++) s -= a[i * n + k] * a[j * n + k];
+      a[i * n + j] = s / dj;
     }
   }
 }
 
 // Triangular solve. l and x are always distinct objects at every call
-// site (d.l vs {d.rhs, s.mw[w], s.c_minv[ci], s.ecol[j]}; s.lww vs
-// s.rw), and x is the only thing written — so restrict here is the
+// site (d.m, holding the in-place factor, vs {d.rhs, s.mw[w],
+// s.c_minv[ci], s.ecol[j]}; s.aww vs s.rw), and x is the only thing
+// written — so restrict here is the
 // difference between keeping l's row in registers across the x[i]
 // store and re-loading it every iteration.
 template <typename T>
@@ -964,7 +1031,7 @@ __device__ void ensure_ecol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   T* col = s.ecol[j];
   for (int i = 0; i < NV; i++) col[i] = T(0);
   col[VOFF + j] = T(1);
-  chol_solve_n(NV, d.l, col);
+  chol_solve_n(NV, d.m, col);
   s.ecomp[j] = true;
 }
 
@@ -983,7 +1050,7 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     for (int i = 0; i < NV; i++) sum += s.jw[w][i] * col[i];
     s.rw[w] = sum;
   }
-  chol_solve_n(N_WELD, s.lww, s.rw);
+  chol_solve_n(N_WELD, s.aww, s.rw);
   for (int w = 0; w < N_WELD; w++) {
     const T x = s.rw[w];
     for (int i = 0; i < NV; i++) col[i] -= s.mw[w][i] * x;
@@ -1106,11 +1173,11 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // -- effective masses (row order: welds, contacts, limits) ------------------
   for (int w = 0; w < N_WELD; w++) {
     for (int i = 0; i < NV; i++) s.mw[w][i] = s.jw[w][i];
-    chol_solve_n(NV, d.l, s.mw[w]);
+    chol_solve_n(NV, d.m, s.mw[w]);
   }
   for (int ci = 0; ci < s.nc; ci++) {
     for (int i = 0; i < NV; i++) s.c_minv[ci][i] = s.c_J[ci][i];
-    chol_solve_n(NV, d.l, s.c_minv[ci]);
+    chol_solve_n(NV, d.m, s.c_minv[ci]);
     T diag = T(0);
     for (int i = 0; i < NV; i++) diag += s.c_J[ci][i] * s.c_minv[ci][i];
     s.c_diag[ci] = diag;
@@ -1130,7 +1197,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       s.aww[r * N_WELD + c] = sum;
       s.aww[c * N_WELD + r] = sum;
     }
-  chol_factor_n(N_WELD, s.aww, s.lww, &d.pd_bad);
+  chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
 
   // -- limit rows: project into the weld null space ---------------------------
   for (int li = 0; li < s.nl; li++) {
@@ -1148,7 +1215,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       for (int i = 0; i < NV; i++) jv += s.jw[r][i] * v[i];
       s.rw[r] = s.bias_w[r] - jv;
     }
-    chol_solve_n(N_WELD, s.lww, s.rw);
+    chol_solve_n(N_WELD, s.aww, s.rw);
     for (int r = 0; r < N_WELD; r++) {
       const T dl = s.rw[r];
       for (int i = 0; i < NV; i++) v[i] += s.mw[r][i] * dl;
@@ -1208,10 +1275,11 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   for (int j = 0; j < NQ; j++)
     d.rhs[VOFF + j] =
         tau[j] - T(DAMPING[j]) * d.v[VOFF + j] - d.c[VOFF + j];
-  // 5. Cholesky
-  chol_factor_n(NV, d.m, d.l, &d.pd_bad);
+  // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
+  // substep (crba rewrites all NV*NV of it next substep)
+  chol_factor_n(NV, d.m, &d.pd_bad);
   // 6. v* = v + h M^-1 (tau - C)
-  chol_solve_n(NV, d.l, d.rhs);
+  chol_solve_n(NV, d.m, d.rhs);
   T v[NV];
   for (int i = 0; i < NV; i++) v[i] = d.v[i] + T(H_SUB) * d.rhs[i];
   // shared per-joint column caches reset per substep (this factor)
@@ -2062,7 +2130,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 }
 
 template <typename T>
-__global__ void __launch_bounds__(THREADS)
+// The `, 1` PINS the register budget at 255 — see the THREADS note: it
+// is not an occupancy hint, it is what stops ptxas's free-choice
+// heuristic from flipping to 64 regs + double the spills.
+__global__ void __launch_bounds__(THREADS, 1)
 step_kernel(Sim<T> P) {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= P.N) return;
