@@ -198,7 +198,8 @@ def test_gears_cuda_parity():
     for k in (3, 5, 7):
         env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
                              device="cuda", dtype=torch.float64,
-                             auto_reset=False, gears=k)
+                             auto_reset=False, gears=k,
+                             want_contacts=True)
         env.reset()
         obs_l = []
         for t in range(2):
@@ -212,7 +213,8 @@ def test_gears_cuda_parity():
     for k in (3, 5, 7):
         env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
                              device="cuda", dtype=torch.float64,
-                             auto_reset=False, gears=k)
+                             auto_reset=False, gears=k,
+                             want_contacts=True)
         env.reset()
         sim = RawBeatSim(max_steps=690, effort_coef=4e-4, gears=k)
         sim.set_chart([note_tuple(n_far)])
