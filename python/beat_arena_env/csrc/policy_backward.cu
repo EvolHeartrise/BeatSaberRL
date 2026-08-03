@@ -178,17 +178,27 @@ __device__ void attn_fwd(BSmem& s, const float* __restrict__ B, int bi,
       const float wq = __ldg(B + B_WQ + k * D + lane);
       const float wk = __ldg(B + B_WK + k * D + lane);
       const float wv = __ldg(B + B_WV + k * D + lane);
-      for (int t = t_lo; t < t_hi; ++t) {
-        const float hv = s.u.a.h[t][k];
-        aq[t - t_lo] += hv * wq;
-        ak[t - t_lo] += hv * wk;
-        av[t - t_lo] += hv * wv;
+      // compile-time-indexed accumulators (see policy_forward.cu header):
+      // a runtime `t` index would push aq/ak/av into local memory
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) {
+          const float hv = s.u.a.h[t][k];
+          aq[i] += hv * wq;
+          ak[i] += hv * wk;
+          av[i] += hv * wv;
+        }
       }
     }
-    for (int t = t_lo; t < t_hi; ++t) {
-      s.u.a.q[t][lane] = aq[t - t_lo];
-      s.u.a.k[t][lane] = ak[t - t_lo];
-      s.u.a.v[t][lane] = av[t - t_lo];
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+      const int t = t_lo + i;
+      if (t < t_hi) {
+        s.u.a.q[t][lane] = aq[i];
+        s.u.a.k[t][lane] = ak[i];
+        s.u.a.v[t][lane] = av[i];
+      }
     }
   }
   __syncthreads();
@@ -274,11 +284,17 @@ __device__ void ffn_out(BSmem& s, const float* __restrict__ B, int bi,
     for (int i = 0; i < 10; ++i) acc[i] = b2;
     for (int k = 0; k < TRUNK; ++k) {
       const float w = __ldg(B + B_FFW2 + k * D + lane);
-      for (int t = t_lo; t < t_hi; ++t)
-        acc[t - t_lo] += s.u.f.f1[t][k] * w;
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) acc[i] += s.u.f.f1[t][k] * w;
+      }
     }
-    for (int t = t_lo; t < t_hi; ++t)
-      s.xin[bi + 1][t][lane] = s.xmid[t][lane] + acc[t - t_lo];
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+      const int t = t_lo + i;
+      if (t < t_hi) s.xin[bi + 1][t][lane] = s.xmid[t][lane] + acc[i];
+    }
   } else if (half == 0) {  // only the 3 readout tokens feed the trunk
     float acc[3];
     const float b2 = __ldg(B + B_FFB2 + lane);
@@ -498,10 +514,18 @@ __device__ void ffn_bwd(BSmem& s, const float* __restrict__ B, float* G,
     for (int i = 0; i < 10; ++i) accs[i] = 0.f;
     for (int c = 0; c < TRUNK; ++c) {
       const float w = __ldg(B + B_FFW1 + lane * TRUNK + c);
-      for (int t = t_lo; t < t_hi; ++t) accs[t - t_lo] += w * s.u.f.f1[t][c];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) accs[i] += w * s.u.f.f1[t][c];
+      }
     }
     __syncthreads();
-    for (int t = t_lo; t < t_hi; ++t) s.u.f.h2[t][lane] = accs[t - t_lo];
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+      const int t = t_lo + i;
+      if (t < t_hi) s.u.f.h2[t][lane] = accs[i];
+    }
   }
   __syncthreads();
   ln_bwd_param(s.u.f.h2, s.xmid, s.stats[bi][1], G + B_LN2_G, G + B_LN2_B,
@@ -533,23 +557,31 @@ __device__ void attn_bwd(BSmem& s, const float* __restrict__ B, float* G,
   __syncthreads();
   // dq, dk, dv into registers, then overwrite q, k, v
   float rdq[10], rdk[10], rdv[10];
-  for (int t = t_lo; t < t_hi; ++t) {
-    float aq = 0.f, ak = 0.f, av = 0.f;
-    #pragma unroll
-    for (int uu = 0; uu < TT; ++uu) {
-      aq += s.u.a.datt[t][uu] * s.u.a.k[uu][lane];
-      ak += s.u.a.datt[uu][t] * s.u.a.q[uu][lane];
-      av += s.u.a.att[uu][t] * s.dx[uu][lane];
+  #pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const int t = t_lo + i;
+    if (t < t_hi) {
+      float aq = 0.f, ak = 0.f, av = 0.f;
+      #pragma unroll
+      for (int uu = 0; uu < TT; ++uu) {
+        aq += s.u.a.datt[t][uu] * s.u.a.k[uu][lane];
+        ak += s.u.a.datt[uu][t] * s.u.a.q[uu][lane];
+        av += s.u.a.att[uu][t] * s.dx[uu][lane];
+      }
+      rdq[i] = aq * 0.125f;
+      rdk[i] = ak * 0.125f;
+      rdv[i] = av;
     }
-    rdq[t - t_lo] = aq * 0.125f;
-    rdk[t - t_lo] = ak * 0.125f;
-    rdv[t - t_lo] = av;
   }
   __syncthreads();
-  for (int t = t_lo; t < t_hi; ++t) {
-    s.u.a.q[t][lane] = rdq[t - t_lo];
-    s.u.a.k[t][lane] = rdk[t - t_lo];
-    s.u.a.v[t][lane] = rdv[t - t_lo];
+  #pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const int t = t_lo + i;
+    if (t < t_hi) {
+      s.u.a.q[t][lane] = rdq[i];
+      s.u.a.k[t][lane] = rdk[i];
+      s.u.a.v[t][lane] = rdv[i];
+    }
   }
   __syncthreads();
   {  // dWq/dWk/dWv (64 x 64 each) + biases
@@ -586,12 +618,20 @@ __device__ void attn_bwd(BSmem& s, const float* __restrict__ B, float* G,
       const float wq = __ldg(B + B_WQ + lane * D + j);
       const float wk = __ldg(B + B_WK + lane * D + j);
       const float wv = __ldg(B + B_WV + lane * D + j);
-      for (int t = t_lo; t < t_hi; ++t)
-        accs[t - t_lo] += wq * s.u.a.q[t][j] + wk * s.u.a.k[t][j]
-                          + wv * s.u.a.v[t][j];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi)
+          accs[i] += wq * s.u.a.q[t][j] + wk * s.u.a.k[t][j]
+                     + wv * s.u.a.v[t][j];
+      }
     }
     __syncthreads();
-    for (int t = t_lo; t < t_hi; ++t) s.u.a.h[t][lane] = accs[t - t_lo];
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+      const int t = t_lo + i;
+      if (t < t_hi) s.u.a.h[t][lane] = accs[i];
+    }
   }
   __syncthreads();
   ln_bwd_param(s.u.a.h, s.xin[bi], s.stats[bi][0], G + B_LN1_G, G + B_LN1_B,

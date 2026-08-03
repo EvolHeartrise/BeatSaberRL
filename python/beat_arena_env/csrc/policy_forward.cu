@@ -15,8 +15,14 @@
 // - Saber/body token features are GATHERED from the obs row via constant
 //   index tables (the v10 obs interleaves q/qd/derived blocks; policy.py
 //   _SABER_L_IDX/_SABER_R_IDX/_BODY_IDX verbatim).
-// - 19 tokens split across the two thread halves as 10 + 9 (bounded
-//   loops instead of the v8 9+9 unrolls).
+// - 19 tokens split across the two thread halves as 10 + 9, kept as
+//   COMPILE-TIME 10-wide unrolls with an `if (t < t_hi)` guard (half 1
+//   runs 9 live lanes). The guard, not a runtime trip count: a loop
+//   bounded by the runtime t_lo/t_hi indexes the per-token accumulator
+//   arrays with a runtime index, which nvcc cannot register-allocate —
+//   they land in local memory (measured: 200 B stack frame, 860 LDL /
+//   690 STL, fused forward 0.26-0.47x eager). With `i` a compile-time
+//   induction variable the accumulators live in registers, as in v8.
 // - Last-block pruning now keeps 3 query tokens (sabers + body) — the
 //   exact-pruning argument is unchanged: the key-dim mask means dropped
 //   rows were never read again.
@@ -244,20 +250,32 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
         const float wq = __ldg(B + B_WQ + k * D + lane);
         const float wk = __ldg(B + B_WK + k * D + lane);
         const float wv = __ldg(B + B_WV + k * D + lane);
-        for (int t = t_lo; t < t_hi; ++t) {
-          const float hv = s.h[t][k];
-          aq[t - t_lo] += hv * wq;
-          ak[t - t_lo] += hv * wk;
-          av[t - t_lo] += hv * wv;
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+          const int t = t_lo + i;
+          if (t < t_hi) {
+            const float hv = s.h[t][k];
+            aq[i] += hv * wq;
+            ak[i] += hv * wk;
+            av[i] += hv * wv;
+          }
         }
       }
-      for (int t = t_lo; t < t_hi; ++t) {
-        s.u.a.k[t][lane] = ak[t - t_lo];
-        s.u.a.v[t][lane] = av[t - t_lo];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) {
+          s.u.a.k[t][lane] = ak[i];
+          s.u.a.v[t][lane] = av[i];
+        }
       }
       // h's LN1 content is dead after every k-loop: q reuses its storage
       __syncthreads();
-      for (int t = t_lo; t < t_hi; ++t) s.h[t][lane] = aq[t - t_lo];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) s.h[t][lane] = aq[i];
+      }
     }
     __syncthreads();
     // scores: q @ k^T / sqrt(64) + key mask — 361 flat dot products
@@ -286,10 +304,17 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       #pragma unroll
       for (int u = 0; u < TT; ++u) {
         const float vu = s.u.a.v[u][lane];
-        for (int t = t_lo; t < t_hi; ++t)
-          a[t - t_lo] += s.u.a.att[t][u] * vu;
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+          const int t = t_lo + i;
+          if (t < t_hi) a[i] += s.u.a.att[t][u] * vu;
+        }
       }
-      for (int t = t_lo; t < t_hi; ++t) s.x[t][lane] += a[t - t_lo];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) s.x[t][lane] += a[i];
+      }
     }
     __syncthreads();
     ln_tokens(s.x, s.h, B + B_LN2_G, B + B_LN2_B, tid);
@@ -315,10 +340,17 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       for (int i = 0; i < 10; ++i) acc[i] = b2;
       for (int k = 0; k < TRUNK; ++k) {
         const float w = __ldg(B + B_FFW2 + k * D + lane);
-        for (int t = t_lo; t < t_hi; ++t)
-          acc[t - t_lo] += s.u.f.f1[t][k] * w;
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+          const int t = t_lo + i;
+          if (t < t_hi) acc[i] += s.u.f.f1[t][k] * w;
+        }
       }
-      for (int t = t_lo; t < t_hi; ++t) s.x[t][lane] += acc[t - t_lo];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) s.x[t][lane] += acc[i];
+      }
     }
     __syncthreads();
   }
@@ -341,10 +373,14 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
       for (int k = 0; k < D; ++k) {
         const float wk = __ldg(B + B_WK + k * D + lane);
         const float wv = __ldg(B + B_WV + k * D + lane);
-        for (int t = t_lo; t < t_hi; ++t) {
-          const float hv = s.h[t][k];
-          ak[t - t_lo] += hv * wk;
-          av[t - t_lo] += hv * wv;
+        #pragma unroll
+        for (int i = 0; i < 10; ++i) {
+          const int t = t_lo + i;
+          if (t < t_hi) {
+            const float hv = s.h[t][k];
+            ak[i] += hv * wk;
+            av[i] += hv * wv;
+          }
         }
         if (half == 0) {
           const float wq = __ldg(B + B_WQ + k * D + lane);
@@ -353,9 +389,13 @@ policy_fwd_kernel(const float* __restrict__ W, const float* __restrict__ obs,
           aq[2] += s.h[2][k] * wq;
         }
       }
-      for (int t = t_lo; t < t_hi; ++t) {
-        s.u.a.k[t][lane] = ak[t - t_lo];
-        s.u.a.v[t][lane] = av[t - t_lo];
+      #pragma unroll
+      for (int i = 0; i < 10; ++i) {
+        const int t = t_lo + i;
+        if (t < t_hi) {
+          s.u.a.k[t][lane] = ak[i];
+          s.u.a.v[t][lane] = av[i];
+        }
       }
       __syncthreads();
       if (half == 0) {
