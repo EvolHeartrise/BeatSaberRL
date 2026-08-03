@@ -167,13 +167,13 @@ def parse_args():
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
-    p.add_argument("--env", choices=["rust", "cuda", "torch"], default=None,
+    p.add_argument("--env", choices=["rust", "cuda"], default=None,
                    help="cuda = the P5 kernel sim (the training backend "
-                        "since 2026-08-01; one launch per tick). torch = "
-                        "the P4 tensor-op mirror (parity/debug backend; "
-                        "obs born on device, ~1 s/vector tick). rust = "
-                        "the reference sim over FFI. Default: cuda on a "
-                        "CUDA device, else rust.")
+                        "since 2026-08-01; one launch per tick). rust = "
+                        "the reference sim over FFI (CPU path + the "
+                        "parity reference). Default: cuda on a CUDA "
+                        "device, else rust. (The P4 torch mirror, "
+                        "--env torch, was removed 2026-08-03.)")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -336,8 +336,7 @@ def main():
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if args.env is None:
         # env v10 (P5): the CUDA kernel is the training backend again;
-        # rust stays the CPU path (the torch mirror remains available
-        # as the parity/debug backend via --env torch)
+        # rust stays the CPU path and the parity reference
         args.env = "cuda" if device.type == "cuda" else "rust"
         print(f"--env not given: defaulting to '{args.env}'", flush=True)
 
@@ -372,11 +371,10 @@ def main():
     ratio_diag = torch.zeros((), device=device)
     logr_max = torch.zeros((), device=device)  # max|log ratio| this update
 
-    tensor_env = args.env in ("cuda", "torch")
+    tensor_env = args.env == "cuda"
     # --graph-rollout is the DEFAULT (2026-07-26); downgrade with a note
     # where it cannot apply (same policy as the fp16 default above).
-    # The torch env is NOT capturable (host-synced contact unions +
-    # Python substep loops), so graphs stay cuda-env-only.
+    # The rust env crosses FFI per tick, so graphs stay cuda-env-only.
     if args.graph_rollout and (args.env != "cuda" or device.type != "cuda"):
         print("--graph-rollout: needs --env cuda on a CUDA device, "
               "forcing off", flush=True)
@@ -423,18 +421,6 @@ def main():
                       effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
                       seed=args.seed, device=device)
-    elif args.env == "torch":
-        from beat_arena_env.torch_env import TorchBeatVecEnv
-        venv = TorchBeatVecEnv(
-            N, cols=tuple(args.cols),
-            rows=tuple(args.rows), chart_len_s=args.chart_len,
-            note_speed_min=args.note_speed_min,
-            note_speed_max=args.note_speed_max,
-            note_prob=args.note_prob, extra_prob=args.extra_prob,
-            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
-            gears=args.gears, seed=args.seed, chart_pool=args.chart_pool,
-            device=device, dtype=torch.float32)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(

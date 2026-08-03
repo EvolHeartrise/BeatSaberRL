@@ -55,11 +55,14 @@ root twist + ω29 + contact events; since P6 additive per-tick "feet"
 weld impulses + "effort"). Gravity is real and nothing holds the body
 up — posture is the policy's problem now. ALL v9 checkpoints,
 replays, and records are retired. The viewer and scripted bot are v10
-(P6); the torch mirror (P4, `--env torch`, f64-bitwise vs Rust) landed
-with the 29-head/obs-340/body-token policy rebuild; the CUDA kernel
-(P5, `csrc/beat_arena_cuda.cu` — the whole 8-substep dynamics tick as
-ONE launch, one thread per env, f64 branch bitwise vs Rust/torch) is
-the default training backend (`--env cuda`) since 2026-08-01.
+(P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` — the whole
+8-substep dynamics tick as ONE launch, one thread per env, f64 branch
+horizon-bounded tight-tolerance vs Rust) is the default training
+backend (`--env cuda`) since 2026-08-01. The P4 torch mirror
+(`--env torch`, f64-bitwise vs Rust) served as the batched parity
+witness through P4/P5 and was REMOVED 2026-08-03 (surface-area
+reduction — every physics change had been landing tri-tier); Rust is
+the reference and `tests/test_v10_parity_cuda.py` is the live gate.
 
 ## Quick start
 
@@ -71,7 +74,7 @@ VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
 # the trainer — v10 (P5): cuda env is the default GPU backend;
-# rust env on CPU; torch env = the parity/debug mirror
+# rust env = the CPU path AND the parity reference
 $VENV/bin/python train_batch.py --num-envs 1024
 $VENV/bin/python train_batch.py --env rust --num-envs 512
 ```
@@ -80,13 +83,16 @@ Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
 and the transformer the only policy — the Python sim, pool encoder, and
 serial trainer were deleted (surface-area reduction). The tensor-op
 port (`--env torch`, torch_env.py + torch_dynamics.py) — removed
-2026-07-25 in the kinematic era — was REBUILT at v10 P4 as a literal
-batched mirror of the dynamics engine (f64 CPU bitwise vs Rust, the
-parity gate). It is Python-dispatch bound (~1 s/vector tick regardless
-of width — full-body dynamics is ~100k tensor ops/tick), which is why
-P5 moved training to the CUDA kernel: `--env cuda` runs the whole tick
-as one launch (~4.9k steps/s at N=1024 on the GTX 1080) and is the
-default. The torch mirror stays as the parity/debug backend.
+2026-07-25 in the kinematic era, REBUILT at v10 P4 as a literal batched
+mirror of the dynamics engine (f64 CPU bitwise vs Rust) — is **removed
+again, 2026-08-03**. It was Python-dispatch bound (~1 s/vector tick
+regardless of width — full-body dynamics is ~100k tensor ops/tick),
+which is why P5 moved training to the CUDA kernel; after that it was
+consumed only by its own parity tests, so every physics change was
+paying a third tier for a witness of a backend nothing ran.
+`--env cuda` runs the whole tick as one launch (~7.2k steps/s at
+N=1024 on the GTX 1080) and is the default; `--env rust` is the CPU
+path and the parity reference.
 
 The Rust sim core (63x faster env.step; training 1.3-1.6x on 8 serial
 envs) builds once with:

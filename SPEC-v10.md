@@ -381,7 +381,7 @@ happening in exactly this order:**
     BITWISE transparent on healthy trajectories.
     **Engagements of the pre-step-10 application are COUNTED** (per
     (env, substep); `pop_envelope_hits()` on RawBeatSim / VecBeatSim /
-    CudaBeatVecEnv / TorchBeatVecEnv, the `pop_pd_hits` pattern) and an
+    CudaBeatVecEnv, the `pop_pd_hits` pattern) and an
     env that engages it during a control tick **TERMINATES that tick**
     with `done = true` and its **reward set to exactly 0** (§4): the
     trajectory is bounded but no longer physical, so none of it may
@@ -587,11 +587,30 @@ replacement drives torques).
 **P4 — torch mirror** (`python/tests/test_v10_parity_torch.py`): f64
 EXACT (bitwise) obs/reward/done/event parity vs Rust across the parity
 config matrix (gears 3/5/7, contacts on, welds on) over full episodes;
-f32 bounded per the existing suite's tolerances.
+f32 bounded per the existing suite's tolerances. **RETIRED 2026-08-03**
+— the gate was met (and is recorded in Divergences §20), but the mirror
+it gated (`torch_env.py` + `torch_dynamics.py`, `--env torch`) had no
+consumer left besides its own tests once P5 took training, so each
+physics change was paying a third tier. Both modules and the P4 test
+module are deleted; see the live contract below.
 
-**P5 — CUDA mirror** (`python/tests/test_v10_parity_cuda.py`): same f64
-exact / f32 bounded matrix vs Rust; fused-policy kernels guarded to the
-v10 layout (29 heads, obs 340) with junk-inertness tests.
+**PARITY CONTRACT (live, from 2026-08-03).** The **Rust crate is THE
+reference sim** — every rule change lands in `rust/src/` first. The
+**CUDA backend is the one gated mirror** (`--env cuda`, the training
+backend), gated by `python/tests/test_v10_parity_cuda.py` per P5. There
+is no bitwise cross-implementation tier any more: the CUDA f64 branch
+is horizon-bounded tight-tolerance by construction (Divergences §21 —
+libdevice is 1 ulp off the CRT libm and nvcc contracts FMAs), so the
+f64 tier is single-tick/short-horizon free-running at the seed band
+PLUS lockstep-resync whole episodes where counters / score
+decomposition / per-note status / done timing are EXACT. Bitwise
+regression coverage of the dynamics kernels themselves lives in the
+Rust cargo suites (`dynamics/tests_dyn.rs`, `tests_soak.rs`,
+`env_tests`), which is where a bitwise claim is actually checkable.
+
+**P5 — CUDA mirror** (`python/tests/test_v10_parity_cuda.py`): the f64
+tier above / f32 bounded matrix vs Rust; fused-policy kernels guarded to
+the v10 layout (29 heads, obs 340) with junk-inertness tests.
 
 **P6 — viewer + bot** (`viz/app` node tests + `python/tests/
 test_v10_bot.py`): JS full-body FK vs sim-logged `sabers` wrist ≤ 1e-6;
@@ -838,7 +857,9 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        only ever removes non-physical velocity. Regression state
        baked in `dynamics/tests_soak.rs`; 2000 × 512 random-gear soak
        clean after both fixes.
-20. **P4 torch-mirror notes (2026-07-31)** — the f64 CPU parity bar was
+20. **P4 torch-mirror notes (2026-07-31; the mirror was REMOVED
+    2026-08-03 — this entry is the record of what it proved, not a
+    live tier)** — the f64 CPU parity bar was
     met EXACTLY (bitwise obs/reward/done/status/state/effort/contact
     impulses across the gears 3/5/7 matrix, trajectories and full
     episodes); the transcription discipline required two measured
@@ -913,11 +934,13 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        quota of knife-edge envs; LOCKSTEP-RESYNC full episodes (the
        CUDA env re-takes Rust's exact state each tick) with counters /
        score decomposition / per-note status / done timing EXACT and
-       rewards inside the integer-rounding flip band; and the same f32
-       well-formedness tier as torch. The bitwise cross-implementation
-       gate remains Rust↔torch-CPU-f64 (P4); the CUDA backend's
-       charter is f32 training throughput with the §20e pivot-floor
-       net mirrored (`pop_pd_hits`, reported per update).
+       rewards inside the integer-rounding flip band; and an f32
+       well-formedness tier. Since the torch mirror's removal
+       (2026-08-03) this IS the cross-implementation gate — there is
+       no bitwise Python tier left; bitwise regression lives in the
+       Rust cargo suites. The CUDA backend's charter is f32 training
+       throughput with the §20e pivot-floor net mirrored
+       (`pop_pd_hits`, reported per update).
     d. **Throughput** (GTX 1080, f32, kernel-only / full training):
        ~4.7 k / ~4.5 k env-steps/s at N = 1024, plateauing at ~9 k /
        ~9.7 k by N = 4096 (vs the torch mirror's 107 at N = 1024 —
@@ -956,14 +979,16 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        (the CUDA `pop_pd_hits` naming; no existing FFI shape
        changed); bench_scoresaber reports run + file totals
        (`pd_floor_hits` in the results JSON — reported, not hidden).
-    c. **Parity**: torch_dynamics f64 mirrors the identical constant
-       and clamp (`torch.clamp(dcol, min=PD_FLOOR_F64)` == max) in
-       `chol_factor` and `_chol12` and no longer raises (check_pd
-       counts `pd_net_hits` for both dtypes); the .cu f64 template
-       branch floors identically (its f32 branch keeps the §20e
-       1e-8). Because the floor is bit-transparent for healthy
-       pivots, the P4 Rust↔torch f64 BITWISE bar and the P5 CUDA
-       tier gates are unchanged and stay green.
+    c. **Parity**: the .cu f64 template branch floors identically
+       (same constant, same max clamp; its f32 branch keeps the §20e
+       1e-8). Because the floor is bit-transparent for healthy pivots,
+       the P5 CUDA tier gates are unchanged and stay green. (The torch
+       mirror carried the same clamp in `chol_factor` / `_chol12` with
+       a `pd_net_hits` counter until its 2026-08-03 removal; the
+       forced-engagement regression now lives only in
+       `tests_dyn::substep_survives_pd_loss_and_counts`, which drives
+       the exactly-singular armature-less matrix through the real
+       substep.)
     d. **Post-floor safety**: the ω caps + step-11 clamps + step-12
        envelope bound the velocities a floored (near-singular) solve
        can emit — the same stability-net role §19/§20e assign them.
@@ -971,7 +996,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        `tests_dyn::substep_survives_pd_loss_and_counts` (armature-less
        gimbal state — the exactly-singular §12 matrix — through the
        full substep: no panic, counter increments, state finite), and
-       `tests/test_v10_pd_floor.py` on the torch mirror + FFI.
+       `tests/test_v10_pd_floor.py` (FFI end-to-end + the cross-tier
+       floor-constant contract).
 23. **§19b root envelope applied BEFORE integration; the escape
     mechanism re-diagnosed (2026-08-03).** §19b attributed the root
     escape to the explicit Coriolis term at `h·ω ≈ 1`. **That
@@ -1037,10 +1063,11 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        larger multiplier would only let more meaningless physics through
        without protecting any real play.
     e. **Counter.** `Workspace::env_hits` (Rust), `Dyn::env_n` +
-       the `env_hits` device tensor (CUDA), `DynBatch._env_hits`
-       (torch), popped by `pop_envelope_hits()` on every backend with
-       identical per-(env, substep) semantics (pinned bitwise
-       Rust↔torch and exactly Rust↔CUDA-f64 on the escape fixture).
+       the `env_hits` device tensor (CUDA), popped by
+       `pop_envelope_hits()` on every backend with identical
+       per-(env, substep) semantics (pinned exactly Rust↔CUDA-f64 on
+       the escape fixture; the retired torch mirror was pinned
+       bitwise there until 2026-08-03).
        The trainer prints it per update; bench_scoresaber writes
        `envelope_hits` into the results JSON next to `pd_floor_hits` —
        reported, never hidden.
@@ -1066,5 +1093,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        soak_state_engages_the_envelope_and_stays_bounded}`,
        `env_tests::{escaped_env_terminates_with_zero_reward,
        healthy_env_never_escapes}` (Rust), and
-       `tests/test_v10_root_escape.py` (all three tiers, including the
-       Rust↔torch f64 BITWISE comparison ON the escape tick).
+       `tests/test_v10_root_escape.py` (Rust FFI + CUDA f64/f32 tiers
+       on the escape fixture: `done`, zeroed reward, engagement count
+       and the ‖Δp‖ ≤ N_SUB·h·ROOT_V_MAX bound all pinned exactly, the
+       state to the single-tick f64 band. The retired torch mirror
+       additionally pinned the escape tick BITWISE until 2026-08-03).
