@@ -445,7 +445,8 @@ class CudaBeatVecEnv:
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate
-        under ring overflow; logging-grade, one sync per call)."""
+        under ring overflow; logging-grade, two syncs per call — the
+        counter .item() and the ring-read .tolist())."""
         total = int(self._ret_total.item())
         new = total - self._popped
         if new <= 0:
