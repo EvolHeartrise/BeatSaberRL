@@ -11,7 +11,9 @@ NOT bitwise vs eager. Backward emits contiguous dq/dk/dv, removing the
 hidden .contiguous() copies in _Fp16Linear.backward.
 
 Falls back to eager when the extension or shape eligibility is missing
-(d != 64, odd/large T, CPU, fp32).
+(d != 64, T > 32, CPU, fp32). Odd T is supported since 2026-08-02 (the
+mask-bias smem load is plain __half now — the v10 19-token layout was
+silently falling back to eager before that).
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def eligible(h, attn_bias):
     run (the bias-folding path must decide first whether to emit
     bias-free mms). h: the (B, T, d) LN output feeding the projections."""
     return (h.dtype is torch.float16 and h.is_cuda and h.size(-1) == 64
-            and h.size(1) <= 32 and h.size(1) % 2 == 0
+            and h.size(1) <= 32
             and attn_bias is not None
             and attn_bias.dtype is torch.float16
             and attn_bias.is_contiguous()

@@ -311,9 +311,10 @@ class NotePolicy(nn.Module):
         # additive attention mask is block-invariant: build it once.
         # The 3 lead lanes (2 sabers + body) are always attendable ->
         # bias exactly +0.0 = F.pad's zero fill (bit-identical).
-        # NOTE: T = 19 is odd, so the fused fp16 attention kernel is
-        # ineligible (it requires even T) — fp16 falls back to eager
-        # attention until P5 revisits the kernel for the v10 layout.
+        # The fused fp16 attention kernel accepts odd T since
+        # 2026-08-02 (plain-__half bias load) — the 19-token v10
+        # layout runs it again; the even-T fallback era was
+        # 2026-07-31..08-02.
         attn_bias = F.pad((note_mask.unsqueeze(1) - 1.0) * MASK_BIAS,
                           (3, 0))
         if fp16:

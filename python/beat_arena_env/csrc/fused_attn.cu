@@ -57,7 +57,7 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
                                 const float2* __restrict__ bq,
                                 const float2* __restrict__ bk,
                                 const float2* __restrict__ bv,
-                                const __half2* __restrict__ bias,  // (B, T/2)
+                                const __half* __restrict__ bias,   // (B, T)
                                 __half* __restrict__ p_out,        // (B,Tq,T)
                                 __half2* __restrict__ out,         // (B,Tq,D2)
                                 int Tq, int T, float alpha) {
@@ -92,12 +92,12 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
     sv[r * SROW + 2 * c2] = fv.x + bv2.x;
     sv[r * SROW + 2 * c2 + 1] = fv.y + bv2.y;
   }
-  const __half2* bb = bias + b * (T / 2);
-  for (int i = tid; i < T / 2; i += THREADS) {
-    const float2 f = __half22float2(bb[i]);
-    sbias[2 * i] = f.x;
-    sbias[2 * i + 1] = f.y;
-  }
+  // plain __half loads: T is tiny (<= 32) so half2 packing on this
+  // vector buys nothing, and odd T (v10's 19 tokens) misaligns a
+  // half2 row base. Bit-identical for even T: same fp16 values, same
+  // fp32 conversion, addressing only.
+  const __half* bb = bias + b * T;
+  for (int i = tid; i < T; i += THREADS) sbias[i] = __half2float(bb[i]);
   __syncthreads();
 
   // scores: pair (i, j) per thread. (A 3-chain accumulator interleave
@@ -400,8 +400,7 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
   check_in(q, "q", B, Tq);
   check_in(k, "k", B, T);
   check_in(v, "v", B, T);
-  TORCH_CHECK(T % 2 == 0 && T <= MAX_T && Tq <= T,
-              "T must be even, <= ", MAX_T, ", Tq <= T");
+  TORCH_CHECK(T <= MAX_T && Tq <= T, "T must be <= ", MAX_T, ", Tq <= T");
   TORCH_CHECK(bias.is_cuda() && bias.is_contiguous()
               && bias.scalar_type() == at::kHalf && bias.numel() == B * T,
               "bias: contiguous fp16 (B,1,T)");
@@ -416,7 +415,7 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
       reinterpret_cast<const __half2*>(k.data_ptr<at::Half>()),
       reinterpret_cast<const __half2*>(v.data_ptr<at::Half>()),
       bias_ptr(bq), bias_ptr(bk), bias_ptr(bv),
-      reinterpret_cast<const __half2*>(bias.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(bias.data_ptr<at::Half>()),
       reinterpret_cast<__half*>(p.data_ptr<at::Half>()),
       reinterpret_cast<__half2*>(out.data_ptr<at::Half>()),
       Tq, T, (float)alpha);
@@ -446,7 +445,7 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
   auto dv = at::empty_like(v);
   // partials stage in sB (T * SROW floats), which must hold the 4
   // warps' D-float partial rows: T >= 4. Below that (never in
-  // production; T is 18) the caller falls back to torch sums.
+  // production; T is 19) the caller falls back to torch sums.
   const bool emit_db = want_db && T >= 4;
   auto dbp = emit_db
       ? at::empty({B, 3, D}, q.options().dtype(at::kFloat))
