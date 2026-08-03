@@ -78,7 +78,7 @@ def run_leg(idx, h, run_dir):
     # was in-flight at a pause) would make the bench refuse the
     # different-model overwrite and record a spurious failure
     shutil.rmtree(run_dir, ignore_errors=True)
-    cmd = [PY, "train_batch.py", "--num-envs", "1024",
+    cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
            "--lr-decay", "cosine", "--seed", "0",
            "--lr", f"{h['lr']:.6g}",
            "--ent-coef", f"{h['ent_coef']:.6g}",

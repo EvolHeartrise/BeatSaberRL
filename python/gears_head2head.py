@@ -56,7 +56,7 @@ def leg(gears):
     if os.path.exists(ck):
         print(f"[gears{gears}] final.pt exists — skipping train", flush=True)
     else:
-        cmd = [PY, "train_batch.py", "--num-envs", "1024",
+        cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
                "--lr-decay", "cosine", "--seed", "0",
                "--ranked-maps", "--seg-len", "25",
                "--chart-pool", "24576",

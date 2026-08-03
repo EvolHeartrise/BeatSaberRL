@@ -57,7 +57,7 @@ def main():
         print(f"{RUN_DIR}/final.pt already exists — refusing to retrain "
               "(delete the run dir to redo)", flush=True)
         return
-    cmd = [PY, "train_batch.py", "--num-envs", "1024",
+    cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
            "--lr-decay", "cosine", "--seed", "0",
            "--ranked-maps", "--seg-len", "25",
            "--chart-pool", "24576",

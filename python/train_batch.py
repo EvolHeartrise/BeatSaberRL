@@ -60,6 +60,11 @@ DUAL_CLIP_C = 3.0
 VF_COEF = 0.5
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
+# the recipe SHAPE: every tuned run is 1024 envs x 128 horizon. The
+# hypers (lr, ent, minibatch count) and every driver's checkpoint
+# cadence are calibrated to this batch, so a run that lands elsewhere
+# gets a loud startup warning (see main()).
+RECIPE_BATCH = 1024 * 128
 # log-ratio clamp before exp() (2026-08-02, 400M-run postmortem). NOT a
 # science change: dual-clip's selection only lets gradient flow through
 # ratio where ratio < max(1 + CLIP, DUAL_CLIP_C), and the loss VALUE is
@@ -393,6 +398,17 @@ def main():
                   f, indent=1, default=str)
     print(f"argv: {' '.join(sys.argv[1:]) or '(bare)'}", flush=True)
     print(f"config: {args_snapshot}", flush=True)
+
+    # Wide-N hazard (2026-08-03): every run driver hardcodes the SHAPE
+    # (--num-envs 1024 --horizon 128) because the tuned hypers and the
+    # checkpoint cadences are calibrated to batch 131,072. Raising N
+    # alone silently rescales the batch, so say so loudly. A warning,
+    # not an error: --bench and the micro-shape tools are legitimately
+    # off-recipe (and skip this entirely under --bench).
+    if not args.bench and batch != RECIPE_BATCH:
+        print(f"!!! BATCH {batch:,} = {N} envs x {T} horizon, NOT the "
+              f"recipe {RECIPE_BATCH:,} — tuned hypers and checkpoint "
+              f"cadences assume {RECIPE_BATCH:,} !!!", flush=True)
 
     if args.ranked_maps and args.env != "cuda":
         raise SystemExit("--ranked-maps requires --env cuda")
