@@ -12,7 +12,7 @@ Three paths, two shapes (rollout N=4096, ScoreSaber bench N=512):
 Each measurement: warmup, then best of --reps timed loops of --iters
 forwards (cuda-synchronized), reported as µs/forward. Two operations
 are timed: "forward" (logits + value on device) and "argmax" (greedy
-(N, 12) actions on device — what bench_scoresaber consumes). Inputs
+(N, 29) actions on device — what bench_scoresaber consumes). Inputs
 live on device; no host<->device copies are inside the timed region.
 """
 
@@ -23,7 +23,8 @@ import time
 
 import torch
 
-from policy import NotePolicy, OBS_DIM, load_policy
+from policy import (N_NOTE_SLOTS, NotePolicy, OBS_DIM, OFF_NOTE_MASK,
+                    load_policy)
 from policy_cuda import FusedNotePolicy
 from cuda_graphs import _Graphed
 
@@ -36,8 +37,7 @@ class _GraphedForward(_Graphed):
 
     def _compute(self):
         with torch.no_grad():
-            logits, value = self.policy(self.s_obs)
-        return torch.stack(logits, dim=1), value
+            return self.policy.forward_stacked(self.s_obs)
 
     def __call__(self, obs):
         self.s_obs.copy_(obs)
@@ -47,8 +47,8 @@ class _GraphedForward(_Graphed):
 class _GraphedArgmax(_GraphedForward):
     def _compute(self):
         with torch.no_grad():
-            logits, _ = self.policy(self.s_obs)
-        return torch.stack(logits, dim=1).argmax(-1)
+            logits, _ = self.policy.forward_stacked(self.s_obs)
+        return logits.argmax(-1)
 
 
 def bench(fn, iters, reps, warmup=10):
@@ -67,7 +67,7 @@ def bench(fn, iters, reps, warmup=10):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--ckpt", default="runs/gen2_ep2_50m/final.pt")
+    p.add_argument("--ckpt", default="runs/v10_gears5_400m/final.pt")
     p.add_argument("--ns", type=int, nargs="+", default=[512, 4096])
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--reps", type=int, default=3)
@@ -93,17 +93,17 @@ def main():
     for n in args.ns:
         g = torch.Generator().manual_seed(0)
         obs = (torch.randn(n, OBS_DIM, generator=g) * 0.7).to(device)
-        obs[:, 270:] = (torch.rand(n, 16, generator=g) < 0.6).float().to(device)
+        obs[:, OFF_NOTE_MASK:] = (
+            torch.rand(n, N_NOTE_SLOTS, generator=g) < 0.6).float().to(device)
 
         def eager_fwd():
             with torch.no_grad():
-                logits, value = policy(obs)
-            return torch.stack(logits, dim=1), value
+                return policy.forward_stacked(obs)
 
         def eager_arg():
             with torch.no_grad():
-                logits, _ = policy(obs)
-            return torch.stack(logits, dim=1).argmax(-1)
+                logits, _ = policy.forward_stacked(obs)
+            return logits.argmax(-1)
 
         gf = _GraphedForward(policy, n, device)
         ga = _GraphedArgmax(policy, n, device)
