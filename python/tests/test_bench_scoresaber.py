@@ -236,6 +236,55 @@ def test_save_and_merge_results(tmp_path):
         bench_scoresaber.load_results(out, "sha256:bb")
 
 
+def test_save_writer_matches_inline_save(tmp_path):
+    """B5: the background writer's on-disk artifact is byte-identical to
+    an inline save_results (bar the `updated` stamp), its snapshot is
+    taken at submit() so later mutations cannot leak in, and close()
+    leaves nothing in flight."""
+    data = {"checkpoint": "x.pt", "checkpoint_name": "run/x.pt",
+            "model_hash": "sha256:aa", "pd_floor_hits": 7}
+    levels = {i: {"leaderboard_id": i, "stars": float(i), "pp": 10.0 * i}
+              for i in range(1, 6)}
+
+    ref = str(tmp_path / "ref.json")
+    bench_scoresaber.save_results(ref, dict(data), dict(levels))
+
+    out = str(tmp_path / "bg.json")
+    w = bench_scoresaber._SaveWriter(out)
+    w.submit(data, levels)
+    # mutations AFTER submit must not reach the snapshot on disk
+    levels[99] = {"leaderboard_id": 99, "stars": 99.0, "pp": 9999.0}
+    data["pd_floor_hits"] = 12345
+    w.close()
+
+    a, b = json.load(open(ref)), json.load(open(out))
+    a.pop("updated"), b.pop("updated")
+    assert a == b
+    assert b["pd_floor_hits"] == 7 and b["n_evaluated"] == 5
+    assert 99 not in {e["leaderboard_id"] for e in b["levels"]}
+    # the caller's own dict is untouched by the writer
+    assert "levels" not in data and "total_weighted_pp" not in data
+
+
+def test_save_writer_coalesces_and_final_save_wins(tmp_path):
+    """Newer snapshots supersede pending ones, and close() joins any
+    in-flight write so a synchronous final save is strictly last."""
+    out = str(tmp_path / "c.json")
+    data = {"checkpoint": "x.pt", "model_hash": "sha256:aa"}
+    w = bench_scoresaber._SaveWriter(out)
+    for n in range(1, 5):
+        w.submit(data, {i: {"leaderboard_id": i, "stars": float(i),
+                            "pp": 1.0} for i in range(n)})
+    w.close()
+    # coalescing drops SUPERSEDED snapshots, never the newest one
+    assert json.load(open(out))["n_evaluated"] == 4
+    bench_scoresaber.save_results(out, data, {1: {"leaderboard_id": 1,
+                                                 "stars": 1.0, "pp": 42.0}})
+    final = json.load(open(out))
+    assert final["n_evaluated"] == 1
+    assert final["total_unweighted_pp"] == 42.0
+
+
 def test_greedy_rollout_smoke():
     """Full finish_slot path on a tiny procedural chart, offline, random
     policy: result well-formed and internally consistent."""

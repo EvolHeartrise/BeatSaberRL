@@ -622,6 +622,17 @@ struct Core {
     misses: u32,
     bombs_hit: u32,
     n_scoreable: u32, // chart objects that are not bombs
+    // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
+    // recomputed from state every tick and each of its disjuncts is
+    // MONOTONE (first_pending only advances and, once !pending, the cut
+    // loop is empty so no new trackers can appear; time and tick only
+    // increase), so a finished env re-stepped without a chart (re)install
+    // can only ever report done again — and it was paying a full 8-substep
+    // physics tick to say so. Bench idle slots (empty chart, done on every
+    // tick) were the whole cost of the "~free" claim in the docstring.
+    // Set where done is computed true, CLEARED in reset_state (the single
+    // funnel every chart install goes through).
+    finished: bool,
     score: f64,       // summed points; max = 115*notes + 85*heads + 20*links
     score_pre: f64,
     score_acc: f64,
@@ -652,6 +663,7 @@ impl Core {
             misses: 0,
             bombs_hit: 0,
             n_scoreable: 0,
+            finished: false,
             score: 0.0,
             score_pre: 0.0,
             score_acc: 0.0,
@@ -712,6 +724,7 @@ impl Core {
         self.misses = 0;
         self.bombs_hit = 0;
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
+        self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
         self.score_pre = 0.0;
         self.score_acc = 0.0;
@@ -835,6 +848,20 @@ impl Core {
     // Events land in self.events_buf (cleared here), in the same order the
     // v9 sim produced them — order is the ComboWalk contract.
     fn step_inner(&mut self, actions: &[u8; NQ]) -> (f64, bool) {
+        // B4 early-out (2026-08-03): the episode already ended and no
+        // chart was installed since, so `done` is structurally pinned true
+        // (see the `finished` field comment). Skip the whole tick —
+        // physics, event scan, obs-affecting state — and report the same
+        // (reward 0, done) pair with an EMPTY event buffer, so a bench
+        // idle slot's ComboWalk cannot re-consume last tick's events.
+        // Frozen state also means write_obs() (still called by the
+        // vector step) keeps reproducing the terminal obs row verbatim,
+        // and `tick` stops climbing so a long-idle slot can never wrap
+        // into max_steps or overflow u32.
+        if self.finished {
+            self.events_buf.clear();
+            return (0.0, true);
+        }
         let prev_pos = self.body.wrist;
         let prev_dir = self.body.blade;
 
@@ -1134,6 +1161,7 @@ impl Core {
             || self.tick >= self.max_steps;
 
         if done {
+            self.finished = true;   // B4: latch; cleared only by reset_state
             // resolve any pending follow-throughs with their partial arcs
             for s in 0..2 {
                 for tr in self.trackers[s].drain(..) {
@@ -1713,6 +1741,83 @@ mod env_tests {
         let mut b2 = Body::new();
         b2.tick(&[0u8; NQ], &gear);
         assert_eq!(b2.effort_j, 0.0, "coast must be exactly free");
+    }
+
+    /// B4: once an episode is done, re-stepping it WITHOUT a chart
+    /// install runs no physics at all — the tick is a pure no-op that
+    /// re-reports (0.0, true) with an empty event buffer, and a chart
+    /// (re)install clears the latch so the env steps normally again.
+    #[test]
+    fn finished_env_early_outs_and_reinstall_clears_it() {
+        let mut acts = [0u8; NQ];
+        acts[10] = 1; // r arm pitch, full + — real torque every tick
+        acts[3] = 2;
+
+        // empty chart = the bench's idle slot: done on the FIRST tick
+        let mut core = Core::new_core(100_000_000, 4e-4, false, 5);
+        core.set_chart_notes(Vec::new());
+        assert!(!core.finished, "install must clear the latch");
+        let (_r0, d0) = core.step_inner(&acts);
+        assert!(d0, "an empty chart is done on tick 1");
+        assert!(core.finished, "done must latch");
+        let q_frozen = core.body.st.q.clone();
+        let v_frozen = core.body.st.v.clone();
+        let obs_frozen = core.build_obs();
+        let tick_frozen = core.tick;
+        let time_frozen = core.time;
+
+        for _ in 0..25 {
+            let (r, d) = core.step_inner(&acts);
+            assert_eq!(r, 0.0, "a finished env must earn exactly nothing");
+            assert!(d, "a finished env stays done");
+            assert!(core.events_buf.is_empty(),
+                    "stale events would be re-consumed by the ComboWalk");
+        }
+        assert_eq!(core.body.st.q, q_frozen, "physics ran on a finished env");
+        assert_eq!(core.body.st.v, v_frozen, "physics ran on a finished env");
+        assert_eq!(core.tick, tick_frozen, "tick must not climb when idle");
+        assert_eq!(core.time, time_frozen, "time must not climb when idle");
+        assert_eq!(core.build_obs(), obs_frozen, "obs must stay the terminal row");
+
+        // reinstall: the latch clears and the body moves again
+        core.set_chart_notes(Vec::new());
+        assert!(!core.finished);
+        let (_r, d) = core.step_inner(&acts);
+        assert!(d, "empty chart is done again after one real tick");
+        assert_ne!(core.body.st.q, State::neutral(MODEL).q,
+                   "the post-install tick must have run real physics");
+    }
+
+    /// B4 monotonicity, the property the early-out rests on: a natural
+    /// (non-empty chart) episode reports done on exactly one tick and
+    /// would keep reporting done forever — checked against the raw
+    /// recomputation with the latch bypassed.
+    #[test]
+    fn done_is_monotone_on_a_real_chart() {
+        // three notes, all far past reach: they resolve as misses and the
+        // episode ends in the v10 tail
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
+                      false, KIND_NOTE, false, false))
+            .collect();
+        let mut core = Core::new_core(690, 4e-4, false, 5);
+        core.set_chart_notes(chart);
+        let acts = [0u8; NQ];
+        let mut first_done = None;
+        for t in 0..690 {
+            let (_r, d) = core.step_inner(&acts);
+            if d {
+                first_done = Some(t);
+                break;
+            }
+        }
+        let t_done = first_done.expect("episode never finished");
+        assert!(t_done > 0, "a real chart must take more than zero ticks");
+        // bypass the latch and recompute `done` from the frozen state the
+        // way step_inner would have: every disjunct is still true
+        core.finished = false;
+        let (_r, d) = core.step_inner(&acts);
+        assert!(d, "done must be structurally monotone");
     }
 
     /// Live gates at the reference pose reproduce the v9 constants:
