@@ -81,7 +81,7 @@ _ext_bwd = None
 
 
 def _load_one(name, src_file, build_subdir):
-    from beat_arena_env.jit_cache import fast_load
+    from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "beat_arena_env", "csrc")
     bdir = os.path.join(src, build_subdir)
@@ -93,9 +93,9 @@ def _load_one(name, src_file, build_subdir):
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
         from torch.utils.cpp_extension import load
         return load(name=name, sources=srcs, build_directory=bdir,
-                    extra_cuda_cflags=["-arch=sm_61"])
+                    extra_cuda_cflags=CUDA_FLAGS, verbose=True)
 
-    return fast_load(name, srcs, bdir, ["-arch=sm_61"], _full)
+    return fast_load(name, srcs, bdir, CUDA_FLAGS, _full)
 
 
 def _load_ext():
@@ -248,6 +248,10 @@ class FusedNotePolicy:
         if obs.dtype != torch.float32:
             obs = obs.float()
         obs = obs.contiguous()
+        if obs.dim() != 2 or obs.shape[1] != OBS_DIM:
+            raise ValueError(                # kernel indexes obs by OBS_DIM
+                f"FusedNotePolicy expects (N, {OBS_DIM}) obs, "
+                f"got {tuple(obs.shape)}")
         n = obs.shape[0]
         bufs = self._bufs.get(n)
         if bufs is None:

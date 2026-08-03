@@ -16,6 +16,19 @@ import torch
 _GRAPH_WARMUP = 3  # eager iterations before capture (torch's documented recipe)
 
 
+def copy_static(static, value, non_blocking=False):
+    """Guarded copy into a fixed forward-path input buffer (2026-08-02):
+    an off-shape value would broadcast silently and corrupt every later
+    replay/launch; a wrong dtype would silently cast. Used by _Graphed
+    subclasses and by the non-graph fused forwards that share the same
+    persistent-buffer contract."""
+    if value.shape != static.shape or value.dtype != static.dtype:
+        raise RuntimeError(
+            f"static input expects {tuple(static.shape)} "
+            f"{static.dtype}, got {tuple(value.shape)} {value.dtype}")
+    static.copy_(value, non_blocking=non_blocking)
+
+
 class _Graphed:
     """Subclasses copy their inputs into static buffers and call _run(),
     which runs _GRAPH_WARMUP eager iterations on a side stream, then
@@ -32,15 +45,8 @@ class _Graphed:
         raise NotImplementedError
 
     def _copy_static(self, static, value, non_blocking=False):
-        """Guarded copy into a captured static input (2026-08-02): an
-        off-shape value would broadcast silently and corrupt every
-        later replay; a wrong dtype would silently cast. Subclasses
-        route their __call__ input copies through this."""
-        if value.shape != static.shape or value.dtype != static.dtype:
-            raise RuntimeError(
-                f"graph static input expects {tuple(static.shape)} "
-                f"{static.dtype}, got {tuple(value.shape)} {value.dtype}")
-        static.copy_(value, non_blocking=non_blocking)
+        """Subclasses route their __call__ input copies through this."""
+        copy_static(static, value, non_blocking=non_blocking)
 
     def _run(self):
         if self.graph is not None:

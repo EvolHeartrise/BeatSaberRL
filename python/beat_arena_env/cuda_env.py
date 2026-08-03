@@ -106,7 +106,7 @@ def _load_ext():
     change; a warm cache loads in ~1 s)."""
     global _ext
     if _ext is None:
-        from beat_arena_env.jit_cache import fast_load
+        from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
         bdir = os.path.join(src, "build")
         os.makedirs(bdir, exist_ok=True)
@@ -118,10 +118,9 @@ def _load_ext():
             from torch.utils.cpp_extension import load
             return load(name="beat_arena_cuda", sources=srcs,
                         build_directory=bdir,
-                        extra_cuda_cflags=["-arch=sm_61"])
+                        extra_cuda_cflags=CUDA_FLAGS, verbose=True)
 
-        _ext = fast_load("beat_arena_cuda", srcs, bdir,
-                         ["-arch=sm_61"], _full)
+        _ext = fast_load("beat_arena_cuda", srcs, bdir, CUDA_FLAGS, _full)
     return _ext
 
 
