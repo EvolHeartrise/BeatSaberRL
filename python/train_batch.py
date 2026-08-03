@@ -1,6 +1,6 @@
-"""Batched-rollout CPU PPO: N parallel Rust envs, ONE policy forward per
-vector step. Same PPO math as train_smoke.py (GAE, dual-clip); the batch
-shape is the variable under study — batch = num_envs x horizon.
+"""Batched-rollout PPO: N parallel envs (default --env cuda, the P5
+kernel sim), ONE policy forward per vector step. GAE + dual-clip PPO;
+batch = num_envs x horizon.
 
 Throughput study:  python train_batch.py --bench --num-envs 256
 Real training:     python train_batch.py --num-envs 128 --total-steps 5000000
@@ -22,7 +22,7 @@ eager Adam form at save time).
 CUDA kernels (policy_cuda.FusedPolicyTrainer): one launch each way,
 recompute-based backward (activation memory O(obs minibatch)), packed
 weights as the single Adam leaf; PPO loss math stays in torch on the
-tiny (mb,12,3)/(mb,) outputs, so semantics cannot drift. d64/1-head
+tiny (mb,29,K)/(mb,) outputs, so semantics cannot drift. d64/1-head
 archs only. Weights are mirrored back into the torch policy once per
 PPO update for rollout sampling and checkpoints. Checkpoints remain
 load-compatible EXCEPT the Adam state (one packed param vs ~50):
@@ -40,6 +40,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -50,7 +51,7 @@ from beat_arena_env.vec_env import BeatVecEnv
 from fp16_linear import bump_weights_version
 from policy import HEAD_SIZES, NotePolicy, OBS_DIM, load_policy
 
-A_DIM = len(HEAD_SIZES)  # 12 factored joint heads (env v6)
+A_DIM = len(HEAD_SIZES)  # 29 factored joint heads (env v10)
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -59,6 +60,19 @@ DUAL_CLIP_C = 3.0
 VF_COEF = 0.5
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
+# log-ratio clamp before exp() (2026-08-02, 400M-run postmortem). NOT a
+# science change: dual-clip's selection only lets gradient flow through
+# ratio where ratio < max(1 + CLIP, DUAL_CLIP_C), and the loss VALUE is
+# selection-invariant for any ratio above that, so clamping at e^20 =
+# 4.9e8 changes no finite loss or gradient — it only stops exp()
+# overflowing fp32 at logratio > ~88, whose inf then rode 0*inf = NaN
+# through the max/min/where backward into every grad (the residual
+# scale-1.0 overflow-zeroed steps in the 400M log).
+LOG_RATIO_CLAMP = 20.0
+# dynamic loss-scale growth: x2 after this many consecutive clean
+# gradient steps (torch GradScaler defaults 2000; 500 here — 62 updates
+# at mb8 — because the scale also has a hard cap at the initial value)
+FP16_GROWTH_INTERVAL = 500.0
 
 
 def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
@@ -80,11 +94,11 @@ def fused_minibatch_losses(trainer, ent_coef, obs, act, logp, adv, ret):
     to the eager body: log_softmax gather == Categorical.log_prob,
     -(p * log p).sum == Categorical.entropy (policy.py's factored
     heads), then the same dual-clip PPO + value + entropy losses."""
-    logits, value = trainer(obs)                    # (mb,12,3), (mb,)
+    logits, value = trainer(obs)                    # (mb,29,K), (mb,)
     logsm = torch.log_softmax(logits, dim=-1)
     newlogp = logsm.gather(-1, act.unsqueeze(-1)).squeeze(-1).sum(-1)
     entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
-    ratio = (newlogp - logp).exp()
+    ratio = (newlogp - logp).clamp(max=LOG_RATIO_CLAMP).exp()
     a_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
     pg_loss = pg_loss_fn(ratio, a_mb)
     v_loss = 0.5 * ((value - ret) ** 2).mean()
@@ -149,11 +163,12 @@ def parse_args():
     p.add_argument("--device", type=str, default=None,
                    help="cuda|cpu (default: cuda if available)")
     p.add_argument("--env", choices=["rust", "cuda", "torch"], default=None,
-                   help="torch = the v10 tensor-op sim (P4 torch mirror — "
-                        "the training home until P5 ports the CUDA "
-                        "kernels; obs born on device). rust = the "
-                        "reference sim over FFI. Default: torch on a CUDA "
-                        "device, else rust. cuda hard-errors until P5.")
+                   help="cuda = the P5 kernel sim (the training backend "
+                        "since 2026-08-01; one launch per tick). torch = "
+                        "the P4 tensor-op mirror (parity/debug backend; "
+                        "obs born on device, ~1 s/vector tick). rust = "
+                        "the reference sim over FFI. Default: cuda on a "
+                        "CUDA device, else rust.")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -185,10 +200,17 @@ def parse_args():
                         "Auto-downgrades (with a note) on CPU/rust env, "
                         "--fused-update, or capture failure")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
-                   help="static loss scale for --fp16 (2^17 from the "
+                   help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
                         "grad elements below fp16 normal range unscaled). "
-                        "Halves automatically on overflow, never grows")
+                        "Dynamic since 2026-08-02: halves per overflow "
+                        "MINIBATCH and doubles after 500 clean gradient "
+                        "steps (capped at the initial value, floored at "
+                        "1) — the 400M postmortem found the old "
+                        "halve-per-UPDATE never-grow ratchet collapsed "
+                        "131072->1 by update 188 and stayed there for "
+                        "94%% of the run, discarding 9.3%% of all "
+                        "gradient steps as overflow-zeroed")
     p.add_argument("--fused-update", action="store_true",
                    help="run the minibatch forward+backward as fused CUDA "
                         "kernels (policy_cuda) with a recompute-based "
@@ -328,14 +350,22 @@ def main():
               "kernels), forcing off", flush=True)
         args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
-    fp16_scale = args.fp16_scale
     # device-side loss-scaling state: NO host syncs in the minibatch
     # loop (an overflow zeroes the grads device-side; the audit rides
-    # the existing once-per-update print sync)
+    # the existing once-per-update print sync). The scale itself is a
+    # device tensor since 2026-08-02 so it can adapt PER MINIBATCH
+    # (halve on overflow, x2 after GROWTH_INTERVAL clean steps, capped
+    # at the initial value) without ever syncing — the old host-float
+    # scale could only move at the once-per-update audit, so all 8
+    # minibatches of an update overflowed before it reacted.
+    fp16_scale = torch.full((), args.fp16_scale, device=device)
+    scale_cap = float(args.fp16_scale)
+    clean_steps = torch.zeros((), device=device)
     found_inf = torch.zeros(1, device=device)
     inv_scale = torch.zeros(1, device=device)
     inf_count = torch.zeros(1, device=device)
     ratio_diag = torch.zeros((), device=device)
+    logr_max = torch.zeros((), device=device)  # max|log ratio| this update
 
     tensor_env = args.env in ("cuda", "torch")
     # --graph-rollout is the DEFAULT (2026-07-26); downgrade with a note
@@ -433,7 +463,9 @@ def main():
     policy.fp16 = args.fp16 == "all"
     if args.fp16 != "off":
         print(f"--fp16 {args.fp16}: fp16-storage activations, fp32 "
-              f"masters, static loss scale {fp16_scale:.0f}", flush=True)
+              f"masters, dynamic loss scale (init {args.fp16_scale:.0f}, "
+              f"halve/overflow-mb, x2/{FP16_GROWTH_INTERVAL:.0f} clean)",
+              flush=True)
         # flat fp32 masters + flat fp16 replica mirror (2026-07-28):
         # every replica refresh (once per update for the graphed
         # rollout, once per minibatch after opt.step) becomes ONE cast
@@ -450,8 +482,8 @@ def main():
         assert device.type == "cuda", "--fused-update needs a CUDA device"
         from policy_cuda import FusedPolicyTrainer
         trainer = FusedPolicyTrainer(policy)  # raises on unsupported arch
-        print("--fused-update: packed 107k-param leaf, fused fwd/bwd kernels",
-              flush=True)
+        print(f"--fused-update: packed {n_params:,}-param leaf, "
+              f"fused fwd/bwd kernels", flush=True)
     params = trainer.parameters() if trainer is not None \
         else policy.parameters()
     # fused=True: one multi-tensor kernel instead of the foreach path's
@@ -531,7 +563,10 @@ def main():
             print(f"--graph-rollout: capture failed, falling back to the "
                   f"eager rollout [{type(e).__name__}: {e}]", flush=True)
 
-    ep_returns = []
+    # bounded (2026-08-02, audit 4.1): only [-100:] is ever read, and
+    # the unbounded list leaked ~monotonically on multi-B runs (both
+    # gen3 5B attempts died ~3.8B with this among the suspects)
+    ep_returns = deque(maxlen=200)
     if resume_ckpt is not None:
         num_updates = resume_ckpt["schedule"]["num_updates"]
         start_update = resume_ckpt["update"]
@@ -644,7 +679,6 @@ def main():
 
         if fp16_update:
             policy.fp16 = True  # 'update' mode: rollout stayed fp32
-            inv_scale.fill_(1.0 / fp16_scale)
         for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
             # synchronizing pageable H2D copy per minibatch (~26 ms/update
@@ -670,7 +704,15 @@ def main():
                     continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     p_obs[sl], p_act[sl])
-                ratio = (newlogp - p_logp[sl]).exp()
+                logratio = newlogp - p_logp[sl]
+                ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
+                if fp16_update:
+                    # overflow forensics (device-side, read at the print
+                    # sync): a max|logratio| near ~88 fingers exp()
+                    # fp32 overflow as the non-finite-grad source, small
+                    # values finger the fp16 activations instead
+                    torch.maximum(logr_max, logratio.detach().abs().max(),
+                                  out=logr_max)
                 if fp16_update and ep_i == 0 and s == 0:
                     # "same policy" fixed point: |ratio-1| at epoch 1
                     # measures rollout/update precision consistency
@@ -687,7 +729,7 @@ def main():
                 else:
                     opt.zero_grad(set_to_none=True)
                 if fp16_update:
-                    # static loss scale, ZERO host syncs: unscale + flag
+                    # dynamic loss scale, ZERO host syncs: unscale + flag
                     # non-finites in one kernel over the FLAT grad
                     # buffer, then zero every grad on overflow
                     # device-side. MUST run before the clip (an inf
@@ -695,6 +737,7 @@ def main():
                     # NaN everywhere). Overflow steps become
                     # momentum-only Adam steps — bounded by lr, audited
                     # at the print.
+                    inv_scale.copy_(fp16_scale.reciprocal())
                     (loss * fp16_scale).backward()
                     grads = ([flat_grad] if flat_grad is not None else
                              [p.grad for p in policy.parameters()
@@ -713,6 +756,24 @@ def main():
                     for g in grads:
                         torch.nan_to_num_(g, nan=0.0, posinf=0.0,
                                           neginf=0.0)
+                    # per-MINIBATCH scale adaptation, all device-side
+                    # (2026-08-02): halve on overflow, x2 after
+                    # FP16_GROWTH_INTERVAL consecutive clean steps,
+                    # clamp to [1, initial]. The old host-float scale
+                    # halved once per UPDATE and never grew — one early
+                    # transient disabled scaling for the rest of a run
+                    # (400M: scale 1 from update 188 on, 9.3% of all
+                    # gradient steps overflow-zeroed). Stream-ordered
+                    # after the backward, so the mul_ never races the
+                    # backward's read of the old scale.
+                    overflow = found_inf[0].clamp(max=1.0)  # 0-dim, 0/1
+                    clean = 1.0 - overflow
+                    clean_steps.mul_(clean).add_(clean)
+                    grow = (clean_steps >= FP16_GROWTH_INTERVAL).to(
+                        torch.float32)
+                    fp16_scale.mul_(0.5 * overflow + clean * (1.0 + grow))
+                    fp16_scale.clamp_(min=1.0, max=scale_cap)
+                    clean_steps.mul_(1.0 - grow)
                     inf_count += found_inf
                     found_inf.zero_()
                 else:
@@ -762,20 +823,25 @@ def main():
                 if pd:
                     print(f"[pd-net] {pd} f32 pivot-floor engagement(s) "
                           "this update", flush=True)
-        recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
+        recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
+                  else float("nan"))
         elapsed = time.time() - start
         rate = (global_step - steps_before) / elapsed
         if fp16_update:
             # ONE host sync (same as the .item() it replaces) reads the
-            # loss, the overflow audit, and the ratio diagnostic together
-            ent_v, inf_v, r1_v = torch.stack(
-                [ent_loss.detach(), inf_count[0], ratio_diag]).tolist()
-            extra = f"  r1 {r1_v:.1e}"
+            # loss, the overflow audit, the ratio diagnostic, the
+            # log-ratio forensic, and the live scale together
+            ent_v, inf_v, r1_v, lmax_v, scale_v = torch.stack(
+                [ent_loss.detach(), inf_count[0], ratio_diag,
+                 logr_max, fp16_scale]).tolist()
+            logr_max.zero_()
+            extra = f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}"
             if inf_v > 0:
-                fp16_scale = max(fp16_scale / 2, 1.0)  # halve, never grow
                 inf_count.zero_()
                 extra += (f"  [fp16] {int(inf_v)} overflow step(s) "
-                          f"zeroed; scale -> {fp16_scale:.0f}")
+                          f"zeroed; scale {scale_v:.0f}")
+            elif scale_v != scale_cap:
+                extra += f"  scale {scale_v:.0f}"
             print(f"update {update+1:>3}/{num_updates}  steps "
                   f"{global_step:>9}  ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  {rate:8,.0f} steps/s  "
@@ -800,7 +866,8 @@ def main():
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)
             break
 
-    recent = np.mean(ep_returns[-100:]) if ep_returns else float("nan")
+    recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
+                  else float("nan"))
     torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                 "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
