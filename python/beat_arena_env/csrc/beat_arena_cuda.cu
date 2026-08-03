@@ -411,6 +411,11 @@ struct Dyn {
   // RNEA scratch
   T om[NF][3], al[NF][3], vo[NF][3], ao[NF][3], fb[NF][3], nb[NF][3];
   bool pd_bad;
+  // PRE-integration root-envelope engagements (Divergences §23):
+  // env_bad = "engaged anywhere in THIS control tick" (the C backstop
+  // trigger), env_n = the per-(env, substep) count the wrapper pops
+  bool env_bad;
+  int env_n;
 };
 
 template <typename T>
@@ -1611,6 +1616,39 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // 7-9. constraint stage
   constraint_solve(d, s, d.q, v);
   for (int i = 0; i < NV; i++) d.v[i] = v[i];
+  // 12-PRE. root velocity envelope, FIRST application (SPEC-v10 §3
+  //     step 12 as amended 2026-08-03 — Divergences §23). Identical
+  //     expression tree to the post-step-11 application at the bottom of
+  //     this function; run HERE it is the one that bounds what the
+  //     integrator consumes: ‖Δp‖ ≤ h·ROOT_V_MAX and |Δθ| ≤ h·ROOT_W_MAX
+  //     per substep, UNCONDITIONALLY, and hence the next substep's
+  //     Baumgarte weld bias. Never engages on a healthy trajectory (a
+  //     converged v10 policy: 0 engagements in 204,800 env-ticks), so it
+  //     is bitwise transparent there. Engagements are counted and the env
+  //     layer terminates the episode on them (C backstop).
+  {
+    bool engaged = false;
+    const T w2 = d.v[3] * d.v[3] + d.v[4] * d.v[4] + d.v[5] * d.v[5];
+    if (w2 > T(ROOT_W_MAX) * T(ROOT_W_MAX)) {
+      const T sc = T(ROOT_W_MAX) / sqrt(w2);
+      d.v[3] *= sc;
+      d.v[4] *= sc;
+      d.v[5] *= sc;
+      engaged = true;
+    }
+    const T l2 = d.v[0] * d.v[0] + d.v[1] * d.v[1] + d.v[2] * d.v[2];
+    if (l2 > T(ROOT_V_MAX) * T(ROOT_V_MAX)) {
+      const T sc = T(ROOT_V_MAX) / sqrt(l2);
+      d.v[0] *= sc;
+      d.v[1] *= sc;
+      d.v[2] *= sc;
+      engaged = true;
+    }
+    if (engaged) {
+      d.env_bad = true;
+      d.env_n += 1;
+    }
+  }
   // 10. semi-implicit Euler positions + root exp-map quaternion
   for (int j = 0; j < NQ; j++) d.q[j] += T(H_SUB) * d.v[VOFF + j];
   for (int i = 0; i < 3; i++) d.p[i] += T(H_SUB) * d.v[i];
@@ -1669,7 +1707,11 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     d.v[vj] = tclamp(d.v[vj], -cap, cap);
     if (s.hit[j]) d.v[vj] = T(0);
   }
-  // 12. root velocity envelope guarantee (Divergences §19b)
+  // 12. root velocity envelope guarantee, SECOND application
+  //     (Divergences §19b; the first is the 12-PRE block above, §23).
+  //     Bounds the STORED velocity — step 11's joint impulses have
+  //     non-zero root rows. Deliberately NOT counted: the pre-integration
+  //     application is the escape signal.
   {
     const T w2 = d.v[3] * d.v[3] + d.v[4] * d.v[4] + d.v[5] * d.v[5];
     if (w2 > T(ROOT_W_MAX) * T(ROOT_W_MAX)) {
@@ -1885,6 +1927,7 @@ struct Sim {
   bool* __restrict__ contact_arm;
   T* __restrict__ effort;
   int* __restrict__ pd_hits;  // f32 pivot-floor engagements (§20e)
+  int* __restrict__ env_hits;  // pre-integration root-envelope hits (§23)
   int64_t* __restrict__ chart_idx;
   // chart pool (P, C), read-only
   const T *__restrict__ p_hit, *__restrict__ p_speed, *__restrict__ p_center,
@@ -2119,6 +2162,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // 8 substeps, accumulating positive work + contact aggregation
   load_state(d, P, e);
   d.pd_bad = false;
+  d.env_bad = false;
+  d.env_n = 0;
   bool arm_l = false, arm_r = false;
   if (P.want_contacts)
     for (int pr = 0; pr < NUM_PAIRS; pr++)
@@ -2147,6 +2192,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     }
   }
   if (d.pd_bad) atomicAdd(P.pd_hits, 1);
+  if (d.env_n) atomicAdd(P.env_hits, d.env_n);
   P.effort[e] = effort;
   P.contact_arm[e * 2] = arm_l;
   P.contact_arm[e * 2 + 1] = arm_r;
@@ -2429,9 +2475,14 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       break;
     }
   const T last_hit = P.p_last_hit[c0];
+  // C backstop (Divergences §23): an env whose root left the physical
+  // envelope this tick terminates — folded into `done` BEFORE the
+  // tracker resolution (identical drain to any other terminal tick) and
+  // its reward zeroed AFTER.
   const bool done =
       (!pending && no_trk && (nn == 0 || time_new > last_hit))
-      || time_new > last_hit + P.p_tail[c0] || tick_new >= P.max_steps;
+      || time_new > last_hit + P.p_tail[c0] || tick_new >= P.max_steps
+      || d.env_bad;
 
   if (done) {  // resolve pending follow-throughs with partial arcs
     for (int h = 0; h < 2; h++) {
@@ -2451,6 +2502,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     }
   }
 
+  if (d.env_bad) reward = T(0);
   const T ep = P.ep_return[e] + reward;
   P.ep_return[e] = ep;
   P.reward[e] = reward;
@@ -2485,6 +2537,8 @@ step_kernel(Sim<T> P) {
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
   } else {
     d.pd_bad = false;
+    d.env_bad = false;
+    d.env_n = 0;
     step_env(d, s, P, e);
   }
   write_obs(d, P, e);
@@ -2498,7 +2552,7 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TCIDX,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -2554,6 +2608,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.contact_arm = ts[TCARM].data_ptr<bool>();
     P.effort = ts[TEFF].data_ptr<scalar_t>();
     P.pd_hits = ts[TPD].data_ptr<int>();
+    P.env_hits = ts[TENV].data_ptr<int>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

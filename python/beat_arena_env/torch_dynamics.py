@@ -520,6 +520,13 @@ class DynBatch:
         self.contact_lambda = z(n, NUM_PAIRS)
         self.contact_point = z(n, NUM_PAIRS, 3)
         self._pd_bad = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # PRE-integration root-envelope engagements (Divergences §23):
+        # _env_bad is per-env for THIS substep (the env layer ORs it over
+        # the tick for the C backstop), _env_hits the cumulative
+        # (env, substep) count popped by pop_envelope_hits()
+        self._env_bad = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self._env_hits = torch.zeros((), dtype=torch.int64,
+                                     device=self.device)
 
     # -- state management -----------------------------------------------------
     def reset_all(self):
@@ -1104,6 +1111,36 @@ class DynBatch:
                              proj_diag=proj_diag, capmass=capmass,
                              lam_c=lam_c, lam_l=lam_l, v_solved=v.clone())
 
+        # 12-PRE. root velocity envelope, FIRST application (SPEC-v10 §3
+        # step 12 as amended 2026-08-03 — Divergences §23). Same
+        # expression tree as the post-step-11 application below; run HERE
+        # it is the one that bounds what the integrator consumes:
+        # ‖Δp‖ ≤ h·ROOT_V_MAX and |Δθ| ≤ h·ROOT_W_MAX per substep,
+        # unconditionally, and hence the next substep's Baumgarte weld
+        # bias. torch.where returns v bitwise when nothing engages, and
+        # nothing engages on any healthy trajectory (a converged v10
+        # policy: 0 engagements in 204,800 env-ticks).
+        v = self.v
+        w2 = v[:, 3] * v[:, 3] + v[:, 4] * v[:, 4] + v[:, 5] * v[:, 5]
+        wbad = w2 > ROOT_W_MAX * ROOT_W_MAX
+        # tensor/tensor division (scalar/tensor is 1-ulp-unsafe, see above)
+        ws = torch.full_like(w2, ROOT_W_MAX) / tsqrt(
+            torch.where(wbad, w2, torch.ones_like(w2)))
+        for i in (3, 4, 5):
+            v[:, i] = torch.where(wbad, v[:, i] * ws, v[:, i])
+        l2 = v[:, 0] * v[:, 0] + v[:, 1] * v[:, 1] + v[:, 2] * v[:, 2]
+        lbad = l2 > ROOT_V_MAX * ROOT_V_MAX
+        ls = torch.full_like(l2, ROOT_V_MAX) / tsqrt(
+            torch.where(lbad, l2, torch.ones_like(l2)))
+        for i in (0, 1, 2):
+            v[:, i] = torch.where(lbad, v[:, i] * ls, v[:, i])
+        self.v = v
+        # engagement bookkeeping (device-side, no host sync): the escape
+        # SIGNAL the env layer's C backstop terminates on
+        eng = wbad | lbad
+        self._env_bad = self._env_bad | eng
+        self._env_hits = self._env_hits + eng.sum()
+
         # 10. semi-implicit Euler positions + root exp-map quaternion
         self.q = self.q + h * self.v[:, VOFF:]
         self.p = self.p + h * self.v[:, :3]
@@ -1152,7 +1189,13 @@ class DynBatch:
             vj = v[:, VOFF + j].clamp(-cap, cap)
             v[:, VOFF + j] = torch.where(hit[:, j], torch.zeros_like(vj), vj)
 
-        # 12. root velocity envelope guarantee
+        # 12. root velocity envelope guarantee, SECOND application
+        # (Divergences §19b; the first is the 12-PRE block above, §23).
+        # This one bounds the STORED velocity — step 11's joint impulses
+        # Δv = M⁻¹e_j·λ have non-zero ROOT rows. Deliberately NOT counted
+        # into _env_hits: the pre-integration application is the escape
+        # signal (measured superset, and the one whose consequences are
+        # unbounded).
         w2 = v[:, 3] * v[:, 3] + v[:, 4] * v[:, 4] + v[:, 5] * v[:, 5]
         wbad = w2 > ROOT_W_MAX * ROOT_W_MAX
         # tensor/tensor division (scalar/tensor is 1-ulp-unsafe, see above)
@@ -1204,6 +1247,21 @@ class DynBatch:
         if bool(self._pd_bad.any().item()):
             self.pd_net_hits += int(self._pd_bad.sum().item())
             self._pd_bad.zero_()
+
+    def pop_envelope_hits(self):
+        """PRE-integration root-envelope engagements since the last pop,
+        counted per (env, substep) — the Rust/CUDA pop_envelope_hits
+        mirror (SPEC-v10 Divergences §23). One host sync."""
+        total = int(self._env_hits.item())
+        self._env_hits = torch.zeros_like(self._env_hits)
+        return total
+
+    def pop_env_bad(self):
+        """Per-env "escaped during the ticks since the last pop" mask,
+        cleared by the read. The env layer's C backstop trigger."""
+        bad = self._env_bad
+        self._env_bad = torch.zeros_like(bad)
+        return bad
 
     # -- derived caches for the env layer -------------------------------------
     def refresh_fk(self):

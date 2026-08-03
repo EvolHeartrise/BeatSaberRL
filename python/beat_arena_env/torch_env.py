@@ -303,6 +303,9 @@ class TorchBeatVecEnv:
         self.axis = zeros(N, 2, 3)
         self.axis_valid = zeros(N, 2, dt=torch.bool)
         self.effort_j = zeros(N)
+        # C backstop (Divergences §23): per-env "the root left the
+        # physical envelope during the last tick" (recomputed each tick)
+        self.escaped = zeros(N, dt=torch.bool)
         self.contact_arm = zeros(N, 2, dt=torch.bool)
         self.contact_imp = zeros(N, NUM_PAIRS)
         self.contact_pt = zeros(N, NUM_PAIRS, 3)
@@ -453,6 +456,10 @@ class TorchBeatVecEnv:
         self.contact_imp = torch.zeros_like(self.contact_imp)
         effort = torch.zeros(self.num_envs, device=self.device,
                              dtype=self.dtype)
+        # C backstop (Divergences §23): this tick's pre-integration
+        # envelope engagements, per env (the cumulative counter behind it
+        # is popped separately by pop_envelope_hits)
+        self.dyn.pop_env_bad()
         for _s in range(N_SUB):
             self.dyn.substep(tau)
             # SPEC-v10 §4 effort: positive work at the end-of-substep
@@ -471,6 +478,7 @@ class TorchBeatVecEnv:
             self.contact_arm = self.contact_arm | torch.stack(
                 [arm_l, arm_r], -1)
         self.effort_j = effort
+        self.escaped = self.dyn.pop_env_bad()
         self.dyn.check_pd()
         self._refresh_fk()
         self.wrist_vel = (self.wrist - prev_wrist) / DT
@@ -729,14 +737,20 @@ class TorchBeatVecEnv:
         self.tick = self.tick + 1
         pending_after = ((self.status == 0) & self.c_valid).any(1)
         no_trackers = ~self.tr_active.any((1, 2))
+        # C backstop (Divergences §23): an env whose root left the
+        # physical envelope this tick terminates — folded into `done`
+        # BEFORE the tracker resolution (so the drain is identical to any
+        # other terminal tick) and its reward zeroed AFTER.
         done = ((~pending_after & no_trackers
                  & ((self.c_n_notes == 0) | (time_new > self.c_last_hit)))
                 | (time_new > self.c_last_hit + self.c_tail)
-                | (self.tick >= self.max_steps))
+                | (self.tick >= self.max_steps)
+                | self.escaped)
 
         # done: resolve pending follow-throughs with their partial arcs
         end_resolve = self.tr_active & done.view(-1, 1, 1)
         reward = self._pay_trackers(end_resolve, reward)
+        reward = torch.where(self.escaped, torch.zeros_like(reward), reward)
 
         self.ep_return = self.ep_return + reward
         self._record_returns(done)
@@ -766,6 +780,12 @@ class TorchBeatVecEnv:
         vals = self._ret_buf[idx].tolist()
         self._popped = total
         return vals
+
+    def pop_envelope_hits(self):
+        """PRE-integration root-envelope engagements since the last pop
+        (SPEC-v10 Divergences §23) — the Rust/CUDA pop_envelope_hits
+        mirror. One host sync."""
+        return self.dyn.pop_envelope_hits()
 
     # -- observation (lib.rs write_obs, SPEC-v10 §5) --------------------------
     def _build_obs(self):

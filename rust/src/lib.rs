@@ -474,6 +474,15 @@ struct Body {
     contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
     contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
     effort_j: f64,                   // last tick's positive work (J)
+    // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
+    // PRE-integration root envelope engage anywhere in THIS tick's 8
+    // substeps? A1 makes such a trajectory bounded; it does not make it
+    // physics, so the env terminates the episode instead of feeding the
+    // policy the garbage observation/reward (the fp16 loss-scale
+    // collapse and the §22 bench panic were both downstream of exactly
+    // that). Measured incidence on a converged policy: 0 in 204,800
+    // env-ticks.
+    escaped: bool,
     // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
@@ -504,6 +513,7 @@ impl Body {
             contact_imp: [0.0; NUM_PAIRS],
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             effort_j: 0.0,
+            escaped: false,
             weld_imp: [0.0; 12],
         };
         b.refresh_fk();
@@ -519,6 +529,7 @@ impl Body {
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.effort_j = 0.0;
+        self.escaped = false;
         self.weld_imp = [0.0; 12];
         self.refresh_fk();
     }
@@ -553,6 +564,10 @@ impl Body {
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.weld_imp = [0.0; 12];
+        // C backstop: this tick's pre-integration envelope engagements
+        // are ws.env_hits' delta over the 8 substeps (the counter itself
+        // is cumulative until pop_envelope_hits)
+        let env_hits0 = self.ws.env_hits;
         let mut effort = 0.0;
         for _ in 0..N_SUB {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
@@ -587,6 +602,7 @@ impl Body {
             }
         }
         self.effort_j = effort;
+        self.escaped = self.ws.env_hits != env_hits0;
         self.refresh_fk();
         for s in 0..2 {
             for k in 0..3 {
@@ -1154,11 +1170,21 @@ impl Core {
         let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
         let pending = self.first_pending < self.chart.len();
         let no_trackers = self.trackers[0].is_empty() && self.trackers[1].is_empty();
+        // C backstop (SPEC-v10 Divergences §23): an env whose root left
+        // the physical envelope during this tick terminates. A1 bounds
+        // that trajectory but does not make it meaningful, and the
+        // observations/rewards it produces are the actual harm. Folded
+        // into `done` BEFORE the tracker resolution so the pending
+        // follow-throughs are drained exactly as on any other terminal
+        // tick; the reward is zeroed AFTER (this tick's physics reward
+        // is garbage, so none of it — effort, cuts, follow-through —
+        // reaches the policy).
         let done = (!pending
             && no_trackers
             && (self.chart.is_empty() || self.time > last_hit))
             || self.time > last_hit + self.tail_s
-            || self.tick >= self.max_steps;
+            || self.tick >= self.max_steps
+            || self.body.escaped;
 
         if done {
             self.finished = true;   // B4: latch; cleared only by reset_state
@@ -1172,6 +1198,9 @@ impl Core {
                     self.events_buf.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 }
             }
+        }
+        if self.body.escaped {
+            reward = 0.0;
         }
 
         (reward, done)
@@ -1339,6 +1368,24 @@ impl RawBeatSim {
         let h = self.core.body.ws.pd_hits;
         self.core.body.ws.pd_hits = 0;
         h
+    }
+
+    /// PRE-integration root-velocity-envelope engagements since the last
+    /// pop (SPEC-v10 Divergences §23), counted per (env, substep) — the
+    /// CUDA backend's pop_envelope_hits mirror. Returns the count and
+    /// zeroes it. 0 on every healthy trajectory; nonzero means at least
+    /// one tick's episode was terminated by the C backstop.
+    fn pop_envelope_hits(&mut self) -> u64 {
+        let h = self.core.body.ws.env_hits;
+        self.core.body.ws.env_hits = 0;
+        h
+    }
+
+    /// Did the PRE-integration envelope engage during the LAST tick
+    /// (i.e. did the C backstop fire)? Test introspection.
+    #[getter]
+    fn escaped(&self) -> bool {
+        self.core.body.escaped
     }
 
     #[getter]
@@ -1619,6 +1666,22 @@ impl VecBeatSim {
             })
             .sum()
     }
+
+    /// PRE-integration root-velocity-envelope engagements summed over
+    /// all envs since the last pop (SPEC-v10 Divergences §23) — the
+    /// CUDA backend's pop_envelope_hits mirror. Returns the count and
+    /// zeroes the per-env counters. ADDITIVE getter; 0 on every healthy
+    /// trajectory.
+    fn pop_envelope_hits(&mut self) -> u64 {
+        self.sims
+            .iter_mut()
+            .map(|s| {
+                let h = s.body.ws.env_hits;
+                s.body.ws.env_hits = 0;
+                h
+            })
+            .sum()
+    }
 }
 
 impl VecBeatSim {
@@ -1818,6 +1881,85 @@ mod env_tests {
         core.finished = false;
         let (_r, d) = core.step_inner(&acts);
         assert!(d, "done must be structurally monotone");
+    }
+
+    /// C backstop (SPEC-v10 Divergences §23): an env whose root leaves
+    /// the physical envelope during a tick terminates with a ZEROED
+    /// reward, and the engagement is counted. The fixture is escape #7
+    /// of the 2026-08-03 corpus (see dynamics::tests_soak) — a state the
+    /// pre-A1 engine teleported 642.7 m from.
+    #[test]
+    fn escaped_env_terminates_with_zero_reward() {
+        use crate::dynamics::tests_soak::{ESC_A, ESC_P, ESC_Q, ESC_QUAT, ESC_V};
+        // a real (non-empty) chart so `done` cannot come from the
+        // empty-chart disjunct; the notes are far in the future
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| {
+                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                 KIND_NOTE, false, false)
+            })
+            .collect();
+        // effort_coef > 0 so the physics reward would otherwise be
+        // strictly negative — the zeroing is observable
+        let mut core = Core::new_core(690, 4e-4, false, 3);
+        core.set_chart_notes(chart);
+        core.body.st.p = ESC_P;
+        core.body.st.quat = ESC_QUAT;
+        core.body.st.q.copy_from_slice(&ESC_Q);
+        core.body.st.v.copy_from_slice(&ESC_V);
+        core.body.refresh_fk();
+        let p0 = core.body.st.p;
+
+        let (reward, done) = core.step_inner(&ESC_A);
+        assert!(core.body.escaped, "the escape state must trip the envelope");
+        assert!(done, "an escaped env must terminate");
+        assert_eq!(reward, 0.0, "an escaped tick's reward must be zeroed");
+        assert!(core.finished, "the terminal latch must be set");
+        assert!(core.body.ws.env_hits > 0, "the engagement must be counted");
+        // A1's bound, at the env layer: 8 substeps x h*ROOT_V_MAX
+        let dp = ((core.body.st.p[0] - p0[0]).powi(2)
+            + (core.body.st.p[1] - p0[1]).powi(2)
+            + (core.body.st.p[2] - p0[2]).powi(2))
+        .sqrt();
+        assert!(
+            dp <= 8.0 * H_SUB * dynamics::step::ROOT_V_MAX + 1e-9,
+            "tick |dp| = {dp} m — the teleport survived"
+        );
+        assert!(
+            core.body.st.p.iter().all(|x| x.is_finite())
+                && core.body.st.v.iter().all(|x| x.is_finite()),
+            "escaped state must still be finite"
+        );
+        // popping zeroes, pd_hits-style
+        let popped = core.body.ws.env_hits;
+        core.body.ws.env_hits = 0;
+        assert!(popped > 0);
+    }
+
+    /// The other half of the contract: an ordinary episode never
+    /// terminates via the C backstop and never counts an engagement.
+    #[test]
+    fn healthy_env_never_escapes() {
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| {
+                (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                 KIND_NOTE, false, false)
+            })
+            .collect();
+        let mut core = Core::new_core(690, 4e-4, false, 5);
+        core.set_chart_notes(chart);
+        let mut acts = [0u8; NQ];
+        acts[10] = 1;
+        acts[3] = 2;
+        acts[15] = 1;
+        for _ in 0..120 {
+            let (_r, d) = core.step_inner(&acts);
+            assert!(!core.body.escaped, "healthy motion must never escape");
+            if d {
+                break;
+            }
+        }
+        assert_eq!(core.body.ws.env_hits, 0);
     }
 
     /// Live gates at the reference pose reproduce the v9 constants:
