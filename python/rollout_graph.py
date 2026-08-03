@@ -39,6 +39,9 @@ class GraphedRollout:
         self.policy = policy
         self.venv = venv
         self._version = None
+        # the fp16 mode the graph is CAPTURED under is baked into its
+        # kernels; refresh()/step() assert it never drifts (2026-08-02)
+        self.captured_fp16 = bool(getattr(policy, "fp16", False))
         self.refresh()  # caches must exist (and be stable) before capture
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -63,8 +66,22 @@ class GraphedRollout:
 
     def refresh(self):
         """In-place fp16 cache refresh, once per weights version. Cheap
-        no-op when the version is unchanged or the rollout is fp32."""
-        if getattr(self.policy, "fp16", False):
+        no-op when the version is unchanged or the rollout is fp32.
+
+        Guarded against policy.fp16 drift (2026-08-02): the trainer
+        flips policy.fp16 around the update under --fp16 update, and a
+        future early-exit between the flips would otherwise leave a
+        captured-fp16 graph refreshing nothing — every replay would
+        silently sample from the LAST update's frozen replica weights
+        (the r1-diagnostic failure class)."""
+        live_fp16 = bool(getattr(self.policy, "fp16", False))
+        if live_fp16 != self.captured_fp16:
+            raise RuntimeError(
+                f"GraphedRollout was captured with policy.fp16="
+                f"{self.captured_fp16} but the policy is now fp16="
+                f"{live_fp16}; the captured kernels cannot follow the "
+                f"mode switch — recapture or restore the flag")
+        if self.captured_fp16:
             import fp16_linear as _fl
             if self._version != _fl._weights_version:
                 self.policy.refresh_fp16_caches()

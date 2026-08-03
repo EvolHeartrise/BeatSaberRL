@@ -89,7 +89,7 @@ class _GraphedArgmax(_Graphed):
         # obs_t is the loop's persistent (pinned) host buffer, so this
         # H2D is an async DMA; the .cpu() on the result syncs before the
         # sim overwrites the buffer
-        self.s_obs.copy_(obs_t, non_blocking=True)
+        self._copy_static(self.s_obs, obs_t, non_blocking=True)
         return self._run()
 
 
