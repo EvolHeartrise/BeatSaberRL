@@ -34,6 +34,9 @@ Limits vs BeatVecEnv: no per-step info dicts, no event stream, CUDA only.
 from __future__ import annotations
 
 import glob
+import hashlib
+import itertools
+import operator
 import os
 import shutil
 import sys
@@ -124,26 +127,56 @@ def _load_ext():
     return _ext
 
 
+# one-pass field extraction for the pool fill (see _charts_to_tensors):
+# ONE Python-level touch per note instead of eleven numpy scalar stores.
+_NOTE_FIELDS = np.dtype([
+    ("hit", np.float64), ("color", np.float64), ("angle", np.float64),
+    ("speed", np.float64), ("any_dir", bool), ("kind", np.int64),
+    ("fpre", bool), ("fpost", bool),
+])
+_note_get = operator.attrgetter("hit_time", "color", "angle", "speed",
+                                "any_dir", "kind", "free_pre", "free_post")
+
+
 def _charts_to_tensors(charts, device, dtype):
     """Pad a list[list[Note]] into per-field (P, C) tensors — env v10:
     episode tail = 0.5 + 1.5/min_speed (live head-plane miss boundary).
     Chart sin/cos are computed by numpy (the CRT libm — bitwise what
-    Rust's set_chart_notes computes)."""
+    Rust's set_chart_notes computes).
+
+    The fill is column-wise (2026-08-03): the notes are flattened once,
+    every field is pulled in a single np.fromiter pass, and one scatter
+    per field places them at the ragged (p, j) slots. The old per-note
+    loop cost ~11 numpy scalar stores per note (~96 s at chart_pool
+    65536, ~45M stores for the ranked segment pool); this is a pure
+    re-ordering of the same copies, so the output is byte-identical."""
     P = len(charts)
     C = max(1, max((len(ch) for ch in charts), default=1))
-    hit = np.zeros((P, C)); x = np.zeros((P, C)); y = np.zeros((P, C))
-    color = np.zeros((P, C)); angle = np.zeros((P, C)); speed = np.ones((P, C))
-    any_dir = np.zeros((P, C), dtype=bool); kind = np.zeros((P, C), np.int64)
-    fpre = np.zeros((P, C), dtype=bool); fpost = np.zeros((P, C), dtype=bool)
-    valid = np.zeros((P, C), dtype=bool)
-    for p, ch in enumerate(charts):
-        for j, n in enumerate(ch):
-            hit[p, j] = n.hit_time
-            x[p, j], y[p, j] = note_center(n)
-            color[p, j] = n.color; angle[p, j] = n.angle; speed[p, j] = n.speed
-            any_dir[p, j] = n.any_dir; kind[p, j] = n.kind
-            fpre[p, j] = n.free_pre; fpost[p, j] = n.free_post
-            valid[p, j] = True
+    lens = np.fromiter((len(ch) for ch in charts), np.int64, P)
+    n_tot = int(lens.sum())
+    flat = list(itertools.chain.from_iterable(charts))
+    # ragged (p, j) -> flat (P*C) destination slots: chart p starts at
+    # p*C in the destination and at cumsum(lens)[p]-lens[p] in `flat`
+    idx = (np.repeat(np.arange(P, dtype=np.int64) * C
+                     - (np.cumsum(lens) - lens), lens)
+           + np.arange(n_tot, dtype=np.int64))
+    rec = np.fromiter(map(_note_get, flat), _NOTE_FIELDS, n_tot)
+    # note_center resolves explicit x/y over col/row, per note
+    xy = np.fromiter((note_center(n) for n in flat), (np.float64, 2), n_tot)
+
+    def fill(vals, dt=np.float64, pad=0.0):
+        a = np.full(P * C, pad, dtype=dt)
+        a[idx] = vals
+        return a.reshape(P, C)
+
+    hit = fill(rec["hit"]); x = fill(xy[:, 0]); y = fill(xy[:, 1])
+    color = fill(rec["color"]); angle = fill(rec["angle"])
+    speed = fill(rec["speed"], pad=1.0)
+    any_dir = fill(rec["any_dir"], bool, False)
+    kind = fill(rec["kind"], np.int64, 0)
+    fpre = fill(rec["fpre"], bool, False)
+    fpost = fill(rec["fpost"], bool, False)
+    valid = fill(np.ones(n_tot, bool), bool, False)
     is_bomb = valid & (kind == KIND_BOMB)
     is_head = valid & (kind == KIND_CHAIN_HEAD)
     is_link = valid & (kind == KIND_CHAIN_LINK)
@@ -183,16 +216,48 @@ def _charts_to_tensors(charts, device, dtype):
     }
 
 
+def _generator_version():
+    """Hash of the code the CACHED POOL CONTENT actually depends on —
+    the bench's parser_version() pattern (bench_scoresaber.py). Hashing
+    chart.py whole (pre-2026-08-03) meant every unrelated edit there —
+    a docstring, `chain_links`, the parser-only helpers — retired the
+    whole 35 GB pool cache and forced a cold ~96 s rebuild per pool.
+
+    Covered: the config class, the generator itself (its `spawn` /
+    `walk_speed` closures ride along in getsource), the position
+    helpers it calls, the Note record whose fields the pool reads, the
+    module-level generator tunables (getsource of a function does NOT
+    see them), and the constants.py geometry that resolves a note to a
+    world position."""
+    import inspect
+
+    from . import chart
+    from . import constants as K
+    h = hashlib.sha256()
+    for sym in (chart.ChartConfig, chart.generate_chart, chart._pos_ranges,
+                chart._nearest_cell, chart.Note, K.note_center, K.col_x):
+        h.update(inspect.getsource(sym).encode())
+    h.update(repr((
+        chart.TICK_DT, chart.TICK_JITTER, chart.ANGLE_SIGMA, chart.SPEED_DEV,
+        chart.EXTRA_PATH, chart.EXTRA_ROT, chart.EXTRA_PERP, chart.EXTRA_DZ,
+        chart.POS_PAD, chart.N_COLS, chart.N_ROWS, chart.LEFT, chart.RIGHT,
+        chart._BOMB_PATH, K.ROW_Y, K.CELL_X, K.KIND_NOTE, K.KIND_BOMB,
+    )).encode())
+    return h.hexdigest()[:16]
+
+
 def _pool_cache_path(cfg, seed, pool_size, dtype):
     """Cache file for a procedural chart pool. Keyed on the FULL chart
-    config + seed + pool size + dtype + a hash of chart.py + a pool
-    LAYOUT version (v10: the tail rule changed to 0.5 + 1.5/min_speed —
-    bumping the key retires every v9-tail pool)."""
-    import hashlib
-    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "chart.py"), "rb").read()
-    blob = repr(("v10", repr(cfg), seed, pool_size, str(dtype))).encode()
-    key = hashlib.sha1(src + blob).hexdigest()[:16]
+    config (it determines content) + seed + pool size + dtype +
+    _generator_version() + a pool LAYOUT version.
+
+    Layout v11 (2026-08-03): the vectorized _charts_to_tensors landed
+    (byte-identical, but a clean break beats any old-key/new-key
+    aliasing) and the key narrowed from all-of-chart.py to the
+    generator symbols. v10 was the 0.5 + 1.5/min_speed tail rule."""
+    blob = repr(("v11", _generator_version(), repr(cfg), seed, pool_size,
+                 str(dtype))).encode()
+    key = hashlib.sha1(blob).hexdigest()[:16]
     cdir = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "pool_cache")
     os.makedirs(cdir, exist_ok=True)

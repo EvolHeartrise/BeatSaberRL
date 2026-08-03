@@ -37,7 +37,8 @@ PY = sys.executable
 OUT_DIR = os.path.join("sweeps", "ent_shape")
 
 # run 085 hypers exactly as the sweep driver passed them (%.6g)
-BASE = ["--num-envs", "1024", "--lr-decay", "cosine",
+BASE = ["--num-envs", "1024", "--horizon", "128",
+        "--lr-decay", "cosine",
         "--ranked-maps", "--seg-len", "25",
         "--chart-pool", "24576",
         "--lr", "0.00296092",

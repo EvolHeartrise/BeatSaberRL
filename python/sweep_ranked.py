@@ -95,7 +95,7 @@ def run_leg(idx, h, run_dir):
     """One ranked-segments training leg + full-catalog bench.
     Returns (catalog_upp, wall_s) or None."""
     shutil.rmtree(run_dir, ignore_errors=True)  # leg = always fresh model
-    cmd = [PY, "train_batch.py", "--num-envs", "1024",
+    cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
            "--lr-decay", "cosine", "--seed", "0",
            "--ranked-maps", "--seg-len", f"{SEG_LEN:g}",
            "--chart-pool", str(SEG_POOL),
