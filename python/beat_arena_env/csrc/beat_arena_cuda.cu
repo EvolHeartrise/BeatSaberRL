@@ -14,13 +14,27 @@
 // Rust's loops in thread-local (local-memory) scratch — every
 // accumulation runs in Rust's exact order by construction, so there is
 // no reduction-order risk anywhere (candidate B's intra-env parallelism
-// was rejected: PGS is strictly ordered, the CRBA/RNEA tree passes are
-// sequential, and the only wide parallelism — multi-RHS triangular
-// solves — would buy ~2x at 3x the parity risk). Occupancy comes from
-// batch width: the production configs run N = 1024..8192 envs;
-// per-thread scratch (~50 KB f32) lives in local memory (coalesced
-// per-thread interleaving), so residency is register-bound, not
-// smem-bound.
+// was rejected: PGS is strictly ordered and the CRBA/RNEA tree passes
+// are sequential). Occupancy comes from batch width: the production
+// configs run N = 1024..8192 envs; per-thread scratch (45,296 B f32,
+// 91,504 B f64 — measured, not estimated) lives in local memory
+// (coalesced per-thread interleaving), so residency is register-bound,
+// not smem-bound.
+//
+// CORRECTION (2026-08-03, A1). That rejection note used to end "...and
+// the only wide parallelism — multi-RHS triangular solves — would buy
+// ~2x at 3x the parity risk". The risk half was WRONG and is retracted.
+// Batching across right-hand sides is a pure LOOP INTERCHANGE, not a
+// reassociation: the RHS are independent, each keeps its OWN
+// accumulator visiting the same terms in the same order, so every value
+// is bitwise what the separate solves produced (argued per site below,
+// gated at max diff 0.0 across f32 and f64, free-running and
+// max_steps=60, want_contacts). It also needs no cross-thread
+// parallelism — the batches run inside the one thread, as ILP. A1
+// landed them (weld block, contacts, limit-row unit columns, plus the
+// weld dot/axpy interchanges) for +33% end to end: train --bench
+// N=1024 5,496 -> 7,283 steps/s, env micro-bench 6,212 -> 8,264
+// env-steps/s. The "~2x" estimate of the prize was the honest half.
 //
 // f64 parity tier (SPEC-v10 Divergences §21, measured in
 // tests/test_v10_parity_cuda.py): CUDA f64 sqrt and division are
@@ -68,10 +82,29 @@ constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int NOTE_FEAT = 14;
 // One WARP per block: the grid is N/32 blocks, so small batches spread
-// over all 20 SMs. P5 profile note: throughput is INSENSITIVE to the
-// block size (128 vs 32: 216 vs 221 ms at N=1024) — the kernel is bound
-// by per-env serial latency + local-memory traffic (45 KB stack/thread,
-// working set far beyond L2), not by occupancy.
+// over all 20 SMs. Throughput is INSENSITIVE to the block size (P5
+// measurement, 128 vs 32: 216 vs 221 ms at N=1024) — consistent with
+// the diagnosis below, and the reason occupancy is not the lever here.
+//
+// The kernel is SERIAL-LATENCY bound. Earlier notes called it "serial
+// latency + local-memory traffic"; the 2026-08-03 A4/A1 measurements
+// separate the two, and traffic is not the binding constraint:
+//   * A1/1c: batching the dense back substitution of the limit-row unit
+//     columns 4-wide won +6.5%; widening the SAME batch to 8, which
+//     halves the factor-load traffic again on top of that, won ZERO
+//     (7,283 -> 7,286 steps/s). The benefit saturates with the number
+//     of independent dependency chains, not with the loads removed —
+//     a latency signature.
+//   * A1/1f: register-blocking the A_ww assembly cut its s.mw loads
+//     6.5x (78*NV -> 12*NV) and measured NEUTRAL on train --bench in
+//     both a 4-wide and a full-row form (the full-row form also pushed
+//     f32 spills 6,948/4,784 -> 8,576/8,100). REVERTED — a pure
+//     traffic cut with no new chains does not pay here.
+//   * A4 (previous session): the unit-RHS forward substitution, which
+//     cuts the dependent chain without cutting the factor's traffic,
+//     paid +21%.
+// The working set (45 KB stack/thread) is still far beyond L2, so
+// traffic is not free — it is simply already hidden behind the chains.
 //
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
@@ -933,6 +966,54 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
   }
 }
 
+// BATCHED multi-RHS solve: W independent right-hand sides, laid out as
+// W consecutive rows of stride `n` (s.mw / s.c_minv are exactly that),
+// sharing ONE factor. This is a pure LOOP INTERCHANGE of W calls to
+// chol_solve_n: the (i, k) iteration space is walked in the same
+// ascending order, and each RHS w keeps its OWN accumulator visiting the
+// same terms in the same sequence from the same seed x[w*n+i], so every
+// value is BITWISE what the W separate calls produced. Nothing is
+// reassociated; only the w loop is hoisted inside.
+//
+// Why it pays on this kernel (serial-latency bound, measured): the
+// scalar solve's inner k-loop is ONE dependent FMA chain of length i,
+// and the W calls run those chains back to back. Interleaved, the W
+// chains are mutually independent, so the chain latency is amortized
+// W-fold; the factor element l[i*n+k] is also loaded once per (i, k)
+// instead of once per (i, k, w). The accumulators are a fixed-size local
+// array indexed only by fully unrolled compile-time w, so they live in
+// registers (W f32 = W*4 B).
+template <int W, typename T>
+__device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
+                                   T* __restrict__ x) {
+  for (int i = 0; i < n; i++) {
+    T s[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) s[w] = x[w * n + i];
+    for (int k = 0; k < i; k++) {
+      const T lik = l[i * n + k];
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lik * x[w * n + k];
+    }
+    const T dg = l[i * n + i];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
+  }
+  for (int i = n - 1; i >= 0; i--) {
+    T s[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) s[w] = x[w * n + i];
+    for (int k = i + 1; k < n; k++) {
+      const T lki = l[k * n + i];
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lki * x[w * n + k];
+    }
+    const T dg = l[i * n + i];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
+  }
+}
+
 // Same solve, specialized for a UNIT right-hand side e_m (x enters as
 // all +0.0 except x[m] = 1). BITWISE identical to chol_solve_n on that
 // input, not an approximation — the forward substitution provably
@@ -958,17 +1039,81 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
 // forward pass would have written, so the caller's full-length zero
 // fill CANNOT shrink. (Rows > m need it too: it is their `s` seed.)
 template <typename T>
-__device__ void chol_solve_unit_n(int n, const T* __restrict__ l,
-                                  T* __restrict__ x, int m) {
+__device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
+                                T* __restrict__ x, int m) {
   for (int i = m; i < n; i++) {
     T s = x[i];
     for (int k = m; k < i; k++) s -= l[i * n + k] * x[k];
     x[i] = s / l[i * n + i];
   }
+}
+
+template <typename T>
+__device__ void chol_back_n(int n, const T* __restrict__ l,
+                            T* __restrict__ x) {
   for (int i = n - 1; i >= 0; i--) {
     T s = x[i];
     for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
     x[i] = s / l[i * n + i];
+  }
+}
+
+template <typename T>
+__device__ void chol_solve_unit_n(int n, const T* __restrict__ l,
+                                  T* __restrict__ x, int m) {
+  chol_fwd_unit_n(n, l, x, m);
+  chol_back_n(n, l, x);
+}
+
+// BACK substitution for 4 / 2 independent columns at once. The back pass
+// is DENSE and m-independent — identical code for every right-hand side —
+// so batching it needs no per-column bookkeeping at all: it is the same
+// loop interchange as chol_solve_multi_n (each column keeps its own
+// accumulator over the same k in the same descending-i order, so every
+// value is bitwise the scalar pass's), just over columns that are not
+// contiguous in memory (s.ecol rows for non-consecutive joints), hence
+// explicit pointers rather than a stride. Accumulators are named scalars
+// so they cannot land in local memory.
+//
+// Only the BACK half is batched for the unit columns: the forward half
+// is sparse from a per-column m (chol_fwd_unit_n), and running a batch
+// from the group's smallest m would do the skipped rows as arithmetic
+// no-ops — correct, but it re-adds exactly the work A4 removed. Back
+// substitution is also the larger half (n^2/2 vs (n-m)^2/2, m >= VOFF).
+template <typename T>
+__device__ void chol_back4_n(int n, const T* __restrict__ l,
+                             T* __restrict__ x0, T* __restrict__ x1,
+                             T* __restrict__ x2, T* __restrict__ x3) {
+  for (int i = n - 1; i >= 0; i--) {
+    T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
+    for (int k = i + 1; k < n; k++) {
+      const T lki = l[k * n + i];
+      s0 -= lki * x0[k];
+      s1 -= lki * x1[k];
+      s2 -= lki * x2[k];
+      s3 -= lki * x3[k];
+    }
+    const T dg = l[i * n + i];
+    x0[i] = s0 / dg;
+    x1[i] = s1 / dg;
+    x2[i] = s2 / dg;
+    x3[i] = s3 / dg;
+  }
+}
+
+template <typename T>
+__device__ void chol_back2_n(int n, const T* __restrict__ l,
+                             T* __restrict__ x0, T* __restrict__ x1) {
+  for (int i = n - 1; i >= 0; i--) {
+    T s0 = x0[i], s1 = x1[i];
+    for (int k = i + 1; k < n; k++) {
+      const T lki = l[k * n + i];
+      s0 -= lki * x0[k];
+      s1 -= lki * x1[k];
+    }
+    const T dg = l[i * n + i];
+    x0[i] = s0 / dg;
+    x1[i] = s1 / dg;
   }
 }
 
@@ -1060,6 +1205,17 @@ __device__ void angular_jacobian_acc(const Dyn<T>& d, int frame, int axis_t,
   row[3 + axis_t] += sign;
 }
 
+// RHS seed: the full-length zero fill is load-bearing for
+// chol_fwd_unit_n / chol_back_n — see chol_solve_unit_n's header (the
+// skipped forward rows keep these +0.0 for the dense back substitution
+// to read).
+template <typename T>
+__device__ __forceinline__ void ecol_seed(Solver<T>& __restrict__ s, int j) {
+  T* col = s.ecol[j];
+  for (int i = 0; i < NV; i++) col[i] = T(0);
+  col[VOFF + j] = T(1);
+}
+
 // Lazily compute the plain M^-1 e_j column (shared by step-8 cap/limit
 // rows and the step-11 clamps — same expression tree as Rust's three
 // separate caches).
@@ -1067,13 +1223,8 @@ template <typename T>
 __device__ void ensure_ecol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                             int j) {
   if (s.ecomp[j]) return;
-  T* col = s.ecol[j];
-  // full-length zero fill is load-bearing for chol_solve_unit_n — see
-  // its header (the skipped forward rows keep these +0.0 for the dense
-  // back substitution to read)
-  for (int i = 0; i < NV; i++) col[i] = T(0);
-  col[VOFF + j] = T(1);
-  chol_solve_unit_n(NV, d.m, col, VOFF + j);
+  ecol_seed(s, j);
+  chol_solve_unit_n(NV, d.m, s.ecol[j], VOFF + j);
   s.ecomp[j] = true;
 }
 
@@ -1086,16 +1237,38 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   ensure_ecol(d, s, j);
   const T plain = s.ecol[j][VOFF + j];
   T* col = s.pcol[j];
-  for (int i = 0; i < NV; i++) col[i] = s.ecol[j][i];
-  for (int w = 0; w < N_WELD; w++) {
-    T sum = T(0);
-    for (int i = 0; i < NV; i++) sum += s.jw[w][i] * col[i];
-    s.rw[w] = sum;
+  // Copy + 12 dots, INTERCHANGED and fused into one pass over i. Each
+  // sum[w] still accumulates over i in ascending order over the same
+  // terms, and the copy is per-element independent, so col and every
+  // sum[w] are bitwise what the three separate passes produced.
+  {
+    T sum[N_WELD];
+#pragma unroll
+    for (int w = 0; w < N_WELD; w++) sum[w] = T(0);
+    for (int i = 0; i < NV; i++) {
+      const T ci = s.ecol[j][i];
+      col[i] = ci;
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) sum[w] += s.jw[w][i] * ci;
+    }
+#pragma unroll
+    for (int w = 0; w < N_WELD; w++) s.rw[w] = sum[w];
   }
   chol_solve_n(N_WELD, s.aww, s.rw);
-  for (int w = 0; w < N_WELD; w++) {
-    const T x = s.rw[w];
-    for (int i = 0; i < NV; i++) col[i] -= s.mw[w][i] * x;
+  {
+    // Same order-preservation argument as the PGS weld update: all 12
+    // multipliers are known before the loop (chol_solve_n has finished
+    // with s.rw), and each col[i] still sees w = 0..11 applied in that
+    // exact sequence — only its 12 memory round trips are gone.
+    T x[N_WELD];
+#pragma unroll
+    for (int w = 0; w < N_WELD; w++) x[w] = s.rw[w];
+    for (int i = 0; i < NV; i++) {
+      T ci = col[i];
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) ci -= s.mw[w][i] * x[w];
+      col[i] = ci;
+    }
   }
   const T dnew = col[VOFF + j];
   s.pdiag[j] = dnew > T(COMPOSITE_EPS) * plain
@@ -1213,21 +1386,100 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   }
 
   // -- effective masses (row order: welds, contacts, limits) ------------------
-  for (int w = 0; w < N_WELD; w++) {
+  // 12 independent solves against ONE factor: batched (see
+  // chol_solve_multi_n — a loop interchange, bitwise). s.mw is
+  // T[N_WELD][NV], i.e. exactly the W-rows-of-stride-NV layout it wants.
+  for (int w = 0; w < N_WELD; w++)
     for (int i = 0; i < NV; i++) s.mw[w][i] = s.jw[w][i];
-    chol_solve_n(NV, d.m, s.mw[w]);
-  }
-  for (int ci = 0; ci < s.nc; ci++) {
-    for (int i = 0; i < NV; i++) s.c_minv[ci][i] = s.c_J[ci][i];
-    chol_solve_n(NV, d.m, s.c_minv[ci]);
-    T diag = T(0);
-    for (int i = 0; i < NV; i++) diag += s.c_J[ci][i] * s.c_minv[ci][i];
-    s.c_diag[ci] = diag;
+  chol_solve_multi_n<N_WELD>(NV, d.m, &s.mw[0][0]);
+  // Contact rows: s.nc is RUNTIME (0..55, typically a handful), so the
+  // batch runs as a 4 / 2 / 1 ladder — the 2-wide tier is worth its own
+  // branch here (+0.4% on train --bench over 4-with-scalar-remainder),
+  // which says the common nc is small. Rows are mutually
+  // independent (c_minv[ci] depends only on c_J[ci] and the factor,
+  // c_diag[ci] only on those two), so grouping the copies / solves /
+  // diagonals changes no value; the solve itself is the same bitwise
+  // interchange as the weld batch.
+  {
+    int ci = 0;
+    for (; ci + 3 < s.nc; ci += 4) {
+      for (int t = 0; t < 4; t++)
+        for (int i = 0; i < NV; i++) s.c_minv[ci + t][i] = s.c_J[ci + t][i];
+      chol_solve_multi_n<4>(NV, d.m, &s.c_minv[ci][0]);
+      for (int t = 0; t < 4; t++) {
+        T diag = T(0);
+        for (int i = 0; i < NV; i++)
+          diag += s.c_J[ci + t][i] * s.c_minv[ci + t][i];
+        s.c_diag[ci + t] = diag;
+      }
+    }
+    if (ci + 1 < s.nc) {
+      for (int t = 0; t < 2; t++)
+        for (int i = 0; i < NV; i++) s.c_minv[ci + t][i] = s.c_J[ci + t][i];
+      chol_solve_multi_n<2>(NV, d.m, &s.c_minv[ci][0]);
+      for (int t = 0; t < 2; t++) {
+        T diag = T(0);
+        for (int i = 0; i < NV; i++)
+          diag += s.c_J[ci + t][i] * s.c_minv[ci + t][i];
+        s.c_diag[ci + t] = diag;
+      }
+      ci += 2;
+    }
+    for (; ci < s.nc; ci++) {
+      for (int i = 0; i < NV; i++) s.c_minv[ci][i] = s.c_J[ci][i];
+      chol_solve_n(NV, d.m, s.c_minv[ci]);
+      T diag = T(0);
+      for (int i = 0; i < NV; i++) diag += s.c_J[ci][i] * s.c_minv[ci][i];
+      s.c_diag[ci] = diag;
+    }
   }
   // limit rows' plain columns = M^-1 e_j (the +-1 row sign commutes
   // exactly through the solve/projection — computed unsigned, applied
   // signed; bitwise identical to Rust's signed-row solves)
-  for (int li = 0; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
+  // BATCHED: this is the first ensure_ecol of the substep (substep
+  // clears ecomp right before calling in), so all s.nl columns are
+  // genuinely uncomputed and adjacent — the only place in the kernel
+  // where a group of unit solves is known up front. Forward halves stay
+  // per-column (each has its own m = VOFF + j); the dense back halves
+  // run 4 / 2 at a time. s.l_j is strictly ascending and its entries are
+  // distinct joints, so the batched pointers never alias.
+  //
+  // Width: s.nl measures mean 7.8, range 3-14 (f32 trace, 256 envs), so
+  // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
+  // steps/s) for ~30 more lines — dropped. See the block-size note in
+  // the header: the gain saturates at four independent chains.
+  {
+    int li = 0;
+    for (; li + 3 < s.nl; li += 4) {
+      const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
+      const int j2 = s.l_j[li + 2], j3 = s.l_j[li + 3];
+      ecol_seed(s, j0);
+      ecol_seed(s, j1);
+      ecol_seed(s, j2);
+      ecol_seed(s, j3);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j0], VOFF + j0);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j1], VOFF + j1);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j2], VOFF + j2);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j3], VOFF + j3);
+      chol_back4_n(NV, d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
+      s.ecomp[j0] = true;
+      s.ecomp[j1] = true;
+      s.ecomp[j2] = true;
+      s.ecomp[j3] = true;
+    }
+    if (li + 1 < s.nl) {
+      const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
+      ecol_seed(s, j0);
+      ecol_seed(s, j1);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j0], VOFF + j0);
+      chol_fwd_unit_n(NV, d.m, s.ecol[j1], VOFF + j1);
+      chol_back2_n(NV, d.m, s.ecol[j0], s.ecol[j1]);
+      s.ecomp[j0] = true;
+      s.ecomp[j1] = true;
+      li += 2;
+    }
+    for (; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
+  }
 
   // -- weld block A_ww = J_w M^-1 J_w^T, factored once ------------------------
   // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]; both
@@ -1251,16 +1503,43 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 
   // -- step 8: exactly 12 iterations, fixed order -----------------------------
   for (int iter = 0; iter < PGS_ITERS; iter++) {
-    // (a) weld block: exact solve of the current residual
-    for (int r = 0; r < N_WELD; r++) {
-      T jv = T(0);
-      for (int i = 0; i < NV; i++) jv += s.jw[r][i] * v[i];
-      s.rw[r] = s.bias_w[r] - jv;
+    // (a) weld block: exact solve of the current residual.
+    // Both halves are LOOP INTERCHANGES of the 12 x NV nests (bitwise —
+    // see the argument below); v[i] is touched once per i instead of 12
+    // times, and the 12 dots / the 12 terms of each v[i] become
+    // independent work instead of 12 back-to-back serial passes.
+    {
+      // 12 dots against the SAME v: each jv[r] accumulates over i in the
+      // identical ascending order over identical terms (v is read-only
+      // here), so every jv[r] is bitwise the scalar loop's.
+      T jv[N_WELD];
+#pragma unroll
+      for (int r = 0; r < N_WELD; r++) jv[r] = T(0);
+      for (int i = 0; i < NV; i++) {
+        const T vi = v[i];
+#pragma unroll
+        for (int r = 0; r < N_WELD; r++) jv[r] += s.jw[r][i] * vi;
+      }
+#pragma unroll
+      for (int r = 0; r < N_WELD; r++) s.rw[r] = s.bias_w[r] - jv[r];
     }
     chol_solve_n(N_WELD, s.aww, s.rw);
-    for (int r = 0; r < N_WELD; r++) {
-      const T dl = s.rw[r];
-      for (int i = 0; i < NV; i++) v[i] += s.mw[r][i] * dl;
+    {
+      // All 12 dl are known before the update (chol_solve_n has already
+      // finished writing s.rw and nothing below writes it), so the r
+      // loop can move inside. ORDER-PRESERVING per element: the r-outer
+      // form applied r = 0..11 to v[i] in that sequence, and so does
+      // this one — the only thing removed is v[i]'s 12 round trips
+      // through memory, which are the identity on the value.
+      T dl[N_WELD];
+#pragma unroll
+      for (int r = 0; r < N_WELD; r++) dl[r] = s.rw[r];
+      for (int i = 0; i < NV; i++) {
+        T vi = v[i];
+#pragma unroll
+        for (int r = 0; r < N_WELD; r++) vi += s.mw[r][i] * dl[r];
+        v[i] = vi;
+      }
     }
     // (b) contacts, pair-id order: projected GS, lambda >= 0
     for (int ci = 0; ci < s.nc; ci++) {
