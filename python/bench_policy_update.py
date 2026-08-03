@@ -31,7 +31,10 @@ import time
 import torch
 import torch.nn as nn
 
-from policy import NotePolicy, OBS_DIM, load_policy
+import math
+
+from policy import (N_ACTION_HEADS, N_NOTE_SLOTS, NotePolicy, OBS_DIM,
+                    OFF_NOTE_MASK, load_policy)
 from policy_cuda import FusedPolicyTrainer
 from train_batch import (MAX_GRAD_NORM, VF_COEF, fused_minibatch_losses,
                          pg_loss_fn)
@@ -40,12 +43,16 @@ ENT_COEF = 0.01
 LR = 3e-4
 
 
-def make_minibatch(n, device, seed=0):
+def make_minibatch(n, device, n_gears, seed=0):
     g = torch.Generator().manual_seed(seed)
     obs = (torch.randn(n, OBS_DIM, generator=g) * 0.7).to(device)
-    obs[:, 270:] = (torch.rand(n, 16, generator=g) < 0.6).float().to(device)
-    act = torch.randint(0, 3, (n, 12), generator=g).to(device)
-    logp = (torch.randn(n, generator=g) * 0.3 - 13.0).to(device)
+    obs[:, OFF_NOTE_MASK:] = (
+        torch.rand(n, N_NOTE_SLOTS, generator=g) < 0.6).float().to(device)
+    act = torch.randint(0, n_gears, (n, N_ACTION_HEADS),
+                        generator=g).to(device)
+    # near-uniform-policy logp: 29 heads x log(1/K)
+    logp0 = -N_ACTION_HEADS * math.log(n_gears)
+    logp = (torch.randn(n, generator=g) * 0.3 + logp0).to(device)
     adv = torch.randn(n, generator=g).to(device)
     ret = torch.randn(n, generator=g).to(device)
     return obs, act, logp, adv, ret
@@ -99,14 +106,17 @@ def peak_mem_mb(fn, warmup=2):
 
 
 def fresh_policy(src, device):
-    p = NotePolicy().to(device)
+    a = src.arch
+    p = NotePolicy(embed=a["embed"], trunk_dim=a["trunk_dim"],
+                   n_blocks=a["n_blocks"], n_heads=a["n_heads"],
+                   n_gears=a["n_gears"]).to(device)
     p.load_state_dict(src.state_dict())
     return p
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--ckpt", default="runs/gen2_ep2_50m/final.pt")
+    ap.add_argument("--ckpt", default="runs/v10_gears5_400m/final.pt")
     ap.add_argument("--mbs", type=int, nargs="+", default=[16384, 32768])
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--reps", type=int, default=3)
@@ -120,7 +130,7 @@ def main():
         print(f"weights: {args.ckpt}")
     except FileNotFoundError:
         torch.manual_seed(0)
-        src = NotePolicy()
+        src = NotePolicy(n_gears=5)  # production default (--gears 5)
         print("weights: random init (checkpoint not found)")
     print(f"gpu: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
     print(f"best of {args.reps} x {args.iters} updates, ms/update "
@@ -131,7 +141,7 @@ def main():
     print("-" * len(hdr))
     mem_rows = []
     for n in args.mbs:
-        data = make_minibatch(n, device)
+        data = make_minibatch(n, device, src.n_gears)
 
         pol_e = fresh_policy(src, device)
         opt_e = torch.optim.Adam(pol_e.parameters(), lr=LR)
