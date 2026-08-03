@@ -1026,27 +1026,28 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   }
 
   // -- step 7: narrow phase + contact rows (pair-id order) --------------------
+  // The 55 pairs reference only NUM_COLLIDERS distinct capsules, so the
+  // world-space endpoints are hoisted here: 24 transforms instead of 110.
+  // Expression structure is identical to the old inline form, so every
+  // endpoint is bit-identical to what the pair loop used to compute.
+  T ca[NUM_COLLIDERS][3], cb[NUM_COLLIDERS][3];
+  for (int c = 0; c < NUM_COLLIDERS; c++) {
+    const int f = COL_FRAME[c];
+    for (int i = 0; i < 3; i++) {
+      ca[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_A[c][0])
+                                + d.r[f][i][1] * T(COL_A[c][1])
+                                + d.r[f][i][2] * T(COL_A[c][2]));
+      cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_B[c][0])
+                                + d.r[f][i][1] * T(COL_B[c][1])
+                                + d.r[f][i][2] * T(COL_B[c][2]));
+    }
+  }
   s.nc = 0;
   for (int pid = 0; pid < NUM_PAIRS; pid++) {
     const int ia = PAIR_A[pid], ib = PAIR_B[pid];
     const int fa = COL_FRAME[ia], fbf = COL_FRAME[ib];
-    T p1[3], q1[3], p2[3], q2[3];
-    for (int i = 0; i < 3; i++) {
-      p1[i] = d.pos[fa][i] + (d.r[fa][i][0] * T(COL_A[ia][0])
-                              + d.r[fa][i][1] * T(COL_A[ia][1])
-                              + d.r[fa][i][2] * T(COL_A[ia][2]));
-      q1[i] = d.pos[fa][i] + (d.r[fa][i][0] * T(COL_B[ia][0])
-                              + d.r[fa][i][1] * T(COL_B[ia][1])
-                              + d.r[fa][i][2] * T(COL_B[ia][2]));
-      p2[i] = d.pos[fbf][i] + (d.r[fbf][i][0] * T(COL_A[ib][0])
-                               + d.r[fbf][i][1] * T(COL_A[ib][1])
-                               + d.r[fbf][i][2] * T(COL_A[ib][2]));
-      q2[i] = d.pos[fbf][i] + (d.r[fbf][i][0] * T(COL_B[ib][0])
-                               + d.r[fbf][i][1] * T(COL_B[ib][1])
-                               + d.r[fbf][i][2] * T(COL_B[ib][2]));
-    }
     T c1[3], c2[3], dist2;
-    seg_seg_closest(p1, q1, p2, q2, c1, c2, &dist2);
+    seg_seg_closest(ca[ia], cb[ia], ca[ib], cb[ib], c1, c2, &dist2);
     const T dist = sqrt(dist2);
     const T gap = dist - T(COL_R[ia] + COL_R[ib]);
     if (gap < T(MARGIN)) {
