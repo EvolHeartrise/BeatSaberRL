@@ -446,9 +446,42 @@ __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
   o[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
 }
 
+// Aliasing contract for the pass-by-reference scratch (2026-08-02):
+// `d` and `s` are two DISTINCT stack objects, declared side by side in
+// step_kernel, and no other pointer into either escapes — so every
+// `Dyn<T>& __restrict__ d` / `Solver<T>& __restrict__ s` parameter below
+// is legal and true. It matters because the kernel is local-memory-
+// traffic bound: without it, a store to any Solver field (s.jw, s.rw,
+// s.c_lam …) makes the compiler re-load the Dyn fields it was holding
+// — above all d.l, the Cholesky factor read by every solve.
+// Read-only aliases are still permitted under restrict (only MODIFIED
+// objects must be reached through the one pointer), which is what keeps
+// `constraint_solve(d, s, d.q, v)` — qpre pointing into d — well
+// defined: nothing writes d.q in that scope.
+// Measured (GTX 1080, sm_61): f32 SASS 32,880 -> 32,682 instructions,
+// LDL 7,091 -> 6,972, STL 3,682 -> 3,640; ptxas f32 frame 51,056 B
+// unchanged with spills 8,244/7,164 -> 8,260/7,176, f64 frame
+// 101,920 -> 101,936 B with spills 19,476/19,516 -> 18,888/18,992.
+// Bit-for-bit identical trajectories in both dtypes; wall time
+// neutral within noise (the kernel is serial-latency bound, so the
+// ~200 removed local-memory instructions do not show up as steps/s) —
+// kept for the codegen headroom the later algorithmic passes need.
+//
+// NO `#pragma unroll` ANYWHERE, deliberately (measured 2026-08-02): a
+// pass adding 55 pragmas to every constant-trip-3/4 loop in fk_all /
+// crba / rnea_bias / the jacobians / constraint_solve / substep
+// produced BYTE-IDENTICAL f32 SASS (and identical instruction counts +
+// spill bytes for f64) — nvcc -O3 already fully unrolls them, and the
+// f32 kernel has only 85 backward branches left in 32,682
+// instructions. Everything still rolled is a big loop (NF frames,
+// NV=35 solves, the 12 PGS iterations); unrolling those is the
+// opposite trade in a kernel already at 128 regs + 8 KB of spills, so
+// it belongs with the algorithmic Cholesky work, not with a
+// mechanical pragma pass.
+
 // fk_all: world rotation/origin per frame + world revolute axes.
 template <typename T>
-__device__ void fk_all(Dyn<T>& d) {
+__device__ void fk_all(Dyn<T>& __restrict__ d) {
   quat_to_rot(d.quat, d.r0);
   for (int k = 0; k < NF; k++) {
     const int par = F_PARENT[k];
@@ -502,7 +535,7 @@ __device__ void add_shift(T i[3][3], T m, const T d[3]) {
 }
 
 template <typename T>
-__device__ void crba(Dyn<T>& d) {
+__device__ void crba(Dyn<T>& __restrict__ d) {
   for (int i = 0; i < NV * NV; i++) d.m[i] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
@@ -639,7 +672,7 @@ __device__ void crba(Dyn<T>& d) {
 
 // RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
 template <typename T>
-__device__ void rnea_bias(Dyn<T>& d) {
+__device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   const T g[3] = {T(0), T(-GRAV), T(0)};
   T om0[3] = {d.v[3], d.v[4], d.v[5]};
   T vo0[3] = {d.v[0], d.v[1], d.v[2]};
@@ -784,6 +817,12 @@ __device__ void rnea_bias(Dyn<T>& d) {
 // constant and max clamp as Rust/torch; Rust counts into ws.pd_hits
 // instead of panicking now), f32 floors at 1e-8 and latches bad only
 // for d <= 0 (Divergences §20e).
+//
+// DELIBERATELY NOT __restrict__ (2026-08-02): m and l are distinct
+// today (d.m/d.l, s.aww/s.lww), but factoring IN PLACE (l == m) is a
+// planned follow-up — a restrict qualifier here would silently become
+// a lie the moment that lands. The disambiguation this function needs
+// (l vs m vs bad) is structural once ptxas sees the concrete callers.
 template <typename T>
 __device__ void chol_factor_n(int n, const T* m, T* l, bool* bad) {
   for (int j = 0; j < n; j++) {
@@ -807,8 +846,14 @@ __device__ void chol_factor_n(int n, const T* m, T* l, bool* bad) {
   }
 }
 
+// Triangular solve. l and x are always distinct objects at every call
+// site (d.l vs {d.rhs, s.mw[w], s.c_minv[ci], s.ecol[j]}; s.lww vs
+// s.rw), and x is the only thing written — so restrict here is the
+// difference between keeping l's row in registers across the x[i]
+// store and re-loading it every iteration.
 template <typename T>
-__device__ void chol_solve_n(int n, const T* l, T* x) {
+__device__ void chol_solve_n(int n, const T* __restrict__ l,
+                             T* __restrict__ x) {
   for (int i = 0; i < n; i++) {
     T s = x[i];
     for (int k = 0; k < i; k++) s -= l[i * n + k] * x[k];
@@ -874,8 +919,12 @@ __device__ void seg_seg_closest(const T p1[3], const T q1[3], const T p2[3],
 
 // ---- solver.rs jacobians ----------------------------------------------------
 template <typename T>
+// row is the only written pointer and never overlaps d/p/n (rows live
+// in s.jw / s.c_J, p in d.pos or s.c_pt); d and p are left unqualified
+// on purpose — one call site passes p = d.pos[frame], a read-only
+// alias.
 __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
-                                   const T n[3], T sign, T* row) {
+                                   const T n[3], T sign, T* __restrict__ row) {
   int k = frame;
   while (k >= 0) {
     if (F_COORD[k] >= 0) {
@@ -896,7 +945,7 @@ __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
 
 template <typename T>
 __device__ void angular_jacobian_acc(const Dyn<T>& d, int frame, int axis_t,
-                                     T sign, T* row) {
+                                     T sign, T* __restrict__ row) {
   int k = frame;
   while (k >= 0) {
     if (F_COORD[k] >= 0) row[VOFF + F_COORD[k]] += sign * d.axw[k][axis_t];
@@ -909,7 +958,8 @@ __device__ void angular_jacobian_acc(const Dyn<T>& d, int frame, int axis_t,
 // rows and the step-11 clamps — same expression tree as Rust's three
 // separate caches).
 template <typename T>
-__device__ void ensure_ecol(Dyn<T>& d, Solver<T>& s, int j) {
+__device__ void ensure_ecol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
+                            int j) {
   if (s.ecomp[j]) return;
   T* col = s.ecol[j];
   for (int i = 0; i < NV; i++) col[i] = T(0);
@@ -921,7 +971,8 @@ __device__ void ensure_ecol(Dyn<T>& d, Solver<T>& s, int j) {
 // Lazily compute the weld-null-space-projected column + composite
 // mobility (solver.rs capcol path; also the limit-row direction).
 template <typename T>
-__device__ void ensure_pcol(Dyn<T>& d, Solver<T>& s, int j) {
+__device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
+                            int j) {
   if (s.pcomp[j]) return;
   ensure_ecol(d, s, j);
   const T plain = s.ecol[j][VOFF + j];
@@ -946,8 +997,9 @@ __device__ void ensure_pcol(Dyn<T>& d, Solver<T>& s, int j) {
 
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
 template <typename T>
-__device__ void constraint_solve(Dyn<T>& d, Solver<T>& s, const T* qpre,
-                                 T* v) {
+__device__ void constraint_solve(Dyn<T>& __restrict__ d,
+                                 Solver<T>& __restrict__ s, const T* qpre,
+                                 T* __restrict__ v) {
   const T hinv = T(1) / T(H_SUB);
 
   // -- assembly: weld rows 0-11 ----------------------------------------------
@@ -1144,7 +1196,8 @@ __device__ void constraint_solve(Dyn<T>& d, Solver<T>& s, const T* qpre,
 
 // ---- step.rs substep (constrained) ------------------------------------------
 template <typename T>
-__device__ void substep(Dyn<T>& d, Solver<T>& s, const T tau[NQ]) {
+__device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
+                        const T* __restrict__ tau) {
   // 1-3. FK, CRBA, RNEA bias
   fk_all(d);
   crba(d);
@@ -1403,46 +1456,65 @@ __device__ T sweep_dist(const T w0[3], const T t0[3], const T t1[3],
 }
 
 // ---- kernel parameters ------------------------------------------------------
+// Every pointer below is __restrict__: the 58 slots are 58 DISTINCT
+// torch tensors, each its own allocation (cuda_env.py CudaBeatVecEnv
+// __init__ + the pool dict + the caller's actions/cand), so no two of
+// them can overlap. Without the qualifier a store through any one of
+// them (e.g. P.status[..] in the note loop) forces the compiler to
+// reload everything else it had cached — the kernel is local/global
+// traffic bound, so that reload traffic is the cost. The const pool
+// pointers additionally become read-only (LDG) loads on sm_61.
+// INVARIANT: if a future change ever aliases two slots to the same
+// tensor, the restrict qualifiers here must go.
 template <typename T>
 struct Sim {
   // dynamics state (mutated in place)
-  T *p, *quat, *q, *v;
+  T *__restrict__ p, *__restrict__ quat, *__restrict__ q, *__restrict__ v;
   // FK caches
-  T *wrist, *blade, *wrist_vel, *head, *shoulder_z;
+  T *__restrict__ wrist, *__restrict__ blade, *__restrict__ wrist_vel,
+      *__restrict__ head, *__restrict__ shoulder_z;
   // swing chain
-  T *swing_acc, *axis;
-  bool* axis_valid;
+  T *__restrict__ swing_acc, *__restrict__ axis;
+  bool* __restrict__ axis_valid;
   // follow-through tracker ring (aggregated)
-  T* tr_acc;
-  int *tr_age, *tr_cnt;
-  bool* tr_active;
-  int* tr_ptr;
+  T* __restrict__ tr_acc;
+  int *__restrict__ tr_age, *__restrict__ tr_cnt;
+  bool* __restrict__ tr_active;
+  int* __restrict__ tr_ptr;
   // episode state
-  int* tick;
-  uint8_t* status;
-  int* first_pending;
-  T* ep_return;
-  int *good, *bad, *miss, *bombs;
-  T *score, *score_pre, *score_acc, *score_post;
+  int* __restrict__ tick;
+  uint8_t* __restrict__ status;
+  int* __restrict__ first_pending;
+  T* __restrict__ ep_return;
+  int *__restrict__ good, *__restrict__ bad, *__restrict__ miss,
+      *__restrict__ bombs;
+  T *__restrict__ score, *__restrict__ score_pre, *__restrict__ score_acc,
+      *__restrict__ score_post;
   // contact aggregation (obs bits + parity introspection)
-  T *contact_imp, *contact_pt;
-  bool* contact_arm;
-  T* effort;
-  int* pd_hits;  // f32 pivot-floor engagements (Divergences §20e)
-  int64_t* chart_idx;
+  T *__restrict__ contact_imp, *__restrict__ contact_pt;
+  bool* __restrict__ contact_arm;
+  T* __restrict__ effort;
+  int* __restrict__ pd_hits;  // f32 pivot-floor engagements (§20e)
+  int64_t* __restrict__ chart_idx;
   // chart pool (P, C), read-only
-  const T *p_hit, *p_speed, *p_center, *p_dvec, *p_rot, *p_good_hy, *p_bad_hy;
-  const bool *p_valid, *p_is_right, *p_any_dir, *p_is_bomb, *p_is_head,
-      *p_is_link, *p_show_dir, *p_free_pre, *p_free_post;
-  const int64_t* p_n_notes;
-  const T *p_last_hit, *p_tail, *p_min_speed;
+  const T *__restrict__ p_hit, *__restrict__ p_speed, *__restrict__ p_center,
+      *__restrict__ p_dvec, *__restrict__ p_rot, *__restrict__ p_good_hy,
+      *__restrict__ p_bad_hy;
+  const bool *__restrict__ p_valid, *__restrict__ p_is_right,
+      *__restrict__ p_any_dir, *__restrict__ p_is_bomb,
+      *__restrict__ p_is_head, *__restrict__ p_is_link,
+      *__restrict__ p_show_dir, *__restrict__ p_free_pre,
+      *__restrict__ p_free_post;
+  const int64_t* __restrict__ p_n_notes;
+  const T *__restrict__ p_last_hit, *__restrict__ p_tail,
+      *__restrict__ p_min_speed;
   // io
-  const int64_t *actions, *cand;
-  T* ret_buf;
-  int* ret_total;
-  float* obs;
-  T* reward;
-  bool* done;
+  const int64_t *__restrict__ actions, *__restrict__ cand;
+  T* __restrict__ ret_buf;
+  int* __restrict__ ret_total;
+  float* __restrict__ obs;
+  T* __restrict__ reward;
+  bool* __restrict__ done;
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
   int gears;
@@ -1453,7 +1525,7 @@ struct Sim {
 // FK caches from the current state (lib.rs Body::refresh_fk): wrist =
 // hand-frame origin, blade = hand-frame +z column, live head/shoulders.
 template <typename T>
-__device__ void refresh_fk(Dyn<T>& d, const Sim<T>& P, int e) {
+__device__ void refresh_fk(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   fk_all(d);
   const int fw[2] = {F_L_WRIST, F_R_WRIST};
   const int fh[2] = {F_L_HAND, F_R_HAND};
@@ -1469,7 +1541,7 @@ __device__ void refresh_fk(Dyn<T>& d, const Sim<T>& P, int e) {
 }
 
 template <typename T>
-__device__ void load_state(Dyn<T>& d, const Sim<T>& P, int e) {
+__device__ void load_state(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   for (int i = 0; i < 3; i++) d.p[i] = P.p[e * 3 + i];
   for (int i = 0; i < 4; i++) d.quat[i] = P.quat[e * 4 + i];
   for (int j = 0; j < NQ; j++) d.q[j] = P.q[e * NQ + j];
@@ -1477,7 +1549,8 @@ __device__ void load_state(Dyn<T>& d, const Sim<T>& P, int e) {
 }
 
 template <typename T>
-__device__ void store_state(const Dyn<T>& d, const Sim<T>& P, int e) {
+__device__ void store_state(const Dyn<T>& __restrict__ d, const Sim<T>& P,
+                            int e) {
   for (int i = 0; i < 3; i++) P.p[e * 3 + i] = d.p[i];
   for (int i = 0; i < 4; i++) P.quat[e * 4 + i] = d.quat[i];
   for (int j = 0; j < NQ; j++) P.q[e * NQ + j] = d.q[j];
@@ -1486,7 +1559,7 @@ __device__ void store_state(const Dyn<T>& d, const Sim<T>& P, int e) {
 
 // Reset env e to the neutral state with a fresh chart (kernel phase E).
 template <typename T>
-__device__ void reset_env(Dyn<T>& d, const Sim<T>& P, int e,
+__device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
                           int64_t chart) {
   d.p[0] = T(BASE_POS0[0]);
   d.p[1] = T(BASE_POS0[1]);
@@ -1528,8 +1601,8 @@ __device__ void reset_env(Dyn<T>& d, const Sim<T>& P, int e,
 // Observation writer (lib.rs write_obs, SPEC-v10 §5) — from the CURRENT
 // tensors (post-reset state included).
 template <typename T>
-__device__ void write_obs(Dyn<T>& d, const Sim<T>& P, int e) {
-  float* obs = P.obs + (size_t)e * OBS_DIM;
+__device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
+  float* __restrict__ obs = P.obs + (size_t)e * OBS_DIM;
   for (int i = 0; i < OBS_DIM; i++) obs[i] = 0.f;
   load_state(d, P, e);
   // root position
@@ -1623,7 +1696,8 @@ __device__ void write_obs(Dyn<T>& d, const Sim<T>& P, int e) {
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
 // entirely per-thread.
 template <typename T>
-__device__ void step_env(Dyn<T>& d, Solver<T>& s, const Sim<T>& P, int e) {
+__device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
+                         const Sim<T>& P, int e) {
   const int C = P.C;
   const int64_t c0 = P.chart_idx[e];
 
