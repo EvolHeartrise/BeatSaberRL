@@ -43,6 +43,14 @@ __inline__ __device__ float warp_allsum(float v) {
   return v;
 }
 
+// NOT column-cached / NOT template-specialized, deliberately: the same
+// register-cache rewrite the fp16 kernels below carry was tried on these
+// two on 2026-08-02 and SHIFTED THE fp32 BITS (rstd differed on ~0.4% of
+// rows, y up to 9.5e-7) — pinning d at compile time fully unrolls the
+// stats loop, which lets nvcc contract `ss += v * v` into an FMA. The
+// fp32 path's seed-0 bit-exactness is the record protocol's regression
+// detector, and the measured prize was ln_fwd 754 -> 692 us on a shape
+// the fp32 path barely uses. Left alone on purpose.
 __global__ void ln_fwd_kernel(const float* __restrict__ x,
                               const float* __restrict__ w,
                               const float* __restrict__ b,
@@ -81,6 +89,8 @@ __global__ void ln_fwd_kernel(const float* __restrict__ x,
 // separate add kernel's full read+read+write pass at the policy's three
 // residual->LN sites. The second column pass re-reads xr[c] the same
 // thread just wrote (L1/L2-hot) — bit-identical to re-adding a+b.
+// (Register-caching it, as the fp16 twin does, needs the compile-time d
+// that shifts this kernel's fp32 bits — see ln_fwd_kernel above.)
 __global__ void ln_fwd_add_kernel(const float* __restrict__ a,
                                   const float* __restrict__ b,
                                   const float* __restrict__ w,
@@ -146,9 +156,19 @@ __global__ void ln_fwd_h_kernel(const __half2* __restrict__ x,
   for (; row < rows; row += stride) {
     const __half2* xr = x + row * d2;
     float s = 0.f, ss = 0.f;
+    // Per-ROW register cache of this lane's activation columns (declared
+    // INSIDE the grid-stride loop — each row refills it). Compile-time
+    // indexed at COLS2_C > 0, so it stays in registers (build log:
+    // 0 bytes stack frame); the affine pass below then never re-reads
+    // the row. Values are identical (__half22float2 is exact), so this
+    // is bitwise. COLS2_C == 0 is the generic runtime-d fallback: no
+    // compile-time bound, so it keeps re-reading rather than spilling a
+    // runtime-indexed array to local memory.
+    float2 cache[COLS2_C > 0 ? COLS2_C : 1];
 #pragma unroll
-    for (int c = lane; c < d2; c += WARP) {
+    for (int c = lane, k = 0; c < d2; c += WARP, k++) {
       const float2 v = __half22float2(xr[c]);
+      if constexpr (COLS2_C > 0) cache[k] = v;
       s += v.x + v.y;
       ss += v.x * v.x + v.y * v.y;
     }
@@ -162,8 +182,10 @@ __global__ void ln_fwd_h_kernel(const __half2* __restrict__ x,
     }
     __half2* yr = y + row * d2;
 #pragma unroll
-    for (int c = lane; c < d2; c += WARP) {
-      const float2 v = __half22float2(xr[c]);
+    for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+      float2 v;
+      if constexpr (COLS2_C > 0) v = cache[k];
+      else v = __half22float2(xr[c]);
       const float2 wv = w[c], bv = b[c];
       float2 o;
       o.x = (v.x - mu) * r * wv.x + bv.x;
@@ -176,11 +198,22 @@ __global__ void ln_fwd_h_kernel(const __half2* __restrict__ x,
 // x = round_h(a + b) written out; stats computed on the ROUNDED value so
 // forward normalization and the backward's xh reconstruction (from the
 // saved fp16 x) see the identical tensor.
+//
+// bb (nullable, fp32 (d,)): a per-channel bias for the b operand, added
+// in this pass's fp32 arithmetic as a + (b + bb) — the fp16 policy's
+// ffn.2 then runs bias-FREE (the sm_61 addmm bias epilogue costs 33-59%
+// of the GEMM, round-4 #2) and its bias rides here instead. This MOVES
+// the bias's rounding position (fp32 sum rounded once, instead of the
+// GEMM epilogue rounding mm+bias to fp16 first), i.e. near-tie class —
+// the host rejects bb on the fp32 path, whose bits are the record
+// protocol's regression detector. bb == nullptr is bitwise unchanged
+// (the add is branched around, not multiplied by zero).
 template <int COLS2_C>
 __global__ void ln_fwd_add_h_kernel(const __half2* __restrict__ a,
                                     const __half2* __restrict__ b_in,
                                     const float2* __restrict__ w,
                                     const float2* __restrict__ b,
+                                    const float2* __restrict__ bb,
                                     __half2* __restrict__ x,
                                     __half2* __restrict__ y,
                                     float* __restrict__ mean,
@@ -197,16 +230,26 @@ __global__ void ln_fwd_add_h_kernel(const __half2* __restrict__ a,
     const __half2* br = b_in + row * d2;
     __half2* xr = x + row * d2;
     float s = 0.f, ss = 0.f;
+    // per-row register cache of the ROUNDED sum (see ln_fwd_h_kernel):
+    // the affine pass used to re-read the hv it had just written
+    float2 cache[COLS2_C > 0 ? COLS2_C : 1];
 #pragma unroll
-    for (int c = lane; c < d2; c += WARP) {
+    for (int c = lane, k = 0; c < d2; c += WARP, k++) {
       const float2 va = __half22float2(ar[c]);
       const float2 vb = __half22float2(br[c]);
       float2 v;
-      v.x = va.x + vb.x;
-      v.y = va.y + vb.y;
+      if (bb) {
+        const float2 vbb = bb[c];
+        v.x = va.x + (vb.x + vbb.x);
+        v.y = va.y + (vb.y + vbb.y);
+      } else {
+        v.x = va.x + vb.x;
+        v.y = va.y + vb.y;
+      }
       const __half2 hv = __float22half2_rn(v);
       xr[c] = hv;
       const float2 vr = __half22float2(hv);  // the value everyone else sees
+      if constexpr (COLS2_C > 0) cache[k] = vr;
       s += vr.x + vr.y;
       ss += vr.x * vr.x + vr.y * vr.y;
     }
@@ -220,8 +263,10 @@ __global__ void ln_fwd_add_h_kernel(const __half2* __restrict__ a,
     }
     __half2* yr = y + row * d2;
 #pragma unroll
-    for (int c = lane; c < d2; c += WARP) {
-      const float2 v = __half22float2(xr[c]);
+    for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+      float2 v;
+      if constexpr (COLS2_C > 0) v = cache[k];
+      else v = __half22float2(xr[c]);
       const float2 wv = w[c], bv = b[c];
       float2 o;
       o.x = (v.x - mu) * r * wv.x + bv.x;
@@ -443,7 +488,9 @@ std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
 }
 
 std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
-                                   at::Tensor bias, double eps) {
+                                   at::Tensor bias, double eps,
+                                   c10::optional<at::Tensor> b_bias_opt) {
+  const at::Tensor bb = b_bias_opt.value_or(at::Tensor());
   const c10::cuda::CUDAGuard guard(a.device());
   TORCH_CHECK(a.is_cuda() && a.is_contiguous() && b.is_contiguous()
               && (a.scalar_type() == at::kFloat
@@ -457,6 +504,14 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
               && w.numel() == d && bias.numel() == d
               && w.scalar_type() == at::kFloat
               && bias.scalar_type() == at::kFloat, "w/b: fp32 contiguous");
+  if (bb.defined()) {
+    // near-tie rounding change: fp16 stream only (see the kernel note)
+    TORCH_CHECK(a.scalar_type() == at::kHalf,
+                "b_bias: fp16 path only — the fp32 path must keep the "
+                "bias in its GEMM epilogue (record-run bit-exactness)");
+    TORCH_CHECK(bb.is_contiguous() && bb.scalar_type() == at::kFloat
+                && bb.numel() == d, "b_bias: fp32 contiguous (d,)");
+  }
   const int64_t rows = a.numel() / d;
   auto x = at::empty_like(a);
   auto y = at::empty_like(a);
@@ -481,6 +536,9 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
           reinterpret_cast<const __half2*>(b.data_ptr<at::Half>()),
           reinterpret_cast<const float2*>(w.data_ptr<float>()),
           reinterpret_cast<const float2*>(bias.data_ptr<float>()),
+          bb.defined()
+              ? reinterpret_cast<const float2*>(bb.data_ptr<float>())
+              : nullptr,
           reinterpret_cast<__half2*>(x.data_ptr<at::Half>()),
           reinterpret_cast<__half2*>(y.data_ptr<at::Half>()),
           mean.data_ptr<float>(), rstd.data_ptr<float>(), rows, d2,
@@ -569,7 +627,11 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ln_fwd", &ln_fwd, "LayerNorm forward -> (y, mean, rstd)");
   m.def("ln_fwd_add", &ln_fwd_add,
-        "Residual add + LayerNorm -> (x = a + b, y = LN(x), mean, rstd)");
+        "Residual add + LayerNorm -> (x = a + b, y = LN(x), mean, rstd); "
+        "optional b_bias (fp32 (d,), fp16 path only) is added to b in "
+        "this pass — the producer GEMM then runs bias-free",
+        py::arg("a"), py::arg("b"), py::arg("w"), py::arg("bias"),
+        py::arg("eps"), py::arg("b_bias") = py::none());
   m.def("ln_bwd", &ln_bwd,
         "LayerNorm backward -> (dx, dw, db); optional gx is a residual "
         "gradient fused into the dx store (dx += gx)",

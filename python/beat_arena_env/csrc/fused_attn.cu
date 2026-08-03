@@ -135,10 +135,19 @@ __global__ void attn_fwd_kernel(const __half2* __restrict__ q,
       s += e;
     }
     const float inv = 1.f / s;
-    __half* pr = p_out + (b * Tq + tid) * T;
-    for (int j = 0; j < T; j++) {
-      row[j] *= inv;
-      pr[j] = __float2half_rn(row[j]);
+    // p_out == nullptr: the no-grad caller discards the softmax rows
+    // (they exist only as the backward's saved tensor), so the store —
+    // and the (B, Tq, T) allocation behind it — are skipped entirely.
+    // `out` is bitwise unaffected: the smem row is normalized either
+    // way, by the same multiply.
+    if (p_out) {
+      __half* pr = p_out + (b * Tq + tid) * T;
+      for (int j = 0; j < T; j++) {
+        row[j] *= inv;
+        pr[j] = __float2half_rn(row[j]);
+      }
+    } else {
+      for (int j = 0; j < T; j++) row[j] *= inv;
     }
   }
   __syncthreads();
@@ -392,7 +401,8 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
                                  at::Tensor bias, double alpha,
                                  c10::optional<at::Tensor> bq,
                                  c10::optional<at::Tensor> bk,
-                                 c10::optional<at::Tensor> bv) {
+                                 c10::optional<at::Tensor> bv,
+                                 bool need_p) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0);
   const int Tq = (int)q.size(1);
@@ -405,7 +415,10 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
               && bias.scalar_type() == at::kHalf && bias.numel() == B * T,
               "bias: contiguous fp16 (B,1,T)");
   auto out = at::empty_like(q);
-  auto p = at::empty({B, Tq, T}, q.options());
+  // need_p == false (the no-grad forward): no (B, Tq, T) allocation at
+  // all — 1.2 MB/kRow at T = Tq = 19 that the caller only threw away
+  auto p = need_p ? at::empty({B, Tq, T}, q.options())
+                  : at::empty({0}, q.options());
   if (B == 0) return {out, p};
   const size_t smem = (size_t)(Tq * SROW + 2 * T * SROW + Tq * T + T)
                       * sizeof(float);
@@ -416,7 +429,7 @@ std::vector<at::Tensor> attn_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
       reinterpret_cast<const __half2*>(v.data_ptr<at::Half>()),
       bias_ptr(bq), bias_ptr(bk), bias_ptr(bv),
       reinterpret_cast<const __half*>(bias.data_ptr<at::Half>()),
-      reinterpret_cast<__half*>(p.data_ptr<at::Half>()),
+      need_p ? reinterpret_cast<__half*>(p.data_ptr<at::Half>()) : nullptr,
       reinterpret_cast<__half2*>(out.data_ptr<at::Half>()),
       Tq, T, (float)alpha);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -476,10 +489,13 @@ std::vector<at::Tensor> attn_bwd(at::Tensor dout, at::Tensor p, at::Tensor q,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_fwd", &attn_fwd,
         "fused single-head attention forward -> (out, p); optional "
-        "bq/bk/bv fold the projection biases into the load",
+        "bq/bk/bv fold the projection biases into the load; need_p=false "
+        "skips the softmax store AND its allocation (no-grad callers), "
+        "returning an empty p",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("bias"),
         py::arg("alpha"), py::arg("bq") = py::none(),
-        py::arg("bk") = py::none(), py::arg("bv") = py::none());
+        py::arg("bk") = py::none(), py::arg("bv") = py::none(),
+        py::arg("need_p") = true);
   m.def("attn_bwd", &attn_bwd,
         "fused single-head attention backward -> (dq, dk, dv, dbp); "
         "dbp = per-sample (3, D) channel sums of dq/dk/dv (bias grads "

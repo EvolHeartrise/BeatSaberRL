@@ -68,6 +68,40 @@ def test_fwd_add_x_is_rounded_sum(dtype):
     assert y.dtype is dtype
 
 
+def test_fwd_add_b_bias_lands_in_the_fp32_sum():
+    """The folded producer-GEMM bias (policy ffn.2 -> next block's
+    ln_attn) must be added INSIDE the pass's fp32 arithmetic, i.e.
+    x == round_h(a + (b + bias)) — and the fp32 record path must refuse
+    it outright (it would move a rounding position there)."""
+    ln = FusedLayerNorm(64).cuda()
+    a = _mk(4096, 64, torch.float16, seed=1)
+    b = _mk(4096, 64, torch.float16, seed=2)
+    bias = torch.randn(64, device="cuda")
+    x, y = ln.forward_add(a, b, bias)
+    assert torch.equal(x, (a.float() + (b.float() + bias)).half())
+    assert y.dtype is torch.float16
+    # and without a bias the kernel is unchanged
+    x0, _ = ln.forward_add(a, b)
+    assert torch.equal(x0, (a.float() + b.float()).half())
+    with pytest.raises(RuntimeError):
+        ln.forward_add(a.float(), b.float(), bias)
+
+
+def test_fwd_add_b_bias_grad_is_the_channel_sum():
+    """d/d(b_bias) is the channel sum of the gradient reaching x — the
+    same reduction the producer Linear's own bias grad used to run."""
+    ln = FusedLayerNorm(64).cuda()
+    torch.nn.init.normal_(ln.weight)
+    a = _mk(1024, 64, torch.float16, seed=1).requires_grad_(True)
+    b = _mk(1024, 64, torch.float16, seed=2).requires_grad_(True)
+    bias = torch.randn(64, device="cuda", requires_grad=True)
+    _, y = ln.forward_add(a, b, bias)
+    y.backward(_mk(1024, 64, torch.float16, seed=3))
+    assert bias.grad.dtype is torch.float32
+    assert torch.equal(a.grad, b.grad)
+    assert torch.equal(bias.grad, a.grad.sum(0, dtype=torch.float32))
+
+
 @pytest.mark.parametrize("d", [64, 128])
 def test_fp16_bwd_vs_fp64(d):
     rows = 4096

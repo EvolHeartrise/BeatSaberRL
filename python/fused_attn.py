@@ -108,6 +108,9 @@ def fused_attn(q, k, v, attn_bias, alpha, bq=None, bk=None, bv=None):
     bq/bk/bv: optional fp32 projection biases folded into the loads
     (pass bias-free q/k/v mms when using them)."""
     if not torch.is_grad_enabled():
-        out, _ = _ext.attn_fwd(q, k, v, attn_bias, alpha, bq, bk, bv)
+        # need_p=False: p exists only as the backward's saved softmax;
+        # with no grad the kernel neither stores nor allocates it
+        out, _ = _ext.attn_fwd(q, k, v, attn_bias, alpha, bq, bk, bv,
+                               False)
         return out
     return _AttnFn.apply(q, k, v, attn_bias, alpha, bq, bk, bv)

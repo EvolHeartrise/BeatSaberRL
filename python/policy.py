@@ -44,9 +44,13 @@ from fused_ln import FusedLayerNorm
 #   BEAT_NO_FUSED_ATTN=1  -> eager attention (also disables qkv bias
 #                            folding, which rides the fused kernel)
 #   BEAT_NO_BIAS_RELU=1   -> eager addmm+ReLU in _seq
+#   BEAT_NO_BIAS_FOLD=1   -> ffn.2 keeps its addmm bias epilogue
+#                            instead of folding into the next block's
+#                            fused residual+LN pass
 import os as _os
 USE_FUSED_ATTN = _os.environ.get("BEAT_NO_FUSED_ATTN", "0") != "1"
 _NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
+_NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -58,8 +62,28 @@ def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     return m(x)
 
 
-def _seq(seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+def _seq(seq: nn.Sequential, x: torch.Tensor, fold_tail: bool = False):
+    """Run a Sequential on the current stream dtype.
+
+    fold_tail=True returns (out, tail_bias): on the fp16 path the FINAL
+    Linear runs BIAS-FREE and its bias comes back for the consumer to
+    fold into its own fused pass (round-4 #2 — the sm_61 addmm bias
+    epilogue is 33-59% of the GEMM). tail_bias is None when the fold
+    does not apply (fp32 record path, missing extension, env toggle),
+    in which case out already carries the bias as before."""
     ms = list(seq)
+    if fold_tail:
+        tail = ms[-1]
+        if (x.dtype is torch.float16 and isinstance(tail, nn.Linear)
+                and not _NO_BIAS_FOLD and _fl.ext_ok()):
+            return (fp16_linear_nobias(_run(ms[:-1], x), tail.weight,
+                                       tail.bias),
+                    tail.bias)
+        return _run(ms, x), None
+    return _run(ms, x)
+
+
+def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
     i = 0
     while i < len(ms):
         m = ms[i]
@@ -153,7 +177,8 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
                 n_queries: int = 0, attn_bias: torch.Tensor | None = None,
-                delta: torch.Tensor | None = None):
+                delta: torch.Tensor | None = None,
+                delta_bias: torch.Tensor | None = None):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -170,11 +195,16 @@ class Block(nn.Module):
         # add rides this block's ln_attn pass (FusedLayerNorm.forward_add)
         # instead of being a separate full-size kernel. Both fusions are
         # bit-exact. Blocks called with n_queries == 0 return
-        # (x_without_ffn, ffn_out) for the next block's delta; the final
-        # block (n_queries > 0) returns the resolved output rows.
+        # (x_without_ffn, ffn_out, ffn_bias) for the next block's delta;
+        # the final block (n_queries > 0) returns the resolved rows.
+        # delta_bias: the producer's ffn.2 bias when that Linear ran
+        # bias-free (fp16 only) — it is added to delta inside the fused
+        # ln_attn pass. NEAR-TIE numerics (the bias rounds in the LN
+        # pass's fp32 sum instead of the GEMM epilogue); the fp32 record
+        # path never sets it (see _seq's fold_tail).
         B, T, _ = x.shape
         if delta is not None:
-            x, h = self.ln_attn.forward_add(x, delta)
+            x, h = self.ln_attn.forward_add(x, delta, delta_bias)
         else:
             h = self.ln_attn(x)
         # fused-attn eligibility decides the PROJECTION form too: the
@@ -190,7 +220,19 @@ class Block(nn.Module):
         else:
             k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         if n_queries:
-            x = x[:, :n_queries]
+            # x.contiguous() is load-bearing, not hygiene: a (B, T, d)
+            # row slice is NOT contiguous, and FusedLayerNorm._eligible
+            # requires it — without it the ln_ffn.forward_add below
+            # silently took the 5-kernel fallback (2026-08-02).
+            # Verified bit-identical on BOTH streams: the fused
+            # ln_fwd_add computes its stats on the once-rounded a + b,
+            # exactly like the fallback's add-then-LN.
+            # h is deliberately left as a view: its only consumer is the
+            # q projection, whose reshape pays the same copy anyway
+            # (fp16), while an explicit .contiguous() flips fp32's
+            # F.linear onto a different cuBLAS path and SHIFTS the
+            # record path's bits (measured 1e-4 on the logits).
+            x = x[:, :n_queries].contiguous()
             h = h[:, :n_queries]
         q = (fp16_linear_nobias(h, self.q_proj.weight, self.q_proj.bias)
              if use_fused else _lin(self.q_proj, h))
@@ -224,10 +266,14 @@ class Block(nn.Module):
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
             att = _lin(self.out_proj, att)
         x, h2 = self.ln_ffn.forward_add(x, att)
-        ffn_out = _seq(self.ffn, h2)
         if n_queries:
-            return x + ffn_out
-        return x, ffn_out
+            # final block: nothing downstream fuses the residual add, so
+            # ffn.2 keeps its own bias
+            return x + _seq(self.ffn, h2)
+        # non-final block: the consumer is the NEXT block's
+        # ln_attn.forward_add, which can absorb ffn.2's bias
+        ffn_out, ffn_bias = _seq(self.ffn, h2, fold_tail=True)
+        return x, ffn_out, ffn_bias
 
 
 class NotePolicy(nn.Module):
@@ -319,13 +365,14 @@ class NotePolicy(nn.Module):
                           (3, 0))
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
-        delta = None
+        delta = delta_b = None
         for blk in self.blocks[:-1]:
-            tokens, delta = blk(tokens, None, attn_bias=attn_bias,
-                                delta=delta)
+            tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
+                                         delta=delta, delta_bias=delta_b)
         # final block: only the 3 readout tokens' outputs are consumed
         tokens = self.blocks[-1](tokens, None, n_queries=3,
-                                 attn_bias=attn_bias, delta=delta)
+                                 attn_bias=attn_bias, delta=delta,
+                                 delta_bias=delta_b)
         h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
         if fp16 and not torch.is_grad_enabled():
             # rollout fast path: weights are frozen between opt.steps,
