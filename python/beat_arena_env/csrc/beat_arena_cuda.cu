@@ -933,6 +933,45 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
   }
 }
 
+// Same solve, specialized for a UNIT right-hand side e_m (x enters as
+// all +0.0 except x[m] = 1). BITWISE identical to chol_solve_n on that
+// input, not an approximation — the forward substitution provably
+// reproduces the incoming +0.0 for every row i < m, and every k < m
+// term of every later row is an exact no-op:
+//   * the factor diagonal is always strictly positive and finite
+//     (chol_factor_n floors the pivot at PD_FLOOR_* through tmax, whose
+//     `a > b ? a : b` form also maps a NaN pivot onto the floor), so
+//     +0.0 / l[i*n+i] = +0.0 — the value already in the buffer;
+//   * by induction on i < m: s starts at x[i] = +0.0 and every term
+//     l[i*n+k] * x[k] has x[k] = +0.0 (k < i < m, established by the
+//     induction), so the product is +-0.0 and s stays exactly +0.0
+//     (+0.0 - +0.0 = +0.0 and +0.0 - -0.0 = +0.0 under RN; FMA
+//     contraction does not change either);
+//   * at i == m the same k < m terms leave s = x[m] = 1 untouched, so
+//     the k-loop may start at k = m (zero iterations here) and the
+//     divide is the identical 1 / l[m*n+m];
+//   * at i > m s starts at +0.0, the k < m terms leave it at +0.0, and
+//     the surviving k >= m terms then run in the SAME ascending order
+//     over the SAME values from the SAME accumulator start.
+// The BACK substitution stays dense: it reads x[k] for k > i, which for
+// k < m are the skipped rows — they must still hold the +0.0 the
+// forward pass would have written, so the caller's full-length zero
+// fill CANNOT shrink. (Rows > m need it too: it is their `s` seed.)
+template <typename T>
+__device__ void chol_solve_unit_n(int n, const T* __restrict__ l,
+                                  T* __restrict__ x, int m) {
+  for (int i = m; i < n; i++) {
+    T s = x[i];
+    for (int k = m; k < i; k++) s -= l[i * n + k] * x[k];
+    x[i] = s / l[i * n + i];
+  }
+  for (int i = n - 1; i >= 0; i--) {
+    T s = x[i];
+    for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
+    x[i] = s / l[i * n + i];
+  }
+}
+
 // ---- collide.rs seg_seg_closest (fixed branch order) ------------------------
 template <typename T>
 __device__ void seg_seg_closest(const T p1[3], const T q1[3], const T p2[3],
@@ -1029,9 +1068,12 @@ __device__ void ensure_ecol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                             int j) {
   if (s.ecomp[j]) return;
   T* col = s.ecol[j];
+  // full-length zero fill is load-bearing for chol_solve_unit_n — see
+  // its header (the skipped forward rows keep these +0.0 for the dense
+  // back substitution to read)
   for (int i = 0; i < NV; i++) col[i] = T(0);
   col[VOFF + j] = T(1);
-  chol_solve_n(NV, d.m, col);
+  chol_solve_unit_n(NV, d.m, col, VOFF + j);
   s.ecomp[j] = true;
 }
 
