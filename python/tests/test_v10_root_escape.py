@@ -1,5 +1,6 @@
 """SPEC-v10 Divergences §23 — the root-escape regression (A1 + the
-envelope-hit counter + the C backstop), all three tiers.
+envelope-hit counter + the C backstop), both live tiers (Rust
+reference + CUDA mirror; the torch mirror was removed 2026-08-03).
 
 The defect (2026-08-03 investigation, research/2026-08-03-root-escape-
 design.md): step 8's ω-cap/limit stage is an OBLIQUE projector under the
@@ -35,9 +36,7 @@ import torch
 
 import beat_arena_rs
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import N_JOINTS, NV
-from beat_arena_env.torch_dynamics import H_SUB, N_SUB, ROOT_V_MAX
-from beat_arena_env.torch_env import TorchBeatVecEnv
+from beat_arena_env.constants import H_SUB, N_JOINTS, N_SUB, NV, ROOT_V_MAX
 
 # a note far beyond every horizon: the tick is pure body dynamics, so
 # `done` can only come from the C backstop
@@ -143,61 +142,11 @@ def test_vec_sim_pop_envelope_hits_zero_in_ordinary_motion():
     assert vec.pop_envelope_hits() == 0
 
 
-# --- (b) torch mirror: bitwise vs Rust ON THE ESCAPE TRAJECTORY --------------
-
-def test_torch_mirror_escape_bitwise_vs_rust():
-    """The f64 parity bar (P4) must hold on the escape path too, not just
-    on healthy trajectories: identical expression trees, both tiers."""
-    env = TorchBeatVecEnv(2, charts=[[FAR_NOTE], [FAR_NOTE]], max_steps=6900,
-                          gears=3, wide_acc=False, effort_coef=4e-4,
-                          device="cpu", dtype=torch.float64, auto_reset=False)
-    env.reset()
-    q36 = torch.tensor([ESC_Q36, ESC_Q36], dtype=torch.float64)
-    # env 1 rides the same escape state; env 0 is the reference copy
-    v35 = torch.tensor([ESC_V35, ESC_V35], dtype=torch.float64)
-    env.set_state(q36, v35)
-    sim = _rust_sim()
-    sim.set_joints(ESC_Q36, ESC_V35)
-
-    obs_t, rew_t, done_t, _ = env.step(
-        torch.tensor([ESC_ACT, ESC_ACT], dtype=torch.int64))
-    obs_r, rew_r, done_r, _ = sim.step(ESC_ACT)
-
-    assert bool(done_t[0]) == done_r is True
-    assert float(rew_t[0]) == rew_r == 0.0
-    np.testing.assert_array_equal(np.array(obs_r), obs_t[0].numpy(),
-                                  err_msg="escape obs not bitwise")
-    np.testing.assert_array_equal(np.array(sim.qpos()), env.qpos()[0].numpy(),
-                                  err_msg="escape qpos not bitwise")
-    np.testing.assert_array_equal(np.array(sim.twist()),
-                                  env.twist()[0].numpy(),
-                                  err_msg="escape twist not bitwise")
-    np.testing.assert_array_equal(np.array(sim.omega()),
-                                  env.omega()[0].numpy(),
-                                  err_msg="escape omega not bitwise")
-    # and the mirror's counter agrees with Rust's (same per-(env, substep)
-    # semantics; 2 envs on the same state = twice the count)
-    assert env.pop_envelope_hits() == 2 * sim.pop_envelope_hits()
-    assert env.pop_envelope_hits() == 0
-
-
-def test_torch_mirror_bound_and_termination():
-    env = TorchBeatVecEnv(1, charts=[[FAR_NOTE]], max_steps=6900, gears=3,
-                          wide_acc=False, effort_coef=4e-4, device="cpu",
-                          dtype=torch.float64, auto_reset=False)
-    env.reset()
-    env.set_state(torch.tensor([ESC_Q36], dtype=torch.float64),
-                  torch.tensor([ESC_V35], dtype=torch.float64))
-    p0 = env.dyn.p.clone()
-    _obs, rew, done, _ = env.step(torch.tensor([ESC_ACT], dtype=torch.int64))
-    dp = float((env.dyn.p - p0).norm(dim=-1)[0])
-    assert bool(done[0]) and float(rew[0]) == 0.0
-    assert bool(env.escaped[0])
-    assert dp <= TICK_DP_BOUND + 1e-9, f"tick |dp| = {dp} m"
-    assert torch.isfinite(env.dyn.v).all() and torch.isfinite(env.dyn.p).all()
-
-
-# --- (c) CUDA tier ----------------------------------------------------------
+# --- (b) CUDA tier ----------------------------------------------------------
+# (The torch mirror carried a THIRD tier here — a bitwise Rust<->torch f64
+#  comparison on the escape tick — until the mirror was removed 2026-08-03.
+#  Everything structural it pinned is pinned below against Rust directly:
+#  done, zeroed reward, the engagement count, and the h*ROOT_V_MAX bound.)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])

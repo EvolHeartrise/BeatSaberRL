@@ -314,9 +314,9 @@ pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
 /// factorization is BIT-IDENTICAL to the unfloored one (max(d, FLOOR)
 /// returns d untouched); the floor only absorbs the singular-pose
 /// noise band (measured gimbal-lock pivots ~ −4.3e-18, §12).
-/// torch_dynamics.py PD_FLOOR_F64 and the .cu f64 path carry the SAME
-/// constant and clamp expression — Rust↔torch f64 bitwise parity is
-/// the binding constraint.
+/// The .cu f64 path carries the SAME constant and clamp expression
+/// (pinned from Python by tests/test_v10_pd_floor.py); Rust owns the
+/// value. (The retired torch mirror carried it too until 2026-08-03.)
 pub const PD_FLOOR_F64: f64 = 1e-17;
 
 /// `chol_factor` with the §22 pivot floor: a pivot below PD_FLOOR_F64

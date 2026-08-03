@@ -156,8 +156,8 @@ constexpr double SLOP = 0.005;
 constexpr double SEG_EPS = 1e-12;
 constexpr double GRAV = 9.81;
 constexpr float PD_FLOOR_F32 = 1e-8f;  // Divergences §20e (f32 only)
-// f64 pivot floor (Divergences §22): algo.rs PD_FLOOR_F64 /
-// torch_dynamics PD_FLOOR_F64 mirrored — same constant, same max clamp.
+// f64 pivot floor (Divergences §22): algo.rs PD_FLOOR_F64 mirrored —
+// same constant, same max clamp (pinned in tests/test_v10_pd_floor.py).
 constexpr double PD_FLOOR_F64 = 1e-17;
 
 // ---- model tables (model.rs, verbatim) --------------------------------------
@@ -868,9 +868,9 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 }
 
 // Dense Cholesky (lower, no pivoting; algo.rs chol_factor_floored)
-// with the pivot-floor guards of torch_dynamics.chol_factor: f64
+// with the same pivot-floor guards: f64
 // floors pivots at PD_FLOOR_F64 = 1e-17 (Divergences §22 — same
-// constant and max clamp as Rust/torch; Rust counts into ws.pd_hits
+// constant and max clamp as Rust; Rust counts into ws.pd_hits
 // instead of panicking now), f32 floors at 1e-8 and latches bad only
 // for d <= 0 (Divergences §20e).
 //

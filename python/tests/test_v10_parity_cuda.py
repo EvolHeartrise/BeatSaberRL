@@ -1,9 +1,14 @@
 """P5 gate — CUDA mirror parity vs the Rust sim (SPEC-v10 §7 P5).
 
+Since the torch mirror's removal (2026-08-03) this is THE
+cross-implementation parity gate: Rust is the reference, CUDA is the
+one gated mirror.
+
 Replaces the v9-era test_cuda_env.py. The CUDA backend transcribes the
 Rust expression trees literally (one thread per env — every accumulation
-in Rust's order), but its f64 tier is NOT bitwise like torch-CPU-f64
-(P4): CUDA's f64 sin/cos/acos differ from the CRT libm by 1 ulp on a
+in Rust's order), but its f64 tier is NOT bitwise (as the retired
+torch-CPU-f64 P4 tier was): CUDA's f64 sin/cos/acos differ from the
+CRT libm by 1 ulp on a
 few %% of inputs and nvcc contracts FMAs (SPEC-v10 Divergences §21 —
 `test_transcendental_agreement` below IS the measurement). Those
 <=1-ulp-per-op seeds are amplified at the v10 dynamics' measured
@@ -18,7 +23,7 @@ ANY non-bitwise mirror. The f64 tier is therefore:
    state each tick, so drift never accumulates): counters, score
    decomposition, per-note status, done timing EXACT over whole
    episodes; per-tick rewards within the score-rounding flip band,
- - the same f32 well-formedness tier as the torch mirror.
+ - an f32 well-formedness + statistical tier.
 
 The whole module is skipped without CUDA (the kernel has no CPU path).
 """
@@ -382,7 +387,43 @@ def test_contact_rich_parity_midline_press():
     assert saw_bits, "press scenario never set the obs contact bits"
 
 
-# --- tier 2: float32 bounded (mirrors the torch f32 tier) --------------------
+# --- (e) effort: coast is EXACTLY free ---------------------------------------
+
+def test_effort_parity_and_coast_free():
+    """Ported from the retired torch P4 module (2026-08-03), which was
+    the only tier asserting it: effort tracks Rust tick by tick (here
+    under per-tick resync, at the f64 seed band rather than bitwise),
+    and gear 0 on every joint costs EXACTLY 0.0 — zero torque means
+    zero positive mechanical work, which is structural in any tier and
+    is asserted as such."""
+    n = 2
+    charts = [[FAR_NOTE]] * n
+    env = _cenv(charts, 5, 6900)
+    env.reset()
+    sims = _rust_sims(charts, 5, 6900)
+    acts = np.zeros((n, N_JOINTS), dtype=np.int64)
+    acts[1, 10] = 1   # env1: r arm pitch full+
+    acts[1, 15] = 3   # env1: r wrist bend quarter
+    for t in range(5):
+        _o, trew, _d, _ = env.step(torch.as_tensor(acts))
+        q36s, v35s = [], []
+        for e, sim in enumerate(sims):
+            _obs, rew_r, _dr, _ev = sim.step([int(x) for x in acts[e]])
+            assert abs(sim.last_effort() - float(env.last_effort()[e])) < 1e-9,\
+                f"t{t} env{e} effort"
+            assert abs(rew_r - float(trew[e])) < 1e-9, f"t{t} env{e} reward"
+            q, v = _rust_state(sim)
+            q36s.append(q)
+            v35s.append(v)
+        assert float(env.last_effort()[0]) == 0.0, f"t{t}: coast not free"
+        wv = env.wrist_vel.clone()
+        env.set_state(torch.tensor(q36s, dtype=torch.float64),
+                      torch.tensor(v35s, dtype=torch.float64))
+        env.wrist_vel.copy_(wv)
+    assert float(env.last_effort()[1]) > 0.0, "driven env must pay effort"
+
+
+# --- tier 2: float32 bounded --------------------------------------------------
 
 def test_parity_f32_bounded():
     """f32 well-formedness + statistical agreement: finite obs, joints

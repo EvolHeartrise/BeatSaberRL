@@ -98,6 +98,16 @@ TAU_MAX = (
     484.68, 100.00, 300.00, 250.00, 180.00, 50.00,
 )
 OMEGA_CAP = (16.0,) * 7 + (40.0,) * 3 + (16.0,) * 4 + (40.0,) * 3 + (16.0,) * 12
+
+# §19b root-velocity envelope (dynamics/step.rs ROOT_W_MAX / ROOT_V_MAX,
+# mirrored in the .cu): a kinematic consequence of the foot welds + the
+# ω caps, applied both BEFORE the step-10 integration (counted, §23) and
+# after step 11. Bounds ‖Δp‖ ≤ H_SUB·ROOT_V_MAX per substep.
+ROOT_W_MAX = 96.0
+ROOT_V_MAX = 48.0
+
+# reference (neutral) root position — dynamics/model.rs base_pos0
+BASE_POS0 = (0.0, 0.94, -0.65)
 # one-way joints (elbow/knee): obs codes (2q - hi)/hi; wrist rolls wrap:
 # obs codes cos/sin (2 lanes); everything else q / max(|lo|, |hi|)
 ONE_WAY_JOINTS = (6, 13, 20, 26)

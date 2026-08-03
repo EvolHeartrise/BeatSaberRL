@@ -3,31 +3,34 @@
 Found benching v10_gears5_400m ckpt_upd0762 (a mid-surge flaily
 policy): a contorted gimbal-adjacent state drove an f64 mass-matrix
 Cholesky pivot non-positive and the old strict factorization PANICKED
-the whole VecBeatSim bench (Rust assert) / raised (torch f64
-check_pd). Both paths now clamp pivots at PD_FLOOR_F64 = 1e-17 (the
-CUDA f32 §20e net scaled by the machine-epsilon ratio) with
-engagements counted — pop_pd_hits on the Rust sims, pd_net_hits on
-the torch mirror. The floor is a simple max, so every healthy
-factorization (smallest physical pivot: wrist armature 2.7e-5, 12
-decades above the floor) is BITWISE untouched — the Rust <-> torch f64
-parity bar (test_v10_parity_torch) is unaffected and remains the
-binding gate.
+the whole VecBeatSim bench (Rust assert). Every tier now clamps pivots
+at PD_FLOOR_F64 = 1e-17 (the CUDA f32 §20e net scaled by the
+machine-epsilon ratio) with engagements counted — pop_pd_hits on the
+Rust sims and on CudaBeatVecEnv. The floor is a simple max, so every
+healthy factorization (smallest physical pivot: wrist armature 2.7e-5,
+12 decades above the floor) is BITWISE untouched.
 
 The singular family (Divergences §12): the shoulder yaw->pitch->twist
 stack gimbal-locks at pitch -90 deg — exactly l/r_arm_pitch's lower
 limit — where the yaw and twist world axes are anti-parallel through
 one point. The armature keeps the HUMANOID's pivots positive there, so
-the deterministic driver below removes the armature from the diagonal
-to reproduce the P1-measured exactly-singular matrix (pivot -4.3e-18).
+FORCING an engagement needs an armature-less model — which only the
+Rust tier can build, so that regression lives in
+`dynamics::tests_dyn::{pivot_floor_clamps_singular_gimbal_matrix,
+substep_survives_pd_loss_and_counts}` (cargo). This module covers the
+FFI end-to-end path, the popped counters, and the cross-tier floor
+CONSTANTS. (Until 2026-08-03 the torch mirror's DynBatch drove the
+forced-engagement case here; it went with the mirror.)
 """
 
+import pathlib
+import re
+
 import numpy as np
-import torch
 
 import beat_arena_rs
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import JOINT_LIMITS, N_JOINTS, NV
-from beat_arena_env.torch_dynamics import ARMATURE, BASE_POS0, DynBatch
+from beat_arena_env.constants import BASE_POS0, JOINT_LIMITS, N_JOINTS, NV
 
 FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
                 angle=4.712, speed=4.0)
@@ -43,33 +46,21 @@ def _gimbal_q36():
     return list(BASE_POS0) + [1.0, 0.0, 0.0, 0.0] + q
 
 
-def test_torch_f64_floor_engages_counts_and_stays_finite():
-    b = DynBatch(2, dtype=torch.float64)
-    b.set_state(_gimbal_q36(), [0.0] * NV)
-    b.fk_all()
-    b.crba()
-    # remove the armature -> the exactly-singular §12 matrix
-    for j in range(N_JOINTS):
-        b.M[:, 6 + j, 6 + j] -= ARMATURE[j]
-    hits0 = b.pd_net_hits
-    b.chol_factor()   # pre-§22: check_pd raised "not positive definite"
-    b.check_pd()      # must NOT raise now
-    assert b.pd_net_hits - hits0 == 2, "both envs must count an engagement"
-    assert torch.isfinite(b.L).all(), "floored factor must stay finite"
-    # and a healthy (armature'd) matrix never engages: bitwise-untouched path
-    b.crba()
-    L_before = None
-    b.chol_factor()
-    L_before = b.L.clone()
-    b.check_pd()
-    assert b.pd_net_hits - hits0 == 2, "healthy matrix must not count"
-    b.chol_factor()
-    assert torch.equal(b.L, L_before), "healthy factorization is deterministic"
-
-
-def test_torch_floor_constant_matches_contract():
-    assert DynBatch.PD_FLOOR_F64 == 1e-17
-    assert DynBatch.PD_FLOOR_F32 == 1e-8
+def test_floor_constants_match_across_tiers():
+    """The §22/§20e contract is a pair of NUMBERS shared by two
+    implementations that cannot import each other. Rust owns
+    PD_FLOOR_F64 (asserted bitwise in tests_dyn); this pins the CUDA
+    kernel's two constexprs to the same contract, which is the check
+    the retired torch mirror used to carry."""
+    cu = (pathlib.Path(__file__).resolve().parents[1]
+          / "beat_arena_env" / "csrc" / "beat_arena_cuda.cu").read_text()
+    f32 = re.search(r"constexpr\s+float\s+PD_FLOOR_F32\s*=\s*([0-9.eE+-]+)f?;",
+                    cu)
+    f64 = re.search(r"constexpr\s+double\s+PD_FLOOR_F64\s*=\s*([0-9.eE+-]+);",
+                    cu)
+    assert f32 and f64, "the .cu pivot-floor constants moved or were renamed"
+    assert float(f32.group(1)) == 1e-8, "§20e f32 net changed"
+    assert float(f64.group(1)) == 1e-17, "§22 f64 floor changed"
 
 
 def test_rust_sim_survives_contorted_state_and_exposes_counter():

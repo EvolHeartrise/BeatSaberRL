@@ -51,7 +51,7 @@ from .constants import (
     KIND_CHAIN_LINK, N_JOINTS, NV, OBS_DIM, note_center,
 )
 
-NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (torch_dynamics.NUM_PAIRS)
+NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 
 # Follow-through tracker ring (v7 design, see the kernel header):
 # same-tick same-saber trackers share (arc, age) forever, so they
