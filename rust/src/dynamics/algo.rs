@@ -328,24 +328,80 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
     let mut hits = 0u32;
     for j in 0..n {
         let mut d = m[j * n + j];
-        for k in 0..j {
-            d -= l[j * n + k] * l[j * n + k];
+        {
+            let lj = &l[j * n..j * n + j]; // row j, columns 0..j
+            for k in 0..j {
+                d -= lj[k] * lj[k];
+            }
         }
-        if d < PD_FLOOR_F64 {
+        // NEGATED comparison, not `d < FLOOR`: a NaN pivot must be
+        // floored and counted too (`NaN < x` is false, so the plain
+        // form let NaN through unfloored and poisoned the whole
+        // factor). `!(d >= FLOOR)` is true for NaN and identical to
+        // `d < FLOOR` for every non-NaN d — this matches the CUDA
+        // tmax/fmax semantics the .cu mirror carries (NaN → floor).
+        if !(d >= PD_FLOOR_F64) {
             hits += 1;
             d = PD_FLOOR_F64;
         }
         let dj = d.sqrt();
         l[j * n + j] = dj;
-        for i in (j + 1)..n {
-            l[j * n + i] = 0.0; // keep the strict upper triangle clean
-        }
-        for i in (j + 1)..n {
-            let mut s = m[i * n + j];
-            for k in 0..j {
-                s -= l[i * n + k] * l[j * n + k];
+        // NOTE (2026-08-03): the strict upper triangle is NOT zeroed
+        // any more. Nothing reads it — `chol_solve` touches only
+        // l[i*n+k] with k ≤ i (forward) and l[k*n+i] with k > i, i.e.
+        // row k column i with i < k, also lower — so the O(n²) zeroing
+        // pass was pure dead stores. `chol_factor` below dropped it
+        // too; the one test that compared whole factors now compares
+        // the lower triangle (tests_dyn.rs).
+        //
+        // UNROLL-AND-JAM by 4 over the row index i: rows i..i+4 share
+        // one pass over the k-chain. Each s_x still subtracts its terms
+        // in ASCENDING k — bit-for-bit the one-row-at-a-time result —
+        // and no jammed row reads a value another writes (the k-chain
+        // stops at k < j, the writes land at column j).
+        let (head, tail) = l.split_at_mut((j + 1) * n);
+        let lj = &head[j * n..j * n + j];
+        let mut i = j + 1;
+        while i + 4 <= n {
+            let (r0, r1, r2, r3) = {
+                let b = (i - j - 1) * n;
+                (b, b + n, b + 2 * n, b + 3 * n)
+            };
+            let (mut s0, mut s1, mut s2, mut s3) = (
+                m[i * n + j],
+                m[(i + 1) * n + j],
+                m[(i + 2) * n + j],
+                m[(i + 3) * n + j],
+            );
+            {
+                let t = &*tail;
+                let (q0, q1) = (&t[r0..r0 + j], &t[r1..r1 + j]);
+                let (q2, q3) = (&t[r2..r2 + j], &t[r3..r3 + j]);
+                for k in 0..j {
+                    let ljk = lj[k];
+                    s0 -= q0[k] * ljk;
+                    s1 -= q1[k] * ljk;
+                    s2 -= q2[k] * ljk;
+                    s3 -= q3[k] * ljk;
+                }
             }
-            l[i * n + j] = s / dj;
+            tail[r0 + j] = s0 / dj;
+            tail[r1 + j] = s1 / dj;
+            tail[r2 + j] = s2 / dj;
+            tail[r3 + j] = s3 / dj;
+            i += 4;
+        }
+        while i < n {
+            let r = (i - j - 1) * n;
+            let mut s = m[i * n + j];
+            {
+                let q = &tail[r..r + j];
+                for k in 0..j {
+                    s -= q[k] * lj[k];
+                }
+            }
+            tail[r + j] = s / dj;
+            i += 1;
         }
     }
     hits
@@ -364,9 +420,8 @@ pub fn chol_factor(n: usize, m: &[f64], l: &mut [f64]) -> bool {
         }
         let dj = d.sqrt();
         l[j * n + j] = dj;
-        for i in (j + 1)..n {
-            l[j * n + i] = 0.0; // keep the strict upper triangle clean
-        }
+        // strict upper triangle left untouched — see the note in
+        // `chol_factor_floored`: no reader, so zeroing it was dead
         for i in (j + 1)..n {
             let mut s = m[i * n + j];
             for k in 0..j {
@@ -379,18 +434,33 @@ pub fn chol_factor(n: usize, m: &[f64], l: &mut [f64]) -> bool {
 }
 
 /// In-place solve M x = b via the factor L (forward then back subst).
+/// (2026-08-03) Both k-chains are expressed over EXACT-LENGTH slices so
+/// LLVM can hoist/erase the per-element bounds checks and vectorize the
+/// unit-stride forward pass. Pure indexing restructure — no `unsafe`,
+/// no `get_unchecked`, no `mul_add`: identical operands in identical
+/// order, so the result is bitwise the naive form's.
 pub fn chol_solve(n: usize, l: &[f64], x: &mut [f64]) {
     for i in 0..n {
+        let lrow = &l[i * n..i * n + i]; // row i, columns 0..i
         let mut s = x[i];
-        for k in 0..i {
-            s -= l[i * n + k] * x[k];
+        {
+            let xr = &x[..i];
+            for k in 0..i {
+                s -= lrow[k] * xr[k];
+            }
         }
         x[i] = s / l[i * n + i];
     }
     for i in (0..n).rev() {
         let mut s = x[i];
-        for k in (i + 1)..n {
-            s -= l[k * n + i] * x[k];
+        {
+            let xr = &x[..n];
+            // rows i+1..n, column i — chunks_exact keeps k ascending,
+            // the same order (and therefore the same partial sums) as
+            // the l[k*n + i] indexing it replaces
+            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+                s -= lrow[i] * xr[k];
+            }
         }
         x[i] = s / l[i * n + i];
     }
