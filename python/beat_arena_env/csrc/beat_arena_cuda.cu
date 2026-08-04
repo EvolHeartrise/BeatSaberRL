@@ -106,6 +106,26 @@ constexpr int NOTE_FEAT = 14;
 // The working set (45 KB stack/thread) is still far beyond L2, so
 // traffic is not free — it is simply already hidden behind the chains.
 //
+// K4/K5 (2026-08-03) REFINES that, and the refinement is the important
+// part: per-item verdicts on this kernel are ORDER-DEPENDENT, so a
+// single measurement of an item in isolation is not a verdict.
+// Measured at N=4096 (env-only micro-bench, median-of-3, budget 600k):
+//   K4c dead upper-triangle stores (~970/substep)      +0.24%
+//   K4a batched unit forward substitution              +0.67%
+//   K4b pivot chain software-pipelined into the rows   +0.37%
+//   K4e inertia_world cached crba -> rnea_bias         -0.06%  (!)
+//   K4d broad-phase sphere reject                      +0.03%  (!)
+//   K5  weld-Jacobian sparsity (35 -> 12 columns)      +8.92%
+// K4e and K4d were REVERTED on those numbers, then RE-PROBED after K5
+// landed and both flipped decisively positive: K4e +1.15%, K4d +0.80%.
+// The reason is register/spill pressure, not arithmetic. K5 cut the
+// three weld contractions from NV to 12 terms, which took f32 spills
+// 6,984/4,768 -> 4,516/3,328 B; under the old pressure K4e's +1,104 B
+// frame and K4d's extra live values each bought back more spill than
+// they saved in work, and the same code became a clear win once the
+// budget had slack. Whenever an item lands that moves spills, re-probe
+// the items that lost by less than ~1%.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -312,6 +332,22 @@ __device__ __forceinline__ bool is_arm_r(int id) {
 
 // feet weld (solver.rs)
 __device__ constexpr int WELD_FRAMES[2] = {F_L_FOOT, F_R_FOOT};
+// K5 — STRUCTURAL SPARSITY of the 12 weld Jacobian rows. A weld row is
+// built by point_jacobian_acc / angular_jacobian_acc, which touch
+// row[VOFF + F_COORD[k]] for k on the frame's ancestor chain plus
+// row[0..5]; every other column is left at the +0.0 of the row's zero
+// fill. Walking F_PARENT from F_L_FOOT = 23 gives frames
+// 23,22,21,20,19,18 -> F_COORD 22,21,20,19,18,17 -> v-columns 23..28,
+// and from F_R_FOOT = 29 frames 29,28,27,26,25,24 -> v-columns 29..34.
+// So rows 0..5 have support {0..5} u {23..28} and rows 6..11 have
+// {0..5} u {29..34}: 12 of NV = 35 columns. The three consumers that
+// contract a weld row (A_ww assembly, the PGS weld dot, ensure_pcol's
+// fused dot) iterate only those ranges; s.jw's zero fill and the
+// full-length s.mw seed copy are UNCHANGED, since s.mw is dense.
+constexpr int WJ_L0 = 23;
+constexpr int WJ_R0 = 29;
+static_assert(WJ_R0 == WJ_L0 + 6 && WJ_R0 + 6 == NV && N_WELD == 12,
+              "K5: weld support layout is {0..5} u {L0..L0+5} / {R0..NV}");
 __device__ constexpr double WELD_TARGET_P[2][3] = {
     {-0.10, 0.07, -0.65}, {0.10, 0.07, -0.65}};
 
@@ -408,6 +444,14 @@ struct Dyn {
   // CRBA composites
   T cm[NF], cc[NF][3], ci[NF][3][3];
   T bm, bc[3], bi[3][3];
+  // R diag(i) R^T per frame, computed by crba and re-read by rnea_bias
+  // (K4e) instead of recomputed there from the same d.r / F_INERTIA.
+  // ci/bi hold the same values on entry but are MUTATED by the leaf->root
+  // composite merge, so the raw world inertia needs its own slot; it is
+  // written and read under the identical F_MASS[k] > 0 predicate, and
+  // crba runs immediately before rnea_bias in substep with d.r untouched
+  // between them (crba writes only m / cm / cc / ci / b* / iw*).
+  T iw[NF][3][3], iw0[3][3];
   // RNEA scratch
   T om[NF][3], al[NF][3], vo[NF][3], ao[NF][3], fb[NF][3], nb[NF][3];
   bool pd_bad;
@@ -582,6 +626,23 @@ __device__ void inertia_world(const T r[3][3], const double idiag[3],
     }
 }
 
+// Same, teed into two destinations from the one register value v (K4e):
+// crba needs a MUTABLE composite seed and a pristine copy for rnea_bias,
+// and both get identical bits with no read-back.
+template <typename T>
+__device__ void inertia_world2(const T r[3][3], const double idiag[3],
+                               T out[3][3], T keep[3][3]) {
+  for (int a = 0; a < 3; a++)
+    for (int b = a; b < 3; b++) {
+      T v = r[a][0] * T(idiag[0]) * r[b][0] + r[a][1] * T(idiag[1]) * r[b][1]
+            + r[a][2] * T(idiag[2]) * r[b][2];
+      out[a][b] = v;
+      out[b][a] = v;
+      keep[a][b] = v;
+      keep[b][a] = v;
+    }
+}
+
 template <typename T>
 __device__ void add_shift(T i[3][3], T m, const T d[3]) {
   T dd = dot3(d, d);
@@ -590,9 +651,23 @@ __device__ void add_shift(T i[3][3], T m, const T d[3]) {
       i[a][b] += m * ((a == b ? dd : T(0)) - d[a] * d[b]);
 }
 
+// LOWER TRIANGLE + DIAGONAL ONLY (2026-08-03, K4c). Every consumer of
+// d.m — chol_factor_n (in place: reads a[j*n+j], a[j*n+k] k<j,
+// a[i*n+k] k<j<i, a[i*n+j] i>j; writes a[j*n+j], a[i*n+j] i>j),
+// chol_solve_n / chol_solve_multi_n (l[i*n+k] k<i; l[k*n+i] k>i, i.e.
+// row k > col i; l[i*n+i]), chol_fwd_unit_n (l[i*n+k] m<=k<i; diag) and
+// chol_back{,2,4}_n (l[k*n+i] k>i; diag) — touches row >= col ONLY.
+// Nothing in the kernel ever reads d.m above the diagonal, so this
+// function no longer writes there: the NV*NV zero fill is narrowed to
+// the 630 lower+diagonal entries (595 stores saved — and ~286 of the
+// kept ones are genuinely load-bearing, entries no producer below
+// touches), the symmetric ancestor pair writes one element at
+// [max*NV+min], and the root-block mirror stores are gone. ~970 dead
+// stores per substep.
 template <typename T>
 __device__ void crba(Dyn<T>& __restrict__ d) {
-  for (int i = 0; i < NV * NV; i++) d.m[i] = T(0);
+  for (int i = 0; i < NV; i++)
+    for (int j = 0; j <= i; j++) d.m[i * NV + j] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
     const T mk = T(F_MASS[k]);
@@ -602,7 +677,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
         d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * T(F_COM[k][0])
                                     + d.r[k][i][1] * T(F_COM[k][1])
                                     + d.r[k][i][2] * T(F_COM[k][2]));
-      inertia_world(d.r[k], F_INERTIA[k], d.ci[k]);
+      inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
     } else {
       for (int i = 0; i < 3; i++) d.cc[k][i] = d.pos[k][i];
       for (int i = 0; i < 3; i++)
@@ -615,7 +690,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
     d.bc[i] = d.p[i] + (d.r0[i][0] * T(BASE_COM[0])
                         + d.r0[i][1] * T(BASE_COM[1])
                         + d.r0[i][2] * T(BASE_COM[2]));
-  inertia_world(d.r0, BASE_INERTIA, d.bi);
+  inertia_world2(d.r0, BASE_INERTIA, d.bi, d.iw0);
 
   // leaf->root accumulation with column fill before parent merge
   for (int k = NF - 1; k >= 0; k--) {
@@ -647,8 +722,9 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
           cross3(rel2, hl, r2xhl);
           T tot2[3] = {ha[0] + r2xhl[0], ha[1] + r2xhl[1], ha[2] + r2xhl[2]};
           const T val = dot3(d.axw[anc], tot2);
-          d.m[ia * NV + j] = val;
-          d.m[j * NV + ia] = val;
+          // symmetric pair -> lower entry only (F_COORD is not monotonic
+          // in the frame index, so the order of ia vs j is a runtime fact)
+          d.m[(ia > j ? ia : j) * NV + (ia > j ? j : ia)] = val;
         }
         anc = F_PARENT[anc];
       }
@@ -658,10 +734,10 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       T rrxhl[3];
       cross3(relr, hl, rrxhl);
       T lr[3] = {ha[0] + rrxhl[0], ha[1] + rrxhl[1], ha[2] + rrxhl[2]};
+      // j >= VOFF > 3 + t, so only the [j][*] halves are in the lower
+      // triangle; the [t][j] / [3+t][j] mirrors were dead.
       for (int t = 0; t < 3; t++) {
-        d.m[t * NV + j] = hl[t];
         d.m[j * NV + t] = hl[t];
-        d.m[(3 + t) * NV + j] = lr[t];
         d.m[j * NV + (3 + t)] = lr[t];
       }
     }
@@ -711,19 +787,17 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
     for (int j = 0; j < 3; j++) rr[i][j] = d.bi[i][j];
   add_shift(rr, d.bm, dd);
   for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) {
+    for (int j = 0; j <= i; j++) {
       d.m[i * NV + j] = i == j ? d.bm : T(0);
       d.m[(3 + i) * NV + (3 + j)] = rr[i][j];
     }
   const T sk[3][3] = {{T(0), -dd[2], dd[1]},
                       {dd[2], T(0), -dd[0]},
                       {-dd[1], dd[0], T(0)}};
+  // (3+i, j) is strictly lower for every i, j in 0..2; the (j, 3+i)
+  // mirror was dead.
   for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) {
-      const T val = d.bm * sk[i][j];
-      d.m[(3 + i) * NV + j] = val;
-      d.m[j * NV + (3 + i)] = val;
-    }
+    for (int j = 0; j < 3; j++) d.m[(3 + i) * NV + j] = d.bm * sk[i][j];
 }
 
 // RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
@@ -784,8 +858,7 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       cross3(omk, omxe, omxomxe);
       T ac[3];
       for (int i = 0; i < 3; i++) ac[i] = (aok[i] + alxe[i]) + omxomxe[i];
-      T iw[3][3];
-      inertia_world(d.r[k], F_INERTIA[k], iw);
+      const T(&iw)[3][3] = d.iw[k];  // K4e
       T fbk[3];
       for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * T(F_MASS[k]);
       T iwal[3], iwom[3];
@@ -821,8 +894,7 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
     cross3(om0, e, omxe);
     cross3(om0, omxe, omxomxe);
     T ac[3] = {omxomxe[0], omxomxe[1], omxomxe[2]};
-    T iw[3][3];
-    inertia_world(d.r0, BASE_INERTIA, iw);
+    const T(&iw)[3][3] = d.iw0;  // K4e
     for (int i = 0; i < 3; i++) f0[i] = (ac[i] - g[i]) * T(BASE_MASS);
     T iwom[3];
     for (int i = 0; i < 3; i++)
@@ -889,9 +961,10 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 //   * every other read is a[i*n+k] / a[j*n+k] with k < j, i.e. columns
 //     already converted to L by earlier j, and no write at column j
 //     touches a column < j.
-// Callers: d.m (written only by crba, which zeroes all NV*NV first) and
-// s.aww (fully rewritten, both triangles, before each factor) — neither
-// is read as M after its factor, so nothing needs the original matrix.
+// Callers: d.m (written only by crba) and s.aww (rewritten before each
+// factor) — neither is read as M after its factor, so nothing needs the
+// original matrix. Both are supplied LOWER TRIANGLE + DIAGONAL ONLY
+// since K4c; this function reads and writes nothing above the diagonal.
 // Frees Dyn::l (NV*NV) and Solver::lww (N_WELD*N_WELD) from the frame.
 //
 // The dead upper-triangle zeroing that used to run here (l[j*n+i],
@@ -903,11 +976,25 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // `a` and `bad` are distinct objects (the matrix buffer vs d.pd_bad),
 // so __restrict__ on both is true and lets the L row stay in registers
 // across the (rare) pivot-floor latch.
+//
+// PIVOT CHAIN SOFTWARE-PIPELINED (2026-08-03, K4b/a). The column-j pivot
+// used to be its own serial reduction over k < j, run back to back with
+// the row loop that immediately follows it. Column j+1's pivot,
+//   dpiv_{j+1} = M[j+1][j+1] - sum_{k<=j} L[j+1][k]^2,
+// depends only on values that are FINAL by the time column j's row loop
+// touches row j+1: L[j+1][k] for k < j was written by earlier columns,
+// and L[j+1][j] is the very first value that loop produces. So it is
+// accumulated INSIDE column j's first row block — the same terms, the
+// same ascending k, one extra scalar carried in a register, zero extra
+// storage and zero extra loads (a[(j+1)*n+k] is already being loaded
+// there as s0's operand) — and column j+1 then starts with its pivot in
+// hand. Bitwise: identical expression, identical order, identical
+// inputs; a[(j+1)*n+(j+1)] is the untouched M diagonal (column j writes
+// only column j).
 template <typename T>
 __device__ void chol_factor_n(int n, T* a, bool* bad) {
+  T dpiv = a[0];  // j = 0: the pivot is M[0][0], no terms
   for (int j = 0; j < n; j++) {
-    T dpiv = a[j * n + j];
-    for (int k = 0; k < j; k++) dpiv -= a[j * n + k] * a[j * n + k];
     if (sizeof(T) == 8) {
       if (dpiv < T(PD_FLOOR_F64)) *bad = true;
       dpiv = tmax(dpiv, T(PD_FLOOR_F64));
@@ -927,6 +1014,41 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
     // inner loop only ever reads columns k < j, and the four deferred
     // stores are all in column j.
     int i = j + 1;
+    // Row j+1 is peeled (as the head of a 4-block when there is room,
+    // scalar otherwise) so the next pivot rides along on its loads.
+    T np = i < n ? a[i * n + i] : T(0);
+    if (i + 3 < n) {
+      const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+      T s0 = a[r0 + j], s1 = a[r1 + j], s2 = a[r2 + j], s3 = a[r3 + j];
+      for (int k = 0; k < j; k++) {
+        const T ljk = a[j * n + k];
+        const T v0 = a[r0 + k];
+        s0 -= v0 * ljk;
+        s1 -= a[r1 + k] * ljk;
+        s2 -= a[r2 + k] * ljk;
+        s3 -= a[r3 + k] * ljk;
+        np -= v0 * v0;
+      }
+      const T l0 = s0 / dj;
+      a[r0 + j] = l0;
+      a[r1 + j] = s1 / dj;
+      a[r2 + j] = s2 / dj;
+      a[r3 + j] = s3 / dj;
+      np -= l0 * l0;
+      i += 4;
+    } else if (i < n) {
+      const int r0 = i * n;
+      T s = a[r0 + j];
+      for (int k = 0; k < j; k++) {
+        const T v0 = a[r0 + k];
+        s -= v0 * a[j * n + k];
+        np -= v0 * v0;
+      }
+      const T l0 = s / dj;
+      a[r0 + j] = l0;
+      np -= l0 * l0;
+      i += 1;
+    }
     for (; i + 3 < n; i += 4) {
       const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
       T s0 = a[r0 + j], s1 = a[r1 + j], s2 = a[r2 + j], s3 = a[r3 + j];
@@ -947,6 +1069,7 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
       for (int k = 0; k < j; k++) s -= a[i * n + k] * a[j * n + k];
       a[i * n + j] = s / dj;
     }
+    dpiv = np;
   }
 }
 
@@ -1053,6 +1176,65 @@ __device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
   }
 }
 
+// BATCHED unit forward substitution, W columns sharing one factor, run
+// DENSE from the group's smallest m0 = min(m_t) (K4a). Every column
+// keeps its own accumulator over the same ascending k, so this is the
+// same loop interchange as chol_solve_multi_n on the rows i >= m_t; the
+// rows and terms it ADDS for a column with m_t > m0 are exact no-ops by
+// chol_fwd_unit_n's own proof, quoted here for the batched shape:
+//   * rows m0 <= i < m_t: x_t[i] enters as the seeded +0.0 and every
+//     term l[i*n+k] * x_t[k] has k < i < m_t, so x_t[k] is +0.0 by
+//     induction — s stays exactly +0.0 (+0.0 - (+-0.0) = +0.0 under RN)
+//     and the store is +0.0 / diag = +0.0, the value already there
+//     (the diagonal is strictly positive and finite: chol_factor_n's
+//     tmax floor maps even a NaN pivot onto PD_FLOOR_*);
+//   * row i == m_t: s enters as 1 and the k < m_t terms subtract +-0.0
+//     from it, leaving 1 — then the surviving k >= m_t terms and the
+//     divide are the scalar pass's, bit for bit;
+//   * rows i > m_t: s enters +0.0, the k < m_t terms leave it +0.0, and
+//     the k >= m_t terms then run in the SAME ascending order over the
+//     SAME values from the SAME accumulator start.
+// So the batch is bitwise the W separate chol_fwd_unit_n calls, and it
+// replaces W back-to-back serial chains with W independent ones.
+template <typename T>
+__device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
+                                 T* __restrict__ x0, T* __restrict__ x1,
+                                 T* __restrict__ x2, T* __restrict__ x3,
+                                 int m0) {
+  for (int i = m0; i < n; i++) {
+    T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
+    for (int k = m0; k < i; k++) {
+      const T lik = l[i * n + k];
+      s0 -= lik * x0[k];
+      s1 -= lik * x1[k];
+      s2 -= lik * x2[k];
+      s3 -= lik * x3[k];
+    }
+    const T dg = l[i * n + i];
+    x0[i] = s0 / dg;
+    x1[i] = s1 / dg;
+    x2[i] = s2 / dg;
+    x3[i] = s3 / dg;
+  }
+}
+
+template <typename T>
+__device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
+                                 T* __restrict__ x0, T* __restrict__ x1,
+                                 int m0) {
+  for (int i = m0; i < n; i++) {
+    T s0 = x0[i], s1 = x1[i];
+    for (int k = m0; k < i; k++) {
+      const T lik = l[i * n + k];
+      s0 -= lik * x0[k];
+      s1 -= lik * x1[k];
+    }
+    const T dg = l[i * n + i];
+    x0[i] = s0 / dg;
+    x1[i] = s1 / dg;
+  }
+}
+
 template <typename T>
 __device__ void chol_back_n(int n, const T* __restrict__ l,
                             T* __restrict__ x) {
@@ -1080,11 +1262,10 @@ __device__ void chol_solve_unit_n(int n, const T* __restrict__ l,
 // explicit pointers rather than a stride. Accumulators are named scalars
 // so they cannot land in local memory.
 //
-// Only the BACK half is batched for the unit columns: the forward half
-// is sparse from a per-column m (chol_fwd_unit_n), and running a batch
-// from the group's smallest m would do the skipped rows as arithmetic
-// no-ops — correct, but it re-adds exactly the work A4 removed. Back
-// substitution is also the larger half (n^2/2 vs (n-m)^2/2, m >= VOFF).
+// The forward half is batched too since K4a (chol_fwd_unit{2,4}_n): it
+// runs dense from the group's smallest m, which does re-add some of the
+// rows A4 removed, but they are exact arithmetic no-ops and the four
+// chains it buys pay for them — measured, see the session note.
 template <typename T>
 __device__ void chol_back4_n(int n, const T* __restrict__ l,
                              T* __restrict__ x0, T* __restrict__ x1,
@@ -1247,14 +1428,31 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // terms, and the copy is per-element independent, so col and every
   // sum[w] are bitwise what the three separate passes produced.
   {
+    // The dot half is segmented onto the K5 weld support: each sum[w]
+    // still visits its own terms in ascending i, only the structural
+    // +-0.0 products are gone. The COPY stays full-length (col is
+    // consumed densely).
     T sum[N_WELD];
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) sum[w] = T(0);
-    for (int i = 0; i < NV; i++) {
+    for (int i = 0; i < VOFF; i++) {  // root columns: all 12 rows
       const T ci = s.ecol[j][i];
       col[i] = ci;
 #pragma unroll
       for (int w = 0; w < N_WELD; w++) sum[w] += s.jw[w][i] * ci;
+    }
+    for (int i = VOFF; i < WJ_L0; i++) col[i] = s.ecol[j][i];  // copy only
+    for (int i = WJ_L0; i < WJ_R0; i++) {  // left-foot chain: rows 0..5
+      const T ci = s.ecol[j][i];
+      col[i] = ci;
+#pragma unroll
+      for (int w = 0; w < N_WELD / 2; w++) sum[w] += s.jw[w][i] * ci;
+    }
+    for (int i = WJ_R0; i < NV; i++) {  // right-foot chain: rows 6..11
+      const T ci = s.ecol[j][i];
+      col[i] = ci;
+#pragma unroll
+      for (int w = N_WELD / 2; w < N_WELD; w++) sum[w] += s.jw[w][i] * ci;
     }
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) s.rw[w] = sum[w];
@@ -1317,7 +1515,14 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // world-space endpoints are hoisted here: 24 transforms instead of 110.
   // Expression structure is identical to the old inline form, so every
   // endpoint is bit-identical to what the pair loop used to compute.
-  T ca[NUM_COLLIDERS][3], cb[NUM_COLLIDERS][3];
+  // BROAD PHASE (K4d): mid[c] and HLR[c] = half_len + radius bound each
+  // capsule by a sphere; seg_dist >= |mid_a-mid_b| - half_a - half_b, so
+  // the `gap < MARGIN` branch provably cannot fire once
+  // |mid_a-mid_b| >= HLR_a + HLR_b + MARGIN. 2% slack on the squared
+  // threshold (~1% linear) vs ~1e-6 f32 error. Retained pairs run
+  // byte-identical code.
+  T ca[NUM_COLLIDERS][3], cb[NUM_COLLIDERS][3], mid[NUM_COLLIDERS][3];
+  T hlr[NUM_COLLIDERS];
   for (int c = 0; c < NUM_COLLIDERS; c++) {
     const int f = COL_FRAME[c];
     for (int i = 0; i < 3; i++) {
@@ -1327,11 +1532,23 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_B[c][0])
                                 + d.r[f][i][1] * T(COL_B[c][1])
                                 + d.r[f][i][2] * T(COL_B[c][2]));
+      mid[c][i] = (ca[c][i] + cb[c][i]) * T(0.5);
     }
+    const double ex = COL_B[c][0] - COL_A[c][0];
+    const double ey = COL_B[c][1] - COL_A[c][1];
+    const double ez = COL_B[c][2] - COL_A[c][2];
+    hlr[c] = T(0.5 * sqrt(ex * ex + ey * ey + ez * ez) + COL_R[c]);
   }
   s.nc = 0;
   for (int pid = 0; pid < NUM_PAIRS; pid++) {
     const int ia = PAIR_A[pid], ib = PAIR_B[pid];
+    {
+      const T mx = mid[ia][0] - mid[ib][0];
+      const T my = mid[ia][1] - mid[ib][1];
+      const T mz = mid[ia][2] - mid[ib][2];
+      const T lim = hlr[ia] + hlr[ib] + T(MARGIN);
+      if (mx * mx + my * my + mz * mz > lim * lim * T(1.02)) continue;
+    }
     const int fa = COL_FRAME[ia], fbf = COL_FRAME[ib];
     T c1[3], c2[3], dist2;
     seg_seg_closest(ca[ia], cb[ia], ca[ib], cb[ib], c1, c2, &dist2);
@@ -1462,10 +1679,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       ecol_seed(s, j1);
       ecol_seed(s, j2);
       ecol_seed(s, j3);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j0], VOFF + j0);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j1], VOFF + j1);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j2], VOFF + j2);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j3], VOFF + j3);
+      // s.l_j ascending => VOFF + j0 is the group's smallest m (K4a)
+      chol_fwd_unit4_n(NV, d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2],
+                       s.ecol[j3], VOFF + j0);
       chol_back4_n(NV, d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
@@ -1476,8 +1692,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       ecol_seed(s, j0);
       ecol_seed(s, j1);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j0], VOFF + j0);
-      chol_fwd_unit_n(NV, d.m, s.ecol[j1], VOFF + j1);
+      chol_fwd_unit2_n(NV, d.m, s.ecol[j0], s.ecol[j1], VOFF + j0);
       chol_back2_n(NV, d.m, s.ecol[j0], s.ecol[j1]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
@@ -1487,13 +1702,19 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   }
 
   // -- weld block A_ww = J_w M^-1 J_w^T, factored once ------------------------
-  // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]; both
-  // triangles from one value (bitwise symmetric, solver.rs)
+  // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]. A_ww is
+  // symmetric, and its only consumers are chol_factor_n (in place) and
+  // chol_solve_n, both of which read row >= col only (see crba's K4c
+  // note), so ONLY the [c][r] (lower, c >= r) entry is stored — the
+  // [r][c] mirror was dead. c == r writes the diagonal once.
+  // Only the 12 columns of s.jw[c]'s K5 support contribute (s.mw is
+  // dense, but it is multiplied by the structural zeros of s.jw[c]).
   for (int r = 0; r < N_WELD; r++)
     for (int c = r; c < N_WELD; c++) {
+      const int lo = c < N_WELD / 2 ? WJ_L0 : WJ_R0;
       T sum = T(0);
-      for (int i = 0; i < NV; i++) sum += s.jw[c][i] * s.mw[r][i];
-      s.aww[r * N_WELD + c] = sum;
+      for (int i = 0; i < VOFF; i++) sum += s.jw[c][i] * s.mw[r][i];
+      for (int i = lo; i < lo + 6; i++) sum += s.jw[c][i] * s.mw[r][i];
       s.aww[c * N_WELD + r] = sum;
     }
   chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
@@ -1517,13 +1738,24 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       // 12 dots against the SAME v: each jv[r] accumulates over i in the
       // identical ascending order over identical terms (v is read-only
       // here), so every jv[r] is bitwise the scalar loop's.
+      // segmented onto the K5 weld support (same ascending i per jv[r])
       T jv[N_WELD];
 #pragma unroll
       for (int r = 0; r < N_WELD; r++) jv[r] = T(0);
-      for (int i = 0; i < NV; i++) {
+      for (int i = 0; i < VOFF; i++) {
         const T vi = v[i];
 #pragma unroll
         for (int r = 0; r < N_WELD; r++) jv[r] += s.jw[r][i] * vi;
+      }
+      for (int i = WJ_L0; i < WJ_R0; i++) {
+        const T vi = v[i];
+#pragma unroll
+        for (int r = 0; r < N_WELD / 2; r++) jv[r] += s.jw[r][i] * vi;
+      }
+      for (int i = WJ_R0; i < NV; i++) {
+        const T vi = v[i];
+#pragma unroll
+        for (int r = N_WELD / 2; r < N_WELD; r++) jv[r] += s.jw[r][i] * vi;
       }
 #pragma unroll
       for (int r = 0; r < N_WELD; r++) s.rw[r] = s.bias_w[r] - jv[r];
