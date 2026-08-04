@@ -7,6 +7,13 @@ edition = "2021"
 name = "beat_arena_rs"
 crate-type = ["cdylib"]
 
+[features]
+# Keeps the solver's introspection-only fields (ConstraintSet::jv_pre)
+# and the weld-row effective-mass diagonal in a non-test build. Off by
+# default: nothing in the solve reads them, and they cost a 35-wide dot
+# per constraint row per substep. `cargo test` enables them implicitly.
+introspect = []
+
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"

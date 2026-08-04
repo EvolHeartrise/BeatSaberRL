@@ -181,14 +181,23 @@ pub struct Contact {
 /// inside a substep).
 pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
     out.clear();
+    // Collider segment endpoints to world (body frame pose from FK),
+    // ONCE per collider instead of once per pair-and-side: the 55 pairs
+    // reference only 12 colliders, so the old inline form recomputed
+    // each of the 24 endpoint transforms ~9× per substep. Bitwise: the
+    // expression per endpoint is character-identical, only hoisted, so
+    // every p1/q1/p2/q2 below is the same f64 it was before.
+    let mut wa = [[0.0f64; 3]; NUM_COLLIDERS];
+    let mut wb = [[0.0f64; 3]; NUM_COLLIDERS];
+    for (ci, c) in COLLIDERS.iter().enumerate() {
+        wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
+        wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));
+    }
     for (pid, &(ia, ib)) in PAIRS.iter().enumerate() {
         let ca = &COLLIDERS[ia];
         let cb = &COLLIDERS[ib];
-        // collider segment endpoints to world (body frame pose from FK)
-        let p1 = add3(ws.p[ca.frame], mat_vec(&ws.r[ca.frame], ca.a));
-        let q1 = add3(ws.p[ca.frame], mat_vec(&ws.r[ca.frame], ca.b));
-        let p2 = add3(ws.p[cb.frame], mat_vec(&ws.r[cb.frame], cb.a));
-        let q2 = add3(ws.p[cb.frame], mat_vec(&ws.r[cb.frame], cb.b));
+        let (p1, q1) = (wa[ia], wb[ia]);
+        let (p2, q2) = (wa[ib], wb[ib]);
         let (_s, _t, c1, c2, d2) = seg_seg_closest(p1, q1, p2, q2);
         let dist = d2.sqrt();
         let gap = dist - (ca.radius + cb.radius);

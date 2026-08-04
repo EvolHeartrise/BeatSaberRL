@@ -89,7 +89,11 @@ pub struct ConstraintSet {
     /// Per-row RHS target velocity b of the last solve.
     pub bias: Vec<f64>,
     /// Per-row J·v* BEFORE the solve (introspection: complementarity /
-    /// no-sticking checks).
+    /// no-sticking checks). INTROSPECTION-ONLY — nothing in the solve
+    /// reads it, so both the field and its per-row nv-dot are compiled
+    /// out of the shipping extension (2026-08-03 dead-work pass);
+    /// `cargo test` and `--features introspect` keep it.
+    #[cfg(any(test, feature = "introspect"))]
     pub jv_pre: Vec<f64>,
     nv: usize,
     j: Vec<f64>,      // MAX_ROWS × nv dense Jacobian rows
@@ -137,6 +141,7 @@ impl ConstraintSet {
             nrows: 0,
             lambda: vec![0.0; MAX_ROWS],
             bias: vec![0.0; MAX_ROWS],
+            #[cfg(any(test, feature = "introspect"))]
             jv_pre: vec![0.0; MAX_ROWS],
             nv,
             j: vec![0.0; MAX_ROWS * nv],
@@ -189,6 +194,11 @@ impl ConstraintSet {
     pub fn solve(&mut self, model: &Model, ws: &mut Workspace, q: &[f64], v: &mut [f64]) {
         let nv = self.nv;
         debug_assert_eq!(nv, model.nv());
+        // (Reborrowing `v` to exactly nv here to hoist the PGS bounds
+        // checks was tried 2026-08-03 and measured 2.6% SLOWER — the
+        // extra reborrow apparently costs more analysis than the checks
+        // it removes, which the row-slice forms already dominate.
+        // Same for slicing st.v in step.rs's clamp axpy. Left alone.)
         let voff = model.voff();
         let hinv = 1.0 / self.h;
         let mut nrows = 0usize;
@@ -297,24 +307,37 @@ impl ConstraintSet {
         self.nrows = nrows;
 
         // ── effective masses: M⁻¹Jᵀ via the substep's Cholesky factor ─
+        // The 12 WELD rows are solved as a dense A_ww block, never by
+        // the per-row `(b − Jv)/diag` update, so their diag is dead in
+        // the shipping build (the only readers are the tests_soak debug
+        // prints and the debug_assert) — cfg! is a compile-time constant
+        // so release drops the branch and the 12 nv-dots with it.
+        let nweld = self.weld_rows();
+        const DIAG_ALL_ROWS: bool =
+            cfg!(any(test, feature = "introspect", debug_assertions));
         for row in 0..nrows {
             let (jrows, mrows) = (&self.j, &mut self.minvjt);
             let jr = &jrows[row * nv..(row + 1) * nv];
             let mr = &mut mrows[row * nv..(row + 1) * nv];
             mr.copy_from_slice(jr);
             chol_solve(nv, &ws.l, mr);
-            let mut d = 0.0;
-            for i in 0..nv {
-                d += jr[i] * mr[i];
+            if DIAG_ALL_ROWS || row >= nweld {
+                let mut d = 0.0;
+                for i in 0..nv {
+                    d += jr[i] * mr[i];
+                }
+                debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
+                self.diag[row] = d;
             }
-            debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
-            self.diag[row] = d;
-            // pre-solve J·v* (introspection only)
-            let mut s = 0.0;
-            for i in 0..nv {
-                s += jr[i] * v[i];
+            // pre-solve J·v* (introspection only — compiled out below)
+            #[cfg(any(test, feature = "introspect"))]
+            {
+                let mut s = 0.0;
+                for i in 0..nv {
+                    s += jr[i] * v[i];
+                }
+                self.jv_pre[row] = s;
             }
-            self.jv_pre[row] = s;
         }
 
         // ── weld-block effective mass A_ww = J_w M⁻¹ J_wᵀ, factored
@@ -323,19 +346,48 @@ impl ConstraintSet {
         //    straight-knee stance — the two feet's vertical rows are
         //    near-parallel through the root — so the 12 bilateral rows
         //    are solved as an exact dense block instead) ─────────────
-        let nweld = self.weld_rows();
         if nweld > 0 {
+            // UNROLL-AND-JAM by 4 over c (2026-08-03): the 78 dots keep
+            // their own ascending-i accumulator, so every partial sum —
+            // and hence every A_ww entry — is bit-for-bit what the
+            // one-dot-at-a-time form produced; only mr's re-traversal
+            // count drops (78 → ~24) and all four j rows stay
+            // UNIT-STRIDE, which the r-inner interchange would have
+            // destroyed (see the weld PGS note below: strided loads cost
+            // more here than the traversals they save).
             for r in 0..nweld {
                 let mr = &self.minvjt[r * nv..(r + 1) * nv];
-                for c in r..nweld {
-                    let jc = &self.j[c * nv..(c + 1) * nv];
+                let jall = &self.j;
+                let mut c = r;
+                while c + 4 <= nweld {
+                    let j0 = &jall[c * nv..(c + 1) * nv];
+                    let j1 = &jall[(c + 1) * nv..(c + 2) * nv];
+                    let j2 = &jall[(c + 2) * nv..(c + 3) * nv];
+                    let j3 = &jall[(c + 3) * nv..(c + 4) * nv];
+                    let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+                    for i in 0..nv {
+                        let m = mr[i];
+                        s0 += j0[i] * m;
+                        s1 += j1[i] * m;
+                        s2 += j2[i] * m;
+                        s3 += j3[i] * m;
+                    }
+                    // both triangles from one value (bitwise symmetric)
+                    for (k, s) in [s0, s1, s2, s3].into_iter().enumerate() {
+                        self.aww[r * nweld + c + k] = s;
+                        self.aww[(c + k) * nweld + r] = s;
+                    }
+                    c += 4;
+                }
+                while c < nweld {
+                    let jc = &jall[c * nv..(c + 1) * nv];
                     let mut s = 0.0;
                     for i in 0..nv {
                         s += jc[i] * mr[i];
                     }
-                    // both triangles from one value (bitwise symmetric)
                     self.aww[r * nweld + c] = s;
                     self.aww[c * nweld + r] = s;
+                    c += 1;
                 }
             }
             // §22 pivot floor here too (second former panic site; the
@@ -360,25 +412,53 @@ impl ConstraintSet {
         //    deterministically.
         let ncon = self.contacts.len();
         if nweld > 0 {
+            // the by-4 jams below assume the 12-row weld block
+            debug_assert_eq!(nweld, N_WELD_ROWS);
             let split = (nweld + ncon) * nv;
             let (head, tail) = self.minvjt.split_at_mut(split);
             for (li, _lim) in self.limset.iter().enumerate() {
                 let row = nweld + ncon + li;
                 let mr = &mut tail[li * nv..(li + 1) * nv];
-                for w in 0..nweld {
-                    let jw = &self.j[w * nv..(w + 1) * nv];
-                    let mut s = 0.0;
+                // UNROLL-AND-JAM by 4 (2026-08-03), both here and in the
+                // back-substitution below: mr is traversed 3× instead of
+                // 12× each way while every accumulator keeps its own
+                // ascending-i order and every mr[i] takes its 12
+                // decrements in w = 0..11 order — bit-for-bit the
+                // one-row-at-a-time result. (A full w/i interchange was
+                // measured SLOWER, see the weld PGS note.)
+                for w in (0..nweld).step_by(4) {
+                    let j0 = &self.j[w * nv..(w + 1) * nv];
+                    let j1 = &self.j[(w + 1) * nv..(w + 2) * nv];
+                    let j2 = &self.j[(w + 2) * nv..(w + 3) * nv];
+                    let j3 = &self.j[(w + 3) * nv..(w + 4) * nv];
+                    let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
                     for i in 0..nv {
-                        s += jw[i] * mr[i];
+                        let m = mr[i];
+                        s0 += j0[i] * m;
+                        s1 += j1[i] * m;
+                        s2 += j2[i] * m;
+                        s3 += j3[i] * m;
                     }
-                    self.rw[w] = s;
+                    self.rw[w] = s0;
+                    self.rw[w + 1] = s1;
+                    self.rw[w + 2] = s2;
+                    self.rw[w + 3] = s3;
                 }
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                for w in 0..nweld {
-                    let x = self.rw[w];
-                    let mw = &head[w * nv..(w + 1) * nv];
+                for w in (0..nweld).step_by(4) {
+                    let (x0, x1) = (self.rw[w], self.rw[w + 1]);
+                    let (x2, x3) = (self.rw[w + 2], self.rw[w + 3]);
+                    let m0 = &head[w * nv..(w + 1) * nv];
+                    let m1 = &head[(w + 1) * nv..(w + 2) * nv];
+                    let m2 = &head[(w + 2) * nv..(w + 3) * nv];
+                    let m3 = &head[(w + 3) * nv..(w + 4) * nv];
                     for i in 0..nv {
-                        mr[i] -= mw[i] * x;
+                        let mut m = mr[i];
+                        m -= m0[i] * x0;
+                        m -= m1[i] * x1;
+                        m -= m2[i] * x2;
+                        m -= m3[i] * x3;
+                        mr[i] = m;
                     }
                 }
                 let jr = &self.j[row * nv..(row + 1) * nv];
@@ -406,7 +486,13 @@ impl ConstraintSet {
             *c = false;
         }
         for _iter in 0..PGS_ITERS {
-            // (a) welds: Δλ_w = A_ww⁻¹ (b_w − J_w v), applied together
+            // (a) welds: Δλ_w = A_ww⁻¹ (b_w − J_w v), applied together.
+            // (An r/i loop INTERCHANGE was tried here 2026-08-03 —
+            // bitwise-clean, but 3.9% SLOWER: at nv = 35 the whole
+            // working set is already L1-resident, so there is no
+            // streaming win to buy, while the r-inner form's nv-strided
+            // loads destroy the unit-stride AVX2 vectorization of these
+            // dots/axpys. Reverted; leave the row-at-a-time shape.)
             if nweld > 0 {
                 for r in 0..nweld {
                     let jr = &self.j[r * nv..(r + 1) * nv];
@@ -471,22 +557,51 @@ impl ConstraintSet {
                         }
                         let plain = self.capcol[jt * nv + vj];
                         if nweld > 0 {
-                            for w in 0..nweld {
-                                let jw = &self.j[w * nv..(w + 1) * nv];
+                            debug_assert_eq!(nweld, N_WELD_ROWS);
+                            // same by-4 jam as the limit-row projection:
+                            // one accumulator per weld row, each still
+                            // summing over i ASCENDING, and each col[i]
+                            // taking its 12 decrements in w = 0..11
+                            // order — bitwise the per-row form.
+                            for w in (0..nweld).step_by(4) {
+                                let j0 = &self.j[w * nv..(w + 1) * nv];
+                                let j1 = &self.j[(w + 1) * nv..(w + 2) * nv];
+                                let j2 = &self.j[(w + 2) * nv..(w + 3) * nv];
+                                let j3 = &self.j[(w + 3) * nv..(w + 4) * nv];
                                 let col = &self.capcol[jt * nv..(jt + 1) * nv];
-                                let mut s = 0.0;
+                                let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
                                 for i in 0..nv {
-                                    s += jw[i] * col[i];
+                                    let c = col[i];
+                                    s0 += j0[i] * c;
+                                    s1 += j1[i] * c;
+                                    s2 += j2[i] * c;
+                                    s3 += j3[i] * c;
                                 }
-                                self.rw[w] = s;
+                                self.rw[w] = s0;
+                                self.rw[w + 1] = s1;
+                                self.rw[w + 2] = s2;
+                                self.rw[w + 3] = s3;
                             }
                             chol_solve(nweld, &self.lww, &mut self.rw);
-                            for w in 0..nweld {
-                                let x = self.rw[w];
-                                // weld minvjt rows live at the head of
-                                // the buffer — disjoint from capcol
+                            // weld minvjt rows live at the head of the
+                            // buffer — disjoint from capcol, so the two
+                            // fields can be borrowed at once
+                            let (capcol, minvjt) = (&mut self.capcol, &self.minvjt);
+                            let col = &mut capcol[jt * nv..(jt + 1) * nv];
+                            for w in (0..nweld).step_by(4) {
+                                let (x0, x1) = (self.rw[w], self.rw[w + 1]);
+                                let (x2, x3) = (self.rw[w + 2], self.rw[w + 3]);
+                                let m0 = &minvjt[w * nv..(w + 1) * nv];
+                                let m1 = &minvjt[(w + 1) * nv..(w + 2) * nv];
+                                let m2 = &minvjt[(w + 2) * nv..(w + 3) * nv];
+                                let m3 = &minvjt[(w + 3) * nv..(w + 4) * nv];
                                 for i in 0..nv {
-                                    self.capcol[jt * nv + i] -= self.minvjt[w * nv + i] * x;
+                                    let mut c = col[i];
+                                    c -= m0[i] * x0;
+                                    c -= m1[i] * x1;
+                                    c -= m2[i] * x2;
+                                    c -= m3[i] * x3;
+                                    col[i] = c;
                                 }
                             }
                         }

@@ -344,9 +344,69 @@ fn pivot_floor_clamps_singular_gimbal_matrix() {
     let mut l_strict = vec![0.0; nv * nv];
     assert!(chol_factor(nv, &mm, &mut l_strict));
     assert_eq!(chol_factor_floored(nv, &mm, &mut ws.l), 0);
-    for (a, b) in ws.l.iter().zip(l_strict.iter()) {
-        assert_eq!(a.to_bits(), b.to_bits(), "floored factor must be bitwise");
+    // LOWER TRIANGLE + diagonal only: since 2026-08-03 neither factor
+    // zeroes the strict upper triangle (dead stores — chol_solve reads
+    // only k ≤ i), so those cells hold whatever the buffer had before.
+    for i in 0..nv {
+        for k in 0..=i {
+            assert_eq!(
+                ws.l[i * nv + k].to_bits(),
+                l_strict[i * nv + k].to_bits(),
+                "floored factor must be bitwise at ({i},{k})"
+            );
+        }
     }
+}
+
+/// §22 NaN semantics (pinned 2026-08-03): a NaN pivot must be FLOORED
+/// and COUNTED, not passed through. The original `d < PD_FLOOR_F64`
+/// test is false for NaN, so a NaN pivot escaped the floor unclamped
+/// and poisoned every subsequent column (sqrt(NaN) = NaN, and the
+/// divide by it NaNs the whole trailing factor). `!(d >= FLOOR)` is
+/// true for NaN and identical for every non-NaN pivot; this matches
+/// the CUDA fmax/tmax mirror (NaN → floor).
+#[test]
+fn nan_pivot_is_floored_and_counted() {
+    // 2×2, diagonal, NaN in the second pivot: the first column is
+    // healthy so the NaN cannot be attributed to earlier arithmetic.
+    let m = [4.0, 0.0, 0.0, f64::NAN];
+    let mut l = [0.0f64; 4];
+    let hits = chol_factor_floored(2, &m, &mut l);
+    assert_eq!(hits, 1, "the NaN pivot must be counted");
+    assert!(l.iter().all(|x| x.is_finite()), "factor must stay finite: {l:?}");
+    assert_eq!(l[0].to_bits(), 2.0f64.to_bits(), "healthy pivot untouched");
+    assert_eq!(
+        l[3].to_bits(),
+        PD_FLOOR_F64.sqrt().to_bits(),
+        "NaN pivot must be clamped to exactly sqrt(PD_FLOOR_F64)"
+    );
+    // and the solve through it stays finite
+    let mut x = [1.0, 1.0];
+    chol_solve(2, &l, &mut x);
+    assert!(x.iter().all(|v| v.is_finite()), "solve must stay finite");
+
+    // a NaN arriving via the accumulation (m[j][j] finite, an earlier
+    // L entry NaN) is floored the same way — the second pivot becomes
+    // 1 - NaN = NaN.
+    let m2 = [1.0, f64::NAN, f64::NAN, 1.0];
+    let mut l2 = [0.0f64; 4];
+    assert_eq!(chol_factor_floored(2, &m2, &mut l2), 1);
+    assert_eq!(l2[3].to_bits(), PD_FLOOR_F64.sqrt().to_bits());
+
+    // control: a healthy 2×2 is bitwise-identical to the strict factor
+    // (0 hits) — the negated comparison changes nothing off the NaN path
+    let m3 = [4.0, 1.0, 1.0, 3.0];
+    let (mut a, mut b) = ([0.0f64; 4], [0.0f64; 4]);
+    assert_eq!(chol_factor_floored(2, &m3, &mut a), 0);
+    assert!(chol_factor(2, &m3, &mut b));
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits());
+    }
+    // and a pivot exactly AT the floor is not counted (>= is inclusive,
+    // matching the original `< FLOOR` boundary exactly)
+    let m4 = [PD_FLOOR_F64, 0.0, 0.0, 1.0];
+    let mut l4 = [0.0f64; 4];
+    assert_eq!(chol_factor_floored(2, &m4, &mut l4), 0);
 }
 
 /// The same family end-to-end through `substep` (the old panic site):
