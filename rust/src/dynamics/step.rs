@@ -6,11 +6,11 @@
 //! the `constraints` hook between the unconstrained-velocity solve and
 //! position integration — solver.rs `ConstraintSet::solve` is the P2
 //! implementation (use `solver::substep_constrained` for the full v10
-//! substep). The hook receives the Workspace (ws.l holds the Cholesky
+//! substep). The hook receives the Workspace (ws.m holds the Cholesky
 //! factor for the J·M⁻¹·Jᵀ effective-mass solves) plus the mutable
 //! velocity to project. Unconstrained callers (P1 tests) pass None.
 
-use super::algo::{chol_factor_floored, chol_solve, crba, rnea};
+use super::algo::{chol_factor_floored_inplace, chol_solve, chol_solve_unit, crba, rnea};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
@@ -134,10 +134,16 @@ pub fn substep_opts(
     //    PD_FLOOR_F64 with engagements counted (Divergences §22 — the
     //    f64 analogue of the CUDA f32 §20e net; 0 hits = bitwise the
     //    old strict factorization)
-    ws.pd_hits += chol_factor_floored(nv, &ws.m, &mut ws.l) as u64;
+    //    Factored IN PLACE (2026-08-03, R1 item 1e): from here to the
+    //    end of the substep `ws.m` holds L, not M (LAPACK `potrf`
+    //    convention). Nothing reads the mass matrix after this point —
+    //    CRBA and the harness damping above are its only other
+    //    touchers — and dropping the second nv×nv buffer keeps the
+    //    factor stage's working set in L1 alongside `j`/`minvjt`.
+    ws.pd_hits += chol_factor_floored_inplace(nv, &mut ws.m[..nv * nv]) as u64;
 
     // 6. unconstrained velocity v* = v + h·M⁻¹(τ − C)
-    chol_solve(nv, &ws.l, &mut ws.rhs);
+    chol_solve(nv, &ws.m, &mut ws.rhs);
     for i in 0..nv {
         ws.vstar[i] = st.v[i] + h * ws.rhs[i];
     }
@@ -260,9 +266,10 @@ pub fn substep_opts(
             let target = if ws.hit[j] { 0.0 } else { st.v[vj].clamp(-cap, cap) };
             if target != st.v[vj] {
                 if !ws.cached[j] {
-                    ws.sol[..nv].fill(0.0);
-                    ws.sol[vj] = 1.0;
-                    chol_solve(nv, &ws.l, &mut ws.sol);
+                    // unit RHS +e_vj — sparse forward + dense back,
+                    // bitwise the fill/store/chol_solve it replaces
+                    // (see `chol_fwd_unit`'s argument in algo.rs)
+                    chol_solve_unit(nv, &ws.m, vj, 1.0, &mut ws.sol[..nv]);
                     ws.solcache[j * nv..(j + 1) * nv].copy_from_slice(&ws.sol[..nv]);
                     ws.cached[j] = true;
                 }

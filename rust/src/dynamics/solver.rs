@@ -15,7 +15,7 @@
 //! Cholesky-factored once per substep), then (b) contact + limit rows
 //! projected Gauss-Seidel to λ ≥ 0, in row order. Effective masses and
 //! impulse propagation via M⁻¹Jᵀ columns solved with the substep's
-//! Cholesky factor (ws.l). Why not per-row GS for the welds: the two
+//! Cholesky factor (ws.m, factored in place). Why not per-row GS: the two
 //! feet's vertical rows are near-parallel through the root at the
 //! straight-knee stance — 12 sweeps leave a 0.14 m/s weld-row residual
 //! (measured), a ~3 mm steady weld violation. Why limit rows in the
@@ -44,7 +44,10 @@
 //! Loop bounds and evaluation order are fixed throughout — the
 //! torch/CUDA mirrors replicate these expression trees literally.
 
-use super::algo::{chol_factor_floored, chol_solve};
+use super::algo::{
+    chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
+    chol_solve_t, chol_solve_unit, chol_solve_x2, chol_solve_x4,
+};
 use super::collide::{narrow_phase, Contact, NUM_PAIRS, SLOP};
 use super::fk::{cross3, dot3, rot_log, sub3};
 use super::model::{Model, F_L_FOOT, F_R_FOOT};
@@ -109,6 +112,20 @@ pub struct ConstraintSet {
     capcached: Vec<bool>, // nq
     /// (joint, sign) per assembled limit row, assembly order.
     limset: Vec<(usize, f64)>,
+    /// Row index of joint j's LOWER-stop (sign +1) limit row this
+    /// solve, or −1. The ω-cap pass reuses that row's already-solved,
+    /// already-projected column instead of redoing the work (R1 1f).
+    limpos: Vec<i32>,
+    /// nv × 12 RHS-minor scratch for the weld batch (R1 1a).
+    wt: Vec<f64>,
+    /// TRANSPOSED weld Jacobian, nv rows of 12 (`jwt[i*12 + w]` =
+    /// J_w[w][i]), rebuilt once per solve. Every consumer of the weld
+    /// rows is a set of 12 INDEPENDENT dots against one shared vector
+    /// — the PGS residual and both weld-null projections — and in this
+    /// layout those 12 accumulators are 12 SIMD lanes, each keeping
+    /// its own ascending-i chain (so the vectorization is legal under
+    /// strict IEEE, unlike vectorizing a single dot's reduction).
+    jwt: Vec<f64>,
 }
 
 /// A composite (weld-consistent) direction with mobility below this
@@ -154,6 +171,35 @@ impl ConstraintSet {
             capmass: vec![0.0; model.nq],
             capcached: vec![false; model.nq],
             limset: Vec::with_capacity(model.nq),
+            limpos: vec![-1; model.nq],
+            wt: vec![0.0; N_WELD_ROWS * nv],
+            jwt: vec![0.0; N_WELD_ROWS * nv],
+        }
+    }
+
+    /// Back-substitute W consecutive `minvjt` rows through the shared
+    /// factor in the RHS-MINOR layout: transpose into `wt`, run
+    /// `chol_back_t`, transpose back. Both copies are exact, so this is
+    /// bitwise `chol_back` applied to each row on its own.
+    fn back_t<const W: usize>(
+        nv: usize,
+        l: &[f64],
+        minvjt: &mut [f64],
+        row: usize,
+        wt: &mut [f64],
+    ) {
+        for r in 0..W {
+            let mr = &minvjt[(row + r) * nv..(row + r + 1) * nv];
+            for i in 0..nv {
+                wt[i * W + r] = mr[i];
+            }
+        }
+        chol_back_t::<W>(nv, l, &mut wt[..W * nv]);
+        for r in 0..W {
+            let mr = &mut minvjt[(row + r) * nv..(row + r + 1) * nv];
+            for i in 0..nv {
+                mr[i] = wt[i * W + r];
+            }
         }
     }
 
@@ -278,6 +324,9 @@ impl ConstraintSet {
         //    rate, the clamp teleports q back — measured 5.8e-4 m of
         //    foot error per substep, a 3.7 mm steady weld violation.
         self.limset.clear();
+        for p in self.limpos.iter_mut() {
+            *p = -1;
+        }
         for j in 0..model.nq {
             let (lo, hi) = model.limits[j];
             let gl = q[j] - lo;
@@ -300,6 +349,9 @@ impl ConstraintSet {
                 } else {
                     (BETA_WELD * hinv) * -gap
                 };
+                if sign == 1.0 {
+                    self.limpos[j] = row as i32;
+                }
                 self.limset.push((j, sign));
                 nrows += 1;
             }
@@ -315,13 +367,101 @@ impl ConstraintSet {
         let nweld = self.weld_rows();
         const DIAG_ALL_ROWS: bool =
             cfg!(any(test, feature = "introspect", debug_assertions));
+        // BATCHED multi-RHS solve (2026-08-03, R1): every row's RHS is
+        // the same shared factor's, so instead of `nrows` serial dense
+        // chol_solves the rows go 4 at a time through `chol_solve_x4`,
+        // which loads the factor ONCE per group of 4 and keeps each
+        // RHS on its own unit-stride ascending-k accumulator chain —
+        // bit-for-bit the serial result (see the algo.rs contract).
+        // The 12 weld rows are exactly 3 groups of 4; the contact rows
+        // continue the same ladder (4 → 2 → 1) from there.
+        let ndense = nweld + self.contacts.len();
+        self.minvjt[..ndense * nv].copy_from_slice(&self.j[..ndense * nv]);
+        {
+            let mut row = 0usize;
+            if nweld == N_WELD_ROWS {
+                // the 12 weld rows go through the RHS-MINOR form
+                // (transpose in, solve, transpose out — both copies
+                // exact, so the whole thing is bitwise `chol_solve`
+                // twelve times). The transposed Jacobian is KEPT in
+                // `jwt` afterwards: the PGS residual and the two
+                // weld-null projections all want exactly this layout.
+                for r in 0..N_WELD_ROWS {
+                    let jr = &self.j[r * nv..(r + 1) * nv];
+                    for i in 0..nv {
+                        self.jwt[i * N_WELD_ROWS + r] = jr[i];
+                    }
+                }
+                self.wt[..N_WELD_ROWS * nv]
+                    .copy_from_slice(&self.jwt[..N_WELD_ROWS * nv]);
+                chol_solve_t::<N_WELD_ROWS>(nv, &ws.m, &mut self.wt[..N_WELD_ROWS * nv]);
+                for r in 0..N_WELD_ROWS {
+                    let mr = &mut self.minvjt[r * nv..(r + 1) * nv];
+                    for i in 0..nv {
+                        mr[i] = self.wt[i * N_WELD_ROWS + r];
+                    }
+                }
+                row = N_WELD_ROWS;
+            }
+            while row + 4 <= ndense {
+                chol_solve_x4(nv, &ws.m, &mut self.minvjt[row * nv..(row + 4) * nv]);
+                row += 4;
+            }
+            if row + 2 <= ndense {
+                chol_solve_x2(nv, &ws.m, &mut self.minvjt[row * nv..(row + 2) * nv]);
+                row += 2;
+            }
+            while row < ndense {
+                chol_solve(nv, &ws.m, &mut self.minvjt[row * nv..(row + 1) * nv]);
+                row += 1;
+            }
+        }
+        // LIMIT rows have the unit right-hand side sign·e_(voff+j) — the
+        // assembly is `jr.fill(0.0)` plus one `jr[voff+j] = sign` store,
+        // so the FORWARD pass has a closed form: rows below the pivot
+        // are exactly the memset's +0.0 (see `chol_fwd_unit`'s bitwise
+        // argument, which rests on §22's negated-comparison pivot floor
+        // making the diagonal positive and finite unconditionally), the
+        // pivot row is one divide, and the rows above it start their
+        // accumulation at k = m. The BACK pass has no such structure —
+        // it is dense — so it is jammed 4 columns at a time instead.
+        for li in 0..self.limset.len() {
+            let (jt, sign) = self.limset[li];
+            let row = ndense + li;
+            chol_fwd_unit(
+                nv,
+                &ws.m,
+                voff + jt,
+                sign,
+                &mut self.minvjt[row * nv..(row + 1) * nv],
+            );
+        }
+        {
+            // RHS-MINOR ladder, same reasoning as the weld batch: the
+            // transposes are exact copies, so the group result is
+            // bitwise `chol_back` once per column.
+            let mut row = ndense;
+            while row + 8 <= nrows {
+                Self::back_t::<8>(nv, &ws.m, &mut self.minvjt, row, &mut self.wt);
+                row += 8;
+            }
+            if row + 4 <= nrows {
+                Self::back_t::<4>(nv, &ws.m, &mut self.minvjt, row, &mut self.wt);
+                row += 4;
+            }
+            if row + 2 <= nrows {
+                chol_back_x2(nv, &ws.m, &mut self.minvjt[row * nv..(row + 2) * nv]);
+                row += 2;
+            }
+            while row < nrows {
+                chol_back(nv, &ws.m, &mut self.minvjt[row * nv..(row + 1) * nv]);
+                row += 1;
+            }
+        }
         for row in 0..nrows {
-            let (jrows, mrows) = (&self.j, &mut self.minvjt);
-            let jr = &jrows[row * nv..(row + 1) * nv];
-            let mr = &mut mrows[row * nv..(row + 1) * nv];
-            mr.copy_from_slice(jr);
-            chol_solve(nv, &ws.l, mr);
             if DIAG_ALL_ROWS || row >= nweld {
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mr = &self.minvjt[row * nv..(row + 1) * nv];
                 let mut d = 0.0;
                 for i in 0..nv {
                     d += jr[i] * mr[i];
@@ -332,6 +472,7 @@ impl ConstraintSet {
             // pre-solve J·v* (introspection only — compiled out below)
             #[cfg(any(test, feature = "introspect"))]
             {
+                let jr = &self.j[row * nv..(row + 1) * nv];
                 let mut s = 0.0;
                 for i in 0..nv {
                     s += jr[i] * v[i];
@@ -356,38 +497,26 @@ impl ConstraintSet {
             // destroyed (see the weld PGS note below: strided loads cost
             // more here than the traversals they save).
             for r in 0..nweld {
-                let mr = &self.minvjt[r * nv..(r + 1) * nv];
-                let jall = &self.j;
-                let mut c = r;
-                while c + 4 <= nweld {
-                    let j0 = &jall[c * nv..(c + 1) * nv];
-                    let j1 = &jall[(c + 1) * nv..(c + 2) * nv];
-                    let j2 = &jall[(c + 2) * nv..(c + 3) * nv];
-                    let j3 = &jall[(c + 3) * nv..(c + 4) * nv];
-                    let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+                let mut s = [0.0f64; N_WELD_ROWS];
+                {
+                    let mr = &self.minvjt[r * nv..(r + 1) * nv];
                     for i in 0..nv {
                         let m = mr[i];
-                        s0 += j0[i] * m;
-                        s1 += j1[i] * m;
-                        s2 += j2[i] * m;
-                        s3 += j3[i] * m;
+                        let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+                        for c in 0..N_WELD_ROWS {
+                            s[c] += jr[c] * m;
+                        }
                     }
-                    // both triangles from one value (bitwise symmetric)
-                    for (k, s) in [s0, s1, s2, s3].into_iter().enumerate() {
-                        self.aww[r * nweld + c + k] = s;
-                        self.aww[(c + k) * nweld + r] = s;
-                    }
-                    c += 4;
                 }
-                while c < nweld {
-                    let jc = &jall[c * nv..(c + 1) * nv];
-                    let mut s = 0.0;
-                    for i in 0..nv {
-                        s += jc[i] * mr[i];
-                    }
-                    self.aww[r * nweld + c] = s;
-                    self.aww[c * nweld + r] = s;
-                    c += 1;
+                // The whole 12-lane row is computed and the c < r lanes
+                // discarded: one vector FMA per i beats the 12 − r
+                // scalar ones the jammed triangle needed, and the lanes
+                // that ARE kept carry the same ascending-i chain as
+                // before. Both triangles still come from ONE value, so
+                // A_ww stays bitwise symmetric by construction.
+                for c in r..nweld {
+                    self.aww[r * nweld + c] = s[c];
+                    self.aww[c * nweld + r] = s[c];
                 }
             }
             // §22 pivot floor here too (second former panic site; the
@@ -426,24 +555,15 @@ impl ConstraintSet {
                 // decrements in w = 0..11 order — bit-for-bit the
                 // one-row-at-a-time result. (A full w/i interchange was
                 // measured SLOWER, see the weld PGS note.)
-                for w in (0..nweld).step_by(4) {
-                    let j0 = &self.j[w * nv..(w + 1) * nv];
-                    let j1 = &self.j[(w + 1) * nv..(w + 2) * nv];
-                    let j2 = &self.j[(w + 2) * nv..(w + 3) * nv];
-                    let j3 = &self.j[(w + 3) * nv..(w + 4) * nv];
-                    let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
-                    for i in 0..nv {
-                        let m = mr[i];
-                        s0 += j0[i] * m;
-                        s1 += j1[i] * m;
-                        s2 += j2[i] * m;
-                        s3 += j3[i] * m;
+                let mut s = [0.0f64; N_WELD_ROWS];
+                for i in 0..nv {
+                    let m = mr[i];
+                    let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+                    for w in 0..N_WELD_ROWS {
+                        s[w] += jr[w] * m;
                     }
-                    self.rw[w] = s0;
-                    self.rw[w + 1] = s1;
-                    self.rw[w + 2] = s2;
-                    self.rw[w + 3] = s3;
                 }
+                self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                 chol_solve(nweld, &self.lww, &mut self.rw);
                 for w in (0..nweld).step_by(4) {
                     let (x0, x1) = (self.rw[w], self.rw[w + 1]);
@@ -492,23 +612,53 @@ impl ConstraintSet {
             // working set is already L1-resident, so there is no
             // streaming win to buy, while the r-inner form's nv-strided
             // loads destroy the unit-stride AVX2 vectorization of these
-            // dots/axpys. Reverted; leave the row-at-a-time shape.)
+            // dots/axpys. Reverted.)
+            //
+            // What DOES win is the same UNROLL-AND-JAM by 4 the A_ww
+            // assembly and the weld-null projections use (2026-08-03,
+            // R1): i stays inner and unit-stride, one accumulator per
+            // weld row, so `v` is traversed 3× per half instead of 12×.
+            // BITWISE: each dot keeps its own ascending-i chain, and in
+            // the axpy each v[i] still takes its 12 increments in
+            // r = 0..11 order (the jam only holds v[i] in a register
+            // across four of them) — bit-for-bit the row-at-a-time
+            // result. This is the hottest loop in the substep: 12
+            // iterations × 12 rows × two nv-wide passes.
             if nweld > 0 {
-                for r in 0..nweld {
-                    let jr = &self.j[r * nv..(r + 1) * nv];
-                    let mut jv = 0.0;
-                    for i in 0..nv {
-                        jv += jr[i] * v[i];
+                debug_assert_eq!(nweld, N_WELD_ROWS);
+                // 12 dots against one shared v, in the TRANSPOSED weld
+                // layout: 12 lanes, each accumulating its own row's
+                // terms over ascending i exactly as the scalar dot did.
+                let mut s = [0.0f64; N_WELD_ROWS];
+                for i in 0..nv {
+                    let vi = v[i];
+                    let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+                    for w in 0..N_WELD_ROWS {
+                        s[w] += jr[w] * vi;
                     }
-                    self.rw[r] = self.bias[r] - jv;
+                }
+                for r in 0..nweld {
+                    self.rw[r] = self.bias[r] - s[r];
                 }
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                for r in 0..nweld {
-                    let d = self.rw[r];
-                    self.lambda[r] += d;
-                    let mr = &self.minvjt[r * nv..(r + 1) * nv];
+                for r in (0..nweld).step_by(4) {
+                    let (d0, d1) = (self.rw[r], self.rw[r + 1]);
+                    let (d2, d3) = (self.rw[r + 2], self.rw[r + 3]);
+                    self.lambda[r] += d0;
+                    self.lambda[r + 1] += d1;
+                    self.lambda[r + 2] += d2;
+                    self.lambda[r + 3] += d3;
+                    let m0 = &self.minvjt[r * nv..(r + 1) * nv];
+                    let m1 = &self.minvjt[(r + 1) * nv..(r + 2) * nv];
+                    let m2 = &self.minvjt[(r + 2) * nv..(r + 3) * nv];
+                    let m3 = &self.minvjt[(r + 3) * nv..(r + 4) * nv];
                     for i in 0..nv {
-                        v[i] += mr[i] * d;
+                        let mut vi = v[i];
+                        vi += m0[i] * d0;
+                        vi += m1[i] * d1;
+                        vi += m2[i] * d2;
+                        vi += m3[i] * d3;
+                        v[i] = vi;
                     }
                 }
             }
@@ -548,12 +698,47 @@ impl ConstraintSet {
                 let cap = model.omega_cap[jt];
                 let target = v[vj].clamp(-cap, cap);
                 if target != v[vj] {
+                    if !self.capcached[jt] && self.limpos[jt] >= 0 {
+                        // DEDUPE (2026-08-03, R1 item 1f): joint jt has
+                        // a LOWER-stop limit row this substep, whose
+                        // right-hand side is +e_vj — the very column
+                        // this pass is about to solve — and which has
+                        // already been through the IDENTICAL weld-null
+                        // projection (same expression tree, same weld
+                        // rows, same A_ww factor). So that row's
+                        // `minvjt` IS this joint's `capcol`, bit for
+                        // bit, and its `diag` IS `capmass`:
+                        //   · pre-projection the two solves are the
+                        //     same call on the same RHS;
+                        //   · `diag[row] = Σᵢ jr[i]·mr[i]` with jr =
+                        //     +e_vj collapses to `1.0 · mr[vj]` (the
+                        //     other terms add ±0.0 to a non-zero
+                        //     partial sum, which is exact) = the cap
+                        //     pass's `plain`, so the COMPOSITE_EPS test
+                        //     and its ∞ verdict are the same test;
+                        //   · the projection is applied to `diag[row]`
+                        //     by the limit block above exactly as the
+                        //     cap pass would apply it to `capmass`.
+                        // ONLY the +1 sign is reused: a −e_vj row would
+                        // need a negation, and −(+0.0) = −0.0 ≠ +0.0
+                        // makes that NOT bitwise (an exactly-cancelling
+                        // entry flips its zero sign), which is why
+                        // `limpos` records lower stops alone.
+                        let lr = self.limpos[jt] as usize;
+                        self.capcol[jt * nv..(jt + 1) * nv]
+                            .copy_from_slice(&self.minvjt[lr * nv..(lr + 1) * nv]);
+                        self.capmass[jt] = self.diag[lr];
+                        self.capcached[jt] = true;
+                    }
                     if !self.capcached[jt] {
                         {
+                            // unit RHS +e_vj: the sparse forward pass
+                            // (rows below vj are exactly the memset's
+                            // +0.0) then the dense back substitution —
+                            // bitwise the fill/store/chol_solve it
+                            // replaces, see `chol_fwd_unit`.
                             let col = &mut self.capcol[jt * nv..(jt + 1) * nv];
-                            col.fill(0.0);
-                            col[vj] = 1.0;
-                            chol_solve(nv, &ws.l, col);
+                            chol_solve_unit(nv, &ws.m, vj, 1.0, col);
                         }
                         let plain = self.capcol[jt * nv + vj];
                         if nweld > 0 {
@@ -563,25 +748,19 @@ impl ConstraintSet {
                             // summing over i ASCENDING, and each col[i]
                             // taking its 12 decrements in w = 0..11
                             // order — bitwise the per-row form.
-                            for w in (0..nweld).step_by(4) {
-                                let j0 = &self.j[w * nv..(w + 1) * nv];
-                                let j1 = &self.j[(w + 1) * nv..(w + 2) * nv];
-                                let j2 = &self.j[(w + 2) * nv..(w + 3) * nv];
-                                let j3 = &self.j[(w + 3) * nv..(w + 4) * nv];
+                            let mut s = [0.0f64; N_WELD_ROWS];
+                            {
                                 let col = &self.capcol[jt * nv..(jt + 1) * nv];
-                                let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
                                 for i in 0..nv {
                                     let c = col[i];
-                                    s0 += j0[i] * c;
-                                    s1 += j1[i] * c;
-                                    s2 += j2[i] * c;
-                                    s3 += j3[i] * c;
+                                    let jr =
+                                        &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+                                    for w in 0..N_WELD_ROWS {
+                                        s[w] += jr[w] * c;
+                                    }
                                 }
-                                self.rw[w] = s0;
-                                self.rw[w + 1] = s1;
-                                self.rw[w + 2] = s2;
-                                self.rw[w + 3] = s3;
                             }
+                            self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                             chol_solve(nweld, &self.lww, &mut self.rw);
                             // weld minvjt rows live at the head of the
                             // buffer — disjoint from capcol, so the two

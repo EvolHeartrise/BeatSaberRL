@@ -399,8 +399,16 @@ fn nan_pivot_is_floored_and_counted() {
     let (mut a, mut b) = ([0.0f64; 4], [0.0f64; 4]);
     assert_eq!(chol_factor_floored(2, &m3, &mut a), 0);
     assert!(chol_factor(2, &m3, &mut b));
-    for (x, y) in a.iter().zip(b.iter()) {
-        assert_eq!(x.to_bits(), y.to_bits());
+    // LOWER TRIANGLE + diagonal only, as in the nv×nv comparison above:
+    // neither factor zeroes the strict upper triangle (dead stores —
+    // chol_solve reads only k ≤ i), and since 2026-08-03 the two-buffer
+    // `chol_factor_floored` is a copy into `l` followed by the in-place
+    // factor, so its upper cells hold the INPUT's upper triangle rather
+    // than the destination's previous contents. No reader either way.
+    for i in 0..2 {
+        for k in 0..=i {
+            assert_eq!(a[i * 2 + k].to_bits(), b[i * 2 + k].to_bits());
+        }
     }
     // and a pivot exactly AT the floor is not counted (>= is inclusive,
     // matching the original `< FLOOR` boundary exactly)
