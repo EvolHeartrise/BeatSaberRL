@@ -325,11 +325,30 @@ pub const PD_FLOOR_F64: f64 = 1e-17;
 /// bitwise-identical to `chol_factor` succeeding). The factor is
 /// always produced; the caller reports the count instead of panicking.
 pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
+    l[..n * n].copy_from_slice(&m[..n * n]);
+    chol_factor_floored_inplace(n, &mut l[..n * n])
+}
+
+/// `chol_factor_floored` writing the factor OVER its input (LAPACK
+/// `potrf` convention) — the shipping form at both production call
+/// sites (2026-08-03, R1 item 1e). Halves the factor stage's working
+/// set from two nv×nv buffers to one, which matters at nv = 35 where
+/// the solver is fighting for L1 against `j` and `minvjt`.
+///
+/// SAFE IN PLACE, and BITWISE the two-buffer form: entry (i, j) is read
+/// as the seed and written as the result within the SAME j iteration,
+/// and column j is untouched by every earlier iteration (iteration j'
+/// writes only column j'), so every operand — the seed `a[i·n+j]`, the
+/// pivot `a[j·n+j]`, and the factor entries `a[·][k<j]` — carries
+/// exactly the value the separate-input version would have read, in the
+/// same order. The strict UPPER triangle is left holding the input's
+/// upper triangle and is never read (see the note below).
+pub fn chol_factor_floored_inplace(n: usize, a: &mut [f64]) -> u32 {
     let mut hits = 0u32;
     for j in 0..n {
-        let mut d = m[j * n + j];
+        let mut d = a[j * n + j];
         {
-            let lj = &l[j * n..j * n + j]; // row j, columns 0..j
+            let lj = &a[j * n..j * n + j]; // row j, columns 0..j
             for k in 0..j {
                 d -= lj[k] * lj[k];
             }
@@ -345,7 +364,7 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
             d = PD_FLOOR_F64;
         }
         let dj = d.sqrt();
-        l[j * n + j] = dj;
+        a[j * n + j] = dj;
         // NOTE (2026-08-03): the strict upper triangle is NOT zeroed
         // any more. Nothing reads it — `chol_solve` touches only
         // l[i*n+k] with k ≤ i (forward) and l[k*n+i] with k > i, i.e.
@@ -359,7 +378,7 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
         // in ASCENDING k — bit-for-bit the one-row-at-a-time result —
         // and no jammed row reads a value another writes (the k-chain
         // stops at k < j, the writes land at column j).
-        let (head, tail) = l.split_at_mut((j + 1) * n);
+        let (head, tail) = a.split_at_mut((j + 1) * n);
         let lj = &head[j * n..j * n + j];
         let mut i = j + 1;
         while i + 4 <= n {
@@ -367,12 +386,11 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
                 let b = (i - j - 1) * n;
                 (b, b + n, b + 2 * n, b + 3 * n)
             };
-            let (mut s0, mut s1, mut s2, mut s3) = (
-                m[i * n + j],
-                m[(i + 1) * n + j],
-                m[(i + 2) * n + j],
-                m[(i + 3) * n + j],
-            );
+            // seeds read from the SAME cells the results are written
+            // back to (in place) — still the untouched input values,
+            // column j being written only in this j iteration
+            let (mut s0, mut s1, mut s2, mut s3) =
+                (tail[r0 + j], tail[r1 + j], tail[r2 + j], tail[r3 + j]);
             {
                 let t = &*tail;
                 let (q0, q1) = (&t[r0..r0 + j], &t[r1..r1 + j]);
@@ -393,7 +411,7 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
         }
         while i < n {
             let r = (i - j - 1) * n;
-            let mut s = m[i * n + j];
+            let mut s = tail[r + j];
             {
                 let q = &tail[r..r + j];
                 for k in 0..j {
@@ -464,6 +482,286 @@ pub fn chol_solve(n: usize, l: &[f64], x: &mut [f64]) {
         }
         x[i] = s / l[i * n + i];
     }
+}
+
+/// Batched in-place solve of W right-hand sides sharing ONE factor.
+/// `x` holds the W RHS ROW-MAJOR — W consecutive rows of `n` doubles,
+/// exactly the `minvjt` layout, so nothing ripples into the A_ww
+/// assembly / weld-null projection / PGS axpy consumers.
+///
+/// SHAPE (2026-08-03, R1): UNROLL-AND-JAM over the RHS index with the
+/// solve index i kept OUTER. Every factor load (`lrow[k]` forward,
+/// `lrow[i]` back) is shared by all W accumulators while each RHS
+/// stream stays UNIT-STRIDE — the form the small-items pass established
+/// as the winner on this CPU. The opposite arrangement (RHS outer, i
+/// inner, or an RHS-minor `x[i*W + r]` transpose) was rejected for the
+/// same reason the weld-PGS interchange was reverted: at nv = 35 the
+/// whole working set is L1-resident, so there is no streaming win to
+/// buy and strided inner loads only cost the unit-stride AVX2
+/// vectorization.
+///
+/// BITWISE: accumulator r subtracts exactly the terms `chol_solve`
+/// would subtract for RHS r, with the same operands in the same
+/// ascending-k order, so every partial sum matches bit for bit; the
+/// closing divide is per-lane IEEE (`vdivpd` is correctly rounded per
+/// element — no reciprocal approximation), so a batched divide equals
+/// W scalar divides exactly.
+pub fn chol_solve_x4(n: usize, l: &[f64], x: &mut [f64]) {
+    debug_assert_eq!(x.len(), 4 * n);
+    let (a, rest) = x.split_at_mut(n);
+    let (b, rest) = rest.split_at_mut(n);
+    let (c, d) = rest.split_at_mut(n);
+    for i in 0..n {
+        let lrow = &l[i * n..i * n + i]; // row i, columns 0..i
+        let (mut s0, mut s1, mut s2, mut s3) = (a[i], b[i], c[i], d[i]);
+        {
+            let (ar, br) = (&a[..i], &b[..i]);
+            let (cr, dr) = (&c[..i], &d[..i]);
+            for k in 0..i {
+                let lk = lrow[k];
+                s0 -= lk * ar[k];
+                s1 -= lk * br[k];
+                s2 -= lk * cr[k];
+                s3 -= lk * dr[k];
+            }
+        }
+        let dg = l[i * n + i];
+        a[i] = s0 / dg;
+        b[i] = s1 / dg;
+        c[i] = s2 / dg;
+        d[i] = s3 / dg;
+    }
+    for i in (0..n).rev() {
+        let (mut s0, mut s1, mut s2, mut s3) = (a[i], b[i], c[i], d[i]);
+        {
+            let (ar, br) = (&a[..n], &b[..n]);
+            let (cr, dr) = (&c[..n], &d[..n]);
+            // rows i+1..n, column i — chunks_exact keeps k ascending,
+            // the same order (and partial sums) as `chol_solve`
+            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+                let lki = lrow[i];
+                s0 -= lki * ar[k];
+                s1 -= lki * br[k];
+                s2 -= lki * cr[k];
+                s3 -= lki * dr[k];
+            }
+        }
+        let dg = l[i * n + i];
+        a[i] = s0 / dg;
+        b[i] = s1 / dg;
+        c[i] = s2 / dg;
+        d[i] = s3 / dg;
+    }
+}
+
+/// Batched solve of 12 right-hand sides held RHS-MINOR: `t` is n rows
+/// of 12, so `t[i*12 + r]` is entry i of RHS r.
+///
+/// Why this layout exists ALONGSIDE `chol_solve_x4` (2026-08-03, R1
+/// 1a): under strict IEEE semantics LLVM may NOT vectorize the k-chain
+/// of a row-major batch — that would reassociate one accumulator's
+/// additions. Here the 12 lanes are 12 INDEPENDENT accumulators, one
+/// per RHS, so a single AVX2 FMA advances four of them at once and the
+/// reassociation question never arises: lane r still subtracts its own
+/// terms in ascending k. Same reason the divide is safe — `vdivpd` is
+/// correctly rounded per lane. The k-chain load `t[k*12 + r]` is a
+/// CONTIGUOUS 12-wide fetch, not a strided one, so this is not the
+/// reverted interchange in disguise.
+///
+/// The caller transposes in and out (an exact copy, bitwise neutral)
+/// rather than storing `minvjt` this way — the RHS-minor layout would
+/// otherwise ripple into the A_ww assembly, the weld-null projections
+/// and the PGS axpy, all of which want unit-stride rows.
+pub fn chol_solve_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
+    debug_assert_eq!(t.len(), W * n);
+    for i in 0..n {
+        let lrow = &l[i * n..i * n + i];
+        let mut s = [0.0f64; W];
+        s.copy_from_slice(&t[i * W..i * W + W]);
+        for k in 0..i {
+            let lk = lrow[k];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lk * xr[r];
+            }
+        }
+        let dg = l[i * n + i];
+        let row = &mut t[i * W..i * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+    for i in (0..n).rev() {
+        let mut s = [0.0f64; W];
+        s.copy_from_slice(&t[i * W..i * W + W]);
+        for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+            let lki = lrow[i];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lki * xr[r];
+            }
+        }
+        let dg = l[i * n + i];
+        let row = &mut t[i * W..i * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+}
+
+/// The BACK half of `chol_solve_t` — for right-hand sides whose
+/// forward pass ran separately (the limit columns: each has its own
+/// pivot row, so their forward passes stay sparse and row-major, but
+/// the dense back pass they share is worth the transpose).
+pub fn chol_back_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
+    debug_assert_eq!(t.len(), W * n);
+    for i in (0..n).rev() {
+        let mut s = [0.0f64; W];
+        s.copy_from_slice(&t[i * W..i * W + W]);
+        for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+            let lki = lrow[i];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lki * xr[r];
+            }
+        }
+        let dg = l[i * n + i];
+        let row = &mut t[i * W..i * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+}
+
+/// `chol_solve_x4` at width 2 — the remainder rung of the batch ladder.
+pub fn chol_solve_x2(n: usize, l: &[f64], x: &mut [f64]) {
+    debug_assert_eq!(x.len(), 2 * n);
+    let (a, b) = x.split_at_mut(n);
+    for i in 0..n {
+        let lrow = &l[i * n..i * n + i];
+        let (mut s0, mut s1) = (a[i], b[i]);
+        {
+            let (ar, br) = (&a[..i], &b[..i]);
+            for k in 0..i {
+                let lk = lrow[k];
+                s0 -= lk * ar[k];
+                s1 -= lk * br[k];
+            }
+        }
+        let dg = l[i * n + i];
+        a[i] = s0 / dg;
+        b[i] = s1 / dg;
+    }
+    for i in (0..n).rev() {
+        let (mut s0, mut s1) = (a[i], b[i]);
+        {
+            let (ar, br) = (&a[..n], &b[..n]);
+            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+                let lki = lrow[i];
+                s0 -= lki * ar[k];
+                s1 -= lki * br[k];
+            }
+        }
+        let dg = l[i * n + i];
+        a[i] = s0 / dg;
+        b[i] = s1 / dg;
+    }
+}
+
+/// BACK substitution alone — verbatim the second half of `chol_solve`
+/// (same operands, same ascending-k order), split out so a right-hand
+/// side whose FORWARD pass has a closed form (`chol_fwd_unit`) can skip
+/// straight to it.
+pub fn chol_back(n: usize, l: &[f64], x: &mut [f64]) {
+    for i in (0..n).rev() {
+        let mut s = x[i];
+        {
+            let xr = &x[..n];
+            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+                s -= lrow[i] * xr[k];
+            }
+        }
+        x[i] = s / l[i * n + i];
+    }
+}
+
+/// `chol_back` jammed over 2 — the remainder rung.
+pub fn chol_back_x2(n: usize, l: &[f64], x: &mut [f64]) {
+    debug_assert_eq!(x.len(), 2 * n);
+    let (a, b) = x.split_at_mut(n);
+    for i in (0..n).rev() {
+        let (mut s0, mut s1) = (a[i], b[i]);
+        {
+            let (ar, br) = (&a[..n], &b[..n]);
+            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
+                let lki = lrow[i];
+                s0 -= lki * ar[k];
+                s1 -= lki * br[k];
+            }
+        }
+        let dg = l[i * n + i];
+        a[i] = s0 / dg;
+        b[i] = s1 / dg;
+    }
+}
+
+/// EXACT sparse forward substitution for the unit right-hand side
+/// `sign·e_m` (`sign` = ±1.0), writing the full length-`n` result.
+/// Mirrors the CUDA `chol_solve_unit_n` template.
+///
+/// Why the leading rows can be skipped rather than computed
+/// (BITWISE argument — the RHS here is produced by `jr.fill(0.0)`
+/// followed by a single `jr[m] = sign` STORE, so every non-pivot entry
+/// is a genuine `+0.0` and no `-0.0` ever seeds the solve; note the row
+/// is never formed by multiplying a zero row by −1, which is the one
+/// construction that would introduce `-0.0` seeds):
+///
+///  * The diagonal is unconditionally positive and finite. §22's pivot
+///    floor is applied through the NEGATED comparison `!(d >= FLOOR)`,
+///    so even a NaN pivot is clamped to `PD_FLOOR_F64` — hence
+///    `l[i·n+i] = sqrt(d) >= sqrt(1e-17) ≈ 3.2e-9 > 0` for EVERY i, no
+///    precondition on the pose. (This is what makes the argument hold
+///    unconditionally; before that fix a NaN pivot could reach here.)
+///  * Row i < m: `s` starts at `+0.0` and each term subtracts
+///    `l[i][k]·(+0.0) = ±0.0`. IEEE round-to-nearest gives
+///    `+0.0 − (+0.0) = +0.0` AND `+0.0 − (−0.0) = +0.0`, so the sign of
+///    the factor entry cannot leak in: `s` stays exactly `+0.0` and
+///    `+0.0 / (positive finite) = +0.0`. The memset therefore
+///    reproduces the dense bytes exactly, not merely the values.
+///  * Row i = m: `s` starts at `sign` and subtracts m terms each
+///    `±0.0`; subtracting a zero from a non-zero finite value is exact,
+///    so `s == sign` bit for bit and `x[m] = sign / l[m·n+m]`.
+///  * Row i > m: `s` starts at `+0.0` and the k < m terms leave it at
+///    `+0.0` by the first bullet, so beginning the accumulation at
+///    k = m gives the identical partial-sum chain. (The `s` seed is
+///    kept as an explicit `+0.0` rather than negating the first
+///    product — `+0.0 − (+0.0)` is `+0.0` where `−(+0.0)` would be
+///    `-0.0`.)
+pub fn chol_fwd_unit(n: usize, l: &[f64], m: usize, sign: f64, x: &mut [f64]) {
+    debug_assert_eq!(x.len(), n);
+    debug_assert!(m < n);
+    x[..m].fill(0.0);
+    x[m] = sign / l[m * n + m];
+    for i in (m + 1)..n {
+        let lrow = &l[i * n..i * n + i]; // row i, columns 0..i
+        let mut s = 0.0;
+        {
+            let xr = &x[..i];
+            for k in m..i {
+                s -= lrow[k] * xr[k];
+            }
+        }
+        x[i] = s / l[i * n + i];
+    }
+}
+
+/// Full solve for a unit right-hand side `sign·e_m`: the sparse
+/// forward pass above then the ordinary dense back substitution
+/// (the back pass has no exploitable structure — by the time it runs
+/// every entry above m is generally non-zero).
+pub fn chol_solve_unit(n: usize, l: &[f64], m: usize, sign: f64, x: &mut [f64]) {
+    chol_fwd_unit(n, l, m, sign, x);
+    chol_back(n, l, x);
 }
 
 /// Total (linear, angular-about-world-origin) momentum at the FK in ws.
