@@ -43,6 +43,13 @@
 //!
 //! Loop bounds and evaluation order are fixed throughout — the
 //! torch/CUDA mirrors replicate these expression trees literally.
+//!
+//! ORDER-DEPENDENCE (2026-08-05, R9 — the rule the CUDA kernel header
+//! already carries): the four weld contractions now visit the weld
+//! Jacobian's SUPPORT instead of all 35 columns, which changes this
+//! module's register/inner-loop economics. Jam widths and any change
+//! previously measured at under ~1% must be RE-PROBED against the
+//! post-R9 build before being called dead.
 
 use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
@@ -71,6 +78,88 @@ pub const N_WELD_ROWS: usize = 12;
 /// Max rows: 12 weld + 55 contact + ≤ 1 joint-limit row per joint
 /// (Divergences §15 — the nearer stop only, when within reach).
 pub const MAX_ROWS: usize = N_WELD_ROWS + NUM_PAIRS + 29; // 96
+
+// ── R9 (2026-08-05): WELD-JACOBIAN SUPPORT — the port of the CUDA
+//    kernel's K5 sparsity (beat_arena_cuda.cu §20c) to the Rust sim.
+//
+// A weld row is assembled as `jr.fill(0.0)` followed by
+// `point_jacobian_acc` / `angular_jacobian_acc`, and those two write
+// ONLY (a) the free-base columns `row[0..3]` / `row[3 + t]` and (b)
+// `row[voff + fr.coord]` for each frame on the welded foot's ancestor
+// chain. Nothing else is ever touched, so every other column keeps the
+// memset's +0.0 EXACTLY.
+//
+//   F_L_FOOT = 23 → chain 23,22,21,20,19,18 → coords 22..17
+//                 → v-columns voff+17 .. voff+22 = 23..28
+//   F_R_FOOT = 29 → chain 29,28,27,26,25,24 → coords 28..23
+//                 → v-columns 29..34
+//
+// so, with voff = 6 and nv = 35:
+//   rows 0..6  (left foot)  support = {0..6} ∪ {23..29}
+//   rows 6..12 (right foot) support = {0..6} ∪ {29..35}
+// and columns 6..23 are +0.0 in ALL TWELVE rows.
+//
+// BITWISE: every consumer is a set of 12 dots `s[w] += J_w[w][i]·x[i]`
+// with `s` seeded +0.0. A skipped term contributes (+0.0)·x = ±0.0, and
+// `y + (±0.0) == y` for every y reachable here: an accumulator seeded
+// +0.0 can never become −0.0 (x + y = −0.0 under RN needs x = y = −0.0),
+// so the −0.0 channel is unreachable and the accumulator is unchanged.
+// The KEPT terms keep their original ascending-i order, interleaved
+// skips and all — no reassociation. (Holds on finite trajectories; the
+// same acceptance as CUDA K5, since 0·NaN = 0·∞ = NaN. Work-order §10.)
+const W_BASE_HI: usize = 6; // free-base columns 0..6, all 12 rows
+const W_L_LO: usize = 23; // left-foot chain, rows 0..6
+const W_L_HI: usize = 29;
+const W_R_LO: usize = 29; // right-foot chain, rows 6..12
+const W_R_HI: usize = 35;
+// Pin the layout the segments are derived from (mirrors the
+// `static_assert` at beat_arena_cuda.cu:349).
+const _: () = {
+    assert!(F_L_FOOT == 23 && F_R_FOOT == 29);
+    assert!(super::model::NQ == 29 && super::model::NV == W_R_HI);
+    assert!(N_WELD_ROWS == 12);
+    assert!(W_BASE_HI == 6 && W_L_LO == 23 && W_L_HI == 29 && W_R_LO == 29);
+};
+
+/// `s[w] += J_w[w][i] · src[i]` for all 12 weld rows, over the SUPPORT
+/// of the weld Jacobian only (R9). `jwt` is the transposed weld
+/// Jacobian (`jwt[i*12 + w]`), `s` a `[f64; N_WELD_ROWS]` seeded +0.0.
+///
+/// Only the all-zero column block 6..23 is skipped; all 12 contiguous
+/// lanes are kept, so the inner loop stays the unit-stride 12-lane AVX2
+/// shape the R1 transpose bought. That is worth +3.4% on its own
+/// (19,505 → 20,162 env-steps/s at N = 256, pooled median of six
+/// interleaved A/B pairs) and −3.6% of bench wall (472 → 455 s).
+///
+/// The FULL tier — additionally restricting the left segment {23..29}
+/// to lanes 0..6 and the right {29..35} to lanes 6..12, which is the
+/// exact 96-of-420 support — was implemented and MEASURED TWICE and is
+/// NOT shipped: 6-lane halves +0.15%, halves padded to 8 lanes
+/// (0..8 / 4..12, the padding lanes reading the +0.0 entries, which is
+/// bitwise-neutral by the same argument) +0.25%, both against a cheap
+/// tier whose own run-to-run spread reached 1.5% on this box. Two more
+/// loop bodies and a padding argument for a gain under the noise floor
+/// is exactly the "neutral with added complexity" the revert rule kills.
+/// The remaining halves are 1.5 AVX2 registers wide — the shape, not the
+/// term count, is what stops paying here.
+macro_rules! weld_support_dot {
+    ($s:expr, $jwt:expr, $src:expr) => {{
+        for i in 0..W_BASE_HI {
+            let x = $src[i];
+            let jr = &$jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+            for w in 0..N_WELD_ROWS {
+                $s[w] += jr[w] * x;
+            }
+        }
+        for i in W_L_LO..W_R_HI {
+            let x = $src[i];
+            let jr = &$jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+            for w in 0..N_WELD_ROWS {
+                $s[w] += jr[w] * x;
+            }
+        }
+    }};
+}
 
 /// Constraint stage state + preallocated buffers (no allocation inside
 /// a substep — contact Vec capacity is reserved up front). Construct
@@ -213,6 +302,42 @@ impl ConstraintSet {
         s
     }
 
+    /// TEST HOOK (R9): the assembled dense weld Jacobian, `N_WELD_ROWS`
+    /// rows of `nv` — the object whose support the segmented loops rest
+    /// on.
+    #[cfg(test)]
+    pub fn weld_j(&self) -> &[f64] {
+        &self.j[..N_WELD_ROWS * self.nv]
+    }
+
+    /// TEST HOOK (R9): the transposed weld Jacobian (`jwt[i*12 + w]`),
+    /// the layout every segmented consumer reads.
+    #[cfg(test)]
+    pub fn weld_jwt(&self) -> &[f64] {
+        &self.jwt[..N_WELD_ROWS * self.nv]
+    }
+
+    /// TEST HOOK (R9): the dense-vs-segmented 12-lane dot, run on the
+    /// LIVE `jwt` of the last solve. Returns (dense, segmented).
+    #[cfg(test)]
+    pub fn weld_dot_ref_vs_segmented(
+        &self,
+        src: &[f64],
+    ) -> ([f64; N_WELD_ROWS], [f64; N_WELD_ROWS]) {
+        let nv = self.nv;
+        let mut dense = [0.0f64; N_WELD_ROWS];
+        for i in 0..nv {
+            let x = src[i];
+            let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+            for w in 0..N_WELD_ROWS {
+                dense[w] += jr[w] * x;
+            }
+        }
+        let mut seg = [0.0f64; N_WELD_ROWS];
+        weld_support_dot!(seg, self.jwt, src);
+        (dense, seg)
+    }
+
     /// Weld row count actually assembled (0 or 12).
     pub fn weld_rows(&self) -> usize {
         if self.welds {
@@ -252,6 +377,11 @@ impl ConstraintSet {
         // ── assembly: weld rows 0–11 ──────────────────────────────────
         if self.welds {
             debug_assert!(model.free_base, "welds assume the humanoid tree");
+            // R9: the weld-support column segments are compile-time
+            // constants derived from the humanoid layout — which is the
+            // only model WELD_FRAMES can index anyway. One predictable
+            // branch per solve keeps that implicit assumption honest.
+            assert_eq!(nv, W_R_HI, "the R9 weld-support segments pin nv = 35");
             for (widx, (&frame, target)) in
                 WELD_FRAMES.iter().zip(WELD_TARGET_P.iter()).enumerate()
             {
@@ -499,14 +629,10 @@ impl ConstraintSet {
             for r in 0..nweld {
                 let mut s = [0.0f64; N_WELD_ROWS];
                 {
+                    // R9: only the weld Jacobian's support is visited —
+                    // columns 6..23 are +0.0 in all 12 rows.
                     let mr = &self.minvjt[r * nv..(r + 1) * nv];
-                    for i in 0..nv {
-                        let m = mr[i];
-                        let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
-                        for c in 0..N_WELD_ROWS {
-                            s[c] += jr[c] * m;
-                        }
-                    }
+                    weld_support_dot!(s, self.jwt, mr);
                 }
                 // The whole 12-lane row is computed and the c < r lanes
                 // discarded: one vector FMA per i beats the 12 − r
@@ -556,13 +682,7 @@ impl ConstraintSet {
                 // one-row-at-a-time result. (A full w/i interchange was
                 // measured SLOWER, see the weld PGS note.)
                 let mut s = [0.0f64; N_WELD_ROWS];
-                for i in 0..nv {
-                    let m = mr[i];
-                    let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
-                    for w in 0..N_WELD_ROWS {
-                        s[w] += jr[w] * m;
-                    }
-                }
+                weld_support_dot!(s, self.jwt, mr); // R9 support only
                 self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                 chol_solve(nweld, &self.lww, &mut self.rw);
                 for w in (0..nweld).step_by(4) {
@@ -630,13 +750,7 @@ impl ConstraintSet {
                 // layout: 12 lanes, each accumulating its own row's
                 // terms over ascending i exactly as the scalar dot did.
                 let mut s = [0.0f64; N_WELD_ROWS];
-                for i in 0..nv {
-                    let vi = v[i];
-                    let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
-                    for w in 0..N_WELD_ROWS {
-                        s[w] += jr[w] * vi;
-                    }
-                }
+                weld_support_dot!(s, self.jwt, v); // R9 support only
                 for r in 0..nweld {
                     self.rw[r] = self.bias[r] - s[r];
                 }
@@ -751,14 +865,7 @@ impl ConstraintSet {
                             let mut s = [0.0f64; N_WELD_ROWS];
                             {
                                 let col = &self.capcol[jt * nv..(jt + 1) * nv];
-                                for i in 0..nv {
-                                    let c = col[i];
-                                    let jr =
-                                        &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
-                                    for w in 0..N_WELD_ROWS {
-                                        s[w] += jr[w] * c;
-                                    }
-                                }
+                                weld_support_dot!(s, self.jwt, col); // R9
                             }
                             self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                             chol_solve(nweld, &self.lww, &mut self.rw);
