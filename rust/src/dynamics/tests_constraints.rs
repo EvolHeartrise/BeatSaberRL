@@ -475,3 +475,124 @@ fn bench_substep_contacts() {
         cs.contacts.len()
     );
 }
+
+/// Gate (R9): the WELD-JACOBIAN SUPPORT claim the segmented weld dots
+/// rest on, plus a dense-vs-segmented bit-equality soak.
+///
+/// Two things are pinned:
+///  1. STRUCTURE — every weld row is `fill(0.0)` + writes on the
+///     free-base columns and the welded foot's ancestor chain, so the
+///     columns outside `{0..6} ∪ chain` hold the memset's +0.0 EXACTLY
+///     (sign bit clear, not merely `== 0.0`). Both the CHEAP tier's
+///     claim (columns 6..23 dead in all 12 rows) and the FULL tier's
+///     (23..29 dead in rows 6..12, 29..35 dead in rows 0..6) are
+///     asserted, so the record survives whichever tier ships.
+///  2. ARITHMETIC — the shipped segmented dot reproduces the dense one
+///     bit for bit on the live `jwt` of every solve, over probe vectors
+///     including the state itself, ±1 unit columns (the −0.0 channel's
+///     only way in) and random dense vectors.
+#[test]
+fn r9_weld_support_and_segmented_dot_bitwise() {
+    let m = &HUMANOID;
+    let nv = m.nv();
+    let voff = m.voff();
+    // ancestor chains of the two welded foot frames, as v-columns
+    let chain = |frame: usize| -> Vec<usize> {
+        let mut out = vec![];
+        let mut k = frame as i32;
+        while k >= 0 {
+            let fr = &m.frames[k as usize];
+            if fr.coord >= 0 {
+                out.push(voff + fr.coord as usize);
+            }
+            k = fr.parent;
+        }
+        out.sort_unstable();
+        out
+    };
+    let cl = chain(WELD_FRAMES[0]);
+    let cr = chain(WELD_FRAMES[1]);
+    assert_eq!(cl, (23..29).collect::<Vec<_>>(), "left-foot chain columns");
+    assert_eq!(cr, (29..35).collect::<Vec<_>>(), "right-foot chain columns");
+
+    let mut rng = Rng(0x0000_0009_5EED_0090);
+    let mut solves = 0usize;
+    let mut probes = 0usize;
+    for state_i in 0..24 {
+        let mut st = super::testutil::random_state(m, &mut rng, true);
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, true, true);
+        let mut tau = [0.0f64; NQ];
+        for k in 0..40 {
+            if k % 8 == 0 {
+                for j in 0..NQ {
+                    let s = match rng.next_u64() % 3 {
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => -1.0,
+                    };
+                    tau[j] = s * m.tau_max[j];
+                }
+            }
+            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+            if !st.v.iter().all(|x| x.is_finite()) {
+                break; // the support claim is a finite-trajectory one
+            }
+            solves += 1;
+            // (1) structure: dead columns are EXACTLY +0.0
+            let j = cs.weld_j();
+            let jwt = cs.weld_jwt();
+            for r in 0..12 {
+                let live: &[usize] = if r < 6 { &cl } else { &cr };
+                for i in 0..nv {
+                    let x = j[r * nv + i];
+                    assert_eq!(
+                        jwt[i * 12 + r].to_bits(),
+                        x.to_bits(),
+                        "jwt transpose mismatch at row {r} col {i}"
+                    );
+                    if i < 6 || live.contains(&i) {
+                        continue;
+                    }
+                    assert_eq!(
+                        x.to_bits(),
+                        0.0f64.to_bits(),
+                        "state {state_i} substep {k}: weld row {r} column \
+                         {i} is {x} — outside the R9 support"
+                    );
+                }
+            }
+            // (2) arithmetic: segmented == dense, bit for bit
+            let mut probe_vecs: Vec<Vec<f64>> = vec![st.v.to_vec()];
+            for c in [0usize, 5, 6, 22, 23, 29, 34] {
+                let mut e = vec![0.0f64; nv];
+                e[c] = if c % 2 == 0 { 1.0 } else { -1.0 };
+                probe_vecs.push(e);
+            }
+            let mut dense_rand = vec![0.0f64; nv];
+            for x in dense_rand.iter_mut() {
+                *x = rng.range(-1e3, 1e3);
+            }
+            probe_vecs.push(dense_rand);
+            for pv in probe_vecs.iter() {
+                let (dense, seg) = cs.weld_dot_ref_vs_segmented(pv);
+                for w in 0..12 {
+                    assert_eq!(
+                        dense[w].to_bits(),
+                        seg[w].to_bits(),
+                        "state {state_i} substep {k} lane {w}: segmented \
+                         {} != dense {}",
+                        seg[w],
+                        dense[w]
+                    );
+                }
+                probes += 1;
+            }
+        }
+    }
+    println!(
+        "R9 support gate: {solves} solves, {probes} dense-vs-segmented \
+         12-lane dots, all bit-identical"
+    );
+    assert!(solves > 500, "corpus too small ({solves} solves)");
+}
