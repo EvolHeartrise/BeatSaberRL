@@ -203,6 +203,34 @@ constexpr int NOTE_FEAT = 14;
 // different transform — a loop interchange over independent right-hand
 // sides — and remains legal in both directions, as today.
 //
+// K7 (2026-08-07) — BATCH ensure_pcol OVER THE LIMIT-ROW GROUP, the same
+// RHS-batching transform applied to the last serial per-column pass in
+// the constraint stage. The limit rows' projected columns were computed
+// one joint at a time, each re-reading all of s.jw (144 loads), its own
+// 12x12 solve, and all of s.mw (420 loads). Batched 4-wide those reads
+// are shared, so a group of four costs one traversal instead of four:
+// 24,224 -> 25,370 env-steps/s at N=4096, +4.73% (5 interleaved rounds,
+// non-overlapping ranges). Width ladder and the two rejected widths are
+// tabulated at the call site.
+//
+// SPILL-CLIFF STATUS AFTER K7 — the headroom is GONE. f32 goes 249 ->
+// 255 registers, still 0 spill stores / 0 spill loads, frame 43,024 ->
+// 43,216 B (the +192 is exactly the rw[4][12] batch). So K7 spent all
+// six registers K6 bought and the kernel is now pinned AT the 255 cap:
+// the NEXT item that adds a live value falls off the cliff, and the
+// "check the build log before reading a micro-bench number" rule is now
+// the first thing K8/K9/K11 must do, not the last.
+// f64 crossed its OWN cliff on the same edit, in the opposite direction
+// from what its history predicted: step_kernel<double> went 90,992 B /
+// 12,308 / 10,300 spills to 85,536 B / ZERO spills at the same 255
+// registers, and its SASS shrank 56,130 -> 38,302 instructions (LDL
+// 12,493 -> 6,624, STL 4,744 -> 2,972). Nothing about the f64 arithmetic
+// got smaller; ptxas simply found a schedule that fits once the
+// per-column pcol pass stopped being four separate live regions. So the
+// K6 header's "the f64 kernel cannot fit either way" is now FALSE — f64
+// is on the cliff edge too, and K8/K9/K11 must gate BOTH dtypes' spill
+// counters, not just f32's.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -1836,6 +1864,134 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   s.pcomp[j] = true;
 }
 
+// K7: BATCHED ensure_pcol. B columns of the limit-row group are computed
+// together so they share the three big reads:
+//   (a) the fused copy+dot pass reads s.jw[w][i] ONCE for all B columns;
+//   (b) the 12x12 weld solve becomes chol_solve_multi_n<B> — the proven
+//       multi-RHS loop interchange, bitwise per right-hand side;
+//   (c) the projection pass reads s.mw[w][i] ONCE for all B columns.
+// BITWISE: the columns are mutually independent (distinct ecol/pcol
+// rows), every sum[b][w] still runs over the same terms in ascending i
+// from the same +0.0 seed, and every col[b][i] still applies w = 0..11
+// in that exact sequence — only the b loop is hoisted inside, which
+// reassociates nothing. NO row blocking is involved anywhere here, so
+// K6's back-substitution prohibition does not apply.
+//
+// PRECONDITIONS at the one call site (constraint_solve's limit
+// projection), all three guaranteed by the substep that calls in:
+//   - s.ecomp[j] is already true for every j in the group — the batched
+//     unit-solve block computes the WHOLE s.l_j group a few lines above
+//     — so ensure_ecol would be a no-op here; it is left out rather than
+//     drag B copies of chol_solve_unit_n into this instantiation.
+//   - s.pcomp[j] is false for every j (substep clears it right before
+//     constraint_solve and this is the substep's first ensure_pcol), so
+//     the lazy-cache early-out cannot fire.
+//   - s.l_j is strictly ascending with distinct joints, so the B
+//     ecol/pcol row pairs never alias.
+// pdiag / pcomp are written exactly as the scalar path writes them.
+template <int B, typename T>
+__device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
+  int j[B];
+  T plain[B];
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    j[b] = js[b];
+    plain[b] = s.ecol[j[b]][VOFF + j[b]];
+  }
+  T rw[B][N_WELD];
+  {
+    // Same segmentation onto the K5 weld support as the scalar body: the
+    // copy half stays full-length, the dot half visits only the support.
+    T sum[B][N_WELD];
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) sum[b][w] = T(0);
+    }
+    for (int i = 0; i < VOFF; i++) {  // root columns: all 12 rows
+      T ci[B];
+#pragma unroll
+      for (int b = 0; b < B; b++) {
+        ci[b] = s.ecol[j[b]][i];
+        s.pcol[j[b]][i] = ci[b];
+      }
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) {
+        const T jwi = s.jw[w][i];
+#pragma unroll
+        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
+      }
+    }
+    for (int i = VOFF; i < WJ_L0; i++) {  // copy only
+#pragma unroll
+      for (int b = 0; b < B; b++) s.pcol[j[b]][i] = s.ecol[j[b]][i];
+    }
+    for (int i = WJ_L0; i < WJ_R0; i++) {  // left-foot chain: rows 0..5
+      T ci[B];
+#pragma unroll
+      for (int b = 0; b < B; b++) {
+        ci[b] = s.ecol[j[b]][i];
+        s.pcol[j[b]][i] = ci[b];
+      }
+#pragma unroll
+      for (int w = 0; w < N_WELD / 2; w++) {
+        const T jwi = s.jw[w][i];
+#pragma unroll
+        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
+      }
+    }
+    for (int i = WJ_R0; i < NV; i++) {  // right-foot chain: rows 6..11
+      T ci[B];
+#pragma unroll
+      for (int b = 0; b < B; b++) {
+        ci[b] = s.ecol[j[b]][i];
+        s.pcol[j[b]][i] = ci[b];
+      }
+#pragma unroll
+      for (int w = N_WELD / 2; w < N_WELD; w++) {
+        const T jwi = s.jw[w][i];
+#pragma unroll
+        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
+      }
+    }
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) rw[b][w] = sum[b][w];
+    }
+  }
+  chol_solve_multi_n<B>(N_WELD, s.aww, &rw[0][0]);
+  {
+    T x[B][N_WELD];
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) x[b][w] = rw[b][w];
+    }
+    for (int i = 0; i < NV; i++) {
+      T ci[B];
+#pragma unroll
+      for (int b = 0; b < B; b++) ci[b] = s.pcol[j[b]][i];
+#pragma unroll
+      for (int w = 0; w < N_WELD; w++) {
+        const T mwi = s.mw[w][i];
+#pragma unroll
+        for (int b = 0; b < B; b++) ci[b] -= mwi * x[b][w];
+      }
+#pragma unroll
+      for (int b = 0; b < B; b++) s.pcol[j[b]][i] = ci[b];
+    }
+  }
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const T dnew = s.pcol[j[b]][VOFF + j[b]];
+    s.pdiag[j[b]] = dnew > T(COMPOSITE_EPS) * plain[b]
+                        ? dnew
+                        : std::numeric_limits<T>::infinity();
+    s.pcomp[j[b]] = true;
+  }
+}
+
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
 template <typename T>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
@@ -2021,6 +2177,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // per-column (each has its own m = VOFF + j); the dense back halves
   // run 4 / 2 at a time. s.l_j is strictly ascending and its entries are
   // distinct joints, so the batched pointers never alias.
+  // LOAD-BEARING for K7: this block must keep covering the WHOLE s.l_j
+  // group — ensure_pcol_multi below takes s.ecomp[j] as a precondition.
   //
   // Width: s.nl measures mean 7.8, range 3-14 (f32 trace, 256 envs), so
   // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
@@ -2076,8 +2234,31 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
 
   // -- limit rows: project into the weld null space ---------------------------
+  // BATCHED (K7) on the same 4 / 2 / 1 ladder as the unit solves above:
+  // the whole group is uncomputed and its columns are independent, so B
+  // of them share the jw read, the 12x12 solve and the mw read. See
+  // ensure_pcol_multi's header for the preconditions this relies on
+  // (they are exactly what the ecol block above establishes).
+  // WIDTH probed (5 / 3 / 3 interleaved rounds vs this build, N = 4096):
+  //   4 / 2 / 1 (this)          24,224 -> 25,370  +4.73%   KEPT
+  //   2 / 1 only                24,240 -> 24,603  +1.50%   rejected
+  //   8 / 4 / 2 / 1             25,366 -> 25,192  -0.69%   REVERTED
+  // (the two rejected rows were measured against the 4-wide arm in its
+  // own pairs, hence the slightly different A-arm readings)
+  // Same saturation the ecol ladder found: four independent chains is
+  // where the gain tops out. The 8-tier fits (f32 still 0 spills, 255
+  // regs, frame 43,472) but nl means 7.8, so it fires on about half the
+  // substeps and pays a doubled live-x[8][12] projection loop for it.
+  {
+    int li = 0;
+    for (; li + 3 < s.nl; li += 4) ensure_pcol_multi<4>(s, &s.l_j[li]);
+    if (li + 1 < s.nl) {
+      ensure_pcol_multi<2>(s, &s.l_j[li]);
+      li += 2;
+    }
+    for (; li < s.nl; li++) ensure_pcol(d, s, s.l_j[li]);
+  }
   for (int li = 0; li < s.nl; li++) {
-    ensure_pcol(d, s, s.l_j[li]);
     s.l_diag[li] = s.pdiag[s.l_j[li]];
     s.l_lam[li] = T(0);
   }
