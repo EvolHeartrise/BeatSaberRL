@@ -231,6 +231,43 @@ constexpr int NOTE_FEAT = 14;
 // is on the cliff edge too, and K8/K9/K11 must gate BOTH dtypes' spill
 // counters, not just f32's.
 //
+// K8+K9 (2026-08-07) — REFINE the K5 weld support and stop materialising
+// the weld Jacobian twice. Three pieces, each probed against the build
+// below it, 5 interleaved A/B rounds at N=4096 apiece:
+//   K8   support 12 cols -> 9 (linear rows) / 7 (angular)
+//                                 25,363.7 -> 25,690.3   +1.29%   KEPT
+//   K9a+b one ancestor walk per foot, single-write stores
+//                                 25,706.3 -> 25,719.4   +0.10%   KEPT
+//   K9c  build J_w straight into s.mw; compact 84-value support store
+//                                 25,706.3 -> 25,821.3   +0.45%   KEPT
+//   PACKAGE                       25,359.7 -> 25,828.1   +1.85%
+// (all four medians of 5; every pair had non-overlapping ranges.)
+// The derivation is at WELD_FRAMES: K5 took the six root columns
+// wholesale, but a linear row's column 3+t is a STRUCTURAL +0.0 (the
+// t-th component of cross(rel0, e_t)) and an angular row touches only
+// 3+t of them; each row also has exactly one entry that is exactly 1.0,
+// contracted as a bare add (1.0*x == x unconditionally). nnz 144 -> 96,
+// of which 12 need no multiply. K9c then drops s.jw entirely: the rows
+// are built in s.mw (which the 12-RHS solve overwrote in place anyway),
+// the 420-load/420-store seed copy is gone, and the raw Jacobian
+// survives as s.jwc[12][6] + s.jwr[6][2] = 84 numbers instead of 420.
+// f32 frame 43,216 -> 41,872 B, still 255 registers and ZERO spills.
+// MEASURED AND REJECTED (recorded at the site): dropping the forced
+// `#pragma unroll` on the A_ww r/c nest costs -0.12% on f32
+// (25,838.9 -> 25,809.0) even though it clears f64's 8-byte spill and
+// shrinks the SASS — the unrolled nest folds WJ_ONE/WJ_ANG/WJ_R2 to
+// immediates, and f32 is the production dtype.
+// SPILL STATUS: f32 41,872 B / 0 / 0 / 255 regs; f64 82,912 B / 8 B
+// spill stores / 8 B spill loads / 255 regs. f64 picked up that 8-byte
+// spill at the K8 step and never lost it; it is one 64-bit value and
+// f64 still measures ~1% off f32's shape, so it was not traded for the
+// f32 point above. f32 has NO headroom: still pinned at 255.
+// SASS f32 33,407 -> 38,070 instrs (LDL 6,595 -> 6,548, STL 2,882 ->
+// 3,042); f64 38,302 -> 43,290 (LDL 6,624 -> 6,570, STL 2,972 ->
+// 2,901). Static size GREW while the kernel got faster — the pragmas
+// above trade code for immediates; static counts are not dynamic
+// traffic (the same caveat K7 recorded).
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -445,14 +482,86 @@ __device__ constexpr int WELD_FRAMES[2] = {F_L_FOOT, F_R_FOOT};
 // 23,22,21,20,19,18 -> F_COORD 22,21,20,19,18,17 -> v-columns 23..28,
 // and from F_R_FOOT = 29 frames 29,28,27,26,25,24 -> v-columns 29..34.
 // So rows 0..5 have support {0..5} u {23..28} and rows 6..11 have
-// {0..5} u {29..34}: 12 of NV = 35 columns. The three consumers that
-// contract a weld row (A_ww assembly, the PGS weld dot, ensure_pcol's
-// fused dot) iterate only those ranges; s.jw's zero fill and the
-// full-length s.mw seed copy are UNCHANGED, since s.mw is dense.
+// {0..5} u {29..34}: 12 of NV = 35 columns.
 constexpr int WJ_L0 = 23;
 constexpr int WJ_R0 = 29;
 static_assert(WJ_R0 == WJ_L0 + 6 && WJ_R0 + 6 == NV && N_WELD == 12,
               "K5: weld support layout is {0..5} u {L0..L0+5} / {R0..NV}");
+//
+// K8 (2026-08-07) — the SAME derivation carried into the six root
+// columns, which K5 took wholesale. Row r of the weld block is
+// r = 6*widx + m; t = m % 3 and the row is ANGULAR iff m >= 3.
+//
+//   ANGULAR row (angular_jacobian_acc, sign = +1): the ancestor walk
+//   writes only row[VOFF + F_COORD[k]], then `row[3 + axis_t] += sign`
+//   -- ONE root column, holding exactly +0.0 + 1.0 = 1.0. Columns 0..2
+//   and the other two of 3..5 are never touched.
+//        support = {3 + t} u chain6  ->  7 columns, one of them 1.0.
+//
+//   LINEAR row (point_jacobian_acc with n = e_t, sign = +1): the walk
+//   writes row[VOFF + F_COORD[k]] += dot3(e_t, w) = w[t]; then
+//   `row[tt] += n[tt]` gives row[t] = +0.0 + 1.0 = 1.0 and leaves the
+//   other two of 0..2 at +0.0; then rxn = cross(rel0, e_t) is added
+//   into row[3..5]. cross(a, e_t)[t] is structurally a[j]*0 - a[k]*0,
+//   i.e. +-0.0, and row[3+t] = +0.0 + (+-0.0) = +0.0 EXACTLY (the zero
+//   fill's +0.0 absorbs the sign -- Divergences 20c). The other two
+//   components are +-a[.] and generally nonzero.
+//        support = {t} u ({3,4,5} \ {3+t}) u chain6  ->  9 columns,
+//        one of them 1.0.
+//
+// nnz 6*9 + 6*7 = 96 vs K5's 144. Per-column contributor counts (used
+// by the two i-outer dots): i in 0..2 -> the 2 linear rows with t == i;
+// i in 3..5 -> the 2 angular rows with 3+t == i plus the 4 linear rows
+// with t != i-3; chainL -> rows 0..5; chainR -> rows 6..11. That is
+// 3*2 + 3*6 + 6*6 + 6*6 = 96, which checks.
+//
+// Every consumer keeps each accumulator's ASCENDING-i term order; the
+// dropped products are (+-0.0)*x and the accumulators are +0.0-seeded,
+// so the -0.0 channel is unreachable (K5's argument verbatim). The
+// entries proven to be exactly 1.0 are contracted as a bare add:
+// 1.0*x == x unconditionally, so that drop is exact even for +-0.0.
+constexpr bool WJ_ANG(int r) { return (r % 6) >= 3; }
+constexpr int WJ_T(int r) { return r % 3; }
+constexpr int WJ_CH0(int r) { return WJ_L0 + 6 * (r / 6); }
+// the ONE column of row r whose entry is exactly 1.0
+constexpr int WJ_ONE(int r) { return WJ_ANG(r) ? 3 + WJ_T(r) : WJ_T(r); }
+// a LINEAR row t's two other root columns, {3,4,5} \ {3+t}, ASCENDING
+__device__ constexpr int WJ_R2[3][2] = {{4, 5}, {3, 5}, {3, 4}};
+// K9c compact-storage indices: linear rows 0,1,2,6,7,8 -> jwr slots
+// 0..5; column 3+u of linear row t -> which of that row's two slots.
+constexpr int WJ_LIN(int r) { return r < N_WELD / 2 ? r : r - 3; }
+constexpr int WJ_RIDX(int t, int u) { return u > t ? u - 1 : u; }
+static_assert(WJ_LIN(0) == 0 && WJ_LIN(2) == 2 && WJ_LIN(6) == 3
+                  && WJ_LIN(8) == 5,
+              "K9c: linear rows 0,1,2,6,7,8 map onto jwr slots 0..5");
+static_assert(WJ_R2[0][WJ_RIDX(0, 1)] == 4 && WJ_R2[0][WJ_RIDX(0, 2)] == 5
+                  && WJ_R2[1][WJ_RIDX(1, 0)] == 3
+                  && WJ_R2[1][WJ_RIDX(1, 2)] == 5
+                  && WJ_R2[2][WJ_RIDX(2, 0)] == 3
+                  && WJ_R2[2][WJ_RIDX(2, 1)] == 4,
+              "K9c: WJ_RIDX(t,u) is the slot holding column 3+u");
+// re-derivation of the ancestor chains straight off F_PARENT/F_COORD:
+// the bit mask of v-columns the walk touches must be exactly the
+// 6-column segment [WJ_CH0, WJ_CH0+6). Equality pins count, contiguity,
+// distinctness AND disjointness from the root columns 0..5 at once.
+constexpr unsigned long long wj_chain_mask(int f) {
+  unsigned long long m = 0;
+  for (int k = f; k >= 0; k = F_PARENT[k])
+    if (F_COORD[k] >= 0) m |= 1ull << (VOFF + F_COORD[k]);
+  return m;
+}
+static_assert(wj_chain_mask(F_L_FOOT) == (0x3full << WJ_L0)
+                  && wj_chain_mask(F_R_FOOT) == (0x3full << WJ_R0),
+              "K8: weld ancestor chains are exactly v-columns 23..28 "
+              "and 29..34 -- 6 distinct columns each, none in 0..5");
+static_assert(WJ_ONE(0) == 0 && WJ_ONE(2) == 2 && WJ_ONE(3) == 3
+                  && WJ_ONE(5) == 5 && WJ_ONE(6) == 0 && WJ_ONE(11) == 5
+                  && WJ_CH0(5) == WJ_L0 && WJ_CH0(6) == WJ_R0,
+              "K8: row -> (one-column, chain) map");
+static_assert(WJ_R2[0][0] == 4 && WJ_R2[0][1] == 5 && WJ_R2[1][0] == 3
+                  && WJ_R2[1][1] == 5 && WJ_R2[2][0] == 3
+                  && WJ_R2[2][1] == 4,
+              "K8: linear-row root extras are {3,4,5}\\{3+t}, ascending");
 __device__ constexpr double WELD_TARGET_P[2][3] = {
     {-0.10, 0.07, -0.65}, {0.10, 0.07, -0.65}};
 
@@ -575,8 +684,15 @@ struct Dyn {
 
 template <typename T>
 struct Solver {
-  // weld rows
-  T jw[N_WELD][NV], mw[N_WELD][NV], bias_w[N_WELD];
+  // weld rows. K9c: the dense J_w is built STRAIGHT INTO mw (which the
+  // 12-RHS solve then overwrites in place with M^-1 J_w^T), so the old
+  // full jw[12][35] copy source is gone -- 1,680 B of f32 frame and a
+  // 420-load/420-store seed pass. All four consumers contract a weld
+  // row against its K8 support only, so the raw Jacobian survives as
+  // 84 numbers: jwc[r][e] is chain column WJ_CH0(r)+e, jwr[WJ_LIN(r)][.]
+  // the two extra root columns WJ_R2[t][.] of a linear row. The 12
+  // exactly-1.0 entries are not stored at all (WJ_ONE(r) is implicit).
+  T mw[N_WELD][NV], jwc[N_WELD][6], jwr[N_WELD / 2][2], bias_w[N_WELD];
   T aww[N_WELD * N_WELD], rw[N_WELD];  // aww: A_ww, then in-place L
   // contacts (compacted, pair-id order)
   int nc;
@@ -1764,16 +1880,10 @@ __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
   for (int t = 0; t < 3; t++) row[3 + t] += sign * rxn[t];
 }
 
-template <typename T>
-__device__ void angular_jacobian_acc(const Dyn<T>& d, int frame, int axis_t,
-                                     T sign, T* __restrict__ row) {
-  int k = frame;
-  while (k >= 0) {
-    if (F_COORD[k] >= 0) row[VOFF + F_COORD[k]] += sign * d.axw[k][axis_t];
-    k = F_PARENT[k];
-  }
-  row[3 + axis_t] += sign;
-}
+// (angular_jacobian_acc lived here; K9a folded its body — one ancestor
+// walk writing row[VOFF + F_COORD[k]] += sign*axw[k][t] plus
+// row[3+t] += sign — into the shared weld walk in constraint_solve,
+// which was its only caller. point_jacobian_acc survives for contacts.)
 
 // RHS seed: the full-length zero fill is load-bearing for
 // chol_fwd_unit_n / chol_back_n — see chol_solve_unit_n's header (the
@@ -1812,31 +1922,47 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // terms, and the copy is per-element independent, so col and every
   // sum[w] are bitwise what the three separate passes produced.
   {
-    // The dot half is segmented onto the K5 weld support: each sum[w]
+    // The dot half is segmented onto the K8 weld support: each sum[w]
     // still visits its own terms in ascending i, only the structural
-    // +-0.0 products are gone. The COPY stays full-length (col is
-    // consumed densely).
+    // +-0.0 products are gone and the exactly-1.0 entries became bare
+    // adds. The COPY stays full-length (col is consumed densely).
     T sum[N_WELD];
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) sum[w] = T(0);
-    for (int i = 0; i < VOFF; i++) {  // root columns: all 12 rows
-      const T ci = s.ecol[j][i];
-      col[i] = ci;
 #pragma unroll
-      for (int w = 0; w < N_WELD; w++) sum[w] += s.jw[w][i] * ci;
+    for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
+      const T ci = s.ecol[j][t];
+      col[t] = ci;
+      sum[t] += ci;
+      sum[6 + t] += ci;
+    }
+#pragma unroll
+    for (int u = 0; u < 3; u++) {  // i = 3,4,5
+      const T ci = s.ecol[j][3 + u];
+      col[3 + u] = ci;
+      sum[3 + u] += ci;  // angular rows 3+u, 9+u (1.0)
+      sum[9 + u] += ci;
+#pragma unroll
+      for (int t = 0; t < 3; t++)
+        if (t != u) {
+          sum[t] += s.jwr[t][WJ_RIDX(t, u)] * ci;
+          sum[6 + t] += s.jwr[3 + t][WJ_RIDX(t, u)] * ci;
+        }
     }
     for (int i = VOFF; i < WJ_L0; i++) col[i] = s.ecol[j][i];  // copy only
-    for (int i = WJ_L0; i < WJ_R0; i++) {  // left-foot chain: rows 0..5
-      const T ci = s.ecol[j][i];
-      col[i] = ci;
 #pragma unroll
-      for (int w = 0; w < N_WELD / 2; w++) sum[w] += s.jw[w][i] * ci;
+    for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
+      const T ci = s.ecol[j][WJ_L0 + e];
+      col[WJ_L0 + e] = ci;
+#pragma unroll
+      for (int w = 0; w < N_WELD / 2; w++) sum[w] += s.jwc[w][e] * ci;
     }
-    for (int i = WJ_R0; i < NV; i++) {  // right-foot chain: rows 6..11
-      const T ci = s.ecol[j][i];
-      col[i] = ci;
 #pragma unroll
-      for (int w = N_WELD / 2; w < N_WELD; w++) sum[w] += s.jw[w][i] * ci;
+    for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
+      const T ci = s.ecol[j][WJ_R0 + e];
+      col[WJ_R0 + e] = ci;
+#pragma unroll
+      for (int w = N_WELD / 2; w < N_WELD; w++) sum[w] += s.jwc[w][e] * ci;
     }
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) s.rw[w] = sum[w];
@@ -1866,7 +1992,8 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 
 // K7: BATCHED ensure_pcol. B columns of the limit-row group are computed
 // together so they share the three big reads:
-//   (a) the fused copy+dot pass reads s.jw[w][i] ONCE for all B columns;
+//   (a) the fused copy+dot pass reads each support value ONCE for all
+//       B columns;
 //   (b) the 12x12 weld solve becomes chol_solve_multi_n<B> — the proven
 //       multi-RHS loop interchange, bitwise per right-hand side;
 //   (c) the projection pass reads s.mw[w][i] ONCE for all B columns.
@@ -1900,7 +2027,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
   }
   T rw[B][N_WELD];
   {
-    // Same segmentation onto the K5 weld support as the scalar body: the
+    // Same segmentation onto the K8 weld support as the scalar body: the
     // copy half stays full-length, the dot half visits only the support.
     T sum[B][N_WELD];
 #pragma unroll
@@ -1908,48 +2035,75 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
 #pragma unroll
       for (int w = 0; w < N_WELD; w++) sum[b][w] = T(0);
     }
-    for (int i = 0; i < VOFF; i++) {  // root columns: all 12 rows
+#pragma unroll
+    for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
       T ci[B];
 #pragma unroll
       for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][i];
-        s.pcol[j[b]][i] = ci[b];
+        ci[b] = s.ecol[j[b]][t];
+        s.pcol[j[b]][t] = ci[b];
       }
 #pragma unroll
-      for (int w = 0; w < N_WELD; w++) {
-        const T jwi = s.jw[w][i];
-#pragma unroll
-        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
+      for (int b = 0; b < B; b++) {
+        sum[b][t] += ci[b];
+        sum[b][6 + t] += ci[b];
       }
+    }
+#pragma unroll
+    for (int u = 0; u < 3; u++) {  // i = 3,4,5
+      T ci[B];
+#pragma unroll
+      for (int b = 0; b < B; b++) {
+        ci[b] = s.ecol[j[b]][3 + u];
+        s.pcol[j[b]][3 + u] = ci[b];
+      }
+#pragma unroll
+      for (int b = 0; b < B; b++) {  // angular rows 3+u, 9+u (1.0)
+        sum[b][3 + u] += ci[b];
+        sum[b][9 + u] += ci[b];
+      }
+#pragma unroll
+      for (int t = 0; t < 3; t++)
+        if (t != u) {
+          const T jl = s.jwr[t][WJ_RIDX(t, u)];
+          const T jr = s.jwr[3 + t][WJ_RIDX(t, u)];
+#pragma unroll
+          for (int b = 0; b < B; b++) {
+            sum[b][t] += jl * ci[b];
+            sum[b][6 + t] += jr * ci[b];
+          }
+        }
     }
     for (int i = VOFF; i < WJ_L0; i++) {  // copy only
 #pragma unroll
       for (int b = 0; b < B; b++) s.pcol[j[b]][i] = s.ecol[j[b]][i];
     }
-    for (int i = WJ_L0; i < WJ_R0; i++) {  // left-foot chain: rows 0..5
+#pragma unroll
+    for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
       T ci[B];
 #pragma unroll
       for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][i];
-        s.pcol[j[b]][i] = ci[b];
+        ci[b] = s.ecol[j[b]][WJ_L0 + e];
+        s.pcol[j[b]][WJ_L0 + e] = ci[b];
       }
 #pragma unroll
       for (int w = 0; w < N_WELD / 2; w++) {
-        const T jwi = s.jw[w][i];
+        const T jwi = s.jwc[w][e];
 #pragma unroll
         for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
       }
     }
-    for (int i = WJ_R0; i < NV; i++) {  // right-foot chain: rows 6..11
+#pragma unroll
+    for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
       T ci[B];
 #pragma unroll
       for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][i];
-        s.pcol[j[b]][i] = ci[b];
+        ci[b] = s.ecol[j[b]][WJ_R0 + e];
+        s.pcol[j[b]][WJ_R0 + e] = ci[b];
       }
 #pragma unroll
       for (int w = N_WELD / 2; w < N_WELD; w++) {
-        const T jwi = s.jw[w][i];
+        const T jwi = s.jwc[w][e];
 #pragma unroll
         for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
       }
@@ -2000,26 +2154,86 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   const T hinv = T(1) / T(H_SUB);
 
   // -- assembly: weld rows 0-11 ----------------------------------------------
+  // K9a — ONE ancestor walk per foot emits all six rows. The three
+  // point_jacobian_acc calls differed only in n = e_t, so each of them
+  // re-derived the SAME rel = pf - pos[k] and w = axw[k] x rel and then
+  // dotted it with a basis vector; dot3(e_t, w) is w[t] (1.0*w[t] is
+  // exact, and the two +-0.0 terms are absorbed by the row's +0.0 zero
+  // fill -- Divergences 20c). The three angular_jacobian_acc calls
+  // walked the same chain again for axw[k][t]. Likewise rel0 = pf - d.p
+  // and rxn = cross(rel0, e_t) are shared, in closed form:
+  //   cross(a, e_0) = (  0, a[2], -a[1])
+  //   cross(a, e_1) = (-a[2],  0,  a[0])
+  //   cross(a, e_2) = ( a[1], -a[0],  0)
+  // whose t-th component is exactly K8's structural +-0.0 (it lands in
+  // column 3+t, which is OUTSIDE the refined support).
+  // K9b — every entry below is a SINGLE `T(0) + value` store into a
+  // column the walk touches at most once (F_COORD injective on the
+  // chain, root columns disjoint from it -- see wj_chain_mask's
+  // static_assert). `T(0) + x` is NOT the identity when x is -0.0, and
+  // that is the point: it reproduces the zero fill's +0.0 absorption
+  // bit for bit, so the stores are what `fill(+0.0); row[col] += x`
+  // wrote. `T(0) - x` does the same for the negated components.
+  // K9c — the rows are built DIRECTLY IN s.mw (same zero fill, same
+  // values, same single writes: s.mw was a verbatim copy of s.jw, so
+  // writing one instead of both is the identity on every element), and
+  // the 84 support values are teed off into s.jwc / s.jwr as they are
+  // stored -- no reload, and the exactly-1.0 entries are not stored.
   for (int widx = 0; widx < 2; widx++) {
     const int frame = WELD_FRAMES[widx];
     const T* pf = d.pos[frame];
+    const int r0 = 6 * widx;
+#pragma unroll
+    for (int m = 0; m < 6; m++)
+      for (int i = 0; i < NV; i++) s.mw[r0 + m][i] = T(0);
+    for (int k = frame; k >= 0; k = F_PARENT[k]) {
+      if (F_COORD[k] < 0) continue;
+      const int col = VOFF + F_COORD[k];
+      const int e = col - (WJ_L0 + 6 * widx);
+      T rel[3], w[3];
+      sub3v(pf, d.pos[k], rel);
+      cross3(d.axw[k], rel, w);
+#pragma unroll
+      for (int t = 0; t < 3; t++) {
+        const T lv = T(0) + w[t];
+        s.mw[r0 + t][col] = lv;
+        s.jwc[r0 + t][e] = lv;
+        const T av = T(0) + d.axw[k][t];
+        s.mw[r0 + 3 + t][col] = av;
+        s.jwc[r0 + 3 + t][e] = av;
+      }
+    }
+    T rel0[3];
+    sub3v(pf, d.p, rel0);
+    const T v04 = T(0) + rel0[2], v05 = T(0) - rel0[1];
+    const T v13 = T(0) - rel0[2], v15 = T(0) + rel0[0];
+    const T v23 = T(0) + rel0[1], v24 = T(0) - rel0[0];
+    s.mw[r0 + 0][0] = T(1);
+    s.mw[r0 + 0][4] = v04;
+    s.mw[r0 + 0][5] = v05;
+    s.mw[r0 + 1][1] = T(1);
+    s.mw[r0 + 1][3] = v13;
+    s.mw[r0 + 1][5] = v15;
+    s.mw[r0 + 2][2] = T(1);
+    s.mw[r0 + 2][3] = v23;
+    s.mw[r0 + 2][4] = v24;
+    s.jwr[3 * widx + 0][0] = v04;  // cols WJ_R2[0] = {4, 5}
+    s.jwr[3 * widx + 0][1] = v05;
+    s.jwr[3 * widx + 1][0] = v13;  // cols WJ_R2[1] = {3, 5}
+    s.jwr[3 * widx + 1][1] = v15;
+    s.jwr[3 * widx + 2][0] = v23;  // cols WJ_R2[2] = {3, 4}
+    s.jwr[3 * widx + 2][1] = v24;
+#pragma unroll
     for (int t = 0; t < 3; t++) {
-      T* jr = s.jw[6 * widx + t];
-      for (int i = 0; i < NV; i++) jr[i] = T(0);
-      T n[3] = {T(0), T(0), T(0)};
-      n[t] = T(1);
-      point_jacobian_acc(d, frame, pf, n, T(1), jr);
-      s.bias_w[6 * widx + t] =
+      s.mw[r0 + 3 + t][3 + t] = T(1);
+      s.bias_w[r0 + t] =
           -(T(BETA_WELD) * hinv) * (pf[t] - T(WELD_TARGET_P[widx][t]));
     }
     T phi[3];
     rot_log(d.r[frame], phi);
-    for (int t = 0; t < 3; t++) {
-      T* jr = s.jw[6 * widx + 3 + t];
-      for (int i = 0; i < NV; i++) jr[i] = T(0);
-      angular_jacobian_acc(d, frame, t, T(1), jr);
-      s.bias_w[6 * widx + 3 + t] = -(T(BETA_WELD) * hinv) * phi[t];
-    }
+#pragma unroll
+    for (int t = 0; t < 3; t++)
+      s.bias_w[r0 + 3 + t] = -(T(BETA_WELD) * hinv) * phi[t];
   }
 
   // -- step 7: narrow phase + contact rows (pair-id order) --------------------
@@ -2123,8 +2337,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // 12 independent solves against ONE factor: batched (see
   // chol_solve_multi_n — a loop interchange, bitwise). s.mw is
   // T[N_WELD][NV], i.e. exactly the W-rows-of-stride-NV layout it wants.
-  for (int w = 0; w < N_WELD; w++)
-    for (int i = 0; i < NV; i++) s.mw[w][i] = s.jw[w][i];
+  // K9c: the assembly above already wrote J_w here, so the 420-element
+  // seed copy that used to stand at this point is gone.
   chol_solve_multi_n<N_WELD>(NV, d.m, &s.mw[0][0]);
   // Contact rows: s.nc is RUNTIME (0..55, typically a handful), so the
   // batch runs as a 4 / 2 / 1 ladder — the 2-wide tier is worth its own
@@ -2221,14 +2435,31 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // chol_solve_n, both of which read row >= col only (see crba's K4c
   // note), so ONLY the [c][r] (lower, c >= r) entry is stored — the
   // [r][c] mirror was dead. c == r writes the diagonal once.
-  // Only the 12 columns of s.jw[c]'s K5 support contribute (s.mw is
-  // dense, but it is multiplied by the structural zeros of s.jw[c]).
+  // Only row c's support contributes (s.mw is dense, but it would be
+  // multiplied by row c's structural zeros). K8 narrows that
+  // from K5's 12 columns to 9 (linear c) / 7 (angular c) and contracts
+  // the one exactly-1.0 entry as a bare add. Ascending column order is
+  // preserved: WJ_ONE(c) < WJ_R2[.] < chain for both row classes.
+  // The two `#pragma unroll` below are LOAD-BEARING, not decoration:
+  // they make c a compile-time constant so WJ_ONE / WJ_ANG / WJ_CH0 /
+  // WJ_R2 fold to immediates instead of arithmetic plus a cmem load.
+  // MEASURED without them (K8, 5 interleaved rounds, N=4096): 25,838.9
+  // -> 25,809.0 = -0.12% on f32, and that is despite the un-unrolled
+  // build being SMALLER (SASS f32 38,070 -> ~33k) and clearing f64's
+  // 8-byte spill. Rejected — f32 is the production dtype.
+#pragma unroll
   for (int r = 0; r < N_WELD; r++)
+#pragma unroll
     for (int c = r; c < N_WELD; c++) {
-      const int lo = c < N_WELD / 2 ? WJ_L0 : WJ_R0;
       T sum = T(0);
-      for (int i = 0; i < VOFF; i++) sum += s.jw[c][i] * s.mw[r][i];
-      for (int i = lo; i < lo + 6; i++) sum += s.jw[c][i] * s.mw[r][i];
+      sum += s.mw[r][WJ_ONE(c)];  // the row's entry there is exactly 1.0
+      if (!WJ_ANG(c)) {
+        sum += s.jwr[WJ_LIN(c)][0] * s.mw[r][WJ_R2[WJ_T(c)][0]];
+        sum += s.jwr[WJ_LIN(c)][1] * s.mw[r][WJ_R2[WJ_T(c)][1]];
+      }
+      const int lo = WJ_CH0(c);
+#pragma unroll
+      for (int e = 0; e < 6; e++) sum += s.jwc[c][e] * s.mw[r][lo + e];
       s.aww[c * N_WELD + r] = sum;
     }
   chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
@@ -2275,24 +2506,40 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       // 12 dots against the SAME v: each jv[r] accumulates over i in the
       // identical ascending order over identical terms (v is read-only
       // here), so every jv[r] is bitwise the scalar loop's.
-      // segmented onto the K5 weld support (same ascending i per jv[r])
+      // segmented onto the K8 weld support via the per-i contributing-row
+      // table (same ascending i per jv[r]; 96 terms, 12 of them 1.0)
       T jv[N_WELD];
 #pragma unroll
       for (int r = 0; r < N_WELD; r++) jv[r] = T(0);
-      for (int i = 0; i < VOFF; i++) {
-        const T vi = v[i];
 #pragma unroll
-        for (int r = 0; r < N_WELD; r++) jv[r] += s.jw[r][i] * vi;
+      for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
+        const T vi = v[t];
+        jv[t] += vi;
+        jv[6 + t] += vi;
       }
-      for (int i = WJ_L0; i < WJ_R0; i++) {
-        const T vi = v[i];
 #pragma unroll
-        for (int r = 0; r < N_WELD / 2; r++) jv[r] += s.jw[r][i] * vi;
+      for (int u = 0; u < 3; u++) {  // i = 3,4,5
+        const T vi = v[3 + u];
+        jv[3 + u] += vi;  // angular rows 3+u, 9+u (1.0)
+        jv[9 + u] += vi;
+#pragma unroll
+        for (int t = 0; t < 3; t++)
+          if (t != u) {  // linear rows with t != u carry rxn[u]
+            jv[t] += s.jwr[t][WJ_RIDX(t, u)] * vi;
+            jv[6 + t] += s.jwr[3 + t][WJ_RIDX(t, u)] * vi;
+          }
       }
-      for (int i = WJ_R0; i < NV; i++) {
-        const T vi = v[i];
 #pragma unroll
-        for (int r = N_WELD / 2; r < N_WELD; r++) jv[r] += s.jw[r][i] * vi;
+      for (int e = 0; e < 6; e++) {
+        const T vi = v[WJ_L0 + e];
+#pragma unroll
+        for (int r = 0; r < N_WELD / 2; r++) jv[r] += s.jwc[r][e] * vi;
+      }
+#pragma unroll
+      for (int e = 0; e < 6; e++) {
+        const T vi = v[WJ_R0 + e];
+#pragma unroll
+        for (int r = N_WELD / 2; r < N_WELD; r++) jv[r] += s.jwc[r][e] * vi;
       }
 #pragma unroll
       for (int r = 0; r < N_WELD; r++) s.rw[r] = s.bias_w[r] - jv[r];
