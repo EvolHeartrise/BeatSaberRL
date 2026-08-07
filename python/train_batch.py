@@ -640,11 +640,15 @@ def main():
         # latency-sensitive region; the print block already syncs)
         # drain before reading the phase timer: kernel launches are
         # async, so without this the section boundary charges queued
-        # work to whichever section blocks next (the 2026-07-25
-        # attribution found the printed split ~inverted: real
-        # production split is ~16% rollout / ~84% update). --bench only:
-        # the drain serializes CPU enqueue with GPU execution and costs
-        # ~2-8% wall, so production keeps async timers (and says so)
+        # work to whichever section blocks next. Measured exec-true
+        # 2026-08-07 on the v10 CUDA env (round-4 kernel): 96% rollout /
+        # 4% update at N=1024/T=128 (12,423 steps/s), 93/7 at
+        # N=4096/T=32 (24,422 steps/s). (The 2026-07-25 figure of
+        # ~16/84 was measured against the retired torch mirror — the
+        # v10 dynamic body inverted it; do not size update-path work
+        # off the old number.) --bench only: the drain serializes CPU
+        # enqueue with GPU execution and costs ~2-8% wall, so
+        # production keeps async timers (and says so)
         if args.bench and device.type == "cuda":
             torch.cuda.synchronize()
         t_rollout += time.perf_counter() - t0
