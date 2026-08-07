@@ -719,6 +719,20 @@ impl ConstraintSet {
         }
         self.nrows = nrows;
 
+        // R26 (feature "stats"): the two assembled row counts this
+        // substep — measured HERE, after both assembly loops, so the
+        // numbers are the ones the effective-mass and PGS stages
+        // actually pay for. Compiled out by default.
+        #[cfg(feature = "stats")]
+        {
+            let nlim = self.limset.len() as u64;
+            let ncon = self.contacts.len() as u64;
+            ws.stats.nlim_sum += nlim;
+            ws.stats.nlim_max = ws.stats.nlim_max.max(nlim);
+            ws.stats.ncon_sum += ncon;
+            ws.stats.ncon_max = ws.stats.ncon_max.max(ncon);
+        }
+
         // ── effective masses: M⁻¹Jᵀ via the substep's Cholesky factor ─
         // The 12 WELD rows are solved as a dense A_ww block, never by
         // the per-row `(b − Jv)/diag` update, so their diag is dead in
@@ -1015,6 +1029,13 @@ impl ConstraintSet {
         for c in self.capcached.iter_mut() {
             *c = false;
         }
+        // R26 (feature "stats"): ω-cap column solves for THIS substep.
+        // The cap pass runs inside every one of the 12 PGS iterations
+        // but `capcached` is only cleared here, so the per-substep total
+        // is at most nq — the counter has to live outside the iteration
+        // loop to see that, and it is flushed once below.
+        #[cfg(feature = "stats")]
+        let mut cap_solves = 0u64;
         for _iter in 0..PGS_ITERS {
             // (a) welds: Δλ_w = A_ww⁻¹ (b_w − J_w v), applied together.
             // (An r/i loop INTERCHANGE was tried here 2026-08-03 —
@@ -1153,6 +1174,14 @@ impl ConstraintSet {
                             let col = &mut self.capcol[jt * nv..(jt + 1) * nv];
                             chol_solve_unit(nv, &ws.m, vj, 1.0, col);
                         }
+                        // R26: counted INSIDE the engage branch — only
+                        // a real chol_solve_unit call above bumps it
+                        // (the `limpos` dedupe path and every cached
+                        // re-entry are deliberately not counted).
+                        #[cfg(feature = "stats")]
+                        {
+                            cap_solves += 1;
+                        }
                         let plain = self.capcol[jt * nv + vj];
                         if nweld > 0 {
                             debug_assert_eq!(nweld, N_WELD_ROWS);
@@ -1195,6 +1224,13 @@ impl ConstraintSet {
                     }
                 }
             }
+        }
+        // R26 (feature "stats"): one flush per substep, after all 12
+        // PGS iterations — sum for the mean, max for the worst case.
+        #[cfg(feature = "stats")]
+        {
+            ws.stats.cap_solves_sum += cap_solves;
+            ws.stats.cap_solves_max = ws.stats.cap_solves_max.max(cap_solves);
         }
     }
 }

@@ -258,6 +258,13 @@ pub fn substep_opts(
         }
         ws.cached[j] = false;
     }
+    // R26 (feature "stats"): step-11 clamp column solves for THIS
+    // substep. `ws.cached` is cleared in the loop just above, so the
+    // per-substep total is at most nq however many Gauss-Seidel passes
+    // run; the counter therefore lives outside the pass loop and is
+    // flushed once after it. Compiled out by default.
+    #[cfg(feature = "stats")]
+    let mut s11_solves = 0u64;
     for _pass in 0..CLAMP_PASSES {
         let mut changed = false;
         for j in 0..model.nq {
@@ -270,6 +277,12 @@ pub fn substep_opts(
                     // bitwise the fill/store/chol_solve it replaces
                     // (see `chol_fwd_unit`'s argument in algo.rs)
                     chol_solve_unit(nv, &ws.m, vj, 1.0, &mut ws.sol[..nv]);
+                    // R26: counted INSIDE the cache-miss branch — a
+                    // cached re-entry is not a solve.
+                    #[cfg(feature = "stats")]
+                    {
+                        s11_solves += 1;
+                    }
                     ws.solcache[j * nv..(j + 1) * nv].copy_from_slice(&ws.sol[..nv]);
                     ws.cached[j] = true;
                 }
@@ -285,6 +298,18 @@ pub fn substep_opts(
         if !changed {
             break;
         }
+    }
+    // R26 (feature "stats"): flush the step-11 solve count and tick the
+    // shared denominator. `nsubsteps` is bumped ONCE per substep here —
+    // it is the denominator for the solver-side counters too, which is
+    // exact under bench traffic (every substep runs the constraint hook
+    // via `substep_constrained`) but would over-count for a P1-style
+    // unconstrained caller. Don't mix the two in one collection window.
+    #[cfg(feature = "stats")]
+    {
+        ws.stats.s11_solves_sum += s11_solves;
+        ws.stats.s11_solves_max = ws.stats.s11_solves_max.max(s11_solves);
+        ws.stats.nsubsteps += 1;
     }
     for j in 0..model.nq {
         let vj = voff + j;

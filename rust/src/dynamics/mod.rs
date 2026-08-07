@@ -62,6 +62,75 @@ impl State {
     }
 }
 
+/// R26 per-substep instrumentation counters. The STRUCT is always
+/// compiled (so the FFI getter can hand back a zeroed one in the default
+/// build), but nothing ever WRITES to it unless the `stats` feature is
+/// on — see `Workspace::stats`, which only exists under that feature.
+///
+/// Every `*_sum` is a running total over substeps and every `*_max` the
+/// worst single substep; divide a sum by `nsubsteps` for the mean. The
+/// counters are cumulative until the owner pops them (lib.rs
+/// `pop_dbg_stats`), exactly like `pd_hits` / `env_hits`.
+///
+/// `nsubsteps` is incremented once per completed `step::substep_opts`,
+/// which is the denominator for ALL five rates: under bench traffic
+/// every substep runs the constraint hook (`substep_constrained`), so
+/// the solver-side counters share it. A P1-style unconstrained caller
+/// would inflate the denominator for `nlim`/`ncon`/`cap_solves` — don't
+/// mix the two in one collection window.
+#[derive(Clone, Copy, Default)]
+pub struct DbgStats {
+    /// completed substeps (the denominator)
+    pub nsubsteps: u64,
+    /// solver.rs: `limset.len()` — joint-limit rows assembled
+    pub nlim_sum: u64,
+    pub nlim_max: u64,
+    /// solver.rs: `contacts.len()` — active contact rows
+    pub ncon_sum: u64,
+    pub ncon_max: u64,
+    /// solver.rs: `chol_solve_unit` calls actually made by the ω-cap
+    /// pass (the engage branch only — a `limpos` dedupe hit or a cached
+    /// column does NOT count)
+    pub cap_solves_sum: u64,
+    pub cap_solves_max: u64,
+    /// step.rs: `chol_solve_unit` calls actually made by the step-11
+    /// clamp block (the cache-miss branch only)
+    pub s11_solves_sum: u64,
+    pub s11_solves_max: u64,
+}
+
+impl DbgStats {
+    /// Fold `o` in: sums add, maxes take the max. Used to aggregate the
+    /// per-env counters of a vec-env into one report.
+    pub fn merge(&mut self, o: &DbgStats) {
+        self.nsubsteps += o.nsubsteps;
+        self.nlim_sum += o.nlim_sum;
+        self.nlim_max = self.nlim_max.max(o.nlim_max);
+        self.ncon_sum += o.ncon_sum;
+        self.ncon_max = self.ncon_max.max(o.ncon_max);
+        self.cap_solves_sum += o.cap_solves_sum;
+        self.cap_solves_max = self.cap_solves_max.max(o.cap_solves_max);
+        self.s11_solves_sum += o.s11_solves_sum;
+        self.s11_solves_max = self.s11_solves_max.max(o.s11_solves_max);
+    }
+
+    /// (name, value) pairs in a fixed order — the FFI layer turns these
+    /// into the Python dict so the key set lives in exactly one place.
+    pub fn as_pairs(&self) -> [(&'static str, u64); 9] {
+        [
+            ("nsubsteps", self.nsubsteps),
+            ("nlim_sum", self.nlim_sum),
+            ("nlim_max", self.nlim_max),
+            ("ncon_sum", self.ncon_sum),
+            ("ncon_max", self.ncon_max),
+            ("cap_solves_sum", self.cap_solves_sum),
+            ("cap_solves_max", self.cap_solves_max),
+            ("s11_solves_sum", self.s11_solves_sum),
+            ("s11_solves_max", self.s11_solves_max),
+        ]
+    }
+}
+
 /// Preallocated buffers for one model — no allocation inside a substep.
 pub struct Workspace {
     // FK
@@ -90,6 +159,10 @@ pub struct Workspace {
     // the trajectory stopped being physics (the env layer terminates
     // the episode on it; see lib.rs Body::escaped).
     pub env_hits: u64,
+    // R26 instrumentation counters — EXISTS ONLY under the `stats`
+    // feature so the shipping build's Workspace layout is untouched.
+    #[cfg(feature = "stats")]
+    pub stats: DbgStats,
     pub cached: Vec<bool>,  // step 11: M⁻¹e_j column cached?
     pub solcache: Vec<f64>, // step 11: cached M⁻¹e_j columns (nq×nv)
     // RNEA / velocity-pass scratch, per frame
@@ -124,6 +197,8 @@ impl Workspace {
             hit: vec![false; model.nq],
             pd_hits: 0,
             env_hits: 0,
+            #[cfg(feature = "stats")]
+            stats: DbgStats::default(),
             cached: vec![false; model.nq],
             solcache: vec![0.0; model.nq * nv],
             om: vec![[0.0; 3]; nf],
