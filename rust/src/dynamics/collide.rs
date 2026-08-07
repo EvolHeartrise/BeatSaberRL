@@ -93,6 +93,91 @@ pub const EXCLUDED_PAIRS: [(usize, usize); 11] = [
 /// and denominator guard — Ericson's EPSILON).
 pub const SEG_EPS: f64 = 1e-12;
 
+// ---------------------------------------------------------------------
+// R11 broad phase. Mean contact count is 0.11/tick, so ~all 55 pairs are
+// computed only to be thrown away. Two CONSERVATIVE reject tests run
+// before the expensive work; a pair that survives both runs the original
+// code on the original values, so every emitted Contact is byte-identical
+// (gated by `broad_phase_matches_dense`, which byte-compares the whole
+// emitted Vec<Contact> against the pre-R11 dense body over a pose soak).
+// Both predicates are written so that only a TRUE comparison rejects:
+// with a NaN coordinate every comparison is false, the pair falls through
+// to the dense path, and `gap < MARGIN` is false there exactly as before
+// — no NaN behaviour is changed.
+// ---------------------------------------------------------------------
+
+/// Part 1 — reject on the SQUARED closest-point distance, before the √.
+///
+/// The narrow phase keeps a pair iff `fl(fl(√d²) − S) < MARGIN` with
+/// `S = fl(r_a + r_b)`, i.e. iff d² lies below a threshold ≈ T², where
+/// `T = S + MARGIN`. √ and the subtraction are monotone in d², so the
+/// keep set is downward closed and a test on d² is exact up to the
+/// rounding of those two operations:
+///   keep ⟹ fl(√d²) < T + ulp(0.01)/2 ⟹ √d² < T·(1 + 2⁻⁵²) + 1e-18,
+/// and with T ≤ 0.4 here that is √d² < T + 1e-16, i.e. d² < (T + 1e-16)².
+/// So rejecting on `d² ≥ (T + 1e-9)²` can never drop a kept pair: the
+/// 1e-9 slack adds 2·T·1e-9 ≥ 2e-10 to the squared threshold, six orders
+/// above that 1e-16 bound and above the ≤1 ulp (≤1e-17) error of
+/// evaluating the table entry itself in a different association order.
+const fn dist_rej2() -> [f64; NUM_PAIRS] {
+    let mut t = [0.0f64; NUM_PAIRS];
+    let mut k = 0;
+    while k < NUM_PAIRS {
+        let (ia, ib) = PAIRS[k];
+        let s = COLLIDERS[ia].radius + COLLIDERS[ib].radius + MARGIN + 1e-9;
+        t[k] = s * s;
+        k += 1;
+    }
+    t
+}
+/// `(r_a + r_b + MARGIN + 1e-9)²` per pair id — see `dist_rej2`.
+pub const DIST_REJ2: [f64; NUM_PAIRS] = dist_rej2();
+
+/// Part 2 — bounding-sphere radius per collider (port of CUDA K4d):
+/// half the segment length plus the radius, so every point of the
+/// collider SURFACE lies within `HLR[c]` of the centerline midpoint.
+/// The segment is rigid, so the world half-length equals this
+/// body-frame one. Literal table (no const √); `hlr_table_bounds_geometry`
+/// pins each entry against the §2 collider geometry.
+pub const HLR: [f64; NUM_COLLIDERS] = [
+    /*  0 torso   */ 0.365, /*  1 head    */ 0.09,
+    /*  2 uarm_l  */ 0.22, /*  3 uarm_r  */ 0.22,
+    /*  4 farm_l  */ 0.19, /*  5 farm_r  */ 0.19,
+    /*  6 fist_l  */ 0.05, /*  7 fist_r  */ 0.05,
+    /*  8 thigh_l */ 0.28, /*  9 thigh_r */ 0.28,
+    /* 10 shank_l */ 0.26, /* 11 shank_r */ 0.26,
+];
+
+/// Part 2 — bounding-sphere reject threshold per pair.
+///
+/// With `mid_c = 0.5·(wa_c + wb_c)`, every point of collider `c` is
+/// within `HLR[c]` of `mid_c`, so by the triangle inequality
+///     gap = seg_dist − r_a − r_b ≥ |mid_a − mid_b| − (HLR_a + HLR_b),
+/// hence keep (gap < MARGIN) ⟹ |mid_a − mid_b| < U, where
+/// `U = HLR_a + HLR_b + MARGIN`. Rejecting on `|Δmid|² > U²·1.02` is
+/// therefore conservative with enormous room to spare: the ×1.02 admits
+/// |Δmid| up to U·1.00995, i.e. ≥ 1.09e-3 of ABSOLUTE slack (the tightest
+/// pair is fist–fist, U = 0.11), which swamps every error in the bound —
+///   · the ≤1e-12 tolerance the HLR table is pinned to,
+///   · rounding of mid, of the difference and of the dot (≤ ~1e-16 at
+///     these magnitudes),
+///   · the ≤1e-15 relative non-orthonormality of the FK rotation, the
+///     only thing that can make the world segment longer than the body
+///     segment whose half-length HLR was built from.
+const fn mid_rej2() -> [f64; NUM_PAIRS] {
+    let mut t = [0.0f64; NUM_PAIRS];
+    let mut k = 0;
+    while k < NUM_PAIRS {
+        let (ia, ib) = PAIRS[k];
+        let u = HLR[ia] + HLR[ib] + MARGIN;
+        t[k] = u * u * 1.02;
+        k += 1;
+    }
+    t
+}
+/// `(HLR_a + HLR_b + MARGIN)²·1.02` per pair id — see `mid_rej2`.
+pub const MID_REJ2: [f64; NUM_PAIRS] = mid_rej2();
+
 /// Closest points between segments p1–q1 and p2–q2 (Ericson, "Real-Time
 /// Collision Detection", §5.1.9 `ClosestPtSegmentSegment`), returning
 /// (s, t, c1, c2, dist²). The parameter-space objective is convex, so
@@ -189,16 +274,31 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
     // every p1/q1/p2/q2 below is the same f64 it was before.
     let mut wa = [[0.0f64; 3]; NUM_COLLIDERS];
     let mut wb = [[0.0f64; 3]; NUM_COLLIDERS];
+    // bounding-sphere centres for the R11 part-2 reject: 36 mul+add for
+    // the whole roster, against 55 segment–segment solves
+    let mut mid = [[0.0f64; 3]; NUM_COLLIDERS];
     for (ci, c) in COLLIDERS.iter().enumerate() {
         wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
         wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));
+        for k in 0..3 {
+            mid[ci][k] = 0.5 * (wa[ci][k] + wb[ci][k]);
+        }
     }
     for (pid, &(ia, ib)) in PAIRS.iter().enumerate() {
+        // R11 part 2: conservative bounding-sphere reject (see MID_REJ2)
+        let dm = sub3(mid[ia], mid[ib]);
+        if dot3(dm, dm) > MID_REJ2[pid] {
+            continue;
+        }
         let ca = &COLLIDERS[ia];
         let cb = &COLLIDERS[ib];
         let (p1, q1) = (wa[ia], wb[ia]);
         let (p2, q2) = (wa[ib], wb[ib]);
         let (_s, _t, c1, c2, d2) = seg_seg_closest(p1, q1, p2, q2);
+        // R11 part 1: conservative reject before the √ (see DIST_REJ2)
+        if d2 >= DIST_REJ2[pid] {
+            continue;
+        }
         let dist = d2.sqrt();
         let gap = dist - (ca.radius + cb.radius);
         if gap < MARGIN {
@@ -213,6 +313,41 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
             };
             // surface points: c1 + n·r_a and c2 − n·r_b; report the
             // midpoint (single contact point per pair, §2)
+            let s1 = add3(c1, scale3(n, ca.radius));
+            let s2 = sub3(c2, scale3(n, cb.radius));
+            let point = scale3(add3(s1, s2), 0.5);
+            out.push(Contact { pair: pid, point, normal: n, gap });
+        }
+    }
+}
+
+/// Pre-R11 narrow phase, verbatim: every pair goes through
+/// `seg_seg_closest` + √ + the margin test, no broad phase. Kept as the
+/// reference the R11 rejects are gated against — `broad_phase_matches_dense`
+/// byte-compares the emitted `Vec<Contact>` of the two over a pose soak.
+#[cfg(test)]
+pub fn narrow_phase_dense(ws: &Workspace, out: &mut Vec<Contact>) {
+    out.clear();
+    let mut wa = [[0.0f64; 3]; NUM_COLLIDERS];
+    let mut wb = [[0.0f64; 3]; NUM_COLLIDERS];
+    for (ci, c) in COLLIDERS.iter().enumerate() {
+        wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
+        wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));
+    }
+    for (pid, &(ia, ib)) in PAIRS.iter().enumerate() {
+        let ca = &COLLIDERS[ia];
+        let cb = &COLLIDERS[ib];
+        let (p1, q1) = (wa[ia], wb[ia]);
+        let (p2, q2) = (wa[ib], wb[ib]);
+        let (_s, _t, c1, c2, d2) = seg_seg_closest(p1, q1, p2, q2);
+        let dist = d2.sqrt();
+        let gap = dist - (ca.radius + cb.radius);
+        if gap < MARGIN {
+            let n = if dist > 1e-9 {
+                scale3(sub3(c2, c1), 1.0 / dist)
+            } else {
+                [0.0, 1.0, 0.0]
+            };
             let s1 = add3(c1, scale3(n, ca.radius));
             let s2 = sub3(c2, scale3(n, cb.radius));
             let point = scale3(add3(s1, s2), 0.5);
