@@ -14,6 +14,16 @@ crate-type = ["cdylib"]
 # per constraint row per substep. `cargo test` enables them implicitly.
 introspect = []
 
+# R26 instrumentation: per-substep rate counters (limit rows, contacts,
+# ω-cap chol_solve_unit calls, step-11 clamp chol_solve_unit calls) that
+# parameterize R21/R22/R27. Off by default and the SHIPPING BUILD MUST
+# STAY THAT WAY: with the feature off the counting statements, the
+# per-substep locals, and the Workspace::stats field all vanish at
+# compile time, so the substep's codegen is identical to pre-R26.
+# `pop_dbg_stats()` still exists in the default build — it returns zeros
+# with enabled = 0, so the Python side never conditionalizes.
+stats = []
+
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"

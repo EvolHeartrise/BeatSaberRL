@@ -41,7 +41,23 @@ use dynamics::model::{
 };
 use dynamics::solver::{substep_constrained, ConstraintSet};
 use dynamics::step::{H_SUB, N_SUB};
-use dynamics::{State, Workspace};
+use dynamics::{DbgStats, State, Workspace};
+use std::collections::HashMap;
+
+/// R26: turn an aggregated `DbgStats` into the `pop_dbg_stats` return
+/// dict. `enabled` is 1 only in a `--features stats` build — in the
+/// default build every other value is structurally 0 (nothing counts),
+/// so a collection script should assert `d["enabled"] == 1` before
+/// trusting a rate.
+fn dbg_stats_dict(s: &DbgStats) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = s
+        .as_pairs()
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect();
+    out.insert("enabled".to_string(), cfg!(feature = "stats") as u64);
+    out
+}
 
 const DT: f64 = 1.0 / 30.0;
 const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
@@ -1381,6 +1397,21 @@ impl RawBeatSim {
         h
     }
 
+    /// R26 per-substep instrumentation counters since the last pop —
+    /// the single-env mirror of `VecBeatSim.pop_dbg_stats`. Returns the
+    /// dict and zeroes the counters. In the DEFAULT build nothing counts
+    /// and every value is 0 with `enabled` = 0 (see `dbg_stats_dict`).
+    fn pop_dbg_stats(&mut self) -> HashMap<String, u64> {
+        #[allow(unused_mut)]
+        let mut acc = DbgStats::default();
+        #[cfg(feature = "stats")]
+        {
+            acc.merge(&self.core.body.ws.stats);
+            self.core.body.ws.stats = DbgStats::default();
+        }
+        dbg_stats_dict(&acc)
+    }
+
     /// Did the PRE-integration envelope engage during the LAST tick
     /// (i.e. did the C backstop fire)? Test introspection.
     #[getter]
@@ -1681,6 +1712,30 @@ impl VecBeatSim {
                 h
             })
             .sum()
+    }
+
+    /// R26 instrumentation: the per-substep rate counters aggregated
+    /// over ALL envs since the last pop, as a dict (sums add, maxes take
+    /// the max, per-env counters are zeroed) — pop_pd_hits-style
+    /// ADDITIVE getter, no existing FFI shape changed.
+    ///
+    /// Keys: nsubsteps, {nlim,ncon,cap_solves,s11_solves}_{sum,max},
+    /// plus `enabled`. Divide a `_sum` by `nsubsteps` for the mean rate;
+    /// `_max` is the worst single substep seen by any env.
+    ///
+    /// The counters only move in a build with `--features stats`. In the
+    /// DEFAULT (shipping) build the counting code does not exist and
+    /// this returns all zeros with `enabled` = 0 — so a collection
+    /// script can call it unconditionally and just assert `enabled`.
+    fn pop_dbg_stats(&mut self) -> HashMap<String, u64> {
+        #[allow(unused_mut)]
+        let mut acc = DbgStats::default();
+        #[cfg(feature = "stats")]
+        for s in self.sims.iter_mut() {
+            acc.merge(&s.body.ws.stats);
+            s.body.ws.stats = DbgStats::default();
+        }
+        dbg_stats_dict(&acc)
     }
 }
 
