@@ -41,9 +41,13 @@ HYPERS = {"lr": 0.00296092,
 
 
 def bench(ck, out):
-    r = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                        "--out", out, "--num-envs", "2048"],
-                       capture_output=True, text=True, timeout=10800)
+    try:
+        r = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
+                            "--out", out, "--num-envs", "2048"],
+                           capture_output=True, text=True, timeout=10800)
+    except subprocess.TimeoutExpired:
+        print(f"BENCH TIMEOUT {ck} (10800s)", flush=True)
+        return None
     if r.returncode != 0 or not os.path.exists(out):
         print(f"BENCH FAILED {ck}: {(r.stderr or '')[-300:]}", flush=True)
         return None
@@ -79,8 +83,13 @@ def main():
         t0 = time.time()
         log = open(os.path.join(RUN_DIR, "train.log"), "w",
                    encoding="utf-8")
-        r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                           text=True, timeout=25200)
+        try:
+            r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                               text=True, timeout=25200)
+        except subprocess.TimeoutExpired:
+            log.close()
+            print("[train] TIMEOUT (25200s)", flush=True)
+            return
         log.close()
         wall = time.time() - t0
         if r.returncode != 0 or not os.path.exists(ck):

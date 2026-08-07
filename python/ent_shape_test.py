@@ -35,6 +35,7 @@ import time
 
 PY = sys.executable
 OUT_DIR = os.path.join("sweeps", "ent_shape")
+TOTAL_STEPS = 176_508_300   # run 085's budget, verbatim
 
 # run 085 hypers exactly as the sweep driver passed them (%.6g)
 BASE = ["--num-envs", "1024", "--horizon", "128",
@@ -45,7 +46,7 @@ BASE = ["--num-envs", "1024", "--horizon", "128",
         "--gamma", "0.914958",
         "--gae-lambda", "0.980024",
         "--effort-coef", "0.240844",
-        "--total-steps", "176508300"]
+        "--total-steps", str(TOTAL_STEPS)]
 
 ENT = {"rise": ("0.013929", "0.0331038"),
        "flat": ("0.0235164", "0.0235164"),
@@ -72,7 +73,14 @@ def run_leg(name, shape, seed):
     cmd = [PY, "train_batch.py", *BASE, "--seed", str(seed),
            "--ent-coef", e0, "--ent-final", e1, "--run-dir", run_dir]
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    # total_steps at a conservative 8,000 steps/s floor (v10 measures
+    # 12.4k at 1024/128, 24.4k at 4096/32 — 2026-08-07) + 1800 s startup
+    tmo = TOTAL_STEPS // 8000 + 1800
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=tmo)
+    except subprocess.TimeoutExpired:
+        print(f"[{name}] TRAIN TIMEOUT ({tmo}s)", flush=True)
+        return None
     wall = time.time() - t0
     ck = os.path.join(run_dir, "final.pt")
     if r.returncode != 0 or not os.path.exists(ck):
@@ -80,10 +88,16 @@ def run_leg(name, shape, seed):
         print(f"[{name}] TRAIN FAILED ({wall:.0f}s): {tail}", flush=True)
         return None
     out = os.path.join(run_dir, "bench.json")
-    b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                        "--out", out,
-                        "--num-envs", "2048", "--fused-forward"],
-                       capture_output=True, text=True, timeout=3000)
+    # 7200 s: the v10 catalog bench runs ~1,900-2,400 s (2026-08-07),
+    # so this is ~3x margin. The old 3000 s was a pre-v10 constant.
+    try:
+        b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
+                            "--out", out,
+                            "--num-envs", "2048", "--fused-forward"],
+                           capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        print(f"[{name}] BENCH TIMEOUT (7200s)", flush=True)
+        return None
     if b.returncode != 0 or not os.path.exists(out):
         print(f"[{name}] BENCH FAILED: {(b.stderr or '')[-300:]}",
               flush=True)

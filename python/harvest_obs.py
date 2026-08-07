@@ -100,11 +100,16 @@ def main():
                   flush=True)
             score = None
         else:
-            r = subprocess.run(
-                [sys.executable, "bench_scoresaber.py", "--ckpt", ck,
-                 "--out", bench_path,
-                 "--num-envs", "2048", "--fused-forward"],
-                capture_output=True, text=True, timeout=3000)
+            # 7200 s: the v10 catalog bench runs ~1,900-2,400 s
+            # (2026-08-07), ~3x margin; 3000 was a pre-v10 constant
+            try:
+                r = subprocess.run(
+                    [sys.executable, "bench_scoresaber.py", "--ckpt", ck,
+                     "--out", bench_path,
+                     "--num-envs", "2048", "--fused-forward"],
+                    capture_output=True, text=True, timeout=7200)
+            except subprocess.TimeoutExpired:
+                sys.exit("BENCH TIMEOUT (7200s)")
             if r.returncode != 0 or not os.path.exists(bench_path):
                 sys.exit(f"BENCH FAILED: {(r.stderr or '')[-300:]}")
     if os.path.exists(bench_path):

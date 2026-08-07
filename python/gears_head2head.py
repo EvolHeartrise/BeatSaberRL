@@ -35,10 +35,16 @@ HYPERS = {"lr": 0.00296092,
 
 
 def bench(ck, out):
-    r = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                        "--out", out,
-                        "--num-envs", "2048"],
-                       capture_output=True, text=True, timeout=3000)
+    # 7200 s: the v10 catalog bench runs ~1,900-2,400 s (2026-08-07),
+    # so this is ~3x margin. The old 3000 s was a pre-v10 constant.
+    try:
+        r = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
+                            "--out", out,
+                            "--num-envs", "2048"],
+                           capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        print(f"BENCH TIMEOUT {ck} (7200s)", flush=True)
+        return None
     if r.returncode != 0 or not os.path.exists(out):
         print(f"BENCH FAILED {ck}: {(r.stderr or '')[-300:]}", flush=True)
         return None
@@ -72,8 +78,16 @@ def leg(gears):
                "--run-dir", run_dir]
         print(f"[gears{gears}] training 400M -> {run_dir}", flush=True)
         t0 = time.time()
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=14400)
+        # total_steps at a conservative 8,000 steps/s floor (v10 measures
+        # 12.4k at 1024/128, 24.4k at 4096/32 — 2026-08-07) + 1800 s
+        # startup
+        tmo = TOTAL_STEPS // 8000 + 1800
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=tmo)
+        except subprocess.TimeoutExpired:
+            print(f"[gears{gears}] TRAIN TIMEOUT ({tmo}s)", flush=True)
+            return None
         wall = time.time() - t0
         if r.returncode != 0 or not os.path.exists(ck):
             tail = (r.stdout or "")[-400:] + (r.stderr or "")[-400:]
