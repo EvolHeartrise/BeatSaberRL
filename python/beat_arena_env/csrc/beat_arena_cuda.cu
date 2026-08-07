@@ -154,6 +154,55 @@ constexpr int NOTE_FEAT = 14;
 //    load-bearing as a rematerialization point (deleting it grew the
 //    f64 frame 90,976 -> 91,008 B).
 //
+// K6 (2026-08-07) — ROW-BLOCK (unroll-and-jam) THE FORWARD
+// SUBSTITUTIONS. Every triangular solve in this kernel used to walk one
+// row at a time: per (i, k) it loaded l[i*n+k] plus the W right-hand
+// sides and did W FMAs. Blocking R rows shares the k < i0 sweep — R
+// l-loads + W x-loads buy R*W FMAs — and, more importantly on a
+// serial-latency-bound kernel, gives R independent accumulator chains
+// where there was one. Measured N=4096, 4 interleaved A/B rounds each,
+// every rung added ON TOP of the previous one:
+//   chol_solve_multi_n fwd R=2 (W=12/4/2)               +1.21%  ->R=3
+//   chol_solve_n fwd R=4                                +0.75%  KEPT
+//   chol_fwd_unit4_n fwd R=2                            +0.72%  ->R=4
+//   chol_fwd_unit2_n + chol_fwd_unit_n fwd R=4          +1.74%  KEPT
+//   chol_fwd_unit4_n R=2 -> R=4                        +27.62%  KEPT
+//   chol_solve_multi_n R=2 -> R=3                       +0.14%  KEPT
+//   chol_solve_multi_n R=3 -> R=4                       +0.03%  REVERTED
+// Package: 18,057 -> 24,180 env-steps/s, +33.9%.
+//
+// THE +27.6% IS A SPILL CLIFF, NOT ARITHMETIC — and it is the single
+// most important fact this task produced. Widening chol_fwd_unit4_n's
+// block from 2 to 4 changed the f32 kernel from 255 registers with
+// 4,588/3,296 B of spill stores/loads to 249 REGISTERS AND ZERO SPILLS
+// (frame 45,056 -> 43,024 B); the f64 kernel, which cannot fit either
+// way, moved by ~1% and its arm gained ~nothing. So:
+//  * The f32 kernel now sits ON the edge of a cliff with ~6 registers
+//    of headroom. Any later item that adds live values can push it back
+//    over and cost ~20% — check `0 bytes spill stores` in the build log
+//    BEFORE trusting a micro-bench delta, and treat a re-spilled build
+//    as a revert regardless of what the arithmetic says.
+//  * The K4/K5 ORDER-DEPENDENCE rule above now applies with much more
+//    force: the whole sub-1% shelf (and anything previously reverted at
+//    a small negative) was measured under 4.6 KB of spill traffic that
+//    no longer exists. Re-probe it against THIS build.
+//
+// ABSOLUTE PROHIBITION: the BACK substitutions are NOT row-blockable —
+// not "unmeasured", structurally illegal. The back pass runs i
+// DESCENDING and accumulates k ASCENDING from i+1, so for a block of
+// rows i0 > i1 > ... the region k > i0 that they share is the TAIL of
+// each row's required order, not a prefix; hoisting it into a shared
+// sweep would make every blocked row consume its high-k terms FIRST,
+// which reassociates the sum. And the terms that would have to run
+// first instead — the near-diagonal k in (i_r, i0] — are exactly the
+// x[k] that the earlier rows of the same block have not produced yet.
+// There is therefore no schedule that both preserves each row's
+// ascending-k order and shares work across the block, at any R. Only
+// the forward direction has the shared PREFIX that makes the blocking
+// bitwise. RHS-batching (chol_solve_multi_n, chol_back{2,4}_n) is a
+// different transform — a loop interchange over independent right-hand
+// sides — and remains legal in both directions, as today.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -1127,13 +1176,51 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
 // difference between keeping l's row in registers across the x[i]
 // store and re-loading it every iteration.
 template <typename T>
+//
+// The FORWARD half is ROW-BLOCKED BY 4 (K6). Unblocked it is ONE
+// dependent chain for the whole triangle: row i's dot is a chain of
+// length i and row i+1 cannot start until x[i] is stored. Blocked, the
+// four rows of a block share the k < i0 sweep as FOUR INDEPENDENT
+// accumulators (and share the x[k] load: 4 + 1 loads per k for 4 FMAs
+// instead of 8), and only the short triangular tail k in [i0, i) — at
+// most three terms, taken from the values just stored — stays serial.
+// BITWISE (forward only): k = 0..i0-1 ascending is the exact PREFIX of
+// every blocked row's required order, and the tail k = i0..i-1 follows
+// it ascending, so each accumulator meets the same terms in the same
+// sequence from the same seed x[i].
 __device__ void chol_solve_n(int n, const T* __restrict__ l,
                              T* __restrict__ x) {
-  for (int i = 0; i < n; i++) {
+  int i = 0;
+  for (; i + 3 < n; i += 4) {
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+    T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
+    for (int k = 0; k < i; k++) {
+      const T xk = x[k];
+      s0 -= l[r0 + k] * xk;
+      s1 -= l[r1 + k] * xk;
+      s2 -= l[r2 + k] * xk;
+      s3 -= l[r3 + k] * xk;
+    }
+    const T v0 = s0 / l[r0 + i];
+    x[i] = v0;
+    s1 -= l[r1 + i] * v0;
+    const T v1 = s1 / l[r1 + i + 1];
+    x[i + 1] = v1;
+    s2 -= l[r2 + i] * v0;
+    s2 -= l[r2 + i + 1] * v1;
+    const T v2 = s2 / l[r2 + i + 2];
+    x[i + 2] = v2;
+    s3 -= l[r3 + i] * v0;
+    s3 -= l[r3 + i + 1] * v1;
+    s3 -= l[r3 + i + 2] * v2;
+    x[i + 3] = s3 / l[r3 + i + 3];
+  }
+  for (; i < n; i++) {
     T s = x[i];
     for (int k = 0; k < i; k++) s -= l[i * n + k] * x[k];
     x[i] = s / l[i * n + i];
   }
+  // BACK half: NOT row-blockable (K6 prohibition, file header).
   for (int i = n - 1; i >= 0; i--) {
     T s = x[i];
     for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
@@ -1158,10 +1245,62 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
 // instead of once per (i, k, w). The accumulators are a fixed-size local
 // array indexed only by fully unrolled compile-time w, so they live in
 // registers (W f32 = W*4 B).
+//
+// The FORWARD half is additionally ROW-BLOCKED BY 3 (K6): rows i0..i0+2
+// share the k < i0 sweep, so the W values x[w*n+k] are loaded ONCE for
+// 3*W FMAs instead of once per (row, w) — per k the block costs 3 + W
+// loads for 3*W FMAs where the unblocked triple cost 3*(1 + W), i.e.
+// 15/36 vs 39/36 at W = 12. The terms k in [i0, i) that a later row of
+// the block needs and the earlier ones do not are applied after those
+// rows' divides, from the registers just stored.
+// R = 4 was measured too and was NOISE over R = 3 (+0.03%, overlapping
+// ranges, f64 spills 12,308/10,300 -> 12,380/10,564) — REVERTED, the
+// x-load saving is already down to a sixth by R = 3.
+// BITWISE (forward only, see the back half's note): row i0's terms are
+// k = 0..i0-1 ascending, unchanged; a later row's are k = 0..i0-1
+// ascending (the SHARED PREFIX of its required order) followed by the
+// tail k = i0.. in ascending order, i.e. exactly its scalar sequence.
+// Every accumulator starts from the same seed x[w*n+i] and meets the
+// same terms in the same order; the x[i0] values it multiplies are the
+// same values the stores just wrote.
 template <int W, typename T>
 __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
                                    T* __restrict__ x) {
-  for (int i = 0; i < n; i++) {
+  int i = 0;
+  for (; i + 2 < n; i += 3) {
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n;
+    T s0[W], s1[W], s2[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) {
+      s0[w] = x[w * n + i];
+      s1[w] = x[w * n + i + 1];
+      s2[w] = x[w * n + i + 2];
+    }
+    for (int k = 0; k < i; k++) {
+      const T l0 = l[r0 + k], l1 = l[r1 + k], l2 = l[r2 + k];
+#pragma unroll
+      for (int w = 0; w < W; w++) {
+        const T xk = x[w * n + k];
+        s0[w] -= l0 * xk;
+        s1[w] -= l1 * xk;
+        s2[w] -= l2 * xk;
+      }
+    }
+    const T d0 = l[r0 + i], l1i = l[r1 + i], d1 = l[r1 + i + 1];
+    const T l2i = l[r2 + i], l2j = l[r2 + i + 1], d2 = l[r2 + i + 2];
+#pragma unroll
+    for (int w = 0; w < W; w++) {
+      const T v0 = s0[w] / d0;
+      x[w * n + i] = v0;
+      s1[w] -= l1i * v0;
+      const T v1 = s1[w] / d1;
+      x[w * n + i + 1] = v1;
+      s2[w] -= l2i * v0;
+      s2[w] -= l2j * v1;
+      x[w * n + i + 2] = s2[w] / d2;
+    }
+  }
+  for (; i < n; i++) {  // up to two rows left over (NV = 35)
     T s[W];
 #pragma unroll
     for (int w = 0; w < W; w++) s[w] = x[w * n + i];
@@ -1174,6 +1313,10 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
 #pragma unroll
     for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
   }
+  // BACK half: row-blocking here is FORBIDDEN, see the K6 prohibition in
+  // the file header (the shared high-k region is each row's TAIL, not a
+  // prefix, and the near-diagonal terms are not available yet). The W
+  // right-hand sides stay batched — that is a different transform.
   for (int i = n - 1; i >= 0; i--) {
     T s[W];
 #pragma unroll
@@ -1216,7 +1359,33 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
 template <typename T>
 __device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
                                 T* __restrict__ x, int m) {
-  for (int i = m; i < n; i++) {
+  // ROW-BLOCKED BY 4 (K6), same forward-only proof as chol_solve_n's.
+  int i = m;
+  for (; i + 3 < n; i += 4) {
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+    T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
+    for (int k = m; k < i; k++) {
+      const T xk = x[k];
+      s0 -= l[r0 + k] * xk;
+      s1 -= l[r1 + k] * xk;
+      s2 -= l[r2 + k] * xk;
+      s3 -= l[r3 + k] * xk;
+    }
+    const T v0 = s0 / l[r0 + i];
+    x[i] = v0;
+    s1 -= l[r1 + i] * v0;
+    const T v1 = s1 / l[r1 + i + 1];
+    x[i + 1] = v1;
+    s2 -= l[r2 + i] * v0;
+    s2 -= l[r2 + i + 1] * v1;
+    const T v2 = s2 / l[r2 + i + 2];
+    x[i + 2] = v2;
+    s3 -= l[r3 + i] * v0;
+    s3 -= l[r3 + i + 1] * v1;
+    s3 -= l[r3 + i + 2] * v2;
+    x[i + 3] = s3 / l[r3 + i + 3];
+  }
+  for (; i < n; i++) {
     T s = x[i];
     for (int k = m; k < i; k++) s -= l[i * n + k] * x[k];
     x[i] = s / l[i * n + i];
@@ -1248,7 +1417,91 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
                                  T* __restrict__ x0, T* __restrict__ x1,
                                  T* __restrict__ x2, T* __restrict__ x3,
                                  int m0) {
-  for (int i = m0; i < n; i++) {
+  // ROW-BLOCKED BY 4 as well (K6): the four x_t[k] are loaded once for
+  // 16 FMAs. Same forward-only proof — the four rows share the ascending
+  // PREFIX k in [m0, i0), and each row's remaining terms k in [i0, i)
+  // follow it ascending, taken from the values the earlier rows of the
+  // block just stored.
+  int i = m0;
+  for (; i + 3 < n; i += 4) {
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+    T a0 = x0[i], a1 = x1[i], a2 = x2[i], a3 = x3[i];
+    T b0 = x0[i + 1], b1 = x1[i + 1], b2 = x2[i + 1], b3 = x3[i + 1];
+    T c0 = x0[i + 2], c1 = x1[i + 2], c2 = x2[i + 2], c3 = x3[i + 2];
+    T e0 = x0[i + 3], e1 = x1[i + 3], e2 = x2[i + 3], e3 = x3[i + 3];
+    for (int k = m0; k < i; k++) {
+      const T la = l[r0 + k], lb = l[r1 + k];
+      const T lc = l[r2 + k], le = l[r3 + k];
+      const T y0 = x0[k], y1 = x1[k], y2 = x2[k], y3 = x3[k];
+      a0 -= la * y0;
+      a1 -= la * y1;
+      a2 -= la * y2;
+      a3 -= la * y3;
+      b0 -= lb * y0;
+      b1 -= lb * y1;
+      b2 -= lb * y2;
+      b3 -= lb * y3;
+      c0 -= lc * y0;
+      c1 -= lc * y1;
+      c2 -= lc * y2;
+      c3 -= lc * y3;
+      e0 -= le * y0;
+      e1 -= le * y1;
+      e2 -= le * y2;
+      e3 -= le * y3;
+    }
+    const T d0 = l[r0 + i];
+    const T v0 = a0 / d0, v1 = a1 / d0, v2 = a2 / d0, v3 = a3 / d0;
+    x0[i] = v0;
+    x1[i] = v1;
+    x2[i] = v2;
+    x3[i] = v3;
+    const T p1 = l[r1 + i];
+    b0 -= p1 * v0;
+    b1 -= p1 * v1;
+    b2 -= p1 * v2;
+    b3 -= p1 * v3;
+    const T d1 = l[r1 + i + 1];
+    const T w0 = b0 / d1, w1 = b1 / d1, w2 = b2 / d1, w3 = b3 / d1;
+    x0[i + 1] = w0;
+    x1[i + 1] = w1;
+    x2[i + 1] = w2;
+    x3[i + 1] = w3;
+    const T p2 = l[r2 + i], q2 = l[r2 + i + 1];
+    c0 -= p2 * v0;
+    c1 -= p2 * v1;
+    c2 -= p2 * v2;
+    c3 -= p2 * v3;
+    c0 -= q2 * w0;
+    c1 -= q2 * w1;
+    c2 -= q2 * w2;
+    c3 -= q2 * w3;
+    const T d2 = l[r2 + i + 2];
+    const T z0 = c0 / d2, z1 = c1 / d2, z2 = c2 / d2, z3 = c3 / d2;
+    x0[i + 2] = z0;
+    x1[i + 2] = z1;
+    x2[i + 2] = z2;
+    x3[i + 2] = z3;
+    const T p3 = l[r3 + i], q3 = l[r3 + i + 1], u3 = l[r3 + i + 2];
+    e0 -= p3 * v0;
+    e1 -= p3 * v1;
+    e2 -= p3 * v2;
+    e3 -= p3 * v3;
+    e0 -= q3 * w0;
+    e1 -= q3 * w1;
+    e2 -= q3 * w2;
+    e3 -= q3 * w3;
+    e0 -= u3 * z0;
+    e1 -= u3 * z1;
+    e2 -= u3 * z2;
+    e3 -= u3 * z3;
+    const T d3 = l[r3 + i + 3];
+    x0[i + 3] = e0 / d3;
+    x1[i + 3] = e1 / d3;
+    x2[i + 3] = e2 / d3;
+    x3[i + 3] = e3 / d3;
+  }
+  for (; i < n; i++) {  // up to three rows left over
     T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
     for (int k = m0; k < i; k++) {
       const T lik = l[i * n + k];
@@ -1269,7 +1522,59 @@ template <typename T>
 __device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
                                  T* __restrict__ x0, T* __restrict__ x1,
                                  int m0) {
-  for (int i = m0; i < n; i++) {
+  // ROW-BLOCKED BY 4 (K6), same forward-only proof.
+  int i = m0;
+  for (; i + 3 < n; i += 4) {
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+    T a0 = x0[i], a1 = x1[i];
+    T b0 = x0[i + 1], b1 = x1[i + 1];
+    T c0 = x0[i + 2], c1 = x1[i + 2];
+    T e0 = x0[i + 3], e1 = x1[i + 3];
+    for (int k = m0; k < i; k++) {
+      const T la = l[r0 + k], lb = l[r1 + k];
+      const T lc = l[r2 + k], le = l[r3 + k];
+      const T y0 = x0[k], y1 = x1[k];
+      a0 -= la * y0;
+      a1 -= la * y1;
+      b0 -= lb * y0;
+      b1 -= lb * y1;
+      c0 -= lc * y0;
+      c1 -= lc * y1;
+      e0 -= le * y0;
+      e1 -= le * y1;
+    }
+    const T d0 = l[r0 + i];
+    const T v00 = a0 / d0, v01 = a1 / d0;
+    x0[i] = v00;
+    x1[i] = v01;
+    const T p1 = l[r1 + i];
+    b0 -= p1 * v00;
+    b1 -= p1 * v01;
+    const T d1 = l[r1 + i + 1];
+    const T v10 = b0 / d1, v11 = b1 / d1;
+    x0[i + 1] = v10;
+    x1[i + 1] = v11;
+    const T p2 = l[r2 + i], q2 = l[r2 + i + 1];
+    c0 -= p2 * v00;
+    c1 -= p2 * v01;
+    c0 -= q2 * v10;
+    c1 -= q2 * v11;
+    const T d2 = l[r2 + i + 2];
+    const T v20 = c0 / d2, v21 = c1 / d2;
+    x0[i + 2] = v20;
+    x1[i + 2] = v21;
+    const T p3 = l[r3 + i], q3 = l[r3 + i + 1], u3 = l[r3 + i + 2];
+    e0 -= p3 * v00;
+    e1 -= p3 * v01;
+    e0 -= q3 * v10;
+    e1 -= q3 * v11;
+    e0 -= u3 * v20;
+    e1 -= u3 * v21;
+    const T d3 = l[r3 + i + 3];
+    x0[i + 3] = e0 / d3;
+    x1[i + 3] = e1 / d3;
+  }
+  for (; i < n; i++) {
     T s0 = x0[i], s1 = x1[i];
     for (int k = m0; k < i; k++) {
       const T lik = l[i * n + k];
@@ -1282,6 +1587,10 @@ __device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
   }
 }
 
+// The back substitutions (this one and chol_back{2,4}_n below) are the
+// one shape in the kernel that must stay row-serial: see the K6
+// ABSOLUTE PROHIBITION in the file header. Do not row-block them, at any
+// R — batching more right-hand sides in is the legal direction.
 template <typename T>
 __device__ void chol_back_n(int n, const T* __restrict__ l,
                             T* __restrict__ x) {
