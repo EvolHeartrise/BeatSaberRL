@@ -406,6 +406,20 @@ impl ConstraintSet {
         (dense, seg)
     }
 
+    /// TEST HOOK (R13): fill the two scratch regions the R13 dead-store
+    /// deletions rest on — `minvjt`'s weld rows and the `wt` staging
+    /// buffer — with NaN. The next solve must reproduce the un-poisoned
+    /// trajectory BIT FOR BIT, which is exactly the claim R13 rests on:
+    /// the weld block's RHS-MINOR path writes every one of those words
+    /// before anything reads them, so seeding `minvjt` rows 0..12 from
+    /// `j` (and copying `jwt -> wt` as a separate pass) were both dead.
+    #[cfg(test)]
+    pub fn poison_weld_scratch(&mut self) {
+        let n = N_WELD_ROWS * self.nv;
+        self.minvjt[..n].fill(f64::NAN);
+        self.wt[..n].fill(f64::NAN);
+    }
+
     /// TEST HOOK (R10): the `(joint, sign)` pairs of the limit rows
     /// assembled by the last solve, assembly order.
     #[cfg(test)]
@@ -615,7 +629,14 @@ impl ConstraintSet {
         // The 12 weld rows are exactly 3 groups of 4; the contact rows
         // continue the same ladder (4 → 2 → 1) from there.
         let ndense = nweld + self.contacts.len();
-        self.minvjt[..ndense * nv].copy_from_slice(&self.j[..ndense * nv]);
+        // R13: the weld block (rows 0..nweld) takes the RHS-MINOR path
+        // below, which OVERWRITES those `minvjt` rows in full from `wt`
+        // — seeding them from `j` here was a dead 12×35 store. `nweld`
+        // is 12 or 0 (`weld_rows`), and it is exactly the same
+        // `nweld == N_WELD_ROWS` test that selects the path, so this
+        // skips precisely the rows that get rewritten.
+        self.minvjt[nweld * nv..ndense * nv]
+            .copy_from_slice(&self.j[nweld * nv..ndense * nv]);
         {
             let mut row = 0usize;
             if nweld == N_WELD_ROWS {
@@ -625,14 +646,17 @@ impl ConstraintSet {
                 // twelve times). The transposed Jacobian is KEPT in
                 // `jwt` afterwards: the PGS residual and the two
                 // weld-null projections all want exactly this layout.
+                // R13: `wt` is only the solve's scratch copy of `jwt`,
+                // so both land from ONE load of `jr[i]` — the separate
+                // 420-word `jwt -> wt` copy is gone.
                 for r in 0..N_WELD_ROWS {
                     let jr = &self.j[r * nv..(r + 1) * nv];
                     for i in 0..nv {
-                        self.jwt[i * N_WELD_ROWS + r] = jr[i];
+                        let x = jr[i];
+                        self.jwt[i * N_WELD_ROWS + r] = x;
+                        self.wt[i * N_WELD_ROWS + r] = x;
                     }
                 }
-                self.wt[..N_WELD_ROWS * nv]
-                    .copy_from_slice(&self.jwt[..N_WELD_ROWS * nv]);
                 chol_solve_t::<N_WELD_ROWS>(nv, &ws.m, &mut self.wt[..N_WELD_ROWS * nv]);
                 for r in 0..N_WELD_ROWS {
                     let mr = &mut self.minvjt[r * nv..(r + 1) * nv];

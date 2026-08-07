@@ -17,6 +17,17 @@ use super::Workspace;
 /// I_world = R · diag(i) · R^T (about the body COM). Upper triangle
 /// computed, lower mirrored — bitwise symmetric by construction (the
 /// two orders (r_a·i)·r_b vs (r_b·i)·r_a round differently).
+///
+/// R12 REVERTED (2026-08-06, measured negative): `crba` and `rnea` each
+/// call this once per massive frame per substep on the SAME FK, so the
+/// second call is redundant — caching it in the Workspace (a 30×Mat3
+/// array written by `crba`, read by `rnea`, i.e. the CUDA K4e port,
+/// which paid +1.15% there) measured **−0.37%** on the CPU
+/// (21,282 → 21,204 env-steps/s, N=256, 3 interleaved A/B rounds, every
+/// round negative). On this machine 30 nine-word stores plus 30 cold
+/// nine-word loads cost more than recomputing 6 three-term dots from an
+/// `ws.r[k]` that `rnea` is loading anyway (`e = R·com` two lines up).
+/// Do not retry without a register/cache-economics change.
 fn inertia_world(r: &Mat3, i: [f64; 3]) -> Mat3 {
     let mut out = [[0.0; 3]; 3];
     for a in 0..3 {
