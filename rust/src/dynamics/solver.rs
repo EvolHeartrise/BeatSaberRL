@@ -50,6 +50,11 @@
 //! module's register/inner-loop economics. Jam widths and any change
 //! previously measured at under ~1% must be RE-PROBED against the
 //! post-R9 build before being called dead.
+//! The rule PAID (2026-08-06, R15): the by-4 axpy jams that R1 had
+//! established as the winners were beaten by width 12 post-R9. It also
+//! bites WITHIN a task — the PGS axpy's own gain fell from +0.29% to
+//! +0.17% once the weld-null axpys were widened, so probe increments
+//! against the build you will actually ship, not against the baseline.
 
 use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
@@ -160,6 +165,109 @@ macro_rules! weld_support_dot {
         }
     }};
 }
+
+/// `weld_support_dot!` for TWO independent sources at once (R16): the
+/// 12-lane `jwt` row is loaded ONCE and feeds both 12-accumulator sets.
+/// BITWISE: `$s0` and `$s1` are separate accumulator sets, each still
+/// visiting its own source over the same ascending i — interleaving two
+/// independent chains moves no term of either.
+macro_rules! weld_support_dot2 {
+    ($s0:expr, $s1:expr, $jwt:expr, $a:expr, $b:expr) => {{
+        for i in 0..W_BASE_HI {
+            let (xa, xb) = ($a[i], $b[i]);
+            let jr = &$jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+            for w in 0..N_WELD_ROWS {
+                $s0[w] += jr[w] * xa;
+                $s1[w] += jr[w] * xb;
+            }
+        }
+        for i in W_L_LO..W_R_HI {
+            let (xa, xb) = ($a[i], $b[i]);
+            let jr = &$jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
+            for w in 0..N_WELD_ROWS {
+                $s0[w] += jr[w] * xa;
+                $s1[w] += jr[w] * xb;
+            }
+        }
+    }};
+}
+
+/// `dst[i] <op>= Σ_w  minvjt_w[i] · d[w]` over ALL TWELVE weld rows in
+/// ONE pass over `dst` (R15). `$mj` is the head of `minvjt` (the 12 weld
+/// rows, row-major, `nv` apart), `$d` a `[f64; N_WELD_ROWS]`, `$op` the
+/// compound assignment (`+=` for the PGS impulse propagation, `-=` for
+/// the two weld-null projections).
+///
+/// BITWISE at ANY jam width, including this one: `dst[i]` takes its 12
+/// updates in w = 0..11 order exactly as the row-at-a-time (and the
+/// by-4) form did — the jam only holds `dst[i]` in a register across all
+/// twelve instead of four, so no term moves and nothing reassociates.
+/// The twelve `m*` slices are disjoint splits of one 12·nv block, so
+/// each stays UNIT-STRIDE in i and the i loop still vectorizes.
+///
+/// WIDTH LADDER, re-probed post-R9 as the module header's
+/// ORDER-DEPENDENCE rule demands (2026-08-06, R15; N = 256, 4 interleaved
+/// ABBA pairs each). What is bought is `dst` ROUND TRIPS — the by-4 form
+/// read and wrote all of `dst` three times per application:
+///   · the two WELD-NULL projections (limit-row + ω-cap column), 4 → 12:
+///     **+0.67%** (22,090 → 22,238) — the winner of this task;
+///   · the PGS impulse propagation, 4 → 12: +0.29% measured alone
+///     (22,080 → 22,145), but only **+0.17%** once the projections were
+///     already at 12 (22,235 → 22,274) — the same registers, counted
+///     twice. Kept for the shared macro (it deletes the third copy of
+///     the by-4 body), NOT for the number;
+///   · the PGS propagation at width 6 (two groups, i.e. 2 round trips
+///     instead of 3): **+0.04%** — noise. The round trip you do not save
+///     is not worth the registers you spend, so it is 12 or nothing.
+macro_rules! weld_axpy12 {
+    ($dst:expr, $mj:expr, $d:expr, $nv:expr, $op:tt) => {{
+        let mj = &$mj[..N_WELD_ROWS * $nv];
+        let (m0, t) = mj.split_at($nv);
+        let (m1, t) = t.split_at($nv);
+        let (m2, t) = t.split_at($nv);
+        let (m3, t) = t.split_at($nv);
+        let (m4, t) = t.split_at($nv);
+        let (m5, t) = t.split_at($nv);
+        let (m6, t) = t.split_at($nv);
+        let (m7, t) = t.split_at($nv);
+        let (m8, t) = t.split_at($nv);
+        let (m9, t) = t.split_at($nv);
+        let (m10, m11) = t.split_at($nv);
+        for i in 0..$nv {
+            let mut x = $dst[i];
+            x $op m0[i] * $d[0];
+            x $op m1[i] * $d[1];
+            x $op m2[i] * $d[2];
+            x $op m3[i] * $d[3];
+            x $op m4[i] * $d[4];
+            x $op m5[i] * $d[5];
+            x $op m6[i] * $d[6];
+            x $op m7[i] * $d[7];
+            x $op m8[i] * $d[8];
+            x $op m9[i] * $d[9];
+            x $op m10[i] * $d[10];
+            x $op m11[i] * $d[11];
+            $dst[i] = x;
+        }
+    }};
+}
+
+// R16 NEGATIVE (2026-08-06) — do not re-add without a register-economy
+// change. Sharing the twelve `minvjt_w[i]` LOADS between two projection
+// targets (a `weld_axpy12_x2!` doing `a -= mw[i]·x0[w]; b -= mw[i]·x1[w]`
+// for w = 0..11 in one i pass) was written, bitwise-clean, and measured
+// **−1.07%** against the same build with two separate `weld_axpy12!`
+// calls (22,280 → 22,042 env-steps/s, N = 256, 4 interleaved ABBA pairs,
+// every pair negative). The dot side of the same jam WINS (+0.42%) —
+// what differs is the loop-invariant budget: the dot carries 12 shared
+// `jr[w]` lanes and its accumulators live in memory anyway, while the
+// axpy already spends its whole register file on 12 base pointers + 12
+// broadcast deltas, so a second column's 12 deltas buy 12 spilled
+// reloads per i to save 12 L1 hits. WIDTH 4 (`weld_support_dot4!` +
+// `chol_solve_x4` + four `weld_axpy12!`s) was also built and measured:
+// **−2.70%** (22,405 → 21,800) — 4×12 dot accumulators no longer fit,
+// and the spill traffic swamps the halved `jwt` traversal. Two is the
+// width that pays.
 
 // ── R10 (2026-08-06): LIMIT-ROW CLOSED FORMS — the rank-1 sibling of
 //    R9's sparsity argument (the CUDA kernel has carried it since the
@@ -822,40 +930,69 @@ impl ConstraintSet {
         //    deterministically.
         let ncon = self.contacts.len();
         if nweld > 0 {
-            // the by-4 jams below assume the 12-row weld block
+            // the 12-wide jams below assume the 12-row weld block
             debug_assert_eq!(nweld, N_WELD_ROWS);
             let split = (nweld + ncon) * nv;
             let (head, tail) = self.minvjt.split_at_mut(split);
-            for (li, &(jt, sign)) in self.limset.iter().enumerate() {
+            let nlim = self.limset.len();
+            // R16 (2026-08-06): limit rows are INDEPENDENT here — row li
+            // reads and writes only its own `minvjt` column — so the two
+            // SHAREABLE stages go two at a time: ONE `jwt` traversal
+            // feeds 2×12 dot accumulators, and the two 12-vectors go
+            // through ONE `chol_solve_x2` against the same A_ww factor
+            // (the same batch contract the weld/contact ladder uses).
+            // Each column still sees its own terms in its own ascending
+            // order, so this is bit-for-bit the one-row-at-a-time result.
+            // MEASURED +0.42% (22,300 → 22,393 env-steps/s at N = 256,
+            // 4 interleaved ABBA pairs) — and this is a LOWER BOUND for
+            // this class: the micro drives random gears while the benched
+            // policy parks joints ON their stops, so the bench assembles
+            // more limit rows per substep (see the R10 note above).
+            // The projection axpy is deliberately NOT shared and width 4
+            // is deliberately not used — both measured negative, see the
+            // R16 NEGATIVE block by `weld_axpy12!`.
+            let mut lj = 0usize;
+            while lj + 2 <= nlim {
+                let (t0, t1) = tail[lj * nv..(lj + 2) * nv].split_at_mut(nv);
+                let mut s = [0.0f64; 2 * N_WELD_ROWS];
+                {
+                    let (s0, s1) = s.split_at_mut(N_WELD_ROWS);
+                    weld_support_dot2!(s0, s1, self.jwt, t0, t1);
+                }
+                chol_solve_x2(nweld, &self.lww, &mut s);
+                let (x0, x1) = s.split_at(N_WELD_ROWS);
+                weld_axpy12!(t0, head, x0, nv, -=);
+                weld_axpy12!(t1, head, x1, nv, -=);
+                for (k, mr) in [&*t0, &*t1].into_iter().enumerate() {
+                    let (jt, sign) = self.limset[lj + k];
+                    let row = nweld + ncon + lj + k;
+                    let dnew = 0.0 + sign * mr[voff + jt];
+                    self.diag[row] = if dnew > COMPOSITE_EPS * self.diag[row] {
+                        dnew
+                    } else {
+                        f64::INFINITY // immobile given welds — row inert
+                    };
+                }
+                lj += 2;
+            }
+            // remainder row (nlim is odd), the scalar path verbatim
+            for li in lj..nlim {
+                let (jt, sign) = self.limset[li];
                 let row = nweld + ncon + li;
                 let mr = &mut tail[li * nv..(li + 1) * nv];
-                // UNROLL-AND-JAM by 4 (2026-08-03), both here and in the
-                // back-substitution below: mr is traversed 3× instead of
-                // 12× each way while every accumulator keeps its own
-                // ascending-i order and every mr[i] takes its 12
-                // decrements in w = 0..11 order — bit-for-bit the
-                // one-row-at-a-time result. (A full w/i interchange was
-                // measured SLOWER, see the weld PGS note.)
+                // UNROLL-AND-JAM (2026-08-03; width re-probed 2026-08-06,
+                // R15): mr is traversed ONCE each way while every
+                // accumulator keeps its own ascending-i order and every
+                // mr[i] takes its 12 decrements in w = 0..11 order —
+                // bit-for-bit the one-row-at-a-time result. (A full w/i
+                // interchange was measured SLOWER, see the weld PGS note.)
                 let mut s = [0.0f64; N_WELD_ROWS];
                 weld_support_dot!(s, self.jwt, mr); // R9 support only
                 self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                for w in (0..nweld).step_by(4) {
-                    let (x0, x1) = (self.rw[w], self.rw[w + 1]);
-                    let (x2, x3) = (self.rw[w + 2], self.rw[w + 3]);
-                    let m0 = &head[w * nv..(w + 1) * nv];
-                    let m1 = &head[(w + 1) * nv..(w + 2) * nv];
-                    let m2 = &head[(w + 2) * nv..(w + 3) * nv];
-                    let m3 = &head[(w + 3) * nv..(w + 4) * nv];
-                    for i in 0..nv {
-                        let mut m = mr[i];
-                        m -= m0[i] * x0;
-                        m -= m1[i] * x1;
-                        m -= m2[i] * x2;
-                        m -= m3[i] * x3;
-                        mr[i] = m;
-                    }
-                }
+                let mut x = [0.0f64; N_WELD_ROWS];
+                x.copy_from_slice(&self.rw[..N_WELD_ROWS]);
+                weld_axpy12!(mr, head, x, nv, -=);
                 // R10: rank-1 row again — the projected mobility is the
                 // pivot entry of the projected column (guard included).
                 let dnew = 0.0 + sign * mr[voff + jt];
@@ -887,16 +1024,17 @@ impl ConstraintSet {
             // loads destroy the unit-stride AVX2 vectorization of these
             // dots/axpys. Reverted.)
             //
-            // What DOES win is the same UNROLL-AND-JAM by 4 the A_ww
-            // assembly and the weld-null projections use (2026-08-03,
-            // R1): i stays inner and unit-stride, one accumulator per
-            // weld row, so `v` is traversed 3× per half instead of 12×.
-            // BITWISE: each dot keeps its own ascending-i chain, and in
-            // the axpy each v[i] still takes its 12 increments in
-            // r = 0..11 order (the jam only holds v[i] in a register
-            // across four of them) — bit-for-bit the row-at-a-time
-            // result. This is the hottest loop in the substep: 12
-            // iterations × 12 rows × two nv-wide passes.
+            // What DOES win is UNROLL-AND-JAM (2026-08-03, R1; widths
+            // re-probed 2026-08-06, R15): i stays inner and unit-stride,
+            // one accumulator per weld row, so `v` is traversed ONCE per
+            // half instead of 12× — the dot through `weld_support_dot!`,
+            // the axpy through `weld_axpy12!` (see there for the width
+            // ladder and its measurements). BITWISE: each dot keeps its
+            // own ascending-i chain, and in the axpy each v[i] still
+            // takes its 12 increments in r = 0..11 order (the jam only
+            // holds v[i] in a register across them) — bit-for-bit the
+            // row-at-a-time result. This is the hottest loop in the
+            // substep: 12 iterations × 12 rows × two nv-wide passes.
             if nweld > 0 {
                 debug_assert_eq!(nweld, N_WELD_ROWS);
                 // 12 dots against one shared v, in the TRANSPOSED weld
@@ -908,26 +1046,12 @@ impl ConstraintSet {
                     self.rw[r] = self.bias[r] - s[r];
                 }
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                for r in (0..nweld).step_by(4) {
-                    let (d0, d1) = (self.rw[r], self.rw[r + 1]);
-                    let (d2, d3) = (self.rw[r + 2], self.rw[r + 3]);
-                    self.lambda[r] += d0;
-                    self.lambda[r + 1] += d1;
-                    self.lambda[r + 2] += d2;
-                    self.lambda[r + 3] += d3;
-                    let m0 = &self.minvjt[r * nv..(r + 1) * nv];
-                    let m1 = &self.minvjt[(r + 1) * nv..(r + 2) * nv];
-                    let m2 = &self.minvjt[(r + 2) * nv..(r + 3) * nv];
-                    let m3 = &self.minvjt[(r + 3) * nv..(r + 4) * nv];
-                    for i in 0..nv {
-                        let mut vi = v[i];
-                        vi += m0[i] * d0;
-                        vi += m1[i] * d1;
-                        vi += m2[i] * d2;
-                        vi += m3[i] * d3;
-                        v[i] = vi;
-                    }
+                let mut d = [0.0f64; N_WELD_ROWS];
+                d.copy_from_slice(&self.rw[..N_WELD_ROWS]);
+                for r in 0..N_WELD_ROWS {
+                    self.lambda[r] += d[r];
                 }
+                weld_axpy12!(v, self.minvjt, d, nv, +=);
             }
             // (b)+(c) contacts (pair-id order) then joint-limit rows
             // (joint order): projected GS, λ ≥ 0.
@@ -1032,8 +1156,8 @@ impl ConstraintSet {
                         let plain = self.capcol[jt * nv + vj];
                         if nweld > 0 {
                             debug_assert_eq!(nweld, N_WELD_ROWS);
-                            // same by-4 jam as the limit-row projection:
-                            // one accumulator per weld row, each still
+                            // same jam as the limit-row projection: one
+                            // accumulator per weld row, each still
                             // summing over i ASCENDING, and each col[i]
                             // taking its 12 decrements in w = 0..11
                             // order — bitwise the per-row form.
@@ -1049,22 +1173,9 @@ impl ConstraintSet {
                             // fields can be borrowed at once
                             let (capcol, minvjt) = (&mut self.capcol, &self.minvjt);
                             let col = &mut capcol[jt * nv..(jt + 1) * nv];
-                            for w in (0..nweld).step_by(4) {
-                                let (x0, x1) = (self.rw[w], self.rw[w + 1]);
-                                let (x2, x3) = (self.rw[w + 2], self.rw[w + 3]);
-                                let m0 = &minvjt[w * nv..(w + 1) * nv];
-                                let m1 = &minvjt[(w + 1) * nv..(w + 2) * nv];
-                                let m2 = &minvjt[(w + 2) * nv..(w + 3) * nv];
-                                let m3 = &minvjt[(w + 3) * nv..(w + 4) * nv];
-                                for i in 0..nv {
-                                    let mut c = col[i];
-                                    c -= m0[i] * x0;
-                                    c -= m1[i] * x1;
-                                    c -= m2[i] * x2;
-                                    c -= m3[i] * x3;
-                                    col[i] = c;
-                                }
-                            }
+                            let mut x = [0.0f64; N_WELD_ROWS];
+                            x.copy_from_slice(&self.rw[..N_WELD_ROWS]);
+                            weld_axpy12!(col, minvjt, x, nv, -=);
                         }
                         let dnew = self.capcol[jt * nv + vj];
                         self.capmass[jt] = if dnew > COMPOSITE_EPS * plain {

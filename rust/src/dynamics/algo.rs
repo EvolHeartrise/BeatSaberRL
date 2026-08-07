@@ -389,6 +389,17 @@ pub fn chol_factor_floored_inplace(n: usize, a: &mut [f64]) -> u32 {
         // in ASCENDING k — bit-for-bit the one-row-at-a-time result —
         // and no jammed row reads a value another writes (the k-chain
         // stops at k < j, the writes land at column j).
+        //
+        // WIDTH 8 REVERTED (2026-08-06, R15 — the post-R9 re-probe the
+        // solver header's ORDER-DEPENDENCE rule asks for): an 8-wide
+        // rung above this one (ladder 8 → 4 → 1, bitwise-clean) measured
+        // **−1.00%** end to end (22,273 → 22,050 env-steps/s at N = 256,
+        // 4 interleaved ABBA pairs, every pair negative). Unlike the
+        // `weld_axpy12!` jams next door this k-chain is a DEPENDENT
+        // scalar recurrence — it cannot vectorize, so the 8 accumulators
+        // and 8 row pointers are 8 real live registers competing with
+        // the address arithmetic, and at n = 35 the halved `lj[k]` load
+        // count is not worth what spills. 4 is the width.
         let (head, tail) = a.split_at_mut((j + 1) * n);
         let lj = &head[j * n..j * n + j];
         let mut i = j + 1;
