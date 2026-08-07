@@ -717,3 +717,80 @@ fn r10_limit_rows_are_rank1_and_closed_form_is_bitwise() {
          guard is then unpinned, which is worse than a failure"
     );
 }
+
+/// Gate (R13): the weld block's `minvjt` rows and the `wt` staging
+/// buffer are WRITE-BEFORE-READ within a solve — the property that
+/// makes R13's two deleted passes dead work.
+///
+/// Before R13, `minvjt` rows 0..12 were seeded from `j` and then fully
+/// overwritten by the RHS-MINOR transpose-back, and `wt` was a separate
+/// `copy_from_slice` of `jwt` that the fused transpose now writes
+/// directly. Both deletions are safe only if nothing in a solve ever
+/// reads a word of those regions that the solve did not itself write.
+/// This runs the same random-gear trajectory twice — once clean, once
+/// with both regions poisoned to NaN before EVERY substep — and demands
+/// bit-identical state and impulse streams. A surviving NaN would
+/// contaminate the weld impulses immediately and the whole state within
+/// a substep, so the gate is sharp.
+#[test]
+fn r13_weld_scratch_is_write_before_read() {
+    let m = &HUMANOID;
+    let mut rng = Rng(0x0000_000D_5EED_0130);
+    // one fixed torque schedule, replayed by both runs
+    let mut sched: Vec<[f64; NQ]> = Vec::new();
+    for _ in 0..(24 * 5) {
+        let mut tau = [0.0f64; NQ];
+        for j in 0..NQ {
+            let s = match rng.next_u64() % 3 {
+                0 => 0.0,
+                1 => 1.0,
+                _ => -1.0,
+            };
+            tau[j] = s * m.tau_max[j];
+        }
+        sched.push(tau);
+    }
+    let states: Vec<State> = (0..24)
+        .map(|_| super::testutil::random_state(m, &mut rng, true))
+        .collect();
+
+    let run = |poison: bool| -> Vec<u64> {
+        let mut bits: Vec<u64> = Vec::new();
+        for (state_i, st0) in states.iter().enumerate() {
+            let mut st = st0.clone();
+            let mut ws = Workspace::new(m);
+            let mut cs = ConstraintSet::new(m, true, true);
+            for k in 0..40 {
+                let tau = &sched[state_i * 5 + k / 8];
+                if poison {
+                    cs.poison_weld_scratch();
+                }
+                substep_constrained(m, &mut st, tau, H, &mut ws, &mut cs);
+                if !st.v.iter().all(|x| x.is_finite()) {
+                    break; // finite-trajectory claim, same cut in both runs
+                }
+                for x in st.q.iter().chain(st.v.iter()).chain(st.p.iter()) {
+                    bits.push(x.to_bits());
+                }
+                for r in 0..cs.nrows {
+                    bits.push(cs.lambda[r].to_bits());
+                }
+            }
+        }
+        bits
+    };
+    let clean = run(false);
+    let poisoned = run(true);
+    assert!(clean.len() > 50_000, "corpus too small ({})", clean.len());
+    assert_eq!(
+        clean, poisoned,
+        "poisoning minvjt's weld rows / wt changed the trajectory — the \
+         weld block does NOT write them all before reading, so R13's \
+         deleted seed copy was load-bearing"
+    );
+    println!(
+        "R13 write-before-read gate: {} recorded words, identical with the \
+         weld scratch poisoned to NaN before every substep",
+        clean.len()
+    );
+}
