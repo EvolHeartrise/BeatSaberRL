@@ -268,6 +268,36 @@ constexpr int NOTE_FEAT = 14;
 // above trade code for immediates; static counts are not dynamic
 // traffic (the same caveat K7 recorded).
 //
+// K11 (2026-08-07) — RHS-MINOR s.mw, and the death of the LDL-width
+// theory. The task was posed as a SASS census: count vector vs scalar
+// local loads in the mw consumers and transpose [N_WELD][NV] ->
+// [NV][N_WELD] only if the scalar loads could be fused. The census
+// (nvcc -lineinfo + nvdisasm -c -g, per-source-line attribution) said
+// they were 100% scalar, so the transpose was built — and it is worth
+// +7.06%, 25,769.5 -> 27,588.8 env-steps/s at N=4096 (6 interleaved A/B
+// rounds, medians, ranges 25,750.7-25,778.3 vs 27,559.6-27,615.0, i.e.
+// non-overlapping by 30x the spread). But NOT ONE LOAD WAS FUSED: f32
+// LDL 6,548 -> 6,548, STL 3,042 -> 3,042, f64 6,570 / 2,901 likewise
+// unchanged; total instructions 38,070 -> 38,088 and 43,290 -> 43,308.
+// The whole gain is ADDRESS ARITHMETIC AND SCHEDULING — 12 consecutive
+// words off one base with immediate offsets, instead of 12 independent
+// runtime-stride addresses live at once — and that is the general
+// lesson for this kernel: it is register- and issue-bound, so a layout
+// change should be judged by how many ADDRESSES its inner loop must
+// keep live, not by LDL width. The corollary is that the SASS LDL
+// census, which K6/K7/K8 all leaned on, is a WEAK instrument here: it
+// was flat across the single largest win of the round.
+// Why ptxas would not fuse: on sm_61 it vectorizes local accesses only
+// in pure copy patterns (the one site in this kernel is
+// `x[b][w] = rw[b][w]`, 18 LDL.128 and zero scalars). Feed the same 12
+// consecutive words into FFMAs and it emits 12 scalar LDL regardless of
+// layout or alignment — __align__(16) on mw was measured at +0.07% =
+// noise and cost 16 B of f64 frame (rejected, recorded at the member).
+// SPILL STATUS UNCHANGED, both dtypes: f32 41,872 B / 0 / 0 / 255 regs,
+// f64 82,912 B / 8 / 8 / 255 regs — byte for byte what K8+K9 left.
+// s.c_minv and the ensure_pcol batches stay row-major on
+// chol_solve_multi_n; only s.mw uses the _tn twin.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -692,7 +722,38 @@ struct Solver {
   // 84 numbers: jwc[r][e] is chain column WJ_CH0(r)+e, jwr[WJ_LIN(r)][.]
   // the two extra root columns WJ_R2[t][.] of a linear row. The 12
   // exactly-1.0 entries are not stored at all (WJ_ONE(r) is implicit).
-  T mw[N_WELD][NV], jwc[N_WELD][6], jwr[N_WELD / 2][2], bias_w[N_WELD];
+  // K11 — mw is stored RHS-MINOR, [NV][N_WELD], not [N_WELD][NV], worth
+  // +7.06% (25,769 -> 27,589 env-steps/s at N=4096, 6 interleaved A/B
+  // rounds, non-overlapping ranges). All four consumers sweep the 12
+  // weld rows in the INNER loop at a fixed column i — the 12-RHS solve
+  // (chol_solve_multi_tn), both ensure_pcol projections, the PGS weld
+  // update — so RHS-minor makes each of those sweeps 12 CONSECUTIVE
+  // per-thread words off ONE base register with immediate offsets;
+  // row-major made them stride-NV, i.e. 12 independent addresses.
+  //
+  // WHY, and what it is NOT: the K11 premise was that contiguity would
+  // let ptxas fuse the sweep into 3 LDL.128. IT DOES NOT. The SASS
+  // census before and after is IDENTICAL to the instruction — f32 LDL
+  // 6,548 -> 6,548 and STL 3,042 -> 3,042 (f64 6,570 / 2,901 likewise
+  // unchanged), total instructions 38,070 -> 38,088 — and EVERY mw
+  // sweep is still 12 scalar LDL (PGS weld update 420 -> 420, A_ww
+  // chain 180 -> 180, batched projection 48 -> 48, 12-RHS solve 12 per
+  // (i, k) either way). ptxas on sm_61 only vectorizes local accesses
+  // in pure copy patterns: the one place it fires in this kernel is
+  // `x[b][w] = rw[b][w]` (18 LDL.128, zero scalars) where the loaded
+  // value feeds a store and nothing else. Feed the same 12 words into
+  // FFMAs and it emits 12 scalar LDL no matter how they are laid out.
+  // So the +7% is ADDRESSING AND SCHEDULING, not load width, and
+  // forcing alignment buys nothing: __align__(16) on this member (which
+  // would make all 35 rows 16-byte aligned) was MEASURED at +0.07% =
+  // NOISE (27,609.5 vs 27,589.7 medians, 3 interleaved rounds,
+  // overlapping ranges) and cost 16 B of f64 frame — REVERTED, do not
+  // re-add it. Local memory is per-thread interleaved, so stride never
+  // affected transactions either. LESSON: on this kernel, judge a
+  // layout change by how many ADDRESS registers the inner loop needs
+  // live, not by LDL width.
+  T mw[NV][N_WELD];
+  T jwc[N_WELD][6], jwr[N_WELD / 2][2], bias_w[N_WELD];
   T aww[N_WELD * N_WELD], rw[N_WELD];  // aww: A_ww, then in-place L
   // contacts (compacted, pair-id order)
   int nc;
@@ -1314,7 +1375,7 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
 }
 
 // Triangular solve. l and x are always distinct objects at every call
-// site (d.m, holding the in-place factor, vs {d.rhs, s.mw[w],
+// site (d.m, holding the in-place factor, vs {d.rhs, s.mw,
 // s.c_minv[ci], s.ecol[j]}; s.aww vs s.rw), and x is the only thing
 // written — so restrict here is the
 // difference between keeping l's row in registers across the x[i]
@@ -1373,7 +1434,8 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
 }
 
 // BATCHED multi-RHS solve: W independent right-hand sides, laid out as
-// W consecutive rows of stride `n` (s.mw / s.c_minv are exactly that),
+// W consecutive rows of stride `n` (s.c_minv and the ensure_pcol
+// batches are exactly that; s.mw is RHS-minor and uses the _tn twin),
 // sharing ONE factor. This is a pure LOOP INTERCHANGE of W calls to
 // chol_solve_n: the (i, k) iteration space is walked in the same
 // ascending order, and each RHS w keeps its OWN accumulator visiting the
@@ -1473,6 +1535,98 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
     const T dg = l[i * n + i];
 #pragma unroll
     for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
+  }
+}
+
+// K11 — the SAME batched solve on a RHS-MINOR right-hand side: x[k*W+w]
+// instead of x[w*n+k]. Only s.mw is stored this way (see Solver::mw);
+// s.c_minv and the ensure_pcol batches keep the row-major entry point
+// above, so both survive.
+//
+// TRIVIALLY BITWISE: this is chol_solve_multi_n with one address map
+// applied to x and nothing else. Same i order, same k order, same w
+// order, same seeds, same divisors, same accumulator chains — every
+// floating-point operation is the identical operation on the identical
+// operands, only fetched from a different offset.
+//
+// Why it is worth a second entry point: the W-loop is the innermost
+// loop of all three halves, so RHS-minor makes its W accesses W
+// CONSECUTIVE per-thread words reachable as immediate offsets from ONE
+// base (`bk = k * W`, W a compile-time constant), where the row-major
+// form needed W separate addresses at runtime stride n. The load COUNT
+// is unchanged — ptxas emits 12 scalar LDL either way, see Solver::mw
+// for why the LDL.128 hypothesis was falsified — but the back half
+// alone runs n(n-1)/2 = 595 (i, k) pairs at W = 12, and cutting each
+// one's address arithmetic to a single IADD is most of K11's +7.06%.
+template <int W, typename T>
+__device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
+                                    T* __restrict__ x) {
+  int i = 0;
+  for (; i + 2 < n; i += 3) {  // ROW-BLOCKED BY 3, as above (K6)
+    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n;
+    const int b0 = i * W, b1 = b0 + W, b2 = b1 + W;
+    T s0[W], s1[W], s2[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) {
+      s0[w] = x[b0 + w];
+      s1[w] = x[b1 + w];
+      s2[w] = x[b2 + w];
+    }
+    for (int k = 0; k < i; k++) {
+      const T l0 = l[r0 + k], l1 = l[r1 + k], l2 = l[r2 + k];
+      const int bk = k * W;
+#pragma unroll
+      for (int w = 0; w < W; w++) {
+        const T xk = x[bk + w];
+        s0[w] -= l0 * xk;
+        s1[w] -= l1 * xk;
+        s2[w] -= l2 * xk;
+      }
+    }
+    const T d0 = l[r0 + i], l1i = l[r1 + i], d1 = l[r1 + i + 1];
+    const T l2i = l[r2 + i], l2j = l[r2 + i + 1], d2 = l[r2 + i + 2];
+#pragma unroll
+    for (int w = 0; w < W; w++) {
+      const T v0 = s0[w] / d0;
+      x[b0 + w] = v0;
+      s1[w] -= l1i * v0;
+      const T v1 = s1[w] / d1;
+      x[b1 + w] = v1;
+      s2[w] -= l2i * v0;
+      s2[w] -= l2j * v1;
+      x[b2 + w] = s2[w] / d2;
+    }
+  }
+  for (; i < n; i++) {  // up to two rows left over (NV = 35)
+    const int bi = i * W;
+    T s[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) s[w] = x[bi + w];
+    for (int k = 0; k < i; k++) {
+      const T lik = l[i * n + k];
+      const int bk = k * W;
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lik * x[bk + w];
+    }
+    const T dg = l[i * n + i];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[bi + w] = s[w] / dg;
+  }
+  // BACK half: not row-blocked (K6 prohibition, file header).
+  for (int i = n - 1; i >= 0; i--) {
+    const int bi = i * W;
+    T s[W];
+#pragma unroll
+    for (int w = 0; w < W; w++) s[w] = x[bi + w];
+    for (int k = i + 1; k < n; k++) {
+      const T lki = l[k * n + i];
+      const int bk = k * W;
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lki * x[bk + w];
+    }
+    const T dg = l[i * n + i];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[bi + w] = s[w] / dg;
   }
 }
 
@@ -1979,7 +2133,7 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     for (int i = 0; i < NV; i++) {
       T ci = col[i];
 #pragma unroll
-      for (int w = 0; w < N_WELD; w++) ci -= s.mw[w][i] * x[w];
+      for (int w = 0; w < N_WELD; w++) ci -= s.mw[i][w] * x[w];
       col[i] = ci;
     }
   }
@@ -1996,7 +2150,7 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 //       B columns;
 //   (b) the 12x12 weld solve becomes chol_solve_multi_n<B> — the proven
 //       multi-RHS loop interchange, bitwise per right-hand side;
-//   (c) the projection pass reads s.mw[w][i] ONCE for all B columns.
+//   (c) the projection pass reads s.mw[i][w] ONCE for all B columns.
 // BITWISE: the columns are mutually independent (distinct ecol/pcol
 // rows), every sum[b][w] still runs over the same terms in ascending i
 // from the same +0.0 seed, and every col[b][i] still applies w = 0..11
@@ -2128,7 +2282,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
       for (int b = 0; b < B; b++) ci[b] = s.pcol[j[b]][i];
 #pragma unroll
       for (int w = 0; w < N_WELD; w++) {
-        const T mwi = s.mw[w][i];
+        const T mwi = s.mw[i][w];
 #pragma unroll
         for (int b = 0; b < B; b++) ci[b] -= mwi * x[b][w];
       }
@@ -2183,9 +2337,11 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     const int frame = WELD_FRAMES[widx];
     const T* pf = d.pos[frame];
     const int r0 = 6 * widx;
+    // K11 layout: same 6 * NV stores of +0.0, i-outer so the six of them
+    // at a fixed column are consecutive words.
+    for (int i = 0; i < NV; i++)
 #pragma unroll
-    for (int m = 0; m < 6; m++)
-      for (int i = 0; i < NV; i++) s.mw[r0 + m][i] = T(0);
+      for (int m = 0; m < 6; m++) s.mw[i][r0 + m] = T(0);
     for (int k = frame; k >= 0; k = F_PARENT[k]) {
       if (F_COORD[k] < 0) continue;
       const int col = VOFF + F_COORD[k];
@@ -2196,10 +2352,10 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 #pragma unroll
       for (int t = 0; t < 3; t++) {
         const T lv = T(0) + w[t];
-        s.mw[r0 + t][col] = lv;
+        s.mw[col][r0 + t] = lv;
         s.jwc[r0 + t][e] = lv;
         const T av = T(0) + d.axw[k][t];
-        s.mw[r0 + 3 + t][col] = av;
+        s.mw[col][r0 + 3 + t] = av;
         s.jwc[r0 + 3 + t][e] = av;
       }
     }
@@ -2208,15 +2364,15 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     const T v04 = T(0) + rel0[2], v05 = T(0) - rel0[1];
     const T v13 = T(0) - rel0[2], v15 = T(0) + rel0[0];
     const T v23 = T(0) + rel0[1], v24 = T(0) - rel0[0];
-    s.mw[r0 + 0][0] = T(1);
-    s.mw[r0 + 0][4] = v04;
-    s.mw[r0 + 0][5] = v05;
-    s.mw[r0 + 1][1] = T(1);
-    s.mw[r0 + 1][3] = v13;
-    s.mw[r0 + 1][5] = v15;
-    s.mw[r0 + 2][2] = T(1);
-    s.mw[r0 + 2][3] = v23;
-    s.mw[r0 + 2][4] = v24;
+    s.mw[0][r0 + 0] = T(1);
+    s.mw[4][r0 + 0] = v04;
+    s.mw[5][r0 + 0] = v05;
+    s.mw[1][r0 + 1] = T(1);
+    s.mw[3][r0 + 1] = v13;
+    s.mw[5][r0 + 1] = v15;
+    s.mw[2][r0 + 2] = T(1);
+    s.mw[3][r0 + 2] = v23;
+    s.mw[4][r0 + 2] = v24;
     s.jwr[3 * widx + 0][0] = v04;  // cols WJ_R2[0] = {4, 5}
     s.jwr[3 * widx + 0][1] = v05;
     s.jwr[3 * widx + 1][0] = v13;  // cols WJ_R2[1] = {3, 5}
@@ -2225,7 +2381,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     s.jwr[3 * widx + 2][1] = v24;
 #pragma unroll
     for (int t = 0; t < 3; t++) {
-      s.mw[r0 + 3 + t][3 + t] = T(1);
+      s.mw[3 + t][r0 + 3 + t] = T(1);
       s.bias_w[r0 + t] =
           -(T(BETA_WELD) * hinv) * (pf[t] - T(WELD_TARGET_P[widx][t]));
     }
@@ -2335,11 +2491,12 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 
   // -- effective masses (row order: welds, contacts, limits) ------------------
   // 12 independent solves against ONE factor: batched (see
-  // chol_solve_multi_n — a loop interchange, bitwise). s.mw is
-  // T[N_WELD][NV], i.e. exactly the W-rows-of-stride-NV layout it wants.
+  // chol_solve_multi_n — a loop interchange, bitwise). K11: s.mw is
+  // T[NV][N_WELD], so the RHS-MINOR entry point takes it (same solve,
+  // one address map; see chol_solve_multi_tn).
   // K9c: the assembly above already wrote J_w here, so the 420-element
   // seed copy that used to stand at this point is gone.
-  chol_solve_multi_n<N_WELD>(NV, d.m, &s.mw[0][0]);
+  chol_solve_multi_tn<N_WELD>(NV, d.m, &s.mw[0][0]);
   // Contact rows: s.nc is RUNTIME (0..55, typically a handful), so the
   // batch runs as a 4 / 2 / 1 ladder — the 2-wide tier is worth its own
   // branch here (+0.4% on train --bench over 4-with-scalar-remainder),
@@ -2452,14 +2609,14 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 #pragma unroll
     for (int c = r; c < N_WELD; c++) {
       T sum = T(0);
-      sum += s.mw[r][WJ_ONE(c)];  // the row's entry there is exactly 1.0
+      sum += s.mw[WJ_ONE(c)][r];  // the row's entry there is exactly 1.0
       if (!WJ_ANG(c)) {
-        sum += s.jwr[WJ_LIN(c)][0] * s.mw[r][WJ_R2[WJ_T(c)][0]];
-        sum += s.jwr[WJ_LIN(c)][1] * s.mw[r][WJ_R2[WJ_T(c)][1]];
+        sum += s.jwr[WJ_LIN(c)][0] * s.mw[WJ_R2[WJ_T(c)][0]][r];
+        sum += s.jwr[WJ_LIN(c)][1] * s.mw[WJ_R2[WJ_T(c)][1]][r];
       }
       const int lo = WJ_CH0(c);
 #pragma unroll
-      for (int e = 0; e < 6; e++) sum += s.jwc[c][e] * s.mw[r][lo + e];
+      for (int e = 0; e < 6; e++) sum += s.jwc[c][e] * s.mw[lo + e][r];
       s.aww[c * N_WELD + r] = sum;
     }
   chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
@@ -2558,7 +2715,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       for (int i = 0; i < NV; i++) {
         T vi = v[i];
 #pragma unroll
-        for (int r = 0; r < N_WELD; r++) vi += s.mw[r][i] * dl[r];
+        for (int r = 0; r < N_WELD; r++) vi += s.mw[i][r] * dl[r];
         v[i] = vi;
       }
     }
