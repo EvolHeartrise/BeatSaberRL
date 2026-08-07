@@ -20,7 +20,10 @@ observations are replayed with the implicit lambda 0.95 they ran with):
   gae_lambda  logit   0.65 .. 0.99   trace decay (gamma*lambda = PG window)
   effort_coef log     0.002 .. 8     flailing tax (log cannot express 0)
   bomb_prob   log     0.003 .. 0.4   bomb density (72%-of-reward question)
-  total_steps log     5e7  .. 4e8    THE COST AXIS (3.3-27 min at ~250k/s)
+  total_steps log     5e7  .. 4e8    THE COST AXIS (1.2-9.3 h at the
+                                     v10 env's ~12k steps/s, measured
+                                     2026-08-07; it was 3.3-27 min at
+                                     the pre-v10 ~250k/s)
 
 Bounds widened 2026-07-27 after runs 010-020: the GP pinned lr and
 ent_coef at their ceilings and gae_lambda/effort/bomb at their floors
@@ -57,7 +60,11 @@ SPACE = {
     "downsample": 1,                   # one bench per leg
     "early_stop_quantile": 0.3,
     "use_gpu": False,                  # GP on CPU; the 1080 belongs to training
-    "max_suggestion_cost": 2200,       # ~4e8 steps + startup, seconds
+    # seconds; ~4e8 steps + startup. Re-derived 2026-08-07 for the v10
+    # env: 12,000 steps/s production floor (measured 12,423 at N=1024/
+    # T=128) -> 4e8 / 12e3 = 33,300 s + startup ~= 35,000. The old 2,200
+    # came from the pre-v10 ~250k steps/s env.
+    "max_suggestion_cost": 35000,
     "train": {
         "lr":          dict(distribution="log_normal", min=1e-4, max=8e-3, scale=0.5),
         "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.3, scale=0.5),
@@ -90,7 +97,15 @@ def run_leg(idx, h, run_dir):
            "--total-steps", str(int(h["total_steps"])),
            "--run-dir", run_dir]
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    # this leg's own budget at a conservative 8,000 steps/s floor (v10
+    # measures 12.4k at 1024/128, 24.4k at 4096/32 — 2026-08-07) plus
+    # 1800 s startup; 4e8 (the cost-axis ceiling) -> 51,800 s
+    tmo = int(h["total_steps"]) // 8000 + 1800
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=tmo)
+    except subprocess.TimeoutExpired:
+        print(f"[run {idx:03d}] TRAIN TIMEOUT ({tmo}s)", flush=True)
+        return None
     wall = time.time() - t0
     ck = os.path.join(run_dir, "final.pt")
     if r.returncode != 0 or not os.path.exists(ck):
@@ -99,12 +114,19 @@ def run_leg(idx, h, run_dir):
               flush=True)
         return None
     out = os.path.join(run_dir, "bench.json")
-    b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                        "--out", out,
-                        # explicit best path (2026-07-27): don't let a future
-                        # default change silently slow or re-class the sweep
-                        "--num-envs", "2048", "--fused-forward"],
-                       capture_output=True, text=True, timeout=3000)
+    # 7200 s: the v10 catalog bench runs ~1,900-2,400 s (2026-08-07),
+    # so this is ~3x margin. The old 3000 s was a pre-v10 constant.
+    try:
+        b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
+                            "--out", out,
+                            # explicit best path (2026-07-27): don't let a
+                            # future default change silently slow or
+                            # re-class the sweep
+                            "--num-envs", "2048", "--fused-forward"],
+                           capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        print(f"[run {idx:03d}] BENCH TIMEOUT (7200s)", flush=True)
+        return None
     if b.returncode != 0 or not os.path.exists(out):
         print(f"[run {idx:03d}] BENCH FAILED: {(b.stderr or '')[-300:]}",
               flush=True)
