@@ -298,6 +298,46 @@ constexpr int NOTE_FEAT = 14;
 // s.c_minv and the ensure_pcol batches stay row-major on
 // chol_solve_multi_n; only s.mw uses the _tn twin.
 //
+// K12 (2026-08-07) — COLUMN-MAJOR CHOLESKY FACTORS, the same
+// live-address transform applied to the OTHER operand. Both matrices
+// that are ever passed as a factor (d.m, 35x35, and s.aww, 12x12) now
+// store element (row R, col C) at [C*n + R]; the ten chol_* functions
+// and the ~10 producer stores in crba / the A_ww assembly swap their two
+// index terms and NOTHING else moves. Worth +3.95%: 27,393.8 ->
+// 28,475.6 env-steps/s at N=4096 (5 interleaved A/B rounds, medians,
+// ranges 27,384.2-27,406.3 vs 28,468.5-28,504.2 — non-overlapping by
+// ~50x the within-arm spread). f64 16,728.9 -> 16,824.2, +0.57%.
+// MECHANISM: every hot loop walks a COLUMN of the factor while varying
+// the row, because the forward substitutions are row-blocked (K6) and
+// the back substitutions read l[k*n+i] with k ascending. Row-major made
+// each of those R rows its own runtime address at stride n — 5 live in
+// chol_factor_n's inner loop (pivot row + 4 blocked rows), 8 in
+// chol_fwd_unit4_n. Column-major collapses them onto ONE base with
+// immediate offsets +0..+3, and turns the back pass's strided walk into
+// a contiguous one. Same argument as K11, now on the l side.
+// BITWISE by construction and gated at max diff 0.0 on f32 AND f64,
+// free-running and max_steps=60, want_contacts on: a bijective address
+// remap leaves every FP operation with identical operands, identical
+// order and identical accumulator seeds at UNCHANGED inline sites, so
+// the K10e2 FMA-contraction hazard (which needs a MOVED inline site)
+// cannot fire. The producers are value-safe because M and A_ww are
+// symmetric — relabelling which triangle of the buffer is occupied does
+// not change any stored number.
+// THE PREDICTION THAT FAILED, and it is the useful part: this item was
+// picked as "the one candidate that strictly REMOVES live address
+// registers, so it can widen the 255-register cliff margin". It moved
+// the register allocator by EXACTLY ZERO. ptxas is byte-identical to the
+// K11 build in both dtypes — f32 41,872 B / 0 / 0 / 255 regs, f64
+// 82,912 B / 8 / 8 / 255 regs — and so is the LDL/STL census (f32
+// 6,548/3,042, f64 6,570/2,901, unchanged to the load); total SASS grew
+// trivially (f32 38,070 -> 38,106, f64 43,290 -> 43,350). So a +3.95%
+// win is once again INVISIBLE to every static counter this file tracks.
+// Together with K11 that is now two of the round's largest gains with a
+// flat census, and the rule hardens: on this kernel, ADDRESS-FORM
+// changes pay in issue slots and scheduling that neither ptxas -v nor a
+// SASS census can see. Do not gate such an item on the counters moving —
+// gate it on the counters not getting WORSE, and measure.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -957,22 +997,25 @@ __device__ void add_shift(T i[3][3], T m, const T d[3]) {
 }
 
 // LOWER TRIANGLE + DIAGONAL ONLY (2026-08-03, K4c). Every consumer of
-// d.m — chol_factor_n (in place: reads a[j*n+j], a[j*n+k] k<j,
-// a[i*n+k] k<j<i, a[i*n+j] i>j; writes a[j*n+j], a[i*n+j] i>j),
-// chol_solve_n / chol_solve_multi_n (l[i*n+k] k<i; l[k*n+i] k>i, i.e.
-// row k > col i; l[i*n+i]), chol_fwd_unit_n (l[i*n+k] m<=k<i; diag) and
-// chol_back{,2,4}_n (l[k*n+i] k>i; diag) — touches row >= col ONLY.
-// Nothing in the kernel ever reads d.m above the diagonal, so this
+// d.m — chol_factor_n (in place), chol_solve_n / chol_solve_multi_n{,_tn}
+// ((i,k) k<i; (k,i) k>i; (i,i)), chol_fwd_unit{,2,4}_n ((i,k) m<=k<i;
+// diag) and chol_back{,2,4}_n ((k,i) k>i; diag) — touches row >= col
+// ONLY. Nothing in the kernel ever reads d.m above the diagonal, so this
 // function no longer writes there: the NV*NV zero fill is narrowed to
 // the 630 lower+diagonal entries (595 stores saved — and ~286 of the
 // kept ones are genuinely load-bearing, entries no producer below
-// touches), the symmetric ancestor pair writes one element at
-// [max*NV+min], and the root-block mirror stores are gone. ~970 dead
-// stores per substep.
+// touches), the symmetric ancestor pair writes one element, and the
+// root-block mirror stores are gone. ~970 dead stores per substep.
+//
+// COLUMN-MAJOR ADDRESSES (K12, 2026-08-07): element (row R, col C) is at
+// d.m[C*NV + R] — see chol_factor_n's header for why. Every store below
+// is the SAME value at the transposed address; the set of entries
+// written is unchanged (still exactly row >= col), and M's symmetry
+// means the values were never orientation-dependent in the first place.
 template <typename T>
 __device__ void crba(Dyn<T>& __restrict__ d) {
   for (int i = 0; i < NV; i++)
-    for (int j = 0; j <= i; j++) d.m[i * NV + j] = T(0);
+    for (int j = 0; j <= i; j++) d.m[j * NV + i] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
     const T mk = T(F_MASS[k]);
@@ -1029,7 +1072,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
           const T val = dot3(d.axw[anc], tot2);
           // symmetric pair -> lower entry only (F_COORD is not monotonic
           // in the frame index, so the order of ia vs j is a runtime fact)
-          d.m[(ia > j ? ia : j) * NV + (ia > j ? j : ia)] = val;
+          d.m[(ia > j ? j : ia) * NV + (ia > j ? ia : j)] = val;
         }
         anc = F_PARENT[anc];
       }
@@ -1042,8 +1085,8 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       // j >= VOFF > 3 + t, so only the [j][*] halves are in the lower
       // triangle; the [t][j] / [3+t][j] mirrors were dead.
       for (int t = 0; t < 3; t++) {
-        d.m[j * NV + t] = hl[t];
-        d.m[j * NV + (3 + t)] = lr[t];
+        d.m[t * NV + j] = hl[t];
+        d.m[(3 + t) * NV + j] = lr[t];
       }
     }
     // merge composite k into parent (or base)
@@ -1093,8 +1136,8 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   add_shift(rr, d.bm, dd);
   for (int i = 0; i < 3; i++)
     for (int j = 0; j <= i; j++) {
-      d.m[i * NV + j] = i == j ? d.bm : T(0);
-      d.m[(3 + i) * NV + (3 + j)] = rr[i][j];
+      d.m[j * NV + i] = i == j ? d.bm : T(0);
+      d.m[(3 + j) * NV + (3 + i)] = rr[i][j];
     }
   const T sk[3][3] = {{T(0), -dd[2], dd[1]},
                       {dd[2], T(0), -dd[0]},
@@ -1102,7 +1145,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   // (3+i, j) is strictly lower for every i, j in 0..2; the (j, 3+i)
   // mirror was dead.
   for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) d.m[(3 + i) * NV + j] = d.bm * sk[i][j];
+    for (int j = 0; j < 3; j++) d.m[j * NV + (3 + i)] = d.bm * sk[i][j];
 }
 
 // RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
@@ -1247,6 +1290,27 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // instead of panicking now), f32 floors at 1e-8 and latches bad only
 // for d <= 0 (Divergences §20e).
 //
+// COLUMN-MAJOR STORAGE (K12, 2026-08-07). Element (row R, col C) of both
+// M and L lives at a[C*n + R] — the transpose of the address map every
+// earlier note here used. NOTHING else changed: same reads, same writes,
+// same order, same expression trees, at the same inline sites. It is a
+// pure bijective remap of addresses, so it is BITWISE by construction
+// (both dtypes gated at max diff 0.0); the producers (crba, the A_ww
+// assembly) just swap their two index terms, which is value-preserving
+// because M and A_ww are symmetric and only one triangle is ever stored.
+// WHY: every hot loop in this file walks a COLUMN of the factor while
+// varying the row. Row-major made that R separate runtime addresses at
+// stride n (5 live in chol_factor_n's inner loop, 8 in chol_fwd_unit4_n);
+// column-major collapses them to ONE base (k*n) with immediate offsets
+// +0..+3 — exactly the live-address transform that won K11 its +7.06%,
+// and the back substitutions' l[k*n+i] sweep becomes contiguous too.
+// This is the one direction that strictly REMOVES live address registers,
+// which matters at the 255-register pin (see the SPILL-CLIFF notes).
+// The triangle actually occupied is therefore a[C*n+R] with R >= C, i.e.
+// the UPPER triangle of the buffer read as a row-major array — the
+// K4c "lower triangle + diagonal only" invariant is unchanged in matrix
+// terms, only its address form moved.
+//
 // IN PLACE, one buffer (2026-08-03; supersedes the 2026-08-02 note that
 // deliberately withheld __restrict__ here pending exactly this change).
 // `a` enters as M and leaves as its lower Cholesky factor L. Legal by
@@ -1256,24 +1320,27 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 //   * column j reads a[j*n+j] (the M diagonal) as its FIRST statement
 //     and writes a[j*n+j] = dj only after the k-loop — read-before-
 //     write, and no later column ever re-reads a diagonal;
-//   * the row loop reads a[i*n+j] as the first statement of iteration i
-//     and writes exactly that one element as its last — read once,
-//     immediately before its own overwrite;
-//   * every other read is a[i*n+k] / a[j*n+k] with k < j, i.e. columns
+//   * the row loop reads a[j*n+i] (element (i, j)) as the first statement
+//     of iteration i and writes exactly that one element as its last —
+//     read once, immediately before its own overwrite;
+//   * every other read is a[k*n+i] / a[k*n+j] with k < j, i.e. columns
 //     already converted to L by earlier j, and no write at column j
-//     touches a column < j.
+//     touches a column < j. Under column-major those columns are the
+//     DISJOINT address blocks [k*n, (k+1)*n), which makes the in-place
+//     aliasing argument a statement about whole blocks rather than
+//     strides: column j writes only inside block j.
 // Callers: d.m (written only by crba) and s.aww (rewritten before each
 // factor) — neither is read as M after its factor, so nothing needs the
 // original matrix. Both are supplied LOWER TRIANGLE + DIAGONAL ONLY
 // since K4c; this function reads and writes nothing above the diagonal.
 // Frees Dyn::l (NV*NV) and Solver::lww (N_WELD*N_WELD) from the frame.
 //
-// The dead upper-triangle zeroing that used to run here (l[j*n+i],
+// The dead upper-triangle zeroing that used to run here (element (j, i),
 // i > j — 595 stores per NV=35 factor + 66 per weld factor, per
 // substep) is GONE: the only readers of a factor are this function
-// (a[i*n+k], a[j*n+k] with k < j <= i) and chol_solve_n (a[i*n+k] k<i;
-// a[k*n+i] k>i = row k, col i with k>i; a[i*n+i]) — strictly lower
-// triangle plus diagonal. Nothing reads above it, so it needs no value.
+// (elements (i, k), (j, k) with k < j <= i) and chol_solve_n ((i, k)
+// k<i; (k, i) k>i; (i, i)) — strictly lower triangle plus diagonal.
+// Nothing reads above it, so it needs no value.
 // `a` and `bad` are distinct objects (the matrix buffer vs d.pd_bad),
 // so __restrict__ on both is true and lets the L row stay in registers
 // across the (rare) pivot-floor latch.
@@ -1287,11 +1354,12 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // and L[j+1][j] is the very first value that loop produces. So it is
 // accumulated INSIDE column j's first row block — the same terms, the
 // same ascending k, one extra scalar carried in a register, zero extra
-// storage and zero extra loads (a[(j+1)*n+k] is already being loaded
+// storage and zero extra loads (element (j+1, k) is already being loaded
 // there as s0's operand) — and column j+1 then starts with its pivot in
 // hand. Bitwise: identical expression, identical order, identical
 // inputs; a[(j+1)*n+(j+1)] is the untouched M diagonal (column j writes
-// only column j).
+// only inside block j, and the diagonal of column j+1 lives in block
+// j+1).
 template <typename T>
 __device__ void chol_factor_n(int n, T* a, bool* bad) {
   T dpiv = a[0];  // j = 0: the pivot is M[0][0], no terms
@@ -1314,61 +1382,64 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
     // the end of the block is safe under the in-place aliasing too: the
     // inner loop only ever reads columns k < j, and the four deferred
     // stores are all in column j.
+    const int cj = j * n;  // COLUMN-MAJOR (K12): column j is contiguous
     int i = j + 1;
     // Row j+1 is peeled (as the head of a 4-block when there is room,
     // scalar otherwise) so the next pivot rides along on its loads.
     T np = i < n ? a[i * n + i] : T(0);
     if (i + 3 < n) {
-      const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
-      T s0 = a[r0 + j], s1 = a[r1 + j], s2 = a[r2 + j], s3 = a[r3 + j];
+      T s0 = a[cj + i], s1 = a[cj + i + 1];
+      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
       for (int k = 0; k < j; k++) {
-        const T ljk = a[j * n + k];
-        const T v0 = a[r0 + k];
+        const int ck = k * n;
+        const T ljk = a[ck + j];
+        const T v0 = a[ck + i];
         s0 -= v0 * ljk;
-        s1 -= a[r1 + k] * ljk;
-        s2 -= a[r2 + k] * ljk;
-        s3 -= a[r3 + k] * ljk;
+        s1 -= a[ck + i + 1] * ljk;
+        s2 -= a[ck + i + 2] * ljk;
+        s3 -= a[ck + i + 3] * ljk;
         np -= v0 * v0;
       }
       const T l0 = s0 / dj;
-      a[r0 + j] = l0;
-      a[r1 + j] = s1 / dj;
-      a[r2 + j] = s2 / dj;
-      a[r3 + j] = s3 / dj;
+      a[cj + i] = l0;
+      a[cj + i + 1] = s1 / dj;
+      a[cj + i + 2] = s2 / dj;
+      a[cj + i + 3] = s3 / dj;
       np -= l0 * l0;
       i += 4;
     } else if (i < n) {
-      const int r0 = i * n;
-      T s = a[r0 + j];
+      T s = a[cj + i];
       for (int k = 0; k < j; k++) {
-        const T v0 = a[r0 + k];
-        s -= v0 * a[j * n + k];
+        const int ck = k * n;
+        const T v0 = a[ck + i];
+        s -= v0 * a[ck + j];
         np -= v0 * v0;
       }
       const T l0 = s / dj;
-      a[r0 + j] = l0;
+      a[cj + i] = l0;
       np -= l0 * l0;
       i += 1;
     }
     for (; i + 3 < n; i += 4) {
-      const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
-      T s0 = a[r0 + j], s1 = a[r1 + j], s2 = a[r2 + j], s3 = a[r3 + j];
+      T s0 = a[cj + i], s1 = a[cj + i + 1];
+      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
       for (int k = 0; k < j; k++) {
-        const T ljk = a[j * n + k];
-        s0 -= a[r0 + k] * ljk;
-        s1 -= a[r1 + k] * ljk;
-        s2 -= a[r2 + k] * ljk;
-        s3 -= a[r3 + k] * ljk;
+        const int ck = k * n;
+        const T ljk = a[ck + j];
+        s0 -= a[ck + i] * ljk;
+        s1 -= a[ck + i + 1] * ljk;
+        s2 -= a[ck + i + 2] * ljk;
+        s3 -= a[ck + i + 3] * ljk;
       }
-      a[r0 + j] = s0 / dj;
-      a[r1 + j] = s1 / dj;
-      a[r2 + j] = s2 / dj;
-      a[r3 + j] = s3 / dj;
+      a[cj + i] = s0 / dj;
+      a[cj + i + 1] = s1 / dj;
+      a[cj + i + 2] = s2 / dj;
+      a[cj + i + 3] = s3 / dj;
     }
     for (; i < n; i++) {
-      T s = a[i * n + j];
-      for (int k = 0; k < j; k++) s -= a[i * n + k] * a[j * n + k];
-      a[i * n + j] = s / dj;
+      T s = a[cj + i];
+      for (int k = 0; k < j; k++) s -= a[k * n + i] * a[k * n + j];
+      a[cj + i] = s / dj;
     }
     dpiv = np;
   }
@@ -1397,39 +1468,41 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
                              T* __restrict__ x) {
   int i = 0;
   for (; i + 3 < n; i += 4) {
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
     T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
     for (int k = 0; k < i; k++) {
+      const int ck = k * n;
       const T xk = x[k];
-      s0 -= l[r0 + k] * xk;
-      s1 -= l[r1 + k] * xk;
-      s2 -= l[r2 + k] * xk;
-      s3 -= l[r3 + k] * xk;
+      s0 -= l[ck + i] * xk;
+      s1 -= l[ck + i + 1] * xk;
+      s2 -= l[ck + i + 2] * xk;
+      s3 -= l[ck + i + 3] * xk;
     }
-    const T v0 = s0 / l[r0 + i];
+    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n, c3 = c2 + n;
+    const T v0 = s0 / l[c0 + i];
     x[i] = v0;
-    s1 -= l[r1 + i] * v0;
-    const T v1 = s1 / l[r1 + i + 1];
+    s1 -= l[c0 + i + 1] * v0;
+    const T v1 = s1 / l[c1 + i + 1];
     x[i + 1] = v1;
-    s2 -= l[r2 + i] * v0;
-    s2 -= l[r2 + i + 1] * v1;
-    const T v2 = s2 / l[r2 + i + 2];
+    s2 -= l[c0 + i + 2] * v0;
+    s2 -= l[c1 + i + 2] * v1;
+    const T v2 = s2 / l[c2 + i + 2];
     x[i + 2] = v2;
-    s3 -= l[r3 + i] * v0;
-    s3 -= l[r3 + i + 1] * v1;
-    s3 -= l[r3 + i + 2] * v2;
-    x[i + 3] = s3 / l[r3 + i + 3];
+    s3 -= l[c0 + i + 3] * v0;
+    s3 -= l[c1 + i + 3] * v1;
+    s3 -= l[c2 + i + 3] * v2;
+    x[i + 3] = s3 / l[c3 + i + 3];
   }
   for (; i < n; i++) {
     T s = x[i];
-    for (int k = 0; k < i; k++) s -= l[i * n + k] * x[k];
+    for (int k = 0; k < i; k++) s -= l[k * n + i] * x[k];
     x[i] = s / l[i * n + i];
   }
   // BACK half: NOT row-blockable (K6 prohibition, file header).
   for (int i = n - 1; i >= 0; i--) {
+    const int ci = i * n;
     T s = x[i];
-    for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
-    x[i] = s / l[i * n + i];
+    for (int k = i + 1; k < n; k++) s -= l[ci + k] * x[k];
+    x[i] = s / l[ci + i];
   }
 }
 
@@ -1447,7 +1520,7 @@ __device__ void chol_solve_n(int n, const T* __restrict__ l,
 // scalar solve's inner k-loop is ONE dependent FMA chain of length i,
 // and the W calls run those chains back to back. Interleaved, the W
 // chains are mutually independent, so the chain latency is amortized
-// W-fold; the factor element l[i*n+k] is also loaded once per (i, k)
+// W-fold; the factor element (i, k) is also loaded once per (i, k)
 // instead of once per (i, k, w). The accumulators are a fixed-size local
 // array indexed only by fully unrolled compile-time w, so they live in
 // registers (W f32 = W*4 B).
@@ -1474,7 +1547,6 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
                                    T* __restrict__ x) {
   int i = 0;
   for (; i + 2 < n; i += 3) {
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n;
     T s0[W], s1[W], s2[W];
 #pragma unroll
     for (int w = 0; w < W; w++) {
@@ -1483,7 +1555,8 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
       s2[w] = x[w * n + i + 2];
     }
     for (int k = 0; k < i; k++) {
-      const T l0 = l[r0 + k], l1 = l[r1 + k], l2 = l[r2 + k];
+      const int ck = k * n;
+      const T l0 = l[ck + i], l1 = l[ck + i + 1], l2 = l[ck + i + 2];
 #pragma unroll
       for (int w = 0; w < W; w++) {
         const T xk = x[w * n + k];
@@ -1492,8 +1565,9 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
         s2[w] -= l2 * xk;
       }
     }
-    const T d0 = l[r0 + i], l1i = l[r1 + i], d1 = l[r1 + i + 1];
-    const T l2i = l[r2 + i], l2j = l[r2 + i + 1], d2 = l[r2 + i + 2];
+    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n;
+    const T d0 = l[c0 + i], l1i = l[c0 + i + 1], d1 = l[c1 + i + 1];
+    const T l2i = l[c0 + i + 2], l2j = l[c1 + i + 2], d2 = l[c2 + i + 2];
 #pragma unroll
     for (int w = 0; w < W; w++) {
       const T v0 = s0[w] / d0;
@@ -1511,7 +1585,7 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
 #pragma unroll
     for (int w = 0; w < W; w++) s[w] = x[w * n + i];
     for (int k = 0; k < i; k++) {
-      const T lik = l[i * n + k];
+      const T lik = l[k * n + i];
 #pragma unroll
       for (int w = 0; w < W; w++) s[w] -= lik * x[w * n + k];
     }
@@ -1524,15 +1598,16 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
   // prefix, and the near-diagonal terms are not available yet). The W
   // right-hand sides stay batched — that is a different transform.
   for (int i = n - 1; i >= 0; i--) {
+    const int ci = i * n;
     T s[W];
 #pragma unroll
     for (int w = 0; w < W; w++) s[w] = x[w * n + i];
     for (int k = i + 1; k < n; k++) {
-      const T lki = l[k * n + i];
+      const T lki = l[ci + k];
 #pragma unroll
       for (int w = 0; w < W; w++) s[w] -= lki * x[w * n + k];
     }
-    const T dg = l[i * n + i];
+    const T dg = l[ci + i];
 #pragma unroll
     for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
   }
@@ -1563,7 +1638,6 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
                                     T* __restrict__ x) {
   int i = 0;
   for (; i + 2 < n; i += 3) {  // ROW-BLOCKED BY 3, as above (K6)
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n;
     const int b0 = i * W, b1 = b0 + W, b2 = b1 + W;
     T s0[W], s1[W], s2[W];
 #pragma unroll
@@ -1573,7 +1647,8 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
       s2[w] = x[b2 + w];
     }
     for (int k = 0; k < i; k++) {
-      const T l0 = l[r0 + k], l1 = l[r1 + k], l2 = l[r2 + k];
+      const int ck = k * n;
+      const T l0 = l[ck + i], l1 = l[ck + i + 1], l2 = l[ck + i + 2];
       const int bk = k * W;
 #pragma unroll
       for (int w = 0; w < W; w++) {
@@ -1583,8 +1658,9 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
         s2[w] -= l2 * xk;
       }
     }
-    const T d0 = l[r0 + i], l1i = l[r1 + i], d1 = l[r1 + i + 1];
-    const T l2i = l[r2 + i], l2j = l[r2 + i + 1], d2 = l[r2 + i + 2];
+    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n;
+    const T d0 = l[c0 + i], l1i = l[c0 + i + 1], d1 = l[c1 + i + 1];
+    const T l2i = l[c0 + i + 2], l2j = l[c1 + i + 2], d2 = l[c2 + i + 2];
 #pragma unroll
     for (int w = 0; w < W; w++) {
       const T v0 = s0[w] / d0;
@@ -1603,7 +1679,7 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
 #pragma unroll
     for (int w = 0; w < W; w++) s[w] = x[bi + w];
     for (int k = 0; k < i; k++) {
-      const T lik = l[i * n + k];
+      const T lik = l[k * n + i];
       const int bk = k * W;
 #pragma unroll
       for (int w = 0; w < W; w++) s[w] -= lik * x[bk + w];
@@ -1615,16 +1691,17 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
   // BACK half: not row-blocked (K6 prohibition, file header).
   for (int i = n - 1; i >= 0; i--) {
     const int bi = i * W;
+    const int ci = i * n;
     T s[W];
 #pragma unroll
     for (int w = 0; w < W; w++) s[w] = x[bi + w];
     for (int k = i + 1; k < n; k++) {
-      const T lki = l[k * n + i];
+      const T lki = l[ci + k];
       const int bk = k * W;
 #pragma unroll
       for (int w = 0; w < W; w++) s[w] -= lki * x[bk + w];
     }
-    const T dg = l[i * n + i];
+    const T dg = l[ci + i];
 #pragma unroll
     for (int w = 0; w < W; w++) x[bi + w] = s[w] / dg;
   }
@@ -1638,15 +1715,15 @@ __device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
 //   * the factor diagonal is always strictly positive and finite
 //     (chol_factor_n floors the pivot at PD_FLOOR_* through tmax, whose
 //     `a > b ? a : b` form also maps a NaN pivot onto the floor), so
-//     +0.0 / l[i*n+i] = +0.0 — the value already in the buffer;
+//     +0.0 / L[i][i] = +0.0 — the value already in the buffer;
 //   * by induction on i < m: s starts at x[i] = +0.0 and every term
-//     l[i*n+k] * x[k] has x[k] = +0.0 (k < i < m, established by the
+//     L[i][k] * x[k] has x[k] = +0.0 (k < i < m, established by the
 //     induction), so the product is +-0.0 and s stays exactly +0.0
 //     (+0.0 - +0.0 = +0.0 and +0.0 - -0.0 = +0.0 under RN; FMA
 //     contraction does not change either);
 //   * at i == m the same k < m terms leave s = x[m] = 1 untouched, so
 //     the k-loop may start at k = m (zero iterations here) and the
-//     divide is the identical 1 / l[m*n+m];
+//     divide is the identical 1 / L[m][m];
 //   * at i > m s starts at +0.0, the k < m terms leave it at +0.0, and
 //     the surviving k >= m terms then run in the SAME ascending order
 //     over the SAME values from the SAME accumulator start.
@@ -1660,32 +1737,33 @@ __device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
   // ROW-BLOCKED BY 4 (K6), same forward-only proof as chol_solve_n's.
   int i = m;
   for (; i + 3 < n; i += 4) {
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
     T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
     for (int k = m; k < i; k++) {
+      const int ck = k * n;
       const T xk = x[k];
-      s0 -= l[r0 + k] * xk;
-      s1 -= l[r1 + k] * xk;
-      s2 -= l[r2 + k] * xk;
-      s3 -= l[r3 + k] * xk;
+      s0 -= l[ck + i] * xk;
+      s1 -= l[ck + i + 1] * xk;
+      s2 -= l[ck + i + 2] * xk;
+      s3 -= l[ck + i + 3] * xk;
     }
-    const T v0 = s0 / l[r0 + i];
+    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n, c3 = c2 + n;
+    const T v0 = s0 / l[c0 + i];
     x[i] = v0;
-    s1 -= l[r1 + i] * v0;
-    const T v1 = s1 / l[r1 + i + 1];
+    s1 -= l[c0 + i + 1] * v0;
+    const T v1 = s1 / l[c1 + i + 1];
     x[i + 1] = v1;
-    s2 -= l[r2 + i] * v0;
-    s2 -= l[r2 + i + 1] * v1;
-    const T v2 = s2 / l[r2 + i + 2];
+    s2 -= l[c0 + i + 2] * v0;
+    s2 -= l[c1 + i + 2] * v1;
+    const T v2 = s2 / l[c2 + i + 2];
     x[i + 2] = v2;
-    s3 -= l[r3 + i] * v0;
-    s3 -= l[r3 + i + 1] * v1;
-    s3 -= l[r3 + i + 2] * v2;
-    x[i + 3] = s3 / l[r3 + i + 3];
+    s3 -= l[c0 + i + 3] * v0;
+    s3 -= l[c1 + i + 3] * v1;
+    s3 -= l[c2 + i + 3] * v2;
+    x[i + 3] = s3 / l[c3 + i + 3];
   }
   for (; i < n; i++) {
     T s = x[i];
-    for (int k = m; k < i; k++) s -= l[i * n + k] * x[k];
+    for (int k = m; k < i; k++) s -= l[k * n + i] * x[k];
     x[i] = s / l[i * n + i];
   }
 }
@@ -1697,7 +1775,7 @@ __device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
 // rows and terms it ADDS for a column with m_t > m0 are exact no-ops by
 // chol_fwd_unit_n's own proof, quoted here for the batched shape:
 //   * rows m0 <= i < m_t: x_t[i] enters as the seeded +0.0 and every
-//     term l[i*n+k] * x_t[k] has k < i < m_t, so x_t[k] is +0.0 by
+//     term L[i][k] * x_t[k] has k < i < m_t, so x_t[k] is +0.0 by
 //     induction — s stays exactly +0.0 (+0.0 - (+-0.0) = +0.0 under RN)
 //     and the store is +0.0 / diag = +0.0, the value already there
 //     (the diagonal is strictly positive and finite: chol_factor_n's
@@ -1722,14 +1800,14 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
   // block just stored.
   int i = m0;
   for (; i + 3 < n; i += 4) {
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
     T a0 = x0[i], a1 = x1[i], a2 = x2[i], a3 = x3[i];
     T b0 = x0[i + 1], b1 = x1[i + 1], b2 = x2[i + 1], b3 = x3[i + 1];
     T c0 = x0[i + 2], c1 = x1[i + 2], c2 = x2[i + 2], c3 = x3[i + 2];
     T e0 = x0[i + 3], e1 = x1[i + 3], e2 = x2[i + 3], e3 = x3[i + 3];
     for (int k = m0; k < i; k++) {
-      const T la = l[r0 + k], lb = l[r1 + k];
-      const T lc = l[r2 + k], le = l[r3 + k];
+      const int ck = k * n;
+      const T la = l[ck + i], lb = l[ck + i + 1];
+      const T lc = l[ck + i + 2], le = l[ck + i + 3];
       const T y0 = x0[k], y1 = x1[k], y2 = x2[k], y3 = x3[k];
       a0 -= la * y0;
       a1 -= la * y1;
@@ -1748,24 +1826,25 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
       e2 -= le * y2;
       e3 -= le * y3;
     }
-    const T d0 = l[r0 + i];
+    const int c0b = i * n, c1b = c0b + n, c2b = c1b + n, c3b = c2b + n;
+    const T d0 = l[c0b + i];
     const T v0 = a0 / d0, v1 = a1 / d0, v2 = a2 / d0, v3 = a3 / d0;
     x0[i] = v0;
     x1[i] = v1;
     x2[i] = v2;
     x3[i] = v3;
-    const T p1 = l[r1 + i];
+    const T p1 = l[c0b + i + 1];
     b0 -= p1 * v0;
     b1 -= p1 * v1;
     b2 -= p1 * v2;
     b3 -= p1 * v3;
-    const T d1 = l[r1 + i + 1];
+    const T d1 = l[c1b + i + 1];
     const T w0 = b0 / d1, w1 = b1 / d1, w2 = b2 / d1, w3 = b3 / d1;
     x0[i + 1] = w0;
     x1[i + 1] = w1;
     x2[i + 1] = w2;
     x3[i + 1] = w3;
-    const T p2 = l[r2 + i], q2 = l[r2 + i + 1];
+    const T p2 = l[c0b + i + 2], q2 = l[c1b + i + 2];
     c0 -= p2 * v0;
     c1 -= p2 * v1;
     c2 -= p2 * v2;
@@ -1774,13 +1853,13 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
     c1 -= q2 * w1;
     c2 -= q2 * w2;
     c3 -= q2 * w3;
-    const T d2 = l[r2 + i + 2];
+    const T d2 = l[c2b + i + 2];
     const T z0 = c0 / d2, z1 = c1 / d2, z2 = c2 / d2, z3 = c3 / d2;
     x0[i + 2] = z0;
     x1[i + 2] = z1;
     x2[i + 2] = z2;
     x3[i + 2] = z3;
-    const T p3 = l[r3 + i], q3 = l[r3 + i + 1], u3 = l[r3 + i + 2];
+    const T p3 = l[c0b + i + 3], q3 = l[c1b + i + 3], u3 = l[c2b + i + 3];
     e0 -= p3 * v0;
     e1 -= p3 * v1;
     e2 -= p3 * v2;
@@ -1793,7 +1872,7 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
     e1 -= u3 * z1;
     e2 -= u3 * z2;
     e3 -= u3 * z3;
-    const T d3 = l[r3 + i + 3];
+    const T d3 = l[c3b + i + 3];
     x0[i + 3] = e0 / d3;
     x1[i + 3] = e1 / d3;
     x2[i + 3] = e2 / d3;
@@ -1802,7 +1881,7 @@ __device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
   for (; i < n; i++) {  // up to three rows left over
     T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
     for (int k = m0; k < i; k++) {
-      const T lik = l[i * n + k];
+      const T lik = l[k * n + i];
       s0 -= lik * x0[k];
       s1 -= lik * x1[k];
       s2 -= lik * x2[k];
@@ -1823,14 +1902,14 @@ __device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
   // ROW-BLOCKED BY 4 (K6), same forward-only proof.
   int i = m0;
   for (; i + 3 < n; i += 4) {
-    const int r0 = i * n, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
     T a0 = x0[i], a1 = x1[i];
     T b0 = x0[i + 1], b1 = x1[i + 1];
     T c0 = x0[i + 2], c1 = x1[i + 2];
     T e0 = x0[i + 3], e1 = x1[i + 3];
     for (int k = m0; k < i; k++) {
-      const T la = l[r0 + k], lb = l[r1 + k];
-      const T lc = l[r2 + k], le = l[r3 + k];
+      const int ck = k * n;
+      const T la = l[ck + i], lb = l[ck + i + 1];
+      const T lc = l[ck + i + 2], le = l[ck + i + 3];
       const T y0 = x0[k], y1 = x1[k];
       a0 -= la * y0;
       a1 -= la * y1;
@@ -1841,41 +1920,42 @@ __device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
       e0 -= le * y0;
       e1 -= le * y1;
     }
-    const T d0 = l[r0 + i];
+    const int c0b = i * n, c1b = c0b + n, c2b = c1b + n, c3b = c2b + n;
+    const T d0 = l[c0b + i];
     const T v00 = a0 / d0, v01 = a1 / d0;
     x0[i] = v00;
     x1[i] = v01;
-    const T p1 = l[r1 + i];
+    const T p1 = l[c0b + i + 1];
     b0 -= p1 * v00;
     b1 -= p1 * v01;
-    const T d1 = l[r1 + i + 1];
+    const T d1 = l[c1b + i + 1];
     const T v10 = b0 / d1, v11 = b1 / d1;
     x0[i + 1] = v10;
     x1[i + 1] = v11;
-    const T p2 = l[r2 + i], q2 = l[r2 + i + 1];
+    const T p2 = l[c0b + i + 2], q2 = l[c1b + i + 2];
     c0 -= p2 * v00;
     c1 -= p2 * v01;
     c0 -= q2 * v10;
     c1 -= q2 * v11;
-    const T d2 = l[r2 + i + 2];
+    const T d2 = l[c2b + i + 2];
     const T v20 = c0 / d2, v21 = c1 / d2;
     x0[i + 2] = v20;
     x1[i + 2] = v21;
-    const T p3 = l[r3 + i], q3 = l[r3 + i + 1], u3 = l[r3 + i + 2];
+    const T p3 = l[c0b + i + 3], q3 = l[c1b + i + 3], u3 = l[c2b + i + 3];
     e0 -= p3 * v00;
     e1 -= p3 * v01;
     e0 -= q3 * v10;
     e1 -= q3 * v11;
     e0 -= u3 * v20;
     e1 -= u3 * v21;
-    const T d3 = l[r3 + i + 3];
+    const T d3 = l[c3b + i + 3];
     x0[i + 3] = e0 / d3;
     x1[i + 3] = e1 / d3;
   }
   for (; i < n; i++) {
     T s0 = x0[i], s1 = x1[i];
     for (int k = m0; k < i; k++) {
-      const T lik = l[i * n + k];
+      const T lik = l[k * n + i];
       s0 -= lik * x0[k];
       s1 -= lik * x1[k];
     }
@@ -1893,9 +1973,10 @@ template <typename T>
 __device__ void chol_back_n(int n, const T* __restrict__ l,
                             T* __restrict__ x) {
   for (int i = n - 1; i >= 0; i--) {
+    const int ci = i * n;
     T s = x[i];
-    for (int k = i + 1; k < n; k++) s -= l[k * n + i] * x[k];
-    x[i] = s / l[i * n + i];
+    for (int k = i + 1; k < n; k++) s -= l[ci + k] * x[k];
+    x[i] = s / l[ci + i];
   }
 }
 
@@ -1925,15 +2006,16 @@ __device__ void chol_back4_n(int n, const T* __restrict__ l,
                              T* __restrict__ x0, T* __restrict__ x1,
                              T* __restrict__ x2, T* __restrict__ x3) {
   for (int i = n - 1; i >= 0; i--) {
+    const int ci = i * n;
     T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
     for (int k = i + 1; k < n; k++) {
-      const T lki = l[k * n + i];
+      const T lki = l[ci + k];
       s0 -= lki * x0[k];
       s1 -= lki * x1[k];
       s2 -= lki * x2[k];
       s3 -= lki * x3[k];
     }
-    const T dg = l[i * n + i];
+    const T dg = l[ci + i];
     x0[i] = s0 / dg;
     x1[i] = s1 / dg;
     x2[i] = s2 / dg;
@@ -1945,13 +2027,14 @@ template <typename T>
 __device__ void chol_back2_n(int n, const T* __restrict__ l,
                              T* __restrict__ x0, T* __restrict__ x1) {
   for (int i = n - 1; i >= 0; i--) {
+    const int ci = i * n;
     T s0 = x0[i], s1 = x1[i];
     for (int k = i + 1; k < n; k++) {
-      const T lki = l[k * n + i];
+      const T lki = l[ci + k];
       s0 -= lki * x0[k];
       s1 -= lki * x1[k];
     }
-    const T dg = l[i * n + i];
+    const T dg = l[ci + i];
     x0[i] = s0 / dg;
     x1[i] = s1 / dg;
   }
@@ -2590,8 +2673,11 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]. A_ww is
   // symmetric, and its only consumers are chol_factor_n (in place) and
   // chol_solve_n, both of which read row >= col only (see crba's K4c
-  // note), so ONLY the [c][r] (lower, c >= r) entry is stored — the
-  // [r][c] mirror was dead. c == r writes the diagonal once.
+  // note), so ONLY the (row c, col r) entry (lower, c >= r) is stored —
+  // the (r, c) mirror was dead. c == r writes the diagonal once. K12:
+  // that entry now lives at aww[r*N_WELD + c] (column-major); same
+  // value, transposed address, and A_ww's symmetry makes the choice of
+  // which triangle to fill immaterial to the values.
   // Only row c's support contributes (s.mw is dense, but it would be
   // multiplied by row c's structural zeros). K8 narrows that
   // from K5's 12 columns to 9 (linear c) / 7 (angular c) and contracts
@@ -2617,7 +2703,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int lo = WJ_CH0(c);
 #pragma unroll
       for (int e = 0; e < 6; e++) sum += s.jwc[c][e] * s.mw[lo + e][r];
-      s.aww[c * N_WELD + r] = sum;
+      s.aww[r * N_WELD + c] = sum;
     }
   chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
 
