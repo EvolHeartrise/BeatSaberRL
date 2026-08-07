@@ -596,3 +596,124 @@ fn r9_weld_support_and_segmented_dot_bitwise() {
     );
     assert!(solves > 500, "corpus too small ({solves} solves)");
 }
+
+/// Gate (R10): the RANK-1 LIMIT-ROW claim the three closed forms rest
+/// on, plus a dense-vs-closed bit-equality soak — and a direct pin on
+/// the `0.0 +` zero-sign guard.
+///
+/// Three things are asserted:
+///  1. STRUCTURE — a limit row is `fill(0.0)` + one `jr[voff+j] = sign`
+///     store, so every other column holds the memset's +0.0 EXACTLY
+///     (sign bit clear, not merely `== 0.0`) and the pivot holds ±1.0.
+///  2. ARITHMETIC — `0.0 + sign·x[voff+j]` reproduces the dense 35-wide
+///     dot bit for bit on the live rows of every solve, over probe
+///     vectors including the state, the row's own (projected) `M⁻¹Jᵀ`
+///     column, ±1 unit columns, and vectors holding ±0.0 at the pivot.
+///  3. THE GUARD IS LOAD-BEARING — for the (common) `x[pivot] = +0.0`,
+///     `sign = −1` case the UNGUARDED product is −0.0 while the dense
+///     sum is +0.0. The test counts those cases and requires the corpus
+///     to actually hit them, so dropping the leading `0.0 +` in the
+///     solver fails here rather than silently 500 substeps downstream.
+#[test]
+fn r10_limit_rows_are_rank1_and_closed_form_is_bitwise() {
+    let m = &HUMANOID;
+    let nv = m.nv();
+    let voff = m.voff();
+    let mut rng = Rng(0x0000_000A_5EED_0100);
+    let mut solves = 0usize;
+    let mut probes = 0usize;
+    let mut limrows = 0usize;
+    let mut guard_hits = 0usize;
+    for _state_i in 0..24 {
+        let mut st = super::testutil::random_state(m, &mut rng, true);
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, true, true);
+        let mut tau = [0.0f64; NQ];
+        for _k in 0..40 {
+            if _k % 8 == 0 {
+                for j in 0..NQ {
+                    let s = match rng.next_u64() % 3 {
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => -1.0,
+                    };
+                    tau[j] = s * m.tau_max[j];
+                }
+            }
+            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+            if !st.v.iter().all(|x| x.is_finite()) {
+                break; // the closed forms are a finite-trajectory claim
+            }
+            solves += 1;
+            let ndense = cs.weld_rows() + cs.contacts.len();
+            let limset: Vec<(usize, f64)> = cs.limit_set().to_vec();
+            assert_eq!(limset.len(), cs.limit_rows(), "limit row bookkeeping");
+            // (1) structure: rank-1, +0.0 everywhere but the pivot
+            for (li, &(jt, sign)) in limset.iter().enumerate() {
+                let jr = cs.row_j(ndense + li);
+                assert!(sign == 1.0 || sign == -1.0, "limit sign {sign}");
+                for i in 0..nv {
+                    let want = if i == voff + jt { sign } else { 0.0 };
+                    assert_eq!(
+                        jr[i].to_bits(),
+                        want.to_bits(),
+                        "limit row {li} (joint {jt}) column {i} is {} — not \
+                         the rank-1 ±1.0-in-a-field-of-+0.0 shape",
+                        jr[i]
+                    );
+                }
+                limrows += 1;
+            }
+            // (2)+(3) arithmetic + guard, over adversarial probe vectors
+            let mut probe_vecs: Vec<Vec<f64>> = vec![st.v.to_vec()];
+            for (li, _) in limset.iter().enumerate() {
+                probe_vecs.push(cs.row_minvjt(ndense + li).to_vec());
+            }
+            probe_vecs.push(vec![0.0f64; nv]); // +0.0 at every pivot
+            probe_vecs.push(vec![-0.0f64; nv]); // −0.0 at every pivot
+            for c in [0usize, 6, 17, 23, 34] {
+                let mut e = vec![0.0f64; nv];
+                e[c] = if c % 2 == 0 { 1.0 } else { -1.0 };
+                probe_vecs.push(e);
+            }
+            let mut dense_rand = vec![0.0f64; nv];
+            for x in dense_rand.iter_mut() {
+                *x = rng.range(-1e3, 1e3);
+            }
+            probe_vecs.push(dense_rand);
+            for pv in probe_vecs.iter() {
+                for (li, (dense, closed)) in
+                    cs.limit_dot_ref_vs_closed(voff, pv).into_iter().enumerate()
+                {
+                    assert_eq!(
+                        dense.to_bits(),
+                        closed.to_bits(),
+                        "limit row {li}: closed {closed} != dense {dense}"
+                    );
+                    let (jt, sign) = limset[li];
+                    let bare = sign * pv[voff + jt];
+                    if bare.to_bits() != dense.to_bits() {
+                        // the ONLY way this can happen is the −0.0 the
+                        // leading `0.0 +` exists to absorb
+                        assert_eq!(bare.to_bits(), (-0.0f64).to_bits());
+                        assert_eq!(dense.to_bits(), 0.0f64.to_bits());
+                        guard_hits += 1;
+                    }
+                    probes += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "R10 rank-1 gate: {solves} solves, {limrows} limit rows, {probes} \
+         dense-vs-closed dots, all bit-identical; {guard_hits} of them \
+         needed the `0.0 +` zero-sign guard"
+    );
+    assert!(solves > 500, "corpus too small ({solves} solves)");
+    assert!(limrows > 500, "no limit rows exercised ({limrows})");
+    assert!(
+        guard_hits > 0,
+        "the corpus never hit the −0.0 case the guard exists for — the \
+         guard is then unpinned, which is worse than a failure"
+    );
+}

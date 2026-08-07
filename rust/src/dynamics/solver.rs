@@ -161,6 +161,44 @@ macro_rules! weld_support_dot {
     }};
 }
 
+// ── R10 (2026-08-06): LIMIT-ROW CLOSED FORMS — the rank-1 sibling of
+//    R9's sparsity argument (the CUDA kernel has carried it since the
+//    unit-RHS forward pass: beat_arena_cuda.cu's PGS reads
+//    `jv = s.l_sign[li] * v[VOFF + j]` instead of a 35-wide dot).
+//
+// A joint-limit row is assembled as `jr.fill(0.0)` plus ONE store
+// `jr[voff + j] = sign` (±1.0). So every contraction `Σᵢ jr[i]·x[i]`
+// over such a row is rank-1 and has the closed form below. Three
+// consumers collapse: the pre-solve effective mass `Σ jr·mr`, the
+// post-weld-null-projection `dnew`, and — 12 times per substep, the hot
+// one — the PGS residual `Σ jr·v`.
+//
+// BITWISE, with the ZERO-SIGN GUARD (the leading `0.0 +` is LOAD-BEARING
+// and must not be dropped):
+//   · the accumulator is seeded +0.0 and the terms below the pivot are
+//     (+0.0)·x[i] = ±0.0; `+0.0 + (±0.0) = +0.0` under RN, so the running
+//     sum entering i = voff+j is EXACTLY +0.0 — i.e. the dense sum
+//     computes `0.0 + sign·x[vj]`, not `sign·x[vj]`;
+//   · those differ: with x[vj] = +0.0 and sign = −1 the bare product is
+//     −0.0 while `0.0 + (−0.0)` is +0.0. That case is not exotic — step
+//     11 parks a clamped joint's rate at exactly 0.0 and upper-stop rows
+//     carry sign = −1 — and it is observable: `bias − jv` turns
+//     `−0.0 − (+0.0) = −0.0` into `−0.0 − (−0.0) = +0.0`;
+//   · terms above the pivot then add ±0.0 to that value, which leaves it
+//     unchanged (including when it is itself +0.0).
+// LLVM cannot fold `0.0 + y` away without `nsz`, which this crate never
+// enables. (Finite trajectories, work-order §10: 0·NaN = 0·∞ = NaN.)
+//
+// MEASURED +5.4% at N = 256 (20,123 → 21,215 env-steps/s, pooled median
+// of six interleaved A/B pairs) and −9.8% of bench wall (440.5 → 397.4 s
+// on stars 4–5, two runs each, spread under 1 s on both sides). The gap
+// between the two is REAL and worth remembering when sizing later work:
+// the micro-bench drives random gears, which throw the body into
+// contorted poses, while the benched policy parks joints ON their stops
+// (knee/elbow/wrist-roll at the 0-limit) — so the bench assembles more
+// limit rows per substep than the micro does, and a limit-row saving is
+// worth strictly more there. Micro is a LOWER BOUND for this class.
+
 /// Constraint stage state + preallocated buffers (no allocation inside
 /// a substep — contact Vec capacity is reserved up front). Construct
 /// once per sim instance; plug into `substep` via `substep_constrained`.
@@ -292,6 +330,36 @@ impl ConstraintSet {
         }
     }
 
+    /// One projected-Gauss-Seidel row update given the row's already
+    /// computed residual `jv`: λ ← max(λ + (b − J·v)/diag, 0), with the
+    /// change propagated through the row's `M⁻¹Jᵀ` column. Split out by
+    /// R10 so the contact half (dense dot) and the limit half (rank-1
+    /// closed form) share ONE copy of the update — `#[inline(always)]`,
+    /// so the two call sites compile to what the single fused loop did.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pgs_row_update(
+        row: usize,
+        nv: usize,
+        jv: f64,
+        bias: &[f64],
+        diag: &[f64],
+        lambda: &mut [f64],
+        minvjt: &[f64],
+        v: &mut [f64],
+    ) {
+        let dl = (bias[row] - jv) / diag[row];
+        let newl = (lambda[row] + dl).max(0.0); // λ ≥ 0
+        let d = newl - lambda[row];
+        lambda[row] = newl;
+        if d != 0.0 {
+            let mr = &minvjt[row * nv..(row + 1) * nv];
+            for i in 0..nv {
+                v[i] += mr[i] * d;
+            }
+        }
+    }
+
     /// J·v of an assembled row (post-solve introspection).
     pub fn jv(&self, row: usize, v: &[f64]) -> f64 {
         let jr = &self.j[row * self.nv..(row + 1) * self.nv];
@@ -336,6 +404,47 @@ impl ConstraintSet {
         let mut seg = [0.0f64; N_WELD_ROWS];
         weld_support_dot!(seg, self.jwt, src);
         (dense, seg)
+    }
+
+    /// TEST HOOK (R10): the `(joint, sign)` pairs of the limit rows
+    /// assembled by the last solve, assembly order.
+    #[cfg(test)]
+    pub fn limit_set(&self) -> &[(usize, f64)] {
+        &self.limset
+    }
+
+    /// TEST HOOK (R10): an assembled Jacobian row of the last solve.
+    #[cfg(test)]
+    pub fn row_j(&self, row: usize) -> &[f64] {
+        &self.j[row * self.nv..(row + 1) * self.nv]
+    }
+
+    /// TEST HOOK (R10): an `M⁻¹Jᵀ` column of the last solve (post
+    /// weld-null projection for the limit rows).
+    #[cfg(test)]
+    pub fn row_minvjt(&self, row: usize) -> &[f64] {
+        &self.minvjt[row * self.nv..(row + 1) * self.nv]
+    }
+
+    /// TEST HOOK (R10): dense-vs-closed-form contraction of every
+    /// assembled LIMIT row against `src`, on the LIVE rows of the last
+    /// solve. Returns `(dense, closed)` per limit row — the single
+    /// expression all three R10 sites collapse.
+    #[cfg(test)]
+    pub fn limit_dot_ref_vs_closed(&self, voff: usize, src: &[f64]) -> Vec<(f64, f64)> {
+        let nv = self.nv;
+        let ndense = self.weld_rows() + self.contacts.len();
+        (0..self.limset.len())
+            .map(|li| {
+                let (jt, sign) = self.limset[li];
+                let jr = &self.j[(ndense + li) * nv..(ndense + li + 1) * nv];
+                let mut d = 0.0;
+                for i in 0..nv {
+                    d += jr[i] * src[i];
+                }
+                (d, 0.0 + sign * src[voff + jt])
+            })
+            .collect()
     }
 
     /// Weld row count actually assembled (0 or 12).
@@ -588,7 +697,7 @@ impl ConstraintSet {
                 row += 1;
             }
         }
-        for row in 0..nrows {
+        for row in 0..ndense {
             if DIAG_ALL_ROWS || row >= nweld {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mr = &self.minvjt[row * nv..(row + 1) * nv];
@@ -600,6 +709,28 @@ impl ConstraintSet {
                 self.diag[row] = d;
             }
             // pre-solve J·v* (introspection only — compiled out below)
+            #[cfg(any(test, feature = "introspect"))]
+            {
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mut s = 0.0;
+                for i in 0..nv {
+                    s += jr[i] * v[i];
+                }
+                self.jv_pre[row] = s;
+            }
+        }
+        // R10: a limit row is rank-1, so its effective mass is one load
+        // instead of a 35-wide dot — with the mandatory `0.0 +` guard
+        // (see the R10 note above; the ω-cap dedupe below already stated
+        // this identity for the sign = +1 rows it reuses).
+        for li in 0..self.limset.len() {
+            let (jt, sign) = self.limset[li];
+            let row = ndense + li;
+            let d = 0.0 + sign * self.minvjt[row * nv + voff + jt];
+            debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
+            self.diag[row] = d;
+            // pre-solve J·v* stays dense: introspection-only, so it is
+            // already compiled out of the shipping build.
             #[cfg(any(test, feature = "introspect"))]
             {
                 let jr = &self.j[row * nv..(row + 1) * nv];
@@ -671,7 +802,7 @@ impl ConstraintSet {
             debug_assert_eq!(nweld, N_WELD_ROWS);
             let split = (nweld + ncon) * nv;
             let (head, tail) = self.minvjt.split_at_mut(split);
-            for (li, _lim) in self.limset.iter().enumerate() {
+            for (li, &(jt, sign)) in self.limset.iter().enumerate() {
                 let row = nweld + ncon + li;
                 let mr = &mut tail[li * nv..(li + 1) * nv];
                 // UNROLL-AND-JAM by 4 (2026-08-03), both here and in the
@@ -701,11 +832,9 @@ impl ConstraintSet {
                         mr[i] = m;
                     }
                 }
-                let jr = &self.j[row * nv..(row + 1) * nv];
-                let mut dnew = 0.0;
-                for i in 0..nv {
-                    dnew += jr[i] * mr[i];
-                }
+                // R10: rank-1 row again — the projected mobility is the
+                // pivot entry of the projected column (guard included).
+                let dnew = 0.0 + sign * mr[voff + jt];
                 self.diag[row] = if dnew > COMPOSITE_EPS * self.diag[row] {
                     dnew
                 } else {
@@ -777,23 +906,45 @@ impl ConstraintSet {
                 }
             }
             // (b)+(c) contacts (pair-id order) then joint-limit rows
-            // (joint order): projected GS, λ ≥ 0
-            for row in nweld..nrows {
+            // (joint order): projected GS, λ ≥ 0.
+            // R10: the one loop is SPLIT at `ndense` — same rows, same
+            // order (contacts before limits, each in its own assembly
+            // order), but the limit half reads its residual straight off
+            // `v` instead of running a 35-wide dot against a row that is
+            // one ±1.0 in a field of +0.0. This is the hot site: 12 PGS
+            // iterations × ~6 limit rows per substep. (The `jv` argument
+            // is the only thing that differs — the λ update and the
+            // impulse propagation are the contact path's, verbatim.)
+            for row in nweld..ndense {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mut jv = 0.0;
                 for i in 0..nv {
                     jv += jr[i] * v[i];
                 }
-                let dl = (self.bias[row] - jv) / self.diag[row];
-                let newl = (self.lambda[row] + dl).max(0.0); // λ ≥ 0
-                let d = newl - self.lambda[row];
-                self.lambda[row] = newl;
-                if d != 0.0 {
-                    let mr = &self.minvjt[row * nv..(row + 1) * nv];
-                    for i in 0..nv {
-                        v[i] += mr[i] * d;
-                    }
-                }
+                Self::pgs_row_update(
+                    row,
+                    nv,
+                    jv,
+                    &self.bias,
+                    &self.diag,
+                    &mut self.lambda,
+                    &self.minvjt,
+                    v,
+                );
+            }
+            for li in 0..self.limset.len() {
+                let (jt, sign) = self.limset[li];
+                let jv = 0.0 + sign * v[voff + jt]; // guard: see R10 note
+                Self::pgs_row_update(
+                    ndense + li,
+                    nv,
+                    jv,
+                    &self.bias,
+                    &self.diag,
+                    &mut self.lambda,
+                    &self.minvjt,
+                    v,
+                );
             }
             // (d) ω-cap pass, joint order 0..28 (step-11's cap rows
             // folded in — Divergence §13's anticipation): the weld
