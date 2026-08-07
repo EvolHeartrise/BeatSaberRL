@@ -338,6 +338,60 @@ constexpr int NOTE_FEAT = 14;
 // SASS census can see. Do not gate such an item on the counters moving —
 // gate it on the counters not getting WORSE, and measure.
 //
+// K18(i) (2026-08-07) — RHS-MINOR s.c_minv: BUILT, GATED, AND REJECTED
+// at -0.33%. DO NOT RE-TRY IT. The round-5 audit ranked this straight
+// after K12 as "K11's argument verbatim" on the contact scratch: store
+// c_minv as [NV][NUM_PAIRS] instead of [NUM_PAIRS][NV] so the 4-RHS
+// contact solve's lane sweep collapses from 4 runtime stride-NV
+// addresses onto one base with immediate offsets. Exactly that was
+// built — chol_solve_multi_tn generalized to <W, STRIDE> with base
+// &c_minv[0][ci] and STRIDE = NUM_PAIRS — in TWO variants, differing
+// only in the 1-wide remainder tier (chol_solve_multi_tn<1> vs a
+// strided chol_solve_sn<STRIDE> twin of chol_solve_n that keeps its
+// R = 4 forward blocking). Every gate passed except the last:
+//   ptxas BYTE-IDENTICAL to the incumbent in both dtypes and both
+//     variants — f32 41,872 B / 0 / 0 / 255 regs, f64 82,912 B / 8 / 8
+//     / 255 (so the counters were not "not worse", they were equal);
+//   bitwise old-vs-new max diff EXACTLY 0.0, f32 AND f64, free-running
+//     and max_steps=60, want_contacts, plus a 128-env random-gear
+//     traffic config added specifically because the 8-env chart configs
+//     never reach nc >= 4 and would not have exercised the 4-wide tier;
+//   pytest 172 green;
+//   A/B, 5 interleaved rounds, N=4096 f32, fresh process per arm:
+//     incumbent            28,492.7  (28,464.5 - 28,521.6)
+//     multi_tn<1> variant  28,382.1  (28,359.5 - 28,416.7)   -0.34%
+//     chol_solve_sn variant 28,400.2 (28,381.1 - 28,404.3)   -0.32%
+//   Both ranges non-overlapping in the WRONG direction, and the two
+//   variants agree to 0.02%, which rules out the remainder tier's
+//   blocking width as the cause: the LAYOUT itself is the loss.
+// WHY IT INVERTS K11's SIGN — this is the rule the round was missing.
+// RHS-minor pays only when the INNER loop of the hot consumers is the
+// LANE loop AND the lane count is reliably > 1. s.mw meets both
+// conditions: all four of its consumers sweep the 12 weld rows
+// innermost at a fixed column, so 12 live addresses become one base.
+// s.c_minv meets NEITHER where it matters.
+//   * The lane count is almost always ONE. Contact-count histogram
+//     under bench traffic (256 envs x 240 ticks, pairs active per
+//     env-tick): 50,816 zero, 7,670 one, 2,238 two, 555 three, 161 four
+//     or more. The 4-wide tier that motivated the item is the rare
+//     path; the 1-wide tier, where a "lane sweep" is a single address
+//     in either layout, is the common one.
+//   * Three of the four consumers vary the ROW index i at a FIXED
+//     contact: the seed copy, the c_diag dot, and the PGS contact axpy
+//     — the last of which runs NV terms per active contact per PGS
+//     iteration x 12 iters x 8 substeps and is the hottest c_minv
+//     reader in the kernel. Row-major makes that walk contiguous;
+//     RHS-minor makes it stride-NUM_PAIRS. So the transform
+//     de-optimizes the hot consumers to optimize a batch width that is
+//     seldom taken.
+// GENERAL FORM, now the third data point after K11 (+7.06%) and K12
+// (+3.95%): before transposing a scratch buffer, ask which index each
+// consumer's INNER loop varies, weighted by how often that consumer
+// actually runs — not whether the shape matches a previous winner.
+// "Same transform as the last win" is not a mechanism.
+// (K18(ii), the ecol contiguous-scratch variant, was out of this task's
+// scope and remains unprobed.)
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -798,6 +852,10 @@ struct Solver {
   // contacts (compacted, pair-id order)
   int nc;
   int c_pair[NUM_PAIRS];
+  // c_minv stays ROW-MAJOR. Transposing it to [NV][NUM_PAIRS] (K11's
+  // shape) was built and measured at -0.33% — see the K18(i) entry in
+  // the file header for the numbers and for why the mw result does not
+  // transfer. Do not re-try it.
   T c_J[NUM_PAIRS][NV], c_minv[NUM_PAIRS][NV];
   T c_bias[NUM_PAIRS], c_diag[NUM_PAIRS], c_lam[NUM_PAIRS];
   T c_pt[NUM_PAIRS][3];
