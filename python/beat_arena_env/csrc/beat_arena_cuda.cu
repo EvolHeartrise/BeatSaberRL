@@ -126,6 +126,34 @@ constexpr int NOTE_FEAT = 14;
 // budget had slack. Whenever an item lands that moves spills, re-probe
 // the items that lost by less than ~1%.
 //
+// K10 (2026-08-07) — the housekeeping bundle, measured the same way
+// (N=4096, 4+ interleaved A/B rounds of 35 s; within-arm spread ~0.1%):
+//   K10a delete the dead RNEA vo chain                   +0.21%  KEPT
+//   K10b skip axw for the one F_COORD < 0 frame          +0.04%  kept
+//                                                (neutral, dead work)
+//   K10c constant HLR table                          NOT APPLICABLE
+//   K10d bound refresh_fk to the upper-body prefix       +0.00%  REVERTED
+//   K10e1 drop write_obs's re-load_state                 -0.11%  REVERTED
+//   K10e2 reuse d.r0 instead of re-running quat_to_rot  NOT BITWISE
+//   K10e3 start the obs zero fill at OFF_NOTES           +0.08%  KEPT
+// Three of those are worth carrying forward as rules:
+//  * K10c was already done BY THE COMPILER. The hlr[] "per-substep
+//    sqrt" is over constexpr COL_A/COL_B, and nvcc folds the whole
+//    expression at compile time in BOTH dtype branches — the f32 SASS
+//    carries 0x3ebae148 (0.365f) etc. as MOV32I immediates, the f64
+//    SASS the matching double halves. Check the SASS before hand-
+//    tabulating a "recomputed" constant.
+//  * K10d is structurally unmeasurable, not merely small: refresh_fk
+//    runs ONCE per control tick against fk_all's EIGHT (one per
+//    substep), so dropping its 12 leg frames removes ~4% of one ninth
+//    of the FK, and FK is not the bottleneck. Do NOT re-probe it after
+//    a spill shift — it moved the ptxas numbers by exactly zero.
+//  * K10e1 is a second instance of the A1/1f finding, now with a
+//    NEGATIVE sign: cutting local/global traffic without shortening a
+//    dependency chain does not pay here, and a redundant reload can be
+//    load-bearing as a rematerialization point (deleting it grew the
+//    f64 frame 90,976 -> 91,008 B).
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -452,8 +480,14 @@ struct Dyn {
   // crba runs immediately before rnea_bias in substep with d.r untouched
   // between them (crba writes only m / cm / cc / ci / b* / iw*).
   T iw[NF][3][3], iw0[3][3];
-  // RNEA scratch
-  T om[NF][3], al[NF][3], vo[NF][3], ao[NF][3], fb[NF][3], nb[NF][3];
+  // RNEA scratch. NO `vo` (K10a): the linear-velocity forward chain
+  // vo[k] = vo[par] + om[par] x (pos[k] - pos[par]) is a fossil of the
+  // general RNEA — this call site is RNEA(q, v, 0) and the bias it
+  // returns is assembled from om / al / ao / fb / nb only. vo was
+  // written by the forward pass and read by nothing but its own
+  // recurrence, so the whole chain was dead (om[par] x d IS still
+  // needed, as the seed of the centrifugal term om x (om x d)).
+  T om[NF][3], al[NF][3], ao[NF][3], fb[NF][3], nb[NF][3];
   bool pd_bad;
   // PRE-integration root-envelope engagements (Divergences §23):
   // env_bad = "engaged anywhere in THIS control tick" (the C backstop
@@ -579,6 +613,23 @@ __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
 // independent accumulators) rather than branch overhead, which is
 // exactly what a bare `#pragma unroll` on the same loop cannot do.
 
+// K10b — d.axw[k] is DEAD for every frame with F_COORD[k] < 0, which is
+// frame 3 (the head) alone. Every reader is guarded by the same
+// predicate: crba's column fill (`coord >= 0 && m > 0`) and its ancestor
+// walk (`F_COORD[anc] >= 0`), rnea_bias's forward joint term and its
+// backward `d.c[VOFF + F_COORD[k]]` write, and both Jacobian
+// accumulators (`if (F_COORD[k] >= 0)`) — so the axis is only ever read
+// through a coordinate index that frame 3 does not have. fk_all
+// therefore computes it inside the same branch that builds the joint
+// rotation; d.axw[3] is simply never written (nor read).
+constexpr int coordless_frames() {
+  int n = 0;
+  for (int k = 0; k < NF; k++) n += F_COORD[k] < 0 ? 1 : 0;
+  return n;
+}
+static_assert(coordless_frames() == 1 && F_COORD[3] < 0,
+              "K10b: frame 3 must be the ONLY F_COORD < 0 frame");
+
 // fk_all: world rotation/origin per frame + world revolute axes.
 template <typename T>
 __device__ void fk_all(Dyn<T>& __restrict__ d) {
@@ -600,14 +651,14 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
         for (int j = 0; j < 3; j++)
           d.r[k][i][j] = rl[i][0] * rj[0][j] + rl[i][1] * rj[1][j]
                          + rl[i][2] * rj[2][j];
+      for (int i = 0; i < 3; i++)
+        d.axw[k][i] = d.r[k][i][0] * T(F_AXIS[k][0])
+                      + d.r[k][i][1] * T(F_AXIS[k][1])
+                      + d.r[k][i][2] * T(F_AXIS[k][2]);
     } else {
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) d.r[k][i][j] = rl[i][j];
     }
-    for (int i = 0; i < 3; i++)
-      d.axw[k][i] = d.r[k][i][0] * T(F_AXIS[k][0])
-                    + d.r[k][i][1] * T(F_AXIS[k][1])
-                    + d.r[k][i][2] * T(F_AXIS[k][2]);
   }
 }
 
@@ -805,20 +856,17 @@ template <typename T>
 __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   const T g[3] = {T(0), T(-GRAV), T(0)};
   T om0[3] = {d.v[3], d.v[4], d.v[5]};
-  T vo0[3] = {d.v[0], d.v[1], d.v[2]};
   // forward pass (acc = 0 everywhere; al0/ao0 = 0)
   for (int k = 0; k < NF; k++) {
     const int par = F_PARENT[k];
     const T* oml = par < 0 ? om0 : d.om[par];
     const T* all = par < 0 ? nullptr : d.al[par];
-    const T* vol = par < 0 ? vo0 : d.vo[par];
     const T* aol = par < 0 ? nullptr : d.ao[par];
     const T* ol = par < 0 ? d.p : d.pos[par];
     T dv[3];
     sub3v(d.pos[k], ol, dv);
     T oxd[3];
     cross3(oml, dv, oxd);
-    T vok[3] = {vol[0] + oxd[0], vol[1] + oxd[1], vol[2] + oxd[2]};
     T alxd[3] = {T(0), T(0), T(0)};
     if (all != nullptr) cross3(all, dv, alxd);
     T oxoxd[3];
@@ -844,7 +892,6 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
     for (int i = 0; i < 3; i++) {
       d.om[k][i] = omk[i];
       d.al[k][i] = alk[i];
-      d.vo[k][i] = vok[i];
       d.ao[k][i] = aok[i];
     }
     if (F_MASS[k] > 0.0) {
@@ -2273,16 +2320,62 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
 
 // Observation writer (lib.rs write_obs, SPEC-v10 §5) — from the CURRENT
 // tensors (post-reset state included).
+//
+// K10e probed three redundancies here; ONE landed. All three rest on the
+// same audit of the three paths that reach here (step_kernel's tail is
+// the only call site): mode 1 reset_env -> {writes d, store_state,
+// refresh_fk}; mode 2 {load_state, refresh_fk}; mode 0 step_env ->
+// {load_state, 8 substeps, store_state, refresh_fk, judgment, optional
+// reset_env}.
+//  1. REVERTED at -0.11% (4 ABBA rounds, N=4096). The re-load_state
+//     below IS redundant — on every path d.p / d.quat / d.q / d.v
+//     already ARE the current tensors (modes 1/2 wrote d from or to
+//     them immediately before; step_env's store_state copied d OUT, and
+//     the judgment block that follows touches no d field but d.env_bad,
+//     with a terminal auto-reset re-establishing the invariant through
+//     reset_env). Deleting it nonetheless COST time and grew the f64
+//     frame 90,976 -> 91,008 B (spills 11,756/9,628 -> 11,812/9,696):
+//     the 71-word reload is a rematerialization point, and without it
+//     the state has to stay live across the whole judgment block. Same
+//     lesson as A1/1f — on this kernel a pure traffic cut with no new
+//     dependency chain does not pay, and can lose.
+//  2. REVERTED, and this one is a trap worth recording. fk_all's first
+//     act is quat_to_rot(d.quat, d.r0) and every path above ends in a
+//     refresh_fk, so d.r0 IS semantically the rotation recomputed
+//     below — but it is NOT bit-identical in f32: nvcc contracts
+//     quat_to_rot's multiply-adds differently when the function is
+//     inlined into fk_all than when it is inlined here, and the probe
+//     caught obs lanes 3, 5 and 8 (r0[0][0], r0[2][0], r0[2][1]) moving
+//     by 1 ulp (5.96e-8) on every f32 suite. f64 was clean, which is
+//     exactly why a single-dtype gate would have shipped it. The
+//     recompute stays. GENERAL RULE: "the same expression tree is
+//     deterministic" is only a bitwise argument at a FIXED inline site.
+//  3. KEPT, +0.08%: the zero fill starts at OFF_NOTES. Lanes 0..99 are
+//     all UNCONDITIONALLY overwritten below — 0..2 root pos, 3..8 the 6D
+//     rotation, 9..14 root vlin/vang, 15..45 the q block (29 joints,
+//     j = 7 and 14 emitting two lanes each = 31), 46..74 qd, 75..94 the
+//     two 10-lane hand blocks, 95..97 head, 98..99 the contact bits —
+//     so their pre-zeroing was 100 dead stores per env per tick (the
+//     static_assert pins the prefix gapless). From OFF_NOTES the fill IS
+//     load-bearing: note features and the mask are written only for
+//     occupied slots.
+static_assert(OFF_ROOT_ROT == 3 && OFF_ROOT_VLIN == 9 && OFF_ROOT_VANG == 12
+                  && OFF_Q == 15 && OFF_QD == OFF_Q + NQ + 2
+                  && OFF_HAND_L == OFF_QD + NQ && OFF_HAND_R == OFF_HAND_L + 10
+                  && OFF_HEAD == OFF_HAND_R + 10 && OFF_CONTACT == OFF_HEAD + 3
+                  && OFF_NOTES == OFF_CONTACT + 2,
+              "K10e: obs lanes 0..OFF_NOTES-1 must be a gapless "
+              "unconditionally-written prefix");
 template <typename T>
 __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   float* __restrict__ obs = P.obs + (size_t)e * OBS_DIM;
-  for (int i = 0; i < OBS_DIM; i++) obs[i] = 0.f;
+  for (int i = OFF_NOTES; i < OBS_DIM; i++) obs[i] = 0.f;
   load_state(d, P, e);
   // root position
   obs[OFF_ROOT_POS] = (float)(d.p[0] / T(X_NORM));
   obs[OFF_ROOT_POS + 1] = (float)((d.p[1] - T(ROOT_Y0)) / T(Y_NORM));
   obs[OFF_ROOT_POS + 2] = (float)((d.p[2] - T(PLANE_Z0)) / T(X_NORM));
-  // 6D two-column rotation
+  // 6D two-column rotation (recomputed on purpose — see K10e note 2)
   T r0[3][3];
   quat_to_rot(d.quat, r0);
   for (int i = 0; i < 3; i++) {
