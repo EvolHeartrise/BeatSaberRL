@@ -392,6 +392,66 @@ constexpr int NOTE_FEAT = 14;
 // (K18(ii), the ecol contiguous-scratch variant, was out of this task's
 // scope and remains unprobed.)
 //
+// K14 (2026-08-07) — COMPILE-TIME CONTACT-ROW SPARSITY: BUILT, GATED
+// AND REJECTED IN THREE FORMS. DO NOT RE-TRY IT. The derivation is
+// sound and is preserved below so nobody re-derives it; what is dead is
+// the idea that s.c_J's structural zeros are worth skipping.
+// THE STRUCTURE (verified against the model tables, not estimated).
+// Contact row ci is two point_jacobian_acc calls on COL_FRAME[PAIR_A]
+// and COL_FRAME[PAIR_B], so
+//     support(pid) = {0..5} u chain(fa) u chain(fb),
+// with chain() the wj_chain_mask walk — 12 to 23 of NV = 35 columns,
+// mean 15.95. It is NOT always two runs (pid 28, colliders 3 and 9, is
+// {0..8} u {16,17,18} u {29,30,31}); but a two-segment COVER always
+// exists — split the support at its widest interior gap, [0..h0] u
+// [l1..h1] — because covering a structurally-zero column is harmless
+// while missing a support column is not. Mean cover 17.11 of 35, so
+// the dense loops would have lost ~51% of their terms AND half of each
+// dot's serial FFMA chain. Table packed h0 | l1<<8 | h1<<16, one
+// constexpr entry per pair id, static_asserted to be exactly that
+// minimal cover of c_pair_mask(pid).
+// WHAT WAS MEASURED (N=4096 f32, 5 interleaved A/B rounds each, fresh
+// process per arm, incumbent re-measured inside every pair):
+//   stage 1, the three c_diag dot sites     28,417.5 -> 28,405.6
+//                                           -0.04%, ranges OVERLAP = noise
+//   stage 2a, PGS dot, two dynamic loops    28,419.6 -> 28,016.0   -1.42%
+//   stage 2b, same + #pragma unroll 4       28,421.5 -> 28,165.5   -0.90%
+//   stage 2c, unrolled NV loop + predicate  28,433.8 -> 28,350.1   -0.29%
+// (2a/2b/2c ranges all non-overlapping in the wrong direction; 2c also
+// FAILED the ptxas gate on its own — f32 frame 41,872 -> 41,936 B.)
+// Everything else passed: bitwise old-vs-new max diff EXACTLY 0.0 on
+// f32 AND f64 across free-running, max_steps=60 and the 128-env
+// random-gear traffic config (which reaches nc = 7 and touches 48 of
+// the 55 pair ids, so the table itself was well covered); pytest 172
+// green; f32 stayed 255 regs / 0 / 0 / 41,872 B in 2a and went to 254
+// regs in 2b, f64 kept its 8-byte slot throughout.
+// THE RULE, and it is the useful part. A sparsity narrowing on this
+// kernel must not cost a loop its COMPILE-TIME TRIP COUNT. The dense
+// `for (i = 0; i < NV; i++) jv += c_J[ci][i] * v[i]` compiles to a
+// fully unrolled straight-line block: 70 LDL at immediate offsets off
+// two bases, 35 FFMAs, no branches, every load issuable ahead of the
+// chain. Keying the bounds on a RUNTIME value (s.c_pair[ci]) turns it
+// into a real loop, and the loss tracks exactly how much of that form
+// is destroyed — -1.42% (two dynamic loops) -> -0.90% (4x unrolled) ->
+// -0.29% (fully unrolled, runtime predicate). That monotone ordering
+// is the proof: the saved arithmetic was never the cost, the FORM was,
+// and the best case of the series extrapolates to zero.
+// WHY K5/K8 PAID AND THIS CANNOT: the weld rows' support is a function
+// of the ROW INDEX, which is a compile-time constant inside the
+// `#pragma unroll` nests, so those narrowed loops kept immediates and
+// full unrolling (the A_ww site's header records that removing the
+// pragma there costs -0.12% for the same reason). "Structural sparsity"
+// with a runtime-indexed support is a DIFFERENT item and does not
+// inherit K5's result.
+// Two further reasons it could not have paid even in the best form:
+// contact work is absent on ~84% of env-ticks (the K18 histogram, and
+// this task's own probe: 25,325 of 30,720 env-ticks at nc = 0), and
+// a ~1% swing from a path that runs on 16% of ticks means most of the
+// measured loss was a whole-kernel scheduling/allocation phase change
+// (2b moved the f32 allocation to 254 registers, 2a/2c moved the f64
+// frame), not contact arithmetic at all — the K6/K12 phase-change
+// lesson again, now with the sign against a "pure" work reduction.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -2864,6 +2924,12 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       }
     }
     // (b) contacts, pair-id order: projected GS, lambda >= 0
+    // This dot is DENSE ON PURPOSE. c_J[ci] has 12-23 structurally
+    // nonzero columns of 35 and K14 narrowed it to a two-segment cover
+    // of the pair's compile-time support: -1.42% / -0.90% / -0.29% in
+    // three forms, all reverted. The bound would be runtime, which
+    // costs this loop its full unrolling — see the K14 block in the
+    // header before touching it.
     for (int ci = 0; ci < s.nc; ci++) {
       T jv = T(0);
       for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * v[i];
