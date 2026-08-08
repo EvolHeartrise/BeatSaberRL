@@ -29,13 +29,36 @@ import importlib.util
 import os
 import sys
 
-CUDA_FLAGS = ["-arch=sm_61", "-Xptxas", "-v"]
-"""nvcc flags shared by every extension in this repo. -Xptxas -v makes
-ptxas print per-kernel registers / stack frame / spill stores+loads /
-lmem, which fast_load captures into <name>.build.log (2026-08-02: the
-spill baseline for the fused policy kernels). The flag list is part of
-the srchash digest below, so editing it invalidates the stamp and
-forces the rebuild that regenerates the log."""
+def _capability():
+    """(major, minor) of the current CUDA device. Deferred on purpose:
+    jit_cache is imported only from inside the lazy extension loaders,
+    which already require a CUDA device (the policy-side loaders wrap
+    the whole load in try/except and fall back to eager on CPU-only
+    machines), so probing here never fires without a GPU."""
+    import torch
+    return torch.cuda.get_device_capability()
+
+
+def cuda_flags():
+    """nvcc flags shared by every extension in this repo, arch pinned to
+    the CURRENT device (sm_61 on the GTX 1080 era, sm_89 on RunPod 4090
+    pods) — a single arch, never a fatbin: builds are per-machine JIT
+    artifacts. -Xptxas -v makes ptxas print per-kernel registers /
+    stack frame / spill stores+loads / lmem, which fast_load captures
+    into <name>.build.log (2026-08-02: the spill baseline for the fused
+    policy kernels). The flag list is part of the srchash digest below,
+    so a new arch (or any flag edit) invalidates the stamp and forces
+    the rebuild that regenerates the log."""
+    maj, mnr = _capability()
+    return [f"-arch=sm_{maj}{mnr}", "-Xptxas", "-v"]
+
+
+def arch_list():
+    """TORCH_CUDA_ARCH_LIST value matching cuda_flags() ('8.9' where
+    nvcc wants sm_89) — keeps torch's own flag-injection path from
+    compiling for a default arch zoo."""
+    maj, mnr = _capability()
+    return f"{maj}.{mnr}"
 
 
 @contextlib.contextmanager
