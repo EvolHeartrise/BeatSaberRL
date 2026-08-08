@@ -296,6 +296,9 @@ def test_greedy_rollout_smoke():
     notes = generate_chart(cfg, np.random.default_rng(3))
     env = RustBeatEnv(external_chart=notes, seed=0)
     obs, _ = env.reset()
+    # seeded: an unseeded random init made this flake ~2/13 full-suite
+    # runs (found during round-5 K17; nothing kernel-related)
+    torch.manual_seed(0)
     policy = NotePolicy()
     slot = {"entry": {"leaderboard_id": 9, "hash": "aa", "song": "s",
                       "mapper": "m", "difficulty": "Easy", "stars": 1.0,
