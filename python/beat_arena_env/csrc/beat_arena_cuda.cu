@@ -687,6 +687,94 @@ constexpr int NOTE_FEAT = 14;
 // items that REDUCE divergence (rather than adding a ladder) now have a
 // measured ceiling to aim at.
 //
+// K15 (2026-08-07) — FOLD THE STEP-6 SOLVE INTO THE WELD MULTI-SOLVE AS
+// A 13th RHS: BUILT, FULLY GATED, AND REVERTED at −0.06% on f32 (noise)
+// even though it is +0.90% on f64 and PASSED EVERY OTHER GATE, including
+// the spill gate the round had it flagged as most likely to fail. DO NOT
+// RE-TRY IT IN THIS FORM. This is the round's cleanest example of the
+// A1/1f -> K10e1 -> K19 family: a pure traffic-and-pass removal on a
+// serial-latency-bound kernel buys nothing on the dtype that matters.
+// WHAT WAS BUILT, exactly as the audit specified. s.mw widened to
+// [NV][13] (RHS-minor, K11 layout — lane 12 is one more immediate offset
+// off the same base); step 4's rhs assembly left AT ITS INLINE SITE in
+// substep() with only its destination changed (d.rhs[i] -> s.mw[i][12]),
+// which is legal because the weld assembly writes only lanes 0..11 and
+// nothing between the seed and the solve touches lane 12; the standalone
+// `chol_solve_n(NV, d.m, d.rhs)` DELETED; chol_solve_multi_tn<12> ->
+// <13>; and `v[i] = d.v[i] + H_SUB * s.mw[i][12]` moved into
+// constraint_solve immediately after the widened solve (v is first read
+// ~160 lines later, at the PGS weld dot, so the move is safe). d.rhs
+// removed from Dyn. Net −1,140 dynamic local loads per substep and one
+// fewer serially-scheduled solve pass.
+// PTXAS — BYTE-IDENTICAL TO THE INCUMBENT IN BOTH DTYPES, which is the
+// first surprise: f32 41,872 B / 0 / 0 / 255 regs, f64 82,912 B / 8 / 8
+// / 255. The audit ranked this the HIGHEST spill risk of the round on
+// the grounds that the forward block's accumulators go 36 -> 39 live
+// (s0/s1/s2 gain a lane each) at zero margin. They do, and ptxas
+// absorbed all three at the same 255-register allocation. The frame did
+// not move either, because mw's +140 B (f32) is exactly d.rhs's −140 B.
+// So the 255-register pin is NOT a hard ceiling on live values — it is
+// where the allocator parks; the K13 note that "the allocator found a
+// 254-register allocation for a different edit" now has a companion in
+// the other direction. Stop treating the cliff as one added value away.
+// BITWISE, and the argument is worth keeping. Max diff EXACTLY 0.0 on
+// f32 AND f64, all 10 dumped arrays byte-equal, over five configs:
+// free-running with want_contacts, max_steps=60, the 128-env random-gear
+// traffic, and K13's stopjam / altstop limit-heavy configs. The solve
+// lane 12 rides is chol_solve_multi_tn (forward row-blocked R=3) where
+// it used to be chol_solve_n (R=4) — DIFFERENT blocking, same values,
+// because the K6 forward argument makes every R produce each row's terms
+// as k = 0..i−1 ascending from the same seed x[i]; the divides and the
+// back half are identical. The K10e2 hazard did not fire: `s −= l*x` is
+// one mul+add with exactly one contraction available and no freedom, and
+// the two expression trees that DID move (the rhs assembly's destination,
+// the v* axpy's enclosing function) were relocated whole, which K19
+// already showed is safe. pytest 172 green.
+// A/B, N=4096, fresh process per arm, TWO order-balanced batches:
+//   batch 1 (incumbent first)  incumbent 28,517.4 (28,497.8 - 28,532.6)
+//                              K15       28,495.4 (28,478.9 - 28,510.9)
+//                              −0.077%, 5/5 paired losses
+//   batch 2 (K15 first)        K15       28,497.8 (28,493.0 - 28,512.0)
+//                              incumbent 28,499.5 (28,487.0 - 28,532.5)
+//                              −0.006%, 2/5 paired wins
+//   pooled (10 pairs)          incumbent 28,514.1  K15 28,496.4
+//                              −0.062%, 8/10 paired losses, ranges
+//                              overlapping over most of their extent
+// i.e. NOISE-to-marginal-negative, and reverted on the round's standing
+// rule that a non-positive f32 verdict is a revert.
+// THE f64 SPLIT IS THE FINDING, and it is new. The SAME .pyd is
+// +0.90% on f64 — 16,869.3 (16,868.9 - 16,939.0) -> 17,021.7 (17,017.1
+// - 17,042.5), 3/3 paired wins, non-overlapping — while f32 is flat.
+// Both dtypes lost the identical pass and the identical ~1,140 loads;
+// the difference is that an f64 load moves twice the bytes against the
+// same 45/91 KB local working set, so on f64 the removed traffic was NOT
+// already hidden behind the serial chains and on f32 it was. That is the
+// A1/1f rule with a MEASURED BOUNDARY on it for the first time: "traffic
+// cuts do not pay here" is a statement about f32's arithmetic-to-traffic
+// ratio, not about the transform. f32 is the production dtype, so the
+// verdict follows f32 (the K8 no-unroll precedent) — but an item that
+// looks traffic-shaped should now be measured on BOTH dtypes before it is
+// called dead, and if the f64 tier ever becomes load-bearing this edit is
+// worth exactly +0.9%.
+// K15B, THE PADDED-STRIDE VARIANT, MEASURED AND REJECTED HARDER at
+// −0.46%. Hypothesis after the flat f32 result: the gain was eaten by
+// address arithmetic, because the mw row stride went 12 (two shifts) to
+// 13 (three, or an XMAD chain) at every one of the four hot mw
+// consumers — K17's power-of-two [NF][16] finding says that is a real
+// tax. So mw was padded to [NV][16] with chol_solve_multi_tn
+// generalized to <W, T, STRIDE> (the K18(i) generalization, re-derived)
+// and W = 13 riding a 16-word row, making every mw address a single
+// shift — CHEAPER than the incumbent's 12. It measured 28,525.9
+// (28,477.7 - 28,549.8) -> 28,395.7 (28,386.3 - 28,428.5), −0.457%,
+// 5/5 paired losses, non-overlapping in the wrong direction, at f32
+// 42,288 B / 0 / 0 / 255 regs (frame +416 B, still no spills). So the
+// stride hypothesis is FALSIFIED: 105 dead words per thread of frame
+// cost more than the address arithmetic saved, and the 12 -> 13 stride
+// was never the tax. The transferable half: on this kernel a
+// power-of-two stride is worth its padding only when the padding is
+// SMALL relative to the frame (K17's tables live in global memory and
+// cost the frame nothing, which is why that one paid).
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
