@@ -523,6 +523,77 @@ constexpr int NOTE_FEAT = 14;
 // compile-time coupling for no measured return; the derivation stands
 // at ANC_WELD_D if anyone wants it back.
 //
+// K19 (2026-08-07) — SPLIT write_obs INTO ITS OWN KERNEL: BUILT, FULLY
+// GATED, AND REJECTED at -0.28% / -0.33%. DO NOT RE-TRY IT. The round-5
+// audit ranked this at +0.5-2% on the premise that step_kernel would get
+// structurally smaller once the obs writer's live ranges left it. That
+// premise is FALSE, and the reason it is false is the finding.
+// WHAT WAS BUILT: a second `__global__ obs_kernel<T>(Sim<T> P)` over the
+// same envs, carrying an `ObsState<T>` of exactly the 71 words
+// load_state reads (p/quat/q/v) instead of a Dyn/Solver frame;
+// write_obs's tail deleted from step_kernel for ALL THREE modes; the new
+// kernel launched right after step_kernel on the same stream from the
+// host `step()` wrapper (so the CUDA-graph capture in rollout_graph.py
+// just records a second node — no Python change). 128 threads, no
+// __launch_bounds__, chosen once and not tuned.
+// STEP 1, THE NULL-LAUNCH FLOOR, measured first and it is the one number
+// that came out as hoped: an EMPTY second kernel with the same Sim<T>
+// parameter block costs NOTHING. 5 interleaved rounds, N=4096 f32:
+// incumbent 28,456.0 (28,448.5-28,492.8) vs empty-second-launch
+// 28,475.4 (28,461.7-28,480.0), i.e. +0.07% with fully overlapping
+// ranges. A second launch per step is FREE on this workload — the
+// enqueue hides behind the ~145 us physics kernel. So nothing below is
+// launch overhead.
+// PTXAS, both dtypes, and this is where the premise died:
+//   step_kernel<float>  41,872 B / 0 / 0 / 255 regs -> BYTE-IDENTICAL
+//     (only cmem[2] 340 -> 316 B, the obs normalisation constants
+//     leaving). Removing a ~340-store tail with its own 71-word reload
+//     moved the f32 register allocator by EXACTLY ZERO.
+//   step_kernel<double> 82,912 B / 8 / 8 -> 82,944 B / 0 / 0 (255 regs):
+//     the frame GREW 32 B and the 8-byte spill slot K8 introduced
+//     finally cleared — and it bought nothing measurable (below).
+//   obs_kernel<float>  312 B frame / 0 spills / 107 regs
+//   obs_kernel<double> 616 B frame / 0 spills / 128 regs
+// THE BITWISE HAZARD DID NOT FIRE, which is worth recording on its own:
+// quat_to_rot acquires a new enclosing __global__ here, exactly the
+// K10e2 setup that moved obs lanes 3/5/8 by 1 ulp last time — and nvcc
+// contracted it identically. Max diff EXACTLY 0.0 on f32 AND f64 over
+// 54 arrays, byte-equal: free-running, max_steps=60, want_contacts,
+// 128-env random-gear traffic, plus explicit mode-1 (reset) and mode-2
+// (set_state) obs captures with their state/FK tensors and the steps
+// that follow each. The difference from K10e2 is that K10e2 moved ONE
+// call to a DIFFERENT surrounding expression tree (fk_all's), whereas
+// K19 moves the WHOLE function body intact; contraction is decided
+// within the tree, so relocating the tree wholesale is safe.
+// A/B, N=4096 f32, fresh process per arm, two independent batches:
+//   batch 1  incumbent 28,476.5 (28,471.8-28,485.8)
+//            split     28,397.5 (28,384.8-28,435.8)   -0.28%
+//   batch 2  incumbent 28,489.2 (28,460.6-28,503.5)
+//            split     28,394.4 (28,386.1-28,414.3)   -0.33%
+//   10 of 10 paired rounds lost; both batches non-overlapping in the
+//   WRONG direction. f64 (3 rounds): 16,866.4 -> 16,847.4, -0.11% with
+//   OVERLAPPING ranges = noise, so clearing f64's spill slot was worth
+//   nothing either.
+// THE MECHANISM, and it is the transferable half. The obs writer moves
+// ~5.6 MB per step at N=4096 (340 floats x 4,096 envs of stores, plus
+// the 71-word reload and the note-block gather). Inside step_kernel
+// those stores were issued by warps whose neighbours were still deep in
+// the serial-latency-bound solve, so the traffic was HIDDEN. As its own
+// kernel it has nothing to overlap with: the grid launches after the
+// physics grid has drained and is pure exposed bandwidth. The split
+// therefore converts free traffic into charged traffic and buys nothing
+// back, because the register frame it was supposed to relieve does not
+// move. Same family as A1/1f and K10e1 — a traffic/pressure argument
+// with no dependency-chain shortening — now with a THIRD sign
+// confirmation, and the general rule for this kernel hardens to:
+//   Work that is memory-bound and currently INTERLEAVED with the serial
+//   solve is running for free. Extracting it into its own launch prices
+//   it, and only a real register-allocation win can pay that price —
+//   check the ptxas frame BEFORE assuming the extraction relieves one.
+// (The null-launch floor above does survive as a reusable fact: a
+// second kernel node per step is free, so future items may split work
+// out whenever the SPLIT-OFF WORK ITSELF is what shrinks.)
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
