@@ -6,8 +6,8 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
 
-# bare `cargo check`/`cargo build` otherwise picks the PATH python
-# (3.14, above pyo3 0.22's max supported 3.13) and fails to configure;
-# maturin builds already use the venv interpreter.
-[env]
-PYO3_PYTHON = "D:\\Git\\claude-teaches\\projects\\kiting-arena\\python\\.venv\\Scripts\\python.exe"
+# bare `cargo check`/`cargo build` configures pyo3 against the PATH
+# python; if that interpreter is newer than pyo3 0.22 supports (> 3.13),
+# export PYO3_PYTHON pointing at the venv interpreter. (The Windows box
+# pinned it here — its PATH python was 3.14; maturin builds always use
+# the venv interpreter and never need this.)

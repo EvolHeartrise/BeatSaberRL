@@ -25,7 +25,8 @@ performs ZERO host<->device syncs; episode returns go to a device ring
 buffer drained by pop_stats() once per PPO update.
 
 The extension is built on first use via torch.utils.cpp_extension.load
-(ninja-cached under csrc/build; -arch=sm_61). Windows toolchain quirks
+(ninja-cached under csrc/build; -arch pinned to the current device via
+jit_cache.cuda_flags()). Windows toolchain quirks
 (CUDA_HOME, cl.exe, ninja discovery) are handled in _toolchain_env().
 
 Limits vs BeatVecEnv: no per-step info dicts, no event stream, CUDA only.
@@ -109,7 +110,7 @@ def _load_ext():
     change; a warm cache loads in ~1 s)."""
     global _ext
     if _ext is None:
-        from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
+        from beat_arena_env.jit_cache import arch_list, cuda_flags, fast_load
         src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
         bdir = os.path.join(src, "build")
         os.makedirs(bdir, exist_ok=True)
@@ -117,13 +118,13 @@ def _load_ext():
 
         def _full():
             _toolchain_env()
-            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", arch_list())
             from torch.utils.cpp_extension import load
             return load(name="beat_arena_cuda", sources=srcs,
                         build_directory=bdir,
-                        extra_cuda_cflags=CUDA_FLAGS, verbose=True)
+                        extra_cuda_cflags=cuda_flags(), verbose=True)
 
-        _ext = fast_load("beat_arena_cuda", srcs, bdir, CUDA_FLAGS, _full)
+        _ext = fast_load("beat_arena_cuda", srcs, bdir, cuda_flags(), _full)
     return _ext
 
 

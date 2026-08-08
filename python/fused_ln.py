@@ -28,7 +28,8 @@ def _load():
     if _ext is None and not _ext_failed:
         try:
             import os
-            from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
+            from beat_arena_env.jit_cache import (arch_list, cuda_flags,
+                                                  fast_load)
             src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "beat_arena_env", "csrc")
             bdir = os.path.join(src, "build_ln")
@@ -38,14 +39,14 @@ def _load():
             def _full():
                 from beat_arena_env.cuda_env import _toolchain_env
                 _toolchain_env()
-                os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+                os.environ.setdefault("TORCH_CUDA_ARCH_LIST", arch_list())
                 from torch.utils.cpp_extension import load
                 return load(name="layer_norm_cuda", sources=srcs,
                             build_directory=bdir,
-                            extra_cuda_cflags=CUDA_FLAGS, verbose=True)
+                            extra_cuda_cflags=cuda_flags(), verbose=True)
 
             _ext = fast_load("layer_norm_cuda", srcs, bdir,
-                             CUDA_FLAGS, _full)
+                             cuda_flags(), _full)
         except Exception as e:  # no nvcc / cl / CUDA: stock LN forever
             _ext_failed = True
             print(f"[fused-ln] unavailable, using torch LayerNorm: {e}",

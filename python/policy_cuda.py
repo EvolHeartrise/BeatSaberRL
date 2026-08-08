@@ -43,7 +43,8 @@ are CUDA-graph-capturable.
 
 Built like beat_arena_env/cuda_env.py: torch.utils.cpp_extension.load
 with the same Windows toolchain discovery, ninja-cached under
-csrc/build_policy and csrc/build_policy_bwd, -arch=sm_61.
+csrc/build_policy and csrc/build_policy_bwd, -arch from
+jit_cache.cuda_flags() (the current device's compute capability).
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ _ext_bwd = None
 
 
 def _load_one(name, src_file, build_subdir):
-    from beat_arena_env.jit_cache import CUDA_FLAGS, fast_load
+    from beat_arena_env.jit_cache import arch_list, cuda_flags, fast_load
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "beat_arena_env", "csrc")
     bdir = os.path.join(src, build_subdir)
@@ -90,12 +91,12 @@ def _load_one(name, src_file, build_subdir):
 
     def _full():
         _toolchain_env()
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "6.1")
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", arch_list())
         from torch.utils.cpp_extension import load
         return load(name=name, sources=srcs, build_directory=bdir,
-                    extra_cuda_cflags=CUDA_FLAGS, verbose=True)
+                    extra_cuda_cflags=cuda_flags(), verbose=True)
 
-    return fast_load(name, srcs, bdir, CUDA_FLAGS, _full)
+    return fast_load(name, srcs, bdir, cuda_flags(), _full)
 
 
 def _load_ext():
