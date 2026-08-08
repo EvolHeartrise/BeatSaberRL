@@ -55,6 +55,49 @@
 //! bites WITHIN a task — the PGS axpy's own gain fell from +0.29% to
 //! +0.17% once the weld-null axpys were widened, so probe increments
 //! against the build you will actually ship, not against the baseline.
+//!
+//! R23 (2026-08-07) — DEAD-STORE SWEEP. Net **+2.10%** at N = 256
+//! (22,326 → 22,795 env-steps/s, two ORDER-BALANCED interleaved ABBA
+//! batches, 10/10 paired wins, ranges non-overlapping by ~6x the
+//! within-arm spread) and **−1.6% of the stars-4-5 bench's step_into
+//! wall** (74.3 → 73.1 s over 28,291 group-steps at --limit 300;
+//! 1,470-level record EXACT, wpp 4,483.24 / upp 190,452.80, 0 field
+//! mismatches, 0 pd-floor and 0 envelope hits). Bitwise: max diff
+//! exactly 0.0 over 4.78M recorded words (f64 state + f32 obs, four
+//! trajectory suites). Five audited sites, each gated on its own
+//! measurement — three landed, two are recorded negatives:
+//!   · **R23a** the limit rows' dense Jacobian, cfg-gated (this file):
+//!     **+1.87%** alone (22,051 → 22,464, 6/6 paired wins);
+//!   · **R23c** `jwt`'s permanently-+0.0 column block, NO cfg gate
+//!     because the bytes are identical (this file): **+1.13%** alone
+//!     (22,327 → 22,579, 6/6);
+//!   · **R23e** `rnea`'s `ws.vo` chain (algo.rs): **+0.45%** alone
+//!     (22,330 → 22,430, 6/6);
+//!   · **R23b** the mass matrix's upper triangle (algo.rs) — the
+//!     free-base half ONLY: **+0.28%** on top of the package
+//!     (12 pairs, two order-balanced batches, 10/12 wins);
+//!   · **R23d** (step.rs `ws.sol`) **−0.84%** and **R23f** (`rw`,
+//!     below) **−2.71%**: both REVERTED, both bitwise-clean, both
+//!     documented at their sites.
+//!
+//! TWO NEW RULES, both earned the expensive way (the six-item package
+//! measured **−1.92%** before the per-item pass found the losers):
+//!   1. **A `chol_*` callee wants ONE dedicated, loop-invariant scratch
+//!      buffer.** Deleting a staging copy by handing the solve a
+//!      runtime-offset window into a bigger array (R23d) or a fresh
+//!      stack `[f64; 12]` (R23f) costs 1–3% — an order of magnitude
+//!      more than the 12–35 word copies it removes. What is being
+//!      traded is not traffic but the callee's addressing/aliasing
+//!      regime across a 12×12 or 35×35 solve.
+//!   2. **A dead-store deletion pays only when the address is a
+//!      COMPILE-TIME constant of the loop.** Buying one with a runtime
+//!      min/max select is a wash: R23b's ancestor-loop half, whose
+//!      lower/upper roles are data-dependent, measured −0.18% and was
+//!      dropped while its statically-typed sibling landed.
+//! And R15's ORDER-DEPENDENCE rule earned its keep twice: R23d was
+//! −0.03% (indistinguishable from zero) measured ALONE and −0.84%
+//! against the build that would ship it, while R23a/c/e summed to
+//! +3.45% individually but delivered +1.85% together.
 
 use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
@@ -297,6 +340,27 @@ macro_rules! weld_axpy12 {
 // LLVM cannot fold `0.0 + y` away without `nsz`, which this crate never
 // enables. (Finite trajectories, work-order §10: 0·NaN = 0·∞ = NaN.)
 //
+// R23a (2026-08-07): with all three contractions closed-form, the dense
+// limit ROW ITSELF has no reader left in the shipping build, so it is no
+// longer assembled there. Every consumer of `self.j` at a row ≥ ndense
+// was re-checked at land time:
+//   · `chol_fwd_unit(nv, m, voff+jt, sign, …)` takes the pivot INDEX and
+//     the sign as arguments — it never looks at `j`;
+//   · the effective mass and the post-projection `dnew` are the R10
+//     closed forms `0.0 + sign·minvjt[row·nv + voff+jt]`;
+//   · the PGS residual is `0.0 + sign·v[voff+jt]`;
+//   · `jv_pre` is `cfg(any(test, feature = "introspect"))`;
+//   · `row_j` / `limit_dot_ref_vs_closed` are `cfg(test)`;
+//   · `pub fn jv` has exactly one caller, tests_constraints.rs.
+// The `self.minvjt[nweld·nv..ndense·nv] ← self.j` seed and the two
+// `for row in 0..ndense` loops stop at ndense by construction, so no
+// dense-row consumer can reach a limit row. `LIMIT_J_ROWS` keeps the
+// assembly for `cargo test`, `--features introspect` and debug builds —
+// the same idiom (and the same three cfgs) as `DIAG_ALL_ROWS` below.
+// Worth `nlim × (nv + 1)` stores per substep, i.e. ~270 under the
+// random-gear micro and ~565 under bench traffic (R26: nlim mean 15.73).
+const LIMIT_J_ROWS: bool = cfg!(any(test, feature = "introspect", debug_assertions));
+
 // MEASURED +5.4% at N = 256 (20,123 → 21,215 env-steps/s, pooled median
 // of six interleaved A/B pairs) and −9.8% of bench wall (440.5 → 397.4 s
 // on stars 4–5, two runs each, spread under 1 s on both sides). The gap
@@ -333,6 +397,14 @@ pub struct ConstraintSet {
     /// `cargo test` and `--features introspect` keep it.
     #[cfg(any(test, feature = "introspect"))]
     pub jv_pre: Vec<f64>,
+    /// TEST HOOK (R23a): when set, every assembled LIMIT row of `j` is
+    /// overwritten with NaN as soon as the assembly loop finishes —
+    /// which is exactly the state the SHIPPING build leaves them in
+    /// (never written at all, so holding whatever the buffer held).
+    /// A trajectory that is bit-identical with this on proves the
+    /// shipping build has no reader for them.
+    #[cfg(test)]
+    pub poison_limit_j: bool,
     nv: usize,
     j: Vec<f64>,      // MAX_ROWS × nv dense Jacobian rows
     minvjt: Vec<f64>, // MAX_ROWS × nv  M⁻¹Jᵀ columns
@@ -340,7 +412,28 @@ pub struct ConstraintSet {
     // weld-block exact solve (Divergences §15): A_ww = J_w M⁻¹ J_wᵀ
     aww: Vec<f64>, // 12×12
     lww: Vec<f64>, // its Cholesky factor
-    rw: Vec<f64>,  // block residual / solve scratch (12)
+    // block residual / solve scratch (12).
+    //
+    // R23f REVERTED (2026-08-07, the round's largest measured negative).
+    // All three A_ww solves round-trip a 12-vector through this heap
+    // buffer (`s` → `rw` → `chol_solve` → `x`); replacing it with a
+    // `[f64; 12]` STACK array at every site — compile-time length, two
+    // 12-word copies fewer per application, bitwise-identical — measured
+    // **−2.71%** at N = 256 (22,323 → 21,717 env-steps/s, 3 interleaved
+    // ABBA rounds, 6/6 paired losses, ranges completely non-overlapping).
+    //
+    // THE RULE, and it also killed R23d: on this CPU a `chol_*` callee
+    // wants ONE dedicated, loop-invariant scratch buffer. `&mut self.rw`
+    // hands it a slice whose base pointer is fixed for the whole substep
+    // and whose allocation nothing else in the solve touches; `&mut x`
+    // on a fresh stack array forces the address to escape into the
+    // callee on every one of the 12 PGS iterations, so the frame slot is
+    // re-established and the solve's accesses can no longer be hoisted
+    // the same way. The copies the transform deletes are 24 L1 hits; the
+    // aliasing/addressing regime it disturbs is the whole 12×12 solve.
+    // Do not retry without an aliasing argument (e.g. `#[inline]`ing the
+    // solve so the array never escapes).
+    rw: Vec<f64>,
     // ω-cap pass caches: weld-consistent M⁻¹e_j columns, lazily solved
     capcol: Vec<f64>,     // nq × nv
     capmass: Vec<f64>,    // nq: e_jᵀ·capcol_j (composite effective mobility)
@@ -395,6 +488,8 @@ impl ConstraintSet {
             bias: vec![0.0; MAX_ROWS],
             #[cfg(any(test, feature = "introspect"))]
             jv_pre: vec![0.0; MAX_ROWS],
+            #[cfg(test)]
+            poison_limit_j: false,
             nv,
             j: vec![0.0; MAX_ROWS * nv],
             minvjt: vec![0.0; MAX_ROWS * nv],
@@ -469,6 +564,11 @@ impl ConstraintSet {
     }
 
     /// J·v of an assembled row (post-solve introspection).
+    ///
+    /// R23a: valid for a LIMIT row only when `LIMIT_J_ROWS` holds
+    /// (test / `introspect` / debug builds) — the shipping build no
+    /// longer assembles those rows, so `self.j` holds stale words there.
+    /// The only caller is `tests_constraints`.
     pub fn jv(&self, row: usize, v: &[f64]) -> f64 {
         let jr = &self.j[row * self.nv..(row + 1) * self.nv];
         let mut s = 0.0;
@@ -491,6 +591,19 @@ impl ConstraintSet {
     #[cfg(test)]
     pub fn weld_jwt(&self) -> &[f64] {
         &self.jwt[..N_WELD_ROWS * self.nv]
+    }
+
+    /// TEST HOOK (R23c): the half-open column range `W_BASE_HI..W_L_LO`
+    /// that R9's support argument makes permanently +0.0 in all twelve
+    /// weld rows — the block the transpose loop no longer stores into
+    /// `jwt`.
+    #[cfg(test)]
+    pub const WELD_DEAD_COLS: (usize, usize) = (W_BASE_HI, W_L_LO);
+
+    /// TEST HOOK (R23c): that block of the LIVE `jwt`, as stored.
+    #[cfg(test)]
+    pub fn weld_jwt_dead_block(&self) -> &[f64] {
+        &self.jwt[W_BASE_HI * N_WELD_ROWS..W_L_LO * N_WELD_ROWS]
     }
 
     /// TEST HOOK (R9): the dense-vs-segmented 12-lane dot, run on the
@@ -702,9 +815,15 @@ impl ConstraintSet {
             };
             if gap < reach {
                 let row = nrows;
-                let jr = &mut self.j[row * nv..(row + 1) * nv];
-                jr.fill(0.0);
-                jr[voff + j] = sign;
+                // R23a: the dense row is introspection-only — see the
+                // `LIMIT_J_ROWS` note above. `cfg!` is a compile-time
+                // constant, so the shipping build drops the fill+store
+                // outright.
+                if LIMIT_J_ROWS {
+                    let jr = &mut self.j[row * nv..(row + 1) * nv];
+                    jr.fill(0.0);
+                    jr[voff + j] = sign;
+                }
                 self.bias[row] = if gap >= 0.0 {
                     -gap * hinv
                 } else {
@@ -718,6 +837,14 @@ impl ConstraintSet {
             }
         }
         self.nrows = nrows;
+
+        // R23a TEST HOOK: emulate the shipping build, where the limit
+        // rows of `j` are never assembled and hold arbitrary words.
+        #[cfg(test)]
+        if self.poison_limit_j {
+            let nd = self.weld_rows() + self.contacts.len();
+            self.j[nd * nv..nrows * nv].fill(f64::NAN);
+        }
 
         // R26 (feature "stats"): the two assembled row counts this
         // substep — measured HERE, after both assembly loops, so the
@@ -771,14 +898,34 @@ impl ConstraintSet {
                 // R13: `wt` is only the solve's scratch copy of `jwt`,
                 // so both land from ONE load of `jr[i]` — the separate
                 // 420-word `jwt -> wt` copy is gone.
+                // R23c: `jwt` rows W_BASE_HI..W_L_LO (columns 6..23) are
+                // +0.0 in ALL TWELVE weld rows — that is the R9 support
+                // argument, and it holds for every solve — so the 204
+                // words they occupy are already the exact `+0.0` bytes
+                // this loop would re-store. `jwt` is written NOWHERE else
+                // and is zero-initialised at construction, so skipping
+                // them leaves identical BYTES, not merely identical
+                // values: no cfg gate is needed and the `weld_jwt` test
+                // hook still sees the true Jacobian.
+                // `wt` is NOT skippable — `back_t` reuses it as scratch
+                // at widths 8/4 and leaves a differently-shaped payload
+                // in the first 8·nv words — but its skipped block is one
+                // contiguous 204-word run, so it becomes a memset.
                 for r in 0..N_WELD_ROWS {
                     let jr = &self.j[r * nv..(r + 1) * nv];
-                    for i in 0..nv {
+                    for i in 0..W_BASE_HI {
+                        let x = jr[i];
+                        self.jwt[i * N_WELD_ROWS + r] = x;
+                        self.wt[i * N_WELD_ROWS + r] = x;
+                    }
+                    for i in W_L_LO..W_R_HI {
                         let x = jr[i];
                         self.jwt[i * N_WELD_ROWS + r] = x;
                         self.wt[i * N_WELD_ROWS + r] = x;
                     }
                 }
+                self.wt[W_BASE_HI * N_WELD_ROWS..W_L_LO * N_WELD_ROWS]
+                    .fill(0.0);
                 chol_solve_t::<N_WELD_ROWS>(nv, &ws.m, &mut self.wt[..N_WELD_ROWS * nv]);
                 for r in 0..N_WELD_ROWS {
                     let mr = &mut self.minvjt[r * nv..(r + 1) * nv];

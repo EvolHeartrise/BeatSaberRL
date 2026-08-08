@@ -9,6 +9,30 @@
 //!
 //! Straightforward loops, fixed evaluation order — the torch/CUDA
 //! mirrors replicate these expression trees literally.
+//!
+//! R23 (2026-08-07) — this file carries two of the dead-store sweep's
+//! three landed items; the round's headline numbers, both new rules and
+//! the two recorded negatives live in the solver.rs header.
+//!   · **R23b** (`crba`): the mass matrix's STRICT UPPER triangle has no
+//!     reader in the shipping build, so the mirror stores are compiled
+//!     out — but only where the lower/upper roles are COMPILE-TIME
+//!     known (the free-base coupling rows and the root skew block, 183
+//!     of ~300 entries). **+0.28%** on top of the package. The
+//!     ancestor-loop half needs a runtime min/max select because `coord`
+//!     is not monotone in frame index; that form measured −0.18% and is
+//!     NOT shipped — see the note at the site.
+//!   · **R23e** (`rnea`): the frame-origin VELOCITY chain is not
+//!     propagated or stored any more. The force/moment block uses
+//!     ao/om/al only, and `ws.vo`'s two real consumers (`momentum`,
+//!     `energy`) each rebuild the chain in their own topological loop.
+//!     **+0.45%** measured alone (22,330 → 22,430 env-steps/s at
+//!     N = 256, 3 interleaved ABBA rounds, 6/6 paired wins,
+//!     non-overlapping).
+//! Both are gated by `tests_constraints::r23_dead_regions_have_no_reader`,
+//! which NaN-poisons each region and requires the trajectory back bit
+//! for bit (the R13 `poison_weld_scratch` idiom); all four poisonings
+//! were confirmed to BITE against deliberately reintroduced readers
+//! before the items landed.
 
 use super::fk::{add3, cross3, dot3, mat_vec, scale3, sub3, Mat3};
 use super::model::Model;
@@ -59,11 +83,33 @@ fn mat_add(a: &mut Mat3, b: &Mat3) {
     }
 }
 
+/// R23b (2026-08-07): CRBA's STRICT UPPER triangle of `ws.m` has no
+/// reader in the shipping build, so the mirror stores are compiled out
+/// of it. The only consumer of the mass matrix is the in-place
+/// factorization two lines later in `step::substep_opts`, and
+/// `chol_factor_floored_inplace` touches `a[j·n+j]` (diagonal),
+/// `a[j·n..j·n+j]` (row j below the diagonal) and `a[i·n..i·n+j]` with
+/// i > j — lower and diagonal ONLY; its own header note already states
+/// this (it is why the strict upper triangle stopped being zeroed in
+/// 2026-08-03). After the factor, `ws.m` holds L and every `chol_*`
+/// reader is likewise lower-only. The harness implicit-damping pass
+/// touches diagonal entries alone.
+///
+/// `MIRROR_M_UPPER` keeps the mirrors for `cargo test` /
+/// `--features introspect` / debug builds, so tests_dyn's BITWISE
+/// M-symmetry test still has both triangles to compare. Same cfg set
+/// (and same reasoning) as solver.rs's `DIAG_ALL_ROWS` / `LIMIT_J_ROWS`.
+/// Worth ~300 stores per substep: 117 ancestor entries, 174 free-base
+/// coupling entries, 9 in the root skew block.
+const MIRROR_M_UPPER: bool = cfg!(any(test, feature = "introspect", debug_assertions));
+
 /// CRBA: fills ws.m (nv×nv, row-major) from the FK in ws. Composite
 /// rigid bodies accumulated leaf→root; column j of M = the generalized
 /// momentum produced by unit rate of coordinate j (moment of momentum
 /// about each ancestor pivot along its axis). Both triangles written
-/// from the same value — M is symmetric BITWISE by construction.
+/// from the same value — M is symmetric BITWISE by construction (and
+/// bitwise symmetric is what the LOWER triangle alone would be, so
+/// R23b's gated mirrors do not weaken the property; see above).
 pub fn crba(model: &Model, ws: &mut Workspace) {
     let nf = model.frames.len();
     let nv = model.nv();
@@ -122,6 +168,23 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
                         ws.axw[anc as usize],
                         add3(ha, cross3(sub3(c, ws.p[anc as usize]), hl)),
                     );
+                    // R23b DELIBERATELY DOES NOT GATE THIS PAIR, and the
+                    // reason is a rule: `coord` is NOT monotone in frame
+                    // index (the arm stacks put the yaw frame's HIGHER
+                    // coord above the pitch frame's), so which of these
+                    // two entries is the lower triangle is a RUNTIME
+                    // question. The gated form
+                    //   let (lr, lc) = if ia < j { (j, ia) } else { (ia, j) };
+                    //   ws.m[lr*nv+lc] = val;
+                    //   if MIRROR_M_UPPER { ws.m[lc*nv+lr] = val; }
+                    // was built and measured: **−0.18%** against the
+                    // shipping build (22,772 → 22,731 env-steps/s at
+                    // N = 256, 3 interleaved ABBA rounds, 4/6 paired
+                    // losses, ranges overlapping) — the compare + two
+                    // index selects cost about what the 117 removed
+                    // stores save. A dead-store deletion pays only when
+                    // the address is a COMPILE-TIME constant of the loop;
+                    // buying it with a runtime select is a wash.
                     ws.m[ia * nv + j] = val;
                     ws.m[j * nv + ia] = val;
                 }
@@ -130,12 +193,19 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
             if model.free_base {
                 // root rows: translation conjugate = h_lin, rotation
                 // conjugate = moment of momentum about the root origin
-                let lr = add3(ha, cross3(sub3(c, ws.p0), hl));
+                let lrow = add3(ha, cross3(sub3(c, ws.p0), hl));
+                // R23b: rows t and 3+t are free-base rows (< voff ≤ j),
+                // so `m[t·nv+j]` / `m[(3+t)·nv+j]` are statically the
+                // STRICT UPPER copies.
                 for t in 0..3 {
-                    ws.m[t * nv + j] = hl[t];
                     ws.m[j * nv + t] = hl[t];
-                    ws.m[(3 + t) * nv + j] = lr[t];
-                    ws.m[j * nv + (3 + t)] = lr[t];
+                    ws.m[j * nv + (3 + t)] = lrow[t];
+                }
+                if MIRROR_M_UPPER {
+                    for t in 0..3 {
+                        ws.m[t * nv + j] = hl[t];
+                        ws.m[(3 + t) * nv + j] = lrow[t];
+                    }
                 }
             }
         }
@@ -178,9 +248,15 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
         let d = sub3(bc, ws.p0);
         let mut rr = bi;
         add_shift(&mut rr, bm, d);
+        // R23b: the translation block is bm·I3 — its six off-diagonal
+        // entries are still the `fill(0.0)` at the top of this function
+        // (nothing between writes rows/cols 0..3 at cols/rows 0..3), so
+        // storing 0.0 over them was dead in BOTH triangles.
+        for i in 0..3 {
+            ws.m[i * nv + i] = bm;
+        }
         for i in 0..3 {
             for j in 0..3 {
-                ws.m[i * nv + j] = if i == j { bm } else { 0.0 };
                 ws.m[(3 + i) * nv + (3 + j)] = rr[i][j];
             }
         }
@@ -189,11 +265,26 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
             [d[2], 0.0, -d[0]],
             [-d[1], d[0], 0.0],
         ];
+        // rows 3+i are strictly below columns j < 3, so the first store
+        // is the lower copy and the second the R23b mirror.
         for i in 0..3 {
             for j in 0..3 {
                 let val = bm * sk[i][j];
                 ws.m[(3 + i) * nv + j] = val;
-                ws.m[j * nv + (3 + i)] = val;
+                if MIRROR_M_UPPER {
+                    ws.m[j * nv + (3 + i)] = val;
+                }
+            }
+        }
+    }
+
+    // R23b TEST HOOK: emulate the shipping build, where the strict upper
+    // triangle carries no CRBA output at all.
+    #[cfg(test)]
+    if ws.poison_m_upper {
+        for r in 0..nv {
+            for c in (r + 1)..nv {
+                ws.m[r * nv + c] = f64::NAN;
             }
         }
     }
@@ -213,30 +304,41 @@ pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
     debug_assert!(acc.map_or(true, |a| a.len() == nv));
     let a_of = |i: usize| acc.map_or(0.0, |a| a[i]);
 
-    // base kinematics: material point at the root origin
-    let (om0, al0, vo0, ao0) = if model.free_base {
+    // base kinematics: material point at the root origin.
+    //
+    // R23e (2026-08-07): RNEA does NOT propagate the frame-origin
+    // VELOCITY chain any more. Nothing downstream of the forward pass
+    // reads it — the per-body force/moment block below uses `ao`, `om`
+    // and `al` only, and the backward pass reads `ws.f` / `ws.n` /
+    // `ws.axw` — while `ws.vo`'s two real consumers, `momentum` and
+    // `energy`, each recompute the whole chain in their OWN topological
+    // loop (they write `ws.vo[k]` from `ws.vo[parent]` in ascending k,
+    // seeded from the base, so they never observe what RNEA left there).
+    // `ws.vo` is kept as a field for exactly those two.
+    // Sizing: `cross3(oml, d)` is common to `vo` and `ao`'s inner cross
+    // and was CSE'd already, so what goes is the `add3`, the 30 three-
+    // word stores and the 30 parent loads, not the cross product.
+    let (om0, al0, ao0) = if model.free_base {
         (
             [v[3], v[4], v[5]],
             [a_of(3), a_of(4), a_of(5)],
-            [v[0], v[1], v[2]],
             [a_of(0), a_of(1), a_of(2)],
         )
     } else {
-        ([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3])
+        ([0.0; 3], [0.0; 3], [0.0; 3])
     };
 
     // forward pass: velocities + accelerations, then per-body inertial
     // force F (about COM) and moment n (about the frame origin)
     for k in 0..nf {
         let fr = &model.frames[k];
-        let (oml, all, vol, aol, ol) = if fr.parent < 0 {
-            (om0, al0, vo0, ao0, ws.p0)
+        let (oml, all, aol, ol) = if fr.parent < 0 {
+            (om0, al0, ao0, ws.p0)
         } else {
             let pk = fr.parent as usize;
-            (ws.om[pk], ws.al[pk], ws.vo[pk], ws.ao[pk], ws.p[pk])
+            (ws.om[pk], ws.al[pk], ws.ao[pk], ws.p[pk])
         };
         let d = sub3(ws.p[k], ol);
-        let vo = add3(vol, cross3(oml, d));
         let ao = add3(
             add3(aol, cross3(all, d)),
             cross3(oml, cross3(oml, d)),
@@ -254,7 +356,6 @@ pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
         };
         ws.om[k] = om;
         ws.al[k] = al;
-        ws.vo[k] = vo;
         ws.ao[k] = ao;
         if fr.mass > 0.0 {
             let e = mat_vec(&ws.r[k], fr.com); // com − origin
