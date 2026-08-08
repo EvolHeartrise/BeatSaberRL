@@ -120,6 +120,14 @@ def main():
     ap.add_argument("--mbs", type=int, nargs="+", default=[16384, 32768])
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--fp16", action="store_true",
+                    help="production config: fp16 forward/backward via the "
+                         "flat replica path + fused Adam (2026-08-08: "
+                         "without this the bench measured an fp32/foreach "
+                         "configuration no production driver runs)")
+    ap.add_argument("--ncopies", type=int, default=2,
+                    help="FusedPolicyTrainer grad-stripe copies (2 was "
+                         "measured optimal on the GTX 1080)")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -144,12 +152,17 @@ def main():
         data = make_minibatch(n, device, src.n_gears)
 
         pol_e = fresh_policy(src, device)
-        opt_e = torch.optim.Adam(pol_e.parameters(), lr=LR)
+        if args.fp16:                    # mirror train_batch.py order:
+            pol_e.fp16 = True            # flatten BEFORE the optimizer is
+            pol_e.flatten_fp16()         # built (p.data pointers move once)
+        opt_e = torch.optim.Adam(pol_e.parameters(), lr=LR,
+                                 fused=args.fp16 or None)
         t_eager = bench(lambda: eager_update(pol_e, opt_e, *data),
                         args.iters, args.reps)
         mem_eager = peak_mem_mb(lambda: eager_update(pol_e, opt_e, *data))
 
-        tr = FusedPolicyTrainer(fresh_policy(src, device))
+        tr = FusedPolicyTrainer(fresh_policy(src, device),
+                                ncopies=args.ncopies)
         opt_f = torch.optim.Adam(tr.parameters(), lr=LR)
         t_fused = bench(lambda: fused_update(tr, opt_f, *data),
                         args.iters, args.reps)

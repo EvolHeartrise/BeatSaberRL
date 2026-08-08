@@ -461,7 +461,7 @@ std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
   auto rstd = at::empty({rows}, x.options().dtype(at::kFloat));
   if (rows == 0) return {y, mean, rstd};
   if (x.scalar_type() == at::kFloat) {
-    ln_fwd_kernel<<<grid_for(rows, 4096), THREADS, 0,
+    ln_fwd_kernel<<<grid_for(rows, 1024), THREADS, 0,
                     at::cuda::getCurrentCUDAStream()>>>(
         x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(),
         y.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
@@ -470,7 +470,7 @@ std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
     TORCH_CHECK(half_ok(x, d), "half path: even d, 4B-aligned");
     const int d2 = d / 2;
     auto launch = [&](auto kernel) {
-      kernel<<<grid_for(rows, 4096), THREADS, 0,
+      kernel<<<grid_for(rows, 1024), THREADS, 0,
                at::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<const __half2*>(x.data_ptr<at::Half>()),
           reinterpret_cast<const float2*>(w.data_ptr<float>()),
@@ -519,7 +519,7 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
   auto rstd = at::empty({rows}, a.options().dtype(at::kFloat));
   if (rows == 0) return {x, y, mean, rstd};
   if (a.scalar_type() == at::kFloat) {
-    ln_fwd_add_kernel<<<grid_for(rows, 4096), THREADS, 0,
+    ln_fwd_add_kernel<<<grid_for(rows, 1024), THREADS, 0,
                         at::cuda::getCurrentCUDAStream()>>>(
         a.data_ptr<float>(), b.data_ptr<float>(), w.data_ptr<float>(),
         bias.data_ptr<float>(), x.data_ptr<float>(), y.data_ptr<float>(),
@@ -530,7 +530,7 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
                 "half path: even d, 4B-aligned");
     const int d2 = d / 2;
     auto launch = [&](auto kernel) {
-      kernel<<<grid_for(rows, 4096), THREADS, 0,
+      kernel<<<grid_for(rows, 1024), THREADS, 0,
                at::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<const __half2*>(a.data_ptr<at::Half>()),
           reinterpret_cast<const __half2*>(b.data_ptr<at::Half>()),
@@ -575,6 +575,10 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
   // fixed-size fp32 partials + deterministic torch sum: bit-reproducible
   // gradients (no cross-block float atomics); dw/db land in fp32 and
   // feed the fp32 LN leaves with no cast
+  // cap 1024 probed at 2048/4096 on the RTX 4090 (2026-08-08, 3 ABAB
+  // pairs, bench_policy_update --fp16 mb=16384): NOISE — 1/3 paired
+  // wins, ranges overlap. The grid-stride loop hides the block count on
+  // 128 SMs just as it did on 20. Left at 1024.
   const int blocks = std::max(grid_for(rows, 1024), 1);
   auto pdw = at::empty({blocks, d}, x.options().dtype(at::kFloat));
   auto pdb = at::empty({blocks, d}, x.options().dtype(at::kFloat));
