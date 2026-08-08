@@ -107,8 +107,12 @@ def main():
         table["final"] = res
         print(f"[final] upp {res['upp']:,.0f} / wpp {res['wpp']:,.2f} / "
               f"FCs {res['fcs']} / acc {res['acc']:.4f}", flush=True)
-    for c in sorted(glob.glob(os.path.join(RUN_DIR, "ckpt_upd*.pt")),
-                    key=lambda p: int(re.search(r"upd(\d+)", p).group(1))):
+    # bench the LAST 3 numbered checkpoints only (user decision
+    # 2026-08-08: 4 bench points total incl. final — the late curve is
+    # the question; the early trajectory isn't worth 11 x 8 min of CPU)
+    numbered = sorted(glob.glob(os.path.join(RUN_DIR, "ckpt_upd*.pt")),
+                      key=lambda p: int(re.search(r"upd(\d+)", p).group(1)))
+    for c in numbered[-3:]:
         name = os.path.basename(c)[:-3]
         rr = bench(c, os.path.join("bench", f"v10_cshape_2h_{name}.json"))
         if rr is None:
