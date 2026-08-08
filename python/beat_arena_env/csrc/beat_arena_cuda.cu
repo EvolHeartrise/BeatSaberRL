@@ -594,6 +594,99 @@ constexpr int NOTE_FEAT = 14;
 // second kernel node per step is free, so future items may split work
 // out whenever the SPLIT-OFF WORK ITSELF is what shrinks.)
 //
+// K13 (2026-08-07) — FUSE THE PGS LIMIT-ROW AXPYS: BUILT, FULLY GATED
+// AND REJECTED at -2.18% (4-wide) and -0.70% (2-wide). DO NOT RE-TRY IT
+// IN THIS FORM. The arithmetic argument was right and the code is not
+// what lost; what lost is a SIMT effect this file had not yet met, and
+// it retires an idiom the round had been treating as free.
+// WHAT WAS BUILT, exactly as the audit specified. A limit row's coupling
+// into v is ONE component (J = sign * e_j) but its update is a full
+// NV-wide axpy, so for a group of <=4 consecutive rows: phase 1 runs the
+// scalar l_lam/newl/dd chain on 4 LOCAL copies of v[VOFF + j_t],
+// cross-updating only those 4 indices as each dd becomes known; phase 2
+// makes ONE sweep over i applying the group's columns in ascending row
+// order. 280 -> 175 loads and 140 -> 35 stores per 4 rows per PGS
+// iteration, and row t+1's read of v[VOFF + j_{t+1}] stops being a
+// local store -> load round trip through a dynamic address. Active rows
+// were packed with a `k == na` test inside an unrolled loop (so pc[]/
+// sd[] stay STATICALLY indexed) and dispatched into compile-time-width
+// 4/3/2/1 sweeps — the K14 trip-count rule honoured throughout — with a
+// dd == 0 row GENUINELY SKIPPED (never entered into the pack; no *0.0,
+// which is not the identity when v[i] is the opposite zero).
+// EVERY GATE PASSED EXCEPT THE LAST, in both variants:
+//   ptxas f32 41,872 B / 0 / 0 and 254 regs (frame byte-identical, one
+//     register BELOW the incumbent's 255 — the cliff did not move);
+//     f64 82,912 B / 8 / 8 / 255 byte-identical (4-wide), 82,896 B in
+//     the 2-wide. So the spill warning the task was written around
+//     never fired, in either dtype.
+//   bitwise old-vs-new max diff EXACTLY 0.0, f32 AND f64, all arrays
+//     byte-equal, over FIVE configs: free-running, max_steps=60, the
+//     128-env random-gear traffic, and TWO NEW LIMIT-HEAVY configs
+//     added because the random-gear micro under-hits this exact block
+//     (measured nl per env-tick: random gear mean 7.54 / max 17;
+//     "stopjam", every joint driven onto its upper stop, mean 20.12 /
+//     median 21 / max 23; "altstop", half the joints jammed each way
+//     and flipped every 40 ticks, mean 14.29). stopjam fires the 4-wide
+//     tier ~5x per PGS iteration and covers every remainder tier. Both
+//     were proven deterministic (two dumps of the same build, byte
+//     equal) before being used as an A/B instrument.
+//   pytest 172 green.
+//   A/B, N=4096, fresh process per arm, 5 interleaved rounds each:
+//     incumbent  28,490.3 (28,460.1 - 28,503.2)
+//     4-wide     27,870.1 (27,859.5 - 27,902.9)   -2.18%   5/5 losses
+//     incumbent  28,472.0 (28,453.3 - 28,495.1)
+//     2-wide     28,272.5 (28,255.2 - 28,288.8)   -0.70%   5/5 losses
+//     f64 (2 rounds, 4-wide) 16,908.2 -> 16,698.6 -1.24%
+//   All ranges non-overlapping in the WRONG direction.
+// THE MECHANISM — A WIDTH LADDER SELECTED BY A PER-LANE DATA-DEPENDENT
+// COUNT COSTS THE UNION OF ITS WIDTHS, NOT THE ONE IT PICKS. This is
+// one thread per env, so 32 envs share a warp and `na` (how many of the
+// group's rows had dd != 0) is a per-LANE value. The warp must execute
+// every arm any lane needs: with na = 1..4 all present across 32 envs —
+// which is the norm — the 4-wide ladder runs sweep<4> AND <3> AND <2>
+// AND <1>, i.e. 4+3+2+1 = 10 column-sweeps of 35 where the scalar form
+// ran 4. The scalar form's `if (dd != 0)` guard has ONE arm, so
+// divergence there costs its single 35-wide block no matter how the
+// lanes disagree. Predicted excess per row: 6 sweeps / 4 rows = 1.5 for
+// the 4-wide vs 1 sweep / 2 rows = 0.5 for the 2-wide, a ratio of 3.0;
+// MEASURED ratio of the losses 2.18 / 0.70 = 3.1. That quantitative
+// agreement is the first evidence, and the width ordering (deeper
+// ladder = bigger loss) is the same monotone-form signature K14 found.
+// THE CONFIRMING EXPERIMENT, and it is decisive: rerun the SAME 4-wide
+// .pyd against WARP-UNIFORM traffic (chart_pool = 1 and one action row
+// broadcast to all envs, verified all-lanes-identical q and v), so that
+// na is warp-uniform and the ladder cannot diverge. 4 interleaved
+// rounds, N=4096 f32: incumbent 100,020.7 (99,883.6 - 100,277.4) vs
+// 4-wide 102,280.4 (102,239.5 - 102,461.2) = +2.26%, 4/4 paired WINS,
+// non-overlapping. The transform's latency/traffic gain is REAL and
+// roughly the size the audit predicted; on production traffic the
+// divergence tax simply exceeds it. Same code, opposite sign, and the
+// only thing changed was whether the lanes agree.
+// THE RULE, which now qualifies the 4/2/1 ladder idiom K6/K7 made
+// standard here: a compile-time-width ladder is free only when its
+// SELECTOR IS WARP-UNIFORM (or when the widths dispatch work that is
+// large compared with the union's excess). ensure_pcol's ladder is
+// keyed on s.nl and runs a handful of times per substep against a 12x12
+// solve; this one was keyed on a data-dependent per-lane count and ran
+// 96 times per tick around 35 FMAs. Before packing a variable count
+// into width tiers, ask what fraction of a warp shares the count.
+// TRAFFIC WEIGHTING MAKES IT WORSE, NOT BETTER (R10's rule, R26's
+// numbers): the random-gear micro under-represents limit work about 2x
+// (nl 7.54 here vs 15.7 on bench traffic, since trained policies park
+// joints on stops), so the micro is a LOWER BOUND on the magnitude of a
+// limit-row effect — and this effect is negative, i.e. the bench verdict
+// is worse than -2.18%. The K18(i)/K17-pja frequency rule with the sign
+// reversed: a hot block amplifies a bad transform too.
+// THE OTHER FACT THE UNIFORM PROBE TURNED UP, unrelated to K13 and worth
+// its own line: the SAME kernel runs 100,021 env-steps/s on identical
+// envs versus 28,490 on the production random-gear traffic — 3.5x. That
+// is not a K13 result (it is the whole kernel, all blocks), but it puts
+// a number on how much of this kernel's cost is warp divergence, and it
+// is the largest single lever anyone has measured on this file. No
+// production traffic is uniform, so it is not directly harvestable, but
+// items that REDUCE divergence (rather than adding a ladder) now have a
+// measured ceiling to aim at.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -3249,6 +3342,14 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
     // (c) limit rows, joint order (J = sign * e_j: exact-zero terms
     // dropped — Divergences §20c sign-of-zero class)
+    // These axpys are DELIBERATELY NOT FUSED across the limit-row group.
+    // K13 built exactly that (phase-1 scalar chain on 4 local v
+    // components, one shared sweep over i, active rows packed into
+    // compile-time 4/3/2/1 widths): bitwise 0.0, no spill, 254 regs —
+    // and -2.18% / -0.70%, because `na` is a per-LANE count and the warp
+    // pays the UNION of the ladder's widths. The same .pyd is +2.26% on
+    // warp-uniform traffic. Read the K13 block in the header before
+    // touching this loop.
     for (int li = 0; li < s.nl; li++) {
       const int j = s.l_j[li];
       const T jv = s.l_sign[li] * v[VOFF + j];
