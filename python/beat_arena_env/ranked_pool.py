@@ -117,7 +117,30 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     if not os.path.exists(cpath):
         from .cuda_env import _charts_to_tensors
         segs = _build_segments(seg_len, catalog, log)
-        pool = _charts_to_tensors(segs, "cpu", dtype)
+        # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
+        # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
+        # arrays + the f32 outputs simultaneously (~5.5 GB at 46k
+        # segments — OOM-killed a 14 GB laptop). Chunks pad to the
+        # global C (pad_to) so per-field concatenation is byte-identical
+        # to the whole-pool call; each chunk's Notes are released as it
+        # is consumed.
+        cmax = max((len(s) for s in segs), default=1)
+        parts = []
+        chunk = 2048
+        for lo in range(0, len(segs), chunk):
+            ch = segs[lo:lo + chunk]
+            segs[lo:lo + chunk] = [None] * len(ch)
+            parts.append(_charts_to_tensors(ch, "cpu", dtype, pad_to=cmax))
+            del ch
+        del segs
+        if not parts:                    # empty catalog: (0, 1) pool
+            parts = [_charts_to_tensors([], "cpu", dtype)]
+        pool = {}
+        for k in list(parts[0]):
+            pool[k] = torch.cat([p[k] for p in parts])
+            for p in parts:
+                del p[k]
+        del parts
         np.savez(cpath, **{k: v.numpy() for k, v in pool.items()})
         log(f"[ranked-pool] cached -> {os.path.basename(cpath)}",
             flush=True)
