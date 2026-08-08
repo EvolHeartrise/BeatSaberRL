@@ -775,6 +775,115 @@ constexpr int NOTE_FEAT = 14;
 // SMALL relative to the frame (K17's tables live in global memory and
 // cost the frame nothing, which is why that one paid).
 //
+// K20 + K16 (2026-08-07) — THE HOUSEKEEPING BUNDLE, and the round's
+// biggest surprise-to-effort ratio. Two of the three K20 items landed
+// for +2.08% together; the third is DEAD ON ITS PREMISE; K16 is dead on
+// its measurement. Package, 5 interleaved A/B rounds N=4096 f32, fresh
+// process per arm: 28,932.0 (28,923.7 - 28,945.3) -> 29,532.5
+// (29,524.2 - 29,535.3), +2.08%, 5/5 paired wins, non-overlapping by
+// ~25x the within-arm spread.
+//
+// K20-1 ensure_pcol COPY -> RE-READ ELIMINATION: +1.96%, and the audit
+// priced it at 0.2%. ensure_pcol used to COPY the plain column into the
+// projected one (col[i] = s.ecol[j][i], fused into the dot pass plus a
+// copy-only range over VOFF..WJ_L0) and then the projection loop re-read
+// col[i] as its seed. The projection now reads s.ecol[j][i] DIRECTLY and
+// writes col[i] only as its OUTPUT, so the copy disappears entirely —
+// both in the scalar body and in K7's ensure_pcol_multi<B>.
+// BITWISE by inspection and gated at max diff EXACTLY 0.0 on f32 AND f64
+// across all five configs (free-running want_contacts, max_steps=60,
+// 128-env random-gear, stopjam, altstop), all 10 arrays byte-equal:
+// col[i] was set to EXACTLY s.ecol[j][i] over the whole 0..NV-1 range
+// (the four segments tile it, by the WJ_R0 + 6 == NV static_assert), so
+// seeding from the source is the same bytes; nothing between the two
+// passes touches either buffer, and s.ecol / s.pcol are distinct members.
+//   A/B N=4096 f32, fresh process per arm, TWO order-balanced batches:
+//     batch 1 (incumbent first) 28,512.5 (28,507.5-28,550.5) ->
+//                               29,084.0 (29,056.8-29,091.1)  +2.00%
+//     batch 2 (K20-1 first)     28,504.2 (28,497.2-28,543.4) ->
+//                               29,071.0 (29,034.3-29,110.3)  +1.99%
+//     pooled (10 pairs)         28,517.3 -> 29,075.7  +1.96%, 10/10
+//     paired WINS, ranges non-overlapping by ~15x the spread.
+//   f64 16,941.2 -> 17,165.5, +1.32%, 3/3.
+//   ptxas BYTE-IDENTICAL both dtypes: f32 41,872 B / 0 / 0 / 255 regs,
+//   f64 82,912 B / 8 / 8 / 255. pytest 172 green.
+// WHY IT IS 10x THE ESTIMATE, and this is the transferable half. The
+// audit costed it as traffic (35 stores + 35 loads per column), and this
+// file's standing rule — A1/1f -> K10e1 -> K19 -> K15 — says pure
+// traffic cuts do not pay on f32. They still don't: what this removes is
+// a STORE -> LOAD FORWARDING DEPENDENCY. The projection's seed for row i
+// was a local store issued a few instructions earlier in the same
+// function, so every one of the 35 rows had to wait for the copy's store
+// to land before its own FFMA chain could start; reading s.ecol instead
+// makes all 35 seeds independent loads that ptxas can hoist ahead of the
+// chain. The SASS census agrees on the traffic and understates the win,
+// as usual here (f32 LDL 6,584 -> 6,447, STL 3,048 -> 2,768, instrs
+// 38,334 -> 37,932). RULE: a removed load that was feeding on a value
+// this thread just STORED is not a traffic cut, it is a chain cut —
+// price it like A4/K6, not like K19.
+//
+// K20-2 rnea_bias DEAD ZERO FILL: +0.13% f32 / +0.11% f64, KEPT at the
+// edge of noise. `for (i < NV) d.c[i] = 0` ran immediately before a
+// backward pass that ASSIGNS every element: the joint columns via
+// d.c[VOFF + F_COORD[k]] (F_COORD is a bijection onto 0..NV-VOFF-1 —
+// now static_asserted at the table by count + surjectivity, which pins
+// injectivity by pigeonhole) and d.c[0..5] from f0/n0, with no read of
+// d.c in between. 35 dead stores per rnea_bias call.
+//   ptxas BYTE-IDENTICAL both dtypes; SASS f32 STL 2,768 -> 2,733
+//   (exactly the 35), LDL UNCHANGED at 6,447 — which is the K10e1 gate
+//   this item was written around: a removed store can lose by shifting a
+//   rematerialization point, and here nothing was rematerialized.
+//   bitwise max diff EXACTLY 0.0 f32 AND f64, all five configs, against
+//   BOTH the K20-1 build and the pre-task incumbent; pytest 172 green.
+//   A/B, two order-balanced batches of 5: 29,072.6 -> 29,109.6, +0.13%,
+//   8/10 paired wins, ranges OVERLAPPING (one 29,316 boost-clock outlier
+//   in the incumbent arm). f64 3/3, +0.11%.
+//   KEPT rather than declared noise because the sign is consistent
+//   across 13 paired rounds and both dtypes and the edit only REMOVES
+//   verified-dead work — but it is honestly a sub-noise item; do not
+//   re-derive a mechanism from +0.13%.
+//
+// K20-3 BROAD-PHASE PAIR RE-READS: NOT BUILT — THE PREMISE IS FALSE.
+// The audit costed "440 loads for 48 distinct values" over the 55 pairs
+// and proposed a collider-outer nest to halve them. The line-attributed
+// SASS census (nvcc -lineinfo + nvdisasm -c -g) says the pid loop is
+// NOT unrolled: it is ONE ROLLED BODY carrying 8 LDL total for the
+// mid/hlr reads (2 per source line at the four broad-phase lines, f32
+// and f64 alike). So 440 is the DYNAMIC count, and hoisting the ia side
+// saves 4 loads on 43 of the 55 iterations = 172 local loads per
+// substep. K15 removed 1,140 loads per substep — 6.6x more — from the
+// same kernel and measured −0.06% on f32. The prize here is a sixth of
+// a measured zero; there is no version of this that pays.
+// The structural objection stands too, and it is why the item cannot be
+// rescued: keeping the K14 compile-time trip counts through a
+// collider-outer nest needs the pid loop template-specialized (55 copies
+// of a narrow-phase body that today is one rolled block) in a block idle
+// on ~84% of env-ticks — precisely the K17 point_jacobian_acc negative.
+// The runtime-bounded alternative is the K14 negative. Do not re-open
+// this without a NEW mechanism; the load count is settled.
+//
+// K16 STEP-11 CLAMP ensure_ecol BATCHING: DEAD — THE PREDICTABLE SET IS
+// EMPTY, measured, not argued. A temporary counter build (three
+// __device__ counters, atomicAdd at the step-11 clamp site, read through
+// two throwaway pybind entry points — NOT committed) over 245,760
+// substeps per config, 128 envs x 240 ticks:
+//   traffic        calls/substep   MISSES/substep   miss rate
+//   random-gear        10.34          0.0123          0.12%
+//   stopjam            56.53          0.0021          0.00%
+//   altstop            32.43          0.0021          0.01%
+// i.e. the clamp passes call ensure_ecol 10-57 times per substep and
+// essentially ALL of them are cache HITS: about one miss per 80
+// substeps, and on the limit-heavy configs the misses are a fixed 512
+// over the whole run (a reset transient), not a rate. There is no group
+// of uncomputed columns at step 11 to batch, at any traffic. The
+// comment at the step-8 batched unit-solve block claiming that block is
+// "the only place in the kernel where a group of unit solves is known up
+// front" is CONFIRMED, not corrected.
+// (The mechanism, for the record: step 8 computes the whole s.l_j group
+// plus the cap rows into the same per-substep s.ecomp cache, and by the
+// time step 11 clamps a joint that joint's column is almost always
+// already there. K16 is closed.)
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -843,6 +952,28 @@ __device__ constexpr int F_PARENT[NF] = {
 __device__ constexpr int F_COORD[NF] = {
     0, 1, 2, -1, 4, 3, 5, 6, 7, 9, 8, 11, 10, 12, 13, 14, 16, 15,
     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28};
+// K20-2: F_COORD is a BIJECTION from the coord-bearing frames onto
+// 0..NV-VOFF-1. Count + surjectivity together pin injectivity
+// (pigeonhole), which is what licenses rnea_bias to drop its d.c zero
+// fill: its backward pass ASSIGNS d.c[VOFF + F_COORD[k]] for every such
+// frame, i.e. every one of d.c[VOFF..NV-1], and d.c[0..5] are assigned
+// from f0/n0. See rnea_bias.
+constexpr unsigned long long f_coord_mask() {
+  unsigned long long m = 0;
+  for (int k = 0; k < NF; k++)
+    if (F_COORD[k] >= 0) m |= 1ull << F_COORD[k];
+  return m;
+}
+constexpr int f_coord_count() {
+  int n = 0;
+  for (int k = 0; k < NF; k++)
+    if (F_COORD[k] >= 0) n++;
+  return n;
+}
+static_assert(f_coord_count() == NV - VOFF
+                  && f_coord_mask() == ((1ull << (NV - VOFF)) - 1),
+              "K20-2: F_COORD must hit every joint column 0..NV-VOFF-1 "
+              "exactly once (rnea_bias's d.c fill is dead only if so)");
 // K17 (2026-08-07) — PRECOMPUTED ANCESTOR TABLES, killing the three
 // F_PARENT pointer-chases. Each site used to walk `k = F_PARENT[k]` and
 // test `F_COORD[k] >= 0` per step; F_PARENT / F_COORD are __device__
@@ -1856,7 +1987,11 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
     for (int i = 0; i < 3; i++) n0[i] = omxiw[i] + exf[i];
   }
   // backward pass
-  for (int i = 0; i < NV; i++) d.c[i] = T(0);
+  // K20-2: NO ZERO FILL. Every d.c[i] is ASSIGNED below — the joint
+  // columns by `d.c[VOFF + F_COORD[k]] = ...` (F_COORD is a bijection
+  // onto 0..NV-VOFF-1, static_asserted at the table) and 0..5 from
+  // f0/n0 at the end — and nothing reads d.c in between, so the 35
+  // stores the fill used to issue were all dead.
   for (int k = NF - 1; k >= 0; k--) {
     if (F_COORD[k] >= 0)
       d.c[VOFF + F_COORD[k]] = dot3(d.axw[k], d.nb[k]);
@@ -2760,29 +2895,35 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   ensure_ecol(d, s, j);
   const T plain = s.ecol[j][VOFF + j];
   T* col = s.pcol[j];
-  // Copy + 12 dots, INTERCHANGED and fused into one pass over i. Each
-  // sum[w] still accumulates over i in ascending order over the same
-  // terms, and the copy is per-element independent, so col and every
-  // sum[w] are bitwise what the three separate passes produced.
+  // K20-1: the 12 dots, in one pass over i. There used to be a COPY
+  // half fused into this pass (col[i] = s.ecol[j][i] over all NV,
+  // including a copy-only range) whose only consumer was the projection
+  // loop below, which re-read col[i] as its seed. The projection now
+  // reads s.ecol[j][i] directly and writes col[i] as its OUTPUT only:
+  // 35 stores and 35 dependent re-loads per column disappear, and the
+  // store->load forwarding edge between the two passes is cut.
+  // BITWISE: col[i] was set EXACTLY = s.ecol[j][i] (a plain copy, whole
+  // range covered — 0..5, VOFF..WJ_L0, WJ_L0..+6, WJ_R0..+6 = 0..NV-1
+  // by the WJ_R0 + 6 == NV static_assert), so seeding from the source
+  // is the same bytes. Each sum[w] still accumulates over i in
+  // ascending order over the same terms.
   {
     // The dot half is segmented onto the K8 weld support: each sum[w]
     // still visits its own terms in ascending i, only the structural
     // +-0.0 products are gone and the exactly-1.0 entries became bare
-    // adds. The COPY stays full-length (col is consumed densely).
+    // adds.
     T sum[N_WELD];
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) sum[w] = T(0);
 #pragma unroll
     for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
       const T ci = s.ecol[j][t];
-      col[t] = ci;
       sum[t] += ci;
       sum[6 + t] += ci;
     }
 #pragma unroll
     for (int u = 0; u < 3; u++) {  // i = 3,4,5
       const T ci = s.ecol[j][3 + u];
-      col[3 + u] = ci;
       sum[3 + u] += ci;  // angular rows 3+u, 9+u (1.0)
       sum[9 + u] += ci;
 #pragma unroll
@@ -2792,18 +2933,17 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           sum[6 + t] += s.jwr[3 + t][WJ_RIDX(t, u)] * ci;
         }
     }
-    for (int i = VOFF; i < WJ_L0; i++) col[i] = s.ecol[j][i];  // copy only
+    // (rows VOFF..WJ_L0 are structurally outside the weld support and,
+    // since K20-1, need no copy either — nothing to do here)
 #pragma unroll
     for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
       const T ci = s.ecol[j][WJ_L0 + e];
-      col[WJ_L0 + e] = ci;
 #pragma unroll
       for (int w = 0; w < N_WELD / 2; w++) sum[w] += s.jwc[w][e] * ci;
     }
 #pragma unroll
     for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
       const T ci = s.ecol[j][WJ_R0 + e];
-      col[WJ_R0 + e] = ci;
 #pragma unroll
       for (int w = N_WELD / 2; w < N_WELD; w++) sum[w] += s.jwc[w][e] * ci;
     }
@@ -2820,7 +2960,7 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 #pragma unroll
     for (int w = 0; w < N_WELD; w++) x[w] = s.rw[w];
     for (int i = 0; i < NV; i++) {
-      T ci = col[i];
+      T ci = s.ecol[j][i];  // K20-1: seed from the source, not the copy
 #pragma unroll
       for (int w = 0; w < N_WELD; w++) ci -= s.mw[i][w] * x[w];
       col[i] = ci;
@@ -2835,7 +2975,7 @@ __device__ void ensure_pcol(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 
 // K7: BATCHED ensure_pcol. B columns of the limit-row group are computed
 // together so they share the three big reads:
-//   (a) the fused copy+dot pass reads each support value ONCE for all
+//   (a) the dot pass reads each support value ONCE for all
 //       B columns;
 //   (b) the 12x12 weld solve becomes chol_solve_multi_n<B> — the proven
 //       multi-RHS loop interchange, bitwise per right-hand side;
@@ -2882,10 +3022,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
     for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
       T ci[B];
 #pragma unroll
-      for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][t];
-        s.pcol[j[b]][t] = ci[b];
-      }
+      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][t];
 #pragma unroll
       for (int b = 0; b < B; b++) {
         sum[b][t] += ci[b];
@@ -2896,10 +3033,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
     for (int u = 0; u < 3; u++) {  // i = 3,4,5
       T ci[B];
 #pragma unroll
-      for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][3 + u];
-        s.pcol[j[b]][3 + u] = ci[b];
-      }
+      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][3 + u];
 #pragma unroll
       for (int b = 0; b < B; b++) {  // angular rows 3+u, 9+u (1.0)
         sum[b][3 + u] += ci[b];
@@ -2917,18 +3051,13 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
           }
         }
     }
-    for (int i = VOFF; i < WJ_L0; i++) {  // copy only
-#pragma unroll
-      for (int b = 0; b < B; b++) s.pcol[j[b]][i] = s.ecol[j[b]][i];
-    }
+    // (K20-1: the copy-only range VOFF..WJ_L0 is gone with the rest of
+    // the copy half — the projection below seeds from s.ecol directly)
 #pragma unroll
     for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
       T ci[B];
 #pragma unroll
-      for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][WJ_L0 + e];
-        s.pcol[j[b]][WJ_L0 + e] = ci[b];
-      }
+      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][WJ_L0 + e];
 #pragma unroll
       for (int w = 0; w < N_WELD / 2; w++) {
         const T jwi = s.jwc[w][e];
@@ -2940,10 +3069,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
     for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
       T ci[B];
 #pragma unroll
-      for (int b = 0; b < B; b++) {
-        ci[b] = s.ecol[j[b]][WJ_R0 + e];
-        s.pcol[j[b]][WJ_R0 + e] = ci[b];
-      }
+      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][WJ_R0 + e];
 #pragma unroll
       for (int w = N_WELD / 2; w < N_WELD; w++) {
         const T jwi = s.jwc[w][e];
@@ -2968,7 +3094,7 @@ __device__ void ensure_pcol_multi(Solver<T>& __restrict__ s, const int* js) {
     for (int i = 0; i < NV; i++) {
       T ci[B];
 #pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.pcol[j[b]][i];
+      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][i];  // K20-1
 #pragma unroll
       for (int w = 0; w < N_WELD; w++) {
         const T mwi = s.mw[i][w];
