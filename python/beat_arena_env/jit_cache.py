@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -119,8 +120,14 @@ def fast_load(name, sources, build_directory, extra_flags, full_load):
     propagate — callers keep their own build-failure policy."""
     digest = _digest(sources, extra_flags)
     stamp = os.path.join(build_directory, name + ".srchash")
-    pyd = os.path.join(build_directory, name + ".pyd")
-    if os.path.exists(stamp) and os.path.exists(pyd):
+    # torch names the artifact <name>.pyd on Windows, <name>.so on Linux;
+    # the literal ".pyd" here (until 2026-08-08) meant the fast path never
+    # fired on the pod and every process start re-paid the ~8-9 s
+    # toolchain re-verification this module exists to skip
+    pyd = next((p for p in (os.path.join(build_directory, name + sfx)
+                            for sfx in importlib.machinery.EXTENSION_SUFFIXES)
+                if os.path.exists(p)), None)
+    if os.path.exists(stamp) and pyd is not None:
         try:
             with open(stamp) as f:
                 if f.read().strip() == digest:

@@ -71,6 +71,9 @@ def main():
     p.add_argument("--ns", type=int, nargs="+", default=[512, 4096])
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--fp16", action="store_true",
+                   help="production rollout config (--fp16 all): fp16 "
+                        "forward via the flat replica path")
     args = p.parse_args()
 
     device = torch.device("cuda")
@@ -82,6 +85,9 @@ def main():
         policy = NotePolicy()
         print("weights: random init (checkpoint not found)")
     policy = policy.to(device).eval()
+    if args.fp16:
+        policy.fp16 = True
+        policy.flatten_fp16()
     fused = FusedNotePolicy(policy)
     print(f"gpu: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
     print(f"best of {args.reps} x {args.iters} iters, µs/forward\n")
