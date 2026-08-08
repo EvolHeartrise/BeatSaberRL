@@ -452,6 +452,77 @@ constexpr int NOTE_FEAT = 14;
 // frame), not contact arithmetic at all — the K6/K12 phase-change
 // lesson again, now with the sign against a "pure" work reduction.
 //
+// K17 (2026-08-07) — CONSTEXPR ANCESTOR TABLES. Of the three F_PARENT
+// pointer-chases the audit named, ONE landed (crba, +0.21%) and two
+// were measured and reverted. Tables at F_COORD; the crba site is the
+// only consumer.
+// THE SASS PRE-CHECK, run before any edit (nvcc -lineinfo + nvdisasm
+// -c -g on the shipped build): none of the three chases was constant-
+// folded, so there was no folding to lose. F_PARENT / F_COORD are
+// __device__ constexpr, i.e. GLOBAL memory read through the const
+// cache, and every walk carries a loop-carried `LDG.E.CI -> LEA ->
+// LDG.E.CI` pair — the next frame index is not addressable until the
+// previous load returns, and the F_COORD load that produces the write
+// column hangs off it. That includes the WELD walk, whose `frame` IS a
+// compile-time 23/29: nvcc unrolls the widx loop into two copies and
+// still leaves each one a rolled chase over k. (It does fold the
+// per-step `F_COORD[k] >= 0` test, into a MOV32I 0x3efbfffe + SHF.R.U64
+// bitmask — that half was already free.)
+//   ANC_N / ANC.f / ANC.c              28,413.6 -> 28,473.9   +0.21% KEPT
+//   + weld walk, unrolled to 6         29,488.0 -> 29,492.7   +0.02% REVERTED
+//   + point_jacobian_acc               28,476.5 -> 28,388.1   -0.31% REVERTED
+// (crba: 10 interleaved rounds, 9 of 10 paired wins, and the first
+// 5-round batch non-overlapping — 28,378.6-28,416.3 vs 28,458.9-
+// 28,498.0. f64 16,903.4 -> 16,920.8, +0.06%. The weld and pja rows
+// were probed against the crba build, in interleaved batches; the weld
+// batch ran in a transient boost clock regime, which is why its
+// absolute numbers are ~1,000 higher — the pairing is what carries it,
+// and the -0.31% package reproduced exactly at both clock regimes.)
+// ptxas BYTE-IDENTICAL to the incumbent in both dtypes: f32 41,872 B /
+// 0 / 0 / 255 regs, f64 82,912 B / 8 / 8 / 255 — the tables live where
+// F_PARENT lives, in global memory, not in the frame. Bitwise max diff
+// EXACTLY 0.0 on f32 AND f64 across free-running, max_steps=60 and the
+// 128-env random-gear traffic config; pytest 172 green.
+// WHY ONLY +0.21% WHEN THE CHASE IS 117 SERIAL STEPS PER crba CALL: the
+// chase latency was already mostly hidden. ptxas hoists the F_PARENT
+// load to the top of the walk body and the body is ~50 instructions
+// deep, so what the table actually trades is a dependent load for
+// ADDRESS ARITHMETIC — and the arithmetic is where the sign lives. Two
+// [NF][10] arrays cost a 64-bit XMAD chain for k * 40 against each of
+// two bases (~12 integer instructions per unrolled group) and measured
+// +0.13%; the same tables at a POWER-OF-TWO [NF][16] stride, which
+// makes the row offset k << 6 and puts both rows a compile-time
+// distance apart off one base, measured +0.09% ON TOP of that (5 of 5
+// paired rounds) and is what ships.
+// PACKING IS THE WRONG DIRECTION, and this is the transferable half.
+// Folding frame and column into ONE word (frame | col << 8, [NF][16])
+// removes a load and a base register — the K11/K12 instrument says it
+// should win — and it measured NEUTRAL-to-NEGATIVE against the
+// incumbent (28,414.9 -> 28,413.9) and clearly worse than the two-array
+// form. The unpack `p & 0xff` sits ON the dependent path between the
+// load and the d.pos[anc] address, which is the one place this kernel
+// cannot absorb an extra op; the two arrays' loads are INDEPENDENT of
+// each other and issue together. So: on a latency-bound site, count ops
+// on the dependent path, not loads.
+// WHY point_jacobian_acc INVERTS THE SIGN — the K18(i) frequency rule
+// again, now on a table instead of a layout. The edit is identical to
+// crba's and the site is structurally the same walk, but it runs in the
+// CONTACT block, which is idle on ~84% of env-ticks (the K14/K18
+// histograms). Turning the rolled chase into a table loop let ptxas
+// unroll it: the two inlined copies went from ~66 instructions and 2
+// LDG.E.CI to ~216 instructions and 22, plus a 10-BRA unroll-remainder
+// ladder, all of it in a rarely-taken block. A chase costs its latency
+// only when it runs; a table costs its code and its loads every time
+// the block is scheduled around.
+// THE WELD WALK, by contrast, DID fold exactly as designed — with widx
+// unrolled and the length static_asserted at 6, every k and col became
+// an immediate and both LDG.E.CI disappeared (cmem[2] 876 -> 900 B) —
+// and it measured +0.02%, i.e. nothing. 96 chase steps per tick against
+// crba's 960: the site was never worth the code. It is REVERTED rather
+// than kept-as-neutral because it adds a forced unroll and a
+// compile-time coupling for no measured return; the derivation stands
+// at ANC_WELD_D if anyone wants it back.
+//
 // The register budget is NOT insensitive, correcting the earlier
 // "-maxrregcount=64 vs the natural 128: within noise" note (measured
 // 2026-08-03): left free, ptxas picks the target from a heuristic that
@@ -520,6 +591,160 @@ __device__ constexpr int F_PARENT[NF] = {
 __device__ constexpr int F_COORD[NF] = {
     0, 1, 2, -1, 4, 3, 5, 6, 7, 9, 8, 11, 10, 12, 13, 14, 16, 15,
     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28};
+// K17 (2026-08-07) — PRECOMPUTED ANCESTOR TABLES, killing the three
+// F_PARENT pointer-chases. Each site used to walk `k = F_PARENT[k]` and
+// test `F_COORD[k] >= 0` per step; F_PARENT / F_COORD are __device__
+// constexpr arrays, i.e. GLOBAL memory read through the const cache, so
+// the SASS (verified before the edit, nvcc -lineinfo + nvdisasm -c -g)
+// carries a loop-carried `LDG.E.CI -> LEA -> LDG.E.CI` pair per step:
+// the next frame index cannot be addressed until the previous load
+// returns, and the F_COORD load that produces the write column hangs
+// off it. NOT ONE OF THE THREE was constant-folded by nvcc, not even
+// the weld walk whose `frame` IS a compile-time 23/29 (the widx loop is
+// unrolled into two copies, yet each keeps a rolled chase over k) — so
+// there is no folding to lose. Per crba call the walks take 117 chase
+// steps; the tables turn each into an INDEPENDENT indexed read off one
+// base, which is the same instrument K11/K12 measured: live addresses
+// and dependence length, not load count.
+//
+// ANC_F[f] lists, in exact walk order, the coord-bearing frames on f's
+// INCLUSIVE ancestor chain (f itself first when F_COORD[f] >= 0);
+// ANC_C[f] the matching v-columns VOFF + F_COORD[.]; ANC_N[f] the
+// length, rows padded with -1. crba's walk is the STRICT-ancestor
+// suffix, so it runs a = 1 .. ANC_N[k]-1 over the same row — legal only
+// because its enclosing `if (coord >= 0)` guard excludes the one
+// F_COORD < 0 frame (k = 3, whose row starts at 2, not 3). Both facts
+// are pinned by anc_tables_ok() below.
+constexpr int ANC_MAXD = 10;
+__device__ constexpr int ANC_N[NF] = {1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 4,
+                                      5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6,
+                                      1, 2, 3, 4, 5, 6};
+// ANC_F / ANC_C are the readable form and exist only at compile time —
+// the DEVICE table is ANC below, the same two rows restrided to 16.
+constexpr int ANC_F[NF][ANC_MAXD] = {
+    { 0, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    { 1,  0, -1, -1, -1, -1, -1, -1, -1, -1},
+    { 2,  1,  0, -1, -1, -1, -1, -1, -1, -1},
+    { 2,  1,  0, -1, -1, -1, -1, -1, -1, -1},
+    { 4,  2,  1,  0, -1, -1, -1, -1, -1, -1},
+    { 5,  4,  2,  1,  0, -1, -1, -1, -1, -1},
+    { 6,  5,  4,  2,  1,  0, -1, -1, -1, -1},
+    { 7,  6,  5,  4,  2,  1,  0, -1, -1, -1},
+    { 8,  7,  6,  5,  4,  2,  1,  0, -1, -1},
+    { 9,  8,  7,  6,  5,  4,  2,  1,  0, -1},
+    {10,  9,  8,  7,  6,  5,  4,  2,  1,  0},
+    {11,  2,  1,  0, -1, -1, -1, -1, -1, -1},
+    {12, 11,  2,  1,  0, -1, -1, -1, -1, -1},
+    {13, 12, 11,  2,  1,  0, -1, -1, -1, -1},
+    {14, 13, 12, 11,  2,  1,  0, -1, -1, -1},
+    {15, 14, 13, 12, 11,  2,  1,  0, -1, -1},
+    {16, 15, 14, 13, 12, 11,  2,  1,  0, -1},
+    {17, 16, 15, 14, 13, 12, 11,  2,  1,  0},
+    {18, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    {19, 18, -1, -1, -1, -1, -1, -1, -1, -1},
+    {20, 19, 18, -1, -1, -1, -1, -1, -1, -1},
+    {21, 20, 19, 18, -1, -1, -1, -1, -1, -1},
+    {22, 21, 20, 19, 18, -1, -1, -1, -1, -1},
+    {23, 22, 21, 20, 19, 18, -1, -1, -1, -1},
+    {24, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    {25, 24, -1, -1, -1, -1, -1, -1, -1, -1},
+    {26, 25, 24, -1, -1, -1, -1, -1, -1, -1},
+    {27, 26, 25, 24, -1, -1, -1, -1, -1, -1},
+    {28, 27, 26, 25, 24, -1, -1, -1, -1, -1},
+    {29, 28, 27, 26, 25, 24, -1, -1, -1, -1}};
+constexpr int ANC_C[NF][ANC_MAXD] = {
+    { 6, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    { 7,  6, -1, -1, -1, -1, -1, -1, -1, -1},
+    { 8,  7,  6, -1, -1, -1, -1, -1, -1, -1},
+    { 8,  7,  6, -1, -1, -1, -1, -1, -1, -1},
+    {10,  8,  7,  6, -1, -1, -1, -1, -1, -1},
+    { 9, 10,  8,  7,  6, -1, -1, -1, -1, -1},
+    {11,  9, 10,  8,  7,  6, -1, -1, -1, -1},
+    {12, 11,  9, 10,  8,  7,  6, -1, -1, -1},
+    {13, 12, 11,  9, 10,  8,  7,  6, -1, -1},
+    {15, 13, 12, 11,  9, 10,  8,  7,  6, -1},
+    {14, 15, 13, 12, 11,  9, 10,  8,  7,  6},
+    {17,  8,  7,  6, -1, -1, -1, -1, -1, -1},
+    {16, 17,  8,  7,  6, -1, -1, -1, -1, -1},
+    {18, 16, 17,  8,  7,  6, -1, -1, -1, -1},
+    {19, 18, 16, 17,  8,  7,  6, -1, -1, -1},
+    {20, 19, 18, 16, 17,  8,  7,  6, -1, -1},
+    {22, 20, 19, 18, 16, 17,  8,  7,  6, -1},
+    {21, 22, 20, 19, 18, 16, 17,  8,  7,  6},
+    {23, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    {24, 23, -1, -1, -1, -1, -1, -1, -1, -1},
+    {25, 24, 23, -1, -1, -1, -1, -1, -1, -1},
+    {26, 25, 24, 23, -1, -1, -1, -1, -1, -1},
+    {27, 26, 25, 24, 23, -1, -1, -1, -1, -1},
+    {28, 27, 26, 25, 24, 23, -1, -1, -1, -1},
+    {29, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+    {30, 29, -1, -1, -1, -1, -1, -1, -1, -1},
+    {31, 30, 29, -1, -1, -1, -1, -1, -1, -1},
+    {32, 31, 30, 29, -1, -1, -1, -1, -1, -1},
+    {33, 32, 31, 30, 29, -1, -1, -1, -1, -1},
+    {34, 33, 32, 31, 30, 29, -1, -1, -1, -1}};
+// Re-derivation of every entry straight off F_PARENT / F_COORD, in the
+// wj_chain_mask idiom: the tables are a claim about the tree, and this
+// is the tree walking itself.
+constexpr int anc_len(int f) {
+  int n = 0;
+  for (int k = f; k >= 0; k = F_PARENT[k])
+    if (F_COORD[k] >= 0) n++;
+  return n;
+}
+constexpr int anc_at(int f, int i) {
+  int n = 0;
+  for (int k = f; k >= 0; k = F_PARENT[k])
+    if (F_COORD[k] >= 0) {
+      if (n == i) return k;
+      n++;
+    }
+  return -1;
+}
+constexpr bool anc_tables_ok() {
+  for (int f = 0; f < NF; f++) {
+    if (ANC_N[f] != anc_len(f) || ANC_N[f] > ANC_MAXD) return false;
+    for (int i = 0; i < ANC_MAXD; i++) {
+      const int e = i < ANC_N[f] ? anc_at(f, i) : -1;
+      if (ANC_F[f][i] != e) return false;
+      if (ANC_C[f][i] != (e >= 0 ? VOFF + F_COORD[e] : -1)) return false;
+    }
+    // the property crba's a = 1.. suffix rests on: for a coord-bearing
+    // frame the row opens with the frame itself and continues with the
+    // walk from its parent, entry for entry.
+    if (F_COORD[f] >= 0) {
+      if (ANC_F[f][0] != f) return false;
+      if (ANC_N[f] != anc_len(F_PARENT[f]) + 1) return false;
+      for (int i = 1; i < ANC_N[f]; i++)
+        if (ANC_F[f][i] != anc_at(F_PARENT[f], i - 1)) return false;
+    }
+  }
+  return true;
+}
+static_assert(anc_tables_ok(),
+              "K17: ANC_N/ANC_F/ANC_C must be the F_PARENT walk, "
+              "coord-filtered, in visit order");
+// The device-side table is the same two rows on a POWER-OF-TWO stride.
+// That detail is addressing, and addressing is what this kernel pays in
+// (K11/K12): at [NF][10] ptxas emitted, per unrolled group of the crba
+// walk, a 64-bit XMAD chain for k * 40 against each of two bases (~12
+// integer instructions); at [NF][16] the row offset is k << 6 and the
+// two rows sit a compile-time distance apart off one base.
+constexpr int ANC_STRIDE = 16;
+struct AncRows {
+  int f[NF][ANC_STRIDE];
+  int c[NF][ANC_STRIDE];
+};
+constexpr AncRows anc_rows() {
+  AncRows t{};
+  for (int i = 0; i < NF; i++)
+    for (int j = 0; j < ANC_STRIDE; j++) {
+      t.f[i][j] = j < ANC_N[i] ? ANC_F[i][j] : -1;
+      t.c[i][j] = j < ANC_N[i] ? ANC_C[i][j] : -1;
+    }
+  return t;
+}
+__device__ constexpr AncRows ANC = anc_rows();
 __device__ constexpr double F_ANCHOR[NF][3] = {
     {0.0, 0.10, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, 0.66, 0.0},
     {-0.20, 0.43, 0.0}, {0, 0, 0}, {0, 0, 0}, {0.0, 0.0, 0.35},
@@ -738,6 +963,14 @@ static_assert(wj_chain_mask(F_L_FOOT) == (0x3full << WJ_L0)
                   && wj_chain_mask(F_R_FOOT) == (0x3full << WJ_R0),
               "K8: weld ancestor chains are exactly v-columns 23..28 "
               "and 29..34 -- 6 distinct columns each, none in 0..5");
+// K17, REVERTED ROW: the weld assembly's chase folds to immediates if
+// its walk is unrolled at a compile-time length, and this is that
+// length — kept as a compile-time claim (it costs nothing) because the
+// item measured +0.02% and the derivation is the only expensive part.
+// See the K17 header block before re-trying it.
+constexpr int ANC_WELD_D = 6;
+static_assert(ANC_N[F_L_FOOT] == ANC_WELD_D && ANC_N[F_R_FOOT] == ANC_WELD_D,
+              "K17: each foot's coord-bearing chain is exactly 6 frames");
 static_assert(WJ_ONE(0) == 0 && WJ_ONE(2) == 2 && WJ_ONE(3) == 3
                   && WJ_ONE(5) == 5 && WJ_ONE(6) == 0 && WJ_ONE(11) == 5
                   && WJ_CH0(5) == WJ_L0 && WJ_CH0(6) == WJ_R0,
@@ -1178,21 +1411,24 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       cross3(rel, hl, relxhl);
       T tot[3] = {ha[0] + relxhl[0], ha[1] + relxhl[1], ha[2] + relxhl[2]};
       d.m[j * NV + j] = dot3(a, tot);
-      int anc = F_PARENT[k];
-      while (anc >= 0) {
-        if (F_COORD[anc] >= 0) {
-          const int ia = VOFF + F_COORD[anc];
-          T rel2[3];
-          sub3v(cvec, d.pos[anc], rel2);
-          T r2xhl[3];
-          cross3(rel2, hl, r2xhl);
-          T tot2[3] = {ha[0] + r2xhl[0], ha[1] + r2xhl[1], ha[2] + r2xhl[2]};
-          const T val = dot3(d.axw[anc], tot2);
-          // symmetric pair -> lower entry only (F_COORD is not monotonic
-          // in the frame index, so the order of ia vs j is a runtime fact)
-          d.m[(ia > j ? j : ia) * NV + (ia > j ? ia : j)] = val;
-        }
-        anc = F_PARENT[anc];
+      // K17 — the same coord-bearing ancestors, in the same order, read
+      // out of ANC.f / ANC.c instead of chased through F_PARENT. Entry 0
+      // is k itself (F_COORD[k] >= 0 holds here), so the strict
+      // ancestors are the a = 1.. suffix; the per-step
+      // `if (F_COORD[anc] >= 0)` filter is baked into the row.
+      const int na = ANC_N[k];
+      for (int a = 1; a < na; a++) {
+        const int anc = ANC.f[k][a];
+        const int ia = ANC.c[k][a];
+        T rel2[3];
+        sub3v(cvec, d.pos[anc], rel2);
+        T r2xhl[3];
+        cross3(rel2, hl, r2xhl);
+        T tot2[3] = {ha[0] + r2xhl[0], ha[1] + r2xhl[1], ha[2] + r2xhl[2]};
+        const T val = dot3(d.axw[anc], tot2);
+        // symmetric pair -> lower entry only (F_COORD is not monotonic
+        // in the frame index, so the order of ia vs j is a runtime fact)
+        d.m[(ia > j ? j : ia) * NV + (ia > j ? ia : j)] = val;
       }
       // root rows
       T relr[3];
