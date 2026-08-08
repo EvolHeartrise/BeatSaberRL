@@ -139,11 +139,17 @@ _note_get = operator.attrgetter("hit_time", "color", "angle", "speed",
                                 "any_dir", "kind", "free_pre", "free_post")
 
 
-def _charts_to_tensors(charts, device, dtype):
+def _charts_to_tensors(charts, device, dtype, pad_to=None):
     """Pad a list[list[Note]] into per-field (P, C) tensors — env v10:
     episode tail = 0.5 + 1.5/min_speed (live head-plane miss boundary).
     Chart sin/cos are computed by numpy (the CRT libm — bitwise what
     Rust's set_chart_notes computes).
+
+    pad_to forces the C dimension (callers packing in chunks pass the
+    global max so chunks concatenate; every pad value is a per-field
+    constant and every derived row stat is row-local, so chunked output
+    is byte-identical to one whole-pool call — pinned by
+    test_ranked_pool_chunked_pack).
 
     The fill is column-wise (2026-08-03): the notes are flattened once,
     every field is pulled in a single np.fromiter pass, and one scatter
@@ -152,7 +158,8 @@ def _charts_to_tensors(charts, device, dtype):
     65536, ~45M stores for the ranked segment pool); this is a pure
     re-ordering of the same copies, so the output is byte-identical."""
     P = len(charts)
-    C = max(1, max((len(ch) for ch in charts), default=1))
+    C = max(1, pad_to if pad_to is not None
+            else max((len(ch) for ch in charts), default=1))
     lens = np.fromiter((len(ch) for ch in charts), np.int64, P)
     n_tot = int(lens.sum())
     flat = list(itertools.chain.from_iterable(charts))
