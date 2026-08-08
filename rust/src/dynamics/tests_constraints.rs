@@ -794,3 +794,199 @@ fn r13_weld_scratch_is_write_before_read() {
         clean.len()
     );
 }
+
+// ── R23 (2026-08-07): DEAD-STORE SWEEP GATES ─────────────────────────
+//
+// Five store sites were verified dead. THREE of them landed (a: the
+// dense limit rows of `j`; b: the free-base half of the mass matrix's
+// upper triangle; e: `rnea`'s `ws.vo` chain) and two were reverted on
+// the measurement, NOT on correctness — R23d (`ws.sol`) and R23f
+// (`ConstraintSet::rw`) are both bitwise-clean and both cost ~1–3%; see
+// the notes at their call sites. Their poison gates are KEPT here
+// anyway, because what they establish (the region really is
+// write-before-read / unread) is what makes those reverts pure
+// performance findings rather than open correctness questions.
+//
+// The gates are built exactly the way R13's
+// `poison_weld_scratch` verified its two — fill the region the shipping
+// build stops writing with NaN in a TEST build (where the stores are
+// still compiled in, so the poison genuinely replaces live data) and
+// require the trajectory back BIT FOR BIT. Any surviving reader turns
+// the run into NaN on the first substep, so the gate is sharp rather
+// than statistical. The fifth (c, `jwt`'s dead column block) is not a
+// poison case at all: those words are asserted to be the exact `+0.0`
+// BYTES, which is why skipping their stores needs no cfg gate.
+//
+// The recorded corpus is q/v/p plus every row impulse, plus `energy`
+// and `momentum` at each tick — the two functions that still own the
+// `ws.vo` chain R23e stopped propagating in `rnea`.
+
+/// Which newly-dead region one `r23_run` pass poisons.
+#[derive(Clone, Copy, PartialEq)]
+enum R23Poison {
+    /// reference pass — nothing poisoned
+    None,
+    /// (a) the dense LIMIT rows of `ConstraintSet::j`
+    LimitJ,
+    /// (b) the strict UPPER triangle of the CRBA mass matrix
+    MUpper,
+    /// (d) step 11's `solcache` — the write-before-read property the
+    ///     REVERTED R23d rested on, kept as a standing invariant
+    Solcache,
+    /// (e) `ws.vo` — `rnea` no longer propagates the frame-origin
+    ///     velocity chain, so it holds whatever was there
+    Vo,
+    /// all four at once
+    All,
+}
+
+impl R23Poison {
+    fn is(self, p: R23Poison) -> bool {
+        self == p || self == R23Poison::All
+    }
+}
+
+/// Replay a fixed set of random states under a fixed torque schedule,
+/// recording every observable f64 as raw bits.
+fn r23_run(p: R23Poison) -> Vec<u64> {
+    let m = &HUMANOID;
+    let mut rng = Rng(0x0000_0023_5EED_2301);
+    let mut sched: Vec<[f64; NQ]> = Vec::new();
+    for _ in 0..(24 * 5) {
+        let mut tau = [0.0f64; NQ];
+        for j in 0..NQ {
+            let s = match rng.next_u64() % 3 {
+                0 => 0.0,
+                1 => 1.0,
+                _ => -1.0,
+            };
+            tau[j] = s * m.tau_max[j];
+        }
+        sched.push(tau);
+    }
+    let states: Vec<State> = (0..24)
+        .map(|_| super::testutil::random_state(m, &mut rng, true))
+        .collect();
+
+    let mut bits: Vec<u64> = Vec::new();
+    for (state_i, st0) in states.iter().enumerate() {
+        let mut st = st0.clone();
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, true, true);
+        ws.poison_m_upper = p.is(R23Poison::MUpper);
+        cs.poison_limit_j = p.is(R23Poison::LimitJ);
+        for k in 0..40 {
+            let tau = &sched[state_i * 5 + k / 8];
+            if p.is(R23Poison::Solcache) {
+                ws.solcache.fill(f64::NAN);
+            }
+            if p.is(R23Poison::Vo) {
+                ws.vo.fill([f64::NAN; 3]);
+            }
+            substep_constrained(m, &mut st, tau, H, &mut ws, &mut cs);
+            if !st.v.iter().all(|x| x.is_finite()) {
+                break; // finite-trajectory claim, same cut in both runs
+            }
+            for x in st.q.iter().chain(st.v.iter()).chain(st.p.iter()) {
+                bits.push(x.to_bits());
+            }
+            for r in 0..cs.nrows {
+                bits.push(cs.lambda[r].to_bits());
+            }
+            // the two surviving owners of the `ws.vo` chain — they must
+            // rebuild it themselves (R23e), so they are recorded from a
+            // possibly-poisoned workspace on purpose
+            if p.is(R23Poison::Vo) {
+                ws.vo.fill([f64::NAN; 3]);
+            }
+            bits.push(energy(m, &mut ws, &st.v).to_bits());
+            let (pl, am) = super::algo::momentum(m, &mut ws, &st.v);
+            for x in pl.iter().chain(am.iter()) {
+                bits.push(x.to_bits());
+            }
+        }
+    }
+    bits
+}
+
+#[test]
+fn r23_dead_regions_have_no_reader() {
+    let clean = r23_run(R23Poison::None);
+    assert!(clean.len() > 50_000, "corpus too small ({})", clean.len());
+    for (p, what) in [
+        (R23Poison::LimitJ, "R23a: the dense LIMIT rows of `j`"),
+        (R23Poison::MUpper, "R23b: the mass matrix's strict UPPER triangle"),
+        (R23Poison::Solcache, "R23d (reverted): step 11's `solcache`"),
+        (R23Poison::Vo, "R23e: `ws.vo`"),
+        (R23Poison::All, "R23a+b+d+e together"),
+    ] {
+        assert_eq!(
+            clean,
+            r23_run(p),
+            "poisoning {what} changed the trajectory — that region is \
+             still READ, so the corresponding R23 store deletion is \
+             NOT dead and must be reverted"
+        );
+    }
+    println!(
+        "R23 dead-region gate: {} recorded words, identical under all \
+         five NaN poisonings",
+        clean.len()
+    );
+}
+
+#[test]
+fn r23c_jwt_dead_columns_are_exactly_plus_zero() {
+    // R23c rests on a BYTE claim, not a value claim: `jwt`'s columns
+    // W_BASE_HI..W_L_LO are +0.0 in every one of the 12 weld rows for
+    // every solve (R9's support argument), and `jwt` is written nowhere
+    // else, so the words the transpose loop stops storing keep the
+    // `vec![0.0; ..]` bytes they were constructed with. Checked here on
+    // LIVE solves, together with the dense weld rows they mirror.
+    let m = &HUMANOID;
+    let (lo, hi) = ConstraintSet::WELD_DEAD_COLS;
+    let nv = m.nv();
+    let mut rng = Rng(0x0000_0023_5EED_23C0);
+    let mut checks = 0usize;
+    for _ in 0..12 {
+        let mut st = super::testutil::random_state(m, &mut rng, true);
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, true, true);
+        for _ in 0..20 {
+            let mut tau = [0.0f64; NQ];
+            for j in 0..NQ {
+                tau[j] = rng.range(-1.0, 1.0) * m.tau_max[j];
+            }
+            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+            if !st.v.iter().all(|x| x.is_finite()) {
+                break;
+            }
+            for (i, x) in cs.weld_jwt_dead_block().iter().enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    0u64,
+                    "jwt dead block word {i} is {x:?}, not the +0.0 BYTES \
+                     R23c skips its store on"
+                );
+            }
+            let j = cs.weld_j();
+            for r in 0..12 {
+                for c in lo..hi {
+                    assert_eq!(
+                        j[r * nv + c].to_bits(),
+                        0u64,
+                        "weld row {r} column {c} is not +0.0 — R9's \
+                         support argument (and R23c with it) is broken"
+                    );
+                }
+            }
+            checks += 1;
+        }
+    }
+    assert!(checks > 100, "too few live solves checked ({checks})");
+    println!(
+        "R23c: {checks} solves × 12 rows × {} dead columns all exactly \
+         +0.0 bytes",
+        hi - lo
+    );
+}

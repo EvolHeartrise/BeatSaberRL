@@ -146,7 +146,20 @@ pub struct Workspace {
     pub c: Vec<f64>,     // RNEA output / bias forces
     pub rhs: Vec<f64>,   // tau − c, then the accel after the solve
     pub vstar: Vec<f64>, // unconstrained post-solve velocity
-    pub sol: Vec<f64>,      // M⁻¹e_j scratch (clamp impulses, P2 rows)
+    // M⁻¹e_j scratch (clamp impulses, P2 rows).
+    //
+    // R23d REVERTED (2026-08-07, measured negative): solving step 11's
+    // clamp column STRAIGHT into `solcache[j·nv..]` and deleting this
+    // staging buffer is bitwise-clean and one nv-word copy cheaper per
+    // cache miss, but it measured −0.03% alone (noise) and **−0.84%** on
+    // top of the landed R23 package (22,733 → 22,542 env-steps/s at
+    // N = 256, 3 interleaved ABBA rounds, 6/6 paired losses, ranges
+    // non-overlapping). See the rule recorded in step.rs at the call
+    // site: a `chol_*` callee wants a dedicated, loop-invariant scratch
+    // slice, not a runtime-offset window into a buffer the caller reads
+    // back through a second pointer. Do not retry without an aliasing
+    // argument. (Same family as R23f, which cost −2.71%.)
+    pub sol: Vec<f64>,
     pub hit: Vec<bool>,     // per-joint limit-hit flags (step 11)
     // f64 Cholesky pivot-floor engagements (SPEC-v10 Divergences §22),
     // cumulative until the owner pops it (lib.rs pop_pd_hits)
@@ -163,12 +176,24 @@ pub struct Workspace {
     // feature so the shipping build's Workspace layout is untouched.
     #[cfg(feature = "stats")]
     pub stats: DbgStats,
+    /// TEST HOOK (R23b): when set, `crba` overwrites the STRICT UPPER
+    /// triangle of `m` with NaN before returning. The shipping build
+    /// leaves that triangle at the `fill(0.0)` it starts from (the
+    /// mirror stores are compiled out), so a trajectory that is
+    /// bit-identical with this on proves nothing downstream reads it.
+    #[cfg(test)]
+    pub poison_m_upper: bool,
     pub cached: Vec<bool>,  // step 11: M⁻¹e_j column cached?
     pub solcache: Vec<f64>, // step 11: cached M⁻¹e_j columns (nq×nv)
     // RNEA / velocity-pass scratch, per frame
     om: Vec<[f64; 3]>, // body angular velocity
     al: Vec<[f64; 3]>, // body angular acceleration
-    vo: Vec<[f64; 3]>, // frame-origin (material point) velocity
+    // frame-origin (material point) velocity. R23e: `rnea` no longer
+    // propagates or stores this — its force/moment block reads only
+    // ao/om/al — so the ONLY writers/readers left are `momentum` and
+    // `energy`, each of which rebuilds the whole chain in its own
+    // topological loop before reading it.
+    vo: Vec<[f64; 3]>,
     ao: Vec<[f64; 3]>, // frame-origin acceleration
     f: Vec<[f64; 3]>,  // backward pass: net force
     n: Vec<[f64; 3]>,  // backward pass: net moment about frame origin
@@ -199,6 +224,8 @@ impl Workspace {
             env_hits: 0,
             #[cfg(feature = "stats")]
             stats: DbgStats::default(),
+            #[cfg(test)]
+            poison_m_upper: false,
             cached: vec![false; model.nq],
             solcache: vec![0.0; model.nq * nv],
             om: vec![[0.0; 3]; nf],

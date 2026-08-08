@@ -276,6 +276,25 @@ pub fn substep_opts(
                     // unit RHS +e_vj — sparse forward + dense back,
                     // bitwise the fill/store/chol_solve it replaces
                     // (see `chol_fwd_unit`'s argument in algo.rs)
+                    //
+                    // R23d REVERTED (2026-08-07): solving STRAIGHT into
+                    // `ws.solcache[j*nv..(j+1)*nv]` and deleting `ws.sol`
+                    // with it compiles (the two are distinct fields, so
+                    // the borrow splits), is bitwise-identical, and saves
+                    // an nv-word copy on every cache miss — R26 measured
+                    // 5.27 of those per substep. It measured −0.03% alone
+                    // (noise) and **−0.84%** on top of the landed R23
+                    // package: 22,733 → 22,542 env-steps/s at N = 256,
+                    // 3 interleaved ABBA rounds, 6/6 paired losses,
+                    // ranges non-overlapping. The staging buffer is the
+                    // FAST form. Same rule as R23f (solver.rs `rw`): a
+                    // `chol_*` callee wants a dedicated, loop-invariant
+                    // scratch slice; a runtime-offset window into a
+                    // buffer the caller then re-reads through `col` two
+                    // lines later is worth ~1% to hand it instead. The
+                    // R15 order-dependence rule earned its keep here —
+                    // measured alone this item was indistinguishable
+                    // from zero.
                     chol_solve_unit(nv, &ws.m, vj, 1.0, &mut ws.sol[..nv]);
                     // R26: counted INSIDE the cache-miss branch — a
                     // cached re-entry is not a solve.
