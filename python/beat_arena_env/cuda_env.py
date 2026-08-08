@@ -76,16 +76,21 @@ _toolchain_done = False
 
 
 def _toolchain_env():
-    """Make torch.utils.cpp_extension work from a bare venv on Windows:
-    locate nvcc (CUDA_HOME), cl.exe (newest VS2022 Hostx64/x64), and ninja
-    (venv Scripts) if they are not already reachable. Memoized."""
+    """Make torch.utils.cpp_extension work from a bare venv: put the
+    venv's bin/Scripts dir (where pip installs ninja) on PATH on any OS
+    (2026-08-08: torch probes PATH, not the venv, so a pod session that
+    runs /root/venv/bin/python without activating never sees ninja), and
+    on Windows additionally locate nvcc (CUDA_HOME) and cl.exe (newest
+    VS2022 Hostx64/x64). Memoized."""
     global _toolchain_done
-    if os.name != "nt" or _toolchain_done:
+    if _toolchain_done:
         return
     _toolchain_done = True
     scripts = os.path.dirname(sys.executable)
     if shutil.which("ninja") is None:
         os.environ["PATH"] = scripts + os.pathsep + os.environ["PATH"]
+    if os.name != "nt":
+        return
     if shutil.which("cl") is None:
         pats = (r"C:\Program Files\Microsoft Visual Studio\2022\*"
                 r"\VC\Tools\MSVC\*\bin\Hostx64\x64",
