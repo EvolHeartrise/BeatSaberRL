@@ -94,7 +94,40 @@ New tests (both engines where applicable):
 
 ## 6. Explicitly out of scope (recorded, not forgotten)
 
-Contact-state observations (blind-feet first, per user's "see if it's
-possible"); K=7 lower body; taxing limit-row impulses; foot colliders
-vs. self-collision (sole corners only touch the GROUND); non-flat
-ground.
+K=7 lower body; taxing limit-row impulses; foot colliders vs.
+self-collision (sole corners only touch the GROUND); non-flat ground.
+(Contact-state observations were out of scope for v11's blind-feet run
+and are now IN scope — §7.)
+
+## 7. env v12 (2026-08-09): contact observations + survival gradient
+
+Added after the v11.1 run's falls plateaued ~5,100/update with episodes
+ending well before the first note: blind feet gave the policy nothing
+to balance WITH, and the v11.1 fall pricing (constant before the first
+note) gave survival time no gradient to climb.
+
+a. **Ground-contact obs.** OBS_DIM 340 → 344. Lanes 340..343 =
+   [L_heel, L_toe, R_heel, R_toe]: the tick-summed ground NORMAL
+   impulse (N·s) of each foot's back/front sole-corner pair (§2 corner
+   order: odd k = z+ = toe), divided by GROUND_IMP_NORM = 24.5 — the
+   spec literal ≈ M_TOTAL·g·DT (24.53 N·s), so a settled two-foot
+   stance sums to ≈ 1.0 across the four lanes. All-zero in weld mode
+   (lanes 0..340 stay the v10 obs verbatim); zeroed on reset; a
+   set_state refresh reads the LAST tick's sums in both engines. The
+   policy feeds the four lanes to the BODY token (BODY_FEAT 50 → 54)
+   in policy.py and both packed CUDA policy kernels.
+
+b. **Survival gradient.** ALIVE_BONUS = 0.002 per tick, contact mode
+   only, added AFTER the follow-through drain and BEFORE the
+   escape/fall overrides — a terminal fall/escape tick never collects
+   it. Sizing: 0.06/s ≈ +11 over a 3-min chart, an order under the
+   note stream (~|70|+), so it cannot out-bid hitting notes or revive
+   the loiter exploit; it exists to make "die at 1.9 s" beat "die at
+   0.5 s" before the first note is ever reachable.
+
+c. **Parity.** The §5 tiers gate the new lanes as part of the full obs
+   and the bonus as part of reward parity; a settled-stance lane test
+   (tests/test_v11_contact_parity.py, CUDA; tests/test_v12_contact_obs.py,
+   Rust) pins the bucket ORDER — nonzero lanes on both sides, so a
+   permutation cannot hide in zeros. Weld regression unchanged
+   (test_v10_parity_cuda.py), new lanes constant 0 there.

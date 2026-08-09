@@ -33,7 +33,7 @@ use rayon::prelude::*;
 // env v10 dynamics core — SPEC-v10.md §1–3 (P1 math, P2 constraints).
 pub mod dynamics;
 
-use dynamics::collide::{NUM_PAIRS, PAIRS};
+use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::quat_to_rot;
 use dynamics::model::{
     Model, F_HEAD, F_L_HAND, F_L_SHOULDER, F_L_WRIST, F_R_HAND, F_R_SHOULDER,
@@ -69,6 +69,15 @@ const COS_TOL: f64 = 0.5;
 const Y_CENTER: f64 = 1.40; // obs y normalization
 const REWARD_BAD: f64 = -0.5;
 const REWARD_MISS: f64 = -0.5;
+// env v12 (unilateral-contact spec §7, 2026-08-09): per-tick survival
+// bonus, CONTACT MODE ONLY. The v11.1 fall pricing left survival-time
+// flat BEFORE the first note (every pre-first-note fall prices the full
+// chart), so a from-scratch policy gets zero gradient on "die at 0.5 s
+// vs 1.9 s" until exploration tunnels to 2.0 s on its own. 0.002/tick
+// (0.06/s) keeps a full 3-min chart's worth (~+11) well under the note
+// stream's scale (~|70|+), so it cannot out-bid hitting notes; it is
+// overridden on fall/escape ticks (the terminal pricing wins).
+const ALIVE_BONUS: f64 = 0.002;
 // env v7.8 (2026-07-24, user-priced): a combo break on ScoreSaber costs
 // ~4 notes of multiplier; -0.5 made bombs the CHEAPEST error in the gym
 // (miss = -0.5 + ~1.0 forgone points) while the referee prices all
@@ -169,8 +178,19 @@ const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 95
 const OFF_CONTACT: usize = OFF_HEAD + 3; // 98: contact bits [L, R]
 const OFF_NOTES: usize = OFF_CONTACT + 2; // 100
 const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 324
-const OBS_DIM: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
-const _: () = assert!(OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340");
+// env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
+// [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse (N·s) per
+// front/back sole-corner pair, / GROUND_IMP_NORM. All-zero in weld mode
+// (the ground block does not exist there), so lanes 0..340 are the v10
+// obs verbatim.
+const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
+const N_GROUND_IMP_LANES: usize = 4;
+const OBS_DIM: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 344
+const _: () = assert!(OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344");
+// ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
+// = 24.53 N·s, rounded to a spec literal both engines share. A settled
+// two-foot stance sums to ≈ 1.0 across the four lanes.
+const GROUND_IMP_NORM: f64 = 24.5;
 const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 100);
 
 const X_NORM: f64 = 1.0;
@@ -523,6 +543,11 @@ struct Body {
     // λ is the constraint impulse ON the body (world frame): the ground
     // reaction; vertical force ≈ weld_imp[1 or 7] / DT.
     weld_imp: [f64; 12],
+    // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
+    // front/back sole-corner pair — [L_heel, L_toe, R_heel, R_toe]
+    // (N·s). Contact mode only; stays 0 under welds. Feeds the four
+    // OFF_GROUND_IMP obs lanes.
+    ground_imp: [f64; 4],
 }
 
 const MODEL: &Model = &HUMANOID;
@@ -554,6 +579,7 @@ impl Body {
             fell: false,
             fall_hits: 0,
             weld_imp: [0.0; 12],
+            ground_imp: [0.0; 4],
         };
         b.refresh_fk();
         b
@@ -571,6 +597,7 @@ impl Body {
         self.escaped = false;
         self.fell = false;
         self.weld_imp = [0.0; 12];
+        self.ground_imp = [0.0; 4];
         self.refresh_fk();
     }
 
@@ -604,6 +631,7 @@ impl Body {
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.weld_imp = [0.0; 12];
+        self.ground_imp = [0.0; 4];
         // C backstop: this tick's pre-integration envelope engagements
         // are ws.env_hits' delta over the 8 substeps (the counter itself
         // is cumulative until pop_envelope_hits)
@@ -638,6 +666,16 @@ impl Body {
             // P6: tick-summed foot-weld impulses (ground reaction)
             for r in 0..nweld {
                 self.weld_imp[r] += self.cs.lambda[r];
+            }
+            // contact spec §7: tick-summed ground NORMAL impulses,
+            // bucketed [L_heel, L_toe, R_heel, R_toe] — corner ids are
+            // foot*4 + k with k odd = z+ (toe), so bucket =
+            // foot*2 + (k & 1). Obs lanes read these after the tick.
+            if self.foot_contact {
+                for (gi, g) in self.cs.ground_contacts.iter().enumerate() {
+                    let b = (g.corner / CORNERS_PER_FOOT) * 2 + (g.corner & 1);
+                    self.ground_imp[b] += self.cs.lambda[self.cs.ground_row(gi)];
+                }
             }
             for (i, c) in self.cs.contacts.iter().enumerate() {
                 let lam = self.cs.lambda[ncbase + i];
@@ -912,6 +950,13 @@ impl Core {
             obs[base + 13] = 1.0; // valid
             obs[OFF_NOTE_MASK + slot] = 1.0;
             slot += 1;
+        }
+
+        // contact spec §7: per-foot ground-contact lanes
+        // [L_heel, L_toe, R_heel, R_toe]; all-zero under welds
+        for k in 0..N_GROUND_IMP_LANES {
+            obs[OFF_GROUND_IMP + k] =
+                (self.body.ground_imp[k] / GROUND_IMP_NORM) as f32;
         }
     }
 
@@ -1269,6 +1314,12 @@ impl Core {
                     self.events_buf.push((tr.note, 5, pts as f32, 0.0, 0.0));
                 }
             }
+        }
+        // contact spec §7: the survival gradient — a per-tick alive
+        // bonus, contact mode only. Added BEFORE the terminal overrides
+        // below so a fall/escape tick never collects it.
+        if self.body.foot_contact {
+            reward += ALIVE_BONUS;
         }
         if self.body.escaped {
             reward = 0.0;

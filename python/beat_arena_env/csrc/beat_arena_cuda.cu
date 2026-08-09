@@ -923,8 +923,17 @@ constexpr int OFF_HEAD = 95;
 constexpr int OFF_CONTACT = 98;
 constexpr int OFF_NOTES = 100;
 constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
-constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS;                // 340
-static_assert(OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340");
+// env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
+// [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse /
+// GROUND_IMP_NORM. All-zero in weld mode, so lanes 0..340 are the v10
+// obs verbatim.
+constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 340
+constexpr int N_GROUND_IMP_LANES = 4;
+constexpr int OBS_DIM = OFF_GROUND_IMP + N_GROUND_IMP_LANES;         // 344
+static_assert(OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344");
+// ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
+// the spec literal lib.rs shares.
+constexpr double GROUND_IMP_NORM = 24.5;
 
 // ---- solver constants (step.rs / solver.rs / collide.rs) --------------------
 constexpr double DT = 1.0 / 30.0;
@@ -1424,6 +1433,10 @@ constexpr double Y_CENTER = 1.40;
 constexpr double REWARD_BAD = -0.5;
 constexpr double REWARD_MISS = -0.5;
 constexpr double REWARD_BOMB = -1.5;
+// env v12 (contact spec §7): per-tick survival bonus, contact mode only
+// — see lib.rs ALIVE_BONUS for the sizing rationale. Overridden by the
+// fall/escape terminal pricing.
+constexpr double ALIVE_BONUS = 0.002;
 constexpr double GOOD_HALF_X = 0.4;
 constexpr double GOOD_HALF_Z = 0.5;
 constexpr double GOOD_Z_SHIFT = -0.25;
@@ -1619,6 +1632,10 @@ struct GroundRows {
   int ng;  // ACTIVE corners this substep, 0..NUM_GROUND_CORNERS
   T g_J[N_GROUND_ROWS][NV], g_minv[N_GROUND_ROWS][NV];
   T g_bias[N_GROUND_ROWS], g_diag[N_GROUND_ROWS], g_lam[N_GROUND_ROWS];
+  // contact spec §7: 2-bit obs bucket (foot*2 + toe) of each ACTIVE
+  // slot, packed 2 bits/slot — the compaction drops corner ids, and the
+  // per-tick ground_imp aggregation needs them back after the solve.
+  uint32_t g_bucket;
 };
 template <typename T>
 struct GroundRows<T, false> {};  // weld mode: no ground rows exist
@@ -3340,6 +3357,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // early exit inside it — the §2 contact loop's contract.
   if constexpr (FC) {
     s.ng = 0;
+    s.g_bucket = 0;
     for (int f = 0; f < 2; f++) {
       const int frame = GROUND_FRAMES[f];
       for (int k = 0; k < CORNERS_PER_FOOT; k++) {
@@ -3378,6 +3396,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
           // gets no Baumgarte term (contact spec §3)
           s.g_bias[nrow + 1] = T(0);
           s.g_bias[nrow + 2] = T(0);
+          // contact spec §7: GROUND_CORNERS order puts z+ (toe) at odd
+          // k, so the obs bucket is foot*2 + (k & 1)
+          s.g_bucket |= (uint32_t)(f * 2 + (k & 1)) << (2 * s.ng);
           s.ng = s.ng + 1;
         }
       }
@@ -4224,6 +4245,12 @@ struct Sim {
   // Written in contact mode only; stays 0 in weld mode, where the feet
   // cannot let go.
   int* __restrict__ fall_hits;
+  // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
+  // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
+  // Body::ground_imp mirror. Written by the step tick in contact mode,
+  // zeroed by reset_env, read back by write_obs in EVERY mode (weld
+  // mode never writes, so the reset zeros stand — lanes stay 0).
+  T* __restrict__ ground_imp;
   int64_t* __restrict__ chart_idx;
   // chart pool (P, C), read-only
   const T *__restrict__ p_hit, *__restrict__ p_speed, *__restrict__ p_center,
@@ -4319,6 +4346,8 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   if (P.want_contacts)
     for (int pr = 0; pr < NUM_PAIRS; pr++)
       P.contact_imp[e * NUM_PAIRS + pr] = T(0);
+  for (int k = 0; k < N_GROUND_IMP_LANES; k++)
+    P.ground_imp[e * N_GROUND_IMP_LANES + k] = T(0);
   P.effort[e] = T(0);
   P.chart_idx[e] = chart;
   P.tick[e] = 0;
@@ -4474,6 +4503,13 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     obs[OFF_NOTE_MASK + slot] = 1.f;
     slot++;
   }
+
+  // contact spec §7: per-foot ground-contact lanes [L_heel, L_toe,
+  // R_heel, R_toe]; the buffer is all-zero under welds
+  for (int k = 0; k < N_GROUND_IMP_LANES; k++)
+    obs[OFF_GROUND_IMP + k] = (float)(
+        P.ground_imp[(size_t)e * N_GROUND_IMP_LANES + k] /
+        T(GROUND_IMP_NORM));
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
@@ -4516,10 +4552,18 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // bounces back has still stopped being the standing task. Structurally
   // false (and folded away) in weld mode.
   bool fell = false;
+  // contact spec §7: tick-summed ground normal impulses per obs bucket
+  // [L_heel, L_toe, R_heel, R_toe] (lib.rs Body::ground_imp). Dead code
+  // in weld mode — no reader, so it folds away.
+  T gimp[4] = {T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
     if constexpr (FC)
       if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
+    if constexpr (FC)
+      for (int gi = 0; gi < s.ng; gi++)
+        gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
+            s.g_lam[gi * GROUND_ROWS_PER_CORNER];
     // SPEC-v10 §4 effort: positive work at the END-of-substep velocity
     for (int j = 0; j < NQ; j++) {
       const T pw = tau[j] * d.v[VOFF + j];
@@ -4545,6 +4589,9 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // one per fallen TICK, not per substep (lib.rs: `if fell { fall_hits += 1 }`)
   if constexpr (FC)
     if (fell) atomicAdd(P.fall_hits, 1);
+  if constexpr (FC)
+    for (int k = 0; k < N_GROUND_IMP_LANES; k++)
+      P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
   P.effort[e] = effort;
   P.contact_arm[e * 2] = arm_l;
   P.contact_arm[e * 2 + 1] = arm_r;
@@ -4858,6 +4905,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
   }
 
+  // contact spec §7 survival gradient — MIRROR of lib.rs: the alive
+  // bonus lands BEFORE the terminal overrides, so a fall/escape tick
+  // never collects it.
+  if constexpr (FC) reward += T(ALIVE_BONUS);
   if (d.env_bad) reward = T(0);
   // v11.1 fall pricing (contact spec §4, 2026-08-09) — MIRROR of
   // lib.rs's fell block: REWARD_MISS x pending scoreable notes, full
@@ -4934,7 +4985,7 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TCIDX,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TGIMP, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -4992,6 +5043,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.pd_hits = ts[TPD].data_ptr<int>();
     P.env_hits = ts[TENV].data_ptr<int>();
     P.fall_hits = ts[TFALL].data_ptr<int>();
+    P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

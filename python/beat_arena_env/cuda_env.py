@@ -431,6 +431,10 @@ class CudaBeatVecEnv:
         # per (env, tick); always 0 in weld mode
         self._fall_hits = z(1, dt=torch.int32)
         self._fall_popped = 0
+        # env v12 (contact spec §7): tick-summed ground normal impulses
+        # per (env, [L_heel, L_toe, R_heel, R_toe]); feeds the four
+        # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
+        self.ground_imp = z(N, 4)
         self.chart_idx = z(N, dt=torch.int64)
         # episode-return ring buffer (device-side)
         self._cap = 4096
@@ -456,6 +460,7 @@ class CudaBeatVecEnv:
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
+            self.ground_imp,
             self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
