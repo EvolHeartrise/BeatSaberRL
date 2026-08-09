@@ -1,20 +1,29 @@
 """Record + verify + convert a bench's top-N pp plays to watchable replays.
 
     python make_top10_replays.py --ckpt <ckpt.pt> --bench <bench.json> \
-        --tag gen2_429m [--top 10]
+        --tag gen2_429m [--top 10] [--workers 10]
 
 For each top play: greedy re-rollout with the bench protocol (cached
 map, real NJS speeds, seed 0) recording JSONL v7, verify the outcome
 counters and multiplied score against the bench entry, then convert to
 a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
 (Was a 598M one-off; parameterized 2026-07-24.)
+
+--workers N (2026-08-08, pod era): plays are independent, so they run
+in a spawn-context process pool — each worker loads its own policy and
+sim. Serial generation left a 256-core pod ~idle; outputs are byte-
+identical to serial (same seed, same deterministic rollout; verified
+at introduction by hashing a full set both ways). Worker prints arrive
+in rank order regardless of completion order.
 """
 
 import argparse
 import json
+import multiprocessing
 import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import torch
 
@@ -32,6 +41,62 @@ def slug(s, n=24):
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:n].lower() or "song"
 
 
+_W = {}          # per-process state: {"policy", "dev"} (set by _worker_init)
+
+
+def _worker_init(ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    dev = torch.device(device)
+    _W["policy"] = load_policy(ckpt).to(dev).eval()
+    _W["dev"] = dev
+
+
+def _make_one(job):
+    """One play: re-rollout, verify vs bench entry, convert, verify decode.
+    Returns (base, line, warn) for rank-ordered printing by the parent."""
+    rank, n_top, entry, tag, label = job
+    policy, dev = _W["policy"], _W["dev"]
+    map_dir = f"maps/scoresaber/{entry['song_hash']}"
+    notes, _ = load_beatmap(map_dir, entry["difficulty"], first_note_s=2.0)
+    base = (f"replays/{tag}_{label}{rank:02d}_"
+            f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
+    env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears)
+    env.set_record(base + ".jsonl")
+    obs, _ = env.reset()
+    walk = scoresaber.ComboTracker()
+    done = False
+    while not done:
+        with torch.no_grad():
+            logits, _ = policy(
+                torch.as_tensor(obs, dtype=torch.float32,
+                                device=dev).unsqueeze(0))
+        obs, _, done, _, info = env.step(
+            [int(l.argmax()) for l in logits])
+        walk.consume(info["events"])
+    exact = (round(walk.score) == entry["score"]
+             and walk.max_combo == entry["highest_combo"]
+             and info["good_cuts"] == entry["good_cuts"])
+    warn = None
+    if not exact:
+        # fp32 argmax near-tie flipped somewhere vs the bench run —
+        # still a faithful greedy play of THIS checkpoint; verify
+        # the pipeline self-consistently against the replay itself
+        warn = (f"    WARNING {entry['song']}: replay score "
+                f"{round(walk.score)} != bench {entry['score']} "
+                f"(near-tie drift; replay is self-consistent)")
+
+    conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
+                 entry["difficulty"], base + ".dat")
+    d = decode_dat(base + ".dat")
+    assert d["final_score"] == round(walk.score), \
+        f".dat decode {d['final_score']} != replay {round(walk.score)}"
+    line = (f"[{rank:2}/{n_top}] {entry['pp']:6.1f}pp "
+            f"{entry['stars']:5.2f}* acc {entry['accuracy']:.3f} "
+            f"{'FC ' if entry['full_combo'] else ''}"
+            f"{entry['song'][:34]!r} -> {base}.dat OK")
+    return base, line, warn
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--ckpt", required=True)
@@ -44,6 +109,9 @@ def main():
                    help="take the WORST N by the sort key instead of "
                         "the best (2026-07-29: bottom-acc failure-mode "
                         "review)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="parallel plays (spawn pool; each worker owns a "
+                        "policy + sim). Outputs byte-identical to serial.")
     p.add_argument("--device", type=str, default=None,
                    help="forward device (default: cuda if available). "
                         "Matching the bench's device maximizes exact "
@@ -61,56 +129,32 @@ def main():
     # and accuracy "top" sets used to collide on topNN names
     label = ("bot" if args.bottom else "top") + (
         "acc" if args.sort == "accuracy" else "pp")
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-    dev = torch.device(args.device
-                       or ("cuda" if torch.cuda.is_available() else "cpu"))
-    policy = load_policy(ckpt).to(dev).eval()
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     # replays/ is gitignored and absent on fresh checkouts (third
     # "output dir assumed to exist" bug of the 2026-08-08 migration)
     os.makedirs("replays", exist_ok=True)
+    jobs = [(rank, len(top), entry, args.tag, label)
+            for rank, entry in enumerate(top, 1)]
     made = []
-    for rank, entry in enumerate(top, 1):
-        map_dir = f"maps/scoresaber/{entry['song_hash']}"
-        notes, _ = load_beatmap(map_dir, entry["difficulty"],
-                                first_note_s=2.0)
-        base = (f"replays/{args.tag}_{label}{rank:02d}_"
-                f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
-        env = RustBeatEnv(external_chart=notes, seed=0,
-                          gears=policy.n_gears)
-        env.set_record(base + ".jsonl")
-        obs, _ = env.reset()
-        walk = scoresaber.ComboTracker()
-        done = False
-        while not done:
-            with torch.no_grad():
-                logits, _ = policy(
-                    torch.as_tensor(obs, dtype=torch.float32,
-                                    device=dev).unsqueeze(0))
-            obs, _, done, _, info = env.step(
-                [int(l.argmax()) for l in logits])
-            walk.consume(info["events"])
-        exact = (round(walk.score) == entry["score"]
-                 and walk.max_combo == entry["highest_combo"]
-                 and info["good_cuts"] == entry["good_cuts"])
-        if not exact:
-            # fp32 argmax near-tie flipped somewhere vs the bench run —
-            # still a faithful greedy play of THIS checkpoint; verify
-            # the pipeline self-consistently against the replay itself
-            print(f"    WARNING {entry['song']}: replay score "
-                  f"{round(walk.score)} != bench {entry['score']} "
-                  f"(near-tie drift; replay is self-consistent)",
-                  flush=True)
-
-        r = conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
-                         entry["difficulty"], base + ".dat")
-        d = decode_dat(base + ".dat")
-        assert d["final_score"] == round(walk.score), \
-            f".dat decode {d['final_score']} != replay {round(walk.score)}"
-        made.append(base)
-        print(f"[{rank:2}/{len(top)}] {entry['pp']:6.1f}pp "
-              f"{entry['stars']:5.2f}* acc {entry['accuracy']:.3f} "
-              f"{'FC ' if entry['full_combo'] else ''}"
-              f"{entry['song'][:34]!r} -> {base}.dat OK", flush=True)
+    if args.workers > 1:
+        ctx = multiprocessing.get_context("spawn")   # CUDA-safe
+        with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs)),
+                                 mp_context=ctx,
+                                 initializer=_worker_init,
+                                 initargs=(args.ckpt, device)) as ex:
+            for base, line, warn in ex.map(_make_one, jobs):
+                if warn:
+                    print(warn, flush=True)
+                print(line, flush=True)
+                made.append(base)
+    else:
+        _worker_init(args.ckpt, device)
+        for job in jobs:
+            base, line, warn = _make_one(job)
+            if warn:
+                print(warn, flush=True)
+            print(line, flush=True)
+            made.append(base)
     print("\nall verified:", len(made))
 
 
