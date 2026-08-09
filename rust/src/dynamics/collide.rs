@@ -10,8 +10,8 @@
 
 use super::fk::{add3, dot3, mat_vec, scale3, sub3};
 use super::model::{
-    F_CHEST, F_HEAD, F_L_HAND, F_L_ELBOW, F_L_SHANK, F_L_THIGH, F_L_UARM, F_R_HAND, F_R_ELBOW,
-    F_R_SHANK, F_R_THIGH, F_R_UARM,
+    F_CHEST, F_HEAD, F_L_FOOT, F_L_HAND, F_L_ELBOW, F_L_SHANK, F_L_THIGH, F_L_UARM, F_R_FOOT,
+    F_R_HAND, F_R_ELBOW, F_R_SHANK, F_R_THIGH, F_R_UARM,
 };
 use super::Workspace;
 
@@ -317,6 +317,85 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
             let s2 = sub3(c2, scale3(n, cb.radius));
             let point = scale3(add3(s1, s2), 0.5);
             out.push(Contact { pair: pid, point, normal: n, gap });
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// GROUND CONTACT — env v11, "Unilateral foot contact" spec §2.
+//
+// A second, much simpler narrow phase: 8 fixed points against the static
+// plane y = 0. No pair table, no segment solve, no broad phase — the gap
+// IS the corner's world y, so activation is one compare per corner.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Sole-box corners in the FOOT frame. Derived from the SPEC-v10 §1.2
+/// foot box (center (0, −0.035, 0.05), half (0.045, 0.035, 0.125)):
+/// the sole plane is y = −0.035 − 0.035 = −0.070 and z = 0.05 ∓ 0.125.
+/// Order within a foot is NORMATIVE (contact spec §2): (x−,z−), (x−,z+),
+/// (x+,z−), (x+,z+).
+#[rustfmt::skip]
+pub const GROUND_CORNERS: [[f64; 3]; 4] = [
+    /* 0 (x−,z−) */ [-0.045, -0.070, -0.075],
+    /* 1 (x−,z+) */ [-0.045, -0.070,  0.175],
+    /* 2 (x+,z−) */ [ 0.045, -0.070, -0.075],
+    /* 3 (x+,z+) */ [ 0.045, -0.070,  0.175],
+];
+
+/// Corner-carrying body frames in the NORMATIVE order (contact spec §2):
+/// foot_l then foot_r.
+pub const GROUND_FRAMES: [usize; 2] = [F_L_FOOT, F_R_FOOT];
+
+pub const CORNERS_PER_FOOT: usize = 4;
+/// 8 = 2 feet × 4 sole corners; also the corner-id range (foot_l 0..4,
+/// foot_r 4..8) that the row order and the CUDA mirror both key on.
+pub const NUM_GROUND_CORNERS: usize = GROUND_FRAMES.len() * CORNERS_PER_FOOT;
+
+/// The reference pose puts the ankle (foot-frame origin) at y = 0.07, so
+/// every corner sits at exactly y = 0 — active and touching at reset
+/// (contact spec §2). Pinned by `ground_corners_touch_at_reference`.
+const _: () = {
+    assert!(NUM_GROUND_CORNERS == 8);
+};
+
+/// One active sole corner (gap < MARGIN) — three constraint rows
+/// (normal + 2 friction), contact spec §3.
+#[derive(Clone, Copy)]
+pub struct GroundContact {
+    /// Normative corner id 0..8 — foot index × 4 + corner index.
+    pub corner: usize,
+    /// Body frame the corner is rigidly attached to.
+    pub frame: usize,
+    /// World corner position (the contact point).
+    pub point: [f64; 3],
+    /// Signed gap = the corner's world y (< 0 penetrating).
+    pub gap: f64,
+}
+
+/// MIRROR: ground narrow phase, contact spec §2. 8 fixed corners against
+/// the plane y = 0 in NORMATIVE corner order (foot_l then foot_r, and
+/// `GROUND_CORNERS` order within a foot) — that order is the row order
+/// downstream, so it must not be permuted. Requires fk_all in ws.
+/// Appends active corners to `out` (cleared here; capacity
+/// NUM_GROUND_CORNERS is reserved by the caller — no allocation inside a
+/// substep).
+pub fn ground_phase(ws: &Workspace, out: &mut Vec<GroundContact>) {
+    out.clear();
+    for f in 0..GROUND_FRAMES.len() {
+        let frame = GROUND_FRAMES[f];
+        for k in 0..CORNERS_PER_FOOT {
+            let point = add3(ws.p[frame], mat_vec(&ws.r[frame], GROUND_CORNERS[k]));
+            // the plane is y = 0 and its normal is +ŷ, so the signed gap
+            // is the corner's world y outright
+            let gap = point[1];
+            if gap < MARGIN {
+                out.push(GroundContact {
+                    corner: f * CORNERS_PER_FOOT + k,
+                    frame,
+                    point,
+                    gap,
+                });
+            }
         }
     }
 }

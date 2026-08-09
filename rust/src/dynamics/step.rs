@@ -150,7 +150,8 @@ pub fn substep_opts(
 
     // ── constraint stage (§3 steps 7–9) via the hook ───────────────
     // 7. collision detection (55-pair table, margin 0.01)
-    // 8. PGS, 12 iterations, fixed row order (welds then contacts)
+    // 8. PGS, 12 iterations, fixed row order (welds — or, in env v11
+    //    contact mode, the ground block — then contacts, then limits)
     // 9. v ← v* + M⁻¹Jᵀλ
     // Implemented by solver::ConstraintSet::solve (P2); None = the
     // unconstrained pipeline.

@@ -8,6 +8,13 @@
 //! capsule narrow phase) and §3 steps 7–9 (solver.rs: foot welds +
 //! contact normal rows, PGS-12) plugged into step.rs's constraint seam
 //! — `solver::substep_constrained` is the full v10 substep.
+//!
+//! Env v11 (2026-08-08, "Unilateral foot contact" spec) adds a SECOND
+//! foot mode behind `ConstraintSet::new_modes(.., ground)`: the 12 weld
+//! rows are dropped and the 8 sole-box corners get unilateral frictional
+//! ground rows against the plane y = 0 (collide.rs `ground_phase`,
+//! solver.rs's ground block). Weld mode stays the DEFAULT and is bitwise
+//! unchanged — `tests_ground.rs` gates both halves.
 
 pub mod algo;
 pub mod collide;
@@ -28,6 +35,8 @@ mod tests_constraints;
 mod tests_dyn;
 #[cfg(test)]
 mod tests_fk;
+#[cfg(test)]
+mod tests_ground;
 #[cfg(test)]
 mod tests_oracle;
 #[cfg(test)]
