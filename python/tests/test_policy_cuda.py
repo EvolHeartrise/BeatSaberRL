@@ -48,7 +48,7 @@ def _rand_obs(n, seed):
     """Random obs with realistic scale and a random 0/1 note mask."""
     g = torch.Generator().manual_seed(seed)
     obs = torch.randn(n, OBS_DIM, generator=g) * 0.7
-    obs[:, OFF_NOTE_MASK:] = (
+    obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS] = (
         torch.rand(n, N_NOTE_SLOTS, generator=g) < 0.6).float()
     return obs.to(DEV)
 
@@ -129,7 +129,7 @@ def test_junk_in_masked_slots_cannot_leak(rand_policy):
     finite junk — asserted at atol 1e-6."""
     fused = FusedNotePolicy(rand_policy)
     obs = _real_obs(32)
-    mask = obs[:, OFF_NOTE_MASK:]
+    mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
     assert (mask == 0).any(), "test needs at least one empty slot"
     junk = obs.clone()
     g = torch.Generator().manual_seed(42)

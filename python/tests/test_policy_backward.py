@@ -54,7 +54,7 @@ ABS_OF_MAX = 1e-3   # absolute floor as a fraction of the largest |grad|
 def _rand_obs(n, seed):
     g = torch.Generator().manual_seed(seed)
     obs = torch.randn(n, OBS_DIM, generator=g) * 0.7
-    obs[:, OFF_NOTE_MASK:] = (
+    obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS] = (
         torch.rand(n, N_NOTE_SLOTS, generator=g) < 0.6).float()
     return obs.to(DEV)
 
@@ -225,7 +225,7 @@ def test_deterministic_and_junk_inert_with_private_copies(rand_policy):
     an exact-zero product)."""
     n = 32
     obs = _real_obs(n)
-    mask = obs[:, OFF_NOTE_MASK:]
+    mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
     assert (mask == 0).any()
     g = torch.Generator().manual_seed(13)
     R = torch.randn(n, N_ACTION_HEADS, K, generator=g).to(DEV)
