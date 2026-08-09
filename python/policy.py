@@ -105,8 +105,10 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # Observation layout (contract; mirrors beat_arena_env/constants.py,
 # obs v10 = SPEC-v10 §5: 340 lanes — root pose/vel (15), q block (31,
 # wrist rolls cos/sin), qd (29), two 10-lane derived hand blocks, head
-# (3), contact bits (2), then the v9-verbatim 16x14 note block + mask).
-OBS_DIM = 340
+# (3), contact bits (2), then the v9-verbatim 16x14 note block + mask —
+# plus the env v12 (unilateral-contact spec §7) 4-lane per-foot
+# ground-contact block at 340..344, fed to the BODY token).
+OBS_DIM = 344
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
 OFF_NOTES = 100
@@ -116,13 +118,15 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 324
 # that hand's q lanes (8, incl. the cos/sin roll pair) + qd lanes (7) +
 # derived block (10) = 25 features + the 2-lane hand one-hot; the ONE
 # body token = root pose/vel block (15) + spine/leg q (15) + spine/leg
-# qd (15) + head (3) + contact bits (2) = 50 features.
+# qd (15) + head (3) + contact bits (2) + ground-contact lanes (4, env
+# v12) = 54 features.
 SABER_FEAT = 25
-BODY_FEAT = 50
+BODY_FEAT = 54
 _SABER_L_IDX = tuple(range(18, 26)) + tuple(range(49, 56)) + tuple(range(75, 85))
 _SABER_R_IDX = tuple(range(26, 34)) + tuple(range(56, 63)) + tuple(range(85, 95))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
-             + tuple(range(63, 75)) + tuple(range(95, 100)))
+             + tuple(range(63, 75)) + tuple(range(95, 100))
+             + tuple(range(340, 344)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —

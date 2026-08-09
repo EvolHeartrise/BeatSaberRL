@@ -36,7 +36,8 @@ if not torch.cuda.is_available():
     pytest.skip("CudaBeatVecEnv needs CUDA", allow_module_level=True)
 
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import JOINT_LIMITS, N_JOINTS, NV, OMEGA_CAP
+from beat_arena_env.constants import (JOINT_LIMITS, N_JOINTS, NV,
+                                      OFF_GROUND_IMP, OMEGA_CAP)
 from beat_arena_env.cuda_env import CudaBeatVecEnv
 import beat_arena_rs
 
@@ -435,3 +436,38 @@ def test_contact_determinism_bitwise():
     assert torch.equal(v1, v2), "velocity not bitwise reproducible"
     assert f1 == f2
     assert f1 > 0, "contact-mode run produced no falls to reproduce"
+
+
+# --- (vii) env v12: ground-contact obs lanes (contact spec §7) -----------------
+
+def test_ground_imp_lanes_settled_parity():
+    """The four OFF_GROUND_IMP lanes on a settling zero-torque stance —
+    CUDA f64 lockstep against Rust at the single-tick band, and NONZERO
+    on both sides, so a bucket permutation cannot hide in zeros. (The
+    generic lockstep tiers above already cover the lanes as part of the
+    full obs; this pins the regime the lanes were built for.) 10 ticks,
+    not more: the unactuated body starts tipping at ~0.7 s and the fall
+    envelope ends the episode."""
+    n = 4
+    sims = _rust_sims(n, 5)
+    env = _cenv(n, 5)
+    env.reset()
+    _resync(env, sims)
+    zero_t = torch.zeros((n, N_JOINTS), dtype=torch.int64)
+    zero_r = [0] * N_JOINTS
+    tobs = None
+    obs_r = [None] * n
+    for _t in range(10):
+        tobs, _tr, _td, _ = env.step(zero_t)
+        for e, sim in enumerate(sims):
+            obs_r[e], _rr, _dr, _ev = sim.step(zero_r)
+    lanes_c = tobs[:, OFF_GROUND_IMP:OFF_GROUND_IMP + 4].cpu().numpy()
+    lanes_r = np.asarray([o[OFF_GROUND_IMP:OFF_GROUND_IMP + 4]
+                          for o in obs_r], dtype=np.float32)
+    d = float(np.abs(lanes_c - lanes_r).max())
+    assert d < 1e-4, f"settled ground_imp lanes diverge: {d:.3e}"
+    assert (lanes_c > 0.0).all() and (lanes_r > 0.0).all(), \
+        "an unloaded bucket in settled stance"
+    sums = lanes_c.sum(axis=1)
+    assert np.all(np.abs(sums - 1.0) < 0.05), \
+        f"weight sum off on CUDA side: {sums}"

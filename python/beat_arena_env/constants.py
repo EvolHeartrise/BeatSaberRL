@@ -178,6 +178,10 @@ _OBS_BLOCKS = (
     ("contact", 2),           # contact bits [L, R]
     ("notes", N_NOTE_SLOTS * NOTE_FEAT),   # v9 NOTE_FEAT verbatim
     ("note_mask", N_NOTE_SLOTS),
+    # env v12 (unilateral-contact spec §7): per-foot ground-contact
+    # lanes [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse
+    # / GROUND_IMP_NORM; all-zero in weld mode
+    ("ground_imp", 4),
 )
 OBS_OFF = {}
 _off = 0
@@ -197,7 +201,13 @@ OFF_HEAD = OBS_OFF["head"]              # 95
 OFF_CONTACT = OBS_OFF["contact"]        # 98
 OFF_NOTES = OBS_OFF["notes"]            # 100
 OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 324
-assert OBS_DIM == 340, "SPEC-v10 §5: OBS_DIM must be 340"
+OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 340
+assert OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344"
+# ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec
+# literal both engines share (contact spec §7)
+GROUND_IMP_NORM = 24.5
+# contact spec §7: per-tick survival bonus, contact mode only
+ALIVE_BONUS = 0.002
 
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0

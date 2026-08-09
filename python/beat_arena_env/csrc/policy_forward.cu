@@ -46,10 +46,10 @@ constexpr int NOTE_FEAT = 14;
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int SABER_FEAT = 25;
 constexpr int SABER_IN = SABER_FEAT + 2;              // + hand one-hot
-constexpr int BODY_FEAT = 50;
+constexpr int BODY_FEAT = 54;  // env v12: + the 4 ground-contact lanes
 constexpr int OFF_NOTES = 100;
 constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
-constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
+constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS + 4; // 344 (env v12)
 constexpr int N_HEADS = 29;     // action heads, K logits each (runtime)
 constexpr int MAX_K = 7;
 constexpr int MAX_NOUT = N_HEADS * MAX_K + 1;         // 204
@@ -69,7 +69,8 @@ __device__ constexpr int BODY_IDX[BODY_FEAT] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
     34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
     63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
-    95, 96, 97, 98, 99};
+    95, 96, 97, 98, 99,
+    340, 341, 342, 343};  // env v12 ground-contact lanes
 
 // --- packed-weight offsets (contract with policy_cuda._pack) ---------------
 constexpr int O_NOTE_W1 = 0;
@@ -84,7 +85,7 @@ constexpr int O_BODY_W1 = O_SAB_B2 + D;
 constexpr int O_BODY_B1 = O_BODY_W1 + BODY_FEAT * D;
 constexpr int O_BODY_W2 = O_BODY_B1 + D;
 constexpr int O_BODY_B2 = O_BODY_W2 + D * D;
-constexpr int FRONT = O_BODY_B2 + D;                  // 18496
+constexpr int FRONT = O_BODY_B2 + D;                  // 18752 (v12)
 // per transformer block (relative to its base)
 constexpr int B_LN1_G = 0;
 constexpr int B_LN1_B = B_LN1_G + D;
@@ -108,7 +109,7 @@ constexpr int T_W2 = T_B1 + TRUNK;
 constexpr int T_B2 = T_W2 + TRUNK * TRUNK;
 constexpr int TRUNK_SZ = T_B2 + TRUNK;                // 41216
 constexpr int H_W = 0;                                // TRUNK x NOUT
-static_assert(FRONT == 18496 && BLK == 29312 && TRUNK_SZ == 41216,
+static_assert(FRONT == 18752 && BLK == 29312 && TRUNK_SZ == 41216,
               "packed layout drifted");
 
 constexpr int expected_numel(int n_blocks, int n_gears) {

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from beat_arena_env import RustBeatEnv, OFF_NOTES, OFF_NOTE_MASK, NOTE_FEAT
+from beat_arena_env.constants import N_NOTE_SLOTS
 from beat_arena_env.constants import N_JOINTS
 from beat_arena_env.vec_env import BeatVecEnv
 from policy import HEAD_SIZES, N_ACTION_HEADS, NotePolicy, OBS_DIM
@@ -43,7 +44,7 @@ def test_junk_in_masked_slots_cannot_leak():
     torch.manual_seed(0)
     policy = NotePolicy()
     obs = _obs_batch()
-    mask = obs[:, OFF_NOTE_MASK:]
+    mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
     assert (mask == 0).any(), "test needs at least one empty slot"
 
     junk = obs.clone()
@@ -63,7 +64,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 340
+    assert OBS_DIM == 344
     assert N_ACTION_HEADS == N_JOINTS == 29
 
 
@@ -84,7 +85,7 @@ def test_vec_env_auto_reset():
         finished += len(infos)
         for info in infos:
             assert info["n_notes"] > 0
-            assert obs[info["env"], OFF_NOTE_MASK:].sum() > 0  # fresh notes
+            assert obs[info["env"], OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() > 0  # fresh notes
     assert finished >= 4
 
 
