@@ -35,9 +35,15 @@ class RustBeatEnv(gym.Env):
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF,
-                 external_chart=None, wide_acc=False, gears=3, seed=0):
+                 external_chart=None, wide_acc=False, gears=3, seed=0,
+                 foot_contact=False):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
-        played on EVERY reset instead of procedural generation."""
+        played on EVERY reset instead of procedural generation.
+
+        foot_contact: env v11 foot_mode (unilateral-contact spec §1) —
+        False = the v10 foot welds (DEFAULT, physics unchanged), True =
+        unilateral frictional ground contact on the 8 sole corners, with
+        the fall termination at root y < 0.55 m."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),
@@ -62,10 +68,12 @@ class RustBeatEnv(gym.Env):
         # bench/eval/replay paths keep real scoring
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef,
-                              wide_acc=wide_acc, gears=gears)
+                              wide_acc=wide_acc, gears=gears,
+                              foot_contact=foot_contact)
         self.effort_coef = effort_coef
         self.wide_acc = wide_acc
         self.gears = gears
+        self.foot_contact = bool(foot_contact)
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
@@ -179,5 +187,9 @@ class RustBeatEnv(gym.Env):
             info.update(score_pre=pre, score_acc=acc, score_post=post)
             info.update(good_cuts=self.sim.good_cuts, bad_cuts=self.sim.bad_cuts,
                         misses=self.sim.misses, n_notes=self.sim.n_notes,
-                        score=self.sim.score, bombs_hit=self.sim.bombs_hit)
+                        score=self.sim.score, bombs_hit=self.sim.bombs_hit,
+                        # contact spec §4: 0 or 1 — a fall ends the
+                        # episode. Reported, never hidden; always 0 in
+                        # weld mode.
+                        falls=self.sim.falls)
         return obs, float(reward), bool(done), False, info

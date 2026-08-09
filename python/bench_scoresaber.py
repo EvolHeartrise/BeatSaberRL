@@ -118,10 +118,11 @@ class _Group:
     __slots__ = ("n", "sim", "fwd", "obs_t", "obs_buf", "act_t", "act_np",
                  "slots", "free", "n_active", "ev", "issued")
 
-    def __init__(self, n, fwd, device, gears=3):
+    def __init__(self, n, fwd, device, gears=3, foot_contact=False):
         self.n = n
         self.sim = VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
-                              return_events=False, gears=gears)
+                              return_events=False, gears=gears,
+                              foot_contact=foot_contact)
         for i in range(n):
             self.sim.set_chart(i, [])
         self.fwd = fwd
@@ -168,6 +169,11 @@ def parse_args():
                         "only on the fused path — its per-sample kernel is "
                         "batch-size-invariant (verified bitwise), so two "
                         "groups of N/2 score identically to one batch of N")
+    p.add_argument("--foot-contact", action="store_true",
+                   help="env v11 unilateral foot contact — MUST match the "
+                        "checkpoint's training physics (a contact-trained "
+                        "policy benched under welds, or vice versa, scores "
+                        "a different physics regime; 2026-08-08)")
     p.add_argument("--num-envs", type=int, default=2048,
                    help="maps evaluated in parallel (policy is batched); "
                         "on the fused path the effective width is capped "
@@ -452,6 +458,7 @@ def main():
         "checkpoint": args.ckpt, "checkpoint_name": ckpt_name,
         "model_hash": mhash, "arch": ckpt.get("arch"),
         "global_step": ckpt.get("global_step"),
+        "foot_contact": args.foot_contact,   # physics-regime provenance
     }
     levels = {e["leaderboard_id"]: e for e in data.get("levels", [])}
 
@@ -561,7 +568,8 @@ def main():
         else:
             fwd_g = (None if args.no_graphs or device.type != "cuda"
                      else _GraphedArgmax(policy, n_g, device))
-        groups.append(_Group(n_g, fwd_g, device, policy.n_gears))
+        groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
+                             foot_contact=args.foot_contact))
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): fused vs torch forwards differ
     # by ~4e-7 in the logits, enough to flip near-tie argmaxes — per-level

@@ -29,6 +29,13 @@ The extension is built on first use via torch.utils.cpp_extension.load
 jit_cache.cuda_flags()). Windows toolchain quirks
 (CUDA_HOME, cl.exe, ninja discovery) are handled in _toolchain_env().
 
+Env v11 (unilateral-contact spec, 2026-08-08) adds `foot_contact=`:
+foot_mode 1 swaps the two 6-DOF foot welds for unilateral frictional
+ground contact on the 8 sole-box corners and arms the fall termination
+(root y < 0.55, counted by `pop_fall_hits()`). It selects a COMPILE-TIME
+kernel instantiation, so the default weld mode is the v10 kernel
+unchanged; test_v11_contact_parity.py is the contact-mode gate.
+
 Limits vs BeatVecEnv: no per-step info dicts, no event stream, CUDA only.
 """
 
@@ -310,7 +317,7 @@ class CudaBeatVecEnv:
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
-                 want_contacts=False):
+                 want_contacts=False, foot_contact=False):
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -324,6 +331,13 @@ class CudaBeatVecEnv:
         # the parity harnesses pass True. Baked here, never mutated =>
         # constant per instance => safe under CUDA-graph capture.
         self.want_contacts = bool(want_contacts)
+        # env v11 foot_mode (unilateral-contact spec §1): False = weld
+        # (v10, the DEFAULT — every existing trajectory unchanged), True =
+        # unilateral frictional ground contact on the 8 sole corners plus
+        # the fall termination. Baked here, never mutated: the kernel
+        # selects a COMPILE-TIME instantiation on it, so it is constant
+        # per instance and safe under CUDA-graph capture.
+        self.foot_contact = bool(foot_contact)
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -413,6 +427,10 @@ class CudaBeatVecEnv:
         # tick with a zeroed reward (the C backstop)
         self._env_hits = z(1, dt=torch.int32)
         self._env_popped = 0
+        # env v11 FALL terminations (unilateral-contact spec §4), counted
+        # per (env, tick); always 0 in weld mode
+        self._fall_hits = z(1, dt=torch.int32)
+        self._fall_popped = 0
         self.chart_idx = z(N, dt=torch.int64)
         # episode-return ring buffer (device-side)
         self._cap = 4096
@@ -437,7 +455,8 @@ class CudaBeatVecEnv:
             self.good, self.bad, self.miss, self.bombs, self.score,
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
-            self.effort_j, self._pd_hits, self._env_hits, self.chart_idx,
+            self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
+            self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -451,7 +470,8 @@ class CudaBeatVecEnv:
     def _launch(self, actions, cand, mode):
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
-                       self.auto_reset, self.gears, self.want_contacts)
+                       self.auto_reset, self.gears, self.want_contacts,
+                       self.foot_contact)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
@@ -550,6 +570,18 @@ class CudaBeatVecEnv:
         total = int(self._env_hits.item())
         new = total - self._env_popped
         self._env_popped = total
+        return new
+
+    def pop_fall_hits(self):
+        """FALL terminations since the last pop (unilateral-contact spec
+        §4) — the Rust backend's pop_fall_hits mirror, same shape as
+        pop_envelope_hits. Counted per (env, tick): each one terminated an
+        env's episode with a zeroed reward because its root dropped below
+        FALL_ROOT_Y = 0.55 m. Always 0 with foot_contact=False, where the
+        feet cannot let go. One sync."""
+        total = int(self._fall_hits.item())
+        new = total - self._fall_popped
+        self._fall_popped = total
         return new
 
     def pop_stats(self):
