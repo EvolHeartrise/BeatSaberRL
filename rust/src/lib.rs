@@ -1270,8 +1270,28 @@ impl Core {
                 }
             }
         }
-        if self.body.escaped || self.body.fell {
+        if self.body.escaped {
             reward = 0.0;
+        }
+        if self.body.fell {
+            // v11.1 fall pricing (contact spec §4, 2026-08-09): the
+            // remaining scoreable notes are charged as misses in one
+            // lump — exactly what ragdolling to the chart's end would
+            // cost. The 8h postmortem showed reward-0 termination
+            // BOUNDS the miss stream, making fast death optimal
+            // (ep_return −0.13 held for 3.4B steps, mean episode
+            // 1.2 s < first_note_s). Statuses are NOT rewritten:
+            // judged counters stay actually-judged, the fall has its
+            // own counter. Full scan, not first_pending: runs once
+            // per episode, and the CUDA mirror transcribes the same
+            // 0..len order.
+            let remaining = self
+                .chart
+                .iter()
+                .zip(self.status.iter())
+                .filter(|(n, s)| **s == 0 && n.kind != KIND_BOMB)
+                .count();
+            reward = REWARD_MISS * remaining as f64;
         }
 
         (reward, done)
@@ -2135,15 +2155,19 @@ mod env_tests {
     #[test]
     fn fall_terminates_with_zero_reward_and_is_counted() {
         // a real (non-empty) chart far in the future, so `done` cannot
-        // come from the empty-chart disjunct; effort_coef > 0 so the
-        // physics reward would otherwise be strictly negative and the
-        // zeroing is observable
-        let chart: Vec<ChartTuple> = (0u8..3)
+        // come from the empty-chart disjunct. v11.1: the fall step is
+        // priced at REWARD_MISS x the pending scoreable notes — all 3
+        // here (they sit at t=8s+, unjudged when the body falls in the
+        // first second) — plus a 4th chart object that is a BOMB and
+        // must NOT be charged.
+        let mut chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
                 (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
                  KIND_NOTE, false, false)
             })
             .collect();
+        chart.push((9.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_BOMB,
+                    false, false));
         let mut core = Core::new_core(690, 4e-4, false, 5, true);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
@@ -2155,7 +2179,12 @@ mod env_tests {
             let (reward, done) = core.step_inner(&acts);
             if core.body.fell {
                 assert!(done, "a fallen env must terminate");
-                assert_eq!(reward, 0.0, "a fallen tick's reward must be zeroed");
+                assert_eq!(
+                    reward,
+                    REWARD_MISS * 3.0,
+                    "fall reward must price the 3 pending scoreable \
+                     notes (and not the bomb)"
+                );
                 assert!(core.finished, "the terminal latch must be set");
                 assert_eq!(core.falls, 1, "the fall must be counted in `falls`");
                 assert!(core.body.fall_hits > 0, "the pop counter must see it");
