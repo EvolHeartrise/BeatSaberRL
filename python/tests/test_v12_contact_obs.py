@@ -45,13 +45,15 @@ def test_settled_stance_lanes_carry_body_weight():
 
 def test_weld_mode_lanes_stay_zero():
     """foot_contact=False: the ground block does not exist, so the four
-    v12 lanes are exactly 0 and lanes 0..340 remain the v10 obs."""
+    v12 lanes are exactly 0 and lanes 0..340 remain the v10 obs. (The
+    v13 body-point lanes after them are NOT zero — positions exist in
+    every mode.)"""
     sim = _sim(False)
     obs = None
     for _ in range(5):
         obs, _r, _d, _ev = sim.step(ZERO_ACT)
     assert obs.shape == (OBS_DIM,)
-    assert not np.asarray(obs[OFF_GROUND_IMP:]).any()
+    assert not np.asarray(obs[OFF_GROUND_IMP:OFF_GROUND_IMP + 4]).any()
 
 
 def test_alive_bonus_priced_per_tick():

@@ -56,7 +56,7 @@ def _q36(joints=None):
 def test_obs_length_and_reset_layout():
     sim = _sim([_note(5.0, 0.3, 1.4)])
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
-    assert obs.shape == (OBS_DIM,) == (344,)
+    assert obs.shape == (OBS_DIM,) == (362,)
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 85,
@@ -101,7 +101,7 @@ def test_obs_length_and_reset_layout():
     assert obs[base + 3] == pytest.approx(-4.0 / 8.0)
     assert obs[base + 13] == 1.0
     assert obs[OFF_NOTE_MASK] == 1.0
-    assert obs[OFF_NOTE_MASK + 1:].sum() == 0.0
+    assert obs[OFF_NOTE_MASK + 1:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == 0.0
 
 
 def test_obs_q_and_qd_track_state():
@@ -159,7 +159,7 @@ def test_note_block_and_mask_track_pending():
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
-    assert obs[OFF_NOTE_MASK:].sum() == n_pending
+    assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
     n = env.chart[0]
     from beat_arena_env.constants import note_center as nc
     base = OFF_NOTES

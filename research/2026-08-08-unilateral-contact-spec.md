@@ -131,3 +131,28 @@ c. **Parity.** The §5 tiers gate the new lanes as part of the full obs
    Rust) pins the bucket ORDER — nonzero lanes on both sides, so a
    permutation cannot hide in zeros. Weld regression unchanged
    (test_v10_parity_cuda.py), new lanes constant 0 there.
+
+## 8. env v13 (2026-08-09): explicit body-point observations
+
+User-directed FK shortcuts: the engines compute every frame position
+each tick; handing six of them to the policy spares network capacity
+for control instead of kinematics.
+
+a. **Lanes.** OBS_DIM 344 → 362. Lanes 344..361 = world positions of
+   [l_elbow, r_elbow, l_knee, r_knee, l_foot, r_foot] (frames 7, 14,
+   21, 27, 23, 29 — knee = shank origin, foot = ankle origin), three
+   lanes each, head-style normalization x/1, (y−Y0)/0.75,
+   (z−PLANE_Z0)/1. Y0: elbows share Y_CENTER = 1.40 (they live in the
+   note field); KNEE_Y0 = 0.50 (hip 0.94 − thigh 0.44); FOOT_Y0 = 0.07
+   (§2 ankle reference height). Present in EVERY mode (weld included —
+   positions are mode-independent); reference-pose values pinned by
+   tests/test_v13_body_pts.py.
+
+b. **Tokenization.** Each elbow goes to its own saber token
+   (SABER_FEAT 25 → 28); knees + feet go to the body token (BODY_FEAT
+   54 → 66). Mirrored in policy.py and both packed CUDA policy kernels
+   (packed FRONT 18752 → 19712).
+
+c. **Parity.** The §5 lockstep tiers gate the lanes as part of the
+   full obs; the Rust-side reference-pose test pins frame choice,
+   order, and normalization literals exactly.

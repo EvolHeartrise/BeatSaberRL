@@ -107,8 +107,10 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # wrist rolls cos/sin), qd (29), two 10-lane derived hand blocks, head
 # (3), contact bits (2), then the v9-verbatim 16x14 note block + mask —
 # plus the env v12 (unilateral-contact spec §7) 4-lane per-foot
-# ground-contact block at 340..344, fed to the BODY token).
-OBS_DIM = 344
+# ground-contact block at 340..344 (BODY token) and the env v13 (spec
+# §8) 18-lane body-point block at 344..362: elbows to their saber
+# tokens, knees + feet to the BODY token).
+OBS_DIM = 362
 N_NOTE_SLOTS = 16
 NOTE_FEAT = 14
 OFF_NOTES = 100
@@ -119,14 +121,18 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 324
 # derived block (10) = 25 features + the 2-lane hand one-hot; the ONE
 # body token = root pose/vel block (15) + spine/leg q (15) + spine/leg
 # qd (15) + head (3) + contact bits (2) + ground-contact lanes (4, env
-# v12) = 54 features.
-SABER_FEAT = 25
-BODY_FEAT = 54
-_SABER_L_IDX = tuple(range(18, 26)) + tuple(range(49, 56)) + tuple(range(75, 85))
-_SABER_R_IDX = tuple(range(26, 34)) + tuple(range(56, 63)) + tuple(range(85, 95))
+# v12) + knee/foot positions (12, env v13) = 66 features. Each saber
+# token gains its arm's elbow position (3, env v13): 25 -> 28.
+SABER_FEAT = 28
+BODY_FEAT = 66
+_SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
+                + tuple(range(75, 85)) + tuple(range(344, 347)))
+_SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
+                + tuple(range(85, 95)) + tuple(range(347, 350)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(95, 100))
-             + tuple(range(340, 344)))
+             + tuple(range(340, 344))
+             + tuple(range(350, 362)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —

@@ -158,7 +158,7 @@ def test_obs_reset_hands_and_notes():
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (344,)
+    assert obs.shape == (OBS_DIM,) == (362,)
     assert OFF_NOTES == 100 and OFF_NOTE_MASK == 324
     # hand blocks at reset: arms straight forward, wrists at
     # (+-0.2, 1.47, 0.0), blades +z, meters zero
@@ -170,7 +170,7 @@ def test_obs_reset_hands_and_notes():
         assert obs[base + 8] == pytest.approx(1.0)          # blade z
         assert obs[base + 9] == 0.0                         # swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
-    assert obs[OFF_NOTE_MASK:].sum() == n_pending
+    assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
     n = env.chart[0]
     base = OFF_NOTES
     from beat_arena_env.constants import note_center as nc

@@ -182,6 +182,10 @@ _OBS_BLOCKS = (
     # lanes [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse
     # / GROUND_IMP_NORM; all-zero in weld mode
     ("ground_imp", 4),
+    # env v13 (contact spec §8): world positions of [l_elbow, r_elbow,
+    # l_knee, r_knee, l_foot, r_foot], head-style normalization
+    # (elbows centered on Y_CENTER, knees on 0.50, feet on 0.07)
+    ("body_pts", 18),
 )
 OBS_OFF = {}
 _off = 0
@@ -202,7 +206,10 @@ OFF_CONTACT = OBS_OFF["contact"]        # 98
 OFF_NOTES = OBS_OFF["notes"]            # 100
 OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 324
 OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 340
-assert OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344"
+OFF_BODY_PTS = OBS_OFF["body_pts"]      # 344
+assert OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362"
+KNEE_Y0 = 0.50   # contact spec §8 normalization centers
+FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec
 # literal both engines share (contact spec §7)
 GROUND_IMP_NORM = 24.5
