@@ -4858,7 +4858,29 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
   }
 
-  if (d.env_bad || fell) reward = T(0);
+  if (d.env_bad) reward = T(0);
+  // v11.1 fall pricing (contact spec §4, 2026-08-09) — MIRROR of
+  // lib.rs's fell block: REWARD_MISS x pending scoreable notes, full
+  // 0..nn scan in chart order, statuses untouched. Replaces the
+  // reward-0 zeroing whose bounded penalty made fast death the 8h
+  // run's converged optimum. The p_valid gate is not load-bearing
+  // (slots 0..nn are exactly the valid ones by pool construction) —
+  // it mirrors the note loop's own i<nn convention so the two scans
+  // can never diverge if that invariant ever changes.
+  if constexpr (FC) {
+    if (fell) {
+      int remaining = 0;
+      for (int i = 0; i < nn; i++) {
+        const int64_t cb = c0 * C + i;
+        if (P.status[e * C + i] == 0 && P.p_valid[cb] &&
+            !P.p_is_bomb[cb])
+          remaining++;
+      }
+      reward = T(REWARD_MISS) * T(remaining);
+    }
+  } else {
+    if (fell) reward = T(0);  // fell is constant-false here; folded
+  }
   const T ep = P.ep_return[e] + reward;
   P.ep_return[e] = ep;
   P.reward[e] = reward;

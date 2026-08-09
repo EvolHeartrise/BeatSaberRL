@@ -54,10 +54,23 @@ self-collision does today — mirror it, do not innovate).
 ## 4. Termination (fall)
 
 Contact mode adds one termination: root y < 0.55 m ⇒ episode
-terminates, reward 0 for the step, counted and REPORTED like the
-root-escape envelope (SPEC-v10 §20e "reported, never hidden"):
-`[fall]` line per update in the trainer, `pop_fall_hits()` on the CUDA
-env, `falls` counter in Rust info. No other envelope changes.
+terminates, counted and REPORTED like the root-escape envelope
+(SPEC-v10 §20e "reported, never hidden"): `[fall]` line per update in
+the trainer, `pop_fall_hits()` on the CUDA env, `falls` counter in
+Rust info. No other envelope changes.
+
+Fall reward (v11.1, 2026-08-09 — replaces the original "reward 0"):
+the fall step's reward is REWARD_MISS (−0.5) × the count of scoreable
+notes still pending (status 0, kind ≠ bomb) at the fall tick — the
+lump-sum cost of lying on the floor missing the rest of the chart.
+Pending-note STATUSES ARE NOT REWRITTEN (judgment counters stay
+actually-judged; the fall is reported via its own counter). Rationale:
+the 8h run proved reward-0 termination is an escape hatch that bounds
+the miss stream — ep_return converged to −0.13 (mean episode 1.2 s,
+death before first_note_s) and held for 3.4B steps. Pricing the
+remaining chart removes the bound exactly, with no tuned constant, and
+keeps episodes short. Root-escape termination keeps its reward-0
+semantics unchanged (physics violation, not game failure).
 
 ## 5. Parity contract
 
