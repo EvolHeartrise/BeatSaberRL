@@ -126,6 +126,14 @@ const REACH_PAST_SHOULDER: f64 = 0.65 + 1.0 + 0.75;
 // fully folded back still > -1.8, and the spine/hip limits stop far
 // short) — P3 divergence note, SPEC-v10 Divergences §18.
 const Z_MISS_TAIL: f64 = 1.5;
+// env v11 FALL termination (unilateral-contact spec §4), CONTACT MODE
+// ONLY: with the feet no longer welded the root can go to the floor, and
+// a fallen body's observations/rewards are not the task. Reference-pose
+// root y is 0.94; 0.55 is a deep crouch the policy cannot reach by
+// squatting within the leg limits and holding the sole flat. Reported
+// exactly like the root-escape envelope (SPEC-v10 §20e "reported, never
+// hidden"): per-tick bool, popped cumulative count, episode counter.
+const FALL_ROOT_Y: f64 = 0.55;
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
@@ -499,6 +507,17 @@ struct Body {
     // that). Measured incidence on a converged policy: 0 in 204,800
     // env-ticks.
     escaped: bool,
+    // env v11 (unilateral-contact spec §1): foot_mode. false = weld
+    // (v10, the DEFAULT — every existing trajectory is bitwise
+    // unchanged), true = unilateral frictional ground contact.
+    foot_contact: bool,
+    // Contact spec §4: did the root drop below FALL_ROOT_Y during THIS
+    // tick's 8 substeps? Contact mode only. Same envelope pattern as
+    // `escaped`: the env terminates the episode and zeroes the reward.
+    fell: bool,
+    // Cumulative fall terminations until the owner pops them (lib.rs
+    // pop_fall_hits) — the `ws.env_hits` / `pd_hits` pattern.
+    fall_hits: u64,
     // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
@@ -509,10 +528,11 @@ struct Body {
 const MODEL: &Model = &HUMANOID;
 
 impl Body {
-    fn new() -> Body {
+    fn new(foot_contact: bool) -> Body {
         let st = State::neutral(MODEL);
         let ws = Workspace::new(MODEL);
-        let cs = ConstraintSet::new(MODEL, true, true);
+        // contact spec §1: contact mode DROPS the 12 weld rows
+        let cs = ConstraintSet::new_modes(MODEL, !foot_contact, true, foot_contact);
         let mut b = Body {
             st,
             ws,
@@ -530,6 +550,9 @@ impl Body {
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             effort_j: 0.0,
             escaped: false,
+            foot_contact,
+            fell: false,
+            fall_hits: 0,
             weld_imp: [0.0; 12],
         };
         b.refresh_fk();
@@ -546,6 +569,7 @@ impl Body {
         self.contact_imp = [0.0; NUM_PAIRS];
         self.effort_j = 0.0;
         self.escaped = false;
+        self.fell = false;
         self.weld_imp = [0.0; 12];
         self.refresh_fk();
     }
@@ -584,6 +608,10 @@ impl Body {
         // are ws.env_hits' delta over the 8 substeps (the counter itself
         // is cumulative until pop_envelope_hits)
         let env_hits0 = self.ws.env_hits;
+        // contact spec §4: the fall test is a PER-SUBSTEP one, like the
+        // envelope above — a body that dips under the floor mid-tick and
+        // bounces back has still stopped being the standing task.
+        let mut fell = false;
         let mut effort = 0.0;
         for _ in 0..N_SUB {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
@@ -596,15 +624,23 @@ impl Body {
                     effort += p * H_SUB;
                 }
             }
+            // contact spec §4: root below the floor threshold at any
+            // substep of this tick
+            if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
+                fell = true;
+            }
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
             let nweld = self.cs.weld_rows();
+            // the self-collision rows sit AFTER the ground block (0 rows
+            // in weld mode) — contact spec §3
+            let ncbase = nweld + self.cs.ground_rows();
             // P6: tick-summed foot-weld impulses (ground reaction)
             for r in 0..nweld {
                 self.weld_imp[r] += self.cs.lambda[r];
             }
             for (i, c) in self.cs.contacts.iter().enumerate() {
-                let lam = self.cs.lambda[nweld + i];
+                let lam = self.cs.lambda[ncbase + i];
                 self.contact_imp[c.pair] += lam;
                 self.contact_pt[c.pair] = c.point;
                 let (ia, ib) = PAIRS[c.pair];
@@ -619,6 +655,10 @@ impl Body {
         }
         self.effort_j = effort;
         self.escaped = self.ws.env_hits != env_hits0;
+        self.fell = fell;
+        if fell {
+            self.fall_hits += 1;
+        }
         self.refresh_fk();
         for s in 0..2 {
             for k in 0..3 {
@@ -653,6 +693,10 @@ struct Core {
     bad_cuts: u32,
     misses: u32,
     bombs_hit: u32,
+    // contact spec §4: fall terminations in THIS episode (0 or 1 — the
+    // fall ends the episode). Reported, never hidden: the trainer's
+    // `[fall]` line reads it.
+    falls: u32,
     n_scoreable: u32, // chart objects that are not bombs
     // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
     // recomputed from state every tick and each of its disjuncts is
@@ -675,7 +719,7 @@ struct Core {
 
 impl Core {
     fn new_core(max_steps: u32, effort_coef: f64, wide_acc: bool,
-                gears: u8) -> Self {
+                gears: u8, foot_contact: bool) -> Self {
         Core {
             max_steps,
             effort_coef,
@@ -687,13 +731,14 @@ impl Core {
             tick: 0,
             time: 0.0,
             first_pending: 0,
-            body: Body::new(),
+            body: Body::new(foot_contact),
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
             good_cuts: 0,
             bad_cuts: 0,
             misses: 0,
             bombs_hit: 0,
+            falls: 0,
             n_scoreable: 0,
             finished: false,
             score: 0.0,
@@ -755,6 +800,7 @@ impl Core {
         self.bad_cuts = 0;
         self.misses = 0;
         self.bombs_hit = 0;
+        self.falls = 0;
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
@@ -1195,12 +1241,21 @@ impl Core {
         // tick; the reward is zeroed AFTER (this tick's physics reward
         // is garbage, so none of it — effort, cuts, follow-through —
         // reaches the policy).
+        // env v11 FALL termination (unilateral-contact spec §4): in
+        // contact mode a root below FALL_ROOT_Y ends the episode with a
+        // ZEROED reward, folded in exactly like the C backstop above —
+        // same place in the `done` disjunction (so the pending
+        // follow-throughs still drain), same post-hoc reward zeroing.
+        if self.body.fell {
+            self.falls += 1;
+        }
         let done = (!pending
             && no_trackers
             && (self.chart.is_empty() || self.time > last_hit))
             || self.time > last_hit + self.tail_s
             || self.tick >= self.max_steps
-            || self.body.escaped;
+            || self.body.escaped
+            || self.body.fell;
 
         if done {
             self.finished = true;   // B4: latch; cleared only by reset_state
@@ -1215,7 +1270,7 @@ impl Core {
                 }
             }
         }
-        if self.body.escaped {
+        if self.body.escaped || self.body.fell {
             reward = 0.0;
         }
 
@@ -1230,13 +1285,17 @@ struct RawBeatSim {
 
 #[pymethods]
 impl RawBeatSim {
+    /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
+    /// weld (v10, DEFAULT — bitwise-unchanged physics), true = unilateral
+    /// frictional ground contact on the 8 sole corners.
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
-                        wide_acc=false, gears=3))]
+                        wide_acc=false, gears=3, foot_contact=false))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
-           gears: u8) -> Self {
+           gears: u8, foot_contact: bool) -> Self {
         RawBeatSim {
-            core: Core::new_core(max_steps, effort_coef, wide_acc, gears),
+            core: Core::new_core(max_steps, effort_coef, wide_acc, gears,
+                                 foot_contact),
         }
     }
 
@@ -1397,6 +1456,16 @@ impl RawBeatSim {
         h
     }
 
+    /// FALL terminations since the last pop (unilateral-contact spec
+    /// §4) — the CUDA backend's `pop_fall_hits` mirror, same shape as
+    /// `pop_envelope_hits`. Returns the count and zeroes it. Always 0 in
+    /// weld mode (`foot_contact=False`), where the feet cannot let go.
+    fn pop_fall_hits(&mut self) -> u64 {
+        let h = self.core.body.fall_hits;
+        self.core.body.fall_hits = 0;
+        h
+    }
+
     /// R26 per-substep instrumentation counters since the last pop —
     /// the single-env mirror of `VecBeatSim.pop_dbg_stats`. Returns the
     /// dict and zeroes the counters. In the DEFAULT build nothing counts
@@ -1417,6 +1486,21 @@ impl RawBeatSim {
     #[getter]
     fn escaped(&self) -> bool {
         self.core.body.escaped
+    }
+
+    /// Did the root drop below FALL_ROOT_Y during the LAST tick
+    /// (unilateral-contact spec §4)? Test introspection, `escaped`'s
+    /// twin. Always false in weld mode.
+    #[getter]
+    fn fell(&self) -> bool {
+        self.core.body.fell
+    }
+
+    /// Fall terminations in THIS episode (contact spec §4) — the `falls`
+    /// counter the info dict reports. 0 or 1: a fall ends the episode.
+    #[getter]
+    fn falls(&self) -> u32 {
+        self.core.falls
     }
 
     #[getter]
@@ -1551,15 +1635,21 @@ struct VecBeatSim {
 
 #[pymethods]
 impl VecBeatSim {
+    /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
+    /// weld (v10, DEFAULT — bitwise-unchanged physics), true = unilateral
+    /// frictional ground contact on the 8 sole corners.
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
-                        gears=3))]
+                        gears=3, foot_contact=false))]
+    #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
-           return_events: bool, wide_acc: bool, gears: u8) -> Self {
+           return_events: bool, wide_acc: bool, gears: u8,
+           foot_contact: bool) -> Self {
         VecBeatSim {
             sims: (0..n)
-                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc, gears))
+                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc, gears,
+                                        foot_contact))
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             return_events,
@@ -1714,6 +1804,27 @@ impl VecBeatSim {
             .sum()
     }
 
+    /// FALL terminations summed over all envs since the last pop
+    /// (unilateral-contact spec §4) — the CUDA backend's `pop_fall_hits`
+    /// mirror, same shape as `pop_envelope_hits`. Returns the count and
+    /// zeroes the per-env counters. ADDITIVE getter; always 0 in weld
+    /// mode.
+    fn pop_fall_hits(&mut self) -> u64 {
+        self.sims
+            .iter_mut()
+            .map(|s| {
+                let h = s.body.fall_hits;
+                s.body.fall_hits = 0;
+                h
+            })
+            .sum()
+    }
+
+    /// Fall terminations in env i's current episode (contact spec §4).
+    fn falls(&self, i: usize) -> u32 {
+        self.sims[i].falls
+    }
+
     /// R26 instrumentation: the per-substep rate counters aggregated
     /// over ALL envs since the last pop, as a dict (sums add, maxes take
     /// the max, per-env counters are zeroed) — pop_pd_hits-style
@@ -1848,7 +1959,7 @@ mod env_tests {
                 }
             }
         }
-        let mut body = Body::new();
+        let mut body = Body::new(false);
         body.tick(&acts, &gear);
         assert!(effort > 0.0, "driven joints must do positive work");
         assert_eq!(body.effort_j, effort, "effort expression trees diverge");
@@ -1856,7 +1967,7 @@ mod env_tests {
         for j in 0..NQ {
             assert_eq!(body.st.q[j], st.q[j]);
         }
-        let mut b2 = Body::new();
+        let mut b2 = Body::new(false);
         b2.tick(&[0u8; NQ], &gear);
         assert_eq!(b2.effort_j, 0.0, "coast must be exactly free");
     }
@@ -1872,7 +1983,7 @@ mod env_tests {
         acts[3] = 2;
 
         // empty chart = the bench's idle slot: done on the FIRST tick
-        let mut core = Core::new_core(100_000_000, 4e-4, false, 5);
+        let mut core = Core::new_core(100_000_000, 4e-4, false, 5, false);
         core.set_chart_notes(Vec::new());
         assert!(!core.finished, "install must clear the latch");
         let (_r0, d0) = core.step_inner(&acts);
@@ -1918,7 +2029,7 @@ mod env_tests {
             .map(|i| (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
-        let mut core = Core::new_core(690, 4e-4, false, 5);
+        let mut core = Core::new_core(690, 4e-4, false, 5, false);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         let mut first_done = None;
@@ -1956,7 +2067,7 @@ mod env_tests {
             .collect();
         // effort_coef > 0 so the physics reward would otherwise be
         // strictly negative — the zeroing is observable
-        let mut core = Core::new_core(690, 4e-4, false, 3);
+        let mut core = Core::new_core(690, 4e-4, false, 3, false);
         core.set_chart_notes(chart);
         core.body.st.p = ESC_P;
         core.body.st.quat = ESC_QUAT;
@@ -2001,7 +2112,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, 4e-4, false, 5);
+        let mut core = Core::new_core(690, 4e-4, false, 5, false);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[10] = 1;
@@ -2017,11 +2128,88 @@ mod env_tests {
         assert_eq!(core.body.ws.env_hits, 0);
     }
 
+    /// Unilateral-contact spec §5 (d) FALL: in contact mode a hard lean
+    /// (full +hip_pitch gears) drops the root below FALL_ROOT_Y, which
+    /// terminates the episode with a ZEROED reward and is COUNTED — the
+    /// root-escape envelope's contract, applied to the new failure mode.
+    #[test]
+    fn fall_terminates_with_zero_reward_and_is_counted() {
+        // a real (non-empty) chart far in the future, so `done` cannot
+        // come from the empty-chart disjunct; effort_coef > 0 so the
+        // physics reward would otherwise be strictly negative and the
+        // zeroing is observable
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| {
+                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                 KIND_NOTE, false, false)
+            })
+            .collect();
+        let mut core = Core::new_core(690, 4e-4, false, 5, true);
+        core.set_chart_notes(chart);
+        let mut acts = [0u8; NQ];
+        acts[17] = 1; // l_hip_pitch, full +
+        acts[23] = 1; // r_hip_pitch, full +
+        let mut fell_at = None;
+        for t in 0..30 {
+            // 1 s
+            let (reward, done) = core.step_inner(&acts);
+            if core.body.fell {
+                assert!(done, "a fallen env must terminate");
+                assert_eq!(reward, 0.0, "a fallen tick's reward must be zeroed");
+                assert!(core.finished, "the terminal latch must be set");
+                assert_eq!(core.falls, 1, "the fall must be counted in `falls`");
+                assert!(core.body.fall_hits > 0, "the pop counter must see it");
+                assert!(
+                    core.body.st.p[1] < FALL_ROOT_Y,
+                    "root y {} is not below the threshold",
+                    core.body.st.p[1]
+                );
+                fell_at = Some(t);
+                break;
+            }
+            assert!(!done, "tick {t} ended for some other reason");
+        }
+        let t = fell_at.expect("1 s of full hip flexion did not fell the body");
+        println!("fall: terminated at tick {t} with root y {:.4}", core.body.st.p[1]);
+        // popping zeroes, pd_hits-style
+        let popped = core.body.fall_hits;
+        core.body.fall_hits = 0;
+        assert!(popped > 0);
+        assert_eq!(core.body.fall_hits, 0);
+    }
+
+    /// The other half of the §5 (d) / §5 (f) contract: in WELD mode
+    /// (`foot_contact = false`, the default) the fall test never fires —
+    /// the feet cannot let go, and the flag must not perturb the v10 env.
+    #[test]
+    fn weld_mode_never_falls() {
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| {
+                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                 KIND_NOTE, false, false)
+            })
+            .collect();
+        let mut core = Core::new_core(690, 4e-4, false, 5, false);
+        core.set_chart_notes(chart);
+        let mut acts = [0u8; NQ];
+        acts[17] = 1;
+        acts[23] = 1;
+        for _ in 0..30 {
+            let (_r, d) = core.step_inner(&acts);
+            assert!(!core.body.fell, "weld mode must never report a fall");
+            if d {
+                break;
+            }
+        }
+        assert_eq!(core.falls, 0);
+        assert_eq!(core.body.fall_hits, 0);
+    }
+
     /// Live gates at the reference pose reproduce the v9 constants:
     /// reach 1.75, miss boundary −0.65 (SPEC-v10 §4).
     #[test]
     fn live_gates_reference_values() {
-        let body = Body::new();
+        let body = Body::new(false);
         assert!((body.reach_z() - 1.75).abs() < 1e-12);
         assert!((body.head[2] - (-0.65)).abs() < 1e-12);
     }

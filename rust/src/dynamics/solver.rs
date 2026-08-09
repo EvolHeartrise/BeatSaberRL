@@ -4,6 +4,11 @@
 //! Row layout (NORMATIVE):
 //!   rows 0–5    foot_l weld — 3 linear then 3 angular,
 //!   rows 6–11   foot_r weld — same layout,
+//!   OR, in env v11 CONTACT mode (`foot_mode` = 1, unilateral-contact
+//!   spec §1/§3 — the weld rows are dropped and the ground block takes
+//!   their place): 3 rows per ACTIVE sole corner, corners in the spec §2
+//!   normative order (foot_l then foot_r, (x−,z−) (x−,z+) (x+,z−)
+//!   (x+,z+) within a foot), rows normal / friction x̂ / friction ẑ,
 //!   then one normal row per ACTIVE contact, in pair-id order (§2),
 //!   then one unilateral JOINT-LIMIT row per joint whose nearer stop is
 //!   within h·ω_cap, joint order 0..28 (folded into the main solve —
@@ -34,6 +39,9 @@
 //!             the 1 cm margin would act as a hard force field).
 //!   limits:   same shape as contacts with slop 0 and β_weld pushback
 //!             (row ±e_j toward the interior).
+//!   ground:   normal rows take the contact shape verbatim (β_c, slop);
+//!             friction rows b = 0 and a BOX projection |λ_t| ≤ MU·λ_n
+//!             against the same sweep's λ_n (contact spec §3).
 //!
 //! Step 11 (ω caps + limit clamps) REMAINS as the outer guarantee —
 //! with the solver limit-aware its impulses are near-null in ordinary
@@ -103,7 +111,9 @@ use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
     chol_solve_t, chol_solve_unit, chol_solve_x2, chol_solve_x4,
 };
-use super::collide::{narrow_phase, Contact, NUM_PAIRS, SLOP};
+use super::collide::{
+    ground_phase, narrow_phase, Contact, GroundContact, NUM_GROUND_CORNERS, NUM_PAIRS, SLOP,
+};
 use super::fk::{cross3, dot3, rot_log, sub3};
 use super::model::{Model, F_L_FOOT, F_R_FOOT};
 use super::step::{substep_wrench, ZERO_WRENCH};
@@ -123,9 +133,42 @@ pub const WELD_FRAMES: [usize; 2] = [F_L_FOOT, F_R_FOOT];
 pub const WELD_TARGET_P: [[f64; 3]; 2] = [[-0.10, 0.07, -0.65], [0.10, 0.07, -0.65]];
 
 pub const N_WELD_ROWS: usize = 12;
-/// Max rows: 12 weld + 55 contact + ≤ 1 joint-limit row per joint
-/// (Divergences §15 — the nearer stop only, when within reach).
-pub const MAX_ROWS: usize = N_WELD_ROWS + NUM_PAIRS + 29; // 96
+
+// ── env v11 GROUND CONTACT (unilateral-contact spec §3) ──────────────
+// The contact-mode replacement for the 12 weld rows: per ACTIVE sole
+// corner one unilateral normal row plus two BOX-clamped friction rows.
+// The rows sit exactly where the weld rows used to (before the
+// self-collision normals), so the §2 pair-id row order is untouched.
+
+/// Coulomb friction coefficient of the ground (contact spec §3,
+/// normative). No restitution — this is a velocity-level PGS at rest
+/// contact.
+pub const MU: f64 = 0.9;
+
+/// Rows per active corner: 1 normal + 2 friction (contact spec §3).
+pub const GROUND_ROWS_PER_CORNER: usize = 3;
+
+/// World row directions of a corner's three rows, in the NORMATIVE
+/// order (contact spec §3): normal ŷ, then friction x̂ and ẑ. The ground
+/// is static, so a row is the corner's own point Jacobian projected on
+/// the direction — no second body to subtract (contrast the §2
+/// self-collision rows, which contract two chains).
+#[rustfmt::skip]
+const GROUND_DIRS: [[f64; 3]; GROUND_ROWS_PER_CORNER] = [
+    /* N  */ [0.0, 1.0, 0.0],
+    /* T1 */ [1.0, 0.0, 0.0],
+    /* T2 */ [0.0, 0.0, 1.0],
+];
+
+/// 24 = all 8 corners active, 3 rows each.
+pub const N_GROUND_ROWS: usize = NUM_GROUND_CORNERS * GROUND_ROWS_PER_CORNER;
+
+/// Max rows: 12 weld + 24 ground + 55 contact + ≤ 1 joint-limit row per
+/// joint (Divergences §15 — the nearer stop only, when within reach).
+/// The weld and ground blocks are mutually exclusive by `foot_mode`
+/// (contact spec §1), so 24 of these are always slack — this is a
+/// buffer bound, not a row count.
+pub const MAX_ROWS: usize = N_WELD_ROWS + N_GROUND_ROWS + NUM_PAIRS + 29; // 120
 
 // ── R9 (2026-08-05): WELD-JACOBIAN SUPPORT — the port of the CUDA
 //    kernel's K5 sparsity (beat_arena_cuda.cu §20c) to the Rust sim.
@@ -377,15 +420,23 @@ const LIMIT_J_ROWS: bool = cfg!(any(test, feature = "introspect", debug_assertio
 pub struct ConstraintSet {
     pub welds: bool,
     pub contacts_enabled: bool,
+    /// `foot_mode` = 1 (contact spec §1): unilateral frictional GROUND
+    /// rows on the 8 sole corners instead of the 12 weld rows. Mutually
+    /// exclusive with `welds` — see `new_modes`.
+    pub ground: bool,
     /// Substep length h — set by the substep wrappers before solving.
     pub h: f64,
     /// Active contacts of the last solve, pair-id order.
     pub contacts: Vec<Contact>,
-    /// Assembled row count of the last solve (welds + contacts +
-    /// limit rows).
+    /// Active sole corners of the last solve, corner order (contact
+    /// spec §2). Three rows each.
+    pub ground_contacts: Vec<GroundContact>,
+    /// Assembled row count of the last solve (welds + ground + contacts
+    /// + limit rows).
     pub nrows: usize,
     /// Per-row impulses λ (N·s) of the last solve. Rows 0..12 welds
-    /// (when enabled), then contacts in pair-id order, then limit
+    /// (when enabled), then 3 rows per active sole corner in corner
+    /// order (contact mode), then contacts in pair-id order, then limit
     /// rows in joint order.
     pub lambda: Vec<f64>,
     /// Per-row RHS target velocity b of the last solve.
@@ -476,13 +527,37 @@ pub struct ConstraintSet {
 const COMPOSITE_EPS: f64 = 1e-4;
 
 impl ConstraintSet {
+    /// `foot_mode` = 0 (weld, the DEFAULT — contact spec §1): the v10
+    /// constraint set, unchanged.
     pub fn new(model: &Model, welds: bool, contacts_enabled: bool) -> ConstraintSet {
+        Self::new_modes(model, welds, contacts_enabled, false)
+    }
+
+    /// `new` plus the env v11 `ground` switch (contact spec §1's
+    /// `foot_mode` = 1).
+    pub fn new_modes(
+        model: &Model,
+        welds: bool,
+        contacts_enabled: bool,
+        ground: bool,
+    ) -> ConstraintSet {
+        // Contact spec §1: `foot_mode` is a SWITCH — in contact mode the
+        // 12 weld rows are DROPPED. Both at once is not a defined
+        // regime and would be silently wrong: the weld-null projection
+        // (Divergences §15) covers the limit rows and the ω-cap columns
+        // only, so ground impulses would break the welds it protects.
+        assert!(
+            !(welds && ground),
+            "foot_mode: weld rows and ground contact rows are exclusive"
+        );
         let nv = model.nv();
         ConstraintSet {
             welds,
             contacts_enabled,
+            ground,
             h: super::step::H_SUB,
             contacts: Vec::with_capacity(NUM_PAIRS),
+            ground_contacts: Vec::with_capacity(NUM_GROUND_CORNERS),
             nrows: 0,
             lambda: vec![0.0; MAX_ROWS],
             bias: vec![0.0; MAX_ROWS],
@@ -553,6 +628,49 @@ impl ConstraintSet {
     ) {
         let dl = (bias[row] - jv) / diag[row];
         let newl = (lambda[row] + dl).max(0.0); // λ ≥ 0
+        let d = newl - lambda[row];
+        lambda[row] = newl;
+        if d != 0.0 {
+            let mr = &minvjt[row * nv..(row + 1) * nv];
+            for i in 0..nv {
+                v[i] += mr[i] * d;
+            }
+        }
+    }
+
+    /// MIRROR: one projected-Gauss-Seidel row update with a SYMMETRIC
+    /// BOX projection |λ| ≤ `bound` instead of the unilateral λ ≥ 0 —
+    /// the ground friction rows (contact spec §3). `bound` is
+    /// `MU · λ_n` of the SAME corner, read after that corner's normal
+    /// row has already been updated THIS sweep (Gauss-Seidel coupling),
+    /// so it is re-imposed on every one of the PGS_ITERS iterations.
+    ///
+    /// Everything except the projection is `pgs_row_update` verbatim,
+    /// including the `d != 0.0` propagation guard, so the two rows
+    /// classes share one impulse-propagation shape.
+    ///
+    /// `.min(bound).max(-bound)` mirrors the unilateral row's
+    /// `.max(0.0)` idiom: Rust's `f64::min`/`max` return the OTHER
+    /// operand when one side is NaN, so an artifact λ collapses onto the
+    /// bound exactly as the λ ≥ 0 row collapses to 0. At `bound == 0.0`
+    /// a negative candidate lands on `−0.0` (the negation of +0.0), and
+    /// `d != 0.0` is then false for a λ that was already zero — no
+    /// impulse, deterministic.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pgs_row_update_box(
+        row: usize,
+        nv: usize,
+        jv: f64,
+        bound: f64,
+        bias: &[f64],
+        diag: &[f64],
+        lambda: &mut [f64],
+        minvjt: &[f64],
+        v: &mut [f64],
+    ) {
+        let dl = (bias[row] - jv) / diag[row];
+        let newl = (lambda[row] + dl).min(bound).max(-bound); // |λ_t| ≤ MU·λ_n
         let d = newl - lambda[row];
         lambda[row] = newl;
         if d != 0.0 {
@@ -668,7 +786,7 @@ impl ConstraintSet {
     #[cfg(test)]
     pub fn limit_dot_ref_vs_closed(&self, voff: usize, src: &[f64]) -> Vec<(f64, f64)> {
         let nv = self.nv;
-        let ndense = self.weld_rows() + self.contacts.len();
+        let ndense = self.weld_rows() + self.ground_rows() + self.contacts.len();
         (0..self.limset.len())
             .map(|li| {
                 let (jt, sign) = self.limset[li];
@@ -691,15 +809,131 @@ impl ConstraintSet {
         }
     }
 
+    /// Ground row count of the last solve: 3 per ACTIVE sole corner
+    /// (0 in weld mode).
+    pub fn ground_rows(&self) -> usize {
+        self.ground_contacts.len() * GROUND_ROWS_PER_CORNER
+    }
+
+    /// Row index of active-corner `gi`'s NORMAL row in the last solve;
+    /// its two friction rows are the next two. Introspection (the fall /
+    /// no-pull / friction gates).
+    pub fn ground_row(&self, gi: usize) -> usize {
+        self.weld_rows() + gi * GROUND_ROWS_PER_CORNER
+    }
+
     /// Number of joint-limit rows assembled by the last solve.
     pub fn limit_rows(&self) -> usize {
-        self.nrows - self.weld_rows() - self.contacts.len()
+        self.nrows - self.weld_rows() - self.ground_rows() - self.contacts.len()
     }
 
     /// Effective mass (J M⁻¹ Jᵀ diagonal) of an assembled row —
     /// post-solve introspection (tests).
     pub fn row_diag(&self, row: usize) -> f64 {
         self.diag[row]
+    }
+
+    /// MIRROR: assemble the ground block — 3 rows per ACTIVE sole
+    /// corner, corners in the contact spec §2 normative order, rows in
+    /// the §3 normative order (normal, then friction x̂, then ẑ).
+    /// Returns the new row count. Straight-line scalar form on purpose:
+    /// the CUDA mirror transcribes it serially.
+    ///
+    /// The rows land where the weld rows used to (the caller passes
+    /// `nrows` = 0 in contact mode), i.e. BEFORE the self-collision
+    /// normals — so the §2 pair-id row order downstream is untouched.
+    fn assemble_ground_rows(
+        &mut self,
+        model: &Model,
+        ws: &Workspace,
+        hinv: f64,
+        mut nrows: usize,
+    ) -> usize {
+        let nv = self.nv;
+        for gi in 0..self.ground_contacts.len() {
+            let gc = self.ground_contacts[gi];
+            for t in 0..GROUND_ROWS_PER_CORNER {
+                let row = nrows + t;
+                let jr = &mut self.j[row * nv..(row + 1) * nv];
+                jr.fill(0.0);
+                // static ground: only the corner's own chain contributes
+                point_jacobian_acc(model, ws, gc.frame, gc.point, GROUND_DIRS[t], 1.0, jr);
+            }
+            // NORMAL row rhs: the §3-step-8 contact pipeline verbatim —
+            // speculative approach limit while the gap is open, Baumgarte
+            // push-out beyond SLOP once penetrating (contact spec §3:
+            // "same β pipeline as the self-collision normals").
+            self.bias[nrows] = if gc.gap >= 0.0 {
+                -gc.gap * hinv
+            } else {
+                (BETA_CONTACT * hinv) * (-gc.gap - SLOP).max(0.0)
+            };
+            // FRICTION rows rhs = 0: friction stabilizes nothing, so it
+            // gets no Baumgarte term (contact spec §3).
+            self.bias[nrows + 1] = 0.0;
+            self.bias[nrows + 2] = 0.0;
+            nrows += GROUND_ROWS_PER_CORNER;
+        }
+        nrows
+    }
+
+    /// MIRROR: one PGS sweep over the ground block, corner order. Per
+    /// corner: the unilateral normal row first (λ_n ≥ 0, the §2 contact
+    /// path verbatim), then its two friction rows box-clamped against
+    /// the λ_n THIS sweep just produced — Gauss-Seidel coupling,
+    /// re-clamped every iteration (contact spec §3).
+    ///
+    /// Fixed trip count over the active corners, no early exit and no
+    /// data-dependent branch inside the sweep: the §2 contact loop's
+    /// contract, which parity and the K13 warp-divergence rule both
+    /// require.
+    fn pgs_ground_sweep(&mut self, nweld: usize, v: &mut [f64]) {
+        let nv = self.nv;
+        for gi in 0..self.ground_contacts.len() {
+            let nrow = nweld + gi * GROUND_ROWS_PER_CORNER;
+            let mut jv = 0.0;
+            {
+                let jr = &self.j[nrow * nv..(nrow + 1) * nv];
+                for i in 0..nv {
+                    jv += jr[i] * v[i];
+                }
+            }
+            Self::pgs_row_update(
+                nrow,
+                nv,
+                jv,
+                &self.bias,
+                &self.diag,
+                &mut self.lambda,
+                &self.minvjt,
+                v,
+            );
+            // the friction cone is read AFTER the normal update, so a
+            // corner that just lost its normal impulse loses its
+            // friction in the same sweep
+            let bound = MU * self.lambda[nrow];
+            for t in 1..GROUND_ROWS_PER_CORNER {
+                let row = nrow + t;
+                let mut jv = 0.0;
+                {
+                    let jr = &self.j[row * nv..(row + 1) * nv];
+                    for i in 0..nv {
+                        jv += jr[i] * v[i];
+                    }
+                }
+                Self::pgs_row_update_box(
+                    row,
+                    nv,
+                    jv,
+                    bound,
+                    &self.bias,
+                    &self.diag,
+                    &mut self.lambda,
+                    &self.minvjt,
+                    v,
+                );
+            }
+        }
     }
 
     /// §3 steps 7–9 against the FK + Cholesky factor already in `ws`
@@ -756,12 +990,26 @@ impl ConstraintSet {
             nrows = N_WELD_ROWS;
         }
 
-        // ── step 7: collision detection (pair-id order) ───────────────
+        // ── step 7: collision detection ───────────────────────────────
+        // Ground corners FIRST (contact spec §2 corner order), then the
+        // 55-pair self-collision table (pair-id order). The two sets are
+        // disjoint — sole corners touch the GROUND only (contact spec
+        // §6) — and the ground block's rows precede the pair rows, so
+        // the §2 pair-id row order is untouched.
+        if self.ground {
+            ground_phase(ws, &mut self.ground_contacts);
+        } else {
+            self.ground_contacts.clear();
+        }
         if self.contacts_enabled {
             narrow_phase(ws, &mut self.contacts);
         } else {
             self.contacts.clear();
         }
+
+        // ── assembly: the ground block, where the weld rows used to be ─
+        nrows = self.assemble_ground_rows(model, ws, hinv, nrows);
+        let nground = self.ground_rows();
 
         // ── assembly: one normal row per active contact ───────────────
         for c in self.contacts.iter() {
@@ -877,7 +1125,11 @@ impl ConstraintSet {
         // bit-for-bit the serial result (see the algo.rs contract).
         // The 12 weld rows are exactly 3 groups of 4; the contact rows
         // continue the same ladder (4 → 2 → 1) from there.
-        let ndense = nweld + self.contacts.len();
+        // "dense" = every row whose Jacobian is assembled in full and
+        // whose M⁻¹Jᵀ column goes through the batched Cholesky ladder:
+        // welds, then the ground block, then the self-collision normals.
+        // (The limit rows below are rank-1 and take the closed forms.)
+        let ndense = nweld + nground + self.contacts.len();
         // R13: the weld block (rows 0..nweld) takes the RHS-MINOR path
         // below, which OVERWRITES those `minvjt` rows in full from `wt`
         // — seeding them from `j` here was a dead 12×35 store. `nweld`
@@ -1089,11 +1341,13 @@ impl ConstraintSet {
         //    given the welds (they already forbid the motion): its
         //    diag is set to +∞, which zeroes every subsequent update
         //    deterministically.
-        let ncon = self.contacts.len();
         if nweld > 0 {
             // the 12-wide jams below assume the 12-row weld block
             debug_assert_eq!(nweld, N_WELD_ROWS);
-            let split = (nweld + ncon) * nv;
+            // `ndense` is `nweld + ncon` here: welds and the ground block
+            // are exclusive (contact spec §1), so nground == 0 whenever
+            // this branch runs.
+            let split = ndense * nv;
             let (head, tail) = self.minvjt.split_at_mut(split);
             let nlim = self.limset.len();
             // R16 (2026-08-06): limit rows are INDEPENDENT here — row li
@@ -1126,7 +1380,7 @@ impl ConstraintSet {
                 weld_axpy12!(t1, head, x1, nv, -=);
                 for (k, mr) in [&*t0, &*t1].into_iter().enumerate() {
                     let (jt, sign) = self.limset[lj + k];
-                    let row = nweld + ncon + lj + k;
+                    let row = ndense + lj + k;
                     let dnew = 0.0 + sign * mr[voff + jt];
                     self.diag[row] = if dnew > COMPOSITE_EPS * self.diag[row] {
                         dnew
@@ -1139,7 +1393,7 @@ impl ConstraintSet {
             // remainder row (nlim is odd), the scalar path verbatim
             for li in lj..nlim {
                 let (jt, sign) = self.limset[li];
-                let row = nweld + ncon + li;
+                let row = ndense + li;
                 let mr = &mut tail[li * nv..(li + 1) * nv];
                 // UNROLL-AND-JAM (2026-08-03; width re-probed 2026-08-06,
                 // R15): mr is traversed ONCE each way while every
@@ -1221,6 +1475,13 @@ impl ConstraintSet {
                 }
                 weld_axpy12!(v, self.minvjt, d, nv, +=);
             }
+            // (a2) ground block (contact spec §3), corner order: the
+            // normal row then its two box-clamped friction rows. Same
+            // iteration count and the same fixed sweep order as the rows
+            // around it — it is simply another projected-GS block, run
+            // where the weld block would be. Empty (and free) in weld
+            // mode: `ground_contacts` is cleared at step 7.
+            self.pgs_ground_sweep(nweld, v);
             // (b)+(c) contacts (pair-id order) then joint-limit rows
             // (joint order): projected GS, λ ≥ 0.
             // R10: the one loop is SPLIT at `ndense` — same rows, same
@@ -1231,7 +1492,7 @@ impl ConstraintSet {
             // iterations × ~6 limit rows per substep. (The `jv` argument
             // is the only thing that differs — the λ update and the
             // impulse propagation are the contact path's, verbatim.)
-            for row in nweld..ndense {
+            for row in nweld + nground..ndense {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mut jv = 0.0;
                 for i in 0..nv {
