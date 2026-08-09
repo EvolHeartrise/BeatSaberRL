@@ -851,15 +851,18 @@ def main():
                           "this update (episodes terminated, reward 0)",
                           flush=True)
         # env v11 FALL terminations (unilateral-contact spec §4): the
-        # root-escape envelope's twin — each one ended an episode with a
-        # zeroed reward because the body went to the floor. Reported,
-        # never hidden, on BOTH backends (unlike [envelope], which is a
-        # CUDA-only counter): structurally 0 without --foot-contact.
+        # root-escape envelope's twin — the body went to the floor.
+        # v11.1: each fall is PRICED at REWARD_MISS x the remaining
+        # scoreable notes (the reward-0 version bred the 8h suicide
+        # optimum). Reported, never hidden, on BOTH backends (unlike
+        # [envelope], a CUDA-only counter): structurally 0 without
+        # --foot-contact.
         if hasattr(venv, "pop_fall_hits"):
             fh = venv.pop_fall_hits()
             if fh:
                 print(f"[fall] {fh} fall termination(s) this update "
-                      "(episodes terminated, reward 0)", flush=True)
+                      "(each priced at its remaining scoreable notes)",
+                      flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
