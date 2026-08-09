@@ -270,6 +270,16 @@ def parse_args():
                         "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
                         "under the doubled alpha/omega body). Resuming a "
                         "geared checkpoint needs the matching --gears")
+    p.add_argument("--foot-contact", default=False,
+                   action=argparse.BooleanOptionalAction,
+                   help="env v11 foot_mode = 1 (unilateral-contact spec "
+                        "§1): replace the two 6-DOF foot welds with "
+                        "unilateral frictional ground contact on the 8 "
+                        "sole-box corners, and terminate an episode whose "
+                        "root drops below 0.55 m (the [fall] line reports "
+                        "them per update). PHYSICS-REGIME BREAK — "
+                        "checkpoints and bench numbers do not carry "
+                        "across the weld/contact boundary")
     p.add_argument("--ranked-maps", action="store_true",
                    help="train on SEGMENTS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
@@ -420,6 +430,7 @@ def main():
                       max_steps=int(args.seg_len * 30) + 90,
                       effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
+                      foot_contact=args.foot_contact,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -431,7 +442,7 @@ def main():
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
-            gears=args.gears,
+            gears=args.gears, foot_contact=args.foot_contact,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -442,7 +453,7 @@ def main():
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
-            seed=args.seed)
+            foot_contact=args.foot_contact, seed=args.seed)
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt)
@@ -839,6 +850,16 @@ def main():
                     print(f"[envelope] {eh} root-escape engagement(s) "
                           "this update (episodes terminated, reward 0)",
                           flush=True)
+        # env v11 FALL terminations (unilateral-contact spec §4): the
+        # root-escape envelope's twin — each one ended an episode with a
+        # zeroed reward because the body went to the floor. Reported,
+        # never hidden, on BOTH backends (unlike [envelope], which is a
+        # CUDA-only counter): structurally 0 without --foot-contact.
+        if hasattr(venv, "pop_fall_hits"):
+            fh = venv.pop_fall_hits()
+            if fh:
+                print(f"[fall] {fh} fall termination(s) this update "
+                      "(episodes terminated, reward 0)", flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
