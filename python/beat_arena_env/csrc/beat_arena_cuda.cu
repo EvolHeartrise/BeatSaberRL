@@ -929,8 +929,14 @@ constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
 // obs verbatim.
 constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 340
 constexpr int N_GROUND_IMP_LANES = 4;
-constexpr int OBS_DIM = OFF_GROUND_IMP + N_GROUND_IMP_LANES;         // 344
-static_assert(OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344");
+// env v13 (contact spec §8): [l_elbow, r_elbow, l_knee, r_knee,
+// l_foot, r_foot] world positions, head-style normalization.
+constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 344
+constexpr int N_BODY_PTS = 6;
+constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 362
+static_assert(OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362");
+constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
+constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
 // the spec literal lib.rs shares.
 constexpr double GROUND_IMP_NORM = 24.5;
@@ -1199,6 +1205,9 @@ constexpr int F_HEAD = 3;
 constexpr int F_L_SHOULDER = 4, F_L_WRIST = 8, F_L_HAND = 10;
 constexpr int F_R_SHOULDER = 11, F_R_WRIST = 15, F_R_HAND = 17;
 constexpr int F_L_FOOT = 23, F_R_FOOT = 29;
+// env v13 (contact spec §8): obs body points
+constexpr int F_L_ELBOW = 7, F_R_ELBOW = 14;
+constexpr int F_L_SHANK = 21, F_R_SHANK = 27;
 
 __device__ constexpr double LIMIT_LO[NQ] = {
     -0.3490658503988659, -0.6981317007977318, -0.5235987755982988,
@@ -4510,6 +4519,21 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     obs[OFF_GROUND_IMP + k] = (float)(
         P.ground_imp[(size_t)e * N_GROUND_IMP_LANES + k] /
         T(GROUND_IMP_NORM));
+
+  // contact spec §8 (env v13): elbow/knee/foot world positions from
+  // d.pos — refresh_fk ran fk_all in every mode before this call
+  {
+    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
+                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
+    const double bp_y0[N_BODY_PTS] = {Y_CENTER, Y_CENTER, KNEE_Y0,
+                                      KNEE_Y0, FOOT_Y0, FOOT_Y0};
+    for (int i = 0; i < N_BODY_PTS; i++) {
+      const int base = OFF_BODY_PTS + 3 * i;
+      obs[base] = (float)(d.pos[bp_f[i]][0] / T(X_NORM));
+      obs[base + 1] = (float)((d.pos[bp_f[i]][1] - T(bp_y0[i])) / T(Y_NORM));
+      obs[base + 2] = (float)((d.pos[bp_f[i]][2] - T(PLANE_Z0)) / T(X_NORM));
+    }
+  }
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),

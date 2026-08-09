@@ -36,7 +36,8 @@ pub mod dynamics;
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::quat_to_rot;
 use dynamics::model::{
-    Model, F_HEAD, F_L_HAND, F_L_SHOULDER, F_L_WRIST, F_R_HAND, F_R_SHOULDER,
+    Model, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
+    F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHANK, F_R_SHOULDER,
     F_R_WRIST, HUMANOID, NQ, NV,
 };
 use dynamics::solver::{substep_constrained, ConstraintSet};
@@ -185,8 +186,17 @@ const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 324
 // obs verbatim.
 const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
 const N_GROUND_IMP_LANES: usize = 4;
-const OBS_DIM: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 344
-const _: () = assert!(OBS_DIM == 344, "contact spec §7: OBS_DIM must be 344");
+// env v13 (contact spec §8): explicit FK shortcuts — world positions of
+// [l_elbow, r_elbow, l_knee, r_knee, l_foot, r_foot], head-style
+// normalization (x/1, (y−Y0)/0.75, (z−PLANE_Z0)/1). Y0 is the point's
+// reference-pose height: elbows share the wrists' Y_CENTER (they live
+// in the note field), knees/feet get their §1.2 reference literals.
+const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 344
+const N_BODY_PTS: usize = 6;
+const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 362
+const _: () = assert!(OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362");
+const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
+const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
 // = 24.53 N·s, rounded to a spec literal both engines share. A settled
 // two-foot stance sums to ≈ 1.0 across the four lanes.
@@ -957,6 +967,22 @@ impl Core {
         for k in 0..N_GROUND_IMP_LANES {
             obs[OFF_GROUND_IMP + k] =
                 (self.body.ground_imp[k] / GROUND_IMP_NORM) as f32;
+        }
+
+        // contact spec §8 (env v13): elbow/knee/foot world positions —
+        // FK the engines already ran, handed to the policy instead of
+        // being re-derived from q through the network
+        const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
+            (F_L_ELBOW, Y_CENTER), (F_R_ELBOW, Y_CENTER),
+            (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
+            (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
+        ];
+        for (i, (f, y0)) in BODY_PTS.iter().enumerate() {
+            let p = &self.body.ws.p[*f];
+            let base = OFF_BODY_PTS + 3 * i;
+            obs[base] = (p[0] / X_NORM) as f32;
+            obs[base + 1] = ((p[1] - y0) / Y_NORM) as f32;
+            obs[base + 2] = ((p[2] - PLANE_Z0) / X_NORM) as f32;
         }
     }
 

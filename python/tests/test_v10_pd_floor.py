@@ -95,7 +95,7 @@ def test_vec_sim_pop_pd_hits_zero_in_ordinary_motion():
     for i in range(n):
         vec.set_chart(i, [note_tuple(FAR_NOTE)])
     rng = np.random.default_rng(7)
-    obs = np.zeros((n, 344), dtype=np.float32)
+    obs = np.zeros((n, 362), dtype=np.float32)
     for _ in range(15):
         acts = rng.integers(0, 3, (n, N_JOINTS)).astype(np.int64)
         vec.step_into(acts, obs)

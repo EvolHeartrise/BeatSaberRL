@@ -69,7 +69,7 @@ _BLK = (2 * EMBED + 3 * (EMBED * EMBED + EMBED) + 2 * EMBED
         + EMBED * (2 * EMBED) + 2 * EMBED + (2 * EMBED) * EMBED + EMBED)
 _TRUNK_SZ = (3 * EMBED * TRUNK_DIM + TRUNK_DIM
              + TRUNK_DIM * TRUNK_DIM + TRUNK_DIM)
-assert _FRONT == 18752 and _BLK == 29312 and _TRUNK_SZ == 41216  # v12
+assert _FRONT == 19712 and _BLK == 29312 and _TRUNK_SZ == 41216  # v13
 
 
 def expected_numel(n_blocks, n_gears):
