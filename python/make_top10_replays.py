@@ -12,6 +12,7 @@ a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
 
 import argparse
 import json
+import os
 import re
 import sys
 
@@ -64,6 +65,9 @@ def main():
     dev = torch.device(args.device
                        or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy = load_policy(ckpt).to(dev).eval()
+    # replays/ is gitignored and absent on fresh checkouts (third
+    # "output dir assumed to exist" bug of the 2026-08-08 migration)
+    os.makedirs("replays", exist_ok=True)
     made = []
     for rank, entry in enumerate(top, 1):
         map_dir = f"maps/scoresaber/{entry['song_hash']}"
