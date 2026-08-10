@@ -248,13 +248,16 @@ def _miss_tick(spine_pitch, speed=8.0):
     raise AssertionError("miss never fired")
 
 
-def test_miss_boundary_moves_with_head():
-    """Leaning the spine forward moves the head toward the hit plane, so
-    the miss boundary (z < head_z) fires EARLIER (fewer ticks after the
-    note crosses the plane)."""
+def test_miss_boundary_is_head_invariant():
+    """env v15 (contact spec §10): the note track is head-anchored, so
+    leaning the spine forward shifts the track away by the head's own
+    displacement — the miss boundary z < head_z reduces to base z <
+    PLANE_Z0, a pure function of chart time, and fires at the SAME tick
+    at any lean. (Pre-v15 this asserted leaning < upright: the boundary
+    used to move with the head while the track stood still.)"""
     upright = _miss_tick(0.0)
     leaning = _miss_tick(JOINT_LIMITS[0][1])    # +45 deg, torque-pinned
-    assert leaning < upright, (upright, leaning)
+    assert leaning == upright, (upright, leaning)
 
 
 def test_reach_gate_moves_with_shoulders():
@@ -344,7 +347,10 @@ def test_sim_plays_a_chart_scripted_torques():
     with near-full credit, and the follow-through resolves. Hand-tuned
     at P3 (seeded search over whip ticks kept as fallback)."""
     def run(whip_tick):
-        sim = _sim([_note(0.9, 0.3, 1.4, speed=4.0)], max_steps=300)
+        # hit 0.9 -> 0.8 (env v15, contact spec §10): the head-anchored
+        # track moves with the whip's trunk reaction; 0.8 re-lands the
+        # hand-tuned whip_tick=15 primary path (cut 83, post 30)
+        sim = _sim([_note(0.8, 0.3, 1.4, speed=4.0)], max_steps=300)
         events = []
         for t in range(90):
             a = list(COAST)

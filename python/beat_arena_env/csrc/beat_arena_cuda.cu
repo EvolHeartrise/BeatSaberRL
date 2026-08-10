@@ -4516,13 +4516,15 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   const int C = P.C;
   const int nn = (int)P.p_n_notes[cc];
   const T time_o = T(P.tick[e]) * T(DT);
+  // v15 head-anchored note track (contact spec §10)
+  const T z_off = P.head[e * 3 + 2] - T(PLANE_Z0);
   int slot = 0;
   for (int i = P.first_pending[e]; i < nn && slot < N_NOTE_SLOTS; i++) {
     const int64_t cb = cc * C + i;
     if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
     float* nb2 = obs + OFF_NOTES + slot * NOTE_FEAT;
-    const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb], T(Z_CLIP_LO),
-                       T(Z_CLIP_HI));
+    const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
+                       T(Z_CLIP_LO), T(Z_CLIP_HI));
     const bool bomb = P.p_is_bomb[cb];
     nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
     nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
@@ -4743,6 +4745,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   const T head_pos[3] = {P.head[e * 3], P.head[e * 3 + 1],
                          P.head[e * 3 + 2]};
   const T head_z = head_pos[2];
+  const T z_off = head_z - T(PLANE_Z0); // v15 head-anchored note track
   const T min_speed = P.p_min_speed[c0];
   const int nn = (int)P.p_n_notes[c0];
   int n_new[2] = {0, 0};
@@ -4752,8 +4755,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     const int64_t cb = c0 * C + i;
     if (!P.p_valid[cb]) continue;
     // sorted hit_time + min_speed: beyond this bound so is every later
-    if ((P.p_hit[cb] - time_new) * min_speed > reach_z) break;
-    const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb];
+    if ((P.p_hit[cb] - time_new) * min_speed + z_off > reach_z) break;
+    const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb] + z_off;
     const bool bomb = P.p_is_bomb[cb];
     if (z < head_z) {
       if (bomb) {

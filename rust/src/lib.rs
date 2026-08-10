@@ -210,6 +210,13 @@ const Z_CLIP: (f64, f64) = (-3.0, 12.0);
 const ROOT_Y0: f64 = 0.94; // reference root height (obs centering)
 const HEAD_Y0: f64 = 1.70; // reference head height (obs centering)
 const PLANE_Z0: f64 = -0.65; // reference body plane (obs centering)
+// env v15 (contact spec §10): the note track is head-anchored in z —
+// every note's world z carries the offset head_z − PLANE_Z0 (zero at
+// the reference pose). Real-BS room semantics: walking toward the
+// notes shifts them away by exactly the walked amount, so approach
+// distance (and therefore hit/miss timing) is invariant to root z.
+// Applied at every note-z evaluation: obs lane, broad-phase bound,
+// judgment. x/y stay world-fixed (lanes are body-independent).
 const ROOT_VLIN_NORM: f64 = 6.0;
 const ROOT_VANG_NORM: f64 = 16.0;
 
@@ -928,7 +935,8 @@ impl Core {
         // contact bits [L, R]
         obs[OFF_CONTACT] = self.body.contact_arm[0] as u8 as f32;
         obs[OFF_CONTACT + 1] = self.body.contact_arm[1] as u8 as f32;
-        // note block — v9 NOTE_FEAT verbatim
+        // note block — v9 NOTE_FEAT verbatim (z head-anchored since v15)
+        let z_off = self.body.head[2] - PLANE_Z0;
         let mut slot = 0usize;
         for i in self.first_pending..self.chart.len() {
             let n = &self.chart[i];
@@ -939,7 +947,8 @@ impl Core {
                 break;
             }
             let base = OFF_NOTES + slot * NOTE_FEAT;
-            let z = ((n.hit_time - self.time) * n.speed).clamp(Z_CLIP.0, Z_CLIP.1);
+            let z = ((n.hit_time - self.time) * n.speed + z_off)
+                .clamp(Z_CLIP.0, Z_CLIP.1);
             obs[base] = (n.x / X_NORM) as f32;
             obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
             obs[base + 2] = (z / Z_SCALE) as f32;
@@ -1089,6 +1098,7 @@ impl Core {
         let reach_z = self.body.reach_z();
         let head_z = self.body.head[2];
         let head = self.body.head;
+        let z_off = head_z - PLANE_Z0; // v15 head-anchored note track
 
         for i in self.first_pending..self.chart.len() {
             if self.status[i] != 0 {
@@ -1097,10 +1107,12 @@ impl Core {
             let n = &self.chart[i]; // by ref: Note is 80 B post-sin/cos
             // sorted by hit_time, and speed >= min_speed for every note:
             // once this bound clears reach_z, so does every later note's z
-            if (n.hit_time - self.time) * self.min_speed > reach_z {
+            // (v15: z_off is shared by every note, so the bound shifts
+            // with it and the sorted-break argument is unchanged)
+            if (n.hit_time - self.time) * self.min_speed + z_off > reach_z {
                 break;
             }
-            let z = (n.hit_time - self.time) * n.speed;
+            let z = (n.hit_time - self.time) * n.speed + z_off;
             if z < head_z {
                 if n.kind == KIND_BOMB {
                     self.status[i] = 4; // passed clean: no penalty, no event
