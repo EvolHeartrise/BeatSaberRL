@@ -227,13 +227,42 @@ fn clamps_hold_limits() {
         substep(m, &mut st, &tau, h, &mut ws, None);
         for j in 0..NQ {
             let (lo, hi) = m.limits[j];
-            assert!(st.q[j] >= lo && st.q[j] <= hi, "q[{j}] out of limits");
-            assert!(st.v[6 + j].abs() <= m.omega_cap[j], "v[{j}] over cap");
+            // v14: stops are reciprocal-impulse springs, not teleports.
+            // On the P1 path (no solver hook, so no limit ROWS — this
+            // test) a full-torque press reaches the Baumgarte
+            // equilibrium h·v_drive/β + slop ≈ 0.06-0.08 rad; the env
+            // path's solver rows absorb the torque first and hold the
+            // 2 mrad slop band (the parked-on-stops gate pins that).
+            // worst excursion = the ARRIVAL substep (integration runs
+            // before step-11, so one substep of uncapped approach rate
+            // lands ~h·(cap + h·τ/M) deep before recovery bites) —
+            // scales with the joint's rate cap; must stay under the
+            // 0.35 teleport backstop
+            let s = h * m.omega_cap[j] * 1.4 + 0.02;
+            if !(st.q[j] >= lo - s && st.q[j] <= hi + s) {
+                println!("EXCURSION q[{j}] = {:.4} vs [{lo:.4}, {hi:.4}] v {:.2} bound {s:.3}",
+                         st.q[j], st.v[6 + j]);
+            }
+            assert!(st.q[j] >= lo - s && st.q[j] <= hi + s, "q[{j}] out of limits");
+            assert!(st.v[6 + j].abs() <= m.omega_cap[j] + 1e-9, "v[{j}] over cap");
         }
     }
     let (lo6, _) = m.limits[6];
-    assert_eq!(st.q[6], lo6, "elbow pinned at its stop");
-    assert_eq!(st.v[6 + 6], 0.0, "limit hit zeroes the rate");
+    // v14 P1-path contract: an undamped full-torque press with no
+    // solver limit rows is a BOUNDED LIMIT CYCLE around the stop
+    // (slam-in, Baumgarte recovery, re-slam) — not a dead park. The
+    // env path (solver rows + damping) parks inside the 2 mrad slop;
+    // the parked-on-stops momentum gate pins that regime. Here we pin:
+    // cycle stays within the arrival band, rate within the cap.
+    let band6 = h * m.omega_cap[6] * 1.4 + 0.02;
+    assert!(
+        (st.q[6] - lo6).abs() <= band6,
+        "elbow cycles within its stop band (q {} vs lo {})", st.q[6], lo6
+    );
+    assert!(
+        st.v[6 + 6].abs() <= m.omega_cap[6] + 1e-9,
+        "cycle rate within the cap, got {}", st.v[6 + 6]
+    );
 }
 
 /// Crude wall-time probe for the orchestrator's throughput projection:
@@ -494,3 +523,76 @@ fn pd_under_random_full_gears() {
     assert!(wroot < 120.0, "root spin left the stability envelope: {wroot}");
 }
 
+
+/// v14 GATE — the phantom-force class (2026-08-10 three-agent audit):
+/// joints PRESSED onto their limit stops in the quasi-static regime —
+/// the regime the trained-policy exploit lived in (8-13 joints pinned,
+/// rates ~0, +250-335 N of phantom support). Airborne (contact mode,
+/// zero ground rows), every joint driven at 0.3·τ_max into a stop:
+/// after the 1 s park-in, rates are ~0, so the explicit-Coriolis
+/// discretization drift (∝ v², the KNOWN h·ω bound of this integrator
+/// — measured ~1.6-3% g when flailing at the 16-40 rad/s caps, and NOT
+/// what this gate is about) vanishes, and any CoM deviation from the
+/// free-fall parabola is a non-reciprocal constraint write. Pre-v14
+/// the direct-write guarantee pass leaked here every substep.
+#[test]
+fn v14_momentum_conserved_with_joints_parked_on_stops() {
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    st.p[1] = 500.0; // airborne: the y=0 plane is unreachable
+    let mut cs = super::solver::ConstraintSet::new_modes(m, false, true, true);
+    let h = 1.0 / 240.0;
+    let g = super::model::G;
+    let mut tau = [0.0; NQ];
+    for j in 0..NQ {
+        tau[j] = -0.3 * m.tau_max[j]; // press the lo stops, gently
+    }
+    // phase 1: park in (1 s) — rates die on the stops
+    for _ in 0..240 {
+        super::solver::substep_constrained(m, &mut st, &tau, h, &mut ws, &mut cs);
+    }
+    // measure the parked joint-rate scale (documents the regime)
+    let vmax = (0..NQ).map(|j| st.v[m.voff() + j].abs()).fold(0.0f64, f64::max);
+    // phase 2 reference: com + com-velocity by central finite difference
+    super::fk::fk_all(m, &st, &mut ws);
+    let c0 = super::testutil::body_com(m, &st, &mut ws);
+    super::solver::substep_constrained(m, &mut st, &tau, h, &mut ws, &mut cs);
+    super::fk::fk_all(m, &st, &mut ws);
+    let c1 = super::testutil::body_com(m, &st, &mut ws);
+    let v0 = [
+        (c1[0] - c0[0]) / h,
+        (c1[1] - c0[1]) / h + 0.5 * g * h, // remove the half-step gravity bias
+        (c1[2] - c0[2]) / h,
+    ];
+    // phase 2: 2 s of sustained pressing; CoM must ride the parabola
+    let mut worst = 0.0f64;
+    for k in 0..480 {
+        super::solver::substep_constrained(m, &mut st, &tau, h, &mut ws, &mut cs);
+        assert!(cs.ground_contacts.is_empty(), "airborne probe touched ground");
+        super::fk::fk_all(m, &st, &mut ws);
+        let com = super::testutil::body_com(m, &st, &mut ws);
+        let t = (k + 2) as f64 * h; // measured from c0
+        let want = [
+            c0[0] + v0[0] * t,
+            c0[1] + v0[1] * t - 0.5 * g * t * t,
+            c0[2] + v0[2] * t,
+        ];
+        let dev = ((com[0] - want[0]).powi(2)
+            + (com[1] - want[1]).powi(2)
+            + (com[2] - want[2]).powi(2))
+        .sqrt();
+        worst = worst.max(dev);
+    }
+    println!(
+        "parked-on-stops free fall: max joint rate {vmax:.2e} rad/s, \
+         worst CoM deviation {:.3} mm over 2 s",
+        worst * 1e3
+    );
+    assert!(
+        worst < 0.01,
+        "phantom force: CoM deviates {:.1} mm from free-fall with joints \
+         parked on stops (pre-v14 leaked ~0.3-3 m here)",
+        worst * 1e3
+    );
+}

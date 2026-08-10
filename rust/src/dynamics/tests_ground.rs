@@ -361,3 +361,56 @@ fn welds_and_ground_are_mutually_exclusive() {
     let _ = ConstraintSet::new_modes(&HUMANOID, true, true, true);
 }
 
+
+/// v14 GATE — CoP consistency (2026-08-10 audit finding #2: no gate
+/// ever checked MOMENT balance, so a phantom moment subsidy was
+/// invisible to the force-only §5 (b) gate). In the settled muscle-tone
+/// stance the center of pressure — Σ λ_n·(x,z) / Σ λ_n over a second —
+/// must sit inside the active-corner hull AND within 4 cm of the CoM's
+/// ground projection: quasi-statics with honest contacts allows nothing
+/// else. Pre-v14, the trained-policy pose held CoP-vs-CoM gaps of
+/// 10-23 cm for 12 s.
+#[test]
+fn v14_settled_cop_matches_com_projection() {
+    let m = super::testutil::muscle_model();
+    let (kp, kd) = super::testutil::muscle_gains();
+    let mut ws = Workspace::new(&m);
+    let mut st = State::neutral(&m);
+    let mut cs = contact_set(&m);
+    let mut tau = [0.0; NQ];
+    let mut cop_num = [0.0f64; 2];
+    let mut cop_den = 0.0f64;
+    let mut com_acc = [0.0f64; 2];
+    let mut n_meas = 0usize;
+    for k in 0..1200 {
+        for j in 0..NQ {
+            tau[j] = kp[j] * (0.0 - st.q[j]);
+        }
+        super::solver::substep_constrained_damped(&m, &mut st, &tau, &kd, H, &mut ws, &mut cs);
+        if k >= 960 {
+            for gi in 0..cs.ground_contacts.len() {
+                let ln = cs.lambda[cs.ground_row(gi)];
+                let p = cs.ground_contacts[gi].point;
+                cop_num[0] += ln * p[0];
+                cop_num[1] += ln * p[2];
+                cop_den += ln;
+            }
+            let com = super::testutil::body_com(&m, &st, &ws);
+            com_acc[0] += com[0];
+            com_acc[1] += com[2];
+            n_meas += 1;
+        }
+    }
+    let cop = [cop_num[0] / cop_den, cop_num[1] / cop_den];
+    let com = [com_acc[0] / n_meas as f64, com_acc[1] / n_meas as f64];
+    let gap = ((cop[0] - com[0]).powi(2) + (cop[1] - com[1]).powi(2)).sqrt();
+    println!(
+        "settled CoP ({:.4}, {:.4}) vs CoM projection ({:.4}, {:.4}): gap {:.1} mm",
+        cop[0], cop[1], com[0], com[1], gap * 1e3
+    );
+    // active-corner hull at the reference stance: x ∈ ±0.145, z ∈
+    // [-0.725, -0.475] — assert CoP inside with 1 mm slack
+    assert!(cop[0].abs() < 0.146 && cop[1] > -0.726 && cop[1] < -0.474,
+            "CoP ({:.4}, {:.4}) left the support hull", cop[0], cop[1]);
+    assert!(gap < 0.04, "CoP-CoM gap {:.1} mm: moment balance broken", gap * 1e3);
+}

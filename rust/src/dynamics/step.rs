@@ -18,8 +18,27 @@ use super::{State, Workspace};
 /// SPEC-v10 §3 substep h = 1/240 s (8 per 1/30 control tick).
 pub const H_SUB: f64 = 1.0 / 240.0;
 pub const N_SUB: usize = 8;
-/// Gauss-Seidel passes of the step-11 clamp solve (see below).
-pub const CLAMP_PASSES: usize = 8;
+/// Gauss-Seidel passes of the step-11 clamp solve (see below). env v14
+/// (2026-08-10, phantom-force audit): 8 → 64. The passes early-exit on
+/// a clean sweep, so the typical substep is unchanged; the budget only
+/// matters for near-collinear axis pairs and many-joints-pinned poses,
+/// which previously fell through to a non-reciprocal direct-write
+/// guarantee pass (deleted — see the step-11 comment).
+pub const CLAMP_PASSES: usize = 64;
+/// v14 joint-stop Baumgarte factor (the ground rows' β, reused): the
+/// per-substep fraction of a stop violation converted into a recovery
+/// rate by the step-11 impulse target.
+pub const BETA_LIMIT: f64 = 0.2;
+/// v14 joint-stop slop (rad past a stop tolerated at rest — the ground
+/// rows' SLOP pattern). Inside the slop the rate target is 0 and a
+/// parked joint fires NO impulses, so steady-state stop-resting leaks
+/// nothing; recovery engages only beyond it. 2 mrad ≈ 0.1°.
+pub const SLOP_LIMIT: f64 = 0.002;
+/// v14 deep-violation position backstop (rad past a stop). Routine
+/// stop traffic never reaches it — one-substep overshoot is bounded by
+/// h·ω_cap ≈ 0.17 rad — so its rare reaction-free clamp is a bounded
+/// safety net of the root-envelope class, not part of the physics.
+pub const LIMIT_TELEPORT_BACKSTOP: f64 = 0.35;
 /// Step-12 root velocity envelope (P3 — Divergences §19): the welded
 /// humanoid's root reaches the ground through a 6-revolute leg chain
 /// whose rates are capped at 16 rad/s each, so |ω_root| ≤ 96 rad/s and
@@ -245,17 +264,41 @@ pub fn substep_opts(
     //     spins the root up to the explicit-Coriolis stability bound
     //     h·ω ≈ 1). M⁻¹e_j columns come from this substep's factor
     //     (M at the pre-integration q), solved lazily once per joint
-    //     and cached. A final direct GUARANTEE pass re-imposes every
-    //     bound exactly; by then the residuals are near-null-mode
-    //     noise with negligible momentum content. The root is never
-    //     clamped. Dissipative as before. (P2 may fold these rows
-    //     into the main PGS; the row ORDER joint 0..28 is the
-    //     contract either way.)
+    //     and cached. The root is never clamped. Dissipative as
+    //     before. (P2 may fold these rows into the main PGS; the row
+    //     ORDER joint 0..28 is the contract either way.)
+    //
+    //     env v14 (2026-08-10): the final direct GUARANTEE pass that
+    //     used to follow the Gauss-Seidel passes is DELETED. Its
+    //     premise ("by then the residuals are near-null-mode noise
+    //     with negligible momentum content") is FALSE exactly when
+    //     many joints pin simultaneously: a trained policy parked
+    //     8-13 joints on stops and the pass's reaction-free writes
+    //     (st.v[vj] = 0) summed to a measured +250-335 N of phantom
+    //     support — 27-46% of body weight, sustained for 12 s — plus
+    //     15.6 m of free-fall deviation over 4 s in a mid-air repro
+    //     (three-agent audit, sessions/2026-08-08 session log). Bounds
+    //     are now enforced only by momentum-consistent impulses; a
+    //     residual bound violation after CLAMP_PASSES leaks POSITION
+    //     error into the next substep's clamp (physically a slightly
+    //     soft stop), never momentum. Gated by the v14 momentum/CoP
+    //     suites (tests_dyn / tests_ground).
     for j in 0..model.nq {
         let (lo, hi) = model.limits[j];
         ws.hit[j] = st.q[j] < lo || st.q[j] > hi;
+        // env v14: NO routine position teleport — the parked-on-stops
+        // gate measures the reaction-free q-write at ~26 mm of CoM
+        // drift per 2 s (it was the last non-reciprocal writer once
+        // the guarantee pass died). Position recovery is carried by
+        // the Baumgarte term in the impulse target below. The clamp
+        // survives only as a deep-violation backstop that no sane
+        // trajectory reaches (one-substep overshoot is ≤ h·cap =
+        // 0.17 rad; the backstop sits at 0.35 rad).
         if ws.hit[j] {
-            st.q[j] = st.q[j].clamp(lo, hi);
+            let over = if st.q[j] < lo { lo - st.q[j] } else { st.q[j] - hi };
+            if over > LIMIT_TELEPORT_BACKSTOP {
+                st.q[j] = st.q[j].clamp(lo, hi);
+            }
         }
         ws.cached[j] = false;
     }
@@ -271,7 +314,25 @@ pub fn substep_opts(
         for j in 0..model.nq {
             let vj = voff + j;
             let cap = model.omega_cap[j];
-            let target = if ws.hit[j] { 0.0 } else { st.v[vj].clamp(-cap, cap) };
+            // v14: at a stop the rate target is a Baumgarte recovery
+            // toward the violated bound (β = BETA_LIMIT, the ground
+            // rows' push-out pattern) instead of dead zero — the
+            // impulse then restores POSITION too, reciprocally.
+            let target = if ws.hit[j] {
+                let (lo, hi) = model.limits[j];
+                let over = if st.q[j] < lo { lo - st.q[j] } else { hi - st.q[j] };
+                // dead-band: inside SLOP_LIMIT a parked joint targets
+                // exactly 0 — once its rate dies no further impulse
+                // fires, so resting on a stop is leak-free
+                let rec = over.abs() - SLOP_LIMIT;
+                if rec <= 0.0 {
+                    0.0
+                } else {
+                    (BETA_LIMIT * over.signum() * rec / h).clamp(-cap, cap)
+                }
+            } else {
+                st.v[vj].clamp(-cap, cap)
+            };
             if target != st.v[vj] {
                 if !ws.cached[j] {
                     // unit RHS +e_vj — sparse forward + dense back,
@@ -331,14 +392,9 @@ pub fn substep_opts(
         ws.stats.s11_solves_max = ws.stats.s11_solves_max.max(s11_solves);
         ws.stats.nsubsteps += 1;
     }
-    for j in 0..model.nq {
-        let vj = voff + j;
-        let cap = model.omega_cap[j];
-        st.v[vj] = st.v[vj].clamp(-cap, cap);
-        if ws.hit[j] {
-            st.v[vj] = 0.0;
-        }
-    }
+    // (env v14: no direct-write guarantee pass here — see the step-11
+    // comment. The Gauss-Seidel impulse passes above are the only
+    // writers of joint rates in this block.)
 
     // 12. root velocity envelope guarantee, SECOND application (ADDED
     //     at P3 — SPEC-v10 Divergences §19b; the first application is

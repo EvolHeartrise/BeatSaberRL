@@ -712,7 +712,10 @@ def test_joint_limits_clamp_and_kill_omega():
         qq = np.asarray(sim.qpos())[7:]
         om = np.asarray(sim.omega())
         lo_j, hi_j = (lim, np.inf) if om0 < 0 else (-np.inf, lim)
-        assert lo_j - 1e-9 <= qq[j] <= hi_j + 1e-9, f"joint {j} crossed"
+        # v14: stops are reciprocal-impulse springs with a 2 mrad rest
+        # slop (contact spec §9) - transient sub-slop penetration
+        # replaces the old reaction-free teleport
+        assert lo_j - 2.1e-3 <= qq[j] <= hi_j + 2.1e-3, f"joint {j} crossed"
         assert abs(qq[j] - lim) <= 0.02, f"joint {j} not at its stop"
         assert abs(om[j]) <= 0.5, f"joint {j} omega not killed"
 

@@ -945,7 +945,17 @@ constexpr double GROUND_IMP_NORM = 24.5;
 constexpr double DT = 1.0 / 30.0;
 constexpr double H_SUB = 1.0 / 240.0;
 constexpr int N_SUB = 8;
-constexpr int CLAMP_PASSES = 8;
+// env v14 (2026-08-10): 8 -> 64, early-out keeps the typical substep
+// unchanged (mirrors step.rs — see its step-11 comment for the
+// phantom-force audit that killed the old guarantee pass).
+constexpr int CLAMP_PASSES = 64;
+// v14 joint-stop treatment (mirrors step.rs BETA_LIMIT / SLOP_LIMIT /
+// LIMIT_TELEPORT_BACKSTOP): stops are reciprocal-impulse springs with
+// a 2 mrad rest slop; the position clamp survives only as a deep-
+// violation backstop.
+constexpr double BETA_LIMIT = 0.2;
+constexpr double SLOP_LIMIT = 0.002;
+constexpr double LIMIT_TELEPORT_BACKSTOP = 0.35;
 constexpr int PGS_ITERS = 12;
 constexpr double BETA_WELD = 0.2;
 constexpr double BETA_CONTACT = 0.2;
@@ -3997,19 +4007,43 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     for (int i = 0; i < 4; i++) d.quat[i] = qq[i] / qn;
   }
   // 11. post-solve clamps as momentum-consistent impulses (joint order,
-  //     CLAMP_PASSES Gauss-Seidel passes with Rust's early-out, then
-  //     the guarantee pass)
+  //     CLAMP_PASSES Gauss-Seidel passes with Rust's early-out). env
+  //     v14: the direct-write guarantee pass is DELETED in both
+  //     engines — its reaction-free writes manufactured up to ~335 N
+  //     of external force when many joints pinned (step.rs step-11
+  //     comment has the audit).
   for (int j = 0; j < NQ; j++) {
     const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
     s.hit[j] = d.q[j] < lo || d.q[j] > hi;
-    if (s.hit[j]) d.q[j] = tclamp(d.q[j], lo, hi);
+    // env v14: no routine position teleport (reaction-free q writes
+    // are the phantom-force class — step.rs comment); deep-violation
+    // backstop only
+    if (s.hit[j]) {
+      const T over = d.q[j] < lo ? lo - d.q[j] : d.q[j] - hi;
+      if (over > T(LIMIT_TELEPORT_BACKSTOP)) d.q[j] = tclamp(d.q[j], lo, hi);
+    }
   }
   for (int pass = 0; pass < CLAMP_PASSES; pass++) {
     bool changed = false;
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = T(OMEGA_CAP[j]);
-      const T target = s.hit[j] ? T(0) : tclamp(d.v[vj], -cap, cap);
+      // v14: at a stop the target is a Baumgarte recovery toward the
+      // bound with a SLOP_LIMIT dead-band (mirrors step.rs) — the
+      // impulse restores position reciprocally; a parked joint inside
+      // the slop fires nothing
+      T target;
+      if (s.hit[j]) {
+        const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+        const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
+        const T rec = fabs(over) - T(SLOP_LIMIT);
+        target = rec <= T(0)
+                     ? T(0)
+                     : tclamp(T(BETA_LIMIT) * (over < T(0) ? -rec : rec) / T(H_SUB),
+                              -cap, cap);
+      } else {
+        target = tclamp(d.v[vj], -cap, cap);
+      }
       if (target != d.v[vj]) {
         ensure_ecol(d, s, j);
         const T* col = s.ecol[j];
@@ -4021,12 +4055,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
     if (!changed) break;
   }
-  for (int j = 0; j < NQ; j++) {
-    const int vj = VOFF + j;
-    const T cap = T(OMEGA_CAP[j]);
-    d.v[vj] = tclamp(d.v[vj], -cap, cap);
-    if (s.hit[j]) d.v[vj] = T(0);
-  }
+  // (env v14: no direct-write guarantee pass — mirror of step.rs.)
   // 12. root velocity envelope guarantee, SECOND application
   //     (Divergences §19b; the first is the 12-PRE block above, §23).
   //     Bounds the STORED velocity — step 11's joint impulses have

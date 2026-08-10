@@ -156,3 +156,45 @@ b. **Tokenization.** Each elbow goes to its own saber token
 c. **Parity.** The §5 lockstep tiers gate the lanes as part of the
    full obs; the Rust-side reference-pose test pins frame choice,
    order, and normalization literals exactly.
+
+## 9. env v14 (2026-08-10): reciprocal joint stops — the phantom-force repair
+
+A three-Opus-agent audit (user-triggered, on the v13 trestle pose)
+proved the step-11 post-solve clamp block manufactured external force:
+the direct-write guarantee pass (v ← 0 at stops, no M⁻¹e_j reaction)
+and the routine position teleport (q ← clamp(lo,hi)) leaked momentum
+whenever joints rode their stops — +250-335 N (27-46% of body weight)
+sustained under the trained pose, 15.6 m of free-fall deviation over
+4 s mid-air. The trained policy had converged INTO the bug (pinning
+8-13 joints maximizes clamp traffic). v11-v13 contact results are
+void in the braced regime.
+
+The v14 contract, both engines:
+a. **No reaction-free writes.** The guarantee pass is deleted; the
+   position teleport survives only as a deep-violation backstop
+   (LIMIT_TELEPORT_BACKSTOP = 0.35 rad — unreachable by one-substep
+   overshoot, root-envelope class). CLAMP_PASSES 8 → 64 (early-out
+   keeps typical substeps unchanged).
+b. **Stops are reciprocal-impulse springs.** The step-11 rate target
+   at a violated stop is a Baumgarte recovery toward the bound
+   (BETA_LIMIT = 0.2) with a rest dead-band (SLOP_LIMIT = 2 mrad):
+   inside the slop a parked joint targets 0 and fires NO impulses, so
+   steady stop-resting leaks nothing. All corrections flow through
+   Δv = M⁻¹e_j·λ.
+c. **Semantics.** Transient penetration ≈ h·(cap + h·τ/M) on arrival
+   (≤ ~0.12 rad legs, ~0.24 rad wrists), rest penetration ≤ 2 mrad.
+   The P1 path (no solver limit rows) under sustained full torque is a
+   bounded limit cycle around the stop; the env path (solver rows)
+   parks inside the slop.
+d. **Gates.** tests_dyn `v14_momentum_conserved_with_joints_parked_on_
+   stops` (airborne press-and-park: CoM rides the free-fall parabola
+   to < 10 mm / 2 s; measures 3.4 mm — vs ~0.3-3 m pre-v14) and
+   tests_ground `v14_settled_cop_matches_com_projection` (CoP inside
+   the hull and within 4 cm of the CoM projection — the moment-balance
+   gate the suite never had). KNOWN separate effect, not covered: the
+   explicit-Coriolis discretization drift at cap-speed flailing
+   (~1.6-3% g, ∝ v², the integrator's documented h·ω bound) — real,
+   velocity-dependent, vanishes when quasi-static, orthogonal to this
+   repair.
+e. v11-era trajectory gates re-pinned where semantics moved (limit
+   crossing tolerance 1e-9 → 2.1e-3; P1 full-press = bounded cycle).
