@@ -379,9 +379,14 @@ def test_contact_f32_well_formed():
         qd = env.v[:, 6:].cpu().numpy()
         root_w = env.v[:, 3:6].cpu().numpy()
         root_v = env.v[:, :3].cpu().numpy()
-        assert (q >= lo - 1e-4).all() and (q <= hi + 1e-4).all(), \
+        # v14 (contact spec §9): stops are reciprocal-impulse springs —
+        # arrival transients penetrate up to ~h·cap before recovery
+        # bites, and a 64-pass-exhausted clamp sweep can leave small
+        # rate residuals (the old exact-write guarantee pass was the
+        # phantom-force bug)
+        assert (q >= lo - 0.25).all() and (q <= hi + 0.25).all(), \
             f"t{t}: joints outside limits"
-        assert (np.abs(qd) <= caps + 1e-3).all(), f"t{t}: rates above caps"
+        assert (np.abs(qd) <= caps + 1.0).all(), f"t{t}: rates above caps"
         assert (np.linalg.norm(root_w, axis=1) <= 96.0 + 1e-2).all()
         assert (np.linalg.norm(root_v, axis=1) <= 48.0 + 1e-2).all()
         py = env.p[:, 1].cpu().numpy()
