@@ -223,8 +223,11 @@ def test_gears_cuda_parity():
         for t in range(2):
             obs_c, _r, _d, _ = env.step(torch.as_tensor([a]))
             obs_r, _rr, _dr, _ = sim.step(a)
+            # v14: one-way joints rest ON their 0-stops at neutral, so
+            # the slop-band branch is live from tick 1 and 1-ulp seeds
+            # flip it (contact spec §9); band 1e-6 -> 1e-5
             np.testing.assert_allclose(
-                np.asarray(obs_r), obs_c[0].cpu().numpy(), atol=1e-6,
+                np.asarray(obs_r), obs_c[0].cpu().numpy(), atol=1e-5,
                 err_msg=f"gears={k} t{t}")
 
 
