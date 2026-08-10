@@ -66,11 +66,19 @@ SPACE = {
     # seconds; 1.2e9 steps at the 148k steps/s contact floor + startup
     "max_suggestion_cost": 8500,
     "train": {
-        "lr":          dict(distribution="log_normal", min=1e-4, max=8e-3, scale=0.5),
+        # widening #1 (2026-08-09, legs 000-038): lr ceiling 8e-3 ->
+        # 1.5e-2 (run 028 EXACTLY on 8e-3, top-half median 6.2e-3),
+        # gae_lambda ceiling 0.995 -> 0.999 (7 of top 10 on 0.995),
+        # ent_final floor 1e-5 -> 1e-6 (top legs pinned). effort floor
+        # NOT lowered: under the ep_return objective the effort axis is
+        # REWARD-PARAMETERIZED (the tax is inside the score), so it pins
+        # low mechanically and its true optimum is unidentifiable here —
+        # pinned-at-floor == tax-off, decide the real tax externally.
+        "lr":          dict(distribution="log_normal", min=1e-4, max=1.5e-2, scale=0.5),
         "ent_coef":    dict(distribution="log_normal", min=1e-4, max=0.3, scale=0.5),
-        "ent_final":   dict(distribution="log_normal", min=1e-5, max=0.1, scale=0.5),
+        "ent_final":   dict(distribution="log_normal", min=1e-6, max=0.1, scale=0.5),
         "gamma":       dict(distribution="logit_normal", min=0.72, max=0.997, scale=0.5),
-        "gae_lambda":  dict(distribution="logit_normal", min=0.65, max=0.995, scale=0.5),
+        "gae_lambda":  dict(distribution="logit_normal", min=0.65, max=0.999, scale=0.5),
         "effort_coef": dict(distribution="log_normal", min=1e-4, max=8.0, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=6e7, max=1.2e9, scale="time"),
     },
