@@ -244,21 +244,27 @@ def test_swing_meter_tracks_rotation():
 
 
 def test_z_is_time_times_speed():
-    """time_until = z / |vz| at every step (spatial obs contract)."""
+    """time_until = (z - z_off) / |vz| at every step (spatial obs
+    contract; env v15, contact spec §10: the note z lane carries the
+    live head anchor z_off = head_z - PLANE_Z0, recovered here from the
+    same obs vector's head lane)."""
+    from beat_arena_env.constants import OFF_HEAD, PLANE_Z0, X_NORM
     env = RustBeatEnv(seed=9)
     obs, _ = env.reset()
     for _ in range(60):
         obs, _, done, _, _ = env.step(COAST)
         if done:
             break
+        z_off = float(obs[OFF_HEAD + 2]) * X_NORM  # head_z - PLANE_Z0
         status = env.sim.status()
         pending = [i for i, s in enumerate(status) if s == 0][:N_NOTE_SLOTS]
         for slot, i in enumerate(pending):
             z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
             vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
             t_until = env.chart[i].hit_time - env.sim.time
-            if -3.0 < t_until * env.chart[i].speed < 12.0:
-                assert z_obs / -vz_obs == pytest.approx(t_until, abs=1e-4)
+            if -3.0 < t_until * env.chart[i].speed + z_off < 12.0:
+                assert (z_obs - z_off) / -vz_obs == pytest.approx(
+                    t_until, abs=1e-4)
 
 
 # --- determinism -------------------------------------------------------------
@@ -520,7 +526,11 @@ def _whip_events(kind=0, ticks=60):
     beyond reach, then whip down at full gear through a note — > 100
     deg of blade arc banks the full 70 pre-swing, and the follow-through
     keeps sweeping for the full 30."""
-    sim = _sim_with_note(_note(0.9, 2, 1, kind=kind), max_steps=300)
+    # hit 0.9 -> 0.8 (env v15, contact spec §10): the whip's reaction
+    # rocks the trunk (head z swings ~1 m), and the head-anchored track
+    # moves with it — at 0.8 the down-whip meets the shifted note with
+    # full pre (70) and follow-through (30) banked
+    sim = _sim_with_note(_note(0.8, 2, 1, kind=kind), max_steps=300)
     events = []
     for t in range(ticks):
         a = [0] * N_JOINTS

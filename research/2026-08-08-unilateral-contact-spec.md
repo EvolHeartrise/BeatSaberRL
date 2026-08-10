@@ -198,3 +198,38 @@ d. **Gates.** tests_dyn `v14_momentum_conserved_with_joints_parked_on_
    repair.
 e. v11-era trajectory gates re-pinned where semantics moved (limit
    crossing tolerance 1e-9 → 2.1e-3; P1 full-press = bounded cycle).
+
+## 10. env v15 (2026-08-10): head-anchored note track
+
+User-identified exploit in the first honest-physics (v14) replays: the
+policy shimmied forward in z to meet notes early — the track targets a
+FIXED world plane (hit plane z = 0) while the body stands at ~−0.65,
+so every step forward was real distance bought and earlier reward.
+Real Beat Saber is room-anchored: you cannot walk the notes closer.
+
+Fix (user-specified semantics): every note's world z carries the live
+offset `z_off = head_z − PLANE_Z0` (zero at the reference pose, where
+head z = −0.65). Walking toward the notes shifts the whole track away
+by exactly the walked amount.
+
+a. **Sites** (both engines, three each): the note obs z lane (offset
+   added before Z_CLIP), the broad-phase sorted-break bound (z_off is
+   shared by every note, so the bound shifts with it and the
+   sorted-by-hit_time argument is unchanged), and the judgment z.
+   x/y stay world-fixed (lanes are body-independent).
+b. **Consequences.** Miss timing becomes a pure function of chart
+   time: z < head_z ⇔ base z < PLANE_Z0, i.e. 0.65/speed seconds
+   past hit_time, invariant to any body motion. Leaning forward now
+   costs reach (the head's full z displacement moves the track away;
+   the shoulders move less) — leaning-in as a reach tactic is gone
+   along with walking. Head bob makes the track jitter by the same
+   mm — harmless, and faithful to the head-anchor semantics.
+c. **Gates.** tests/test_v15_note_offset.py (Rust reference): per-tick
+   obs identity note_z = base + (head_z − PLANE_Z0) under live tipping
+   (offset exercised > 2 mm), and analytic miss-tick invariance under
+   a spine lunge. CUDA is gated by the §5 lockstep tiers (note lanes
+   are full-obs; judgment feeds reward). Python constants export
+   PLANE_Z0.
+d. Physics untouched — this is a scoring/obs change; v14 checkpoints
+   remain physically valid but their walk-forward habit is
+   reward-dead under v15.

@@ -219,6 +219,9 @@ ALIVE_BONUS = 0.002
 X_NORM, Y_NORM = 1.0, 0.75
 Z_SCALE = 8.0
 Z_CLIP = (-3.0, 12.0)
+# reference body plane (obs centering; contact spec §10: also the zero
+# point of the v15 head-anchored note-track offset head_z - PLANE_Z0)
+PLANE_Z0 = -0.65
 ROOT_VLIN_NORM = 6.0
 ROOT_VANG_NORM = 16.0
 
