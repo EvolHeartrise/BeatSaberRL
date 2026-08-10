@@ -1449,6 +1449,60 @@ impl RawBeatSim {
         out
     }
 
+    /// World center of mass from the §1.2 mass model (introspection —
+    /// balance forensics). Σ mᵢ (pᵢ + Rᵢ·comᵢ) / M over the base +
+    /// every mass-carrying frame, current FK.
+    fn com(&self) -> [f64; 3] {
+        let b = &self.core.body;
+        let mut acc = [0.0f64; 3];
+        let mut mass = MODEL.base_mass;
+        let r0 = dynamics::fk::quat_to_rot(b.st.quat);
+        for k in 0..3 {
+            // base com is in the root frame
+            acc[k] = MODEL.base_mass
+                * (b.st.p[k]
+                    + r0[k][0] * MODEL.base_com[0]
+                    + r0[k][1] * MODEL.base_com[1]
+                    + r0[k][2] * MODEL.base_com[2]);
+        }
+        for (f, fr) in MODEL.frames.iter().enumerate() {
+            if fr.mass == 0.0 {
+                continue;
+            }
+            mass += fr.mass;
+            let (p, r) = (&b.ws.p[f], &b.ws.r[f]);
+            for k in 0..3 {
+                acc[k] += fr.mass
+                    * (p[k]
+                        + r[k][0] * fr.com[0]
+                        + r[k][1] * fr.com[1]
+                        + r[k][2] * fr.com[2]);
+            }
+        }
+        [acc[0] / mass, acc[1] / mass, acc[2] / mass]
+    }
+
+    /// World positions of the 8 sole corners (contact spec §2 normative
+    /// order), current FK. Introspection — support-polygon forensics.
+    fn sole_corners(&self) -> Vec<[f64; 3]> {
+        use dynamics::collide::{CORNERS_PER_FOOT, GROUND_CORNERS, GROUND_FRAMES};
+        let b = &self.core.body;
+        let mut out = Vec::with_capacity(8);
+        for f in 0..GROUND_FRAMES.len() {
+            let frame = GROUND_FRAMES[f];
+            let (p, r) = (&b.ws.p[frame], &b.ws.r[frame]);
+            for k in 0..CORNERS_PER_FOOT {
+                let c = &GROUND_CORNERS[k];
+                out.push([
+                    p[0] + r[0][0] * c[0] + r[0][1] * c[1] + r[0][2] * c[2],
+                    p[1] + r[1][0] * c[0] + r[1][1] * c[1] + r[1][2] * c[2],
+                    p[2] + r[2][0] * c[0] + r[2][1] * c[1] + r[2][2] * c[2],
+                ]);
+            }
+        }
+        out
+    }
+
     /// Replay v10 `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
     fn twist(&self) -> [f64; 6] {
         let v = &self.core.body.st.v;
