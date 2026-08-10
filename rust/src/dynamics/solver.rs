@@ -1090,7 +1090,10 @@ impl ConstraintSet {
         // rows of `j` are never assembled and hold arbitrary words.
         #[cfg(test)]
         if self.poison_limit_j {
-            let nd = self.weld_rows() + self.contacts.len();
+            // v14 audit fix: include the ground block, or in contact
+            // mode this would NaN the GROUND rows instead of the
+            // limit rows it means to poison
+            let nd = self.weld_rows() + self.ground_rows() + self.contacts.len();
             self.j[nd * nv..nrows * nv].fill(f64::NAN);
         }
 

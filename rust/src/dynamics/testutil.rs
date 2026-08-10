@@ -106,3 +106,31 @@ pub fn random_state(model: &Model, rng: &mut Rng, with_vel: bool) -> State {
     }
     st
 }
+
+/// World center of mass from the §1.2 mass model — v14 audit
+/// instrumentation (mirrors lib.rs `RawBeatSim::com`). Requires fresh
+/// FK in `ws`.
+pub fn body_com(model: &Model, st: &super::State, ws: &super::Workspace) -> [f64; 3] {
+    let r0 = super::fk::quat_to_rot(st.quat);
+    let mut acc = [0.0f64; 3];
+    let mut mass = model.base_mass;
+    for k in 0..3 {
+        acc[k] = model.base_mass
+            * (st.p[k]
+                + r0[k][0] * model.base_com[0]
+                + r0[k][1] * model.base_com[1]
+                + r0[k][2] * model.base_com[2]);
+    }
+    for (f, fr) in model.frames.iter().enumerate() {
+        if fr.mass == 0.0 {
+            continue;
+        }
+        mass += fr.mass;
+        let (p, r) = (&ws.p[f], &ws.r[f]);
+        for k in 0..3 {
+            acc[k] += fr.mass
+                * (p[k] + r[k][0] * fr.com[0] + r[k][1] * fr.com[1] + r[k][2] * fr.com[2]);
+        }
+    }
+    [acc[0] / mass, acc[1] / mass, acc[2] / mass]
+}
