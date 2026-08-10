@@ -41,14 +41,15 @@ def slug(s, n=24):
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:n].lower() or "song"
 
 
-_W = {}          # per-process state: {"policy", "dev"} (set by _worker_init)
+_W = {}          # per-process state: {"policy", "dev", "fc"} (set by _worker_init)
 
 
-def _worker_init(ckpt_path, device):
+def _worker_init(ckpt_path, device, foot_contact=False):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
+    _W["fc"] = foot_contact
 
 
 def _make_one(job):
@@ -60,7 +61,8 @@ def _make_one(job):
     notes, _ = load_beatmap(map_dir, entry["difficulty"], first_note_s=2.0)
     base = (f"replays/{tag}_{label}{rank:02d}_"
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
-    env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears)
+    env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
+                      foot_contact=_W["fc"])
     env.set_record(base + ".jsonl")
     obs, _ = env.reset()
     walk = scoresaber.ComboTracker()
@@ -112,6 +114,10 @@ def main():
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
+    p.add_argument("--foot-contact", action="store_true",
+                   help="env v11 contact physics — MUST match how the "
+                        "checkpoint was trained (a v12+/contact ckpt "
+                        "replayed under welds is a different game)")
     p.add_argument("--device", type=str, default=None,
                    help="forward device (default: cuda if available). "
                         "Matching the bench's device maximizes exact "
@@ -141,14 +147,15 @@ def main():
         with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs)),
                                  mp_context=ctx,
                                  initializer=_worker_init,
-                                 initargs=(args.ckpt, device)) as ex:
+                                 initargs=(args.ckpt, device,
+                                           args.foot_contact)) as ex:
             for base, line, warn in ex.map(_make_one, jobs):
                 if warn:
                     print(warn, flush=True)
                 print(line, flush=True)
                 made.append(base)
     else:
-        _worker_init(args.ckpt, device)
+        _worker_init(args.ckpt, device, args.foot_contact)
         for job in jobs:
             base, line, warn = _make_one(job)
             if warn:
