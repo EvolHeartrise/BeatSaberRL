@@ -177,6 +177,15 @@ def main():
     for idx in range(start, args.max_runs):
         hypers, info = protein.suggest(deepcopy(FILL))
         h = hypers["train"]
+        # phase 2 (2026-08-10, after legs 000-051): discrimination floor.
+        # The 60-130M regime is mapped — a flat -64.5..-67 stand-and-miss
+        # plateau where the objective barely separates configs, so the
+        # cost-aware GP rationally kept buying cheap legs forever.
+        # Note-hitting (where gamma/lambda/lr actually differentiate)
+        # starts ~300M+ (v12 1h: first pp by 262M, upp 123 at 524M).
+        # Clamp suggested budgets up; the clamped value is what gets
+        # observed, so the GP fits the leg that actually ran.
+        h["total_steps"] = max(h["total_steps"], 3e8)
         run_dir = os.path.join(args.dir, f"run_{idx:03d}")
         print(f"[run {idx:03d}] lr {h['lr']:.2e} ent {h['ent_coef']:.2e}"
               f"->{h['ent_final']:.2e} gamma {h['gamma']:.4f} "
