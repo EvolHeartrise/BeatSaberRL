@@ -11,7 +11,7 @@
   import {
     BLOCK, DT, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES,
     ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK, frameQuatScene,
-    noteFrame, poseQ36, qAt,
+    noteFrame, poseQ36, qAt, viewerTrackOffset,
   } from "./replay.js";
   import Body from "./Body.svelte";
   import Notes from "./Notes.svelte";
@@ -36,6 +36,13 @@
     ? poseQ36(pose)
     : (pb.rep ? qAt(pb.rep, tickIdx, u) : null));
   const fkAll = $derived(q36 ? bodyFK(q36) : null);
+
+  // ---- env v15 head-anchored note track (contact spec §10) -----------------
+  // z_off = head_z - PLANE_Z0 of the body being DRAWN this frame, so the
+  // notes can never drift from the sabers. Taking it here (from the FK
+  // that is already computed) also keeps the notes and the track scenery
+  // in lockstep. viewerTrackOffset holds the strict header gate.
+  const zOff = $derived(viewerTrackOffset(pb.rep, pose.on, fkAll));
 
   // self-collision contact markers (replay contact events, flash 0.4 s)
   const contacts = $derived(
@@ -106,26 +113,37 @@
   <T.MeshStandardMaterial color="#12151c" />
 </T.Mesh>
 
-<T.LineSegments geometry={tunnelGeo}>
-  <T.LineBasicMaterial color="#1d212b" />
-</T.LineSegments>
-<T.LineSegments geometry={reachGeo}>
-  <T.LineBasicMaterial color="#2a3040" />
-</T.LineSegments>
-<T.LineSegments geometry={gridGeo}>
-  <T.LineBasicMaterial color="#39404f" />
-</T.LineSegments>
+<!-- The TRACK: tunnel, hit-plane grid and the reach/miss datum planes all
+     belong to the note track, so under env v15 they ride the same
+     head-anchored offset the notes do (world +zOff -> scene -zOff). That
+     keeps the hit plane under the notes at their hit time, and puts the
+     miss plane back exactly on the sim's boundary, world z = head_z
+     (= -Z_MISS + zOff). The floor above is real ground and stays put. -->
+<T.Group position={[0, 0, -zOff]}>
+  <T.LineSegments geometry={tunnelGeo}>
+    <T.LineBasicMaterial color="#1d212b" />
+  </T.LineSegments>
+  <T.LineSegments geometry={reachGeo}>
+    <T.LineBasicMaterial color="#2a3040" />
+  </T.LineSegments>
+  <T.LineSegments geometry={gridGeo}>
+    <T.LineBasicMaterial color="#39404f" />
+  </T.LineSegments>
+</T.Group>
 
 {#if pb.rep}
-  <Notes />
+  <Notes {zOff} />
 {/if}
 
 {#if pose.on && pose.ref}
-  <!-- static reference note at a chosen cell, z = 0, for eyeballing reach -->
+  <!-- Reference note at a chosen cell, for eyeballing reach. It sits at
+       the hit plane, which under v15 is world z = zOff: leaning in moves
+       the note away by the head's own z travel, so the panel can no
+       longer be read as "lean forward, gain reach". -->
   {@const rx = LANE_X[pose.ref.col]}
   {@const ry = ROW_Y[pose.ref.row]}
-  {@const refQ = frameQuatScene(noteFrame([rx, ry, 0], 0, 1))}
-  <T.Group position={[rx, ry, 0]} quaternion={refQ}>
+  {@const refQ = frameQuatScene(noteFrame([rx, ry, zOff], 0, 1))}
+  <T.Group position={[rx, ry, -zOff]} quaternion={refQ}>
     <T.Mesh>
       <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
       <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />

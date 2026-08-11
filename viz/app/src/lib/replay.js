@@ -17,6 +17,16 @@
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
+//
+// env v15 (contact spec §10) — HEAD-ANCHORED NOTE TRACK. Every chart
+// object's world z carries the live offset z_off(t) = head_z(t) - PLANE_Z0:
+//
+//     note_z(t) = (hit_time - t) * speed + z_off(t)
+//
+// so walking/leaning toward the notes pushes the whole track away by
+// exactly the distance travelled. x and y are unchanged. The header field
+// "track_anchor": "head" is ADDITIVE: recordings that carry it get the
+// offset, pre-v15 recordings (field absent) keep the old fixed track.
 
 // BLOCK 0.5: the real game's visual cube (verified against the
 // ScoreSaber viewer's note mesh, 2026-07-30)
@@ -32,6 +42,11 @@ export const Z_FAR = 12.0;
 // env v10: REACH/miss are LIVE-POSE gates in the sim; the viewer keeps
 // the reference-pose planes (1.75 / -0.65) for the static scenery only
 export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 0.65;
+// env v15: the reference body plane the head-anchored track is measured
+// from (head z at the reference pose). Z_MISS === -PLANE_Z0.
+export const PLANE_Z0 = -0.65;
+// header value that turns the head-anchored track on (strict gate)
+export const TRACK_ANCHOR_HEAD = "head";
 export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 
 // object kinds (chart entry `kind`)
@@ -435,8 +450,67 @@ export function parseReplay(text) {
   );
   return {
     config: head.header.config, chart, ticks, outcomes, posts,
+    // env v15 ADDITIVE header field: "head" -> head-anchored note track.
+    // Anything else (including absent) means the pre-v15 FIXED track.
+    trackAnchor: head.header.track_anchor ?? null,
     arcs: arcPairs(chart),
   };
+}
+
+/** True when this replay's chart objects ride the v15 head-anchored
+ * track. STRICT gate: the header field must be present and "head". */
+export function isHeadAnchored(rep) {
+  return !!rep && rep.trackAnchor === TRACK_ANCHOR_HEAD;
+}
+
+// The head-anchored offset needs one full-body FK per query; playback
+// asks for the same (tick, u) many times per frame, so memoize the last.
+let _offMemo = { rep: null, k: -1, u: -1, v: 0 };
+
+/** World z of the HEAD frame origin at fractional tick (tickIdx + u) —
+ * the same head the viewer draws the skeleton's head from, and the one
+ * the sim anchors the track to (lib.rs `self.body.head[2]`). */
+export function headZAt(rep, tickIdx, u = 0) {
+  return bodyFK(qAt(rep, tickIdx, u)).p[F_HEAD][2];
+}
+
+/** v15 track offset z_off = head_z - PLANE_Z0 at fractional tick
+ * (tickIdx + u); exactly 0 for pre-v15 replays (no "track_anchor" in the
+ * header), so legacy recordings render on the old fixed track. */
+export function trackOffset(rep, tickIdx, u = 0) {
+  if (!isHeadAnchored(rep) || !rep.ticks || !rep.ticks.length) return 0;
+  const k = Math.max(0, Math.min(Math.floor(tickIdx), rep.ticks.length - 1));
+  const uu = Math.min(1, Math.max(0, u));
+  if (_offMemo.rep === rep && _offMemo.k === k && _offMemo.u === uu)
+    return _offMemo.v;
+  const v = headZAt(rep, k, uu) - PLANE_Z0;
+  _offMemo = { rep, k, u: uu, v };
+  return v;
+}
+
+/** Same, for a continuous replay time in seconds. */
+export function trackOffsetAt(rep, time) {
+  const f = time / DT;
+  const k = Math.floor(f);
+  return trackOffset(rep, k, f - k);
+}
+
+/** z_off of the pose/body the viewer is currently DRAWING, from its FK
+ * result — used so notes line up with the sabers frame-for-frame. */
+export function trackOffsetOfFK(fk) {
+  return fk ? fk.p[F_HEAD][2] - PLANE_Z0 : 0;
+}
+
+/** THE viewer's track-offset gate, in one place: `rep` = the loaded
+ * replay (or null), `poseOn` = manual pose mode, `fk` = FK of the body
+ * being drawn. A loaded replay decides STRICTLY by its header — only
+ * "track_anchor": "head" shifts anything, so pre-v15 recordings keep the
+ * old fixed track. With no replay loaded, pose mode shows the current
+ * (v15) env's head-anchored track. */
+export function viewerTrackOffset(rep, poseOn, fk) {
+  if (!fk) return 0;
+  if (rep) return isHeadAnchored(rep) ? trackOffsetOfFK(fk) : 0;
+  return poseOn ? trackOffsetOfFK(fk) : 0;
 }
 
 /** Arc scoring hints: pair each fpost note (arc head) with the NEXT
@@ -537,7 +611,10 @@ export function cutPlaneLocal(rep, noteIdx) {
   const cur = rep.ticks[k].sabers[hand];
   const pw = [prev[0], prev[1], prev[2]], pd = [prev[3], prev[4], prev[5]];
   const cw = [cur[0], cur[1], cur[2]], cd = [cur[3], cur[4], cur[5]];
-  const zCut = (n.t - (k + 1) * DT) * n.speed;
+  // v15: the note really sat at base + z_off(tick k) when the blade met
+  // it — the sabers below are that same tick's, so the offset must be
+  // taken there for the reconstructed plane to be the sim's plane.
+  const zCut = (n.t - (k + 1) * DT) * n.speed + trackOffset(rep, k);
   const [cx, cy] = noteCenter(n);
   const center = [cx, cy, zCut];
   // contact fraction: closest point of the tick-k blade line to center
@@ -631,14 +708,23 @@ export function effortAt(rep, tickIdx) {
 }
 
 /** Objects still flying at `time`, with their world z. Bombs that were
- * never hit produce NO event — they despawn at the miss boundary. */
-export function pendingNotes(rep, time) {
+ * never hit produce NO event — they despawn at the miss boundary.
+ *
+ * `zOff` is the v15 head-anchored track offset (0 for pre-v15 replays).
+ * Each entry carries BOTH z's: `z` is the rendered world z (base + zOff,
+ * what the sim judges against and what must line up with the sabers) and
+ * `zBase` is the chart-time z. The spawn/despawn bounds stay on `zBase`
+ * because the sim's boundaries move with the track too — `note_z < head_z`
+ * reduces to `base z < PLANE_Z0` (spec §10b), and the far bound shifts
+ * with z_off since z_off is shared by every note (§10a). */
+export function pendingNotes(rep, time, zOff = 0) {
   const out = [];
   rep.chart.forEach((n, i) => {
     const o = rep.outcomes[i];
     if (o && time >= (o.tick + 1) * DT) return;
-    const z = (n.t - time) * n.speed;
-    if (z <= Z_FAR && z >= -Z_MISS) out.push({ n, i, z });
+    const zBase = (n.t - time) * n.speed;
+    if (zBase <= Z_FAR && zBase >= -Z_MISS)
+      out.push({ n, i, z: zBase + zOff, zBase });
   });
   return out;
 }
@@ -646,7 +732,10 @@ export function pendingNotes(rep, time) {
 const FADE_S = 0.6;
 
 /** Resolved-note effects (0.6 s window): split halves / link pop /
- * bomb flash / fail outline. */
+ * bomb flash / fail outline. Each entry carries the v15 track offset
+ * FROZEN at the frame the effect spawns on (the viewer draws the body of
+ * tick o.tick + 1 then): the debris stays where the note actually was
+ * when it resolved, instead of sliding with later head motion. */
 export function aftermaths(rep, time) {
   const out = [];
   rep.chart.forEach((n, i) => {
@@ -654,7 +743,10 @@ export function aftermaths(rep, time) {
     if (!o) return;
     const age = time - (o.tick + 1) * DT;
     if (age < 0 || age > FADE_S) return;
-    out.push({ n, i, o, age, alpha: 1 - age / FADE_S });
+    out.push({
+      n, i, o, age, alpha: 1 - age / FADE_S,
+      zOff: trackOffset(rep, o.tick + 1),
+    });
   });
   return out;
 }
@@ -664,12 +756,16 @@ export function activePosts(rep, time) {
   return rep.posts
     .map((p) => ({ ...p, age: time - (p.tick + 1) * DT }))
     .filter((p) => p.age >= 0 && p.age <= FADE_S)
-    .map((p) => ({ ...p, alpha: 1 - p.age / FADE_S }));
+    .map((p) => ({
+      ...p, alpha: 1 - p.age / FADE_S, zOff: trackOffset(rep, p.tick + 1),
+    }));
 }
 
 /** Arc hint tubes visible at `time`: head/tail world positions of each
- * paired arc whose span overlaps the visible tunnel. */
-export function activeArcs(rep, time) {
+ * paired arc whose span overlaps the visible tunnel. `zOff` is the v15
+ * track offset (see pendingNotes): the tube rides the track, the
+ * visibility bounds stay on the chart-time z. */
+export function activeArcs(rep, time, zOff = 0) {
   const out = [];
   rep.arcs.forEach(({ head, tail }, k) => {
     const h = rep.chart[head], t = rep.chart[tail];
@@ -678,8 +774,8 @@ export function activeArcs(rep, time) {
     if (zt > Z_FAR || zh < -Z_MISS) return;
     out.push({
       k, head, tail, color: h.color,
-      a: [...noteCenter(h), zh],
-      b: [...noteCenter(t), zt],
+      a: [...noteCenter(h), zh + zOff],
+      b: [...noteCenter(t), zt + zOff],
     });
   });
   return out;

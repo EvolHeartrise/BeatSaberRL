@@ -6,11 +6,13 @@ import assert from "node:assert/strict";
 import {
   DT, F_HEAD, F_L_FOOT, F_R_FOOT, FRAMES, GROUPS, HEAD, JOINT_LIMITS,
   JOINT_NAMES, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LOOK_VERT,
-  N_JOINTS, OMEGA_CAP, PAIRS, ROOT_POS0, TAU_MAX, Z_MISS, activeArcs,
-  activeContacts, activePosts, aftermaths, bodyFK, clampQ29, counts,
-  cutPlaneLocal, effortAt, fkSaber, footForces, frameQuatScene, gearTable,
-  hitboxRot, maxScore, mirrorQ29, noteFrame, noteLam, noteRot, parseReplay,
-  pendingNotes, poseQ36, qAt, saberAt, tauOf, tipOf, tipSpeed,
+  N_JOINTS, OMEGA_CAP, PAIRS, PLANE_Z0, ROOT_POS0, TAU_MAX, Z_FAR, Z_MISS,
+  activeArcs, activeContacts, activePosts, aftermaths, bodyFK, clampQ29,
+  counts, cutPlaneLocal, effortAt, fkSaber, footForces, frameQuatScene,
+  gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
+  noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
+  saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
+  trackOffsetOfFK, viewerTrackOffset,
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
@@ -192,7 +194,9 @@ for (const frac of [0, 0.3, 0.6, 0.9, 1.0]) {
   const p = pendingNotes(rep, t), a = aftermaths(rep, t),
     po = activePosts(rep, t), ar = activeArcs(rep, t);
   assert.ok(p.length + a.length >= 0 && po.length >= 0 && ar.length >= 0);
-  p.forEach(({ z }) => assert.ok(z >= -Z_MISS - 1e-9 && z <= 12 + 1e-9));
+  // the chart-time z is what the spawn/despawn bounds are taken on
+  p.forEach(({ zBase }) =>
+    assert.ok(zBase >= -Z_MISS - 1e-9 && zBase <= Z_FAR + 1e-9));
 }
 
 // arc pairs are sane: same color, tail after head, within the window
@@ -319,6 +323,231 @@ assert.equal(noteLam({ kind: 0 }, 11), 0);
 assert.equal(noteLam({ kind: 0 }, -0.5), 1);
 for (const kind of [KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK])
   assert.equal(noteLam({ kind }, 1), 0, "lam leaks past plain notes");
+
+// ============================================================================
+// env v15 (unilateral-contact spec §10): HEAD-ANCHORED NOTE TRACK.
+//   note_z(t) = (hit_time - t) * speed + z_off(t),  z_off = head_z - PLANE_Z0
+// The header field "track_anchor": "head" is ADDITIVE and the gate is
+// STRICT: absent (every pre-v15 recording) means the old fixed track.
+// ============================================================================
+assert.equal(PLANE_Z0, -0.65);
+assert.equal(Z_MISS, -PLANE_Z0, "Z_MISS is the reference plane's depth");
+
+// ---- (a) LEGACY replay (no track_anchor): NO offset, ever -------------------
+{
+  assert.equal(rep.trackAnchor, null, "legacy replay must carry no anchor");
+  assert.equal(isHeadAnchored(rep), false);
+  // the legacy body's head moves plenty; none of it may reach the track
+  const hz = rep.ticks.map((_, k) => headZAt(rep, k));
+  const span = Math.max(...hz) - Math.min(...hz);
+  assert.ok(span > 0.002, `legacy head barely moves (${span} m) — weak test`);
+  for (let k = 0; k < rep.ticks.length; k += 11) {
+    assert.equal(trackOffset(rep, k), 0, `legacy offset at tick ${k}`);
+    assert.equal(trackOffset(rep, k, 0.5), 0);
+    assert.equal(trackOffsetAt(rep, k * DT), 0);
+  }
+  // ...so the rendered z IS the chart-time z, for every flying object
+  for (const frac of [0, 0.25, 0.5, 0.75, 1.0]) {
+    const t = frac * last * DT;
+    pendingNotes(rep, t, trackOffsetAt(rep, t)).forEach(({ n, z, zBase }) => {
+      assert.equal(z, zBase, "legacy note picked up an offset");
+      assert.equal(zBase, (n.t - t) * n.speed);
+    });
+    aftermaths(rep, t).forEach((a) => assert.equal(a.zOff, 0));
+    activePosts(rep, t).forEach((p) => assert.equal(p.zOff, 0));
+    const off = activeArcs(rep, t, trackOffsetAt(rep, t));
+    activeArcs(rep, t).forEach((a, i) => {
+      assert.equal(a.a[2], off[i].a[2]);
+      assert.equal(a.b[2], off[i].b[2]);
+    });
+  }
+  // the viewer-level gate agrees, in replay AND pose mode
+  const fk = bodyFK(rep.ticks[10].q);
+  assert.ok(Math.abs(trackOffsetOfFK(fk)) > 1e-6, "flat head — weak test");
+  assert.equal(viewerTrackOffset(rep, false, fk), 0);
+  assert.equal(viewerTrackOffset(rep, true, fk), 0,
+    "pose mode must not resurrect the offset for a legacy replay");
+  console.log(`legacy replay: fixed track held over ${rep.ticks.length} ` +
+    `ticks (head z span ${span.toFixed(3)} m)`);
+}
+
+// ---- (b) HEAD-ANCHORED replay: offset applied every tick --------------------
+// Prefer a real v15 recording; fall back to the legacy one with the
+// ADDITIVE field spliced into its header (exactly what the writer adds).
+const V15_PATH = new URL(
+  "../../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.jsonl",
+  import.meta.url);
+const legacyText = readFileSync(path, "utf8");
+const anchored = (text, anchor = "head") => {
+  const lines = text.split("\n");
+  const h = JSON.parse(lines[0]);
+  h.header.track_anchor = anchor;
+  lines[0] = JSON.stringify(h);
+  return lines.join("\n");
+};
+let v15, v15Src;
+try {
+  v15 = parseReplay(readFileSync(V15_PATH, "utf8"));
+  v15Src = "recorded v15 probe";
+} catch {
+  v15 = parseReplay(anchored(legacyText));
+  v15Src = "legacy replay + spliced track_anchor";
+}
+{
+  assert.equal(v15.trackAnchor, "head");
+  assert.ok(isHeadAnchored(v15));
+
+  // z_off IS head_z - PLANE_Z0, at every tick, from the SAME full-body FK
+  // the viewer draws the head with (fk.p[F_HEAD]) — no separate model.
+  // Exact against the drawn pose (qAt renormalizes the logged quaternion);
+  // against the raw logged q it agrees to the 5-dp quat rounding.
+  let lo = Infinity, hi = -Infinity, worstHead = 0;
+  for (let k = 0; k < v15.ticks.length; k++) {
+    const drawn = bodyFK(qAt(v15, k, 0)).p[F_HEAD][2];
+    assert.equal(trackOffset(v15, k), drawn - PLANE_Z0,
+      `z_off != head_z - PLANE_Z0 at tick ${k}`);
+    assert.equal(headZAt(v15, k), drawn);
+    worstHead = Math.max(worstHead,
+      Math.abs(drawn - bodyFK(v15.ticks[k].q).p[F_HEAD][2]));
+    lo = Math.min(lo, trackOffset(v15, k));
+    hi = Math.max(hi, trackOffset(v15, k));
+  }
+  assert.ok(worstHead < 1e-4,
+    `drawn head z drifts from the logged head z: ${worstHead}`);
+  // the Rust gate demands the offset actually be exercised (> 2 mm)
+  assert.ok(hi - lo > 0.002,
+    `head-anchored offset never moves (${hi - lo} m)`);
+
+  // interpolated ticks come from the interpolated pose, and stay bracketed
+  for (let k = 0; k + 1 < v15.ticks.length; k += 7) {
+    const a = trackOffset(v15, k), b = trackOffset(v15, k + 1);
+    const m = trackOffset(v15, k, 0.5);
+    assert.ok(m >= Math.min(a, b) - 1e-9 && m <= Math.max(a, b) + 1e-9,
+      `interpolated z_off outside its bracket at ${k}`);
+    assert.equal(m, bodyFK(qAt(v15, k, 0.5)).p[F_HEAD][2] - PLANE_Z0);
+  }
+
+  // rendered z = base + z_off for EVERY flying object at several ticks
+  // with visibly different offsets; the chart-time z is untouched.
+  let checked = 0;
+  const offsets = new Set();
+  for (let k = 0; k < v15.ticks.length; k += 3) {
+    const t = k * DT;
+    const off = trackOffsetAt(v15, t);
+    offsets.add(off.toFixed(4));
+    for (const { n, z, zBase } of pendingNotes(v15, t, off)) {
+      assert.equal(zBase, (n.t - t) * n.speed, `base z moved at tick ${k}`);
+      assert.equal(z, zBase + off, `note z != base + z_off at tick ${k}`);
+      // the sim's live miss plane is world z = head_z; nothing renders past it
+      assert.ok(z >= headZAt(v15, k) - 1e-9, `note behind the head at ${k}`);
+      checked++;
+    }
+  }
+  assert.ok(checked > 20, `only ${checked} note-ticks checked`);
+  assert.ok(offsets.size > 3, "offset never varied across the sampled ticks");
+
+  // arcs ride the track too, and the frozen aftermath/post offsets are the
+  // ones from the frame the effect spawns on (tick o.tick + 1)
+  for (let k = 0; k < v15.ticks.length; k += 5) {
+    const t = k * DT, off = trackOffsetAt(v15, t);
+    const base = activeArcs(v15, t), moved = activeArcs(v15, t, off);
+    base.forEach((a, i) => {
+      assert.ok(Math.abs(moved[i].a[2] - (a.a[2] + off)) < 1e-12);
+      assert.ok(Math.abs(moved[i].b[2] - (a.b[2] + off)) < 1e-12);
+    });
+    aftermaths(v15, t).forEach((a) =>
+      assert.equal(a.zOff, trackOffset(v15, a.o.tick + 1),
+        "aftermath offset not frozen at its spawn frame"));
+    activePosts(v15, t).forEach((p) =>
+      assert.equal(p.zOff, trackOffset(v15, p.tick + 1)));
+  }
+
+  // §10b: miss timing is a pure function of CHART time — every recorded
+  // miss fires within one tick of the note's base z crossing PLANE_Z0,
+  // whatever the body was doing. This is the property the viewer relies
+  // on to keep culling on zBase.
+  let misses = 0;
+  v15.chart.forEach((n, i) => {
+    const o = v15.outcomes[i];
+    if (!o || o.kind !== "miss") return;
+    misses++;
+    const zb = (n.t - (o.tick + 1) * DT) * n.speed;
+    assert.ok(zb < PLANE_Z0 + 1e-9 && zb >= PLANE_Z0 - n.speed * DT - 1e-9,
+      `miss ${i} fired at base z ${zb}, not at the PLANE_Z0 crossing`);
+  });
+
+  // ---- A/B: the SAME ticks with the flag stripped render on the old track
+  const stripped = parseReplay(anchored(
+    v15Src === "recorded v15 probe"
+      ? readFileSync(V15_PATH, "utf8") : legacyText, "world"));
+  assert.equal(stripped.trackAnchor, "world");
+  assert.equal(isHeadAnchored(stripped), false,
+    "gate must accept ONLY the exact value \"head\"");
+  for (let k = 0; k < stripped.ticks.length; k += 7) {
+    assert.equal(trackOffset(stripped, k), 0);
+    const t = k * DT;
+    const a = pendingNotes(v15, t, trackOffsetAt(v15, t));
+    const b = pendingNotes(stripped, t, trackOffsetAt(stripped, t));
+    assert.equal(a.length, b.length);
+    a.forEach((e, i) => {
+      assert.equal(e.zBase, b[i].zBase, "chart-time z differs across the gate");
+      assert.equal(b[i].z, b[i].zBase, "unflagged replay picked up an offset");
+    });
+  }
+  console.log(`v15 (${v15Src}): z_off in [${lo.toFixed(3)}, ${hi.toFixed(3)}] ` +
+    `m over ${v15.ticks.length} ticks, ${checked} note-ticks pinned, ` +
+    `${misses} misses at the PLANE_Z0 crossing`);
+}
+
+// ---- (c) synthetic replay with an ANALYTICALLY known head trajectory --------
+// Root z ramps and the spine pitches, so head z = root_z + 0.66 sin(pitch)
+// (the head is welded 0.10 + 0.66 above the root through the spine chain).
+{
+  const chart = [
+    { t: 1.0, x: 0.3, y: 1.4, color: 0, angle: 4.712389, speed: 5.0,
+      any: false, kind: 0, fpre: false, fpost: false },
+    { t: 1.5, x: -0.9, y: 1.9, color: 1, angle: 0.0, speed: 3.0,
+      any: true, kind: 1, fpre: false, fpost: false },
+  ];
+  const pitches = [0, 0.2, -0.35, 0.45];
+  const rootZ = [-0.65, -0.5, -0.9, -0.2];
+  const ticks = pitches.map((pitch, k) => ({
+    t: k,
+    q: [0, 0.94, rootZ[k], 1, 0, 0, 0, pitch, ...Array(28).fill(0)],
+    events: [], reward: 0,
+  }));
+  const build = (header) => parseReplay([JSON.stringify({ header }),
+    ...ticks.map((t) => JSON.stringify(t))].join("\n"));
+  const base = { version: "v10", config: { gears: 5 }, chart };
+  const withFlag = build({ ...base, track_anchor: "head" });
+  const noFlag = build(base);
+
+  pitches.forEach((pitch, k) => {
+    const want = rootZ[k] + 0.66 * Math.sin(pitch) - PLANE_Z0;
+    assert.ok(Math.abs(trackOffset(withFlag, k) - want) < 1e-12,
+      `synthetic z_off at tick ${k}: ${trackOffset(withFlag, k)} vs ${want}`);
+    assert.equal(trackOffset(noFlag, k), 0);
+    const t = k * DT;
+    const on = pendingNotes(withFlag, t, trackOffsetAt(withFlag, t));
+    const off = pendingNotes(noFlag, t, trackOffsetAt(noFlag, t));
+    assert.equal(on.length, off.length);
+    on.forEach((e, i) => {
+      assert.ok(Math.abs(e.z - (e.zBase + want)) < 1e-12,
+        `synthetic note z at tick ${k}`);
+      assert.equal(off[i].z, off[i].zBase);
+      // x / y are body-independent (spec §10a): lanes never move
+      assert.equal(e.n.x, off[i].n.x);
+      assert.equal(e.n.y, off[i].n.y);
+    });
+  });
+  // pose mode with no replay loaded follows the drawn head; without it, 0
+  const fk = bodyFK(withFlag.ticks[3].q);
+  assert.ok(Math.abs(viewerTrackOffset(null, true, fk)
+    - (rootZ[3] + 0.66 * Math.sin(pitches[3]) - PLANE_Z0)) < 1e-12);
+  assert.equal(viewerTrackOffset(null, false, fk), 0);
+  assert.equal(viewerTrackOffset(withFlag, false, null), 0);
+  console.log("synthetic head-anchored track: analytic z_off matches");
+}
 
 // replays from retired parameterizations are rejected with the friendly
 // "re-record" message (v10 viewers reject EVERYTHING else — house rule)

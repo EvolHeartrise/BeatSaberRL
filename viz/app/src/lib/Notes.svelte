@@ -19,11 +19,16 @@
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
+  // env v15 head-anchored track: `zOff` = head_z - PLANE_Z0 of the body
+  // being DRAWN this frame (Scene owns it, so notes and sabers can never
+  // disagree). It is exactly 0 for pre-v15 replays.
+  let { zOff = 0 } = $props();
+
   const time = $derived(pb.cur * DT);
-  const pend = $derived(pendingNotes(pb.rep, time));
+  const pend = $derived(pendingNotes(pb.rep, time, zOff));
   const after = $derived(aftermaths(pb.rep, time));
   const posts = $derived(activePosts(pb.rep, time));
-  const arcs = $derived(activeArcs(pb.rep, time));
+  const arcs = $derived(activeArcs(pb.rep, time, zOff));
 
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
   const headGeo = new THREE.BoxGeometry(BLOCK, BLOCK * HEAD_SQUASH, BLOCK);
@@ -163,9 +168,15 @@
   {/if}
 {/each}
 
-{#each pend as { n, z } (n)}
+<!-- `z` is the RENDERED world z (chart-time z + the v15 track offset);
+     `zBase` is the chart-time z. Distance-to-the-player judgements (fade
+     into the tunnel, in-reach outline) use zBase — the tunnel and reach
+     box ride the same offset in Scene.svelte, so a zBase test is exactly
+     a test against the shifted scenery. Position/billboarding use z,
+     mirroring lib.rs (lam is computed from the OFFSET z there). -->
+{#each pend as { n, z, zBase } (n)}
   {@const [cx, cy] = noteCenter(n)}
-  {@const alpha = fade(z)}
+  {@const alpha = fade(zBase)}
   <!-- env v7.6: plain notes (dots included) look at the player's head as
        they approach (lam blends toward full head-facing at the plane);
        heads/links keep the pure z-roll via lam = 0 -->
@@ -200,7 +211,7 @@
           opacity={alpha}
         />
       </T.Mesh>
-      {#if inReach(z)}
+      {#if inReach(zBase)}
         <T.LineSegments geometry={edges}>
           <T.LineBasicMaterial color="#e8eaf0" />
         </T.LineSegments>
@@ -249,11 +260,14 @@
   {/if}
 {/each}
 
-{#each after as { n, i, o, age, alpha } (n)}
+<!-- `oz` is the v15 track offset frozen at the frame the effect spawned:
+     the debris/outline sits where the object actually was, and stays put
+     while later head motion moves the live track. 0 on pre-v15 replays. -->
+{#each after as { n, i, o, age, alpha, zOff: oz } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {#if o.kind === "bomb"}
     <!-- bomb hit: red flash + label at the bomb's position at hit time -->
-    {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed}
+    {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
     <T.Mesh position={[cx, cy, -zHit]}>
       <T.SphereGeometry args={[BOMB_RADIUS + age * 1.2, 20, 14]} />
       <T.MeshBasicMaterial color="#ff4a4a" transparent
@@ -268,7 +282,7 @@
     />
   {:else if o.kind === "good" && n.kind === KIND_CHAIN_LINK}
     <!-- link good cut: quick shrink/pop of the slab -->
-    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4)}
+    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
     {@const sc = Math.max(0.02, 1 - age * 2.4)}
     <T.Mesh geometry={linkGeo} position={[cx, cy, -zCut]}
       rotation={[0, 0, noteRot(n)]} scale={[sc, sc, sc]}>
@@ -279,7 +293,7 @@
       text={"+" + o.points.toFixed(0)}
       color={GOOD_COL}
       size={0.13}
-      position={[cx, cy + LINK_H + age * 0.5, 0.02]}
+      position={[cx, cy + LINK_H + age * 0.5, 0.02 - oz]}
       opacity={alpha}
     />
   {:else if o.kind === "good"}
@@ -288,7 +302,7 @@
          carried along the sweep, tumble about the blade axis, fade.
          Off-center cuts produce honestly unequal chunks. Chain heads
          reuse the split squashed to their half-height look. -->
-    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4)}
+    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
     {@const sp = splitFor(i)}
     {@const squash = n.kind === KIND_CHAIN_HEAD ? HEAD_SQUASH : 1}
     {#each sp.sides as side}
@@ -319,16 +333,19 @@
       text={"+" + o.points.toFixed(0)}
       color={GOOD_COL}
       size={0.16}
-      position={[cx, cy + HALF * 1.2 + age * 0.5, 0.02]}
+      position={[cx, cy + HALF * 1.2 + age * 0.5, 0.02 - oz]}
       opacity={alpha}
     />
   {:else}
     <!-- bad cut / miss: outline + reason at the object's position when
          the event fired. Since env v7.3 misses register at the head
          plane (z = -0.65) so the outline reads fine there; the clamp
-         only guards pre-v7.3 replays whose misses fired further back. -->
+         only guards pre-v7.3 replays whose misses fired further back.
+         Env v15: the clamp stays on the chart-time z (the sim's miss
+         boundary is base z < PLANE_Z0), then the frozen offset carries
+         the outline onto the live miss plane at world z = head_z. -->
     {@const col = o.kind === "bad" ? BAD_COL : MISS_COL}
-    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS)}
+    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS) + oz}
     <T.LineSegments geometry={failGeo} position={[cx, cy, -zEv]}
       rotation={[0, 0, noteRot(n)]}>
       <T.LineBasicMaterial color={col} transparent opacity={alpha} />
@@ -350,7 +367,7 @@
     color="#9ece6a"
     size={0.11}
     bold={false}
-    position={[cx, cy - HALF * 1.4 - p.age * 0.4, 0.02]}
+    position={[cx, cy - HALF * 1.4 - p.age * 0.4, 0.02 - p.zOff]}
     opacity={p.alpha}
   />
 {/each}
