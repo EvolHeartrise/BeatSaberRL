@@ -1,4 +1,12 @@
-"""WSD 1h A/B probe: trunk 3,000 + leaf 400 vs the v15 cosine baseline.
+"""WSD 1h A/B probe ROUND 2: budget-free trunk entropy anneal.
+
+Round 1 (runs/wsd_probe_1h) lost 1.5 vs 174.6 upp: constant trunk ent
+0.03 out-paid the game (41.6 nats at trunk end) — the ent bonus is
+part of the OBJECTIVE, unlike lr. Round 2 keeps everything else and
+gives the trunk an absolute-index exponential ent anneal
+(0.03 -> floor 1e-3, tau 1000 upd — tracks the cosine baseline's
+winning linear path: ~0.012 at upd 1000, ~0.0049 at 2000, ~0.0024 at
+3000) which is budget-free, so trunk extension stays legal.
 
 Same total compute as the v15 probe (3,400 updates x 131,072 =
 445,644,800 steps), same env (v15 head-anchored track), same s4 recipe
@@ -27,7 +35,7 @@ import sys
 import time
 
 PY = sys.executable
-RUN_DIR = os.path.join("runs", "wsd_probe_1h")
+RUN_DIR = os.path.join("runs", "wsd_probe_1h_r2")
 NUM_ENVS, HORIZON = 16384, 8
 TRUNK_UPDATES, LEAF_UPDATES = 3_000, 400
 BATCH = NUM_ENVS * HORIZON
@@ -92,6 +100,7 @@ def main():
     else:
         ok = run_phase("trunk", [PY, "train_batch.py", *COMMON,
                                  "--lr", "5e-3", "--lr-decay", "wsd",
+                                 "--ent-final", "1e-3", "--ent-tau", "1000",
                                  "--total-steps", str(TRUNK_UPDATES * BATCH),
                                  "--ckpt-every", "500",
                                  "--run-dir", RUN_DIR], "trunk.log")
@@ -110,12 +119,13 @@ def main():
 
     table = {}
     for name, ck in (("trunk_raw", trunk_ck), ("leaf", leaf_ck)):
-        res = bench(ck, os.path.join("bench", f"wsd_probe_1h_{name}.json"))
+        res = bench(ck, os.path.join("bench", f"wsd_probe_1h_r2_{name}.json"))
         if res:
             table[name] = res
             print(f"[{name}] upp {res['upp']:,.0f} / wpp {res['wpp']:,.2f} / "
                   f"FCs {res['fcs']} / acc {res['acc']:.4f}", flush=True)
     table["baseline_v15_cosine"] = {"upp": 174.57, "wpp": 10.69}
+    table["baseline_wsd_r1_leaf"] = {"upp": 1.52, "wpp": 0.65}
     print("DONE " + json.dumps(table), flush=True)
 
 
