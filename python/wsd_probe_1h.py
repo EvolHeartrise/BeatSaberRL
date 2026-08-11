@@ -1,12 +1,15 @@
-"""WSD 1h A/B probe ROUND 2: budget-free trunk entropy anneal.
+"""WSD 1h A/B probe ROUND 3: cooler trunk lr.
 
-Round 1 (runs/wsd_probe_1h) lost 1.5 vs 174.6 upp: constant trunk ent
-0.03 out-paid the game (41.6 nats at trunk end) — the ent bonus is
-part of the OBJECTIVE, unlike lr. Round 2 keeps everything else and
-gives the trunk an absolute-index exponential ent anneal
-(0.03 -> floor 1e-3, tau 1000 upd — tracks the cosine baseline's
-winning linear path: ~0.012 at upd 1000, ~0.0049 at 2000, ~0.0024 at
-3000) which is budget-free, so trunk extension stays legal.
+Round 1 (runs/wsd_probe_1h, 1.5 upp): constant trunk ent 0.03 paid
+for randomness. Round 2 (runs/wsd_probe_1h_r2, 21.4 upp): ent fixed
+via absolute-index exp anneal (healthy entropy path, trunk->leaf gap
+x12) but the trunk lr — pinned at the cosine PEAK 5e-3 — kept the
+optimizer in the unstable-step regime the whole trunk (maxlr 285-954
+throughout; cosine's consolidation happened in its ~2.6e-3 -> 1e-3
+mid-band, which the WSD arm never visited). Trunk lr is a FREE
+parameter of WSD; constant-at-peak was the unfair choice. Round 3
+changes exactly one thing: trunk lr 5e-3 -> 2e-3 (~ cosine's
+time-average, = the band where v15's falls breakthrough happened).
 
 Same total compute as the v15 probe (3,400 updates x 131,072 =
 445,644,800 steps), same env (v15 head-anchored track), same s4 recipe
@@ -35,7 +38,7 @@ import sys
 import time
 
 PY = sys.executable
-RUN_DIR = os.path.join("runs", "wsd_probe_1h_r2")
+RUN_DIR = os.path.join("runs", "wsd_probe_1h_r3")
 NUM_ENVS, HORIZON = 16384, 8
 TRUNK_UPDATES, LEAF_UPDATES = 3_000, 400
 BATCH = NUM_ENVS * HORIZON
@@ -99,7 +102,7 @@ def main():
         print(f"{trunk_ck} exists — skipping trunk", flush=True)
     else:
         ok = run_phase("trunk", [PY, "train_batch.py", *COMMON,
-                                 "--lr", "5e-3", "--lr-decay", "wsd",
+                                 "--lr", "2e-3", "--lr-decay", "wsd",
                                  "--ent-final", "1e-3", "--ent-tau", "1000",
                                  "--total-steps", str(TRUNK_UPDATES * BATCH),
                                  "--ckpt-every", "500",
@@ -119,13 +122,14 @@ def main():
 
     table = {}
     for name, ck in (("trunk_raw", trunk_ck), ("leaf", leaf_ck)):
-        res = bench(ck, os.path.join("bench", f"wsd_probe_1h_r2_{name}.json"))
+        res = bench(ck, os.path.join("bench", f"wsd_probe_1h_r3_{name}.json"))
         if res:
             table[name] = res
             print(f"[{name}] upp {res['upp']:,.0f} / wpp {res['wpp']:,.2f} / "
                   f"FCs {res['fcs']} / acc {res['acc']:.4f}", flush=True)
     table["baseline_v15_cosine"] = {"upp": 174.57, "wpp": 10.69}
     table["baseline_wsd_r1_leaf"] = {"upp": 1.52, "wpp": 0.65}
+    table["baseline_wsd_r2_leaf"] = {"upp": 21.37, "wpp": 2.12}
     print("DONE " + json.dumps(table), flush=True)
 
 
