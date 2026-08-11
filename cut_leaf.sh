@@ -76,8 +76,11 @@ print(p.get('publicIp') or '', pm.get('22') or '')") || true
 done
 [ -n "$IP" ] && [ -n "$PORT" ] || { echo "[cut_leaf] no ssh after 10 min"; exit 1; }
 echo "[cut_leaf] ssh root@$IP:$PORT"
+# keepalives: a severed TCP session must fail fast, not hang the
+# orchestrator against an already-finished pod (bug found 2026-08-11)
 SSH=(ssh -p "$PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=no
-     -o ConnectTimeout=15 "root@$IP")
+     -o ConnectTimeout=15 -o ServerAliveInterval=15
+     -o ServerAliveCountMax=4 "root@$IP")
 for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && break; sleep 10; done
 
 # bootstrap + leaf + bench, under the pod-lifetime cap
@@ -93,7 +96,7 @@ python train_batch.py \
   --gamma 0.965 --gae-lambda 0.98 --effort-coef 1e-4 --ent-coef 0.03 \
   --resume "$TRUNK_DIR/$CKPT_NAME" \
   --cooldown-updates $COOLDOWN --ent-final $ENT_FINAL \
-  --run-dir "$LEAF_DIR" 2>&1 | tail -3
+  --run-dir "$LEAF_DIR" 2>&1 | tee "$LEAF_DIR/leaf_train.log" | tail -3
 LEAF=\$(ls "$LEAF_DIR"/leaf_from_upd*.pt)
 python bench_scoresaber.py --ckpt "\$LEAF" --num-envs 2048 --foot-contact \
   --out "bench/wsd_leafcut_upd$UPD.json" > /dev/null
