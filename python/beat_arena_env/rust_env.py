@@ -90,6 +90,11 @@ class RustBeatEnv(gym.Env):
     def _start_record(self):
         header = {"header": {
             "version": "v10",     # env v10 body: viewers reject others
+            # env v15 (contact spec §10), ADDITIVE: the note track is
+            # head-anchored — viewers must add head_z - PLANE_Z0 to
+            # every note's world z. Absent on pre-v15 recordings
+            # (fixed track); readers treat absence as fixed.
+            "track_anchor": "head",
             "config": {
                 "chart_len_s": self.cfg.chart_len_s,
                 "colors": self.cfg.colors,
