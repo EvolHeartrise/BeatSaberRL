@@ -9,16 +9,19 @@
   // overlay; the 3D body is driven from the shared pose state through
   // the normal bodyFK path.
   import {
-    pose, mirrorPoseLR, resetPose, setPoseJoint, setPoseRoot,
+    pb, pose, mirrorPoseLR, resetPose, setPoseJoint, setPoseRoot,
   } from "./state.svelte.js";
   import {
     F_HEAD, GROUPS, JOINT_LIMITS, JOINT_NAMES, LANE_X, ROW_Y,
-    SABER_COLORS, bodyFK, fkSaber, poseQ36,
+    SABER_COLORS, bodyFK, fkSaber, poseQ36, viewerTrackOffset,
   } from "./replay.js";
 
   const DEG = 180 / Math.PI;
   const q36 = $derived(poseQ36(pose));
   const fk = $derived(bodyFK(q36));
+  // env v15: the hit plane rides the head (same gate the scene uses), so
+  // the reference note is at z = zOff, not a fixed 0.
+  const zOff = $derived(viewerTrackOffset(pb.rep, true, fk));
   const sabers = $derived([0, 1].map((h) => fkSaber(fk, h)));
   const v3 = (v) => v.map((x) => x.toFixed(3)).join(", ");
 
@@ -125,7 +128,7 @@
       head ({v3(fk.p[F_HEAD])})
     </div>
     <div class="ref">
-      <span class="dim">reference note (z = 0):</span>
+      <span class="dim">reference note (hit plane z = {zOff.toFixed(3)}):</span>
       <select
         value={refValue}
         onchange={(e) => setRef(e.target.value)}

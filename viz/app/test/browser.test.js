@@ -13,6 +13,11 @@ const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
 const dist = resolve("dist/index.html");
 const replay = resolve(process.argv[2] ??
   "../../python/replays/v10_scripted_ep00_seed0.jsonl");
+// env v15: a recording whose header carries "track_anchor": "head", so the
+// built bundle is exercised on the head-anchored track as well as on the
+// legacy fixed one above (skipped if the probe recording is not present).
+const replayV15 = resolve(process.argv[3] ??
+  "../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.jsonl");
 if (!existsSync(dist)) throw new Error("run `npm run build` first");
 mkdirSync("test/out", { recursive: true });
 
@@ -93,6 +98,28 @@ try {
   const hud = await page.$eval("#hud", (el) => el.textContent);
   console.log("HUD:", hud.replace(/\s+/g, " ").trim());
   if (!/t\s+[1-9]?\d\.\d+s/.test(hud)) throw new Error("time not advancing");
+
+  // ---- env v15 head-anchored track: same bundle, a replay whose header
+  // carries "track_anchor": "head". The notes and the tunnel/grid/reach
+  // scenery ride head_z - PLANE_Z0, so a tick where the bot has moved in z
+  // shows the whole track displaced while the floor stays put.
+  if (existsSync(replayV15)) {
+    await input.uploadFile(replayV15);
+    await page.waitForFunction(
+      () => document.querySelector("#drop").textContent.includes("v15"),
+      { timeout: 10000 });
+    await new Promise((r) => setTimeout(r, 800));
+    await scrub(60);
+    await new Promise((r) => setTimeout(r, 500));
+    await page.screenshot({ path: "test/out/v15-head-anchored.png" });
+    const hud15 = await page.$eval("#hud", (el) => el.textContent);
+    console.log("HUD (v15):", hud15.replace(/\s+/g, " ").trim());
+    if (!/tick\s*60\b/.test(hud15))
+      throw new Error("v15 replay did not scrub");
+  } else {
+    console.log("no v15 recording at " + replayV15 + " — skipped");
+  }
+
   const webgl = await page.evaluate(() => {
     const cv = document.querySelector("#stage canvas");
     return !!(cv.getContext("webgl2") || cv.getContext("webgl"));
