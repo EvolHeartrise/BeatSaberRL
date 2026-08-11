@@ -127,23 +127,18 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=LR)
-    p.add_argument("--lr-decay", choices=["none", "cosine", "linear", "wsd"],
-                   default="none",
-                   help="anneal lr from --lr to --lr-final over the run "
-                        "(motivated by the 2026-07-21 finding: 3e-4 "
-                        "discovers, ~1e-4 refines). 'wsd' (2026-08-10, "
-                        "MiniCPM / EPFL constant+cooldown): linear warmup "
-                        "then CONSTANT lr with no decay — an open-ended "
-                        "TRUNK whose checkpoints can be extended (--resume "
-                        "with a larger --total-steps) or branched into "
-                        "decayed LEAF deliverables (--cooldown-updates)")
+    # WSD is the ONLY schedule since 2026-08-11 (user decision after the
+    # 3-round A/B: r3 leaf 166.4 vs cosine 174.6 = parity, falls 149 vs
+    # 859, plus extendable trunks). Every run is a TRUNK (warmup then
+    # constant lr, open-ended) or a LEAF (--cooldown-updates branch).
+    # cosine/linear and the ckpt_upd/final.pt naming removed with it;
+    # pre-WSD checkpoints remain usable as --init-from warm-starts.
     p.add_argument("--lr-final", type=float, default=1e-4,
-                   help="end-of-run lr for --lr-decay (wsd: the leaf "
-                        "cooldown's floor)")
+                   help="the leaf cooldown's lr floor")
     p.add_argument("--warmup-updates", type=int, default=0,
-                   help="wsd only: linear lr warmup length in updates "
-                        "(0 = auto, 1.5%% of the run's updates); stored in "
-                        "the checkpoint schedule so resumes agree")
+                   help="linear lr warmup length in updates (0 = auto, "
+                        "1.5%% of the run's updates); stored in the "
+                        "checkpoint schedule so resumes agree")
     p.add_argument("--cooldown-updates", type=int, default=0,
                    help="wsd LEAF mode: with --resume <trunk ckpt>, branch "
                         "off and decay lr 1-sqrt from --lr to --lr-final "
@@ -154,13 +149,11 @@ def parse_args():
                         "checkpoint, never from a leaf")
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--ent-final", type=float, default=None,
-                   help="linearly anneal the entropy coef from --ent-coef "
-                        "to this over the run (default: constant). Added "
-                        "2026-07-27 for the Protein sweep — the best gen2 "
-                        "arm was 'lowent', so late-run entropy pressure "
-                        "is a live tuning axis")
+                   help="leaf: the cooldown's entropy target; trunk with "
+                        "--ent-tau: the anneal FLOOR. Ignored (with a "
+                        "notice) on a constant-ent trunk")
     p.add_argument("--ent-tau", type=int, default=0,
-                   help="wsd trunk: exponential entropy-anneal time constant "
+                   help="trunk: exponential entropy-anneal time constant "
                         "in UPDATES — ent(u) = --ent-final + (--ent-coef - "
                         "--ent-final) * exp(-u/tau), a pure function of the "
                         "ABSOLUTE update index, so extending the trunk "
@@ -361,15 +354,18 @@ def main():
                 "state (saved by this trainer version); older checkpoints "
                 "can only be --init-from warm-starts")
         sched = resume_ckpt["schedule"]
+        if sched.get("lr_decay", "wsd") != "wsd":
+            raise SystemExit(
+                f"--resume: pre-WSD checkpoint (schedule "
+                f"'{sched['lr_decay']}') — the old schedules were removed "
+                f"2026-08-11; old-era checkpoints can only be --init-from "
+                f"warm-starts")
         args.lr, args.lr_final = sched["lr"], sched["lr_final"]
-        args.lr_decay = sched["lr_decay"]
-        if sched["lr_decay"] == "wsd":
-            # trunk entropy curve is checkpoint state, like lr: an
-            # extension must continue the exact curve, and a leaf must
-            # start from the trunk's live value (--ent-final stays CLI:
-            # it is the leaf's cooldown target)
-            args.ent_coef = sched.get("ent_coef", args.ent_coef)
-            args.ent_tau = sched.get("ent_tau", 0)
+        # trunk entropy curve is checkpoint state, like lr: an extension
+        # must continue the exact curve, and a leaf must start from the
+        # trunk's live value (--ent-final stays CLI: the leaf's target)
+        args.ent_coef = sched.get("ent_coef", args.ent_coef)
+        args.ent_tau = sched.get("ent_tau", 0)
         if args.run_dir is None:      # continue in the checkpoint's run dir
             args.run_dir = os.path.dirname(os.path.abspath(args.resume))
     if args.run_dir is None:
@@ -634,11 +630,8 @@ def main():
         num_updates = resume_ckpt["schedule"]["num_updates"]
         start_update = resume_ckpt["update"]
         global_step = resume_ckpt["global_step"]
-        if args.lr_decay == "wsd":
-            ent_floor = resume_ckpt["schedule"].get("ent_floor")
+        ent_floor = resume_ckpt["schedule"].get("ent_floor")
         if args.cooldown_updates > 0:
-            assert args.lr_decay == "wsd", \
-                "--cooldown-updates needs a wsd trunk checkpoint"
             assert resume_ckpt.get("wsd_role", "trunk") == "trunk", \
                 "cooldown must branch from a TRUNK checkpoint, not a leaf"
             leaf_from = start_update
@@ -651,7 +644,7 @@ def main():
                      if args.ent_final is not None
                      else f", ent held {ent_start:.3g}") + ")",
                   flush=True)
-        elif args.lr_decay == "wsd":
+        else:
             assert resume_ckpt.get("wsd_role", "trunk") == "trunk", \
                 "leaves are terminal — continue from the trunk checkpoint"
             extended = max(1, args.total_steps // batch)
@@ -660,10 +653,9 @@ def main():
                       f"{extended:,} updates (constant lr, absolute-index "
                       f"ent curve — extension rewrites nothing)", flush=True)
                 num_updates = extended
-        if args.lr_decay == "wsd":
-            warmup_updates = resume_ckpt["schedule"].get(
-                "warmup_updates",
-                args.warmup_updates or max(1, round(0.015 * num_updates)))
+        warmup_updates = resume_ckpt["schedule"].get(
+            "warmup_updates",
+            args.warmup_updates or max(1, round(0.015 * num_updates)))
         print(f"RESUMED {args.resume} at update {start_update}/{num_updates} "
               f"(step {global_step:,}; lr/schedule/Adam state restored; "
               f"env stream fresh)", flush=True)
@@ -671,24 +663,23 @@ def main():
         num_updates = max(1, args.total_steps // batch)
         start_update = 0
         global_step = 0
-        if args.lr_decay == "wsd":
-            warmup_updates = (args.warmup_updates
-                              or max(1, round(0.015 * num_updates)))
-            if args.ent_tau > 0:
-                assert args.ent_final is not None, \
-                    "--ent-tau needs --ent-final as the anneal floor"
-                ent_floor = args.ent_final
-                ent_desc = (f"ent {args.ent_coef:.3g} -> floor "
-                            f"{ent_floor:.3g} exp(tau={args.ent_tau} upd)")
-            else:
-                ent_desc = f"ent constant {args.ent_coef:.3g}"
-            print(f"WSD TRUNK: warmup {warmup_updates} updates -> constant "
-                  f"lr {args.lr:.3g}, {ent_desc} (open-ended; branch a leaf "
-                  f"with --resume <trunk ckpt> --cooldown-updates N)",
-                  flush=True)
-    if (args.lr_decay == "wsd" and leaf_from is None and args.ent_tau <= 0
+        warmup_updates = (args.warmup_updates
+                          or max(1, round(0.015 * num_updates)))
+        if args.ent_tau > 0:
+            assert args.ent_final is not None, \
+                "--ent-tau needs --ent-final as the anneal floor"
+            ent_floor = args.ent_final
+            ent_desc = (f"ent {args.ent_coef:.3g} -> floor "
+                        f"{ent_floor:.3g} exp(tau={args.ent_tau} upd)")
+        else:
+            ent_desc = f"ent constant {args.ent_coef:.3g}"
+        print(f"WSD TRUNK: warmup {warmup_updates} updates -> constant "
+              f"lr {args.lr:.3g}, {ent_desc} (open-ended; branch a leaf "
+              f"with --resume <trunk ckpt> --cooldown-updates N)",
+              flush=True)
+    if (leaf_from is None and args.ent_tau <= 0
             and args.ent_final is not None):
-        print("wsd trunk (no --ent-tau): --ent-final IGNORED — entropy is "
+        print("trunk (no --ent-tau): --ent-final IGNORED — entropy is "
               "constant on this trunk; the anneal belongs to the leaf "
               "cooldown", flush=True)
     steps_before = global_step
@@ -699,45 +690,29 @@ def main():
           f"minibatch {mb_size}, device {device} ===", flush=True)
 
     for update in range(start_update, num_updates):
-        if args.lr_decay != "none":
-            if args.lr_decay == "wsd":
-                if leaf_from is not None:
-                    # leaf cooldown: 1-sqrt decay to the floor (EPFL
-                    # 2405.18392: 1-sqrt/linear shapes win; ~10-20% of
-                    # trunk length)
-                    tau = (update - leaf_from + 1) / max(
-                        1, args.cooldown_updates)
-                    lr_now = args.lr_final + (args.lr - args.lr_final) * (
-                        1.0 - math.sqrt(tau))
-                elif update < warmup_updates:
-                    lr_now = args.lr * (update + 1) / warmup_updates
-                else:
-                    lr_now = args.lr        # the trunk: constant, forever
-            else:
-                frac = update / max(1, num_updates - 1)
-                if args.lr_decay == "cosine":
-                    lr_now = args.lr_final + (args.lr - args.lr_final) * (
-                        0.5 * (1.0 + math.cos(math.pi * frac)))
-                else:
-                    lr_now = args.lr + (args.lr_final - args.lr) * frac
-            for g in opt.param_groups:
-                g["lr"] = lr_now
-        ent_now = args.ent_coef
-        if args.lr_decay == "wsd":
-            if leaf_from is not None:
-                ent_now = ent_start
-                if args.ent_final is not None:
-                    tau = (update - leaf_from + 1) / max(
-                        1, args.cooldown_updates)
-                    ent_now = ent_start + (args.ent_final - ent_start) * tau
-            else:
-                # trunk: absolute-index exponential to the floor (or
-                # constant if --ent-tau 0) — never a function of
-                # num_updates, so extension continues the curve
-                ent_now = trunk_ent(update)
-        elif args.ent_final is not None:
-            ent_now = args.ent_coef + (args.ent_final - args.ent_coef) * (
-                update / max(1, num_updates - 1))
+        if leaf_from is not None:
+            # leaf cooldown: 1-sqrt decay to the floor (EPFL 2405.18392:
+            # 1-sqrt/linear shapes win; ~10-20% of trunk length)
+            tau = (update - leaf_from + 1) / max(1, args.cooldown_updates)
+            lr_now = args.lr_final + (args.lr - args.lr_final) * (
+                1.0 - math.sqrt(tau))
+        elif update < warmup_updates:
+            lr_now = args.lr * (update + 1) / warmup_updates
+        else:
+            lr_now = args.lr                # the trunk: constant, forever
+        for g in opt.param_groups:
+            g["lr"] = lr_now
+        if leaf_from is not None:
+            ent_now = ent_start
+            if args.ent_final is not None:
+                tau = (update - leaf_from + 1) / max(
+                    1, args.cooldown_updates)
+                ent_now = ent_start + (args.ent_final - ent_start) * tau
+        else:
+            # trunk: absolute-index exponential to the floor (or constant
+            # if --ent-tau 0) — never a function of num_updates, so
+            # extension continues the curve
+            ent_now = trunk_ent(update)
         t0 = time.perf_counter()
         if graph_roll is not None:
             graph_roll.refresh()  # in-place fp16 caches after opt.steps
@@ -1018,12 +993,9 @@ def main():
                   f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
-            if args.lr_decay == "wsd":
-                name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
-                        if leaf_from is not None
-                        else f"trunk_upd{update+1:05d}.pt")
-            else:
-                name = f"ckpt_upd{update+1:04d}.pt"
+            name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
+                    if leaf_from is not None
+                    else f"trunk_upd{update+1:05d}.pt")
             torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                         "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
@@ -1031,11 +1003,10 @@ def main():
                         "optimizer": cpu_opt_state(opt),
                         "args": args_snapshot,
                         "wsd_role": ("leaf" if leaf_from is not None
-                                     else "trunk") if args.lr_decay == "wsd"
-                                    else None,
+                                     else "trunk"),
                         "branched_from_update": leaf_from,
                         "schedule": {"lr": args.lr, "lr_final": args.lr_final,
-                                     "lr_decay": args.lr_decay,
+                                     "lr_decay": "wsd",
                                      "warmup_updates": warmup_updates,
                                      "ent_coef": args.ent_coef,
                                      "ent_tau": args.ent_tau,
@@ -1048,11 +1019,8 @@ def main():
 
     recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
-    if args.lr_decay == "wsd":
-        final_name = (f"leaf_from_upd{leaf_from:05d}.pt"
-                      if leaf_from is not None else "trunk_final.pt")
-    else:
-        final_name = "final.pt"
+    final_name = (f"leaf_from_upd{leaf_from:05d}.pt"
+                  if leaf_from is not None else "trunk_final.pt")
     torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
                 "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
@@ -1060,11 +1028,10 @@ def main():
                 "optimizer": cpu_opt_state(opt),
                 "args": args_snapshot,
                 "wsd_role": ("leaf" if leaf_from is not None
-                             else "trunk") if args.lr_decay == "wsd"
-                            else None,
+                             else "trunk"),
                 "branched_from_update": leaf_from,
                 "schedule": {"lr": args.lr, "lr_final": args.lr_final,
-                             "lr_decay": args.lr_decay,
+                             "lr_decay": "wsd",
                              "warmup_updates": warmup_updates,
                              "ent_coef": args.ent_coef,
                              "ent_tau": args.ent_tau,

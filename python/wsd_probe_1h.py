@@ -102,7 +102,7 @@ def main():
         print(f"{trunk_ck} exists — skipping trunk", flush=True)
     else:
         ok = run_phase("trunk", [PY, "train_batch.py", *COMMON,
-                                 "--lr", "2e-3", "--lr-decay", "wsd",
+                                 "--lr", "2e-3",
                                  "--ent-final", "1e-3", "--ent-tau", "1000",
                                  "--total-steps", str(TRUNK_UPDATES * BATCH),
                                  "--ckpt-every", "500",
