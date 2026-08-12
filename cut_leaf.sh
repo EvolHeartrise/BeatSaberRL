@@ -19,6 +19,11 @@ set -euo pipefail
 CKPT_NAME="${1:?usage: cut_leaf.sh trunk_updNNNNN.pt [cooldown] [ent_final]}"
 COOLDOWN="${2:-400}"
 ENT_FINAL="${3:-3e-6}"
+# TRUNK_RUN selects which trunk run dir to branch from (overridable:
+# TRUNK_RUN=wsd_probe_1h_r3 bash cut_leaf.sh ...). Leaf output paths
+# carry it so same-numbered checkpoints of different trunks never
+# collide (r3's upd12000 vs v16's upd12000).
+TRUNK_RUN="${TRUNK_RUN:-v16_probe_1h}"
 
 case "$CKPT_NAME" in
   trunk_upd*.pt) ;;
@@ -32,16 +37,16 @@ AUTH=(-H "Authorization: Bearer $KEY" -H "Content-Type: application/json")
 SSH_KEY=~/.ssh/runpod_ed25519
 PUBKEY=$(cat "$SSH_KEY.pub")
 REPO=/workspace/claude-teaches/projects/beat-arena
-TRUNK_DIR="$REPO/python/runs/wsd_probe_1h_r3"
+TRUNK_DIR="$REPO/python/runs/$TRUNK_RUN"
 UPD="${CKPT_NAME//[!0-9]/}"
-LEAF_DIR="$REPO/python/runs/leafcuts/upd${UPD}_cd${COOLDOWN}"
+LEAF_DIR="$REPO/python/runs/leafcuts/${TRUNK_RUN}_upd${UPD}_cd${COOLDOWN}"
 HARD_CAP_S=$(( 3 * 3600 ))   # pod lifetime cap: no overnight billing
 
 echo "[cut_leaf] $CKPT_NAME -> $COOLDOWN-update leaf (ent -> $ENT_FINAL)"
 
 POD_ID=$(curl -sf --max-time 60 "${AUTH[@]}" -X POST "$API/pods" -d @- << EOF | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])"
 {
-  "name": "leafcut-upd$UPD-cd$COOLDOWN",
+  "name": "leafcut-$TRUNK_RUN-upd$UPD",
   "imageName": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
   "cloudType": "SECURE",
   "gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
@@ -86,7 +91,7 @@ for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && break; sleep 10; done
 # bootstrap + leaf + bench, under the pod-lifetime cap
 timeout "$HARD_CAP_S" "${SSH[@]}" bash -s << EOF
 set -euo pipefail
-bash $REPO/setup_pod.sh > /workspace/leafcut_upd${UPD}_cd${COOLDOWN}.setup.log 2>&1
+bash $REPO/setup_pod.sh > /workspace/leafcut_${TRUNK_RUN}_upd${UPD}.setup.log 2>&1
 export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:\$PATH VIRTUAL_ENV=/root/venv
 cd $REPO/python
 mkdir -p "$LEAF_DIR"
@@ -99,12 +104,12 @@ python train_batch.py \
   --run-dir "$LEAF_DIR" 2>&1 | tee "$LEAF_DIR/leaf_train.log" | tail -3
 LEAF=\$(ls "$LEAF_DIR"/leaf_from_upd*.pt)
 python bench_scoresaber.py --ckpt "\$LEAF" --num-envs 2048 --foot-contact \
-  --out "bench/wsd_leafcut_upd${UPD}_cd${COOLDOWN}.json" > /dev/null
+  --out "bench/leafcut_${TRUNK_RUN}_upd${UPD}_cd${COOLDOWN}.json" > /dev/null
 python - << 'PYEOF'
 import json
-b = json.load(open("bench/wsd_leafcut_upd${UPD}_cd${COOLDOWN}.json"))
-print(f"LEAF_BENCH upd$UPD cd$COOLDOWN upp {b['total_unweighted_pp']:.2f} "
+b = json.load(open("bench/leafcut_${TRUNK_RUN}_upd${UPD}_cd${COOLDOWN}.json"))
+print(f"LEAF_BENCH $TRUNK_RUN upd$UPD cd$COOLDOWN upp {b['total_unweighted_pp']:.2f} "
       f"wpp {b['total_weighted_pp']:.2f}")
 PYEOF
 EOF
-echo "[cut_leaf] done — leaf + bench on the volume (runs/leafcuts/upd$UPD, bench/wsd_leafcut_upd${UPD}_cd${COOLDOWN}.json)"
+echo "[cut_leaf] done — leaf + bench on the volume (runs/leafcuts/upd$UPD, bench/leafcut_${TRUNK_RUN}_upd${UPD}_cd${COOLDOWN}.json)"
