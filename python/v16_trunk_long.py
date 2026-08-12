@@ -21,7 +21,7 @@ PY = sys.executable
 RUN_DIR = os.path.join("runs", "v16_probe_1h")   # the ongoing v16 trunk
 NUM_ENVS, HORIZON = 16384, 8
 BATCH = NUM_ENVS * HORIZON
-TRUNK_TOTAL = 24_000
+TRUNK_TOTAL = int(sys.argv[1]) if len(sys.argv) > 1 else 24_000
 TRAIN_TIMEOUT = 42_000
 
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
