@@ -17,7 +17,7 @@
 set -euo pipefail
 
 CKPT_NAME="${1:?usage: cut_leaf.sh trunk_updNNNNN.pt [cooldown] [ent_final]}"
-COOLDOWN="${2:-2000}"
+COOLDOWN="${2:-400}"
 ENT_FINAL="${3:-3e-6}"
 
 case "$CKPT_NAME" in
