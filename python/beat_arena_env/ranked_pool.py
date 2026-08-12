@@ -40,11 +40,11 @@ MAX_OBJECTS = 512     # smem guard: C*4B must stay well under 6 KB/block
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _cache_path(seg_len, ver, catalog_path):
+def _cache_path(seg_len, ver, catalog_path, lead_s):
     with open(catalog_path, "rb") as f:
         cat = f.read()
     key = hashlib.sha1(
-        f"{seg_len:g}_{ver}_v2".encode() + cat
+        f"{seg_len:g}_{ver}_v2_lead{lead_s:g}".encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
     os.makedirs(cdir, exist_ok=True)
@@ -60,7 +60,7 @@ def _tuple_note(t):
                 free_pre=bool(t[8]), free_post=bool(t[9]))
 
 
-def _build_segments(seg_len, catalog_path, log):
+def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
     import json
     import sys
     sys.path.insert(0, _BASE)
@@ -80,7 +80,7 @@ def _build_segments(seg_len, catalog_path, log):
             continue
         last = tup[-1][0]
         for k in range(int(np.ceil((last + 1e-6) / seg_len))):
-            lo = k * seg_len + (LEAD_S if k else 0.0)
+            lo = k * seg_len + (lead_s if k else 0.0)
             hi = (k + 1) * seg_len
             win = [t for t in tup if lo <= t[0] < hi]
             if len(win) > MAX_OBJECTS:
@@ -103,7 +103,12 @@ def _build_segments(seg_len, catalog_path, log):
 
 def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
                      device="cuda", dtype=torch.float32,
-                     catalog=None, log=print):
+                     catalog=None, log=print, lead_s=LEAD_S):
+    # lead_s (env v16, contact spec §11): the k>0 windows' head gap —
+    # the earliest possible first note of a segment episode. Default
+    # keeps the historical 1.5 s; the survival-drift postmortem
+    # hypothesis #4 is that a long pre-note phase feeds the
+    # survival-consolidation feedback loop.
     """(P, C) pool dict on `device`. First call builds + caches the full
     segment set (minutes); later calls load the npz (~seconds). `sample`
     takes a seeded without-replacement subset (VRAM control; every leg
@@ -113,10 +118,10 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     import sys
     sys.path.insert(0, _BASE)
     import bench_scoresaber as bs
-    cpath = _cache_path(seg_len, bs.parser_version(), catalog)
+    cpath = _cache_path(seg_len, bs.parser_version(), catalog, lead_s)
     if not os.path.exists(cpath):
         from .cuda_env import _charts_to_tensors
-        segs = _build_segments(seg_len, catalog, log)
+        segs = _build_segments(seg_len, catalog, log, lead_s=lead_s)
         # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
         # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
         # arrays + the f32 outputs simultaneously (~5.5 GB at 46k

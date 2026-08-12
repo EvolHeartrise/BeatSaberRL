@@ -233,3 +233,33 @@ c. **Gates.** tests/test_v15_note_offset.py (Rust reference): per-tick
 d. Physics untouched — this is a scoring/obs change; v14 checkpoints
    remain physically valid but their walk-forward habit is
    reward-dead under v15.
+
+## 11. env v16 (2026-08-12): discounted fall pricing + segment lead
+
+Motivated by the 8h-trunk survival-drift postmortem (leaf value
+peaked at upd ~8k then decayed while balance kept improving; user
+suspects #1 and #4 pre-registered in sessions/2026-08-10-wsd).
+
+a. **Discounted fall pricing.** The v11.1 lump sum is return-
+   equivalent to standing-and-missing, but NOT under discounting: it
+   lands the whole remaining penalty undiscounted at the fall tick —
+   a manufactured risk premium on reaching. v16: the fall charges
+   REWARD_MISS × Σ_pending fall_gamma^k_i, k_i = min(ceil(max(0,
+   t_miss_i − t_now) / DT), 600), t_miss_i = hit_time + (−PLANE_Z0)/
+   speed (the §10b miss boundary). `fall_gamma` is a sim ctor kwarg
+   (RawBeatSim / VecBeatSim / RustBeatEnv / BeatVecEnv /
+   CudaBeatVecEnv), DEFAULT 1.0 = the v11.1 count bitwise (every
+   factor is 1.0); the trainer passes its --gamma so the charge is
+   return-equivalent under the agent's own discount. Sequential
+   multiply in chart order, cap 600 ticks (0.965^600 < 5e-10):
+   deterministic, transcribed identically by the CUDA mirror
+   (identical f64 division/ceil/multiply order — parity-safe without
+   pow). Gates: tests/test_v16_fall_pricing.py (formula identity at
+   1e-12; gamma=1.0 exactness); §5 lockstep tiers gate the mirror.
+b. **Segment lead (`lead_s`).** ranked_pool's k>0 window head gap
+   (was the LEAD_S=1.5 literal) is now a parameter, plumbed as
+   trainer --lead-s (default 1.5, cache-keyed). Hypothesis #4:
+   falls spike → more pre-first-note episodes → data mix drifts to
+   survival → consolidation consolidates survival; a shorter lead
+   keeps note data in the mix. Probe value: 0.5.
+c. Scoring, obs, physics all untouched; OBS_DIM 362 unchanged.
