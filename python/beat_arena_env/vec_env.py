@@ -28,7 +28,7 @@ class BeatVecEnv:
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF, wide_acc=False,
-                 gears=3, seed=0, foot_contact=False):
+                 gears=3, seed=0, foot_contact=False, fall_gamma=1.0):
         """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
         False = the v10 foot welds (DEFAULT), True = unilateral ground
         contact on the 8 sole corners + the fall termination."""
@@ -47,7 +47,8 @@ class BeatVecEnv:
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
                               effort_coef=effort_coef, return_events=False,
                               wide_acc=wide_acc, gears=gears,
-                              foot_contact=foot_contact)
+                              foot_contact=foot_contact,
+                              fall_gamma=fall_gamma)
         self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)

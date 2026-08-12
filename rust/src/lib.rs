@@ -752,6 +752,14 @@ struct Core {
     // fall ends the episode). Reported, never hidden: the trainer's
     // `[fall]` line reads it.
     falls: u32,
+    // env v16 (contact spec §11): discount base for fall pricing.
+    // 1.0 = v11.1 lump sum (count of pending scoreables). Set to the
+    // TRAINER'S gamma so a fall is return-equivalent to standing and
+    // missing under the agent's own discount — the v11.1 lump charged
+    // the whole remaining miss stream UNDISCOUNTED at the fall tick,
+    // a manufactured risk premium on reaching (8h-trunk survival-
+    // drift postmortem, 2026-08-12).
+    fall_gamma: f64,
     n_scoreable: u32, // chart objects that are not bombs
     // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
     // recomputed from state every tick and each of its disjuncts is
@@ -794,6 +802,7 @@ impl Core {
             misses: 0,
             bombs_hit: 0,
             falls: 0,
+            fall_gamma: 1.0,
             n_scoreable: 0,
             finished: false,
             score: 0.0,
@@ -1374,13 +1383,31 @@ impl Core {
             // own counter. Full scan, not first_pending: runs once
             // per episode, and the CUDA mirror transcribes the same
             // 0..len order.
-            let remaining = self
-                .chart
-                .iter()
-                .zip(self.status.iter())
-                .filter(|(n, s)| **s == 0 && n.kind != KIND_BOMB)
-                .count();
-            reward = REWARD_MISS * remaining as f64;
+            // v16: each pending scoreable is charged at fall_gamma ^
+            // (ticks until its miss boundary, v15 spec: t_miss =
+            // hit_time + (-PLANE_Z0)/speed). fall_gamma = 1.0
+            // reproduces the v11.1 count exactly (every factor is 1.0
+            // bitwise). Sequential multiply, ticks capped at 600
+            // (gamma^600 < 5e-10 at 0.965): deterministic and
+            // transcribed in the same order by the CUDA mirror.
+            let mut charge = 0.0;
+            for (n, st) in self.chart.iter().zip(self.status.iter()) {
+                if *st != 0 || n.kind == KIND_BOMB {
+                    continue;
+                }
+                let t_miss = n.hit_time + (-PLANE_Z0) / n.speed;
+                let dt = (t_miss - self.time).max(0.0);
+                let mut k = (dt / DT).ceil() as i64;
+                if k > 600 {
+                    k = 600;
+                }
+                let mut w = 1.0;
+                for _ in 0..k {
+                    w *= self.fall_gamma;
+                }
+                charge += w;
+            }
+            reward = REWARD_MISS * charge;
         }
 
         (reward, done)
@@ -1399,13 +1426,14 @@ impl RawBeatSim {
     /// frictional ground contact on the 8 sole corners.
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
-                        wide_acc=false, gears=3, foot_contact=false))]
+                        wide_acc=false, gears=3, foot_contact=false,
+                        fall_gamma=1.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
-           gears: u8, foot_contact: bool) -> Self {
-        RawBeatSim {
-            core: Core::new_core(max_steps, effort_coef, wide_acc, gears,
-                                 foot_contact),
-        }
+           gears: u8, foot_contact: bool, fall_gamma: f64) -> Self {
+        let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
+                                      gears, foot_contact);
+        core.fall_gamma = fall_gamma;
+        RawBeatSim { core }
     }
 
     /// chart: list of (hit_time, x, y, color, angle_rad, speed, any_dir,
@@ -1804,15 +1832,19 @@ impl VecBeatSim {
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
-                        gears=3, foot_contact=false))]
+                        gears=3, foot_contact=false, fall_gamma=1.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
-           foot_contact: bool) -> Self {
+           foot_contact: bool, fall_gamma: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
-                .map(|_| Core::new_core(max_steps, effort_coef, wide_acc, gears,
-                                        foot_contact))
+                .map(|_| {
+                    let mut c = Core::new_core(max_steps, effort_coef,
+                                               wide_acc, gears, foot_contact);
+                    c.fall_gamma = fall_gamma;
+                    c
+                })
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             return_events,

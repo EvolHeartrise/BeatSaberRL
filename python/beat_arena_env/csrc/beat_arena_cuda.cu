@@ -4311,6 +4311,7 @@ struct Sim {
   bool* __restrict__ done;
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
+  T fall_gamma;   // v16 (contact spec §11): fall-pricing discount base
   int gears;
   bool wide_acc;
   bool auto_reset;
@@ -4976,14 +4977,27 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // can never diverge if that invariant ever changes.
   if constexpr (FC) {
     if (fell) {
-      int remaining = 0;
+      // v16 (contact spec §11) — MIRROR of lib.rs: each pending
+      // scoreable charged at fall_gamma^(ticks to its v15 miss
+      // boundary t_miss = hit + 0.65/speed), ceil(dt/DT), ticks
+      // capped at 600, sequential multiply in the same order.
+      // fall_gamma = 1.0 reproduces the v11.1 count bitwise.
+      T charge = T(0);
       for (int i = 0; i < nn; i++) {
         const int64_t cb = c0 * C + i;
         if (P.status[e * C + i] == 0 && P.p_valid[cb] &&
-            !P.p_is_bomb[cb])
-          remaining++;
+            !P.p_is_bomb[cb]) {
+          T t_miss = P.p_hit[cb] + T(0.65) / P.p_speed[cb];
+          T dtm = t_miss - time_new;
+          if (dtm < T(0)) dtm = T(0);
+          long k = (long)ceil(dtm / T(DT));
+          if (k > 600) k = 600;
+          T w = T(1);
+          for (long j = 0; j < k; j++) w *= P.fall_gamma;
+          charge += w;
+        }
       }
-      reward = T(REWARD_MISS) * T(remaining);
+      reward = T(REWARD_MISS) * charge;
     }
   } else {
     if (fell) reward = T(0);  // fell is constant-false here; folded
@@ -5051,7 +5065,7 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact) {
+          bool want_contacts, bool foot_contact, double fall_gamma) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5134,6 +5148,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.cap = (int)cap;
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
+    P.fall_gamma = (scalar_t)fall_gamma;
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;

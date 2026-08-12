@@ -312,6 +312,11 @@ def parse_args():
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
+    p.add_argument("--lead-s", type=float, default=1.5,
+                   help="ranked-maps segment head gap (s) — the earliest "
+                        "first note of an episode (env v16, contact spec "
+                        "§11: shorter keeps note data in the mix when "
+                        "falls spike, damping survival-drift)")
     p.add_argument("--seg-len", type=float, default=25.0,
                    help="ranked-maps segment length in song seconds")
     return p.parse_args()
@@ -458,12 +463,13 @@ def main():
         from beat_arena_env.ranked_pool import load_ranked_pool
         pool = load_ranked_pool(seg_len=args.seg_len,
                                 sample=args.chart_pool, seed=args.seed,
-                                device=device)
+                                device=device, lead_s=args.lead_s)
         venv = VecCls(N, pool=pool,
                       max_steps=int(args.seg_len * 30) + 90,
                       effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
                       foot_contact=args.foot_contact,
+                      fall_gamma=args.gamma,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -476,6 +482,7 @@ def main():
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
             gears=args.gears, foot_contact=args.foot_contact,
+            fall_gamma=args.gamma,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -486,7 +493,8 @@ def main():
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
-            foot_contact=args.foot_contact, seed=args.seed)
+            foot_contact=args.foot_contact, fall_gamma=args.gamma,
+            seed=args.seed)
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt)

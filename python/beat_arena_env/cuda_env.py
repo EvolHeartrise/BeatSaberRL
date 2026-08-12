@@ -317,7 +317,8 @@ class CudaBeatVecEnv:
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
-                 want_contacts=False, foot_contact=False):
+                 want_contacts=False, foot_contact=False,
+                 fall_gamma=1.0):
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -338,6 +339,9 @@ class CudaBeatVecEnv:
         # selects a COMPILE-TIME instantiation on it, so it is constant
         # per instance and safe under CUDA-graph capture.
         self.foot_contact = bool(foot_contact)
+        # v16 (contact spec §11): fall-pricing discount base; pass the
+        # trainer's gamma. 1.0 = v11.1 lump-sum count.
+        self.fall_gamma = float(fall_gamma)
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -476,7 +480,7 @@ class CudaBeatVecEnv:
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact)
+                       self.foot_contact, self.fall_gamma)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
