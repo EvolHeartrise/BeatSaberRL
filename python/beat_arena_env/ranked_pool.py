@@ -173,7 +173,15 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
             for p in parts:
                 del p[k]
         del parts
-        np.savez(cpath, **{k: v.numpy() for k, v in pool.items()})
+        # tmp + atomic rename: the cache lives on a SHARED network
+        # volume and other pods poll for it — a direct savez exposes a
+        # partial npz for the whole multi-GB write (the v17 lr-ladder
+        # launch raced exactly this, 2026-08-13)
+        # (tmp must END in .npz — np.savez appends the suffix otherwise
+        # and the rename source would not exist)
+        tmp = cpath[:-len(".npz")] + f".tmp{os.getpid()}.npz"
+        np.savez(tmp, **{k: v.numpy() for k, v in pool.items()})
+        os.replace(tmp, cpath)
         log(f"[ranked-pool] cached -> {os.path.basename(cpath)}",
             flush=True)
     data = np.load(cpath)

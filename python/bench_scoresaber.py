@@ -172,6 +172,7 @@ def parse_args():
     p.add_argument("--refresh-catalog", action="store_true")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
+    return p.parse_args()
 
 
 def model_hash(state_dict) -> str:
@@ -529,9 +530,8 @@ def main():
     if prev_path is not None and prev_path != fwd_path:
         sys.exit(f"error: {out_path} holds {prev_path!r}-forward results but "
                  f"this run would use {fwd_path!r}. Matching flag "
-                 f"(--fused-forward/--no-fused-forward/--no-graphs) or a "
-                 f"fresh --out required; --force with the matching flag "
-                 f"re-evaluates everything on one path.")
+                 f"(--no-graphs) or a fresh --out required; --force with "
+                 f"the matching flag re-evaluates everything on one path.")
     full_force = args.force and args.stars is None and args.limit == 0
     if (prev_path is None and not full_force
             and any("skipped" not in e for e in levels.values())):
