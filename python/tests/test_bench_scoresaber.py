@@ -318,9 +318,24 @@ def test_greedy_rollout_smoke():
                                      (w.score, w.max_combo, w.breaks))
     assert r["max_score"] > 0 and 0 <= r["score"] <= r["max_score"]
     assert 0.0 <= r["accuracy"] <= 1.0 and r["pp"] >= 0.0
-    assert r["good_cuts"] + r["bad_cuts"] + r["misses"] == r["n_notes"]
+    # <= not ==: a random policy can drive the root out of the §23
+    # escape envelope and end the episode with notes still pending
+    # (arch-dependent argmax stream — surfaced by the 861k rescale;
+    # the strict identity is pinned below on a coast rollout, which
+    # can never escape)
+    assert r["good_cuts"] + r["bad_cuts"] + r["misses"] <= r["n_notes"]
     assert r["highest_combo"] <= r["n_notes"]
     assert isinstance(r["full_combo"], bool)
+
+    # coast rollout: zero actions never escape; every scoreable note
+    # resolves (all misses), so the counter identity is exact
+    env2 = RustBeatEnv(external_chart=notes, seed=0)
+    env2.reset()
+    done = False
+    while not done:
+        _obs, _r2, done, _t, info = env2.step([0] * len(act))
+    assert (info["good_cuts"] + info["bad_cuts"] + info["misses"]
+            == info["n_notes"])
 
 
 def test_vectorized_events_match_serial():

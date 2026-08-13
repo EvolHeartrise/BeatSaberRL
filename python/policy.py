@@ -171,7 +171,7 @@ class Block(nn.Module):
     a concat-heads output projection.
     """
 
-    def __init__(self, d: int, n_heads: int = 1):
+    def __init__(self, d: int, n_heads: int = 1, ffn_mult: int = 2):
         super().__init__()
         assert d % n_heads == 0, f"embed {d} not divisible by {n_heads} heads"
         # FusedLayerNorm == nn.LayerNorm in state_dict/params; on CUDA
@@ -182,7 +182,10 @@ class Block(nn.Module):
         self.v_proj = nn.Linear(d, d)
         self.out_proj = nn.Linear(d, d) if n_heads > 1 else None
         self.ln_ffn = FusedLayerNorm(d)
-        self.ffn = _mlp([d, 2 * d, d])
+        # ffn_mult (v17 scale-up): hidden width ratio. The historical
+        # layout is 2x (the 138k-param arch and the fused-kernel
+        # contract); the scaled arch uses the standard 4x.
+        self.ffn = _mlp([d, ffn_mult * d, d])
         self.d = d
         self.n_heads = n_heads
         self.dh = d // n_heads
@@ -289,9 +292,15 @@ class Block(nn.Module):
 
 
 class NotePolicy(nn.Module):
-    def __init__(self, embed: int = 64, trunk_dim: int = 128,
-                 encoder: str = "transformer", n_blocks: int = 2,
-                 n_heads: int = 1, n_gears: int = 3):
+    # v17 scaled defaults (2026-08-13, user-approved 6.2x): embed 128,
+    # 4 attention heads (multi-entity reasoning — a saber can attend to
+    # its next note AND an incoming wall separately), 3 blocks, 4x FFN,
+    # trunk 256 -> ~861k params at gears 5 (was 138,642). The 138k arch
+    # and its fused update kernels were retired with it (no conversion,
+    # house pattern); training runs the eager fp16 path.
+    def __init__(self, embed: int = 128, trunk_dim: int = 256,
+                 encoder: str = "transformer", n_blocks: int = 3,
+                 n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
@@ -300,11 +309,12 @@ class NotePolicy(nn.Module):
         self.embed = embed
         self.n_gears = n_gears
         self.head_sizes = (n_gears,) * N_ACTION_HEADS
-        # v10 arch record: obs 340, 29 heads, body token — load_policy
-        # REFUSES checkpoints without these markers (v9 and earlier).
+        # arch record: load_policy REFUSES checkpoints whose markers
+        # don't match the current era (obs 426 / ffn_mult present).
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads,
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
+                     "ffn_mult": ffn_mult,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
@@ -312,7 +322,7 @@ class NotePolicy(nn.Module):
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
         self.body_mlp = _mlp([BODY_FEAT, embed, embed])
         self.blocks = nn.ModuleList(
-            Block(embed, n_heads) for _ in range(n_blocks))
+            Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
         # readout = [saber_L, saber_R, body] output embeddings
         self.trunk = _mlp([3 * embed, trunk_dim, trunk_dim])
         # 29 factored joint heads, K = n_gears options each (env v8)
@@ -497,15 +507,16 @@ def load_policy(ckpt) -> NotePolicy:
     arch = ckpt.get("arch", {})
     if (arch.get("obs_dim") != OBS_DIM
             or arch.get("n_action_heads") != N_ACTION_HEADS
+            or "ffn_mult" not in arch
             or not arch.get("body_token", False)):
         raise SystemExit(
-            f"checkpoint is not env v17 (needs arch obs_dim={OBS_DIM}, "
-            f"n_action_heads=29, body_token=True; got {dict(arch)}). "
-            "v16-and-earlier checkpoints were retired by the v17 entity "
-            "window (walls; obs 362 -> 426) — retrain, no conversion.")
+            f"checkpoint is not v17-scaled era (needs arch obs_dim="
+            f"{OBS_DIM}, n_action_heads=29, ffn_mult, body_token=True; "
+            f"got {dict(arch)}). Pre-scale checkpoints (obs 362 / the "
+            "138k arch) were retired — retrain, no conversion.")
     policy = NotePolicy(
-        embed=arch.get("embed", 64), trunk_dim=arch.get("trunk_dim", 128),
-        n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1),
-        n_gears=arch.get("n_gears", 3))
+        embed=arch["embed"], trunk_dim=arch["trunk_dim"],
+        n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
+        n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"])
     policy.load_state_dict(ckpt["state_dict"])
     return policy

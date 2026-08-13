@@ -18,16 +18,12 @@ buffer copies + capturable Adam) at every shape tried. Checkpoints
 saved by graphs-era runs load unchanged (they were normalized to the
 eager Adam form at save time).
 
---fused-update replaces the minibatch forward+backward with the fused
-CUDA kernels (policy_cuda.FusedPolicyTrainer): one launch each way,
 recompute-based backward (activation memory O(obs minibatch)), packed
 weights as the single Adam leaf; PPO loss math stays in torch on the
 tiny (mb,29,K)/(mb,) outputs, so semantics cannot drift. d64/1-head
 archs only. Weights are mirrored back into the torch policy once per
 PPO update for rollout sampling and checkpoints. Checkpoints remain
 load-compatible EXCEPT the Adam state (one packed param vs ~50):
---resume of a --fused-update checkpoint needs --fused-update again,
-and vice versa. NOTE (2026-07-25): on speed it now trails the
 optimized eager path — its value is the ~160x activation-memory
 reduction (large-arch / large-minibatch headroom).
 """
@@ -92,24 +88,6 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     dual = torch.min(standard, ceiling)
     loss = torch.where(adv < 0, dual, standard)
     return loss.mean()
-
-
-def fused_minibatch_losses(trainer, ent_coef, obs, act, logp, adv, ret):
-    """The PPO minibatch losses over the fused forward. Identical math
-    to the eager body: log_softmax gather == Categorical.log_prob,
-    -(p * log p).sum == Categorical.entropy (policy.py's factored
-    heads), then the same dual-clip PPO + value + entropy losses."""
-    logits, value = trainer(obs)                    # (mb,29,K), (mb,)
-    logsm = torch.log_softmax(logits, dim=-1)
-    newlogp = logsm.gather(-1, act.unsqueeze(-1)).squeeze(-1).sum(-1)
-    entropy = -(logsm.exp() * logsm).sum(-1).sum(-1)
-    ratio = (newlogp - logp).clamp(max=LOG_RATIO_CLAMP).exp()
-    a_mb = (adv - adv.mean()) / (adv.std() + 1e-8)
-    pg_loss = pg_loss_fn(ratio, a_mb)
-    v_loss = 0.5 * ((value - ret) ** 2).mean()
-    ent_loss = entropy.mean()
-    loss = pg_loss - ent_coef * ent_loss + VF_COEF * v_loss
-    return loss, ent_loss
 
 
 def parse_args():
@@ -225,8 +203,8 @@ def parse_args():
                         "DEFAULT since 2026-07-26 — gate-cleared with "
                         "--fp16 all: 1.20x rollout, +72.4 wpp paired). "
                         "Changes the sampling RNG stream vs eager. "
-                        "Auto-downgrades (with a note) on CPU/rust env, "
-                        "--fused-update, or capture failure")
+                        "Auto-downgrades (with a note) on CPU/rust env "
+                        "or capture failure")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -239,18 +217,14 @@ def parse_args():
                         "131072->1 by update 188 and stayed there for "
                         "94%% of the run, discarding 9.3%% of all "
                         "gradient steps as overflow-zeroed")
-    p.add_argument("--fused-update", action="store_true",
-                   help="run the minibatch forward+backward as fused CUDA "
-                        "kernels (policy_cuda) with a recompute-based "
-                        "backward — activation memory O(obs minibatch) — "
-                        "and Adam over the packed weights. d64/1-head arch "
-                        "only; --resume only onto another --fused-update "
-                        "checkpoint. Memory feature, not a speed feature")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
-    p.add_argument("--embed", type=int, default=64)
-    p.add_argument("--trunk-dim", type=int, default=128)
-    p.add_argument("--n-blocks", type=int, default=2)
-    p.add_argument("--n-heads", type=int, default=1)
+    # v17 scaled arch (2026-08-13, user-approved): 861,202 params at
+    # gears 5 (was 138,642). The flags remain for ablations.
+    p.add_argument("--embed", type=int, default=128)
+    p.add_argument("--trunk-dim", type=int, default=256)
+    p.add_argument("--n-blocks", type=int, default=3)
+    p.add_argument("--n-heads", type=int, default=4)
+    p.add_argument("--ffn-mult", type=int, default=4)
     # env config (generator v2 dials, SPEC.md §Chart generation)
     # --colors REMOVED (2026-07-26, user decision): the right-only
     # default silently trained gen3's 5B run one-handed (49.9% of
@@ -397,10 +371,6 @@ def main():
     if args.fp16 != "off" and device.type != "cuda":
         print("--fp16: CPU device, forcing off", flush=True)
         args.fp16 = "off"
-    if args.fp16 != "off" and args.fused_update:
-        print("--fp16: incompatible with --fused-update (fp32 packed "
-              "kernels), forcing off", flush=True)
-        args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
     # device-side loss-scaling state: NO host syncs in the minibatch
     # loop (an overflow zeroes the grads device-side; the audit rides
@@ -425,10 +395,6 @@ def main():
     # The rust env crosses FFI per tick, so graphs stay cuda-env-only.
     if args.graph_rollout and (args.env != "cuda" or device.type != "cuda"):
         print("--graph-rollout: needs --env cuda on a CUDA device, "
-              "forcing off", flush=True)
-        args.graph_rollout = False
-    if args.graph_rollout and args.fused_update:
-        print("--graph-rollout: incompatible with --fused-update, "
               "forcing off", flush=True)
         args.graph_rollout = False
 
@@ -506,7 +472,7 @@ def main():
     else:
         policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
-                            n_gears=args.gears)
+                            n_gears=args.gears, ffn_mult=args.ffn_mult)
     if policy.n_gears != args.gears:
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "
@@ -526,20 +492,15 @@ def main():
         # kernel, and the fused-head cache becomes a static view. Must
         # precede graph capture; p.data views never move afterward
         # (checkpoints/Adam unchanged — Adam mutates the views in
-        # place). --fused-update never reaches here (fp16 forced off).
+        # place).
         if device.type == "cuda":
             policy.flatten_fp16()
             print("--fp16: flat master/replica buffers (1-kernel "
                   "refresh)", flush=True)
-    trainer = None
-    if args.fused_update:
-        assert device.type == "cuda", "--fused-update needs a CUDA device"
-        from policy_cuda import FusedPolicyTrainer
-        trainer = FusedPolicyTrainer(policy)  # raises on unsupported arch
-        print(f"--fused-update: packed {n_params:,}-param leaf, "
-              f"fused fwd/bwd kernels", flush=True)
-    params = trainer.parameters() if trainer is not None \
-        else policy.parameters()
+    # (--fused-update was retired 2026-08-13 with the 138k arch: the
+    # packed kernels were hard-wired to embed 64 / trunk 128 and the
+    # eager fp16 path was the production path throughout v16.)
+    params = policy.parameters()
     # fused=True: one multi-tensor kernel instead of the foreach path's
     # ~10 launches per step (77 elementwise calls/minibatch measured in
     # the 2026-07-25 profile). Same per-element math, not guaranteed
@@ -559,19 +520,17 @@ def main():
             opt.load_state_dict(opt_sd)
         except ValueError as e:
             raise SystemExit(
-                "--resume optimizer state does not match this update path "
-                "(a --fused-update checkpoint stores Adam state over ONE "
-                "packed param; the eager path over per-module params). "
-                f"Re-run with the matching flag. [{e}]")
+                f"--resume optimizer state does not match this policy "
+                f"arch (pre-scale checkpoints were retired). [{e}]")
 
     # Flat grad buffer (2026-07-28): every p.grad is a view into ONE
     # contiguous buffer, so zero/unscale/overflow-mul/nan_to_num/clip
     # run as single-tensor kernels instead of 66-tensor loops (~880
     # launches/update -> ~30). Autograd accumulates in place into
     # existing grads, so the views persist; a one-time guard below
-    # verifies that. Eager path only (the fused trainer packs its own).
+    # verifies that.
     flat_grad = None
-    if trainer is None and device.type == "cuda":
+    if device.type == "cuda":
         f_params = list(policy.parameters())
         flat_grad = torch.zeros(sum(p.numel() for p in f_params),
                                 device=device)
@@ -817,17 +776,6 @@ def main():
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
             for s in range(0, batch, mb_size):
                 sl = slice(s, s + mb_size)
-                if trainer is not None:  # fused minibatch body
-                    loss, ent_loss = fused_minibatch_losses(
-                        trainer, ent_now, p_obs[sl], p_act[sl],
-                        p_logp[sl], p_adv[sl], p_ret[sl])
-                    opt.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(trainer.parameters(),
-                                             MAX_GRAD_NORM)
-                    opt.step()
-                    bump_weights_version()
-                    continue
                 _, newlogp, entropy, newval = policy.get_action_and_value(
                     p_obs[sl], p_act[sl])
                 logratio = newlogp - p_logp[sl]
@@ -930,10 +878,6 @@ def main():
                 bump_weights_version()  # invalidate fp16 replica caches
         if fp16_update:
             policy.fp16 = args.fp16 == "all"
-        if trainer is not None:
-            # mirror the packed weights into the torch policy: the next
-            # rollout and any checkpoint below read the module's params
-            trainer.unpack_to(policy)
         if args.bench and device.type == "cuda":
             torch.cuda.synchronize()  # see rollout-timer note
         t_update += time.perf_counter() - t0
