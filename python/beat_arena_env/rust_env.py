@@ -19,7 +19,7 @@ import json
 import gymnasium as gym
 import numpy as np
 
-from .chart import ChartConfig, generate_chart, note_tuple
+from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
 from .constants import (
     EFFORT_COEF, EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
 )
@@ -36,9 +36,11 @@ class RustBeatEnv(gym.Env):
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF,
                  external_chart=None, wide_acc=False, gears=3, seed=0,
-                 foot_contact=False, fall_gamma=1.0):
+                 foot_contact=False, fall_gamma=1.0, external_walls=None):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
+        external_walls: list[Wall] riding along (env v17, spec §12) —
+        real maps only; the procedural generator emits no walls.
 
         foot_contact: env v11 foot_mode (unilateral-contact spec §1) —
         False = the v10 foot welds (DEFAULT, physics unchanged), True =
@@ -57,6 +59,7 @@ class RustBeatEnv(gym.Env):
         self._record_lines = None
         self.chart = []
         self._external = list(external_chart) if external_chart else None
+        self.walls = list(external_walls) if external_walls else []
         # +90 ticks: the episode tail must cover the miss-boundary trip
         # (live head plane, env v10) past the last note
         if self._external:
@@ -118,6 +121,15 @@ class RustBeatEnv(gym.Env):
                        "kind": n.kind,
                        "fpre": n.free_pre, "fpost": n.free_post}
                       for n in self.chart],
+            # env v17 (spec §12): obstacles — world-space AABBs on the
+            # same head-anchored track; front face runs 0.25 m behind
+            # the note plane (the sim applies the offset, the header
+            # carries the parser's finished geometry)
+            "walls": [{"t": w.start_time, "cx": round(w.cx, 4),
+                       "cy": round(w.cy, 4), "w": round(w.width, 4),
+                       "h": round(w.height, 4), "l": round(w.length, 4),
+                       "speed": round(w.speed, 4)}
+                      for w in self.walls],
         }}
         self._record_lines = [json.dumps(header)]
 
@@ -172,7 +184,8 @@ class RustBeatEnv(gym.Env):
         self._episode += 1
         self.chart = (self._external if self._external is not None
                       else generate_chart(self.cfg, np.random.default_rng(seed)))
-        obs = self.sim.set_chart([note_tuple(n) for n in self.chart])
+        obs = self.sim.set_chart([note_tuple(n) for n in self.chart],
+                                 [wall_tuple(w) for w in self.walls])
         if self._record_path is not None:
             self._start_record()
         return obs, {}
@@ -197,5 +210,7 @@ class RustBeatEnv(gym.Env):
                         # contact spec §4: 0 or 1 — a fall ends the
                         # episode. Reported, never hidden; always 0 in
                         # weld mode.
-                        falls=self.sim.falls)
+                        falls=self.sim.falls,
+                        # env v17: head-in-wall ticks (spec §12b)
+                        walls_in=self.sim.walls_in)
         return obs, float(reward), bool(done), False, info

@@ -55,7 +55,7 @@ import torch
 
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
-from beat_arena_env.chart import note_tuple
+from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM
 from beat_arena_rs import VecBeatSim
 from cuda_graphs import _Graphed, copy_static
@@ -334,6 +334,7 @@ def parser_version():
     with open(beatsaver.__file__, "rb") as f:
         h.update(f.read())
     for sym in (chart.Note, chart.note_tuple, chart.chain_links,
+                chart.Wall, chart.wall_tuple,
                 scoresaber.ComboTracker, scoresaber.max_multiplied_score):
         h.update(inspect.getsource(sym).encode())
     h.update(repr(sorted(scoresaber.MAX_UNIT_POINTS.items())).encode())
@@ -363,6 +364,7 @@ def load_or_parse(entry, cache_dir, chart_cache, ver):
                                first_note_s=2.0)
     payload = {
         "tuples": [note_tuple(n) for n in notes],
+        "walls": [wall_tuple(w) for w in meta["walls"]],
         "max_score": scoresaber.max_multiplied_score(notes) if notes else 0,
         "duration_s": meta["duration_s"] if notes else 0.0,
         "last_hit_s": notes[-1].hit_time if notes else 0.0,
@@ -721,7 +723,8 @@ def main():
                             "stars": entry["stars"], "skipped": skip}
                         continue
                     i = gr.free.pop()
-                    gr.sim.set_chart(i, tuples)
+                    gr.sim.set_chart(i, tuples,
+                                     payload.get("walls", []))
                     gr.sim.obs_one_into(i, gr.obs_buf)  # in-place row write
                     gr.slots[i] = {
                         "entry": entry,

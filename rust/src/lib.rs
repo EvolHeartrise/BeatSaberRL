@@ -162,9 +162,21 @@ const KIND_BOMB: u8 = 1;
 const KIND_CHAIN_HEAD: u8 = 2;
 const KIND_CHAIN_LINK: u8 = 3;
 
-// --- obs layout v10 (SPEC-v10 §5; offsets DERIVED, order is a contract) ------
+// env v17 (contact spec §12): walls. The head CENTER is the collision
+// point (no sweep); each tick inside ANY wall costs WALL_PEN once.
+// The viewer builds wall front faces 0.25 m behind the note plane
+// ("walls just built like that" — WallManager.cs UpdateVisual), so a
+// wall's front reaches the head 0.4/NJS s after its nominal time.
+const WALL_PEN: f64 = -0.05;
+const WALL_FRONT_OFF: f64 = 0.25;
+
+// --- obs layout v17 (spec §12d; offsets DERIVED, order is a contract) --------
+// The 16 slots are a SHARED entity window (notes + walls), filled
+// nearest-first by 3D distance from the head center; entities behind
+// the head consume no slots. ENT_FEAT = the v9 note lanes verbatim,
+// then [is_wall, width, height, length].
 const N_NOTE_SLOTS: usize = 16;
-const NOTE_FEAT: usize = 14;
+const NOTE_FEAT: usize = 18;
 const HAND_FEAT: usize = 10; // wrist pos(3) + wrist vel(3) + blade(3) + meter
 const Q_LANES: usize = NQ + 2; // 31: the two wrist rolls code as cos/sin
 const OFF_ROOT_POS: usize = 0; // x/1, (y-0.94)/0.75, (z+0.65)/1
@@ -178,23 +190,23 @@ const OFF_HAND_R: usize = OFF_HAND_L + HAND_FEAT; // 85
 const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 95
 const OFF_CONTACT: usize = OFF_HEAD + 3; // 98: contact bits [L, R]
 const OFF_NOTES: usize = OFF_CONTACT + 2; // 100
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 324
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 388
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse (N·s) per
 // front/back sole-corner pair, / GROUND_IMP_NORM. All-zero in weld mode
 // (the ground block does not exist there), so lanes 0..340 are the v10
 // obs verbatim.
-const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 340
+const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 404
 const N_GROUND_IMP_LANES: usize = 4;
 // env v13 (contact spec §8): explicit FK shortcuts — world positions of
 // [l_elbow, r_elbow, l_knee, r_knee, l_foot, r_foot], head-style
 // normalization (x/1, (y−Y0)/0.75, (z−PLANE_Z0)/1). Y0 is the point's
 // reference-pose height: elbows share the wrists' Y_CENTER (they live
 // in the note field), knees/feet get their §1.2 reference literals.
-const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 344
+const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 408
 const N_BODY_PTS: usize = 6;
-const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 362
-const _: () = assert!(OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362");
+const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 426
+const _: () = assert!(OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
@@ -224,6 +236,21 @@ const ROOT_VANG_NORM: f64 = 16.0;
 /// implementation (Rust, torch, Python tools) agrees on halves.
 fn round_pts(x: f64) -> f64 {
     (x + 0.5).floor()
+}
+
+/// env v17 obstacle (spec §12): a world-space AABB riding the
+/// head-anchored track. Geometry arrives FINISHED from the parser
+/// (viewer scales/clamps applied); the sim only moves the box and
+/// tests the head point. Half-extents precomputed for the AABB test.
+#[derive(Clone, Copy)]
+struct Wall {
+    start_time: f64, // front face crosses the note plane (nominal, s)
+    cx: f64,         // box center x (m, world)
+    cy: f64,         // box center y (m, world)
+    half_w: f64,
+    half_h: f64,
+    len: f64,        // full z extent (m)
+    speed: f64,      // approach speed (m/s)
 }
 
 #[derive(Clone, Copy)]
@@ -513,6 +540,8 @@ struct Tracker {
 }
 
 type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
+// wall_tuple order (chart.py): (t0, cx, cy, width, height, length, speed)
+type WallTuple = (f64, f64, f64, f64, f64, f64, f64);
 
 /// The v10 physical body: dynamics state + solver buffers + the derived
 /// per-tick caches the judgment/obs layers consume. One per env.
@@ -761,6 +790,14 @@ struct Core {
     // drift postmortem, 2026-08-12).
     fall_gamma: f64,
     n_scoreable: u32, // chart objects that are not bombs
+    // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
+    // latches once the back face clears the head (monotone per wall);
+    // first_wall advances over the passed prefix; walls_in counts ticks
+    // with the head inside any wall this episode.
+    walls: Vec<Wall>,
+    wall_passed: Vec<bool>,
+    first_wall: usize,
+    walls_in: u32,
     // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
     // recomputed from state every tick and each of its disjuncts is
     // MONOTONE (first_pending only advances and, once !pending, the cut
@@ -804,6 +841,10 @@ impl Core {
             falls: 0,
             fall_gamma: 1.0,
             n_scoreable: 0,
+            walls: Vec::new(),
+            wall_passed: Vec::new(),
+            first_wall: 0,
+            walls_in: 0,
             finished: false,
             score: 0.0,
             score_pre: 0.0,
@@ -811,6 +852,27 @@ impl Core {
             score_post: 0.0,
             events_buf: Vec::new(),
         }
+    }
+
+    fn set_walls(&mut self, walls: Vec<WallTuple>) {
+        self.walls = walls
+            .into_iter()
+            .map(|(t0, cx, cy, w, h, len, speed)| Wall {
+                start_time: t0,
+                cx,
+                cy,
+                half_w: w / 2.0,
+                half_h: h / 2.0,
+                len,
+                speed,
+            })
+            .collect();
+        assert!(
+            self.walls
+                .windows(2)
+                .all(|w| w[0].start_time <= w[1].start_time),
+            "walls must be sorted by start_time"
+        );
     }
 
     fn set_chart_notes(&mut self, chart: Vec<ChartTuple>) {
@@ -860,6 +922,9 @@ impl Core {
         self.body.reset();
         self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
+        self.wall_passed = vec![false; self.walls.len()];
+        self.first_wall = 0;
+        self.walls_in = 0;
         self.good_cuts = 0;
         self.bad_cuts = 0;
         self.misses = 0;
@@ -944,40 +1009,119 @@ impl Core {
         // contact bits [L, R]
         obs[OFF_CONTACT] = self.body.contact_arm[0] as u8 as f32;
         obs[OFF_CONTACT + 1] = self.body.contact_arm[1] as u8 as f32;
-        // note block — v9 NOTE_FEAT verbatim (z head-anchored since v15)
+        // entity window (env v17, spec §12c/d): 16 SHARED slots, notes
+        // and walls in one pool, filled nearest-first by 3D distance
+        // from the head center. Entities behind the head consume no
+        // slots (notes: past the §10b miss boundary; walls: back face
+        // past the head). Head-anchoring makes every dz head-z-
+        // invariant, so the sort cannot be gamed by walking (v15).
         let z_off = self.body.head[2] - PLANE_Z0;
-        let mut slot = 0usize;
+        let head = &self.body.head;
+        // selection buffer, ascending by dist2; ties keep the FIRST-
+        // scanned entity (strict-< displacement). Scan order: notes in
+        // chart order, then walls — the CUDA mirror transcribes the
+        // same comparison order (§5 parity).
+        let mut sel = [(f64::INFINITY, false, 0usize); N_NOTE_SLOTS];
+        let mut n_sel = 0usize;
+        fn insert(
+            sel: &mut [(f64, bool, usize); N_NOTE_SLOTS],
+            n_sel: &mut usize,
+            cand: (f64, bool, usize),
+        ) {
+            if *n_sel == N_NOTE_SLOTS && cand.0 >= sel[N_NOTE_SLOTS - 1].0 {
+                return;
+            }
+            let mut i = (*n_sel).min(N_NOTE_SLOTS - 1);
+            while i > 0 && cand.0 < sel[i - 1].0 {
+                sel[i] = sel[i - 1];
+                i -= 1;
+            }
+            sel[i] = cand;
+            *n_sel = (*n_sel + 1).min(N_NOTE_SLOTS);
+        }
         for i in self.first_pending..self.chart.len() {
-            let n = &self.chart[i];
             if self.status[i] != 0 {
                 continue;
             }
-            if slot >= N_NOTE_SLOTS {
+            let n = &self.chart[i];
+            // sorted-chart early exit: dz >= (hit−t)·min_speed − PLANE_Z0
+            // for this and every later note, and dist >= dz — once that
+            // lower bound alone beats the current worst kept distance,
+            // no later note can enter the window
+            let dz_lb = (n.hit_time - self.time) * self.min_speed - PLANE_Z0;
+            if n_sel == N_NOTE_SLOTS && dz_lb > 0.0
+                && dz_lb * dz_lb >= sel[N_NOTE_SLOTS - 1].0
+            {
                 break;
             }
+            let dz = (n.hit_time - self.time) * n.speed - PLANE_Z0;
+            if dz < 0.0 {
+                continue; // behind the head (== past the miss boundary)
+            }
+            let dx = n.x - head[0];
+            let dy = n.y - head[1];
+            insert(&mut sel, &mut n_sel, (dx * dx + dy * dy + dz * dz, false, i));
+        }
+        for wi in self.first_wall..self.walls.len() {
+            if self.wall_passed[wi] {
+                continue;
+            }
+            let w = &self.walls[wi];
+            let dzf = (w.start_time - self.time) * w.speed - PLANE_Z0 - WALL_FRONT_OFF;
+            if dzf + w.len < 0.0 {
+                continue; // back face behind the head (flag lags a tick)
+            }
+            // clamp-based nearest point on the AABB: per-axis separation
+            // (0 inside; the middle z term is negative whenever the head
+            // is within the span, so .max(0.0) closes the interior case)
+            let sx = ((head[0] - w.cx).abs() - w.half_w).max(0.0);
+            let sy = ((head[1] - w.cy).abs() - w.half_h).max(0.0);
+            let sz = dzf.max(-(dzf + w.len)).max(0.0);
+            insert(&mut sel, &mut n_sel, (sx * sx + sy * sy + sz * sz, true, wi));
+        }
+        for slot in 0..n_sel {
+            let (_, is_wall, idx) = sel[slot];
             let base = OFF_NOTES + slot * NOTE_FEAT;
-            let z = ((n.hit_time - self.time) * n.speed + z_off)
-                .clamp(Z_CLIP.0, Z_CLIP.1);
-            obs[base] = (n.x / X_NORM) as f32;
-            obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
-            obs[base + 2] = (z / Z_SCALE) as f32;
-            obs[base + 3] = (-n.speed / Z_SCALE) as f32;
-            if n.kind != KIND_BOMB {
-                obs[base + 4 + n.color as usize] = 1.0;
+            if is_wall {
+                let w = &self.walls[idx];
+                let zf = ((w.start_time - self.time) * w.speed - WALL_FRONT_OFF
+                    + z_off)
+                    .clamp(Z_CLIP.0, Z_CLIP.1);
+                obs[base] = (w.cx / X_NORM) as f32;
+                obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
+                obs[base + 2] = (zf / Z_SCALE) as f32;
+                obs[base + 3] = (-w.speed / Z_SCALE) as f32;
+                // lanes 4..13 (color/dir/kind/free) stay zero
+                obs[base + 13] = 1.0; // valid
+                obs[base + 14] = 1.0; // is_wall
+                obs[base + 15] = (2.0 * w.half_w / X_NORM) as f32;
+                obs[base + 16] = (2.0 * w.half_h / Y_NORM) as f32;
+                obs[base + 17] = (w.len / Z_SCALE) as f32;
+            } else {
+                let n = &self.chart[idx];
+                let z = ((n.hit_time - self.time) * n.speed + z_off)
+                    .clamp(Z_CLIP.0, Z_CLIP.1);
+                obs[base] = (n.x / X_NORM) as f32;
+                obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
+                obs[base + 2] = (z / Z_SCALE) as f32;
+                obs[base + 3] = (-n.speed / Z_SCALE) as f32;
+                if n.kind != KIND_BOMB {
+                    obs[base + 4 + n.color as usize] = 1.0;
+                }
+                let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
+                if n.kind != KIND_BOMB && show_dir {
+                    obs[base + 6] = n.cos_a as f32;
+                    obs[base + 7] = n.sin_a as f32;
+                }
+                obs[base + 8] = (n.kind == KIND_BOMB) as u8 as f32;
+                obs[base + 9] = (n.kind == KIND_CHAIN_HEAD) as u8 as f32;
+                obs[base + 10] = (n.kind == KIND_CHAIN_LINK) as u8 as f32;
+                obs[base + 11] = n.free_pre as u8 as f32;
+                obs[base + 12] = n.free_post as u8 as f32;
+                obs[base + 13] = 1.0; // valid
+                // lanes 14..17 (is_wall, w/h/l) stay zero
             }
-            let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
-            if n.kind != KIND_BOMB && show_dir {
-                obs[base + 6] = n.cos_a as f32;
-                obs[base + 7] = n.sin_a as f32;
-            }
-            obs[base + 8] = (n.kind == KIND_BOMB) as u8 as f32;
-            obs[base + 9] = (n.kind == KIND_CHAIN_HEAD) as u8 as f32;
-            obs[base + 10] = (n.kind == KIND_CHAIN_LINK) as u8 as f32;
-            obs[base + 11] = n.free_pre as u8 as f32;
-            obs[base + 12] = n.free_post as u8 as f32;
-            obs[base + 13] = 1.0; // valid
             obs[OFF_NOTE_MASK + slot] = 1.0;
-            slot += 1;
         }
 
         // contact spec §7: per-foot ground-contact lanes
@@ -1011,7 +1155,8 @@ impl Core {
     }
 
     // event codes: 0 ok, 1 slow, 2 angle, 3 wrong_hand, 4 miss, 5 post
-    // (follow-through resolution), 6 bomb hit. The f32 is points awarded.
+    // (follow-through resolution), 6 bomb hit, 7 head-in-wall tick (env
+    // v17; note id = u32::MAX). The f32 is points awarded.
     // Events land in self.events_buf (cleared here), in the same order the
     // v9 sim produced them — order is the ComboWalk contract.
     fn step_inner(&mut self, actions: &[u8; NQ]) -> (f64, bool) {
@@ -1316,6 +1461,40 @@ impl Core {
 
         self.tick += 1;
         // advance the low-water cursor past the newly resolved prefix
+        // ── env v17 walls (spec §12b): head center vs AABB ────────────
+        // Head-anchored like notes: dz_front = (t0 − t)·speed + 0.4 is
+        // the front face's z relative to the HEAD ((−PLANE_Z0) − 0.25 =
+        // 0.4), invariant to root z by construction. Inside iff the
+        // head sits within the span and the x/y box. One penalty per
+        // tick regardless of how many walls overlap the head.
+        let mut in_wall = false;
+        for wi in self.first_wall..self.walls.len() {
+            if self.wall_passed[wi] {
+                continue;
+            }
+            let w = &self.walls[wi];
+            let dzf = (w.start_time - self.time) * w.speed - PLANE_Z0 - WALL_FRONT_OFF;
+            if dzf + w.len < 0.0 {
+                self.wall_passed[wi] = true; // back face behind the head
+                continue;
+            }
+            if dzf <= 0.0
+                && (head[0] - w.cx).abs() <= w.half_w
+                && (head[1] - w.cy).abs() <= w.half_h
+            {
+                in_wall = true;
+            }
+        }
+        if in_wall {
+            reward += WALL_PEN;
+            self.walls_in += 1;
+            // event code 7: head-in-wall tick (note id unused -> u32::MAX)
+            self.events_buf.push((u32::MAX, 7, 0.0, 0.0, 0.0));
+        }
+        while self.first_wall < self.walls.len() && self.wall_passed[self.first_wall] {
+            self.first_wall += 1;
+        }
+
         while self.first_pending < self.chart.len()
             && self.status[self.first_pending] != 0
         {
@@ -1438,12 +1617,18 @@ impl RawBeatSim {
 
     /// chart: list of (hit_time, x, y, color, angle_rad, speed, any_dir,
     /// kind, free_pre, free_post), sorted by hit_time; positions in
-    /// meters (env v7). Resets state, returns the reset observation.
+    /// meters (env v7). walls (env v17): list of (start_time, cx, cy,
+    /// width, height, length, speed), sorted by start_time — installed
+    /// BEFORE the chart so reset_state sizes wall_passed. Resets state,
+    /// returns the reset observation.
+    #[pyo3(signature = (chart, walls = Vec::new()))]
     fn set_chart<'py>(
         &mut self,
         py: Python<'py>,
         chart: Vec<ChartTuple>,
+        walls: Vec<WallTuple>,
     ) -> Bound<'py, PyArray1<f32>> {
+        self.core.set_walls(walls);
         self.core.set_chart_notes(chart);
         PyArray1::from_slice_bound(py, &self.core.build_obs())
     }
@@ -1453,7 +1638,7 @@ impl RawBeatSim {
     /// +/-full torque, finer +/- gear pairs append (constants.gear_table).
     /// Returns (obs, reward, done, events); events = [(note_idx, code,
     /// points, pre_pts, acc_pts)] with codes 0 ok, 1 slow, 2 angle,
-    /// 3 wrong_hand, 4 miss, 5 post, 6 bomb.
+    /// 3 wrong_hand, 4 miss, 5 post, 6 bomb, 7 head-in-wall (id u32::MAX).
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -1710,6 +1895,12 @@ impl RawBeatSim {
     fn bombs_hit(&self) -> u32 {
         self.core.bombs_hit
     }
+    /// env v17: ticks this episode with the head inside a wall (each
+    /// charged WALL_PEN). ADDITIVE getter (spec §12b).
+    #[getter]
+    fn walls_in(&self) -> u32 {
+        self.core.walls_in
+    }
     /// Scoreable objects (notes + chain heads + links; bombs excluded).
     #[getter]
     fn n_notes(&self) -> u32 {
@@ -1851,8 +2042,10 @@ impl VecBeatSim {
         }
     }
 
-    fn set_chart(&mut self, i: usize, chart: Vec<ChartTuple>) {
+    #[pyo3(signature = (i, chart, walls = Vec::new()))]
+    fn set_chart(&mut self, i: usize, chart: Vec<ChartTuple>, walls: Vec<WallTuple>) {
         let n_objects = chart.len();
+        self.sims[i].set_walls(walls);
         self.sims[i].set_chart_notes(chart);
         if let Some(walks) = &mut self.walks {
             walks[i] = ComboWalk::new(n_objects);
@@ -2018,6 +2211,12 @@ impl VecBeatSim {
     /// Fall terminations in env i's current episode (contact spec §4).
     fn falls(&self, i: usize) -> u32 {
         self.sims[i].falls
+    }
+
+    /// env v17: head-in-wall ticks in env i's current episode (each
+    /// charged WALL_PEN). ADDITIVE getter (spec §12b).
+    fn walls_in(&self, i: usize) -> u32 {
+        self.sims[i].walls_in
     }
 
     /// R26 instrumentation: the per-substep rate counters aggregated

@@ -43,14 +43,14 @@ namespace {
 constexpr int D = 64;           // embed
 constexpr int TT = 19;          // tokens: 2 sabers + body + 16 note slots
 constexpr int TRUNK = 128;
-constexpr int NOTE_FEAT = 14;
+constexpr int NOTE_FEAT = 18;  // env v17: + [is_wall, width, height, length]
 constexpr int N_NOTE_SLOTS = 16;
 constexpr int SABER_FEAT = 28;  // env v13: + own elbow position
 constexpr int SABER_IN = SABER_FEAT + 2;
 constexpr int BODY_FEAT = 66;  // v12 ground lanes + v13 knee/foot positions
 constexpr int OFF_NOTES = 100;
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
-constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS + 4 + 18; // 362 (env v13)
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 388
+constexpr int OBS_DIM = OFF_NOTE_MASK + N_NOTE_SLOTS + 4 + 18; // 426 (env v17)
 constexpr int N_HEADS = 29;
 constexpr int MAX_K = 7;
 constexpr int MAX_NOUT = N_HEADS * MAX_K + 1;         // 204
@@ -62,20 +62,20 @@ __device__ constexpr int SABER_L_IDX[SABER_FEAT] = {
     18, 19, 20, 21, 22, 23, 24, 25,
     49, 50, 51, 52, 53, 54, 55,
     75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
-    344, 345, 346};  // env v13 l_elbow position
+    408, 409, 410};  // env v13 l_elbow position (v17 lanes)
 __device__ constexpr int SABER_R_IDX[SABER_FEAT] = {
     26, 27, 28, 29, 30, 31, 32, 33,
     56, 57, 58, 59, 60, 61, 62,
     85, 86, 87, 88, 89, 90, 91, 92, 93, 94,
-    347, 348, 349};  // env v13 r_elbow position
+    411, 412, 413};  // env v13 r_elbow position (v17 lanes)
 __device__ constexpr int BODY_IDX[BODY_FEAT] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
     34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
     63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
     95, 96, 97, 98, 99,
-    340, 341, 342, 343,   // env v12 ground-contact lanes
-    350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360,
-    361};  // env v13 knee/foot positions
+    404, 405, 406, 407,   // env v12 ground-contact lanes (v17)
+    414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424,
+    425};  // env v13 knee/foot positions
 
 // --- packed offsets (contract with policy_cuda._pack; == forward's) --------
 constexpr int O_NOTE_W1 = 0;
@@ -111,7 +111,7 @@ constexpr int T_B1 = T_W1 + 3 * D * TRUNK;
 constexpr int T_W2 = T_B1 + TRUNK;
 constexpr int T_B2 = T_W2 + TRUNK * TRUNK;
 constexpr int TRUNK_SZ = T_B2 + TRUNK;                // 41216
-static_assert(FRONT == 19712 && BLK == 29312 && TRUNK_SZ == 41216,
+static_assert(FRONT == 19968 && BLK == 29312 && TRUNK_SZ == 41216,
               "packed layout drifted");
 
 constexpr int expected_numel(int n_blocks, int n_gears) {

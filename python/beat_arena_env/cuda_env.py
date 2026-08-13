@@ -236,6 +236,42 @@ def _charts_to_tensors(charts, device, dtype, pad_to=None):
     }
 
 
+def _walls_to_tensors(walls, device, dtype, pad_to=None):
+    """Pad a list[list[wall_tuple]] into per-field (P, W) tensors (env
+    v17, spec §12). wall_tuple order: (t0, cx, cy, width, height,
+    length, speed). Same chunk-stable contract as _charts_to_tensors:
+    pad values are per-field constants (speed pads 1.0 to stay
+    division-safe), so chunked packing concatenates byte-identically."""
+    P = len(walls)
+    W = max(1, pad_to if pad_to is not None
+            else max((len(ws) for ws in walls), default=1))
+    lens = np.fromiter((len(ws) for ws in walls), np.int64, P)
+    n_tot = int(lens.sum())
+    flat = list(itertools.chain.from_iterable(walls))
+    idx = (np.repeat(np.arange(P, dtype=np.int64) * W
+                     - (np.cumsum(lens) - lens), lens)
+           + np.arange(n_tot, dtype=np.int64))
+    rec = np.array(flat, np.float64).reshape(n_tot, 7) if n_tot else \
+        np.zeros((0, 7), np.float64)
+
+    def fill(col, pad=0.0):
+        a = np.full(P * W, pad, dtype=np.float64)
+        a[idx] = rec[:, col]
+        return a.reshape(P, W)
+
+    valid = np.zeros(P * W, bool)
+    valid[idx] = True
+    valid = valid.reshape(P, W)
+    t = lambda a, dt=dtype: torch.as_tensor(a, device=device, dtype=dt)
+    return {
+        "wall_t": t(fill(0)), "wall_cx": t(fill(1)), "wall_cy": t(fill(2)),
+        "wall_w": t(fill(3)), "wall_h": t(fill(4)), "wall_len": t(fill(5)),
+        "wall_speed": t(fill(6, pad=1.0)),
+        "wall_valid": t(valid, torch.bool),
+        "n_walls": t(lens, torch.long),
+    }
+
+
 def _generator_version():
     """Hash of the code the CACHED POOL CONTENT actually depends on —
     the bench's parser_version() pattern (bench_scoresaber.py). Hashing
@@ -379,6 +415,13 @@ class CudaBeatVecEnv:
         else:
             self.pool = _charts_to_tensors(charts, self.device, dtype)
         self.pool_size, self.C = self.pool["hit"].shape
+        # env v17: pools without wall tensors (procedural generator,
+        # charts= test mode, pre-v17 caches) get an all-empty (P, 1)
+        # wall block — every wall lane inert, kernel behavior = v16
+        if "wall_t" not in self.pool:
+            self.pool.update(_walls_to_tensors(
+                [[] for _ in range(self.pool_size)], self.device, dtype))
+        self.W = self.pool["wall_t"].shape[1]
         if max_steps is None:
             max_steps = int(chart_len_s * 30) + 90
         self.max_steps = int(max_steps)
@@ -440,6 +483,11 @@ class CudaBeatVecEnv:
         # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
         self.ground_imp = z(N, 4)
         self.chart_idx = z(N, dt=torch.int64)
+        # env v17 wall state (spec §12b): passed latches, passed-prefix
+        # cursor, head-in-wall tick counter
+        self.wall_passed = z(N, self.W, dt=torch.bool)
+        self.first_wall = z(N, dt=torch.int32)
+        self.walls_in = z(N, dt=torch.int32)
         # episode-return ring buffer (device-side)
         self._cap = 4096
         self._ret_buf = z(self._cap)
@@ -472,6 +520,10 @@ class CudaBeatVecEnv:
             p["is_head"], p["is_link"], p["show_dir"], p["free_pre"],
             p["free_post"],
             p["n_notes"], p["last_hit"], p["tail"], p["min_speed"],
+            p["wall_t"], p["wall_cx"], p["wall_cy"], p["wall_w"],
+            p["wall_h"], p["wall_len"], p["wall_speed"],
+            p["wall_valid"], p["n_walls"],
+            self.wall_passed, self.first_wall, self.walls_in,
             self._ret_buf, self._ret_total, self._obs, self._reward,
             self._done,
         ]

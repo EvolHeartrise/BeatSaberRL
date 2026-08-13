@@ -18,7 +18,12 @@ arcs as scoring grants (head note free_post, tail note free_pre), the
 paired-note ANGLE SNAP rule (exactly two same-color notes on a beat
 snap their arrows to the line between them when within 40 deg —
 ArcViewer NoteManager.GetSnapAngles), and piecewise BPM->time
-conversion. NOT parsed (noted for later): walls/obstacles, 360/90
+conversion.
+
+Env v17 additions: walls/obstacles (all three schemas, ScoreSaber-
+watch geometry verbatim — spec §12a; vanilla only, ME wall types
+skipped), returned in meta["walls"] as chart.Wall AABBs.
+NOT parsed (noted for later): 360/90
 rotation events, NJS events, Noodle/ME custom data (fake notes are NOT
 filtered), one-saber characteristic, left-hand mirroring.
 
@@ -40,8 +45,18 @@ import os
 import zipfile
 from dataclasses import replace
 
-from .chart import Note, chain_links
+from .chart import Note, Wall, chain_links
 from .constants import (KIND_BOMB, KIND_CHAIN_HEAD, KIND_NOTE, ROW_Y, col_x)
+
+# env v17 wall conversion constants (ScoreSaber watch WallManager.cs /
+# ObjectManager.cs — spec §12a). Grid x origin −0.9 matches our
+# col_x(0) = −0.9 + 0.3; the wall y scale is 0.6 (WallHScale), NOT the
+# note RowHeight 0.55.
+_WALL_LANE_W = 0.6      # ObjectManager.LaneWidth
+_WALL_H_SCALE = 0.6     # ObjectManager.WallHScale
+_WALL_GRID_X0 = -0.9    # ObjectManager.GridBottomLeft.x (y0 is 0)
+_WALL_MIN_SIZE = 0.06   # WallManager.MinWallSize (width/height/length)
+_WALL_MAX_TOP = 3.0     # ClampPlayerHeight ceiling
 
 # cutDirection -> swing angle (radians; 0 = +x, CCW, y up)
 _DIR_ANGLE = {
@@ -246,6 +261,39 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         clock = _BeatClock(bpm, changes)
 
     notes: list[Note] = []
+    walls: list[Wall] = []
+
+    def add_wall(beat, x, y, w, h, dur_beats, v4_walls):
+        """ScoreSaber-watch Wall(BeatmapObstacle) verbatim (spec §12a).
+        Vanilla only — the ME/Noodle branches (customData size/
+        coordinates, precision values) are out of scope like notes'."""
+        if dur_beats < 0:                       # negative walls flip
+            beat, dur_beats = beat + dur_beats, -dur_beats
+        y = min(max(int(y), 0), 4 if v4_walls else 2)
+        h = min(float(h), 5.0 - y)
+        world_w = float(w) * _WALL_LANE_W
+        world_h = h * _WALL_H_SCALE
+        # MinWallSize floor keeps the sign (viewer Mathf.Sign); vanilla
+        # maps have positive sizes but zero-width walls do exist
+        world_w = max(abs(world_w), _WALL_MIN_SIZE) * math.copysign(1.0, world_w)
+        world_h = max(abs(world_h), _WALL_MIN_SIZE) * math.copysign(1.0, world_h)
+        cx = _WALL_GRID_X0 + float(x) * _WALL_LANE_W + (world_w - _WALL_LANE_W) / 2
+        cy = y * _WALL_H_SCALE + world_h / 2
+        # ClampPlayerHeight (vanilla walls always clamp): bottom >= 0,
+        # then top <= 3 m by shrinking + recentering
+        bottom = cy - world_h / 2
+        if bottom < 0:
+            cy -= bottom
+        top = cy + world_h / 2
+        if top > _WALL_MAX_TOP:
+            diff = top - _WALL_MAX_TOP
+            world_h -= diff
+            cy -= diff / 2
+        t0 = clock.time(beat)
+        dur_s = clock.time(beat + dur_beats) - t0
+        length = max(dur_s * speed, _WALL_MIN_SIZE)
+        walls.append(Wall(start_time=t0, cx=cx, cy=cy, width=abs(world_w),
+                          height=abs(world_h), length=length, speed=speed))
 
     def add_note(beat, x, y, color, d, angle_off_deg=0.0, kind=KIND_NOTE):
         nonlocal dropped
@@ -331,6 +379,11 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
             td = cdata[a["ti"]] if a.get("ti") is not None else {}
             add_arc(a["hb"], hd.get("x", 0), hd.get("y", 0), hd.get("c", 0),
                     a["tb"], td.get("x", 0), td.get("y", 0), td.get("c", 0))
+        odata = data.get("obstaclesData", [])
+        for o in data.get("obstacles", []):
+            d = odata[o["i"]] if o.get("i") is not None else {}
+            add_wall(o["b"], d.get("x", 0), d.get("y", 0), d.get("w", 1),
+                     d.get("h", 1), float(d.get("d", 0)), v4_walls=True)
     elif "colorNotes" in data:                        # v3 schema
         # .get(..., 0) throughout: some serializers omit zero-valued
         # fields (KeyError 'y'/'c' skipped 6 catalog levels; the v4
@@ -349,6 +402,9 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
             add_arc(a["b"], a.get("x", 0), a.get("y", 0), a.get("c", 0),
                     a["tb"], a.get("tx", 0), a.get("ty", 0),
                     a.get("tc", a.get("c", 0)))
+        for o in data.get("obstacles", []):
+            add_wall(o["b"], o.get("x", 0), o.get("y", 0), o.get("w", 1),
+                     o.get("h", 1), float(o.get("d", 0)), v4_walls=False)
     else:                                             # v2 schema
         for n in data["_notes"]:
             if n["_type"] in (0, 1):
@@ -356,17 +412,32 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
                          n["_type"], n["_cutDirection"])
             elif n["_type"] == 3:
                 add_bomb(n["_time"], n["_lineIndex"], n["_lineLayer"])
+        for o in data.get("_obstacles", []):
+            t = int(o.get("_type", 0))
+            if t >= 1000:            # Mapping Extensions wall: out of scope
+                continue
+            if (o.get("_customData") or {}).get("_fake"):
+                continue
+            # v2 wall shape is coded in _type: 0 = full wall (grid bottom,
+            # 5 rows tall -> capped to 3 m), 1 = crouch wall (hangs
+            # y 1.2..3.0 m)
+            add_wall(o["_time"], o.get("_lineIndex", 0), 0 if t == 0 else 2,
+                     o.get("_width", 1), 5 if t == 0 else 3,
+                     float(o.get("_duration", 0)), v4_walls=False)
 
     notes = _snap_paired_angles(notes)
     notes.sort(key=lambda n: n.hit_time)
+    walls.sort(key=lambda w: w.start_time)
     shift = 0.0
     if first_note_s is not None and notes:
         shift = first_note_s - notes[0].hit_time
         notes = [replace(n, hit_time=n.hit_time + shift) for n in notes]
+        walls = [replace(w, start_time=w.start_time + shift) for w in walls]
 
     scoreable = [n for n in notes if n.kind != KIND_BOMB]
     meta = {"bpm": bpm, "njs": njs, "speed": speed, "difficulty": difficulty,
             "n_notes": len(scoreable), "n_bombs": len(notes) - len(scoreable),
+            "n_walls": len(walls), "walls": walls,
             "dropped": dropped, "song_name": song_name,
             "duration_s": notes[-1].hit_time - notes[0].hit_time if notes else 0.0,
             "nps": (len(scoreable) / (notes[-1].hit_time - notes[0].hit_time))

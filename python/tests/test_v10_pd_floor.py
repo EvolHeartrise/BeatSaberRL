@@ -30,7 +30,8 @@ import numpy as np
 
 import beat_arena_rs
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import BASE_POS0, JOINT_LIMITS, N_JOINTS, NV
+from beat_arena_env.constants import (BASE_POS0, JOINT_LIMITS, N_JOINTS, NV,
+                                      OBS_DIM)
 
 FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
                 angle=4.712, speed=4.0)
@@ -95,7 +96,7 @@ def test_vec_sim_pop_pd_hits_zero_in_ordinary_motion():
     for i in range(n):
         vec.set_chart(i, [note_tuple(FAR_NOTE)])
     rng = np.random.default_rng(7)
-    obs = np.zeros((n, 362), dtype=np.float32)
+    obs = np.zeros((n, OBS_DIM), dtype=np.float32)
     for _ in range(15):
         acts = rng.integers(0, 3, (n, N_JOINTS)).astype(np.int64)
         vec.step_into(acts, obs)

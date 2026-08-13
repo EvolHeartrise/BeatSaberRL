@@ -69,7 +69,9 @@ _BLK = (2 * EMBED + 3 * (EMBED * EMBED + EMBED) + 2 * EMBED
         + EMBED * (2 * EMBED) + 2 * EMBED + (2 * EMBED) * EMBED + EMBED)
 _TRUNK_SZ = (3 * EMBED * TRUNK_DIM + TRUNK_DIM
              + TRUNK_DIM * TRUNK_DIM + TRUNK_DIM)
-assert _FRONT == 19712 and _BLK == 29312 and _TRUNK_SZ == 41216  # v13
+assert _FRONT == 19968 and _BLK == 29312 and _TRUNK_SZ == 41216  # v17
+# v17: _FRONT grew 19712 -> 19968 (NOTE_FEAT 14 -> 18, +4*EMBED note-W1
+# rows for [is_wall, width, height, length])
 
 
 def expected_numel(n_blocks, n_gears):

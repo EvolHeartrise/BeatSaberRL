@@ -103,18 +103,20 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
     return x
 
 # Observation layout (contract; mirrors beat_arena_env/constants.py,
-# obs v10 = SPEC-v10 §5: 340 lanes — root pose/vel (15), q block (31,
-# wrist rolls cos/sin), qd (29), two 10-lane derived hand blocks, head
-# (3), contact bits (2), then the v9-verbatim 16x14 note block + mask —
-# plus the env v12 (unilateral-contact spec §7) 4-lane per-foot
-# ground-contact block at 340..344 (BODY token) and the env v13 (spec
-# §8) 18-lane body-point block at 344..362: elbows to their saber
-# tokens, knees + feet to the BODY token).
-OBS_DIM = 362
+# obs v17 = unilateral-contact spec §12: root pose/vel (15), q block
+# (31, wrist rolls cos/sin), qd (29), two 10-lane derived hand blocks,
+# head (3), contact bits (2), then the 16x18 ENTITY block + mask (env
+# v17: notes AND walls share the slots, nearest-first by head distance;
+# per-token = the v9 note lanes then [is_wall, width, height, length])
+# — plus the env v12 (spec §7) 4-lane per-foot ground-contact block at
+# 404..408 (BODY token) and the env v13 (spec §8) 18-lane body-point
+# block at 408..426: elbows to their saber tokens, knees + feet to the
+# BODY token.
+OBS_DIM = 426
 N_NOTE_SLOTS = 16
-NOTE_FEAT = 14
+NOTE_FEAT = 18
 OFF_NOTES = 100
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 324
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 388
 # Token layout (SPEC-v10 §5 "informative", finalized here at P4):
 # [saber_L, saber_R, body, note_0..15] = 19 tokens. Each saber token =
 # that hand's q lanes (8, incl. the cos/sin roll pair) + qd lanes (7) +
@@ -126,13 +128,13 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 324
 SABER_FEAT = 28
 BODY_FEAT = 66
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
-                + tuple(range(75, 85)) + tuple(range(344, 347)))
+                + tuple(range(75, 85)) + tuple(range(408, 411)))
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
-                + tuple(range(85, 95)) + tuple(range(347, 350)))
+                + tuple(range(85, 95)) + tuple(range(411, 414)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(95, 100))
-             + tuple(range(340, 344))
-             + tuple(range(350, 362)))
+             + tuple(range(404, 408))
+             + tuple(range(414, 426)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —
@@ -497,10 +499,10 @@ def load_policy(ckpt) -> NotePolicy:
             or arch.get("n_action_heads") != N_ACTION_HEADS
             or not arch.get("body_token", False)):
         raise SystemExit(
-            "checkpoint is not env v10 (needs arch obs_dim=340, "
+            f"checkpoint is not env v17 (needs arch obs_dim={OBS_DIM}, "
             f"n_action_heads=29, body_token=True; got {dict(arch)}). "
-            "v9 and earlier checkpoints were retired with the v10 body — "
-            "retrain, there is no conversion.")
+            "v16-and-earlier checkpoints were retired by the v17 entity "
+            "window (walls; obs 362 -> 426) — retrain, no conversion.")
     policy = NotePolicy(
         embed=arch.get("embed", 64), trunk_dim=arch.get("trunk_dim", 128),
         n_blocks=arch.get("n_blocks", 2), n_heads=arch.get("n_heads", 1),
