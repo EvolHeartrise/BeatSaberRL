@@ -47,6 +47,11 @@ export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 0.65;
 export const PLANE_Z0 = -0.65;
 // header value that turns the head-anchored track on (strict gate)
 export const TRACK_ANCHOR_HEAD = "head";
+// env v17 (contact spec §12a): a wall's front face runs 0.25 m BEHIND
+// the note plane (ScoreSaber WallManager build quirk):
+//     z_front(t) = (wall.t - t) * speed + WALL_Z_SHIFT + z_off
+// and the box extends AWAY from the player to z_front + l.
+export const WALL_Z_SHIFT = -0.25;
 export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 
 // object kinds (chart entry `kind`)
@@ -453,6 +458,10 @@ export function parseReplay(text) {
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
     trackAnchor: head.header.track_anchor ?? null,
+    // env v17 ADDITIVE header field: world-space wall AABBs, geometry
+    // finished by the parser ({t, cx, cy, w, h, l, speed} per wall).
+    // Pre-v17 recordings (field absent) render exactly as before.
+    walls: head.header.walls ?? [],
     arcs: arcPairs(chart),
   };
 }
@@ -725,6 +734,22 @@ export function pendingNotes(rep, time, zOff = 0) {
     const zBase = (n.t - time) * n.speed;
     if (zBase <= Z_FAR && zBase >= -Z_MISS)
       out.push({ n, i, z: zBase + zOff, zBase });
+  });
+  return out;
+}
+
+/** env v17 walls overlapping the visible tunnel at `time`. Walls ride
+ * the SAME head-anchored track as notes (spec §12a), so `zOff` is the
+ * v15 offset already computed for pendingNotes; like there, visibility
+ * bounds stay on the chart-time z (the far bound and the head plane
+ * shift with z_off together). Pre-v17 replays have walls = [] and
+ * render exactly as before. */
+export function pendingWalls(rep, time, zOff = 0) {
+  const out = [];
+  (rep.walls ?? []).forEach((w, i) => {
+    const zFrontBase = (w.t - time) * w.speed + WALL_Z_SHIFT;
+    if (zFrontBase <= Z_FAR && zFrontBase + w.l >= -Z_MISS)
+      out.push({ w, i, zFront: zFrontBase + zOff, zFrontBase });
   });
   return out;
 }

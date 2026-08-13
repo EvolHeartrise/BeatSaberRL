@@ -159,9 +159,16 @@ KIND_BOMB = 1
 KIND_CHAIN_HEAD = 2
 KIND_CHAIN_LINK = 3
 
-# --- obs layout v10 (SPEC-v10 §5; offsets DERIVED from the block table) ------
+# --- obs layout v17 (spec §12; offsets DERIVED from the block table) ---------
+# env v17: the 16 slots are a SHARED entity window (notes + walls),
+# nearest-first by 3D head distance; per-token = the v9 note lanes then
+# [is_wall, width, height, length]. Behind-the-head entities are
+# excluded.
 N_NOTE_SLOTS = 16
-NOTE_FEAT = 14
+NOTE_FEAT = 18
+# env v17 wall reward/geometry literals (spec §12a/b)
+WALL_PEN = -0.05        # per tick with the head inside any wall
+WALL_FRONT_OFF = 0.25   # viewer front-face offset behind the note plane (m)
 HAND_FEAT = 10        # wrist pos(3), wrist vel(3), blade dir(3), swing meter
 Q_LANES = N_JOINTS + len(WRAP_JOINTS)   # 31: wrist rolls code as cos/sin
 
@@ -176,7 +183,7 @@ _OBS_BLOCKS = (
     ("hand_r", HAND_FEAT),
     ("head", 3),              # x/1, (y-1.70)/0.75, (z+0.65)/1
     ("contact", 2),           # contact bits [L, R]
-    ("notes", N_NOTE_SLOTS * NOTE_FEAT),   # v9 NOTE_FEAT verbatim
+    ("notes", N_NOTE_SLOTS * NOTE_FEAT),   # v17 shared entity block
     ("note_mask", N_NOTE_SLOTS),
     # env v12 (unilateral-contact spec §7): per-foot ground-contact
     # lanes [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse
@@ -204,10 +211,10 @@ OFF_HAND_R = OBS_OFF["hand_r"]          # 85
 OFF_HEAD = OBS_OFF["head"]              # 95
 OFF_CONTACT = OBS_OFF["contact"]        # 98
 OFF_NOTES = OBS_OFF["notes"]            # 100
-OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 324
-OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 340
-OFF_BODY_PTS = OBS_OFF["body_pts"]      # 344
-assert OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362"
+OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 388
+OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 404
+OFF_BODY_PTS = OBS_OFF["body_pts"]      # 408
+assert OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

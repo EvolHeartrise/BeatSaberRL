@@ -30,7 +30,7 @@ import os
 import numpy as np
 import torch
 
-from .chart import Note
+from .chart import Note, Wall
 from .constants import KIND_BOMB
 
 LEAD_S = 1.5          # k>0 windows: drop notes cut mid-flight
@@ -43,8 +43,9 @@ _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _cache_path(seg_len, ver, catalog_path, lead_s):
     with open(catalog_path, "rb") as f:
         cat = f.read()
+    # v3: env v17 — wall tensors joined the pool payload
     key = hashlib.sha1(
-        f"{seg_len:g}_{ver}_v2_lead{lead_s:g}".encode() + cat
+        f"{seg_len:g}_{ver}_v3_lead{lead_s:g}".encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
     os.makedirs(cdir, exist_ok=True)
@@ -60,6 +61,23 @@ def _tuple_note(t):
                 free_pre=bool(t[8]), free_post=bool(t[9]))
 
 
+def _window_walls(wtups, lo, hi, base):
+    """Walls (as wall_tuples) clipped to the window [lo, hi) and rebased
+    to window start (env v17). A wall's time-span is [start, start +
+    length/speed]; spans intersecting the window are kept with the
+    outside portion CUT OFF — the same philosophy as dropping the k>0
+    lead notes (objects mid-flight at the cut don't materialize
+    mid-episode around the player)."""
+    out = []
+    for (t0, cx, cy, w, h, ln, sp) in wtups:
+        t1 = t0 + ln / sp
+        c0, c1 = max(t0, lo), min(t1, hi)
+        if c1 <= c0:
+            continue
+        out.append((c0 - base, cx, cy, w, h, (c1 - c0) * sp, sp))
+    return out
+
+
 def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
     import json
     import sys
@@ -69,13 +87,14 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
     # see byte-identical note streams for the same level
     ver = bs.parser_version()
     catalog = json.load(open(catalog_path, encoding="utf-8"))
-    segments, dropped_sparse, dropped_fat = [], 0, 0
+    segments, seg_walls, dropped_sparse, dropped_fat = [], [], 0, 0
     for i, entry in enumerate(catalog):
         payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
                                                        "scoresaber"),
                                    os.path.join(_BASE, "maps",
                                                 "chart_cache"), ver)
         tup = sorted(payload["tuples"], key=lambda t: t[0])
+        wtups = sorted(payload.get("walls", []), key=lambda t: t[0])
         if not tup:
             continue
         last = tup[-1][0]
@@ -92,13 +111,15 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
             base = k * seg_len
             segments.append([_tuple_note((t[0] - base,) + tuple(t[1:]))
                              for t in win])
+            seg_walls.append(_window_walls(wtups, lo, hi, base))
         if (i + 1) % 1000 == 0:
             log(f"[ranked-pool] {i + 1}/{len(catalog)} levels -> "
                 f"{len(segments)} segments", flush=True)
+    n_wall_segs = sum(1 for w in seg_walls if w)
     log(f"[ranked-pool] {len(segments)} segments of {seg_len:g}s "
-        f"(dropped {dropped_sparse} sparse, {dropped_fat} >"
-        f"{MAX_OBJECTS}-object)", flush=True)
-    return segments
+        f"({n_wall_segs} with walls; dropped {dropped_sparse} sparse, "
+        f"{dropped_fat} >{MAX_OBJECTS}-object)", flush=True)
+    return segments, seg_walls
 
 
 def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
@@ -120,8 +141,9 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     import bench_scoresaber as bs
     cpath = _cache_path(seg_len, bs.parser_version(), catalog, lead_s)
     if not os.path.exists(cpath):
-        from .cuda_env import _charts_to_tensors
-        segs = _build_segments(seg_len, catalog, log, lead_s=lead_s)
+        from .cuda_env import _charts_to_tensors, _walls_to_tensors
+        segs, seg_walls = _build_segments(seg_len, catalog, log,
+                                          lead_s=lead_s)
         # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
         # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
         # arrays + the f32 outputs simultaneously (~5.5 GB at 46k
@@ -130,16 +152,21 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
         # to the whole-pool call; each chunk's Notes are released as it
         # is consumed.
         cmax = max((len(s) for s in segs), default=1)
+        wmax = max((len(w) for w in seg_walls), default=1)
         parts = []
         chunk = 2048
         for lo in range(0, len(segs), chunk):
             ch = segs[lo:lo + chunk]
+            cw = seg_walls[lo:lo + chunk]
             segs[lo:lo + chunk] = [None] * len(ch)
-            parts.append(_charts_to_tensors(ch, "cpu", dtype, pad_to=cmax))
+            part = _charts_to_tensors(ch, "cpu", dtype, pad_to=cmax)
+            part.update(_walls_to_tensors(cw, "cpu", dtype, pad_to=wmax))
+            parts.append(part)
             del ch
         del segs
         if not parts:                    # empty catalog: (0, 1) pool
             parts = [_charts_to_tensors([], "cpu", dtype)]
+            parts[0].update(_walls_to_tensors([], "cpu", dtype))
         pool = {}
         for k in list(parts[0]):
             pool[k] = torch.cat([p[k] for p in parts])
@@ -158,12 +185,16 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     out = {}
     n_notes = data["n_notes"][idx] if idx is not None else data["n_notes"]
     cmax = max(1, int(n_notes.max()))
+    # wall tensors trim on THEIR own ragged dim (W), not the note C
+    n_walls = data["n_walls"][idx] if idx is not None else data["n_walls"]
+    wmax = max(1, int(n_walls.max()))
     for k in data.files:
         a = data[k]
         if idx is not None:
             a = a[idx]
-        if a.ndim >= 2 and a.shape[1] > cmax:
-            a = a[:, :cmax]
+        lim = wmax if k.startswith("wall_") else cmax
+        if a.ndim >= 2 and a.shape[1] > lim:
+            a = a[:, :lim]
         out[k] = torch.as_tensor(a, device=device)
     log(f"[ranked-pool] {out['hit'].shape[0]} segments on {device} "
         f"(C={out['hit'].shape[1]}, "

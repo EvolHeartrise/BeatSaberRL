@@ -56,11 +56,11 @@ def _q36(joints=None):
 def test_obs_length_and_reset_layout():
     sim = _sim([_note(5.0, 0.3, 1.4)])
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
-    assert obs.shape == (OBS_DIM,) == (362,)
+    assert obs.shape == (OBS_DIM,) == (426,)   # env v17: 16x18 entities
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 85,
-                                          95, 98, 100, 324)
+                                          95, 98, 100, 388)
     # root at reference: centered position zero, identity rotation 6D
     assert np.allclose(obs[OFF_ROOT_POS:OFF_ROOT_POS + 3], 0.0)
     assert np.allclose(obs[OFF_ROOT_ROT:OFF_ROOT_ROT + 6],
@@ -160,13 +160,21 @@ def test_note_block_and_mask_track_pending():
     obs, _ = env.reset()
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
+    # env v17: slots are DISTANCE-sorted (nearest first), not
+    # hit_time-sorted, so the soonest note is somewhere in the window
+    # (procedural charts have no walls to displace it) — find it by its
+    # x/z signature and pin the lane contents there.
     n = env.chart[0]
     from beat_arena_env.constants import note_center as nc
-    base = OFF_NOTES
-    assert obs[base + 13] == 1.0
-    assert obs[base + 0] == pytest.approx(nc(n)[0], abs=1e-6)
     z = min(n.hit_time * n.speed, 12.0)
-    assert obs[base + 2] == pytest.approx(z / 8.0)
+    hit_slots = [s for s in range(N_NOTE_SLOTS)
+                 if obs[OFF_NOTE_MASK + s] == 1.0
+                 and abs(obs[OFF_NOTES + s * NOTE_FEAT] - nc(n)[0]) < 1e-6
+                 and abs(obs[OFF_NOTES + s * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
+    assert hit_slots, "soonest note missing from the entity window"
+    base = OFF_NOTES + hit_slots[0] * NOTE_FEAT
+    assert obs[base + 13] == 1.0
+    assert obs[base + 14] == 0.0                    # not a wall
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
     assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
 

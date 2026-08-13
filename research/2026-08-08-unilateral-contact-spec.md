@@ -263,3 +263,64 @@ b. **Segment lead (`lead_s`).** ranked_pool's k>0 window head gap
    survival → consolidation consolidates survival; a shorter lead
    keeps note data in the mix. Probe value: 0.5.
 c. Scoring, obs, physics all untouched; OBS_DIM 362 unchanged.
+
+## 12. env v17 (2026-08-13): walls + distance-sorted entity window
+
+User-driven after reviewing v16 leaf replays. Two coupled changes:
+real-map obstacles enter the sim, and the note window becomes a
+shared distance-sorted entity window so walls and notes ride the
+same 16 slots (one transformer token stream, same self-attention).
+
+a. **Wall geometry (ScoreSaber watch parity).** Parsed from all
+   three schemas exactly as research/vendor/scoresaber-watch does:
+   v2 `_obstacles` (`_type` 0 → y=0,h=5 full wall; `_type` 1 →
+   y=2,h=3 crouch wall; ME `_type` ≥ 1000 skipped — ME/Noodle stay
+   out of scope exactly like notes), v3 `obstacles` {b,x,y,d,w,h},
+   v4 index-indirected obstacles+obstaclesData. Conversion
+   (WallManager.cs): y clamped (0..2 v2/v3, 0..4 v4), h capped at
+   5−y; world width = w·0.6 (LaneWidth), world height = h·0.6
+   (WallHScale); center x = −0.9 + x·0.6 + (width−0.6)/2, center
+   y = y·0.6 + height/2; |width|,|height| floored at 0.06
+   (MinWallSize); ClampPlayerHeight: bottom edge ≥ 0, top ≤ 3 m
+   (shrink + recenter); negative durations flipped; length =
+   duration_s · NJS, floored at 0.06 m. Front face runs 0.25 m
+   BEHIND the note plane (viewer front-face alignment quirk), so
+   the wall front reaches the head 0.4/NJS s after its nominal
+   time. Walls are head-anchored in z like notes (§10): dz_front =
+   (t_start − t)·speed + 0.4 is head-z-invariant; the wall spans
+   dz ∈ [dz_front, dz_front + length].
+b. **Head-in-wall penalty.** Head CENTER point vs wall AABB each
+   tick (no sweep): inside iff dz_front ≤ 0 ≤ dz_front + length and
+   |head_x − cx| ≤ width/2 and |head_y − cy| ≤ height/2. Each tick
+   inside ANY wall: reward += WALL_PEN = −0.05 (once per tick, not
+   per wall — overlapping walls are one hazard), event code 7,
+   `walls_in` episode counter. No termination, no combo/score
+   interaction, no saber/wall collision.
+c. **Distance-sorted shared entity window.** The 16 obs slots are
+   filled nearest-first by 3D distance from the head center, notes
+   and walls in one pool. Note distance: Δx = x − head_x, Δy = y −
+   head_y, dz = (hit − t)·speed + 0.65 (head-invariant; 0 exactly
+   at the §10b miss boundary = the head plane). Wall distance:
+   clamp-based nearest point on the AABB (per-axis separation,
+   x/y world, z via dz_front/length) — cheaper and tighter than
+   any corner. Entities BEHIND the head consume no slots: notes
+   with dz < 0 (⇔ t > t_miss, already judged), walls with
+   dz_front + length < 0. Note scan early-terminates via the
+   sorted chart: once (hit_i − t)·min_speed exceeds the current
+   16th-best distance no later note can qualify. Ties break by
+   chart index (stable) — the CUDA mirror transcribes the same
+   comparison order for §5 parity.
+d. **Token layout.** ENT_FEAT 14 → 18: the v9 note lanes verbatim
+   (x, y, z, vz, colorL, colorR, cosθ, sinθ, is_bomb,
+   is_chain_head, is_chain_link, free_pre, free_post, valid) then
+   [is_wall, width/X_NORM, height/Y_NORM, length/Z_SCALE]. Wall
+   tokens: x = center_x/X_NORM, y = (center_y − Y_CENTER)/Y_NORM,
+   z = front-face obs z ((t_start−t)·s − 0.25 + z_off)/Z_SCALE
+   (same frame as note z lanes), vz = −speed/Z_SCALE; color/dir/
+   kind/free lanes zero. OBS_DIM 362 → 426 (100 + 16·18 + 16 mask
+   + 4 ground + 18 body pts). NEW ERA: v16-and-earlier checkpoints
+   cannot resume or warm-start (input width changed).
+e. Sources: real BeatSaver maps only — the procedural generator
+   emits no walls (recorded for later). Replay JSONL header gains
+   a `walls` array (viewer renders translucent boxes on the
+   anchored track).

@@ -58,11 +58,12 @@ def _make_one(job):
     rank, n_top, entry, tag, label = job
     policy, dev = _W["policy"], _W["dev"]
     map_dir = f"maps/scoresaber/{entry['song_hash']}"
-    notes, _ = load_beatmap(map_dir, entry["difficulty"], first_note_s=2.0)
+    notes, meta = load_beatmap(map_dir, entry["difficulty"], first_note_s=2.0)
     base = (f"replays/{tag}_{label}{rank:02d}_"
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
-                      foot_contact=_W["fc"])
+                      foot_contact=_W["fc"],
+                      external_walls=meta["walls"])
     env.set_record(base + ".jsonl")
     obs, _ = env.reset()
     walk = scoresaber.ComboTracker()

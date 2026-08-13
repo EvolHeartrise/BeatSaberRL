@@ -88,7 +88,12 @@ constexpr int NUM_PAIRS = 55;
 constexpr int N_WELD = 12;
 constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 16;
-constexpr int NOTE_FEAT = 14;
+// env v17 (contact spec §12): shared entity window — notes AND walls
+// ride the 16 slots, nearest-first by head distance; per-token = the
+// v9 note lanes then [is_wall, width, height, length].
+constexpr int NOTE_FEAT = 18;
+constexpr double WALL_PEN = -0.05;      // per tick with head inside a wall
+constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // One WARP per block: the grid is N/32 blocks, so small batches spread
 // over all 20 SMs. Throughput is INSENSITIVE to the block size (P5
 // measurement, 128 vs 32: 216 vs 221 ms at N=1024) — consistent with
@@ -922,19 +927,19 @@ constexpr int OFF_HAND_R = 85;
 constexpr int OFF_HEAD = 95;
 constexpr int OFF_CONTACT = 98;
 constexpr int OFF_NOTES = 100;
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 324
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 388
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse /
 // GROUND_IMP_NORM. All-zero in weld mode, so lanes 0..340 are the v10
 // obs verbatim.
-constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 340
+constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 404
 constexpr int N_GROUND_IMP_LANES = 4;
 // env v13 (contact spec §8): [l_elbow, r_elbow, l_knee, r_knee,
 // l_foot, r_foot] world positions, head-style normalization.
-constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 344
+constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 408
 constexpr int N_BODY_PTS = 6;
-constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 362
-static_assert(OBS_DIM == 362, "contact spec §8: OBS_DIM must be 362");
+constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 426
+static_assert(OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426");
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
@@ -4302,6 +4307,19 @@ struct Sim {
   const int64_t* __restrict__ p_n_notes;
   const T *__restrict__ p_last_hit, *__restrict__ p_tail,
       *__restrict__ p_min_speed;
+  // env v17 wall pool (P, W), read-only, indexed by the SAME chart_idx
+  const T *__restrict__ p_wall_t, *__restrict__ p_wall_cx,
+      *__restrict__ p_wall_cy, *__restrict__ p_wall_w,
+      *__restrict__ p_wall_h, *__restrict__ p_wall_len,
+      *__restrict__ p_wall_speed;
+  const bool* __restrict__ p_wall_valid;
+  const int64_t* __restrict__ p_n_walls;
+  // env v17 per-env wall state: passed latches (E, W), passed-prefix
+  // cursor, and the head-in-wall tick counter the wrapper reports
+  bool* __restrict__ wall_passed;
+  int* __restrict__ first_wall;
+  int* __restrict__ walls_in;
+  int W;  // wall pool second dim
   // io
   const int64_t *__restrict__ actions, *__restrict__ cand;
   T* __restrict__ ret_buf;
@@ -4401,6 +4419,10 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.score_acc[e] = T(0);
   P.score_post[e] = T(0);
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
+  // env v17 wall state
+  P.first_wall[e] = 0;
+  P.walls_in[e] = 0;
+  for (int i = 0; i < P.W; i++) P.wall_passed[e * P.W + i] = false;
 }
 
 // Observation writer (lib.rs write_obs, SPEC-v10 §5) — from the CURRENT
@@ -4512,37 +4534,104 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   obs[OFF_HEAD + 2] = (float)((P.head[e * 3 + 2] - T(PLANE_Z0)) / T(X_NORM));
   obs[OFF_CONTACT] = P.contact_arm[e * 2] ? 1.f : 0.f;
   obs[OFF_CONTACT + 1] = P.contact_arm[e * 2 + 1] ? 1.f : 0.f;
-  // note block — v9 NOTE_FEAT verbatim
+  // entity window (env v17, spec §12c/d) — lib.rs write_obs verbatim:
+  // 16 SHARED slots, notes + walls, nearest-first by 3D head distance;
+  // behind-the-head entities excluded; ties keep the first-scanned
+  // entity (strict-< displacement), scan = notes in chart order then
+  // walls (§5 parity: identical comparison order).
   const int64_t cc = P.chart_idx[e];
   const int C = P.C;
   const int nn = (int)P.p_n_notes[cc];
   const T time_o = T(P.tick[e]) * T(DT);
-  // v15 head-anchored note track (contact spec §10)
+  // v15 head-anchored track (contact spec §10)
   const T z_off = P.head[e * 3 + 2] - T(PLANE_Z0);
-  int slot = 0;
-  for (int i = P.first_pending[e]; i < nn && slot < N_NOTE_SLOTS; i++) {
+  const T hx = P.head[e * 3], hy = P.head[e * 3 + 1];
+  T sel_d[N_NOTE_SLOTS];
+  bool sel_wall[N_NOTE_SLOTS];
+  int sel_idx[N_NOTE_SLOTS];
+  int n_sel = 0;
+  auto insert = [&](T d2, bool is_wall, int idx) {
+    if (n_sel == N_NOTE_SLOTS && d2 >= sel_d[N_NOTE_SLOTS - 1]) return;
+    int i = n_sel < N_NOTE_SLOTS - 1 ? n_sel : N_NOTE_SLOTS - 1;
+    for (; i > 0 && d2 < sel_d[i - 1]; i--) {
+      sel_d[i] = sel_d[i - 1];
+      sel_wall[i] = sel_wall[i - 1];
+      sel_idx[i] = sel_idx[i - 1];
+    }
+    sel_d[i] = d2;
+    sel_wall[i] = is_wall;
+    sel_idx[i] = idx;
+    if (n_sel < N_NOTE_SLOTS) n_sel++;
+  };
+  const T msp = P.p_min_speed[cc];
+  for (int i = P.first_pending[e]; i < nn; i++) {
     const int64_t cb = cc * C + i;
     if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
+    // sorted-chart early exit (lib.rs): the z lower bound alone beats
+    // the worst kept distance for this and every later note
+    const T dz_lb = (P.p_hit[cb] - time_o) * msp - T(PLANE_Z0);
+    if (n_sel == N_NOTE_SLOTS && dz_lb > T(0)
+        && dz_lb * dz_lb >= sel_d[N_NOTE_SLOTS - 1])
+      break;
+    const T dz = (P.p_hit[cb] - time_o) * P.p_speed[cb] - T(PLANE_Z0);
+    if (dz < T(0)) continue;  // behind the head (past the miss boundary)
+    const T dx = P.p_center[cb * 2] - hx;
+    const T dy = P.p_center[cb * 2 + 1] - hy;
+    insert(dx * dx + dy * dy + dz * dz, false, i);
+  }
+  const int nw = (int)P.p_n_walls[cc];
+  for (int wi = P.first_wall[e]; wi < nw; wi++) {
+    const int64_t wb = cc * P.W + wi;
+    if (!P.p_wall_valid[wb] || P.wall_passed[e * P.W + wi]) continue;
+    const T dzf = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
+        - T(PLANE_Z0) - T(WALL_FRONT_OFF);
+    const T len = P.p_wall_len[wb];
+    if (dzf + len < T(0)) continue;  // back face behind the head
+    const T sx = tmax(fabs(hx - P.p_wall_cx[wb]) - P.p_wall_w[wb] * T(0.5), T(0));
+    const T sy = tmax(fabs(hy - P.p_wall_cy[wb]) - P.p_wall_h[wb] * T(0.5), T(0));
+    const T sz = tmax(tmax(dzf, -(dzf + len)), T(0));
+    insert(sx * sx + sy * sy + sz * sz, true, wi);
+  }
+  for (int slot = 0; slot < n_sel; slot++) {
     float* nb2 = obs + OFF_NOTES + slot * NOTE_FEAT;
-    const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
-                       T(Z_CLIP_LO), T(Z_CLIP_HI));
-    const bool bomb = P.p_is_bomb[cb];
-    nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
-    nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
-    nb2[2] = (float)(z / T(Z_SCALE));
-    nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
-    nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
-    nb2[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
-    nb2[6] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2] : 0.f;
-    nb2[7] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2 + 1] : 0.f;
-    nb2[8] = bomb ? 1.f : 0.f;
-    nb2[9] = P.p_is_head[cb] ? 1.f : 0.f;
-    nb2[10] = P.p_is_link[cb] ? 1.f : 0.f;
-    nb2[11] = P.p_free_pre[cb] ? 1.f : 0.f;
-    nb2[12] = P.p_free_post[cb] ? 1.f : 0.f;
-    nb2[13] = 1.f;
+    if (sel_wall[slot]) {
+      const int64_t wb = cc * P.W + sel_idx[slot];
+      const T zf = tclamp(
+          (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
+              - T(WALL_FRONT_OFF) + z_off,
+          T(Z_CLIP_LO), T(Z_CLIP_HI));
+      nb2[0] = (float)(P.p_wall_cx[wb] / T(X_NORM));
+      nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
+      nb2[2] = (float)(zf / T(Z_SCALE));
+      nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
+      // lanes 4..13 (color/dir/kind/free) stay zero
+      nb2[13] = 1.f;  // valid
+      nb2[14] = 1.f;  // is_wall
+      nb2[15] = (float)(P.p_wall_w[wb] / T(X_NORM));
+      nb2[16] = (float)(P.p_wall_h[wb] / T(Y_NORM));
+      nb2[17] = (float)(P.p_wall_len[wb] / T(Z_SCALE));
+    } else {
+      const int64_t cb = cc * C + sel_idx[slot];
+      const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
+                         T(Z_CLIP_LO), T(Z_CLIP_HI));
+      const bool bomb = P.p_is_bomb[cb];
+      nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
+      nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
+      nb2[2] = (float)(z / T(Z_SCALE));
+      nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
+      nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
+      nb2[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
+      nb2[6] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2] : 0.f;
+      nb2[7] = P.p_show_dir[cb] ? (float)P.p_dvec[cb * 2 + 1] : 0.f;
+      nb2[8] = bomb ? 1.f : 0.f;
+      nb2[9] = P.p_is_head[cb] ? 1.f : 0.f;
+      nb2[10] = P.p_is_link[cb] ? 1.f : 0.f;
+      nb2[11] = P.p_free_pre[cb] ? 1.f : 0.f;
+      nb2[12] = P.p_free_post[cb] ? 1.f : 0.f;
+      nb2[13] = 1.f;
+      // lanes 14..17 (is_wall, w/h/l) stay zero
+    }
     obs[OFF_NOTE_MASK + slot] = 1.f;
-    slot++;
   }
 
   // contact spec §7: per-foot ground-contact lanes [L_heel, L_toe,
@@ -4917,6 +5006,37 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
   }
 
+  // env v17 walls (spec §12b) — lib.rs step_inner verbatim, same
+  // reward summation position (after all judgment terms). Head center
+  // vs AABB; one WALL_PEN per tick regardless of overlapping walls.
+  {
+    const int nw = (int)P.p_n_walls[c0];
+    const T hx2 = P.head[e * 3], hy2 = P.head[e * 3 + 1];
+    bool in_wall = false;
+    for (int wi = P.first_wall[e]; wi < nw; wi++) {
+      const int64_t wb = c0 * P.W + wi;
+      if (!P.p_wall_valid[wb] || P.wall_passed[e * P.W + wi]) continue;
+      const T dzf = (P.p_wall_t[wb] - time_new) * P.p_wall_speed[wb]
+          - T(PLANE_Z0) - T(WALL_FRONT_OFF);
+      const T len = P.p_wall_len[wb];
+      if (dzf + len < T(0)) {
+        P.wall_passed[e * P.W + wi] = true;  // back face behind the head
+        continue;
+      }
+      if (dzf <= T(0)
+          && fabs(hx2 - P.p_wall_cx[wb]) <= P.p_wall_w[wb] * T(0.5)
+          && fabs(hy2 - P.p_wall_cy[wb]) <= P.p_wall_h[wb] * T(0.5))
+        in_wall = true;
+    }
+    if (in_wall) {
+      reward += T(WALL_PEN);
+      P.walls_in[e] += 1;
+    }
+    int fw = P.first_wall[e];
+    while (fw < nw && P.wall_passed[e * P.W + fw]) fw++;
+    P.first_wall[e] = fw;
+  }
+
   const int tick_new = P.tick[e] + 1;
   P.tick[e] = tick_new;
   // advance the low-water cursor
@@ -5059,6 +5179,9 @@ enum {
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
+  // env v17 wall pool (P, W) + per-env wall state
+  PWALLT, PWALLCX, PWALLCY, PWALLW, PWALLH, PWALLLEN, PWALLSP,
+  PWALLVALID, PNWALLS, TWALLPASS, TFIRSTW, TWALLSIN,
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
@@ -5135,6 +5258,19 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.p_last_hit = ts[PLASTHIT].data_ptr<scalar_t>();
     P.p_tail = ts[PTAIL].data_ptr<scalar_t>();
     P.p_min_speed = ts[PMINSP].data_ptr<scalar_t>();
+    P.p_wall_t = ts[PWALLT].data_ptr<scalar_t>();
+    P.p_wall_cx = ts[PWALLCX].data_ptr<scalar_t>();
+    P.p_wall_cy = ts[PWALLCY].data_ptr<scalar_t>();
+    P.p_wall_w = ts[PWALLW].data_ptr<scalar_t>();
+    P.p_wall_h = ts[PWALLH].data_ptr<scalar_t>();
+    P.p_wall_len = ts[PWALLLEN].data_ptr<scalar_t>();
+    P.p_wall_speed = ts[PWALLSP].data_ptr<scalar_t>();
+    P.p_wall_valid = ts[PWALLVALID].data_ptr<bool>();
+    P.p_n_walls = ts[PNWALLS].data_ptr<int64_t>();
+    P.wall_passed = ts[TWALLPASS].data_ptr<bool>();
+    P.first_wall = ts[TFIRSTW].data_ptr<int>();
+    P.walls_in = ts[TWALLSIN].data_ptr<int>();
+    P.W = (int)ts[TWALLPASS].size(1);
     P.actions = actions.data_ptr<int64_t>();
     P.cand = cand.data_ptr<int64_t>();
     P.ret_buf = ts[RBUF].data_ptr<scalar_t>();

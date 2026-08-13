@@ -77,6 +77,27 @@ class Note:
     # snap), but external tools (ScoreSaber replay export) need the int
 
 
+@dataclass(frozen=True)
+class Wall:
+    """env v17 obstacle (unilateral-contact spec §12): world-space AABB
+    riding the head-anchored track. Geometry is FINISHED here — the
+    parser applies the full ScoreSaber-watch conversion (0.6 scales,
+    clamps, min sizes, the 0.25 m front-face offset lives in the SIM,
+    not in these fields) so the sim just moves a box."""
+    start_time: float   # nominal time (s): front face crosses the note plane
+    cx: float           # box center x (m, world)
+    cy: float           # box center y (m, world)
+    width: float        # full x extent (m)
+    height: float       # full y extent (m)
+    length: float       # full z extent (m) = duration_s * NJS
+    speed: float        # approach speed toward the plane (m/s) = NJS
+
+
+def wall_tuple(w: Wall):
+    """The (t, cx, cy, width, height, length, speed) tuple the sims eat."""
+    return (w.start_time, w.cx, w.cy, w.width, w.height, w.length, w.speed)
+
+
 @dataclass
 class ChartConfig:
     chart_len_s: float = 20.0

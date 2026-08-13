@@ -15,7 +15,7 @@
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
     MISS_COL, REACH_Z, SABER_COLORS, Z_FAR, Z_MISS, activeArcs, activePosts,
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, noteCenter,
-    noteFrame, noteLam, noteRot, pendingNotes,
+    noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
   } from "./replay.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -29,6 +29,7 @@
   const after = $derived(aftermaths(pb.rep, time));
   const posts = $derived(activePosts(pb.rep, time));
   const arcs = $derived(activeArcs(pb.rep, time, zOff));
+  const walls = $derived(pendingWalls(pb.rep, time, zOff));
 
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
   const headGeo = new THREE.BoxGeometry(BLOCK, BLOCK * HEAD_SQUASH, BLOCK);
@@ -39,6 +40,10 @@
   const linkEdgesGeo = new THREE.EdgesGeometry(linkGeo);
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
+  // env v17 walls: one unit cube scaled per wall (w, h, l vary per wall)
+  const wallGeo = new THREE.BoxGeometry(1, 1, 1);
+  const wallEdgesGeo = new THREE.EdgesGeometry(wallGeo);
+  const WALL_COL = "#ff2f2f"; // classic BS translucent red
 
   // real hitboxes ('h' overlay): good box shifted toward the player; the
   // small box is all the wrong-color saber can trigger. Env v7.4 rolls
@@ -151,6 +156,37 @@
              len: dir.length() };
   }
 </script>
+
+<!-- env v17 walls (spec §12a): translucent red AABBs riding the SAME
+     head-anchored track as the notes (zOff already applied by
+     pendingWalls). World box x: cx ± w/2, y: cy ± h/2, z: zFront ..
+     zFront + l (away from the player), so the scene-space center is
+     -(zFront + l/2). Fade into the tunnel uses the chart-time front z,
+     like the notes' zBase. -->
+{#each walls as { w, zFront, zFrontBase } (w)}
+  {@const alpha = fade(zFrontBase)}
+  <T.Group
+    position={[w.cx, w.cy, -(zFront + w.l / 2)]}
+    scale={[w.w, w.h, w.l]}
+  >
+    <T.Mesh geometry={wallGeo}>
+      <T.MeshBasicMaterial
+        color={WALL_COL}
+        transparent
+        opacity={0.25 * alpha}
+        depthWrite={false}
+      />
+    </T.Mesh>
+    <T.LineSegments geometry={wallEdgesGeo}>
+      <T.LineBasicMaterial
+        color={WALL_COL}
+        transparent
+        opacity={0.6 * alpha}
+        depthWrite={false}
+      />
+    </T.LineSegments>
+  </T.Group>
+{/each}
 
 <!-- arc grants: subtle glowing tube head -> tail (a scoring hint) -->
 {#each arcs as a (a.k)}
