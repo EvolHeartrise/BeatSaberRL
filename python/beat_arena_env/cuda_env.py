@@ -354,7 +354,10 @@ class CudaBeatVecEnv:
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
-                 fall_gamma=1.0):
+                 fall_gamma=1.0, walls=None):
+        # walls (env v17, charts= test mode only): list[list[wall_tuple]]
+        # aligned with `charts` — chart i plays with walls[i]. Ranked
+        # pools carry their wall tensors themselves.
         self.num_envs = num_envs
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -414,6 +417,10 @@ class CudaBeatVecEnv:
                       flush=True)
         else:
             self.pool = _charts_to_tensors(charts, self.device, dtype)
+            if walls is not None:
+                assert len(walls) == len(charts)
+                self.pool.update(
+                    _walls_to_tensors(walls, self.device, dtype))
         self.pool_size, self.C = self.pool["hit"].shape
         # env v17: pools without wall tensors (procedural generator,
         # charts= test mode, pre-v17 caches) get an all-empty (P, 1)

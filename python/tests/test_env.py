@@ -158,8 +158,8 @@ def test_obs_reset_hands_and_notes():
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (362,)
-    assert OFF_NOTES == 100 and OFF_NOTE_MASK == 324
+    assert obs.shape == (OBS_DIM,) == (426,)   # env v17
+    assert OFF_NOTES == 100 and OFF_NOTE_MASK == 388   # env v17
     # hand blocks at reset: arms straight forward, wrists at
     # (+-0.2, 1.47, 0.0), blades +z, meters zero
     for base, x in ((OFF_HAND_L, -0.2), (OFF_HAND_R, 0.2)):
@@ -171,18 +171,25 @@ def test_obs_reset_hands_and_notes():
         assert obs[base + 9] == 0.0                         # swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
+    # env v17: slots are DISTANCE-sorted (nearest to the head first),
+    # so chart[0] (the SOONEST note) sits wherever its distance ranks —
+    # find it by its x/z signature, then pin the lane semantics there
     n = env.chart[0]
-    base = OFF_NOTES
     from beat_arena_env.constants import note_center as nc
-    assert obs[base + 13] == 1.0                            # valid
-    assert obs[base + 0] == pytest.approx(nc(n)[0], abs=1e-6)
-    assert obs[base + 1] == pytest.approx((nc(n)[1] - 1.40) / 0.75, abs=1e-6)
     z = min(n.hit_time * n.speed, 12.0)
-    assert obs[base + 2] == pytest.approx(z / 8.0)
+    hits = [s2 for s2 in range(N_NOTE_SLOTS)
+            if obs[OFF_NOTE_MASK + s2] == 1.0
+            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT] - nc(n)[0]) < 1e-6
+            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
+    assert hits, "soonest note missing from the entity window"
+    base = OFF_NOTES + hits[0] * NOTE_FEAT
+    assert obs[base + 13] == 1.0                            # valid
+    assert obs[base + 1] == pytest.approx((nc(n)[1] - 1.40) / 0.75, abs=1e-6)
     assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
     assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
     assert not obs[base + 8:base + 13].any()                # kind/arc flags
+    assert not obs[base + 14:base + 18].any()               # wall lanes
     for slot in range(n_pending, N_NOTE_SLOTS):
         assert not obs[OFF_NOTES + slot * NOTE_FEAT:
                        OFF_NOTES + (slot + 1) * NOTE_FEAT].any()
