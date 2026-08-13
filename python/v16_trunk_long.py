@@ -55,8 +55,14 @@ def bench(ck, out):
 
 
 def main():
-    trunk_ck = os.path.join(RUN_DIR, "trunk_final.pt")
+    # Resume from the highest NUMBERED checkpoint: trunk_final.pt is only
+    # written on clean completion, so after a pod death it is stale — the
+    # numbered ckpts (every 500) are the real frontier.
+    import glob
+    numbered = sorted(glob.glob(os.path.join(RUN_DIR, "trunk_upd*.pt")))
+    trunk_ck = numbered[-1] if numbered else os.path.join(RUN_DIR, "trunk_final.pt")
     assert os.path.exists(trunk_ck), f"{trunk_ck} missing"
+    print(f"[trunk-ext] resuming from {trunk_ck}", flush=True)
     cmd = [PY, "train_batch.py", *COMMON,
            "--resume", trunk_ck,
            "--total-steps", str(TRUNK_TOTAL * BATCH),
@@ -64,7 +70,7 @@ def main():
            "--run-dir", RUN_DIR]
     print(f"[trunk-ext] v16 trunk -> {TRUNK_TOTAL:,} updates", flush=True)
     t0 = time.time()
-    with open(os.path.join(RUN_DIR, "trunk_ext.log"), "w",
+    with open(os.path.join(RUN_DIR, "trunk_ext.log"), "a",
               encoding="utf-8") as log:
         try:
             r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
@@ -80,8 +86,10 @@ def main():
         return
     print(f"[trunk-ext] done in {wall/60:.1f} min", flush=True)
 
-    res = bench(trunk_ck, os.path.join("bench", "v16_trunk24k_raw.json"))
-    table = {"trunk_raw_24k": res} if res else {}
+    final_ck = os.path.join(RUN_DIR, "trunk_final.pt")
+    res = bench(final_ck,
+                os.path.join("bench", f"v16_trunk{TRUNK_TOTAL // 1000}k_raw.json"))
+    table = {f"trunk_raw_{TRUNK_TOTAL // 1000}k": res} if res else {}
     table["baseline_1h_leaf"] = {"upp": 69658.43, "wpp": 3105.6}
     print("DONE " + json.dumps(table), flush=True)
 
