@@ -93,21 +93,6 @@ class _GraphedArgmax(_Graphed):
         return self._run()
 
 
-class _FusedArgmax:
-    """Bench forward via the fused single-launch CUDA kernel
-    (policy_cuda.FusedNotePolicy): logits + stacked argmax in ONE launch,
-    no graph capture needed. Same call contract as _GraphedArgmax."""
-
-    def __init__(self, policy, n, device):
-        from policy_cuda import FusedNotePolicy
-        self.fused = FusedNotePolicy(policy, device)
-        self.s_obs = torch.zeros(n, OBS_DIM, device=device)
-
-    def __call__(self, obs_t):
-        copy_static(self.s_obs, obs_t, non_blocking=True)
-        return self.fused.argmax(self.s_obs)
-
-
 class _Group:
     """One pipeline group: its own sim, forward, pinned obs/act buffers,
     slot bookkeeping, and a CUDA event fencing its in-flight GPU chain
@@ -161,14 +146,9 @@ def parse_args():
     p.add_argument("--timing", action="store_true",
                    help="print a per-phase wall-clock decomposition of the "
                         "eval loop (feed/issue/sync/step/finish) at the end")
-    p.add_argument("--pipeline", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="two-group software pipeline: while one half's "
-                        "forward+D2H is in flight on the GPU, the CPU runs "
-                        "the other half's Rust sim (2026-07-27). Engages "
-                        "only on the fused path — its per-sample kernel is "
-                        "batch-size-invariant (verified bitwise), so two "
-                        "groups of N/2 score identically to one batch of N")
+    # (--pipeline was retired 2026-08-13 with the fused per-sample
+    # forward: the two-group split needed its batch invariance; cuBLAS
+    # forwards are width-sensitive, so the bench runs one group now)
     p.add_argument("--foot-contact", action="store_true",
                    help="env v11 unilateral foot contact — MUST match the "
                         "checkpoint's training physics (a contact-trained "
@@ -192,14 +172,6 @@ def parse_args():
     p.add_argument("--refresh-catalog", action="store_true")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
-    p.add_argument("--fused-forward", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="use the fused single-kernel CUDA forward "
-                        "(policy_cuda, JIT-built) for the argmax rollout; "
-                        "falls back to the graphed/eager path if the kernel "
-                        "is unavailable (2026-07-27: default ON — it is both "
-                        "the fast path and the batch-size-invariant one)")
-    return p.parse_args()
 
 
 def model_hash(state_dict) -> str:
@@ -529,15 +501,6 @@ def main():
     # yes. rust/src/lib.rs now latches `finished` and early-outs, so an
     # idle slot costs exactly one tick per recycle.
     N = args.num_envs
-    if args.fused_forward:
-        # adaptive width (2026-07-27): wide N amortizes the per-step sync
-        # drain (full catalog 81.6s@512 -> 74.1s@1024) and is score-free on
-        # the fused path — the kernel is per-sample with no cross-sample
-        # reduction, VERIFIED bitwise N=512 vs N=1024 over all 6101 levels.
-        # Banded runs cap at ~tasks/3 so slots still refill a few times.
-        # (Torch paths keep the fixed width: cuBLAS retiles with N, so an
-        # adaptive width could flip near-ties between resumes there.)
-        N = max(1, min(N, -(-len(tasks) // 3)))
     # Two-group pipeline (2026-07-27): with a single group the loop is a
     # strict serial chain — GPU idles during the Rust sim, CPU idles
     # during the forward. Two half-size groups alternate: while group A's
@@ -545,40 +508,23 @@ def main():
     # syncs B's event and runs B's sim + bookkeeping. Fused path only:
     # the kernel's per-sample batch invariance (verified bitwise 512 vs
     # 1024) is what makes N/2 groups score-identical; cuBLAS is not.
-    use_fused = False
-    if args.fused_forward and device.type == "cuda":
-        try:                             # JIT build/arch may fail: fall back
-            _FusedArgmax(policy, 1, device)   # availability probe
-            use_fused = True
-            print("[fused-forward] single-launch CUDA forward active",
-                  flush=True)
-        except Exception as e:
-            print(f"[fused-forward] unavailable, falling back: {e}",
-                  flush=True)
-    pipelined = args.pipeline and use_fused and N >= 2
-    if pipelined:
-        n_a = (N + 1) // 2
-        sizes = [n_a, N - n_a]
-        print(f"[pipeline] two groups of {sizes[0]}/{sizes[1]} envs",
-              flush=True)
-    else:
-        sizes = [N]
+    # (the fused per-sample forward and its two-group pipeline were
+    # retired 2026-08-13 with the 138k arch; the graphed torch forward
+    # is the only CUDA path now — batch width is score-relevant on it,
+    # so N stays exactly --num-envs)
+    sizes = [N]
     groups = []
     for n_g in sizes:
-        if use_fused:
-            fwd_g = _FusedArgmax(policy, n_g, device)
-        else:
-            fwd_g = (None if args.no_graphs or device.type != "cuda"
-                     else _GraphedArgmax(policy, n_g, device))
+        fwd_g = (None if args.no_graphs or device.type != "cuda"
+                 else _GraphedArgmax(policy, n_g, device))
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
                              foot_contact=args.foot_contact))
     fwd = groups[0].fwd                  # for the provenance stamp below
-    # Forward-path provenance (2026-07-27): fused vs torch forwards differ
-    # by ~4e-7 in the logits, enough to flip near-tie argmaxes — per-level
-    # results are only comparable within one path. Same weights + different
-    # path must therefore NOT silently merge into one file.
-    fwd_path = ("fused" if isinstance(fwd, _FusedArgmax) else
-                "graphed" if isinstance(fwd, _GraphedArgmax) else "eager")
+    # Forward-path provenance (2026-07-27): different forward paths
+    # differ by ~4e-7 in the logits, enough to flip near-tie argmaxes —
+    # per-level results are only comparable within one path. Same
+    # weights + different path must therefore NOT silently merge.
+    fwd_path = ("graphed" if isinstance(fwd, _GraphedArgmax) else "eager")
     prev_path = data.get("forward")
     if prev_path is not None and prev_path != fwd_path:
         sys.exit(f"error: {out_path} holds {prev_path!r}-forward results but "
