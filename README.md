@@ -170,7 +170,13 @@ page; the viewer fetches the map from BeatSaver by the embedded hash).
 Format reverse-engineered from the viewer's own source — vendored
 snapshot + annotated format notes in
 `research/vendor/scoresaber-watch/` (full clone: `D:\Git\scoresaber-watch`).
-Pose frames come from the recorded joint state via the FK mirror; the
+Pose frames come from the recorded joint state via the FK mirror —
+including the HEAD pose (position + rotation), which the viewer uses
+for real: first person is its default camera and its note-arrival
+plane sits at `head.z + 0.65`, so the exported head both aims the
+camera and reproduces env v15's head-anchored note track. Recordings
+older than record_rev 2 have no head rotation and still convert, to
+the old fixed forward-facing placeholder. The
 final score reproduces the ScoreSaber bench's multiplied score exactly
 (per-note totals exact; the pre/acc split of a cut is reconstructed
 assuming full pre-swing, so per-component popups can differ on

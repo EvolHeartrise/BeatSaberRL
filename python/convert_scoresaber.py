@@ -21,10 +21,32 @@ repo (mirrored at projects/beat-arena/research/vendor/scoresaber-watch):
 
 Fidelity notes:
 - Pose frames are exact: replay v10 `sabers` carries the FK wrist
-  position + unit blade direction per hand directly, 30 fps. The head
-  pose frame stays the REFERENCE head (the v10 body's live head is in
-  the replay's full q — exporting it awaits the P6 full-body FK mirror;
-  the viewer only uses the head frame cosmetically).
+  position + unit blade direction per hand directly, 30 fps, and
+  (record_rev 2) `head` carries the FK head frame's world position +
+  rotation. Both go out unmapped except for the player-space z shift
+  below: the env's world axes ARE the viewer's (x right, y up, z
+  forward down the note track), and both write the same local-+z-is-
+  forward convention — the blade is the hand frame's +z column, the
+  gaze is the head frame's +z column, and Unity aims a camera along
+  its transform's +z. So the head's world rotation matrix converts
+  straight to a Unity quaternion (rust `fk::rot_to_quat`, wxyz →
+  written xyzw) with no axis remap and no handedness flip.
+- The head frame is LOAD-BEARING in the viewer, not cosmetic:
+  * first person is the DEFAULT camera today (SettingsManager
+    migrates "firstpersonreplay" false → true) and
+    CameraUpdater.UpdateFirstPersonCamera sets the camera transform
+    to PlayerPositionManager.HeadPosition/HeadRotation outright;
+  * ObjectManager.CutPlanePos = HeadPosition.z + PlayerCutPlaneDistance
+    — the note-arrival plane FOLLOWS the recorded head. Writing a
+    frozen head (what we did before record_rev 2) therefore froze the
+    viewer's note track while the sim's own track moved: env v15 puts
+    every note at world z + (head_z − PLANE_Z0) with PLANE_Z0 = −0.65,
+    i.e. arrival at head_z + 0.65, which is exactly the viewer's rule
+    once the head is real. Head y/x do not move notes (the viewer, like
+    the sim, anchors z only).
+  Per-frame rotations are hemisphere-aligned to their predecessor
+  (q and −q are one rotation, but PlayerPositionManager lerps raw
+  quaternions between frames, so a sign flip would spin the camera).
 - Coordinates are the game's PLAYER SPACE: player at z = 0, notes
   arriving at z = +0.65 (the viewer's PlayerCutPlaneDistance — it
   parents all replay poses under a rig 0.65 m behind the world origin
@@ -71,7 +93,8 @@ MAGIC = (b"ScoreSaber Replay " + "\U0001F44C\U0001F920".encode() + b"\r\n")
 assert len(MAGIC) == 28
 
 DIFF_RAW = {"Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9}
-HEAD_POS = (0.0, 1.70, -0.65)          # env v7 look-at anchor
+HEAD_POS = (0.0, 1.70, -0.65)          # env v7 anchor = v10 neutral head
+HEAD_QUAT = (0.0, 0.0, 0.0, 1.0)       # Unity xyzw identity: gaze at +z
 PLAYER_HEIGHT = 1.80                   # env body height (NOT the head y)
 
 # env world -> replay player space: the file wants the player at z = 0
@@ -135,6 +158,38 @@ def w_str(b, s):
 
 def w_vec3(b, v):
     return b + struct.pack("<3f", *v)
+
+
+def head_frame(tick):
+    """A tick's head pose as (env-world position, Unity xyzw quaternion).
+
+    Source: replay `head` = [px, py, pz, qw, qx, qy, qz] — the FK head
+    frame's world origin and world-from-body rotation, scalar-first
+    (rust `RawBeatSim::head_pose`, record_rev 2). Two conversions:
+
+    * wxyz -> xyzw, because ScoreSaberUtils.ReadPositionData reads a
+      pose as 3 floats of position then Quaternion(x, y, z, w) — the
+      Unity ctor's component order, NOT scalar-first (see the vendored
+      Loading/Replays/ScoreSaber/Utils/ScoreSaberUtils.cs);
+    * renormalize, because the recorder rounds components to 1e-6 and
+      the viewer feeds the quaternion to Quaternion.Lerp and then
+      straight into a camera transform.
+
+    No axis mapping: env world axes == viewer axes (only the z origin
+    differs, applied by `player_space`).
+
+    BACKWARD COMPATIBILITY: recordings written before record_rev 2 have
+    no `head` field. They fall back to the historic placeholder — the
+    neutral head anchor, facing down the note track — which is what
+    those files used to produce, so re-converting an old replay is a
+    no-op rather than an error.
+    """
+    h = tick.get("head")
+    if h is None:
+        return HEAD_POS, HEAD_QUAT
+    pos, (qw, qx, qy, qz) = tuple(h[0:3]), h[3:7]
+    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) or 1.0
+    return pos, (qx / n, qy / n, qz / n, qw / n)
 
 
 def quat_from_forward(d):
@@ -213,30 +268,44 @@ def metadata_block(song_hash, difficulty):
 
 
 def pose_block(ticks, offset):
+    """Head + both hands per tick, in the game's player space.
+
+    Frame layout (their ScoreSaberDecoder.ReadFrames): head, leftHand,
+    rightHand — each 3 floats position + 4 floats quaternion (xyzw) —
+    then int fps and float time.
+    """
     frames = []
-    prev_tips = [None, None]
+    prev_head_q = None
     for line in ticks:
         t = line["time"] + offset
+        head_pos, head_q = head_frame(line)
+        if prev_head_q is not None and sum(
+                u * v for u, v in zip(head_q, prev_head_q)) < 0.0:
+            # hemisphere continuity: PlayerPositionManager.UpdateBeat
+            # lerps consecutive head quaternions and CameraUpdater
+            # feeds the result to the first-person camera, so a sign
+            # flip between frames would swing the view the long way
+            # round for one frame interval
+            head_q = tuple(-c for c in head_q)
+        prev_head_q = head_q
         hands = []
         for hand in (0, 1):
             # replay v10 sabers: [wx, wy, wz, bx, by, bz] per hand
             s = line["sabers"][hand]
             wrist, blade = s[0:3], s[3:6]
-            tip = tuple(wrist[i] + blade[i] for i in range(3))
             hands.append((tuple(wrist), quat_from_forward(blade)))
-            prev_tips[hand] = tip
-        frames.append((t, hands))
+        frames.append((t, head_pos, head_q, hands))
     b = bytearray()
     b = w_int(b, len(frames))
     eps = 1e-4
     last_t = None
-    for t, hands in frames:
+    for t, head_pos, head_q, hands in frames:
         t = max(t, eps)                            # reader drops time==0
         if last_t is not None and t <= last_t:     # and duplicate times
             t = last_t + eps
         last_t = t
-        b = w_vec3(b, player_space(HEAD_POS))
-        b += struct.pack("<4f", 0.0, 0.0, 0.0, 1.0)
+        b = w_vec3(b, player_space(head_pos))
+        b += struct.pack("<4f", *head_q)
         for pos, quat in hands:
             b = w_vec3(b, player_space(pos))
             b += struct.pack("<4f", *quat)
@@ -324,18 +393,25 @@ def build_events(ticks, real_notes, offset):
         # Change-only keyframes, mirroring the game's recorder (real
         # replays emit combo/multiplier/energy events only when the value
         # changes — e.g. the multiplier stream goes silent at a held 8x,
-        # the energy stream once capped at 1.0).
+        # the energy stream once capped at 1.0). env v17 walls: i is
+        # None (walls have no note); "wall" is the per-tick obstacle
+        # drain at the base game's 1.3/s (GameEnergyCounter
+        # obstacleEnergyDrainPerSecond / 30 Hz), "wall_enter" is the
+        # combo break itself (no energy cost of its own).
         if not combo_tl or combo_tl[-1][0] != walk.combo:
             combo_tl.append((walk.combo, t))
         mult_state = (walk.multiplier, walk.progress_fraction)
         if not mult_tl or mult_tl[-1][:2] != mult_state:
             mult_tl.append((*mult_state, t))
         nonlocal energy
-        link = sts[i] in (ST_CHAINLINK, ST_CHAINLINKARCHEAD)
+        link = i is not None and sts[i] in (ST_CHAINLINK,
+                                            ST_CHAINLINKARCHEAD)
         delta = {"good": 0.002 if link else 0.01,
                  "bad": -0.025 if link else -0.1,
                  "miss": -0.03 if link else -0.15,
-                 "bomb": -0.15}[outcome]
+                 "bomb": -0.15,
+                 "wall": -1.3 / 30.0,
+                 "wall_enter": 0.0}[outcome]
         # floor above zero: at zero the game FAILS and the run would end;
         # our agent plays on regardless (No-Fail-like, without the
         # modifier flag). The live watch viewer IGNORES this block and
@@ -350,6 +426,13 @@ def build_events(ticks, real_notes, offset):
         t = line["time"] + offset
         for ev in line["events"]:
             kind, body = next(iter(ev.items()))
+            if kind in ("wall", "wall_enter"):
+                # env v17 (spec §12b): entry breaks combo, the per-tick
+                # drain does not; neither touches the note-event stream
+                if kind == "wall_enter":
+                    walk.on_break()
+                hud(t, None, kind)
+                continue
             i = body["note"]
             n = real_notes[i]
             if kind == "post":

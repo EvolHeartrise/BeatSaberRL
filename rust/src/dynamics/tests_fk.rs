@@ -86,6 +86,112 @@ fn neutral_stance() {
     }
 }
 
+/// `rot_to_quat` must be the EXACT inverse of `quat_to_rot` — it is the
+/// only step between the FK head frame and the replay/.dat head
+/// rotation, so a wrong branch would silently mis-aim the exported
+/// first-person camera instead of failing loudly.
+///
+/// Grid: identity, the three 180° axis flips (θ = π — the trace branch
+/// is unusable there and a naive √(1+tr) implementation NaNs), and 500
+/// random rotations. Checks the rotation round-trips to 1e-14 and the
+/// quaternion returns up to sign (q and −q are one rotation).
+#[test]
+fn rot_to_quat_inverts_quat_to_rot() {
+    use super::fk::{quat_to_rot, rot_to_quat};
+
+    let mut quats: Vec<[f64; 4]> = vec![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0], // π about x — r00 branch
+        [0.0, 0.0, 1.0, 0.0], // π about y — r11 branch
+        [0.0, 0.0, 0.0, 1.0], // π about z — r22 branch
+    ];
+    let mut rng = Rng(0x5EED_F0F0_1234_0002);
+    while quats.len() < 504 {
+        let mut q = [0.0f64; 4];
+        for x in q.iter_mut() {
+            *x = rng.range(-1.0, 1.0);
+        }
+        let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        if n > 0.1 {
+            quats.push([q[0] / n, q[1] / n, q[2] / n, q[3] / n]);
+        }
+    }
+
+    for (qi, q) in quats.iter().enumerate() {
+        let r = quat_to_rot(*q);
+        let got = rot_to_quat(&r);
+        // unit, and equal to ±q componentwise
+        let n = (got[0] * got[0] + got[1] * got[1] + got[2] * got[2] + got[3] * got[3]).sqrt();
+        assert!((n - 1.0).abs() < 1e-14, "quat {qi} norm {n}");
+        let dot = got[0] * q[0] + got[1] * q[1] + got[2] * q[2] + got[3] * q[3];
+        let s = if dot < 0.0 { -1.0 } else { 1.0 };
+        for k in 0..4 {
+            let d = (s * got[k] - q[k]).abs();
+            assert!(d < 1e-14, "quat {qi} component {k}: |d| = {d:e}");
+        }
+        // and the rotation itself is bit-close after the round trip
+        let r2 = quat_to_rot(got);
+        for i in 0..3 {
+            for j in 0..3 {
+                let d = (r2[i][j] - r[i][j]).abs();
+                assert!(d < 1e-14, "quat {qi} R[{i}][{j}]: |d| = {d:e}");
+            }
+        }
+    }
+}
+
+/// The exported head pose (replay v10 `head` / .dat pose frame): the
+/// head is WELDED to the chest, so its world rotation IS the spine
+/// stack, and its local +z is the gaze direction down the note track —
+/// the same local-+z-is-forward convention the blades use. Neutral must
+/// give the (0, 1.70, −0.65) anchor with an identity quaternion, since
+/// the .dat exporter writes that quaternion straight through as the
+/// viewer's first-person camera rotation.
+#[test]
+fn head_pose_is_the_spine_pose() {
+    use super::fk::{quat_to_rot, rot_to_quat};
+    const A_SPINE_YAW: usize = 1; // §1.4 order: pitch, yaw, roll
+
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    fk_all(m, &st, &mut ws);
+    assert_vec3(ws.p[F_HEAD], [0.0, 1.70, -0.65], "head");
+    let q = rot_to_quat(&ws.r[F_HEAD]);
+    for (k, want) in [1.0, 0.0, 0.0, 0.0].iter().enumerate() {
+        assert!(
+            (q[k] - want).abs() <= TOL,
+            "neutral head quat[{k}] = {}",
+            q[k]
+        );
+    }
+
+    // yaw the spine +30°: the gaze (local +z) swings toward +x, and the
+    // quaternion is the half-angle rotation about +y
+    let a = 30f64.to_radians();
+    st.q[A_SPINE_YAW] = a;
+    fk_all(m, &st, &mut ws);
+    let q = rot_to_quat(&ws.r[F_HEAD]);
+    let want = [(a / 2.0).cos(), 0.0, (a / 2.0).sin(), 0.0];
+    for k in 0..4 {
+        assert!(
+            (q[k] - want[k]).abs() <= TOL,
+            "yawed head quat[{k}] = {}",
+            q[k]
+        );
+    }
+    let gaze = [ws.r[F_HEAD][0][2], ws.r[F_HEAD][1][2], ws.r[F_HEAD][2][2]];
+    assert_vec3(gaze, [a.sin(), 0.0, a.cos()], "gaze");
+    // and the matrix the viewer would rebuild from the quaternion is
+    // the FK matrix itself
+    let r2 = quat_to_rot(q);
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!((r2[i][j] - ws.r[F_HEAD][i][j]).abs() <= TOL);
+        }
+    }
+}
+
 /// The load-bearing P1 gate: v10 FK vs the v9 `fk()` on the arm chains.
 /// Grid: all-zero, every joint at each limit (per hand), 100 random
 /// in-limit poses (fixed seed). If this fails the bug may be in

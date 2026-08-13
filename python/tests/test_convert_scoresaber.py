@@ -11,7 +11,10 @@ P3 gate recipe; the unactuated body cannot hold a pose for the later
 notes, which resolve as misses/flails under a seeded random gear
 stream). The fixture plays at first_note_s = 0.9 so the cut happens
 while the body is still upright; the converter's align gets the same
-value. Replay v10: sabers carry [wrist(3), blade(3)] directly.
+value. Replay v10: sabers carry [wrist(3), blade(3)] directly, and
+(record_rev 2) `head` carries the FK head pose [p(3), quat wxyz(4)] —
+the flail gives a moving, TURNING head, which is what pins the exported
+head frame against the old fixed placeholder.
 """
 
 import json
@@ -292,10 +295,12 @@ def test_frames_wellformed(converted):
         for key in ("head", "left", "right"):
             q = f[key][3:7]
             assert math.fsum(c * c for c in q) == pytest.approx(1.0, abs=1e-4)
-    # PLAYER SPACE: head at z = 0 (the viewer parents poses under a rig
-    # 0.65 m back and expects notes to arrive at head.z + 0.65; writing
-    # env world coords here shifted the whole avatar behind the platform)
-    assert frames[0]["head"][:3] == pytest.approx((0.0, 1.70, 0.0))
+    # PLAYER SPACE: the first frame's head sits at the neutral anchor
+    # z = 0 (the viewer parents poses under a rig 0.65 m back and puts
+    # the note-arrival plane at head.z + 0.65; writing env world coords
+    # here shifted the whole avatar behind the platform). One tick of
+    # gravity has barely moved it.
+    assert frames[0]["head"][:3] == pytest.approx((0.0, 1.70, 0.0), abs=0.02)
     # saber frames = recorded wrists shifted env world -> player space
     # (replay v10 sabers: [wrist(3), blade(3)])
     ticks = converted["ticks"]
@@ -304,6 +309,57 @@ def test_frames_wellformed(converted):
             wrist = ticks[i]["sabers"][hand][0:3]
             want = (wrist[0], wrist[1], wrist[2] + 0.65)
             assert frames[i][key][:3] == pytest.approx(want, abs=1e-5)
+
+
+def test_head_frames_are_the_simulated_head(converted):
+    """The head frame is the BODY's head, position and rotation — the
+    viewer's first-person camera is set to it outright
+    (CameraUpdater.UpdateFirstPersonCamera) and its note-arrival plane
+    follows its z (ObjectManager.CutPlanePos = HeadPosition.z + 0.65).
+
+    Round-trip: every decoded head frame equals the recorded replay
+    `head` (record_rev 2) — position shifted env world -> player space,
+    quaternion re-ordered wxyz -> the xyzw that
+    ScoreSaberUtils.ReadPositionData reads, up to the hemisphere sign
+    (q and -q are one rotation; the converter aligns consecutive frames
+    so the viewer's Quaternion.Lerp never takes the long way round).
+    """
+    frames = converted["decoded"]["frames"]
+    ticks = converted["ticks"]
+    assert all("head" in t for t in ticks), "recorder wrote no head pose"
+
+    moved = turned = False
+    prev = None
+    for f, t in zip(frames, ticks):
+        px, py, pz, qw, qx, qy, qz = t["head"]
+        assert f["head"][:3] == pytest.approx((px, py, pz + 0.65), abs=1e-5)
+        want = (qx, qy, qz, qw)
+        n = math.sqrt(math.fsum(c * c for c in want))
+        want = tuple(c / n for c in want)
+        got = f["head"][3:7]
+        sign = 1.0 if math.fsum(a * b for a, b in zip(got, want)) >= 0 else -1.0
+        assert got == pytest.approx(tuple(sign * c for c in want), abs=1e-5)
+        # hemisphere continuity across the written stream
+        if prev is not None:
+            assert math.fsum(a * b for a, b in zip(got, prev)) >= 0.0
+        prev = got
+        moved |= abs(f["head"][2]) > 1e-3
+        turned |= math.sqrt(math.fsum(c * c for c in got[:3])) > 1e-3
+    # the placeholder head (fixed anchor, identity rotation) is gone:
+    # this flailing body both walks its head off the reference plane
+    # and turns it
+    assert moved and turned
+
+
+def test_head_frame_legacy_fallback():
+    """Recordings older than record_rev 2 carry no `head` field; they
+    must still convert, to the historic placeholder (neutral anchor,
+    facing down the note track) rather than raising."""
+    pos, quat = conv.head_frame({"sabers": [[0.0] * 6, [0.0] * 6]})
+    assert pos == conv.HEAD_POS and quat == (0.0, 0.0, 0.0, 1.0)
+    # and a present field wins, renormalized and re-ordered to xyzw
+    pos, quat = conv.head_frame({"head": [1.0, 2.0, 3.0, 2.0, 0.0, 0.0, 0.0]})
+    assert pos == (1.0, 2.0, 3.0) and quat == (0.0, 0.0, 0.0, 1.0)
 
 
 def test_times_are_end_of_tick(converted):

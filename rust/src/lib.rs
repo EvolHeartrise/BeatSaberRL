@@ -798,6 +798,13 @@ struct Core {
     wall_passed: Vec<bool>,
     first_wall: usize,
     walls_in: u32,
+    // spec §12b combo rule (user, 2026-08-13): ENTERING a wall is a
+    // combo break (event 8); STAYING inside drains (event 7 per tick)
+    // but does not re-break; the head must be OUT for >= 1 tick before
+    // the next entry breaks again — i.e. break on the rising edge of
+    // this latch, which holds last tick's in-wall state.
+    was_in_wall: bool,
+    wall_enters: u32,
     // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
     // recomputed from state every tick and each of its disjuncts is
     // MONOTONE (first_pending only advances and, once !pending, the cut
@@ -845,6 +852,8 @@ impl Core {
             wall_passed: Vec::new(),
             first_wall: 0,
             walls_in: 0,
+            was_in_wall: false,
+            wall_enters: 0,
             finished: false,
             score: 0.0,
             score_pre: 0.0,
@@ -925,6 +934,8 @@ impl Core {
         self.wall_passed = vec![false; self.walls.len()];
         self.first_wall = 0;
         self.walls_in = 0;
+        self.was_in_wall = false;
+        self.wall_enters = 0;
         self.good_cuts = 0;
         self.bad_cuts = 0;
         self.misses = 0;
@@ -1486,11 +1497,19 @@ impl Core {
             }
         }
         if in_wall {
+            if !self.was_in_wall {
+                // rising edge: COMBO BREAK (event 8). The scoring
+                // layers (ComboWalk / ComboTracker / .dat walk) break
+                // on 8 and IGNORE 7 — spec §12b combo rule.
+                self.wall_enters += 1;
+                self.events_buf.push((u32::MAX, 8, 0.0, 0.0, 0.0));
+            }
             reward += WALL_PEN;
             self.walls_in += 1;
             // event code 7: head-in-wall tick (note id unused -> u32::MAX)
             self.events_buf.push((u32::MAX, 7, 0.0, 0.0, 0.0));
         }
+        self.was_in_wall = in_wall;
         while self.first_wall < self.walls.len() && self.wall_passed[self.first_wall] {
             self.first_wall += 1;
         }
@@ -1749,6 +1768,33 @@ impl RawBeatSim {
         })
     }
 
+    /// Replay v10 `head` (record_rev 2, ADDITIVE): the FK head frame's
+    /// world pose — origin (3) then the world-from-body rotation as a
+    /// scalar-first quaternion, [px, py, pz, qw, qx, qy, qz]. Same
+    /// quaternion convention as `qpos`'s root block (wxyz), so the two
+    /// read alike.
+    ///
+    /// WHY a getter and not "derive it from q": the head is WELDED to
+    /// the chest (§1.2, no neck DoF), so its rotation is the spine
+    /// pitch→yaw→roll stack applied to the root quaternion — cheap
+    /// here off the live FK workspace, a full tree walk anywhere else.
+    /// `sabers()` exists for exactly the same reason (§6 "viewer
+    /// convenience"), and the .dat exporter needs the head pose the way
+    /// it needs the wrists: watch.scoresaber.com drives its
+    /// first-person camera straight off the recorded head frame
+    /// (Previewer/Graphics/Camera/CameraUpdater.UpdateFirstPersonCamera).
+    ///
+    /// At the neutral stance this is [0, 1.70, -0.65, 1, 0, 0, 0]:
+    /// world-aligned frames, head local +z = the gaze direction down
+    /// the note track (the same local-+z-is-forward convention `blade`
+    /// uses for the hands).
+    fn head_pose(&self) -> [f64; 7] {
+        let ws = &self.core.body.ws;
+        let p = ws.p[F_HEAD];
+        let q = dynamics::fk::rot_to_quat(&ws.r[F_HEAD]);
+        [p[0], p[1], p[2], q[0], q[1], q[2], q[3]]
+    }
+
     /// Blade unit directions [[x, y, z]; 2] (FK cache).
     fn blades(&self) -> [[f64; 3]; 2] {
         [0, 1].map(|s| self.core.body.blade[s])
@@ -1901,6 +1947,12 @@ impl RawBeatSim {
     fn walls_in(&self) -> u32 {
         self.core.walls_in
     }
+    /// env v17: wall ENTRIES this episode — combo breaks under the
+    /// §12b combo rule (edge-triggered; >= 1 tick out re-arms).
+    #[getter]
+    fn wall_enters(&self) -> u32 {
+        self.core.wall_enters
+    }
     /// Scoreable objects (notes + chain heads + links; bombs excluded).
     #[getter]
     fn n_notes(&self) -> u32 {
@@ -1991,8 +2043,13 @@ impl ComboWalk {
                 };
                 self.score += pts as f64 * m as f64;
             }
+            7 => {}
+            // 7 = head-in-wall drain tick: NO combo effect (spec §12b —
+            // only the ENTRY breaks; without this arm the catch-all
+            // below would have broken combo every tick inside a wall)
             _ => {
-                // slow / angle / wrong_hand / miss / bomb: combo break
+                // slow / angle / wrong_hand / miss / bomb / wall ENTRY
+                // (8): combo break
                 self.combo = 0;
                 self.breaks += 1;
                 self.multiplier = (self.multiplier / 2).max(1);
@@ -2217,6 +2274,11 @@ impl VecBeatSim {
     /// charged WALL_PEN). ADDITIVE getter (spec §12b).
     fn walls_in(&self, i: usize) -> u32 {
         self.sims[i].walls_in
+    }
+
+    /// env v17: wall entries (combo breaks) in env i's episode.
+    fn wall_enters(&self, i: usize) -> u32 {
+        self.sims[i].wall_enters
     }
 
     /// R26 instrumentation: the per-substep rate counters aggregated

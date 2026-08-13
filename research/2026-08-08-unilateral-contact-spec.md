@@ -324,3 +324,23 @@ e. Sources: real BeatSaver maps only — the procedural generator
    emits no walls (recorded for later). Replay JSONL header gains
    a `walls` array (viewer renders translucent boxes on the
    anchored track).
+
+### §12b addendum (2026-08-13): wall combo rule (user-specified)
+
+ENTERING a wall is a COMBO BREAK; STAYING inside keeps draining
+(WALL_PEN per tick / the .dat energy stream) but does NOT re-break;
+the head must be OUT of every wall for >= 1 tick before the next
+entry breaks again. Mechanically: the sim latches last tick's
+in-wall state and emits event 8 ("wall_enter") on the rising edge
+only, alongside the per-tick event 7 ("wall"); `wall_enters` counts
+entries. ALL THREE scoring layers apply it identically (user
+decision): lib.rs ComboWalk (bench), scoresaber.ComboTracker
+(replay verification), and convert_scoresaber's .dat walk — event 7
+is explicitly a combo no-op in each (the catch-all break arms would
+otherwise have broken combo EVERY tick inside a wall, and
+EVENT_REASONS lacked codes 7/8 entirely — a latent KeyError).
+No energy meter / fail in the bench (combo is the only scored
+effect); accuracy keeps the no-break ideal denominator. The .dat
+energy stream takes the base game's 1.3/s obstacle drain for HUD
+honesty; the live watch viewer recomputes combo from note events
+and will not show wall breaks — known cosmetic divergence.

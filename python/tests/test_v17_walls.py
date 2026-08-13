@@ -308,3 +308,41 @@ def test_wall_at_head_outranks_everything():
         sim.step(ZERO_ACT)
     slots = _slots(sim.obs())
     assert slots[0][1] == 1.0 and slots[0][0][14] == 1.0  # wall in slot 0
+
+
+# --- combo rule (spec §12b addendum): entry breaks, stay drains ---------------
+
+def test_wall_enter_is_edge_triggered():
+    # two crossings separated by >= 1 tick out -> exactly two entries;
+    # overlapping walls forming one continuous span -> exactly one
+    big = dict(cx=0.0, cy=0.0, width=20.0, height=40.0, speed=4.0)
+    two = [Wall(start_time=1.0, length=0.8, **big),
+           Wall(start_time=1.5, length=0.8, **big)]
+    sim = _sim(FAR_NOTE, two)
+    enters = 0
+    for _ in range(90):
+        _o, _r, _d, ev = sim.step(ZERO_ACT)
+        enters += sum(1 for e in ev if e[1] == 8)
+    assert enters == 2 == sim.wall_enters
+    assert sim.walls_in > 2          # the drain ran for the whole spans
+
+    overlap = [Wall(start_time=1.0, length=2.0, **big),
+               Wall(start_time=1.2, length=1.0, **big)]
+    sim = _sim(FAR_NOTE, overlap)
+    enters = 0
+    for _ in range(90):
+        _o, _r, _d, ev = sim.step(ZERO_ACT)
+        enters += sum(1 for e in ev if e[1] == 8)
+    assert enters == 1 == sim.wall_enters
+
+
+def test_combo_tracker_wall_semantics():
+    from beat_arena_env.scoresaber import ComboTracker
+    w = ComboTracker()
+    w.on_cut(0)
+    w.on_points(0, 100)
+    w.consume([(0, "wall", 0.0)] * 5)          # drain ticks: NO break
+    assert w.breaks == 0 and w.combo == 1
+    w.consume([(0, "wall_enter", 0.0)])        # the entry breaks
+    assert w.breaks == 1 and w.combo == 0
+    assert w.score == 100.0                    # breaks never touch score
