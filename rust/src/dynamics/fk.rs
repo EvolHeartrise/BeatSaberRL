@@ -90,6 +90,56 @@ pub fn quat_to_rot(q: [f64; 4]) -> Mat3 {
     ]
 }
 
+/// SO(3) → wxyz (scalar-first) quaternion: the exact inverse of
+/// `quat_to_rot`, for exporting a FK frame's world rotation (replay
+/// v10 `head`, §6). Shepperd's branch — take the largest of
+/// (trace, r00, r11, r22) so the divisor is never small; the naive
+/// w = ½√(1+tr) form loses every digit as θ → π (tr → −1), which a
+/// tumbling body REACHES (a fallen head faces backwards).
+///
+/// Returns an arbitrary sign representative (q and −q are the same
+/// rotation). Consumers that INTERPOLATE a sequence of these must fix
+/// the sign continuity themselves — see convert_scoresaber.py, which
+/// hemisphere-aligns consecutive replay frames because the viewer
+/// lerps between them.
+pub fn rot_to_quat(r: &Mat3) -> [f64; 4] {
+    let (m00, m11, m22) = (r[0][0], r[1][1], r[2][2]);
+    let tr = m00 + m11 + m22;
+    if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0; // 4w
+        [
+            0.25 * s,
+            (r[2][1] - r[1][2]) / s,
+            (r[0][2] - r[2][0]) / s,
+            (r[1][0] - r[0][1]) / s,
+        ]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0; // 4x
+        [
+            (r[2][1] - r[1][2]) / s,
+            0.25 * s,
+            (r[0][1] + r[1][0]) / s,
+            (r[0][2] + r[2][0]) / s,
+        ]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0; // 4y
+        [
+            (r[0][2] - r[2][0]) / s,
+            (r[0][1] + r[1][0]) / s,
+            0.25 * s,
+            (r[1][2] + r[2][1]) / s,
+        ]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0; // 4z
+        [
+            (r[1][0] - r[0][1]) / s,
+            (r[0][2] + r[2][0]) / s,
+            (r[1][2] + r[2][1]) / s,
+            0.25 * s,
+        ]
+    }
+}
+
 /// SO(3) log map: the rotation vector φ with R = exp([φ]×). Used for
 /// the weld orientation error (SPEC-v10 §3 step 8). Small-angle guard
 /// θ < 1e-9 → first-order φ = ½·vee(R − Rᵀ); weld errors are held tiny

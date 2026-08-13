@@ -253,9 +253,12 @@ def q_normalizer(j):
 
 
 # event codes returned by the Rust sim's step(); "post" = follow-through
-# resolution for an already-counted good cut (carries points only)
+# resolution for an already-counted good cut (carries points only).
+# env v17 (spec §12b): "wall" = head-in-wall drain tick (NO combo
+# effect), "wall_enter" = the rising edge — a COMBO BREAK; >= 1 tick
+# out of walls re-arms it. Both carry note id u32::MAX (no note).
 EVENT_REASONS = {0: "ok", 1: "slow", 2: "angle", 3: "wrong_hand", 4: "miss",
-                 5: "post", 6: "bomb"}
+                 5: "post", 6: "bomb", 7: "wall", 8: "wall_enter"}
 # reasons that consume a scoreable note (not follow-throughs / bombs)
 NOTE_OUTCOMES = ("ok", "slow", "angle", "wrong_hand", "miss")
 

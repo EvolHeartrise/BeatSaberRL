@@ -475,9 +475,12 @@ fused (trunk → 29·K + 1) GEMM.
 
 ## 6. Replay v10 (JSONL)
 
-Header line: `{"header": {"version": "v10", "config": {...},
-"chart": [...]}}` — chart entries unchanged from v7+. Viewers reject
-non-"v10" versions (all v9 replays/checkpoints retire, house pattern).
+Header line: `{"header": {"version": "v10", "record_rev": 2,
+"config": {...}, "chart": [...]}}` — chart entries unchanged from v7+.
+Viewers reject non-"v10" versions (all v9 replays/checkpoints retire,
+house pattern). `version` names the BODY generation only; the per-tick
+record grows ADDITIVELY under `record_rev` (absent/1 = pre-`head`,
+2 = `head` present), so a new field never retires a reader.
 
 Per-tick record:
 
@@ -487,6 +490,7 @@ Per-tick record:
  "twist": [vx, vy, vz, wx, wy, wz],
  "omega": [<29 joint velocities>],
  "sabers": [[wx, wy, wz, bx, by, bz], [wx, wy, wz, bx, by, bz]],
+ "head": [px, py, pz, qw, qx, qy, qz],
  "action": [<29 gear ids>],
  "reward": 0.0,
  "contacts": [{"pair": 12, "p": [x, y, z], "j": 0.42}],
@@ -499,6 +503,13 @@ Per-tick record:
 - `sabers`: per hand [L, R], FK wrist position + unit blade dir — viewer
   convenience (the v9 fields the viewer actually consumes); the viewer does
   full-skeleton FK from `q`.
+- `head` (record_rev 2, ADDITIVE): the FK head frame's world origin and
+  world-from-body rotation, quaternion **wxyz** like `q`'s root block.
+  Same "viewer convenience" role as `sabers` — derivable from `q`, logged
+  because the head is welded to the chest (§1.2) and every exporter needs
+  its ROTATION: the ScoreSaber `.dat` head frame drives
+  watch.scoresaber.com's first-person camera AND its note-arrival plane.
+  Head local +z is the gaze, matching `blade` = hand frame +z (§1.3).
 - `contacts`: one entry per pair with nonzero tick-summed normal impulse:
   normative `pair id` (§2), world contact point (last substep's), scalar
   impulse `j` = Σ_substeps λ_n (N·s). Empty list omitted-or-empty (writer

@@ -166,14 +166,20 @@ class ComboTracker:
         return 1.0 if need is None else self._progress / need
 
     def consume(self, events):
-        """Feed one step's info["events"] (reason-string form)."""
+        """Feed one step's info["events"] (reason-string form). env v17
+        wall rule (spec §12b): "wall_enter" (the rising edge of head-in-
+        wall) breaks combo; "wall" (per-tick drain) has NO combo effect
+        — without the explicit skip the catch-all would break combo on
+        every tick spent inside a wall."""
         for note_idx, reason, pts in events:
             if reason == "ok":
                 self.on_cut(note_idx)
                 self.on_points(note_idx, pts)
             elif reason == "post":
                 self.on_points(note_idx, pts)
-            else:            # slow / angle / wrong_hand / miss / bomb
+            elif reason == "wall":
+                pass
+            else:            # slow/angle/wrong_hand/miss/bomb/wall_enter
                 self.on_break()
 
 

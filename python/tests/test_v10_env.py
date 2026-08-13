@@ -313,6 +313,8 @@ def test_replay_v10_roundtrip(tmp_path):
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
     assert head["header"]["version"] == "v10"
+    # additive per-tick schema revision (§6): 2 = "head" on every tick
+    assert head["header"]["record_rev"] == 2
     assert head["header"]["config"]["gears"] == 3
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c
@@ -331,6 +333,18 @@ def test_replay_v10_roundtrip(tmp_path):
         for s in t["sabers"]:
             assert np.hypot(np.hypot(s[3], s[4]), s[5]) == pytest.approx(
                 1.0, abs=1e-3)
+        # record_rev 2: FK head pose [p(3), quat wxyz(4)], unit
+        # quaternion (rounded to 6 dp)
+        assert len(t["head"]) == 7
+        assert np.linalg.norm(t["head"][3:7]) == pytest.approx(1.0, abs=1e-5)
+    # the head starts at the §1.1 neutral anchor and is NOT a constant:
+    # exporters (convert_scoresaber.py) put this rotation on the
+    # ScoreSaber viewer's first-person camera
+    assert ticks[0]["head"][:3] == pytest.approx([0.0, 1.70, -0.65], abs=0.1)  # tick 0 records AFTER one (randomly actuated) step — the reset pose itself is exact
+    assert ticks[0]["head"][3:7] == pytest.approx([1.0, 0.0, 0.0, 0.0],
+                                                 abs=0.1)
+    assert any(t["head"][:3] != ticks[0]["head"][:3] for t in ticks)
+    assert any(t["head"][3:7] != ticks[0]["head"][3:7] for t in ticks)
     # counters + score reconstruct from the event stream
     goods = sum(1 for t in ticks for e in t["events"]
                 if "cut" in e and e["cut"]["good"])

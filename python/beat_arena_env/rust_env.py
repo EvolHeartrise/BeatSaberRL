@@ -94,6 +94,17 @@ class RustBeatEnv(gym.Env):
     def _start_record(self):
         header = {"header": {
             "version": "v10",     # env v10 body: viewers reject others
+            # RECORD-SCHEMA revision, additive-only (SPEC-v10 §6).
+            # "version" names the BODY generation and is hard-gated
+            # ("v10" exactly) by viz/app/src/lib/replay.js and
+            # convert_scoresaber.py, so bumping it to advertise a new
+            # per-tick FIELD would retire every reader for no reason —
+            # schema growth is versioned here instead. Absent/1 = the
+            # pre-2026-08-13 record (no "head"); 2 = per-tick "head"
+            # (FK head pose) present on every tick. Readers must treat a
+            # HIGHER rev as "fields I do not know about are present",
+            # never as an error.
+            "record_rev": 2,
             # env v15 (contact spec §10), ADDITIVE: the note track is
             # head-anchored — viewers must add head_z - PLANE_Z0 to
             # every note's world z. Absent on pre-v15 recordings
@@ -144,6 +155,13 @@ class RustBeatEnv(gym.Env):
         # vertical force ≈ jy/DT), "effort" = the tick's positive
         # mechanical work (J). τ per joint is NOT logged: it is exactly
         # gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
+        # record_rev 2 ADDITIVE field: "head" = the FK head frame's
+        # world pose [px, py, pz, qw, qx, qy, qz] (quaternion scalar-
+        # first, like q's root block). Derivable from q by a tree walk
+        # — logged for the same reason "sabers" is (§6 "viewer
+        # convenience"), and because convert_scoresaber.py needs the
+        # head ROTATION: watch.scoresaber.com's first-person camera is
+        # driven straight off the .dat's head frame.
         self._record_lines.append(json.dumps({
             "t": self.sim.tick - 1,
             "time": round(self.sim.time - 1.0 / 30.0, 5),
@@ -151,6 +169,10 @@ class RustBeatEnv(gym.Env):
             "twist": [round(v, 4) for v in self.sim.twist()],
             "omega": [round(v, 4) for v in self.sim.omega()],
             "sabers": [[round(v, 4) for v in s] for s in self.sim.sabers()],
+            # 6 decimals on the quaternion too: it is REnormalized
+            # downstream, and 1e-6 keeps the residual well under the
+            # 1e-4 unit-norm tolerance the .dat round-trip asserts
+            "head": [round(v, 6) for v in self.sim.head_pose()],
             "action": [int(a) for a in action],
             "reward": round(float(reward), 4),
             "contacts": [{"pair": int(p), "p": [round(x, 4), round(y, 4),
@@ -165,6 +187,10 @@ class RustBeatEnv(gym.Env):
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}
                 if code == 5 else
                 {"bomb": {"note": int(i)}} if code == 6 else
+                # env v17 (spec §12b): wall drain tick / wall-entry
+                # combo break — no note id (the sim sends u32::MAX)
+                {"wall": {}} if code == 7 else
+                {"wall_enter": {}} if code == 8 else
                 # good cuts carry the component split (2026-07-25):
                 # points = pre + acc (+30 on arc-headed free_post grants)
                 {"cut": {"note": int(i), "good": code == 0,
@@ -211,6 +237,8 @@ class RustBeatEnv(gym.Env):
                         # episode. Reported, never hidden; always 0 in
                         # weld mode.
                         falls=self.sim.falls,
-                        # env v17: head-in-wall ticks (spec §12b)
-                        walls_in=self.sim.walls_in)
+                        # env v17: head-in-wall ticks + wall entries
+                        # (= combo breaks, spec §12b)
+                        walls_in=self.sim.walls_in,
+                        wall_enters=self.sim.wall_enters)
         return obs, float(reward), bool(done), False, info
