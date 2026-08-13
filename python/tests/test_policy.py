@@ -64,7 +64,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 362
+    assert OBS_DIM == 426   # env v17: 16x18 entity block
     assert N_ACTION_HEADS == N_JOINTS == 29
 
 

@@ -130,16 +130,49 @@ def test_grad_parity_random_weights(rand_policy, n):
     _assert_grad_close(fused, ref)
 
 
+def _knife_edge_rows(policy, obs, thresh=1e-6):
+    """Rows whose forward pass runs within `thresh` of a ReLU boundary
+    anywhere in the net. On such rows fp32 implementations legitimately
+    land on either side of the gate (rounding decides the SIGN), and a
+    flip shifts grads by O(activation), not O(ulp) — no continuous
+    error bound can absorb it. Found the hard way (env v17, 2026-08-13):
+    one row in 2048 with a blocks.0.ffn.0 pre-activation at 8.9e-8 put
+    a 5e-2 grad delta on a kernel that matched eager fp32 to 1e-6."""
+    flags = torch.zeros(obs.shape[0], dtype=torch.bool, device=obs.device)
+    hooks = []
+
+    def h(_m, _inp, out):
+        m = out.abs().flatten(1).min(1).values if out.dim() > 1 else out.abs()
+        flags.copy_(flags | (m < thresh))
+
+    # only Linears whose output feeds a ReLU gate: _mlp[0] of the four
+    # front/trunk MLPs and each block's ffn[0] (the last Linear of every
+    # _mlp and the q/k/v/head projections have no gate to flip)
+    gated = [policy.note_mlp[0], policy.saber_mlp[0], policy.body_mlp[0],
+             policy.trunk[0]] + [b.ffn[0] for b in policy.blocks]
+    for m in gated:
+        hooks.append(m.register_forward_hook(h))
+    with torch.no_grad():
+        policy(obs)
+    for hk in hooks:
+        hk.remove()
+    return flags
+
+
 def test_grad_parity_vs_f64(rand_policy):
     """Real rollout obs, mb 2048: fused-fp32 and torch-fp32 against the
     float64 torch reference. The fused error must stay within a small
     factor of torch's own fp32 error (they share the fp32-forward
-    discretization; only the reduction strategy differs)."""
+    discretization; only the reduction strategy differs). Knife-edge
+    rows (see _knife_edge_rows) are excluded before grading."""
     n = 2048
     obs = _real_obs(n)
     g = torch.Generator().manual_seed(5)
     R = torch.randn(n, N_ACTION_HEADS, K, generator=g).to(DEV)
     Rv = torch.randn(n, generator=g).to(DEV)
+    keep = ~_knife_edge_rows(rand_policy, obs)
+    assert keep.sum() >= 0.95 * n, "unexpectedly many knife-edge rows"
+    obs, R, Rv = obs[keep], R[keep], Rv[keep]
     ref64 = _linear_loss_grads_torch(rand_policy, obs, R, Rv, torch.float64)
     ref32 = _linear_loss_grads_torch(rand_policy, obs, R, Rv)
     fused, _ = _linear_loss_grads_fused(rand_policy, obs, R, Rv)
