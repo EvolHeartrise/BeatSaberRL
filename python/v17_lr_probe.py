@@ -45,7 +45,8 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
 
 def run(cmd, log_name, timeout):
     t0 = time.time()
-    with open(os.path.join(RUN_DIR, log_name), "w", encoding="utf-8") as log:
+    # "a" not "w": a crash-resumed rung must not clobber the pre-crash log
+    with open(os.path.join(RUN_DIR, log_name), "a", encoding="utf-8") as log:
         r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
                            text=True, timeout=timeout)
     if r.returncode != 0:
@@ -59,12 +60,26 @@ def run(cmd, log_name, timeout):
 def main():
     os.makedirs(RUN_DIR, exist_ok=True)
     batch = NUM_ENVS * HORIZON
-    print(f"[lr-probe {TAG}] trunk {TRUNK_UPDATES} updates @ lr {LR}",
-          flush=True)
-    w = run([PY, "train_batch.py", *COMMON, "--lr", LR,
-             "--total-steps", str(TRUNK_UPDATES * batch),
-             "--ckpt-every", "1000", "--run-dir", RUN_DIR],
-            "trunk.log", 21_600)
+    # Crash-resume from the highest NUMBERED ckpt (trunk_final.pt only
+    # exists on clean completion — the 2026-08-14 balance-outage pod
+    # death mid-rung is exactly the case this covers)
+    import glob
+    numbered = sorted(glob.glob(os.path.join(RUN_DIR, "trunk_upd*.pt")))
+    resume = (["--resume", numbered[-1]] if numbered
+              and not os.path.exists(os.path.join(
+                  RUN_DIR, f"trunk_upd{TRUNK_UPDATES:05d}.pt")) else [])
+    done = os.path.exists(os.path.join(RUN_DIR,
+                                       f"trunk_upd{TRUNK_UPDATES:05d}.pt"))
+    print(f"[lr-probe {TAG}] trunk {TRUNK_UPDATES} updates @ lr {LR}"
+          + (f" (resuming {os.path.basename(numbered[-1])})" if resume
+             else " (already complete)" if done else ""), flush=True)
+    if not done:
+        w = run([PY, "train_batch.py", *COMMON, "--lr", LR, *resume,
+                 "--total-steps", str(TRUNK_UPDATES * batch),
+                 "--ckpt-every", "1000", "--run-dir", RUN_DIR],
+                "trunk.log", 21_600)
+    else:
+        w = 0.0
     print(f"[lr-probe {TAG}] trunk done in {w/60:.1f} min", flush=True)
 
     trunk_ck = os.path.join(RUN_DIR, f"trunk_upd{TRUNK_UPDATES:05d}.pt")
