@@ -57,6 +57,7 @@ from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM
+from beat_arena_env.mirror import mirror_tuples, mirror_walls
 from beat_arena_rs import VecBeatSim
 from cuda_graphs import _Graphed, copy_static
 from policy import load_policy
@@ -170,6 +171,11 @@ def parse_args():
                         "parser-source hash); empty string disables")
     p.add_argument("--catalog", type=str, default="maps/scoresaber_catalog.json")
     p.add_argument("--refresh-catalog", action="store_true")
+    p.add_argument("--mirror", action="store_true",
+                   help="bench on left-right mirrored charts (handedness-"
+                        "bias diagnostic; scores are NOT ScoreSaber-"
+                        "comparable — compare only against another "
+                        "--mirror or non-mirror run of the same catalog)")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
     return p.parse_args()
@@ -427,6 +433,9 @@ def main():
     policy = policy.to(device).eval()
 
     out_path = args.out or default_out_path(args.ckpt)
+    if args.mirror and not args.out:     # never merge mirrored scores into
+        root, ext = os.path.splitext(out_path)   # the normal results file
+        out_path = f"{root}_mirror{ext}"
     ckpt_name = "/".join(os.path.normpath(os.path.abspath(args.ckpt))
                          .replace("\\", "/").split("/")[-2:])
     data = load_results(out_path, mhash) or {
@@ -434,7 +443,12 @@ def main():
         "model_hash": mhash, "arch": ckpt.get("arch"),
         "global_step": ckpt.get("global_step"),
         "foot_contact": args.foot_contact,   # physics-regime provenance
+        "mirror": args.mirror,               # charts left-right reflected
     }
+    if bool(data.get("mirror")) != args.mirror:
+        sys.exit(f"error: {out_path} holds mirror={data.get('mirror')} "
+                 f"results but this run has --mirror={args.mirror} — "
+                 f"use a different --out")
     levels = {e["leaderboard_id"]: e for e in data.get("levels", [])}
 
     if args.refresh_catalog or not os.path.exists(args.catalog):
@@ -669,8 +683,12 @@ def main():
                             "stars": entry["stars"], "skipped": skip}
                         continue
                     i = gr.free.pop()
+                    if args.mirror:
+                        tuples = mirror_tuples(tuples)
                     gr.sim.set_chart(i, tuples,
-                                     payload.get("walls", []))
+                                     mirror_walls(payload.get("walls", []))
+                                     if args.mirror
+                                     else payload.get("walls", []))
                     gr.sim.obs_one_into(i, gr.obs_buf)  # in-place row write
                     gr.slots[i] = {
                         "entry": entry,

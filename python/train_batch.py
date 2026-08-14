@@ -293,6 +293,11 @@ def parse_args():
                         "falls spike, damping survival-drift)")
     p.add_argument("--seg-len", type=float, default=25.0,
                    help="ranked-maps segment length in song seconds")
+    p.add_argument("--mirror-augment", action="store_true",
+                   help="double the ranked-maps pool with left-right "
+                        "mirrored copies of every segment (handedness-"
+                        "bias regularizer, 2026-08-14; --chart-pool "
+                        "subsamples the doubled pool)")
     return p.parse_args()
 
 
@@ -429,7 +434,8 @@ def main():
         from beat_arena_env.ranked_pool import load_ranked_pool
         pool = load_ranked_pool(seg_len=args.seg_len,
                                 sample=args.chart_pool, seed=args.seed,
-                                device=device, lead_s=args.lead_s)
+                                device=device, lead_s=args.lead_s,
+                                mirror=args.mirror_augment)
         venv = VecCls(N, pool=pool,
                       max_steps=int(args.seg_len * 30) + 90,
                       effort_coef=args.effort_coef,

@@ -32,6 +32,7 @@ import torch
 
 from .chart import Note, Wall
 from .constants import KIND_BOMB
+from .mirror import mirror_tuples, mirror_walls
 
 LEAD_S = 1.5          # k>0 windows: drop notes cut mid-flight
 MIN_SCOREABLE = 4     # drop near-empty tail windows
@@ -40,12 +41,13 @@ MAX_OBJECTS = 512     # smem guard: C*4B must stay well under 6 KB/block
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _cache_path(seg_len, ver, catalog_path, lead_s):
+def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     with open(catalog_path, "rb") as f:
         cat = f.read()
     # v3: env v17 — wall tensors joined the pool payload
     key = hashlib.sha1(
-        f"{seg_len:g}_{ver}_v3_lead{lead_s:g}".encode() + cat
+        (f"{seg_len:g}_{ver}_v3_lead{lead_s:g}"
+         + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
     os.makedirs(cdir, exist_ok=True)
@@ -78,7 +80,8 @@ def _window_walls(wtups, lo, hi, base):
     return out
 
 
-def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
+def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
+                    mirror=False):
     import json
     import sys
     sys.path.insert(0, _BASE)
@@ -109,9 +112,14 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
                 dropped_sparse += 1
                 continue
             base = k * seg_len
-            segments.append([_tuple_note((t[0] - base,) + tuple(t[1:]))
-                             for t in win])
-            seg_walls.append(_window_walls(wtups, lo, hi, base))
+            reb = [(t[0] - base,) + tuple(t[1:]) for t in win]
+            wreb = _window_walls(wtups, lo, hi, base)
+            segments.append([_tuple_note(t) for t in reb])
+            seg_walls.append(wreb)
+            if mirror:   # augmentation: every window also plays reflected
+                segments.append([_tuple_note(t)
+                                 for t in mirror_tuples(reb)])
+                seg_walls.append(mirror_walls(wreb))
         if (i + 1) % 1000 == 0:
             log(f"[ranked-pool] {i + 1}/{len(catalog)} levels -> "
                 f"{len(segments)} segments", flush=True)
@@ -124,7 +132,8 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S):
 
 def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
                      device="cuda", dtype=torch.float32,
-                     catalog=None, log=print, lead_s=LEAD_S):
+                     catalog=None, log=print, lead_s=LEAD_S,
+                     mirror=False):
     # lead_s (env v16, contact spec §11): the k>0 windows' head gap —
     # the earliest possible first note of a segment episode. Default
     # keeps the historical 1.5 s; the survival-drift postmortem
@@ -139,11 +148,12 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     import sys
     sys.path.insert(0, _BASE)
     import bench_scoresaber as bs
-    cpath = _cache_path(seg_len, bs.parser_version(), catalog, lead_s)
+    cpath = _cache_path(seg_len, bs.parser_version(), catalog, lead_s,
+                        mirror=mirror)
     if not os.path.exists(cpath):
         from .cuda_env import _charts_to_tensors, _walls_to_tensors
         segs, seg_walls = _build_segments(seg_len, catalog, log,
-                                          lead_s=lead_s)
+                                          lead_s=lead_s, mirror=mirror)
         # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
         # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
         # arrays + the f32 outputs simultaneously (~5.5 GB at 46k
