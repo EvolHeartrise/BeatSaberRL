@@ -51,7 +51,13 @@ def cuda_flags():
     so a new arch (or any flag edit) invalidates the stamp and forces
     the rebuild that regenerates the log."""
     maj, mnr = _capability()
-    return [f"-arch=sm_{maj}{mnr}", "-Xptxas", "-v"]
+    flags = [f"-arch=sm_{maj}{mnr}", "-Xptxas", "-v"]
+    # BEAT_LINEINFO=1: source-line info for Nsight Compute source view
+    # (profiling only — being in the digest, it forces one rebuild each
+    # way, which is the intended behavior)
+    if os.environ.get("BEAT_LINEINFO") == "1":
+        flags.append("-lineinfo")
+    return flags
 
 
 def arch_list():

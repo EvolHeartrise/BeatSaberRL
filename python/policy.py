@@ -41,6 +41,24 @@ from fused_ln import FusedLayerNorm
 import os as _os
 _NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
 _NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
+# Perf-ladder toggles (audit Tier 1.3-1.5, 2026-08-15), fp16 stream
+# ONLY — the fp32 record path stays bitwise stable under every setting.
+# Defaults stay legacy until the pod ladder measures a win:
+#   BEAT_ATTN=fold   multi-head: pre-scale q by dh^-1/2 (the SDPA-style
+#                    exact-same-math reassociation) + in-place bias add
+#                    — drops one full-scores-size kernel per block
+#   BEAT_ATTN=sdpa   multi-head via F.scaled_dot_product_attention
+#                    (key-side additive mask, no all-masked rows). The
+#                    old SDPA refutation was sm_61/d64/T19/1-head.
+#   BEAT_QKV_PACKED=1   q/k/v (k/v in the final block) as ONE GEMM per
+#                    block against cat fp16 replicas (flat groups)
+#   BEAT_PACKED_HEADS=1 update-path head GEMM reuses the rollout's
+#                    fused-head cache instead of 30-way cats per
+#                    minibatch
+_ATTN_MODE = _os.environ.get("BEAT_ATTN", "legacy")
+assert _ATTN_MODE in ("legacy", "fold", "sdpa"), _ATTN_MODE
+_QKV_PACKED = _os.environ.get("BEAT_QKV_PACKED", "0") == "1"
+_PACKED_HEADS = _os.environ.get("BEAT_PACKED_HEADS", "0") == "1"
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -215,7 +233,24 @@ class Block(nn.Module):
             x, h = self.ln_attn.forward_add(x, delta, delta_bias)
         else:
             h = self.ln_attn(x)
-        k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
+        qkv = None
+        if _QKV_PACKED and h.dtype is torch.float16:
+            # Tier 1.4: q/k/v share input h -> one GEMM against the cat
+            # replicas. The final block's q runs on the SLICED h, so
+            # only k/v pack there — their cat is the qkv group's tail
+            # rows (layout [wq wk wv], flatten_fp16_replicas groups=).
+            wh, bh = _fl.packed_halves(
+                [self.q_proj, self.k_proj, self.v_proj])
+            if n_queries:
+                kv = _fl.fp16_packed_linear(h, wh[self.d:], bh[self.d:],
+                                            [self.k_proj, self.v_proj])
+                k, v = kv.split(self.d, dim=-1)
+            else:
+                qkv = _fl.fp16_packed_linear(
+                    h, wh, bh, [self.q_proj, self.k_proj, self.v_proj])
+                q, k, v = qkv.split(self.d, dim=-1)
+        else:
+            k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         if n_queries:
             # x.contiguous() is load-bearing, not hygiene: a (B, T, d)
             # row slice is NOT contiguous, and FusedLayerNorm._eligible
@@ -231,7 +266,8 @@ class Block(nn.Module):
             # record path's bits (measured 1e-4 on the logits).
             x = x[:, :n_queries].contiguous()
             h = h[:, :n_queries]
-        q = _lin(self.q_proj, h)
+        if qkv is None:
+            q = _lin(self.q_proj, h)
         Tq = q.shape[1]
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
@@ -247,9 +283,25 @@ class Block(nn.Module):
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
             v = v.view(B, T, self.n_heads, self.dh).transpose(1, 2)
-            scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)   # (B,H,Tq,T)
-            scores = scores + attn_bias.unsqueeze(1)              # (B,1,1,T)
-            att = torch.softmax(scores, dim=-1) @ v               # (B,H,Tq,dh)
+            if _ATTN_MODE == "sdpa" and q.dtype is torch.float16:
+                # Tier 1.3b: fused attention. The additive key mask is
+                # legal here — no row is ever all-masked (3 lead lanes
+                # are always attendable), so no NaN softmax rows.
+                att = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias.unsqueeze(1))
+            else:
+                if _ATTN_MODE == "fold" and q.dtype is torch.float16:
+                    # Tier 1.3a: pre-scale q (tiny tensor) instead of
+                    # dividing the (B,H,Tq,T) scores, and add the bias
+                    # in place — one full-scores kernel dropped, one
+                    # alloc dropped. Near-tie numerics (mul-by-
+                    # reciprocal on q vs divide on scores).
+                    scores = (q * self.dh ** -0.5) @ k.transpose(-2, -1)
+                    scores += attn_bias.unsqueeze(1)
+                else:
+                    scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)
+                    scores = scores + attn_bias.unsqueeze(1)     # (B,1,1,T)
+                att = torch.softmax(scores, dim=-1) @ v          # (B,H,Tq,dh)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
             att = _lin(self.out_proj, att)
         x, h2 = self.ln_ffn.forward_add(x, att)
@@ -377,6 +429,17 @@ class NotePolicy(nn.Module):
             out = F.linear(h, c[1], c[2]).float()
             return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
                     out[:, -1])
+        if fp16 and _PACKED_HEADS:
+            # Tier 1.5: the update path reuses the rollout's fused-head
+            # cache — no 30-way weight/bias cats (or their backward
+            # split nodes) per minibatch; grads route to the individual
+            # head masters via the packed Function's row slices.
+            c = self._refresh_head_cache()
+            out = _fl.fp16_packed_linear(
+                h, c[1], c[2], list(self.heads) + [self.value_head]
+            ).float()
+            return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
+                    out[:, -1])
         w = torch.cat([hd.weight for hd in self.heads]
                       + [self.value_head.weight])
         b = torch.cat([hd.bias for hd in self.heads]
@@ -397,7 +460,16 @@ class NotePolicy(nn.Module):
         rebuilt, refreshed by the same single flat cast as everything
         else. Trainer-only; MUST run before CUDA-graph capture."""
         tail = list(self.heads) + [self.value_head]
-        w16, b16 = _fl.flatten_fp16_replicas(self, tail_group=tail)
+        # qkv groups (Tier 1.4): laid out [wq wk wv | bq bk bv] per
+        # block so packed_halves resolves to static views. Grouping is
+        # harmless when the toggle is off (layout-only), but kept
+        # toggle-gated so the flat buffer layout — and therefore any
+        # bit-comparison of flat-order-dependent consumers — is
+        # unchanged in the default configuration.
+        groups = ([[blk.q_proj, blk.k_proj, blk.v_proj]
+                   for blk in self.blocks] if _QKV_PACKED else None)
+        w16, b16 = _fl.flatten_fp16_replicas(self, tail_group=tail,
+                                             groups=groups)
         self._head_cache = [None, w16, b16]
         self._flat_fp16 = True
 
@@ -438,6 +510,7 @@ class NotePolicy(nn.Module):
             if isinstance(m, nn.Linear):
                 _fl._half_params(m.weight, m.bias)
         self._refresh_head_cache()
+        _fl.refresh_packed()   # non-flat packed qkv cat caches, if any
 
     def forward(self, obs: torch.Tensor):
         logits, value = self.forward_stacked(obs)
