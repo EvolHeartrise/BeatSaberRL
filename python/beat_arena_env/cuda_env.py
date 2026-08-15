@@ -4,7 +4,7 @@ step (P5).
 rust/src/lib.rs remains THE reference implementation; this backend runs
 the whole v10 step — 8 constrained dynamics substeps (SPEC-v10 §3),
 gear->torque actuation, work-based effort, swept-surface judgment,
-auto-reset, obs 340 — inside one custom CUDA kernel
+auto-reset, the obs write — inside one custom CUDA kernel
 (csrc/beat_arena_cuda.cu), one THREAD per env (P5 parallelization
 decision: the Rust expression trees transcribe serially per thread, so
 every accumulation keeps Rust's exact order; occupancy comes from batch

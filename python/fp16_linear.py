@@ -104,9 +104,9 @@ def flatten_fp16_replicas(module, tail_group=None):
     linears = [m for m in module.modules() if isinstance(m, nn.Linear)]
     tail = list(tail_group or [])
     others = [m for m in linears if m not in tail]
-    # Alignment contract: fused_attn casts master biases to float2* and
-    # replicas to __half2* (needs 8 B), and cuBLAS selects vectorized
-    # GEMM paths by pointer alignment — so every independently-consumed
+    # Alignment contract: cuBLAS selects vectorized GEMM paths by
+    # pointer alignment (and future consumers may cast to __half2*/
+    # float2*, needing 8 B) — so every independently-consumed
     # slice starts on a 16-ELEMENT boundary (64 B fp32 / 32 B fp16,
     # comfortably past every kernel's preference). The tail BIAS group
     # is the one exception — its members stay back-to-back (unaligned)

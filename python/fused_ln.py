@@ -1,7 +1,8 @@
 """Drop-in fused LayerNorm (csrc/layer_norm.cu) for the policy's
-d=64/128 rows — the 2026-07-25 survey measured torch's LayerNorm at
-37 GB/s vs 218 achievable at this shape (+1.13x on the whole update
-when replaced).
+d=64/128 rows. PROVENANCE: justified by a 2026-07-25 sm_61 (GTX 1080)
+survey (torch LN at 37 GB/s vs 218 achievable; +1.13x whole-update)
+— NOT re-measured on the 4090/861k config; see
+PERF_AUDIT_2026-08-16.md Tier 2.2 before extending this machinery.
 
 `FusedLayerNorm` subclasses nn.LayerNorm, so state_dict layout, param
 names, and checkpoints are byte-identical; it routes contiguous CUDA

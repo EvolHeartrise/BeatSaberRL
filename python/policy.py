@@ -1,28 +1,23 @@
 """Note-sequence policy for Beat Arena (SPEC.md §Policy).
 
-Two encoder arms over the 12-slot upcoming-note window:
+Current production shape (v18, 2026-08-16): the 24-slot shared entity
+window (notes + walls, distance-sorted), two saber tokens and one body
+token form a 27-token sequence run through 3 full pre-LN transformer
+blocks (LayerNorm -> 4-head self-attention -> residual; LayerNorm ->
+4x FFN -> residual) at embed 128, then a 256-wide trunk MLP and 29
+factored action heads + a value head (~861k params, the 2026-08-13
+user-approved 6.2x scale-up).
 
-- ``transformer`` (the only encoder since 2026-07-20 — the pool
-  baseline was deleted at user direction after the easy-config studies
-  concluded): the notes, two saber tokens AND (env v10) one body token
-  form a 19-token sequence run through 2 full pre-LN transformer blocks
-  (LayerNorm -> single-head self-attention -> residual; LayerNorm ->
-  FFN -> residual).
-  Each note token carries its z position along the approach axis (obs v2)
-  — with constant note speed that IS the temporal ordering, expressed
-  spatially (time_until = z / |vz|), so no separate positional encoding
-  is needed. Readout = the two saber tokens' output embeddings, i.e. each
-  hand's token gathers what it needs from the note stream via attention
-  (a CLS-token-style readout, one per hand).
-
-Unlike kiting-arena's deliberately minimal attention arm, the transformer
-here gets its standard optimization aids (LayerNorm, FFN, residuals) —
-that A/B's live hypothesis (b) was that stripping them handicaps training.
+Each entity token carries its z position along the approach axis —
+with constant note speed that IS the temporal ordering, expressed
+spatially (time_until = z / |vz|), so no separate positional encoding
+is needed. Readout = the two saber tokens' output embeddings (a
+CLS-token-style readout, one per hand) plus the body token.
 
 No action masks exist in this env: every action is always legal, so the
 logprob is the unconditional sum over the 29 factored heads (env v10
 full-body gear control, SPEC-v10 §1.4 joint order; pure independent
-factorization, no kind-gating like kiting).
+factorization).
 """
 
 from __future__ import annotations
@@ -33,22 +28,17 @@ import torch.nn.functional as F
 
 import fp16_linear as _fl
 from fp16_linear import fp16_linear, fp16_linear_nobias, fp16_linear_relu
-from fused_attn import eligible as _fused_attn_ok, fused_attn as _fused_attn
 from fused_ln import FusedLayerNorm
 
-# Fused single-head attention on the fp16 update path (round-4 #15,
-# default ON since 2026-07-25: 1.76x on the attention slice fwd+bwd,
-# grads closer to fp64 than eager's on every input). Module-level switch
-# so experiment arms can pin it; near-tie numerics class (never touches
-# the fp32 record path). Env toggles (debug/bisect):
-#   BEAT_NO_FUSED_ATTN=1  -> eager attention (also disables qkv bias
-#                            folding, which rides the fused kernel)
+# (The round-4 fused single-head attention kernel was DELETED
+# 2026-08-16: it only ever ran at n_heads == 1 and d == 64, both
+# impossible since the 6.2x scale-up — see PERF_AUDIT_2026-08-16.md.)
+# Env toggles (debug/bisect) for the LIVE fp16 epilogue paths:
 #   BEAT_NO_BIAS_RELU=1   -> eager addmm+ReLU in _seq
 #   BEAT_NO_BIAS_FOLD=1   -> ffn.2 keeps its addmm bias epilogue
 #                            instead of folding into the next block's
 #                            fused residual+LN pass
 import os as _os
-USE_FUSED_ATTN = _os.environ.get("BEAT_NO_FUSED_ATTN", "0") != "1"
 _NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
 _NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
 
@@ -225,18 +215,7 @@ class Block(nn.Module):
             x, h = self.ln_attn.forward_add(x, delta, delta_bias)
         else:
             h = self.ln_attn(x)
-        # fused-attn eligibility decides the PROJECTION form too: the
-        # fused path runs bias-free mms and folds the q/k/v biases into
-        # the attention kernel's loads (round-4 #2: the sm_61 addmm
-        # bias epilogue costs 33-59% of each GEMM)
-        use_fused = (USE_FUSED_ATTN and self.n_heads == 1
-                     and h.dtype is torch.float16
-                     and _fused_attn_ok(h, attn_bias))
-        if use_fused:
-            k = fp16_linear_nobias(h, self.k_proj.weight, self.k_proj.bias)
-            v = fp16_linear_nobias(h, self.v_proj.weight, self.v_proj.bias)
-        else:
-            k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
+        k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         if n_queries:
             # x.contiguous() is load-bearing, not hygiene: a (B, T, d)
             # row slice is NOT contiguous, and FusedLayerNorm._eligible
@@ -252,28 +231,18 @@ class Block(nn.Module):
             # record path's bits (measured 1e-4 on the logits).
             x = x[:, :n_queries].contiguous()
             h = h[:, :n_queries]
-        q = (fp16_linear_nobias(h, self.q_proj.weight, self.q_proj.bias)
-             if use_fused else _lin(self.q_proj, h))
+        q = _lin(self.q_proj, h)
         Tq = q.shape[1]
         if attn_bias is None:
             attn_bias = (key_mask.unsqueeze(1) - 1.0) * MASK_BIAS  # (B, 1, T)
         if self.n_heads == 1:
-            if use_fused:
-                # fp16 path: one fused kernel per direction (round-4
-                # #15) — the scores tensor never touches global memory.
-                # Near-tie tolerance class, so fp16-only: the fp32
-                # update path below stays bitwise for the record runs.
-                att = _fused_attn(q, k, v, attn_bias, self.d ** -0.5,
-                                  self.q_proj.bias, self.k_proj.bias,
-                                  self.v_proj.bias)
-            else:
-                # scale + mask ride the GEMM epilogue: one kernel
-                # instead of three (matmul, div, add). Bitwise-identical
-                # here because d ** -0.5 is a power of two at d = 64/128
-                # (exact multiply)
-                scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
-                                       alpha=self.d ** -0.5)      # (B, Tq, T)
-                att = torch.softmax(scores, dim=-1) @ v
+            # scale + mask ride the GEMM epilogue: one kernel
+            # instead of three (matmul, div, add). Bitwise-identical
+            # here because d ** -0.5 is a power of two at d = 64/128
+            # (exact multiply)
+            scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
+                                   alpha=self.d ** -0.5)      # (B, Tq, T)
+            att = torch.softmax(scores, dim=-1) @ v
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
