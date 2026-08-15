@@ -120,7 +120,7 @@ def main():
         src = load_policy(torch.load(args.ckpt, map_location="cpu",
                                      weights_only=True))
         print(f"weights: {args.ckpt}")
-    except FileNotFoundError:
+    except (FileNotFoundError, SystemExit):
         torch.manual_seed(0)
         src = NotePolicy(n_gears=5)  # production default (--gears 5)
         print("weights: random init (checkpoint not found)")
