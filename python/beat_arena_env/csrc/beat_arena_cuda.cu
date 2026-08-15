@@ -4266,16 +4266,6 @@ __device__ T sweep_dist(const T w0[3], const T t0[3], const T t1[3],
 // tensor, the restrict qualifiers here must go.
 template <typename T>
 struct Sim {
-  // warp-coherence env permutation (2026-08-15, audit Tier 3.3):
-  // thread gid processes env env_order[gid] (nullptr = identity). The
-  // wrapper sorts envs by remaining-note count each tick so a warp's
-  // 32 threads run similar note/wall loop trip counts. Per-env math is
-  // untouched — every state read/write stays keyed on e — so results
-  // are bitwise identical per env under ANY permutation; the only
-  // order-sensitive effect is the ret_buf ring's within-tick ordering
-  // (telemetry). Cross-env atomics here are integer counters, which
-  // commute exactly.
-  const int* __restrict__ env_order;
   // dynamics state (mutated in place)
   T *__restrict__ p, *__restrict__ quat, *__restrict__ q, *__restrict__ v;
   // FK caches
@@ -5146,10 +5136,8 @@ template <typename T, bool FC>
 // heuristic from flipping to 64 regs + double the spills.
 __global__ void __launch_bounds__(THREADS, 1)
 step_kernel(Sim<T> P) {
-  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gid >= P.N) return;
-  // Tier 3.3 (see Sim.env_order): identity when no permutation is set
-  const int e = P.env_order ? P.env_order[gid] : gid;
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= P.N) return;
   // thread-local scratch (local memory; per-thread interleaved =
   // coalesced across the warp for same-index access)
   Dyn<T> d;
@@ -5193,8 +5181,7 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_const,
-          at::Tensor env_order) {
+          bool want_contacts, bool foot_contact, double fall_const) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5202,17 +5189,10 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
   TORCH_CHECK(actions.scalar_type() == at::kLong && actions.is_contiguous());
   TORCH_CHECK(cand.scalar_type() == at::kLong && cand.is_contiguous());
   const int64_t N = q.size(0);
-  const bool perm = env_order.defined() && env_order.numel() > 0;
-  if (perm) {
-    TORCH_CHECK(env_order.scalar_type() == at::kInt
-                && env_order.is_contiguous() && env_order.numel() == N,
-                "env_order: contiguous int32 (N,) or empty");
-  }
   const int64_t C = ts[TSTATUS].size(1);
   const int64_t cap = ts[RBUF].size(0);
   AT_DISPATCH_FLOATING_TYPES(q.scalar_type(), "beat_arena_step_v10", [&] {
     Sim<scalar_t> P;
-    P.env_order = perm ? env_order.data_ptr<int>() : nullptr;
     P.p = ts[TP].data_ptr<scalar_t>();
     P.quat = ts[TQUAT].data_ptr<scalar_t>();
     P.q = ts[TQ].data_ptr<scalar_t>();
