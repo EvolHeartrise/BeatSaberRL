@@ -31,9 +31,13 @@ import time
 PY = sys.executable
 ARM = sys.argv[1]
 ARMS = {
+    # const/constpush flags are now the train_batch DEFAULTS; kept for
+    # provenance. w24 = the env v18 window-24 validation arm (obs 578):
+    # pure defaults, compared against the constpush 3k baseline.
     "const": ["--fall-pen", "5.0"],
     "constpush": ["--fall-pen", "5.0", "--push-prob", "0.00333",
                   "--push-vmax", "0.5", "--start-jitter", "0.2"],
+    "w24": [],
 }
 EXTRA = ARMS[ARM]
 RUN_DIR = os.path.join("runs", f"v18_fall_{ARM}")

@@ -175,7 +175,7 @@ const WALL_FRONT_OFF: f64 = 0.25;
 // nearest-first by 3D distance from the head center; entities behind
 // the head consume no slots. ENT_FEAT = the v9 note lanes verbatim,
 // then [is_wall, width, height, length].
-const N_NOTE_SLOTS: usize = 16;
+const N_NOTE_SLOTS: usize = 24; // env v18: 16 -> 24 (eviction study)
 const NOTE_FEAT: usize = 18;
 const HAND_FEAT: usize = 10; // wrist pos(3) + wrist vel(3) + blade(3) + meter
 const Q_LANES: usize = NQ + 2; // 31: the two wrist rolls code as cos/sin
@@ -190,13 +190,13 @@ const OFF_HAND_R: usize = OFF_HAND_L + HAND_FEAT; // 85
 const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 95
 const OFF_CONTACT: usize = OFF_HEAD + 3; // 98: contact bits [L, R]
 const OFF_NOTES: usize = OFF_CONTACT + 2; // 100
-const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 388
+const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 532
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse (N·s) per
 // front/back sole-corner pair, / GROUND_IMP_NORM. All-zero in weld mode
 // (the ground block does not exist there), so lanes 0..340 are the v10
 // obs verbatim.
-const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 404
+const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 556
 const N_GROUND_IMP_LANES: usize = 4;
 // env v13 (contact spec §8): explicit FK shortcuts — world positions of
 // [l_elbow, r_elbow, l_knee, r_knee, l_foot, r_foot], head-style
@@ -205,8 +205,8 @@ const N_GROUND_IMP_LANES: usize = 4;
 // in the note field), knees/feet get their §1.2 reference literals.
 const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 408
 const N_BODY_PTS: usize = 6;
-const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 426
-const _: () = assert!(OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426");
+const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 578
+const _: () = assert!(OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
