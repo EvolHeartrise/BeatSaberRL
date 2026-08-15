@@ -1,10 +1,13 @@
 """env v18 pins (2026-08-15): constant fall pricing + perturbation kicks.
 
-The sparse-state exploit this fixes: legacy fall pricing charges the
-discounted remaining scoreable notes, so falls in note-sparse states
-(segment tails, map intros) were near-free and the policy learned
-fall-indifference exactly there (replay analysis, fpm campaign).
-fall_const > 0 makes the terminal reward a flat -fall_const.
+Constant pricing is the SOLE fall-pricing mode since 2026-08-15 (the
+legacy discounted remaining-notes charge is removed): falls in
+note-sparse states (segment tails, map intros) were near-free under
+the old charge and the policy learned fall-indifference exactly
+there (fpm replay analysis; the 3-arm probe measured falls/update
+8-10k -> ~35 and bench zeros 35 -> 2 after the fix). Default
+fall_const = 5.0 = the probe winner; pushes default ON in
+train_batch but OFF at the env layer (parity/tests).
 
 Contact-mode zero-action episodes fall on their own (the unactuated
 body slumps; the wall tests lean on the same physics), which gives a
@@ -29,28 +32,17 @@ DENSE = [Note(hit_time=5.0 + 0.5 * i, col=2, row=1, x=0.3, y=1.4,
               color=i % 2, angle=4.712, speed=4.0) for i in range(50)]
 
 
-def _fall_reward(chart, fall_const, fall_gamma=1.0):
+def _fall_reward(chart, fall_const=None):
+    kw = {} if fall_const is None else {"fall_const": fall_const}
     sim = beat_arena_rs.RawBeatSim(max_steps=600, effort_coef=0.0,
                                    wide_acc=False, gears=5,
-                                   foot_contact=True,
-                                   fall_gamma=fall_gamma,
-                                   fall_const=fall_const)
+                                   foot_contact=True, **kw)
     sim.set_chart([note_tuple(n) for n in chart], [])
     for _ in range(600):
         _obs, r, done, _ev = sim.step(ZERO_ACT)
         if done:
             return r
     raise AssertionError("episode never terminated")
-
-
-def test_legacy_pricing_depends_on_remaining_notes():
-    # fall_gamma=1.0: charge = 0.5 * remaining scoreable count exactly
-    r_sparse = _fall_reward(SPARSE, fall_const=0.0)
-    r_dense = _fall_reward(DENSE, fall_const=0.0)
-    assert r_sparse == pytest.approx(-0.5)     # 1 pending note
-    assert r_dense == pytest.approx(-25.0)     # 50 pending notes
-    # the exploit in one line: same fall, 50x cheaper on the sparse chart
-    assert r_sparse > r_dense
 
 
 def test_const_pricing_is_flat():
@@ -60,11 +52,14 @@ def test_const_pricing_is_flat():
     assert r_dense == pytest.approx(-5.0)
 
 
-def test_const_zero_is_bitwise_legacy():
-    # 0.0 must take the legacy branch, not "flat zero"
-    assert _fall_reward(DENSE, fall_const=0.0, fall_gamma=0.965) \
-        == _fall_reward(DENSE, fall_const=0.0, fall_gamma=0.965)
-    assert _fall_reward(DENSE, fall_const=0.0) == pytest.approx(-25.0)
+def test_default_is_five():
+    # constructor default = the probe winner; no kwarg needed
+    assert _fall_reward(DENSE) == pytest.approx(-5.0)
+    assert _fall_reward(SPARSE) == pytest.approx(-5.0)
+
+
+def test_magnitude_is_respected():
+    assert _fall_reward(DENSE, fall_const=2.5) == pytest.approx(-2.5)
 
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(),

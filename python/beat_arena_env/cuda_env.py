@@ -355,7 +355,7 @@ class CudaBeatVecEnv:
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
-                 fall_gamma=1.0, fall_const=0.0, walls=None,
+                 fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
@@ -380,12 +380,9 @@ class CudaBeatVecEnv:
         # selects a COMPILE-TIME instantiation on it, so it is constant
         # per instance and safe under CUDA-graph capture.
         self.foot_contact = bool(foot_contact)
-        # v16 (contact spec §11): fall-pricing discount base; pass the
-        # trainer's gamma. 1.0 = v11.1 lump-sum count.
-        self.fall_gamma = float(fall_gamma)
-        # env v18 (2026-08-15): > 0 = constant fall pricing (flat
-        # -fall_const terminal reward; kills the sparse-state
-        # fall-indifference exploit). 0 = legacy remaining-notes charge.
+        # env v18 (2026-08-15, sole mode): flat -fall_const terminal
+        # reward on a fall (kills the sparse-state fall-indifference
+        # exploit; the legacy remaining-notes charge is REMOVED).
         self.fall_const = float(fall_const)
         # env v18 perturbation training (push-recovery lit): with
         # probability push_prob per (env, tick) add a horizontal root
@@ -556,7 +553,7 @@ class CudaBeatVecEnv:
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_gamma, self.fall_const)
+                       self.foot_contact, self.fall_const)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
