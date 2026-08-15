@@ -356,8 +356,7 @@ class CudaBeatVecEnv:
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
-                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
-                 env_perm=False):
+                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -396,11 +395,6 @@ class CudaBeatVecEnv:
         self.push_prob = float(push_prob)
         self.push_vmax = float(push_vmax)
         self.start_jitter = float(start_jitter)
-        # warp-coherence env permutation (audit Tier 3.3): per-env
-        # bitwise identical, so it can also be forced from outside for
-        # A/B without plumbing (BEAT_ENV_PERM=1)
-        self.env_perm = bool(env_perm) or os.environ.get(
-            "BEAT_ENV_PERM", "0") == "1"
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -519,10 +513,6 @@ class CudaBeatVecEnv:
         self._cap = 4096
         self._ret_buf = z(self._cap)
         self._ret_total = z(1, dt=torch.int32)
-        # Tier 3.3 permutation: static int32 order buffer (refreshed in
-        # place — CUDA-graph contract) + the empty "identity" sentinel
-        self._order32 = z(N, dt=torch.int32)
-        self._no_order = torch.empty(0, dtype=torch.int32, device=dv)
         self._popped = 0
         self._obs = z(N, OBS_DIM, dt=torch.float32)
         self._reward = z(N)
@@ -560,22 +550,10 @@ class CudaBeatVecEnv:
         ]
 
     def _launch(self, actions, cand, mode):
-        order = self._no_order
-        if mode == 0 and self.env_perm:
-            # warp-coherence permutation (audit Tier 3.3): thread gid
-            # runs env order[gid], envs sorted by remaining-note count
-            # so a warp's 32 lanes see similar loop trip counts.
-            # Stable sort -> deterministic; all device ops, graph-safe;
-            # per-env results bitwise identical under any permutation.
-            key = (self.pool["n_notes"].gather(0, self.chart_idx)
-                   - self.first_pending.to(torch.int64))
-            self._order32.copy_(
-                torch.argsort(key, stable=True).to(torch.int32))
-            order = self._order32
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_const, order)
+                       self.foot_contact, self.fall_const)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
