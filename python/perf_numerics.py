@@ -34,7 +34,7 @@ def build(ckpt_path):
         policy = load_policy(torch.load(ckpt_path, map_location="cpu",
                                         weights_only=True))
         print(f"weights: {ckpt_path}")
-    except FileNotFoundError:
+    except (FileNotFoundError, SystemExit):
         torch.manual_seed(0)
         policy = NotePolicy(n_gears=5)
         print("weights: random init")
