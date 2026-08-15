@@ -56,12 +56,23 @@ enqueue is 30 ms/iter vs 48 ms/iter GPU execution (63%), the queue
 stays full, the phase is GPU-bound not launch-bound at mb 16384.
 Graphs would buy ~0 at production shape. Skip.
 
-Remaining open: 3.1/3.2 (pool layout / status transpose) — decided by
-the pool-residency probe (tiny L2-resident pool vs full 7.1 GB pool:
-if step time is flat, pool reads are not the bottleneck and Tier 3
-layout work is refuted too); then 2.3 bf16 behind a learning gate
-(user decision — it changes numerics and deletes the loss-scale
-apparatus).
+Tier 3.1/3.2 pool layout: **REFUTED by the residency probe** —
+step_kernel is 136.9 / 138.3 / 135.7 ms/tick at pool 2 MB (L2-resident)
+/ 105 MB / 7.1 GB. Flat across three orders of magnitude of pool size
+=> pool reads are not the bottleneck; AoS repack and status transpose
+cannot pay. The kernel is bound by its 42 KB/thread local frame
+(Dyn+Solver scratch), which only Tier 4 surgery touches (NUM_PAIRS /
+packed-triangle frame reduction, warp-per-env — parity-breaking, "do
+not do casually", measure the realized nc histogram first).
+
+## CAMPAIGN VERDICT (2026-08-15)
+
+Banked: **+5.4–6.9% steps/s** (SDPA combo + width fixes, adopted).
+Refuted by measurement: warp-coherence permutation (null), graphed
+update (not launch-bound), pool layout (residency-flat). Still open:
+2.3 bf16 (learning gate + user decision) and Tier 4 local-frame
+surgery (parity-breaking class, needs explicit sign-off). Every
+sm_61-era perf verdict has now been re-measured or retired on sm_89.
 
 ## Tier 0 — measure first (~1h)
 - 0.1 `train_batch.py --bench` at production shape: get the TRUE
