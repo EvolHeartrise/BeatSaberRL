@@ -44,6 +44,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import itertools
+import math
 import operator
 import os
 import shutil
@@ -354,7 +355,8 @@ class CudaBeatVecEnv:
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
-                 fall_gamma=1.0, walls=None):
+                 fall_gamma=1.0, fall_const=0.0, walls=None,
+                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -381,6 +383,21 @@ class CudaBeatVecEnv:
         # v16 (contact spec §11): fall-pricing discount base; pass the
         # trainer's gamma. 1.0 = v11.1 lump-sum count.
         self.fall_gamma = float(fall_gamma)
+        # env v18 (2026-08-15): > 0 = constant fall pricing (flat
+        # -fall_const terminal reward; kills the sparse-state
+        # fall-indifference exploit). 0 = legacy remaining-notes charge.
+        self.fall_const = float(fall_const)
+        # env v18 perturbation training (push-recovery lit): with
+        # probability push_prob per (env, tick) add a horizontal root
+        # velocity kick, |dv| ~ U(0, push_vmax) m/s, direction uniform.
+        # start_jitter: same kick applied to every env that reset this
+        # tick (RSI-flavored start-state variety), |dv| ~ U(0, start_jitter).
+        # Python-side v[:, 0/2] mutation between kernel launches — an
+        # impulse by construction; seeded via self._gen. Training only:
+        # bench/replay use the Rust sim, which has no push path.
+        self.push_prob = float(push_prob)
+        self.push_vmax = float(push_vmax)
+        self.start_jitter = float(start_jitter)
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -539,7 +556,7 @@ class CudaBeatVecEnv:
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_gamma)
+                       self.foot_contact, self.fall_gamma, self.fall_const)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
@@ -555,15 +572,38 @@ class CudaBeatVecEnv:
         self._episode += 1
         return self._obs
 
+    def _kick(self, gate, vmax):
+        """Horizontal root-velocity impulse (env v18 perturbation
+        training): per env, |dv| ~ U(0, vmax) x gate, direction uniform
+        in the x-z plane. CUDA-GRAPH-SAFE by construction — fixed
+        shapes (full-width masked mul, never boolean indexing), no host
+        syncs, default CUDA RNG (torch handles its offset across graph
+        replays; the action-sampling stream already relies on this)."""
+        g = gate.to(self.dtype)
+        mag = torch.rand(self.num_envs, device=self.device,
+                         dtype=self.dtype) * vmax * g
+        ang = torch.rand(self.num_envs, device=self.device,
+                         dtype=self.dtype) * (2.0 * math.pi)
+        self.v[:, 0] += mag * torch.cos(ang)
+        self.v[:, 2] += mag * torch.sin(ang)
+
     def step(self, actions):
         if not torch.is_tensor(actions):
             actions = torch.as_tensor(np.asarray(actions))
         actions = actions.to(self.device).long().reshape(
             self.num_envs, N_JOINTS).contiguous()
+        if self.push_prob > 0.0:
+            self._kick(torch.rand(self.num_envs, device=self.device,
+                                  dtype=self.dtype) < self.push_prob,
+                       self.push_vmax)
         cand = self._cand() if self.auto_reset else self._zero_cand
         self._launch(actions, cand, 0)
         if self.auto_reset:
             self._episode += 1
+            # envs that terminated this tick were auto-reset in-kernel;
+            # jitter their fresh start state (obs catches up next tick)
+            if self.start_jitter > 0.0:
+                self._kick(self._done, self.start_jitter)
         return self._obs, self._reward, self._done, []
 
     # -- parity / tooling hooks (tests/test_v10_parity_cuda.py) ---------------

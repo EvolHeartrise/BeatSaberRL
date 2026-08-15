@@ -781,6 +781,15 @@ struct Core {
     // fall ends the episode). Reported, never hidden: the trainer's
     // `[fall]` line reads it.
     falls: u32,
+    // env v18 (2026-08-15): constant fall pricing. > 0.0 replaces the
+    // remaining-notes charge with a FLAT terminal reward of
+    // -fall_const, killing the sparse-state fall-indifference exploit
+    // (replay analysis: segment tails/map intros made falls near-free;
+    // the policy learned "few visible notes -> falling is cheap").
+    // Sized in return units (~ the dense-case discounted charge, so
+    // average harshness stays in the tolerated regime). 0.0 = legacy
+    // remaining-notes pricing, bitwise unchanged.
+    fall_const: f64,
     // env v16 (contact spec §11): discount base for fall pricing.
     // 1.0 = v11.1 lump sum (count of pending scoreables). Set to the
     // TRAINER'S gamma so a fall is return-equivalent to standing and
@@ -846,6 +855,7 @@ impl Core {
             misses: 0,
             bombs_hit: 0,
             falls: 0,
+            fall_const: 0.0,
             fall_gamma: 1.0,
             n_scoreable: 0,
             walls: Vec::new(),
@@ -1569,7 +1579,11 @@ impl Core {
         if self.body.escaped {
             reward = 0.0;
         }
-        if self.body.fell {
+        if self.body.fell && self.fall_const > 0.0 {
+            // env v18 constant pricing: flat terminal reward, no
+            // dependence on remaining notes (see field comment)
+            reward = -self.fall_const;
+        } else if self.body.fell {
             // v11.1 fall pricing (contact spec §4, 2026-08-09): the
             // remaining scoreable notes are charged as misses in one
             // lump — exactly what ragdolling to the chart's end would
@@ -1625,12 +1639,14 @@ impl RawBeatSim {
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         wide_acc=false, gears=3, foot_contact=false,
-                        fall_gamma=1.0))]
+                        fall_gamma=1.0, fall_const=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
-           gears: u8, foot_contact: bool, fall_gamma: f64) -> Self {
+           gears: u8, foot_contact: bool, fall_gamma: f64,
+           fall_const: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_gamma = fall_gamma;
+        core.fall_const = fall_const;
         RawBeatSim { core }
     }
 
@@ -2080,17 +2096,19 @@ impl VecBeatSim {
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
-                        gears=3, foot_contact=false, fall_gamma=1.0))]
+                        gears=3, foot_contact=false, fall_gamma=1.0,
+                        fall_const=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
-           foot_contact: bool, fall_gamma: f64) -> Self {
+           foot_contact: bool, fall_gamma: f64, fall_const: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
                     let mut c = Core::new_core(max_steps, effort_coef,
                                                wide_acc, gears, foot_contact);
                     c.fall_gamma = fall_gamma;
+                    c.fall_const = fall_const;
                     c
                 })
                 .collect(),

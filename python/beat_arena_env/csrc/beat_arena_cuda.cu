@@ -4330,6 +4330,7 @@ struct Sim {
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
   T fall_gamma;   // v16 (contact spec §11): fall-pricing discount base
+  T fall_const;   // v18: > 0 = flat -fall_const terminal reward (lib.rs mirror)
   int gears;
   bool wide_acc;
   bool auto_reset;
@@ -5096,7 +5097,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // it mirrors the note loop's own i<nn convention so the two scans
   // can never diverge if that invariant ever changes.
   if constexpr (FC) {
-    if (fell) {
+    if (fell && P.fall_const > T(0)) {
+      // env v18 — MIRROR of lib.rs: constant pricing, flat terminal
+      // reward independent of remaining notes
+      reward = -P.fall_const;
+    } else if (fell) {
       // v16 (contact spec §11) — MIRROR of lib.rs: each pending
       // scoreable charged at fall_gamma^(ticks to its v15 miss
       // boundary t_miss = hit + 0.65/speed), ceil(dt/DT), ticks
@@ -5188,7 +5193,8 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_gamma) {
+          bool want_contacts, bool foot_contact, double fall_gamma,
+          double fall_const) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5285,6 +5291,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
     P.fall_gamma = (scalar_t)fall_gamma;
+    P.fall_const = (scalar_t)fall_const;
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
