@@ -298,20 +298,20 @@ def parse_args():
                         "mirrored copies of every segment (handedness-"
                         "bias regularizer, 2026-08-14; --chart-pool "
                         "subsamples the doubled pool)")
-    p.add_argument("--fall-pen", type=float, default=0.0,
+    p.add_argument("--fall-pen", type=float, default=5.0,
                    help="env v18: constant fall penalty (return units, "
-                        "positive number; terminal reward = -value). "
-                        "Replaces the discounted remaining-notes charge "
-                        "whose sparse-state near-zero pricing taught "
-                        "fall-indifference (2026-08-15 replay analysis). "
-                        "0 = legacy pricing")
-    p.add_argument("--push-prob", type=float, default=0.0,
-                   help="env v18 perturbation training: per-(env,tick) "
+                        "positive; terminal reward = -value). DEFAULT is "
+                        "the 3-arm-probe winner (2026-08-15: falls/update "
+                        "8-10k -> ~35, bench zeros 35 -> 2); the legacy "
+                        "remaining-notes charge is REMOVED")
+    p.add_argument("--push-prob", type=float, default=0.00333,
+                   help="env v18 perturbation training (DEFAULT = probe "
+                        "winner, ~1 kick / 10 s / env): per-(env,tick) "
                         "probability of a horizontal root-velocity kick "
-                        "(push-recovery robustness; CUDA env only)")
-    p.add_argument("--push-vmax", type=float, default=0.0,
+                        "(CUDA env only). 0 disables")
+    p.add_argument("--push-vmax", type=float, default=0.5,
                    help="max kick magnitude m/s (|dv| ~ U(0, vmax))")
-    p.add_argument("--start-jitter", type=float, default=0.0,
+    p.add_argument("--start-jitter", type=float, default=0.2,
                    help="episode-start kick magnitude m/s applied to "
                         "freshly reset envs (RSI-flavored start variety)")
     return p.parse_args()
@@ -457,7 +457,7 @@ def main():
                       effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
                       foot_contact=args.foot_contact,
-                      fall_gamma=args.gamma, fall_const=args.fall_pen,
+                      fall_const=args.fall_pen,
                       push_prob=args.push_prob, push_vmax=args.push_vmax,
                       start_jitter=args.start_jitter,
                       seed=args.seed, device=device)
@@ -472,7 +472,7 @@ def main():
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
             gears=args.gears, foot_contact=args.foot_contact,
-            fall_gamma=args.gamma, fall_const=args.fall_pen,
+            fall_const=args.fall_pen,
             push_prob=args.push_prob, push_vmax=args.push_vmax,
             start_jitter=args.start_jitter,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
@@ -485,7 +485,7 @@ def main():
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
-            foot_contact=args.foot_contact, fall_gamma=args.gamma,
+            foot_contact=args.foot_contact, fall_const=args.fall_pen,
             seed=args.seed)
 
     if resume_ckpt is not None:

@@ -36,7 +36,7 @@ class RustBeatEnv(gym.Env):
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF,
                  external_chart=None, wide_acc=False, gears=3, seed=0,
-                 foot_contact=False, fall_gamma=1.0, fall_const=0.0,
+                 foot_contact=False, fall_const=5.0,
                  external_walls=None):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
@@ -74,7 +74,7 @@ class RustBeatEnv(gym.Env):
         self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef,
                               wide_acc=wide_acc, gears=gears,
                               foot_contact=foot_contact,
-                              fall_gamma=fall_gamma, fall_const=fall_const)
+                              fall_const=fall_const)
         self.effort_coef = effort_coef
         self.wide_acc = wide_acc
         self.gears = gears

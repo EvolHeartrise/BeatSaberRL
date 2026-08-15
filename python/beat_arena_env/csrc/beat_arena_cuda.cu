@@ -4329,8 +4329,7 @@ struct Sim {
   bool* __restrict__ done;
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
-  T fall_gamma;   // v16 (contact spec §11): fall-pricing discount base
-  T fall_const;   // v18: > 0 = flat -fall_const terminal reward (lib.rs mirror)
+  T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
   int gears;
   bool wide_acc;
   bool auto_reset;
@@ -5097,32 +5096,9 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // it mirrors the note loop's own i<nn convention so the two scans
   // can never diverge if that invariant ever changes.
   if constexpr (FC) {
-    if (fell && P.fall_const > T(0)) {
-      // env v18 — MIRROR of lib.rs: constant pricing, flat terminal
-      // reward independent of remaining notes
+    if (fell) {
+      // env v18 (sole mode) — MIRROR of lib.rs: flat terminal reward
       reward = -P.fall_const;
-    } else if (fell) {
-      // v16 (contact spec §11) — MIRROR of lib.rs: each pending
-      // scoreable charged at fall_gamma^(ticks to its v15 miss
-      // boundary t_miss = hit + 0.65/speed), ceil(dt/DT), ticks
-      // capped at 600, sequential multiply in the same order.
-      // fall_gamma = 1.0 reproduces the v11.1 count bitwise.
-      T charge = T(0);
-      for (int i = 0; i < nn; i++) {
-        const int64_t cb = c0 * C + i;
-        if (P.status[e * C + i] == 0 && P.p_valid[cb] &&
-            !P.p_is_bomb[cb]) {
-          T t_miss = P.p_hit[cb] + T(0.65) / P.p_speed[cb];
-          T dtm = t_miss - time_new;
-          if (dtm < T(0)) dtm = T(0);
-          long k = (long)ceil(dtm / T(DT));
-          if (k > 600) k = 600;
-          T w = T(1);
-          for (long j = 0; j < k; j++) w *= P.fall_gamma;
-          charge += w;
-        }
-      }
-      reward = T(REWARD_MISS) * charge;
     }
   } else {
     if (fell) reward = T(0);  // fell is constant-false here; folded
@@ -5193,8 +5169,7 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_gamma,
-          double fall_const) {
+          bool want_contacts, bool foot_contact, double fall_const) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5290,7 +5265,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.cap = (int)cap;
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
-    P.fall_gamma = (scalar_t)fall_gamma;
     P.fall_const = (scalar_t)fall_const;
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
