@@ -283,8 +283,8 @@ def test_fall_envelope_parity():
     """Contact spec §5 (d), across engines. A hard lean (full +hip_pitch
     on both legs) drops the root below FALL_ROOT_Y; under the lockstep
     resync both engines must call it on the SAME tick, terminate, price
-    the fall at REWARD_MISS x pending scoreable notes (v11.1 — here the
-    single FAR_NOTE, so exactly -0.5), and COUNT it — Rust in `falls` /
+    the fall at the v18 CONSTANT -fall_const (default 5.0 — flat, no
+    dependence on pending notes), and COUNT it — Rust in `falls` /
     `pop_fall_hits`, CUDA in `pop_fall_hits`."""
     n, gears = 1, 5
     env = _cenv(n, gears)
@@ -302,9 +302,9 @@ def test_fall_envelope_parity():
             f"t{t}: rust done {d_r} vs cuda {bool(tdone[0])} (root y {root_y})"
         if d_r:
             assert sims[0].fell, f"t{t}: rust terminated but not by a fall"
-            assert rew_r == -0.5, \
-                f"fall must price the pending FAR_NOTE at REWARD_MISS, got {rew_r}"
-            assert float(trew[0]) == -0.5, \
+            assert rew_r == -5.0, \
+                f"fall must price at the v18 constant -5.0, got {rew_r}"
+            assert float(trew[0]) == -5.0, \
                 f"CUDA fall pricing mismatch: {float(trew[0])}"
             assert sims[0].falls == 1, "rust must count the fall"
             fall_tick = t
