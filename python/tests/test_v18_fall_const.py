@@ -1,0 +1,100 @@
+"""env v18 pins (2026-08-15): constant fall pricing + perturbation kicks.
+
+The sparse-state exploit this fixes: legacy fall pricing charges the
+discounted remaining scoreable notes, so falls in note-sparse states
+(segment tails, map intros) were near-free and the policy learned
+fall-indifference exactly there (replay analysis, fpm campaign).
+fall_const > 0 makes the terminal reward a flat -fall_const.
+
+Contact-mode zero-action episodes fall on their own (the unactuated
+body slumps; the wall tests lean on the same physics), which gives a
+deterministic fall without crafting actions.
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import beat_arena_rs  # noqa: E402
+from beat_arena_env.chart import Note, note_tuple  # noqa: E402
+
+ZERO_ACT = [0] * 29
+
+SPARSE = [Note(hit_time=100.0, col=2, row=1, x=2.5, y=1.4, color=0,
+               angle=4.712, speed=4.0)]
+DENSE = [Note(hit_time=5.0 + 0.5 * i, col=2, row=1, x=0.3, y=1.4,
+              color=i % 2, angle=4.712, speed=4.0) for i in range(50)]
+
+
+def _fall_reward(chart, fall_const, fall_gamma=1.0):
+    sim = beat_arena_rs.RawBeatSim(max_steps=600, effort_coef=0.0,
+                                   wide_acc=False, gears=5,
+                                   foot_contact=True,
+                                   fall_gamma=fall_gamma,
+                                   fall_const=fall_const)
+    sim.set_chart([note_tuple(n) for n in chart], [])
+    for _ in range(600):
+        _obs, r, done, _ev = sim.step(ZERO_ACT)
+        if done:
+            return r
+    raise AssertionError("episode never terminated")
+
+
+def test_legacy_pricing_depends_on_remaining_notes():
+    # fall_gamma=1.0: charge = 0.5 * remaining scoreable count exactly
+    r_sparse = _fall_reward(SPARSE, fall_const=0.0)
+    r_dense = _fall_reward(DENSE, fall_const=0.0)
+    assert r_sparse == pytest.approx(-0.5)     # 1 pending note
+    assert r_dense == pytest.approx(-25.0)     # 50 pending notes
+    # the exploit in one line: same fall, 50x cheaper on the sparse chart
+    assert r_sparse > r_dense
+
+
+def test_const_pricing_is_flat():
+    r_sparse = _fall_reward(SPARSE, fall_const=5.0)
+    r_dense = _fall_reward(DENSE, fall_const=5.0)
+    assert r_sparse == pytest.approx(-5.0)
+    assert r_dense == pytest.approx(-5.0)
+
+
+def test_const_zero_is_bitwise_legacy():
+    # 0.0 must take the legacy branch, not "flat zero"
+    assert _fall_reward(DENSE, fall_const=0.0, fall_gamma=0.965) \
+        == _fall_reward(DENSE, fall_const=0.0, fall_gamma=0.965)
+    assert _fall_reward(DENSE, fall_const=0.0) == pytest.approx(-25.0)
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(),
+                    reason="CUDA env")
+def test_cuda_const_pricing_and_push_smoke():
+    import torch
+    from beat_arena_env.cuda_env import CudaBeatVecEnv
+
+    charts = [DENSE, SPARSE, DENSE, SPARSE]
+    env = CudaBeatVecEnv(4, charts=charts, gears=5, foot_contact=True,
+                         fall_const=5.0, auto_reset=False,
+                         device="cuda", dtype=torch.float64)
+    env.reset()
+    acts = torch.zeros(4, 29, dtype=torch.long, device="cuda")
+    done_r = torch.full((4,), float("nan"), dtype=torch.float64,
+                        device="cuda")
+    for _ in range(600):
+        _obs, r, done, _ = env.step(acts)
+        new = done & torch.isnan(done_r)
+        done_r[new] = r[new]
+        if bool(done.all()):
+            break
+    assert bool(done.all())
+    assert torch.allclose(done_r, torch.full_like(done_r, -5.0))
+
+    # push smoke: prob 1, vmax 1 -> root linear velocity must move
+    env2 = CudaBeatVecEnv(4, charts=charts, gears=5, foot_contact=True,
+                          push_prob=1.0, push_vmax=1.0,
+                          device="cuda", dtype=torch.float64)
+    env2.reset()
+    v0 = env2.v[:, :3].clone()
+    env2.step(acts)
+    assert not torch.allclose(env2.v[:, :3], v0)
