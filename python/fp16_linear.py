@@ -19,11 +19,21 @@ it exists so CPU tests can exercise the code path).
 
 from __future__ import annotations
 
+import os as _os
+
 import torch
 import torch.nn.functional as F
 
 _ext = None
 _ext_failed = False
+
+# relu_bwd widths beyond the 138k-era 64/128 (audit Tier 1.2, added
+# 2026-08-15). BEAT_NO_WIDE_RELU_BWD=1 pins the old gate for A/B —
+# note db then comes from a torch gm.sum(0) instead of the kernel's
+# fixed-order partials, so the two settings differ in db's LAST
+# ROUNDING only (same accepted class as the existing 64/128 path).
+_RELU_BWD_DIMS = ((64, 128) if _os.environ.get("BEAT_NO_WIDE_RELU_BWD")
+                  == "1" else (64, 128, 256, 512))
 
 
 def _load():
@@ -88,7 +98,7 @@ def flat_refresh():
         _flat[0] = _weights_version
 
 
-def flatten_fp16_replicas(module, tail_group=None):
+def flatten_fp16_replicas(module, tail_group=None, groups=None):
     """Repack every nn.Linear master (w, b) of `module` into ONE
     contiguous fp32 buffer (p.data become views — Adam keeps mutating
     them in place, state_dict/checkpoints unchanged) with a parallel
@@ -98,12 +108,21 @@ def flatten_fp16_replicas(module, tail_group=None):
     tensors (the policy's fused action head). Returns (w16, b16) views
     for the tail group, or None.
 
+    `groups` (optional, list of ordered Linear lists, 2026-08-15 audit
+    Tier 1.4): each group is ALSO laid out [w0..wn | b0..bn] so its
+    concatenated fp16 (weights, biases) exist as static views —
+    registered on group[0].weight._group_views for packed_halves().
+    Group members keep their individual _flat_views too (a member can
+    still run as a standalone Linear — the final block's q_proj does).
+
     MUST run before any CUDA-graph capture, and never again after —
     p.data pointers move exactly once, here."""
     import torch.nn as nn
     linears = [m for m in module.modules() if isinstance(m, nn.Linear)]
     tail = list(tail_group or [])
-    others = [m for m in linears if m not in tail]
+    groups = [list(g) for g in (groups or [])]
+    grouped = [m for g in groups for m in g]
+    others = [m for m in linears if m not in tail and m not in grouped]
     # Alignment contract: cuBLAS selects vectorized GEMM paths by
     # pointer alignment (and future consumers may cast to __half2*/
     # float2*, needing 8 B) — so every independently-consumed
@@ -120,6 +139,21 @@ def flatten_fp16_replicas(module, tail_group=None):
             off = (off + ALIGN - 1) & ~(ALIGN - 1)
             plan.append((p_, off))
             off += p_.numel()
+    group_meta = []                # (members, w_off, b_off)
+    for g in groups:
+        assert all(m.weight.numel() % ALIGN == 0 for m in g), \
+            "group weights must keep alignment back-to-back"
+        off = (off + ALIGN - 1) & ~(ALIGN - 1)
+        gw0 = off
+        for m in g:
+            plan.append((m.weight, off))
+            off += m.weight.numel()
+        off = (off + ALIGN - 1) & ~(ALIGN - 1)
+        gb0 = off                  # biases back-to-back: the cat view
+        for m in g:                # must exist (torch-only consumers)
+            plan.append((m.bias, off))
+            off += m.bias.numel()
+        group_meta.append((g, gw0, gb0))
     off = (off + ALIGN - 1) & ~(ALIGN - 1)
     assert all(m.weight.numel() % ALIGN == 0 for m in tail), \
         "tail weights must keep alignment back-to-back"
@@ -146,6 +180,12 @@ def flatten_fp16_replicas(module, tail_group=None):
         m.weight._flat_views = (
             flat16[wo:wo + m.weight.numel()].view_as(m.weight),
             flat16[bo:bo + m.bias.numel()].view_as(m.bias))
+    for g, gw0, gb0 in group_meta:
+        rows = sum(m.weight.shape[0] for m in g)
+        n_w = sum(m.weight.numel() for m in g)
+        g[0].weight._group_views = (
+            flat16[gw0:gw0 + n_w].view(rows, g[0].weight.shape[1]),
+            flat16[gb0:gb0 + rows])
     if not tail:
         return None
     tw0 = offs[id(tail[0].weight)]
@@ -186,6 +226,117 @@ def _half_params(w, b):
         cache = (_weights_version, cache[1], cache[2])
         w._fp16_cache = cache
     return cache[1], cache[2]
+
+
+# Packed Linear groups (audit Tier 1.4/1.5, 2026-08-15): several
+# same-input Linears run as ONE GEMM against their concatenated fp16
+# replicas. Flat-registered groups (flatten_fp16_replicas groups=) get
+# static views refreshed by the single flat cast; otherwise a
+# version-keyed cat cache (registered here so refresh_packed() can
+# force-refresh under CUDA graphs, mirroring _half_params).
+_packed_caches = []
+
+
+def _refresh_packed_one(c):
+    o = 0
+    w16 = c[1].view(-1)
+    for m in c[3]:
+        n = m.weight.numel()
+        w16[o:o + n].copy_(m.weight.detach().view(-1))
+        o += n
+    o = 0
+    for m in c[3]:
+        n = m.bias.numel()
+        c[2][o:o + n].copy_(m.bias.detach())
+        o += n
+    c[0] = _weights_version
+
+
+def refresh_packed():
+    """Force-refresh every non-flat packed cat cache (graphed callers —
+    flat groups ride flat_refresh and never appear here)."""
+    for c in _packed_caches:
+        if c[0] != _weights_version:
+            _refresh_packed_one(c)
+
+
+def packed_halves(ms):
+    """(w16, b16) cat replicas for an ordered Linear group `ms`: static
+    flat-group views when flattened, else a version-keyed cache."""
+    gv = getattr(ms[0].weight, "_group_views", None)
+    if gv is not None:
+        flat_refresh()
+        return gv
+    c = getattr(ms[0].weight, "_packed_cache", None)
+    if c is None:
+        w = torch.cat([m.weight.detach() for m in ms]).half()
+        b = torch.cat([m.bias.detach() for m in ms]).half()
+        c = [_weights_version, w, b, list(ms)]
+        ms[0].weight._packed_cache = c
+        _packed_caches.append(c)
+    elif c[0] != _weights_version:
+        _refresh_packed_one(c)
+    return c[1], c[2]
+
+
+class _Fp16PackedLinear(torch.autograd.Function):
+    """One addmm over a group's concatenated fp16 replicas; the backward
+    computes the CONCATENATED dW/db (one wgrad + one sum instead of one
+    per member) and returns row slices routed to each member's fp32
+    master. The masters ride along as unused forward args purely for
+    grad routing — with the trainer's flat-grad views, autograd
+    accumulates the slices in place, so the flat-guard contract holds."""
+
+    @staticmethod
+    def forward(ctx, x, wh, bh, splits, *params):
+        x2 = x.reshape(-1, x.shape[-1])
+        y = torch.addmm(bh, x2, wh.t())
+        ctx.save_for_backward(x2, wh)
+        ctx.splits = splits
+        return y.view(*x.shape[:-1], wh.shape[0])
+
+    @staticmethod
+    def backward(ctx, gy):
+        x2, wh = ctx.saved_tensors
+        splits = ctx.splits
+        g2 = gy.reshape(-1, gy.shape[-1])
+        if not g2.is_contiguous():
+            g2 = g2.contiguous()
+        dx = None
+        if ctx.needs_input_grad[0]:
+            dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
+        n = len(splits)
+        dws = [None] * n
+        dbs = [None] * n
+        if any(ctx.needs_input_grad[4:4 + n]):
+            ext = _load()
+            dwcat = (ext.wgrad(g2, x2) if ext is not None
+                     else g2.float().t() @ x2.float())
+            o = 0
+            for i, r in enumerate(splits):
+                dws[i] = dwcat[o:o + r]
+                o += r
+        if any(ctx.needs_input_grad[4 + n:]):
+            dbcat = g2.sum(0, dtype=torch.float32)
+            o = 0
+            for i, r in enumerate(splits):
+                dbs[i] = dbcat[o:o + r]
+                o += r
+        return (dx, None, None, None, *dws, *dbs)
+
+
+def fp16_packed_linear(x, wh, bh, ms):
+    """x @ cat(w).T + cat(b) for a Linear group on the fp16 stream. wh/bh
+    are the group's cat fp16 replicas (packed_halves or a slice of them
+    — the final block packs k/v only via the tail rows of its qkv
+    group)."""
+    if not torch.is_grad_enabled():
+        x2 = x.reshape(-1, x.shape[-1])
+        return torch.addmm(bh, x2, wh.t()).view(*x.shape[:-1], wh.shape[0])
+    splits = tuple(m.weight.shape[0] for m in ms)
+    ws = [m.weight for m in ms]
+    bs = [m.bias for m in ms]
+    return _Fp16PackedLinear.apply(x, wh, bh, splits, *ws, *bs)
 
 
 class _Fp16Linear(torch.autograd.Function):
@@ -278,7 +429,7 @@ class _Fp16LinearReLU(torch.autograd.Function):
             g2 = g2.contiguous()
         ext = _load()
         part = None
-        if hasattr(ext, "relu_bwd") and g2.shape[-1] in (64, 128):
+        if hasattr(ext, "relu_bwd") and g2.shape[-1] in _RELU_BWD_DIMS:
             # one pass: mask + fp32 column-sum partials — replaces
             # threshold_backward + a separate full-tensor gm.sum(0)
             # re-read (2026-07-28)

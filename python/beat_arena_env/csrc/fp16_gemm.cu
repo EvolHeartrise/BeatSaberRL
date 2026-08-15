@@ -2,9 +2,11 @@
 // COMPUTE and fp32 output, via explicit cublasGemmEx.
 //
 // PROVENANCE WARNING (2026-08-16): every measurement below is sm_61
-// (GTX 1080 / cu126) — none re-measured on the 4090/861k config, and
-// the fast-path width gates (64/128) MISS the v17 ffn (512) and trunk
-// (256); see PERF_AUDIT_2026-08-16.md Tier 1.1/1.2.
+// (GTX 1080 / cu126) — none re-measured on the 4090/861k config; see
+// PERF_AUDIT_2026-08-16.md. (The audit's Tier 1.1/1.2 width-gate
+// misses — ffn 512 / trunk 256 falling to the slow paths — were fixed
+// 2026-08-15; BEAT_GEMM_LEGACY=1 restores the old bias_relu dispatch
+// for A/B.)
 //
 // Why this exists (2026-07-25 gate benchmarks, GTX 1080 / cu126):
 // torch's half matmul dispatch routes the TN large-K shape (K = mb*18 =
@@ -23,6 +25,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace {
 
@@ -44,9 +47,12 @@ __global__ void bias_relu_kernel(__half2* __restrict__ y,
   y[i] = __float22half2_rn(o);
 }
 
-// Power-of-two d2 specialization (all the policy's Linear widths: 64
-// and 128 -> d2 32/64). The generic kernel's `i % d2` is a SIGNED
-// 64-BIT remainder — Pascal has no s64 divide, nvcc emits tens of
+// Power-of-two d2 specialization. Originally instantiated for the
+// 138k arch's widths only (64/128 -> d2 32/64); the v17 scale-up's
+// ffn hidden (512) and trunk (256) fell through to the generic
+// s64-modulo kernel for three days (PERF_AUDIT_2026-08-16.md Tier
+// 1.1) — d2 256/128 instantiated 2026-08-15. The generic kernel's
+// `i % d2` is a SIGNED 64-BIT remainder — nvcc emits tens of
 // instructions per element in a kernel whose real work is 2 loads +
 // 2 FMA + 1 store. Here the index is int32 and the remainder is a
 // compile-time mask. Bit-identical: index math only.
@@ -62,6 +68,17 @@ __global__ void bias_relu_kernel_p2(__half2* __restrict__ y,
   o.x = fmaxf(v.x + bb.x, 0.f);
   o.y = fmaxf(v.y + bb.y, 0.f);
   y[i] = __float22half2_rn(o);
+}
+
+// BEAT_GEMM_LEGACY=1 pins the pre-2026-08-15 dispatch (generic kernel
+// for d2 128/256) so the measurement ladder can A/B the width fix
+// without a rebuild. Read once — dispatch stays branch-free.
+bool legacy_dispatch() {
+  static const bool v = []() {
+    const char* e = getenv("BEAT_GEMM_LEGACY");
+    return e && e[0] == '1';
+  }();
+  return v;
 }
 
 void bias_relu_(at::Tensor y, at::Tensor b) {
@@ -86,6 +103,12 @@ void bias_relu_(at::Tensor y, at::Tensor b) {
         yp, bp, (int)n2);
   } else if (n2 <= INT32_MAX && d2 == 32) {
     bias_relu_kernel_p2<32><<<(unsigned)blocks, threads, 0, stream>>>(
+        yp, bp, (int)n2);
+  } else if (n2 <= INT32_MAX && d2 == 256 && !legacy_dispatch()) {
+    bias_relu_kernel_p2<256><<<(unsigned)blocks, threads, 0, stream>>>(
+        yp, bp, (int)n2);
+  } else if (n2 <= INT32_MAX && d2 == 128 && !legacy_dispatch()) {
+    bias_relu_kernel_p2<128><<<(unsigned)blocks, threads, 0, stream>>>(
         yp, bp, (int)n2);
   } else {
     bias_relu_kernel<<<(unsigned)blocks, threads, 0, stream>>>(
@@ -143,7 +166,8 @@ std::vector<at::Tensor> relu_bwd(at::Tensor gy, at::Tensor y) {
   TORCH_CHECK(y.is_cuda() && y.is_contiguous()
               && y.scalar_type() == at::kHalf && y.sizes() == gy.sizes(),
               "y: contiguous CUDA fp16, same shape as gy");
-  TORCH_CHECK(d == 64 || d == 128, "relu_bwd: last dim must be 64/128");
+  TORCH_CHECK(d == 64 || d == 128 || d == 256 || d == 512,
+              "relu_bwd: last dim must be 64/128/256/512");
   const int64_t n2 = gy.numel() / 2;
   TORCH_CHECK(n2 <= INT32_MAX, "relu_bwd: tensor too large");
   auto gm = at::empty_like(gy);
@@ -157,7 +181,18 @@ std::vector<at::Tensor> relu_bwd(at::Tensor gy, at::Tensor y) {
   auto* yp = reinterpret_cast<const __half2*>(y.data_ptr<at::Half>());
   auto* mp = reinterpret_cast<__half2*>(gm.data_ptr<at::Half>());
   auto* pp = part.data_ptr<float>();
-  if (d == 128) {
+  // v17 widths (2026-08-15, audit Tier 1.2): d 512/256 -> D2C 256/128.
+  // The shared buffer stays 512 floats for every D2C: usage is
+  // (blockDim/D2C) groups x 2*D2C = 2*blockDim = 512, D2C-independent;
+  // the column-ownership invariant (grid stride % D2C == 0) holds
+  // because blockDim = 256 is a multiple of every D2C here.
+  if (d == 512) {
+    relu_bwd_kernel<256><<<blocks, threads, 0, stream>>>(gp, yp, mp, pp,
+                                                         (int)n2);
+  } else if (d == 256) {
+    relu_bwd_kernel<128><<<blocks, threads, 0, stream>>>(gp, yp, mp, pp,
+                                                         (int)n2);
+  } else if (d == 128) {
     relu_bwd_kernel<64><<<blocks, threads, 0, stream>>>(gp, yp, mp, pp,
                                                         (int)n2);
   } else {
