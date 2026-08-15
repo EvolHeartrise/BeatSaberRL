@@ -222,7 +222,7 @@ def test_overlapping_walls_charge_once_per_tick():
 # --- obs: the shared distance-sorted entity window (spec §12c/d) -------------
 
 def _slots(obs):
-    """[(slot_dict, mask)] for the 16 entity slots."""
+    """[(slot_dict, mask)] for the entity slots."""
     out = []
     for s in range(N_NOTE_SLOTS):
         base = OFF_NOTES + s * NOTE_FEAT
@@ -236,7 +236,7 @@ def test_obs_dim_and_wall_token_lanes():
                 length=4.0, speed=4.0)
     sim = _sim(FAR_NOTE, [wall])
     obs = sim.obs()
-    assert len(obs) == OBS_DIM == 426
+    assert len(obs) == OBS_DIM == 578
     slots = _slots(obs)
     # two entities pending: the wall (nearer: front at 0.4+5*4-... at
     # t=0 dz_front=5*4+0.4=20.4 vs the note's dz=100*4+0.65) -> slot 0

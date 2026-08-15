@@ -93,20 +93,20 @@ def test_wall_lockstep_parity():
             assert (7 in ev_codes[i]) == (env.walls_in[i].item()
                                           > total_in[i]), (tick, i)
             total_in[i] = env.walls_in[i].item()
-        # entity window (lanes 100..404: 16x18 tokens + mask). The token
+        # entity window (lanes 100..556: 24x18 tokens + mask). The token
         # z lanes carry z_off = head_z − PLANE_Z0, and the engines' FK
         # heads differ by ≤1 f64 ulp per §21 (transcendentals + FMA
         # contraction) which one violent-collapse tick amplifies to
         # ~1e-5 m (measured: 3.9e-6 on the z lane at tick 34) — so the
         # continuous lanes get atol 1e-4 (any selection/indexing bug is
-        # O(0.1)+), while the slot mask stays EXACT. Lanes ≥404
+        # O(0.1)+), while the slot mask stays EXACT. Lanes ≥556
         # (ground/body FK) belong to the §5 dynamics tiers, not here.
         obs_c2 = obs_c.cpu().numpy().reshape(N, OBS_DIM)
         obs_r = np.stack([np.asarray(s.obs()) for s in sims])
-        np.testing.assert_allclose(obs_c2[:, 100:388], obs_r[:, 100:388],
+        np.testing.assert_allclose(obs_c2[:, 100:532], obs_r[:, 100:532],
                                    rtol=0.0, atol=1e-4,
                                    err_msg=f"tick {tick}")
-        np.testing.assert_array_equal(obs_c2[:, 388:404], obs_r[:, 388:404],
+        np.testing.assert_array_equal(obs_c2[:, 532:556], obs_r[:, 532:556],
                                       err_msg=f"tick {tick} (mask)")
     for i, sim in enumerate(sims):
         assert sim.walls_in == env.walls_in[i].item(), i

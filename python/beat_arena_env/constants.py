@@ -160,11 +160,14 @@ KIND_CHAIN_HEAD = 2
 KIND_CHAIN_LINK = 3
 
 # --- obs layout v17 (spec §12; offsets DERIVED from the block table) ---------
-# env v17: the 16 slots are a SHARED entity window (notes + walls),
+# env v17: the slots are a SHARED entity window (notes + walls),
 # nearest-first by 3D head distance; per-token = the v9 note lanes then
 # [is_wall, width, height, length]. Behind-the-head entities are
-# excluded.
-N_NOTE_SLOTS = 16
+# excluded. 16 -> 24 in env v18 (2026-08-16, user decision): the
+# eviction study measured 3.4%% of scoreable notes crowded out of the
+# 16-window during their critical pre-hit second (54%% recovered at 24;
+# dense-stream maps like MARENOL ran 76%% blind).
+N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 # env v17 wall reward/geometry literals (spec §12a/b)
 WALL_PEN = -0.05        # per tick with the head inside any wall
@@ -211,10 +214,10 @@ OFF_HAND_R = OBS_OFF["hand_r"]          # 85
 OFF_HEAD = OBS_OFF["head"]              # 95
 OFF_CONTACT = OBS_OFF["contact"]        # 98
 OFF_NOTES = OBS_OFF["notes"]            # 100
-OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 388
-OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 404
-OFF_BODY_PTS = OBS_OFF["body_pts"]      # 408
-assert OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426"
+OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 532
+OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 556
+OFF_BODY_PTS = OBS_OFF["body_pts"]      # 560
+assert OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

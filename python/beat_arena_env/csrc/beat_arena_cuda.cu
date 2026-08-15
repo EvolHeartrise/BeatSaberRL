@@ -87,7 +87,7 @@ constexpr int NUM_COLLIDERS = 12;
 constexpr int NUM_PAIRS = 55;
 constexpr int N_WELD = 12;
 constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
-constexpr int N_NOTE_SLOTS = 16;
+constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // env v17 (contact spec §12): shared entity window — notes AND walls
 // ride the 16 slots, nearest-first by head distance; per-token = the
 // v9 note lanes then [is_wall, width, height, length].
@@ -927,19 +927,19 @@ constexpr int OFF_HAND_R = 85;
 constexpr int OFF_HEAD = 95;
 constexpr int OFF_CONTACT = 98;
 constexpr int OFF_NOTES = 100;
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 388
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 532
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse /
 // GROUND_IMP_NORM. All-zero in weld mode, so lanes 0..340 are the v10
 // obs verbatim.
-constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 404
+constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 556
 constexpr int N_GROUND_IMP_LANES = 4;
 // env v13 (contact spec §8): [l_elbow, r_elbow, l_knee, r_knee,
 // l_foot, r_foot] world positions, head-style normalization.
 constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 408
 constexpr int N_BODY_PTS = 6;
-constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 426
-static_assert(OBS_DIM == 426, "contact spec §12: OBS_DIM must be 426");
+constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 578
+static_assert(OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578");
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to

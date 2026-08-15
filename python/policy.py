@@ -109,16 +109,16 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # v17: notes AND walls share the slots, nearest-first by head distance;
 # per-token = the v9 note lanes then [is_wall, width, height, length])
 # — plus the env v12 (spec §7) 4-lane per-foot ground-contact block at
-# 404..408 (BODY token) and the env v13 (spec §8) 18-lane body-point
-# block at 408..426: elbows to their saber tokens, knees + feet to the
-# BODY token.
-OBS_DIM = 426
-N_NOTE_SLOTS = 16
+# 556..560 (BODY token) and the env v13 (spec §8) 18-lane body-point
+# block at 560..578: elbows to their saber tokens, knees + feet to the
+# BODY token. Window 16 -> 24 in env v18 (eviction study).
+OBS_DIM = 578
+N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 OFF_NOTES = 100
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 388
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 532
 # Token layout (SPEC-v10 §5 "informative", finalized here at P4):
-# [saber_L, saber_R, body, note_0..15] = 19 tokens. Each saber token =
+# [saber_L, saber_R, body, note_0..23] = 27 tokens. Each saber token =
 # that hand's q lanes (8, incl. the cos/sin roll pair) + qd lanes (7) +
 # derived block (10) = 25 features + the 2-lane hand one-hot; the ONE
 # body token = root pose/vel block (15) + spine/leg q (15) + spine/leg
@@ -127,14 +127,17 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 388
 # token gains its arm's elbow position (3, env v13): 25 -> 28.
 SABER_FEAT = 28
 BODY_FEAT = 66
+# derived from the window size so a future slot change can't skew them
+_GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
+_BP = _GI + 4                           # body_pts block (18)
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
-                + tuple(range(75, 85)) + tuple(range(408, 411)))
+                + tuple(range(75, 85)) + tuple(range(_BP, _BP + 3)))
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
-                + tuple(range(85, 95)) + tuple(range(411, 414)))
+                + tuple(range(85, 95)) + tuple(range(_BP + 3, _BP + 6)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(95, 100))
-             + tuple(range(404, 408))
-             + tuple(range(414, 426)))
+             + tuple(range(_GI, _GI + 4))
+             + tuple(range(_BP + 6, _BP + 18)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —
@@ -347,7 +350,7 @@ class NotePolicy(nn.Module):
         sabers = obs.index_select(1, self._saber_idx)                # (B, 50)
         body = obs.index_select(1, self._body_idx)                   # (B, 50)
         notes = obs[:, OFF_NOTES:OFF_NOTE_MASK].reshape(
-            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 16, 14)
+            -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 24, 18)
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, body, notes, note_mask
 
