@@ -1,6 +1,11 @@
 // fp16-storage weight-grad GEMM: dW = dY^T X with fp16 inputs, fp32
 // COMPUTE and fp32 output, via explicit cublasGemmEx.
 //
+// PROVENANCE WARNING (2026-08-16): every measurement below is sm_61
+// (GTX 1080 / cu126) — none re-measured on the 4090/861k config, and
+// the fast-path width gates (64/128) MISS the v17 ffn (512) and trunk
+// (256); see PERF_AUDIT_2026-08-16.md Tier 1.1/1.2.
+//
 // Why this exists (2026-07-25 gate benchmarks, GTX 1080 / cu126):
 // torch's half matmul dispatch routes the TN large-K shape (K = mb*18 =
 // 589,824) to a kernel that is BOTH 4.5x slower than fp32 AND sloppily

@@ -3,10 +3,11 @@
 Survives the trainer's CUDA-graphs removal (2026-07-25 — the fused
 action head + last-block pruning in policy.py eliminated the launch
 storm capture used to hide, leaving capture as pure overhead there).
-Still used where a graph genuinely pays or serves as the honest
-incumbent: the ScoreSaber bench's argmax-forward fallback
-(bench_scoresaber._GraphedArgmax) and the forward microbench
-(bench_policy_forward.py).
+Still used where a graph genuinely pays: the ScoreSaber bench's
+graphed argmax forward and train_batch's --graph-rollout capture.
+(The bench_policy_* microbenches were deleted with the fused-kernel
+stack, 2026-08-13; restore from bd07669^ if re-benching — see
+PERF_AUDIT_2026-08-16.md Tier 0.)
 """
 
 from __future__ import annotations

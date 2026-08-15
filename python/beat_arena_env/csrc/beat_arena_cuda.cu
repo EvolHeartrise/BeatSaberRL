@@ -5,7 +5,7 @@
 // limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
 // 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
 // + gear->tau, work-based effort, blade sweep/cut judgment, scoring,
-// obs 340 — a semantics-exact transcription of rust/src/lib.rs +
+// obs write (OBS_DIM below) — a semantics-exact transcription of rust/src/lib.rs +
 // rust/src/dynamics/{model,fk,algo,collide,solver,step}.rs. The Rust
 // crate remains THE reference implementation.
 //
@@ -89,17 +89,29 @@ constexpr int N_WELD = 12;
 constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // env v17 (contact spec §12): shared entity window — notes AND walls
-// ride the 16 slots, nearest-first by head distance; per-token = the
-// v9 note lanes then [is_wall, width, height, length].
+// ride the N_NOTE_SLOTS slots, nearest-first by head distance;
+// per-token = the v9 note lanes then [is_wall, width, height, length].
 constexpr int NOTE_FEAT = 18;
 constexpr double WALL_PEN = -0.05;      // per tick with head inside a wall
 constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
+// ============================ PROVENANCE WARNING =====================
+// (2026-08-16) EVERY measurement, occupancy figure, and perf verdict
+// in this header and the K-series notes below was taken on sm_61
+// (20-SM GTX 1080). None has been re-measured on the production RTX
+// 4090 (128 SMs, sm_89) or at the current batch shapes. Treat them as
+// provenance for the do-not-retry list, NOT as current truth. The
+// current measurement plan (Nsight run, bandwidth-vs-latency
+// disambiguation, layout candidates) lives in
+// projects/beat-arena/PERF_AUDIT_2026-08-16.md.
+// =====================================================================
+//
 // One WARP per block: the grid is N/32 blocks, so small batches spread
 // over all 20 SMs. Throughput is INSENSITIVE to the block size (P5
 // measurement, 128 vs 32: 216 vs 221 ms at N=1024) — consistent with
 // the diagnosis below, and the reason occupancy is not the lever here.
 //
-// The kernel is SERIAL-LATENCY bound. Earlier notes called it "serial
+// The kernel is SERIAL-LATENCY bound (per the sm_61 measurements —
+// the 4090's local-memory picture may differ; see the audit). Earlier notes called it "serial
 // latency + local-memory traffic"; the 2026-08-03 A4/A1 measurements
 // separate the two, and traffic is not the binding constraint:
 //   * A1/1c: batching the dense back substitution of the limit-row unit

@@ -18,14 +18,12 @@ buffer copies + capturable Adam) at every shape tried. Checkpoints
 saved by graphs-era runs load unchanged (they were normalized to the
 eager Adam form at save time).
 
-recompute-based backward (activation memory O(obs minibatch)), packed
-weights as the single Adam leaf; PPO loss math stays in torch on the
-tiny (mb,29,K)/(mb,) outputs, so semantics cannot drift. d64/1-head
-archs only. Weights are mirrored back into the torch policy once per
-PPO update for rollout sampling and checkpoints. Checkpoints remain
-load-compatible EXCEPT the Adam state (one packed param vs ~50):
-optimized eager path — its value is the ~160x activation-memory
-reduction (large-arch / large-minibatch headroom).
+The update path is eager torch + the fp16-storage helpers
+(fp16_linear.py: flat fp32 masters with contiguous fp16 replicas,
+fused Adam over flat views, device-side dynamic loss scale). The old
+fused-kernel update stack (recompute backward, packed single-leaf
+Adam, d64/1-head only) was DELETED at the 2026-08-13 scale-up — see
+PERF_AUDIT_2026-08-16.md for what is and isn't currently measured.
 """
 
 from __future__ import annotations
