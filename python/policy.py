@@ -41,24 +41,26 @@ from fused_ln import FusedLayerNorm
 import os as _os
 _NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
 _NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
-# Perf-ladder toggles (audit Tier 1.3-1.5, 2026-08-15), fp16 stream
-# ONLY — the fp32 record path stays bitwise stable under every setting.
-# Defaults stay legacy until the pod ladder measures a win:
-#   BEAT_ATTN=fold   multi-head: pre-scale q by dh^-1/2 (the SDPA-style
-#                    exact-same-math reassociation) + in-place bias add
-#                    — drops one full-scores-size kernel per block
-#   BEAT_ATTN=sdpa   multi-head via F.scaled_dot_product_attention
-#                    (key-side additive mask, no all-masked rows). The
-#                    old SDPA refutation was sm_61/d64/T19/1-head.
-#   BEAT_QKV_PACKED=1   q/k/v (k/v in the final block) as ONE GEMM per
-#                    block against cat fp16 replicas (flat groups)
-#   BEAT_PACKED_HEADS=1 update-path head GEMM reuses the rollout's
-#                    fused-head cache instead of 30-way cats per
-#                    minibatch
-_ATTN_MODE = _os.environ.get("BEAT_ATTN", "legacy")
+# Perf toggles (audit Tier 1.3-1.5), fp16 stream ONLY — the fp32
+# record path stays bitwise stable under every setting. Defaults are
+# the 2026-08-15 ladder WINNERS (isolated-pod A/B, numerics-gated):
+# sdpa+qkv+heads measured 49.2 -> 40.3 ms/update (-18%), graphed
+# rollout forward -23% at N=16384, production train --bench +5.4-6.9%
+# steps/s — and r1 (rollout/update consistency) is EXACTLY 0 because
+# both phases now run the same SDPA kernels. Numerics class: fp16
+# last-rounding (worst 5.9e-3 rel on grad probes), same accepted class
+# as the delta_bias fold. Escape hatches for bisects:
+#   BEAT_ATTN=legacy    hand-rolled scores/softmax/@v (pre-ladder)
+#   BEAT_ATTN=fold      pre-scaled-q reassociation (measured mid)
+#   BEAT_QKV_PACKED=0   per-projection q/k/v GEMMs
+#   BEAT_PACKED_HEADS=0 30-way head cat per update minibatch
+# (The old "SDPA slower" refutation was sm_61/d64/T19/1-head — it did
+# not transfer to the 4090/4-head/27-token config, as the audit
+# predicted.)
+_ATTN_MODE = _os.environ.get("BEAT_ATTN", "sdpa")
 assert _ATTN_MODE in ("legacy", "fold", "sdpa"), _ATTN_MODE
-_QKV_PACKED = _os.environ.get("BEAT_QKV_PACKED", "0") == "1"
-_PACKED_HEADS = _os.environ.get("BEAT_PACKED_HEADS", "0") == "1"
+_QKV_PACKED = _os.environ.get("BEAT_QKV_PACKED", "1") == "1"
+_PACKED_HEADS = _os.environ.get("BEAT_PACKED_HEADS", "1") == "1"
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:

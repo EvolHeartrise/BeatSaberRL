@@ -7,6 +7,47 @@ profile. Structural fact: EVERY perf verdict in the repo predates the
 current 861k/27-token config (the 4090 round measured the 138k arch;
 the kernel header's numbers are sm_61).
 
+## MEASURED — 2026-08-15 ladder (isolated 4090 pod, ranked-pool shape)
+
+Tier 0 answers:
+- 0.1 split at production shape (N=16384 T=8, exec-true): **71%
+  rollout / 29% update** — the "update grew to 35–50%" estimate was
+  WRONG; 2.1's upside re-scales to ~1–3.5% of wall.
+- Torch-profiler census: **step_kernel = 90% of the rollout phase
+  (~146 ms/tick at 16384 envs) ≈ 64% of total wall.** The env kernel
+  is the dominant lever; every policy-stack item combined caps at ~10%.
+- 0.2 sm_89 census (cold build): step_kernel<float> 254 regs (write)
+  / 168 (read-only), 42 KB stack frame, ZERO spills; fp64 variants
+  spill (parity-test-only, don't care).
+- 0.3 ncu: **ERR_NVGPUCTRPERM — counters locked on RunPod secure
+  cloud.** Bandwidth-vs-latency stays unresolved by counters; census
+  proxies: 8-warp reg ceiling + 42 KB/thread local frame both stand.
+  Tier 3.3 (warp-coherence permutation) is justified either way.
+- relu_bwd<256> measures ~1.3 TB/s effective — at the DRAM roofline,
+  already optimal.
+
+Tier 1 A/B (ms/update mb=16384 | graphed fwd µs N=16384 | prod steps/s):
+- A0 pre-audit baseline: 49.23 | 16,149 | 80.6k
+- A1 gemm widths:        48.32 | 16,150 | 79.8k (update −1.8%, ~0.5%
+  wall — real but small; bit-identical, kept)
+- fold: 48.55; sdpa: 42.24 | 12,482 (**−23% fwd**); qkv: 45.83; heads:
+  48.32 (0 alone — kept for the launch-count cut, bit-identical)
+- **A7 sdpa+qkv+heads: 40.33 (−18%) | 11,900 (−26%) | 85.0k
+  (+5.4–6.9% end-to-end). ADOPTED as defaults 2026-08-15.** Numerics
+  gate: worst 5.9e-3 rel (fp16 last-rounding class); r1 becomes
+  exactly 0 (rollout and update share the SDPA kernels). Escape
+  hatches: BEAT_ATTN=legacy|fold, BEAT_QKV_PACKED=0,
+  BEAT_PACKED_HEADS=0, BEAT_GEMM_LEGACY=1, BEAT_NO_WIDE_RELU_BWD=1.
+- The sm_61 SDPA refutation indeed did not transfer (audit 1.3
+  vindicated); old fused-attn deletion re-confirmed dead.
+
+Revised order after adoption: Tier 3.3 warp-coherence spike (10–25%
+of an env kernel that is 64% of wall = 6–16% total, the biggest
+remaining lever) -> 3.1/3.2 layout (unresolved by ncu, cheap to A/B
+directly) -> 2.1 graphed update (re-scaled ~1–3.5%) -> 2.2 compile
+arm (largely subsumed: SDPA adopted) -> 2.3 bf16 behind a learning
+gate.
+
 ## Tier 0 — measure first (~1h)
 - 0.1 `train_batch.py --bench` at production shape: get the TRUE
   rollout/update split (est. update now 35–50% of wall, was 19%).
