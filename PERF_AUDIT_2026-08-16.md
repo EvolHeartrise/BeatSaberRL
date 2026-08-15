@@ -69,10 +69,38 @@ not do casually", measure the realized nc histogram first).
 
 Banked: **+5.4–6.9% steps/s** (SDPA combo + width fixes, adopted).
 Refuted by measurement: warp-coherence permutation (null), graphed
-update (not launch-bound), pool layout (residency-flat). Still open:
-2.3 bf16 (learning gate + user decision) and Tier 4 local-frame
-surgery (parity-breaking class, needs explicit sign-off). Every
+update (not launch-bound), pool layout (residency-flat). Every
 sm_61-era perf verdict has now been re-measured or retired on sm_89.
+
+## Tier 4 probes (2026-08-15, user-approved) — frame surgery REFUTED
+
+- N-scaling (stock kernel, step ms/tick): 56.1 / 79.6 / 124.0 / 194.0
+  at N = 4k/8k/16k/32k => per-env cost FALLS monotonically (13.7 ->
+  5.9 us/env). Latency-bound, parallelism-starved (4 warps/SM at
+  production N); footprint is not the binder. Cache-thrash would show
+  the opposite slope.
+- Realized nc histogram (39.3M (env,substep) samples, trained policy,
+  full mirrored pool): production max nc = 7 (92.7% zero); 4x-push
+  stress max = 8 (90.3% zero). The audit's prerequisite, now measured
+  on the live recipe.
+- NC_CAP=16 capacity build: frame 42,224 -> 30,288 B BUT +3.1% SLOWER
+  (124.0 -> 127.8 ms/tick) — ptxas allocation flipped 254 -> 168 regs,
+  the K6/K12 phase-change failure mode. Capacity never touches traffic
+  (nc <= 8 rows are all that is written); the flip only hurts. DO NOT
+  RETRY frame-capacity or packed-triangle cuts on this evidence — they
+  shrink bytes the kernel never waits on.
+
+What WOULD move the env kernel, quantified:
+1. **warp-per-env rewrite** — the real Tier 4 item. Latency-bound at
+   ~0.1% FLOP utilization; cooperative 32-lane linear algebra could
+   plausibly buy several x on 64% of wall. Weeks of work, breaks the
+   bitwise-CRT parity claim (accumulation orders change) => tolerance
+   -tier re-baseline. Needs an explicit go/no-go as a project.
+2. **N=32768** — measured TODAY: 2x envs for 1.56x step time = +28%
+   env-phase throughput, no kernel change. But it changes the PPO
+   batch (or halves horizon to keep batch 131,072 at T=4) => learning
+   gate + recipe decision, not a perf patch.
+3. bf16 (unchanged: learning gate + user decision).
 
 ## Tier 0 — measure first (~1h)
 - 0.1 `train_batch.py --bench` at production shape: get the TRUE
