@@ -938,7 +938,7 @@ def main():
             fh = venv.pop_fall_hits()
             if fh:
                 print(f"[fall] {fh} fall termination(s) this update "
-                      "(each priced at its remaining scoreable notes)",
+                      "(each priced at the flat fall_const)",
                       flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
