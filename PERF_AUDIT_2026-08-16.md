@@ -41,12 +41,27 @@ Tier 1 A/B (ms/update mb=16384 | graphed fwd µs N=16384 | prod steps/s):
 - The sm_61 SDPA refutation indeed did not transfer (audit 1.3
   vindicated); old fused-attn deletion re-confirmed dead.
 
-Revised order after adoption: Tier 3.3 warp-coherence spike (10–25%
-of an env kernel that is 64% of wall = 6–16% total, the biggest
-remaining lever) -> 3.1/3.2 layout (unresolved by ncu, cheap to A/B
-directly) -> 2.1 graphed update (re-scaled ~1–3.5%) -> 2.2 compile
-arm (largely subsumed: SDPA adopted) -> 2.3 bf16 behind a learning
-gate.
+Tier 3.3 warp-coherence permutation: **MEASURED NULL, reverted**
+(implemented behind BEAT_ENV_PERM, bitwise-identity proven — 86
+parity/env tests green with the permutation forced on — then:
+step_kernel 134.07 -> 133.75 ms/tick (−0.24%, noise), --bench 86.5k
+vs 87.0k (noise)). The header's 3.5x identical-envs figure is another
+sm_61 verdict that did not transfer: sm_89 cost is dominated by the
+42 KB/thread local frame, whose traffic is order-invariant. DO NOT
+RETRY without counters showing divergence stalls. (Mechanism lives in
+git history at 1c548d1 if a future arch changes the calculus.)
+
+Tier 2.1 graphed update: **REFUTED by the census** — update-phase CPU
+enqueue is 30 ms/iter vs 48 ms/iter GPU execution (63%), the queue
+stays full, the phase is GPU-bound not launch-bound at mb 16384.
+Graphs would buy ~0 at production shape. Skip.
+
+Remaining open: 3.1/3.2 (pool layout / status transpose) — decided by
+the pool-residency probe (tiny L2-resident pool vs full 7.1 GB pool:
+if step time is flat, pool reads are not the bottleneck and Tier 3
+layout work is refuted too); then 2.3 bf16 behind a learning gate
+(user decision — it changes numerics and deletes the loss-scale
+apparatus).
 
 ## Tier 0 — measure first (~1h)
 - 0.1 `train_batch.py --bench` at production shape: get the TRUE
