@@ -390,6 +390,13 @@ def test_sim_plays_a_chart_scripted_torques():
         # track moves with the whip's trunk reaction; 0.8 re-lands the
         # hand-tuned whip_tick=15 primary path (cut 83, post 30)
         sim = _sim([_note(0.8, 0.3, 1.4, speed=4.0)], max_steps=300)
+        # env v20: this script is calibrated to the pre-v20 zero-arm pose;
+        # pin it (the ready stance only moves the episode START pose, not
+        # the mechanics under test)
+        q = list(sim.qpos())
+        for _j in (3, 6, 8, 10, 13, 15):
+            q[7 + _j] = 0.0
+        sim.set_joints(q, [0.0] * 35)
         events = []
         for t in range(90):
             a = list(COAST)

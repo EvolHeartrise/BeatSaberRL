@@ -141,9 +141,14 @@ def test_reset_obs_exact():
     obs = env.reset()
     sims = _rust_sims(charts, 5, 6900)
     for i, sim in enumerate(sims):
-        np.testing.assert_array_equal(np.asarray(sim.obs()),
-                                      obs[i].cpu().numpy(),
-                                      err_msg=f"env{i} reset obs")
+        # env v20: the arm ready stance makes reset obs exercise
+        # sin/cos, so the §21 1-ulp CUDA-vs-CRT trig divergence now
+        # reaches a few near-zero FK lanes at reset too — same class,
+        # same bound, no longer bitwise
+        np.testing.assert_allclose(np.asarray(sim.obs()),
+                                   obs[i].cpu().numpy(),
+                                   rtol=0, atol=2e-15,
+                                   err_msg=f"env{i} reset obs")
 
 
 def test_set_state_fk_parity():
@@ -493,7 +498,10 @@ def test_parity_f32_bounded():
         # bites, and a 64-pass-exhausted clamp sweep can leave small
         # rate residuals (the old exact-write guarantee pass was the
         # phantom-force bug)
-        assert (q >= lo - 0.25).all() and (q <= hi + 0.25).all(), \
+        # slack 0.25 -> 0.4 (env v20): the ready stance starts elbows/
+        # wrists nearer their stops, so random-torque transients
+        # overshoot a little further before the limit rows catch them
+        assert (q >= lo - 0.4).all() and (q <= hi + 0.4).all(), \
             f"t{t}: joints outside limits"
         assert (np.abs(qd) <= caps + 1.0).all(), f"t{t}: rates above caps"
         assert (np.linalg.norm(root_w, axis=1) <= 96.0 + 1e-2).all()
@@ -510,7 +518,11 @@ def test_parity_f32_bounded():
                      (sim.bad_cuts, int(env.bad[e])),
                      (sim.misses, int(env.miss[e]))):
             assert abs(a - b) <= 3, f"env{e} f32 counters drifted"
-        assert abs(sim.score - float(env.score[e])) <= 120.0, \
+        # 120 -> 300 (env v20): the ready stance scores far more under
+        # random torques (blades start cocked near the track), so the
+        # chaotic f32-vs-f64 trajectory divergence carries more points;
+        # same well-formedness intent, rescaled band
+        assert abs(sim.score - float(env.score[e])) <= 300.0, \
             f"env{e} f32 score drifted"
     # the §20e safety net: counted, not hidden — and inert in ordinary play
     hits = env.pop_pd_hits()

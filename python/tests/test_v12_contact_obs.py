@@ -21,6 +21,13 @@ def _sim(foot_contact):
                                    wide_acc=False, gears=5,
                                    foot_contact=foot_contact)
     sim.set_chart([note_tuple(FAR_NOTE)])
+    # env v20: this script is calibrated to the pre-v20 zero-arm pose;
+    # pin it (the ready stance only moves the episode START pose, not
+    # the mechanics under test)
+    q = list(sim.qpos())
+    for _j in (3, 6, 8, 10, 13, 15):
+        q[7 + _j] = 0.0
+    sim.set_joints(q, [0.0] * 35)
     return sim
 
 

@@ -416,8 +416,9 @@ def test_rust_combo_walk_matches_python():
     # rng 7 -> 17 (env v15, contact spec §10): the head-anchored
     # track shifts with the flailing trunk even in weld mode, and
     # seed 7's lucky random hits stopped connecting in episode 0
-    # (the walk itself matched exactly; only score>0 broke)
-    acts = np.random.default_rng(17).integers(0, 3, size=(400, 2, 29))
+    # (the walk itself matched exactly; only score>0 broke).
+    # 17 -> 41 (env v20): same story again under the arm ready stance.
+    acts = np.random.default_rng(41).integers(0, 3, size=(400, 2, 29))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
     while not all(r is not None for r in rust_result):

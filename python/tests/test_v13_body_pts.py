@@ -62,7 +62,15 @@ def test_body_pt_lanes_track_motion():
     sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
                                    wide_acc=False, gears=5,
                                    foot_contact=False)
-    o0 = np.asarray(sim.set_chart([note_tuple(FAR_NOTE)]), dtype=np.float64)
+    sim.set_chart([note_tuple(FAR_NOTE)])
+    # env v20: this script is calibrated to the pre-v20 zero-arm pose;
+    # pin it (the ready stance only moves the episode START pose, not
+    # the mechanics under test)
+    q = list(sim.qpos())
+    for _j in (3, 6, 8, 10, 13, 15):
+        q[7 + _j] = 0.0
+    sim.set_joints(q, [0.0] * 35)
+    o0 = np.asarray(sim.obs(), dtype=np.float64)
     act = [0] * N_JOINTS
     act[20] = 1  # l_knee full flex (one-way joint, gear id 1 = +1.0)
     obs = o0
