@@ -38,11 +38,23 @@ ARMS = {
     "constpush": ["--fall-pen", "5.0", "--push-prob", "0.00333",
                   "--push-vmax", "0.5", "--start-jitter", "0.2"],
     "w24": [],
+    # N learning gate (2026-08-15): same PPO batch (65,536 x 2 =
+    # 131,072) and update count, but the rollout pays 2 env ticks per
+    # update instead of 8 — the wall-clock arm. MUST run with
+    # BEAT_CHOL_RL=1 BEAT_MIN_BLOCKS=16 exported (the flag-pair kernel:
+    # 352.8 ms @65k, the +39%/env occupancy win). Judged on leaf-end
+    # return vs the w24 baseline (+118.2) AND trunk wall minutes; the
+    # learning risk under test is the T=2 GAE bootstrap horizon.
+    "n65": ["--num-envs", "65536", "--horizon", "2"],
 }
 EXTRA = ARMS[ARM]
 RUN_DIR = os.path.join("runs", f"v18_fall_{ARM}")
 NUM_ENVS, HORIZON = 16384, 8
-TRUNK_UPDATES = 3_000
+# n65's two-sided win condition (user, 2026-08-15): leaf at 3,000 =
+# equal-optimization comparison; leaf at 3,750 = equal-WALL comparison
+# (3,750 cheaper updates ~ the baseline's 77-min trunk).
+TRUNK_UPDATES = 3_750 if ARM == "n65" else 3_000
+LEAF_CUTS = [3_000, 3_750] if ARM == "n65" else [3_000]
 COOLDOWN = 400
 
 # the fpm campaign recipe verbatim (v17_trunk_long.py COMMON)
@@ -88,31 +100,38 @@ def main():
                 "trunk.log", 21_600)
         print(f"[fall-probe {ARM}] trunk done in {w/60:.1f} min", flush=True)
 
-    w = run([PY, "train_batch.py", *COMMON, *EXTRA,
-             "--resume", done_ck,
-             "--cooldown-updates", str(COOLDOWN), "--ent-final", "3e-6",
-             "--run-dir", RUN_DIR], "leaf.log", 7_200)
-    print(f"[fall-probe {ARM}] leaf done in {w/60:.1f} min", flush=True)
+    for cut in LEAF_CUTS:
+        cut_ck = os.path.join(RUN_DIR, f"trunk_upd{cut:05d}.pt")
+        leaf_log = f"leaf_{cut:05d}.log"
+        w = run([PY, "train_batch.py", *COMMON, *EXTRA,
+                 "--resume", cut_ck,
+                 "--cooldown-updates", str(COOLDOWN),
+                 "--ent-final", "3e-6",
+                 "--run-dir", RUN_DIR], leaf_log, 7_200)
+        print(f"[fall-probe {ARM}] leaf@{cut} done in {w/60:.1f} min",
+              flush=True)
 
-    leaf = [f for f in os.listdir(RUN_DIR)
-            if f.startswith("leaf_from") and f.endswith(".pt")][0]
-    out = os.path.join("bench", f"v18_fall_{ARM}.json")
-    run([PY, "bench_scoresaber.py", "--ckpt", os.path.join(RUN_DIR, leaf),
-         "--num-envs", "2048", "--foot-contact", "--out", out],
-        "bench.log", 10_800)
-    b = json.load(open(out, encoding="utf-8"))
-    lv = [x for x in b["levels"] if "skipped" not in x]
-    fcs = sum(1 for x in lv if x.get("full_combo"))
-    zeros = sum(1 for x in lv if x.get("accuracy", 0.0) < 0.01)
-    ret = "?"
-    with open(os.path.join(RUN_DIR, "leaf.log"), encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("update"):
-                ret = line.split()[5]
-    print(f"PROBE_RESULT {ARM} leaf_return {ret} "
-          f"upp {b['total_unweighted_pp']:.2f} "
-          f"wpp {b['total_weighted_pp']:.2f} fcs {fcs} zeros {zeros}",
-          flush=True)
+        leaf = [f for f in os.listdir(RUN_DIR)
+                if f.startswith("leaf_from") and f"{cut:05d}" in f
+                and f.endswith(".pt")][0]
+        out = os.path.join("bench", f"v18_fall_{ARM}_{cut:05d}.json")
+        run([PY, "bench_scoresaber.py",
+             "--ckpt", os.path.join(RUN_DIR, leaf),
+             "--num-envs", "2048", "--foot-contact", "--out", out],
+            f"bench_{cut:05d}.log", 10_800)
+        b = json.load(open(out, encoding="utf-8"))
+        lv = [x for x in b["levels"] if "skipped" not in x]
+        fcs = sum(1 for x in lv if x.get("full_combo"))
+        zeros = sum(1 for x in lv if x.get("accuracy", 0.0) < 0.01)
+        ret = "?"
+        with open(os.path.join(RUN_DIR, leaf_log), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("update"):
+                    ret = line.split()[5]
+        print(f"PROBE_RESULT {ARM}@{cut} leaf_return {ret} "
+              f"upp {b['total_unweighted_pp']:.2f} "
+              f"wpp {b['total_weighted_pp']:.2f} fcs {fcs} zeros {zeros}",
+              flush=True)
 
 
 if __name__ == "__main__":
