@@ -61,6 +61,12 @@ class BeatVecEnv:
         without foot_contact=True."""
         return self.sim.pop_fall_hits()
 
+    def pop_flail(self):
+        """env v19 flail telemetry — CUDA-backend-only; this Rust-backed
+        wrapper reports zeros so the trainer's [flail] line degrades
+        gracefully instead of branching on backend."""
+        return 0.0, 0
+
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
         self.sim.set_chart(i, [note_tuple(n) for n in generate_chart(self.cfg, rng)])

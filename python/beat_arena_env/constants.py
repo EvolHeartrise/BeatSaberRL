@@ -172,7 +172,12 @@ NOTE_FEAT = 18
 # env v17 wall reward/geometry literals (spec §12a/b)
 WALL_PEN = -0.05        # per tick with the head inside any wall
 WALL_FRONT_OFF = 0.25   # viewer front-face offset behind the note plane (m)
-HAND_FEAT = 10        # wrist pos(3), wrist vel(3), blade dir(3), swing meter
+# env v19 (2026-08-16): +1 lane — remaining follow-through credit,
+# Σ over the hand's live trackers of (1 − min(acc/POST_FULL, 1)),
+# clipped to 2 (fresh single-note tracker = 1.0; idle/broken/capped
+# all read 0 = "swinging earns nothing"). Closes the post-swing
+# credit-assignment hole behind the flail bug (user diagnosis).
+HAND_FEAT = 11        # wrist pos(3), wrist vel(3), blade dir(3), meter, post_rem
 Q_LANES = N_JOINTS + len(WRAP_JOINTS)   # 31: wrist rolls code as cos/sin
 
 _OBS_BLOCKS = (
@@ -210,14 +215,14 @@ OFF_ROOT_VANG = OBS_OFF["root_vang"]    # 12
 OFF_Q = OBS_OFF["q"]                    # 15
 OFF_QD = OBS_OFF["qd"]                  # 46
 OFF_HAND_L = OBS_OFF["hand_l"]          # 75
-OFF_HAND_R = OBS_OFF["hand_r"]          # 85
-OFF_HEAD = OBS_OFF["head"]              # 95
-OFF_CONTACT = OBS_OFF["contact"]        # 98
-OFF_NOTES = OBS_OFF["notes"]            # 100
-OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 532
-OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 556
-OFF_BODY_PTS = OBS_OFF["body_pts"]      # 560
-assert OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578"
+OFF_HAND_R = OBS_OFF["hand_r"]          # 86 (env v19)
+OFF_HEAD = OBS_OFF["head"]              # 97 (env v19)
+OFF_CONTACT = OBS_OFF["contact"]        # 100 (env v19)
+OFF_NOTES = OBS_OFF["notes"]            # 102 (env v19)
+OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 534 (env v19)
+OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 558 (env v19)
+OFF_BODY_PTS = OBS_OFF["body_pts"]      # 562 (env v19)
+assert OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

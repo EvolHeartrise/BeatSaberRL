@@ -224,6 +224,12 @@ def save_results(path, data, levels):
     # measuring breadth across the whole evaluated set
     data["total_unweighted_pp"] = round(
         sum(e["pp"] for e in evaluated), 2)
+    # env v19: catalog-wide mean flail (rad per note-free tick) — the
+    # phantom-swing judge for the post_rem obs A/B. .get() keeps old
+    # results files (pre-v19 levels lack the fields) loadable.
+    _ft = sum(e.get("flail_ticks", 0) for e in evaluated)
+    data["flail_rad_per_tick"] = round(
+        sum(e.get("flail_rad", 0.0) for e in evaluated) / _ft, 5) if _ft else 0.0
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -412,6 +418,10 @@ def finish_slot(slot, info, combo):
         # component analyses come free from the results file
         "score_pre": info["score_pre"], "score_acc": info["score_acc"],
         "score_post": info["score_post"],
+        # env v19 flail telemetry: blade arc (rad) by follow-through-idle
+        # hands on note-free ticks + those ticks' count, this level
+        "flail_rad": round(info["flail_rad"], 3),
+        "flail_ticks": info["flail_ticks"],
     }
 
 
@@ -614,11 +624,13 @@ def main():
                         combo = gr.sim.combo(i)  # BEFORE set_chart resets
                         g, b, m, n_scoreable, _, bombs = gr.sim.counters(i)
                         c_pre, c_acc, c_post = gr.sim.components(i)
+                        fl_rad, fl_ticks = gr.sim.flail(i)
                         result = finish_slot(s, {
                             "good_cuts": g, "bad_cuts": b, "misses": m,
                             "n_notes": n_scoreable, "bombs_hit": bombs,
                             "score_pre": c_pre, "score_acc": c_acc,
-                            "score_post": c_post}, combo)
+                            "score_post": c_post, "flail_rad": fl_rad,
+                            "flail_ticks": fl_ticks}, combo)
                         levels[result["leaderboard_id"]] = result
                         n_done += 1
                         n_finished += 1

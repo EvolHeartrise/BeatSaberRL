@@ -940,6 +940,15 @@ def main():
                 print(f"[fall] {fh} fall termination(s) this update "
                       "(each priced at the flat fall_const)",
                       flush=True)
+        # env v19 flail telemetry: mean blade arc (rad, both hands) per
+        # note-free env-tick from hands with no live follow-through —
+        # the phantom-swing signal the v19 post_rem obs lane targets.
+        # CUDA-backend counter; the Rust wrapper reports zeros.
+        if hasattr(venv, "pop_flail"):
+            fl_rad, fl_ticks = venv.pop_flail()
+            if fl_ticks:
+                print(f"[flail] {fl_rad / fl_ticks:.4f} rad/idle-tick "
+                      f"({fl_ticks} note-free env-ticks)", flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
