@@ -27,9 +27,15 @@ def test_body_pt_lanes_reference_pose():
     lane space, x/1, (y−Y0)/0.75, (z+0.65)/1."""
     obs = _reset_obs(True)
     pts = obs[OFF_BODY_PTS:OFF_BODY_PTS + 18].reshape(6, 3)
+    # elbows move with the env v20 arm ready stance — take them from
+    # the fk_body mirror; knees/feet stay at the §1.2 reference
+    from beat_arena_env.constants import q_start
+    from beat_arena_env.kinematics import F_L_ELBOW, F_R_ELBOW, fk_body
+    _, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start())
+    le, re = pos[F_L_ELBOW], pos[F_R_ELBOW]
     exp = np.array([
-        [-0.20, (1.47 - Y_CENTER) / Y_NORM, 0.35],   # l_elbow
-        [+0.20, (1.47 - Y_CENTER) / Y_NORM, 0.35],   # r_elbow
+        [le[0], (le[1] - Y_CENTER) / Y_NORM, le[2] + 0.65],  # l_elbow
+        [re[0], (re[1] - Y_CENTER) / Y_NORM, re[2] + 0.65],  # r_elbow
         [-0.10, (0.50 - KNEE_Y0) / Y_NORM, 0.0],     # l_knee
         [+0.10, (0.50 - KNEE_Y0) / Y_NORM, 0.0],     # r_knee
         [-0.10, (0.07 - FOOT_Y0) / Y_NORM, 0.0],     # l_foot

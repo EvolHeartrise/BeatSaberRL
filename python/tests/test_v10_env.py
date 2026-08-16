@@ -66,30 +66,47 @@ def test_obs_length_and_reset_layout():
     assert np.allclose(obs[OFF_ROOT_ROT:OFF_ROOT_ROT + 6],
                        [1, 0, 0, 0, 1, 0])
     assert not obs[OFF_ROOT_VLIN:OFF_ROOT_VANG + 3].any()
-    # q block: all joints zero => lanes zero EXCEPT the wrist-roll
-    # cos/sin pairs (cos 0 = 1) and the one-way elbow/knee lanes (-1)
+    # q block (env v20): every joint at its q_start() value — the arm
+    # ready stance is nonzero (pitch/elbow/bend), everything else zero.
+    # Expectations derive from the §5 normalizer table, not literals.
+    import math as _m
+    from beat_arena_env.constants import JOINT_LIMITS, q_start
+    q0 = q_start()
     q = obs[OFF_Q:OFF_QD]
     assert q.shape == (31,)
     lane = 0
     for j in range(N_JOINTS):
         if j in WRAP_JOINTS:
-            assert q[lane] == 1.0 and q[lane + 1] == 0.0, f"joint {j}"
+            assert q[lane] == pytest.approx(_m.cos(q0[j])), f"joint {j}"
+            assert q[lane + 1] == pytest.approx(_m.sin(q0[j])), f"joint {j}"
             lane += 2
         elif j in ONE_WAY_JOINTS:
-            assert q[lane] == pytest.approx(-1.0), f"joint {j}"
+            hi = JOINT_LIMITS[j][1]
+            assert q[lane] == pytest.approx((2 * q0[j] - hi) / hi), \
+                f"joint {j}"
             lane += 1
         else:
-            assert q[lane] == 0.0, f"joint {j}"
+            lo, hi = JOINT_LIMITS[j]
+            assert q[lane] == pytest.approx(
+                q0[j] / max(abs(lo), abs(hi))), f"joint {j}"
             lane += 1
     assert lane == 31
     assert not obs[OFF_QD:OFF_QD + N_JOINTS].any()
-    # hands at reference: wrists (±0.2, 1.47, 0.0), blades +z, meter 0
-    for base, x in ((OFF_HAND_L, -0.2), (OFF_HAND_R, 0.2)):
-        assert obs[base] == pytest.approx(x)
-        assert obs[base + 1] == pytest.approx((1.47 - 1.40) / 0.75)
-        assert obs[base + 2] == pytest.approx(0.0, abs=1e-6)
+    # hands at the v20 ready stance: wrist positions and blade dirs
+    # from the fk_body python mirror of the same start pose
+    from beat_arena_env.kinematics import (F_L_HAND, F_L_WRIST, F_R_HAND,
+                                           F_R_WRIST, fk_body)
+    rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q0)
+    for base, fw, fh in ((OFF_HAND_L, F_L_WRIST, F_L_HAND),
+                         (OFF_HAND_R, F_R_WRIST, F_R_HAND)):
+        w, r = pos[fw], rots[fh]
+        assert obs[base] == pytest.approx(w[0], abs=1e-6)
+        assert obs[base + 1] == pytest.approx((w[1] - 1.40) / 0.75,
+                                              abs=1e-6)
+        assert obs[base + 2] == pytest.approx(w[2], abs=1e-6)
         assert not obs[base + 3:base + 6].any()          # wrist vel
-        assert np.allclose(obs[base + 6:base + 9], [0, 0, 1], atol=1e-9)
+        assert np.allclose(obs[base + 6:base + 9],
+                           [r[0][2], r[1][2], r[2][2]], atol=1e-6)
         assert obs[base + 9] == 0.0                      # swing meter
     # head at reference (0, 1.70, -0.65) => centered zeros
     assert np.allclose(obs[OFF_HEAD:OFF_HEAD + 3], 0.0, atol=1e-9)
