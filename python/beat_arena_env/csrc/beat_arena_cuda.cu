@@ -2256,25 +2256,144 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // so __restrict__ on both is true and lets the L row stay in registers
 // across the (rare) pivot-floor latch.
 //
-// PIVOT CHAIN SOFTWARE-PIPELINED (2026-08-03, K4b/a). The column-j pivot
-// used to be its own serial reduction over k < j, run back to back with
-// the row loop that immediately follows it. Column j+1's pivot,
+// PIVOT CHAIN SOFTWARE-PIPELINED (2026-08-03, K4b/a) — SUPERSEDED BY K21
+// BELOW, kept for the record because the reasoning still explains what
+// the right-looking form gets for free. The column-j pivot used to be
+// its own serial reduction over k < j, run back to back with the row
+// loop that immediately follows it. Column j+1's pivot,
 //   dpiv_{j+1} = M[j+1][j+1] - sum_{k<=j} L[j+1][k]^2,
 // depends only on values that are FINAL by the time column j's row loop
 // touches row j+1: L[j+1][k] for k < j was written by earlier columns,
-// and L[j+1][j] is the very first value that loop produces. So it is
+// and L[j+1][j] is the very first value that loop produces. So it was
 // accumulated INSIDE column j's first row block — the same terms, the
 // same ascending k, one extra scalar carried in a register, zero extra
-// storage and zero extra loads (element (j+1, k) is already being loaded
-// there as s0's operand) — and column j+1 then starts with its pivot in
-// hand. Bitwise: identical expression, identical order, identical
-// inputs; a[(j+1)*n+(j+1)] is the untouched M diagonal (column j writes
-// only inside block j, and the diagonal of column j+1 lives in block
-// j+1).
+// storage and zero extra loads (element (j+1, k) was already being
+// loaded there as s0's operand) — and column j+1 then started with its
+// pivot in hand. In the right-looking form the pivot needs no pipelining
+// at all: column j's diagonal is finished, in place, by the rank-1
+// update of column j-1, and column j simply LOADS it.
+//
+// K21 (2026-08-15) — LEFT-LOOKING -> RIGHT-LOOKING. The one micro
+// back-port that survived the four-way warp rescue analysis
+// (WARP_ENV_SOLVER_CORE.md §4.2, WARP_RESCUE_LEGACY_SIDE.md §4.1), and
+// it is warp-independent: nothing in its argument touches a lane
+// mapping, so it lands on the LEGACY serial kernel exactly as written.
+//
+// WHAT MOVED. Left-looking held each output element's accumulator in a
+// register and swept k = 0..j-1 to gather its terms just before writing
+// it. Right-looking turns that inside out: as soon as column j's pivot
+// resolves and its column is scaled, the rank-1 update
+//   A[i][c] -= L[i][j] * L[c][j],   c = j+1..n-1,  i = c..n-1
+// is pushed into the whole trailing submatrix immediately. Every
+// trailing element therefore receives its subtractions ONE j AT A TIME,
+// j ASCENDING — the same terms, in the same order, from the same seed
+// M[i][c] — instead of all at once at the end. Only the interleaving in
+// time changed.
+//
+// WHY (the chain arithmetic, n = NV = 35). Op counts are unchanged:
+// 6,545 FMA (sum_j j*(34-j)), 595 divides (sum_j (34-j)), 35 sqrt. What
+// changes is the DEPENDENT chain, which is what this kernel is bound by:
+//   * left-looking: accumulator s_t is a serial chain of length j, so
+//     the critical path is sum_j j = 595 dependent FMAs, plus 35
+//     (sqrt + divide). The K6 jam bought ILP, NOT chain length.
+//   * right-looking: within a column the rank-1 FMAs target DIFFERENT
+//     elements and are mutually independent, so a column contributes
+//     max/sqrt -> divide -> ONE FMA before the next column's diagonal is
+//     final. 35 columns * ~4 dependent ops = ~140 dependent steps.
+// 595 -> ~140 is 4.3x on the FMA chain (5.7x counting the sqrt/divide
+// tail the old form also paid). This is the kernel's single best-
+// attested win class: `:129-131` — A4 cut a dependent chain WITHOUT
+// cutting traffic and paid +21% — against `:120-128` where two pure
+// traffic cuts measured exactly zero.
+//
+// THE COST, stated honestly. Serially, right-looking writes the whole
+// trailing submatrix per column: ~6,545 read-modify-writes into the
+// 42 KB local frame, where left-looking accumulated in a register and
+// stored once. It TRADES chain length for local traffic — the direction
+// this file's own evidence endorses (`:132-133`: traffic "is simply
+// already hidden behind the chains"), but the trade is real and the
+// A/B on the pod is what settles it.
+//
+// K6's UNROLL-AND-JAM IS DELIBERATELY DROPPED, and so is the peeled
+// pivot row. Both existed for one reason: to manufacture ILP for the
+// left-looking form, whose single accumulator chain had none. The
+// right-looking form has natural ILP by construction — the rank-1
+// update's subtractions are independent ACROSS ELEMENTS, so the inner
+// loop is already n-c independent FMAs and the scale loop n-1-j
+// independent divides. Jamming it would add live registers and address
+// pressure at the 255-register pin to buy ILP that is already there.
+// Plain nests; no #pragma unroll, because every trip count here is a
+// function of the runtime `n` (35 for d.m, 12 for s.aww) and there is no
+// compile-time count to unroll.
+//
+// PRESERVED EXACTLY: the `chol_factor_floored` pivot-FLOOR semantics and
+// both thresholds (f64 latches `bad` on dpiv < PD_FLOOR_F64 and clamps
+// there; f32 latches only on dpiv <= 0 and clamps at PD_FLOOR_F32; the
+// tmax form still maps a NaN pivot onto the floor, which
+// chol_fwd_unit*_n's headers depend on); the `bad` monotone latch; the
+// column-major a[C*n+R] contract; fp32/fp64 genericity; and the
+// per-element arithmetic ORDER. The lower triangle + diagonal this
+// leaves is byte-for-byte what the left-looking form left, so every
+// consumer — chol_solve_n / _multi_n / _multi_tn / _fwd_unit*_n /
+// _back*_n, which read (i,k) k<i, (k,i) k>i and the diagonal — is
+// untouched by construction.
+//
+// BITWISE ARGUMENT, element by element:
+//   * off-diagonal (i, c): left-looking computed
+//       s = M[i][c]; for k = 0..c-1: s -= L[i][k]*L[c][k]; L[i][c] = s/dc.
+//     Right-looking seeds the SAME M[i][c] in place and applies the SAME
+//     terms for k = 0..c-1 in the SAME ascending order (k is now the
+//     outer column loop), then divides the same value by the same dc.
+//   * diagonal (c, c): left-looking accumulated `np` from M[c][c] over
+//     `np -= v0*v0` with v0 = L[c][k], k ascending. Right-looking's
+//     update at i == c is `a[cc+c] -= a[cj+c] * ljc` where both operands
+//     ARE that same L[c][j] — the identical `v*v` term, same ascending
+//     order. The accumulator now lives in memory instead of a register,
+//     which is value-preserving: f32/f64 stores round to the declared
+//     type and there is no extended-precision register on this target.
+//   * OPERAND ORDER inside each multiply is kept as (row element) *
+//     (pivot-row element), matching `:2292-2295`, and each subtraction
+//     is still ONE STATEMENT of the shape `X -= Y*Z`, so it contracts to
+//     the same single FFMA under --fmad=true. No mul/sub was split, no
+//     fma chain was restructured — this is the K10e2 hazard's only
+//     escape and it is closed by keeping the expression shape identical.
+//
+// HARNESS (g++ shim, the stage-2 technique; source kept as
+// b1_harness.cpp): old and new device functions compiled side by side
+// under g++ -O2 and run on the SAME buffers, comparing the FULL n*n
+// buffer by memcmp plus the `bad` flag. 1,754 cases / 1,409,410 words
+// per arm, 688 of them tripping the pivot floor: 200 well-conditioned
+// random SPD (n=35), 150 rank-deficient/near-singular, 100 ill-scaled
+// (1e-8..1e8 row scaling), 100 adversarial non-PD (negative diagonals,
+// +0/-0 diagonals, denormals, zeroed sub-blocks), the degenerate fixed
+// set (all-zero, all-negative-zero, identity, negative identity,
+// alternating-zero diagonal, rank-1 all-ones, NaN/+Inf/-Inf entries),
+// 120 at N_WELD = 12, and 200 at n = 1..8 to cover every remainder tier
+// of the OLD form's 4-way peel. Buffer slots ABOVE the diagonal are
+// poisoned with sNaN patterns so a stray write is caught too.
+//   -ffp-contract=off                   -> 0 mismatching words, 0 flags
+//   forced fma() at every SUBMUL site   -> 0 mismatching words, 0 flags
+// Those two arms BRACKET nvcc: no contraction anywhere, and full
+// statement-level contraction everywhere. GCC 13's -ffp-contract=on is
+// a no-op alias for `off` (verified: zero vfmadd in the binary), so the
+// explicit-fma arm is what stands in for --fmad=true. Mutation-tested
+// live: replacing the divide with a reciprocal multiply in the new form
+// produced 400,335 mismatching words, and weakening the f32 `bad`
+// predicate produced 9 flag mismatches.
+//   -ffp-contract=fast FAILS (336,619 words, 1 ulp). That is the
+// PRE-EXISTING hazard recorded in WARP_RESCUE_LEGACY_SIDE.md §4.2, not
+// a property of this transform: under `fast` GCC contracts each site by
+// its own scheduling whim and is not even self-consistent WITHIN the old
+// function — it emits vfnmadd231ss for the peeled scalar row and
+// separate vmulss + vsubss for the 4-wide jammed block. The kernel's
+// no-fast-math discipline is what protects the gate.
 template <typename T>
 __device__ void chol_factor_n(int n, T* a, bool* bad) {
-  T dpiv = a[0];  // j = 0: the pivot is M[0][0], no terms
   for (int j = 0; j < n; j++) {
+    const int cj = j * n;  // COLUMN-MAJOR (K12): column j is contiguous
+    // The diagonal was finished in place by column j-1's rank-1 update
+    // (or is the untouched M[0][0] at j = 0), so the pivot is a LOAD.
+    T dpiv = a[cj + j];
     if (sizeof(T) == 8) {
       if (dpiv < T(PD_FLOOR_F64)) *bad = true;
       dpiv = tmax(dpiv, T(PD_FLOOR_F64));
@@ -2283,76 +2402,24 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
       dpiv = tmax(dpiv, T(PD_FLOOR_F32));
     }
     const T dj = sqrt(dpiv);
-    a[j * n + j] = dj;
-    // Row loop, UNROLLED AND JAMMED BY 4: the pivot row a[j*n+k] (k<j)
-    // used to be re-read once per i; jammed it is read once per FOUR i,
-    // and the four s_t carry independent dependency chains instead of
-    // one. Bitwise: each s_t accumulates over k in the same ascending
-    // order, over the same values, as its scalar counterpart — no
-    // reassociation, only interleaving. Deferring the four stores to
-    // the end of the block is safe under the in-place aliasing too: the
-    // inner loop only ever reads columns k < j, and the four deferred
-    // stores are all in column j.
-    const int cj = j * n;  // COLUMN-MAJOR (K12): column j is contiguous
-    int i = j + 1;
-    // Row j+1 is peeled (as the head of a 4-block when there is room,
-    // scalar otherwise) so the next pivot rides along on its loads.
-    T np = i < n ? a[i * n + i] : T(0);
-    if (i + 3 < n) {
-      T s0 = a[cj + i], s1 = a[cj + i + 1];
-      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T ljk = a[ck + j];
-        const T v0 = a[ck + i];
-        s0 -= v0 * ljk;
-        s1 -= a[ck + i + 1] * ljk;
-        s2 -= a[ck + i + 2] * ljk;
-        s3 -= a[ck + i + 3] * ljk;
-        np -= v0 * v0;
-      }
-      const T l0 = s0 / dj;
-      a[cj + i] = l0;
-      a[cj + i + 1] = s1 / dj;
-      a[cj + i + 2] = s2 / dj;
-      a[cj + i + 3] = s3 / dj;
-      np -= l0 * l0;
-      i += 4;
-    } else if (i < n) {
-      T s = a[cj + i];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T v0 = a[ck + i];
-        s -= v0 * a[ck + j];
-        np -= v0 * v0;
-      }
-      const T l0 = s / dj;
-      a[cj + i] = l0;
-      np -= l0 * l0;
-      i += 1;
-    }
-    for (; i + 3 < n; i += 4) {
-      T s0 = a[cj + i], s1 = a[cj + i + 1];
-      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T ljk = a[ck + j];
-        s0 -= a[ck + i] * ljk;
-        s1 -= a[ck + i + 1] * ljk;
-        s2 -= a[ck + i + 2] * ljk;
-        s3 -= a[ck + i + 3] * ljk;
-      }
-      a[cj + i] = s0 / dj;
-      a[cj + i + 1] = s1 / dj;
-      a[cj + i + 2] = s2 / dj;
-      a[cj + i + 3] = s3 / dj;
-    }
-    for (; i < n; i++) {
-      T s = a[cj + i];
-      for (int k = 0; k < j; k++) s -= a[k * n + i] * a[k * n + j];
+    a[cj + j] = dj;  // read-before-write, and no later column re-reads it
+    // SCALE: L[i][j] = A[i][j] / dj, i > j. The n-1-j divides are
+    // mutually independent — one divide of chain, not n-1-j.
+    for (int i = j + 1; i < n; i++) {
+      const T s = a[cj + i];
       a[cj + i] = s / dj;
     }
-    dpiv = np;
+    // RANK-1 UPDATE of the trailing submatrix, columns c > j, rows
+    // i >= c (diagonal included). Reads live in column j, writes in
+    // column c > j: DISJOINT address blocks under column-major, so the
+    // in-place aliasing argument is a statement about whole blocks.
+    // Every (i, c) here is independent of every other, which is the
+    // whole ILP story — no jam required.
+    for (int c = j + 1; c < n; c++) {
+      const int cc = c * n;
+      const T ljc = a[cj + c];  // L[c][j], already scaled above
+      for (int i = c; i < n; i++) a[cc + i] -= a[cj + i] * ljc;
+    }
   }
 }
 
@@ -5176,233 +5243,327 @@ step_kernel(Sim<T> P) {
   write_obs(d, P, e);
 }
 
-// ============================ WARP STAGE 2 ===================================
-// FUSED MULTI-RHS TRIANGULAR SOLVE. design/WARP_ENV_SOLVER_CORE.md §4.3
-// (authoritative), WARP_ENV_RECONCILIATION.md S2, WARP_ENV_SHELL.md §7
-// (sync / liveness). WARP PATH ONLY: step_kernel and every device function
-// it reaches are untouched below, so the f64 parity oracle and the f32 A/B
-// reference keep their exact codegen. Nothing above this line changed.
+// ======================= SUB-WARP W2-DUAL (LANES_PER_ENV = W) ================
+// design/WARP_RESCUE_SUBWARP.md §5.2 (authoritative), WARP_RESCUE_OCCUPANCY.md
+// §1/§4 (the residency identity and the x[NV]-forced-to-local finding),
+// WARP_RESCUE_MARSHALLING.md §4.1/§8 (why the shared factor tile is a
+// residency REGRESSION). This supersedes the 32-lane stage-2 form; its shared
+// tile, warp_stage_factor and warp_rhs_in/out are DELETED, not compiled out.
+// WARP PATH ONLY: step_kernel and every device function it reaches are
+// untouched, so the f64 parity oracle and the f32 A/B reference keep their
+// exact codegen.
 //
-// WHAT MOVES. Per substep the solver runs 1 + 3*ng + nc + nl (weld mode:
-// + 12) INDEPENDENT forward/back triangular solves against the SAME
-// in-place factor of d.m — nominally ~33 at contact-rich ticks, worst case
-// 62. Stage 1 ran them one after another on lane 0, each re-reading the
-// whole 630-element factor out of that lane's local frame: ~33 x (1,190
-// dependent FMAs + ~2,450 local loads). Stage 2 runs them ONE PER LANE.
+// WHY THE 32-LANE FORM DIED, in one line: envs/SM = threads_per_SM / W, and
+// sm_89 holds 256 threads/SM at 255 regs, so W=32 holds EIGHT env chains
+// against legacy's 128. It measured 614.0 / 634.6 ms/tick against legacy's
+// 124.0 for exactly that reason (OCCUPANCY §1.3). W is now a template
+// parameter and W=2 is the only rung whose break-even is 1.02x.
 //
-// THE BITWISE ARGUMENT (this stage is gated at max diff exactly 0.0).
-// The parallelism is ACROSS independent RHS vectors, never across the
-// summation index inside one solve. Lane w owns RHS w and calls the
-// UNCHANGED `chol_solve_n` on it: same function, same n, same ascending k
-// per row, same divisors, same accumulator seeds. Three links close the
-// chain to what the legacy code computed:
-//   * the batched entry points the legacy code uses on these RHS
-//     (chol_solve_multi_n<4>/<2> for g_minv / c_minv, chol_solve_multi_tn
-//     <12> for s.mw) are pure LOOP INTERCHANGES of chol_solve_n and say so
-//     in their own headers — every RHS keeps its own accumulator over the
-//     same terms in the same order;
-//   * the unit-RHS specialization (chol_fwd_unit{,2,4}_n + chol_back{,2,4}
-//     _n behind ensure_ecol) is proven BITWISE identical to chol_solve_n on
-//     the zero-filled e_m seed in chol_fwd_unit_n's header (the skipped
-//     rows provably reproduce the incoming +0.0, and the caller's
-//     full-length zero fill is what the dense back half reads). So the
-//     sweep may seed e_m and run the generic solve;
-//   * the factor the lanes read is a plain f32 COPY of lane 0's d.m into
-//     shared — a copy rounds nothing, and only the lower triangle +
-//     diagonal is copied because that is exactly the set chol_solve_n
-//     reads ((i,k) k<i, (k,i) k>i, (i,i); see chol_factor_n's K12 note).
-// No shuffle carries a partial sum, so there is no reassociation anywhere
-// in this stage and no tolerance tier is opened. Run-to-run determinism is
-// unconditional: fixed lane<->RHS mapping, full-mask shuffles with
-// compile-time trip counts, no atomics, no cg::reduce.
+// GEOMETRY (SUBWARP §5.2). 32-thread blocks = ONE warp = 32/W envs. Group
+// lane gl = threadIdx.x % W, group index g = threadIdx.x / W, env
+// e = blockIdx.x * (32/W) + g, GMASK = ((1<<W)-1) << (W*g). At W=2 that is
+// 16 envs per block, 0x3 << 2g.
+//   __launch_bounds__(32, 8): ptxas is told to fit 8 blocks/SM at 32
+//   threads, i.e. 65,536 / (32*8) = 256 -> clamped to the hardware max 255
+//   regs/thread. That is the SAME budget the legacy body already fits with
+//   ZERO spills (PERF_AUDIT :19-21), so the pin costs nothing and buys the
+//   occupancy target. Resident: 8 blocks x 16 envs = 128 envs/SM at W=2 —
+//   IDENTICAL to legacy at N=16384. Register file goes 32,640/65,536 (50%)
+//   -> 65,280/65,536 (99.6%); warps/SM 4 -> 8.
+//   W=4 -> 8 envs/blk -> 64 envs/SM at 255 regs (the recompile needs the
+//   register budget to fall to ~128 to hold 128 envs; that is the ladder's
+//   next gate, not this change's).
 //
-// CHECKED, not assumed (no GPU on the authoring host): the three
-// equivalences above were run on 200 random SPD f32 factors on the CPU —
-// chol_solve_unit_n vs chol_solve_n on e_m, chol_fwd_unit4_n + chol_back4_n
-// vs 4 chol_solve_n, chol_solve_multi_n<4> and chol_solve_multi_tn<12> vs
-// the separate calls — ZERO mismatching words in every case. One caveat
-// worth writing down because it is a real cliff: they are exact under
-// WITHIN-EXPRESSION FMA contraction (ISO C's model, and nvcc's
-// `--fmad=true` default) and under no contraction at all, but they BREAK
-// under gcc's cross-statement `-ffp-contract=fast` (thousands of words, on
-// FMA hardware) — the two code shapes offer the optimizer different
-// cross-statement fusion opportunities. This build must therefore keep
-// its no-fast-math discipline (the file already states it: no
-// -use_fast_math, no --ftz); a fast-math flag would not degrade the warp
-// kernel's accuracy so much as silently retire its bitwise gate.
+// NO __shared__ ANYWHERE. MARSHALLING §4.1 priced the 19,600 B/block stage-2
+// tile at +45..65 ms of the +20.6 ms measured regression: 39,200 B/SM forces
+// the driver to a 64 KB shared / 64 KB L1 carveout and evicts the CRBA/RNEA
+// working set, which has no other home, to give d.m — already the most
+// L1-resident object in the frame — a guaranteed one. This kernel declares no
+// shared memory at all, so it runs with the full 128 KB L1.
 //
-// DEPENDENCY AUDIT (done by reading the assembly sites, not assumed —
-// SOLVER_CORE §4.3 claims all RHS are known before any of them is solved;
-// this is the verification). Inside constraint_solve the four producers
-// run BEFORE the first solve and none of them reads a solve result:
-//   ground rows  s.g_J / s.g_bias   (:3395-3443) <- d.pos, d.r, d.p only
-//   contact rows s.c_J / s.c_bias   (:3474-3516) <- d.pos, d.r, d.p only
-//   limit rows   s.l_j / s.l_sign   (:3519-3540) <- qpre (= d.q) only
-//   weld rows    s.mw (weld mode)   (:3323-3381) <- d.pos, d.r, d.p only
-// `v` — the one value that DOES depend on a solve (step 6) — is read by
-// none of them; it is first touched in the PGS sweep. So all four groups
-// FUSE, and the diag reductions (g_diag / c_diag) that read the outputs
-// move below the sweep unchanged: they consume only their own row's J and
-// M^-1 J^T, so regrouping them changes no value (the same argument the
-// legacy 4/2/1 ladders already run on).
-// EXCLUDED, and why — reported, not forced:
-//   * step-6 `M^-1 (tau - C)` (substep :3956). Hoistable in principle (its
-//     RHS is final before the factor), but it is issued BEFORE
-//     constraint_solve assembles anything, so fusing it would mean
-//     splitting the assembly out of constraint_solve — a restructure of
-//     the legacy call graph this stage refuses to make for 1 RHS of ~33
-//     (~3% of the sweep). It stays where it is and merely reads the STAGED
-//     factor instead of local d.m.
-//   * the step-8 lazy omega-cap `ensure_pcol` (:3924) and the step-11
-//     clamp `ensure_ecol` (:4066). These are computed ON DEMAND from
-//     runtime row activity DURING / AFTER the PGS iteration — a column is
-//     requested only when that joint's velocity actually crossed its cap,
-//     which depends on the impulses the sweep's own outputs produced. They
-//     are NOT hoistable and stay serial on lane 0 against d.m. Cost is
-//     small by measurement: the omega-cap path is "0..29, usually ~0" and
-//     K16 measured the step-11 miss rate at 0.12%.
-//   * the 12x12 weld solves (:3716 factor, :3810 per PGS iteration, and
-//     ensure_pcol_multi's) — a DIFFERENT factor (s.aww), and the :3810 one
-//     is the PGS residual, i.e. serial by construction. Weld mode only.
-// So the fused set is {12 weld columns (weld mode), 3*ng ground rows, nc
-// contact rows, nl eagerly-known limit columns} = the whole of the design's
-// count except the single step-6 RHS and the two lazy tails.
+// ---------------------------------------------------------------------------
+// THE ONE STRUCTURAL DECISION: REDUNDANT SERIAL EXECUTION, NOT LANE-0 SERIAL.
+// ---------------------------------------------------------------------------
+// SUBWARP §5.2 sketches "group lane 0 runs the serial phases, other lanes
+// predicated" AND a PGS row body in which lane gl reads `s.g_J[nrow][i]` and
+// `v[i]` at i = gl, gl+W, ... Those two are incompatible: under lane-0-serial
+// the whole frame (d, s, v) lives in lane 0's LOCAL memory, which no other
+// lane can address, so lane 1 has nothing to dot. The 32-lane form paid for
+// that gap with warp_rhs_in/warp_rhs_out — 35 shuffles per RHS in AND out,
+// plus a 630-word factor staging pass — and MARSHALLING §2 counted 3,414
+// hand-off instructions per substep for it.
 //
-// SHARED-MEMORY BUDGET. One tile per env: the factor, COLUMN-MAJOR at
-// stride NV = 35, UNPADDED (RECONCILIATION decision 1; 35 is coprime with
-// 32, so padding to 36 is what would create the 4-way conflicts). NV*NV =
-// 1,225 words = 4,900 B/env of the shell's 6,144 B/env contract (79.8%,
-// 1,244 B/env left for the shell's control block), 19,600 B/block at
-// ENVS_PER_BLOCK = 4 against the 48 KB static limit. 630 of the 1,225
-// words are live (lower triangle + diagonal); the packed-NV(NV+1)/2 form
-// that would halve this is the SHELL §2.2 stage-6/7 probe, deliberately
-// not taken here — dense keeps the address map identical to d.m's, which
-// is what lets the copy be a copy and the solve be the same function.
-// Bank behaviour is a non-issue in THIS mapping: all 32 lanes read the
-// SAME address at the same time (lane = RHS, not lane = row), so every
-// factor access is a broadcast.
+// The resolution here is to make the operands available WITHOUT moving them:
+// ALL W LANES OF A GROUP RUN THE SERIAL BODY, REDUNDANTLY, ON THEIR OWN
+// FRAMES. The lanes are convergent by construction (identical inputs =>
+// identical branches => identical bits), so:
+//   * the redundant work costs ZERO extra latency — SIMT issues one
+//     instruction for the whole group, exactly as it does for the 32 envs a
+//     legacy warp carries;
+//   * every operand every lane needs is already in that lane's frame, so the
+//     publish/collect census is ZERO for the factor, for d.pos/d.r/d.axw, for
+//     the constraint rows, and for every count (s.ng / s.nc / s.nl are
+//     computed in each lane, so the three stage-2 count broadcasts are gone);
+//   * every data-dependent branch is GROUP-UNIFORM for free, which is exactly
+//     the property the collectives below need.
+// What it costs is W x the per-env LOCAL LINE traffic (one 128 B line now
+// serves 32/W envs instead of 32) and W x the local-memory footprint.
+// OCCUPANCY §1.3 measured >= 6.4x headroom above legacy's local-line demand
+// from the S1 build; W=2 spends 2x of it. That is the trade, stated plainly.
 //
-// SYNC POINTS (SHELL §7.2 asks that every one be written down here).
-// Six, all `__syncwarp(0xffffffff)`, all warp-uniform-reachable:
-//   1. warp_stage_factor's, after lane 0's predicated shared writes —
-//      the ONE load-bearing barrier in the stage;
-//   2. entering the sweep, before the count broadcasts (phase boundary);
-//   3. after the publish loop, before the solve;
-//   4. after the solve, before the collect;
-//   5. after the sweep's last round, before lane 0's diag block;
-//   6. after the diag block / at the end of substep_warp (phase boundary).
-// Plus the shuffles themselves: every `__shfl_sync` uses the full mask and
-// sits at a point every lane reaches, because every loop bound around one
-// is either a compile-time constant or a value broadcast from lane 0
-// first. That is why stage 1's `if (lane != 0) return` had to go.
+// SIDE EFFECTS ARE THE EXCEPTION and are predicated to gl == 0: the four
+// atomicAdds (pd_hits / env_hits / fall_hits / ret_total), the ret_buf write
+// that consumes one of them, and the read-modify-write accumulation into
+// P.contact_imp. Everything else the tick writes to global is a plain store
+// of a value all W lanes computed identically, and the whole judgment tail is
+// already inside a single `if (gl == 0)` block.
 //
-// COST, honestly (this is a WIN, not a free lunch). What the stage buys:
-// ~W x 1,190 dependent FMAs and ~W x 2,450 lane-0 local loads collapse to
-// one solve's worth of latency across W lanes, with the factor read from
-// shared instead of local. What it pays: the RHS are born and die in lane
-// 0's frame, so each one costs NV publish shuffles + NV collect shuffles
-// (a unit column costs 1 publish shuffle instead of NV — it is rebuilt on
-// the owning lane from the joint index) plus lane 0's NV loads and NV
-// stores, and the factor staging costs lane 0 630 loads + 630 shared
-// stores per substep. At W = 33 that is ~4,600 hand-off instructions
-// against ~120,000 removed. The hand-off is exactly what stages 3-6
-// delete as the state itself goes distributed, so it should be read as
-// scaffolding cost, not as the steady state.
+// ---------------------------------------------------------------------------
+// WHAT IS ACTUALLY PARALLEL AT W=2
+// ---------------------------------------------------------------------------
+// (a) THE FUSED MULTI-RHS SWEEP. Per substep the solver runs
+//     1 + 3*ng + nc + nl independent forward/back triangular solves against
+//     the same in-place factor of d.m. Lane gl owns RHS base+gl and runs the
+//     compile-time-N solve on ITS OWN factor — no shared tile, no broadcast,
+//     no publish. Only the RESULTS cross lanes, W*NV shuffles per round, so
+//     every lane's frame ends up holding the whole fused set (the step-11
+//     clamp and ensure_ecol read s.ecol[j] densely, so an owned-indices-only
+//     distribution would be wrong there).
+//     HONEST CHAIN ARITHMETIC, because SUBWARP §2.4 gets this row wrong.
+//     Its "39,270 -> 1,260" prices the sweep against 33 UNBATCHED serial
+//     solves. MARSHALLING §3 already corrected that: the legacy ladder is
+//     ALREADY batched 4/2/1 and issues FIVE chains for the measured
+//     ng=2/nc=0/nl=8 workload. At W=2 with one RHS per lane a 14-wide sweep
+//     is ceil(14/2) = SEVEN chains. The sweep is therefore CHAIN-NEGATIVE at
+//     W=2 versus the incumbent (7 + 1 step-6 vs 5 + 1) and only turns
+//     positive at W >= 8 (ceil(14/8) = 2). It is kept because it is the shape
+//     the ladder recompiles into, and because the W=2 measurement is the
+//     falsification the project needs; it is NOT where a W=2 win comes from.
+// (b) THE PGS ROW BODIES. Per row: a 35-dot, a 3-op scalar chain, a 35-axpy,
+//     strictly Gauss-Seidel over rows. Lane gl takes elements i = gl, gl+W,
+//     ...; one __shfl_xor_sync butterfly combines the dot; the scalar chain
+//     is recomputed redundantly in every lane from the identical reduced
+//     value; the axpy writes only owned elements. 18 + 1 + 18 = 37 dependent
+//     steps against 70 (SUBWARP §3.3). This IS where a W=2 win would come
+//     from: at the measured workload it removes ~3,900 of the substep's
+//     ~39,100 dependent steps.
+// (c) Everything else — collide, FK, CRBA, RNEA, the Cholesky factor, the
+//     weld block, the step-11 clamps, obs — stays serial (redundantly) in
+//     this stage.
 //
-// WHY LANE = RHS AND NOT LANE = ROW. SOLVER_CORE §4.3's form is lane = row
-// with the RHS tile in registers, and its critical path is 70 levels for
-// the whole tile instead of 1,190 FMAs per lane — strictly better ONCE THE
-// STATE IS DISTRIBUTED. It is not better yet: at stage 2 every RHS is born
-// and consumed in lane 0's local frame, so either mapping pays the same
-// 35*W publish + 35*W collect, and lane = row pays a cross-lane transpose
-// on top. RHS-per-lane also keeps the per-lane arithmetic textually equal
-// to the scalar code, which is what makes the bitwise gate a reading
-// exercise rather than a proof. The row mapping is the natural form at
-// stage 4+ (warp Cholesky, distributed v) and is expected to land there.
+// THE DISTRIBUTED-v INVARIANT. `v` is REPLICATED (all NV entries correct in
+// every lane) everywhere except inside the PGS iteration loop, where it is
+// GROUP-DISTRIBUTED: lane gl's v[i] is correct for i % W == gl and stale
+// otherwise. The three places inside the loop that need a non-owned entry
+// take it by shuffle from its owner (the limit rows' J = sign*e_j, the
+// omega-cap pass's v[vj] read, and the FC=false weld block, which needs the
+// whole vector and therefore re-gathers). sw_gather_nv at the bottom of
+// constraint_solve_sw restores replication once per substep, before the
+// integrator and the clamps read v.
 //
-// WHAT CHANGES AT STAGE 3. The PGS row bodies (the 35-wide dots and axpys
-// at :3841-3935) go lane-parallel with shuffle butterflies — the FIRST
-// deliberate reassociation in this kernel, so stage 3 is where the bitwise
-// gate is retired for the warp path and replaced by SHELL §5a's tolerance
-// ladder. Everything in stage 2 stays bitwise. Stage 3 also gets the first
-// real use out of the shared tile beyond broadcast reads, and it is where
-// the publish/collect shuffle traffic here starts to disappear (a
-// distributed `v` and distributed rows mean the sweep's outputs never have
-// to come back to lane 0). Stage 4 replaces warp_stage_factor's serial
-// 630-element copy with a right-looking warp factorization that writes the
-// shared tile directly. The `__launch_bounds__(WARP_BLOCK_THREADS, 1)` pin
-// stays until then for the reason stage 1 recorded: the frame is still
-// lane-0-resident, and pinning the W1 128-register config now would spill
-// it and fail the census for a reason that says nothing about the mapping.
+// ---------------------------------------------------------------------------
+// SYNC AND MASK DISCIPLINE — the deadlock-freedom argument
+// ---------------------------------------------------------------------------
+// 1. EVERY collective in this call graph names GMASK, never 0xffffffff, and
+//    every shuffle passes width = W so the exchange is segment-local. A warp
+//    now carries 32/W INDEPENDENT envs whose control flow diverges freely
+//    (different s.ng, different s.nc, different early exits in the clamp
+//    passes); a full-mask collective would demand that all 32 lanes reach the
+//    same instruction, which they provably do not. GMASK is safe because the
+//    W lanes of one group are convergent BY CONSTRUCTION — redundant
+//    execution makes every per-env value bit-identical across the group, so
+//    every branch enclosing a collective is group-uniform.
+// 2. The ONLY lane-varying branch in the group is the fused sweep's RHS-kind
+//    selection (`gw = base + gl` picks weld / ground / contact / limit / idle
+//    arms). It contains NO collective, and the group reconverges before the
+//    result exchange. On Volta+ independent thread scheduling __shfl_sync
+//    blocks until every lane named in the mask arrives; all W do, so it
+//    completes.
+// 3. `e >= P.N` is GROUP-uniform, so it retires a whole group or none of it.
+//    A retired group appears in no other group's GMASK, so no live lane can
+//    ever wait on it — divergence between the 32/W envs sharing the warp is
+//    free, and the block's envs cannot deadlock each other. __syncthreads is
+//    illegal here FOREVER (a partially retired block cannot meet a block
+//    barrier) and does not appear. __syncwarp does not appear either, in any
+//    mask: with no shared memory and no cross-lane traffic through memory,
+//    the only cross-lane data movement is register shuffles, and a
+//    __shfl_*_sync is itself the synchronization its own mask needs.
+//
+// ---------------------------------------------------------------------------
+// NUMERICS — this is the first non-bitwise change in the warp path
+// ---------------------------------------------------------------------------
+// The PGS dot is REASSOCIATED: 35 ascending terms become W partial sums, each
+// ascending over its own stride-W subsequence, combined by a fixed
+// log2(W)-step butterfly. At W=2 that is a single cut,
+// (sum over even i) + (sum over odd i). Nothing else moves:
+//   * the axpy is ELEMENTWISE — lane gl computes exactly the products the
+//     serial loop computed for those i, in the same order, into the same
+//     accumulator. BITWISE.
+//   * the triangular solve is parallel ACROSS RHS, never across the
+//     summation index; each lane runs the same compile-time-N body with the
+//     same ascending k per row. BITWISE.
+//   * the scalar chain (dl / newl / dd), the clamps, the integrator, FK,
+//     CRBA, RNEA, the factor and the diag dots are untouched. BITWISE.
+//   * __shfl moves a bit pattern; and the butterfly's combine is
+//     commutative-only at W=2 (lane 0 forms E+O, lane 1 forms O+E, and IEEE
+//     addition is commutative on finite operands), so the group's lanes agree
+//     BIT FOR BIT and the scalar chain stays group-uniform. At W=4/W=8 the
+//     tree is fixed by the code, so every lane still forms the same value in
+//     the same order.
+// Run-to-run determinism is therefore UNCONDITIONAL: fixed lane<->element
+// mapping, fixed-shape butterfly with compile-time trip counts, no atomics on
+// the numeric path, no cg::reduce. tests/test_warp_env.py keeps the bitwise
+// determinism gate and moves the legacy-parity gate to a tolerance tier.
 
-constexpr unsigned WARP_FULL = 0xffffffffu;
-// Column-major, stride NV, unpadded — see the budget note above.
-constexpr int WARP_SM_WORDS_PER_ENV = NV * NV;
+// Sub-warp geometry. W must be a power of two in [2, 16]: 32/W envs share a
+// warp, and 1u << W must not overflow the mask.
+template <int W>
+struct SubWarpGeom {
+  static_assert(W >= 2 && W <= 16, "LANES_PER_ENV must be in [2, 16]");
+  static_assert((W & (W - 1)) == 0, "LANES_PER_ENV must be a power of two");
+  static constexpr int ENVS_PER_BLOCK = 32 / W;
+  static constexpr int ROUNDS_NV = (NV + W - 1) / W;  // 18 at W=2
+};
 
-// Publish lane 0's final factor into the warp's shared tile.
-// ONLY LANE 0 CAN DO THIS: d.m lives in its local frame, which no other
-// lane can address. Lower triangle + diagonal only (a[c*NV+r], r >= c) —
-// the exact set every reader of a factor touches, per chol_factor_n's
-// header, so the 595 untouched words above the diagonal are left as they
-// are and never read.
-// SYNC: the __syncwarp() is LOAD-BEARING — a lane-predicated shared write
-// consumed by every other lane (SHELL §7.2 / SOLVER_CORE §8.10).
-template <typename T>
-__device__ __forceinline__ void warp_stage_factor(const T* __restrict__ src,
-                                                  T* __restrict__ sm,
-                                                  int lane) {
-  if (lane == 0)
-    for (int c = 0; c < NV; c++)
-      for (int r = c; r < NV; r++) sm[c * NV + r] = src[c * NV + r];
-  __syncwarp(WARP_FULL);
+// Group butterfly reduction. Fixed tree, compile-time trip count, GMASK +
+// width = W so the exchange never leaves the group. Every lane leaves with
+// the same value: at W=2 by commutativity of IEEE addition, at W>2 because
+// the tree is identical in every lane.
+template <int W, typename T>
+__device__ __forceinline__ T sw_group_sum(unsigned gmask, T v) {
+#pragma unroll
+  for (int b = 1; b < W; b <<= 1) v += __shfl_xor_sync(gmask, v, b, W);
+  return v;
 }
 
-// Move one NV-vector from lane 0's frame into lane `w`'s solve buffer.
-// `src` is a lane-0 local address (element i at src[i * stride]); the other
-// lanes form the same address in their OWN frames and never load from it —
-// the ternary is what keeps the read on lane 0. Every lane executes all NV
-// shuffles: `w` and `stride` are warp-uniform (loop counters and compile-
-// time constants), which is the whole-warp liveness the full mask needs.
-template <typename T>
-__device__ __forceinline__ void warp_rhs_in(const T* src, int stride, int w,
-                                            T* __restrict__ x, int lane) {
-  for (int i = 0; i < NV; i++) {
-    T val = lane == 0 ? src[i * stride] : T(0);
-    val = __shfl_sync(WARP_FULL, val, 0);
-    if (lane == w) x[i] = val;
+// Broadcast from a GROUP-UNIFORM source lane (a loop counter or an index
+// derived from replicated state — never from a lane-varying value).
+template <int W, typename T>
+__device__ __forceinline__ T sw_bcast(unsigned gmask, T v, int src) {
+  return __shfl_sync(gmask, v, src, W);
+}
+
+// Restore replication of a group-distributed NV-vector: element i is owned by
+// lane i % W, and `i % W` is a loop counter, hence group-uniform. NV shuffles,
+// once per substep.
+template <int W, typename T>
+__device__ __forceinline__ void sw_gather_nv(unsigned gmask, T* x) {
+  for (int i = 0; i < NV; i++) x[i] = __shfl_sync(gmask, x[i], i % W, W);
+}
+
+// The group-split NV dot. `a` is REPLICATED (a constraint row: every lane
+// assembled it); `b` is the group-distributed v, so only owned indices are
+// read. THE ONE REASSOCIATION SITE IN THIS KERNEL — see the numerics note.
+template <int W, typename T>
+__device__ __forceinline__ T sw_dot_nv(unsigned gmask, const T* __restrict__ a,
+                                       const T* __restrict__ b, int gl) {
+  T acc = T(0);
+#pragma unroll
+  for (int r = 0; r < SubWarpGeom<W>::ROUNDS_NV; r++) {
+    const int i = r * W + gl;
+    if (i < NV) acc += a[i] * b[i];  // predicated, not branched
+  }
+  return sw_group_sum<W>(gmask, acc);
+}
+
+// The group-split NV axpy. ELEMENTWISE, therefore BITWISE: lane gl performs
+// exactly the fused multiply-adds the serial loop performed on those i, on
+// the same accumulator, in the same order.
+template <int W, typename T>
+__device__ __forceinline__ void sw_axpy_nv(const T* __restrict__ a, T c,
+                                           T* __restrict__ x, int gl) {
+#pragma unroll
+  for (int r = 0; r < SubWarpGeom<W>::ROUNDS_NV; r++) {
+    const int i = r * W + gl;
+    if (i < NV) x[i] += a[i] * c;
   }
 }
 
-// The mirror: lane `w`'s solved vector back into lane 0's frame. Same
-// uniformity contract; the shuffle itself is the only synchronization the
-// hand-off needs (full mask, every lane arrives, source lane uniform).
-template <typename T>
-__device__ __forceinline__ void warp_rhs_out(T* dst, int stride, int w,
-                                             const T* __restrict__ x,
-                                             int lane) {
-  for (int i = 0; i < NV; i++) {
-    const T val = __shfl_sync(WARP_FULL, x[i], w);
-    if (lane == 0) dst[i * stride] = val;
+// COMPILE-TIME-N triangular solve — OCCUPANCY §5 prerequisite 2. The runtime-n
+// chol_solve_n cannot be unrolled to constant indices, so the caller's
+// `T x[NV]` is forced into LOCAL memory and every lane runs ~1,190 dependent
+// local round trips for its solve; at W=32 that was a 32x local-traffic
+// amplification on the sweep's hot loop and plausibly the whole of stage 2's
+// +3.4%. With N a template parameter and the nests unrolled, x[] is
+// register-resident and the factor addresses fold to immediates.
+// BITWISE: this is chol_solve_n with `n` renamed to `N`. Same blocking (K6's
+// row-blocked-by-4 forward half, the K6-prohibited dense back half), same
+// ascending k per row, same divisors, same accumulator seeds.
+// THE RISK, stated so the census can falsify it: x[] only reaches registers if
+// BOTH nests unroll, which is ~1,260 statements per instantiation. If ptxas
+// answers that with spills, or if the I-cache pressure shows up as a slowdown
+// on a kernel this large, the pragmas come off and `x` goes back to local —
+// that is a measurement, and it is one of the two things the W2-DUAL A/B is
+// for (the other is the residency claim).
+template <int N, typename T>
+__device__ __forceinline__ void chol_solve_cn(const T* __restrict__ l,
+                                              T* __restrict__ x) {
+  int i = 0;
+#pragma unroll
+  for (; i + 3 < N; i += 4) {
+    T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
+#pragma unroll
+    for (int k = 0; k < i; k++) {
+      const int ck = k * N;
+      const T xk = x[k];
+      s0 -= l[ck + i] * xk;
+      s1 -= l[ck + i + 1] * xk;
+      s2 -= l[ck + i + 2] * xk;
+      s3 -= l[ck + i + 3] * xk;
+    }
+    const int c0 = i * N, c1 = c0 + N, c2 = c1 + N, c3 = c2 + N;
+    const T v0 = s0 / l[c0 + i];
+    x[i] = v0;
+    s1 -= l[c0 + i + 1] * v0;
+    const T v1 = s1 / l[c1 + i + 1];
+    x[i + 1] = v1;
+    s2 -= l[c0 + i + 2] * v0;
+    s2 -= l[c1 + i + 2] * v1;
+    const T v2 = s2 / l[c2 + i + 2];
+    x[i + 2] = v2;
+    s3 -= l[c0 + i + 3] * v0;
+    s3 -= l[c1 + i + 3] * v1;
+    s3 -= l[c2 + i + 3] * v2;
+    x[i + 3] = s3 / l[c3 + i + 3];
+  }
+#pragma unroll
+  for (; i < N; i++) {
+    T s = x[i];
+#pragma unroll
+    for (int k = 0; k < i; k++) s -= l[k * N + i] * x[k];
+    x[i] = s / l[i * N + i];
+  }
+#pragma unroll
+  for (int b = N - 1; b >= 0; b--) {
+    const int cb = b * N;
+    T s = x[b];
+#pragma unroll
+    for (int k = b + 1; k < N; k++) s -= l[cb + k] * x[k];
+    x[b] = s / l[cb + b];
   }
 }
 
-// ---- solver.rs ConstraintSet::solve (steps 7-9), WARP FORK ------------------
-// Stage-2 fork of constraint_solve. The assembly block and the PGS block
-// below are VERBATIM COPIES of constraint_solve:3297-3540 and :3679-3936 as
-// of the stage-1 commit, wrapped in `if (lane == 0)` and DELIBERATELY NOT
-// RE-INDENTED so that a diff of the copied region against the original is
-// empty — that, not this comment, is the review instrument. Only the
-// effective-mass block between them is new (the fused sweep). The legacy
-// constraint_solve keeps its own codegen and its own call graph.
-template <typename T, bool FC>
-__device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
-                                      Solver<T, FC>& __restrict__ s,
-                                      const T* qpre, T* __restrict__ v,
-                                      T* __restrict__ sm, int lane) {
+// ---- solver.rs ConstraintSet::solve (steps 7-9), SUB-WARP FORK --------------
+// Sub-warp fork of constraint_solve. The assembly block and the PGS block
+// below are COPIES of constraint_solve:3297-3540 and :3679-3936 and are
+// DELIBERATELY NOT RE-INDENTED so that a diff of the copied region against
+// the original stays readable — that, not this comment, is the review
+// instrument. Two things are new: the fused sweep between them, and the
+// group-split dot/axpy inside the PGS row bodies.
+//
+// PHASE A (assembly) and the diag block run REDUNDANTLY IN ALL W LANES — see
+// the structural note in the header. That is what makes s.g_J / s.c_J /
+// s.g_bias / s.ng / s.nc / s.nl replicated without a single shuffle, and it
+// is why the three stage-2 count broadcasts are gone.
+template <int W, typename T, bool FC>
+__device__ void constraint_solve_sw(Dyn<T>& __restrict__ d,
+                                    Solver<T, FC>& __restrict__ s,
+                                    const T* qpre, T* __restrict__ v,
+                                    unsigned gmask, int gl) {
   const T hinv = T(1) / T(H_SUB);
 
-  // -- PHASE A: assembly, serial on lane 0 (goes lane-parallel at S3/S5) -----
-  if (lane == 0) {
+  // -- PHASE A: assembly, redundant in all W lanes ---------------------------
+  {
   // -- assembly: weld rows 0-11 (foot_mode = 0 only) --------------------------
   // K9a — ONE ancestor walk per foot emits all six rows. The three
   // point_jacobian_acc calls differed only in n = e_t, so each of them
@@ -5649,88 +5810,109 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
   }
   }
 
-  // -- STAGE 2: ONE fused warp sweep for every effective-mass RHS ------------
+  // -- THE FUSED MULTI-RHS SWEEP, W lanes wide -------------------------------
   // Row order of the fused set is the legacy solve order — welds, ground
-  // rows, contacts, limit columns — so lane w owns exactly the RHS the
-  // serial code solved w-th. The mapping is fixed by code, not by
+  // rows, contacts, limit columns — so lane gl owns exactly the RHS the
+  // serial code solved (base+gl)-th. The mapping is fixed by code, not by
   // scheduling, which is half of the determinism gate.
-  // COUNTS MUST BE WARP-UNIFORM (SOLVER_CORE §8.8): s.ng / s.nc / s.nl were
-  // written by lane 0's assembly above and exist only there, so they are
-  // broadcast before any loop bound is derived from them. Every loop below
-  // is therefore uniform and every lane reaches every shuffle.
-  __syncwarp(WARP_FULL);
+  // NO COUNT BROADCASTS: s.ng / s.nc / s.nl were computed by every lane's own
+  // assembly above, so they are already group-uniform. Stage 2 needed three
+  // __shfl_sync here; this form needs none.
   int nwr = 0;
   if constexpr (!FC) nwr = N_WELD;  // s.mw's 12 columns, RHS-minor (K11)
   int ngr = 0;
-  if constexpr (FC)
-    ngr = __shfl_sync(WARP_FULL,
-                      lane == 0 ? s.ng * GROUND_ROWS_PER_CORNER : 0, 0);
-  const int ncr = __shfl_sync(WARP_FULL, lane == 0 ? s.nc : 0, 0);
-  const int nlr = __shfl_sync(WARP_FULL, lane == 0 ? s.nl : 0, 0);
+  if constexpr (FC) ngr = s.ng * GROUND_ROWS_PER_CORNER;
+  const int ncr = s.nc;
+  const int nlr = s.nl;
   const int wtot = nwr + ngr + ncr + nlr;
-  // Worst case is 12 + 24 + 55 + 29 = 120 > 32, so the sweep tiles in
-  // predicated rounds of 32. Production is one round (nominal ~33 counts
-  // the step-6 RHS this sweep excludes; measured ng is an S0 instrument
-  // still running, and NC_CAP is an S7 probe — neither is assumed here).
+  // Worst case is 12 + 24 + 55 + 29 = 120, so the sweep tiles in predicated
+  // rounds of W. At W=2 the measured ng=2 / nc=0 / nl=8 workload is 14 RHS =
+  // 7 rounds; see the header's honest chain arithmetic — that is MORE chains
+  // than the legacy 4/2/1 ladder's five, and the reason this phase is not
+  // where a W=2 win comes from.
   T x[NV];
-  for (int base = 0; base < wtot; base += 32) {
-    const int wend = wtot - base < 32 ? wtot - base : 32;
+  for (int base = 0; base < wtot; base += W) {
+    const int wend = wtot - base < W ? wtot - base : W;
+    const int gw = base + gl;  // THIS lane's RHS — lane-varying, no collective
     // Lanes without an RHS this round solve the zero vector: the factor
-    // diagonal is strictly positive and finite (chol_factor_n floors it),
-    // so that is exact zeros — no NaN, no denormal, and above all NO
-    // DIVERGENCE around a region the next phase's shuffles have to
-    // reconverge from. The fill also gives the unit RHS below its zero
-    // seed, which chol_fwd_unit_n's proof requires be full-length.
+    // diagonal is strictly positive and finite (chol_factor_n floors it), so
+    // that is exact zeros — no NaN, no denormal, and above all no early exit
+    // in front of the exchange below. The fill also gives the unit RHS its
+    // full-length zero seed, which chol_fwd_unit_n's proof requires.
+    // EVERY index into x[] below is a compile-time constant after unrolling —
+    // that is the whole point of chol_solve_cn, and a single runtime index
+    // here would put x back in local memory and undo it (OCCUPANCY §5's
+    // second prerequisite: the unit-RHS seed becomes an UNROLLED PREDICATED
+    // WRITE, not a store through a runtime `m`).
+#pragma unroll
     for (int i = 0; i < NV; i++) x[i] = T(0);
-    for (int w = 0; w < wend; w++) {
-      const int gw = base + w;
+    // SEEDING IS FREE. Every lane assembled every row itself, so it reads its
+    // OWN frame — stage 2's warp_rhs_in (35 shuffles + 35 lane-0 local loads
+    // per RHS) is deleted outright.
+    if (gw < wtot) {
       if (gw < nwr) {
-        if constexpr (!FC) warp_rhs_in<T>(&s.mw[0][gw], N_WELD, w, x, lane);
+        if constexpr (!FC) {
+#pragma unroll
+          for (int i = 0; i < NV; i++) x[i] = s.mw[i][gw];
+        }
       } else if (gw < nwr + ngr) {
-        if constexpr (FC) warp_rhs_in<T>(&s.g_J[gw - nwr][0], 1, w, x, lane);
+        if constexpr (FC) {
+#pragma unroll
+          for (int i = 0; i < NV; i++) x[i] = s.g_J[gw - nwr][i];
+        }
       } else if (gw < nwr + ngr + ncr) {
-        warp_rhs_in<T>(&s.c_J[gw - nwr - ngr][0], 1, w, x, lane);
+#pragma unroll
+        for (int i = 0; i < NV; i++) x[i] = s.c_J[gw - nwr - ngr][i];
       } else {
-        // unit column e_{VOFF+j}: 1 shuffle instead of NV — the seed is
-        // reconstructed on the owning lane from the joint index alone
-        const int li = gw - nwr - ngr - ncr;
-        const int m = __shfl_sync(WARP_FULL,
-                                  lane == 0 ? VOFF + s.l_j[li] : 0, 0);
-        if (lane == w) x[m] = T(1);
+        // unit column e_{VOFF+j}
+        const int m = VOFF + s.l_j[gw - nwr - ngr - ncr];
+#pragma unroll
+        for (int i = 0; i < NV; i++)
+          if (i == m) x[i] = T(1);
       }
     }
-    // THE SOLVE. Unmodified chol_solve_n, one RHS per lane, all 32 lanes
-    // reading the one shared factor at the SAME address (broadcast). No
-    // shuffle, no shared write, no cross-lane term: this is the scalar
-    // solve, 32 of them at once.
-    __syncwarp(WARP_FULL);
-    chol_solve_n(NV, sm, x);
-    __syncwarp(WARP_FULL);
+    // THE SOLVE. chol_solve_cn<NV> — chol_solve_n with a compile-time n so
+    // x[] stays in registers (OCCUPANCY §5) — one RHS per lane, each against
+    // its OWN d.m. No shared tile, no factor broadcast, no cross-lane term:
+    // this is the scalar solve, W of them at once, and it is bitwise.
+    chol_solve_cn<NV>(d.m, x);
+    // THE EXCHANGE, and the only marshalling left in the substep. Every lane
+    // must end up holding the WHOLE fused set: s.ecol[j] is read densely by
+    // ensure_ecol and by the step-11 clamps, so an owned-indices-only
+    // distribution would be wrong there. W*NV shuffles per round; the source
+    // lane `w` is a loop counter, hence group-uniform, and every lane of the
+    // group reaches every one of them.
     for (int w = 0; w < wend; w++) {
-      const int gw = base + w;
-      if (gw < nwr) {
-        if constexpr (!FC)  // in place, exactly as chol_solve_multi_tn was
-          warp_rhs_out<T>(&s.mw[0][gw], N_WELD, w, x, lane);
-      } else if (gw < nwr + ngr) {
-        if constexpr (FC)
-          warp_rhs_out<T>(&s.g_minv[gw - nwr][0], 1, w, x, lane);
-      } else if (gw < nwr + ngr + ncr) {
-        warp_rhs_out<T>(&s.c_minv[gw - nwr - ngr][0], 1, w, x, lane);
+      const int ow = base + w;
+      T* dst = nullptr;
+      int stride = 1;
+      if (ow < nwr) {
+        if constexpr (!FC) {  // in place, exactly as chol_solve_multi_tn was
+          dst = &s.mw[0][ow];
+          stride = N_WELD;
+        }
+      } else if (ow < nwr + ngr) {
+        if constexpr (FC) dst = &s.g_minv[ow - nwr][0];
+      } else if (ow < nwr + ngr + ncr) {
+        dst = &s.c_minv[ow - nwr - ngr][0];
       } else {
-        const int li = gw - nwr - ngr - ncr;
-        // only lane 0 dereferences dst, and only lane 0 has s.l_j
-        warp_rhs_out<T>(&s.ecol[lane == 0 ? s.l_j[li] : 0][0], 1, w, x, lane);
+        dst = &s.ecol[s.l_j[ow - nwr - ngr - ncr]][0];
+      }
+#pragma unroll
+      for (int i = 0; i < NV; i++) {
+        const T val = sw_bcast<W>(gmask, x[i], w);
+        if (dst) dst[i * stride] = val;
       }
     }
   }
-  __syncwarp(WARP_FULL);
-  if (lane == 0) {
+  {
     // The diagonals, verbatim from the legacy ladders' tails minus the
-    // solves. Each reads ONLY its own row's J and M^-1 J^T, so hoisting
-    // them out of the 4/2/1 grouping changes no value — the same
-    // independence the legacy code already relies on to group them at all.
-    // Ascending i per row is preserved, which is what makes each dot
-    // bitwise the ladder's.
+    // solves. Each reads ONLY its own row's J and M^-1 J^T, so hoisting them
+    // out of the 4/2/1 grouping changes no value — the same independence the
+    // legacy code already relies on to group them at all. Ascending i per row
+    // is preserved, and this is DELIBERATELY NOT group-split: keeping it
+    // serial (redundantly, in every lane) costs 17 issue slots and keeps one
+    // more quantity bitwise, which narrows the tolerance tier the tests open.
     if constexpr (FC) {
       const int ngr0 = s.ng * GROUND_ROWS_PER_CORNER;
       for (int gi = 0; gi < ngr0; gi++) {
@@ -5749,10 +5931,10 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
     // step-8 cap take (ensure_ecol early-returns on it).
     for (int li = 0; li < s.nl; li++) s.ecomp[s.l_j[li]] = true;
   }
-  __syncwarp(WARP_FULL);
 
-  // -- PHASE C: weld block + PGS, serial on lane 0 (S3 takes the row bodies) -
-  if (lane == 0) {
+  // -- PHASE C: weld block + PGS. The ROW BODIES are group-split; everything
+  //    else here runs redundantly in all W lanes.
+  {
   // -- weld block A_ww = J_w M^-1 J_w^T, factored once ------------------------
   // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]. A_ww is
   // symmetric, and its only consumers are chol_factor_n (in place) and
@@ -5842,6 +6024,11 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
     // times, and the 12 dots / the 12 terms of each v[i] become
     // independent work instead of 12 back-to-back serial passes.
     if constexpr (!FC) {
+    // The weld block needs the WHOLE v (its 12 dots are segmented onto the K8
+    // support, not onto a stride-W subsequence), so it re-establishes
+    // replication first: idempotent on the first iteration, NV shuffles on
+    // the others, and weld mode only — production is FC=true.
+    sw_gather_nv<W>(gmask, v);
     {
       // 12 dots against the SAME v: each jv[r] accumulates over i in the
       // identical ascending order over identical terms (v is read-only
@@ -5914,14 +6101,17 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
       for (int gi = 0; gi < s.ng; gi++) {
         const int nrow = gi * GROUND_ROWS_PER_CORNER;
         {
-          T jv = T(0);
-          for (int i = 0; i < NV; i++) jv += s.g_J[nrow][i] * v[i];
+          // GROUP-SPLIT ROW BODY. The dot reassociates (one butterfly cut at
+          // W=2); the scalar chain below is recomputed redundantly in every
+          // lane from the identical reduced jv, so g_lam stays bit-identical
+          // across the group and `dd != 0` stays GROUP-UNIFORM; the axpy is
+          // elementwise and therefore bitwise.
+          const T jv = sw_dot_nv<W>(gmask, s.g_J[nrow], v, gl);
           const T dl = (s.g_bias[nrow] - jv) / s.g_diag[nrow];
           const T newl = tmax(s.g_lam[nrow] + dl, T(0));  // lambda_n >= 0
           const T dd = newl - s.g_lam[nrow];
           s.g_lam[nrow] = newl;
-          if (dd != T(0))
-            for (int i = 0; i < NV; i++) v[i] += s.g_minv[nrow][i] * dd;
+          if (dd != T(0)) sw_axpy_nv<W>(s.g_minv[nrow], dd, v, gl);
         }
         // the friction cone is read AFTER the normal update, so a corner
         // that just lost its normal impulse loses its friction in the
@@ -5929,8 +6119,7 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
         const T bound = T(GROUND_MU) * s.g_lam[nrow];
         for (int t = 1; t < GROUND_ROWS_PER_CORNER; t++) {
           const int row = nrow + t;
-          T jv = T(0);
-          for (int i = 0; i < NV; i++) jv += s.g_J[row][i] * v[i];
+          const T jv = sw_dot_nv<W>(gmask, s.g_J[row], v, gl);
           const T dl = (s.g_bias[row] - jv) / s.g_diag[row];
           // |lambda_t| <= MU * lambda_n. Rust writes
           // `(lambda + dl).min(bound).max(-bound)`; tmin/tmax reproduce
@@ -5941,8 +6130,7 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
           const T newl = tmax(tmin(s.g_lam[row] + dl, bound), -bound);
           const T dd = newl - s.g_lam[row];
           s.g_lam[row] = newl;
-          if (dd != T(0))
-            for (int i = 0; i < NV; i++) v[i] += s.g_minv[row][i] * dd;
+          if (dd != T(0)) sw_axpy_nv<W>(s.g_minv[row], dd, v, gl);
         }
       }
     }
@@ -5954,14 +6142,12 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
     // costs this loop its full unrolling — see the K14 block in the
     // header before touching it.
     for (int ci = 0; ci < s.nc; ci++) {
-      T jv = T(0);
-      for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * v[i];
+      const T jv = sw_dot_nv<W>(gmask, s.c_J[ci], v, gl);
       const T dl = (s.c_bias[ci] - jv) / s.c_diag[ci];
       const T newl = tmax(s.c_lam[ci] + dl, T(0));
       const T dd = newl - s.c_lam[ci];
       s.c_lam[ci] = newl;
-      if (dd != T(0))
-        for (int i = 0; i < NV; i++) v[i] += s.c_minv[ci][i] * dd;
+      if (dd != T(0)) sw_axpy_nv<W>(s.c_minv[ci], dd, v, gl);
     }
     // (c) limit rows, joint order (J = sign * e_j: exact-zero terms
     // dropped — Divergences §20c sign-of-zero class)
@@ -5975,7 +6161,12 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
     // touching this loop.
     for (int li = 0; li < s.nl; li++) {
       const int j = s.l_j[li];
-      const T jv = s.l_sign[li] * v[VOFF + j];
+      // J = sign * e_j touches ONE element of the group-distributed v, so it
+      // is taken from its owner. s.l_j is replicated, so (VOFF+j) % W is
+      // group-uniform and every lane reaches the shuffle. BITWISE: a shuffle
+      // moves a bit pattern.
+      const T jv = s.l_sign[li] * sw_bcast<W>(gmask, v[VOFF + j],
+                                              (VOFF + j) % W);
       const T dl = (s.l_bias[li] - jv) / s.l_diag[li];
       const T newl = tmax(s.l_lam[li] + dl, T(0));
       const T dd = newl - s.l_lam[li];
@@ -5986,9 +6177,9 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
         // project into — see ensure_pcol); the weld arm is left textually
         // untouched so its codegen cannot move.
         if constexpr (FC) {
-          for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * sd;
+          sw_axpy_nv<W>(s.ecol[j], sd, v, gl);
         } else {
-          for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * sd;
+          sw_axpy_nv<W>(s.pcol[j], sd, v, gl);
         }
       }
     }
@@ -5996,36 +6187,43 @@ __device__ void constraint_solve_warp(Dyn<T>& __restrict__ d,
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = T(OMEGA_CAP[j]);
-      const T target = tclamp(v[vj], -cap, cap);
-      if (target != v[vj]) {
-        ensure_pcol(d, s, j);
+      // one shuffle replaces one local load, and it makes the guard
+      // group-uniform: every lane sees the SAME v[vj] and takes the same arm
+      const T vvj = sw_bcast<W>(gmask, v[vj], vj % W);
+      const T target = tclamp(vvj, -cap, cap);
+      if (target != vvj) {
+        ensure_pcol(d, s, j);  // redundant in all lanes, bit-identical
         if (!isinf(s.pdiag[j])) {
-          const T lam = (target - v[vj]) / s.pdiag[j];
+          const T lam = (target - vvj) / s.pdiag[j];
           if constexpr (FC) {
-            for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * lam;
+            sw_axpy_nv<W>(s.ecol[j], lam, v, gl);
           } else {
-            for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * lam;
+            sw_axpy_nv<W>(s.pcol[j], lam, v, gl);
           }
-          v[vj] = target;  // exact — the cap is a hard bound
+          if (gl == vj % W) v[vj] = target;  // exact — the cap is a hard bound
         }
       }
     }
   }
   }
+  // v goes back to REPLICATED before the integrator, the step-11 clamps and
+  // store_state read it. NV shuffles, once per substep, and the only cost the
+  // distributed-v invariant charges outside the PGS loop.
+  sw_gather_nv<W>(gmask, v);
 }
 
-// ---- step.rs substep (constrained), WARP FORK -------------------------------
-// Stage-2 fork of substep. Everything except the fused sweep inside
-// constraint_solve_warp is still lane 0's, so the values are the legacy
-// values; the copied regions (substep:3943-3954 and :3966-4097) are
-// verbatim and un-re-indented for the same diff-is-empty reason.
-template <typename T, bool FC>
-__device__ void substep_warp(Dyn<T>& __restrict__ d,
-                             Solver<T, FC>& __restrict__ s,
-                             const T* __restrict__ tau, T* __restrict__ sm,
-                             int lane) {
-  T v[NV];  // hoisted out of the phase blocks; only lane 0's is meaningful
-  if (lane == 0) {
+// ---- step.rs substep (constrained), SUB-WARP FORK ---------------------------
+// Sub-warp fork of substep. Steps 1-6 and 10-12 run REDUNDANTLY in all W
+// lanes (see the header's structural note), so the factor is final in EVERY
+// lane's own d.m and there is nothing to stage: warp_stage_factor and the
+// shared tile are gone. The copied regions (substep:3943-3954 and :3966-4097)
+// are verbatim and un-re-indented for the same diff-is-empty reason.
+template <int W, typename T, bool FC>
+__device__ void substep_sw(Dyn<T>& __restrict__ d,
+                           Solver<T, FC>& __restrict__ s,
+                           const T* __restrict__ tau, unsigned gmask, int gl) {
+  T v[NV];  // REPLICATED here; group-distributed only inside the PGS loop
+  {
   // 1-3. FK, CRBA, RNEA bias
   fk_all(d);
   crba(d);
@@ -6039,17 +6237,13 @@ __device__ void substep_warp(Dyn<T>& __restrict__ d,
   // substep (crba rewrites all NV*NV of it next substep)
   chol_factor_n(NV, d.m, &d.pd_bad);
   }
-  // The factor is final in lane 0's d.m from here to the end of the
-  // substep. Publish it (its own __syncwarp) so every lane can read it.
-  warp_stage_factor<T>(d.m, sm, lane);
-  if (lane == 0) {
+  {
     // 6. v* = v + h M^-1 (tau - C). NOT part of the fused sweep — see the
     // dependency audit: its RHS is ready, but it is issued before
     // constraint_solve assembles the rows it would fuse with, and moving
-    // the assembly is a stage-2 non-goal. It does read the STAGED factor
-    // (shared, broadcast) instead of local d.m: a copy of f32 words, so
-    // bitwise the same solve on the same values.
-    chol_solve_n(NV, sm, d.rhs);
+    // the assembly is a non-goal here. It reads this lane's OWN local d.m,
+    // exactly as the legacy body does.
+    chol_solve_n(NV, d.m, d.rhs);
 
   for (int i = 0; i < NV; i++) v[i] = d.v[i] + T(H_SUB) * d.rhs[i];
   // shared per-joint column caches reset per substep (this factor)
@@ -6058,9 +6252,9 @@ __device__ void substep_warp(Dyn<T>& __restrict__ d,
     s.pcomp[j] = false;
   }
   }
-  // 7-9. constraint stage — the only whole-warp phase in the substep
-  constraint_solve_warp(d, s, d.q, v, sm, lane);
-  if (lane == 0) {
+  // 7-9. constraint stage — the only group-cooperative phase in the substep
+  constraint_solve_sw<W>(d, s, d.q, v, gmask, gl);
+  {
   for (int i = 0; i < NV; i++) d.v[i] = v[i];
   // 12-PRE. root velocity envelope, FIRST application (SPEC-v10 §3
   //     step 12 as amended 2026-08-03 — Divergences §23). Identical
@@ -6194,42 +6388,35 @@ __device__ void substep_warp(Dyn<T>& __restrict__ d,
     }
   }
   }
-  // Phase boundary (SHELL §7.2 discipline). Not load-bearing today — no
-  // shared write crosses it — but the sync points are the contract stages
-  // 3-6 will hang their lane-parallel phases on.
-  __syncwarp(WARP_FULL);
 }
 
-// ---- One 30 Hz control tick (lib.rs step_inner), WARP FORK ------------------
-// Stage-2 fork of step_env. Its ONLY warp-relevant statement is the
-// substep call, but stage 1's `if (lane != 0) return` is illegal now (an
-// exited lane cannot be in the converged set a full-mask shuffle requires),
-// so the tick's serial work is PREDICATED rather than skipped. The head is
-// restructured only to hoist declarations out of the predicated blocks —
-// same statements, same order, same values; the substep-loop tail
+// ---- One 30 Hz control tick (lib.rs step_inner), SUB-WARP FORK --------------
+// Sub-warp fork of step_env. Its only group-cooperative statement is the
+// substep call. `if (lane != 0) return` remains illegal (an exited lane cannot
+// be in the converged set a masked shuffle requires), so the tick's work is
+// PREDICATED rather than skipped — but only the SIDE EFFECTS are: the frame
+// work (tau, load_state, the substeps) runs in every lane so that every lane
+// carries the same Dyn/Solver into the group-cooperative phases. The head is
+// restructured only to hoist declarations out of the predicated blocks — same
+// statements, same order, same values; the substep-loop tail
 // (step_env:4719-4743) and the judgment tail (:4745-5127) are verbatim.
-template <typename T, bool FC>
-__device__ void step_env_warp(Dyn<T>& __restrict__ d,
-                              Solver<T, FC>& __restrict__ s,
-                              const Sim<T>& P, int e, T* __restrict__ sm,
-                              int lane) {
+template <int W, typename T, bool FC>
+__device__ void step_env_sw(Dyn<T>& __restrict__ d,
+                            Solver<T, FC>& __restrict__ s,
+                            const Sim<T>& P, int e, unsigned gmask, int gl) {
   const int C = P.C;
   const int64_t c0 = P.chart_idx[e];
-  // declarations at function scope: their initializers are lane 0's work,
-  // but the substep loop between the two predicated regions needs them live
+  // declarations at function scope: the substep loop between the predicated
+  // regions needs them live
   T prev_w[2][3], prev_d[2][3];
   T tau[NQ];
   bool arm_l = false, arm_r = false;
   T effort = T(0);
   bool fell = false;
   T gimp[4] = {T(0), T(0), T(0), T(0)};
-  if (lane == 0) {
-    // previous FK caches
-    for (int h = 0; h < 2; h++)
-      for (int k = 0; k < 3; k++) {
-        prev_w[h][k] = P.wrist[(e * 2 + h) * 3 + k];
-        prev_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
-      }
+  // REPLICATED: every lane needs tau and the loaded state to run its own copy
+  // of the substep body.
+  {
     // gear ids -> torques (lib.rs Body::tick)
     const double* gr = gear_row(P.gears);
     for (int j = 0; j < NQ; j++) {
@@ -6241,14 +6428,24 @@ __device__ void step_env_warp(Dyn<T>& __restrict__ d,
     d.pd_bad = false;
     d.env_bad = false;
     d.env_n = 0;
+  }
+  if (gl == 0) {
+    // previous FK caches (consumed only by the gl == 0 judgment tail)
+    for (int h = 0; h < 2; h++)
+      for (int k = 0; k < 3; k++) {
+        prev_w[h][k] = P.wrist[(e * 2 + h) * 3 + k];
+        prev_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
+      }
+    // GLOBAL STORE: one lane only, so the += accumulation below cannot be
+    // done W times over
     if (P.want_contacts)
       for (int pr = 0; pr < NUM_PAIRS; pr++)
         P.contact_imp[e * NUM_PAIRS + pr] = T(0);
   }
   // 8 substeps, accumulating positive work + contact aggregation
   for (int sub = 0; sub < N_SUB; sub++) {
-    substep_warp(d, s, tau, sm, lane);
-    if (lane == 0) {
+    substep_sw<W>(d, s, tau, gmask, gl);
+    if (gl == 0) {
     if constexpr (FC)
       if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
     if constexpr (FC)
@@ -6276,7 +6473,11 @@ __device__ void step_env_warp(Dyn<T>& __restrict__ d,
     }
     }
   }
-  if (lane == 0) {
+  // THE WHOLE JUDGMENT TAIL IS gl == 0. It is pure per-env bookkeeping with no
+  // group-cooperative work, and it holds every remaining side effect: the four
+  // atomicAdds, the ret_buf write that consumes one of them, and the
+  // read-modify-write into P.ep_return.
+  if (gl == 0) {
   if (d.pd_bad) atomicAdd(P.pd_hits, 1);
   if (d.env_n) atomicAdd(P.env_hits, d.env_n);
   // one per fallen TICK, not per substep (lib.rs: `if fell { fall_hits += 1 }`)
@@ -6663,101 +6864,85 @@ __device__ void step_env_warp(Dyn<T>& __restrict__ d,
   }
 }
 
-// ---- warp-per-env kernel, STAGE 2 -------------------------------------------
+// ---- sub-warp-per-env kernel, W2-DUAL ---------------------------------------
 //
-// design/WARP_ENV_SHELL.md §1.1 + WARP_ENV_RECONCILIATION.md S1/S2. One env
-// per WARP instead of one per thread. Stage 1 was the SHELL ALONE (lane 0
-// ran the thread-per-env body verbatim, 31 lanes retired, a deliberate
-// slowdown). Stage 2 keeps that body but routes it through the WARP FORK
-// (step_env_warp -> substep_warp -> constraint_solve_warp) so the
-// effective-mass triangular solves run one RHS per lane against a shared
-// factor — see the WARP STAGE 2 header above for the bitwise argument, the
-// dependency audit and the shared budget. The gate is still BITWISE
-// identity with step_kernel at f32: nothing here reassociates anything.
+// design/WARP_RESCUE_SUBWARP.md §5.2. One env per GROUP of W lanes; a
+// 32-thread block is one warp and carries 32/W independent envs. See the
+// SUB-WARP header above for the geometry, the redundant-execution decision,
+// the sync/mask discipline and the numerics.
 //
-// LANE LIVENESS. Stage 1's `if (lane != 0) return` is GONE and must not
-// come back: the fork executes full-mask shuffles and __syncwarp, and an
-// exited lane cannot be a member of the converged set either requires. All
-// 32 lanes run to the end of the kernel; the serial phases are predicated.
-// The only early return left is the WARP-UNIFORM `e >= P.N` guard, which
-// retires a whole warp or none of it.
+// LANE LIVENESS. `if (gl != 0) return` is illegal and must not come back: the
+// fork executes GMASK shuffles, and an exited lane cannot be a member of the
+// converged set they require. Every lane runs to the end of the kernel. The
+// only early return is the GROUP-UNIFORM `e >= P.N` guard, which retires a
+// whole group or none of it — and a retired group appears in no live group's
+// GMASK, so it can never be waited on.
 //
-// f32 ONLY. The host selects it under `if constexpr`, so AT_DISPATCH's
-// double pass never instantiates it; f64 stays on step_kernel, which is
-// the parity oracle against Rust and the escape hatch.
-constexpr int ENVS_PER_BLOCK = 4;
-constexpr int WARP_BLOCK_THREADS = ENVS_PER_BLOCK * 32;  // 128
-// SHARED CENSUS (gate this every stage, SHELL §8.1): 1,225 words = 4,900 B
-// per env of the 6,144 B/env contract, 19,600 B per 4-env block. Static,
-// not extern — the size is a compile-time constant of the mapping, so a
-// static_assert can guard it and the launch needs no dynamic shmem argument.
-static_assert(WARP_SM_WORDS_PER_ENV * sizeof(float) <= 6144,
-              "warp shared tile exceeds the SHELL §7.4 6,144 B/env contract");
-static_assert(WARP_SM_WORDS_PER_ENV * ENVS_PER_BLOCK * sizeof(float)
-                  <= 48 * 1024,
-              "warp shared per block exceeds the 48 KB static limit");
+// f32 ONLY. The host selects it under `if constexpr`, so AT_DISPATCH's double
+// pass never instantiates it; f64 stays on step_kernel, which is the parity
+// oracle against Rust and the escape hatch.
 
-template <typename T, bool FC>
-// STAGE-1 pin, RETAINED UNCHANGED AT STAGE 2 for the same reason: stage 2
-// distributes the SOLVES, not the FRAME — d.m, s.c_J, s.ecol and the rest
-// still live in lane 0's local memory, so the budget this pin protects is
-// the same budget stage 1 measured. The W1 config below moves in with the
-// arena (SHELL §2.3), not with the sweep.
-// Deliberately NOT the W1 contract. The lane-0 body is the
-// thread-per-env body, so it still wants the full 255-register budget
-// the legacy kernel buys with __launch_bounds__(THREADS, 1) (see the
-// THREADS rationale): min-blocks 1 keeps ptxas off the free-choice
-// heuristic that flips 168 -> 64 regs under unrelated frame changes,
-// without shrinking a budget for a frame that has not been split across
-// lanes yet. __launch_bounds__(128, 4) — 128 regs, 4 blocks/SM, 16
-// warps/SM — is the SHELL §1.2 W1 config and belongs to the later stage
-// that actually distributes the frame (§6 staging); pinning it now would
-// spill the undistributed 42 KB frame and fail the census gate for a
-// reason that says nothing about the mapping.
-__global__ void __launch_bounds__(WARP_BLOCK_THREADS, 1)
-step_kernel_warp(Sim<T> P) {
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  const int e = blockIdx.x * ENVS_PER_BLOCK + warp;
-  // e is WARP-UNIFORM, so this guard retires a whole warp or none of it.
-  // That is what makes __syncwarp sufficient for all intra-env
-  // communication later and what forbids __syncthreads FOREVER in this
-  // call graph: a partially-retired block cannot meet a block barrier.
+// THE LADDER RUNG. W=4 and W=8 are a recompile of this one constant — the
+// whole call graph is templated on it. SUBWARP §2.1: W=2 and W=4 hold full
+// production residency under the optimistic register model, W=8 under the
+// optimistic one only, and W>=16 is architecturally excluded (48 warps/SM caps
+// it at 96 / 48 envs/SM against legacy's 128).
+// BEAT_SW_LANES=W (jit_cache -D, digest-tracked): the W=4/8 ladder is
+// a recompile, per the sub-warp design.
+#ifndef BEAT_SW_LANES
+#define BEAT_SW_LANES 2
+#endif
+constexpr int SW_LANES = BEAT_SW_LANES;
+constexpr int SW_BLOCK_THREADS = 32;  // ONE warp per block, always
+constexpr int SW_ENVS_PER_BLOCK = SubWarpGeom<SW_LANES>::ENVS_PER_BLOCK;  // 16
+static_assert(SW_BLOCK_THREADS == 32,
+              "the sub-warp kernel's mask discipline assumes one warp/block");
+static_assert(SW_ENVS_PER_BLOCK * SW_LANES == SW_BLOCK_THREADS,
+              "every lane of the block must belong to exactly one group");
+
+// REGISTER / RESIDENCY CENSUS, stated so ptxas can falsify it:
+//   __launch_bounds__(32, 8) asks for 8 blocks/SM at 32 threads = 256
+//   threads/SM, so ptxas may allocate 65,536/256 = 256 -> clamped to the
+//   hardware maximum 255 regs/thread. That is the budget the legacy body
+//   already fits with ZERO spills (PERF_AUDIT :19-21), so the pin is free.
+//   Resident envs/SM = 8 blocks x (32/W) envs = 128 at W=2 — identical to
+//   legacy at N=16384 — and warps/SM goes 4 -> 8.
+//   HARD GATE: <= 255 regs and zero spills. If chol_solve_cn's full unroll
+//   spills, that is the finding, not a detail.
+template <int W, typename T, bool FC>
+__global__ void __launch_bounds__(32, 8) step_kernel_sw(Sim<T> P) {
+  const int gl = threadIdx.x & (W - 1);   // lane within the group
+  const int g = (int)threadIdx.x / W;     // group within the warp/block
+  const int e = blockIdx.x * SubWarpGeom<W>::ENVS_PER_BLOCK + g;
+  // GMASK is the ONLY mask any collective in this call graph names. Never
+  // 0xffffffff: the other 32/W - 1 envs in this warp diverge freely.
+  const unsigned gmask = ((1u << W) - 1u) << (W * g);
+  // e is GROUP-uniform, so this retires a whole group or none of it. No
+  // __syncthreads exists in this call graph and none may be added: a
+  // partially retired block cannot meet a block barrier.
   if (e >= P.N) return;
-  // (stage 1's `if (lane != 0) return` stood here — see the liveness note
-  // in this kernel's header for why it is now illegal.)
-  //
-  // One factor tile per env in the block, at a per-warp offset. STATIC
-  // shared: the tile size is a constant of the mapping, so the launch stays
-  // a plain <<<>>> with no dynamic-shmem argument and the two static_asserts
-  // above are the census gate.
-  __shared__ T smem[ENVS_PER_BLOCK * WARP_SM_WORDS_PER_ENV];
-  T* const sm = smem + warp * WARP_SM_WORDS_PER_ENV;
-  // Same per-thread local scratch as step_kernel, still whole-env on lane 0
-  // (the arena of SHELL §2.3 is what splits it, and it lands with the
-  // phases that need it). Lanes 1..31 declare the frame and never read it.
+  // NO __shared__ — see MARSHALLING §4.1. The full 128 KB L1 stays L1.
+  // Same per-thread local scratch as step_kernel, and EVERY lane of the group
+  // keeps a live copy of it (that is the redundant-execution decision).
   Dyn<T> d;
   Solver<T, FC> s;
   if (P.mode == 1) {
-    // P.mode is launch-uniform, so these arms never split a warp. Modes 1
-    // and 2 reach no warp-cooperative phase at all — pure lane-0 work.
-    if (lane == 0) reset_env(d, P, e, P.cand[e]);
+    // P.mode is launch-uniform, so these arms never split a group. Modes 1
+    // and 2 reach no group-cooperative phase at all — pure single-lane work,
+    // and the frame they build is discarded after write_obs.
+    if (gl == 0) reset_env(d, P, e, P.cand[e]);
   } else if (P.mode == 2) {
-    if (lane == 0) {
+    if (gl == 0) {
       load_state(d, P, e);
       refresh_fk(d, P, e);
       for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
     }
   } else {
-    if (lane == 0) {
-      d.pd_bad = false;
-      d.env_bad = false;
-      d.env_n = 0;
-    }
-    // whole-warp: every lane enters, the fork predicates internally
-    step_env_warp(d, s, P, e, sm, lane);
+    // whole-group: every lane enters and runs the body; the fork predicates
+    // only the side effects
+    step_env_sw<W>(d, s, P, e, gmask, gl);
   }
-  if (lane == 0) write_obs(d, P, e);
+  if (gl == 0) write_obs(d, P, e);
 }
 
 // tensor-list slots (order is a contract with cuda_env.py _tensors)
@@ -6787,7 +6972,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
               " state tensors, got ", ts.size());
   TORCH_CHECK(kernel_variant == 0 || kernel_variant == 1,
               "kernel_variant must be 0 (thread-per-env) or 1 "
-              "(warp-per-env, f32 only), got ", kernel_variant);
+              "(sub-warp-per-env, f32 only), got ", kernel_variant);
   const auto& q = ts[TQ];
   TORCH_CHECK(q.is_cuda(), "state must live on CUDA");
   TORCH_CHECK(actions.scalar_type() == at::kLong && actions.is_contiguous());
@@ -6886,23 +7071,23 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
     P.want_contacts = want_contacts;
-    // kernel_variant 1 = warp-per-env, and ONLY at f32: AT_DISPATCH
-    // instantiates this lambda for both scalar types, so `if constexpr`
-    // is what keeps step_kernel_warp<double> out of the fatbin. f64 is
-    // not an error under variant 1, it falls through to the legacy
+    // kernel_variant 1 = sub-warp-per-env (W2-DUAL), and ONLY at f32:
+    // AT_DISPATCH instantiates this lambda for both scalar types, so
+    // `if constexpr` is what keeps step_kernel_sw<double> out of the fatbin.
+    // f64 is not an error under variant 1, it falls through to the legacy
     // kernel — that kernel is the Rust parity oracle and must stay the
     // f64 path whatever the variant says.
     bool launched = false;
     if constexpr (std::is_same<scalar_t, float>::value) {
       if (kernel_variant == 1) {
         const unsigned blocks =
-            (unsigned)((N + ENVS_PER_BLOCK - 1) / ENVS_PER_BLOCK);
+            (unsigned)((N + SW_ENVS_PER_BLOCK - 1) / SW_ENVS_PER_BLOCK);
         if (foot_contact)
-          step_kernel_warp<scalar_t, true><<<blocks, WARP_BLOCK_THREADS, 0,
-              at::cuda::getCurrentCUDAStream()>>>(P);
+          step_kernel_sw<SW_LANES, scalar_t, true><<<blocks, SW_BLOCK_THREADS,
+              0, at::cuda::getCurrentCUDAStream()>>>(P);
         else
-          step_kernel_warp<scalar_t, false><<<blocks, WARP_BLOCK_THREADS, 0,
-              at::cuda::getCurrentCUDAStream()>>>(P);
+          step_kernel_sw<SW_LANES, scalar_t, false><<<blocks, SW_BLOCK_THREADS,
+              0, at::cuda::getCurrentCUDAStream()>>>(P);
         launched = true;
       }
     }
@@ -6960,8 +7145,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "(unilateral ground contact) instead of the v10 foot welds. "
         "kernel_variant is REQUIRED and POSITIONAL: this module names no "
         "py::arg, so pybind cannot carry a default for it. 0 = "
-        "thread-per-env (the incumbent, both dtypes), 1 = warp-per-env "
-        "(f32 only; f64 falls back to 0)");
+        "thread-per-env (the incumbent, both dtypes), 1 = sub-warp-per-env "
+        "(W2-DUAL, f32 only; f64 falls back to 0)");
   m.def("transcend", &transcend,
         "f64 transcendental probe: y = op(x) on the device (0 sin, "
         "1 cos, 2 acos, 3 sqrt, 4 recip)");

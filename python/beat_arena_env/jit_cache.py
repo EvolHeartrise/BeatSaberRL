@@ -63,6 +63,10 @@ def cuda_flags():
     mb = os.environ.get("BEAT_MIN_BLOCKS")
     if mb and mb.isdigit() and mb != "1":
         flags.append(f"-DBEAT_MIN_BLOCKS={int(mb)}")
+    # BEAT_SW_LANES=W: sub-warp lane-count ladder rung (W=2 default)
+    sw = os.environ.get("BEAT_SW_LANES")
+    if sw and sw.isdigit() and sw != "2":
+        flags.append(f"-DBEAT_SW_LANES={int(sw)}")
     return flags
 
 
