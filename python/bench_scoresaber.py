@@ -420,8 +420,8 @@ def finish_slot(slot, info, combo):
         "score_post": info["score_post"],
         # env v19 flail telemetry: blade arc (rad) by follow-through-idle
         # hands on note-free ticks + those ticks' count, this level
-        "flail_rad": round(info["flail_rad"], 3),
-        "flail_ticks": info["flail_ticks"],
+        "flail_rad": round(info.get("flail_rad", 0.0), 3),
+        "flail_ticks": info.get("flail_ticks", 0),
     }
 
 

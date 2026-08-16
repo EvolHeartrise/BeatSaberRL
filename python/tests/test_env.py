@@ -158,8 +158,8 @@ def test_obs_reset_hands_and_notes():
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (578,)   # env v18 window 24
-    assert OFF_NOTES == 100 and OFF_NOTE_MASK == 532   # env v18
+    assert obs.shape == (OBS_DIM,) == (580,)   # env v19: 11-lane hands
+    assert OFF_NOTES == 102 and OFF_NOTE_MASK == 534   # env v19
     # hand blocks at reset: arms straight forward, wrists at
     # (+-0.2, 1.47, 0.0), blades +z, meters zero
     for base, x in ((OFF_HAND_L, -0.2), (OFF_HAND_R, 0.2)):
