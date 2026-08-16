@@ -1,5 +1,10 @@
-"""Long v17 trunk, full-pool + mirror campaign (user decision
-2026-08-14): train FROM SCRATCH on ALL ~46k ranked segments (the old
+"""v18 CAMPAIGN trunk (user go 2026-08-16): window 24 + constant fall
+price + perturbation kicks (all train_batch defaults now) on the full
+mirrored pool — the recipe validated end-to-end by the w24 probe
+(+118.2 leaf return / wpp ATH 10,348 / 417 FCs vs constpush w16).
+Fresh RUN_DIR: the old fpm trunk is obs-426 era and must not be
+resumed. Originally: long v17 trunk, full-pool + mirror campaign
+(user decision 2026-08-14): train FROM SCRATCH on ALL ~46k ranked segments (the old
 --chart-pool 24576 was a fixed seed-0 subset — 47% of the catalog
 never trained) doubled by left-right mirror augmentation (~92k
 segments, ~5.9 GB pool). Diversity is the medicine for the
@@ -27,7 +32,7 @@ import sys
 import time
 
 PY = sys.executable
-RUN_DIR = os.path.join("runs", "v17_trunk_fpm")   # full pool + mirror
+RUN_DIR = os.path.join("runs", "v18_campaign")   # w24+constpush era
 NUM_ENVS, HORIZON = 16384, 8
 BATCH = NUM_ENVS * HORIZON
 LR = "7e-4"
@@ -103,10 +108,10 @@ def main():
     final_ck = os.path.join(RUN_DIR, "trunk_final.pt")
     res = bench(final_ck,
                 os.path.join("bench",
-                             f"v17fpm_trunk{TRUNK_TOTAL // 1000}k_raw.json"))
+                             f"v18_campaign_trunk{TRUNK_TOTAL // 1000}k_raw.json"))
     table = {f"trunk_raw_{TRUNK_TOTAL // 1000}k": res} if res else {}
-    # old-pool baseline: NOT return-comparable (pool mix changed), upp is
-    table["old_pool_7e-4_leaf"] = {"upp": 468551.11, "wpp": 7250.50}
+    # the w24 validation-probe leaf is the standing baseline
+    table["w24_probe_3k_leaf"] = {"upp": 1330255.25, "wpp": 10348.00}
     print("DONE " + json.dumps(table), flush=True)
 
 
