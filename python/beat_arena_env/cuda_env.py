@@ -356,7 +356,8 @@ class CudaBeatVecEnv:
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
-                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0):
+                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
+                 env_warp=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -395,6 +396,16 @@ class CudaBeatVecEnv:
         self.push_prob = float(push_prob)
         self.push_vmax = float(push_vmax)
         self.start_jitter = float(start_jitter)
+        # warp-per-env kernel (design/WARP_ENV_SHELL.md), stage 1: one env
+        # per warp with the whole body still serial on lane 0, so it is
+        # BITWISE the thread-per-env kernel at f32 and a large slowdown.
+        # DEFAULT OFF — env var is the escape hatch precedent (BEAT_ATTN,
+        # BEAT_QKV_PACKED). Baked here, never mutated => constant per
+        # instance => CUDA-graph safe, exactly like foot_contact above.
+        # f64 ignores it: the kernel falls back to thread-per-env, which
+        # stays the Rust parity oracle.
+        self.kernel_variant = 1 if (
+            env_warp or os.environ.get("BEAT_ENV_WARP", "0") == "1") else 0
         self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
@@ -553,7 +564,8 @@ class CudaBeatVecEnv:
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_const)
+                       self.foot_contact, self.fall_const,
+                       self.kernel_variant)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
