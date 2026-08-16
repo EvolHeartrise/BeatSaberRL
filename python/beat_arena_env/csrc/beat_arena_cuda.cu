@@ -928,6 +928,21 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // (warp-per-env with the factor in shared memory) — out of P5 scope.
 constexpr int THREADS = 32;
 
+// Occupancy-ladder knob (WARP_RESCUE_LEGACY_SIDE.md §1, 2026-08-15):
+// every historical "occupancy is not the lever" verdict — including the
+// paragraph above — was measured GRID-STARVED (<= 8 blocks/SM even
+// requested). BEAT_MIN_BLOCKS pins minBlocksPerMultiprocessor for the
+// legacy kernel exactly as hard as the (THREADS, 1) pin does, so the
+// free-choice instability the paragraph above documents cannot occur on
+// any rung; the register CAP that comes with K > 8 (65,536/32/K) is the
+// experiment. Default 1 == the shipped kernel, bit for bit. The ladder
+// is only meaningful at N >= 32,768 (below that the grid supplies fewer
+// blocks than the pin asks for). Set via jit_cache BEAT_MIN_BLOCKS=K
+// (part of the flag digest => forces the rebuild that re-censuses).
+#ifndef BEAT_MIN_BLOCKS
+#define BEAT_MIN_BLOCKS 1
+#endif
+
 // ---- obs layout (SPEC-v10 §5; mirrors constants.py) -------------------------
 constexpr int OFF_ROOT_POS = 0;
 constexpr int OFF_ROOT_ROT = 3;
@@ -5135,7 +5150,7 @@ template <typename T, bool FC>
 // The `, 1` PINS the register budget at 255 — see the THREADS note: it
 // is not an occupancy hint, it is what stops ptxas's free-choice
 // heuristic from flipping to 64 regs + double the spills.
-__global__ void __launch_bounds__(THREADS, 1)
+__global__ void __launch_bounds__(THREADS, BEAT_MIN_BLOCKS)
 step_kernel(Sim<T> P) {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= P.N) return;

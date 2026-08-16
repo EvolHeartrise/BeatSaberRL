@@ -57,6 +57,12 @@ def cuda_flags():
     # way, which is the intended behavior)
     if os.environ.get("BEAT_LINEINFO") == "1":
         flags.append("-lineinfo")
+    # BEAT_MIN_BLOCKS=K: legacy step_kernel occupancy-ladder rung (see
+    # the kernel's BEAT_MIN_BLOCKS comment). Digest membership forces
+    # the rebuild + fresh ptxas census per rung.
+    mb = os.environ.get("BEAT_MIN_BLOCKS")
+    if mb and mb.isdigit() and mb != "1":
+        flags.append(f"-DBEAT_MIN_BLOCKS={int(mb)}")
     return flags
 
 
