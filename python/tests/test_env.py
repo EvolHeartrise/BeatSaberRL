@@ -235,6 +235,9 @@ def test_swing_meter_tracks_rotation():
     Uses the right BEND joint torque (action index 15, env v10)."""
     env = RustBeatEnv(seed=3)
     env.reset()
+    # env v20: script calibrated to the pre-v20 zero-arm pose
+    _set_arm(env.sim, 0, [0.0] * 7, [0.0] * 7)
+    _set_arm(env.sim, 1, [0.0] * 7, [0.0] * 7)
     b = OFF_HAND_R + 9   # right hand's swing meter
     bend_plus = [0] * N_JOINTS
     bend_plus[15] = 1
@@ -545,6 +548,9 @@ def _whip_events(kind=0, ticks=60):
     # moves with it — at 0.8 the down-whip meets the shifted note with
     # full pre (70) and follow-through (30) banked
     sim = _sim_with_note(_note(0.8, 2, 1, kind=kind), max_steps=300)
+    # env v20: the whip is hand-tuned against the zero-arm start
+    _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)
+    _set_arm(sim, 1, [0.0] * 7, [0.0] * 7)
     events = []
     for t in range(ticks):
         a = [0] * N_JOINTS
@@ -599,12 +605,14 @@ def test_forward_blade_reaches_early_note():
     # note arrives in 0.3 s: z ~ 1.07 m after one tick; the forward blade
     # spans z 0..1 at (0.2, 1.47) — right next to cell (2,1) at (0.3, 1.4)
     sim = _sim_with_note(_note(0.3, 2, 1))
+    _set_arm(sim, 1, [0.0] * 7, [0.0] * 7)   # env v20: legacy forward arm
     _park(sim, 0)
-    ev, _ = _coast(sim)                    # right arm still at start pose
+    ev, _ = _coast(sim)                    # right arm at the LEGACY pose
     assert _codes(ev) == [(0, 1)]          # touched it (near-static -> slow)
     # same note, blade flat at z ~ -0.195: the box front (z ~ 0.32) is
     # still 0.5 m short of the blade plane -> nothing within reach
     sim = _sim_with_note(_note(0.3, 2, 1))
+    _set_arm(sim, 1, [0.0] * 7, [0.0] * 7)
     _park(sim, 0)
     _set_flat(sim, 1, np.pi / 2)
     ev, _ = _coast(sim)

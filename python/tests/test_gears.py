@@ -32,6 +32,13 @@ def _sim(gears, effort_coef=0.0):
     sim = RawBeatSim(max_steps=690, effort_coef=effort_coef, gears=gears)
     n = Note(hit_time=15.0, col=0, row=0, color=1, angle=0.0, speed=4.0)
     sim.set_chart([note_tuple(n)])
+    # env v20: this script is calibrated to the pre-v20 zero-arm pose;
+    # pin it (the ready stance only moves the episode START pose, not
+    # the mechanics under test)
+    q = list(sim.qpos())
+    for _j in (3, 6, 8, 10, 13, 15):
+        q[7 + _j] = 0.0
+    sim.set_joints(q, [0.0] * 35)
     return sim
 
 

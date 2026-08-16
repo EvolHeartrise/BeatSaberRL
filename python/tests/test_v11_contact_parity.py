@@ -455,6 +455,14 @@ def test_ground_imp_lanes_settled_parity():
     envelope ends the episode."""
     n = 4
     sims = _rust_sims(n, 5)
+    # env v20: the 10-tick settle band is calibrated to the zero-arm
+    # stance (hanging arms swing and delay settling); pin the legacy
+    # pose in Rust, then _resync copies it into the CUDA env
+    for sim in sims:
+        q = list(sim.qpos())
+        for _j in (3, 6, 8, 10, 13, 15):
+            q[7 + _j] = 0.0
+        sim.set_joints(q, [0.0] * 35)
     env = _cenv(n, 5)
     env.reset()
     _resync(env, sims)
