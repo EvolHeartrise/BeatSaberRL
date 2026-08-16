@@ -356,7 +356,8 @@ class CudaBeatVecEnv:
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
-                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0):
+                 push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
+                 foot_z_coef=0.0, start_pose_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -384,6 +385,15 @@ class CudaBeatVecEnv:
         # reward on a fall (kills the sparse-state fall-indifference
         # exploit; the legacy remaining-notes charge is REMOVED).
         self.fall_const = float(fall_const)
+        # env v20 (2026-08-16): per-tick |foot_z - PLANE_Z0| penalty
+        # (both engines) + training-only start-pose leg jitter (radians;
+        # kernel reset_env samples the 12 leg joints from per-env U(-1,1)
+        # draws and drops the root so no sole corner clips the ground).
+        self.foot_z_coef = float(foot_z_coef)
+        self.start_pose_jitter = float(start_pose_jitter)
+        assert start_pose_jitter == 0.0 or foot_contact, \
+            "start_pose_jitter fights the v10 foot welds; contact mode only"
+
         # env v18 perturbation training (push-recovery lit): with
         # probability push_prob per (env, tick) add a horizontal root
         # velocity kick, |dv| ~ U(0, push_vmax) m/s, direction uniform.
@@ -507,6 +517,12 @@ class CudaBeatVecEnv:
         # the Rust reference carries the obs change but not this.
         self.flail_rad = z(N)
         self.flail_ticks = z(N, dt=torch.int32)
+        # env v20 start-pose jitter draws: (N, 12) in [-1, 1), refilled
+        # in-place before every launch when enabled (in-place uniform_
+        # keeps the fixed address CUDA graphs capture; torch's RNG
+        # offset handling makes replays draw fresh values, the _kick
+        # precedent). Consumed only by envs that reset this launch.
+        self._pose_jit = z(N, 12)
         # env v12 (contact spec §7): tick-summed ground normal impulses
         # per (env, [L_heel, L_toe, R_heel, R_toe]); feeds the four
         # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
@@ -543,6 +559,7 @@ class CudaBeatVecEnv:
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
             self.flail_rad, self.flail_ticks,
             self.ground_imp,
+            self._pose_jit,
             self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
@@ -559,10 +576,13 @@ class CudaBeatVecEnv:
         ]
 
     def _launch(self, actions, cand, mode):
+        if self.start_pose_jitter > 0.0:
+            self._pose_jit.uniform_(-1.0, 1.0)
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_const)
+                       self.foot_contact, self.fall_const,
+                       self.foot_z_coef, self.start_pose_jitter)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""

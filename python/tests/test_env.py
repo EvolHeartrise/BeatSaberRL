@@ -160,14 +160,21 @@ def test_obs_reset_hands_and_notes():
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (580,)   # env v19: 11-lane hands
     assert OFF_NOTES == 102 and OFF_NOTE_MASK == 534   # env v19
-    # hand blocks at reset: arms straight forward, wrists at
-    # (+-0.2, 1.47, 0.0), blades +z, meters zero
-    for base, x in ((OFF_HAND_L, -0.2), (OFF_HAND_R, 0.2)):
-        assert obs[base] == pytest.approx(x / 1.0)
-        assert obs[base + 1] == pytest.approx((1.47 - 1.40) / 0.75)
-        assert obs[base + 2] == pytest.approx(0.0, abs=1e-6)
+    # hand blocks at reset (env v20 ready stance): wrists/blades from
+    # the fk_body mirror of the shared start pose
+    from beat_arena_env.constants import q_start
+    from beat_arena_env.kinematics import (F_L_HAND, F_L_WRIST, F_R_HAND,
+                                           F_R_WRIST, fk_body)
+    rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start())
+    for base, fw, fh in ((OFF_HAND_L, F_L_WRIST, F_L_HAND),
+                         (OFF_HAND_R, F_R_WRIST, F_R_HAND)):
+        w, r = pos[fw], rots[fh]
+        assert obs[base] == pytest.approx(w[0], abs=1e-6)
+        assert obs[base + 1] == pytest.approx((w[1] - 1.40) / 0.75,
+                                              abs=1e-6)
+        assert obs[base + 2] == pytest.approx(w[2], abs=1e-6)
         assert not obs[base + 3:base + 6].any()             # wrist vel
-        assert obs[base + 8] == pytest.approx(1.0)          # blade z
+        assert obs[base + 8] == pytest.approx(r[2][2], abs=1e-6)  # blade z
         assert obs[base + 9] == 0.0                         # swing meter
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending

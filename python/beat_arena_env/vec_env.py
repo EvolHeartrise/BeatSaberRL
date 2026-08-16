@@ -28,6 +28,7 @@ class BeatVecEnv:
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF, wide_acc=False,
+                 foot_z_coef=0.0,
                  gears=3, seed=0, foot_contact=False, fall_const=5.0):
         """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
         False = the v10 foot welds (DEFAULT), True = unilateral ground
@@ -48,7 +49,8 @@ class BeatVecEnv:
                               effort_coef=effort_coef, return_events=False,
                               wide_acc=wide_acc, gears=gears,
                               foot_contact=foot_contact,
-                              fall_const=fall_const)
+                              fall_const=fall_const,
+                              foot_z_coef=foot_z_coef)
         self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)

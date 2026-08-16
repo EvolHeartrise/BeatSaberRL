@@ -4541,6 +4541,16 @@ struct Sim {
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
   T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
+  // env v20 (2026-08-16): per-tick penalty foot_z_coef * (|lfoot_z -
+  // PLANE_Z0| + |rfoot_z - PLANE_Z0|) — linear in each foot's world-z
+  // distance from the reference foot z (lib.rs mirror). 0 = off.
+  T foot_z_coef;
+  // env v20 start-pose jitter (TRAINING-ONLY, no lib.rs mirror — the
+  // push/start_jitter precedent): per-env U(-1,1) draws for the 12 leg
+  // joints, refilled by the wrapper every launch; consumed by reset_env
+  // when start_pose_jitter > 0 (radians scale).
+  const T* __restrict__ pose_jit;
+  T start_pose_jitter;
   int gears;
   bool wide_acc;
   bool auto_reset;
@@ -4599,7 +4609,42 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   d.quat[2] = T(0);
   d.quat[3] = T(0);
   for (int j = 0; j < NQ; j++) d.q[j] = T(0);
+  // env v20 (user, 2026-08-16): episode-start ARM pose — real-player
+  // ready stance (lib.rs Q_START_ARM mirror, exact same f64 literals)
+  d.q[3] = T(-1.3962634015954636);   // l_arm_pitch  -80 deg
+  d.q[6] = T(1.7453292519943295);    // l_elbow      100 deg
+  d.q[8] = T(1.2217304763960306);    // l_wrist_bend  70 deg
+  d.q[10] = T(-1.3962634015954636);  // r_arm_pitch
+  d.q[13] = T(1.7453292519943295);   // r_elbow
+  d.q[15] = T(1.2217304763960306);   // r_wrist_bend
   for (int i = 0; i < NV; i++) d.v[i] = T(0);
+  // env v20 start-pose jitter (training-only): small uniform leg/foot
+  // joint offsets (12 joints, §1.4 indices 17..28), clamped to the
+  // joint ranges; the one-way knees (20, 26) take |draw| so half the
+  // resets aren't clamped flat. Then the EXACT no-ground-clip fix:
+  // FK the sampled pose, transform the 8 sole corners (contact spec
+  // §2 GROUND_CORNERS), and drop/lift the root so the lowest corner
+  // sits exactly on the ground plane (y = 0).
+  if (P.start_pose_jitter > T(0)) {
+    for (int k = 0; k < 12; k++) {
+      const int j = 17 + k;
+      T jit = P.pose_jit[e * 12 + k] * P.start_pose_jitter;
+      if (j == 20 || j == 26) jit = fabs(jit);
+      d.q[j] = tclamp(jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
+    }
+    fk_all(d);
+    T min_y = T(1e9);
+    for (int f = 0; f < 2; f++) {
+      const int fr = GROUND_FRAMES[f];
+      for (int c = 0; c < CORNERS_PER_FOOT; c++) {
+        T y = d.pos[fr][1];
+        for (int k = 0; k < 3; k++)
+          y += d.r[fr][1][k] * T(GROUND_CORNERS[c][k]);
+        min_y = tmin(min_y, y);
+      }
+    }
+    d.p[1] -= min_y;
+  }
   store_state(d, P, e);
   refresh_fk(d, P, e);
   for (int s = 0; s < 2; s++) {
@@ -4977,6 +5022,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   T reward = T(0);
   reward -= P.effort_coef * effort;
+  // env v20 foot-z penalty: d.pos holds this tick's FK (refresh_fk ran
+  // fk_all just above — the same source the §8 body_pts lanes read)
+  if (P.foot_z_coef > T(0)) {
+    reward -= P.foot_z_coef
+              * (fabs(d.pos[F_L_FOOT][2] - T(PLANE_Z0))
+                 + fabs(d.pos[F_R_FOOT][2] - T(PLANE_Z0)));
+  }
 
   // swing chain update
   T deltas[2];
@@ -5423,6 +5475,7 @@ enum {
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT, TGIMP, TCIDX,
+  TPOSEJIT,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -5435,7 +5488,8 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_const) {
+          bool want_contacts, bool foot_contact, double fall_const,
+          double foot_z_coef, double start_pose_jitter) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5534,6 +5588,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.mode = (int)mode;
     P.effort_coef = (scalar_t)effort_coef;
     P.fall_const = (scalar_t)fall_const;
+    P.foot_z_coef = (scalar_t)foot_z_coef;
+    P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
+    P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;

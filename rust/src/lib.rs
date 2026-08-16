@@ -158,6 +158,16 @@ const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 // env v19 flail telemetry: a tick is "note-free" when the next pending
 // chart object is further out than this (s). Telemetry only.
 const FLAIL_LEAD_S: f64 = 1.0;
+// env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
+// deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
+const Q_START_ARM: [(usize, f64); 6] = [
+    (3, -1.3962634015954636),
+    (6, 1.7453292519943295),
+    (8, 1.2217304763960306),
+    (10, -1.3962634015954636),
+    (13, 1.7453292519943295),
+    (15, 1.2217304763960306),
+];
 
 // object kinds (mirrors constants.py)
 const KIND_NOTE: u8 = 0;
@@ -641,6 +651,14 @@ impl Body {
 
     fn reset(&mut self) {
         self.st = State::neutral(MODEL);
+        // env v20 (user, 2026-08-16): episode-start ARM pose — the
+        // real-player ready stance (arms hang, forearms cocked, wrists
+        // tilted forward) instead of the zombie arms-forward zero pose.
+        // Literals are exact f64 radians shared verbatim with the .cu
+        // and constants.py mirrors (parity-bound).
+        for (j, v) in Q_START_ARM {
+            self.st.q[j] = v;
+        }
         self.tau = [0.0; NQ];
         self.wrist_vel = [[0.0; 3]; 2];
         self.swing_acc = [0.0; 2];
@@ -792,6 +810,12 @@ struct Core {
     // env v18 constant fall pricing (2026-08-15, sole mode): flat
     // -fall_const terminal reward on a fall (see fell block).
     fall_const: f64,
+    // env v20 (2026-08-16, user direction): per-tick penalty
+    // foot_z_coef * (|lfoot_z - PLANE_Z0| + |rfoot_z - PLANE_Z0|) —
+    // linear in each foot's world-z distance from the reference
+    // ("standard starting") foot z. Targets the shimmy toward/away
+    // from the note plane. 0.0 = off (the pre-v20 reward verbatim).
+    foot_z_coef: f64,
     n_scoreable: u32, // chart objects that are not bombs
     // env v19 flail telemetry (CUDA-backend mirror, telemetry only):
     // blade arc (rad) accrued on note-free ticks (next pending chart
@@ -858,6 +882,7 @@ impl Core {
             bombs_hit: 0,
             falls: 0,
             fall_const: 5.0,
+            foot_z_coef: 0.0,
             n_scoreable: 0,
             flail_rad: 0.0,
             flail_ticks: 0,
@@ -1224,6 +1249,14 @@ impl Core {
         let gear = self.gear;
         self.body.tick(actions, &gear);
         reward -= self.effort_coef * self.body.effort_j;
+        // env v20 foot-z penalty: ws.p holds this tick's FK (the same
+        // source the §8 body_pts obs lanes read)
+        if self.foot_z_coef > 0.0 {
+            let lz = self.body.ws.p[F_L_FOOT][2];
+            let rz = self.body.ws.p[F_R_FOOT][2];
+            reward -= self.foot_z_coef
+                * ((lz - PLANE_Z0).abs() + (rz - PLANE_Z0).abs());
+        }
 
         // swing chain update (feeds pre-swing + follow-through scores)
         for s in 0..2 {
@@ -1648,12 +1681,14 @@ impl RawBeatSim {
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         wide_acc=false, gears=3, foot_contact=false,
-                        fall_const=5.0))]
+                        fall_const=5.0, foot_z_coef=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
-           gears: u8, foot_contact: bool, fall_const: f64) -> Self {
+           gears: u8, foot_contact: bool, fall_const: f64,
+           foot_z_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
+        core.foot_z_coef = foot_z_coef;
         RawBeatSim { core }
     }
 
@@ -2103,17 +2138,19 @@ impl VecBeatSim {
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
-                        gears=3, foot_contact=false, fall_const=5.0))]
+                        gears=3, foot_contact=false, fall_const=5.0,
+                        foot_z_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
-           foot_contact: bool, fall_const: f64) -> Self {
+           foot_contact: bool, fall_const: f64, foot_z_coef: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
                     let mut c = Core::new_core(max_steps, effort_coef,
                                                wide_acc, gears, foot_contact);
                     c.fall_const = fall_const;
+                    c.foot_z_coef = foot_z_coef;
                     c
                 })
                 .collect(),

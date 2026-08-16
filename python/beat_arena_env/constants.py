@@ -113,6 +113,25 @@ BASE_POS0 = (0.0, 0.94, -0.65)
 ONE_WAY_JOINTS = (6, 13, 20, 26)
 WRAP_JOINTS = (7, 14)
 
+# env v20 (user, 2026-08-16): episode-start ARM pose — the real-player
+# ready stance (arms hang at pitch -80 deg, forearms cocked at elbow
+# 100 deg, wrists tilted forward at bend 70 deg) replaces the zombie
+# arms-forward zero pose at every episode reset. (§1.4 indices; exact
+# f64 radians, mirrored verbatim in lib.rs Q_START_ARM and the .cu.)
+Q_START_ARM = ((3, -1.3962634015954636), (6, 1.7453292519943295),
+               (8, 1.2217304763960306), (10, -1.3962634015954636),
+               (13, 1.7453292519943295), (15, 1.2217304763960306))
+
+
+def q_start():
+    """The 29-joint episode-start pose vector (env v20 arm stance,
+    legs/spine zero)."""
+    q = [0.0] * N_JOINTS
+    for j, v in Q_START_ARM:
+        q[j] = v
+    return q
+
+
 # --- action gears (env v8, unchanged tables — v10 scales TORQUE) -------------
 # Per-joint action id -> signed torque fraction of TAU_MAX. Id 0 is
 # coast and ids 1/2 are +full/-full at EVERY K (the ternary era is the
