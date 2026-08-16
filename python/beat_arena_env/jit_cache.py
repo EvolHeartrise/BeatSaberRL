@@ -63,10 +63,13 @@ def cuda_flags():
     mb = os.environ.get("BEAT_MIN_BLOCKS")
     if mb and mb.isdigit() and mb != "1":
         flags.append(f"-DBEAT_MIN_BLOCKS={int(mb)}")
-    # BEAT_SW_LANES=W: sub-warp lane-count ladder rung (W=2 default)
-    sw = os.environ.get("BEAT_SW_LANES")
-    if sw and sw.isdigit() and sw != "2":
-        flags.append(f"-DBEAT_SW_LANES={int(sw)}")
+    # BEAT_CHOL_RL=1: right-looking chol_factor_n arm (see the function's
+    # K21 header). Default off — it is +2.5% ALONE at N=16k and only pays
+    # paired with BEAT_MIN_BLOCKS=16 at N >= 65,536, where the register
+    # demand it frees (254 -> 168) is what makes that rung buildable.
+    # Digest membership forces the rebuild each way.
+    if os.environ.get("BEAT_CHOL_RL") == "1":
+        flags.append("-DBEAT_CHOL_RL=1")
     return flags
 
 
