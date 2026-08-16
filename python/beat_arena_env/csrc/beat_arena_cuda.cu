@@ -74,6 +74,7 @@
 #include <cuda_runtime.h>
 
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -5160,6 +5161,73 @@ step_kernel(Sim<T> P) {
   write_obs(d, P, e);
 }
 
+// ---- warp-per-env kernel, STAGE 1 (shell only) ------------------------------
+//
+// design/WARP_ENV_SHELL.md §1.1 + WARP_ENV_RECONCILIATION.md S1. One env
+// per WARP instead of one per thread. Stage 1 is the SHELL ALONE: lane 0
+// runs the thread-per-env body verbatim through the same device
+// functions, so this kernel computes the same values from the same
+// inputs in the same order and the gate is BITWISE identity with
+// step_kernel at f32. A slowdown is the expected result (31 of 32 lanes
+// idle); it is the floor every later stage is measured against, not a
+// regression. Nothing here is a physics change — the solver math moves
+// lane-parallel from stage 2 on.
+//
+// f32 ONLY. The host selects it under `if constexpr`, so AT_DISPATCH's
+// double pass never instantiates it; f64 stays on step_kernel, which is
+// the parity oracle against Rust and the escape hatch.
+constexpr int ENVS_PER_BLOCK = 4;
+constexpr int WARP_BLOCK_THREADS = ENVS_PER_BLOCK * 32;  // 128
+
+template <typename T, bool FC>
+// STAGE-1 pin, deliberately NOT the W1 contract. The lane-0 body is the
+// thread-per-env body, so it still wants the full 255-register budget
+// the legacy kernel buys with __launch_bounds__(THREADS, 1) (see the
+// THREADS rationale): min-blocks 1 keeps ptxas off the free-choice
+// heuristic that flips 168 -> 64 regs under unrelated frame changes,
+// without shrinking a budget for a frame that has not been split across
+// lanes yet. __launch_bounds__(128, 4) — 128 regs, 4 blocks/SM, 16
+// warps/SM — is the SHELL §1.2 W1 config and belongs to the later stage
+// that actually distributes the frame (§6 staging); pinning it now would
+// spill the undistributed 42 KB frame and fail the census gate for a
+// reason that says nothing about the mapping.
+__global__ void __launch_bounds__(WARP_BLOCK_THREADS, 1)
+step_kernel_warp(Sim<T> P) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int e = blockIdx.x * ENVS_PER_BLOCK + warp;
+  // e is WARP-UNIFORM, so this guard retires a whole warp or none of it.
+  // That is what makes __syncwarp sufficient for all intra-env
+  // communication later and what forbids __syncthreads FOREVER in this
+  // call graph: a partially-retired block cannot meet a block barrier.
+  if (e >= P.N) return;
+  // Stage 1 executes no shuffle, ballot or warp sync below, so lanes
+  // 1..31 may leave. THIS RETURN BECOMES ILLEGAL the moment any phase
+  // goes lane-parallel: an exited lane cannot be a member of the
+  // converged set that __syncwarp / a full-mask __shfl_sync requires, so
+  // stage 2 must replace it with predication or a park-and-rendezvous.
+  if (lane != 0) return;
+  // Same per-thread local scratch as step_kernel. The local-memory
+  // interleaving that made same-index access coalesce across a warp does
+  // NOT pay here (one live lane per warp) — the arena of SHELL §2.3 is
+  // what fixes that, and it lands with the phases that need it.
+  Dyn<T> d;
+  Solver<T, FC> s;
+  if (P.mode == 1) {
+    reset_env(d, P, e, P.cand[e]);
+  } else if (P.mode == 2) {
+    load_state(d, P, e);
+    refresh_fk(d, P, e);
+    for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
+  } else {
+    d.pd_bad = false;
+    d.env_bad = false;
+    d.env_n = 0;
+    step_env(d, s, P, e);
+  }
+  write_obs(d, P, e);
+}
+
 // tensor-list slots (order is a contract with cuda_env.py _tensors)
 enum {
   TP = 0, TQUAT, TQ, TV,
@@ -5181,9 +5249,13 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_const) {
+          bool want_contacts, bool foot_contact, double fall_const,
+          int64_t kernel_variant) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
+  TORCH_CHECK(kernel_variant == 0 || kernel_variant == 1,
+              "kernel_variant must be 0 (thread-per-env) or 1 "
+              "(warp-per-env, f32 only), got ", kernel_variant);
   const auto& q = ts[TQ];
   TORCH_CHECK(q.is_cuda(), "state must live on CUDA");
   TORCH_CHECK(actions.scalar_type() == at::kLong && actions.is_contiguous());
@@ -5282,16 +5354,38 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
     P.want_contacts = want_contacts;
-    const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
-    // env v11 foot_mode: a COMPILE-TIME switch (see GROUND_CORNERS), so
-    // the choice is made here, once per launch, and the weld kernel is
-    // the v10 one to the byte.
-    if (foot_contact)
-      step_kernel<scalar_t, true><<<blocks, THREADS, 0,
-                                    at::cuda::getCurrentCUDAStream()>>>(P);
-    else
-      step_kernel<scalar_t, false><<<blocks, THREADS, 0,
-                                     at::cuda::getCurrentCUDAStream()>>>(P);
+    // kernel_variant 1 = warp-per-env, and ONLY at f32: AT_DISPATCH
+    // instantiates this lambda for both scalar types, so `if constexpr`
+    // is what keeps step_kernel_warp<double> out of the fatbin. f64 is
+    // not an error under variant 1, it falls through to the legacy
+    // kernel — that kernel is the Rust parity oracle and must stay the
+    // f64 path whatever the variant says.
+    bool launched = false;
+    if constexpr (std::is_same<scalar_t, float>::value) {
+      if (kernel_variant == 1) {
+        const unsigned blocks =
+            (unsigned)((N + ENVS_PER_BLOCK - 1) / ENVS_PER_BLOCK);
+        if (foot_contact)
+          step_kernel_warp<scalar_t, true><<<blocks, WARP_BLOCK_THREADS, 0,
+              at::cuda::getCurrentCUDAStream()>>>(P);
+        else
+          step_kernel_warp<scalar_t, false><<<blocks, WARP_BLOCK_THREADS, 0,
+              at::cuda::getCurrentCUDAStream()>>>(P);
+        launched = true;
+      }
+    }
+    if (!launched) {
+      const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
+      // env v11 foot_mode: a COMPILE-TIME switch (see GROUND_CORNERS), so
+      // the choice is made here, once per launch, and the weld kernel is
+      // the v10 one to the byte.
+      if (foot_contact)
+        step_kernel<scalar_t, true><<<blocks, THREADS, 0,
+                                      at::cuda::getCurrentCUDAStream()>>>(P);
+      else
+        step_kernel<scalar_t, false><<<blocks, THREADS, 0,
+                                       at::cuda::getCurrentCUDAStream()>>>(P);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
 }
@@ -5331,7 +5425,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "refresh after a state write (mode 2) for every env; state "
         "tensors mutated in place, obs/reward/done written into their "
         "output slots. foot_contact selects env v11 foot_mode = 1 "
-        "(unilateral ground contact) instead of the v10 foot welds");
+        "(unilateral ground contact) instead of the v10 foot welds. "
+        "kernel_variant is REQUIRED and POSITIONAL: this module names no "
+        "py::arg, so pybind cannot carry a default for it. 0 = "
+        "thread-per-env (the incumbent, both dtypes), 1 = warp-per-env "
+        "(f32 only; f64 falls back to 0)");
   m.def("transcend", &transcend,
         "f64 transcendental probe: y = op(x) on the device (0 sin, "
         "1 cos, 2 acos, 3 sqrt, 4 recip)");
