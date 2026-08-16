@@ -499,6 +499,14 @@ class CudaBeatVecEnv:
         # per (env, tick); always 0 in weld mode
         self._fall_hits = z(1, dt=torch.int32)
         self._fall_popped = 0
+        # env v19 flail telemetry (per env, kernel-accrued): blade arc
+        # on note-free ticks by hands with no live follow-through, and
+        # the note-free tick count. Popped + zeroed by pop_flail;
+        # deliberately NOT zeroed by reset_env so episode boundaries
+        # don't drop data between pops. CUDA-backend-only telemetry —
+        # the Rust reference carries the obs change but not this.
+        self.flail_rad = z(N)
+        self.flail_ticks = z(N, dt=torch.int32)
         # env v12 (contact spec §7): tick-summed ground normal impulses
         # per (env, [L_heel, L_toe, R_heel, R_toe]); feeds the four
         # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
@@ -533,6 +541,7 @@ class CudaBeatVecEnv:
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
+            self.flail_rad, self.flail_ticks,
             self.ground_imp,
             self.chart_idx,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
@@ -688,6 +697,17 @@ class CudaBeatVecEnv:
         new = total - self._fall_popped
         self._fall_popped = total
         return new
+
+    def pop_flail(self):
+        """env v19 flail telemetry since the last pop: (blade arc in rad
+        accrued by follow-through-idle hands on note-free ticks, count
+        of note-free env-ticks). Sums the per-env accumulators and
+        zeroes them — logging-grade, two syncs per call."""
+        rad = float(self.flail_rad.sum().item())
+        ticks = int(self.flail_ticks.sum().item())
+        self.flail_rad.zero_()
+        self.flail_ticks.zero_()
+        return rad, ticks
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate

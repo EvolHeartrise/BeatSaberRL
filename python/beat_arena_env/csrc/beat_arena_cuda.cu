@@ -949,24 +949,26 @@ constexpr int OFF_ROOT_VLIN = 9;
 constexpr int OFF_ROOT_VANG = 12;
 constexpr int OFF_Q = 15;
 constexpr int OFF_QD = 46;
+// env v19: hand blocks grow 10 -> 11 lanes (+ remaining follow-through
+// credit, mirroring lib.rs HAND_FEAT = 11) — everything after shifts +2.
 constexpr int OFF_HAND_L = 75;
-constexpr int OFF_HAND_R = 85;
-constexpr int OFF_HEAD = 95;
-constexpr int OFF_CONTACT = 98;
-constexpr int OFF_NOTES = 100;
-constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 532
+constexpr int OFF_HAND_R = 86;
+constexpr int OFF_HEAD = 97;
+constexpr int OFF_CONTACT = 100;
+constexpr int OFF_NOTES = 102;
+constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 534
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse /
 // GROUND_IMP_NORM. All-zero in weld mode, so lanes 0..340 are the v10
 // obs verbatim.
-constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 556
+constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 558
 constexpr int N_GROUND_IMP_LANES = 4;
 // env v13 (contact spec §8): [l_elbow, r_elbow, l_knee, r_knee,
 // l_foot, r_foot] world positions, head-style normalization.
-constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 408
+constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 562
 constexpr int N_BODY_PTS = 6;
-constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 578
-static_assert(OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578");
+constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 580
+static_assert(OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580");
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
@@ -1504,6 +1506,10 @@ constexpr double PTS_ACC = 15.0;
 constexpr double SCORE_MAX = 115.0;
 constexpr double CHAIN_LINK_PTS = 20.0;
 constexpr double SWING_BREAK = 0.005;
+// env v19 flail telemetry: a tick is "note-free" when the next
+// scoreable note is further out than this (s). Telemetry only — no
+// reward or obs effect.
+constexpr double FLAIL_LEAD_S = 1.0;
 constexpr int FOLLOW_TIMEOUT = 15;
 constexpr double LOOK_VERT = 0.8;
 constexpr double LOOK_DIST = 8.0;
@@ -4486,6 +4492,13 @@ struct Sim {
   // Written in contact mode only; stays 0 in weld mode, where the feet
   // cannot let go.
   int* __restrict__ fall_hits;
+  // env v19 flail telemetry (per env, popped + zeroed by the wrapper's
+  // pop_flail, NOT touched by reset_env): blade arc (rad) accrued on
+  // note-free ticks (next scoreable note > FLAIL_LEAD_S away) by hands
+  // with no live follow-through tracker — swinging that cannot earn —
+  // and the count of those note-free ticks (the denominator).
+  T* __restrict__ flail_rad;
+  int* __restrict__ flail_ticks;
   // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
   // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
   // Body::ground_imp mirror. Written by the step tick in contact mode,
@@ -4655,19 +4668,19 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
 //     exactly why a single-dtype gate would have shipped it. The
 //     recompute stays. GENERAL RULE: "the same expression tree is
 //     deterministic" is only a bitwise argument at a FIXED inline site.
-//  3. KEPT, +0.08%: the zero fill starts at OFF_NOTES. Lanes 0..99 are
+//  3. KEPT, +0.08%: the zero fill starts at OFF_NOTES. Lanes 0..101 are
 //     all UNCONDITIONALLY overwritten below — 0..2 root pos, 3..8 the 6D
 //     rotation, 9..14 root vlin/vang, 15..45 the q block (29 joints,
-//     j = 7 and 14 emitting two lanes each = 31), 46..74 qd, 75..94 the
-//     two 10-lane hand blocks, 95..97 head, 98..99 the contact bits —
-//     so their pre-zeroing was 100 dead stores per env per tick (the
-//     static_assert pins the prefix gapless). From OFF_NOTES the fill IS
-//     load-bearing: note features and the mask are written only for
-//     occupied slots.
+//     j = 7 and 14 emitting two lanes each = 31), 46..74 qd, 75..96 the
+//     two 11-lane hand blocks (env v19), 97..99 head, 100..101 the
+//     contact bits — so their pre-zeroing was dead stores per env per
+//     tick (the static_assert pins the prefix gapless). From OFF_NOTES
+//     the fill IS load-bearing: note features and the mask are written
+//     only for occupied slots.
 static_assert(OFF_ROOT_ROT == 3 && OFF_ROOT_VLIN == 9 && OFF_ROOT_VANG == 12
                   && OFF_Q == 15 && OFF_QD == OFF_Q + NQ + 2
-                  && OFF_HAND_L == OFF_QD + NQ && OFF_HAND_R == OFF_HAND_L + 10
-                  && OFF_HEAD == OFF_HAND_R + 10 && OFF_CONTACT == OFF_HEAD + 3
+                  && OFF_HAND_L == OFF_QD + NQ && OFF_HAND_R == OFF_HAND_L + 11
+                  && OFF_HEAD == OFF_HAND_R + 11 && OFF_CONTACT == OFF_HEAD + 3
                   && OFF_NOTES == OFF_CONTACT + 2,
               "K10e: obs lanes 0..OFF_NOTES-1 must be a gapless "
               "unconditionally-written prefix");
@@ -4725,6 +4738,19 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     }
     obs[base + 9] =
         (float)tmin(P.swing_acc[e * 2 + s] / T(PRE_FULL), T(2));
+    // env v19: remaining follow-through credit — Σ over live trackers
+    // of cnt · (1 − min(acc/POST_FULL, 1)), clipped to 2. Ring walked
+    // from tr_ptr with cnt-many single additions so the f-p sum order
+    // matches lib.rs' per-note Vec (spawn order) bitwise.
+    T rem = T(0);
+    const int rptr = P.tr_ptr[e * 2 + s];
+    for (int kk = 0; kk < N_TRACKERS; kk++) {
+      const int rb = (e * 2 + s) * N_TRACKERS + (rptr + kk) % N_TRACKERS;
+      if (!P.tr_active[rb]) continue;
+      const T term = T(1) - tmin(P.tr_acc[rb] / T(POST_FULL), T(1));
+      for (int cix = P.tr_cnt[rb]; cix > 0; cix--) rem += term;
+    }
+    obs[base + 10] = (float)tmin(rem, T(2));
   }
   // head + contact bits
   obs[OFF_HEAD] = (float)(P.head[e * 3] / T(X_NORM));
@@ -5037,6 +5063,35 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   const T min_speed = P.p_min_speed[c0];
   const int nn = (int)P.p_n_notes[c0];
   int n_new[2] = {0, 0};
+
+  // env v19 flail telemetry: on ticks whose next scoreable note is
+  // > FLAIL_LEAD_S out, blade arc from hands with no live
+  // follow-through is swinging that cannot earn. Runs BEFORE this
+  // tick's cuts (a cut this tick implies a note inside the lead
+  // window anyway). Pure accumulation — no reward/obs/termination
+  // effect; popped by the wrapper.
+  {
+    T next_gap = T(2) * T(FLAIL_LEAD_S);
+    for (int i = P.first_pending[e]; i < nn; i++) {
+      if (P.status[e * C + i] != 0 || !P.p_valid[c0 * C + i]) continue;
+      next_gap = P.p_hit[c0 * C + i] - time_new;
+      break;
+    }
+    if (next_gap > T(FLAIL_LEAD_S)) {
+      T fr = T(0);
+      for (int h = 0; h < 2; h++) {
+        bool live = false;
+        for (int kk = 0; kk < N_TRACKERS; kk++)
+          if (P.tr_active[(e * 2 + h) * N_TRACKERS + kk]) {
+            live = true;
+            break;
+          }
+        if (!live) fr += deltas[h];
+      }
+      P.flail_rad[e] += fr;
+      P.flail_ticks[e] += 1;
+    }
+  }
 
   for (int i = P.first_pending[e]; i < nn; i++) {
     if (P.status[e * C + i] != 0) continue;
@@ -5367,7 +5422,7 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TGIMP, TCIDX,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT, TGIMP, TCIDX,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -5428,6 +5483,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.pd_hits = ts[TPD].data_ptr<int>();
     P.env_hits = ts[TENV].data_ptr<int>();
     P.fall_hits = ts[TFALL].data_ptr<int>();
+    P.flail_rad = ts[TFLAILR].data_ptr<scalar_t>();
+    P.flail_ticks = ts[TFLAILT].data_ptr<int>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();

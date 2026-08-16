@@ -119,33 +119,36 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # v17: notes AND walls share the slots, nearest-first by head distance;
 # per-token = the v9 note lanes then [is_wall, width, height, length])
 # — plus the env v12 (spec §7) 4-lane per-foot ground-contact block at
-# 556..560 (BODY token) and the env v13 (spec §8) 18-lane body-point
-# block at 560..578: elbows to their saber tokens, knees + feet to the
-# BODY token. Window 16 -> 24 in env v18 (eviction study).
-OBS_DIM = 578
+# 558..562 (BODY token) and the env v13 (spec §8) 18-lane body-point
+# block at 562..580: elbows to their saber tokens, knees + feet to the
+# BODY token. Window 16 -> 24 in env v18 (eviction study); hand blocks
+# 10 -> 11 lanes in env v19 (remaining follow-through credit),
+# OBS_DIM 578 -> 580, offsets past the hands +2.
+OBS_DIM = 580
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
-OFF_NOTES = 100
-OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 532
+OFF_NOTES = 102
+OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 534
 # Token layout (SPEC-v10 §5 "informative", finalized here at P4):
 # [saber_L, saber_R, body, note_0..23] = 27 tokens. Each saber token =
 # that hand's q lanes (8, incl. the cos/sin roll pair) + qd lanes (7) +
-# derived block (10) = 25 features + the 2-lane hand one-hot; the ONE
-# body token = root pose/vel block (15) + spine/leg q (15) + spine/leg
-# qd (15) + head (3) + contact bits (2) + ground-contact lanes (4, env
-# v12) + knee/foot positions (12, env v13) = 66 features. Each saber
-# token gains its arm's elbow position (3, env v13): 25 -> 28.
-SABER_FEAT = 28
+# derived block (11, env v19: + remaining follow-through credit) = 26
+# features + the 2-lane hand one-hot; the ONE body token = root
+# pose/vel block (15) + spine/leg q (15) + spine/leg qd (15) + head (3)
+# + contact bits (2) + ground-contact lanes (4, env v12) + knee/foot
+# positions (12, env v13) = 66 features. Each saber token gains its
+# arm's elbow position (3, env v13): 26 -> 29.
+SABER_FEAT = 29
 BODY_FEAT = 66
 # derived from the window size so a future slot change can't skew them
 _GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
 _BP = _GI + 4                           # body_pts block (18)
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
-                + tuple(range(75, 85)) + tuple(range(_BP, _BP + 3)))
+                + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3)))
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
-                + tuple(range(85, 95)) + tuple(range(_BP + 3, _BP + 6)))
+                + tuple(range(86, 97)) + tuple(range(_BP + 3, _BP + 6)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
-             + tuple(range(63, 75)) + tuple(range(95, 100))
+             + tuple(range(63, 75)) + tuple(range(97, 102))
              + tuple(range(_GI, _GI + 4))
              + tuple(range(_BP + 6, _BP + 18)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT

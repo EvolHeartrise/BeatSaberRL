@@ -155,6 +155,9 @@ const SCORE_MAX: f64 = 115.0;
 const CHAIN_LINK_PTS: f64 = 20.0;
 const SWING_BREAK: f64 = 0.005; // rad/tick below which the swing chain breaks
 const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
+// env v19 flail telemetry: a tick is "note-free" when the next pending
+// chart object is further out than this (s). Telemetry only.
+const FLAIL_LEAD_S: f64 = 1.0;
 
 // object kinds (mirrors constants.py)
 const KIND_NOTE: u8 = 0;
@@ -177,7 +180,12 @@ const WALL_FRONT_OFF: f64 = 0.25;
 // then [is_wall, width, height, length].
 const N_NOTE_SLOTS: usize = 24; // env v18: 16 -> 24 (eviction study)
 const NOTE_FEAT: usize = 18;
-const HAND_FEAT: usize = 10; // wrist pos(3) + wrist vel(3) + blade(3) + meter
+// env v19: + remaining follow-through credit (1 lane) — Σ over the
+// hand's live trackers of (1 − min(acc/POST_FULL, 1)), clipped to 2.
+// Fixes the post-swing credit-assignment hole: follow-through reward
+// lands after the note leaves the obs, which taught policies that
+// swinging at nothing pays (the flail bug, user diagnosis 2026-08-16).
+const HAND_FEAT: usize = 11; // wrist pos(3) + vel(3) + blade(3) + meter + post_rem
 const Q_LANES: usize = NQ + 2; // 31: the two wrist rolls code as cos/sin
 const OFF_ROOT_POS: usize = 0; // x/1, (y-0.94)/0.75, (z+0.65)/1
 const OFF_ROOT_ROT: usize = OFF_ROOT_POS + 3; // 6D two-column rotation
@@ -186,10 +194,10 @@ const OFF_ROOT_VANG: usize = OFF_ROOT_VLIN + 3; // world, /16
 const OFF_Q: usize = OFF_ROOT_VANG + 3; // 15
 const OFF_QD: usize = OFF_Q + Q_LANES; // 46: qd_j / omega_cap[j]
 const OFF_HAND_L: usize = OFF_QD + NQ; // 75
-const OFF_HAND_R: usize = OFF_HAND_L + HAND_FEAT; // 85
-const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 95
-const OFF_CONTACT: usize = OFF_HEAD + 3; // 98: contact bits [L, R]
-const OFF_NOTES: usize = OFF_CONTACT + 2; // 100
+const OFF_HAND_R: usize = OFF_HAND_L + HAND_FEAT; // 86 (env v19)
+const OFF_HEAD: usize = OFF_HAND_R + HAND_FEAT; // 97 (env v19)
+const OFF_CONTACT: usize = OFF_HEAD + 3; // 100: contact bits [L, R]
+const OFF_NOTES: usize = OFF_CONTACT + 2; // 102 (env v19)
 const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 532
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse (N·s) per
@@ -205,15 +213,15 @@ const N_GROUND_IMP_LANES: usize = 4;
 // in the note field), knees/feet get their §1.2 reference literals.
 const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 408
 const N_BODY_PTS: usize = 6;
-const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 578
-const _: () = assert!(OBS_DIM == 578, "contact spec §12 (v18 window 24): OBS_DIM must be 578");
+const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 580 (env v19)
+const _: () = assert!(OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
 // = 24.53 N·s, rounded to a spec literal both engines share. A settled
 // two-foot stance sums to ≈ 1.0 across the four lanes.
 const GROUND_IMP_NORM: f64 = 24.5;
-const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 100);
+const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 102);
 
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
@@ -785,6 +793,14 @@ struct Core {
     // -fall_const terminal reward on a fall (see fell block).
     fall_const: f64,
     n_scoreable: u32, // chart objects that are not bombs
+    // env v19 flail telemetry (CUDA-backend mirror, telemetry only):
+    // blade arc (rad) accrued on note-free ticks (next pending chart
+    // object > FLAIL_LEAD_S out) by hands with no live follow-through
+    // tracker, plus the count of those ticks. PER-EPISODE here (zeroed
+    // by reset_state, read per level by the bench); the CUDA twin is
+    // pop-based instead — each matches its consumer.
+    flail_rad: f64,
+    flail_ticks: u32,
     // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
     // latches once the back face clears the head (monotone per wall);
     // first_wall advances over the passed prefix; walls_in counts ticks
@@ -843,6 +859,8 @@ impl Core {
             falls: 0,
             fall_const: 5.0,
             n_scoreable: 0,
+            flail_rad: 0.0,
+            flail_ticks: 0,
             walls: Vec::new(),
             wall_passed: Vec::new(),
             first_wall: 0,
@@ -937,6 +955,8 @@ impl Core {
         self.bombs_hit = 0;
         self.falls = 0;
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
+        self.flail_rad = 0.0;
+        self.flail_ticks = 0;
         self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
         self.score_pre = 0.0;
@@ -1007,6 +1027,17 @@ impl Core {
                 obs[base + 6 + k] = b.blade[s][k] as f32;
             }
             obs[base + 9] = (b.swing_acc[s] / PRE_FULL).min(2.0) as f32;
+            // env v19: remaining follow-through credit. Encoded so 0
+            // means "swinging earns nothing now" (idle / broken /
+            // capped all collapse there) and a fresh single-note
+            // tracker reads 1.0. Summed in spawn order — the CUDA
+            // ring walk from tr_ptr must add in this same order for
+            // bitwise obs parity.
+            let mut rem = 0.0f64;
+            for tr in &self.trackers[s] {
+                rem += 1.0 - (tr.acc / POST_FULL).min(1.0);
+            }
+            obs[base + 10] = rem.min(2.0) as f32;
         }
         // head position (FK, centered on the reference pose)
         obs[OFF_HEAD] = (self.body.head[0] / X_NORM) as f32;
@@ -1247,6 +1278,30 @@ impl Core {
         }
 
         self.time = (self.tick + 1) as f64 * DT;
+
+        // env v19 flail telemetry (CUDA mirror, telemetry only): on
+        // ticks whose next pending chart object is > FLAIL_LEAD_S out,
+        // blade arc from hands with no live follow-through tracker is
+        // swinging that cannot earn. Runs BEFORE this tick's cuts,
+        // exactly like the .cu twin.
+        {
+            let mut next_gap = 2.0 * FLAIL_LEAD_S;
+            for i in self.first_pending..self.chart.len() {
+                if self.status[i] != 0 {
+                    continue;
+                }
+                next_gap = self.chart[i].hit_time - self.time;
+                break;
+            }
+            if next_gap > FLAIL_LEAD_S {
+                for s in 0..2 {
+                    if self.trackers[s].is_empty() {
+                        self.flail_rad += deltas[s];
+                    }
+                }
+                self.flail_ticks += 1;
+            }
+        }
 
         // both sabers' swept surfaces this tick
         let tris = [
@@ -2183,6 +2238,15 @@ impl VecBeatSim {
     fn components(&self, i: usize) -> (f64, f64, f64) {
         let s = &self.sims[i];
         (s.score_pre, s.score_acc, s.score_post)
+    }
+
+    /// env v19 flail telemetry for env i, THIS episode: (blade arc in
+    /// rad accrued by follow-through-idle hands on note-free ticks,
+    /// count of note-free ticks). Read at done, before set_chart
+    /// resets it — same lifecycle as counters(). ADDITIVE getter.
+    fn flail(&self, i: usize) -> (f64, u32) {
+        let s = &self.sims[i];
+        (s.flail_rad, s.flail_ticks)
     }
 
     /// f64 Cholesky pivot-floor engagements summed over all envs since

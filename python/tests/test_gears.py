@@ -172,7 +172,7 @@ def test_policy_head_width_roundtrip():
         a, _, _, _ = policy.get_action_and_value(
             torch.as_tensor(obs).unsqueeze(0))
     obs2, _r, _d, _t, _info = env.step([int(x) for x in a[0]])
-    assert obs2.shape == (578,)   # env v18 window 24
+    assert obs2.shape == (580,)   # env v19: 11-lane hands
     # v9-shaped checkpoint (no v10 arch markers) is refused
     with pytest.raises(SystemExit):
         load_policy({"state_dict": {}, "arch": {"embed": 64, "n_gears": 5}})
