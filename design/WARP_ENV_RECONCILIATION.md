@@ -55,3 +55,12 @@ alone, gates ptxas census BEFORE timing, and reverts on census fail):
       return) before any campaign adopts the warp kernel.
 - STOP RULE (solver doc): if S2+S3 do not beat the legacy kernel
   end-to-end, stop — S4-S6 cover only ~14% of today's ops.
+
+## S0 result (2026-08-15, 39.3M samples/arm, trained policy, full pool)
+
+Realized ground-row count ng per (env,substep): production
+{0: 4.4%, 1: 17.7%, 2: 45.7%, 3: 24.9%, 4: 6.8%, >=5: 0.5%}, max 8;
+stress pushes shift mass toward 0/1 (airborne) but same max 8. So the
+typical fused-sweep width is 1 + 3*ng + nc + nl ≈ 8-15 RHS (ONE round
+of 32 lanes); the ~33-RHS two-round case is the contact-rich tail.
+Stage-1 floor recorded: 614.0 vs 122.5 ms/tick (5.01x, by design).
