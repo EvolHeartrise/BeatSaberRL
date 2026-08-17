@@ -27,30 +27,47 @@ def test_body_pt_lanes_reference_pose():
     lane space, x/1, (y−Y0)/0.75, (z+0.65)/1."""
     obs = _reset_obs(True)
     pts = obs[OFF_BODY_PTS:OFF_BODY_PTS + 18].reshape(6, 3)
-    # elbows move with the env v20 arm ready stance — take them from
-    # the fk_body mirror; knees/feet stay at the §1.2 reference
+    # env v21: ALL six points derive from the fk_body mirror of the
+    # CONTACT start pose (arm ready stance + wide leg stance) with the
+    # exact sole-corner root drop applied
     from beat_arena_env.constants import q_start
-    from beat_arena_env.kinematics import F_L_ELBOW, F_R_ELBOW, fk_body
-    _, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start())
-    le, re = pos[F_L_ELBOW], pos[F_R_ELBOW]
-    exp = np.array([
-        [le[0], (le[1] - Y_CENTER) / Y_NORM, le[2] + 0.65],  # l_elbow
-        [re[0], (re[1] - Y_CENTER) / Y_NORM, re[2] + 0.65],  # r_elbow
-        [-0.10, (0.50 - KNEE_Y0) / Y_NORM, 0.0],     # l_knee
-        [+0.10, (0.50 - KNEE_Y0) / Y_NORM, 0.0],     # r_knee
-        [-0.10, (0.07 - FOOT_Y0) / Y_NORM, 0.0],     # l_foot
-        [+0.10, (0.07 - FOOT_Y0) / Y_NORM, 0.0],     # r_foot
-    ])
+    from beat_arena_env.kinematics import (F_L_ELBOW, F_L_FOOT, F_R_ELBOW,
+                                           F_R_FOOT, fk_body)
+    corners = ((-0.045, -0.070, -0.075), (-0.045, -0.070, 0.175),
+               (0.045, -0.070, -0.075), (0.045, -0.070, 0.175))
+    rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0]
+                        + q_start(foot_contact=True))
+    drop = min(pos[fr][1] + sum(rots[fr][1][k] * c[k] for k in range(3))
+               for fr in (F_L_FOOT, F_R_FOOT) for c in corners)
+    exp = []
+    for fr, y0 in ((F_L_ELBOW, Y_CENTER), (F_R_ELBOW, Y_CENTER),
+                   (21, KNEE_Y0), (27, KNEE_Y0),         # knee frames
+                   (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0)):
+        p = pos[fr]
+        exp.append([p[0], (p[1] - drop - y0) / Y_NORM, p[2] + 0.65])
+    exp = np.array(exp)
     assert np.abs(pts - exp).max() < 1e-6, f"\n{pts}\nvs\n{exp}"
 
 
 def test_body_pt_lanes_present_in_weld_mode():
-    """Positions exist in every mode — weld obs carries them too, and
-    identically to contact mode at the identical reset state."""
-    w, c = _reset_obs(False), _reset_obs(True)
+    """Positions exist in every mode. env v21: RESET poses differ by
+    mode (the wide leg stance is contact-only), so the cross-mode
+    identity is asserted at an EXPLICITLY matched state instead."""
+    w = _reset_obs(False)
     assert w.shape == (OBS_DIM,)
-    np.testing.assert_array_equal(w[OFF_BODY_PTS:], c[OFF_BODY_PTS:])
     assert np.abs(w[OFF_BODY_PTS:]).max() > 0.05
+    from beat_arena_env.constants import q_start
+    q36 = [0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start()
+    obs2 = []
+    for fc in (False, True):
+        sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+                                       wide_acc=False, gears=5,
+                                       foot_contact=fc)
+        sim.set_chart([note_tuple(FAR_NOTE)])
+        sim.set_joints(list(q36), [0.0] * 35)
+        obs2.append(np.asarray(sim.obs(), dtype=np.float64))
+    np.testing.assert_array_equal(obs2[0][OFF_BODY_PTS:],
+                                  obs2[1][OFF_BODY_PTS:])
 
 
 def test_body_pt_lanes_track_motion():

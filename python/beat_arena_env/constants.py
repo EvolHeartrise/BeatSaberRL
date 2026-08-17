@@ -121,14 +121,28 @@ WRAP_JOINTS = (7, 14)
 Q_START_ARM = ((3, -1.3962634015954636), (6, 1.7453292519943295),
                (8, 1.2217304763960306), (10, -1.3962634015954636),
                (13, 1.7453292519943295), (15, 1.2217304763960306))
+# env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
+# +-8 deg, ankle_roll counter-rolls so the soles stay flat (verified:
+# fk_body foot up-vector exactly (0,1,0)). CONTACT MODE ONLY (weld
+# mode's feet are welded at the v10 reference). Exact f64 radians,
+# mirrored verbatim in lib.rs Q_START_LEG and the .cu.
+Q_START_LEG = ((19, -0.13962634015954636), (22, 0.13962634015954636),
+               (25, 0.13962634015954636), (28, -0.13962634015954636))
+# The stance's per-side foot X (fk_body of the v21 start pose; the
+# root ground-drop does not move X): left foot -> -FOOT_X0, right ->
+# +FOOT_X0 — the per-foot targets of the --foot-x-coef penalty.
+FOOT_X0 = 0.22108059783525694
 
 
-def q_start():
-    """The 29-joint episode-start pose vector (env v20 arm stance,
-    legs/spine zero)."""
+def q_start(foot_contact=False):
+    """The 29-joint episode-start pose vector: env v20 arm ready
+    stance, plus (contact mode only) the env v21 wide leg stance."""
     q = [0.0] * N_JOINTS
     for j, v in Q_START_ARM:
         q[j] = v
+    if foot_contact:
+        for j, v in Q_START_LEG:
+            q[j] = v
     return q
 
 

@@ -1510,6 +1510,13 @@ constexpr double SWING_BREAK = 0.005;
 // scoreable note is further out than this (s). Telemetry only — no
 // reward or obs effect.
 constexpr double FLAIL_LEAD_S = 1.0;
+// env v21 (lib.rs mirrors, exact shared f64 literals): wide stance —
+// hip_roll splays the legs +-8 deg, ankle_roll counter-rolls so the
+// soles stay flat. Contact mode only (weld mode's feet are welded at
+// the v10 reference). FOOT_X0 = the stance's per-side foot x (fk of
+// the start pose; the root ground-drop does not move x).
+constexpr double Q_START_HIP_ROLL = 0.13962634015954636;   // 8 deg
+constexpr double FOOT_X0 = 0.22108059783525694;
 constexpr int FOLLOW_TIMEOUT = 15;
 constexpr double LOOK_VERT = 0.8;
 constexpr double LOOK_DIST = 8.0;
@@ -4545,6 +4552,13 @@ struct Sim {
   // PLANE_Z0| + |rfoot_z - PLANE_Z0|) — linear in each foot's world-z
   // distance from the reference foot z (lib.rs mirror). 0 = off.
   T foot_z_coef;
+  // env v21: the X twin — each foot priced against its OWN side's
+  // wide-stance x (left -> -FOOT_X0, right -> +FOOT_X0). 0 = off.
+  T foot_x_coef;
+  // env v21: reset_env needs the runtime mode flag (the kernel's
+  // FOOT_CONTACT template parameter is not visible there) to gate the
+  // wide stance + ground fit.
+  bool foot_contact;
   // env v20 start-pose jitter (TRAINING-ONLY, no lib.rs mirror — the
   // push/start_jitter precedent): per-env U(-1,1) draws for the 12 leg
   // joints, refilled by the wrapper every launch; consumed by reset_env
@@ -4618,19 +4632,25 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   d.q[13] = T(1.7453292519943295);   // r_elbow
   d.q[15] = T(1.2217304763960306);   // r_wrist_bend
   for (int i = 0; i < NV; i++) d.v[i] = T(0);
-  // env v20 start-pose jitter (training-only): small uniform leg/foot
-  // joint offsets (12 joints, §1.4 indices 17..28), clamped to the
-  // joint ranges; the one-way knees (20, 26) take |draw| so half the
-  // resets aren't clamped flat. Then the EXACT no-ground-clip fix:
-  // FK the sampled pose, transform the 8 sole corners (contact spec
-  // §2 GROUND_CORNERS), and drop/lift the root so the lowest corner
-  // sits exactly on the ground plane (y = 0).
-  if (P.start_pose_jitter > T(0)) {
-    for (int k = 0; k < 12; k++) {
-      const int j = 17 + k;
-      T jit = P.pose_jit[e * 12 + k] * P.start_pose_jitter;
-      if (j == 20 || j == 26) jit = fabs(jit);
-      d.q[j] = tclamp(jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
+  // env v21 (contact mode only): wide stance, then OPTIONAL v20
+  // start-pose jitter CENTERED on the stance (12 leg joints, §1.4
+  // indices 17..28; one-way knees take |draw|), clamped to the joint
+  // ranges. ALWAYS finish with the exact no-clip fix: FK the pose,
+  // transform the 8 sole corners (contact spec §2 GROUND_CORNERS),
+  // and drop/lift the root so the lowest corner sits exactly on the
+  // ground plane (y = 0) — the stance alone lifts the ankles ~8.5 mm.
+  if (P.foot_contact) {
+    d.q[19] = T(-Q_START_HIP_ROLL);  // l_hip_roll
+    d.q[22] = T(Q_START_HIP_ROLL);   // l_ankle_roll (counter)
+    d.q[25] = T(Q_START_HIP_ROLL);   // r_hip_roll
+    d.q[28] = T(-Q_START_HIP_ROLL);  // r_ankle_roll (counter)
+    if (P.start_pose_jitter > T(0)) {
+      for (int k = 0; k < 12; k++) {
+        const int j = 17 + k;
+        T jit = P.pose_jit[e * 12 + k] * P.start_pose_jitter;
+        if (j == 20 || j == 26) jit = fabs(jit);
+        d.q[j] = tclamp(d.q[j] + jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
+      }
     }
     fk_all(d);
     T min_y = T(1e9);
@@ -5028,6 +5048,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     reward -= P.foot_z_coef
               * (fabs(d.pos[F_L_FOOT][2] - T(PLANE_Z0))
                  + fabs(d.pos[F_R_FOOT][2] - T(PLANE_Z0)));
+  }
+  // env v21 foot-x penalty: each foot against its own stance x
+  if (P.foot_x_coef > T(0)) {
+    reward -= P.foot_x_coef
+              * (fabs(d.pos[F_L_FOOT][0] + T(FOOT_X0))
+                 + fabs(d.pos[F_R_FOOT][0] - T(FOOT_X0)));
   }
 
   // swing chain update
@@ -5489,7 +5515,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
-          double foot_z_coef, double start_pose_jitter) {
+          double foot_z_coef, double foot_x_coef,
+          double start_pose_jitter) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5589,6 +5616,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.effort_coef = (scalar_t)effort_coef;
     P.fall_const = (scalar_t)fall_const;
     P.foot_z_coef = (scalar_t)foot_z_coef;
+    P.foot_x_coef = (scalar_t)foot_x_coef;
+    P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.gears = (int)gears;
