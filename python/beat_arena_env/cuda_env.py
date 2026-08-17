@@ -363,7 +363,8 @@ class CudaBeatVecEnv:
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
-                 foot_z_coef=0.0, foot_x_coef=0.0, start_pose_jitter=0.0):
+                 foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
+                 foot_shape_coef=0.0, start_pose_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -399,6 +400,10 @@ class CudaBeatVecEnv:
         # env v21: the X twin — each foot priced against its own
         # wide-stance x (constants.FOOT_X0)
         self.foot_x_coef = float(foot_x_coef)
+        # env v22: hinged rent radius (0 = v21 pure-linear) + potential-
+        # based delta-shaping coefficient (see lib.rs field comments)
+        self.foot_hinge_r = float(foot_hinge_r)
+        self.foot_shape_coef = float(foot_shape_coef)
         self.start_pose_jitter = float(start_pose_jitter)
         assert start_pose_jitter == 0.0 or foot_contact, \
             "start_pose_jitter fights the v10 foot welds; contact mode only"
@@ -532,6 +537,8 @@ class CudaBeatVecEnv:
         # offset handling makes replays draw fresh values, the _kick
         # precedent). Consumed only by envs that reset this launch.
         self._pose_jit = z(N, 12)
+        # env v22: previous tick's total hinged foot deviation
+        self._foot_pot = z(N)
         # env v12 (contact spec §7): tick-summed ground normal impulses
         # per (env, [L_heel, L_toe, R_heel, R_toe]); feeds the four
         # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
@@ -570,6 +577,7 @@ class CudaBeatVecEnv:
             self.ground_imp,
             self.chart_idx,
             self._pose_jit,
+            self._foot_pot,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -592,6 +600,7 @@ class CudaBeatVecEnv:
                        self.auto_reset, self.gears, self.want_contacts,
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
+                       self.foot_hinge_r, self.foot_shape_coef,
                        self.start_pose_jitter)
 
     def _cand(self):

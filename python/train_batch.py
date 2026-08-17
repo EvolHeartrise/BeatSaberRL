@@ -313,6 +313,17 @@ def parse_args():
     p.add_argument("--start-jitter", type=float, default=0.2,
                    help="episode-start kick magnitude m/s applied to "
                         "freshly reset envs (RSI-flavored start variety)")
+    p.add_argument("--foot-hinge-r", type=float, default=0.0,
+                   help="env v22: free radius (m) for BOTH foot penalties "
+                        "— deviation inside it costs nothing (target "
+                        "AREAS), rent applies to the excess. 0 = the v21 "
+                        "pure-linear behavior")
+    p.add_argument("--foot-shape-coef", type=float, default=0.0,
+                   help="env v22: potential-based delta shaping on the "
+                        "total hinged foot deviation — reward/punish each "
+                        "tick's CHANGE in deviation (round trips net "
+                        "zero; sharpens credit assignment; provably "
+                        "optimum-preserving). 0 = off")
     p.add_argument("--foot-x-coef", type=float, default=0.0,
                    help="env v21: per-tick penalty coefficient on each "
                         "foot's |world_x - its_stance_x| (per-side "
@@ -483,6 +494,8 @@ def main():
                       start_jitter=args.start_jitter,
                       foot_z_coef=args.foot_z_coef,
                       foot_x_coef=args.foot_x_coef,
+                      foot_hinge_r=args.foot_hinge_r,
+                      foot_shape_coef=args.foot_shape_coef,
                       start_pose_jitter=args.start_pose_jitter,
                       seed=args.seed, device=device)
     elif tensor_env:
@@ -501,6 +514,8 @@ def main():
             start_jitter=args.start_jitter,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,
+            foot_hinge_r=args.foot_hinge_r,
+            foot_shape_coef=args.foot_shape_coef,
             start_pose_jitter=args.start_pose_jitter,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -515,6 +530,8 @@ def main():
             foot_contact=args.foot_contact, fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,
+            foot_hinge_r=args.foot_hinge_r,
+            foot_shape_coef=args.foot_shape_coef,
             seed=args.seed)
 
     if resume_ckpt is not None:
