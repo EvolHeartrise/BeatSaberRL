@@ -56,7 +56,7 @@ def _q36(joints=None):
 def test_obs_length_and_reset_layout():
     sim = _sim([_note(5.0, 0.3, 1.4)])
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
-    assert obs.shape == (OBS_DIM,) == (580,)   # env v19: 11-lane hands
+    assert obs.shape == (OBS_DIM,) == (598,)   # env v24: body-point velocity lanes
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 86,

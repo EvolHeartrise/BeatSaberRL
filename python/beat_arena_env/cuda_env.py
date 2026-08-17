@@ -539,6 +539,9 @@ class CudaBeatVecEnv:
         # offset handling makes replays draw fresh values, the _kick
         # precedent). Consumed only by envs that reset this launch.
         self._pose_jit = z(N, 12)
+        # env v24: §8 body-point finite-diff base + world velocities
+        self._bp_pos = z(N, 18)
+        self._bp_vel = z(N, 18)
         # env v22: previous tick's total hinged foot deviation
         self._foot_pot = z(N)
         # env v12 (contact spec §7): tick-summed ground normal impulses
@@ -580,6 +583,7 @@ class CudaBeatVecEnv:
             self.chart_idx,
             self._pose_jit,
             self._foot_pot,
+            self._bp_pos, self._bp_vel,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],

@@ -42,7 +42,7 @@ def _refresh(env):
 def test_reset_lanes_zero():
     env = _env()
     obs = env.reset()
-    assert obs.shape[1] == OBS_DIM == 580
+    assert obs.shape[1] == OBS_DIM == 598
     assert not obs[:, LANE_L].any()
     assert not obs[:, LANE_R].any()
 

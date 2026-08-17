@@ -239,8 +239,21 @@ const N_GROUND_IMP_LANES: usize = 4;
 // in the note field), knees/feet get their §1.2 reference literals.
 const OFF_BODY_PTS: usize = OFF_GROUND_IMP + N_GROUND_IMP_LANES; // 408
 const N_BODY_PTS: usize = 6;
-const OBS_DIM: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 580 (env v19)
-const _: () = assert!(OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580");
+// env v24 (user direction 2026-08-17): world VELOCITIES of the same 6
+// §8 body points, wrist_vel-style finite difference across the tick,
+// /V_NORM. Point velocity is otherwise a deep FK-Jacobian computation
+// to ask of the network — and foot world velocity is exactly the slip
+// signal (same legibility lesson as the v19 post_rem lane).
+const OFF_BODY_PT_VEL: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 580
+const OBS_DIM: usize = OFF_BODY_PT_VEL + 3 * N_BODY_PTS; // 598 (env v24)
+// §8 body-point frames + their obs y-centering (shared by the position
+// lanes, the velocity finite-diff and the foot reward terms' docs)
+const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
+    (F_L_ELBOW, Y_CENTER), (F_R_ELBOW, Y_CENTER),
+    (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
+    (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
+];
+const _: () = assert!(OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
@@ -591,6 +604,8 @@ struct Body {
     shoulder_z: [f64; 2],
     // judgment caches
     wrist_vel: [[f64; 3]; 2], // finite difference across the last tick
+    // env v24: §8 body-point world velocities, same finite-diff scheme
+    body_pt_vel: [[f64; 3]; N_BODY_PTS],
     swing_acc: [f64; 2],      // arc of the current continuous swing (rad)
     axis: [Option<[f64; 3]>; 2], // last tick's rotation axis (unit)
     // per-tick contact aggregation (obs bits + replay events)
@@ -661,6 +676,7 @@ impl Body {
             head: [0.0; 3],
             shoulder_z: [0.0; 2],
             wrist_vel: [[0.0; 3]; 2],
+            body_pt_vel: [[0.0; 3]; N_BODY_PTS],
             swing_acc: [0.0; 2],
             axis: [None; 2],
             contact_arm: [false; 2],
@@ -699,6 +715,7 @@ impl Body {
         }
         self.tau = [0.0; NQ];
         self.wrist_vel = [[0.0; 3]; 2];
+        self.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
         self.swing_acc = [0.0; 2];
         self.axis = [None; 2];
         self.contact_arm = [false; 2];
@@ -763,6 +780,12 @@ impl Body {
         }
         self.act_frac = act;
         let prev_wrist = self.wrist;
+        // env v24: last tick's §8 body-point positions (ws.p holds the
+        // previous refresh_fk), the finite-diff base for body_pt_vel
+        let mut prev_bp = [[0.0f64; 3]; N_BODY_PTS];
+        for (i, (f, _)) in BODY_PTS.iter().enumerate() {
+            prev_bp[i] = self.ws.p[*f];
+        }
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.weld_imp = [0.0; 12];
@@ -844,6 +867,12 @@ impl Body {
         for s in 0..2 {
             for k in 0..3 {
                 self.wrist_vel[s][k] = (self.wrist[s][k] - prev_wrist[s][k]) / DT;
+            }
+        }
+        for (i, (f, _)) in BODY_PTS.iter().enumerate() {
+            for k in 0..3 {
+                self.body_pt_vel[i][k] =
+                    (self.ws.p[*f][k] - prev_bp[i][k]) / DT;
             }
         }
     }
@@ -1296,17 +1325,22 @@ impl Core {
         // contact spec §8 (env v13): elbow/knee/foot world positions —
         // FK the engines already ran, handed to the policy instead of
         // being re-derived from q through the network
-        const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
-            (F_L_ELBOW, Y_CENTER), (F_R_ELBOW, Y_CENTER),
-            (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
-            (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
-        ];
         for (i, (f, y0)) in BODY_PTS.iter().enumerate() {
             let p = &self.body.ws.p[*f];
             let base = OFF_BODY_PTS + 3 * i;
             obs[base] = (p[0] / X_NORM) as f32;
             obs[base + 1] = ((p[1] - y0) / Y_NORM) as f32;
             obs[base + 2] = ((p[2] - PLANE_Z0) / X_NORM) as f32;
+        }
+        // env v24: the same points' world velocities (finite diff
+        // across the last tick, wrist_vel-style, /V_NORM; zero at
+        // reset and after a set_state refresh)
+        for i in 0..N_BODY_PTS {
+            let base = OFF_BODY_PT_VEL + 3 * i;
+            for k in 0..3 {
+                obs[base + k] =
+                    (self.body.body_pt_vel[i][k] / V_NORM) as f32;
+            }
         }
     }
 
@@ -2037,6 +2071,7 @@ impl RawBeatSim {
         body.st.v.copy_from_slice(&v);
         body.refresh_fk();
         body.wrist_vel = [[0.0; 3]; 2];
+        body.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
     }
 
     /// Last tick's effort in JOULES (positive mechanical work, SPEC-v10

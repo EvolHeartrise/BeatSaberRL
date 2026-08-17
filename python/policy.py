@@ -123,8 +123,11 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # block at 562..580: elbows to their saber tokens, knees + feet to the
 # BODY token. Window 16 -> 24 in env v18 (eviction study); hand blocks
 # 10 -> 11 lanes in env v19 (remaining follow-through credit),
-# OBS_DIM 578 -> 580, offsets past the hands +2.
-OBS_DIM = 580
+# OBS_DIM 578 -> 580, offsets past the hands +2. Env v24: 18-lane
+# body-point VELOCITY block at 580..598, routed like the positions
+# (elbow vels to their saber tokens, knee + foot vels to BODY),
+# OBS_DIM 580 -> 598.
+OBS_DIM = 598
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 OFF_NOTES = 102
@@ -136,21 +139,26 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 534
 # features + the 2-lane hand one-hot; the ONE body token = root
 # pose/vel block (15) + spine/leg q (15) + spine/leg qd (15) + head (3)
 # + contact bits (2) + ground-contact lanes (4, env v12) + knee/foot
-# positions (12, env v13) = 66 features. Each saber token gains its
-# arm's elbow position (3, env v13): 26 -> 29.
-SABER_FEAT = 29
-BODY_FEAT = 66
+# positions (12, env v13) + knee/foot velocities (12, env v24) = 78
+# features. Each saber token gains its arm's elbow position (3, env
+# v13) and elbow velocity (3, env v24): 26 -> 32.
+SABER_FEAT = 32
+BODY_FEAT = 78
 # derived from the window size so a future slot change can't skew them
 _GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
 _BP = _GI + 4                           # body_pts block (18)
+_BPV = _BP + 18                         # body_pt_vel block (18, env v24)
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
-                + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3)))
+                + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3))
+                + tuple(range(_BPV, _BPV + 3)))
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
-                + tuple(range(86, 97)) + tuple(range(_BP + 3, _BP + 6)))
+                + tuple(range(86, 97)) + tuple(range(_BP + 3, _BP + 6))
+                + tuple(range(_BPV + 3, _BPV + 6)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(97, 102))
              + tuple(range(_GI, _GI + 4))
-             + tuple(range(_BP + 6, _BP + 18)))
+             + tuple(range(_BP + 6, _BP + 18))
+             + tuple(range(_BPV + 6, _BPV + 18)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —

@@ -234,6 +234,10 @@ _OBS_BLOCKS = (
     # l_knee, r_knee, l_foot, r_foot], head-style normalization
     # (elbows centered on Y_CENTER, knees on 0.50, feet on 0.07)
     ("body_pts", 18),
+    # env v24: the same 6 points' world VELOCITIES — wrist_vel-style
+    # finite difference across the tick, /V_NORM; zero at reset and
+    # after a set_state refresh. Foot world velocity is the slip signal.
+    ("body_pt_vel", 18),
 )
 OBS_OFF = {}
 _off = 0
@@ -255,7 +259,8 @@ OFF_NOTES = OBS_OFF["notes"]            # 102 (env v19)
 OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 534 (env v19)
 OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 558 (env v19)
 OFF_BODY_PTS = OBS_OFF["body_pts"]      # 562 (env v19)
-assert OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580"
+OFF_BODY_PT_VEL = OBS_OFF["body_pt_vel"]  # 580 (env v24)
+assert OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec
