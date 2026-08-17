@@ -36,6 +36,12 @@ ground contact on the 8 sole-box corners and arms the fall termination
 kernel instantiation, so the default weld mode is the v10 kernel
 unchanged; test_v11_contact_parity.py is the contact-mode gate.
 
+WELD MODE IS TEST-HARNESS ONLY since 2026-08-16 (user decision): the
+production surfaces (train_batch, bench_scoresaber) force contact mode
+unconditionally. foot_contact=False survives solely so the
+scripted-mechanics suite has a stable platform (an unactuated contact
+body tips in ~0.7 s, which would end every multi-second swing script).
+
 Limits vs BeatVecEnv: no per-step info dicts, no event stream, CUDA only.
 """
 

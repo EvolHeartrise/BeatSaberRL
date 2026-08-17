@@ -31,8 +31,9 @@ class BeatVecEnv:
                  foot_z_coef=0.0, foot_x_coef=0.0,
                  gears=3, seed=0, foot_contact=False, fall_const=5.0):
         """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
-        False = the v10 foot welds (DEFAULT), True = unilateral ground
-        contact on the 8 sole corners + the fall termination."""
+        False = the v10 foot welds (TEST-HARNESS ONLY since 2026-08-16
+        — production is contact-only and train/bench force it), True =
+        unilateral ground contact + the fall termination."""
         self.num_envs = num_envs
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
