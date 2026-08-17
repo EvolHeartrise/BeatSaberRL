@@ -97,7 +97,7 @@ TAU_MAX = (
     350.00, 100.00, 180.00, 250.00, 180.00, 50.00,
     350.00, 100.00, 180.00, 250.00, 180.00, 50.00,
 )
-OMEGA_CAP = (16.0,) * 7 + (40.0,) * 3 + (16.0,) * 4 + (40.0,) * 3 + (16.0,) * 12
+OMEGA_CAP = (16.0,) * 7 + (50.0,) * 3 + (16.0,) * 4 + (50.0,) * 3 + (16.0,) * 12
 
 # §19b root-velocity envelope (dynamics/step.rs ROOT_W_MAX / ROOT_V_MAX,
 # mirrored in the .cu): a kinematic consequence of the foot welds + the
@@ -336,7 +336,10 @@ L_FORE = 0.30         # m
 HEAD = HEAD0
 N_HAND_JOINTS = 7     # v9 per-hand joint count (pitch..dev)
 ALPHA_ARM, OMEGA_ARM = 160.0, 16.0
-ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0
+ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # scripted-harness timing
+# model, NOT the engine cap (that is OMEGA_CAP above, 50 since
+# 2026-08-18) — kept at the old conservative 40 so scripted swing
+# waits stay generous
 JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
 JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
 PITCH_LIM = math.radians(90.0)
