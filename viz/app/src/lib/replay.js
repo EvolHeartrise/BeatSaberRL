@@ -474,7 +474,12 @@ export function isHeadAnchored(rep) {
 
 // The head-anchored offset needs one full-body FK per query; playback
 // asks for the same (tick, u) many times per frame, so memoize the last.
+// Integer-tick (u = 0) offsets are also re-asked every frame by the
+// aftermath/post effects (their zOff is FROZEN at the spawn tick, each
+// at its own k, which would thrash a single-slot memo) — cache those
+// per replay so each spawn tick costs one FK ever.
 let _offMemo = { rep: null, k: -1, u: -1, v: 0 };
+const _offTicks = new WeakMap(); // rep -> Map(k -> z_off at (k, 0))
 
 /** World z of the HEAD frame origin at fractional tick (tickIdx + u) —
  * the same head the viewer draws the skeleton's head from, and the one
@@ -490,6 +495,13 @@ export function trackOffset(rep, tickIdx, u = 0) {
   if (!isHeadAnchored(rep) || !rep.ticks || !rep.ticks.length) return 0;
   const k = Math.max(0, Math.min(Math.floor(tickIdx), rep.ticks.length - 1));
   const uu = Math.min(1, Math.max(0, u));
+  if (uu === 0) {
+    let m = _offTicks.get(rep);
+    if (!m) _offTicks.set(rep, (m = new Map()));
+    let v = m.get(k);
+    if (v === undefined) m.set(k, (v = headZAt(rep, k, 0) - PLANE_Z0));
+    return v;
+  }
   if (_offMemo.rep === rep && _offMemo.k === k && _offMemo.u === uu)
     return _offMemo.v;
   const v = headZAt(rep, k, uu) - PLANE_Z0;
@@ -659,22 +671,45 @@ export function tipSpeed(rep, tickIdx, s) {
   return Math.hypot(t1[0] - t0[0], t1[1] - t0[1], t1[2] - t0[2]) / DT;
 }
 
-/** Cumulative HUD counters up to and including uptoTick. */
+/** Cumulative HUD counters up to and including uptoTick. O(1) per call:
+ * the running totals are built once per replay (lazily, cached by rep) by
+ * the same loop in the same order the old per-call scan summed them, so
+ * every float comes out bit-identical — the HUD asks at every tick of
+ * playback, which made the per-call O(ticks) scan quadratic overall. */
+const _countsCache = new WeakMap(); // rep -> per-tick cumulative arrays
 export function counts(rep, uptoTick) {
-  const c = { good: 0, bad: 0, miss: 0, bombs: 0, reward: 0, score: 0 };
-  for (let k = 0; k <= uptoTick && k < rep.ticks.length; k++) {
-    c.reward += rep.ticks[k].reward;
-    rep.ticks[k].events.forEach((e) => {
-      if (e.cut) {
-        c[e.cut.good ? "good" : "bad"]++;
-        c.score += e.cut.points || 0;
-      }
-      if (e.post) c.score += e.post.points;
-      if (e.miss !== undefined) c.miss++;
-      if (e.bomb !== undefined) c.bombs++;
-    });
+  let cum = _countsCache.get(rep);
+  if (!cum) {
+    const n = rep.ticks.length;
+    cum = {
+      good: new Int32Array(n), bad: new Int32Array(n),
+      miss: new Int32Array(n), bombs: new Int32Array(n),
+      reward: new Float64Array(n), score: new Float64Array(n),
+    };
+    const c = { good: 0, bad: 0, miss: 0, bombs: 0, reward: 0, score: 0 };
+    for (let k = 0; k < n; k++) {
+      c.reward += rep.ticks[k].reward;
+      rep.ticks[k].events.forEach((e) => {
+        if (e.cut) {
+          c[e.cut.good ? "good" : "bad"]++;
+          c.score += e.cut.points || 0;
+        }
+        if (e.post) c.score += e.post.points;
+        if (e.miss !== undefined) c.miss++;
+        if (e.bomb !== undefined) c.bombs++;
+      });
+      cum.good[k] = c.good; cum.bad[k] = c.bad;
+      cum.miss[k] = c.miss; cum.bombs[k] = c.bombs;
+      cum.reward[k] = c.reward; cum.score[k] = c.score;
+    }
+    _countsCache.set(rep, cum);
   }
-  return c;
+  const k = Math.min(uptoTick, rep.ticks.length - 1);
+  if (k < 0) return { good: 0, bad: 0, miss: 0, bombs: 0, reward: 0, score: 0 };
+  return {
+    good: cum.good[k], bad: cum.bad[k], miss: cum.miss[k],
+    bombs: cum.bombs[k], reward: cum.reward[k], score: cum.score[k],
+  };
 }
 
 /** Self-collision contact markers visible at `time` (0.4 s flash):
@@ -776,14 +811,19 @@ export function aftermaths(rep, time) {
   return out;
 }
 
-/** Follow-through "+N follow" popups active at `time`. */
+/** Follow-through "+N follow" popups active at `time`. Single pass that
+ * only allocates for the (few) active popups — the map/filter/map chain
+ * cloned every post on the replay every frame. */
 export function activePosts(rep, time) {
-  return rep.posts
-    .map((p) => ({ ...p, age: time - (p.tick + 1) * DT }))
-    .filter((p) => p.age >= 0 && p.age <= FADE_S)
-    .map((p) => ({
-      ...p, alpha: 1 - p.age / FADE_S, zOff: trackOffset(rep, p.tick + 1),
-    }));
+  const out = [];
+  for (const p of rep.posts) {
+    const age = time - (p.tick + 1) * DT;
+    if (age < 0 || age > FADE_S) continue;
+    out.push({
+      ...p, age, alpha: 1 - age / FADE_S, zOff: trackOffset(rep, p.tick + 1),
+    });
+  }
+  return out;
 }
 
 /** Arc hint tubes visible at `time`: head/tail world positions of each

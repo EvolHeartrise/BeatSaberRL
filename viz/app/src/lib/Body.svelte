@@ -42,6 +42,17 @@
 
   const TRUNK = "#2a2f3b", LIMB = "#232733";
 
+  // Bone cylinders built ONCE: FK is rigid, so every segment's length is
+  // the model constant (chest 0.43, upper arm 0.35, forearm 0.30, thigh
+  // 0.44, shank 0.43, pelvis 0.20) — feeding the per-frame measured
+  // length through geometry `args` recreated (and never freed until
+  // unmount) ~10 CylinderGeometries every frame.
+  const cyl = (r, len) => new THREE.CylinderGeometry(r, r, len, 12);
+  const chestGeo = cyl(0.15, 0.43);
+  const uarmGeo = cyl(0.045, 0.35), farmGeo = cyl(0.04, 0.30);
+  const thighGeo = cyl(0.06, 0.44), shankGeo = cyl(0.045, 0.43);
+  const pelvisGeo = cyl(0.10, 0.20);
+
   // capsule segments: [frame, a_local, b_local, radius, color per side]
   const pelvis = $derived(seg(
     framePoint({ r: [fk.r0], p: [fk.p0] }, 0, [-0.10, 0, 0]),
@@ -49,24 +60,24 @@
   const chest = $derived(seg(fk.p[F_CHEST],
     framePoint(fk, F_CHEST, [0, 0.43, 0])));
   const segs = $derived([
-    // [seg, radius, color]
-    [chest, 0.15, TRUNK],
+    // [seg, geometry, color]
+    [chest, chestGeo, TRUNK],
     // arm bones joint-to-joint: the shoulder/wrist clusters are stacked
     // co-located frames and F_*_SHOULDER is the FIRST (yaw) one — an
     // extrusion along its local z ignores pitch/twist and misses the
     // elbow whenever the arm is off neutral
-    [seg(fk.p[F_L_SHOULDER], fk.p[F_L_ELBOW]), 0.045, SABER_DARK[0]],
-    [seg(fk.p[F_L_ELBOW], fk.p[F_L_WRIST]), 0.04, SABER_DARK[0]],
-    [seg(fk.p[F_R_SHOULDER], fk.p[F_R_ELBOW]), 0.045, SABER_DARK[1]],
-    [seg(fk.p[F_R_ELBOW], fk.p[F_R_WRIST]), 0.04, SABER_DARK[1]],
+    [seg(fk.p[F_L_SHOULDER], fk.p[F_L_ELBOW]), uarmGeo, SABER_DARK[0]],
+    [seg(fk.p[F_L_ELBOW], fk.p[F_L_WRIST]), farmGeo, SABER_DARK[0]],
+    [seg(fk.p[F_R_SHOULDER], fk.p[F_R_ELBOW]), uarmGeo, SABER_DARK[1]],
+    [seg(fk.p[F_R_ELBOW], fk.p[F_R_WRIST]), farmGeo, SABER_DARK[1]],
     [seg(fk.p[F_L_THIGH], framePoint(fk, F_L_THIGH, [0, -0.44, 0])),
-      0.06, LIMB],
+      thighGeo, LIMB],
     [seg(fk.p[F_L_SHANK], framePoint(fk, F_L_SHANK, [0, -0.43, 0])),
-      0.045, LIMB],
+      shankGeo, LIMB],
     [seg(fk.p[F_R_THIGH], framePoint(fk, F_R_THIGH, [0, -0.44, 0])),
-      0.06, LIMB],
+      thighGeo, LIMB],
     [seg(fk.p[F_R_SHANK], framePoint(fk, F_R_SHANK, [0, -0.43, 0])),
-      0.045, LIMB],
+      shankGeo, LIMB],
   ]);
   const head = $derived(toScene(fk.p[F_HEAD]));
   const fists = $derived([0, 1].map((s) =>
@@ -80,15 +91,13 @@
 </script>
 
 {#each segs as s, i (i)}
-  <T.Mesh position={s[0].pos} quaternion={s[0].quat}>
-    <T.CylinderGeometry args={[s[1], s[1], Math.max(s[0].len, 1e-4), 12]} />
+  <T.Mesh position={s[0].pos} quaternion={s[0].quat} geometry={s[1]}>
     <T.MeshStandardMaterial color={s[2]} />
   </T.Mesh>
 {/each}
 
 <!-- pelvis capsule (x-aligned in the root frame) -->
-<T.Mesh position={pelvis.pos} quaternion={pelvis.quat}>
-  <T.CylinderGeometry args={[0.10, 0.10, Math.max(pelvis.len, 1e-4), 12]} />
+<T.Mesh position={pelvis.pos} quaternion={pelvis.quat} geometry={pelvisGeo}>
   <T.MeshStandardMaterial color={TRUNK} />
 </T.Mesh>
 
