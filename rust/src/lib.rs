@@ -598,6 +598,12 @@ struct Body {
     contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
     contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
     effort_j: f64,                   // last tick's positive work (J)
+    // env v23 activation (user direction 2026-08-17): this tick's
+    // commanded |gear fraction| summed over the 29 joints — the
+    // muscle-activation analog (Σ|tau_j|/tau_max_j, constant over the
+    // tick since tau is held). Priced by Core::iso_coef; isometric
+    // holds and limit-jamming pay it, coast is the only free command.
+    act_frac: f64,
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -654,6 +660,7 @@ impl Body {
             contact_imp: [0.0; NUM_PAIRS],
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             effort_j: 0.0,
+            act_frac: 0.0,
             escaped: false,
             foot_contact,
             fell: false,
@@ -689,6 +696,7 @@ impl Body {
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.effort_j = 0.0;
+        self.act_frac = 0.0;
         self.escaped = false;
         self.fell = false;
         self.weld_imp = [0.0; 12];
@@ -737,11 +745,14 @@ impl Body {
     /// h = 1/240 (SPEC-v10 §3/§4), accumulating positive work and
     /// contact impulses, then FK-cache refresh + finite-diff wrist vel.
     fn tick(&mut self, actions: &[u8; NQ], gear: &[f64; 7]) {
+        let mut act = 0.0;
         for j in 0..NQ {
             let a = actions[j] as usize;
             let frac = if a < 7 { gear[a] } else { 0.0 };
             self.tau[j] = frac * MODEL.tau_max[j];
+            act += frac.abs();
         }
+        self.act_frac = act;
         let prev_wrist = self.wrist;
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
@@ -876,6 +887,10 @@ struct Core {
     // terms remain the anti-parking objective (delta shaping alone
     // would make a parked pose free). 0.0 = off.
     foot_shape_coef: f64,
+    // env v23: per-tick activation price on Body::act_frac (0 = the
+    // pre-v23 reward verbatim; velocity-blind by design — the work
+    // term effort_coef prices speed, this prices force)
+    iso_coef: f64,
     // the previous tick's pot (reset to 0 — resets start on-target)
     prev_foot_pot: f64,
     n_scoreable: u32, // chart objects that are not bombs
@@ -948,6 +963,7 @@ impl Core {
             foot_x_coef: 0.0,
             foot_hinge_r: 0.0,
             foot_shape_coef: 0.0,
+            iso_coef: 0.0,
             prev_foot_pot: 0.0,
             n_scoreable: 0,
             flail_rad: 0.0,
@@ -1316,6 +1332,7 @@ impl Core {
         let gear = self.gear;
         self.body.tick(actions, &gear);
         reward -= self.effort_coef * self.body.effort_j;
+        reward -= self.iso_coef * self.body.act_frac;
         // env v20/v21/v22 foot terms: ws.p holds this tick's FK (the
         // same source the §8 body_pts obs lanes read). Hinged rent
         // (free inside foot_hinge_r, the v21 pure-linear behavior at
@@ -1763,11 +1780,11 @@ impl RawBeatSim {
                         wide_acc=false, gears=3, foot_contact=false,
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
-                        foot_shape_coef=0.0))]
+                        foot_shape_coef=0.0, iso_coef=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64) -> Self {
+           foot_shape_coef: f64, iso_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
@@ -1775,6 +1792,7 @@ impl RawBeatSim {
         core.foot_x_coef = foot_x_coef;
         core.foot_hinge_r = foot_hinge_r;
         core.foot_shape_coef = foot_shape_coef;
+        core.iso_coef = iso_coef;
         RawBeatSim { core }
     }
 
@@ -2227,13 +2245,14 @@ impl VecBeatSim {
                         combo_walk=false, return_events=true, wide_acc=false,
                         gears=3, foot_contact=false, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
-                        foot_hinge_r=0.0, foot_shape_coef=0.0))]
+                        foot_hinge_r=0.0, foot_shape_coef=0.0,
+                        iso_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64) -> Self {
+           foot_shape_coef: f64, iso_coef: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2244,6 +2263,7 @@ impl VecBeatSim {
                     c.foot_x_coef = foot_x_coef;
                     c.foot_hinge_r = foot_hinge_r;
                     c.foot_shape_coef = foot_shape_coef;
+                    c.iso_coef = iso_coef;
                     c
                 })
                 .collect(),

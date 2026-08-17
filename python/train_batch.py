@@ -324,6 +324,13 @@ def parse_args():
                         "tick's CHANGE in deviation (round trips net "
                         "zero; sharpens credit assignment; provably "
                         "optimum-preserving). 0 = off")
+    p.add_argument("--iso-coef", type=float, default=0.0,
+                   help="env v23: per-tick activation cost — iso_coef * "
+                        "sum of commanded |gear fraction| over the 29 "
+                        "joints (muscle-activation analog: isometric "
+                        "holds and limit-jamming pay, coast is free; "
+                        "velocity-blind, unlike --effort-coef's "
+                        "positive-work price). 0 = off")
     p.add_argument("--foot-x-coef", type=float, default=0.0,
                    help="env v21: per-tick penalty coefficient on each "
                         "foot's |world_x - its_stance_x| (per-side "
@@ -496,6 +503,7 @@ def main():
                       foot_x_coef=args.foot_x_coef,
                       foot_hinge_r=args.foot_hinge_r,
                       foot_shape_coef=args.foot_shape_coef,
+                      iso_coef=args.iso_coef,
                       start_pose_jitter=args.start_pose_jitter,
                       seed=args.seed, device=device)
     elif tensor_env:
@@ -516,6 +524,7 @@ def main():
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
             foot_shape_coef=args.foot_shape_coef,
+            iso_coef=args.iso_coef,
             start_pose_jitter=args.start_pose_jitter,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -532,6 +541,7 @@ def main():
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
             foot_shape_coef=args.foot_shape_coef,
+            iso_coef=args.iso_coef,
             seed=args.seed)
 
     if resume_ckpt is not None:

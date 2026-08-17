@@ -364,7 +364,8 @@ class CudaBeatVecEnv:
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
-                 foot_shape_coef=0.0, start_pose_jitter=0.0):
+                 foot_shape_coef=0.0, iso_coef=0.0,
+                 start_pose_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -404,6 +405,7 @@ class CudaBeatVecEnv:
         # based delta-shaping coefficient (see lib.rs field comments)
         self.foot_hinge_r = float(foot_hinge_r)
         self.foot_shape_coef = float(foot_shape_coef)
+        self.iso_coef = float(iso_coef)
         self.start_pose_jitter = float(start_pose_jitter)
         assert start_pose_jitter == 0.0 or foot_contact, \
             "start_pose_jitter fights the v10 foot welds; contact mode only"
@@ -601,7 +603,7 @@ class CudaBeatVecEnv:
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
                        self.foot_hinge_r, self.foot_shape_coef,
-                       self.start_pose_jitter)
+                       self.iso_coef, self.start_pose_jitter)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
