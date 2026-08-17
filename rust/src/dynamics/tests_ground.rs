@@ -235,7 +235,9 @@ fn static_friction_holds_at_100n_and_slides_at_1000n() {
         };
         run(&mut st, &mut ws, &mut cs, 960, 0.0); // 4 s settle
         let rx0 = st.p[0];
-        run(&mut st, &mut ws, &mut cs, 96, push); // 0.4 s: lean transient
+        // 0.9 s of lean transient (the 2026-08-17 leg caps softened the
+        // hip springs, so the lean settles slower than the old 0.4 s)
+        run(&mut st, &mut ws, &mut cs, 216, push);
         let cm = corners(&st, &mut ws); // steady-state window start
         run(&mut st, &mut ws, &mut cs, 24, push); // final 0.1 s
         let c1 = corners(&st, &mut ws);
@@ -265,7 +267,11 @@ fn static_friction_holds_at_100n_and_slides_at_1000n() {
         "100 N steady-state creep {:.4} m / 0.1 s — the μ = 0.9 cone should hold",
         slip_load[0]
     );
-    assert!(root[0] < 0.15, "100 N moved the root {:.4} m (lean bound)", root[0]);
+    // lean bound 0.15 -> 0.7: at the 2026-08-17 human leg caps the
+    // stance springs are softer and 100 N held for 1.0 s leans the body
+    // ~0.56 m (feet STUCK at 0.15 mm — the friction contract holds; the
+    // lean is posture, not sliding, and posture is not this gate's job)
+    assert!(root[0] < 0.7, "100 N moved the root {:.4} m (lean bound)", root[0]);
     // SLIDE arm: past the cone the stance runs away at meter scale
     // (nothing stays penetrating or in-margin, so corner travel is
     // unmeasurable — the root IS the metric here)

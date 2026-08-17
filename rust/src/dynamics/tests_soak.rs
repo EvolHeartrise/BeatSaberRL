@@ -240,9 +240,21 @@ fn soak_state_engages_the_envelope_and_stays_bounded() {
     let m = &HUMANOID;
     let mut st = blow_state();
     let mut ws = Workspace::new(m);
-    let mut cs = ConstraintSet::new(m, true, true);
+    // 2026-08-17 human leg caps: the captured state's §23 divergence
+    // was POWERED by the old 485/300 hip torques — at human caps it no
+    // longer diverges (0 engagements over 48 ticks; 2x and 4x joint-
+    // rate amplification did not re-trigger it either), and with welds
+    // active any injected root velocity is absorbed by the solve
+    // before the check. The clamp mechanism is pinned directly
+    // instead: constraints OFF so a runaway root velocity survives to
+    // the pre-integration check — the envelope must engage, count,
+    // and hold the per-substep dp bound while doing so.
+    let mut cs = ConstraintSet::new_modes(m, false, false, false);
     let tau = gear_tau(&BLOW_A);
     let bound = H_SUB * ROOT_V_MAX;
+    st.v[0] = 40.0;
+    st.v[1] = 25.0;
+    st.v[2] = -40.0;
     for _ in 0..3 * N_SUB {
         let p0 = st.p;
         substep_constrained(m, &mut st, &tau, H_SUB, &mut ws, &mut cs);
