@@ -43,6 +43,11 @@
   // env v17 walls: one unit cube scaled per wall (w, h, l vary per wall)
   const wallGeo = new THREE.BoxGeometry(1, 1, 1);
   const wallEdgesGeo = new THREE.EdgesGeometry(wallGeo);
+  // animated-size shapes as unit geometry + per-frame scale, same pattern
+  // as the walls: size-in-`args` geometry would be recreated (and held
+  // undisposed) every frame it is on screen
+  const arcGeo = new THREE.CylinderGeometry(0.035, 0.035, 1, 8, 1, true);
+  const flashGeo = new THREE.SphereGeometry(1, 20, 14);
   const WALL_COL = "#ff2f2f"; // classic BS translucent red
 
   // real hitboxes ('h' overlay): good box shifted toward the player; the
@@ -192,8 +197,8 @@
 {#each arcs as a (a.k)}
   {@const s = arcSeg(a.a, a.b)}
   {#if s.len > 1e-4}
-    <T.Mesh position={s.pos} quaternion={s.quat}>
-      <T.CylinderGeometry args={[0.035, 0.035, s.len, 8, 1, true]} />
+    <T.Mesh geometry={arcGeo} position={s.pos} quaternion={s.quat}
+      scale={[1, s.len, 1]}>
       <T.MeshBasicMaterial
         color={SABER_COLORS[a.color]}
         transparent
@@ -304,8 +309,8 @@
   {#if o.kind === "bomb"}
     <!-- bomb hit: red flash + label at the bomb's position at hit time -->
     {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
-    <T.Mesh position={[cx, cy, -zHit]}>
-      <T.SphereGeometry args={[BOMB_RADIUS + age * 1.2, 20, 14]} />
+    <T.Mesh geometry={flashGeo} position={[cx, cy, -zHit]}
+      scale={BOMB_RADIUS + age * 1.2}>
       <T.MeshBasicMaterial color="#ff4a4a" transparent
         opacity={alpha * 0.55} depthWrite={false} />
     </T.Mesh>

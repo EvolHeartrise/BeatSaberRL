@@ -18,6 +18,8 @@
   const scoreable = $derived(
     pb.rep ? pb.rep.chart.filter((n) => n.kind !== 1).length : 0);
   const nBombs = $derived(pb.rep ? pb.rep.chart.length - scoreable : 0);
+  // cached: the HUD re-renders every tick and maxScore is O(chart)
+  const maxPts = $derived(pb.rep ? maxScore(pb.rep.chart) : 0);
 
   function load(text, name) {
     try {
@@ -126,7 +128,7 @@
       {#if pb.rep && c}
         t <b>{time.toFixed(2)}s</b> · tick <b>{tickIdx}</b>/{lastTick()} ·
         return <b>{c.reward.toFixed(2)}</b> ·
-        score <b>{c.score.toFixed(0)}</b>/{maxScore(pb.rep.chart)} ·
+        score <b>{c.score.toFixed(0)}</b>/{maxPts} ·
         <span class="good">good {c.good}</span> /
         <span class="bad">bad {c.bad}</span> /
         <span class="miss">miss {c.miss}</span> of {scoreable}

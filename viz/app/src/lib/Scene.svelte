@@ -83,6 +83,11 @@
   // pose; these lines are the static scenery datum
   const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
 
+  // contact markers: one unit sphere scaled per marker (the radius varies
+  // per contact, and radius-in-`args` geometry would be recreated — and
+  // held undisposed — every frame the flash is alive)
+  const contactGeo = new THREE.SphereGeometry(1, 12, 8);
+
   // pose-mode reference note: a static cube at a chosen cell, z = 0.
   const refEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
@@ -172,8 +177,8 @@
 <!-- self-collision contact markers: flash a sphere at the contact
      point, sized by the tick-summed impulse -->
 {#each contacts as c, i (i)}
-  <T.Mesh position={[c.p[0], c.p[1], -c.p[2]]}>
-    <T.SphereGeometry args={[c.radius, 12, 8]} />
+  <T.Mesh geometry={contactGeo} position={[c.p[0], c.p[1], -c.p[2]]}
+    scale={c.radius}>
     <T.MeshBasicMaterial
       color="#f0d35e"
       transparent
