@@ -180,8 +180,16 @@ class RustBeatEnv(gym.Env):
                                                 round(z, 4)],
                           "j": round(imp, 4)}
                          for p, x, y, z, imp in self.sim.contacts()],
-            "feet": [[round(v, 4) for v in f]
-                     for f in self.sim.weld_impulses()],
+            # replay fix (2026-08-17): "feet" was wired to the retired
+            # welds' impulses and read all-zero in contact mode. Sum
+            # both sources — exactly one is nonzero per mode (weld rows
+            # don't exist in contact mode and vice versa); the ground
+            # reaction has no angular part, so lanes 3..5 keep the weld
+            # value (0 in contact mode) and the schema is unchanged.
+            "feet": [[round(w + (g[k] if k < 3 else 0.0), 4)
+                      for k, w in enumerate(wf)]
+                     for wf, g in zip(self.sim.weld_impulses(),
+                                      self.sim.ground_reaction())],
             "effort": round(self.sim.last_effort(), 4),
             "events": [
                 {"miss": {"note": int(i)}} if code == 4 else

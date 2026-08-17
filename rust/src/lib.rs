@@ -634,6 +634,13 @@ struct Body {
     // (N·s). Contact mode only; stays 0 under welds. Feeds the four
     // OFF_GROUND_IMP obs lanes.
     ground_imp: [f64; 4],
+    // replay fix (2026-08-17): tick-summed ground-reaction impulse per
+    // foot [L, R] x [x friction, y normal, z friction] (N·s, world
+    // frame) — ALL rows of every active sole corner, not just the §7
+    // normal buckets. Contact mode only; stays 0 under welds. Feeds
+    // the replay "feet" lanes, which read all-zero in contact mode
+    // while they were wired to the retired welds' impulses.
+    foot_grf: [[f64; 3]; 2],
 }
 
 const MODEL: &Model = &HUMANOID;
@@ -667,6 +674,7 @@ impl Body {
             fall_hits: 0,
             weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
+            foot_grf: [[0.0; 3]; 2],
         };
         b.refresh_fk();
         b
@@ -701,6 +709,7 @@ impl Body {
         self.fell = false;
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
+        self.foot_grf = [[0.0; 3]; 2];
         self.refresh_fk();
         // env v21: the wide stance lifts the ankles ~8.5 mm, so drop
         // the root until the lowest sole corner sits exactly on the
@@ -758,6 +767,7 @@ impl Body {
         self.contact_imp = [0.0; NUM_PAIRS];
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
+        self.foot_grf = [[0.0; 3]; 2];
         // C backstop: this tick's pre-integration envelope engagements
         // are ws.env_hits' delta over the 8 substeps (the counter itself
         // is cumulative until pop_envelope_hits)
@@ -800,7 +810,14 @@ impl Body {
             if self.foot_contact {
                 for (gi, g) in self.cs.ground_contacts.iter().enumerate() {
                     let b = (g.corner / CORNERS_PER_FOOT) * 2 + (g.corner & 1);
-                    self.ground_imp[b] += self.cs.lambda[self.cs.ground_row(gi)];
+                    let nrow = self.cs.ground_row(gi);
+                    self.ground_imp[b] += self.cs.lambda[nrow];
+                    // full ground reaction per foot for the replay
+                    // "feet" lanes: rows are normal ŷ, friction x̂, ẑ
+                    let f = g.corner / CORNERS_PER_FOOT;
+                    self.foot_grf[f][0] += self.cs.lambda[nrow + 1];
+                    self.foot_grf[f][1] += self.cs.lambda[nrow];
+                    self.foot_grf[f][2] += self.cs.lambda[nrow + 2];
                 }
             }
             for (i, c) in self.cs.contacts.iter().enumerate() {
@@ -1988,6 +2005,15 @@ impl RawBeatSim {
         ]
     }
 
+    /// Contact-mode twin of `weld_impulses` (replay fix 2026-08-17):
+    /// tick-summed GROUND-CONTACT reaction impulse per foot [L, R],
+    /// [jx, jy, jz] (N·s, world frame) — jy sums the sole corners'
+    /// normal rows, jx/jz their friction rows. Vertical reaction force
+    /// ≈ jy / DT. Zero under welds (no ground rows exist there).
+    fn ground_reaction(&self) -> [[f64; 3]; 2] {
+        self.core.body.foot_grf
+    }
+
     /// Per-note status: 0 pending, 1 good, 2 bad/bomb-hit, 3 missed,
     /// 4 bomb passed clean.
     fn status(&self) -> Vec<u8> {
@@ -2773,11 +2799,11 @@ mod env_tests {
     #[test]
     fn fall_terminates_with_zero_reward_and_is_counted() {
         // a real (non-empty) chart far in the future, so `done` cannot
-        // come from the empty-chart disjunct. v11.1: the fall step is
-        // priced at REWARD_MISS x the pending scoreable notes — all 3
-        // here (they sit at t=8s+, unjudged when the body falls in the
-        // first second) — plus a 4th chart object that is a BOMB and
-        // must NOT be charged.
+        // come from the empty-chart disjunct. v18 (sole mode): the fall
+        // step is priced FLAT at -fall_const (default 5.0), independent
+        // of the pending chart — the 3 unjudged notes and the bomb are
+        // scenery. (Pre-v18 this asserted REWARD_MISS x pending notes;
+        // the assert was stale from 2026-08-13 to 2026-08-17.)
         let mut chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
                 (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
@@ -2798,10 +2824,9 @@ mod env_tests {
             if core.body.fell {
                 assert!(done, "a fallen env must terminate");
                 assert_eq!(
-                    reward,
-                    REWARD_MISS * 3.0,
-                    "fall reward must price the 3 pending scoreable \
-                     notes (and not the bomb)"
+                    reward, -core.fall_const,
+                    "the fall step must be priced flat at -fall_const \
+                     (v18 sole mode), chart-independent"
                 );
                 assert!(core.finished, "the terminal latch must be set");
                 assert_eq!(core.falls, 1, "the fall must be counted in `falls`");
@@ -2823,6 +2848,47 @@ mod env_tests {
         core.body.fall_hits = 0;
         assert!(popped > 0);
         assert_eq!(core.body.fall_hits, 0);
+    }
+
+    /// Replay fix (2026-08-17): in contact mode the per-foot ground-
+    /// reaction accumulator (the replay "feet" lanes' new source) must
+    /// carry the body weight — the tick-summed normal impulses of both
+    /// feet ≈ weight x DT while the body stands — and the weld lanes
+    /// must stay zero. Regression for the all-zero "feet" bug: the
+    /// recorder read the retired welds' impulses in contact mode.
+    #[test]
+    fn ground_reaction_carries_weight_in_contact_mode() {
+        let chart: Vec<ChartTuple> = vec![(8.0, 0.0, 1.0, 0, 0.0, 6.0,
+                                           false, KIND_NOTE, false, false)];
+        let mut core = Core::new_core(690, 4e-4, false, 5, true);
+        core.set_chart_notes(chart);
+        let acts = [0u8; NQ];
+        // ticks 1-3: the first tick still carries the reset's settling
+        // transient (the corners load up ~16 % under weight x DT);
+        // by tick 3 the stance is in force balance and the zero-torque
+        // topple (~0.7 s) has not unloaded it yet
+        core.step_inner(&acts);
+        core.step_inner(&acts);
+        core.step_inner(&acts);
+        let jy = core.body.foot_grf[0][1] + core.body.foot_grf[1][1];
+        let weight_dt = 75.02 * dynamics::model::G / 30.0;
+        assert!(
+            (jy - weight_dt).abs() < 0.15 * weight_dt,
+            "both feet's normal impulse {jy:.3} N·s vs weight x DT \
+             {weight_dt:.3} N·s"
+        );
+        // per-foot split is roughly even at the symmetric reset
+        for f in 0..2 {
+            assert!(
+                core.body.foot_grf[f][1] > 0.25 * weight_dt,
+                "foot {f} carries only {:.3} N·s",
+                core.body.foot_grf[f][1]
+            );
+        }
+        assert!(
+            core.body.weld_imp.iter().all(|v| *v == 0.0),
+            "weld lanes must stay zero in contact mode"
+        );
     }
 
     /// The other half of the §5 (d) / §5 (f) contract: in WELD mode

@@ -1461,7 +1461,8 @@ constexpr int N_GROUND_ROWS = NUM_GROUND_CORNERS * GROUND_ROWS_PER_CORNER;
 static_assert(NUM_GROUND_CORNERS == 8 && N_GROUND_ROWS == 24,
               "contact spec §2/§3: 8 sole corners, 3 rows each");
 // Coulomb friction coefficient of the ground (contact spec §3).
-constexpr double GROUND_MU = 0.9;
+constexpr double GROUND_MU = 0.9;  // lib.rs MU mirror — DO NOT raise
+// past 0.9: the box-clamped PGS loses stick above it (see solver.rs MU)
 // Corner-carrying frames in the NORMATIVE order: foot_l then foot_r.
 __device__ constexpr int GROUND_FRAMES[2] = {F_L_FOOT, F_R_FOOT};
 // Sole-box corners in the FOOT frame, NORMATIVE order within a foot:
