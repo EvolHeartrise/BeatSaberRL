@@ -93,7 +93,10 @@ def test_body_pt_lanes_track_motion():
     obs = o0
     for _ in range(10):
         obs, _r, _d, _ev = sim.step(act)
-    d = np.abs(obs[OFF_BODY_PTS:] - o0[OFF_BODY_PTS:]).reshape(6, 3)
+    # slice ends at the position block — env v24 appended velocity
+    # lanes after it, which this motion test does not pin
+    d = np.abs(obs[OFF_BODY_PTS:OFF_BODY_PTS + 18]
+               - o0[OFF_BODY_PTS:OFF_BODY_PTS + 18]).reshape(6, 3)
     l_knee_move, r_knee_move = d[2].max(), d[3].max()
     assert l_knee_move > 1e-3, f"driven knee's lanes froze: {d}"
     # welded feet rock the whole body, so the passive side moves too —
