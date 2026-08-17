@@ -4555,6 +4555,13 @@ struct Sim {
   // env v21: the X twin — each foot priced against its OWN side's
   // wide-stance x (left -> -FOOT_X0, right -> +FOOT_X0). 0 = off.
   T foot_x_coef;
+  // env v22: hinged rent radius (0 = v21 pure-linear verbatim) +
+  // potential-based delta-shaping coefficient (lib.rs mirror).
+  T foot_hinge_r;
+  T foot_shape_coef;
+  // env v22: previous tick's total hinged foot deviation, per env
+  // (zeroed by reset_env — resets start on-target).
+  T* __restrict__ foot_pot;
   // env v21: reset_env needs the runtime mode flag (the kernel's
   // FOOT_CONTACT template parameter is not visible there) to gate the
   // wide stance + ground fit.
@@ -4682,6 +4689,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   for (int k = 0; k < N_GROUND_IMP_LANES; k++)
     P.ground_imp[e * N_GROUND_IMP_LANES + k] = T(0);
   P.effort[e] = T(0);
+  P.foot_pot[e] = T(0);
   P.chart_idx[e] = chart;
   P.tick[e] = 0;
   P.first_pending[e] = 0;
@@ -5042,18 +5050,28 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   T reward = T(0);
   reward -= P.effort_coef * effort;
-  // env v20 foot-z penalty: d.pos holds this tick's FK (refresh_fk ran
-  // fk_all just above — the same source the §8 body_pts lanes read)
-  if (P.foot_z_coef > T(0)) {
-    reward -= P.foot_z_coef
-              * (fabs(d.pos[F_L_FOOT][2] - T(PLANE_Z0))
-                 + fabs(d.pos[F_R_FOOT][2] - T(PLANE_Z0)));
-  }
-  // env v21 foot-x penalty: each foot against its own stance x
-  if (P.foot_x_coef > T(0)) {
-    reward -= P.foot_x_coef
-              * (fabs(d.pos[F_L_FOOT][0] + T(FOOT_X0))
-                 + fabs(d.pos[F_R_FOOT][0] - T(FOOT_X0)));
+  // env v20/v21/v22 foot terms (lib.rs mirror): hinged rent (free
+  // inside foot_hinge_r; r = 0 is the v21 pure-linear behavior) +
+  // optional potential-based delta shaping. d.pos holds this tick's
+  // FK — the same source the §8 body_pts lanes read.
+  if (P.foot_z_coef > T(0) || P.foot_x_coef > T(0)
+      || P.foot_shape_coef > T(0)) {
+    const T hxl = tmax(fabs(d.pos[F_L_FOOT][0] + T(FOOT_X0))
+                       - P.foot_hinge_r, T(0));
+    const T hxr = tmax(fabs(d.pos[F_R_FOOT][0] - T(FOOT_X0))
+                       - P.foot_hinge_r, T(0));
+    const T hzl = tmax(fabs(d.pos[F_L_FOOT][2] - T(PLANE_Z0))
+                       - P.foot_hinge_r, T(0));
+    const T hzr = tmax(fabs(d.pos[F_R_FOOT][2] - T(PLANE_Z0))
+                       - P.foot_hinge_r, T(0));
+    const T hx = hxl + hxr;
+    const T hz = hzl + hzr;
+    reward -= P.foot_x_coef * hx + P.foot_z_coef * hz;
+    if (P.foot_shape_coef > T(0)) {
+      const T pot = hx + hz;
+      reward += P.foot_shape_coef * (P.foot_pot[e] - pot);
+      P.foot_pot[e] = pot;
+    }
   }
 
   // swing chain update
@@ -5501,7 +5519,7 @@ enum {
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT, TGIMP, TCIDX,
-  TPOSEJIT,
+  TPOSEJIT, TFOOTPOT,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -5515,8 +5533,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps, double effort_coef,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
-          double foot_z_coef, double foot_x_coef,
-          double start_pose_jitter) {
+          double foot_z_coef, double foot_x_coef, double foot_hinge_r,
+          double foot_shape_coef, double start_pose_jitter) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5617,6 +5635,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.fall_const = (scalar_t)fall_const;
     P.foot_z_coef = (scalar_t)foot_z_coef;
     P.foot_x_coef = (scalar_t)foot_x_coef;
+    P.foot_hinge_r = (scalar_t)foot_hinge_r;
+    P.foot_shape_coef = (scalar_t)foot_shape_coef;
+    P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;

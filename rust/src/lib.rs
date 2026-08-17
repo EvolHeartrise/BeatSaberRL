@@ -863,6 +863,21 @@ struct Core {
     // (-FOOT_X0)| + |rfoot_x - FOOT_X0|), each foot priced against its
     // OWN side's wide-stance x. 0.0 = off.
     foot_x_coef: f64,
+    // env v22 (user direction 2026-08-16): the foot penalties become
+    // HINGED — deviation inside this radius is free ("target AREAS"),
+    // rent applies only to the excess. 0.0 = the v21 pure-linear
+    // behavior verbatim.
+    foot_hinge_r: f64,
+    // env v22: potential-based delta shaping (Ng et al. 1999,
+    // undiscounted variant — round trips telescope to exactly zero):
+    // each tick, reward += coef * (prev_pot - pot) where pot = the
+    // total hinged deviation of both feet on both axes. Sharpens
+    // credit assignment onto the tick that moved a foot; the RENT
+    // terms remain the anti-parking objective (delta shaping alone
+    // would make a parked pose free). 0.0 = off.
+    foot_shape_coef: f64,
+    // the previous tick's pot (reset to 0 — resets start on-target)
+    prev_foot_pot: f64,
     n_scoreable: u32, // chart objects that are not bombs
     // env v19 flail telemetry (CUDA-backend mirror, telemetry only):
     // blade arc (rad) accrued on note-free ticks (next pending chart
@@ -931,6 +946,9 @@ impl Core {
             fall_const: 5.0,
             foot_z_coef: 0.0,
             foot_x_coef: 0.0,
+            foot_hinge_r: 0.0,
+            foot_shape_coef: 0.0,
+            prev_foot_pot: 0.0,
             n_scoreable: 0,
             flail_rad: 0.0,
             flail_ticks: 0,
@@ -1030,6 +1048,7 @@ impl Core {
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.flail_rad = 0.0;
         self.flail_ticks = 0;
+        self.prev_foot_pot = 0.0;
         self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
         self.score_pre = 0.0;
@@ -1297,20 +1316,25 @@ impl Core {
         let gear = self.gear;
         self.body.tick(actions, &gear);
         reward -= self.effort_coef * self.body.effort_j;
-        // env v20 foot-z penalty: ws.p holds this tick's FK (the same
-        // source the §8 body_pts obs lanes read)
-        if self.foot_z_coef > 0.0 {
-            let lz = self.body.ws.p[F_L_FOOT][2];
-            let rz = self.body.ws.p[F_R_FOOT][2];
-            reward -= self.foot_z_coef
-                * ((lz - PLANE_Z0).abs() + (rz - PLANE_Z0).abs());
-        }
-        // env v21 foot-x penalty: each foot against its own stance x
-        if self.foot_x_coef > 0.0 {
-            let lx = self.body.ws.p[F_L_FOOT][0];
-            let rx = self.body.ws.p[F_R_FOOT][0];
-            reward -= self.foot_x_coef
-                * ((lx + FOOT_X0).abs() + (rx - FOOT_X0).abs());
+        // env v20/v21/v22 foot terms: ws.p holds this tick's FK (the
+        // same source the §8 body_pts obs lanes read). Hinged rent
+        // (free inside foot_hinge_r, the v21 pure-linear behavior at
+        // r = 0) + optional potential-based delta shaping.
+        if self.foot_z_coef > 0.0 || self.foot_x_coef > 0.0
+            || self.foot_shape_coef > 0.0
+        {
+            let r = self.foot_hinge_r;
+            let h = |v: f64| (v.abs() - r).max(0.0);
+            let lf = &self.body.ws.p[F_L_FOOT];
+            let rf = &self.body.ws.p[F_R_FOOT];
+            let hx = h(lf[0] + FOOT_X0) + h(rf[0] - FOOT_X0);
+            let hz = h(lf[2] - PLANE_Z0) + h(rf[2] - PLANE_Z0);
+            reward -= self.foot_x_coef * hx + self.foot_z_coef * hz;
+            if self.foot_shape_coef > 0.0 {
+                let pot = hx + hz;
+                reward += self.foot_shape_coef * (self.prev_foot_pot - pot);
+                self.prev_foot_pot = pot;
+            }
         }
 
         // swing chain update (feeds pre-swing + follow-through scores)
@@ -1738,15 +1762,19 @@ impl RawBeatSim {
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         wide_acc=false, gears=3, foot_contact=false,
                         fall_const=5.0, foot_z_coef=0.0,
-                        foot_x_coef=0.0))]
+                        foot_x_coef=0.0, foot_hinge_r=0.0,
+                        foot_shape_coef=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
-           foot_z_coef: f64, foot_x_coef: f64) -> Self {
+           foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
+           foot_shape_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
         core.foot_x_coef = foot_x_coef;
+        core.foot_hinge_r = foot_hinge_r;
+        core.foot_shape_coef = foot_shape_coef;
         RawBeatSim { core }
     }
 
@@ -2198,12 +2226,14 @@ impl VecBeatSim {
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
                         gears=3, foot_contact=false, fall_const=5.0,
-                        foot_z_coef=0.0, foot_x_coef=0.0))]
+                        foot_z_coef=0.0, foot_x_coef=0.0,
+                        foot_hinge_r=0.0, foot_shape_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
-           foot_x_coef: f64) -> Self {
+           foot_x_coef: f64, foot_hinge_r: f64,
+           foot_shape_coef: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2212,6 +2242,8 @@ impl VecBeatSim {
                     c.fall_const = fall_const;
                     c.foot_z_coef = foot_z_coef;
                     c.foot_x_coef = foot_x_coef;
+                    c.foot_hinge_r = foot_hinge_r;
+                    c.foot_shape_coef = foot_shape_coef;
                     c
                 })
                 .collect(),
