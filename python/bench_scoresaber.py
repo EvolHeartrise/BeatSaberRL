@@ -150,11 +150,13 @@ def parse_args():
     # (--pipeline was retired 2026-08-13 with the fused per-sample
     # forward: the two-group split needed its batch invariance; cuBLAS
     # forwards are width-sensitive, so the bench runs one group now)
-    p.add_argument("--foot-contact", action="store_true",
-                   help="env v11 unilateral foot contact — MUST match the "
-                        "checkpoint's training physics (a contact-trained "
-                        "policy benched under welds, or vice versa, scores "
-                        "a different physics regime; 2026-08-08)")
+    p.add_argument("--foot-contact", action="store_true", default=True,
+                   help="DEPRECATED NO-OP (2026-08-16): contact mode is "
+                        "the only physics the bench runs — every "
+                        "production checkpoint is contact-trained. The "
+                        "flag is accepted so older drivers keep running. "
+                        "(Weld-era checkpoints predate env v11 and are "
+                        "archival.)")
     p.add_argument("--num-envs", type=int, default=2048,
                    help="maps evaluated in parallel (policy is batched); "
                         "on the fused path the effective width is capped "

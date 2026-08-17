@@ -265,14 +265,15 @@ def parse_args():
                         "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
                         "under the doubled alpha/omega body). Resuming a "
                         "geared checkpoint needs the matching --gears")
-    p.add_argument("--foot-contact", default=False,
+    p.add_argument("--foot-contact", default=True,
                    action=argparse.BooleanOptionalAction,
-                   help="env v11 foot_mode = 1 (unilateral-contact spec "
-                        "§1): replace the two 6-DOF foot welds with "
-                        "unilateral frictional ground contact on the 8 "
-                        "sole-box corners, and terminate an episode whose "
-                        "root drops below 0.55 m (the [fall] line reports "
-                        "them per update). PHYSICS-REGIME BREAK — "
+                   help="DEPRECATED NO-OP (2026-08-16, user decision): "
+                        "contact mode (env v11 foot_mode = 1) is the ONLY "
+                        "training mode — the flag is accepted so older "
+                        "drivers keep running, and --no-foot-contact is "
+                        "IGNORED with a notice. Weld mode survives solely "
+                        "as an internal test harness. Historical text: "
+                        "PHYSICS-REGIME BREAK — "
                         "checkpoints and bench numbers do not carry "
                         "across the weld/contact boundary")
     p.add_argument("--ranked-maps", action="store_true",
@@ -354,6 +355,13 @@ def cpu_opt_state(opt):
 
 def main():
     args = parse_args()
+    # env v21 (2026-08-16, user decision): weld mode is REMOVED from the
+    # production surface — contact is the only mode this trainer runs.
+    if not args.foot_contact:
+        print("[foot-contact] --no-foot-contact is a deprecated no-op: "
+              "contact mode is the only training mode (weld = test "
+              "harness only)", flush=True)
+        args.foot_contact = True
     if args.bench:
         args.total_steps = args.num_envs * args.horizon * 4
     resume_ckpt = None

@@ -1731,8 +1731,9 @@ struct RawBeatSim {
 #[pymethods]
 impl RawBeatSim {
     /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
-    /// weld (v10, DEFAULT — bitwise-unchanged physics), true = unilateral
-    /// frictional ground contact on the 8 sole corners.
+    /// weld (v10 — TEST-HARNESS ONLY since 2026-08-16, production is
+    /// contact-only), true = unilateral frictional ground contact on
+    /// the 8 sole corners.
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         wide_acc=false, gears=3, foot_contact=false,
@@ -2190,8 +2191,9 @@ struct VecBeatSim {
 #[pymethods]
 impl VecBeatSim {
     /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
-    /// weld (v10, DEFAULT — bitwise-unchanged physics), true = unilateral
-    /// frictional ground contact on the 8 sole corners.
+    /// weld (v10 — TEST-HARNESS ONLY since 2026-08-16, production is
+    /// contact-only), true = unilateral frictional ground contact on
+    /// the 8 sole corners.
     #[new]
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
