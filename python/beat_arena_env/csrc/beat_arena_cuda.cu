@@ -4559,6 +4559,10 @@ struct Sim {
   // potential-based delta-shaping coefficient (lib.rs mirror).
   T foot_hinge_r;
   T foot_shape_coef;
+  // env v23: per-tick activation price on the commanded Σ|gear frac|
+  // over the 29 joints (lib.rs mirror). Velocity-blind by design:
+  // effort_coef prices speed (work), this prices force. 0 = off.
+  T iso_coef;
   // env v22: previous tick's total hinged foot deviation, per env
   // (zeroed by reset_env — resets start on-target).
   T* __restrict__ foot_pot;
@@ -4970,13 +4974,16 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       prev_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
     }
 
-  // gear ids -> torques (lib.rs Body::tick)
+  // gear ids -> torques (lib.rs Body::tick); act accumulates the v23
+  // commanded activation Σ|frac| in double, matching lib.rs' f64 sum
   T tau[NQ];
   const double* gr = gear_row(P.gears);
+  double act = 0.0;
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
     const double frac = a < 7 ? gr[a] : 0.0;
     tau[j] = T(frac) * T(TAU_MAX[j]);
+    act += fabs(frac);
   }
 
   // 8 substeps, accumulating positive work + contact aggregation
@@ -5050,6 +5057,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   T reward = T(0);
   reward -= P.effort_coef * effort;
+  reward -= P.iso_coef * T(act);
   // env v20/v21/v22 foot terms (lib.rs mirror): hinged rent (free
   // inside foot_hinge_r; r = 0 is the v21 pure-linear behavior) +
   // optional potential-based delta shaping. d.pos holds this tick's
@@ -5534,7 +5542,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
-          double foot_shape_coef, double start_pose_jitter) {
+          double foot_shape_coef, double iso_coef,
+          double start_pose_jitter) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5637,6 +5646,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_x_coef = (scalar_t)foot_x_coef;
     P.foot_hinge_r = (scalar_t)foot_hinge_r;
     P.foot_shape_coef = (scalar_t)foot_shape_coef;
+    P.iso_coef = (scalar_t)iso_coef;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();

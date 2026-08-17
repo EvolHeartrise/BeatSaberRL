@@ -29,7 +29,7 @@ class BeatVecEnv:
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, effort_coef=EFFORT_COEF, wide_acc=False,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
-                 foot_shape_coef=0.0,
+                 foot_shape_coef=0.0, iso_coef=0.0,
                  gears=3, seed=0, foot_contact=False, fall_const=5.0):
         """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
         False = the v10 foot welds (TEST-HARNESS ONLY since 2026-08-16
@@ -55,7 +55,8 @@ class BeatVecEnv:
                               foot_z_coef=foot_z_coef,
                               foot_x_coef=foot_x_coef,
                               foot_hinge_r=foot_hinge_r,
-                              foot_shape_coef=foot_shape_coef)
+                              foot_shape_coef=foot_shape_coef,
+                              iso_coef=iso_coef)
         self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
