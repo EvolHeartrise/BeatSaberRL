@@ -256,7 +256,7 @@ const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
 const _: () = assert!(OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
-// ≈ one tick of full-body weight: M_TOTAL·g·DT = 75.02 kg · 9.81 · (1/30)
+// ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
 // = 24.53 N·s, rounded to a spec literal both engines share. A settled
 // two-foot stance sums to ≈ 1.0 across the four lanes.
 const GROUND_IMP_NORM: f64 = 24.5;
@@ -2906,7 +2906,7 @@ mod env_tests {
         core.step_inner(&acts);
         core.step_inner(&acts);
         let jy = core.body.foot_grf[0][1] + core.body.foot_grf[1][1];
-        let weight_dt = 75.02 * dynamics::model::G / 30.0;
+        let weight_dt = 74.50 * dynamics::model::G / 30.0;
         assert!(
             (jy - weight_dt).abs() < 0.15 * weight_dt,
             "both feet's normal impulse {jy:.3} N·s vs weight x DT \

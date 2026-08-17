@@ -107,9 +107,17 @@ const I_UARM: [f64; 3] = [0.029222, 0.029222, 0.001966];
 const M_FARM: f64 = 1.20;
 const COM_FARM: [f64; 3] = [0.0, 0.0, 0.15];
 const I_FARM: [f64; 3] = [0.013056, 0.013056, 0.000931];
-const M_HAND: f64 = 0.61; // 0.46 fist + 0.15 controller point mass
+// Hand mass (user direction 2026-08-18): 0.35 kg fist, NO controller
+// mass (was 0.61 = 0.46 fist + 0.15 controller). Real Beat Saber
+// players exploit controller movement/angular prediction to make
+// large swings with low effort — they never truly accelerate the
+// full fist+controller mass through the whole range at speed — so a
+// literal composite mass over-prices swings and was feeding vertical
+// body jitter during play. Inertia rescaled with the mass
+// (0.000460 x 0.35/0.61).
+const M_HAND: f64 = 0.35;
 const COM_HAND: [f64; 3] = [0.0, 0.0, 0.06];
-const I_HAND: [f64; 3] = [0.000460, 0.000460, 0.000460];
+const I_HAND: [f64; 3] = [0.000264, 0.000264, 0.000264];
 const M_THIGH: f64 = 10.60;
 const COM_THIGH: [f64; 3] = [0.0, -0.22, 0.0];
 const I_THIGH: [f64; 3] = [0.250198, 0.018493, 0.250198];
