@@ -143,6 +143,16 @@ pub const N_WELD_ROWS: usize = 12;
 /// Coulomb friction coefficient of the ground (contact spec §3,
 /// normative). No restitution — this is a velocity-level PGS at rest
 /// contact.
+///
+/// DO NOT RAISE above 0.9 without replacing the friction projection:
+/// a bump to 1.1 was attempted (2026-08-17, sneaker-rubber realism)
+/// and the per-row box-clamped Gauss-Seidel LOSES STICK above
+/// μ ≈ 0.9 on the standing body — the sweep limit-cycles instead of
+/// converging, and loaded corners creep at 2-3 cm per 0.1 s under a
+/// 100 N push (measured; iteration count does not fix it: 12/24/48/96
+/// iters all creep, while μ = 0.9 sticks at < 1 mm). Raising μ past
+/// the cliff makes friction WEAKER in practice, not stronger. A
+/// coupled cone projection per corner would be needed first.
 pub const MU: f64 = 0.9;
 
 /// Rows per active corner: 1 normal + 2 friction (contact spec §3).
