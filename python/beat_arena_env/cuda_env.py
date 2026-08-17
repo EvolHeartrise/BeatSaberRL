@@ -357,7 +357,7 @@ class CudaBeatVecEnv:
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
-                 foot_z_coef=0.0, start_pose_jitter=0.0):
+                 foot_z_coef=0.0, foot_x_coef=0.0, start_pose_jitter=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -390,6 +390,9 @@ class CudaBeatVecEnv:
         # kernel reset_env samples the 12 leg joints from per-env U(-1,1)
         # draws and drops the root so no sole corner clips the ground).
         self.foot_z_coef = float(foot_z_coef)
+        # env v21: the X twin — each foot priced against its own
+        # wide-stance x (constants.FOOT_X0)
+        self.foot_x_coef = float(foot_x_coef)
         self.start_pose_jitter = float(start_pose_jitter)
         assert start_pose_jitter == 0.0 or foot_contact, \
             "start_pose_jitter fights the v10 foot welds; contact mode only"
@@ -582,7 +585,8 @@ class CudaBeatVecEnv:
                        self.max_steps, self.effort_coef, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
                        self.foot_contact, self.fall_const,
-                       self.foot_z_coef, self.start_pose_jitter)
+                       self.foot_z_coef, self.foot_x_coef,
+                       self.start_pose_jitter)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""

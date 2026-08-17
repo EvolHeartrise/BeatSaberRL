@@ -160,6 +160,22 @@ const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 const FLAIL_LEAD_S: f64 = 1.0;
 // env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
+// env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
+// +-8 deg, ankle_roll counter-rolls so the soles stay flat (verified
+// via the fk_body mirror: foot up-vector exactly (0,1,0)). CONTACT
+// MODE ONLY: in weld mode the feet are welded at the v10 reference,
+// and a leg stance would fight the welds.
+const Q_START_LEG: [(usize, f64); 4] = [
+    (19, -0.13962634015954636),  // l_hip_roll  -8 deg
+    (22, 0.13962634015954636),   // l_ankle_roll +8 deg (counter)
+    (25, 0.13962634015954636),   // r_hip_roll  +8 deg
+    (28, -0.13962634015954636),  // r_ankle_roll -8 deg (counter)
+];
+// The wide stance's foot X positions (fk_body of the v21 start pose;
+// the root ground-drop does not move X). Per-foot penalty targets:
+// left foot -> -FOOT_X0, right foot -> +FOOT_X0.
+const FOOT_X0: f64 = 0.22108059783525694;
+
 const Q_START_ARM: [(usize, f64); 6] = [
     (3, -1.3962634015954636),
     (6, 1.7453292519943295),
@@ -659,6 +675,13 @@ impl Body {
         for (j, v) in Q_START_ARM {
             self.st.q[j] = v;
         }
+        // env v21 wide stance (contact mode only; weld mode's feet are
+        // welded at the v10 reference and a stance would fight them)
+        if self.foot_contact {
+            for (j, v) in Q_START_LEG {
+                self.st.q[j] = v;
+            }
+        }
         self.tau = [0.0; NQ];
         self.wrist_vel = [[0.0; 3]; 2];
         self.swing_acc = [0.0; 2];
@@ -671,6 +694,26 @@ impl Body {
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
         self.refresh_fk();
+        // env v21: the wide stance lifts the ankles ~8.5 mm, so drop
+        // the root until the lowest sole corner sits exactly on the
+        // ground (the v20 jitter's corner arithmetic; both engines
+        // share this expression tree).
+        if self.foot_contact {
+            use dynamics::collide::{GROUND_CORNERS, GROUND_FRAMES};
+            let mut min_y = f64::INFINITY;
+            for fr in GROUND_FRAMES {
+                let (r, p) = (&self.ws.r[fr], &self.ws.p[fr]);
+                for c in &GROUND_CORNERS {
+                    let y = p[1] + r[1][0] * c[0] + r[1][1] * c[1]
+                        + r[1][2] * c[2];
+                    if y < min_y {
+                        min_y = y;
+                    }
+                }
+            }
+            self.st.p[1] -= min_y;
+            self.refresh_fk();
+        }
     }
 
     /// FK caches from the current state: wrist = hand-frame origin,
@@ -816,6 +859,10 @@ struct Core {
     // ("standard starting") foot z. Targets the shimmy toward/away
     // from the note plane. 0.0 = off (the pre-v20 reward verbatim).
     foot_z_coef: f64,
+    // env v21: the X twin — per-tick foot_x_coef * (|lfoot_x -
+    // (-FOOT_X0)| + |rfoot_x - FOOT_X0|), each foot priced against its
+    // OWN side's wide-stance x. 0.0 = off.
+    foot_x_coef: f64,
     n_scoreable: u32, // chart objects that are not bombs
     // env v19 flail telemetry (CUDA-backend mirror, telemetry only):
     // blade arc (rad) accrued on note-free ticks (next pending chart
@@ -883,6 +930,7 @@ impl Core {
             falls: 0,
             fall_const: 5.0,
             foot_z_coef: 0.0,
+            foot_x_coef: 0.0,
             n_scoreable: 0,
             flail_rad: 0.0,
             flail_ticks: 0,
@@ -1256,6 +1304,13 @@ impl Core {
             let rz = self.body.ws.p[F_R_FOOT][2];
             reward -= self.foot_z_coef
                 * ((lz - PLANE_Z0).abs() + (rz - PLANE_Z0).abs());
+        }
+        // env v21 foot-x penalty: each foot against its own stance x
+        if self.foot_x_coef > 0.0 {
+            let lx = self.body.ws.p[F_L_FOOT][0];
+            let rx = self.body.ws.p[F_R_FOOT][0];
+            reward -= self.foot_x_coef
+                * ((lx + FOOT_X0).abs() + (rx - FOOT_X0).abs());
         }
 
         // swing chain update (feeds pre-swing + follow-through scores)
@@ -1681,14 +1736,16 @@ impl RawBeatSim {
     #[new]
     #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         wide_acc=false, gears=3, foot_contact=false,
-                        fall_const=5.0, foot_z_coef=0.0))]
+                        fall_const=5.0, foot_z_coef=0.0,
+                        foot_x_coef=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
-           foot_z_coef: f64) -> Self {
+           foot_z_coef: f64, foot_x_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
+        core.foot_x_coef = foot_x_coef;
         RawBeatSim { core }
     }
 
@@ -2139,11 +2196,12 @@ impl VecBeatSim {
     #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
                         combo_walk=false, return_events=true, wide_acc=false,
                         gears=3, foot_contact=false, fall_const=5.0,
-                        foot_z_coef=0.0))]
+                        foot_z_coef=0.0, foot_x_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
-           foot_contact: bool, fall_const: f64, foot_z_coef: f64) -> Self {
+           foot_contact: bool, fall_const: f64, foot_z_coef: f64,
+           foot_x_coef: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2151,6 +2209,7 @@ impl VecBeatSim {
                                                wide_acc, gears, foot_contact);
                     c.fall_const = fall_const;
                     c.foot_z_coef = foot_z_coef;
+                    c.foot_x_coef = foot_x_coef;
                     c
                 })
                 .collect(),

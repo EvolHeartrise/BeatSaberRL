@@ -312,6 +312,11 @@ def parse_args():
     p.add_argument("--start-jitter", type=float, default=0.2,
                    help="episode-start kick magnitude m/s applied to "
                         "freshly reset envs (RSI-flavored start variety)")
+    p.add_argument("--foot-x-coef", type=float, default=0.0,
+                   help="env v21: per-tick penalty coefficient on each "
+                        "foot's |world_x - its_stance_x| (per-side "
+                        "targets +-FOOT_X0; targets lateral wander). "
+                        "0 = off")
     p.add_argument("--foot-z-coef", type=float, default=0.0,
                    help="env v20: per-tick penalty coefficient on each "
                         "foot's |world_z - reference_z| (linear; targets "
@@ -469,6 +474,7 @@ def main():
                       push_prob=args.push_prob, push_vmax=args.push_vmax,
                       start_jitter=args.start_jitter,
                       foot_z_coef=args.foot_z_coef,
+                      foot_x_coef=args.foot_x_coef,
                       start_pose_jitter=args.start_pose_jitter,
                       seed=args.seed, device=device)
     elif tensor_env:
@@ -486,6 +492,7 @@ def main():
             push_prob=args.push_prob, push_vmax=args.push_vmax,
             start_jitter=args.start_jitter,
             foot_z_coef=args.foot_z_coef,
+            foot_x_coef=args.foot_x_coef,
             start_pose_jitter=args.start_pose_jitter,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -499,6 +506,7 @@ def main():
             effort_coef=args.effort_coef, wide_acc=args.wide_acc,
             foot_contact=args.foot_contact, fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
+            foot_x_coef=args.foot_x_coef,
             seed=args.seed)
 
     if resume_ckpt is not None:
