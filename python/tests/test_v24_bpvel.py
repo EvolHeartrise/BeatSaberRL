@@ -53,7 +53,10 @@ def test_obs_dim_and_reset_zero():
 @cuda
 def test_vel_is_position_delta_over_dt():
     env = _env()
-    prev = env.reset()
+    # step() returns the SAME obs buffer object every call (written in
+    # place) — clone, or prev aliases the current tick and the delta
+    # reads zero
+    prev = env.reset().clone()
     # a couple of gravity/settle ticks produce real motion at every
     # point; the vel lane must equal the position lanes' delta
     for _ in range(3):
@@ -64,7 +67,7 @@ def test_vel_is_position_delta_over_dt():
         # rounding after the /DT/V_NORM rescale
         assert torch.allclose(got, want, atol=1e-5), (
             (got - want).abs().max().item())
-        prev = obs
+        prev = obs.clone()
     # and the body actually moved (the contract above is not 0 == 0)
     assert _vel_lanes(prev).abs().max().item() > 1e-4
 
