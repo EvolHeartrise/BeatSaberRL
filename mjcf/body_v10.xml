@@ -20,8 +20,9 @@
   - Stacked same-body joints are declared OUTER to INNER assuming MuJoCo
     composes them in declaration order; the P2b FK cross-check vs v9 fk()
     runs FIRST and catches a reversed convention.
-  - Controller mass (0.15 kg) is folded into each hand <inertial>
-    (0.61 kg total at the fist center); blades are massless ghost geoms
+  - Hands are FIST-ONLY 0.35 kg (2026-08-18: controller mass removed —
+    real players exploit controller motion prediction and never truly
+    swing the composite mass); blades are massless ghost geoms
     with no contacts.
 -->
 <mujoco model="beat_arena_body_v10">
@@ -107,8 +108,8 @@
               <joint name="l_wrist_bend" type="hinge" axis="-1 0 0"
                      range="-1.6580627893946132 1.6580627893946132"
                      damping="0.00159"/>
-              <inertial pos="0 0 0.06" mass="0.61"
-                        diaginertia="0.000460 0.000460 0.000460"/>
+              <inertial pos="0 0 0.06" mass="0.35"
+                        diaginertia="0.000264 0.000264 0.000264"/>
               <geom name="g_fist_l" type="sphere" pos="0 0 0.06"
                     size="0.05" rgba="0.8 0.42 0.46 1"/>
               <geom name="g_blade_l" type="capsule"
@@ -149,8 +150,8 @@
               <joint name="r_wrist_bend" type="hinge" axis="-1 0 0"
                      range="-1.6580627893946132 1.6580627893946132"
                      damping="0.00159"/>
-              <inertial pos="0 0 0.06" mass="0.61"
-                        diaginertia="0.000460 0.000460 0.000460"/>
+              <inertial pos="0 0 0.06" mass="0.35"
+                        diaginertia="0.000264 0.000264 0.000264"/>
               <geom name="g_fist_r" type="sphere" pos="0 0 0.06"
                     size="0.05" rgba="0.38 0.62 0.85 1"/>
               <geom name="g_blade_r" type="capsule"
@@ -336,15 +337,15 @@
     <motor name="m_r_wrist_roll" joint="r_wrist_roll" gear="1.06"/>
     <motor name="m_r_wrist_bend" joint="r_wrist_bend" gear="1.06"/>
     <motor name="m_r_wrist_dev" joint="r_wrist_dev" gear="1.06"/>
-    <motor name="m_l_hip_pitch" joint="l_hip_pitch" gear="484.68"/>
+    <motor name="m_l_hip_pitch" joint="l_hip_pitch" gear="350.00"/>
     <motor name="m_l_hip_yaw" joint="l_hip_yaw" gear="100.00"/>
-    <motor name="m_l_hip_roll" joint="l_hip_roll" gear="300.00"/>
+    <motor name="m_l_hip_roll" joint="l_hip_roll" gear="180.00"/>
     <motor name="m_l_knee" joint="l_knee" gear="250.00"/>
     <motor name="m_l_ankle_pitch" joint="l_ankle_pitch" gear="180.00"/>
     <motor name="m_l_ankle_roll" joint="l_ankle_roll" gear="50.00"/>
-    <motor name="m_r_hip_pitch" joint="r_hip_pitch" gear="484.68"/>
+    <motor name="m_r_hip_pitch" joint="r_hip_pitch" gear="350.00"/>
     <motor name="m_r_hip_yaw" joint="r_hip_yaw" gear="100.00"/>
-    <motor name="m_r_hip_roll" joint="r_hip_roll" gear="300.00"/>
+    <motor name="m_r_hip_roll" joint="r_hip_roll" gear="180.00"/>
     <motor name="m_r_knee" joint="r_knee" gear="250.00"/>
     <motor name="m_r_ankle_pitch" joint="r_ankle_pitch" gear="180.00"/>
     <motor name="m_r_ankle_roll" joint="r_ankle_roll" gear="50.00"/>

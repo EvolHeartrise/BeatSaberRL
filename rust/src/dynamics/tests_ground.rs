@@ -20,7 +20,7 @@ use super::{State, Workspace};
 
 const H: f64 = 1.0 / 240.0;
 /// SPEC-v10 §1.2 total body mass — the weight the ground must carry.
-const BODY_MASS: f64 = 75.02;
+const BODY_MASS: f64 = 74.50;
 const WEIGHT: f64 = BODY_MASS * super::model::G;
 
 fn contact_set(m: &super::model::Model) -> ConstraintSet {

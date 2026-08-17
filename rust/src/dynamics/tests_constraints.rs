@@ -103,7 +103,7 @@ fn stance_weld_force_sum() {
     run(&mut st, &mut ws, &mut cs, 960); // 4 s settle
     let fy = run(&mut st, &mut ws, &mut cs, 240); // 1 s measure
     let droop = st.q.iter().fold(0.0f64, |a, q| a.max(q.abs()));
-    let weight = 75.02 * 9.81;
+    let weight = 74.50 * 9.81;
     println!(
         "muscle-tone stance: mean vertical weld force {fy:.2} N (weight {weight:.2}), max droop {droop:.4} rad"
     );
