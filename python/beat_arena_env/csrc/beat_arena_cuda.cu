@@ -967,8 +967,10 @@ constexpr int N_GROUND_IMP_LANES = 4;
 // l_foot, r_foot] world positions, head-style normalization.
 constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 562
 constexpr int N_BODY_PTS = 6;
-constexpr int OBS_DIM = OFF_BODY_PTS + 3 * N_BODY_PTS;               // 580
-static_assert(OBS_DIM == 580, "spec §12 (env v19 post_rem lanes): OBS_DIM must be 580");
+// env v24: world velocities of the §8 points (lib.rs mirror)
+constexpr int OFF_BODY_PT_VEL = OFF_BODY_PTS + 3 * N_BODY_PTS;       // 580
+constexpr int OBS_DIM = OFF_BODY_PT_VEL + 3 * N_BODY_PTS;            // 598
+static_assert(OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598");
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
@@ -4471,6 +4473,9 @@ struct Sim {
   // FK caches
   T *__restrict__ wrist, *__restrict__ blade, *__restrict__ wrist_vel,
       *__restrict__ head, *__restrict__ shoulder_z;
+  // env v24: §8 body-point positions of the last tick (finite-diff
+  // base) and the resulting world velocities (lib.rs body_pt_vel)
+  T *__restrict__ body_pt, *__restrict__ body_pt_vel;
   // swing chain
   T *__restrict__ swing_acc, *__restrict__ axis;
   bool* __restrict__ axis_valid;
@@ -4679,6 +4684,18 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   }
   store_state(d, P, e);
   refresh_fk(d, P, e);
+  // env v24: seed the finite-diff base with the reset pose's §8
+  // points, velocities zero (lib.rs Body reset mirror)
+  {
+    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
+                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
+    for (int i = 0; i < N_BODY_PTS; i++)
+      for (int k = 0; k < 3; k++) {
+        const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
+        P.body_pt[idx] = d.pos[bp_f[i]][k];
+        P.body_pt_vel[idx] = T(0);
+      }
+  }
   for (int s = 0; s < 2; s++) {
     for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
     P.swing_acc[e * 2 + s] = T(0);
@@ -4957,6 +4974,15 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       obs[base + 2] = (float)((d.pos[bp_f[i]][2] - T(PLANE_Z0)) / T(X_NORM));
     }
   }
+  // env v24: the same points' world velocities (lib.rs mirror —
+  // finite diff across the last tick, /V_NORM; the tensor is zeroed
+  // at reset and after a mode-2 refresh)
+  for (int i = 0; i < N_BODY_PTS; i++) {
+    const int base = OFF_BODY_PT_VEL + 3 * i;
+    for (int k = 0; k < 3; k++)
+      obs[base + k] = (float)(
+          P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3 + k] / T(V_NORM));
+  }
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
@@ -5055,6 +5081,20 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       P.wrist_vel[(e * 2 + h) * 3 + k] =
           (new_w[h][k] - prev_w[h][k]) / T(DT);
     }
+  // env v24: body-point world velocities — finite diff against the
+  // last tick's stored positions, then advance the base (lib.rs
+  // Body::tick mirror; d.pos holds this tick's refreshed FK)
+  {
+    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
+                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
+    for (int i = 0; i < N_BODY_PTS; i++)
+      for (int k = 0; k < 3; k++) {
+        const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
+        const T np = d.pos[bp_f[i]][k];
+        P.body_pt_vel[idx] = (np - P.body_pt[idx]) / T(DT);
+        P.body_pt[idx] = np;
+      }
+  }
 
   T reward = T(0);
   reward -= P.effort_coef * effort;
@@ -5497,6 +5537,18 @@ step_kernel(Sim<T> P) {
     load_state(d, P, e);
     refresh_fk(d, P, e);
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
+    // env v24: set_state semantics — re-seed the finite-diff base at
+    // the refreshed pose, velocities zero (lib.rs set_state mirror)
+    {
+      const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
+                                    F_R_SHANK, F_L_FOOT, F_R_FOOT};
+      for (int i = 0; i < N_BODY_PTS; i++)
+        for (int k = 0; k < 3; k++) {
+          const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
+          P.body_pt[idx] = d.pos[bp_f[i]][k];
+          P.body_pt_vel[idx] = T(0);
+        }
+    }
   } else {
     d.pd_bad = false;
     d.env_bad = false;
@@ -5528,7 +5580,7 @@ enum {
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT, TGIMP, TCIDX,
-  TPOSEJIT, TFOOTPOT,
+  TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
@@ -5649,6 +5701,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_shape_coef = (scalar_t)foot_shape_coef;
     P.iso_coef = (scalar_t)iso_coef;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
+    P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
+    P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
     P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
