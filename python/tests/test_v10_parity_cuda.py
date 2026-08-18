@@ -331,8 +331,11 @@ def test_lockstep_episode_parity():
     # per-tick rewards: identical up to integer score-rounding flips at
     # razor-thin pre/acc boundaries (<= 2 pts = 2/115)
     assert rew_diff <= 0.05, f"reward diff {rew_diff}"
-    # knife-edge obs flips are rare
-    assert flips <= 0.05 * ticks, f"{flips}/{ticks} flip ticks"
+    # knife-edge obs flips are rare. Band 5% -> 8% (2026-08-18): the
+    # fist-only hand + cap-50 wrist is twitchier, so more ticks sit at
+    # discrete-threshold knife edges where f32-vs-f64 flips (measured
+    # 5.8% at the change)
+    assert flips <= 0.08 * ticks, f"{flips}/{ticks} flip ticks"
     # counters / score decomposition / per-note status: EXACT
     for e, sim in enumerate(sims):
         cnt = ((sim.good_cuts, sim.bad_cuts, sim.misses, sim.bombs_hit),

@@ -170,8 +170,8 @@ def _fit_roll(hand, roll, bend):
 
 def _swing_time(arc):
     """Seconds to sweep `arc` from rest at full wrist accel (+ margin).
-    v10 wrist: τ_max/I_ref = 400 rad/s² by construction (§1.5), cap 40
-    — the v9 wrist-tier numbers verbatim."""
+    ALPHA_WRIST/OMEGA_WRIST mirror the LIVE engine wrist (fist-only
+    hand + cap 50 since 2026-08-18) — see constants.py derivation."""
     if arc <= OMEGA_WRIST ** 2 / (2 * ALPHA_WRIST):
         return float(np.sqrt(2 * arc / ALPHA_WRIST)) + 0.04
     return OMEGA_WRIST / (2 * ALPHA_WRIST) + arc / OMEGA_WRIST + 0.04

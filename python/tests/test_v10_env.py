@@ -388,7 +388,7 @@ def test_sim_plays_a_chart_scripted_torques():
     def run(whip_tick):
         # hit 0.9 -> 0.8 (env v15, contact spec §10): the head-anchored
         # track moves with the whip's trunk reaction; 0.8 re-lands the
-        # hand-tuned whip_tick=15 primary path (cut 83, post 30)
+        # hand-tuned whip_tick=17 primary path (fist-only hand era)
         sim = _sim([_note(0.8, 0.3, 1.4, speed=4.0)], max_steps=300)
         # env v20: this script is calibrated to the pre-v20 zero-arm pose;
         # pin it (the ready stance only moves the episode START pose, not
@@ -407,7 +407,8 @@ def test_sim_plays_a_chart_scripted_torques():
                 break
         return sim, events
 
-    sim, events = run(15)                    # the hand-tuned sequence
+    # 15 -> 17 (2026-08-18 fist-only hand — see the test_env whip note)
+    sim, events = run(17)
     if not any(c == 0 for _, c, *_ in events):
         # crude deterministic fallback search (seeded ordering)
         for whip in (12, 14, 16, 18, 13, 17):
