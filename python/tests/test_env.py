@@ -554,7 +554,11 @@ def _whip_events(kind=0, ticks=60):
     events = []
     for t in range(ticks):
         a = [0] * N_JOINTS
-        a[A_R_ARM] = 1 if t < 15 else 2
+        # windup 15 -> 17 ticks (2026-08-18 fist-only hand): the
+        # lighter arm whips ~10% faster, so the old timing slammed the
+        # -90 deg pitch stop mid-follow-through (post accrued 0); two
+        # more windup ticks re-land the cut with full sweep room
+        a[A_R_ARM] = 1 if t < 17 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:

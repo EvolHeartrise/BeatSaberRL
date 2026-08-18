@@ -336,10 +336,12 @@ L_FORE = 0.30         # m
 HEAD = HEAD0
 N_HAND_JOINTS = 7     # v9 per-hand joint count (pitch..dev)
 ALPHA_ARM, OMEGA_ARM = 160.0, 16.0
-ALPHA_WRIST, OMEGA_WRIST = 400.0, 40.0  # scripted-harness timing
-# model, NOT the engine cap (that is OMEGA_CAP above, 50 since
-# 2026-08-18) — kept at the old conservative 40 so scripted swing
-# waits stay generous
+# scripted-harness wrist model — tracks the TRUE engine values so
+# scripted swings land as designed (a too-slow model overshoots):
+# alpha = tau_max / (armature + I_hand + m_hand*d^2)
+#       = 1.06 / (0.0000266 + 0.000264 + 0.35*0.06^2) ~ 684 rad/s^2
+# (2026-08-18 fist-only hand); omega = the wrist cap (50).
+ALPHA_WRIST, OMEGA_WRIST = 684.0, 50.0
 JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
 JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
 PITCH_LIM = math.radians(90.0)
