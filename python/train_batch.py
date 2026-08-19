@@ -52,6 +52,13 @@ GAE_LAMBDA = 0.95
 CLIP = 0.2
 DUAL_CLIP_C = 3.0
 VF_COEF = 0.5
+# value-target normalization EMA rate, per update (2026-08-19 critic
+# redesign, topics/critic-design.md T1): the critic predicts
+# NORMALIZED values v_hat; V = v_hat*sig+mu everywhere GAE reads it.
+# Fixes the silent VF_COEF re-weighting under return-scale shifts
+# (v26 gamma 0.99 inflated v_loss ~10x into the shared trunk).
+# halflife ~69 updates at 0.01.
+VALUE_NORM_BETA = 0.01
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
 # the recipe SHAPE: every tuned run is 1024 envs x 128 horizon. The
@@ -115,6 +122,31 @@ def parse_args():
                    help="linear lr warmup length in updates (0 = auto, "
                         "1.5%% of the run's updates); stored in the "
                         "checkpoint schedule so resumes agree")
+    # 2026-08-19 critic redesign (topics/critic-design.md T0-T4)
+    p.add_argument("--vf-coef", type=float, default=VF_COEF,
+                   help="value-loss weight; targets are normalized, so "
+                        "this is a real relative weight now")
+    p.add_argument("--critic-lr-mult", type=float, default=3.0,
+                   help="critic param-group lr multiplier (T1, "
+                        "ProtoMotions ships 5x; 1.0 disables). Inactive "
+                        "when resuming a legacy single-group optimizer")
+    p.add_argument("--critic-detach", action="store_true",
+                   help="T4: stop value-loss gradients at the shared "
+                        "trunk boundary (PPG-style detach)")
+    p.add_argument("--diag-every", type=int, default=50,
+                   help="every N updates run the critic/trunk "
+                        "diagnostics minibatch (grad cosine, dormant "
+                        "neurons, feature rank; ~2 extra backwards on "
+                        "2048 rows + one host sync). 0 disables")
+    p.add_argument("--mb-accum", type=int, default=1,
+                   help="split each minibatch into K micro-batches with "
+                        "gradient accumulation — same math (full-mb adv "
+                        "stats, means of equal micro means), ~1/K the "
+                        "update-pass activation peak (24 GB fallback)")
+    p.add_argument("--init-critic-fresh", action="store_true",
+                   help="with --init-from and a pre-redesign checkpoint: "
+                        "load actor/trunk weights, build a FRESH "
+                        "adapool_v1 critic (cross-era warm start)")
     p.add_argument("--cooldown-updates", type=int, default=0,
                    help="wsd LEAF mode: with --resume <trunk ckpt>, branch "
                         "off and decay lr 1-sqrt from --lr to --lr-final "
@@ -425,6 +457,8 @@ def main():
     N, T = args.num_envs, args.horizon
     batch = N * T
     mb_size = batch // args.minibatches
+    assert args.mb_accum >= 1 and mb_size % args.mb_accum == 0, (
+        f"--mb-accum {args.mb_accum} must divide minibatch {mb_size}")
 
     # --fp16 update is the DEFAULT (2026-07-25); downgrade quietly where
     # it cannot apply instead of crashing paths that never asked for it
@@ -549,12 +583,32 @@ def main():
     elif args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
         policy = load_policy(ckpt)
+        if args.init_critic_fresh and policy.critic_arch == "linear_v0":
+            fresh = NotePolicy(
+                embed=policy.arch["embed"],
+                trunk_dim=policy.arch["trunk_dim"],
+                n_blocks=policy.arch["n_blocks"],
+                n_heads=policy.arch["n_heads"],
+                n_gears=policy.arch["n_gears"],
+                ffn_mult=policy.arch["ffn_mult"], critic="adapool_v1")
+            missing, unexpected = fresh.load_state_dict(
+                policy.state_dict(), strict=False)
+            assert (all(k.startswith("critic_") for k in missing)
+                    and all(k.startswith("value_head") for k in
+                            unexpected)), (missing, unexpected)
+            policy = fresh
+            print("--init-critic-fresh: actor/trunk from the "
+                  "checkpoint, FRESH adapool_v1 critic", flush=True)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",
               flush=True)
     else:
         policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
                             n_gears=args.gears, ffn_mult=args.ffn_mult)
+    policy.critic_detach = args.critic_detach
+    if args.critic_detach:
+        print("--critic-detach: value-loss gradients stop at the "
+              "shared-trunk boundary (T4)", flush=True)
     if policy.n_gears != args.gears:
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "
@@ -582,13 +636,30 @@ def main():
     # (--fused-update was retired 2026-08-13 with the 138k arch: the
     # packed kernels were hard-wired to embed 64 / trunk 128 and the
     # eager fp16 path was the production path throughout v16.)
-    params = policy.parameters()
     # fused=True: one multi-tensor kernel instead of the foreach path's
     # ~10 launches per step (77 elementwise calls/minibatch measured in
     # the 2026-07-25 profile). Same per-element math, not guaranteed
     # bitwise vs foreach.
     fused_adam = device.type == "cuda"
-    opt = torch.optim.Adam(params, lr=args.lr, fused=fused_adam)
+    # T1 critic lr split: the critic params (adapool modules, or the
+    # legacy value_head) form their own group with an lr multiplier the
+    # schedule loop re-applies every update via the "lr_mult" key
+    # (extra param_group keys survive state_dict round trips).
+    crit_p = [p for n, p in policy.named_parameters()
+              if n.startswith(("critic_", "value_head"))]
+    main_p = [p for n, p in policy.named_parameters()
+              if not n.startswith(("critic_", "value_head"))]
+    opt = torch.optim.Adam(
+        [{"params": main_p, "lr": args.lr, "lr_mult": 1.0},
+         {"params": crit_p, "lr": args.lr * args.critic_lr_mult,
+          "lr_mult": args.critic_lr_mult}],
+        lr=args.lr, fused=fused_adam)
+    if resume_ckpt is not None and len(
+            resume_ckpt["optimizer"]["param_groups"]) != 2:
+        print("resume: legacy single-group optimizer state — "
+              "--critic-lr-mult inactive on this run", flush=True)
+        opt = torch.optim.Adam(policy.parameters(), lr=args.lr,
+                               fused=fused_adam)
     if resume_ckpt is not None:
         try:
             # stamp the fused flag into the SAVED groups before loading:
@@ -612,15 +683,33 @@ def main():
     # existing grads, so the views persist; a one-time guard below
     # verifies that.
     flat_grad = None
+    diag_groups = None
     if device.type == "cuda":
         f_params = list(policy.parameters())
         flat_grad = torch.zeros(sum(p.numel() for p in f_params),
                                 device=device)
         off = 0
-        for p_ in f_params:
+        name_off = {}
+        for (n_, _), p_ in zip(policy.named_parameters(), f_params):
             p_.grad = flat_grad[off:off + p_.numel()].view_as(p_)
+            name_off[n_] = off
             off += p_.numel()
         flat_guard = True
+        # diag slices over the flat buffer: params are registered
+        # encoder -> blocks -> trunk -> heads -> critic, so the SHARED
+        # region is everything before the first head. Per-group
+        # boundaries feed the [diag] per-layer grad norms.
+        shared_end = name_off.get("heads.0.weight", off)
+        diag_groups = [("enc", 0, name_off.get("blocks.0.ln_attn.weight",
+                                               shared_end))]
+        for i in range(len(policy.blocks)):
+            lo = name_off.get(f"blocks.{i}.ln_attn.weight")
+            hi = name_off.get(f"blocks.{i + 1}.ln_attn.weight",
+                              name_off.get("trunk.0.weight", shared_end))
+            if lo is not None:
+                diag_groups.append((f"blk{i}", lo, hi))
+        diag_groups.append(("trunk", name_off.get("trunk.0.weight",
+                                                  shared_end), shared_end))
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 
@@ -644,6 +733,27 @@ def main():
     b_adv = torch.zeros((T, N), device=device)
     b_ret = torch.zeros((T, N), device=device)
     gae_zero = torch.zeros(N, device=device)  # t = T-1 scan seed
+
+    # T1 value-target normalization (2026-08-19): the policy's value
+    # output is the NORMALIZED prediction; b_val stores UNNORMALIZED
+    # V = v_hat*sig+mu so GAE/EV read real return units. Stats are
+    # device tensors (no syncs; floats only at the ckpt-save sync).
+    ret_mu = torch.zeros((), device=device)
+    ret_var = torch.ones((), device=device)
+    ret_sig = torch.ones((), device=device)
+    value_norm_init = True
+    if resume_ckpt is not None:
+        vn = resume_ckpt.get("value_norm")
+        if vn is not None:
+            ret_mu.fill_(vn["mu"])
+            ret_var.fill_(vn["var"])
+            torch.sqrt(ret_var.clamp_min(1e-8), out=ret_sig)
+            value_norm_init = False
+        else:
+            print("!!! resume: checkpoint predates value normalization "
+                  "— the critic will RE-FIT to normalized targets over "
+                  "the first ~100 updates (EV dips, then recovers) !!!",
+                  flush=True)
 
     graph_roll = None
     if args.graph_rollout:
@@ -750,7 +860,7 @@ def main():
         else:
             lr_now = args.lr                # the trunk: constant, forever
         for g in opt.param_groups:
-            g["lr"] = lr_now
+            g["lr"] = lr_now * g.get("lr_mult", 1.0)
         if leaf_from is not None:
             ent_now = ent_start
             if args.ent_final is not None:
@@ -768,7 +878,9 @@ def main():
             for t in range(T):
                 b_obs[t] = venv._obs
                 a, logp, v, rew, done = graph_roll.step()
-                b_act[t], b_logp[t], b_val[t] = a, logp, v
+                b_act[t], b_logp[t] = a, logp
+                # unnormalize the value prediction (in place, no temps)
+                b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
                 b_rew[t] = rew
                 # copy_ does the bool->float conversion in one kernel
                 # with no temp (done.to() allocated one per step)
@@ -780,7 +892,8 @@ def main():
             with torch.no_grad():
                 a, logp, _, v = policy.get_action_and_value(
                     obs, need_entropy=False)
-            b_act[t], b_logp[t], b_val[t] = a, logp, v
+            b_act[t], b_logp[t] = a, logp
+            b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
             if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
                 b_rew[t] = rew.to(b_rew.dtype)
@@ -820,7 +933,8 @@ def main():
             # the discarded sample also consumed RNG — dropping it
             # shifts the sampling stream, accepted at the same time as
             # the Gumbel-max switch)
-            b_val[T] = policy.forward_stacked(obs)[1]
+            b_val[T].copy_(policy.forward_stacked(obs)[1]
+                           ).mul_(ret_sig).add_(ret_mu)
             # everything non-recursive hoisted out of the T-loop (same
             # elementwise op order as the per-t version, so bit-exact);
             # only the scan itself stays sequential. The scan writes
@@ -846,6 +960,21 @@ def main():
             # LOW EV is unambiguously a bad critic.
             ev = 1.0 - (returns - b_val[:T]).var() \
                 / returns.var().clamp_min(1e-12)
+            # T1 value-norm stats (EMA, device-side, no syncs). Updated
+            # BEFORE the targets are formed; b_val was unnormalized
+            # with last update's stats — consistent to within one
+            # beta = VALUE_NORM_BETA step.
+            r_mu, r_var = returns.mean(), returns.var()
+            if value_norm_init:
+                ret_mu.copy_(r_mu)
+                ret_var.copy_(r_var)
+                value_norm_init = False
+            else:
+                ret_mu.mul_(1.0 - VALUE_NORM_BETA).add_(
+                    VALUE_NORM_BETA * r_mu)
+                ret_var.mul_(1.0 - VALUE_NORM_BETA).add_(
+                    VALUE_NORM_BETA * r_var)
+            torch.sqrt(ret_var.clamp_min(1e-8), out=ret_sig)
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, A_DIM)
@@ -855,6 +984,59 @@ def main():
 
         if fp16_update:
             policy.fp16 = True  # 'update' mode: rollout stayed fp32
+
+        if (args.diag_every > 0 and flat_grad is not None
+                and update % args.diag_every == 0):
+            # T0 diagnostics (2026-08-19, topics/critic-design.md): a
+            # 2048-row grad-enabled forward + TWO extra backwards,
+            # separating the policy-loss and value-loss gradients over
+            # the SHARED params (flat buffer [0, shared_end)) — their
+            # cosine discriminates actor/critic interference from
+            # underfitting; per-group norms + dormant-neuron fraction +
+            # trunk-feature effective rank discriminate critic
+            # interference from gradient-propagation failure
+            # (2506.15544's critic-independent collapse mode). Costs
+            # one host sync at its print — diag-cadence only.
+            dn = min(2048, batch)
+            policy._diag_stash = True
+            _, dlogp, _, dval = policy.get_action_and_value(
+                f_obs[:dn], f_act[:dn], need_entropy=False)
+            policy._diag_stash = False
+            dratio = (dlogp - f_logp[:dn]).clamp(
+                max=LOG_RATIO_CLAMP).exp()
+            da = f_adv[:dn]
+            da = (da - da.mean()) / (da.std() + 1e-8)
+            d_pg = pg_loss_fn(dratio, da)
+            d_v = 0.5 * ((dval - (f_ret[:dn] - ret_mu) / ret_sig)
+                         ** 2).mean()
+            dscale = fp16_scale if fp16_update else 1.0
+            flat_grad.zero_()
+            (d_pg * dscale).backward(retain_graph=True)
+            g_pi = flat_grad[:shared_end] / dscale
+            flat_grad.zero_()
+            (d_v * dscale).backward()
+            g_v = flat_grad[:shared_end] / dscale
+            flat_grad.zero_()
+            torch.nan_to_num_(g_pi, nan=0.0, posinf=0.0, neginf=0.0)
+            torch.nan_to_num_(g_v, nan=0.0, posinf=0.0, neginf=0.0)
+            n_pi, n_v = g_pi.norm(), g_v.norm()
+            gcos = (g_pi @ g_v) / (n_pi * n_v + 1e-12)
+            h_d = policy._diag_h.float()
+            policy._diag_h = None
+            a_mean = h_d.abs().mean(0)
+            dorm = (a_mean < 0.025 * a_mean.mean()).float().mean()
+            sv = torch.linalg.svdvals(h_d - h_d.mean(0))
+            cum = sv.cumsum(0) / sv.sum().clamp_min(1e-12)
+            srank = int((cum < 0.99).sum().item()) + 1
+            per_g = "  ".join(
+                f"{nm} {g_pi[a:b].norm().item():.1e}/"
+                f"{g_v[a:b].norm().item():.1e}"
+                for nm, a, b in diag_groups)
+            print(f"[diag] upd {update + 1}  gradcos {gcos.item():+.3f}"
+                  f"  |g_pi| {n_pi.item():.2e}  |g_v| {n_v.item():.2e}"
+                  f"  dormant {dorm.item():.3f}  srank {srank}/"
+                  f"{h_d.shape[1]}  pi/v: {per_g}", flush=True)
+
         for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
             # synchronizing pageable H2D copy per minibatch (~26 ms/update
@@ -866,33 +1048,54 @@ def main():
             p_obs, p_act = f_obs[perm], f_act[perm]
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
             for s in range(0, batch, mb_size):
-                sl = slice(s, s + mb_size)
-                _, newlogp, entropy, newval = policy.get_action_and_value(
-                    p_obs[sl], p_act[sl])
-                logratio = newlogp - p_logp[sl]
-                ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
-                if fp16_update:
-                    # overflow forensics (device-side, read at the print
-                    # sync): a max|logratio| near ~88 fingers exp()
-                    # fp32 overflow as the non-finite-grad source, small
-                    # values finger the fp16 activations instead
-                    torch.maximum(logr_max, logratio.detach().abs().max(),
-                                  out=logr_max)
-                if fp16_update and ep_i == 0 and s == 0:
-                    # "same policy" fixed point: |ratio-1| at epoch 1
-                    # measures rollout/update precision consistency
-                    # (device-side; read at the per-update print sync)
-                    ratio_diag = (ratio - 1.0).abs().mean().detach()
-                a_mb = p_adv[sl]
-                a_mb = (a_mb - a_mb.mean()) / (a_mb.std() + 1e-8)
-                pg_loss = pg_loss_fn(ratio, a_mb)
-                v_loss = 0.5 * ((newval - p_ret[sl]) ** 2).mean()
-                ent_loss = entropy.mean()
-                loss = pg_loss - ent_now * ent_loss + VF_COEF * v_loss
+                # advantage stats over the FULL minibatch so --mb-accum
+                # K>1 is the same math as K=1 (each micro loss is a
+                # mean over an equal slice; the (1/K)-scaled sum of
+                # micro means IS the minibatch mean, modulo fp
+                # association); one opt.step per minibatch either way
+                a_full = p_adv[s:s + mb_size]
+                a_mu = a_full.mean()
+                a_sd = a_full.std()
                 if flat_grad is not None:
                     flat_grad.zero_()
                 else:
                     opt.zero_grad(set_to_none=True)
+                micro = mb_size // args.mb_accum
+                for j in range(args.mb_accum):
+                    sl = slice(s + j * micro, s + (j + 1) * micro)
+                    _, newlogp, entropy, newval = \
+                        policy.get_action_and_value(p_obs[sl], p_act[sl])
+                    logratio = newlogp - p_logp[sl]
+                    ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
+                    if fp16_update:
+                        # overflow forensics (device-side, read at the
+                        # print sync): a max|logratio| near ~88 fingers
+                        # exp() fp32 overflow as the non-finite-grad
+                        # source, small values finger the fp16
+                        # activations instead
+                        torch.maximum(logr_max,
+                                      logratio.detach().abs().max(),
+                                      out=logr_max)
+                    if fp16_update and ep_i == 0 and s == 0 and j == 0:
+                        # "same policy" fixed point: |ratio-1| at epoch
+                        # 1 measures rollout/update precision
+                        # consistency (device-side; read at the
+                        # per-update print sync)
+                        ratio_diag = (ratio - 1.0).abs().mean().detach()
+                    a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
+                    pg_loss = pg_loss_fn(ratio, a_mb)
+                    # T1: the critic learns the NORMALIZED target
+                    v_tgt = (p_ret[sl] - ret_mu) / ret_sig
+                    v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
+                    ent_loss = entropy.mean()
+                    loss = (pg_loss - ent_now * ent_loss
+                            + args.vf_coef * v_loss)
+                    if args.mb_accum > 1:
+                        loss = loss / args.mb_accum
+                    if fp16_update:
+                        (loss * fp16_scale).backward()
+                    else:
+                        loss.backward()
                 if fp16_update:
                     # dynamic loss scale, ZERO host syncs: unscale + flag
                     # non-finites in one kernel over the FLAT grad
@@ -903,7 +1106,6 @@ def main():
                     # momentum-only Adam steps — bounded by lr, audited
                     # at the print.
                     inv_scale.copy_(fp16_scale.reciprocal())
-                    (loss * fp16_scale).backward()
                     grads = ([flat_grad] if flat_grad is not None else
                              [p.grad for p in policy.parameters()
                               if p.grad is not None])
@@ -941,8 +1143,6 @@ def main():
                     clean_steps.mul_(1.0 - grow)
                     inf_count += found_inf
                     found_inf.zero_()
-                else:
-                    loss.backward()
                 if flat_grad is not None:
                     if flat_guard:
                         # one-time: autograd must have accumulated INTO
@@ -1055,6 +1255,8 @@ def main():
                         "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
                         "recent_return": float(recent),
+                        "value_norm": {"mu": float(ret_mu),
+                                       "var": float(ret_var)},
                         "optimizer": cpu_opt_state(opt),
                         "args": args_snapshot,
                         "wsd_role": ("leaf" if leaf_from is not None
@@ -1068,6 +1270,11 @@ def main():
                                      "ent_floor": ent_floor,
                                      "num_updates": num_updates}},
                        os.path.join(args.run_dir, name))
+            if device.type == "cuda":
+                # VRAM audit (GPU-tier decision prereq, 2026-08-19)
+                print(f"[ckpt] {name}  peak-vram "
+                      f"{torch.cuda.max_memory_allocated() / 2**30:.2f} "
+                      f"GiB", flush=True)
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)
             break
@@ -1080,6 +1287,8 @@ def main():
                 "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
                 "recent_return": float(recent),
+                "value_norm": {"mu": float(ret_mu),
+                               "var": float(ret_var)},
                 "optimizer": cpu_opt_state(opt),
                 "args": args_snapshot,
                 "wsd_role": ("leaf" if leaf_from is not None
@@ -1096,9 +1305,11 @@ def main():
     tot = t_rollout + t_update
     split_kind = "exec-true" if args.bench else \
         "enqueue-attributed, NOT execution time — use --bench"
+    vram = (f" | peak-vram {torch.cuda.max_memory_allocated() / 2**30:.2f} "
+            f"GiB" if device.type == "cuda" else "")
     print(f"THROUGHPUT: {(global_step - steps_before) / (time.time() - start):,.0f} steps/s total | "
           f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% "
-          f"({split_kind}) | N={N} T={T}", flush=True)
+          f"({split_kind}) | N={N} T={T}{vram}", flush=True)
 
 
 if __name__ == "__main__":
