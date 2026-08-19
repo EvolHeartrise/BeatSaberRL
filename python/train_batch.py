@@ -837,6 +837,15 @@ def main():
                 torch.mul(coef[t], adv[t + 1], out=adv[t])
                 adv[t].add_(deltas[t])
             returns = torch.add(adv, b_val[:T], out=b_ret)
+            # critic diagnostic (2026-08-19): explained variance of the
+            # PRE-update value predictions against their own GAE targets
+            # over the full T x N batch. 0-dim device tensor, read at
+            # the per-update print sync — no extra host sync. Caveat at
+            # T=8/gamma .965 the target is ~75% bootstrap, so EV ~1
+            # means self-consistent + 8-step-reward-accurate, while a
+            # LOW EV is unambiguously a bad critic.
+            ev = 1.0 - (returns - b_val[:T]).var() \
+                / returns.var().clamp_min(1e-12)
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, A_DIM)
@@ -1015,8 +1024,8 @@ def main():
             # ONE host sync (same as the .item() it replaces) reads the
             # loss, the overflow audit, the ratio diagnostic, the
             # log-ratio forensic, and the live scale together
-            ent_v, inf_v, r1_v, lmax_v, scale_v = torch.stack(
-                [ent_loss.detach(), inf_count[0], ratio_diag,
+            ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v = torch.stack(
+                [ent_loss.detach(), ev, inf_count[0], ratio_diag,
                  logr_max, fp16_scale]).tolist()
             logr_max.zero_()
             extra = f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}"
@@ -1028,12 +1037,15 @@ def main():
                 extra += f"  scale {scale_v:.0f}"
             print(f"update {update+1:>3}/{num_updates}  steps "
                   f"{global_step:>9}  ep_return(last100) {recent:8.3f}  "
-                  f"ent {ent_v:.3f}  {rate:8,.0f} steps/s  "
+                  f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
         else:
+            # one stacked read = one sync, same as the old ent .item()
+            ent_v, ev_v = torch.stack([ent_loss.detach(), ev]).tolist()
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
-                  f"ep_return(last100) {recent:8.3f}  ent {ent_loss.item():.3f}  "
-                  f"{rate:8,.0f} steps/s  {elapsed:6.1f}s", flush=True)
+                  f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
+                  f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
+                  flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
