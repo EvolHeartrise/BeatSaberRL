@@ -5,8 +5,11 @@ window (notes + walls, distance-sorted), two saber tokens and one body
 token form a 27-token sequence run through 3 full pre-LN transformer
 blocks (LayerNorm -> 4-head self-attention -> residual; LayerNorm ->
 4x FFN -> residual) at embed 128, then a 256-wide trunk MLP and 29
-factored action heads + a value head (~861k params, the 2026-08-13
-user-approved 6.2x scale-up).
+factored action heads (~863k actor params, the 2026-08-13
+user-approved 6.2x scale-up) plus the adapool_v1 critic (2026-08-19,
+topics/critic-design.md): a body-token-derived attention-pool query
+over the resolved token stream + a 3-layer value MLP, ~231k critic
+params, ~1.09M total. The critic reads; it is never read.
 
 Each entity token carries its z position along the approach axis —
 with constant note speed that IS the temporal ordering, expressed
@@ -337,21 +340,26 @@ class NotePolicy(nn.Module):
     # house pattern); training runs the eager fp16 path.
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
-                 n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4):
+                 n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
+                 critic: str = "adapool_v1"):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
+        assert critic in ("linear_v0", "adapool_v1"), critic
         self.encoder = encoder
         self.embed = embed
+        self.n_heads = n_heads
         self.n_gears = n_gears
+        self.critic_arch = critic
         self.head_sizes = (n_gears,) * N_ACTION_HEADS
         # arch record: load_policy REFUSES checkpoints whose markers
         # don't match the current era (obs 426 / ffn_mult present).
+        # "critic" absent = the pre-2026-08-19 Linear(trunk,1) probe.
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads,
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
-                     "ffn_mult": ffn_mult,
+                     "ffn_mult": ffn_mult, "critic": critic,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True}
         self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
@@ -365,7 +373,40 @@ class NotePolicy(nn.Module):
         # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
-        self.value_head = nn.Linear(trunk_dim, 1)
+        # Critic (2026-08-19 redesign, topics/critic-design.md):
+        # linear_v0 = the retired Linear(trunk,1) probe, kept ONLY so
+        # pre-redesign checkpoints (v25/v26 campaigns) stay benchable.
+        # adapool_v1 = query-derived attention pooling (Brothers
+        # 2506.09215: a state-DERIVED query wins over a free learned
+        # CLS token in exactly our low-SNR entity regime) + value MLP:
+        # the critic's query is a projection of the body token's
+        # embedding entering the final block; it pools READ-ONLY over
+        # all 27 resolved tokens (nothing attends back — the actor
+        # path is bit-identical to linear_v0), then a 3-layer MLP on
+        # [pooled, trunk] predicts the NORMALIZED value (the trainer
+        # owns the return-normalization stats). Registered AFTER the
+        # heads so the critic occupies the tail of parameters() order
+        # (the trainer's flat-grad diagnostics slice on that).
+        if critic == "linear_v0":
+            self.value_head = nn.Linear(trunk_dim, 1)
+        else:
+            self.critic_ln = FusedLayerNorm(embed)
+            self.critic_q = nn.Linear(embed, embed)
+            self.critic_k = nn.Linear(embed, embed)
+            self.critic_v = nn.Linear(embed, embed)
+            self.critic_out = nn.Linear(embed, embed)
+            self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
+                                    trunk_dim, 1])
+        # T4 escape hatch (PPG §3.6 detach): True stops value-loss
+        # gradients at the shared-trunk boundary — the critic trains
+        # on detached features. Plain attribute, NOT in state_dict.
+        self.critic_detach = False
+        # trainer diagnostics: _diag_stash=True makes the next forward
+        # keep its trunk output on self._diag_h (forward hooks can't
+        # see it — the fp16 paths bypass module __call__). Plain
+        # attrs; the graphed rollout captures with the flag False.
+        self._diag_stash = False
+        self._diag_h = None
         # token-slice index buffers (device-tracked, not in state_dict)
         self.register_buffer(
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
@@ -428,42 +469,83 @@ class NotePolicy(nn.Module):
         for blk in self.blocks[:-1]:
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
                                          delta=delta, delta_bias=delta_b)
+        legacy = self.critic_arch == "linear_v0"
+        x_res = None
+        if not legacy:
+            # the critic pools over the RESOLVED token stream entering
+            # the final block — the same embeddings the final block's
+            # k/v see (its fused ln_attn pass folds this add; the
+            # critic pays it once, one (B,27,d) add)
+            x_res = tokens
+            if delta is not None:
+                x_res = (x_res + delta if delta_b is None
+                         else x_res + delta + delta_b)
         # final block: only the 3 readout tokens' outputs are consumed
         tokens = self.blocks[-1](tokens, None, n_queries=3,
                                  attn_bias=attn_bias, delta=delta,
                                  delta_bias=delta_b)
         h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
+        if self._diag_stash:
+            self._diag_h = h
+        tail = (list(self.heads) + [self.value_head] if legacy
+                else list(self.heads))
         if fp16 and not torch.is_grad_enabled():
             # rollout fast path: weights are frozen between opt.steps,
-            # so the 30-tensor cat + fp16 cast is cached per weight
+            # so the tail-tensor cat + fp16 cast is cached per weight
             # EPOCH (fp16_linear.bump_weights_version — tensor _version
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
-            return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
-                    out[:, -1])
-        if fp16 and _PACKED_HEADS:
+        elif fp16 and _PACKED_HEADS:
             # Tier 1.5: the update path reuses the rollout's fused-head
-            # cache — no 30-way weight/bias cats (or their backward
+            # cache — no per-head weight/bias cats (or their backward
             # split nodes) per minibatch; grads route to the individual
             # head masters via the packed Function's row slices.
             c = self._refresh_head_cache()
-            out = _fl.fp16_packed_linear(
-                h, c[1], c[2], list(self.heads) + [self.value_head]
-            ).float()
+            out = _fl.fp16_packed_linear(h, c[1], c[2], tail).float()
+        else:
+            w = torch.cat([m.weight for m in tail])
+            b = torch.cat([m.bias for m in tail])
+            if fp16:
+                # C5: the hard fp32 boundary — everything after
+                # (log_softmax, sampling, PPO math) is exactly today's
+                # fp32 code
+                out = fp16_linear(h, w, b).float()
+            else:
+                out = F.linear(h, w, b)                  # (B, 29K [+1])
+        if legacy:
             return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
                     out[:, -1])
-        w = torch.cat([hd.weight for hd in self.heads]
-                      + [self.value_head.weight])
-        b = torch.cat([hd.bias for hd in self.heads]
-                      + [self.value_head.bias])
-        if fp16:
-            # C5: the hard fp32 boundary — everything after (log_softmax,
-            # sampling, PPO math) is exactly today's fp32 code
-            out = fp16_linear(h, w, b).float()
-        else:
-            out = F.linear(h, w, b)                          # (B, 29K + 1)
-        return out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears), out[:, -1]
+        return (out.view(B, N_ACTION_HEADS, self.n_gears),
+                self._critic(x_res, h, attn_bias))
+
+    def _critic(self, x_res: torch.Tensor, h: torch.Tensor,
+                attn_bias: torch.Tensor) -> torch.Tensor:
+        """adapool_v1 value path. Query = a learned projection of the
+        BODY token's post-LN embedding (state-derived, per Brothers
+        2506.09215 — never a free CLS parameter); multi-head attention
+        pool over all resolved tokens under the same additive note
+        mask; value MLP on [pooled, trunk readout]. Read-only by
+        construction: nothing here feeds back into the actor path.
+        Output is the NORMALIZED value prediction (fp32) — the trainer
+        owns the return-normalization stats."""
+        if self.critic_detach:
+            x_res, h = x_res.detach(), h.detach()
+        B, T, d = x_res.shape
+        hv = self.critic_ln(x_res)
+        q = _lin(self.critic_q, hv[:, 2:3])          # body-derived query
+        k = _lin(self.critic_k, hv)
+        v = _lin(self.critic_v, hv)
+        nh, dh = self.n_heads, d // self.n_heads
+        q = q.view(B, 1, nh, dh).transpose(1, 2)
+        k = k.view(B, T, nh, dh).transpose(1, 2)
+        v = v.view(B, T, nh, dh).transpose(1, 2)
+        scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
+        scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
+        a = torch.softmax(scores, dim=-1) @ v
+        a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
+        val = _seq(self.critic_mlp, torch.cat([a, h], dim=-1))
+        return val.float().squeeze(-1)
 
     def flatten_fp16(self):
         """Repack all Linear masters into one flat fp32 buffer with a
@@ -472,7 +554,8 @@ class NotePolicy(nn.Module):
         fused-head cache becomes a pair of static VIEWS — never
         rebuilt, refreshed by the same single flat cast as everything
         else. Trainer-only; MUST run before CUDA-graph capture."""
-        tail = list(self.heads) + [self.value_head]
+        tail = list(self.heads) + (
+            [self.value_head] if self.critic_arch == "linear_v0" else [])
         # qkv groups (Tier 1.4): laid out [wq wk wv | bq bk bv] per
         # block so packed_halves resolves to static views. Grouping is
         # harmless when the toggle is off (layout-only), but kept
@@ -497,10 +580,11 @@ class NotePolicy(nn.Module):
         vers = _fl._weights_version
         c = getattr(self, "_head_cache", None)
         if c is None or c[0] != vers:
-            w = torch.cat([hd.weight for hd in self.heads]
-                          + [self.value_head.weight])
-            b = torch.cat([hd.bias for hd in self.heads]
-                          + [self.value_head.bias])
+            tail = list(self.heads) + (
+                [self.value_head] if self.critic_arch == "linear_v0"
+                else [])
+            w = torch.cat([m.weight for m in tail])
+            b = torch.cat([m.bias for m in tail])
             if c is None:
                 c = [vers, w.half(), b.half()]
                 self._head_cache = c
@@ -575,6 +659,9 @@ def load_policy(ckpt) -> NotePolicy:
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
-        n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"])
+        n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
+        # pre-2026-08-19 checkpoints carry no critic marker: they are
+        # the Linear(trunk,1) era, still loadable for bench/replay
+        critic=arch.get("critic", "linear_v0"))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
