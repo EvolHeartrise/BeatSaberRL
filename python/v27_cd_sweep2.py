@@ -1,14 +1,12 @@
 """v27 cooldown sweep, point 2 (user direction 2026-08-19): repeat
-the cd-length sweep from the 9,000-update trunk (= recipe-18k depth,
-adjacent to the champion's 19k) so we have optimal-cd measurements at
+the cd-length sweep from the 4,500-update trunk (= recipe-9k depth) so we have optimal-cd measurements at
 TWO depths. Arms cd100/200/400/800: cd50 was refuted at the 1,500
 sweep (+54.3 return — the 30->3e-6 entropy crash in 50 updates breaks
 the policy); cd800 added because EPFL 2405.18392's 10-20%-of-trunk
 guidance predicts the optimum GROWS with trunk length (10-20% of
-9,000 = 900-1,800 — cd800 probes that direction without betting 2x
-the GPU time on it).
+4,500 = 450-900 — cd800 probes past the bracket top).
 
-    python v27_cd_sweep2.py    # requires runs/v27_critic/trunk_upd09000.pt
+    python v27_cd_sweep2.py    # requires runs/v27_critic/trunk_upd04500.pt
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ from v27_cd_sweep import leaf_stats, run_logged
 
 PY = sys.executable
 ARMS = [100, 200, 400, 800]
-TRUNK_CK = os.path.join(PROBE_DIR, "trunk_upd09000.pt")
+TRUNK_CK = os.path.join(PROBE_DIR, "trunk_upd04500.pt")
 
 
 def main():
@@ -30,15 +28,15 @@ def main():
     if not os.path.exists(TRUNK_CK):
         sys.exit(f"[cd-sweep2] missing {TRUNK_CK} — extend the trunk first")
     for cd in ARMS:
-        rd = os.path.join("runs", f"v27_9k_cd{cd:03d}")
-        out = os.path.join("bench", f"v27_critic_leaf09000_cd{cd:03d}.json")
+        rd = os.path.join("runs", f"v27_45k_cd{cd:03d}")
+        out = os.path.join("bench", f"v27_critic_leaf04500_cd{cd:03d}.json")
         if os.path.exists(out):
             print(f"[cd-sweep2] cd{cd} already benched, skipping",
                   flush=True)
             continue
         os.makedirs(rd, exist_ok=True)
         if not [f for f in os.listdir(rd) if f.startswith("leaf_from")]:
-            print(f"[cd-sweep2] cutting cd{cd} from upd 9000", flush=True)
+            print(f"[cd-sweep2] cutting cd{cd} from upd 4500", flush=True)
             w = run_logged([PY, "train_batch.py", *COMMON,
                             "--resume", TRUNK_CK,
                             "--cooldown-updates", str(cd),
@@ -52,7 +50,7 @@ def main():
                     "--ckpt", os.path.join(rd, leaf),
                     "--num-envs", "2048", "--foot-contact", "--out", out],
                    os.path.join(rd, "bench.log"), 10_800)
-        print(f"SWEEP2_RESULT v27_9k_cd{cd:03d} {leaf_stats(rd, out)}",
+        print(f"SWEEP2_RESULT v27_45k_cd{cd:03d} {leaf_stats(rd, out)}",
               flush=True)
     print("SWEEP2-DONE", flush=True)
 
