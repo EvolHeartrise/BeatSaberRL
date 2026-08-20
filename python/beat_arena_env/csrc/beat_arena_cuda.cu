@@ -1541,6 +1541,14 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // ends the episode with a ZEROED reward, reported exactly like the
 // root-escape envelope (SPEC-v10 §20e "reported, never hidden").
 constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headroom for wall ducks)
+// TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
+// mirror: root up-axis tilted more than 30 deg forward/back
+// (sagittal) or 40 deg to the side (lateral) at ANY substep ends the
+// episode, priced like a fall (flat -fall_const). Tangent-squared
+// form on the world up-axis of the root frame; also trips whenever
+// up_y <= 0 (past horizontal, where the ratios lose meaning).
+constexpr double TILT_TAN2_PITCH = 0.3333333333333333;  // tan^2(30 deg)
+constexpr double TILT_TAN2_ROLL = 0.7040881910418472;   // tan^2(40 deg)
 
 // env v8 gears (lib.rs gear_signed)
 __device__ constexpr double GEAR_TAB[3][7] = {
@@ -4508,6 +4516,8 @@ struct Sim {
   // Written in contact mode only; stays 0 in weld mode, where the feet
   // cannot let go.
   int* __restrict__ fall_hits;
+  // (env, TICK) tilt terminations — lib.rs tilt_hits mirror
+  int* __restrict__ tilt_hits;
   // env v19 flail telemetry (per env, popped + zeroed by the wrapper's
   // pop_flail, NOT touched by reset_env): blade arc (rad) accrued on
   // note-free ticks (next scoreable note > FLAIL_LEAD_S away) by hands
@@ -5050,14 +5060,25 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // bounces back has still stopped being the standing task. Structurally
   // false (and folded away) in weld mode.
   bool fell = false;
+  bool tilted = false;
   // contact spec §7: tick-summed ground normal impulses per obs bucket
   // [L_heel, L_toe, R_heel, R_toe] (lib.rs Body::ground_imp). Dead code
   // in weld mode — no reader, so it folds away.
   T gimp[4] = {T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
-    if constexpr (FC)
+    if constexpr (FC) {
       if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
+      // TILT envelope: world up-axis of the root frame from the
+      // scalar-first quat (up = R * yhat)
+      const T upx = T(2) * (d.quat[1] * d.quat[2] - d.quat[0] * d.quat[3]);
+      const T upy = T(1)
+          - T(2) * (d.quat[1] * d.quat[1] + d.quat[3] * d.quat[3]);
+      const T upz = T(2) * (d.quat[2] * d.quat[3] + d.quat[0] * d.quat[1]);
+      if (upy <= T(0) || upz * upz > T(TILT_TAN2_PITCH) * upy * upy
+          || upx * upx > T(TILT_TAN2_ROLL) * upy * upy)
+        tilted = true;
+    }
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
         gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
@@ -5087,6 +5108,9 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // one per fallen TICK, not per substep (lib.rs: `if fell { fall_hits += 1 }`)
   if constexpr (FC)
     if (fell) atomicAdd(P.fall_hits, 1);
+  // one per tilted TICK, like fall_hits
+  if constexpr (FC)
+    if (tilted) atomicAdd(P.tilt_hits, 1);
   if constexpr (FC)
     for (int k = 0; k < N_GROUND_IMP_LANES; k++)
       P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
@@ -5489,7 +5513,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   const bool done =
       (!pending && no_trk && (nn == 0 || time_new > last_hit))
       || time_new > last_hit + P.p_tail[c0] || tick_new >= P.max_steps
-      || d.env_bad || fell;
+      || d.env_bad || fell || tilted;
 
   if (done) {  // resolve pending follow-throughs with partial arcs
     for (int h = 0; h < 2; h++) {
@@ -5524,12 +5548,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // it mirrors the note loop's own i<nn convention so the two scans
   // can never diverge if that invariant ever changes.
   if constexpr (FC) {
-    if (fell) {
-      // env v18 (sole mode) — MIRROR of lib.rs: flat terminal reward
+    if (fell || tilted) {
+      // env v18 (sole mode) — MIRROR of lib.rs: flat terminal reward;
+      // tilt terminations (2026-08-20) priced identically
       reward = -P.fall_const;
     }
   } else {
-    if (fell) reward = T(0);  // fell is constant-false here; folded
+    if (fell) reward = T(0);  // fell/tilted constant-false here; folded
   }
   const T ep = P.ep_return[e] + reward;
   P.ep_return[e] = ep;
@@ -5609,7 +5634,7 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TTILT, TFLAILR, TFLAILT,
   TACCP, TACCC, TGIMP, TCIDX,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
@@ -5675,6 +5700,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.pd_hits = ts[TPD].data_ptr<int>();
     P.env_hits = ts[TENV].data_ptr<int>();
     P.fall_hits = ts[TFALL].data_ptr<int>();
+    P.tilt_hits = ts[TTILT].data_ptr<int>();
     P.flail_rad = ts[TFLAILR].data_ptr<scalar_t>();
     P.flail_ticks = ts[TFLAILT].data_ptr<int>();
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
