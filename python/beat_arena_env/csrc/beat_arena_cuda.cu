@@ -1543,10 +1543,11 @@ constexpr double ROOT_VANG_NORM = 16.0;
 constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headroom for wall ducks)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: root up-axis tilted more than 30 deg forward/back
-// (sagittal) or 40 deg to the side (lateral) at ANY substep ends the
-// episode, priced like a fall (flat -fall_const). Tangent-squared
-// form on the world up-axis of the root frame; also trips whenever
-// up_y <= 0 (past horizontal, where the ratios lose meaning).
+// (sagittal) or 40 deg to the side (lateral) at the END of a tick
+// ends the episode, priced like a fall (flat -fall_const). Checked
+// per TICK, not per substep (user: substep-rate cost, no benefit).
+// Tangent-squared form on the world up-axis of the root frame; also
+// trips whenever up_y <= 0 (past horizontal).
 constexpr double TILT_TAN2_PITCH = 0.3333333333333333;  // tan^2(30 deg)
 constexpr double TILT_TAN2_ROLL = 0.7040881910418472;   // tan^2(40 deg)
 
@@ -5067,18 +5068,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   T gimp[4] = {T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
-    if constexpr (FC) {
+    if constexpr (FC)
       if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
-      // TILT envelope: world up-axis of the root frame from the
-      // scalar-first quat (up = R * yhat)
-      const T upx = T(2) * (d.quat[1] * d.quat[2] - d.quat[0] * d.quat[3]);
-      const T upy = T(1)
-          - T(2) * (d.quat[1] * d.quat[1] + d.quat[3] * d.quat[3]);
-      const T upz = T(2) * (d.quat[2] * d.quat[3] + d.quat[0] * d.quat[1]);
-      if (upy <= T(0) || upz * upz > T(TILT_TAN2_PITCH) * upy * upy
-          || upx * upx > T(TILT_TAN2_ROLL) * upy * upy)
-        tilted = true;
-    }
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
         gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
@@ -5108,9 +5099,20 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // one per fallen TICK, not per substep (lib.rs: `if fell { fall_hits += 1 }`)
   if constexpr (FC)
     if (fell) atomicAdd(P.fall_hits, 1);
-  // one per tilted TICK, like fall_hits
-  if constexpr (FC)
+  // TILT envelope — ONCE per tick on the end-of-tick state (user
+  // 2026-08-20: substep-rate checking is cost without benefit; a tilt
+  // is not a transient the way a floor dip is). World up-axis of the
+  // root frame from the scalar-first quat (up = R * yhat).
+  if constexpr (FC) {
+    const T upx = T(2) * (d.quat[1] * d.quat[2] - d.quat[0] * d.quat[3]);
+    const T upy = T(1)
+        - T(2) * (d.quat[1] * d.quat[1] + d.quat[3] * d.quat[3]);
+    const T upz = T(2) * (d.quat[2] * d.quat[3] + d.quat[0] * d.quat[1]);
+    if (upy <= T(0) || upz * upz > T(TILT_TAN2_PITCH) * upy * upy
+        || upx * upx > T(TILT_TAN2_ROLL) * upy * upy)
+      tilted = true;
     if (tilted) atomicAdd(P.tilt_hits, 1);
+  }
   if constexpr (FC)
     for (int k = 0; k < N_GROUND_IMP_LANES; k++)
       P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
