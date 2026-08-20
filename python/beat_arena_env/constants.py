@@ -203,7 +203,7 @@ KIND_CHAIN_LINK = 3
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 # env v17 wall reward/geometry literals (spec §12a/b)
-WALL_PEN = -0.05        # per tick with the head inside any wall
+WALL_PEN = -0.5         # ONCE, on the tick the head ENTERS a wall (2026-08-20; was -0.05/tick)
 WALL_FRONT_OFF = 0.25   # viewer front-face offset behind the note plane (m)
 # env v19 (2026-08-16): +1 lane — remaining follow-through credit,
 # Σ over the hand's live trackers of (1 − min(acc/POST_FULL, 1)),

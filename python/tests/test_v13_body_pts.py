@@ -100,6 +100,9 @@ def test_body_pt_lanes_track_motion():
     l_knee_move, r_knee_move = d[2].max(), d[3].max()
     assert l_knee_move > 1e-3, f"driven knee's lanes froze: {d}"
     # welded feet rock the whole body, so the passive side moves too —
-    # only the RATIO is side-selective
-    assert l_knee_move > 2 * r_knee_move, \
+    # only the RATIO is side-selective. Threshold 2x -> 1.25x at the
+    # 2026-08-20 knee 250 -> 150: the driven side's flexion shrank with
+    # the cap while the reaction rocking scales with the same torque
+    # (measured ratio 1.39 at knee-150)
+    assert l_knee_move > 1.25 * r_knee_move, \
         f"knee lanes not side-selective: l {l_knee_move} r {r_knee_move}"
