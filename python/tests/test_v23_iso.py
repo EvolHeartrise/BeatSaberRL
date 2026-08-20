@@ -22,8 +22,13 @@ COEF = 0.01
 
 def _env(**kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
+    # weld mode since 2026-08-20: the iso charge is COMMAND-based
+    # (physics-independent), and in contact mode the chest-tilt/fall
+    # terminal overrides (reward = -fall_const replaces the tick) can
+    # erase the measured gap — full-gear-on-all-29 tips the body
+    # within the velocity-blind test's 5-tick window.
     return CudaBeatVecEnv(64, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=True, gears=5, **KW, **kw)
+                          foot_contact=False, gears=5, **KW, **kw)
 
 
 def _pair():

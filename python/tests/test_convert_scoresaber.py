@@ -184,7 +184,8 @@ RAW_NOTES = [
     (9.0, 0, 0, 0, 1),      # left/red
 ]
 BOMB = (6.0, 0, 2)
-FIRST_NOTE_S = 0.9          # sim time of the first note (whip window)
+FIRST_NOTE_S = 1.0          # sim time of the first note (whip window;
+                            # 0.9 -> 1.0 at the 2026-08-20 shoulder -25%)
 
 
 @pytest.fixture(scope="module")
@@ -212,13 +213,16 @@ def converted(tmp_path_factory):
     rng = np.random.default_rng(5)
     events, done, t = [], False, 0
     while not done:
-        # ticks 0-14: raise/hold the right arm at the +65 pitch stop;
-        # 15-26: whip down through the first note (the P3 gate recipe);
+        # ticks 0-19: raise/hold the right arm at the +65 pitch stop;
+        # 20-39: whip down through the first note (the P3 gate recipe,
+        # retimed 15/27 -> 20/40 at the 2026-08-20 shoulder -25%: the
+        # slower arm needs a longer raise and whip to connect — swept
+        # on-pod, 4 cuts / 185 pts at this timing);
         # then seeded random gears (flail) for the rest of the episode
         a = np.zeros(29, dtype=np.int64)
-        if t < 15:
+        if t < 20:
             a[10] = 1
-        elif t < 27:
+        elif t < 40:
             a[10] = 2
         else:
             a = rng.integers(0, 3, size=29)
