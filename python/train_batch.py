@@ -1257,10 +1257,12 @@ def main():
         # the phantom-swing signal the v19 post_rem obs lane targets.
         # CUDA-backend counter; the Rust wrapper reports zeros.
         if hasattr(venv, "pop_flail"):
-            fl_rad, fl_ticks = venv.pop_flail()
+            fl_l, fl_r, fl_ticks = venv.pop_flail()
             if fl_ticks:
-                print(f"[flail] {fl_rad / fl_ticks:.4f} rad/idle-tick "
-                      f"({fl_ticks} note-free env-ticks)", flush=True)
+                print(f"[flail] {(fl_l + fl_r) / fl_ticks:.4f} "
+                      f"rad/idle-tick (L {fl_l / fl_ticks:.4f} / "
+                      f"R {fl_r / fl_ticks:.4f}; {fl_ticks} note-free "
+                      "env-ticks)", flush=True)
         # 2026-08-20 THE metric (user decision): training accuracy =
         # note score credited / (115 * good cuts) since the last pop.
         # Event-flow ratio — no completion window, no wave phase, no

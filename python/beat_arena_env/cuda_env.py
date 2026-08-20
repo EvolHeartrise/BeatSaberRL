@@ -546,7 +546,7 @@ class CudaBeatVecEnv:
         # deliberately NOT zeroed by reset_env so episode boundaries
         # don't drop data between pops. CUDA-backend-only telemetry —
         # the Rust reference carries the obs change but not this.
-        self.flail_rad = z(N)
+        self.flail_rad = z(N, 2)   # per-hand [L, R] since 2026-08-20
         self.flail_ticks = z(N, dt=torch.int32)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
@@ -794,15 +794,17 @@ class CudaBeatVecEnv:
         return new
 
     def pop_flail(self):
-        """env v19 flail telemetry since the last pop: (blade arc in rad
-        accrued by follow-through-idle hands on note-free ticks, count
-        of note-free env-ticks). Sums the per-env accumulators and
+        """env v19 flail telemetry since the last pop: (L blade arc in
+        rad, R blade arc, count of note-free env-ticks) accrued by
+        follow-through-idle hands on note-free ticks. Per-hand since
+        2026-08-20 (user direction). Sums the per-env accumulators and
         zeroes them — logging-grade, two syncs per call."""
-        rad = float(self.flail_rad.sum().item())
+        per_hand = self.flail_rad.sum(dim=0)
+        rad_l, rad_r = float(per_hand[0].item()), float(per_hand[1].item())
         ticks = int(self.flail_ticks.sum().item())
         self.flail_rad.zero_()
         self.flail_ticks.zero_()
-        return rad, ticks
+        return rad_l, rad_r, ticks
 
     def pop_acc(self):
         """Training-accuracy telemetry since the last pop: (note-score
