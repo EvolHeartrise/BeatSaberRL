@@ -19,9 +19,10 @@ costs. v26-gamma anchors (recipe-unit benches 3000/6000 = these cuts):
 upp 1,008,371 @1500 / 1,154,713 @3000. v28: 991,685 / 1,015,402.
 v27 (gamma 0.965): 1,325,969 / 1,432,843.
 
-Trunk 3,000 updates (recipe-6k), ckpt every 500; cd800 leaves from
-upd 1500 / 3000, benched with BEAT_Z_CLIP_HI=40. Idempotent: re-run
-resumes the trunk from the latest ckpt and skips benched cuts.
+Trunk 3,000 updates (recipe-6k), ckpt every 500; cd800 leaf from
+upd 3000 only (user skipped the 1500 cut mid-run), benched with
+BEAT_Z_CLIP_HI=40. Idempotent: re-run resumes the trunk from the
+latest ckpt and skips benched cuts.
 
     python v29_g99_probe.py
 """
@@ -38,7 +39,7 @@ PY = sys.executable
 RUN_DIR = os.path.join("runs", "v29_g99")
 NUM_ENVS, HORIZON = 32768, 8
 TRUNK_UPDATES = 3_000
-CUTS = [1_500, 3_000]
+CUTS = [3_000]
 COOLDOWN = 800
 Z_CLIP_HI = "40"
 
