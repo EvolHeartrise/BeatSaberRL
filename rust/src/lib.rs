@@ -734,7 +734,7 @@ impl Body {
             tilted: false,
             fall_hits: 0,
             tilt_hits: 0,
-            foot_down_prev: [true, true],
+            foot_down_prev: [false, false],
             foot_lifts_tick: 0,
             foot_lift_hits: 0,
             weld_imp: [0.0; 12],
@@ -774,8 +774,11 @@ impl Body {
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
-        // episode starts standing: both feet grounded
-        self.foot_down_prev = [true, true];
+        // arm-after-first-plant (user 2026-08-20): start UNARMED so a
+        // foot that begins the episode in the air (start-pose jitter)
+        // is never charged — the lift edge only arms once the foot has
+        // actually been seen grounded.
+        self.foot_down_prev = [false, false];
         self.foot_lifts_tick = 0;
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
