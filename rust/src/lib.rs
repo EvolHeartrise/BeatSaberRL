@@ -148,7 +148,7 @@ const Z_MISS_TAIL: f64 = 1.5;
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
 const FALL_ROOT_Y: f64 = 0.45;
-// TILT termination (2026-08-20), contact mode only: root up-axis
+// TILT termination (2026-08-20), contact mode only: CHEST up-axis
 // tilted more than 30 deg forward/back (sagittal) or 40 deg to the
 // side (lateral) at the END of a tick ends the episode, priced like
 // a fall (flat -fall_const). Per-TICK check, not per substep (user:
@@ -668,7 +668,7 @@ struct Body {
     // tick's 8 substeps? Contact mode only. Same envelope pattern as
     // `escaped`: the env terminates the episode and zeroes the reward.
     fell: bool,
-    // TILT (2026-08-20): did the root up-axis exceed the sagittal /
+    // TILT (2026-08-20): did the CHEST up-axis exceed the sagittal /
     // lateral limits during THIS tick's 8 substeps? Same envelope
     // pattern as `fell`, same flat -fall_const pricing.
     tilted: bool,
@@ -922,13 +922,27 @@ impl Body {
         }
         // TILT envelope (2026-08-20): ONCE per tick on the end-of-tick
         // state (substep-rate checking is cost without benefit — a
-        // tilt is not a transient the way a floor dip is). World
-        // up-axis of the root frame from the scalar-first quat.
+        // tilt is not a transient the way a floor dip is). Measured on
+        // the CHEST (user 2026-08-20, v30 night-of-nights replay: the
+        // pelvis-only check was gamed — pelvis surfed 28 deg while the
+        // spine pinned its -20 deg limit for a sustained ~70 deg
+        // backbend). Chest up-axis = R_root * Rx(spine_pitch) *
+        // Ry(spine_yaw) * Rz(spine_roll) * yhat (§1.3 spine stack);
+        // spine-local up composed first, then rotated by the root quat.
         if self.foot_contact {
-            let q = &self.st.quat;
-            let upx = 2.0 * (q[1] * q[2] - q[0] * q[3]);
-            let upy = 1.0 - 2.0 * (q[1] * q[1] + q[3] * q[3]);
-            let upz = 2.0 * (q[2] * q[3] + q[0] * q[1]);
+            let (sp, sy, sr) = (self.st.q[0], self.st.q[1], self.st.q[2]);
+            let (cp, s_p) = (sp.cos(), sp.sin());
+            let (cy, s_y) = (sy.cos(), sy.sin());
+            let (cr, s_r) = (sr.cos(), sr.sin());
+            let v = [
+                -cy * s_r,
+                cp * cr - s_p * s_y * s_r,
+                s_p * cr + cp * s_y * s_r,
+            ];
+            let r = quat_to_rot(self.st.quat);
+            let upx = r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2];
+            let upy = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
+            let upz = r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2];
             if upy <= 0.0
                 || upz * upz > TILT_TAN2_PITCH * upy * upy
                 || upx * upx > TILT_TAN2_ROLL * upy * upy

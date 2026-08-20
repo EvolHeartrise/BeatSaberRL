@@ -1542,7 +1542,7 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // root-escape envelope (SPEC-v10 §20e "reported, never hidden").
 constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headroom for wall ducks)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
-// mirror: root up-axis tilted more than 30 deg forward/back
+// mirror: CHEST up-axis tilted more than 30 deg forward/back
 // (sagittal) or 40 deg to the side (lateral) at the END of a tick
 // ends the episode, priced like a fall (flat -fall_const). Checked
 // per TICK, not per substep (user: substep-rate cost, no benefit).
@@ -5117,13 +5117,30 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     if (fell) atomicAdd(P.fall_hits, 1);
   // TILT envelope — ONCE per tick on the end-of-tick state (user
   // 2026-08-20: substep-rate checking is cost without benefit; a tilt
-  // is not a transient the way a floor dip is). World up-axis of the
-  // root frame from the scalar-first quat (up = R * yhat).
+  // is not a transient the way a floor dip is). Measured on the CHEST
+  // (user 2026-08-20, v30 night-of-nights replay: the pelvis-only
+  // check was gamed — pelvis surfed 28 deg while the spine pinned its
+  // -20 deg limit for a sustained ~70 deg backbend). Chest up-axis =
+  // R_root * Rx(spine_pitch) * Ry(spine_yaw) * Rz(spine_roll) * yhat;
+  // the spine-local up v is composed first, then quat-rotated.
   if constexpr (FC) {
-    const T upx = T(2) * (d.quat[1] * d.quat[2] - d.quat[0] * d.quat[3]);
-    const T upy = T(1)
-        - T(2) * (d.quat[1] * d.quat[1] + d.quat[3] * d.quat[3]);
-    const T upz = T(2) * (d.quat[2] * d.quat[3] + d.quat[0] * d.quat[1]);
+    const T cp = cos(d.q[0]), sp = sin(d.q[0]);
+    const T cy = cos(d.q[1]), sy = sin(d.q[1]);
+    const T cr = cos(d.q[2]), sr = sin(d.q[2]);
+    const T v0 = -cy * sr;
+    const T v1 = cp * cr - sp * sy * sr;
+    const T v2 = sp * cr + cp * sy * sr;
+    const T qw = d.quat[0], qx = d.quat[1], qy = d.quat[2],
+            qz = d.quat[3];
+    const T upx = (T(1) - T(2) * (qy * qy + qz * qz)) * v0
+        + T(2) * (qx * qy - qw * qz) * v1
+        + T(2) * (qx * qz + qw * qy) * v2;
+    const T upy = T(2) * (qx * qy + qw * qz) * v0
+        + (T(1) - T(2) * (qx * qx + qz * qz)) * v1
+        + T(2) * (qy * qz - qw * qx) * v2;
+    const T upz = T(2) * (qx * qz - qw * qy) * v0
+        + T(2) * (qy * qz + qw * qx) * v1
+        + (T(1) - T(2) * (qx * qx + qy * qy)) * v2;
     if (upy <= T(0) || upz * upz > T(TILT_TAN2_PITCH) * upy * upy
         || upx * upx > T(TILT_TAN2_ROLL) * upy * upy)
       tilted = true;
