@@ -5319,7 +5319,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       break;
     }
     if (next_gap > T(FLAIL_LEAD_S)) {
-      T fr = T(0);
+      // per-HAND accumulation since 2026-08-20 (user: separate L/R
+      // flail in the training telemetry) — flail_rad is (E, 2)
       for (int h = 0; h < 2; h++) {
         bool live = false;
         for (int kk = 0; kk < N_TRACKERS; kk++)
@@ -5327,9 +5328,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
             live = true;
             break;
           }
-        if (!live) fr += deltas[h];
+        if (!live) P.flail_rad[e * 2 + h] += deltas[h];
       }
-      P.flail_rad[e] += fr;
       P.flail_ticks[e] += 1;
     }
   }
