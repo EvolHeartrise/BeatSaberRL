@@ -1540,15 +1540,15 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // ONLY — lib.rs FALL_ROOT_Y. Root below this at ANY substep of the tick
 // ends the episode with a ZEROED reward, reported exactly like the
 // root-escape envelope (SPEC-v10 §20e "reported, never hidden").
-constexpr double FALL_ROOT_Y = 0.4;  // 2026-08-20: 0.55 -> 0.45 -> 0.4 (crouch headroom; chest-tilt cone guards the fold)
+constexpr double FALL_ROOT_Y = 0.35;  // 2026-08-20: 0.55 -> 0.45 -> 0.4 -> 0.35 (crouch headroom; chest-tilt cone guards the fold)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
-// mirror: CHEST up-axis tilted more than 30 deg forward/back
+// mirror: CHEST up-axis tilted more than 40 deg forward/back
 // (sagittal) or 40 deg to the side (lateral) at the END of a tick
 // ends the episode, priced like a fall (flat -fall_const). Checked
 // per TICK, not per substep (user: substep-rate cost, no benefit).
 // Tangent-squared form on the world up-axis of the root frame; also
 // trips whenever up_y <= 0 (past horizontal).
-constexpr double TILT_TAN2_PITCH = 0.3333333333333333;  // tan^2(30 deg)
+constexpr double TILT_TAN2_PITCH = 0.7040881910418472;  // tan^2(40 deg) — 30 -> 40 (user 2026-08-20)
 constexpr double TILT_TAN2_ROLL = 0.7040881910418472;   // tan^2(40 deg)
 // FOOT-LIFT penalty (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: flat charge on the TICK a foot leaves the ground (edge:

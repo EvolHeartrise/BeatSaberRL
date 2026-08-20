@@ -528,7 +528,7 @@ class CudaBeatVecEnv:
         # per (env, tick); always 0 in weld mode
         self._fall_hits = z(1, dt=torch.int32)
         self._fall_popped = 0
-        # TILT terminations (2026-08-20): root up-axis > 30 deg
+        # TILT terminations (2026-08-20): chest up-axis > 40 deg
         # sagittal / > 40 deg lateral, fall-priced
         self._tilt_hits = z(1, dt=torch.int32)
         self._tilt_popped = 0
@@ -764,7 +764,7 @@ class CudaBeatVecEnv:
         §4) — the Rust backend's pop_fall_hits mirror, same shape as
         pop_envelope_hits. Counted per (env, tick): each one terminated an
         env's episode with a zeroed reward because its root dropped below
-        FALL_ROOT_Y = 0.4 m. Always 0 with foot_contact=False, where the
+        FALL_ROOT_Y = 0.35 m. Always 0 with foot_contact=False, where the
         feet cannot let go. One sync."""
         total = int(self._fall_hits.item())
         new = total - self._fall_popped
@@ -773,7 +773,7 @@ class CudaBeatVecEnv:
 
     def pop_tilt_hits(self):
         """TILT terminations since the last pop (2026-08-20): CHEST
-        up-axis (root x spine stack) tilted more than 30 deg
+        up-axis (root x spine stack) tilted more than 40 deg
         forward/back or 40 deg to the
         side at end of tick (per-TICK check, not per substep) —
         episode ends priced at the flat fall_const, exactly like a

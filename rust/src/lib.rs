@@ -147,14 +147,14 @@ const Z_MISS_TAIL: f64 = 1.5;
 // minimum. Reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
-const FALL_ROOT_Y: f64 = 0.4;
+const FALL_ROOT_Y: f64 = 0.35;
 // TILT termination (2026-08-20), contact mode only: CHEST up-axis
-// tilted more than 30 deg forward/back (sagittal) or 40 deg to the
+// tilted more than 40 deg forward/back (sagittal) or 40 deg to the
 // side (lateral) at the END of a tick ends the episode, priced like
 // a fall (flat -fall_const). Per-TICK check, not per substep (user:
 // substep-rate cost, no benefit). Tangent-squared form on
 // up = R * yhat; also trips whenever up_y <= 0 (past horizontal).
-const TILT_TAN2_PITCH: f64 = 0.3333333333333333; // tan^2(30 deg)
+const TILT_TAN2_PITCH: f64 = 0.7040881910418472; // tan^2(40 deg) — 30 -> 40 (user 2026-08-20)
 const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
 // FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
 // the TICK a foot leaves the ground (edge: that foot's tick-summed
@@ -2232,7 +2232,7 @@ impl RawBeatSim {
     }
 
     /// TILT terminations since the last pop (2026-08-20): root up-axis
-    /// > 30 deg sagittal / > 40 deg lateral at any substep, priced at
+    /// > 40 deg sagittal / > 40 deg lateral at end of tick, priced at
     /// the flat fall_const — the CUDA backend's `pop_tilt_hits` mirror.
     fn pop_tilt_hits(&mut self) -> u64 {
         let h = self.core.body.tilt_hits;
@@ -3009,7 +3009,7 @@ mod env_tests {
 
     /// Unilateral-contact spec §5 (d), updated 2026-08-20: in contact
     /// mode a hard lean (full +hip_pitch gears) now trips the TILT
-    /// envelope (root up-axis > 30 deg sagittal) BEFORE the root can
+    /// envelope (chest up-axis > 40 deg sagittal) BEFORE the root can
     /// drop below FALL_ROOT_Y — terminating the episode priced flat at
     /// -fall_const and COUNTED, the root-escape envelope's contract.
     /// The fall path shares the same pricing branch (fell || tilted),
