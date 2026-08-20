@@ -418,7 +418,10 @@ def test_rust_combo_walk_matches_python():
     # seed 7's lucky random hits stopped connecting in episode 0
     # (the walk itself matched exactly; only score>0 broke).
     # 17 -> 41 (env v20): same story again under the arm ready stance.
-    acts = np.random.default_rng(41).integers(0, 3, size=(400, 2, 29))
+    # 41 -> 42 (2026-08-20 spine -25%): and again — the weaker waist
+    # rewrote the flail trajectory (swept: 42 scores 342/114, exact
+    # walk match).
+    acts = np.random.default_rng(42).integers(0, 3, size=(400, 2, 29))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
     while not all(r is not None for r in rust_result):
