@@ -346,9 +346,11 @@ def parse_args():
                         "(CUDA env only). 0 disables")
     p.add_argument("--push-vmax", type=float, default=0.5,
                    help="max kick magnitude m/s (|dv| ~ U(0, vmax))")
-    p.add_argument("--start-jitter", type=float, default=0.2,
-                   help="episode-start kick magnitude m/s applied to "
-                        "freshly reset envs (RSI-flavored start variety)")
+    p.add_argument("--start-jitter", type=float, default=0.15,
+                   help="episode-start kick cap m/s for freshly reset "
+                        "envs: |dv| ~ U(0, s), direction uniform "
+                        "(RSI-flavored start variety; 0.2 -> 0.15 "
+                        "2026-08-20)")
     p.add_argument("--foot-hinge-r", type=float, default=0.0,
                    help="env v22: free radius (m) for BOTH foot penalties "
                         "— deviation inside it costs nothing (target "
