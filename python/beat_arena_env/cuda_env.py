@@ -532,6 +532,13 @@ class CudaBeatVecEnv:
         # sagittal / > 40 deg lateral, fall-priced
         self._tilt_hits = z(1, dt=torch.int32)
         self._tilt_popped = 0
+        # FOOT-LIFT penalty (2026-08-20): lift-event pop counter +
+        # per-foot grounded-last-tick edge state (starts True: episodes
+        # begin standing; kernel re-trues it on every reset)
+        self._lift_hits = z(1, dt=torch.int32)
+        self._lift_popped = 0
+        self.foot_down_prev = z(N, 2, dt=torch.bool)
+        self.foot_down_prev.fill_(True)
         # env v19 flail telemetry (per env, kernel-accrued): blade arc
         # on note-free ticks by hands with no live follow-through, and
         # the note-free tick count. Popped + zeroed by pop_flail;
@@ -594,7 +601,7 @@ class CudaBeatVecEnv:
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
-            self._tilt_hits,
+            self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
             self.acc_pts, self.acc_cuts,
             self.ground_imp,
@@ -772,6 +779,16 @@ class CudaBeatVecEnv:
         total = int(self._tilt_hits.item())
         new = total - self._tilt_popped
         self._tilt_popped = total
+        return new
+
+    def pop_foot_lifts(self):
+        """Foot-lift events since the last pop (2026-08-20): a foot's
+        tick-summed ground normal impulse hit zero after a grounded
+        tick — each charged the flat FOOT_LIFT_PEN (-0.1), per foot.
+        Always 0 with foot_contact=False. One sync."""
+        total = int(self._lift_hits.item())
+        new = total - self._lift_popped
+        self._lift_popped = total
         return new
 
     def pop_flail(self):
