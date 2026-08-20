@@ -679,10 +679,10 @@ struct Body {
     tilt_hits: u64,
     // FOOT-LIFT (2026-08-20): per-foot grounded-last-tick edge state,
     // this tick's lift-event count (0..2), and the cumulative pop
-    // counter (pop_foot_lifts) — fall_hits pattern.
+    // counters (pop_foot_lifts, PER FOOT [L, R]) — fall_hits pattern.
     foot_down_prev: [bool; 2],
     foot_lifts_tick: u8,
-    foot_lift_hits: u64,
+    foot_lift_hits: [u64; 2],
     // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
@@ -736,7 +736,7 @@ impl Body {
             tilt_hits: 0,
             foot_down_prev: [false, false],
             foot_lifts_tick: 0,
-            foot_lift_hits: 0,
+            foot_lift_hits: [0, 0],
             weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
             foot_grf: [[0.0; 3]; 2],
@@ -964,7 +964,7 @@ impl Body {
                     self.ground_imp[f * 2] + self.ground_imp[f * 2 + 1] > 0.0;
                 if !down && self.foot_down_prev[f] {
                     self.foot_lifts_tick += 1;
-                    self.foot_lift_hits += 1;
+                    self.foot_lift_hits[f] += 1;
                 }
                 self.foot_down_prev[f] = down;
             }
@@ -2240,14 +2240,14 @@ impl RawBeatSim {
         h
     }
 
-    /// Foot-lift events since the last pop (2026-08-20): a foot's
-    /// tick-summed ground normal impulse hit zero after a grounded
-    /// tick — each charged the flat FOOT_LIFT_PEN. The CUDA backend's
-    /// `pop_foot_lifts` mirror.
-    fn pop_foot_lifts(&mut self) -> u64 {
+    /// Foot-lift events since the last pop (2026-08-20), (left,
+    /// right) — a foot's tick-summed ground normal impulse hit zero
+    /// after a grounded tick, each charged the flat FOOT_LIFT_PEN.
+    /// The CUDA backend's `pop_foot_lifts` mirror.
+    fn pop_foot_lifts(&mut self) -> (u64, u64) {
         let h = self.core.body.foot_lift_hits;
-        self.core.body.foot_lift_hits = 0;
-        h
+        self.core.body.foot_lift_hits = [0, 0];
+        (h[0], h[1])
     }
 
     /// R26 per-substep instrumentation counters since the last pop —
@@ -2670,17 +2670,17 @@ impl VecBeatSim {
     }
 
     /// Foot-lift events summed over all envs since the last pop
-    /// (2026-08-20) — the CUDA backend's `pop_foot_lifts` mirror.
-    /// ADDITIVE getter; always 0 in weld mode.
-    fn pop_foot_lifts(&mut self) -> u64 {
-        self.sims
-            .iter_mut()
-            .map(|s| {
-                let h = s.body.foot_lift_hits;
-                s.body.foot_lift_hits = 0;
-                h
-            })
-            .sum()
+    /// (2026-08-20), (left, right) — the CUDA backend's
+    /// `pop_foot_lifts` mirror. ADDITIVE getter; (0, 0) in weld mode.
+    fn pop_foot_lifts(&mut self) -> (u64, u64) {
+        let (mut l, mut r) = (0u64, 0u64);
+        for s in self.sims.iter_mut() {
+            let h = s.body.foot_lift_hits;
+            s.body.foot_lift_hits = [0, 0];
+            l += h[0];
+            r += h[1];
+        }
+        (l, r)
     }
 
     /// Fall terminations in env i's current episode (contact spec §4).
