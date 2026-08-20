@@ -4771,9 +4771,12 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
   P.in_wall_prev[e] = false;
-  // episode starts standing: both feet grounded
-  P.foot_down_prev[e * 2] = true;
-  P.foot_down_prev[e * 2 + 1] = true;
+  // arm-after-first-plant (user 2026-08-20): start UNARMED so a foot
+  // that begins the episode in the air (start-pose jitter) is never
+  // charged — the lift edge only arms once the foot has actually been
+  // seen grounded.
+  P.foot_down_prev[e * 2] = false;
+  P.foot_down_prev[e * 2 + 1] = false;
   for (int i = 0; i < P.W; i++) P.wall_passed[e * P.W + i] = false;
 }
 

@@ -533,12 +533,13 @@ class CudaBeatVecEnv:
         self._tilt_hits = z(1, dt=torch.int32)
         self._tilt_popped = 0
         # FOOT-LIFT penalty (2026-08-20): lift-event pop counter +
-        # per-foot grounded-last-tick edge state (starts True: episodes
-        # begin standing; kernel re-trues it on every reset)
+        # per-foot grounded-last-tick edge state. Starts False
+        # (UNARMED): a foot that begins an episode in the air is never
+        # charged — the edge arms on the first grounded tick (kernel
+        # re-falses it on every reset).
         self._lift_hits = z(1, dt=torch.int32)
         self._lift_popped = 0
         self.foot_down_prev = z(N, 2, dt=torch.bool)
-        self.foot_down_prev.fill_(True)
         # env v19 flail telemetry (per env, kernel-accrued): blade arc
         # on note-free ticks by hands with no live follow-through, and
         # the note-free tick count. Popped + zeroed by pop_flail;
