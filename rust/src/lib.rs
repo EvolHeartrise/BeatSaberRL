@@ -192,11 +192,14 @@ const KIND_CHAIN_HEAD: u8 = 2;
 const KIND_CHAIN_LINK: u8 = 3;
 
 // env v17 (contact spec §12): walls. The head CENTER is the collision
-// point (no sweep); each tick inside ANY wall costs WALL_PEN once.
+// point (no sweep). WALL_PEN is charged ONCE, on the tick the head
+// ENTERS a wall (the was_in_wall rising edge, same trigger as the
+// combo break; >= 1 tick fully outside re-arms it) — 2026-08-20,
+// was -0.05 every tick inside. walls_in still counts ticks inside.
 // The viewer builds wall front faces 0.25 m behind the note plane
 // ("walls just built like that" — WallManager.cs UpdateVisual), so a
 // wall's front reaches the head 0.4/NJS s after its nominal time.
-const WALL_PEN: f64 = -0.05;
+const WALL_PEN: f64 = -0.5;
 const WALL_FRONT_OFF: f64 = 0.25;
 
 // --- obs layout v17 (spec §12d; offsets DERIVED, order is a contract) --------
@@ -1743,11 +1746,13 @@ impl Core {
             if !self.was_in_wall {
                 // rising edge: COMBO BREAK (event 8). The scoring
                 // layers (ComboWalk / ComboTracker / .dat walk) break
-                // on 8 and IGNORE 7 — spec §12b combo rule.
+                // on 8 and IGNORE 7 — spec §12b combo rule. Since
+                // 2026-08-20 WALL_PEN is also charged HERE, once per
+                // entry, instead of every tick inside.
                 self.wall_enters += 1;
                 self.events_buf.push((u32::MAX, 8, 0.0, 0.0, 0.0));
+                reward += WALL_PEN;
             }
-            reward += WALL_PEN;
             self.walls_in += 1;
             // event code 7: head-in-wall tick (note id unused -> u32::MAX)
             self.events_buf.push((u32::MAX, 7, 0.0, 0.0, 0.0));
@@ -2177,8 +2182,9 @@ impl RawBeatSim {
     fn bombs_hit(&self) -> u32 {
         self.core.bombs_hit
     }
-    /// env v17: ticks this episode with the head inside a wall (each
-    /// charged WALL_PEN). ADDITIVE getter (spec §12b).
+    /// env v17: ticks this episode with the head inside a wall
+    /// (telemetry only since 2026-08-20 — WALL_PEN now lands once per
+    /// wall_enters edge, not per tick). ADDITIVE getter (spec §12b).
     #[getter]
     fn walls_in(&self) -> u32 {
         self.core.walls_in

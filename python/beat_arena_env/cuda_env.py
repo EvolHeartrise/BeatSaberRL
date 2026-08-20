@@ -563,6 +563,9 @@ class CudaBeatVecEnv:
         self.wall_passed = z(N, self.W, dt=torch.bool)
         self.first_wall = z(N, dt=torch.int32)
         self.walls_in = z(N, dt=torch.int32)
+        # head-in-wall state last tick — entry-edge for the
+        # once-per-entry WALL_PEN (2026-08-20; kernel-reset per episode)
+        self.in_wall_prev = z(N, dt=torch.bool)
         # episode-return ring buffer (device-side)
         self._cap = 4096
         self._ret_buf = z(self._cap)
@@ -604,6 +607,7 @@ class CudaBeatVecEnv:
             p["wall_h"], p["wall_len"], p["wall_speed"],
             p["wall_valid"], p["n_walls"],
             self.wall_passed, self.first_wall, self.walls_in,
+            self.in_wall_prev,
             self._ret_buf, self._ret_total, self._obs, self._reward,
             self._done,
         ]
