@@ -344,9 +344,9 @@ def parse_args():
                         "winner, ~1 kick / 10 s / env): per-(env,tick) "
                         "probability of a horizontal root-velocity kick "
                         "(CUDA env only). 0 disables")
-    p.add_argument("--push-vmax", type=float, default=0.25,
+    p.add_argument("--push-vmax", type=float, default=0.15,
                    help="max kick magnitude m/s (|dv| ~ U(0, vmax); "
-                        "0.5 -> 0.25 2026-08-20)")
+                        "0.5 -> 0.15 2026-08-20)")
     p.add_argument("--start-jitter", type=float, default=0.15,
                    help="episode-start kick cap m/s for freshly reset "
                         "envs: |dv| ~ U(0, s), direction uniform "
