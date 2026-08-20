@@ -40,6 +40,10 @@ RUN_DIR = os.path.join("runs", "v30_package")
 NUM_ENVS, HORIZON = 32768, 8
 TRUNK_UPDATES = 4_500
 CUTS = [1_500, 3_000, 4_500]
+# user 2026-08-20: benches skipped for the 1500/3000 leaves — leaf
+# training acc is the read there; only the terminal leaf gets the
+# full bench (leaves are still cut at every rung)
+BENCH_CUTS = [4_500]
 COOLDOWN = 800
 Z_CLIP_HI = "40"
 
@@ -56,6 +60,24 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--start-pose-jitter", "0.15", "--foot-z-coef", "0.01",
           "--foot-x-coef", "0.01",
           "--foot-hinge-r", "0.12", "--foot-shape-coef", "0.05"]
+
+
+def leaf_only_stats(run_dir):
+    """leaf_stats minus the bench fields — field-name parsing (never
+    positional) of the leaf log's last update line."""
+    ret = ev = acc = "?"
+    with open(os.path.join(run_dir, "leaf.log"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("update"):
+                parts = line.split()
+
+                def fld(name, parts=parts):
+                    return (parts[parts.index(name) + 1]
+                            if name in parts else "?")
+                ret = fld("ep_return(last100)")
+                ev = fld("ev")
+                acc = fld("acc")
+    return f"leaf_return {ret} leaf_acc {acc} leaf_ev {ev} bench SKIPPED"
 
 
 def run(cmd, log_path, timeout, env_extra=None):
@@ -98,7 +120,7 @@ def main():
         ck = os.path.join(RUN_DIR, f"trunk_upd{cut:05d}.pt")
         rd = os.path.join("runs", f"v30_cut{cut:05d}_cd{COOLDOWN}")
         out = os.path.join("bench", f"v30_package_leaf{cut:05d}.json")
-        if os.path.exists(out):
+        if cut in BENCH_CUTS and os.path.exists(out):
             print(f"[v30-probe] cut {cut} already benched", flush=True)
             continue
         os.makedirs(rd, exist_ok=True)
@@ -112,6 +134,10 @@ def main():
                     os.path.join(rd, "leaf.log"), 14_400)
             print(f"[v30-probe] cut {cut} leaf done in {w/60:.1f} min",
                   flush=True)
+        if cut not in BENCH_CUTS:
+            print(f"PROBE_RESULT v30_package@{cut} {leaf_only_stats(rd)}",
+                  flush=True)
+            continue
         leaf = [f for f in os.listdir(rd)
                 if f.startswith("leaf_from") and f.endswith(".pt")][0]
         # the bench backend is the RUST sim: it reads BEAT_Z_CLIP_HI
