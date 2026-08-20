@@ -150,9 +150,10 @@ const Z_MISS_TAIL: f64 = 1.5;
 const FALL_ROOT_Y: f64 = 0.45;
 // TILT termination (2026-08-20), contact mode only: root up-axis
 // tilted more than 30 deg forward/back (sagittal) or 40 deg to the
-// side (lateral) at ANY substep ends the episode, priced like a fall
-// (flat -fall_const). Tangent-squared form on up = R * yhat; also
-// trips whenever up_y <= 0 (past horizontal).
+// side (lateral) at the END of a tick ends the episode, priced like
+// a fall (flat -fall_const). Per-TICK check, not per substep (user:
+// substep-rate cost, no benefit). Tangent-squared form on
+// up = R * yhat; also trips whenever up_y <= 0 (past horizontal).
 const TILT_TAN2_PITCH: f64 = 0.3333333333333333; // tan^2(30 deg)
 const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
 
@@ -853,20 +854,6 @@ impl Body {
             if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
                 fell = true;
             }
-            // TILT envelope (2026-08-20): world up-axis of the root
-            // frame from the scalar-first quat (up = R * yhat)
-            if self.foot_contact {
-                let q = &self.st.quat;
-                let upx = 2.0 * (q[1] * q[2] - q[0] * q[3]);
-                let upy = 1.0 - 2.0 * (q[1] * q[1] + q[3] * q[3]);
-                let upz = 2.0 * (q[2] * q[3] + q[0] * q[1]);
-                if upy <= 0.0
-                    || upz * upz > TILT_TAN2_PITCH * upy * upy
-                    || upx * upx > TILT_TAN2_ROLL * upy * upy
-                {
-                    tilted = true;
-                }
-            }
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
             let nweld = self.cs.weld_rows();
@@ -913,6 +900,22 @@ impl Body {
         self.fell = fell;
         if fell {
             self.fall_hits += 1;
+        }
+        // TILT envelope (2026-08-20): ONCE per tick on the end-of-tick
+        // state (substep-rate checking is cost without benefit — a
+        // tilt is not a transient the way a floor dip is). World
+        // up-axis of the root frame from the scalar-first quat.
+        if self.foot_contact {
+            let q = &self.st.quat;
+            let upx = 2.0 * (q[1] * q[2] - q[0] * q[3]);
+            let upy = 1.0 - 2.0 * (q[1] * q[1] + q[3] * q[3]);
+            let upz = 2.0 * (q[2] * q[3] + q[0] * q[1]);
+            if upy <= 0.0
+                || upz * upz > TILT_TAN2_PITCH * upy * upy
+                || upx * upx > TILT_TAN2_ROLL * upy * upy
+            {
+                tilted = true;
+            }
         }
         self.tilted = tilted;
         if tilted {
