@@ -14,13 +14,18 @@ v26's 0.99 which still bought one arm's elbow park). The probe asks:
 with the obs grown to (partially) match, does a 5 s horizon pay for
 itself — and does the +10.6% residual premium still buy the park?
 
-Trunk 4,500 updates (recipe-9k, 1.18B steps), ckpt every 500; cd800
-leaves (user direction; the two-depth cd law: longer won everywhere,
-plateau 400-800) from upd 1500 / 3000 / 4500, each benched with
-BEAT_Z_CLIP_HI=40 (the rust bench backend reads the env var).
+Trunk 7,500 updates (recipe-15k, 1.97B steps; extended from 4,500 by
+user direction 2026-08-20), ckpt every 500; cd800 leaves (user
+direction; the two-depth cd law: longer won everywhere, plateau
+400-800) every 1,500 updates: upd 1500 / 3000 / 4500 / 6000 / 7500,
+each benched with BEAT_Z_CLIP_HI=40 (the rust bench backend reads the
+env var). Idempotent: re-running resumes the trunk from the latest
+stored ckpt and skips already-benched cuts, so the 7.5k extension is
+just this same script run again after the 4.5k pass.
 
 Judges vs the v27 line at matched depth: cd400@1500 1,325,969;
-cd400@3000 1,432,843; cd800@4500 1,491,015 (all-time #2). acc is THE
+cd400@3000 1,432,843; cd800@4500 1,491,015; cd800@6000 1,528,494
+(all-time record); 7500 is past v27's deepest point. acc is THE
 training metric; elbow-at-contact on the winner decides the posture
 claim (v27 12k-equiv parked at L 3.0 / R 4.5 despite acc records).
 
@@ -38,8 +43,8 @@ import time
 PY = sys.executable
 RUN_DIR = os.path.join("runs", "v28_zgamma")
 NUM_ENVS, HORIZON = 32768, 8
-TRUNK_UPDATES = 4_500
-CUTS = [1_500, 3_000, 4_500]
+TRUNK_UPDATES = 7_500
+CUTS = [1_500, 3_000, 4_500, 6_000, 7_500]
 COOLDOWN = 800
 Z_CLIP_HI = "40"
 
