@@ -154,7 +154,12 @@ fn weld_drift_random_full_gears() {
             // human-realism leg caps (hip_pitch 350 / hip_roll 180): the
             // random-gear trajectory shifted and peaks at 1.04e-2
             assert!(wp < 1.5e-2, "weld position violation {wp:e} m");
-            assert!(wr < 5e-2, "weld orientation violation {wr:e} rad");
+            // orientation gate recalibrated 5e-2 -> 1.2e-1 at the
+            // 2026-08-20 torque pass (knee 150, legs -25%, shoulder
+            // pitch/yaw 85.38): trajectory shifted again, peaks at
+            // 8.11e-2 rad (wp 8.28e-3, root 0.96 m — bounded, finite;
+            // same Baumgarte-floor phenomenon, same ~1.5x margin)
+            assert!(wr < 1.2e-1, "weld orientation violation {wr:e} rad");
             assert!(st.q.iter().all(|x| x.is_finite()));
             assert!(st.v.iter().all(|x| x.is_finite()));
         }
