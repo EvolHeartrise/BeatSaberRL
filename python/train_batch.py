@@ -843,6 +843,7 @@ def main():
               "cooldown", flush=True)
     steps_before = global_step
     t_rollout = t_update = 0.0
+    diag_probe_obs = None    # frozen first-diag batch (psrank probe)
     start = time.time()
 
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
@@ -1028,6 +1029,26 @@ def main():
             sv = torch.linalg.svdvals(h_d - h_d.mean(0))
             cum = sv.cumsum(0) / sv.sum().clamp_min(1e-12)
             srank = int((cum < 0.99).sum().item()) + 1
+            # fixed-probe srank (2026-08-20): the on-policy srank
+            # confounds representation contraction with STATE-
+            # DISTRIBUTION narrowing (a sharpening policy visits fewer
+            # states). Freeze the first diag batch of this process and
+            # re-measure rank on it every diag: probe-srank stable
+            # while on-policy srank falls = benign narrowing; both
+            # falling = genuine capacity contraction (plasticity loss)
+            # -> act (weight decay / resets / scale-up).
+            if diag_probe_obs is None:
+                diag_probe_obs = f_obs[:dn].clone()
+            with torch.no_grad():
+                policy._diag_stash = True
+                policy.get_action_and_value(diag_probe_obs,
+                                            need_entropy=False)
+                policy._diag_stash = False
+            hp = policy._diag_h.float()
+            policy._diag_h = None
+            svp = torch.linalg.svdvals(hp - hp.mean(0))
+            cump = svp.cumsum(0) / svp.sum().clamp_min(1e-12)
+            psrank = int((cump < 0.99).sum().item()) + 1
             per_g = "  ".join(
                 f"{nm} {g_pi[a:b].norm().item():.1e}/"
                 f"{g_v[a:b].norm().item():.1e}"
@@ -1035,7 +1056,8 @@ def main():
             print(f"[diag] upd {update + 1}  gradcos {gcos.item():+.3f}"
                   f"  |g_pi| {n_pi.item():.2e}  |g_v| {n_v.item():.2e}"
                   f"  dormant {dorm.item():.3f}  srank {srank}/"
-                  f"{h_d.shape[1]}  pi/v: {per_g}", flush=True)
+                  f"{h_d.shape[1]}  psrank {psrank}"
+                  f"  pi/v: {per_g}", flush=True)
 
         for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
