@@ -5,7 +5,8 @@
 //! not merely "some standing".
 //!
 //! §5 (a) settle, (b) no-pull + weight support, (c) static friction
-//! (100 N holds / 1000 N slides), (e) bitwise determinism, (f) weld
+//! (40 N holds / 1000 N slides; hold arm 100 -> 40 N at the
+//! 2026-08-20 torque softening), (e) bitwise determinism, (f) weld
 //! regression. §5 (d) fall termination is an ENV-layer gate and lives in
 //! lib.rs `env_tests` beside its root-escape twin.
 
@@ -156,9 +157,17 @@ fn no_pull_and_weight_is_carried() {
     );
 }
 
-/// Gate §5 (c) STATIC FRICTION: from a settled stance, 0.5 s of lateral
-/// +x root push. At 100 N the μ = 0.9 cone must HOLD the loaded sole
-/// corners; at 1000 N (> μ·mg ≈ 662 N) the stance must slide out.
+/// Gate §5 (c) STATIC FRICTION: from a settled stance, a sustained
+/// lateral +x root push. At 40 N the μ = 0.9 cone must HOLD the loaded
+/// sole corners; at 1000 N (> μ·mg ≈ 662 N) the stance must slide out.
+///
+/// Hold-arm force 100 -> 40 N (2026-08-20 spine -25% / leg torque
+/// pass): the muscle-tone stance's P-gains scale with tau_max, and at
+/// the softened waist a sustained 100 N (or 60 N) has NO static lean —
+/// the body folds until a foot unloads, its shrunken cone lets go, and
+/// the stance walks away (root 1.6 m by 1.4 s at 100 N). The friction
+/// CONTRACT is unchanged; 40 N is the posture-holdable load at the new
+/// gains (measured: 0.57 mm slip, 2 corners loaded, 0.59 m lean).
 ///
 /// AMBIGUITY RESOLVED (recorded, not silently deviated from), two
 /// points, both about WHAT IS MEASURED — the scenario and the forces are
@@ -193,7 +202,7 @@ fn no_pull_and_weight_is_carried() {
 /// runaway (past the cone nothing stays penetrating or in-margin, so
 /// corner travel is unmeasurable there by construction).
 #[test]
-fn static_friction_holds_at_100n_and_slides_at_1000n() {
+fn static_friction_holds_at_40n_and_slides_at_1000n() {
     let m = super::testutil::muscle_model();
     let (kp, _kd) = super::testutil::muscle_gains();
     let mut slip_load = [0.0f64; 2]; // corners penetrating at both ends
@@ -202,7 +211,7 @@ fn static_friction_holds_at_100n_and_slides_at_1000n() {
     let mut root = [0.0f64; 2];
     // slide arm must clear the cone: MU * 736 N body weight (~662 N at
     // mu = 0.9), so 1000 N with ~50 % margin
-    for (case, push) in [(0usize, 100.0f64), (1, 1000.0)] {
+    for (case, push) in [(0usize, 40.0f64), (1, 1000.0)] {
         let mut ws = Workspace::new(&m);
         let mut st = State::neutral(&m);
         let mut cs = contact_set(&m);
@@ -235,9 +244,11 @@ fn static_friction_holds_at_100n_and_slides_at_1000n() {
         };
         run(&mut st, &mut ws, &mut cs, 960, 0.0); // 4 s settle
         let rx0 = st.p[0];
-        // 0.9 s of lean transient (the 2026-08-17 leg caps softened the
-        // hip springs, so the lean settles slower than the old 0.4 s)
-        run(&mut st, &mut ws, &mut cs, 216, push);
+        // 1.4 s of lean transient (the 2026-08-17 leg caps softened the
+        // hip springs — 0.4 s -> 0.9 s; the 2026-08-20 spine -25% pass
+        // softened the waist too and 0.9 s still left 1.3 mm of creep
+        // in the measurement window)
+        run(&mut st, &mut ws, &mut cs, 336, push);
         let cm = corners(&st, &mut ws); // steady-state window start
         run(&mut st, &mut ws, &mut cs, 24, push); // final 0.1 s
         let c1 = corners(&st, &mut ws);
@@ -261,24 +272,24 @@ fn static_friction_holds_at_100n_and_slides_at_1000n() {
     }
     // HOLD arm: loaded corners must be STUCK once the lean settles —
     // < 1 mm over the final 0.1 s (i.e. creep < 1 cm/s)
-    assert!(tracked[0] >= 2, "100 N: only {} corners stayed loaded", tracked[0]);
+    assert!(tracked[0] >= 2, "40 N: only {} corners stayed loaded", tracked[0]);
     assert!(
         slip_load[0] < 0.001,
-        "100 N steady-state creep {:.4} m / 0.1 s — the μ = 0.9 cone should hold",
+        "40 N steady-state creep {:.4} m / 0.1 s — the μ = 0.9 cone should hold",
         slip_load[0]
     );
     // lean bound 0.15 -> 0.7: at the 2026-08-17 human leg caps the
     // stance springs are softer and 100 N held for 1.0 s leans the body
     // ~0.56 m (feet STUCK at 0.15 mm — the friction contract holds; the
     // lean is posture, not sliding, and posture is not this gate's job)
-    assert!(root[0] < 0.7, "100 N moved the root {:.4} m (lean bound)", root[0]);
+    assert!(root[0] < 0.7, "40 N moved the root {:.4} m (lean bound)", root[0]);
     // SLIDE arm: past the cone the stance runs away at meter scale
     // (nothing stays penetrating or in-margin, so corner travel is
     // unmeasurable — the root IS the metric here)
     assert!(root[1] > 0.5, "1000 N moved the root only {:.4} m", root[1]);
     assert!(
         root[1] > 4.0 * root[0],
-        "1000 N runaway ({:.4} m) is not clear of the 100 N lean ({:.4} m)",
+        "1000 N runaway ({:.4} m) is not clear of the 40 N lean ({:.4} m)",
         root[1],
         root[0]
     );
