@@ -533,6 +533,12 @@ class CudaBeatVecEnv:
         # the Rust reference carries the obs change but not this.
         self.flail_rad = z(N)
         self.flail_ticks = z(N, dt=torch.int32)
+        # 2026-08-20 training-accuracy telemetry (user metric decision):
+        # note-score points as credited + good-cut count, per env.
+        # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
+        # continuous flow, phase-free by construction.
+        self.acc_pts = z(N)
+        self.acc_cuts = z(N, dt=torch.int32)
         # env v20 start-pose jitter draws: (N, 12) in [-1, 1), refilled
         # in-place before every launch when enabled (in-place uniform_
         # keeps the fixed address CUDA graphs capture; torch's RNG
@@ -579,6 +585,7 @@ class CudaBeatVecEnv:
             self.contact_imp, self.contact_pt, self.contact_arm,
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
             self.flail_rad, self.flail_ticks,
+            self.acc_pts, self.acc_cuts,
             self.ground_imp,
             self.chart_idx,
             self._pose_jit,
@@ -753,6 +760,17 @@ class CudaBeatVecEnv:
         self.flail_rad.zero_()
         self.flail_ticks.zero_()
         return rad, ticks
+
+    def pop_acc(self):
+        """Training-accuracy telemetry since the last pop: (note-score
+        points credited, good cuts). acc = pts / (115 * cuts). Sums the
+        per-env accumulators and zeroes them — logging-grade, two syncs
+        per call."""
+        pts = float(self.acc_pts.sum().item())
+        cuts = int(self.acc_cuts.sum().item())
+        self.acc_pts.zero_()
+        self.acc_cuts.zero_()
+        return pts, cuts
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate

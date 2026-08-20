@@ -1216,6 +1216,16 @@ def main():
             if fl_ticks:
                 print(f"[flail] {fl_rad / fl_ticks:.4f} rad/idle-tick "
                       f"({fl_ticks} note-free env-ticks)", flush=True)
+        # 2026-08-20 THE metric (user decision): training accuracy =
+        # note score credited / (115 * good cuts) since the last pop.
+        # Event-flow ratio — no completion window, no wave phase, no
+        # censoring; at recipe shape ~tens of thousands of cuts per
+        # update, so a single print is already ±~0.1%.
+        acc_now = float("nan")
+        if hasattr(venv, "pop_acc"):
+            a_pts, a_cuts = venv.pop_acc()
+            if a_cuts:
+                acc_now = a_pts / (115.0 * a_cuts)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
@@ -1236,13 +1246,15 @@ def main():
             elif scale_v != scale_cap:
                 extra += f"  scale {scale_v:.0f}"
             print(f"update {update+1:>3}/{num_updates}  steps "
-                  f"{global_step:>9}  ep_return(last100) {recent:8.3f}  "
+                  f"{global_step:>9}  acc {acc_now:.4f}  "
+                  f"ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
             ent_v, ev_v = torch.stack([ent_loss.detach(), ev]).tolist()
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
+                  f"acc {acc_now:.4f}  "
                   f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
                   flush=True)
@@ -1255,6 +1267,7 @@ def main():
                         "encoder": policy.encoder,
                         "update": update + 1, "global_step": global_step,
                         "recent_return": float(recent),
+                        "recent_acc": float(acc_now),
                         "value_norm": {"mu": float(ret_mu),
                                        "var": float(ret_var)},
                         "optimizer": cpu_opt_state(opt),
@@ -1287,6 +1300,7 @@ def main():
                 "encoder": policy.encoder,
                 "update": update + 1, "global_step": global_step,
                 "recent_return": float(recent),
+                "recent_acc": float(acc_now),
                 "value_norm": {"mu": float(ret_mu),
                                "var": float(ret_var)},
                 "optimizer": cpu_opt_state(opt),
