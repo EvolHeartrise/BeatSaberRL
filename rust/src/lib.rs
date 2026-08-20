@@ -156,6 +156,10 @@ const FALL_ROOT_Y: f64 = 0.45;
 // up = R * yhat; also trips whenever up_y <= 0 (past horizontal).
 const TILT_TAN2_PITCH: f64 = 0.3333333333333333; // tan^2(30 deg)
 const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
+// FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
+// the TICK a foot leaves the ground (edge: that foot's tick-summed
+// ground normal impulse hits zero after a grounded tick), per foot.
+const FOOT_LIFT_PEN: f64 = -0.1;
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
@@ -673,6 +677,12 @@ struct Body {
     fall_hits: u64,
     // Cumulative tilt terminations (pop_tilt_hits) — fall_hits pattern.
     tilt_hits: u64,
+    // FOOT-LIFT (2026-08-20): per-foot grounded-last-tick edge state,
+    // this tick's lift-event count (0..2), and the cumulative pop
+    // counter (pop_foot_lifts) — fall_hits pattern.
+    foot_down_prev: [bool; 2],
+    foot_lifts_tick: u8,
+    foot_lift_hits: u64,
     // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
@@ -724,6 +734,9 @@ impl Body {
             tilted: false,
             fall_hits: 0,
             tilt_hits: 0,
+            foot_down_prev: [true, true],
+            foot_lifts_tick: 0,
+            foot_lift_hits: 0,
             weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
             foot_grf: [[0.0; 3]; 2],
@@ -761,6 +774,9 @@ impl Body {
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
+        // episode starts standing: both feet grounded
+        self.foot_down_prev = [true, true];
+        self.foot_lifts_tick = 0;
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
         self.foot_grf = [[0.0; 3]; 2];
@@ -920,6 +936,21 @@ impl Body {
         self.tilted = tilted;
         if tilted {
             self.tilt_hits += 1;
+        }
+        // FOOT-LIFT (2026-08-20): edge on the tick-summed ground
+        // normal impulse per foot (ground_imp buckets
+        // [L_heel, L_toe, R_heel, R_toe]); charged in step_inner.
+        self.foot_lifts_tick = 0;
+        if self.foot_contact {
+            for f in 0..2 {
+                let down =
+                    self.ground_imp[f * 2] + self.ground_imp[f * 2 + 1] > 0.0;
+                if !down && self.foot_down_prev[f] {
+                    self.foot_lifts_tick += 1;
+                    self.foot_lift_hits += 1;
+                }
+                self.foot_down_prev[f] = down;
+            }
         }
         self.refresh_fk();
         for s in 0..2 {
@@ -1446,6 +1477,9 @@ impl Core {
         self.body.tick(actions, &gear);
         reward -= self.effort_coef * self.body.effort_j;
         reward -= self.iso_coef * self.body.act_frac;
+        // FOOT-LIFT penalty (2026-08-20): flat charge per lift event
+        // this tick (see Body::tick edge detection)
+        reward += FOOT_LIFT_PEN * self.body.foot_lifts_tick as f64;
         // env v20/v21/v22 foot terms: ws.p holds this tick's FK (the
         // same source the §8 body_pts obs lanes read). Hinged rent
         // (free inside foot_hinge_r, the v21 pure-linear behavior at
@@ -2189,6 +2223,16 @@ impl RawBeatSim {
         h
     }
 
+    /// Foot-lift events since the last pop (2026-08-20): a foot's
+    /// tick-summed ground normal impulse hit zero after a grounded
+    /// tick — each charged the flat FOOT_LIFT_PEN. The CUDA backend's
+    /// `pop_foot_lifts` mirror.
+    fn pop_foot_lifts(&mut self) -> u64 {
+        let h = self.core.body.foot_lift_hits;
+        self.core.body.foot_lift_hits = 0;
+        h
+    }
+
     /// R26 per-substep instrumentation counters since the last pop —
     /// the single-env mirror of `VecBeatSim.pop_dbg_stats`. Returns the
     /// dict and zeroes the counters. In the DEFAULT build nothing counts
@@ -2603,6 +2647,20 @@ impl VecBeatSim {
             .map(|s| {
                 let h = s.body.tilt_hits;
                 s.body.tilt_hits = 0;
+                h
+            })
+            .sum()
+    }
+
+    /// Foot-lift events summed over all envs since the last pop
+    /// (2026-08-20) — the CUDA backend's `pop_foot_lifts` mirror.
+    /// ADDITIVE getter; always 0 in weld mode.
+    fn pop_foot_lifts(&mut self) -> u64 {
+        self.sims
+            .iter_mut()
+            .map(|s| {
+                let h = s.body.foot_lift_hits;
+                s.body.foot_lift_hits = 0;
                 h
             })
             .sum()

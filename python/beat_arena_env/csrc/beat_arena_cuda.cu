@@ -1550,6 +1550,12 @@ constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headro
 // trips whenever up_y <= 0 (past horizontal).
 constexpr double TILT_TAN2_PITCH = 0.3333333333333333;  // tan^2(30 deg)
 constexpr double TILT_TAN2_ROLL = 0.7040881910418472;   // tan^2(40 deg)
+// FOOT-LIFT penalty (user 2026-08-20), CONTACT MODE ONLY — lib.rs
+// mirror: flat charge on the TICK a foot leaves the ground (edge:
+// that foot's tick-summed ground normal impulse hits zero after a
+// grounded tick), per foot. Grazing contact can flicker the edge;
+// the pop counter makes that visible if it ever matters.
+constexpr double FOOT_LIFT_PEN = -0.1;
 
 // env v8 gears (lib.rs gear_signed)
 __device__ constexpr double GEAR_TAB[3][7] = {
@@ -4519,6 +4525,10 @@ struct Sim {
   int* __restrict__ fall_hits;
   // (env, TICK) tilt terminations — lib.rs tilt_hits mirror
   int* __restrict__ tilt_hits;
+  // foot-lift events (pop counter) + per-foot grounded-last-tick
+  // state (E, 2) — lib.rs foot_lift_hits / foot_down_prev mirrors
+  int* __restrict__ foot_lift_hits;
+  bool* __restrict__ foot_down_prev;
   // env v19 flail telemetry (per env, popped + zeroed by the wrapper's
   // pop_flail, NOT touched by reset_env): blade arc (rad) accrued on
   // note-free ticks (next scoreable note > FLAIL_LEAD_S away) by hands
@@ -4761,6 +4771,9 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
   P.in_wall_prev[e] = false;
+  // episode starts standing: both feet grounded
+  P.foot_down_prev[e * 2] = true;
+  P.foot_down_prev[e * 2 + 1] = true;
   for (int i = 0; i < P.W; i++) P.wall_passed[e * P.W + i] = false;
 }
 
@@ -5147,6 +5160,20 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   T reward = T(0);
   reward -= P.effort_coef * effort;
   reward -= P.iso_coef * T(act);
+  // FOOT-LIFT penalty (2026-08-20): flat FOOT_LIFT_PEN the tick a
+  // foot leaves the ground — edge on the tick-summed ground normal
+  // impulse (gimp buckets [L_heel, L_toe, R_heel, R_toe]), per foot.
+  // lib.rs mirror; folds away in weld mode (feet cannot lift).
+  if constexpr (FC) {
+    for (int f = 0; f < 2; f++) {
+      const bool fdown = gimp[f * 2] + gimp[f * 2 + 1] > T(0);
+      if (!fdown && P.foot_down_prev[e * 2 + f]) {
+        reward += T(FOOT_LIFT_PEN);
+        atomicAdd(P.foot_lift_hits, 1);
+      }
+      P.foot_down_prev[e * 2 + f] = fdown;
+    }
+  }
   // env v20/v21/v22 foot terms (lib.rs mirror): hinged rent (free
   // inside foot_hinge_r; r = 0 is the v21 pure-linear behavior) +
   // optional potential-based delta shaping. d.pos holds this tick's
@@ -5636,7 +5663,8 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TTILT, TFLAILR, TFLAILT,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
+  TFLAILR, TFLAILT,
   TACCP, TACCC, TGIMP, TCIDX,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
@@ -5703,6 +5731,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.env_hits = ts[TENV].data_ptr<int>();
     P.fall_hits = ts[TFALL].data_ptr<int>();
     P.tilt_hits = ts[TTILT].data_ptr<int>();
+    P.foot_lift_hits = ts[TLIFT].data_ptr<int>();
+    P.foot_down_prev = ts[TFOOTDOWN].data_ptr<bool>();
     P.flail_rad = ts[TFLAILR].data_ptr<scalar_t>();
     P.flail_ticks = ts[TFLAILT].data_ptr<int>();
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
