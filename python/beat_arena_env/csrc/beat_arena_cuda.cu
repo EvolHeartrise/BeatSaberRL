@@ -1540,7 +1540,7 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // ONLY — lib.rs FALL_ROOT_Y. Root below this at ANY substep of the tick
 // ends the episode with a ZEROED reward, reported exactly like the
 // root-escape envelope (SPEC-v10 §20e "reported, never hidden").
-constexpr double FALL_ROOT_Y = 0.55;
+constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headroom for wall ducks)
 
 // env v8 gears (lib.rs gear_signed)
 __device__ constexpr double GEAR_TAB[3][7] = {
