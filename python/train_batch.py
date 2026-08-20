@@ -1238,6 +1238,12 @@ def main():
                 print(f"[fall] {fh} fall termination(s) this update "
                       "(each priced at the flat fall_const)",
                       flush=True)
+        if hasattr(venv, "pop_tilt_hits"):
+            th = venv.pop_tilt_hits()
+            if th:
+                print(f"[tilt] {th} tilt termination(s) this update "
+                      "(root up-axis >30deg sagittal / >40deg lateral; "
+                      "flat fall_const)", flush=True)
         # env v19 flail telemetry: mean blade arc (rad, both hands) per
         # note-free env-tick from hands with no live follow-through —
         # the phantom-swing signal the v19 post_rem obs lane targets.

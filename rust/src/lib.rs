@@ -148,6 +148,13 @@ const Z_MISS_TAIL: f64 = 1.5;
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
 const FALL_ROOT_Y: f64 = 0.45;
+// TILT termination (2026-08-20), contact mode only: root up-axis
+// tilted more than 30 deg forward/back (sagittal) or 40 deg to the
+// side (lateral) at ANY substep ends the episode, priced like a fall
+// (flat -fall_const). Tangent-squared form on up = R * yhat; also
+// trips whenever up_y <= 0 (past horizontal).
+const TILT_TAN2_PITCH: f64 = 0.3333333333333333; // tan^2(30 deg)
+const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
 const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
@@ -656,9 +663,15 @@ struct Body {
     // tick's 8 substeps? Contact mode only. Same envelope pattern as
     // `escaped`: the env terminates the episode and zeroes the reward.
     fell: bool,
+    // TILT (2026-08-20): did the root up-axis exceed the sagittal /
+    // lateral limits during THIS tick's 8 substeps? Same envelope
+    // pattern as `fell`, same flat -fall_const pricing.
+    tilted: bool,
     // Cumulative fall terminations until the owner pops them (lib.rs
     // pop_fall_hits) — the `ws.env_hits` / `pd_hits` pattern.
     fall_hits: u64,
+    // Cumulative tilt terminations (pop_tilt_hits) — fall_hits pattern.
+    tilt_hits: u64,
     // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
@@ -707,7 +720,9 @@ impl Body {
             escaped: false,
             foot_contact,
             fell: false,
+            tilted: false,
             fall_hits: 0,
+            tilt_hits: 0,
             weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
             foot_grf: [[0.0; 3]; 2],
@@ -744,6 +759,7 @@ impl Body {
         self.act_frac = 0.0;
         self.escaped = false;
         self.fell = false;
+        self.tilted = false;
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
         self.foot_grf = [[0.0; 3]; 2];
@@ -819,6 +835,7 @@ impl Body {
         // envelope above — a body that dips under the floor mid-tick and
         // bounces back has still stopped being the standing task.
         let mut fell = false;
+        let mut tilted = false;
         let mut effort = 0.0;
         for _ in 0..N_SUB {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
@@ -835,6 +852,20 @@ impl Body {
             // substep of this tick
             if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
                 fell = true;
+            }
+            // TILT envelope (2026-08-20): world up-axis of the root
+            // frame from the scalar-first quat (up = R * yhat)
+            if self.foot_contact {
+                let q = &self.st.quat;
+                let upx = 2.0 * (q[1] * q[2] - q[0] * q[3]);
+                let upy = 1.0 - 2.0 * (q[1] * q[1] + q[3] * q[3]);
+                let upz = 2.0 * (q[2] * q[3] + q[0] * q[1]);
+                if upy <= 0.0
+                    || upz * upz > TILT_TAN2_PITCH * upy * upy
+                    || upx * upx > TILT_TAN2_ROLL * upy * upy
+                {
+                    tilted = true;
+                }
             }
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
@@ -883,6 +914,10 @@ impl Body {
         if fell {
             self.fall_hits += 1;
         }
+        self.tilted = tilted;
+        if tilted {
+            self.tilt_hits += 1;
+        }
         self.refresh_fk();
         for s in 0..2 {
             for k in 0..3 {
@@ -927,6 +962,8 @@ struct Core {
     // fall ends the episode). Reported, never hidden: the trainer's
     // `[fall]` line reads it.
     falls: u32,
+    // TILT terminations in this episode (2026-08-20) — `falls` pattern.
+    tilts: u32,
     // env v18 constant fall pricing (2026-08-15, sole mode): flat
     // -fall_const terminal reward on a fall (see fell block).
     fall_const: f64,
@@ -1024,6 +1061,7 @@ impl Core {
             misses: 0,
             bombs_hit: 0,
             falls: 0,
+            tilts: 0,
             fall_const: 5.0,
             foot_z_coef: 0.0,
             foot_x_coef: 0.0,
@@ -1127,6 +1165,7 @@ impl Core {
         self.misses = 0;
         self.bombs_hit = 0;
         self.falls = 0;
+        self.tilts = 0;
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.flail_rad = 0.0;
         self.flail_ticks = 0;
@@ -1791,13 +1830,17 @@ impl Core {
         if self.body.fell {
             self.falls += 1;
         }
+        if self.body.tilted {
+            self.tilts += 1;
+        }
         let done = (!pending
             && no_trackers
             && (self.chart.is_empty() || self.time > last_hit))
             || self.time > last_hit + self.tail_s
             || self.tick >= self.max_steps
             || self.body.escaped
-            || self.body.fell;
+            || self.body.fell
+            || self.body.tilted;
 
         if done {
             self.finished = true;   // B4: latch; cleared only by reset_state
@@ -1821,9 +1864,10 @@ impl Core {
         if self.body.escaped {
             reward = 0.0;
         }
-        if self.body.fell {
+        if self.body.fell || self.body.tilted {
             // env v18 (2026-08-15, DEFAULT — legacy remaining-notes
-            // pricing REMOVED): flat terminal reward. The discounted
+            // pricing REMOVED): flat terminal reward; tilt terminations
+            // (2026-08-20) priced identically. The discounted
             // remaining-notes charge priced sparse-state falls near
             // zero and taught fall-indifference exactly there (fpm
             // replay analysis); the 3-arm probe measured falls/update
@@ -2133,6 +2177,15 @@ impl RawBeatSim {
         h
     }
 
+    /// TILT terminations since the last pop (2026-08-20): root up-axis
+    /// > 30 deg sagittal / > 40 deg lateral at any substep, priced at
+    /// the flat fall_const — the CUDA backend's `pop_tilt_hits` mirror.
+    fn pop_tilt_hits(&mut self) -> u64 {
+        let h = self.core.body.tilt_hits;
+        self.core.body.tilt_hits = 0;
+        h
+    }
+
     /// R26 per-substep instrumentation counters since the last pop —
     /// the single-env mirror of `VecBeatSim.pop_dbg_stats`. Returns the
     /// dict and zeroes the counters. In the DEFAULT build nothing counts
@@ -2168,6 +2221,13 @@ impl RawBeatSim {
     #[getter]
     fn falls(&self) -> u32 {
         self.core.falls
+    }
+
+    /// Tilt terminations in THIS episode (2026-08-20). 0 or 1: a tilt
+    /// ends the episode.
+    #[getter]
+    fn tilts(&self) -> u32 {
+        self.core.tilts
     }
 
     #[getter]
@@ -2531,9 +2591,28 @@ impl VecBeatSim {
             .sum()
     }
 
+    /// TILT terminations summed over all envs since the last pop
+    /// (2026-08-20) — the CUDA backend's `pop_tilt_hits` mirror.
+    /// ADDITIVE getter; always 0 in weld mode.
+    fn pop_tilt_hits(&mut self) -> u64 {
+        self.sims
+            .iter_mut()
+            .map(|s| {
+                let h = s.body.tilt_hits;
+                s.body.tilt_hits = 0;
+                h
+            })
+            .sum()
+    }
+
     /// Fall terminations in env i's current episode (contact spec §4).
     fn falls(&self, i: usize) -> u32 {
         self.sims[i].falls
+    }
+
+    /// Tilt terminations in env i's current episode (2026-08-20).
+    fn tilts(&self, i: usize) -> u32 {
+        self.sims[i].tilts
     }
 
     /// env v17: head-in-wall ticks in env i's current episode (each
@@ -2850,10 +2929,13 @@ mod env_tests {
         assert_eq!(core.body.ws.env_hits, 0);
     }
 
-    /// Unilateral-contact spec §5 (d) FALL: in contact mode a hard lean
-    /// (full +hip_pitch gears) drops the root below FALL_ROOT_Y, which
-    /// terminates the episode with a ZEROED reward and is COUNTED — the
-    /// root-escape envelope's contract, applied to the new failure mode.
+    /// Unilateral-contact spec §5 (d), updated 2026-08-20: in contact
+    /// mode a hard lean (full +hip_pitch gears) now trips the TILT
+    /// envelope (root up-axis > 30 deg sagittal) BEFORE the root can
+    /// drop below FALL_ROOT_Y — terminating the episode priced flat at
+    /// -fall_const and COUNTED, the root-escape envelope's contract.
+    /// The fall path shares the same pricing branch (fell || tilted),
+    /// so the flat-pricing assert covers both.
     #[test]
     fn fall_terminates_with_zero_reward_and_is_counted() {
         // a real (non-empty) chart far in the future, so `done` cannot
@@ -2875,37 +2957,38 @@ mod env_tests {
         let mut acts = [0u8; NQ];
         acts[17] = 1; // l_hip_pitch, full +
         acts[23] = 1; // r_hip_pitch, full +
-        let mut fell_at = None;
+        let mut ended_at = None;
         for t in 0..30 {
             // 1 s
             let (reward, done) = core.step_inner(&acts);
-            if core.body.fell {
-                assert!(done, "a fallen env must terminate");
+            if core.body.tilted || core.body.fell {
+                assert!(done, "a tilted/fallen env must terminate");
                 assert_eq!(
                     reward, -core.fall_const,
-                    "the fall step must be priced flat at -fall_const \
-                     (v18 sole mode), chart-independent"
+                    "the terminal step must be priced flat at \
+                     -fall_const (v18 sole mode), chart-independent"
                 );
                 assert!(core.finished, "the terminal latch must be set");
-                assert_eq!(core.falls, 1, "the fall must be counted in `falls`");
-                assert!(core.body.fall_hits > 0, "the pop counter must see it");
                 assert!(
-                    core.body.st.p[1] < FALL_ROOT_Y,
-                    "root y {} is not below the threshold",
+                    core.body.tilted,
+                    "a full hip-pitch lean must trip the TILT envelope \
+                     before the root reaches FALL_ROOT_Y (root y {})",
                     core.body.st.p[1]
                 );
-                fell_at = Some(t);
+                assert_eq!(core.tilts, 1, "the tilt must be counted in `tilts`");
+                assert!(core.body.tilt_hits > 0, "the pop counter must see it");
+                ended_at = Some(t);
                 break;
             }
             assert!(!done, "tick {t} ended for some other reason");
         }
-        let t = fell_at.expect("1 s of full hip flexion did not fell the body");
-        println!("fall: terminated at tick {t} with root y {:.4}", core.body.st.p[1]);
+        let t = ended_at.expect("1 s of full hip flexion did not tip the body");
+        println!("tilt: terminated at tick {t} with root y {:.4}", core.body.st.p[1]);
         // popping zeroes, pd_hits-style
-        let popped = core.body.fall_hits;
-        core.body.fall_hits = 0;
+        let popped = core.body.tilt_hits;
+        core.body.tilt_hits = 0;
         assert!(popped > 0);
-        assert_eq!(core.body.fall_hits, 0);
+        assert_eq!(core.body.tilt_hits, 0);
     }
 
     /// Replay fix (2026-08-17): in contact mode the per-foot ground-

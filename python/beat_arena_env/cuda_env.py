@@ -32,7 +32,7 @@ jit_cache.cuda_flags()). Windows toolchain quirks
 Env v11 (unilateral-contact spec, 2026-08-08) adds `foot_contact=`:
 foot_mode 1 swaps the two 6-DOF foot welds for unilateral frictional
 ground contact on the 8 sole-box corners and arms the fall termination
-(root y < 0.55, counted by `pop_fall_hits()`). It selects a COMPILE-TIME
+(root y < 0.45, counted by `pop_fall_hits()`). It selects a COMPILE-TIME
 kernel instantiation, so the default weld mode is the v10 kernel
 unchanged; test_v11_contact_parity.py is the contact-mode gate.
 
@@ -528,6 +528,10 @@ class CudaBeatVecEnv:
         # per (env, tick); always 0 in weld mode
         self._fall_hits = z(1, dt=torch.int32)
         self._fall_popped = 0
+        # TILT terminations (2026-08-20): root up-axis > 30 deg
+        # sagittal / > 40 deg lateral, fall-priced
+        self._tilt_hits = z(1, dt=torch.int32)
+        self._tilt_popped = 0
         # env v19 flail telemetry (per env, kernel-accrued): blade arc
         # on note-free ticks by hands with no live follow-through, and
         # the note-free tick count. Popped + zeroed by pop_flail;
@@ -590,6 +594,7 @@ class CudaBeatVecEnv:
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
             self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
+            self._tilt_hits,
             self.flail_rad, self.flail_ticks,
             self.acc_pts, self.acc_cuts,
             self.ground_imp,
@@ -751,11 +756,22 @@ class CudaBeatVecEnv:
         §4) — the Rust backend's pop_fall_hits mirror, same shape as
         pop_envelope_hits. Counted per (env, tick): each one terminated an
         env's episode with a zeroed reward because its root dropped below
-        FALL_ROOT_Y = 0.55 m. Always 0 with foot_contact=False, where the
+        FALL_ROOT_Y = 0.45 m. Always 0 with foot_contact=False, where the
         feet cannot let go. One sync."""
         total = int(self._fall_hits.item())
         new = total - self._fall_popped
         self._fall_popped = total
+        return new
+
+    def pop_tilt_hits(self):
+        """TILT terminations since the last pop (2026-08-20): root
+        up-axis tilted more than 30 deg forward/back or 40 deg to the
+        side at any substep — episode ends priced at the flat
+        fall_const, exactly like a fall. Always 0 with
+        foot_contact=False. One sync."""
+        total = int(self._tilt_hits.item())
+        new = total - self._tilt_popped
+        self._tilt_popped = total
         return new
 
     def pop_flail(self):
