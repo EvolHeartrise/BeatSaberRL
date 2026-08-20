@@ -4515,6 +4515,17 @@ struct Sim {
   // and the count of those note-free ticks (the denominator).
   T* __restrict__ flail_rad;
   int* __restrict__ flail_ticks;
+  // 2026-08-20 training-accuracy telemetry (user metric decision:
+  // average note score over all notes hit replaces leaf-end return as
+  // the guiding training metric). acc_pts accrues every point of note
+  // score AS IT IS CREDITED (pre+acc at the cut, post at follow-
+  // through resolution, x cnt for stacked trackers); acc_cuts counts
+  // good cuts once at cut time. Per env, popped + zeroed by the
+  // wrapper's pop_acc, NOT touched by reset_env — a continuous flow
+  // with no episode windowing, so the ratio acc_pts/(115*acc_cuts) is
+  // phase-free by construction (no completion waves, no censoring).
+  T* __restrict__ acc_pts;
+  int* __restrict__ acc_cuts;
   // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
   // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
   // Body::ground_imp mirror. Written by the step tick in contact mode,
@@ -5186,6 +5197,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
+        P.acc_pts[e] += pts * T(cnt);
         P.tr_active[b] = false;
       }
     }
@@ -5378,6 +5390,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.score[e] += pts;
         P.score_pre[e] += pre_pts;
         P.score_acc[e] += acc_pts;
+        P.acc_pts[e] += pts;
+        P.acc_cuts[e] += 1;
       } else {
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
@@ -5478,6 +5492,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
+        P.acc_pts[e] += pts * T(cnt);
         P.tr_active[b] = false;
       }
     }
@@ -5582,7 +5597,8 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT, TGIMP, TCIDX,
+  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TFLAILR, TFLAILT,
+  TACCP, TACCC, TGIMP, TCIDX,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
@@ -5649,6 +5665,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.fall_hits = ts[TFALL].data_ptr<int>();
     P.flail_rad = ts[TFLAILR].data_ptr<scalar_t>();
     P.flail_ticks = ts[TFLAILT].data_ptr<int>();
+    P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
+    P.acc_cuts = ts[TACCC].data_ptr<int>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
