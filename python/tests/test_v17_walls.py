@@ -189,7 +189,12 @@ def test_head_in_wall_penalty_window():
             assert 7 not in codes, (k, t)
     assert ticks_in > 0
     assert sim.walls_in == ticks_in
-    assert reward_in == pytest.approx(WALL_PEN * ticks_in)
+    # 2026-08-20: WALL_PEN charges ONCE, on the entry edge — one
+    # continuous pass through the wall is one charge no matter how
+    # long the head stays inside (walls_in still counts dwell ticks,
+    # and the per-tick code-7 events above are unchanged)
+    assert sim.wall_enters == 1
+    assert reward_in == pytest.approx(WALL_PEN)
 
 
 def test_dodged_wall_charges_nothing():
@@ -207,16 +212,22 @@ def test_dodged_wall_charges_nothing():
     assert total == 0.0
 
 
-def test_overlapping_walls_charge_once_per_tick():
+def test_overlapping_walls_charge_once_per_entry():
     walls = [Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
                   length=2.0, speed=4.0),
              Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
                   length=2.0, speed=4.0)]
     sim = _sim(FAR_NOTE, walls)
+    total = 0.0
     for _ in range(120):
         _obs, r, _d, _ev = sim.step(ZERO_ACT)
-        assert r >= WALL_PEN - 1e-12      # never double-charged
+        total += r
+        assert r >= WALL_PEN - 1e-12      # never double-charged in a tick
     assert sim.walls_in > 0
+    # 2026-08-20 entry-edge pricing: two perfectly overlapping walls,
+    # one continuous entry -> exactly one WALL_PEN across the pass
+    assert sim.wall_enters == 1
+    assert total == pytest.approx(WALL_PEN)
 
 
 # --- obs: the shared distance-sorted entity window (spec §12c/d) -------------

@@ -55,16 +55,21 @@ def test_miss_tick_invariant_to_body_motion():
     cannot touch (x = 2.5) must miss at the same analytic tick whether
     the body stands still or lunges: t > hit_time + 0.65/speed. The
     note is fast and early (speed 8, hit 0.1 s) because honest physics
-    is unforgiving — even a quarter-gear spine lean FALLS the body at
-    tick ~9, so the miss must land before that."""
+    is unforgiving — a leaning body terminates within ticks (pre-
+    2026-08-20 by falling at tick ~9; now the TILT envelope catches
+    the spine gear's pelvis reaction torque even sooner), so the miss
+    must land before the lean can kill the episode. The lunge is
+    full-gear ankle pitch: the whole body pivots slowly about the
+    ankles (head z moves, pelvis stays inside the 30-deg cone for far
+    longer than 6 ticks)."""
     note = Note(hit_time=0.1, col=2, row=1, x=2.5, y=1.4, color=1,
                 angle=4.712, speed=8.0)
     # miss when (0.1 - t)*8 < -0.65  =>  t > 0.18125  =>  step 6
     want_tick = 6
 
     lunge = list(ZERO_ACT)
-    lunge[0] = 3  # quarter + gear on spine_pitch: head z moves ~0.17 m
-    #               by tick 6, planted feet, blades nowhere near x = 2.5
+    lunge[21] = 1  # l_ankle_pitch full +
+    lunge[27] = 1  # r_ankle_pitch full +
     for acts in (ZERO_ACT, lunge):
         sim = _sim([note])
         miss_tick = None
