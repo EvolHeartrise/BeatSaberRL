@@ -772,8 +772,9 @@ class CudaBeatVecEnv:
         return new
 
     def pop_tilt_hits(self):
-        """TILT terminations since the last pop (2026-08-20): root
-        up-axis tilted more than 30 deg forward/back or 40 deg to the
+        """TILT terminations since the last pop (2026-08-20): CHEST
+        up-axis (root x spine stack) tilted more than 30 deg
+        forward/back or 40 deg to the
         side at end of tick (per-TICK check, not per substep) —
         episode ends priced at the flat fall_const, exactly like a
         fall. Always 0 with foot_contact=False. One sync."""
