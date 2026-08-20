@@ -143,6 +143,10 @@ def parse_args():
                         "gradient accumulation — same math (full-mb adv "
                         "stats, means of equal micro means), ~1/K the "
                         "update-pass activation peak (24 GB fallback)")
+    p.add_argument("--z-clip-hi", type=float, default=12.0,
+                   help="v28: obs z-lane upper clamp in meters (exact-"
+                        "timing lookahead = z_clip_hi / note speed). "
+                        "12.0 = every pre-v28 era; CUDA env only")
     p.add_argument("--init-critic-fresh", action="store_true",
                    help="with --init-from and a pre-redesign checkpoint: "
                         "load actor/trunk weights, build a FRESH "
@@ -518,6 +522,9 @@ def main():
 
     if args.ranked_maps and args.env != "cuda":
         raise SystemExit("--ranked-maps requires --env cuda")
+    if args.z_clip_hi != 12.0 and args.env != "cuda":
+        raise SystemExit("--z-clip-hi: the rust backend reads "
+                         "BEAT_Z_CLIP_HI instead (CUDA env only here)")
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
@@ -539,6 +546,7 @@ def main():
                       foot_shape_coef=args.foot_shape_coef,
                       iso_coef=args.iso_coef,
                       start_pose_jitter=args.start_pose_jitter,
+                      z_clip_hi=args.z_clip_hi,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -560,6 +568,7 @@ def main():
             foot_shape_coef=args.foot_shape_coef,
             iso_coef=args.iso_coef,
             start_pose_jitter=args.start_pose_jitter,
+            z_clip_hi=args.z_clip_hi,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(

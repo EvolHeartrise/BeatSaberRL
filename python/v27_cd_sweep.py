@@ -45,15 +45,22 @@ def leaf_stats(run_dir, bench_json):
     lv = [x for x in b["levels"] if "skipped" not in x]
     fcs = sum(1 for x in lv if x.get("full_combo"))
     zeros = sum(1 for x in lv if x.get("accuracy", 0.0) < 0.01)
-    ret = ev = "?"
+    ret = ev = acc = "?"
     with open(os.path.join(run_dir, "leaf.log"), encoding="utf-8") as f:
         for line in f:
             if line.startswith("update"):
+                # field-NAME parsing (2026-08-20): positional parts[5]
+                # silently read the new acc column when the print
+                # format grew — never index update lines by position
                 parts = line.split()
-                ret = parts[5]
-                if "ev" in parts:
-                    ev = parts[parts.index("ev") + 1]
-    return (f"leaf_return {ret} leaf_ev {ev} "
+
+                def fld(name, parts=parts):
+                    return (parts[parts.index(name) + 1]
+                            if name in parts else "?")
+                ret = fld("ep_return(last100)")
+                ev = fld("ev")
+                acc = fld("acc")
+    return (f"leaf_return {ret} leaf_acc {acc} leaf_ev {ev} "
             f"upp {b['total_unweighted_pp']:.2f} "
             f"wpp {b['total_weighted_pp']:.2f} fcs {fcs} zeros {zeros} "
             f"flail {b.get('flail_rad_per_tick', -1):.5f}")
