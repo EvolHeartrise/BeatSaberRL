@@ -92,7 +92,7 @@ constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // ride the N_NOTE_SLOTS slots, nearest-first by head distance;
 // per-token = the v9 note lanes then [is_wall, width, height, length].
 constexpr int NOTE_FEAT = 18;
-constexpr double WALL_PEN = -0.05;      // per tick with head inside a wall
+constexpr double WALL_PEN = -0.5;       // ONCE, on the tick the head ENTERS a wall (2026-08-20; was -0.05/tick)
 constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // ============================ PROVENANCE WARNING =====================
 // (2026-08-16) EVERY measurement, occupancy figure, and perf verdict
@@ -4557,6 +4557,9 @@ struct Sim {
   bool* __restrict__ wall_passed;
   int* __restrict__ first_wall;
   int* __restrict__ walls_in;
+  // was the head inside a wall LAST tick — entry-edge state for the
+  // once-per-entry WALL_PEN (lib.rs was_in_wall mirror)
+  bool* __restrict__ in_wall_prev;
   int W;  // wall pool second dim
   // io
   const int64_t *__restrict__ actions, *__restrict__ cand;
@@ -4746,6 +4749,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   // env v17 wall state
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
+  P.in_wall_prev[e] = false;
   for (int i = 0; i < P.W; i++) P.wall_passed[e * P.W + i] = false;
 }
 
@@ -5427,7 +5431,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   // env v17 walls (spec §12b) — lib.rs step_inner verbatim, same
   // reward summation position (after all judgment terms). Head center
-  // vs AABB; one WALL_PEN per tick regardless of overlapping walls.
+  // vs AABB; WALL_PEN charged ONCE on the entry edge (head outside
+  // last tick, inside now — lib.rs was_in_wall/wall_enters rule),
+  // regardless of overlapping walls. walls_in still counts every
+  // tick inside; >= 1 tick fully outside re-arms the charge.
   {
     const int nw = (int)P.p_n_walls[c0];
     const T hx2 = P.head[e * 3], hy2 = P.head[e * 3 + 1];
@@ -5448,9 +5455,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         in_wall = true;
     }
     if (in_wall) {
-      reward += T(WALL_PEN);
+      if (!P.in_wall_prev[e]) reward += T(WALL_PEN);
       P.walls_in[e] += 1;
     }
+    P.in_wall_prev[e] = in_wall;
     int fw = P.first_wall[e];
     while (fw < nw && P.wall_passed[e * P.W + fw]) fw++;
     P.first_wall[e] = fw;
@@ -5609,7 +5617,7 @@ enum {
   PNNOTES, PLASTHIT, PTAIL, PMINSP,
   // env v17 wall pool (P, W) + per-env wall state
   PWALLT, PWALLCX, PWALLCY, PWALLW, PWALLH, PWALLLEN, PWALLSP,
-  PWALLVALID, PNWALLS, TWALLPASS, TFIRSTW, TWALLSIN,
+  PWALLVALID, PNWALLS, TWALLPASS, TFIRSTW, TWALLSIN, TINWALLPREV,
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
@@ -5705,6 +5713,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wall_passed = ts[TWALLPASS].data_ptr<bool>();
     P.first_wall = ts[TFIRSTW].data_ptr<int>();
     P.walls_in = ts[TWALLSIN].data_ptr<int>();
+    P.in_wall_prev = ts[TINWALLPREV].data_ptr<bool>();
     P.W = (int)ts[TWALLPASS].size(1);
     P.actions = actions.data_ptr<int64_t>();
     P.cand = cand.data_ptr<int64_t>();
