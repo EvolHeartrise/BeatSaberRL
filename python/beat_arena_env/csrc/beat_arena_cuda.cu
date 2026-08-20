@@ -1540,7 +1540,7 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // ONLY — lib.rs FALL_ROOT_Y. Root below this at ANY substep of the tick
 // ends the episode with a ZEROED reward, reported exactly like the
 // root-escape envelope (SPEC-v10 §20e "reported, never hidden").
-constexpr double FALL_ROOT_Y = 0.45;  // 2026-08-20: 0.55 -> 0.45 (crouch headroom for wall ducks)
+constexpr double FALL_ROOT_Y = 0.4;  // 2026-08-20: 0.55 -> 0.45 -> 0.4 (crouch headroom; chest-tilt cone guards the fold)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: CHEST up-axis tilted more than 30 deg forward/back
 // (sagittal) or 40 deg to the side (lateral) at the END of a tick

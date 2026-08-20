@@ -141,13 +141,13 @@ const Z_MISS_TAIL: f64 = 1.5;
 // a fallen body's observations/rewards are not the task. Reference-pose
 // root y is 0.94; the original 0.55 was a deep crouch the policy cannot
 // reach by squatting within the leg limits and holding the sole flat.
-// 2026-08-20: lowered to 0.45 to add dynamic headroom below the legal
+// 2026-08-20: lowered to 0.45 then 0.4 to add dynamic headroom below the legal
 // squat envelope — the entry-edge WALL_PEN wants ducks to be learnable,
 // and a fast hip-fold descent transiently undershoots the static
 // minimum. Reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
-const FALL_ROOT_Y: f64 = 0.45;
+const FALL_ROOT_Y: f64 = 0.4;
 // TILT termination (2026-08-20), contact mode only: CHEST up-axis
 // tilted more than 30 deg forward/back (sagittal) or 40 deg to the
 // side (lateral) at the END of a tick ends the episode, priced like
