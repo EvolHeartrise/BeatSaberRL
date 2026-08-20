@@ -266,6 +266,19 @@ const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
 const Z_CLIP: (f64, f64) = (-3.0, 12.0);
+// v28 probe (2026-08-20): the obs z-lane upper clamp is runtime-
+// overridable via BEAT_Z_CLIP_HI (meters; default Z_CLIP.1 = the
+// pre-v28 era) so one binary serves every checkpoint era — the CUDA
+// twin takes it as a step parameter instead. Read once per process.
+fn z_clip_hi() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BEAT_Z_CLIP_HI")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Z_CLIP.1)
+    })
+}
 const ROOT_Y0: f64 = 0.94; // reference root height (obs centering)
 const HEAD_Y0: f64 = 1.70; // reference head height (obs centering)
 const PLANE_Z0: f64 = -0.65; // reference body plane (obs centering)
@@ -1277,7 +1290,7 @@ impl Core {
                 let w = &self.walls[idx];
                 let zf = ((w.start_time - self.time) * w.speed - WALL_FRONT_OFF
                     + z_off)
-                    .clamp(Z_CLIP.0, Z_CLIP.1);
+                    .clamp(Z_CLIP.0, z_clip_hi());
                 obs[base] = (w.cx / X_NORM) as f32;
                 obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (zf / Z_SCALE) as f32;
@@ -1291,7 +1304,7 @@ impl Core {
             } else {
                 let n = &self.chart[idx];
                 let z = ((n.hit_time - self.time) * n.speed + z_off)
-                    .clamp(Z_CLIP.0, Z_CLIP.1);
+                    .clamp(Z_CLIP.0, z_clip_hi());
                 obs[base] = (n.x / X_NORM) as f32;
                 obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (z / Z_SCALE) as f32;

@@ -4568,6 +4568,10 @@ struct Sim {
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T effort_coef;
   T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
+  // v28 probe (2026-08-20): obs z-lane upper clamp (m), RUNTIME so one
+  // binary serves every era (old ckpts bench at 12; the rust twin
+  // reads BEAT_Z_CLIP_HI). Z_CLIP_HI stays as the default.
+  T z_clip_hi;
   // env v20 (2026-08-16): per-tick penalty foot_z_coef * (|lfoot_z -
   // PLANE_Z0| + |rfoot_z - PLANE_Z0|) — linear in each foot's world-z
   // distance from the reference foot z (lib.rs mirror). 0 = off.
@@ -4932,7 +4936,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       const T zf = tclamp(
           (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
               - T(WALL_FRONT_OFF) + z_off,
-          T(Z_CLIP_LO), T(Z_CLIP_HI));
+          T(Z_CLIP_LO), P.z_clip_hi);
       nb2[0] = (float)(P.p_wall_cx[wb] / T(X_NORM));
       nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
@@ -4946,7 +4950,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     } else {
       const int64_t cb = cc * C + sel_idx[slot];
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
-                         T(Z_CLIP_LO), T(Z_CLIP_HI));
+                         T(Z_CLIP_LO), P.z_clip_hi);
       const bool bomb = P.p_is_bomb[cb];
       nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
       nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
@@ -5615,7 +5619,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           bool want_contacts, bool foot_contact, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
           double foot_shape_coef, double iso_coef,
-          double start_pose_jitter) {
+          double start_pose_jitter, double z_clip_hi) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5721,6 +5725,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_hinge_r = (scalar_t)foot_hinge_r;
     P.foot_shape_coef = (scalar_t)foot_shape_coef;
     P.iso_coef = (scalar_t)iso_coef;
+    P.z_clip_hi = (scalar_t)z_clip_hi;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
