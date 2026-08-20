@@ -764,7 +764,7 @@ class CudaBeatVecEnv:
         §4) — the Rust backend's pop_fall_hits mirror, same shape as
         pop_envelope_hits. Counted per (env, tick): each one terminated an
         env's episode with a zeroed reward because its root dropped below
-        FALL_ROOT_Y = 0.45 m. Always 0 with foot_contact=False, where the
+        FALL_ROOT_Y = 0.4 m. Always 0 with foot_contact=False, where the
         feet cannot let go. One sync."""
         total = int(self._fall_hits.item())
         new = total - self._fall_popped
