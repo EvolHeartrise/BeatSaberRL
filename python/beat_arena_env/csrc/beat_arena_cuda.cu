@@ -4525,8 +4525,9 @@ struct Sim {
   int* __restrict__ fall_hits;
   // (env, TICK) tilt terminations — lib.rs tilt_hits mirror
   int* __restrict__ tilt_hits;
-  // foot-lift events (pop counter) + per-foot grounded-last-tick
-  // state (E, 2) — lib.rs foot_lift_hits / foot_down_prev mirrors
+  // foot-lift events (pop counter, PER FOOT [L, R] since 2026-08-20)
+  // + per-foot grounded-last-tick state (E, 2) — lib.rs
+  // foot_lift_hits / foot_down_prev mirrors
   int* __restrict__ foot_lift_hits;
   bool* __restrict__ foot_down_prev;
   // env v19 flail telemetry (per env, popped + zeroed by the wrapper's
@@ -5189,7 +5190,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       const bool fdown = gimp[f * 2] + gimp[f * 2 + 1] > T(0);
       if (!fdown && P.foot_down_prev[e * 2 + f]) {
         reward += T(FOOT_LIFT_PEN);
-        atomicAdd(P.foot_lift_hits, 1);
+        atomicAdd(&P.foot_lift_hits[f], 1);
       }
       P.foot_down_prev[e * 2 + f] = fdown;
     }

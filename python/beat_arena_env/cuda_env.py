@@ -537,8 +537,8 @@ class CudaBeatVecEnv:
         # (UNARMED): a foot that begins an episode in the air is never
         # charged — the edge arms on the first grounded tick (kernel
         # re-falses it on every reset).
-        self._lift_hits = z(1, dt=torch.int32)
-        self._lift_popped = 0
+        self._lift_hits = z(2, dt=torch.int32)   # per-foot [L, R]
+        self._lift_popped = [0, 0]
         self.foot_down_prev = z(N, 2, dt=torch.bool)
         # env v19 flail telemetry (per env, kernel-accrued): blade arc
         # on note-free ticks by hands with no live follow-through, and
@@ -786,11 +786,13 @@ class CudaBeatVecEnv:
     def pop_foot_lifts(self):
         """Foot-lift events since the last pop (2026-08-20): a foot's
         tick-summed ground normal impulse hit zero after a grounded
-        tick — each charged the flat FOOT_LIFT_PEN (-0.1), per foot.
-        Always 0 with foot_contact=False. One sync."""
-        total = int(self._lift_hits.item())
-        new = total - self._lift_popped
-        self._lift_popped = total
+        tick — each charged the flat FOOT_LIFT_PEN (-0.1). Returns
+        (left, right) counts since the last pop (per-foot split, user
+        2026-08-20). Always (0, 0) with foot_contact=False. One
+        sync."""
+        tl, tr = (int(x) for x in self._lift_hits.tolist())
+        new = (tl - self._lift_popped[0], tr - self._lift_popped[1])
+        self._lift_popped = [tl, tr]
         return new
 
     def pop_flail(self):
