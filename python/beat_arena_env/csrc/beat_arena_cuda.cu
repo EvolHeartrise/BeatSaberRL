@@ -1553,7 +1553,7 @@ constexpr double FALL_ROOT_Y = 0.25;  // 2026-08-21: 0.5 -> 0.25 (user; follows 
 // forward = up_z > 0 (body faces +z); also trips whenever
 // up_y <= 0 (past horizontal).
 constexpr double TILT_TAN2_FWD = 0.7040881910418472;   // tan^2(40 deg)
-constexpr double TILT_TAN2_BACK = 0.1324743314317942;  // tan^2(20 deg)
+constexpr double TILT_TAN2_BACK = 0.03109120412576338;  // tan^2(10 deg) — 2026-08-21: 20 -> 10 deg (user)
 constexpr double TILT_TAN2_ROLL = 0.7040881910418472;  // tan^2(40 deg)
 // FOOT-LIFT penalty (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: flat charge on the TICK a foot leaves the ground (edge:

@@ -157,7 +157,7 @@ const FALL_ROOT_Y: f64 = 0.25;
 // forward = up_z > 0 (body faces +z); also trips whenever
 // up_y <= 0 (past horizontal).
 const TILT_TAN2_FWD: f64 = 0.7040881910418472; // tan^2(40 deg)
-const TILT_TAN2_BACK: f64 = 0.1324743314317942; // tan^2(20 deg)
+const TILT_TAN2_BACK: f64 = 0.03109120412576338; // tan^2(10 deg) — 2026-08-21: 20 -> 10 deg (user)
 const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
 // FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
 // the TICK a foot leaves the ground (edge: that foot's tick-summed
