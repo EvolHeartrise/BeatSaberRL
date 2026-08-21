@@ -1537,19 +1537,24 @@ constexpr double PLANE_Z0 = -0.65;
 constexpr double ROOT_VLIN_NORM = 6.0;
 constexpr double ROOT_VANG_NORM = 16.0;
 // env v11 FALL termination (unilateral-contact spec §4), CONTACT MODE
-// ONLY — lib.rs FALL_ROOT_Y. Root below this at ANY substep of the tick
-// ends the episode with a ZEROED reward, reported exactly like the
-// root-escape envelope (SPEC-v10 §20e "reported, never hidden").
-constexpr double FALL_ROOT_Y = 0.35;  // 2026-08-20: 0.55 -> 0.45 -> 0.4 -> 0.35 (crouch headroom; chest-tilt cone guards the fold)
+// ONLY — lib.rs FALL_ROOT_Y. Root below this at the END of a tick
+// (per-TICK since 2026-08-20, user: consistent with the tilt check;
+// the per-substep dip test is retired) ends the episode with a ZEROED
+// reward, reported exactly like the root-escape envelope (SPEC-v10
+// §20e "reported, never hidden").
+constexpr double FALL_ROOT_Y = 0.3;  // 2026-08-20: 0.55 -> ... -> 0.35 -> 0.3 (crouch headroom; chest-tilt cone guards the fold)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
-// mirror: CHEST up-axis tilted more than 40 deg forward/back
-// (sagittal) or 40 deg to the side (lateral) at the END of a tick
-// ends the episode, priced like a fall (flat -fall_const). Checked
-// per TICK, not per substep (user: substep-rate cost, no benefit).
-// Tangent-squared form on the world up-axis of the root frame; also
-// trips whenever up_y <= 0 (past horizontal).
-constexpr double TILT_TAN2_PITCH = 0.7040881910418472;  // tan^2(40 deg) — 30 -> 40 (user 2026-08-20)
-constexpr double TILT_TAN2_ROLL = 0.7040881910418472;   // tan^2(40 deg)
+// mirror: CHEST up-axis tilted more than 40 deg FORWARD, 20 deg
+// BACKWARD (asymmetric sagittal, user 2026-08-20 — the tight back
+// bound targets the v30 backbend exploit; forward stays duck-sized)
+// or 40 deg to the side (lateral) at the END of a tick ends the
+// episode, priced like a fall (flat -fall_const). Checked per TICK,
+// not per substep. Tangent-squared form on the chest up-axis;
+// forward = up_z > 0 (body faces +z); also trips whenever
+// up_y <= 0 (past horizontal).
+constexpr double TILT_TAN2_FWD = 0.7040881910418472;   // tan^2(40 deg)
+constexpr double TILT_TAN2_BACK = 0.1324743314317942;  // tan^2(20 deg)
+constexpr double TILT_TAN2_ROLL = 0.7040881910418472;  // tan^2(40 deg)
 // FOOT-LIFT penalty (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: flat charge on the TICK a foot leaves the ground (edge:
 // that foot's tick-summed ground normal impulse hits zero after a
@@ -5074,10 +5079,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     for (int pr = 0; pr < NUM_PAIRS; pr++)
       P.contact_imp[e * NUM_PAIRS + pr] = T(0);
   T effort = T(0);
-  // env v11 FALL (contact spec §4): a PER-SUBSTEP test, like the root
-  // envelope above — a body that dips under the floor mid-tick and
-  // bounces back has still stopped being the standing task. Structurally
-  // false (and folded away) in weld mode.
+  // env v11 FALL (contact spec §4): per-TICK on the end-of-tick root
+  // height since 2026-08-20 (user — consistent with the tilt check; a
+  // mid-tick dip that recovers within the tick no longer terminates).
+  // Structurally false (and folded away) in weld mode.
   bool fell = false;
   bool tilted = false;
   // contact spec §7: tick-summed ground normal impulses per obs bucket
@@ -5086,8 +5091,6 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   T gimp[4] = {T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
-    if constexpr (FC)
-      if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
         gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
@@ -5114,9 +5117,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   }
   if (d.pd_bad) atomicAdd(P.pd_hits, 1);
   if (d.env_n) atomicAdd(P.env_hits, d.env_n);
-  // one per fallen TICK, not per substep (lib.rs: `if fell { fall_hits += 1 }`)
-  if constexpr (FC)
+  // FALL check at end of tick; one count per fallen tick (lib.rs mirror)
+  if constexpr (FC) {
+    if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
     if (fell) atomicAdd(P.fall_hits, 1);
+  }
   // TILT envelope — ONCE per tick on the end-of-tick state (user
   // 2026-08-20: substep-rate checking is cost without benefit; a tilt
   // is not a transient the way a floor dip is). Measured on the CHEST
@@ -5143,7 +5148,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     const T upz = T(2) * (qx * qz - qw * qy) * v0
         + T(2) * (qy * qz + qw * qx) * v1
         + (T(1) - T(2) * (qx * qx + qy * qy)) * v2;
-    if (upy <= T(0) || upz * upz > T(TILT_TAN2_PITCH) * upy * upy
+    const T sag2 = upz > T(0) ? T(TILT_TAN2_FWD) : T(TILT_TAN2_BACK);
+    if (upy <= T(0) || upz * upz > sag2 * upy * upy
         || upx * upx > T(TILT_TAN2_ROLL) * upy * upy)
       tilted = true;
     if (tilted) atomicAdd(P.tilt_hits, 1);
