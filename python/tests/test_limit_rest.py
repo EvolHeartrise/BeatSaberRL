@@ -159,7 +159,7 @@ def test_cuda_flow_and_pricing_consistency():
 
     def env(**kw):
         kw.setdefault("foot_contact", True)
-        e = CudaBeatVecEnv(1, charts=[[note_tuple(FAR_NOTE)]], seed=0,
+        e = CudaBeatVecEnv(1, charts=[[FAR_NOTE]], seed=0,
                            device="cuda", gears=5,
                            max_steps=6900, push_prob=0.0, push_vmax=0.0,
                            start_jitter=0.0, auto_reset=False, **kw)
