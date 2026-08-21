@@ -245,10 +245,9 @@ def test_metadata_and_magic(converted):
     assert d["level_id"] == "custom_level_" + "AB" * 20
     assert d["difficulty"] == 7 and d["characteristic"] == "Standard"
     assert not d["left_handed"] and d["n_heights"] == 0
-    # BODY height: the viewer shifts all objects by (height - 1.8)/2.
-    # env v33 calibrates the body as a 2.4 m player (+0.3 baked into the
-    # sim's chart y), so 2.40 here makes the viewer apply the same +0.3
-    assert d["height"] == pytest.approx(2.40)
+    # BODY height (viewer shifts all objects by (height - 1.8)/2):
+    # constants.PLAYER_HEIGHT, 1.80 since the v33 offset was reverted
+    assert d["height"] == pytest.approx(1.80)
     assert d["platform"] == "PC" and d["game_version"]
 
 
