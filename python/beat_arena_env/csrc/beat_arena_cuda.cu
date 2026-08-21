@@ -4511,6 +4511,10 @@ struct Sim {
   int* __restrict__ tick;
   uint8_t* __restrict__ status;
   int* __restrict__ first_pending;
+  // R12 warp-coherence permutation: thread gid serves env env_order[gid]
+  // (identity unless the host sorts it — see cuda_env.step). A bijection
+  // on the thread->env assignment only; all P.*[e] addressing unchanged.
+  const int* __restrict__ env_order;
   T* __restrict__ ep_return;
   int *__restrict__ good, *__restrict__ bad, *__restrict__ miss,
       *__restrict__ bombs;
@@ -5634,8 +5638,15 @@ template <typename T, bool FC>
 // heuristic from flipping to 64 regs + double the spills.
 __global__ void __launch_bounds__(THREADS, BEAT_MIN_BLOCKS)
 step_kernel(Sim<T> P) {
-  const int e = blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= P.N) return;
+  // R12 (2026-08-21): warp-coherence env permutation. The grid walks
+  // env_order — identity by default; under BEAT_ENV_ORDER=1 the host
+  // sorts it by (chart, first_pending) each tick so warp-mates share
+  // note windows (audit 3.3: identical-envs header ran 3.5x production
+  // traffic). Per-env work and every P.*[e] address are unchanged —
+  // a bijection on thread->env assignment, bitwise-identical per env.
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= P.N) return;
+  const int e = P.env_order[gid];
   // thread-local scratch (local memory; per-thread interleaved =
   // coalesced across the warp for same-index access)
   Dyn<T> d;
@@ -5701,6 +5712,7 @@ enum {
   // env v17 wall pool (P, W) + per-env wall state
   PWALLT, PWALLCX, PWALLCY, PWALLW, PWALLH, PWALLLEN, PWALLSP,
   PWALLVALID, PNWALLS, TWALLPASS, TFIRSTW, TWALLSIN, TINWALLPREV,
+  TENVORD,
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
@@ -5800,6 +5812,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.first_wall = ts[TFIRSTW].data_ptr<int>();
     P.walls_in = ts[TWALLSIN].data_ptr<int>();
     P.in_wall_prev = ts[TINWALLPREV].data_ptr<bool>();
+    P.env_order = ts[TENVORD].data_ptr<int>();
     P.W = (int)ts[TWALLPASS].size(1);
     P.actions = actions.data_ptr<int64_t>();
     P.cand = cand.data_ptr<int64_t>();
