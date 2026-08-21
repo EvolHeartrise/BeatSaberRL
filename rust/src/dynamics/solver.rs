@@ -837,6 +837,20 @@ impl ConstraintSet {
         self.nrows - self.weld_rows() - self.ground_rows() - self.contacts.len()
     }
 
+    /// `(joint, λ)` of every limit row of the last solve, assembly
+    /// order — the impulse (N·m·s) each stop actually carried this
+    /// substep. λ is PGS-clamped ≥ 0 (unilateral rows); a row is
+    /// assembled whenever the joint is within reach of a stop, so a
+    /// hovering-but-not-resting joint reports λ ≈ 0. Feeds the env v34
+    /// limit-rest telemetry/penalty (lib.rs Body::limit_imp).
+    pub fn limit_row_lambdas(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let base = self.weld_rows() + self.ground_rows() + self.contacts.len();
+        self.limset
+            .iter()
+            .enumerate()
+            .map(move |(li, &(j, _sign))| (j, self.lambda[base + li]))
+    }
+
     /// Effective mass (J M⁻¹ Jᵀ diagonal) of an assembled row —
     /// post-solve introspection (tests).
     pub fn row_diag(&self, row: usize) -> f64 {
