@@ -112,6 +112,11 @@ def main():
                    help="take the WORST N by the sort key instead of "
                         "the best (2026-07-29: bottom-acc failure-mode "
                         "review)")
+    p.add_argument("--label", default=None,
+                   help="override the filename label (default: derived "
+                        "from --sort/--bottom, e.g. toppp/botacc). Used "
+                        "by curated selections (2026-08-21 wall-heavy "
+                        "set) where the sort key isn't the story")
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
@@ -134,7 +139,7 @@ def main():
                  key=lambda e: sgn * e[args.sort])[:args.top]
     # label carries the sort key too (2026-07-30, user request): the pp
     # and accuracy "top" sets used to collide on topNN names
-    label = ("bot" if args.bottom else "top") + (
+    label = args.label or ("bot" if args.bottom else "top") + (
         "acc" if args.sort == "accuracy" else "pp")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     # replays/ is gitignored and absent on fresh checkouts (third
