@@ -36,7 +36,16 @@ for e in bench["levels"]:
     scored.append((min(dodge, duck), dodge + duck, dodge, duck, e))
 
 scored.sort(key=lambda t: (-t[0], -t[1]))
-pick = scored[:args.top]
+# one entry per SONG (2026-08-21: the raw ranking returned one song at
+# four difficulties) — keep each song's best-ranked difficulty
+pick, seen = [], set()
+for t in scored:
+    if t[4]["song_hash"] in seen:
+        continue
+    seen.add(t[4]["song_hash"])
+    pick.append(t)
+    if len(pick) == args.top:
+        break
 for rank, (_, total, dodge, duck, e) in enumerate(pick, 1):
     print(f"[{rank}] {e['song'][:40]!r} walls={total} "
           f"(dodge {dodge} / duck {duck}) pp={e['pp']:.0f} "
