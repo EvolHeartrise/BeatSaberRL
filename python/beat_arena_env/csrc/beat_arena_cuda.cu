@@ -4546,6 +4546,15 @@ struct Sim {
   // and the count of those note-free ticks (the denominator).
   T* __restrict__ flail_rad;
   int* __restrict__ flail_ticks;
+  // env v34 (2026-08-21) limit-rest telemetry (per env, [legs, spine],
+  // popped + zeroed by the wrapper's pop_limit_rest, NOT touched by
+  // reset_env): tick-summed joint-limit-row impulses (N.m.s) the
+  // POSTURAL stops carried — spine joints 0..3 and leg joints 17..29;
+  // the 14 arm joints are out of scope (whips legitimately slam arm
+  // stops at speed). Step-11 clamp impulses are NOT counted (the
+  // solver is limit-aware; they are near-null by design).
+  T* __restrict__ limit_rest;
+  int* __restrict__ limit_rest_ticks;
   // 2026-08-20 training-accuracy telemetry (user metric decision:
   // average note score over all notes hit replaces leaf-end return as
   // the guiding training metric). acc_pts accrues every point of note
@@ -4622,6 +4631,13 @@ struct Sim {
   // over the 29 joints (lib.rs mirror). Velocity-blind by design:
   // effort_coef prices speed (work), this prices force. 0 = off.
   T iso_coef;
+  // env v34: per-tick price on the postural limit-rest impulse (the
+  // limit_rest accumulation above; lib.rs Core::limit_coef mirror).
+  // Proportional to the CARRIED impulse: a knee-locked stand (near-
+  // zero moment on the stop) is near-free, a crouch parked on its
+  // hip/knee stops pays its full gravity moment. 0 = off (bitwise
+  // pre-v34 rewards).
+  T limit_coef;
   // env v22: previous tick's total hinged foot deviation, per env
   // (zeroed by reset_env — resets start on-target).
   T* __restrict__ foot_pot;
@@ -5093,12 +5109,23 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // [L_heel, L_toe, R_heel, R_toe] (lib.rs Body::ground_imp). Dead code
   // in weld mode — no reader, so it folds away.
   T gimp[4] = {T(0), T(0), T(0), T(0)};
+  // env v34 limit-rest: this tick's postural limit-row impulse
+  T lrest_legs = T(0), lrest_spine = T(0);
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
         gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
             s.g_lam[gi * GROUND_ROWS_PER_CORNER];
+    // env v34: joint-limit-row lambda this substep, postural scope
+    // ([legs, spine]; arms skipped). l_lam is already >= 0 (PGS
+    // unilateral clamp) — tmax is belt-and-suspenders (lib.rs mirror).
+    for (int li = 0; li < s.nl; li++) {
+      const int lj = s.l_j[li];
+      const T ll = tmax(s.l_lam[li], T(0));
+      if (lj < 3) lrest_spine += ll;
+      else if (lj >= 17) lrest_legs += ll;
+    }
     // SPEC-v10 §4 effort: positive work at the END-of-substep velocity
     for (int j = 0; j < NQ; j++) {
       const T pw = tau[j] * d.v[VOFF + j];
@@ -5192,6 +5219,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   T reward = T(0);
   reward -= P.effort_coef * effort;
   reward -= P.iso_coef * T(act);
+  // env v34: limit-rest penalty + always-on telemetry (accumulates at
+  // coef 0 too, so stop-resting is observable before it is priced)
+  reward -= P.limit_coef * (lrest_legs + lrest_spine);
+  P.limit_rest[e * 2 + 0] += lrest_legs;
+  P.limit_rest[e * 2 + 1] += lrest_spine;
+  P.limit_rest_ticks[e] += 1;
   // FOOT-LIFT penalty (2026-08-20): flat FOOT_LIFT_PEN the tick a
   // foot leaves the ground — edge on the tick-summed ground normal
   // impulse (gimp buckets [L_heel, L_toe, R_heel, R_toe]), per foot.
@@ -5704,7 +5737,7 @@ enum {
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
   TFLAILR, TFLAILT,
-  TACCP, TACCC, TGIMP, TCIDX,
+  TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
@@ -5721,7 +5754,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
-          double foot_shape_coef, double iso_coef,
+          double foot_shape_coef, double iso_coef, double limit_coef,
           double start_pose_jitter, double z_clip_hi) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
@@ -5778,6 +5811,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
     P.acc_cuts = ts[TACCC].data_ptr<int>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
+    P.limit_rest = ts[TLIMREST].data_ptr<scalar_t>();
+    P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
@@ -5833,6 +5868,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_hinge_r = (scalar_t)foot_hinge_r;
     P.foot_shape_coef = (scalar_t)foot_shape_coef;
     P.iso_coef = (scalar_t)iso_coef;
+    P.limit_coef = (scalar_t)limit_coef;
     P.z_clip_hi = (scalar_t)z_clip_hi;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();

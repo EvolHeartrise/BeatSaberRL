@@ -363,6 +363,12 @@ def parse_args():
                         "tick's CHANGE in deviation (round trips net "
                         "zero; sharpens credit assignment; provably "
                         "optimum-preserving). 0 = off")
+    p.add_argument("--limit-coef", type=float, default=0.0,
+                   help="env v34: per-tick price on the joint-limit-row "
+                        "impulse (N*m*s) the POSTURAL stops carry (spine "
+                        "+ legs; arms exempt) — resting a pose on its "
+                        "stops pays its gravity moment, an active hold "
+                        "does not. 0 = off (bitwise pre-v34 rewards)")
     p.add_argument("--iso-coef", type=float, default=0.0,
                    help="env v23: per-tick activation cost — iso_coef * "
                         "sum of commanded |gear fraction| over the 29 "
@@ -548,6 +554,7 @@ def main():
                       foot_hinge_r=args.foot_hinge_r,
                       foot_shape_coef=args.foot_shape_coef,
                       iso_coef=args.iso_coef,
+                      limit_coef=args.limit_coef,
                       start_pose_jitter=args.start_pose_jitter,
                       z_clip_hi=args.z_clip_hi,
                       seed=args.seed, device=device)
@@ -1264,6 +1271,15 @@ def main():
                       f"rad/idle-tick (L {fl_l / fl_ticks:.4f} / "
                       f"R {fl_r / fl_ticks:.4f}; {fl_ticks} note-free "
                       "env-ticks)", flush=True)
+        # env v34 limit-rest telemetry: mean postural limit-row
+        # lambda-flow per env-tick (N*m*s), legs / spine split —
+        # sustained flow means the pose is resting on its stops.
+        if hasattr(venv, "pop_limit_rest"):
+            lr_l, lr_s, lr_t = venv.pop_limit_rest()
+            if lr_t:
+                print(f"[limitrest] {(lr_l + lr_s) / lr_t:.4f} "
+                      f"N*m*s/tick (legs {lr_l / lr_t:.4f} / spine "
+                      f"{lr_s / lr_t:.4f})", flush=True)
         # 2026-08-20 THE metric (user decision): training accuracy =
         # note score credited / (115 * good cuts) since the last pop.
         # Event-flow ratio — no completion window, no wave phase, no

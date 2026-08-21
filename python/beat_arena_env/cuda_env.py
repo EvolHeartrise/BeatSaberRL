@@ -364,7 +364,7 @@ class CudaBeatVecEnv:
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
-                 foot_shape_coef=0.0, iso_coef=0.0,
+                 foot_shape_coef=0.0, iso_coef=0.0, limit_coef=0.0,
                  start_pose_jitter=0.0, z_clip_hi=12.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
@@ -406,6 +406,7 @@ class CudaBeatVecEnv:
         self.foot_hinge_r = float(foot_hinge_r)
         self.foot_shape_coef = float(foot_shape_coef)
         self.iso_coef = float(iso_coef)
+        self.limit_coef = float(limit_coef)
         # v28: obs z-lane upper clamp (m), runtime per-run (arg wins;
         # the rust twin reads BEAT_Z_CLIP_HI instead)
         self.z_clip_hi = float(z_clip_hi)
@@ -548,6 +549,12 @@ class CudaBeatVecEnv:
         # the Rust reference carries the obs change but not this.
         self.flail_rad = z(N, 2)   # per-hand [L, R] since 2026-08-20
         self.flail_ticks = z(N, dt=torch.int32)
+        # env v34 limit-rest telemetry (per env, kernel-accrued):
+        # tick-summed postural joint-limit-row impulses [legs, spine]
+        # (N*m*s) and the tick count. Popped + zeroed by
+        # pop_limit_rest; reset_env leaves them alone (flail pattern).
+        self.limit_rest = z(N, 2)
+        self.limit_rest_ticks = z(N, dt=torch.int32)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -617,6 +624,7 @@ class CudaBeatVecEnv:
             self.acc_pts, self.acc_cuts,
             self.ground_imp,
             self.chart_idx,
+            self.limit_rest, self.limit_rest_ticks,
             self._pose_jit,
             self._foot_pot,
             self._bp_pos, self._bp_vel,
@@ -645,8 +653,8 @@ class CudaBeatVecEnv:
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
                        self.foot_hinge_r, self.foot_shape_coef,
-                       self.iso_coef, self.start_pose_jitter,
-                       self.z_clip_hi)
+                       self.iso_coef, self.limit_coef,
+                       self.start_pose_jitter, self.z_clip_hi)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
@@ -830,6 +838,20 @@ class CudaBeatVecEnv:
         self.flail_rad.zero_()
         self.flail_ticks.zero_()
         return rad_l, rad_r, ticks
+
+    def pop_limit_rest(self):
+        """env v34 limit-rest telemetry since the last pop:
+        (legs lambda-flow in N*m*s, spine lambda-flow, env-ticks) —
+        tick-summed postural joint-limit-row impulses (spine 0..3 +
+        legs 17..29; arms out of scope). Accumulates regardless of
+        limit_coef. Sums the per-env accumulators and zeroes them —
+        logging-grade, two syncs per call."""
+        buckets = self.limit_rest.sum(dim=0)
+        legs, spine = float(buckets[0].item()), float(buckets[1].item())
+        ticks = int(self.limit_rest_ticks.sum().item())
+        self.limit_rest.zero_()
+        self.limit_rest_ticks.zero_()
+        return legs, spine, ticks
 
     def pop_acc(self):
         """Training-accuracy telemetry since the last pop, PER HAND
