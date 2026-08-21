@@ -95,7 +95,13 @@ assert len(MAGIC) == 28
 DIFF_RAW = {"Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9}
 HEAD_POS = (0.0, 1.70, -0.65)          # env v7 anchor = v10 neutral head
 HEAD_QUAT = (0.0, 0.0, 0.0, 1.0)       # Unity xyzw identity: gaze at +z
-PLAYER_HEIGHT = 1.80                   # env body height (NOT the head y)
+# env v33 (2026-08-21): the env calibrates the body as a 2.4 m player
+# (constants.PLAYER_HEIGHT) — every chart object's y carries the game's
+# (height - 1.8)/2 = +0.3 offset in-sim. Writing the SAME height here
+# makes the viewer re-apply the identical +0.3 to its own map objects
+# (ObjectManager.playerHeightOffset), so sim and viewer agree. NOT the
+# head y (that mistake sank all notes 5 cm once already).
+PLAYER_HEIGHT = 2.40
 
 # env world -> replay player space: the file wants the player at z = 0
 # with notes arriving at +0.65; the env's z = 0 cut plane / z = -0.65

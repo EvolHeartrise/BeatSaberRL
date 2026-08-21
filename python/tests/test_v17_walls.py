@@ -84,7 +84,7 @@ def test_v2_full_wall_geometry(tmp_path):
                             first_note_s=2.0)
     (w,) = meta["walls"]
     assert w.cx == pytest.approx(0.0)
-    assert w.cy == pytest.approx(1.5)
+    assert w.cy == pytest.approx(1.8)
     assert w.width == pytest.approx(1.2)
     assert w.height == pytest.approx(3.0)
     assert w.length == pytest.approx(3.0 * 10.0)   # 3 s * njs 10
@@ -100,10 +100,10 @@ def test_v2_crouch_wall_hangs_from_above(tmp_path):
                                     [(1.0, 0, 1, 1.0, 4)]), "Normal",
                             first_note_s=2.0)
     (w,) = meta["walls"]
-    assert w.cy == pytest.approx(2.1)
+    assert w.cy == pytest.approx(2.4)
     assert w.height == pytest.approx(1.8)
-    assert w.cy - w.height / 2 == pytest.approx(1.2)
-    assert w.cy + w.height / 2 == pytest.approx(3.0)
+    assert w.cy - w.height / 2 == pytest.approx(1.5)
+    assert w.cy + w.height / 2 == pytest.approx(3.3)
     assert w.width == pytest.approx(2.4)
 
 
@@ -121,7 +121,7 @@ def test_v3_top_clamp_and_min_sizes(tmp_path):
                                     [(1.0, 1, 0, 1, 5, 0.0)]), "Normal")
     (w,) = meta["walls"]
     assert w.height == pytest.approx(3.0)
-    assert w.cy == pytest.approx(1.5)
+    assert w.cy == pytest.approx(1.8)
     assert w.length == pytest.approx(0.06)
 
 
@@ -141,7 +141,7 @@ def test_v4_y_clamp_is_wider(tmp_path):
     _n, meta = load_beatmap(_mk_map(tmp_path, "v4", NOTE1,
                                     [(1.0, 0, 4, 1, 3, 1.0)]), "Normal")
     (w,) = meta["walls"]
-    assert w.cy == pytest.approx(2.7)
+    assert w.cy == pytest.approx(3.0)
     assert w.height == pytest.approx(0.6)
 
 

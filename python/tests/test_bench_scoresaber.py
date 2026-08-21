@@ -422,7 +422,10 @@ def test_rust_combo_walk_matches_python():
     # rewrote the flail trajectory (swept: 42 scores 342/114, exact
     # walk match). 42 -> 43 (2026-08-20 ankle_p +35: wider passive
     # rock, same story; swept: 43 scores 69/154, exact walk match).
-    acts = np.random.default_rng(43).integers(0, 3, size=(400, 2, 29))
+    # 43 -> 47 (2026-08-21 env v33 player-height offset: notes ride
+    # +0.3 higher, seed 43's random flails stopped connecting; swept:
+    # 47 scores 75/266, exact walk match).
+    acts = np.random.default_rng(47).integers(0, 3, size=(400, 2, 29))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
     while not all(r is not None for r in rust_result):

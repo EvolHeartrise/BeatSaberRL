@@ -51,6 +51,13 @@ FLAT_WRIST = (0.2, 1.3955705, -0.1950711)   # right-hand wrist FK of FLAT_ARM
 
 def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False,
           kind=0, x=None, y=None, free_pre=False, free_post=False):
+    # env v33: ROW_Y carries the +0.3 player-height offset; the scripted
+    # fixtures in this file are calibrated to the PRE-offset heights and
+    # test cut mechanics at fixed world geometry, so pin y explicitly
+    # (the row->y mapping itself is covered by the chart/positions tests)
+    if y is None:
+        from beat_arena_env.constants import PLAYER_HEIGHT_OFFSET
+        y = ROW_Y[row] - PLAYER_HEIGHT_OFFSET
     return Note(hit_time=hit_time, col=col, row=row, color=color,
                 angle=angle, speed=speed, any_dir=any_dir, kind=kind,
                 x=x, y=y, free_pre=free_pre, free_post=free_post)
@@ -939,8 +946,9 @@ def test_chart_positions_are_continuous():
     chart = generate_chart(cfg, np.random.default_rng(23))
     xs = [nc(n)[0] for n in chart]
     ys = [nc(n)[1] for n in chart]
+    from beat_arena_env.constants import PLAYER_HEIGHT_OFFSET as _PH
     assert all(-1.1 - 1e-9 <= x <= 1.1 + 1e-9 for x in xs)
-    assert all(0.65 - 1e-9 <= y <= 2.1 + 1e-9 for y in ys)
+    assert all(0.65 + _PH - 1e-9 <= y <= 2.1 + _PH + 1e-9 for y in ys)
     assert len({round(x, 3) for x in xs}) > 20      # actually continuous
     assert len({round(y, 3) for y in ys}) > 20
     assert max(xs) > 0.9 or min(xs) < -0.9          # the margin gets used

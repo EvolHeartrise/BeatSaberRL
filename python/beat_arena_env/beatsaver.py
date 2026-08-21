@@ -46,7 +46,8 @@ import zipfile
 from dataclasses import replace
 
 from .chart import Note, Wall, chain_links
-from .constants import (KIND_BOMB, KIND_CHAIN_HEAD, KIND_NOTE, ROW_Y, col_x)
+from .constants import (KIND_BOMB, KIND_CHAIN_HEAD, KIND_NOTE,
+                        PLAYER_HEIGHT_OFFSET, ROW_Y, col_x)
 
 # env v17 wall conversion constants (ScoreSaber watch WallManager.cs /
 # ObjectManager.cs — spec §12a). Grid x origin −0.9 matches our
@@ -292,7 +293,11 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         t0 = clock.time(beat)
         dur_s = clock.time(beat + dur_beats) - t0
         length = max(dur_s * speed, _WALL_MIN_SIZE)
-        walls.append(Wall(start_time=t0, cx=cx, cy=cy, width=abs(world_w),
+        # env v33: player-height offset AFTER all clamps — the viewer
+        # adds playerHeightOffset at render time, downstream of the
+        # ClampPlayerHeight conversion, so the order here matches it
+        walls.append(Wall(start_time=t0, cx=cx,
+                          cy=cy + PLAYER_HEIGHT_OFFSET, width=abs(world_w),
                           height=abs(world_h), length=length, speed=speed))
 
     def add_note(beat, x, y, color, d, angle_off_deg=0.0, kind=KIND_NOTE):
