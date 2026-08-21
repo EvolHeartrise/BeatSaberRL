@@ -6,7 +6,7 @@ leg joints 17..29; the 14 arm joints are exempt — whips legitimately
 slam arm stops at speed). lambda is the impulse the stop actually
 carried, so resting a pose on its stops pays its gravity moment while
 an active hold (hovering off the stop) pays ~nothing. Telemetry
-(pop_limit_rest -> (legs, spine, ticks)) accumulates regardless of
+(pop_limit_rest -> (legs, spine, arms, ticks)) accumulates regardless of
 the coefficient. limit_coef = 0 (the default everywhere) leaves the
 reward stream exactly as before: the penalty term is 0 * flow and the
 accumulators have no other reader.
@@ -67,11 +67,11 @@ def _crouch_act():
 def test_crouch_rests_on_leg_stops_and_upright_does_not():
     sim = _sim(foot_contact=True)
     _run(sim, _crouch_act(), 60)
-    legs_c, _spine_c, ticks_c = sim.pop_limit_rest()
+    legs_c, _spine_c, _arms_c, ticks_c = sim.pop_limit_rest()
     assert ticks_c > 0
     sim2 = _sim(foot_contact=True)
     _run(sim2, [0] * N_JOINTS, ticks_c)
-    legs_u, _spine_u, ticks_u = sim2.pop_limit_rest()
+    legs_u, _spine_u, _arms_u, ticks_u = sim2.pop_limit_rest()
     assert ticks_u > 0
     # the collapsed pose parks its weight on the knee/hip stops; the
     # coasting reset stance may graze its stops but carries far less
@@ -92,7 +92,7 @@ def test_pricing_gap_equals_coef_times_flow():
     r0, t0 = _run(s0, act, 60)
     r1, t1 = _run(s1, act, 60)
     assert t0 == t1               # identical physics, identical episode
-    legs, spine, _ = s0.pop_limit_rest()
+    legs, spine, _arms, _ = s0.pop_limit_rest()
     assert legs + spine > 1.0
     # the penalty is the ONLY reward difference, and it prices exactly
     # the popped flow (same trajectory, f64)
@@ -111,7 +111,7 @@ def test_spine_stop_lands_in_spine_bucket():
     act = [0] * N_JOINTS
     act[SPINE_P] = 2                        # full extension, -20 deg stop
     _run(sim, act, 40)
-    _legs, spine, _ = sim.pop_limit_rest()
+    _legs, spine, _arms, _ = sim.pop_limit_rest()
     assert spine > 0.1, f"spine flow {spine}"
 
 
@@ -142,15 +142,44 @@ def test_arm_stops_are_exempt():
         sim.set_joints(q, [0.0] * 35)
         sim.pop_limit_rest()                    # discard reset transient
         _obs, r, _done, _ev = sim.step(act)
-        legs, spine, ticks = sim.pop_limit_rest()
+        legs, spine, arms, ticks = sim.pop_limit_rest()
         assert ticks == 1
         assert legs == 0.0 and spine == 0.0, (legs, spine)
+        # the elbow's carried lambda shows in the ARMS telemetry bucket
+        assert arms > 0.0
         # elbow stayed pinned (its row genuinely carried this tick)
         assert sim.qpos()[7 + R_ELBOW] < JOINT_LIMITS[R_ELBOW][0] + 0.05
         if coef == 0.0:
             r0 = r
     # a HUGE coef changes nothing when only exempt rows carry
     assert r == r0
+
+
+def test_limit_arms_prices_arm_rows():
+    # env v35: same single-tick elbow-on-stop isolation as above, but
+    # with limit_arms the arm row's lambda IS priced — the reward gap
+    # between priced and unpriced equals coef * arms flow exactly
+    # (identical trajectory, f64).
+    from beat_arena_env.constants import JOINT_LIMITS
+    act = [0] * N_JOINTS
+    act[R_ELBOW] = 2
+    rs = []
+    flows = []
+    for kw in ({}, {"limit_coef": COEF, "limit_arms": True}):
+        sim = _sim(foot_contact=False, **kw)
+        q = list(sim.qpos())
+        q[7 + L_KNEE] = q[7 + R_KNEE] = 0.3
+        q[7 + R_ELBOW] = JOINT_LIMITS[R_ELBOW][0]
+        sim.set_joints(q, [0.0] * 35)
+        sim.pop_limit_rest()
+        _obs, r, _done, _ev = sim.step(act)
+        legs, spine, arms, ticks = sim.pop_limit_rest()
+        assert ticks == 1 and legs == 0.0 and spine == 0.0
+        assert arms > 0.0
+        rs.append(r)
+        flows.append(arms)
+    assert flows[0] == pytest.approx(flows[1], abs=0.0)   # same physics
+    assert rs[0] - rs[1] == pytest.approx(COEF * flows[0], abs=1e-9)
 
 
 @cuda
@@ -177,7 +206,7 @@ def test_cuda_flow_and_pricing_consistency():
         _o, r1, _d1, _i = w1.step(act)
         tot0 += float(r0[0].item())
         tot1 += float(r1[0].item())
-    legs_w, spine_w, ticks_w = w0.pop_limit_rest()
+    legs_w, spine_w, _arms_w, ticks_w = w0.pop_limit_rest()
     assert ticks_w > 0 and legs_w > 1.0
     assert tot0 - tot1 == pytest.approx(COEF * (legs_w + spine_w),
                                         rel=5e-3)
@@ -191,17 +220,17 @@ def test_cuda_flow_and_pricing_consistency():
         ticks += 1
         if bool(d0[0].item()):
             break
-    legs, spine, _t = e0.pop_limit_rest()
+    legs, spine, _arms, _t = e0.pop_limit_rest()
     assert legs > 1.0
     eu = env()
     for _ in range(ticks):
         eu.step(torch.zeros_like(act))
-    legs_u, _s, _t = eu.pop_limit_rest()
+    legs_u, _s, _a, _t = eu.pop_limit_rest()
     assert legs > 5.0 * max(legs_u, 1e-9)
     # cross-engine magnitude sanity vs the Rust fixture (statics
     # dominate the parked pose, so the engines agree to a factor)
     rs = _sim(foot_contact=True)
     _run(rs, _crouch_act(), 60)
-    legs_r, spine_r, _ = rs.pop_limit_rest()
+    legs_r, spine_r, _arms_r, _ = rs.pop_limit_rest()
     ratio = (legs + spine) / max(legs_r + spine_r, 1e-9)
     assert 0.5 < ratio < 2.0, f"CUDA/Rust flow ratio {ratio}"

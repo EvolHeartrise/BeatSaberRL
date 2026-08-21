@@ -706,7 +706,7 @@ struct Body {
     // notes). Priced by Core::limit_coef; resting a pose on its
     // stops shows up as sustained λ-flow here, an active hold does
     // not.
-    limit_imp: [f64; 2],
+    limit_imp: [f64; 3],
     // replay fix (2026-08-17): tick-summed ground-reaction impulse per
     // foot [L, R] x [x friction, y normal, z friction] (N·s, world
     // frame) — ALL rows of every active sole corner, not just the §7
@@ -753,7 +753,7 @@ impl Body {
             foot_lift_hits: [0, 0],
             weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
-            limit_imp: [0.0; 2],
+            limit_imp: [0.0; 3],
             foot_grf: [[0.0; 3]; 2],
         };
         b.refresh_fk();
@@ -861,7 +861,7 @@ impl Body {
         self.contact_imp = [0.0; NUM_PAIRS];
         self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
-        self.limit_imp = [0.0; 2];
+        self.limit_imp = [0.0; 3];
         self.foot_grf = [[0.0; 3]; 2];
         // C backstop: this tick's pre-integration envelope engagements
         // are ws.env_hits' delta over the 8 substeps (the counter itself
@@ -922,6 +922,10 @@ impl Body {
                     self.limit_imp[1] += l;
                 } else if j >= 17 {
                     self.limit_imp[0] += l;
+                } else {
+                    // arms — telemetry always; priced only when
+                    // Core::limit_arms widens the scope (env v35)
+                    self.limit_imp[2] += l;
                 }
             }
             for (i, c) in self.cs.contacts.iter().enumerate() {
@@ -1082,11 +1086,13 @@ struct Core {
     // the stop) is near-free while a crouch parked on hip/knee stops
     // pays its full gravity moment.
     limit_coef: f64,
+    // env v35: widen pricing scope to the 14 arm joints too
+    limit_arms: bool,
     // cumulative limit-rest telemetry until popped (pop_limit_rest,
     // fall_hits pattern): λ-flow sums [legs, spine] and the tick count
     // — accumulated REGARDLESS of limit_coef so stop-resting is
     // observable at coef 0.
-    limit_rest_sum: [f64; 2],
+    limit_rest_sum: [f64; 3],
     limit_rest_ticks: u64,
     // the previous tick's pot (reset to 0 — resets start on-target)
     prev_foot_pot: f64,
@@ -1163,7 +1169,8 @@ impl Core {
             foot_shape_coef: 0.0,
             iso_coef: 0.0,
             limit_coef: 0.0,
-            limit_rest_sum: [0.0; 2],
+            limit_arms: false,
+            limit_rest_sum: [0.0; 3],
             limit_rest_ticks: 0,
             prev_foot_pot: 0.0,
             n_scoreable: 0,
@@ -1543,9 +1550,11 @@ impl Core {
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
-            * (self.body.limit_imp[0] + self.body.limit_imp[1]);
+            * (self.body.limit_imp[0] + self.body.limit_imp[1]
+               + if self.limit_arms { self.body.limit_imp[2] } else { 0.0 });
         self.limit_rest_sum[0] += self.body.limit_imp[0];
         self.limit_rest_sum[1] += self.body.limit_imp[1];
+        self.limit_rest_sum[2] += self.body.limit_imp[2];
         self.limit_rest_ticks += 1;
         // FOOT-LIFT penalty (2026-08-20): flat charge per lift event
         // this tick (see Body::tick edge detection)
@@ -2005,11 +2014,12 @@ impl RawBeatSim {
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, iso_coef=0.0,
-                        limit_coef=0.0))]
+                        limit_coef=0.0, limit_arms=false))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64) -> Self {
+           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
+           limit_arms: bool) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
@@ -2019,6 +2029,7 @@ impl RawBeatSim {
         core.foot_shape_coef = foot_shape_coef;
         core.iso_coef = iso_coef;
         core.limit_coef = limit_coef;
+        core.limit_arms = limit_arms;
         RawBeatSim { core }
     }
 
@@ -2307,12 +2318,12 @@ impl RawBeatSim {
 
     /// env v34 limit-rest telemetry since the last pop: (legs λ-flow
     /// N·m·s, spine λ-flow, env-ticks). CUDA `pop_limit_rest` mirror.
-    fn pop_limit_rest(&mut self) -> (f64, f64, u64) {
+    fn pop_limit_rest(&mut self) -> (f64, f64, f64, u64) {
         let s = self.core.limit_rest_sum;
         let t = self.core.limit_rest_ticks;
-        self.core.limit_rest_sum = [0.0; 2];
+        self.core.limit_rest_sum = [0.0; 3];
         self.core.limit_rest_ticks = 0;
-        (s[0], s[1], t)
+        (s[0], s[1], s[2], t)
     }
 
     /// R26 per-substep instrumentation counters since the last pop —
@@ -2519,13 +2530,15 @@ impl VecBeatSim {
                         gears=3, foot_contact=false, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
-                        iso_coef=0.0, limit_coef=0.0))]
+                        iso_coef=0.0, limit_coef=0.0,
+                        limit_arms=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64) -> Self {
+           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
+           limit_arms: bool) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2538,6 +2551,7 @@ impl VecBeatSim {
                     c.foot_shape_coef = foot_shape_coef;
                     c.iso_coef = iso_coef;
                     c.limit_coef = limit_coef;
+                    c.limit_arms = limit_arms;
                     c
                 })
                 .collect(),
@@ -2708,16 +2722,17 @@ impl VecBeatSim {
     /// env v34 limit-rest telemetry summed over all envs since the last
     /// pop: (legs λ-flow N·m·s, spine λ-flow, env-ticks). CUDA
     /// `pop_limit_rest` mirror.
-    fn pop_limit_rest(&mut self) -> (f64, f64, u64) {
-        let (mut lg, mut sp, mut tk) = (0.0f64, 0.0f64, 0u64);
+    fn pop_limit_rest(&mut self) -> (f64, f64, f64, u64) {
+        let (mut lg, mut sp, mut ar, mut tk) = (0.0f64, 0.0f64, 0.0f64, 0u64);
         for s in self.sims.iter_mut() {
             lg += s.limit_rest_sum[0];
             sp += s.limit_rest_sum[1];
+            ar += s.limit_rest_sum[2];
             tk += s.limit_rest_ticks;
-            s.limit_rest_sum = [0.0; 2];
+            s.limit_rest_sum = [0.0; 3];
             s.limit_rest_ticks = 0;
         }
-        (lg, sp, tk)
+        (lg, sp, ar, tk)
     }
 
     /// FALL terminations summed over all envs since the last pop
