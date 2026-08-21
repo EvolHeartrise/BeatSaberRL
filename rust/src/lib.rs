@@ -147,14 +147,17 @@ const Z_MISS_TAIL: f64 = 1.5;
 // minimum. Reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
-const FALL_ROOT_Y: f64 = 0.35;
+const FALL_ROOT_Y: f64 = 0.3;
 // TILT termination (2026-08-20), contact mode only: CHEST up-axis
-// tilted more than 40 deg forward/back (sagittal) or 40 deg to the
-// side (lateral) at the END of a tick ends the episode, priced like
-// a fall (flat -fall_const). Per-TICK check, not per substep (user:
-// substep-rate cost, no benefit). Tangent-squared form on
-// up = R * yhat; also trips whenever up_y <= 0 (past horizontal).
-const TILT_TAN2_PITCH: f64 = 0.7040881910418472; // tan^2(40 deg) — 30 -> 40 (user 2026-08-20)
+// tilted more than 40 deg FORWARD, 20 deg BACKWARD (asymmetric
+// sagittal, user 2026-08-20 — the tight back bound targets the v30
+// backbend exploit; forward stays duck-sized) or 40 deg to the side
+// (lateral) at the END of a tick ends the episode, priced like a
+// fall (flat -fall_const). Per-TICK check. Tangent-squared form;
+// forward = up_z > 0 (body faces +z); also trips whenever
+// up_y <= 0 (past horizontal).
+const TILT_TAN2_FWD: f64 = 0.7040881910418472; // tan^2(40 deg)
+const TILT_TAN2_BACK: f64 = 0.1324743314317942; // tan^2(20 deg)
 const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
 // FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
 // the TICK a foot leaves the ground (edge: that foot's tick-summed
@@ -664,9 +667,10 @@ struct Body {
     // (v10, the DEFAULT — every existing trajectory is bitwise
     // unchanged), true = unilateral frictional ground contact.
     foot_contact: bool,
-    // Contact spec §4: did the root drop below FALL_ROOT_Y during THIS
-    // tick's 8 substeps? Contact mode only. Same envelope pattern as
-    // `escaped`: the env terminates the episode and zeroes the reward.
+    // Contact spec §4: was the root below FALL_ROOT_Y at the END of
+    // this tick (per-TICK since 2026-08-20)? Contact mode only. Same
+    // envelope pattern as `escaped`: the env terminates the episode
+    // and zeroes the reward.
     fell: bool,
     // TILT (2026-08-20): did the CHEST up-axis exceed the sagittal /
     // lateral limits during THIS tick's 8 substeps? Same envelope
@@ -868,11 +872,7 @@ impl Body {
                     effort += p * H_SUB;
                 }
             }
-            // contact spec §4: root below the floor threshold at any
-            // substep of this tick
-            if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
-                fell = true;
-            }
+
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
             let nweld = self.cs.weld_rows();
@@ -916,6 +916,11 @@ impl Body {
         }
         self.effort_j = effort;
         self.escaped = self.ws.env_hits != env_hits0;
+        // contact spec §4 (per-TICK since 2026-08-20): root below the
+        // floor threshold at the end of the tick
+        if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
+            fell = true;
+        }
         self.fell = fell;
         if fell {
             self.fall_hits += 1;
@@ -943,8 +948,9 @@ impl Body {
             let upx = r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2];
             let upy = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
             let upz = r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2];
+            let sag2 = if upz > 0.0 { TILT_TAN2_FWD } else { TILT_TAN2_BACK };
             if upy <= 0.0
-                || upz * upz > TILT_TAN2_PITCH * upy * upy
+                || upz * upz > sag2 * upy * upy
                 || upx * upx > TILT_TAN2_ROLL * upy * upy
             {
                 tilted = true;
