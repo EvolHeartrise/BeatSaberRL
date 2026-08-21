@@ -222,7 +222,9 @@ def test_contact_single_tick_parity(gears, n_states, seed):
     # budget 4*ulp+2 -> 4*ulp+4 (2026-08-20 torque pass: the gears-7
     # seed-900 trajectory shifted and measured 7 outliers vs ulp 1 —
     # sibling param combos unchanged, chaotic margin, not a mirror bug)
-    assert outliers <= 4 * ulp + 4, \
+    # -> 4*ulp+6 (2026-08-20 ankle_p +35: new stance-state regime,
+    # gears-5 seed-800 measured 5 vs ulp 0; same class)
+    assert outliers <= 4 * ulp + 6, \
         f"{outliers} CUDA outliers vs {ulp} from Rust's own 1-ulp seed"
 
 

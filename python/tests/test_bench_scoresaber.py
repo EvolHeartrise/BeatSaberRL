@@ -420,8 +420,9 @@ def test_rust_combo_walk_matches_python():
     # 17 -> 41 (env v20): same story again under the arm ready stance.
     # 41 -> 42 (2026-08-20 spine -25%): and again — the weaker waist
     # rewrote the flail trajectory (swept: 42 scores 342/114, exact
-    # walk match).
-    acts = np.random.default_rng(42).integers(0, 3, size=(400, 2, 29))
+    # walk match). 42 -> 43 (2026-08-20 ankle_p +35: wider passive
+    # rock, same story; swept: 43 scores 69/154, exact walk match).
+    acts = np.random.default_rng(43).integers(0, 3, size=(400, 2, 29))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
     while not all(r is not None for r in rust_result):

@@ -545,9 +545,12 @@ def _whip_events(kind=0, ticks=60):
     keeps sweeping for the full 30."""
     # hit 0.9 -> 0.8 (env v15, contact spec §10): the whip's reaction
     # rocks the trunk (head z swings ~1 m), and the head-anchored track
-    # moves with it — at 0.8 the down-whip meets the shifted note with
-    # full pre (70) and follow-through (30) banked
-    sim = _sim_with_note(_note(0.8, 2, 1, kind=kind), max_steps=300)
+    # moves with it. 0.8 -> PER-KIND (2026-08-20 ankle_p hi 20 -> 35
+    # deg: the weld-mode passive rock grew again and split the two
+    # kinds' timing windows — swept on-pod at windup 19: regular note
+    # lands full pre/post at 0.75, chain head at 0.85).
+    hit = 0.85 if kind == KIND_CHAIN_HEAD else 0.75
+    sim = _sim_with_note(_note(hit, 2, 1, kind=kind), max_steps=300)
     # env v20: the whip is hand-tuned against the zero-arm start
     _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)
     _set_arm(sim, 1, [0.0] * 7, [0.0] * 7)
@@ -557,8 +560,9 @@ def _whip_events(kind=0, ticks=60):
         # windup 15 -> 17 ticks (2026-08-18 fist-only hand): the
         # lighter arm whips ~10% faster, so the old timing slammed the
         # -90 deg pitch stop mid-follow-through (post accrued 0); two
-        # more windup ticks re-land the cut with full sweep room
-        a[A_R_ARM] = 1 if t < 17 else 2
+        # more windup ticks re-land the cut with full sweep room.
+        # 17 -> 19 (2026-08-20 ankle_p +35: rock retune, see hit above)
+        a[A_R_ARM] = 1 if t < 19 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:

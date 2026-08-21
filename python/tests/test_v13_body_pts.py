@@ -91,7 +91,12 @@ def test_body_pt_lanes_track_motion():
     act = [0] * N_JOINTS
     act[20] = 1  # l_knee full flex (one-way joint, gear id 1 = +1.0)
     obs = o0
-    for _ in range(10):
+    # drive 10 -> 5 ticks (2026-08-20 ankle_p +35): the wider ankle
+    # range lets the welded body ROCK further, and by 10 ticks the
+    # whole-body rock drowns the driven side (ratio 1.07); the knee
+    # flexion itself saturates early, so 5 ticks keeps the signal
+    # (measured l 0.247 / r 0.161, ratio 1.53)
+    for _ in range(5):
         obs, _r, _d, _ev = sim.step(act)
     # slice ends at the position block — env v24 appended velocity
     # lanes after it, which this motion test does not pin
