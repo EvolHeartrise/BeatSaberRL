@@ -48,7 +48,7 @@ N_UPPER = 17
 J_L_HIP_PITCH, J_R_HIP_PITCH = 17, 23
 # lib.rs FALL_ROOT_Y / beat_arena_cuda.cu FALL_ROOT_Y (contact spec §4;
 # 0.55 -> ... -> 0.35 -> 0.3 2026-08-20, crouch headroom)
-FALL_ROOT_Y = 0.5
+FALL_ROOT_Y = 0.25
 # a note far beyond every horizon: pure body dynamics, no judgment
 FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
                 angle=4.712, speed=4.0)

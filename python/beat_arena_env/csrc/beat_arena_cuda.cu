@@ -1542,7 +1542,7 @@ constexpr double ROOT_VANG_NORM = 16.0;
 // the per-substep dip test is retired) ends the episode with a ZEROED
 // reward, reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden").
-constexpr double FALL_ROOT_Y = 0.5;  // 2026-08-21: back up 0.3 -> 0.5 — the +0.3 player-height offset (constants.py) removed the crouch incentive the 0.3 headroom served; 0.5 evicts the limbo-squat band while ducks stay legal
+constexpr double FALL_ROOT_Y = 0.25;  // 2026-08-21: 0.5 -> 0.25 (user; follows the player-height revert to 1.8 — full crouch headroom restored)
 // TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
 // mirror: CHEST up-axis tilted more than 40 deg FORWARD, 20 deg
 // BACKWARD (asymmetric sagittal, user 2026-08-20 — the tight back
