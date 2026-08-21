@@ -177,3 +177,39 @@ measurement arm -> 2.1 -> 2.3 behind a learning gate.
 Stale comments to fix while there: policy.py header (12-slot/19-token/
 2-block/1-head claims), beat_arena_cuda.cu "16 slots"/"obs 340",
 cuda_env.py OFF_BODY_PTS comment.
+
+## 2026-08-21 addendum — warp-per-env re-probe (RTX 5090) + Tier 3.3 LANDED
+
+**Warp-per-env: refutation STANDS on sm_120.** Fresh isolated micro-bench
+(design/wpe_microbench_5090.cu, 5090): 32-lane cooperative chol
+factor+solves on the production shapes (NV=35 + 12-wide multi-RHS, f32,
+8 substeps) beats serial thread-per-env 2.0x at N=32768 (3.9x at 4096)
+— the isolated-algebra upside is real, as the 2026-08-15 design docs
+claimed. But the binding terms were never the algebra: the S1/S2
+campaign measured marshalling-on-the-serial-path + L1-carveout +
+envs/SM collapse (W=32: 634 ms/tick; sub-warp ladder W=2/4/8:
+169/251/338 vs legacy 121.8@16k — loses at every rung; stop rule fired,
+family deleted at 5d30814). Nothing in the sm_89->sm_120 move changes
+that arithmetic (same 1536 threads/SM ceiling, same local-frame L1
+economics). NOT re-attempted beyond the micro-bench; BEAT_CHOL_RL+K16
+remains the only surviving rung and still requires N>=65,536.
+
+**Tier 3.3 warp-coherence env permutation: LANDED (R12), key CORRECTED.**
+step_kernel walks env_order[gid] (identity default; BEAT_ENV_ORDER=1
+sorts per tick). Bijection on thread->env assignment only => per-env
+BITWISE identity under ANY permutation — proven by
+tests/test_env_order_bitwise.py (scrambled + sorted arms + run-to-run
+determinism; --bench acc matches identity to 4 dp in production shape).
+- The audit's proposed key (pending-count / chart-phase) measured NULL:
+  -0.06% env-only, +0.31% train --bench. The 3.5x identical-envs header
+  was broadcast-load uniformity, not warp coherence.
+- DYNAMICS key (ground-contact heel/toe bitmask * 4096 + quantized root
+  height — the substep's ng branch driver): env-only ms/tick
+  190.45 -> 172.34 = +9.5% at N=32768; production champion-shape
+  train --bench 116,804 -> 123,081 steps/s = **+5.4% end-to-end**.
+- Cost: one argsort(N) per tick (~us) + one coalesced int load per
+  thread; identity-order overhead measured -0.06% (noise). Default OFF.
+- N-ladder (env-only ms/tick delta, dynamics key): +3.3% @4096,
+  +5.6% @8192, +13.2% @16384, +9.5% @32768 — the win peaks where
+  occupancy is starved but traffic is already diverse.
+- Pod gate with the change: 229/229 (227 + 2 new R12 tests).

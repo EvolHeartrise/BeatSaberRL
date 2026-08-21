@@ -578,6 +578,16 @@ class CudaBeatVecEnv:
         # head-in-wall state last tick — entry-edge for the
         # once-per-entry WALL_PEN (2026-08-20; kernel-reset per episode)
         self.in_wall_prev = z(N, dt=torch.bool)
+        # R12 warp-coherence permutation: thread gid serves env
+        # env_order[gid]. Identity unless BEAT_ENV_ORDER=1, which sorts
+        # by (chart, first_pending) each tick so warp-mates share note
+        # windows. A bijection on thread->env assignment only — per-env
+        # results are bitwise-identical under ANY permutation
+        # (tests/test_env_order_bitwise.py).
+        self.env_order = torch.arange(N, dtype=torch.int32,
+                                      device=self.device)
+        self._env_order_on = os.environ.get("BEAT_ENV_ORDER", "0") == "1"
+        self._gbits = torch.tensor([1, 2, 4, 8], device=self.device)
         # episode-return ring buffer (device-side)
         self._cap = 4096
         self._ret_buf = z(self._cap)
@@ -621,6 +631,7 @@ class CudaBeatVecEnv:
             p["wall_valid"], p["n_walls"],
             self.wall_passed, self.first_wall, self.walls_in,
             self.in_wall_prev,
+            self.env_order,
             self._ret_buf, self._ret_total, self._obs, self._reward,
             self._done,
         ]
@@ -676,6 +687,18 @@ class CudaBeatVecEnv:
                                   dtype=self.dtype) < self.push_prob,
                        self.push_vmax)
         cand = self._cand() if self.auto_reset else self._zero_cand
+        if self._env_order_on:
+            # R12: group envs by DYNAMICS state — ground-contact config
+            # (heel/toe bitmask, the substep's ng branch driver) then
+            # quantized root height. Chart-phase keying measured NULL
+            # (-0.06%); this key measured +8.7% ms/tick at N=32768
+            # (2026-08-21 A/B, r12_dyn_ab). stable=True is part of the
+            # run-to-run determinism gate.
+            gmask = ((self.ground_imp > 0).long() * self._gbits).sum(1)
+            key = (gmask * 4096
+                   + (self.p[:, 1] * 100).long().clamp(0, 4095))
+            self.env_order.copy_(
+                torch.argsort(key, stable=True).to(torch.int32))
         self._launch(actions, cand, 0)
         if self.auto_reset:
             self._episode += 1
