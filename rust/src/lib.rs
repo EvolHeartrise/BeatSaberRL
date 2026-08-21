@@ -147,7 +147,7 @@ const Z_MISS_TAIL: f64 = 1.5;
 // minimum. Reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
-const FALL_ROOT_Y: f64 = 0.5;
+const FALL_ROOT_Y: f64 = 0.25;
 // TILT termination (2026-08-20), contact mode only: CHEST up-axis
 // tilted more than 40 deg FORWARD, 20 deg BACKWARD (asymmetric
 // sagittal, user 2026-08-20 — the tight back bound targets the v30
