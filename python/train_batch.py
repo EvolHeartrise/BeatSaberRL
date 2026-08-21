@@ -1245,7 +1245,7 @@ def main():
             th = venv.pop_tilt_hits()
             if th:
                 print(f"[tilt] {th} tilt termination(s) this update "
-                      "(chest up-axis fwd>40 / back>20 / lateral>40 deg; "
+                      "(chest up-axis fwd>40 / back>10 / lateral>40 deg; "
                       "flat fall_const)", flush=True)
         if hasattr(venv, "pop_foot_lifts"):
             lh_l, lh_r = venv.pop_foot_lifts()
