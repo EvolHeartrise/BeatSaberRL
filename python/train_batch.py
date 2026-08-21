@@ -1269,11 +1269,15 @@ def main():
         # Event-flow ratio — no completion window, no wave phase, no
         # censoring; at recipe shape ~tens of thousands of cuts per
         # update, so a single print is already ±~0.1%.
-        acc_now = float("nan")
+        acc_now = acc_l = acc_r = float("nan")
         if hasattr(venv, "pop_acc"):
-            a_pts, a_cuts = venv.pop_acc()
-            if a_cuts:
-                acc_now = a_pts / (115.0 * a_cuts)
+            p_l, p_r, c_l, c_r = venv.pop_acc()
+            if c_l + c_r:
+                acc_now = (p_l + p_r) / (115.0 * (c_l + c_r))
+            if c_l:
+                acc_l = p_l / (115.0 * c_l)
+            if c_r:
+                acc_r = p_r / (115.0 * c_r)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
@@ -1295,6 +1299,7 @@ def main():
                 extra += f"  scale {scale_v:.0f}"
             print(f"update {update+1:>3}/{num_updates}  steps "
                   f"{global_step:>9}  acc {acc_now:.4f}  "
+                  f"accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
@@ -1302,7 +1307,7 @@ def main():
             # one stacked read = one sync, same as the old ent .item()
             ent_v, ev_v = torch.stack([ent_loss.detach(), ev]).tolist()
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
-                  f"acc {acc_now:.4f}  "
+                  f"acc {acc_now:.4f}  accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
                   flush=True)

@@ -552,8 +552,8 @@ class CudaBeatVecEnv:
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
         # continuous flow, phase-free by construction.
-        self.acc_pts = z(N)
-        self.acc_cuts = z(N, dt=torch.int32)
+        self.acc_pts = z(N, 2)                  # per-hand [L, R]
+        self.acc_cuts = z(N, 2, dt=torch.int32)
         # env v20 start-pose jitter draws: (N, 12) in [-1, 1), refilled
         # in-place before every launch when enabled (in-place uniform_
         # keeps the fixed address CUDA graphs capture; torch's RNG
@@ -809,15 +809,19 @@ class CudaBeatVecEnv:
         return rad_l, rad_r, ticks
 
     def pop_acc(self):
-        """Training-accuracy telemetry since the last pop: (note-score
-        points credited, good cuts). acc = pts / (115 * cuts). Sums the
-        per-env accumulators and zeroes them — logging-grade, two syncs
-        per call."""
-        pts = float(self.acc_pts.sum().item())
-        cuts = int(self.acc_cuts.sum().item())
+        """Training-accuracy telemetry since the last pop, PER HAND
+        since 2026-08-20 (user): (pts_l, pts_r, cuts_l, cuts_r) —
+        note-score points credited and good cuts, [L, R]. Combined
+        acc = (pts_l+pts_r) / (115 * (cuts_l+cuts_r)). Sums the
+        per-env accumulators and zeroes them — logging-grade, two
+        syncs per call."""
+        p = self.acc_pts.sum(dim=0)
+        c = self.acc_cuts.sum(dim=0)
+        pts_l, pts_r = float(p[0].item()), float(p[1].item())
+        cuts_l, cuts_r = int(c[0].item()), int(c[1].item())
         self.acc_pts.zero_()
         self.acc_cuts.zero_()
-        return pts, cuts
+        return pts_l, pts_r, cuts_l, cuts_r
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate
