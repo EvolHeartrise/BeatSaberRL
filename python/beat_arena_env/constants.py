@@ -26,15 +26,14 @@ ACC_NORM = 0.3         # accuracy normalizer (m) — real BS value
 COS_TOL = 0.5
 BLOCK = 0.5            # visual block edge (m) — rendering only since v7
 CELL_X = 0.6           # real lane pitch (m); columns at x = -0.9 .. 0.9
-# env v33 player height (2026-08-21): the game shifts every object's y
-# by (playerHeight - 1.8) / 2 (scoresaber-watch ObjectManager, clamps
-# settings 1.2-2.4 / replay -0.2..+0.6). Our body cuts from the
-# SHOULDER (wrist tau 1.06 Nm), so it is calibrated as a 2.4 m player
-# to center the note band on its shoulder workspace — the BS-native
-# fix for the limbo-squat. Applied to row centers here and to real-map
-# wall y in beatsaver.py; convert_scoresaber writes the matching
-# initialHeight so the viewer re-applies the identical shift.
-PLAYER_HEIGHT = 2.4
+# Player height (BS mechanic): the game shifts every object's y by
+# (playerHeight - 1.8) / 2 (scoresaber-watch ObjectManager, clamps
+# settings 1.2-2.4 / replay -0.2..+0.6), applied to row centers here
+# and to real-map wall y in beatsaver.py; convert_scoresaber writes
+# the matching initialHeight so the viewer applies the same shift.
+# 2026-08-21: briefly 2.4 (env v33 limbo-squat fix, offset +0.3),
+# REVERTED to 1.8 (offset 0) same day by user order.
+PLAYER_HEIGHT = 1.8
 PLAYER_HEIGHT_OFFSET = (PLAYER_HEIGHT - 1.8) / 2          # +0.3
 _R = PLAYER_HEIGHT_OFFSET
 ROW_Y = (0.85 + _R, 1.40 + _R, 1.90 + _R)   # real rows + height offset
