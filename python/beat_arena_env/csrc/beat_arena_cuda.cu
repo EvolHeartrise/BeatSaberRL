@@ -4542,7 +4542,8 @@ struct Sim {
   // the guiding training metric). acc_pts accrues every point of note
   // score AS IT IS CREDITED (pre+acc at the cut, post at follow-
   // through resolution, x cnt for stacked trackers); acc_cuts counts
-  // good cuts once at cut time. Per env, popped + zeroed by the
+  // good cuts once at cut time. Per (env, HAND) [L, R] since
+  // 2026-08-20 (user: per-hand acc); popped + zeroed by the
   // wrapper's pop_acc, NOT touched by reset_env — a continuous flow
   // with no episode windowing, so the ratio acc_pts/(115*acc_cuts) is
   // phase-free by construction (no completion waves, no censoring).
@@ -5279,7 +5280,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
-        P.acc_pts[e] += pts * T(cnt);
+        P.acc_pts[e * 2 + h] += pts * T(cnt);
         P.tr_active[b] = false;
       }
     }
@@ -5472,8 +5473,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.score[e] += pts;
         P.score_pre[e] += pre_pts;
         P.score_acc[e] += acc_pts;
-        P.acc_pts[e] += pts;
-        P.acc_cuts[e] += 1;
+        P.acc_pts[e * 2 + m] += pts;
+        P.acc_cuts[e * 2 + m] += 1;
       } else {
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
@@ -5578,7 +5579,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         for (int cix = 0; cix < cnt; cix++) reward += pts / T(SCORE_MAX);
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
-        P.acc_pts[e] += pts * T(cnt);
+        P.acc_pts[e * 2 + h] += pts * T(cnt);
         P.tr_active[b] = false;
       }
     }
