@@ -218,7 +218,7 @@ const KIND_CHAIN_LINK: u8 = 3;
 // The viewer builds wall front faces 0.25 m behind the note plane
 // ("walls just built like that" — WallManager.cs UpdateVisual), so a
 // wall's front reaches the head 0.4/NJS s after its nominal time.
-const WALL_PEN: f64 = -0.5;
+const WALL_PEN: f64 = -1.5; // 2026-08-22: -0.5 -> -1.5 (bomb parity, user)
 const WALL_FRONT_OFF: f64 = 0.25;
 
 // --- obs layout v17 (spec §12d; offsets DERIVED, order is a contract) --------
