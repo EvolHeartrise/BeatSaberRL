@@ -90,7 +90,9 @@ constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // env v17 (contact spec §12): shared entity window — notes AND walls
 // ride the N_NOTE_SLOTS slots, nearest-first by head distance;
-// per-token = the v9 note lanes then [is_wall, width, height, length].
+// per-token = the v9 note lanes then [is_wall, width, height, 0]
+// (last lane carried wall length until 2026-08-22; retired as
+// redundant with back-face lane 4 minus front-face lane 2).
 constexpr int NOTE_FEAT = 18;
 constexpr double WALL_PEN = -1.5;       // ONCE, on the head-entry tick (2026-08-22: -0.5 -> -1.5, bomb parity per user)
 constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
@@ -5018,7 +5020,8 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[14] = 1.f;  // is_wall
       nb2[15] = (float)(P.p_wall_w[wb] / T(X_NORM));
       nb2[16] = (float)(P.p_wall_h[wb] / T(Y_NORM));
-      nb2[17] = (float)(P.p_wall_len[wb] / T(Z_SCALE));
+      // lane 17 (wall length) retired: redundant with lane 4 - lane 2
+      // inside the obs window; stays zero.
     } else {
       const int64_t cb = cc * C + sel_idx[slot];
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,

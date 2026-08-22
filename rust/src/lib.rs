@@ -225,7 +225,8 @@ const WALL_FRONT_OFF: f64 = 0.25;
 // The 16 slots are a SHARED entity window (notes + walls), filled
 // nearest-first by 3D distance from the head center; entities behind
 // the head consume no slots. ENT_FEAT = the v9 note lanes verbatim,
-// then [is_wall, width, height, length].
+// then [is_wall, width, height, 0] (last lane carried wall length
+// until 2026-08-22; retired as redundant with lane 4 - lane 2).
 const N_NOTE_SLOTS: usize = 24; // env v18: 16 -> 24 (eviction study)
 const NOTE_FEAT: usize = 18;
 // env v19: + remaining follow-through credit (1 lane) — Σ over the
@@ -1460,7 +1461,8 @@ impl Core {
                 obs[base + 14] = 1.0; // is_wall
                 obs[base + 15] = (2.0 * w.half_w / X_NORM) as f32;
                 obs[base + 16] = (2.0 * w.half_h / Y_NORM) as f32;
-                obs[base + 17] = (w.len / Z_SCALE) as f32;
+                // lane 17 (wall length) retired: redundant with
+                // lane 4 - lane 2 inside the obs window; stays zero.
             } else {
                 let n = &self.chart[idx];
                 let z = ((n.hit_time - self.time) * n.speed + z_off)
