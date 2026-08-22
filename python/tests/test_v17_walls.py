@@ -137,11 +137,29 @@ def test_v3_nonpositive_durations_dropped(tmp_path):
     assert meta["walls"] == []
 
 
+def test_outer_column_walls_dropped(tmp_path):
+    # env v36 (user): walls with no x-overlap of the middle two
+    # columns (open interval -0.6..0.6) never threaten the body ->
+    # dropped at parse. Column 0 alone spans [-1.2, -0.6], column 3
+    # alone spans [0.6, 1.2]: both exactly edge-touching -> dropped.
+    # A 2-wide wall from column 0 spans [-1.2, 0] -> overlaps -> kept.
+    _n, meta = load_beatmap(_mk_map(tmp_path, "v3", NOTE1,
+                                    [(1.0, 0, 0, 1, 3, 1.0),
+                                     (1.5, 3, 0, 1, 3, 1.0),
+                                     (2.0, 0, 0, 2, 3, 1.0)]), "Normal",
+                            first_note_s=2.0)
+    (w,) = meta["walls"]
+    assert w.cx == pytest.approx(-0.6)
+    assert w.width == pytest.approx(1.2)
+    assert w.start_time == pytest.approx(3.0)   # the 2.0-beat wall
+
+
 def test_v4_y_clamp_is_wider(tmp_path):
     # v4 walls clamp y to 0..4 (v2/v3 clamp to 2): y=4 h=3 ->
     # h=min(3, 5-4)=1, world h=0.6, cy=2.4+0.3=2.7 (top 3.0, inert)
+    # (column 1, not 0 — outer-column walls are dropped since env v36)
     _n, meta = load_beatmap(_mk_map(tmp_path, "v4", NOTE1,
-                                    [(1.0, 0, 4, 1, 3, 1.0)]), "Normal")
+                                    [(1.0, 1, 4, 1, 3, 1.0)]), "Normal")
     (w,) = meta["walls"]
     assert w.cy == pytest.approx(2.7)
     assert w.height == pytest.approx(0.6)
