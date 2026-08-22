@@ -286,6 +286,18 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         world_w = max(abs(world_w), _WALL_MIN_SIZE) * math.copysign(1.0, world_w)
         world_h = max(abs(world_h), _WALL_MIN_SIZE) * math.copysign(1.0, world_h)
         cx = _WALL_GRID_X0 + float(x) * _WALL_LANE_W + (world_w - _WALL_LANE_W) / 2
+        # env v36 (user, 2026-08-22): walls confined to the OUTER
+        # columns are DROPPED — the middle two columns span
+        # x in (-0.6, 0.6) (lane width 0.6, grid +-1.2) and a wall
+        # with no x-overlap there never threatens the body: it exists
+        # only as decoration/lighting. Dropping keeps the entity
+        # window for walls that matter and shrinks the wall arrays.
+        # Edge-touching (e.g. exactly [0.6, 1.2]) counts as no overlap.
+        half_w = abs(world_w) / 2
+        if cx - half_w >= _WALL_LANE_W - 1e-9 \
+                or cx + half_w <= -_WALL_LANE_W + 1e-9:
+            dropped += 1
+            return
         cy = y * _WALL_H_SCALE + world_h / 2
         # ClampPlayerHeight (vanilla walls always clamp): bottom >= 0,
         # then top <= 3 m by shrinking + recentering
