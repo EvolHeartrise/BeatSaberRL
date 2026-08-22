@@ -1529,7 +1529,7 @@ constexpr double LOOK_DIST = 8.0;
 constexpr double X_NORM = 1.0;
 constexpr double Y_NORM = 0.75;
 constexpr double Z_SCALE = 8.0;
-constexpr double Z_CLIP_LO = 0.0;   // 2026-08-22 (user): was -3.0 — only straddling walls ever reached negative z, and lane 4 (back face) now carries the remaining-wall signal
+constexpr double Z_CLIP_LO = -0.65;  // = PLANE_Z0, the HEAD/miss boundary (2026-08-22, user intent "nothing behind the body"; was -3.0, briefly 0.0 — but lane 0 is the cut PLANE 0.65 m in front of the head, and notes stay cuttable / walls interactable down to the head)
 constexpr double Z_CLIP_HI = 12.0;
 constexpr double ROOT_Y0 = 0.94;
 constexpr double HEAD_Y0 = 1.70;
