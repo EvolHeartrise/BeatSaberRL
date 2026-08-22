@@ -1446,10 +1446,12 @@ impl Core {
                 obs[base + 2] = (zf / Z_SCALE) as f32;
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
                 // env v36: lane 4 = BACK-face z (wall end), clamped
-                // [0, hi] — exact for any wall length while lane 2's
-                // front face saturates at Z_CLIP.0 inside long walls.
+                // [Z_CLIP.0, hi] (= the head boundary, like lane 2) —
+                // exact for any wall length while lane 2's front face
+                // saturates inside long walls.
                 obs[base + 4] =
-                    ((zfu + w.len).clamp(0.0, z_clip_hi()) / Z_SCALE) as f32;
+                    ((zfu + w.len).clamp(Z_CLIP.0, z_clip_hi()) / Z_SCALE)
+                        as f32;
                 // lanes 5..13 (color/dir/kind/free) stay zero
                 obs[base + 13] = 1.0; // valid
                 obs[base + 14] = 1.0; // is_wall
