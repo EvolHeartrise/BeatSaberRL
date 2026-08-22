@@ -1370,6 +1370,9 @@ impl Core {
         // past the head). Head-anchoring makes every dz head-z-
         // invariant, so the sort cannot be gamed by walking (v15).
         let z_off = self.body.head[2] - PLANE_Z0;
+        // 2026-08-22: z-lane low clamp = LIVE head z (exact existence
+        // boundary; see the .cu mirror's note)
+        let z_lo = self.body.head[2];
         let head = &self.body.head;
         // selection buffer, ascending by dist2; ties keep the FIRST-
         // scanned entity (strict-< displacement). Scan order: notes in
@@ -1440,7 +1443,7 @@ impl Core {
                 let w = &self.walls[idx];
                 let zfu = (w.start_time - self.time) * w.speed - WALL_FRONT_OFF
                     + z_off;
-                let zf = zfu.clamp(Z_CLIP.0, z_clip_hi());
+                let zf = zfu.clamp(z_lo, z_clip_hi());
                 obs[base] = (w.cx / X_NORM) as f32;
                 obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (zf / Z_SCALE) as f32;
@@ -1450,7 +1453,7 @@ impl Core {
                 // exact for any wall length while lane 2's front face
                 // saturates inside long walls.
                 obs[base + 4] =
-                    ((zfu + w.len).clamp(Z_CLIP.0, z_clip_hi()) / Z_SCALE)
+                    ((zfu + w.len).clamp(z_lo, z_clip_hi()) / Z_SCALE)
                         as f32;
                 // lanes 5..13 (color/dir/kind/free) stay zero
                 obs[base + 13] = 1.0; // valid
@@ -1461,7 +1464,7 @@ impl Core {
             } else {
                 let n = &self.chart[idx];
                 let z = ((n.hit_time - self.time) * n.speed + z_off)
-                    .clamp(Z_CLIP.0, z_clip_hi());
+                    .clamp(z_lo, z_clip_hi());
                 obs[base] = (n.x / X_NORM) as f32;
                 obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (z / Z_SCALE) as f32;

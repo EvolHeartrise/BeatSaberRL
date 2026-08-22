@@ -4942,6 +4942,11 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   const T time_o = T(P.tick[e]) * T(DT);
   // v15 head-anchored track (contact spec §10)
   const T z_off = P.head[e * 3 + 2] - T(PLANE_Z0);
+  // 2026-08-22 (user): the z-lane low clamp is the LIVE head z — the
+  // exact existence boundary (miss/pass/wall removal all reduce to
+  // lane < head_z), so no live object's z is ever flattened, under
+  // any lean. (Constant floors -3.0 / 0.0 / -0.65 all predate this.)
+  const T z_lo = P.head[e * 3 + 2];
   const T hx = P.head[e * 3], hy = P.head[e * 3 + 1];
   T sel_d[N_NOTE_SLOTS];
   bool sel_wall[N_NOTE_SLOTS];
@@ -4995,7 +5000,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       const int64_t wb = cc * P.W + sel_idx[slot];
       const T zfu = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
           - T(WALL_FRONT_OFF) + z_off;
-      const T zf = tclamp(zfu, T(Z_CLIP_LO), P.z_clip_hi);
+      const T zf = tclamp(zfu, z_lo, P.z_clip_hi);
       nb2[0] = (float)(P.p_wall_cx[wb] / T(X_NORM));
       nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
@@ -5006,7 +5011,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       // HEAD boundary (-0.65, like lane 2): an observable wall's back
       // face is ahead of the head, so the floor clips nothing live —
       // it only bounds the lane on the removal tick.
-      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], T(Z_CLIP_LO),
+      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], z_lo,
                               P.z_clip_hi) / T(Z_SCALE));
       // lanes 5..13 (color/dir/kind/free) stay zero
       nb2[13] = 1.f;  // valid
@@ -5017,7 +5022,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     } else {
       const int64_t cb = cc * C + sel_idx[slot];
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
-                         T(Z_CLIP_LO), P.z_clip_hi);
+                         z_lo, P.z_clip_hi);
       const bool bomb = P.p_is_bomb[cb];
       nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
       nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
