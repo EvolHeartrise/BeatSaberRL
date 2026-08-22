@@ -282,7 +282,7 @@ def test_obs_dim_and_wall_token_lanes():
     assert tok0[13] == 1.0                      # valid
     assert tok0[15] == pytest.approx(1.2, abs=1e-6)   # width / X_NORM(1)
     assert tok0[16] == pytest.approx(3.0 / 0.75, abs=1e-5)  # height / Y_NORM
-    assert tok0[17] == pytest.approx(4.0 / 8.0, abs=1e-6)   # length / Z_SCALE
+    assert tok0[17] == 0.0   # length lane retired 2026-08-22 (lane 4 - lane 2 covers it)
     assert tok0[3] == pytest.approx(-4.0 / 8.0, abs=1e-6)   # z-vel
     # env v36 lane 4: BACK-face z = front z + length, clamped [0, hi].
     # At t=0 the front face is at 5.0*4 - 0.25 + z_off; with the fresh
