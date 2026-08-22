@@ -90,9 +90,9 @@ constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // env v17 (contact spec §12): shared entity window — notes AND walls
 // ride the N_NOTE_SLOTS slots, nearest-first by head distance;
-// per-token = the v9 note lanes then [is_wall, width, height, 0]
-// (last lane carried wall length until 2026-08-22; retired as
-// redundant with back-face lane 4 minus front-face lane 2).
+// per-token = the v9 note lanes then [is_wall, width, height,
+// back-face z] (last lane carried wall length until 2026-08-22;
+// retired as redundant with back-face minus front-face lane 2).
 constexpr int NOTE_FEAT = 18;
 constexpr double WALL_PEN = -1.5;       // ONCE, on the head-entry tick (2026-08-22: -0.5 -> -1.5, bomb parity per user)
 constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
@@ -5007,21 +5007,20 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
-      // env v36: lane 4 = BACK-face z (wall end), clamped
-      // [Z_CLIP_LO, hi] — exact for any wall length while lane 2's
-      // front face saturates inside long walls. The low clamp is the
-      // HEAD boundary (-0.65, like lane 2): an observable wall's back
-      // face is ahead of the head, so the floor clips nothing live —
-      // it only bounds the lane on the removal tick.
-      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], z_lo,
-                              P.z_clip_hi) / T(Z_SCALE));
-      // lanes 5..13 (color/dir/kind/free) stay zero
-      nb2[13] = 1.f;  // valid
+      // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
       nb2[14] = 1.f;  // is_wall
       nb2[15] = (float)(P.p_wall_w[wb] / T(X_NORM));
       nb2[16] = (float)(P.p_wall_h[wb] / T(Y_NORM));
-      // lane 17 (wall length) retired: redundant with lane 4 - lane 2
-      // inside the obs window; stays zero.
+      // env v36: lane 17 = BACK-face z (wall end), clamped like lane
+      // 2 to [live head z, hi] — exact for any wall length while the
+      // front face saturates inside long walls. An observable wall's
+      // back face is ahead of the head, so the floor clips nothing
+      // live — it only bounds the lane on the removal tick. (Lived in
+      // lane 4 for one commit; moved here 2026-08-22 so no lane is
+      // binary-for-notes / continuous-for-walls under the shared
+      // token encoder. Lane 17 held wall length until the same day.)
+      nb2[17] = (float)(tclamp(zfu + P.p_wall_len[wb], z_lo,
+                               P.z_clip_hi) / T(Z_SCALE));
     } else {
       const int64_t cb = cc * C + sel_idx[slot];
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
@@ -5040,8 +5039,10 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[10] = P.p_is_link[cb] ? 1.f : 0.f;
       nb2[11] = P.p_free_pre[cb] ? 1.f : 0.f;
       nb2[12] = P.p_free_post[cb] ? 1.f : 0.f;
-      nb2[13] = 1.f;
-      // lanes 14..17 (is_wall, w/h/l) stay zero
+      // lanes 13..17 stay zero. Lane 13 (in-token valid) retired
+      // 2026-08-22: it exactly duplicated the OFF_NOTE_MASK block,
+      // which gates attention — so it read constant 1 on every token
+      // the policy could see. The mask block stays.
     }
     obs[OFF_NOTE_MASK + slot] = 1.f;
   }

@@ -225,8 +225,9 @@ const WALL_FRONT_OFF: f64 = 0.25;
 // The 16 slots are a SHARED entity window (notes + walls), filled
 // nearest-first by 3D distance from the head center; entities behind
 // the head consume no slots. ENT_FEAT = the v9 note lanes verbatim,
-// then [is_wall, width, height, 0] (last lane carried wall length
-// until 2026-08-22; retired as redundant with lane 4 - lane 2).
+// then [is_wall, width, height, back-face z] (last lane carried wall
+// length until 2026-08-22; retired as redundant with back-face minus
+// front-face lane 2).
 const N_NOTE_SLOTS: usize = 24; // env v18: 16 -> 24 (eviction study)
 const NOTE_FEAT: usize = 18;
 // env v19: + remaining follow-through credit (1 lane) — Σ over the
@@ -1449,20 +1450,20 @@ impl Core {
                 obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (zf / Z_SCALE) as f32;
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
-                // env v36: lane 4 = BACK-face z (wall end), clamped
-                // [Z_CLIP.0, hi] (= the head boundary, like lane 2) —
-                // exact for any wall length while lane 2's front face
-                // saturates inside long walls.
-                obs[base + 4] =
-                    ((zfu + w.len).clamp(z_lo, z_clip_hi()) / Z_SCALE)
-                        as f32;
-                // lanes 5..13 (color/dir/kind/free) stay zero
-                obs[base + 13] = 1.0; // valid
+                // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
                 obs[base + 14] = 1.0; // is_wall
                 obs[base + 15] = (2.0 * w.half_w / X_NORM) as f32;
                 obs[base + 16] = (2.0 * w.half_h / Y_NORM) as f32;
-                // lane 17 (wall length) retired: redundant with
-                // lane 4 - lane 2 inside the obs window; stays zero.
+                // env v36: lane 17 = BACK-face z (wall end), clamped
+                // like lane 2 to [live head z, hi] — exact for any
+                // wall length while the front face saturates inside
+                // long walls. (Moved from lane 4 2026-08-22 so no
+                // lane is binary-for-notes / continuous-for-walls
+                // under the shared token encoder; lane 17 held wall
+                // length until the same day.)
+                obs[base + 17] =
+                    ((zfu + w.len).clamp(z_lo, z_clip_hi()) / Z_SCALE)
+                        as f32;
             } else {
                 let n = &self.chart[idx];
                 let z = ((n.hit_time - self.time) * n.speed + z_off)
@@ -1484,8 +1485,11 @@ impl Core {
                 obs[base + 10] = (n.kind == KIND_CHAIN_LINK) as u8 as f32;
                 obs[base + 11] = n.free_pre as u8 as f32;
                 obs[base + 12] = n.free_post as u8 as f32;
-                obs[base + 13] = 1.0; // valid
-                // lanes 14..17 (is_wall, w/h/l) stay zero
+                // lanes 13..17 stay zero. Lane 13 (in-token valid)
+                // retired 2026-08-22: it exactly duplicated the
+                // OFF_NOTE_MASK block, which gates attention — so it
+                // read constant 1 on every token the policy could
+                // see. The mask block stays.
             }
             obs[OFF_NOTE_MASK + slot] = 1.0;
         }

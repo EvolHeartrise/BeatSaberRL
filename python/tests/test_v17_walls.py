@@ -279,23 +279,24 @@ def test_obs_dim_and_wall_token_lanes():
     assert m0 == 1.0 and m1 == 1.0
     assert all(m == 0.0 for _t, m in slots[2:])
     assert tok0[14] == 1.0                      # is_wall
-    assert tok0[13] == 1.0                      # valid
+    assert tok0[13] == 0.0    # ex-valid lane, retired 2026-08-22 (mask block gates)
     assert tok0[15] == pytest.approx(1.2, abs=1e-6)   # width / X_NORM(1)
     assert tok0[16] == pytest.approx(3.0 / 0.75, abs=1e-5)  # height / Y_NORM
-    assert tok0[17] == 0.0   # length lane retired 2026-08-22 (lane 4 - lane 2 covers it)
     assert tok0[3] == pytest.approx(-4.0 / 8.0, abs=1e-6)   # z-vel
-    # env v36 lane 4: BACK-face z = front z + length, clamped [0, hi].
-    # At t=0 the front face is at 5.0*4 - 0.25 + z_off; with the fresh
-    # sim's z_off = 0 the lane is (19.75 + 4) / 8 clamped by z_clip_hi
-    # (default 12) -> 12 / 8
-    assert tok0[4] == pytest.approx(12.0 / 8.0, abs=1e-5)
+    assert tok0[4] == 0.0   # note-only color lane stays zero for walls
+    # env v36 lane 17: BACK-face z = front z + length, clamped [lo,
+    # hi] (moved from lane 4 2026-08-22; the retired length lane's
+    # slot). At t=0 the front face is at 5.0*4 - 0.25 + z_off; with
+    # the fresh sim's z_off = 0 the lane is (19.75 + 4) / 8 clamped by
+    # z_clip_hi (default 12) -> 12 / 8
+    assert tok0[17] == pytest.approx(12.0 / 8.0, abs=1e-5)
     assert tok1[14] == 0.0 and tok1[8] == 0.0   # the note: not wall/bomb
     assert tok1[15] == tok1[16] == tok1[17] == 0.0
 
 
 def test_long_wall_back_face_lane_stays_exact_inside():
     """Straddling a LONG wall, lane 2's front face saturates at
-    Z_CLIP_LO (-0.65 = the head since 2026-08-22) while lane 4 keeps
+    the live head z (since 2026-08-22) while lane 17 keeps
     reporting the true remaining-wall distance."""
     from beat_arena_env.constants import Z_SCALE
     wall = Wall(start_time=0.5, cx=0.0, cy=1.5, width=2.4, height=3.0,
@@ -322,8 +323,8 @@ def test_long_wall_back_face_lane_stays_exact_inside():
     want_back = (zf + 10.0) / Z_SCALE
     # absolute: nominal remaining +- the head-z drift the z_off anchor
     # adds (welded body sways; bound it at 0.6 m)
-    assert tok0[4] == pytest.approx(want_back, abs=0.6 / Z_SCALE), \
-        f"back-face lane {tok0[4]} != true remaining {want_back}"
+    assert tok0[17] == pytest.approx(want_back, abs=0.6 / Z_SCALE), \
+        f"back-face lane {tok0[17]} != true remaining {want_back}"
     # exact tracking: across one tick the lane must advance by the
     # wall's speed*DT (z_off drift per tick is < 0.02 m)
     sim.step([0] * N_JOINTS)
@@ -332,7 +333,7 @@ def test_long_wall_back_face_lane_stays_exact_inside():
     assert m0b == 1.0 and tok0b[14] == 1.0
     head_z2 = obs2[OFF_HEAD + 2] * 1.0 + (-0.65)
     assert tok0b[2] == pytest.approx(head_z2 / Z_SCALE, abs=1e-4)
-    assert tok0[4] - tok0b[4] == pytest.approx(8.0 * DT / Z_SCALE,
+    assert tok0[17] - tok0b[17] == pytest.approx(8.0 * DT / Z_SCALE,
                                                abs=0.03 / Z_SCALE), \
         "back-face lane not tracking wall motion while front saturated"
 
