@@ -268,8 +268,15 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         """ScoreSaber-watch Wall(BeatmapObstacle) verbatim (spec §12a).
         Vanilla only — the ME/Noodle branches (customData size/
         coordinates, precision values) are out of scope like notes'."""
-        if dur_beats < 0:                       # negative walls flip
-            beat, dur_beats = beat + dur_beats, -dur_beats
+        # env v36 (user, 2026-08-22): zero- and negative-duration walls
+        # are DROPPED, not floored/flipped — they are decorative laser
+        # effects in real maps, unhittable in real BS, and (pre-sweep)
+        # were sub-tick phase-through freebies here. Supersedes the
+        # viewer-verbatim negative-flip rule.
+        if dur_beats <= 0:
+            nonlocal dropped
+            dropped += 1
+            return
         y = min(max(int(y), 0), 4 if v4_walls else 2)
         h = min(float(h), 5.0 - y)
         world_w = float(w) * _WALL_LANE_W

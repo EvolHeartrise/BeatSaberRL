@@ -5573,11 +5573,21 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       const T dzf = (P.p_wall_t[wb] - time_new) * P.p_wall_speed[wb]
           - T(PLANE_Z0) - T(WALL_FRONT_OFF);
       const T len = P.p_wall_len[wb];
-      if (dzf + len < T(0)) {
+      // env v36 INTERVAL SWEEP (user): the wall occupies the head
+      // plane during a time window; charge if that window intersects
+      // (time_old, time_new] instead of point-sampling at time_new —
+      // sub-tick (thin/fast) walls can no longer phase through
+      // between ticks. In dzf terms the tick's swept span is
+      // [dzf, dzf + speed*DT]; overlap with the wall's [-len, 0] iff
+      // dzf <= 0 && dzf + len + speed*DT >= 0. x/y use the end-of-
+      // tick head (moves mm-scale within one tick — documented
+      // approximation). The passed latch still fires on the same
+      // tick (disjoint per-tick windows: no double charge).
+      const bool z_hit = dzf <= T(0)
+          && dzf + len + P.p_wall_speed[wb] * T(DT) >= T(0);
+      if (dzf + len < T(0))
         P.wall_passed[e * P.W + wi] = true;  // back face behind the head
-        continue;
-      }
-      if (dzf <= T(0)
+      if (z_hit
           && fabs(hx2 - P.p_wall_cx[wb]) <= P.p_wall_w[wb] * T(0.5)
           && fabs(hy2 - P.p_wall_cy[wb]) <= P.p_wall_h[wb] * T(0.5))
         in_wall = true;
