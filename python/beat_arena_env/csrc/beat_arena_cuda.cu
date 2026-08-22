@@ -92,7 +92,7 @@ constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // ride the N_NOTE_SLOTS slots, nearest-first by head distance;
 // per-token = the v9 note lanes then [is_wall, width, height, length].
 constexpr int NOTE_FEAT = 18;
-constexpr double WALL_PEN = -0.5;       // ONCE, on the tick the head ENTERS a wall (2026-08-20; was -0.05/tick)
+constexpr double WALL_PEN = -1.5;       // ONCE, on the head-entry tick (2026-08-22: -0.5 -> -1.5, bomb parity per user)
 constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // ============================ PROVENANCE WARNING =====================
 // (2026-08-16) EVERY measurement, occupancy figure, and perf verdict
