@@ -4993,15 +4993,20 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     float* nb2 = obs + OFF_NOTES + slot * NOTE_FEAT;
     if (sel_wall[slot]) {
       const int64_t wb = cc * P.W + sel_idx[slot];
-      const T zf = tclamp(
-          (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
-              - T(WALL_FRONT_OFF) + z_off,
-          T(Z_CLIP_LO), P.z_clip_hi);
+      const T zfu = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
+          - T(WALL_FRONT_OFF) + z_off;
+      const T zf = tclamp(zfu, T(Z_CLIP_LO), P.z_clip_hi);
       nb2[0] = (float)(P.p_wall_cx[wb] / T(X_NORM));
       nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
-      // lanes 4..13 (color/dir/kind/free) stay zero
+      // env v36: lane 4 = BACK-face z (wall end), clamped [0, hi] —
+      // exact for any wall length while lane 2's front face saturates
+      // at Z_CLIP_LO inside long walls (>|Z_CLIP_LO| m). Never needs a
+      // low clamp: an observable wall's back face is ahead of the head.
+      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], T(0), P.z_clip_hi)
+                       / T(Z_SCALE));
+      // lanes 5..13 (color/dir/kind/free) stay zero
       nb2[13] = 1.f;  // valid
       nb2[14] = 1.f;  // is_wall
       nb2[15] = (float)(P.p_wall_w[wb] / T(X_NORM));
