@@ -116,23 +116,25 @@ def test_v2_mapping_extensions_wall_skipped(tmp_path):
 def test_v3_top_clamp_and_min_sizes(tmp_path):
     # y=2, h=3 -> world h=1.8 centered 2.1, top 3.0: clamp inert.
     # y=0, h=5 (5-0 cap inert) -> world 3.0, top exactly 3.0: inert.
-    # zero-duration wall -> length floored at MinWallSize 0.06.
+    # near-zero (but POSITIVE — env v36 drops dur <= 0) duration ->
+    # length floored at MinWallSize 0.06.
     _n, meta = load_beatmap(_mk_map(tmp_path, "v3", NOTE1,
-                                    [(1.0, 1, 0, 1, 5, 0.0)]), "Normal")
+                                    [(1.0, 1, 0, 1, 5, 0.001)]), "Normal")
     (w,) = meta["walls"]
     assert w.height == pytest.approx(3.0)
     assert w.cy == pytest.approx(1.5)
     assert w.length == pytest.approx(0.06)
 
 
-def test_v3_negative_duration_flips(tmp_path):
-    # d=-2 at beat 3 == a 2-beat wall starting at beat 1
+def test_v3_nonpositive_durations_dropped(tmp_path):
+    # env v36 (user): zero- and negative-duration walls are decorative
+    # laser effects — dropped at parse (supersedes the viewer-verbatim
+    # negative-flip rule this test previously pinned)
     _n, meta = load_beatmap(_mk_map(tmp_path, "v3", NOTE1,
-                                    [(3.0, 0, 0, 1, 3, -2.0)]), "Normal",
+                                    [(3.0, 0, 0, 1, 3, -2.0),
+                                     (1.0, 1, 0, 1, 3, 0.0)]), "Normal",
                             first_note_s=2.0)
-    (w,) = meta["walls"]
-    assert w.start_time == pytest.approx(2.0)      # beat 1 == the note beat
-    assert w.length == pytest.approx(2.0 * 10.0)
+    assert meta["walls"] == []
 
 
 def test_v4_y_clamp_is_wider(tmp_path):
@@ -166,12 +168,14 @@ FAR_NOTE = [Note(hit_time=100.0, col=2, row=1, x=2.5, y=1.4, color=0,
 def test_head_in_wall_penalty_window():
     # Wall spanning far beyond the grid: front crosses the plane at
     # t=1, at speed 4 it reaches the head 0.4/4 = 0.1 s later, and the
-    # back face (len 2 m) passes 2/4 = 0.5 s after that. The box is
+    # back face (len 2.05 m — off the tick grid so the exit boundary
+    # is not a knife-edge fp equality under the v36 sweep) passes
+    # 2.05/4 s after that. The box is
     # made HUGE in x/y because the unactuated weld-mode body SLUMPS —
     # by ~1.5 s the head is near the floor — so the test isolates the
     # z window (the x/y test has its own dodged-wall case).
     wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                length=2.0, speed=4.0)
+                length=2.05, speed=4.0)
     sim = _sim(FAR_NOTE, [wall])
     ticks_in, reward_in = 0, 0.0
     for k in range(1, 121):
@@ -180,7 +184,10 @@ def test_head_in_wall_penalty_window():
         codes = [e[1] for e in ev]
         t = k * DT
         dzf = (wall.start_time - t) * wall.speed - PLANE_Z0 - WALL_FRONT_OFF
-        inside = dzf <= 0.0 <= dzf + wall.length
+        # env v36 interval sweep: a tick is "in" if the wall's head-
+        # plane window intersects the tick's swept span — one extra
+        # dwell tick at exit vs the old end-of-tick point test
+        inside = dzf <= 0.0 <= dzf + wall.length + wall.speed * DT
         if inside:
             ticks_in += 1
             reward_in += r
@@ -195,6 +202,23 @@ def test_head_in_wall_penalty_window():
     # and the per-tick code-7 events above are unchanged)
     assert sim.wall_enters == 1
     assert reward_in == pytest.approx(WALL_PEN)
+
+
+def test_thin_fast_wall_cannot_phase_through():
+    """env v36 sweep: a wall whose head-plane window (len/speed =
+    7.5 ms) fits entirely between two 33 ms ticks was invisible to the
+    old end-of-tick point test; the interval sweep must charge it
+    exactly once."""
+    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=0.06, speed=8.0)
+    sim = _sim(FAR_NOTE, [wall])
+    total, enters = 0.0, 0
+    for _k in range(90):
+        _obs, r, _done, _ev = sim.step(ZERO_ACT)
+        total += r
+    assert sim.wall_enters == 1, "thin wall phased through the sweep"
+    assert sim.walls_in == 1                     # one swept tick
+    assert total == pytest.approx(WALL_PEN)
 
 
 def test_dodged_wall_charges_nothing():

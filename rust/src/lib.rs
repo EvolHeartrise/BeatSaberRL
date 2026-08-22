@@ -1895,11 +1895,14 @@ impl Core {
             }
             let w = &self.walls[wi];
             let dzf = (w.start_time - self.time) * w.speed - PLANE_Z0 - WALL_FRONT_OFF;
+            // env v36 interval sweep — see the .cu mirror: charge if
+            // the wall's head-plane window intersects this tick's
+            // (time_old, time_new] span; sub-tick walls can't phase.
+            let z_hit = dzf <= 0.0 && dzf + w.len + w.speed * DT >= 0.0;
             if dzf + w.len < 0.0 {
                 self.wall_passed[wi] = true; // back face behind the head
-                continue;
             }
-            if dzf <= 0.0
+            if z_hit
                 && (head[0] - w.cx).abs() <= w.half_w
                 && (head[1] - w.cy).abs() <= w.half_h
             {
