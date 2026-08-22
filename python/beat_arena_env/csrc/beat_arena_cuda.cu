@@ -5000,12 +5000,14 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
-      // env v36: lane 4 = BACK-face z (wall end), clamped [0, hi] —
-      // exact for any wall length while lane 2's front face saturates
-      // at Z_CLIP_LO inside long walls (>|Z_CLIP_LO| m). Never needs a
-      // low clamp: an observable wall's back face is ahead of the head.
-      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], T(0), P.z_clip_hi)
-                       / T(Z_SCALE));
+      // env v36: lane 4 = BACK-face z (wall end), clamped
+      // [Z_CLIP_LO, hi] — exact for any wall length while lane 2's
+      // front face saturates inside long walls. The low clamp is the
+      // HEAD boundary (-0.65, like lane 2): an observable wall's back
+      // face is ahead of the head, so the floor clips nothing live —
+      // it only bounds the lane on the removal tick.
+      nb2[4] = (float)(tclamp(zfu + P.p_wall_len[wb], T(Z_CLIP_LO),
+                              P.z_clip_hi) / T(Z_SCALE));
       // lanes 5..13 (color/dir/kind/free) stay zero
       nb2[13] = 1.f;  // valid
       nb2[14] = 1.f;  // is_wall
