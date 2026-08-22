@@ -286,8 +286,8 @@ def test_z_is_time_times_speed():
             z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
             vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
             t_until = env.chart[i].hit_time - env.sim.time
-            # clip window lo 0.0 since 2026-08-22 (was -3.0)
-            if 0.0 < t_until * env.chart[i].speed + z_off < 12.0:
+            # clip window lo -0.65 (= PLANE_Z0, the head) since 2026-08-22
+            if -0.65 < t_until * env.chart[i].speed + z_off < 12.0:
                 assert (z_obs - z_off) / -vz_obs == pytest.approx(
                     t_until, abs=1e-4)
 

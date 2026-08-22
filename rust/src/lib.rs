@@ -287,7 +287,7 @@ const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 102);
 const X_NORM: f64 = 1.0;
 const Y_NORM: f64 = 0.75;
 const Z_SCALE: f64 = 8.0;
-const Z_CLIP: (f64, f64) = (0.0, 12.0); // 2026-08-22 (user): lo was -3.0; wall back-face lane 4 supersedes negative front-face readings
+const Z_CLIP: (f64, f64) = (-0.65, 12.0); // lo = PLANE_Z0 = the head/miss boundary (2026-08-22; was -3.0, briefly 0.0 — see .cu note)
 // v28 probe (2026-08-20): the obs z-lane upper clamp is runtime-
 // overridable via BEAT_Z_CLIP_HI (meters; default Z_CLIP.1 = the
 // pre-v28 era) so one binary serves every checkpoint era — the CUDA
