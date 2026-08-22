@@ -1438,14 +1438,19 @@ impl Core {
             let base = OFF_NOTES + slot * NOTE_FEAT;
             if is_wall {
                 let w = &self.walls[idx];
-                let zf = ((w.start_time - self.time) * w.speed - WALL_FRONT_OFF
-                    + z_off)
-                    .clamp(Z_CLIP.0, z_clip_hi());
+                let zfu = (w.start_time - self.time) * w.speed - WALL_FRONT_OFF
+                    + z_off;
+                let zf = zfu.clamp(Z_CLIP.0, z_clip_hi());
                 obs[base] = (w.cx / X_NORM) as f32;
                 obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
                 obs[base + 2] = (zf / Z_SCALE) as f32;
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
-                // lanes 4..13 (color/dir/kind/free) stay zero
+                // env v36: lane 4 = BACK-face z (wall end), clamped
+                // [0, hi] — exact for any wall length while lane 2's
+                // front face saturates at Z_CLIP.0 inside long walls.
+                obs[base + 4] =
+                    ((zfu + w.len).clamp(0.0, z_clip_hi()) / Z_SCALE) as f32;
+                // lanes 5..13 (color/dir/kind/free) stay zero
                 obs[base + 13] = 1.0; // valid
                 obs[base + 14] = 1.0; // is_wall
                 obs[base + 15] = (2.0 * w.half_w / X_NORM) as f32;

@@ -260,8 +260,54 @@ def test_obs_dim_and_wall_token_lanes():
     assert tok0[16] == pytest.approx(3.0 / 0.75, abs=1e-5)  # height / Y_NORM
     assert tok0[17] == pytest.approx(4.0 / 8.0, abs=1e-6)   # length / Z_SCALE
     assert tok0[3] == pytest.approx(-4.0 / 8.0, abs=1e-6)   # z-vel
+    # env v36 lane 4: BACK-face z = front z + length, clamped [0, hi].
+    # At t=0 the front face is at 5.0*4 - 0.25 + z_off; with the fresh
+    # sim's z_off = 0 the lane is (19.75 + 4) / 8 clamped by z_clip_hi
+    # (default 12) -> 12 / 8
+    assert tok0[4] == pytest.approx(12.0 / 8.0, abs=1e-5)
     assert tok1[14] == 0.0 and tok1[8] == 0.0   # the note: not wall/bomb
     assert tok1[15] == tok1[16] == tok1[17] == 0.0
+
+
+def test_long_wall_back_face_lane_stays_exact_inside():
+    """env v36: straddling a LONG wall (> |Z_CLIP_LO| m), lane 2's
+    front face saturates at Z_CLIP_LO but lane 4 keeps reporting the
+    true remaining-wall distance."""
+    from beat_arena_env.constants import Z_SCALE
+    wall = Wall(start_time=0.5, cx=0.0, cy=1.5, width=2.4, height=3.0,
+                length=10.0, speed=8.0)
+    sim = _sim(FAR_NOTE, [wall])
+    deep_tick = None
+    for t in range(300):
+        sim.step([0] * N_JOINTS)
+        # front face z at end-of-tick time (z_off ~ 0 for the welded
+        # coasting body within f32 noise)
+        zf = (0.5 - sim.time) * 8.0 - 0.25
+        if zf < -3.5:
+            deep_tick = t
+            break
+    assert deep_tick is not None, "never got deep inside the wall"
+    obs = sim.obs()
+    (tok0, m0) = _slots(obs)[0]
+    assert m0 == 1.0 and tok0[14] == 1.0        # wall still observed
+    assert tok0[2] == pytest.approx(-3.0 / Z_SCALE, abs=1e-4), \
+        "front-face lane should be saturated at Z_CLIP_LO"
+    zf = (0.5 - sim.time) * 8.0 - 0.25
+    want_back = (zf + 10.0) / Z_SCALE
+    # absolute: nominal remaining +- the head-z drift the z_off anchor
+    # adds (welded body sways; bound it at 0.6 m)
+    assert tok0[4] == pytest.approx(want_back, abs=0.6 / Z_SCALE), \
+        f"back-face lane {tok0[4]} != true remaining {want_back}"
+    # exact tracking: across one tick the lane must advance by the
+    # wall's speed*DT (z_off drift per tick is < 0.02 m)
+    sim.step([0] * N_JOINTS)
+    obs2 = sim.obs()
+    (tok0b, m0b) = _slots(obs2)[0]
+    assert m0b == 1.0 and tok0b[14] == 1.0
+    assert tok0b[2] == pytest.approx(-3.0 / Z_SCALE, abs=1e-4)
+    assert tok0[4] - tok0b[4] == pytest.approx(8.0 * DT / Z_SCALE,
+                                               abs=0.03 / Z_SCALE), \
+        "back-face lane not tracking wall motion while front saturated"
 
 
 def test_window_admits_nearest_not_soonest():
