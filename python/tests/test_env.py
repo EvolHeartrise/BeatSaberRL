@@ -197,7 +197,7 @@ def test_obs_reset_hands_and_notes():
             and abs(obs[OFF_NOTES + s2 * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
     assert hits, "soonest note missing from the entity window"
     base = OFF_NOTES + hits[0] * NOTE_FEAT
-    assert obs[base + 13] == 1.0                            # valid
+    assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
     assert obs[base + 1] == pytest.approx((nc(n)[1] - 1.40) / 0.75, abs=1e-6)
     assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
@@ -615,7 +615,7 @@ def test_dot_note_obs_is_zero_vector():
     sim = RawBeatSim(max_steps=690)
     obs = sim.set_chart([note_tuple(_note(2.0, 1, 1, any_dir=True))])
     assert obs[OFF_NOTES + 6] == 0.0 and obs[OFF_NOTES + 7] == 0.0
-    assert obs[OFF_NOTES + 13] == 1.0  # still valid
+    assert obs[OFF_NOTES + 13] == 0.0  # ex-valid lane, retired 2026-08-22
 
 
 def test_forward_blade_reaches_early_note():

@@ -116,7 +116,7 @@ def test_obs_length_and_reset_layout():
     assert obs[base] == pytest.approx(0.3)
     assert obs[base + 1] == pytest.approx((1.4 - 1.40) / 0.75)
     assert obs[base + 3] == pytest.approx(-4.0 / 8.0)
-    assert obs[base + 13] == 1.0
+    assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
     assert obs[OFF_NOTE_MASK] == 1.0
     assert obs[OFF_NOTE_MASK + 1:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == 0.0
 
@@ -190,7 +190,7 @@ def test_note_block_and_mask_track_pending():
                  and abs(obs[OFF_NOTES + s * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
     assert hit_slots, "soonest note missing from the entity window"
     base = OFF_NOTES + hit_slots[0] * NOTE_FEAT
-    assert obs[base + 13] == 1.0
+    assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
     assert obs[base + 14] == 0.0                    # not a wall
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
     assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
