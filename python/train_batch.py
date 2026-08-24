@@ -392,6 +392,10 @@ def parse_args():
                    help="env v20: per-tick penalty coefficient on each "
                         "foot's |world_z - reference_z| (linear; targets "
                         "the toward/away-from-notes shimmy). 0 = off")
+    p.add_argument("--crouch-start-prob", type=float, default=0.0,
+                   help="env v38: fraction of resets that spawn in a "
+                        "physics-validated crouch (continuous depth, "
+                        "knee 0.3-1.5 rad; posture-diversity fix)")
     p.add_argument("--start-pose-jitter", type=float, default=0.0,
                    help="env v20 (CUDA training only): episode-start leg/"
                         "foot joint jitter scale in radians — 12 leg "
@@ -565,6 +569,7 @@ def main():
                       limit_arms=args.limit_arms,
                       wall_despawn=args.wall_despawn,
                       start_pose_jitter=args.start_pose_jitter,
+                      crouch_start_prob=args.crouch_start_prob,
                       z_clip_hi=args.z_clip_hi,
                       seed=args.seed, device=device)
     elif tensor_env:
@@ -587,6 +592,7 @@ def main():
             foot_shape_coef=args.foot_shape_coef,
             iso_coef=args.iso_coef,
             start_pose_jitter=args.start_pose_jitter,
+            crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:

@@ -4657,6 +4657,14 @@ struct Sim {
   // when start_pose_jitter > 0 (radians scale).
   const T* __restrict__ pose_jit;
   T start_pose_jitter;
+  // env v38 crouch-rich starts (user; TRAINING-ONLY, jitter
+  // precedent): with prob crouch_prob a reset samples a continuous
+  // depth along CROUCH_ROWS (physics-validated squat synergy:
+  // supported-survival >= the standing reset's own 21/60 under the
+  // same probe controller; generated 2026-08-24, scratchpad
+  // gen_crouch_table.py). Jitter then applies CENTERED on the crouch
+  // pose; the sole-corner root drop makes any pose ground-exact.
+  T crouch_prob;
   int gears;
   bool wide_acc;
   bool auto_reset;
@@ -4704,6 +4712,20 @@ __device__ void store_state(const Dyn<T>& __restrict__ d, const Sim<T>& P,
 }
 
 // Reset env e to the neutral state with a fresh chart (kernel phase E).
+
+// env v38 crouch ladder: (spine_p, hip_p, knee, ankle_p) f64 radians,
+// knee 0.3..1.5; root y 0.921..0.699. Values from the balance search
+// (c1/c2/c4 synergy params) — regenerate with gen_crouch_table.py.
+#define N_CROUCH 7
+__device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
+    {-0.03, 0.10499999999999998, 0.3, 0.195},
+    {-0.05, 0.325, 0.5, 0.175},
+    {0.0, 0.45499999999999996, 0.7, 0.24499999999999997},
+    {0.09000000000000001, 0.585, 0.9, 0.315},
+    {0.0, 0.605, 1.1, 0.49500000000000005},
+    {0.0, 0.6891347618019847, 1.3, 0.6108652381980153},
+    {0.15000000000000002, 0.8891347618019847, 1.5, 0.6108652381980153},
+};
 template <typename T>
 __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
                           int64_t chart) {
@@ -4736,10 +4758,26 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
     d.q[22] = T(Q_START_HIP_ROLL);   // l_ankle_roll (counter)
     d.q[25] = T(Q_START_HIP_ROLL);   // r_hip_roll
     d.q[28] = T(-Q_START_HIP_ROLL);  // r_ankle_roll (counter)
+    if (P.crouch_prob > T(0)
+        && (P.pose_jit[e * 14 + 12] + T(1)) * T(0.5) < P.crouch_prob) {
+      const T u = (P.pose_jit[e * 14 + 13] + T(1)) * T(0.5)
+          * T(N_CROUCH - 1);
+      int i0 = (int)u;
+      if (i0 > N_CROUCH - 2) i0 = N_CROUCH - 2;
+      const T f = u - T(i0);
+      T row[4];
+      for (int k = 0; k < 4; k++)
+        row[k] = T(CROUCH_ROWS[i0][k]) * (T(1) - f)
+            + T(CROUCH_ROWS[i0 + 1][k]) * f;
+      d.q[0] = row[0];
+      d.q[17] = row[1]; d.q[23] = row[1];
+      d.q[20] = row[2]; d.q[26] = row[2];
+      d.q[21] = row[3]; d.q[27] = row[3];
+    }
     if (P.start_pose_jitter > T(0)) {
       for (int k = 0; k < 12; k++) {
         const int j = 17 + k;
-        T jit = P.pose_jit[e * 12 + k] * P.start_pose_jitter;
+        T jit = P.pose_jit[e * 14 + k] * P.start_pose_jitter;
         if (j == 20 || j == 26) jit = fabs(jit);
         d.q[j] = tclamp(d.q[j] + jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
       }
@@ -5810,7 +5848,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           double foot_shape_coef, double iso_coef, double limit_coef,
           int64_t limit_arms,
           int64_t wall_despawn,
-          double start_pose_jitter, double z_clip_hi) {
+          double start_pose_jitter, double crouch_prob,
+          double z_clip_hi) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5933,6 +5972,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
+    P.crouch_prob = (scalar_t)crouch_prob;
     P.gears = (int)gears;
     P.wide_acc = wide_acc;
     P.auto_reset = auto_reset;
