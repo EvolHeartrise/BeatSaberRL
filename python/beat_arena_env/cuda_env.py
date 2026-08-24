@@ -366,6 +366,7 @@ class CudaBeatVecEnv:
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, iso_coef=0.0, limit_coef=0.0,
                  limit_arms=False,
+                 wall_despawn=False,
                  start_pose_jitter=0.0, z_clip_hi=12.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
@@ -409,6 +410,9 @@ class CudaBeatVecEnv:
         self.iso_coef = float(iso_coef)
         self.limit_coef = float(limit_coef)
         self.limit_arms = bool(limit_arms)
+        # env v37: bomb-like wall despawn on charge (training-only aid;
+        # bench/replays leave it off for faithful persistent walls)
+        self.wall_despawn = bool(wall_despawn)
         # v28: obs z-lane upper clamp (m), runtime per-run (arg wins;
         # the rust twin reads BEAT_Z_CLIP_HI instead)
         self.z_clip_hi = float(z_clip_hi)
@@ -658,6 +662,7 @@ class CudaBeatVecEnv:
                        self.foot_hinge_r, self.foot_shape_coef,
                        self.iso_coef, self.limit_coef,
                        int(self.limit_arms),
+                       int(self.wall_despawn),
                        self.start_pose_jitter, self.z_clip_hi)
 
     def _cand(self):

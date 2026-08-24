@@ -373,6 +373,9 @@ def parse_args():
                    help="env v35: widen --limit-coef's scope to the 14 "
                         "arm joints as well (all-body pricing; default "
                         "postural-only keeps whip stop-slams free)")
+    p.add_argument("--wall-despawn", action="store_true",
+                   help="env v37: walls despawn on the charged hit "
+                        "(bomb-like; training-only credit aid)")
     p.add_argument("--iso-coef", type=float, default=0.0,
                    help="env v23: per-tick activation cost — iso_coef * "
                         "sum of commanded |gear fraction| over the 29 "
@@ -560,6 +563,7 @@ def main():
                       iso_coef=args.iso_coef,
                       limit_coef=args.limit_coef,
                       limit_arms=args.limit_arms,
+                      wall_despawn=args.wall_despawn,
                       start_pose_jitter=args.start_pose_jitter,
                       z_clip_hi=args.z_clip_hi,
                       seed=args.seed, device=device)
