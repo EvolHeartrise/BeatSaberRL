@@ -1313,9 +1313,14 @@ def main():
             # ONE host sync (same as the .item() it replaces) reads the
             # loss, the overflow audit, the ratio diagnostic, the
             # log-ratio forensic, and the live scale together
-            ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v = torch.stack(
+            # "return" (2026-08-24, user): reward accumulated THIS
+            # update, mean per env over the T-tick rollout — the
+            # population analog of acc, unlike the episode-terminated
+            # ep_return(last100) trailing window.
+            ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v = torch.stack(
                 [ent_loss.detach(), ev, inf_count[0], ratio_diag,
-                 logr_max, fp16_scale]).tolist()
+                 logr_max, fp16_scale,
+                 b_rew.sum() / b_rew.shape[1]]).tolist()
             logr_max.zero_()
             extra = f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}"
             if inf_v > 0:
@@ -1327,14 +1332,18 @@ def main():
             print(f"update {update+1:>3}/{num_updates}  steps "
                   f"{global_step:>9}  acc {acc_now:.4f}  "
                   f"accL {acc_l:.4f}  accR {acc_r:.4f}  "
+                  f"return {ret_v:7.3f}  "
                   f"ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
-            ent_v, ev_v = torch.stack([ent_loss.detach(), ev]).tolist()
+            ent_v, ev_v, ret_v = torch.stack(
+                [ent_loss.detach(), ev,
+                 b_rew.sum() / b_rew.shape[1]]).tolist()
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
                   f"acc {acc_now:.4f}  accL {acc_l:.4f}  accR {acc_r:.4f}  "
+                  f"return {ret_v:7.3f}  "
                   f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
                   flush=True)
