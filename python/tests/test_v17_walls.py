@@ -356,6 +356,55 @@ def test_long_wall_back_face_lane_stays_exact_inside():
         "back-face lane not tracking wall motion while front saturated"
 
 
+def test_wall_despawn_charges_once_and_removes():
+    """env v37 (user): with wall_despawn=True a wall charges WALL_PEN on
+    the entry tick, despawns (obs + penalty loops both skip it via the
+    passed latch), and produces NO in-wall tick events afterward."""
+    import beat_arena_rs
+    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=10.0, speed=4.0)   # long: would linger 2.5 s
+    sim = beat_arena_rs.RawBeatSim(max_steps=600, effort_coef=0.0,
+                                   wide_acc=False, gears=5,
+                                   foot_contact=False, wall_despawn=True)
+    sim.set_chart([note_tuple(n) for n in FAR_NOTE],
+                  [wall_tuple(wall)])
+    total, enter_ticks, in_ticks = 0.0, 0, 0
+    seen_after = False
+    for k in range(1, 181):
+        obs, r, _d, ev = sim.step(ZERO_ACT)
+        codes = [e[1] for e in ev]
+        total += r
+        if 8 in codes:
+            enter_ticks += 1
+            entry_k = k
+        in_ticks += codes.count(7)
+        # after the charge the wall must be OUT of the obs window
+        if enter_ticks and k > entry_k:
+            base = OFF_NOTES  # slot 0 would hold the wall if present
+            if obs[base + 14] == 1.0:
+                seen_after = True
+    assert enter_ticks == 1, "exactly one charged entry"
+    assert in_ticks == 0, "despawn mode emits no in-wall tick events"
+    assert total == pytest.approx(WALL_PEN), "one fee, nothing else"
+    assert not seen_after, "wall stayed in obs after despawn"
+
+
+def test_wall_despawn_default_off_keeps_persistence():
+    """Default (bench) semantics unchanged: the wall persists after
+    entry and keeps emitting in-wall ticks."""
+    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=10.0, speed=4.0)
+    sim = _sim(FAR_NOTE, [wall])
+    enters, in_ticks = 0, 0
+    for _k in range(1, 181):
+        _obs, _r, _d, ev = sim.step(ZERO_ACT)
+        codes = [e[1] for e in ev]
+        enters += codes.count(8)
+        in_ticks += codes.count(7)
+    assert enters == 1
+    assert in_ticks > 10, "persistent wall keeps ticking inside"
+
+
 def test_window_admits_nearest_not_soonest():
     # 16 SOONER notes far off to the side (x=4 -> dist >= 4) vs one
     # LATER but slower note dead ahead of the head (x=0, y=1.7, speed

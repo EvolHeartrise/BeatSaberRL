@@ -1090,6 +1090,13 @@ struct Core {
     limit_coef: f64,
     // env v35: widen pricing scope to the 14 arm joints too
     limit_arms: bool,
+    // env v37 (user, 2026-08-23): training-only credit-assignment aid —
+    // a wall DESPAWNS on the tick its fee is charged (bomb-like: one
+    // WALL_PEN per wall object, per-wall not per-edge; stacked walls
+    // each charge). Removed walls leave obs immediately, so any
+    // visible wall is an unpaid, still-avoidable threat. Default
+    // false: bench/replays keep faithful persistent walls.
+    wall_despawn: bool,
     // cumulative limit-rest telemetry until popped (pop_limit_rest,
     // fall_hits pattern): λ-flow sums [legs, spine] and the tick count
     // — accumulated REGARDLESS of limit_coef so stop-resting is
@@ -1172,6 +1179,7 @@ impl Core {
             iso_coef: 0.0,
             limit_coef: 0.0,
             limit_arms: false,
+            wall_despawn: false,
             limit_rest_sum: [0.0; 3],
             limit_rest_ticks: 0,
             prev_foot_pot: 0.0,
@@ -1917,7 +1925,17 @@ impl Core {
                 && (head[0] - w.cx).abs() <= w.half_w
                 && (head[1] - w.cy).abs() <= w.half_h
             {
-                in_wall = true;
+                if self.wall_despawn {
+                    // env v37: charge and remove THIS wall; no
+                    // lingering in-wall ticks, no event 7 stream.
+                    self.wall_enters += 1;
+                    self.walls_in += 1; // counts entries in despawn mode
+                    self.events_buf.push((u32::MAX, 8, 0.0, 0.0, 0.0));
+                    reward += WALL_PEN;
+                    self.wall_passed[wi] = true;
+                } else {
+                    in_wall = true;
+                }
             }
         }
         if in_wall {
@@ -2033,12 +2051,13 @@ impl RawBeatSim {
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, iso_coef=0.0,
-                        limit_coef=0.0, limit_arms=false))]
+                        limit_coef=0.0, limit_arms=false,
+                        wall_despawn=false))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
            foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
-           limit_arms: bool) -> Self {
+           limit_arms: bool, wall_despawn: bool) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
@@ -2049,6 +2068,7 @@ impl RawBeatSim {
         core.iso_coef = iso_coef;
         core.limit_coef = limit_coef;
         core.limit_arms = limit_arms;
+        core.wall_despawn = wall_despawn;
         RawBeatSim { core }
     }
 
@@ -2550,14 +2570,14 @@ impl VecBeatSim {
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         iso_coef=0.0, limit_coef=0.0,
-                        limit_arms=false))]
+                        limit_arms=false, wall_despawn=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
            foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
-           limit_arms: bool) -> Self {
+           limit_arms: bool, wall_despawn: bool) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2571,6 +2591,7 @@ impl VecBeatSim {
                     c.iso_coef = iso_coef;
                     c.limit_coef = limit_coef;
                     c.limit_arms = limit_arms;
+                    c.wall_despawn = wall_despawn;
                     c
                 })
                 .collect(),

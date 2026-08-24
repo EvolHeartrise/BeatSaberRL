@@ -4642,6 +4642,8 @@ struct Sim {
   // pre-v34 rewards).
   T limit_coef;
   int limit_arms;  // env v35: price arm limit rows too (0 = postural only)
+  // env v37: bomb-like wall despawn on charge (training-only flag)
+  int wall_despawn;
   // env v22: previous tick's total hinged foot deviation, per env
   // (zeroed by reset_env — resets start on-target).
   T* __restrict__ foot_pot;
@@ -5600,8 +5602,17 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.wall_passed[e * P.W + wi] = true;  // back face behind the head
       if (z_hit
           && fabs(hx2 - P.p_wall_cx[wb]) <= P.p_wall_w[wb] * T(0.5)
-          && fabs(hy2 - P.p_wall_cy[wb]) <= P.p_wall_h[wb] * T(0.5))
-        in_wall = true;
+          && fabs(hy2 - P.p_wall_cy[wb]) <= P.p_wall_h[wb] * T(0.5)) {
+        if (P.wall_despawn) {
+          // env v37 (lib.rs mirror): charge and remove THIS wall —
+          // one fee per wall object, no lingering in-wall ticks.
+          reward += T(WALL_PEN);
+          P.wall_passed[e * P.W + wi] = true;
+          P.walls_in[e] += 1;  // counts entries in despawn mode
+        } else {
+          in_wall = true;
+        }
+      }
     }
     if (in_wall) {
       if (!P.in_wall_prev[e]) reward += T(WALL_PEN);
@@ -5787,6 +5798,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
           double foot_shape_coef, double iso_coef, double limit_coef,
           int64_t limit_arms,
+          int64_t wall_despawn,
           double start_pose_jitter, double z_clip_hi) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
@@ -5902,6 +5914,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.iso_coef = (scalar_t)iso_coef;
     P.limit_coef = (scalar_t)limit_coef;
     P.limit_arms = (int)limit_arms;
+    P.wall_despawn = (int)wall_despawn;
     P.z_clip_hi = (scalar_t)z_clip_hi;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
