@@ -19,8 +19,10 @@ not C. C's real costs are global memory (N*C status bytes) and one
 O(C) zeroing per reset: both trivial.)
 
 Windows cover [k*seg_len, (k+1)*seg_len) in song time, notes rebased
-to window start; for k > 0 the first LEAD_S seconds are dropped (those
-notes were mid-flight at the cut). Windows with < MIN_SCOREABLE
+to window start; the first LEAD_S seconds of EVERY window are dropped
+(k > 0: those notes were mid-flight at the cut; k = 0 since
+2026-08-23: negative-shift intro walls otherwise reach the head on
+the first tick — an unavoidable charge). Windows with < MIN_SCOREABLE
 scoreable objects or > MAX_OBJECTS total are dropped (counts are
 reported). Built once and cached as npz keyed on (parser version,
 seg_len, catalog bytes) — every sweep leg then pays only the npz load
@@ -58,8 +60,10 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     # v3: env v17 — wall tensors joined the pool payload
     # v4: 2026-08-23 — MAX_OBJECTS 512 -> 1536 (cap change is invisible
     # to the parser hash, so it must bump the pool key itself)
+    # v5: 2026-08-23 — lead gap applies to k=0 (intro walls clipped to
+    # >= lead_s; kills unavoidable first-tick wall charges)
     key = hashlib.sha1(
-        (f"{seg_len:g}_{ver}_v4_lead{lead_s:g}"
+        (f"{seg_len:g}_{ver}_v5_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
@@ -115,7 +119,15 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
             continue
         last = tup[-1][0]
         for k in range(int(np.ceil((last + 1e-6) / seg_len))):
-            lo = k * seg_len + (lead_s if k else 0.0)
+            # 2026-08-23 (user): lead gap applies to k=0 too. The
+            # note-anchored parser shift (first note -> 2.0 s) can be
+            # NEGATIVE, putting intro walls at t <= 0; without the gap
+            # they clip to c0 = 0 and reach the head in 0.4/speed s —
+            # 32 catalog segments charged an unavoidable first-tick
+            # WALL_PEN (measured 19-21 ms entry). Notes are unaffected
+            # (none before 2.0 s); intro walls now start >= lead_s out,
+            # making "nothing materializes mid-flight" uniform.
+            lo = k * seg_len + lead_s
             hi = (k + 1) * seg_len
             win = [t for t in tup if lo <= t[0] < hi]
             if len(win) > MAX_OBJECTS:
