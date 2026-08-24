@@ -1454,8 +1454,15 @@ impl Core {
                 let zfu = (w.start_time - self.time) * w.speed - WALL_FRONT_OFF
                     + z_off;
                 let zf = zfu.clamp(z_lo, z_clip_hi());
-                obs[base] = (w.cx / X_NORM) as f32;
-                obs[base + 1] = ((w.cy - Y_CENTER) / Y_NORM) as f32;
+                // env v38 (user): entity x/y are HEAD-RELATIVE —
+                // kills the absolute-coordinate shortcut the near-
+                // constant standing head height taught (posture-
+                // invariance / duck-amnesia fix). Mechanics
+                // untouched; head pose stays in obs; z was already
+                // head-anchored via z_off.
+                obs[base] = ((w.cx - self.body.head[0]) / X_NORM) as f32;
+                obs[base + 1] =
+                    ((w.cy - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = (zf / Z_SCALE) as f32;
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
                 // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
@@ -1476,8 +1483,10 @@ impl Core {
                 let n = &self.chart[idx];
                 let z = ((n.hit_time - self.time) * n.speed + z_off)
                     .clamp(z_lo, z_clip_hi());
-                obs[base] = (n.x / X_NORM) as f32;
-                obs[base + 1] = ((n.y - Y_CENTER) / Y_NORM) as f32;
+                // env v38: head-relative x/y (see wall branch note)
+                obs[base] = ((n.x - self.body.head[0]) / X_NORM) as f32;
+                obs[base + 1] =
+                    ((n.y - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = (z / Z_SCALE) as f32;
                 obs[base + 3] = (-n.speed / Z_SCALE) as f32;
                 if n.kind != KIND_BOMB {

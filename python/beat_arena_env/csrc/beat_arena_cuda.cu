@@ -5005,8 +5005,14 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       const T zfu = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
           - T(WALL_FRONT_OFF) + z_off;
       const T zf = tclamp(zfu, z_lo, P.z_clip_hi);
-      nb2[0] = (float)(P.p_wall_cx[wb] / T(X_NORM));
-      nb2[1] = (float)((P.p_wall_cy[wb] - T(Y_CENTER)) / T(Y_NORM));
+      // env v38 (user): entity x/y are HEAD-RELATIVE — the near-
+      // constant standing head height let the encoder learn an
+      // absolute-coordinate shortcut that mis-generalizes the moment
+      // the head moves (posture-invariance / duck-amnesia fix).
+      // Mechanics untouched; head pose itself stays in obs. z was
+      // already head-anchored via z_off.
+      nb2[0] = (float)((P.p_wall_cx[wb] - P.head[e * 3]) / T(X_NORM));
+      nb2[1] = (float)((P.p_wall_cy[wb] - P.head[e * 3 + 1]) / T(Y_NORM));
       nb2[2] = (float)(zf / T(Z_SCALE));
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
       // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
@@ -5028,8 +5034,10 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
                          z_lo, P.z_clip_hi);
       const bool bomb = P.p_is_bomb[cb];
-      nb2[0] = (float)(P.p_center[cb * 2] / T(X_NORM));
-      nb2[1] = (float)((P.p_center[cb * 2 + 1] - T(Y_CENTER)) / T(Y_NORM));
+      // env v38: head-relative x/y (see wall branch note)
+      nb2[0] = (float)((P.p_center[cb * 2] - P.head[e * 3]) / T(X_NORM));
+      nb2[1] = (float)((P.p_center[cb * 2 + 1] - P.head[e * 3 + 1])
+                       / T(Y_NORM));
       nb2[2] = (float)(z / T(Z_SCALE));
       nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
       nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;

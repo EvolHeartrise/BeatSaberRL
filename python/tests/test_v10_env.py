@@ -113,8 +113,9 @@ def test_obs_length_and_reset_layout():
     assert not obs[OFF_CONTACT:OFF_CONTACT + 2].any()
     # one pending note
     base = OFF_NOTES
-    assert obs[base] == pytest.approx(0.3)
-    assert obs[base + 1] == pytest.approx((1.4 - 1.40) / 0.75)
+    # env v38: entity x/y are head-relative (head at reference (0, 1.70))
+    assert obs[base] == pytest.approx(0.3 - 0.0)
+    assert obs[base + 1] == pytest.approx((1.4 - 1.70) / 0.75)
     assert obs[base + 3] == pytest.approx(-4.0 / 8.0)
     assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
     assert obs[OFF_NOTE_MASK] == 1.0
@@ -186,7 +187,8 @@ def test_note_block_and_mask_track_pending():
     z = min(n.hit_time * n.speed, 12.0)
     hit_slots = [s for s in range(N_NOTE_SLOTS)
                  if obs[OFF_NOTE_MASK + s] == 1.0
-                 and abs(obs[OFF_NOTES + s * NOTE_FEAT] - nc(n)[0]) < 1e-6
+                 and abs(obs[OFF_NOTES + s * NOTE_FEAT]
+                         - (nc(n)[0] - obs[OFF_HEAD])) < 1e-6
                  and abs(obs[OFF_NOTES + s * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
     assert hit_slots, "soonest note missing from the entity window"
     base = OFF_NOTES + hit_slots[0] * NOTE_FEAT
