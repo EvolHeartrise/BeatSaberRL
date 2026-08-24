@@ -9,17 +9,22 @@ behind the ~87% accuracy ceiling.
 
 SEGMENTS, not whole maps, by design (user decision 2026-07-29): median
 ranked map is 884 notes / 173 s vs the env's ~90-object / 690-step
-regime, and 1,235 maps exceed the kernel's C~1536 smem-scratch
-occupancy budget. 25 s windows keep C in the hundreds, episode length
-uniform, and every kernel/graph shape static.
+regime. 25 s windows keep C in the hundreds, episode length uniform,
+and every kernel/graph shape static. (A pre-2026-08 comment here
+claimed a "C~1536 smem-scratch occupancy budget"; the current kernel
+has NO shared-memory structures at all — thread-per-env, local-memory
+scratch, register-bound — and its chart scans are first_pending- and
+sorted-time-windowed, so per-tick cost tracks the in-flight window,
+not C. C's real costs are global memory (N*C status bytes) and one
+O(C) zeroing per reset: both trivial.)
 
 Windows cover [k*seg_len, (k+1)*seg_len) in song time, notes rebased
 to window start; for k > 0 the first LEAD_S seconds are dropped (those
 notes were mid-flight at the cut). Windows with < MIN_SCOREABLE
-scoreable objects or > MAX_OBJECTS total are dropped (the latter is
-the smem guard; counts are reported). Built once and cached as npz
-keyed on (parser version, seg_len, catalog bytes) — every sweep leg
-then pays only the npz load + a seeded subsample.
+scoreable objects or > MAX_OBJECTS total are dropped (counts are
+reported). Built once and cached as npz keyed on (parser version,
+seg_len, catalog bytes) — every sweep leg then pays only the npz load
++ a seeded subsample.
 """
 
 from __future__ import annotations
@@ -36,7 +41,13 @@ from .mirror import mirror_tuples, mirror_walls
 
 LEAD_S = 1.5          # k>0 windows: drop notes cut mid-flight
 MIN_SCOREABLE = 4     # drop near-empty tail windows
-MAX_OBJECTS = 512     # smem guard: C*4B must stay well under 6 KB/block
+# 2026-08-23 (user): 512 -> 1536. The old "smem guard" rationale was
+# stale (see module docstring — the kernel is not smem-bound and never
+# scans O(C) per tick). Measured over the current catalog: densest
+# real window is 1,489 entities; 1,536 admits every segment (the old
+# cap dropped 128, 0.27%). Cost: status bytes N*C (50 MB at N=32768)
+# and pool tensors padded to the observed max — both trivial.
+MAX_OBJECTS = 1536
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -45,8 +56,10 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     with open(catalog_path, "rb") as f:
         cat = f.read()
     # v3: env v17 — wall tensors joined the pool payload
+    # v4: 2026-08-23 — MAX_OBJECTS 512 -> 1536 (cap change is invisible
+    # to the parser hash, so it must bump the pool key itself)
     key = hashlib.sha1(
-        (f"{seg_len:g}_{ver}_v3_lead{lead_s:g}"
+        (f"{seg_len:g}_{ver}_v4_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
