@@ -100,8 +100,9 @@ def test_obs_length_and_reset_layout():
     for base, fw, fh in ((OFF_HAND_L, F_L_WRIST, F_L_HAND),
                          (OFF_HAND_R, F_R_WRIST, F_R_HAND)):
         w, r = pos[fw], rots[fh]
-        assert obs[base] == pytest.approx(w[0], abs=1e-6)
-        assert obs[base + 1] == pytest.approx((w[1] - 1.40) / 0.75,
+        # env v38: wrist x/y head-relative (reference head (0, 1.70))
+        assert obs[base] == pytest.approx(w[0] - 0.0, abs=1e-6)
+        assert obs[base + 1] == pytest.approx((w[1] - 1.70) / 0.75,
                                               abs=1e-6)
         assert obs[base + 2] == pytest.approx(w[2], abs=1e-6)
         assert not obs[base + 3:base + 6].any()          # wrist vel
