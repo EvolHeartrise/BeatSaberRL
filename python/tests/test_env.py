@@ -33,7 +33,8 @@ from beat_arena_env import (
 )
 from beat_arena_env.constants import (
     A_L_ARM, A_R_ARM, DT, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK,
-    KIND_NOTE, N_JOINTS, NV, NQPOS, OFF_HAND_L, OFF_HAND_R, ROOT_POS0,
+    KIND_NOTE, N_JOINTS, NV, NQPOS, OFF_HAND_L, OFF_HAND_R, OFF_HEAD,
+    ROOT_POS0,
     ROW_Y, col_x, joint_limits,
 )
 from beat_arena_env.kinematics import fk
@@ -193,12 +194,15 @@ def test_obs_reset_hands_and_notes():
     z = min(n.hit_time * n.speed, 12.0)
     hits = [s2 for s2 in range(N_NOTE_SLOTS)
             if obs[OFF_NOTE_MASK + s2] == 1.0
-            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT] - nc(n)[0]) < 1e-6
+            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT]
+                    - (nc(n)[0] - obs[OFF_HEAD])) < 1e-6
             and abs(obs[OFF_NOTES + s2 * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
     assert hits, "soonest note missing from the entity window"
     base = OFF_NOTES + hits[0] * NOTE_FEAT
     assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
-    assert obs[base + 1] == pytest.approx((nc(n)[1] - 1.40) / 0.75, abs=1e-6)
+    head_y = obs[OFF_HEAD + 1] * 0.75 + 1.70
+    # env v38: entity y is head-relative
+    assert obs[base + 1] == pytest.approx((nc(n)[1] - head_y) / 0.75, abs=1e-6)
     assert obs[base + 3] == pytest.approx(-n.speed / 8.0)
     assert obs[base + 6] == pytest.approx(np.cos(n.angle), abs=1e-6)
     assert obs[base + 7] == pytest.approx(np.sin(n.angle), abs=1e-6)
