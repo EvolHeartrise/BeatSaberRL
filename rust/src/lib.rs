@@ -1346,8 +1346,15 @@ impl Core {
         // hand derived blocks (v9 semantics on the v10 FK)
         for (s, base) in [(0usize, OFF_HAND_L), (1usize, OFF_HAND_R)] {
             let b = &self.body;
-            obs[base] = (b.wrist[s][0] / X_NORM) as f32;
-            obs[base + 1] = ((b.wrist[s][1] - Y_CENTER) / Y_NORM) as f32;
+            // env v38: wrist x/y join the entities' head-relative
+            // frame so note<->saber aiming is a per-axis difference
+            // inside one frame (lit: interacting tokens must share a
+            // frame; dual-effector rules out saber anchors). z stays
+            // world — entity z lanes are world z (z_off cancels), so
+            // z was already frame-consistent. Velocities/blades stay
+            // world (no near-constant shortcut in velocity; jitter).
+            obs[base] = ((b.wrist[s][0] - b.head[0]) / X_NORM) as f32;
+            obs[base + 1] = ((b.wrist[s][1] - b.head[1]) / Y_NORM) as f32;
             obs[base + 2] = b.wrist[s][2] as f32;
             for k in 0..3 {
                 obs[base + 3 + k] = (b.wrist_vel[s][k] / V_NORM) as f32;

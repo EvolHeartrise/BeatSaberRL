@@ -4906,8 +4906,11 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   for (int s = 0; s < 2; s++) {
     const int base = bases[s];
     const int wb = (e * 2 + s) * 3;
-    obs[base] = (float)(P.wrist[wb] / T(X_NORM));
-    obs[base + 1] = (float)((P.wrist[wb + 1] - T(Y_CENTER)) / T(Y_NORM));
+    // env v38: wrist x/y head-relative (lib.rs mirror; z stays world
+    // — already consistent with the entity z lanes)
+    obs[base] = (float)((P.wrist[wb] - P.head[e * 3]) / T(X_NORM));
+    obs[base + 1] = (float)((P.wrist[wb + 1] - P.head[e * 3 + 1])
+                            / T(Y_NORM));
     obs[base + 2] = (float)P.wrist[wb + 2];
     for (int k = 0; k < 3; k++) {
       obs[base + 3 + k] = (float)(P.wrist_vel[wb + k] / T(V_NORM));
