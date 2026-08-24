@@ -367,7 +367,8 @@ class CudaBeatVecEnv:
                  foot_shape_coef=0.0, iso_coef=0.0, limit_coef=0.0,
                  limit_arms=False,
                  wall_despawn=False,
-                 start_pose_jitter=0.0, z_clip_hi=12.0):
+                 start_pose_jitter=0.0, crouch_start_prob=0.0,
+                 z_clip_hi=12.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -419,6 +420,10 @@ class CudaBeatVecEnv:
         self.start_pose_jitter = float(start_pose_jitter)
         assert start_pose_jitter == 0.0 or foot_contact, \
             "start_pose_jitter fights the v10 foot welds; contact mode only"
+        # env v38 crouch-rich starts (training-only; see kernel table)
+        self.crouch_start_prob = float(crouch_start_prob)
+        assert crouch_start_prob == 0.0 or foot_contact, \
+            "crouch starts need contact mode (welded feet fight the pose)"
 
         # env v18 perturbation training (push-recovery lit): with
         # probability push_prob per (env, tick) add a horizontal root
@@ -573,7 +578,7 @@ class CudaBeatVecEnv:
         # keeps the fixed address CUDA graphs capture; torch's RNG
         # offset handling makes replays draw fresh values, the _kick
         # precedent). Consumed only by envs that reset this launch.
-        self._pose_jit = z(N, 12)
+        self._pose_jit = z(N, 14)  # 12 jitter + crouch gate/depth
         # env v24: §8 body-point finite-diff base + world velocities
         self._bp_pos = z(N, 18)
         self._bp_vel = z(N, 18)
@@ -652,7 +657,7 @@ class CudaBeatVecEnv:
         ]
 
     def _launch(self, actions, cand, mode):
-        if self.start_pose_jitter > 0.0:
+        if self.start_pose_jitter > 0.0 or self.crouch_start_prob > 0.0:
             self._pose_jit.uniform_(-1.0, 1.0)
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.effort_coef, self.wide_acc,
@@ -663,7 +668,8 @@ class CudaBeatVecEnv:
                        self.iso_coef, self.limit_coef,
                        int(self.limit_arms),
                        int(self.wall_despawn),
-                       self.start_pose_jitter, self.z_clip_hi)
+                       self.start_pose_jitter, self.crouch_start_prob,
+                       self.z_clip_hi)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""

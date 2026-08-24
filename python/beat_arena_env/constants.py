@@ -379,3 +379,21 @@ def joint_limits(hand):
             (TWIST_LO[hand], TWIST_HI[hand]), (0.0, ELBOW_HI),
             (ROLL_LO[hand], ROLL_HI[hand]), (-BEND_LIM, BEND_LIM),
             (DEV_LO[hand], DEV_HI[hand])]
+
+# env v38 crouch-rich start ladder (user, 2026-08-24): (spine_p,
+# hip_p, knee, ankle_p) f64 radians, mirrored VERBATIM in the .cu
+# CROUCH_ROWS (parity-bound literals). Physics-validated squat
+# synergy: each row's supported-survival under the probe controller
+# >= the standing reset's own 21/60; root y 0.921 -> 0.699. Reset
+# lerps adjacent rows for continuous depth, jitter applies on top,
+# sole-corner drop grounds the pose. Regenerate:
+# scratchpad/gen_crouch_table.py.
+CROUCH_START_ROWS = (
+    (-0.03, 0.10499999999999998, 0.3, 0.195),
+    (-0.05, 0.325, 0.5, 0.175),
+    (0.0, 0.45499999999999996, 0.7, 0.24499999999999997),
+    (0.09000000000000001, 0.585, 0.9, 0.315),
+    (0.0, 0.605, 1.1, 0.49500000000000005),
+    (0.0, 0.6891347618019847, 1.3, 0.6108652381980153),
+    (0.15000000000000002, 0.8891347618019847, 1.5, 0.6108652381980153),
+)
