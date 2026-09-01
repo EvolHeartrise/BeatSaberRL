@@ -600,12 +600,21 @@ update compute — the paired 50M gate measured **+110.9 wpp (dAcc
 t=+12.88, score_acc +32.5%) AND 1.61x wall** (~250k steps/s at the
 production config). Overturns the 07-21 "single-pass fails" study,
 which conflated sample reuse with gradient-step density.
-**`--fp16 all --graph-rollout` is the production DEFAULT for training
+**`--fp16 all` is the production DEFAULT for training
 legs (2026-07-26, user decision)**: fp16-storage activations everywhere
 (fp32 cuBLAS compute, fp32 master weights/checkpoints, static loss
-scale 2^17), the rollout step captured as ONE CUDA graph, fused
+scale 2^17), fused
 single-head attention on the fp16 path, chart pool 65536 — ~140k
-steps/s vs 78k fp32-era (1.8x) at the production config. The 2026-07-26
+steps/s vs 78k fp32-era (1.8x) at the production config.
+`--graph-rollout` was part of that default until **2026-08-31, when it
+was REMOVED**: at the production width (N=32,768) the graphed forward
+measured 0.99x eager and the end-to-end rollout/update split was
+identical with and without it, so the capture/refresh machinery and
+its eager-divergent sampling RNG stream were pure cost. The 1.20x it
+was adopted for was a small-N launch-overhead win. The ScoreSaber
+bench keeps its OWN graphed argmax (`cuda_graphs.py`, opt out with
+`--no-graphs`); that path is unchanged and bench JSONs still stamp
+`forward`. The 2026-07-26
 graph gate measured the all-fp16 graphed arm at **+72.4 wpp (paired
 dAcc t=+6.63, score_acc +8.7%)** over fp32-rollout 'update' mode — the
 epoch-1 ratio diagnostic (r1 2.0e-3 -> 6.7e-4) attributes it to

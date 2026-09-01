@@ -4,7 +4,10 @@ Survives the trainer's CUDA-graphs removal (2026-07-25 — the fused
 action head + last-block pruning in policy.py eliminated the launch
 storm capture used to hide, leaving capture as pure overhead there).
 Still used where a graph genuinely pays: the ScoreSaber bench's
-graphed argmax forward and train_batch's --graph-rollout capture.
+graphed argmax forward. (train_batch's --graph-rollout capture also
+lived here until 2026-08-31, when it was removed — 0.99x eager at
+N=32,768, i.e. the same "pure overhead" verdict as 2026-07-25, just
+reached at a width where the launch storm no longer dominates.)
 (The bench_policy_* microbenches were restored 2026-08-15 as the
 perf-ladder A/B instrument — see PERF_AUDIT_2026-08-16.md Tier 0.)
 """

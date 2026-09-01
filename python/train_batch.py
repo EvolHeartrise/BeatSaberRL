@@ -234,19 +234,6 @@ def parse_args():
                         "(the pre-gate default); 'off' = full fp32 "
                         "(record-attempt fallback). Checkpoints stay "
                         "fp32 in every mode. Forced off on CPU devices")
-    p.add_argument("--graph-rollout", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="capture the rollout step (policy fwd + sample + "
-                        "env kernel) as ONE CUDA graph (round-4 #9; "
-                        "DEFAULT since 2026-07-26 — gate-cleared with "
-                        "--fp16 all: 1.20x rollout, +72.4 wpp paired). "
-                        "MEASURED DEAD AT WIDTH 2026-08-31: at N=32,768 "
-                        "the graphed forward is 0.99x eager and the "
-                        "end-to-end split is identical either way — the "
-                        "1.20x was a small-N launch-overhead win. "
-                        "Changes the sampling RNG stream vs eager. "
-                        "Auto-downgrades (with a note) on CPU/rust env "
-                        "or capture failure")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -516,13 +503,14 @@ def main():
     logr_max = torch.zeros((), device=device)  # max|log ratio| this update
 
     tensor_env = args.env == "cuda"
-    # --graph-rollout is the DEFAULT (2026-07-26); downgrade with a note
-    # where it cannot apply (same policy as the fp16 default above).
-    # The rust env crosses FFI per tick, so graphs stay cuda-env-only.
-    if args.graph_rollout and (args.env != "cuda" or device.type != "cuda"):
-        print("--graph-rollout: needs --env cuda on a CUDA device, "
-              "forcing off", flush=True)
-        args.graph_rollout = False
+    # (--graph-rollout / rollout_graph.py REMOVED 2026-08-31: measured
+    # 0.99x eager for the graphed forward at N=32,768 and an identical
+    # end-to-end phase split, so the capture/refresh machinery and its
+    # eager-divergent sampling RNG stream bought nothing at production
+    # width. The 1.20x it was adopted for in 2026-07-26 was a small-N
+    # launch-overhead win. The BENCH keeps its own separate graphed
+    # argmax — cuda_graphs.py, bench_scoresaber --no-graphs — which is
+    # untouched, and bench JSONs still stamp forward=graphed/eager.)
 
     # Config provenance (2026-07-26, after the gen3 postmortem: a
     # missing --colors flag survived a 5B run and a 4-arm bisect because
@@ -797,19 +785,6 @@ def main():
                   "the first ~100 updates (EV dips, then recovers) !!!",
                   flush=True)
 
-    graph_roll = None
-    if args.graph_rollout:
-        try:
-            from rollout_graph import GraphedRollout
-            graph_roll = GraphedRollout(policy, venv)
-            print(f"--graph-rollout: rollout step captured as one CUDA "
-                  f"graph ({'fp16' if policy.fp16 else 'fp32'} rollout; "
-                  f"sampling RNG stream differs from eager)", flush=True)
-        except Exception as e:  # driver/WDDM capture failure: eager fallback
-            graph_roll = None
-            print(f"--graph-rollout: capture failed, falling back to the "
-                  f"eager rollout [{type(e).__name__}: {e}]", flush=True)
-
     # bounded (2026-08-02, audit 4.1): only [-100:] is ever read, and
     # the unbounded list leaked ~monotonically on multi-B runs (both
     # gen3 5B attempts died ~3.8B with this among the suspects)
@@ -916,21 +891,7 @@ def main():
             # extension continues the curve
             ent_now = trunk_ent(update)
         t0 = time.perf_counter()
-        if graph_roll is not None:
-            graph_roll.refresh()  # in-place fp16 caches after opt.steps
-            for t in range(T):
-                b_obs[t] = venv._obs
-                a, logp, v, rew, done = graph_roll.step()
-                b_act[t], b_logp[t] = a, logp
-                # unnormalize the value prediction (in place, no temps)
-                b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
-                b_rew[t] = rew
-                # copy_ does the bool->float conversion in one kernel
-                # with no temp (done.to() allocated one per step)
-                b_done[t].copy_(done)
-                global_step += N
-            obs = venv._obs
-        for t in range(T if graph_roll is None else 0):
+        for t in range(T):
             b_obs[t] = obs
             with torch.no_grad():
                 a, logp, _, v = policy.get_action_and_value(
@@ -959,7 +920,8 @@ def main():
         # async, so without this the section boundary charges queued
         # work to whichever section blocks next. Measured exec-true
         # 2026-08-31 on a 5090, N=32,768/T=32, the 1.09M-param policy:
-        # 70% rollout / 30% update (identical with --no-graph-rollout).
+        # 70% rollout / 30% update (measured identical graphed vs
+        # eager, which is why --graph-rollout was removed same day).
         # That --bench figure is warmup-inflated (it caps at 4 updates
         # and the drain serializes), so the steady-state split is better
         # read off the isolated instruments at the same shape:
@@ -974,7 +936,12 @@ def main():
         # 2026-07-25 ~16/84 is older still (retired torch mirror).
         # --bench only: the drain serializes CPU
         # enqueue with GPU execution and costs ~2-8% wall, so
-        # production keeps async timers (and says so). The 2-8% is
+        # production keeps async timers (and says so). Since the
+        # --graph-rollout removal the async split is at least
+        # indicative — a production T=32 leg now prints ~56/44 against
+        # the ~57/43 exec-true estimate, where the graphed rollout used
+        # to print a meaningless 0/100 (one launch swallowed the whole
+        # rollout). Still not execution time; use --bench to rule. The 2-8% is
         # itself unverified at this width: the 2026-08-31 --bench run
         # came out 34% below production steps/s, but at 4 updates that
         # is mostly warmup, so the two effects are not separable
