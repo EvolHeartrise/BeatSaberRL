@@ -99,6 +99,18 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     return loss.mean()
 
 
+def adv_filter_indices(f_adv, train_n):
+    """Top-advantage filter (arXiv:2606.23348 §V-E): indices of the
+    train_n transitions to train on, ranked by |GAE advantage| —
+    two-sided, so both strong positive and strong negative surprises
+    survive and the near-zero-gradient middle drops. (A signed
+    one-sided variant was cut before ever training a full run,
+    2026-08-31 user decision: its critic only saw returns above its
+    own predictions and EV collapsed 0.768 -> 0.015 in the 50-update
+    smoke.) Unordered (sorted=False); the caller shuffles."""
+    return torch.topk(f_adv.abs(), train_n, sorted=False).indices
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--num-envs", type=int, default=128)
@@ -147,6 +159,18 @@ def parse_args():
                         "gradient accumulation — same math (full-mb adv "
                         "stats, means of equal micro means), ~1/K the "
                         "update-pass activation peak (24 GB fallback)")
+    # Top-advantage filtering (arXiv:2606.23348 §V-E, Generals.io):
+    # keep only the top FRACTION of each rollout batch ranked by
+    # |GAE advantage| and run the whole update (policy + value +
+    # entropy) on those alone. Minibatch SIZE is unchanged; the
+    # minibatch COUNT shrinks, so optimizer steps per update scale
+    # with the fraction — that is where the wall-clock saving comes
+    # from. Ranking is by MAGNITUDE (two-sided; see
+    # adv_filter_indices for why the signed variant was cut).
+    p.add_argument("--adv-filter", type=float, default=1.0,
+                   help="fraction of the rollout batch to train on, "
+                        "selected by |advantage| rank (1.0 = off). "
+                        "Rounded to a whole number of minibatches")
     p.add_argument("--z-clip-hi", type=float, default=12.0,
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
@@ -478,6 +502,13 @@ def main():
     mb_size = batch // args.minibatches
     assert args.mb_accum >= 1 and mb_size % args.mb_accum == 0, (
         f"--mb-accum {args.mb_accum} must divide minibatch {mb_size}")
+    assert 0.0 < args.adv_filter <= 1.0, (
+        f"--adv-filter {args.adv_filter} must be in (0, 1]")
+    # round to whole minibatches so the slice loop needs no tail case
+    train_n = max(mb_size,
+                  int(round(batch * args.adv_filter / mb_size)) * mb_size)
+    train_n = min(train_n, batch)
+    adv_filter_on = train_n < batch
 
     # --fp16 update is the DEFAULT (2026-07-25); downgrade quietly where
     # it cannot apply instead of crashing paths that never asked for it
@@ -863,8 +894,11 @@ def main():
     diag_probe_obs = None    # frozen first-diag batch (psrank probe)
     start = time.time()
 
+    filt = (f", adv-filter top |A| {train_n}/{batch} "
+            f"({train_n // mb_size} minibatches)"
+            if adv_filter_on else "")
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size}, device {device} ===", flush=True)
+          f"minibatch {mb_size}, device {device}{filt} ===", flush=True)
 
     for update in range(start_update, num_updates):
         if leaf_from is not None:
@@ -1015,6 +1049,14 @@ def main():
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
 
+        if adv_filter_on:
+            # top-advantage filter, LAZILY — only the index tensor
+            # lives here; the per-epoch gather composes it with the
+            # shuffle so no filtered copy of the flat buffers is ever
+            # materialized. Diagnostics and EV above stay full-batch
+            # on purpose: they remain comparable across runs.
+            keep_idx = adv_filter_indices(f_adv, train_n)
+
         if fp16_update:
             policy.fp16 = True  # 'update' mode: rollout stayed fp32
 
@@ -1109,10 +1151,12 @@ def main():
             # and hand minibatches contiguous slices: 5 gathers instead
             # of 40, identical rows in identical order per minibatch, so
             # every downstream op sees the same values (2026-07-28)
-            perm = torch.randperm(batch, device=device)
+            perm = torch.randperm(train_n, device=device)
+            if adv_filter_on:
+                perm = keep_idx[perm]
             p_obs, p_act = f_obs[perm], f_act[perm]
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
-            for s in range(0, batch, mb_size):
+            for s in range(0, train_n, mb_size):
                 # advantage stats over the FULL minibatch so --mb-accum
                 # K>1 is the same math as K=1 (each micro loss is a
                 # mean over an equal slice; the (1/K)-scaled sum of
