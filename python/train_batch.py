@@ -61,10 +61,14 @@ VF_COEF = 0.5
 VALUE_NORM_BETA = 0.01
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
-# the recipe SHAPE: every tuned run is 1024 envs x 128 horizon. The
-# hypers (lr, ent, minibatch count) and every driver's checkpoint
-# cadence are calibrated to this batch, so a run that lands elsewhere
-# gets a loud startup warning (see main()).
+# the recipe SHAPE. STALE as of 2026-08-31: no production run has used
+# 1024x128 since the 2026-08-08 shape ladder. The live shapes are
+# 32,768x8 (batch 262,144, the v27-v38 champion recipe) and 32,768x32
+# (batch 1,048,576, the T=32 era), so the warning below now fires on
+# every legitimate run and is pure noise. Changing the constant is a
+# BEHAVIOUR change (it decides who gets warned) and needs a call on
+# whether the guard should carry a set of admissible shapes or be
+# retired; left alone deliberately.
 RECIPE_BATCH = 1024 * 128
 # log-ratio clamp before exp() (2026-08-02, 400M-run postmortem). NOT a
 # science change: dual-clip's selection only lets gradient flow through
@@ -236,6 +240,10 @@ def parse_args():
                         "env kernel) as ONE CUDA graph (round-4 #9; "
                         "DEFAULT since 2026-07-26 — gate-cleared with "
                         "--fp16 all: 1.20x rollout, +72.4 wpp paired). "
+                        "MEASURED DEAD AT WIDTH 2026-08-31: at N=32,768 "
+                        "the graphed forward is 0.99x eager and the "
+                        "end-to-end split is identical either way — the "
+                        "1.20x was a small-N launch-overhead win. "
                         "Changes the sampling RNG stream vs eager. "
                         "Auto-downgrades (with a note) on CPU/rust env "
                         "or capture failure")
@@ -950,14 +958,27 @@ def main():
         # drain before reading the phase timer: kernel launches are
         # async, so without this the section boundary charges queued
         # work to whichever section blocks next. Measured exec-true
-        # 2026-08-07 on the v10 CUDA env (round-4 kernel): 96% rollout /
-        # 4% update at N=1024/T=128 (12,423 steps/s), 93/7 at
-        # N=4096/T=32 (24,422 steps/s). (The 2026-07-25 figure of
-        # ~16/84 was measured against the retired torch mirror — the
-        # v10 dynamic body inverted it; do not size update-path work
-        # off the old number.) --bench only: the drain serializes CPU
+        # 2026-08-31 on a 5090, N=32,768/T=32, the 1.09M-param policy:
+        # 70% rollout / 30% update (identical with --no-graph-rollout).
+        # That --bench figure is warmup-inflated (it caps at 4 updates
+        # and the drain serializes), so the steady-state split is better
+        # read off the isolated instruments at the same shape:
+        # bench_policy_update --mbs 16384 = 39.70 ms x 64 mb = 2.54 s and
+        # bench_policy_forward --ns 32768 = 26.72 ms x 32 = 0.86 s
+        # against a 5.96 s/update production cycle => roughly
+        # 57% rollout / 43% update, the env kernel being ~43% alone.
+        # The UPDATE SHARE GREW ~5x from the 93/7 measured 2026-08-07
+        # (N=4096/T=32): that was the 138k-param policy, before the
+        # 6.2x actor scale-up (2026-08-13) and the adapool critic
+        # (2026-08-19). Do not size update-path work off 93/7 — and the
+        # 2026-07-25 ~16/84 is older still (retired torch mirror).
+        # --bench only: the drain serializes CPU
         # enqueue with GPU execution and costs ~2-8% wall, so
-        # production keeps async timers (and says so)
+        # production keeps async timers (and says so). The 2-8% is
+        # itself unverified at this width: the 2026-08-31 --bench run
+        # came out 34% below production steps/s, but at 4 updates that
+        # is mostly warmup, so the two effects are not separable
+        # without lifting the cap.
         if args.bench and device.type == "cuda":
             torch.cuda.synchronize()
         t_rollout += time.perf_counter() - t0
@@ -989,10 +1010,20 @@ def main():
             # critic diagnostic (2026-08-19): explained variance of the
             # PRE-update value predictions against their own GAE targets
             # over the full T x N batch. 0-dim device tensor, read at
-            # the per-update print sync — no extra host sync. Caveat at
-            # T=8/gamma .965 the target is ~75% bootstrap, so EV ~1
-            # means self-consistent + 8-step-reward-accurate, while a
-            # LOW EV is unambiguously a bad critic.
+            # the per-update print sync — no extra host sync.
+            # READ THIS BEFORE TRUSTING EV (2026-08-31): returns is
+            # adv + b_val[:T], so (returns - b_val[:T]) IS adv exactly
+            # and EV = 1 - Var(adv)/Var(adv + V) identically. It is
+            # therefore near 1 whenever state-value spread dominates
+            # per-action advantage spread — which is always true here
+            # (V swings hugely across a song). EV is a CHANGE detector,
+            # not an absolute critic-quality measure: a drop means
+            # something broke, but a high value is close to structural.
+            # It also falls with T for a mechanical reason (longer
+            # traces accumulate more deltas, so Var(adv) grows): the
+            # T=8 0.995 vs T=32 0.992 gap is not a quality gap.
+            # Bootstrap share of the target is gamma^T = 75% at T=8,
+            # 32% at T=32.
             ev = 1.0 - (returns - b_val[:T]).var() \
                 / returns.var().clamp_min(1e-12)
             # T1 value-norm stats (EMA, device-side, no syncs). Updated
@@ -1071,6 +1102,17 @@ def main():
             # while on-policy srank falls = benign narrowing; both
             # falling = genuine capacity contraction (plasticity loss)
             # -> act (weight decay / resets / scale-up).
+            # NOT COMPARABLE ACROSS A RESUME (2026-08-31): the probe is
+            # process-local, so every --resume re-captures it and psrank
+            # steps discontinuously at the branch point. Worse, a resume
+            # captures it on the first update after "env stream fresh",
+            # when every env is at t=0 — an episode-start-heavy and so
+            # unusually NARROW batch, which depresses psrank for reasons
+            # that have nothing to do with the network (seen at the T=32
+            # 2250->4500 extension: psrank read 51 vs on-policy 56,
+            # inverting the healthy ordering purely as an artifact).
+            # Compare psrank only WITHIN one process; persisting
+            # diag_probe_obs in the checkpoint would fix this.
             if diag_probe_obs is None:
                 diag_probe_obs = f_obs[:dn].clone()
             with torch.no_grad():
