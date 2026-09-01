@@ -9,8 +9,10 @@ ever ran at n_heads == 1 / d == 64, see PERF_AUDIT_2026-08-16.md.)
 Two paths, two shapes (production rollout N=16384, ScoreSaber bench
 N=2048):
   eager    torch no_grad forward (launch-bound path)
-  graphed  the same forward captured as one CUDA graph (train_batch.py
-           --graph-rollout, the production default)
+  graphed  the same forward captured as one CUDA graph (the mechanism
+           the ScoreSaber bench uses for its argmax forward; the
+           trainer's --graph-rollout was removed 2026-08-31 after this
+           very instrument measured it at 0.99x eager at N=32,768)
 
 Each measurement: warmup, then best of --reps timed loops of --iters
 forwards (cuda-synchronized), reported as µs/forward. Two operations
