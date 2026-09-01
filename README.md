@@ -156,6 +156,13 @@ D2H, and a JIT trust-the-cache startup. All bitwise-exact (the fused
 per-sample kernel is batch-size-invariant, verified over the full
 catalog): **~128 maps/s warm, full catalog ~48s** on the GTX 1080 box
 (first run parses + warms the cache under `maps/chart_cache/`, ~380 MB).
+Those figures are the KINEMATIC (v7) era and no longer apply: on the
+v10 dynamic body a full 6,097-difficulty bench measures **~18 min
+(~343 levels/min) on a 5090** (2026-08-31). The 7-10 min/checkpoint
+quoted in the 2026-08-08 migration notes is the v10/v11 env on a 4090
+and is also stale — walls and MAX_OBJECTS 1536 landed after it. Rate
+is very uneven across the catalog (a high-star stretch runs ~134
+levels/min), so do NOT extrapolate a total from a short sample.
 
 ## Exporting to ScoreSaber's replay viewer
 
