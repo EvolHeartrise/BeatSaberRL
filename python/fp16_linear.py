@@ -345,6 +345,12 @@ class _Fp16Linear(torch.autograd.Function):
         # x: fp16 (..., K); w: fp32 master (M, K); b: fp32 master (M)
         wh, bh = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
+        if not x2.is_contiguous():
+            # a (B, 1, K) token slice reshapes to a strided (B, K) VIEW
+            # (the critic's body-row query, 2026-09-02); addmm takes the
+            # leading-dim stride but wgrad's cublasGemmEx contract needs
+            # a contiguous x — copy here, once (2 MB at micro 8192).
+            x2 = x2.contiguous()
         y = torch.addmm(bh, x2, wh.t())
         ctx.save_for_backward(x2, wh)
         return y.view(*x.shape[:-1], w.shape[0])

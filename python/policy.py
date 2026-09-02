@@ -230,7 +230,8 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
                 n_queries: int = 0, attn_bias: torch.Tensor | None = None,
                 delta: torch.Tensor | None = None,
-                delta_bias: torch.Tensor | None = None):
+                delta_bias: torch.Tensor | None = None,
+                want_resolved: bool = False):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -254,6 +255,14 @@ class Block(nn.Module):
         # ln_attn pass. NEAR-TIE numerics (the bias rounds in the LN
         # pass's fp32 sum instead of the GEMM epilogue); the fp32 record
         # path never sets it (see _seq's fold_tail).
+        # want_resolved (final block only, 2026-09-02 Tier 1.1): ALSO
+        # return the full (B, T, d) resolved residual stream entering
+        # this block — the x this pass writes (delta + delta_bias
+        # folded), BEFORE the n_queries slice — for the adapool critic,
+        # which pools over exactly the token embeddings this block's
+        # own k/v see. Returning it here is free (the tensor exists);
+        # the caller used to RECOMPUTE it as tokens + delta + delta_b,
+        # which promoted the fp16 stream to fp32 (fp32 bias Parameter).
         B, T, _ = x.shape
         if delta is not None:
             x, h = self.ln_attn.forward_add(x, delta, delta_bias)
@@ -290,6 +299,7 @@ class Block(nn.Module):
             # (fp16), while an explicit .contiguous() flips fp32's
             # F.linear onto a different cuBLAS path and SHIFTS the
             # record path's bits (measured 1e-4 on the logits).
+            x_full = x
             x = x[:, :n_queries].contiguous()
             h = h[:, :n_queries]
         if qkv is None:
@@ -334,7 +344,8 @@ class Block(nn.Module):
         if n_queries:
             # final block: nothing downstream fuses the residual add, so
             # ffn.2 keeps its own bias
-            return x + _seq(self.ffn, h2)
+            out = x + _seq(self.ffn, h2)
+            return (out, x_full) if want_resolved else out
         # non-final block: the consumer is the NEXT block's
         # ln_attn.forward_add, which can absorb ffn.2's bias
         ffn_out, ffn_bias = _seq(self.ffn, h2, fold_tail=True)
@@ -484,20 +495,34 @@ class NotePolicy(nn.Module):
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
                                          delta=delta, delta_bias=delta_b)
         legacy = self.critic_arch == "linear_v0"
-        x_res = None
-        if not legacy:
-            # the critic pools over the RESOLVED token stream entering
-            # the final block — the same embeddings the final block's
-            # k/v see (its fused ln_attn pass folds this add; the
-            # critic pays it once, one (B,27,d) add)
-            x_res = tokens
-            if delta is not None:
-                x_res = (x_res + delta if delta_b is None
-                         else x_res + delta + delta_b)
-        # final block: only the 3 readout tokens' outputs are consumed
+        # final block: only the 3 readout tokens' outputs are consumed.
+        # adapool critic: it pools over the RESOLVED token stream
+        # entering the final block — the same embeddings that block's
+        # k/v see — which the block's fused ln_attn pass writes anyway,
+        # so the block hands it back (want_resolved) instead of this
+        # function recomputing `tokens + delta + delta_b` (2026-09-02,
+        # Tier 1.1 of the 09-02 static audit, A §1). That recompute was
+        # the fp32-critic bug: delta_b is the fp32 ffn.2.bias
+        # PARAMETER, and dimensioned fp16 + dimensioned fp32 promotes
+        # to fp32, so on the fp16 stream x_res — and with it critic_ln,
+        # the four critic Linears (stock F.linear, non-tensor-core fp32
+        # SGEMM), two hidden reshape copies in the pooling matmuls and
+        # critic_mlp — silently ran in fp32 through stock torch since
+        # the adapool commit (8d36d47). Now: 2 fewer (B,27,d) kernels,
+        # the critic input is bit-consistent with the block's own k/v
+        # input, and _critic rides the fp16 machinery. fp32 record path
+        # (--fp16 off / CPU): bit-identical — the fused ln_fwd_add's x
+        # IS `a + b` in fp32, exactly the old sum (delta_b is None
+        # there). fp16: the value moves at fp16-rounding level, the
+        # class already accepted for the actor; r1 is untouched (the
+        # value is not in the ratio). Pinned by tests/test_critic_fp16.
         tokens = self.blocks[-1](tokens, None, n_queries=3,
                                  attn_bias=attn_bias, delta=delta,
-                                 delta_bias=delta_b)
+                                 delta_bias=delta_b,
+                                 want_resolved=not legacy)
+        x_res = None
+        if not legacy:
+            tokens, x_res = tokens
         h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
         if self._diag_stash:
             self._diag_h = h
@@ -546,17 +571,41 @@ class NotePolicy(nn.Module):
         if self.critic_detach:
             x_res, h = x_res.detach(), h.detach()
         B, T, d = x_res.shape
+        # On the fp16 stream x_res is fp16 (Tier 1.1, see
+        # forward_stacked), so from here every stage takes the same
+        # fp16 path as the actor blocks: fp16 ln_fwd kernel, fp16_linear
+        # (custom wgrad) for q/out, packed k/v, SDPA, and critic_mlp's
+        # bias_relu / relu_bwd epilogues.
         hv = self.critic_ln(x_res)
         q = _lin(self.critic_q, hv[:, 2:3])          # body-derived query
-        k = _lin(self.critic_k, hv)
-        v = _lin(self.critic_v, hv)
+        if _QKV_PACKED and hv.dtype is torch.float16:
+            # A §9 / B §7: k and v share input hv -> ONE GEMM against
+            # the [wk wv] cat replicas (a flat group when flattened,
+            # else a version-keyed cat cache), one wgrad + one bias
+            # sum in backward. Same mechanism as the blocks' qkv.
+            wh, bh = _fl.packed_halves([self.critic_k, self.critic_v])
+            kv = _fl.fp16_packed_linear(hv, wh, bh,
+                                        [self.critic_k, self.critic_v])
+            k, v = kv.split(d, dim=-1)
+        else:
+            k = _lin(self.critic_k, hv)
+            v = _lin(self.critic_v, hv)
         nh, dh = self.n_heads, d // self.n_heads
         q = q.view(B, 1, nh, dh).transpose(1, 2)
         k = k.view(B, T, nh, dh).transpose(1, 2)
         v = v.view(B, T, nh, dh).transpose(1, 2)
-        scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
-        scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
-        a = torch.softmax(scores, dim=-1) @ v
+        if _ATTN_MODE == "sdpa" and q.dtype is torch.float16:
+            # Tq = 1 fused attention under the same additive key mask
+            # the blocks use (no all-masked rows: the 3 lead lanes are
+            # always attendable). Replaces two batched matmuls whose
+            # non-collapsible (B, nh) batch strides forced hidden
+            # reshape COPIES of k and v, forward and backward.
+            a = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias.unsqueeze(1))   # (B,nh,1,dh)
+        else:
+            scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
+            scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
+            a = torch.softmax(scores, dim=-1) @ v
         a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
         val = _seq(self.critic_mlp, torch.cat([a, h], dim=-1))
         return val.float().squeeze(-1)
@@ -578,6 +627,10 @@ class NotePolicy(nn.Module):
         # unchanged in the default configuration.
         groups = ([[blk.q_proj, blk.k_proj, blk.v_proj]
                    for blk in self.blocks] if _QKV_PACKED else None)
+        if _QKV_PACKED and self.critic_arch != "linear_v0":
+            # critic k/v pack the same way (Tier 1.1 / A §9); critic_q
+            # runs on the single body row and stays a standalone Linear
+            groups.append([self.critic_k, self.critic_v])
         w16, b16 = _fl.flatten_fp16_replicas(self, tail_group=tail,
                                              groups=groups)
         self._head_cache = [None, w16, b16]
