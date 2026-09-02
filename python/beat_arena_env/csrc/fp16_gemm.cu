@@ -174,7 +174,14 @@ std::vector<at::Tensor> relu_bwd(at::Tensor gy, at::Tensor y) {
   const int threads = 256;
   const int blocks = (int)std::min<int64_t>(
       512, (n2 + threads - 1) / threads);
-  auto part = at::zeros({blocks, d}, gy.options().dtype(at::kFloat));
+  // at::empty, not zeros (2026-09-02, Tier 1.5 of the 09-02 audit
+  // A §8): the kernel's tail writes ALL d columns of EVERY launched
+  // block's row (threads 0..D2C-1 each store 2 floats, 2*D2C == d for
+  // every dispatch below, and a thread whose grid-stride loop never
+  // ran still stores its 0.f partials), so the memset was dead — ~900
+  // launches per production update across the 7 relu sites. n2 == 0
+  // returns before the launch with blocks == 0, i.e. an empty part.
+  auto part = at::empty({blocks, d}, gy.options().dtype(at::kFloat));
   if (n2 == 0) return {gm, part};
   auto stream = at::cuda::getCurrentCUDAStream();
   auto* gp = reinterpret_cast<const __half2*>(gy.data_ptr<at::Half>());
