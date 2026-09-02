@@ -112,6 +112,33 @@ def adv_filter_indices(f_adv, train_n):
     return torch.topk(f_adv.abs(), train_n, sorted=False).indices
 
 
+def adv_filter_stats(f_adv, keep_idx):
+    """Advantage-normalization statistics under --adv-filter (2026-09-02,
+    Tier 1.4 of the 09-02 static audit, C §1.1). Returns (mu, sd,
+    sd_kept / sd_full), all 0-dim device tensors, no host sync.
+
+    Why FULL-batch: the kept set {|A| >= median|A|} has sd ~1.36x the
+    full batch's (Gaussian: sqrt(1.857); Laplace 1.39). Normalizing each
+    minibatch by ITS OWN stats — which is what the unfiltered path does
+    and what the filtered path did until today — therefore shrank the
+    normalized advantages 0.73x relative to the entropy and value terms,
+    i.e. an implicit ent_coef x1.36 and, compounded with the kept rows'
+    larger value residuals, ~2.2x the value-gradient share into the
+    shared trunk. The 2026-08-31 "parity" probe was run with that
+    confound. Normalizing by the full batch's mu/sd puts a kept row on
+    exactly the scale it would have had unfiltered, so the filter changes
+    WHICH rows carry gradient and nothing about the loss balance.
+
+    The ratio is the C §5 item-7 instrument: it is the confound's
+    magnitude, measured per update instead of assumed. Computed once per
+    update on the flat GAE buffer — one gather of train_n floats plus
+    three reductions, against a ~46k-launch update."""
+    mu = f_adv.mean()
+    sd = f_adv.std()
+    ratio = f_adv[keep_idx].std() / (sd + 1e-8)
+    return mu, sd, ratio
+
+
 def resolve_env_order(flag, environ):
     """R12 env-order resolution (2026-09-02, Tier 0.1). `flag` is
     args.env_order: True/False if --env-order/--no-env-order was given,
@@ -150,7 +177,8 @@ def entropy_report(ent_head):
     return groups, lo, ent_head[lo], sum(ent_head)
 
 
-def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head):
+def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
+                   af_ratio=None):
     """The `[kl]` diagnostic line (2026-09-02, Tier 0.3 of the 09-02
     static audit). `mb1/mbN` = first/last minibatch of THIS update, so
     the pair brackets the within-update drift over 64 optimizer steps.
@@ -158,14 +186,18 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head):
     1 +/- CLIP, which contribute zero policy gradient. entfull is the
     full-batch 29-head entropy sum from the t=0 rollout forward — it is
     unaffected by --adv-filter (unlike `ent`, which is the last
-    minibatch's KEPT rows) and lags `ent` by one update."""
+    minibatch's KEPT rows) and lags `ent` by one update. `af_ratio`
+    (1.4, only when filtering) is sd(kept advantages) / sd(all), the
+    measured size of the normalization confound C §1.1 predicted at
+    ~1.36 — printed as `afsd`."""
     groups, lo, lo_v, total = entropy_report(ent_head)
     gs = "  ".join(f"{nm} {v:.3f}" for nm, v in groups)
+    af = "" if af_ratio is None else f"  afsd {af_ratio:.3f}"
     return (f"[kl] upd {update:>3}  kl(mb1/mbN) {klf:.2e}/{kll:.2e}"
             f"  clipfrac {cff:.4f}/{cfl:.4f}"
             f"  gnorm {gnorm:.3f}  clipc {clipc:.3f}"
             f"  ent/head {gs}  min {lo_v:.3f} (h{lo})"
-            f"  entfull {total:.3f}")
+            f"  entfull {total:.3f}{af}")
 
 
 def parse_args():
@@ -633,6 +665,9 @@ def main():
     kl_last = torch.zeros((), device=device)
     cf_first = torch.zeros((), device=device)
     cf_last = torch.zeros((), device=device)
+    # 1.4 / C §5 item 7: sd(kept adv) / sd(full adv) when filtering,
+    # written once per update by adv_filter_stats, read at the sync.
+    af_ratio = torch.zeros((), device=device)
     # pre-clip global grad norm and the clip coefficient it produces,
     # summed over the update's optimizer steps (C §2.2: total_norm was
     # computed and thrown away, so nothing ever said whether the 0.5
@@ -1025,7 +1060,7 @@ def main():
     start = time.time()
 
     filt = (f", adv-filter top |A| {train_n}/{batch} "
-            f"({train_n // mb_size} minibatches)"
+            f"({train_n // mb_size} minibatches, full-batch adv norm)"
             if adv_filter_on else "")
     # env-order state is on the banner because it was invisible for the
     # 12 days it existed (2026-08-21 -> 09-02): nothing printed it and
@@ -1223,6 +1258,12 @@ def main():
             # materialized. Diagnostics and EV above stay full-batch
             # on purpose: they remain comparable across runs.
             keep_idx = adv_filter_indices(f_adv, train_n)
+            # 1.4: normalization stats over the FULL batch, once per
+            # update, used by every minibatch below (see
+            # adv_filter_stats for why; C §1.1). Off -> the minibatch
+            # loop keeps its own per-minibatch stats, bit-identical.
+            af_mu, af_sd, af_r = adv_filter_stats(f_adv, keep_idx)
+            af_ratio.copy_(af_r)
 
         if fp16_update:
             policy.fp16 = True  # 'update' mode: rollout stayed fp32
@@ -1328,10 +1369,17 @@ def main():
                 # K>1 is the same math as K=1 (each micro loss is a
                 # mean over an equal slice; the (1/K)-scaled sum of
                 # micro means IS the minibatch mean, modulo fp
-                # association); one opt.step per minibatch either way
-                a_full = p_adv[s:s + mb_size]
-                a_mu = a_full.mean()
-                a_sd = a_full.std()
+                # association); one opt.step per minibatch either way.
+                # Under --adv-filter the stats are the full-batch ones
+                # computed once above (1.4): a kept minibatch's own sd
+                # is ~1.36x the batch's, which used to shrink the PG
+                # term 0.73x against entropy and value.
+                if adv_filter_on:
+                    a_mu, a_sd = af_mu, af_sd
+                else:
+                    a_full = p_adv[s:s + mb_size]
+                    a_mu = a_full.mean()
+                    a_sd = a_full.std()
                 # 0.3: which minibatch(es) get the KL/clipfrac probe.
                 # Host-side ints only — no sync. Accumulated across the
                 # accum micros as (1/K)-weighted micro means, which IS
@@ -1616,11 +1664,11 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1)]),
+                     clipc_sum / max(opt_steps, 1), af_ratio]),
                 ent_head]).tolist()
             (ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v,
-             klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v) = _d[:13]
-            eh_v = _d[13:]
+             klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v, af_v) = _d[:14]
+            eh_v = _d[14:]
             logr_max.zero_()
             gnorm_sum.zero_()
             clipc_sum.zero_()
@@ -1640,7 +1688,9 @@ def main():
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
-                                 gn_v, cc_v, eh_v), flush=True)
+                                 gn_v, cc_v, eh_v,
+                                 af_v if adv_filter_on else None),
+                  flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
             _d = torch.cat([
@@ -1649,11 +1699,11 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1)]),
+                     clipc_sum / max(opt_steps, 1), af_ratio]),
                 ent_head]).tolist()
             (ent_v, ev_v, ret_v, klf_v, kll_v, cff_v, cfl_v,
-             gn_v, cc_v) = _d[:9]
-            eh_v = _d[9:]
+             gn_v, cc_v, af_v) = _d[:10]
+            eh_v = _d[10:]
             gnorm_sum.zero_()
             clipc_sum.zero_()
             opt_steps = 0
@@ -1664,7 +1714,9 @@ def main():
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
                   flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
-                                 gn_v, cc_v, eh_v), flush=True)
+                                 gn_v, cc_v, eh_v,
+                                 af_v if adv_filter_on else None),
+                  flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
