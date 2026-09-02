@@ -259,6 +259,175 @@ A real line (update 5, unfiltered, 5-update run from a fresh init):
   place on its first run.
 
 
+### Tier 1 results (measured 2026-09-02)
+
+Same pod (`194.14.47.19`, RTX 5090, torch 2.8.0.dev+cu128), same
+session, same production argv as Tier 0 (`--num-envs 32768 --horizon 32
+--minibatches 64 --mb-accum 2`, `--env-order` now default ON). The
+baseline was RE-MEASURED at `cb339ca` in this session, not taken from
+the Tier 0 table (which it reproduces: 115.3k steps/s, 13.78 GiB,
+identical 5-update prints). Every item shipped alone, measured, then
+committed, in the order 1.2 → 1.3 → 1.5 → 1.1 so the one
+numerics-changing item lands last. 1.4 (adv-filter normalization) was
+skipped by brief. Instruments per item: full gate (`pytest tests/`),
+5-update same-seed production-shape run for bit-identity / numerics,
+`train_batch --bench` × 2 reps (exec-true phase seconds, peak VRAM),
+`bench_policy_forward --fp16 --ns 32768` × 2, `bench_policy_update
+--fp16 --mbs 16384 --mb-accum 2` × 2. Run-to-run spread on steps/s is
+0.31% (Tier 0); anything inside it is called a null below.
+
+#### Cumulative table
+
+| state | commit | steps/s (2 reps) | rollout s / 4 upd | update s / 4 upd | peak GiB (rollout / update) | BPF ms @32768 | BPU ms 16384/accum 2 | gate |
+|---|---|---|---|---|---|---|---|---|
+| baseline `cb339ca` | — | 115,331 / 115,199 | 25.48 / 25.54 | 10.83 / 10.81 | 13.78 | 26.09 / 26.21 | 40.00 / 39.96 | 268 |
+| + 1.2 `del` perm copies | `decd53a` | 115,231 / 115,265 | 25.52 / 25.48 | 10.82 / 10.84 | **13.01** (12.60 / 13.01) | 26.09 / 26.22 | 39.96 / 39.96 | 268 |
+| + 1.3 `b_act` uint8 | `54f0bc9` | 115,121 / 115,210 | 25.52 / 25.50 | 10.85 / 10.84 | **12.61** (12.17 / 12.61) | 26.10 / 26.23 | 39.98 / 39.99 | 268 |
+| + 1.5 `relu_bwd` `at::empty` | `9436ba3` | 115,186 / 115,435 | 25.53 / 25.43 | 10.81 / 10.84 | 12.61 (12.17 / 12.61) | 26.08 / 26.22 | 39.96 / 39.94 | 268 |
+| + 1.1 fp16 critic | `f4f6011` | **125,992 / 125,999** | **24.42 / 24.42** | **8.80 / 8.80** | 12.60 (12.17 / 12.60) | **18.42 / 18.50** | **32.22 / 32.17** | 279 |
+
+Net over the four items: **+9.3% steps/s** (115.3k → 126.0k), update
+phase **−18.7%** (10.82 → 8.80 s), rollout **−4.2%** (25.5 → 24.4 s),
+peak **−1.18 GiB** (13.78 → 12.60), all of the wall gain from 1.1 and
+all of the VRAM gain from 1.2 + 1.3.
+
+#### Per-item verdicts
+
+**1.2 `del` the permuted copies — −0.77 GiB, wall null, bit-identical.**
+The audit said −1.5 GiB. The new `--bench` per-phase attribution
+(`[bench-mem]` lines: resident at rollout start / rollout peak / update
+peak, host-side allocator reads at the syncs `--bench` already does)
+explains the difference. Before the `del`, update 1 read
+`resident 9.11 / rollout 12.32 / update 13.01` and every later update
+`10.58 / 13.78 / 13.78`: the 1.46 GiB of perm copies (p_obs 1.17 +
+p_act 0.23 + small) raised the rollout peak from 12.32 to 13.78, and
+the update bracket ALSO peaked at 13.78 because its first op is the
+GAE bootstrap forward at the same N — the same 3.21 GiB forward
+transient as the rollout. After the `del`: `9.40 / 12.60 / 13.01`. So
+the audit's inference "the peak is in the rollout" was right, but the
+minibatch loop (perm copies 1.46 + saved activations ~2.15 over the
+9.4 resident) sat only 0.77 GiB under it and becomes the new peak. A
+second leak found on the way: the `_` local holding the last micro's
+action slice is a VIEW of `p_act` and kept its storage alive past the
+`del` (+0.23 GiB at the next rollout start); it is in the `del` list now.
+
+**1.3 `b_act` uint8 — −0.40 GiB, wall null, bit-identical.** −0.20 on
+the buffer (resident at update 1: 9.11 → 8.91) and −0.20 on its perm
+copy under the update-phase peak. The cast back to int64 happens per
+micro-batch inside `get_action_and_value` (gather needs a long index).
+
+**1.5 `relu_bwd` `at::zeros` → `at::empty` — NULL, bit-identical.**
+Verified from the launch geometry first: threads `0..D2C-1` of every
+launched block store both floats of their column pair, `2*D2C == d`
+for every dispatch, and a thread whose grid-stride loop never ran
+still stores its `0.f` partials, so every `(block, column)` of `part`
+is written. The JIT rebuild fired on the pod (srchash `d74f6e…` →
+`4dffc3…`, `.so` rebuilt inside the gate run). Every instrument came
+back inside the spread (steps/s 115,186 / 115,435, update 10.81 /
+10.84 s, BPU 39.96 / 39.94 ms). Kept because it is correct and free;
+~900 tiny memsets per update are not a byte/FLOP item in a GPU-bound
+phase, exactly as Tier 0.2 predicted for launch-count items.
+
+**1.1 The critic on the fp16 stream — the whole Tier 1 wall gain, and
+bigger than the audit's estimate.**
+
+*Diagnosis confirmed before the change* (`x_res` probe at N=8192 on
+the fp16 stream): `x_res` **fp32**, `critic_ln` input/output **fp32**,
+and the profile of a value-loss fwd+bwd showed `aten::linear` ×7 and
+fp32 `sgemm_largek` kernels — i.e. the stock non-tensor-core path.
+After: every one of those reads fp16, the same probe's device time
+fell 69.0 → 56.4 ms, and `_scaled_dot_product_efficient_attention`
+runs ×4 (3 blocks + the critic pool; not the math fallback).
+
+*What shipped:* the final block returns its already-resolved fp16
+residual stream (`want_resolved`, the `x` its fused `ln_attn` pass
+writes before the `n_queries` slice) instead of `forward_stacked`
+recomputing `tokens + delta + delta_b`; `critic_ln` runs the fp16
+kernel; `critic_q`/`critic_out` go through `fp16_linear` (the body-row
+query slice needed a `.contiguous()` guard in `_Fp16Linear.forward` —
+a `(B,1,K)` slice reshapes to a strided view that `wgrad` rejects);
+`critic_k`/`critic_v` are one packed GEMM via the existing group
+machinery (a flat group in `flatten_fp16`, a version-keyed cat cache
+otherwise); the pool is `F.scaled_dot_product_attention` with Tq=1
+under `BEAT_ATTN=sdpa` (the legacy matmul path stays as the escape
+hatch, and it now covers the critic too); `critic_mlp` takes the
+`bias_relu` / `relu_bwd` epilogues. The fp32 record path is
+bit-identical (the fused `ln_fwd_add`'s `x` IS `a + b` in fp32, which
+is what the old recompute produced there — pinned by
+`tests/test_critic_fp16.py::test_fp32_path_matches_old_recompute_bitwise`).
+
+*Measured:* `bench_policy_forward --ns 32768`: 26.1 → **18.4 ms
+(−29%)**; `bench_policy_update 16384/accum 2`: 39.95 → **32.2 ms
+(−19%)**, peak 2487 → 2475 MB; `train_batch --bench`: update phase
+10.82 → **8.80 s (−18.7%)**, rollout 25.5 → **24.4 s (−4.2%)**, total
+**115.3k → 126.0k steps/s (+9.3%)**, two reps within 7 steps/s of each
+other. The audit estimated 8–12% of update GPU time and ~1.5% of the
+rollout; the update came in at 19% and the rollout at 4%, so the fp32
+critic cost more than the byte census gave it — plausibly the
+non-tensor-core SGEMMs and the m=1 batched GEMMs, which the census
+priced at "~1 ms". **VRAM did NOT move** (12.61 → 12.60): the rollout
+peak stayed at 12.17 (3.20 GiB over resident) with the fp32 critic
+transients gone, so that transient is something else (the env kernel's
+own allocations, or the actor's attention/FFN buffers at N=32768 —
+not attributed here); the audit's −1.5 to −1.8 GiB for this item was
+wrong.
+
+*Numerics gate:* (a) gate **279 passed** (268 + 11 new pin tests);
+(b) `tests/test_policy.py` unchanged and passing (its value check is
+the fp32 path, which is bit-identical); (c) 5-update same-seed run vs
+the pre-change run from the same session, update 5: `acc 0.6584` vs
+0.6582, `return −15.607` vs −15.585, `ent 46.484` vs 46.485, **`ev
+0.502` vs 0.512** (the brief's ±0.02), `r1 1.0e-06` vs 1.6e-06 —
+update 1 is identical in acc/return (the first rollout samples from
+the same init policy; the value is not in the sampling path), and the
+divergence from update 2 on is the trajectory noise of a changed
+value gradient, not a shift; (d) `perf_numerics compare` against the
+pre-change dump: logits and head grads **bit-identical** (actor path
+untouched), value max-diff 5.6e-5 on 5.5e-2, value-MLP / `critic_out`
+grads ≤1% max-rel, `critic_v` 10%, and the score-path grads
+(`critic_q`, `critic_k`, `critic_ln`) at O(1) max-rel — which needed
+the isolation probe below before accepting.
+
+*Isolation probe (grads of a value-only loss, 4096 rows, five fp16
+arms vs the fp32 path on the same weights):* packed vs unpacked k/v is
+**bit-identical in the forward** and in every grad downstream of `hv`;
+`dW_k`/`dW_v` differ at 1e-12–1e-10 (wgrad accumulation order at N=256
+vs 128) and `critic_ln`'s grad at 5e-3 rel (dhv is one rounded GEMM
+instead of two plus an add) — routing is correct. SDPA vs the legacy
+fp16 matmul pool: value max-rel 5.5e-3 vs 4.3e-3; downstream critic
+grads cos > 0.998 in both. The score-path grads are at the init noise
+floor: `|dW_k|max` ≈ 7e-6, `|dW_q|max` ≈ 7e-6 (`critic_k.bias`'s grad
+is mathematically 0 — a per-key constant is softmax-invariant), where
+cos vs fp32 is 0.3–0.4 for either fp16 arm; scaling the critic q/k
+weights ×8 lifts them to cos 0.85–0.88 (SDPA) / 0.96–0.97 (legacy).
+So SDPA-Tq=1's backward is somewhat less faithful on the score path
+than the fp16 matmuls at init, both are in the fp16 class the actor's
+2026-08-15 SDPA ladder already accepted, and the run-level gate (c)
+shows no EV/acc effect. Kept SDPA; `BEAT_ATTN=legacy` is the bisect
+hatch if a long run ever disagrees. The pin test compares fp16 vs
+fp32 only on the grads that carry signal at init (v / out / value MLP,
+cos > 0.98) and packed vs unpacked for routing.
+
+*Also landed with 1.1:* `perf_numerics.py` had crashed on every
+adapool policy since 2026-08-19 (it probed `value_head`); it now
+probes the critic's packed k/v, body-row query and value-MLP grads
+instead, which is how (d) was run.
+
+#### What Tier 1 changes for the rest of the plan
+
+- The update phase is now 8.80 s / 4 updates against the rollout's
+  24.4 (26% / 74% exec-true). A §5 (cuBLASLt bias+ReLU epilogue) and
+  A §7 (`wgrad` beta=1) are the remaining byte/FLOP items there and
+  should be re-estimated against 8.8 s, not 10.8.
+- `--mb-accum 1` costs +1.65 GiB (Tier 0.2) — at 12.60 peak on 32 GB
+  that is now free VRAM-wise; it buys ~1% of the update phase.
+- The rollout-phase peak (12.17, 3.20 GiB over resident) is NOT the
+  critic and is now the thing to attribute if VRAM matters (T=64 /
+  2.6 wants b_obs 2.5 GB); `torch.cuda.memory._record_memory_history`
+  over one rollout tick would settle it.
+- B §2 / 2.2 (critic on a side stream) is now cheaper to test — the
+  critic is ~a third of the forward it was.
+
 ### Architecture notes (C §3)
 
 - `trunk = Linear, ReLU, Linear` then Linear heads: the actor's readout ends in two linear layers in a row, so `trunk.2` adds optimization geometry but no capacity, and `dormant` measured on its signed linear output is structurally ~0 — the instrument is placed where it cannot read. Measure dormancy on `trunk.0`'s ReLU output or FFN hiddens; a ReLU after `trunk.2` is a probe, not a patch.
