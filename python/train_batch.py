@@ -43,7 +43,8 @@ import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
 from fp16_linear import bump_weights_version
-from policy import HEAD_SIZES, NotePolicy, OBS_DIM, load_policy
+from policy import (HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
+                    load_policy)
 
 A_DIM = len(HEAD_SIZES)  # 29 factored joint heads (env v10)
 
@@ -109,6 +110,62 @@ def adv_filter_indices(f_adv, train_n):
     own predictions and EV collapsed 0.768 -> 0.015 in the 50-update
     smoke.) Unordered (sorted=False); the caller shuffles."""
     return torch.topk(f_adv.abs(), train_n, sorted=False).indices
+
+
+def resolve_env_order(flag, environ):
+    """R12 env-order resolution (2026-09-02, Tier 0.1). `flag` is
+    args.env_order: True/False if --env-order/--no-env-order was given,
+    None if neither was. Precedence: explicit flag > a BEAT_ENV_ORDER
+    already in the shell > ON.
+
+    The shell variable is kept in the chain (rather than the flag simply
+    defaulting True) so the standalone env-var contract other tools and
+    the 2026-08-21 A/B harness use still works, and so a pod that
+    exports BEAT_ENV_ORDER=0 to quarantine the permutation is not
+    silently overridden by the new default."""
+    if flag is None:
+        return environ.get("BEAT_ENV_ORDER", "1") == "1"
+    return bool(flag)
+
+
+def entropy_report(ent_head):
+    """Per-limb-group entropy, the weakest head, and the 29-head sum.
+
+    `ent_head` is a length-29 sequence of MEAN per-head entropies in the
+    env's actuated order (policy.HEAD_GROUPS: spine 3, armL 7, armR 7,
+    legL 6, legR 6). Pure host-side arithmetic over values that have
+    ALREADY been synced by the per-update print — it adds no device
+    work and no sync.
+
+    Group figures are MEANS over the heads in a group, not sums, so
+    spine (3 heads) and armL (7 heads) are directly comparable to each
+    other; ln(K) is the per-head ceiling (1.0986 at --gears 3, 1.6094
+    at --gears 5). The returned total is the 29-head SUM, i.e. the
+    full-batch analogue of the printed `ent` (2026-09-02).
+
+    Returns (groups, min_head_index, min_head_entropy, total)."""
+    groups = [(nm, sum(ent_head[a:b]) / (b - a))
+              for nm, a, b in HEAD_GROUPS]
+    lo = min(range(len(ent_head)), key=ent_head.__getitem__)
+    return groups, lo, ent_head[lo], sum(ent_head)
+
+
+def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head):
+    """The `[kl]` diagnostic line (2026-09-02, Tier 0.3 of the 09-02
+    static audit). `mb1/mbN` = first/last minibatch of THIS update, so
+    the pair brackets the within-update drift over 64 optimizer steps.
+    kl is the k3 estimator; clipfrac is the share of rows outside
+    1 +/- CLIP, which contribute zero policy gradient. entfull is the
+    full-batch 29-head entropy sum from the t=0 rollout forward — it is
+    unaffected by --adv-filter (unlike `ent`, which is the last
+    minibatch's KEPT rows) and lags `ent` by one update."""
+    groups, lo, lo_v, total = entropy_report(ent_head)
+    gs = "  ".join(f"{nm} {v:.3f}" for nm, v in groups)
+    return (f"[kl] upd {update:>3}  kl(mb1/mbN) {klf:.2e}/{kll:.2e}"
+            f"  clipfrac {cff:.4f}/{cfl:.4f}"
+            f"  gnorm {gnorm:.3f}  clipc {clipc:.3f}"
+            f"  ent/head {gs}  min {lo_v:.3f} (h{lo})"
+            f"  entfull {total:.3f}")
 
 
 def parse_args():
@@ -237,6 +294,27 @@ def parse_args():
                         "parity reference). Default: cuda on a CUDA "
                         "device, else rust. (The P4 torch mirror, "
                         "--env torch, was removed 2026-08-03.)")
+    # R12 warp-coherence env permutation (cuda_env.py:608, the
+    # dynamics-key argsort). Promoted from a bare BEAT_ENV_ORDER env
+    # var to a real flag 2026-09-02 (Tier 0.1 of the 09-02 static
+    # audit): it was default OFF and no launcher ever set it, so the
+    # +5.4% measured on the previous pod (2026-08-21, 123,081 vs
+    # 116,804 steps/s) was never actually collected by a campaign.
+    # Per-env results are bitwise-identical under ANY thread->env
+    # bijection (tests/test_env_order_bitwise.py), so this is a pure
+    # throughput knob. Default ON. Resolution order: explicit flag >
+    # a pre-existing BEAT_ENV_ORDER in the shell > ON. The trainer
+    # re-exports the resolved value into os.environ BEFORE the env is
+    # constructed, so cuda_env's reader is untouched and the env var
+    # keeps working standalone (the bitwise test drives
+    # _env_order_on directly and is unaffected either way).
+    p.add_argument("--env-order", dest="env_order", action="store_true",
+                   default=None,
+                   help="R12 warp-coherence env permutation (--env cuda; "
+                        "bitwise identical per env). Default ON; "
+                        "overrides BEAT_ENV_ORDER")
+    p.add_argument("--no-env-order", dest="env_order", action="store_false",
+                   help="disable the R12 permutation (identity ordering)")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -516,6 +594,11 @@ def main():
         print("--fp16: CPU device, forcing off", flush=True)
         args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
+    # R12 env-order resolution, BEFORE any env is constructed (cuda_env
+    # snapshots os.environ in __init__). Explicit flag wins; otherwise
+    # a BEAT_ENV_ORDER already in the shell wins; otherwise ON.
+    args.env_order = resolve_env_order(args.env_order, os.environ)
+    os.environ["BEAT_ENV_ORDER"] = "1" if args.env_order else "0"
     # device-side loss-scaling state: NO host syncs in the minibatch
     # loop (an overflow zeroes the grads device-side; the audit rides
     # the existing once-per-update print sync). The scale itself is a
@@ -532,6 +615,36 @@ def main():
     inf_count = torch.zeros(1, device=device)
     ratio_diag = torch.zeros((), device=device)
     logr_max = torch.zeros((), device=device)  # max|log ratio| this update
+    # --- Tier 0.3 diagnostics (2026-09-02 static audit, C §1.2 / §2.2 /
+    # §5). ALL device-side, accumulated in the minibatch loop with
+    # add_/copy_ and read exactly once at the existing per-update print
+    # sync: the minibatch loop still has ZERO host syncs, which is the
+    # invariant the loss-scale machinery above is built around. Cost is
+    # ~11 kernels on each of 4 micro-batches (first/last minibatch) plus
+    # 2 per optimizer step, against ~46k launches/update.
+    #   kl_*  = k3 approx-KL (Schulman, http://joschu.net/blog/kl-approx),
+    #           mean of (r - 1) - log r: unbiased, non-negative, far
+    #           lower variance than -log r at the ratios PPO lives at.
+    #   cf_*  = clipfrac, fraction of rows with |r - 1| > CLIP — the
+    #           share of the minibatch contributing ZERO policy gradient.
+    #           first vs last minibatch brackets the within-update drift
+    #           (64 Adam steps at production shape).
+    kl_first = torch.zeros((), device=device)
+    kl_last = torch.zeros((), device=device)
+    cf_first = torch.zeros((), device=device)
+    cf_last = torch.zeros((), device=device)
+    # pre-clip global grad norm and the clip coefficient it produces,
+    # summed over the update's optimizer steps (C §2.2: total_norm was
+    # computed and thrown away, so nothing ever said whether the 0.5
+    # clip binds). clipc < 1 means it bound on that step.
+    gnorm_sum = torch.zeros((), device=device)
+    clipc_sum = torch.zeros((), device=device)
+    opt_steps = 0                      # host-side counter, no sync
+    # full-batch per-head entropy, (29,). Taken from the t=0 rollout
+    # forward (see the rollout loop) so it is over ALL N envs and is
+    # therefore comparable across --adv-filter settings, unlike the
+    # printed `ent`, which is the last minibatch's KEPT rows (C §5.4).
+    ent_head = torch.zeros(A_DIM, device=device)
 
     tensor_env = args.env == "cuda"
     # (--graph-rollout / rollout_graph.py REMOVED 2026-08-31: measured
@@ -897,8 +1010,21 @@ def main():
     filt = (f", adv-filter top |A| {train_n}/{batch} "
             f"({train_n // mb_size} minibatches)"
             if adv_filter_on else "")
+    # env-order state is on the banner because it was invisible for the
+    # 12 days it existed (2026-08-21 -> 09-02): nothing printed it and
+    # nothing set it, so no log ever said which ordering a run used.
+    # Read off the ENV, not off args — a banner that reports the request
+    # rather than the fact is how this knob stayed dark in the first
+    # place; the assert catches a future env that stops reading the var.
+    eo_live = getattr(venv, "_env_order_on", None)
+    if eo_live is not None:
+        assert eo_live == bool(args.env_order), (
+            f"--env-order {args.env_order} did not reach the env "
+            f"(_env_order_on={eo_live})")
+    eo = "" if eo_live is None else \
+        f", env-order {'on' if eo_live else 'off'}"
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size}, device {device}{filt} ===", flush=True)
+          f"minibatch {mb_size}, device {device}{filt}{eo} ===", flush=True)
 
     for update in range(start_update, num_updates):
         if leaf_from is not None:
@@ -928,8 +1054,25 @@ def main():
         for t in range(T):
             b_obs[t] = obs
             with torch.no_grad():
+                # t == 0 only: pay the entropy reduction (~4 kernels and
+                # one (N,29,3) probs buffer, ONCE per update) to get a
+                # FULL-BATCH per-head entropy — every env, before the
+                # --adv-filter ever selects rows. Chosen over the two
+                # alternatives in the audit because it adds NO extra
+                # forward at production width: the rollout forward is
+                # happening anyway and the rollout is 70% of the wall.
+                # It reads the policy at the START of update u (i.e.
+                # after update u-1's last opt.step), where the printed
+                # `ent` reads it mid-update; that one-update lag is the
+                # price of the free measurement and is stated on the
+                # [kl] line's `entfull` label. Entropy consumes no RNG,
+                # so the sampling stream is bit-identical either way
+                # (policy.get_action_and_value docstring, 2026-07-28).
                 a, logp, _, v = policy.get_action_and_value(
-                    obs, need_entropy=False)
+                    obs, need_entropy=(t == 0))
+            if t == 0:
+                torch.mean(policy._ent_h, dim=0, out=ent_head)
+                policy._ent_h = None
             b_act[t], b_logp[t] = a, logp
             b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
             if tensor_env:
@@ -1165,6 +1308,19 @@ def main():
                 a_full = p_adv[s:s + mb_size]
                 a_mu = a_full.mean()
                 a_sd = a_full.std()
+                # 0.3: which minibatch(es) get the KL/clipfrac probe.
+                # Host-side ints only — no sync. Accumulated across the
+                # accum micros as (1/K)-weighted micro means, which IS
+                # the minibatch mean (the same equal-slice argument the
+                # loss below relies on). A single-minibatch update
+                # (--minibatches 1) is both first and last and fills
+                # both slots, so mb1 == mbN there rather than mbN going
+                # permanently stale.
+                kl_slots = []
+                if ep_i == 0 and s == 0:
+                    kl_slots.append((kl_first, cf_first))
+                if (ep_i == args.epochs - 1 and s + mb_size >= train_n):
+                    kl_slots.append((kl_last, cf_last))
                 if flat_grad is not None:
                     flat_grad.zero_()
                 else:
@@ -1185,6 +1341,20 @@ def main():
                         torch.maximum(logr_max,
                                       logratio.detach().abs().max(),
                                       out=logr_max)
+                    if kl_slots:
+                        # k3 approx-KL and clipfrac, device-side.
+                        # .detach() keeps these out of the graph; the
+                        # ratio/logratio tensors are the ones the loss
+                        # already built, so nothing is recomputed.
+                        r_m1 = ratio.detach() - 1.0
+                        kl_m = (r_m1 - logratio.detach()).mean()
+                        cf_m = (r_m1.abs() > CLIP).to(r_m1.dtype).mean()
+                        for kl_t, cf_t in kl_slots:
+                            if j == 0:
+                                kl_t.zero_()
+                                cf_t.zero_()
+                            kl_t.add_(kl_m, alpha=1.0 / args.mb_accum)
+                            cf_t.add_(cf_m, alpha=1.0 / args.mb_accum)
                     if fp16_update and ep_i == 0 and s == 0 and j == 0:
                         # "same policy" fixed point: |ratio-1| at epoch
                         # 1 measures rollout/update precision
@@ -1271,9 +1441,22 @@ def main():
                     clip_coef = (MAX_GRAD_NORM / (total_norm + 1e-6)
                                  ).clamp(max=1.0)
                     flat_grad.mul_(clip_coef)
+                    # 0.3 / C §2.2: both were computed and discarded.
+                    # 2 device-side adds per optimizer step; the means
+                    # are formed at the print sync. clipc < 1 = the 0.5
+                    # clip bound on some steps this update. NOTE these
+                    # are POST-unscale, POST-overflow-zero norms, so an
+                    # overflow step contributes gnorm 0 / clipc 1.
+                    gnorm_sum.add_(total_norm)
+                    clipc_sum.add_(clip_coef)
+                    opt_steps += 1
                 else:
-                    nn.utils.clip_grad_norm_(policy.parameters(),
-                                             MAX_GRAD_NORM)
+                    tn = nn.utils.clip_grad_norm_(policy.parameters(),
+                                                  MAX_GRAD_NORM)
+                    gnorm_sum.add_(tn.detach())
+                    clipc_sum.add_((MAX_GRAD_NORM / (tn.detach() + 1e-6)
+                                    ).clamp(max=1.0))
+                    opt_steps += 1
                 opt.step()
                 bump_weights_version()  # invalidate fp16 replica caches
         if fp16_update:
@@ -1376,11 +1559,25 @@ def main():
             # update, mean per env over the T-tick rollout — the
             # population analog of acc, unlike the episode-terminated
             # ep_return(last100) trailing window.
-            ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v = torch.stack(
-                [ent_loss.detach(), ev, inf_count[0], ratio_diag,
-                 logr_max, fp16_scale,
-                 b_rew.sum() / b_rew.shape[1]]).tolist()
+            # ONE cat -> ONE .tolist() -> ONE sync, exactly as before:
+            # the 0.3 diagnostics ride the sync that already existed,
+            # they do not add one (that is the whole design constraint).
+            _d = torch.cat([
+                torch.stack(
+                    [ent_loss.detach(), ev, inf_count[0], ratio_diag,
+                     logr_max, fp16_scale,
+                     b_rew.sum() / b_rew.shape[1],
+                     kl_first, kl_last, cf_first, cf_last,
+                     gnorm_sum / max(opt_steps, 1),
+                     clipc_sum / max(opt_steps, 1)]),
+                ent_head]).tolist()
+            (ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v,
+             klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v) = _d[:13]
+            eh_v = _d[13:]
             logr_max.zero_()
+            gnorm_sum.zero_()
+            clipc_sum.zero_()
+            opt_steps = 0
             extra = f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}"
             if inf_v > 0:
                 inf_count.zero_()
@@ -1395,17 +1592,32 @@ def main():
                   f"ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
+            print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
+                                 gn_v, cc_v, eh_v), flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
-            ent_v, ev_v, ret_v = torch.stack(
-                [ent_loss.detach(), ev,
-                 b_rew.sum() / b_rew.shape[1]]).tolist()
+            _d = torch.cat([
+                torch.stack(
+                    [ent_loss.detach(), ev,
+                     b_rew.sum() / b_rew.shape[1],
+                     kl_first, kl_last, cf_first, cf_last,
+                     gnorm_sum / max(opt_steps, 1),
+                     clipc_sum / max(opt_steps, 1)]),
+                ent_head]).tolist()
+            (ent_v, ev_v, ret_v, klf_v, kll_v, cff_v, cfl_v,
+             gn_v, cc_v) = _d[:9]
+            eh_v = _d[9:]
+            gnorm_sum.zero_()
+            clipc_sum.zero_()
+            opt_steps = 0
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
                   f"acc {acc_now:.4f}  accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"return {ret_v:7.3f}  "
                   f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
                   flush=True)
+            print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
+                                 gn_v, cc_v, eh_v), flush=True)
 
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
@@ -1469,9 +1681,15 @@ def main():
         "enqueue-attributed, NOT execution time — use --bench"
     vram = (f" | peak-vram {torch.cuda.max_memory_allocated() / 2**30:.2f} "
             f"GiB" if device.type == "cuda" else "")
+    # seconds alongside the percentages (2026-09-02): integer percents
+    # cannot resolve an update-phase A/B (a 10% update change is 3% of
+    # the wall and rounds away), which is exactly what Tier 0.2 asked
+    # this line for.
     print(f"THROUGHPUT: {(global_step - steps_before) / (time.time() - start):,.0f} steps/s total | "
           f"rollout {100*t_rollout/tot:.0f}% update {100*t_update/tot:.0f}% "
-          f"({split_kind}) | N={N} T={T}{vram}", flush=True)
+          f"({split_kind}) [{t_rollout:.2f}s / {t_update:.2f}s over "
+          f"{num_updates - start_update} upd] | N={N} T={T}{vram}",
+          flush=True)
 
 
 if __name__ == "__main__":
