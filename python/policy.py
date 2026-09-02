@@ -170,6 +170,16 @@ assert len(_BODY_IDX) == BODY_FEAT
 # default; a policy's real sizes live in policy.head_sizes.
 N_ACTION_HEADS = 29
 HEAD_SIZES = (3,) * N_ACTION_HEADS
+# Head -> limb grouping for diagnostics (2026-09-02). The network has
+# NO explicit grouping — the 29 heads are one packed (145, 256) GEMM
+# and head h is simply action lane h — so this is DERIVED from the
+# actuated order above, which is the action-index contract shared with
+# the env (beat_arena_env/constants.py JOINT_NAMES, A_SPINE=0,
+# A_L_ARM=3, A_R_ARM=10, A_L_LEG=17, A_R_LEG=23). Duplicated rather
+# than imported to keep policy.py a leaf module; the duplication is
+# pinned against constants.py by tests/test_head_entropy.py.
+HEAD_GROUPS = (("spine", 0, 3), ("armL", 3, 10), ("armR", 10, 17),
+               ("legL", 17, 23), ("legR", 23, 29))
 
 # Additive attention-mask magnitude. 2^14: exactly representable in fp16
 # (the fp16-storage path needs the bias to survive an fp16 round trip;
@@ -407,6 +417,10 @@ class NotePolicy(nn.Module):
         # attrs; the graphed rollout captures with the flag False.
         self._diag_stash = False
         self._diag_h = None
+        # per-head entropy of the last need_entropy=True forward, (B, 29)
+        # (2026-09-02). Written unconditionally when entropy is asked
+        # for — it is the same tensor the sum reduces, not extra work.
+        self._ent_h = None
         # token-slice index buffers (device-tracked, not in state_dict)
         self.register_buffer(
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
@@ -637,7 +651,21 @@ class NotePolicy(nn.Module):
         if need_entropy:
             if probs is None:
                 probs = logsm.exp()
-            entropy = -(probs * logsm).sum(-1).sum(-1)
+            # PER-HEAD first, then the 29-head sum. Bit-identical to the
+            # old `-(probs*logsm).sum(-1).sum(-1)`: that was already two
+            # reductions in exactly this order, so splitting the
+            # intermediate out is a rename, not a numerics change (pinned
+            # by tests/test_head_entropy.py). `_ent_h` is stashed for the
+            # trainer's per-group / min-head entropy diagnostic
+            # (2026-09-02, Tier 0.3 of the 09-02 static audit) and costs
+            # zero extra kernels; the caller clears it.
+            ent_h = -(probs * logsm).sum(-1)                  # (B, 29)
+            # .detach(): the stash outlives the backward (the trainer
+            # clears it at the next rollout tick 0), and a live grad_fn
+            # would pin that micro-batch's autograd nodes for the rest
+            # of the update. Shares storage, so it is a view, not a copy.
+            self._ent_h = ent_h.detach()
+            entropy = ent_h.sum(-1)
         return action, logprob, entropy, value
 
 

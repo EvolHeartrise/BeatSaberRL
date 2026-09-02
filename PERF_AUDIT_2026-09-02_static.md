@@ -29,6 +29,8 @@ optimizer steps**, not 32; `--mb-accum 2` only splits each backward.
 | 0.2 | `train_batch --bench` at production shape, `--mb-accum 1` vs `2` | accum 2 was adopted for graph-pool OOMs that no longer exist; it doubles the per-minibatch enqueue. Decides whether the update is CPU-enqueue-bound, which gates A §4/§6/§7/§10 | A §2 |
 | 0.3 | Log clipfrac + approx-KL (first and last minibatch), pre-clip grad norm / `clip_coef`, per-group and min-head entropy, and a full-batch entropy under the filter | The joint 29-head ratio leaves ±0.2 at a per-head change of 0.63%; nothing measures how much of each update is zero-gradient. `total_norm` is computed and discarded. Under the filter the printed `ent` is the kept-row entropy and is not comparable to unfiltered runs | C §1.2, §2.2, §5 |
 
+**All three executed 2026-09-02 — see "Tier 0 results" below.** 0.1 was NOT set on the pod, is now the `--env-order` flag (default ON), and measures **NULL** here (+0.1%, not +5.4%). 0.2: the update phase is **GPU-bound**, accum 2 costs 1.0% of the update phase / 0.26% wall and saves 1.65 GiB — production default left at 2, and every Tier-1/2 item gated on "if CPU-bound" takes its low end. 0.3 shipped, bit-identical; last-minibatch clipfrac reaches 0.237 (0.249 under `--adv-filter 0.5`) by update 5 and is still rising, so §2.1's gate is essentially met; the 0.5 grad clip stops binding after update 2.
+
 ### Tier 1: confirmed-by-code defects and free wins
 
 | # | item | expected | risk | source |
@@ -65,6 +67,197 @@ optimizer steps**, not 32; `--mb-accum 2` only splits each backward.
 ### Diagnostics worth adding (all fit in the once-per-update print sync)
 
 Approx-KL and clipfrac (first/last mb); `clip_coef` mean; per-group and min-head entropy; full-batch entropy under the filter; bootstrap calibration (`b_val[T]` from update u vs realized 32-tick return from u+1 — the non-structural critic-quality metric EV cannot give); critic skill vs a note-counter baseline; kept/full advantage σ ratio when filtering; diag on kept rows; per-position advantage variance. (C §5)
+
+### Tier 0 results (measured 2026-09-02)
+
+All numbers from ONE session on the RTX 5090 pod `194.14.47.19` (torch
+2.8.0.dev+cu128), production shape `--num-envs 32768 --horizon 32
+--minibatches 64` (batch 1,048,576, minibatch 16,384), the T=32 campaign
+argv. `--bench` caps at 4 updates and is warmup-inflated — the totals
+below (~115.6k steps/s) sit ~7% under the 124,224 steps/s 50-update
+reference **from the previous pod**, and are NOT comparable to it;
+every comparison here is within this pod and this session. Run-to-run
+spread over identical arms: **0.31%** on total steps/s (115,300 →
+115,655 over 5 reps of accum 2), 0.37–0.74% on the phase seconds.
+
+#### 0.1 `BEAT_ENV_ORDER` — NOT set on the pod; promoted to `--env-order`; the +5.4% does NOT reproduce (NULL)
+
+(a) Confirmed unset: `echo $BEAT_ENV_ORDER` is empty and the name appears
+in none of `/root/.bashrc`, `/root/.profile`, `/etc/profile`,
+`/etc/environment`. Also confirmed the var still *works*: with
+`BEAT_ENV_ORDER=1`, `_env_order_on` is True and `env.env_order` is
+non-identity after 40 ticks (identity without it) — so the null below is
+a real null, not a knob that failed to engage.
+
+(b) Shipped as `--env-order` / `--no-env-order`, **default ON**,
+resolved as *explicit flag > shell `BEAT_ENV_ORDER` > ON* and re-exported
+into `os.environ` before the env is constructed (`cuda_env.py`'s reader
+is untouched, so the standalone env-var contract and
+`tests/test_env_order_bitwise.py` are unaffected). It is in the resolved
+`args.json` config dump and on the `=== batched PPO` banner, read off
+`venv._env_order_on` rather than off `args` with an assert between them.
+Pinned by `tests/test_env_order_flag.py` (7 tests).
+
+(c) Measured, `--bench`, both code versions (env var on the old build,
+flag on the new — same numbers):
+
+| arm | steps/s (reps) | mean | Δ |
+|---|---|---|---|
+| accum 2, env-order **off** | 115,628 / 115,411 / 115,456 / 115,300 | 115,449 | — |
+| accum 2, env-order **on** | 115,560 / 115,477 / 115,555 / 115,628 / 115,655 | 115,575 | +0.11% |
+| accum 1, env-order **off** | 115,712 / 115,747 / 115,677 / 115,856 | 115,748 | — |
+| accum 1, env-order **on** | 115,850 / 115,893 / 116,009 / 115,830 / 115,747 | 115,866 | +0.10% |
+
+The sharp instrument is the **rollout phase alone** (the permutation
+touches nothing else), from the new exec-true `[rollout s / update s]`
+split: **on 25.425 s (n=6) vs off 25.450 s (n=4) over 4 updates —
++0.10%**.
+
+**Verdict: NULL on this pod.** +0.1%, inside the 0.31% run-to-run
+spread, against the +5.4% (123,081 vs 116,804) measured at nominally
+this shape on 2026-08-21 on the *previous* pod. Not explained here; the
+candidates are the pod change itself and the env changes since (v35
+`--limit-arms`, v38 `--crouch-start-prob`, `--wall-despawn`), which move
+the ground-contact branch profile the dynamics key sorts on. **Budget
+nothing for env-order.** The flag stays and stays default ON — it is
+bitwise identical, free, and now visible, which is the actual fix: the
+knob was dark for 12 days and no log said which ordering a run used.
+
+#### 0.2 `--mb-accum 1` vs `2` — the update phase is **GPU-bound**, not CPU-enqueue-bound
+
+`train_batch --bench`, production shape, env-order held constant per pair:
+
+| arm | steps/s (reps) | mean | update phase, s / 4 upd (reps) | mean | peak VRAM |
+|---|---|---|---|---|---|
+| `--mb-accum 2` | 115,555 / 115,628 / 115,655 / 115,456 / 115,300 | 115,519 | 10.81 / 10.79 / 10.81 / 10.82 / 10.87 | **10.820** | **13.78 GiB** |
+| `--mb-accum 1` | 116,009 / 115,830 / 115,747 / 115,677 / 115,856 | 115,824 | 10.69 / 10.71 / 10.70 / 10.73 / 10.71 | **10.708** | **15.43 GiB** |
+
+Rollout phase is unchanged across the pair (25.41 vs 25.44 s), as it must
+be — that agreement is what says the ~0.4% timer resolution is real.
+
+Isolated GPU-side cost, `bench_policy_update.py --fp16` (best of 3 × 50,
+`--mb-accum` knob added for this), two independent invocations each:
+
+| mb | accum | ms/update | peak MB |
+|---|---|---|---|
+| 8192 | 1 | 20.32 / 20.35 | 2487.0 |
+| 16384 | 1 | 39.53 / 39.55 | 4974.0 |
+| 16384 | 2 | 39.93 / 39.94 | 2487.2 |
+
+`2 × t(8192) = 40.67` vs `t(16384) = 39.54` → **+2.9%**, but that arm
+pays two optimizer steps; the direct knob (two micros, one step) is
+**39.94 vs 39.54 = +1.01%**.
+
+**Verdict: NOT CPU-enqueue-bound.** Accum 2 roughly doubles the fwd/bwd
+launches per minibatch (~690 vs ~345, the census above) at unchanged
+GPU FLOPs. If enqueue were binding, the update phase would grow by
+something like that ratio — this section predicted **10–30% wall**. It
+grows **1.04%** end-to-end (10.820 → 10.708 s) and **1.01%** in the
+isolated instrument, which is the size of the GEMM-efficiency loss from
+halving M (221k → 110k rows), not of a doubled enqueue. Two more
+consistency checks: the trainer's per-minibatch update time is 42.27 ms
+(accum 2) and 41.83 ms (accum 1) against the isolated 39.94 / 39.54 —
+the loss-scale + flat-grad + gather machinery costs **+5.8% in both
+arms**, which it could not if either were enqueue-starved. The 4090-era
+census (CPU 30 ms vs GPU 48 ms/minibatch at accum 1) does **not**
+transfer to this pod.
+
+Consequences for the tiers below — take the **GPU-bound branch** of every
+item gated on 0.2:
+- **A §4** (CUDA-graph the update minibatch): "0 if GPU-bound" → **drop**.
+- **A §6** (~20 bookkeeping launches/minibatch), **A §7 / 2.9** (`wgrad`
+  beta=1), **A §10 / 2.11** (`torch.compile` the loss tail): take their
+  low ends (~0.3%, ~1% of update GPU, ~0.5%), not their CPU-bound ceilings.
+- The wins left in the update phase are the ones that move **bytes and
+  FLOPs**: A §1 (the fp32 critic), A §3, A §5.
+
+**Production default unchanged** (`--mb-accum 2`), as briefed. For the
+record the trade is +0.26% wall for **+1.65 GiB peak** (13.78 → 15.43),
+which is not worth taking on its own; revisit after Tier 1.1 + 1.2 + 1.3
+free ~3 GiB, when accum 1 becomes free.
+
+#### 0.3 Logging — shipped, bit-identical, and the first real clipfrac/KL numbers
+
+Added to the trainer, all device-side and read at the **existing**
+once-per-update print sync (one `torch.cat` → one `.tolist()` → one
+sync, exactly as before; the minibatch loop still has **zero** host
+syncs): k3 approx-KL and clipfrac on the first and last minibatch, mean
+pre-clip grad norm and mean `clip_coef` over the update's optimizer
+steps, per-limb-group and min-head entropy, and a full-batch `entfull`.
+`get_action_and_value` now exposes per-head entropy (`policy._ent_h`);
+the split is a rename of the two reductions that were already there, so
+`entropy` is bitwise unchanged. `HEAD_GROUPS` (spine 3 / armL 7 / armR 7
+/ legL 6 / legR 6) is derived from the env's actuated-order contract and
+pinned against `beat_arena_env.constants` in
+`tests/test_head_entropy.py` (14 tests). Gate: **268 passed** (was 247).
+
+`entfull` is taken from the **t=0 rollout forward** — the option that
+adds no extra forward at production width (the rollout forward happens
+anyway; it costs ~4 kernels and one `(N,29,3)` buffer once per update).
+It is therefore over all 32,768 envs regardless of `--adv-filter`, and
+it reads the policy at the *start* of update u, so it lags the printed
+`ent` by one update: measured `entfull(u=5) = 46.529` vs
+`ent(u=4) = 46.530`.
+
+**Bit-identity confirmed.** 5-update runs at the same seed, before and
+after, `--no-env-order` on both: `acc` / `accL` / `accR` / `return` /
+`ent` / `ev` identical to every printed digit on all five updates
+(update 5: `acc 0.6582 accL 0.6502 accR 0.6658 return -15.585 ent 46.485
+ev 0.512`), peak VRAM identical at 13.78 GiB, throughput 116,285 vs
+116,257 steps/s (−0.02%, inside noise). `ep_return(last100)` differs, as
+it already did between env-order arms — it is a mean over whichever 100
+episodes the ring buffer popped, which the thread→env assignment
+reorders.
+
+A real line (update 5, unfiltered, 5-update run from a fresh init):
+
+```
+[kl] upd   5  kl(mb1/mbN) 2.00e-10/1.45e-02  clipfrac 0.0000/0.2365  gnorm 0.180  clipc 1.000  ent/head spine 1.591  armL 1.606  armR 1.607  legL 1.605  legR 1.606  min 1.567 (h0)  entfull 46.529
+```
+
+**What the first numbers say (against the C §1.2 prediction):**
+
+| upd | clipfrac mb1 / mbN | k3 KL mb1 / mbN | gnorm | clipc |
+|---|---|---|---|---|
+| 1 | 0.0000 / 0.0901 | 5.9e-10 / 7.05e-03 | 0.385 | 0.913 |
+| 2 | 0.0000 / 0.1093 | 1.6e-10 / 8.04e-03 | 0.228 | 0.969 |
+| 3 | 0.0000 / 0.2134 | 1.2e-10 / 1.30e-02 | 0.155 | 1.000 |
+| 4 | 0.0000 / 0.2031 | 1.8e-10 / 1.27e-02 | 0.198 | 1.000 |
+| 5 | 0.0000 / 0.2365 | 2.0e-10 / 1.45e-02 | 0.180 | 1.000 |
+
+- **C §1.2 is confirmed in direction and is at its own threshold in
+  magnitude.** The first minibatch is exactly the same-policy fixed
+  point (clipfrac 0, k3 KL ~2e-10, consistent with `r1` ~1e-6), so
+  *all* of the clipping is manufactured inside one update by the 63
+  preceding Adam steps. Last-minibatch clipfrac climbs 0.090 → 0.237
+  over five updates and is **still rising**. The §2.1 gate was
+  "last-mb clipfrac > ~0.25 (0.3)": at update 5, unfiltered, it is
+  0.2365 — within noise of the gate, on a policy that is still
+  essentially uniform (entropy 46.5 of 46.67 max). Read it again at
+  update 50 and 500 before committing to per-head clipping, but the
+  expectation should now be that the gate is met.
+- Under `--adv-filter 0.5` the same series is **higher** despite half
+  the optimizer steps (32 vs 64): 0.105 → 0.131 → 0.209 → 0.246 →
+  **0.249**. That is C §1.1's normalization confound made visible — the
+  kept set's larger |A| spread means each of the 32 steps moves the
+  policy further than each of the 64 does.
+- **Joint per-update KL is large.** 1.45e-02 (k3, last minibatch)
+  against the ~0.008–0.01 an rl_games-style adaptive-KL controller
+  targets. C §2.3 has something to act on, and the threshold it needs
+  can now be set from data.
+- **C §2.2 answered: the 0.5 grad clip is inert in the steady state.**
+  `clipc` is 0.913 at update 1 and 0.969 at update 2 — i.e. it binds
+  during lr warmup — then **exactly 1.000 from update 3 onward**, with
+  `gnorm` 0.15–0.31 against `MAX_GRAD_NORM` 0.5. It is not a live
+  regularizer at this shape; it is a warmup guard.
+- **Entropy: only the spine has started to move.** Every group sits
+  within 0.02 of the `--gears 5` ceiling ln 5 = 1.6094 at update 5, and
+  the *only* one falling is spine (1.603 → 1.591). The weakest head is
+  **h0 = `spine_pitch`** (1.597 → 1.567); armL / armR / legL / legR are
+  pinned at the uniform ceiling. The 29-head sum (46.53 of 46.67) could
+  never have shown that — this is the min-head instrument earning its
+  place on its first run.
+
 
 ### Architecture notes (C §3)
 
