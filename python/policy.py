@@ -646,6 +646,11 @@ class NotePolicy(nn.Module):
             # rollout capture already carried.
             g = torch.empty_like(logsm).exponential_()
             action = (logsm - g.log()).argmax(-1)
+        elif action.dtype is not torch.long:
+            # the trainer stores rollout actions as uint8 (2026-09-02,
+            # Tier 1.3); gather needs an int64 index. Exact (integers),
+            # (B, 29) — a tiny per-micro-batch cast.
+            action = action.long()
         logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
         entropy = None
         if need_entropy:
