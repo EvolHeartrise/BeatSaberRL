@@ -896,7 +896,14 @@ def main():
     # source values at full precision there).
     obs_dt = torch.float16 if args.fp16 == "all" else torch.float32
     b_obs = torch.zeros((T, N, OBS_DIM), device=device, dtype=obs_dt)
-    b_act = torch.zeros((T, N, A_DIM), dtype=torch.long, device=device)
+    # uint8 actions (2026-09-02, Tier 1.3 of the 09-02 audit A §3 /
+    # B §5): gear indices live in [0, n_gears) with n_gears <= 7, so
+    # the int64 (T, N, 29) buffer (243 MB at production shape, plus the
+    # same again on the per-epoch perm copy) was 8x oversized. The
+    # per-tick store casts (exact, integers); the consumers cast back
+    # to int64 per micro-batch (policy.get_action_and_value — gather
+    # needs a long index). Bit-identical.
+    b_act = torch.zeros((T, N, A_DIM), dtype=torch.uint8, device=device)
     b_logp = torch.zeros((T, N), device=device)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
