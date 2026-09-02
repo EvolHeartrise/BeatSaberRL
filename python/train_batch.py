@@ -1004,6 +1004,16 @@ def main():
               "cooldown", flush=True)
     steps_before = global_step
     t_rollout = t_update = 0.0
+    # --bench only (2026-09-02, Tier 1.2 of the 09-02 static audit):
+    # per-phase peak-VRAM attribution. The audit INFERRED "the peak is
+    # in the rollout" from the adv-filter delta; this reads it. Host-
+    # side allocator stats taken at the phase syncs --bench already
+    # does — no device work, no extra syncs. The global peak on the
+    # THROUGHPUT line becomes the max of the two brackets (the resets
+    # would otherwise hide the earlier phase from max_memory_allocated).
+    # res_pre = resident bytes at the START of a rollout, i.e. what the
+    # previous update left behind (the perm copies, before 1.2).
+    peak_roll = peak_upd = res_pre = 0
     diag_probe_obs = None    # frozen first-diag batch (psrank probe)
     start = time.time()
 
@@ -1050,6 +1060,10 @@ def main():
             # if --ent-tau 0) — never a function of num_updates, so
             # extension continues the curve
             ent_now = trunk_ent(update)
+        if args.bench and device.type == "cuda":
+            res_now = torch.cuda.memory_allocated()
+            res_pre = max(res_pre, res_now)
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
         for t in range(T):
             b_obs[t] = obs
@@ -1125,6 +1139,9 @@ def main():
         # without lifting the cap.
         if args.bench and device.type == "cuda":
             torch.cuda.synchronize()
+            pk_r = torch.cuda.max_memory_allocated()
+            peak_roll = max(peak_roll, pk_r)
+            torch.cuda.reset_peak_memory_stats()
         t_rollout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -1459,10 +1476,33 @@ def main():
                     opt_steps += 1
                 opt.step()
                 bump_weights_version()  # invalidate fp16 replica caches
+        # Tier 1.2 (2026-09-02 audit A §3): the permuted copies (p_obs
+        # 1.25 GB + p_act at production shape) are dead once the epoch
+        # loop ends, but as loop-scope Python locals they lived through
+        # the ENTIRE next rollout + GAE until the next update's gather
+        # reassigned them — sitting under the rollout-phase peak doing
+        # nothing. keep_idx (--adv-filter) likewise. Bit-identical: the
+        # same rows are re-gathered next update either way. `_` is the
+        # last micro's action slice — a VIEW of p_act, which would keep
+        # that storage alive through the del (measured: +0.23 GiB
+        # resident at the next rollout start without it).
+        del p_obs, p_act, p_logp, p_adv, p_ret, perm, _
+        if adv_filter_on:
+            del keep_idx
         if fp16_update:
             policy.fp16 = args.fp16 == "all"
         if args.bench and device.type == "cuda":
             torch.cuda.synchronize()  # see rollout-timer note
+            pk_u = torch.cuda.max_memory_allocated()
+            peak_upd = max(peak_upd, pk_u)
+            # per-update attribution line (host-side only): the first
+            # update's rollout has no update leftovers yet, so the
+            # u=1 vs u>=2 rollout peaks are the "what the update left
+            # behind" measurement in one run
+            print(f"[bench-mem] upd {update + 1}: resident at rollout "
+                  f"start {res_now / 2**30:.2f}  rollout peak "
+                  f"{pk_r / 2**30:.2f}  update peak {pk_u / 2**30:.2f} "
+                  "GiB", flush=True)
         t_update += time.perf_counter() - t0
 
         if tensor_env:
@@ -1679,8 +1719,16 @@ def main():
     tot = t_rollout + t_update
     split_kind = "exec-true" if args.bench else \
         "enqueue-attributed, NOT execution time — use --bench"
-    vram = (f" | peak-vram {torch.cuda.max_memory_allocated() / 2**30:.2f} "
-            f"GiB" if device.type == "cuda" else "")
+    vram = ""
+    if device.type == "cuda":
+        peak = torch.cuda.max_memory_allocated()
+        if args.bench:
+            peak = max(peak, peak_roll, peak_upd)
+        vram = f" | peak-vram {peak / 2**30:.2f} GiB"
+        if args.bench:
+            vram += (f" (rollout {peak_roll / 2**30:.2f} / update "
+                     f"{peak_upd / 2**30:.2f}; resident at rollout start "
+                     f"{res_pre / 2**30:.2f})")
     # seconds alongside the percentages (2026-09-02): integer percents
     # cannot resolve an update-phase A/B (a 10% update change is 3% of
     # the wall and rounds away), which is exactly what Tier 0.2 asked
