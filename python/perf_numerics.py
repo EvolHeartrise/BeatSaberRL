@@ -67,12 +67,25 @@ def dump(args):
               "g_trunk": policy.trunk[0].weight,
               "g_head0": policy.heads[0].weight,
               "g_head28": policy.heads[28].weight,
-              "g_value": policy.value_head.weight,
               # bias grads ride relu_bwd's fixed-order partials at the
               # NEW widths (512/256) — probe them explicitly
               "g_ffn0_b": blk.ffn[0].bias,
               "g_trunk_b": policy.trunk[0].bias,
               "g_q0_b": blk.q_proj.bias}
+    if policy.critic_arch == "linear_v0":
+        probes["g_value"] = policy.value_head.weight
+    else:
+        # adapool critic (the dump crashed on `value_head` for every
+        # post-2026-08-19 policy until 2026-09-02): packed k/v routing,
+        # the body-row query, and the value MLP's relu_bwd bias path
+        probes.update({"g_ck": policy.critic_k.weight,
+                       "g_cv": policy.critic_v.weight,
+                       "g_cq": policy.critic_q.weight,
+                       "g_cout": policy.critic_out.weight,
+                       "g_cmlp0": policy.critic_mlp[0].weight,
+                       "g_cmlp0_b": policy.critic_mlp[0].bias,
+                       "g_cmlp4": policy.critic_mlp[4].weight,
+                       "g_cln": policy.critic_ln.weight})
     for k, p in probes.items():
         out[k] = (p.grad.detach().float().cpu() if p.grad is not None
                   else torch.zeros(1))
