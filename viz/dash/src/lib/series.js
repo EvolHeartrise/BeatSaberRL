@@ -61,6 +61,10 @@ const DERIVED = {
   sps_k: (r) => (r.sps == null ? null : r.sps / 1000),
   kl_first_pos: (r) => (r.kl_first > 0 ? r.kl_first : null),
   kl_last_pos: (r) => (r.kl_last > 0 ? r.kl_last : null),
+  // log-scale variants: a log axis cannot show 0, so zero-event updates
+  // become gaps rather than dragging the axis to -inf (2026-09-03)
+  falls_per_1m_pos: (r, i, recs) => { const v = per1M(r, "falls", batchOf(recs, i)); return v > 0 ? v : null; },
+  tilts_per_1m_pos: (r, i, recs) => { const v = per1M(r, "tilts", batchOf(recs, i)); return v > 0 ? v : null; },
 };
 
 export function seriesValues(recs, key) {
@@ -91,7 +95,7 @@ export const PANELS = [
   { id: "ent", title: "entropy (ent: last minibatch · entfull: full batch)", series: ["ent", "entfull"] },
   { id: "ev", title: "explained variance", series: ["ev"] },
   { id: "sps", title: "steps / s (thousands)", series: ["sps_k"] },
-  { id: "falls", title: "terminations per 1M samples", series: ["falls_per_1m", "tilts_per_1m"] },
+  { id: "falls", title: "terminations per 1M samples (log)", series: ["falls_per_1m_pos", "tilts_per_1m_pos"], log: true },
   { id: "clipfrac", title: "clipfrac (first / last minibatch)", series: ["clipfrac_first", "clipfrac_last"] },
   { id: "kl", title: "KL k3 (first / last minibatch, log)", series: ["kl_first_pos", "kl_last_pos"], log: true },
   { id: "gnorm", title: "grad norm · clip coefficient", series: ["gnorm", "clipc"] },
@@ -105,7 +109,7 @@ export const PANELS = [
 
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
-  "acc", "return", "ep_return", "ent", "entfull", "ev", "sps_k", "falls_per_1m",
+  "acc", "return", "ep_return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc",
 ];
 export const DIFF_KEYS = ["acc", "return", "ep_return", "ent", "ev"];
@@ -114,6 +118,7 @@ export const LABELS = {
   acc: "acc", accL: "accL", accR: "accR", return: "return", ep_return: "ep_return",
   ent: "ent", entfull: "entfull", ev: "ev", sps_k: "steps/s (k)",
   falls_per_1m: "falls / 1M", tilts_per_1m: "tilts / 1M", lifts_per_1m: "lifts / 1M",
+  falls_per_1m_pos: "falls / 1M (log)", tilts_per_1m_pos: "tilts / 1M (log)",
   clipfrac_first: "clipfrac mb1", clipfrac_last: "clipfrac mbN",
   kl_first_pos: "kl mb1", kl_last_pos: "kl mbN", gnorm: "gnorm", clipc: "clipc",
   ent_spine: "spine", ent_armL: "armL", ent_armR: "armR", ent_legL: "legL", ent_legR: "legR",
