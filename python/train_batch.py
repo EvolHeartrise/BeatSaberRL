@@ -43,6 +43,7 @@ import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
 from fp16_linear import bump_weights_version
+from metrics_log import dumps_record, update_record
 from policy import (HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
                     load_policy)
 
@@ -1124,6 +1125,29 @@ def main():
           f"minibatch {mb_size}, device {device}{filt}{eo}{cs} ===",
           flush=True)
 
+    # Structured per-update metrics (2026-09-03, dashboard option B):
+    # one JSON line per update appended to <run_dir>/metrics.jsonl,
+    # built from the values the per-update print sync already brought
+    # to the host (no new sync, no science). Append-mode so a --resume
+    # continues the file. Telemetry must never kill training: the first
+    # failure disables it for the rest of the run.
+    metrics_path = os.path.join(args.run_dir, "metrics.jsonl")
+    metrics_f = None
+
+    def write_metrics(*a, **kw):
+        nonlocal metrics_f
+        if metrics_f is False:
+            return
+        try:
+            if metrics_f is None:
+                metrics_f = open(metrics_path, "a", encoding="utf-8")
+            metrics_f.write(dumps_record(update_record(*a, **kw)) + "\n")
+            metrics_f.flush()
+        except Exception as e:  # noqa: BLE001 — never fatal
+            print(f"[metrics] disabled after write failure: {e!r}",
+                  flush=True)
+            metrics_f = False
+
     for update in range(start_update, num_updates):
         if leaf_from is not None:
             # leaf cooldown: 1-sqrt decay to the floor (EPFL 2405.18392:
@@ -1335,6 +1359,7 @@ def main():
         if fp16_update:
             policy.fp16 = True  # 'update' mode: rollout stayed fp32
 
+        m_diag = None
         if (args.diag_every > 0 and flat_grad is not None
                 and update % args.diag_every == 0):
             # T0 diagnostics (2026-08-19, topics/critic-design.md): a
@@ -1409,15 +1434,22 @@ def main():
             svp = torch.linalg.svdvals(hp - hp.mean(0))
             cump = svp.cumsum(0) / svp.sum().clamp_min(1e-12)
             psrank = int((cump < 0.99).sum().item()) + 1
-            per_g = "  ".join(
-                f"{nm} {g_pi[a:b].norm().item():.1e}/"
-                f"{g_v[a:b].norm().item():.1e}"
-                for nm, a, b in diag_groups)
-            print(f"[diag] upd {update + 1}  gradcos {gcos.item():+.3f}"
-                  f"  |g_pi| {n_pi.item():.2e}  |g_v| {n_v.item():.2e}"
-                  f"  dormant {dorm.item():.3f}  srank {srank}/"
+            # same .item() calls as before, hoisted so the metrics line
+            # can reuse them without a second sync each
+            per_gv = [(nm, g_pi[a:b].norm().item(), g_v[a:b].norm().item())
+                      for nm, a, b in diag_groups]
+            per_g = "  ".join(f"{nm} {a:.1e}/{b:.1e}" for nm, a, b in per_gv)
+            gcos_v, npi_v, nv_v, dorm_v = (gcos.item(), n_pi.item(),
+                                           n_v.item(), dorm.item())
+            print(f"[diag] upd {update + 1}  gradcos {gcos_v:+.3f}"
+                  f"  |g_pi| {npi_v:.2e}  |g_v| {nv_v:.2e}"
+                  f"  dormant {dorm_v:.3f}  srank {srank}/"
                   f"{h_d.shape[1]}  psrank {psrank}"
                   f"  pi/v: {per_g}", flush=True)
+            m_diag = {"gradcos": gcos_v, "gpi": npi_v, "gv": nv_v,
+                      "dormant": dorm_v, "srank": srank,
+                      "srank_dim": int(h_d.shape[1]), "psrank": psrank,
+                      "groups": {nm: [a, b] for nm, a, b in per_gv}}
 
         for ep_i in range(args.epochs):
             # device-side shuffle: a host-side index array costs a
@@ -1627,6 +1659,7 @@ def main():
                   "GiB", flush=True)
         t_update += time.perf_counter() - t0
 
+        m_ev = {}  # event-line values for the metrics line
         if tensor_env:
             # deferred from the rollout->GAE boundary: this is the one
             # place per update the host reads the device anyway
@@ -1635,6 +1668,7 @@ def main():
             # reported, never hidden
             if hasattr(venv, "pop_pd_hits"):
                 pd = venv.pop_pd_hits()
+                m_ev["pd_net"] = pd
                 if pd:
                     print(f"[pd-net] {pd} f32 pivot-floor engagement(s) "
                           "this update", flush=True)
@@ -1644,6 +1678,7 @@ def main():
             # a converged policy measures 0.
             if hasattr(venv, "pop_envelope_hits"):
                 eh = venv.pop_envelope_hits()
+                m_ev["envelope"] = eh
                 if eh:
                     print(f"[envelope] {eh} root-escape engagement(s) "
                           "this update (episodes terminated, reward 0)",
@@ -1657,18 +1692,21 @@ def main():
         # --foot-contact.
         if hasattr(venv, "pop_fall_hits"):
             fh = venv.pop_fall_hits()
+            m_ev["falls"] = fh
             if fh:
                 print(f"[fall] {fh} fall termination(s) this update "
                       "(each priced at the flat fall_const)",
                       flush=True)
         if hasattr(venv, "pop_tilt_hits"):
             th = venv.pop_tilt_hits()
+            m_ev["tilts"] = th
             if th:
                 print(f"[tilt] {th} tilt termination(s) this update "
                       "(chest up-axis fwd>40 / back>20 / lateral>40 deg; "
                       "flat fall_const)", flush=True)
         if hasattr(venv, "pop_foot_lifts"):
             lh_l, lh_r = venv.pop_foot_lifts()
+            m_ev.update(lifts=lh_l + lh_r, lifts_L=lh_l, lifts_R=lh_r)
             if lh_l or lh_r:
                 print(f"[lift] {lh_l + lh_r} foot-lift event(s) this "
                       f"update (L {lh_l} / R {lh_r}; each charged the "
@@ -1680,6 +1718,9 @@ def main():
         if hasattr(venv, "pop_flail"):
             fl_l, fl_r, fl_ticks = venv.pop_flail()
             if fl_ticks:
+                m_ev.update(flail=(fl_l + fl_r) / fl_ticks,
+                            flail_L=fl_l / fl_ticks, flail_R=fl_r / fl_ticks,
+                            flail_ticks=fl_ticks)
                 print(f"[flail] {(fl_l + fl_r) / fl_ticks:.4f} "
                       f"rad/idle-tick (L {fl_l / fl_ticks:.4f} / "
                       f"R {fl_r / fl_ticks:.4f}; {fl_ticks} note-free "
@@ -1691,6 +1732,10 @@ def main():
         if hasattr(venv, "pop_limit_rest"):
             lr_l, lr_s, lr_a, lr_t = venv.pop_limit_rest()
             if lr_t:
+                m_ev.update(limitrest=(lr_l + lr_s + lr_a) / lr_t,
+                            limitrest_legs=lr_l / lr_t,
+                            limitrest_spine=lr_s / lr_t,
+                            limitrest_arms=lr_a / lr_t)
                 print(f"[limitrest] {(lr_l + lr_s + lr_a) / lr_t:.4f} "
                       f"N*m*s/tick (legs {lr_l / lr_t:.4f} / spine "
                       f"{lr_s / lr_t:.4f} / arms {lr_a / lr_t:.4f})",
@@ -1785,6 +1830,7 @@ def main():
                                  af_v if adv_filter_on else None),
                   flush=True)
 
+        m_ckpt = m_vram = None
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
             name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
                     if leaf_from is not None
@@ -1809,11 +1855,28 @@ def main():
                                      "ent_floor": ent_floor,
                                      "num_updates": num_updates}},
                        os.path.join(args.run_dir, name))
+            m_ckpt = name
             if device.type == "cuda":
                 # VRAM audit (GPU-tier decision prereq, 2026-08-19)
+                m_vram = torch.cuda.max_memory_allocated() / 2**30
                 print(f"[ckpt] {name}  peak-vram "
                       f"{torch.cuda.max_memory_allocated() / 2**30:.2f} "
                       f"GiB", flush=True)
+        # the metrics line: the same host values the two prints above
+        # consumed (plus this update's event counters, [diag] and
+        # [ckpt]) — no extra sync, and write_metrics is never fatal
+        write_metrics(
+            update + 1, num_updates, global_step, t=time.time(),
+            elapsed=elapsed, rate=rate, acc=acc_now, acc_l=acc_l,
+            acc_r=acc_r, ret=ret_v, recent=recent, ent=ent_v, ev=ev_v,
+            r1=r1_v if fp16_update else None,
+            maxlr=lmax_v if fp16_update else None,
+            fp16_overflow=int(inf_v) if fp16_update else None,
+            fp16_scale=scale_v if fp16_update else None,
+            kl_first=klf_v, kl_last=kll_v, cf_first=cff_v, cf_last=cfl_v,
+            gnorm=gn_v, clipc=cc_v, ent_head=eh_v,
+            af_ratio=af_v if adv_filter_on else None, events=m_ev,
+            diag=m_diag, ckpt=m_ckpt, peak_vram=m_vram)
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)
             break
