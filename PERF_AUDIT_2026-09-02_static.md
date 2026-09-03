@@ -1178,3 +1178,160 @@ write now sits after the env launch in both modes (measured free).
 allocator pool (irrelevant with the flag off); a tail-fill probe would
 need the critic eligible mid-kernel (a device-side spin, not an event)
 and is not worth building given the sub-partition arithmetic.
+
+### 2.5 results (measured 2026-09-03)
+
+Same pod (`194.14.47.19`, RTX 5090 sm_120, torch 2.8.0.dev20250319+cu128,
+cuBLAS 12.8), same session, same production argv as 2.2/2.7
+(`--num-envs 32768 --horizon 32 --minibatches 64 --mb-accum 2 …`,
+env-order default ON, critic-stream OFF). Baseline RE-MEASURED in this
+session at the pod's tree (= laptop HEAD `193b381`, every relevant file
+md5-matched); it reproduces the 2.2 table (126.3k, 5.76 GiB, identical
+5-update prints). Instruments: `train_batch --bench` ×3 (exec-true
+phase seconds, `[bench-mem]` peaks), `bench_policy_update --fp16 --mbs
+8192 16384 --mb-accum 2` ×2, `bench_policy_forward --fp16 --ns 32768`
+×2, a 5-update same-seed run per arm, full gate under both toggle
+values, `perf_numerics` dump/compare (random init AND a trained
+checkpoint), a shape probe with `torch.profiler` kernel names, and a
+profiled production minibatch (mb 16384, accum 2) in both modes.
+
+**Change (`fp16_linear.py`, `policy.py` comment, `tests/test_lt_epilogue.py`,
+toggle `BEAT_LT_EPILOGUE`, default ON).** `_Fp16LinearReLU.forward`
+and the no-grad `fp16_linear_relu` fast path call `_relu_forward`,
+which runs `torch._addmm_activation(b16, x2, w16.t())` — cublasLt's
+`RELU_BIAS` epilogue, bias = the flat fp16 replica view — when
+`_lt_epilogue_ok` holds (contiguous row-major x/w, contiguous 1-D
+bias, 16-B-aligned pointers; every flat replica view is 32-B aligned
+by `flatten_fp16_replicas`' ALIGN=16-element contract), else the old
+two-pass bias-free `torch.mm` + `bias_relu_(y, b_fp32)`. Backward
+untouched (`relu_bwd` / `wgrad` from the saved post-ReLU `y`).
+`BEAT_LT_EPILOGUE=0` is the bisect hatch. The sm_61 history (round-4
+#2's 33–59% addmm-epilogue cost, the 08-16 width fix, the never-run Lt
+re-probe) is written into the toggle's comment so it is not re-run.
+
+#### Table (3 baseline reps vs 3 ON reps + 2 OFF reps)
+
+| state | steps/s | rollout s / 4 upd | update s / 4 upd | peak GiB (rollout / update / resident@start) | BPF ms @32768 | BPU ms 8192 / 16384 (accum 2) | gate |
+|---|---|---|---|---|---|---|---|
+| baseline (`193b381`) | 126,146 / 126,270 / 126,439 — mean **126,285** | 24.44 / 24.40 / 24.36 | 8.74 / 8.75 / 8.75 | 5.76 (5.33 / 5.76 / 2.13) | 18.42 / 18.50 | 24.81, 22.77 / 32.12, 32.14 | 304 |
+| **`BEAT_LT_EPILOGUE=1` (new default)** | 129,193 / 129,260 / 128,968 — mean **129,140 (+2.3%)** | **24.01 / 23.98 / 24.04 (−1.5%)** | **8.40 / 8.40 / 8.42 (−4.0%)** | 5.76 (5.33 / 5.76 / 2.13) | **15.88 / 16.05 (−13.5%)** | 21.67, 22.06 / **30.90, 30.91 (−3.8%)** | **321** (304 + 17) |
+| `BEAT_LT_EPILOGUE=0` (new code) | 126,333 / 126,122 | 24.38 / 24.38 | 8.76 / 8.81 | 5.76 (5.33 / 5.76 / 2.13) | — | — | 321 |
+
+- **steps/s +2.3% (126.3k → 129.1k), every rep of the ON arm above
+  every rep of both OFF arms** (spread 0.2%; the Tier-0 run-to-run
+  figure is 0.31%). The update phase gives −0.34 s / 4 upd (−4.0%,
+  the audit's 3–5% ceiling), the rollout −0.38 s (−1.5%): the
+  rollout forward runs the same nine ReLU sites at N=32768, where
+  the three ffn.0 `bias_relu_` passes over (32768·27, 512) were ~2.5 ms
+  of the 18.4 ms forward (BPF −13.5%). VRAM unchanged (the fused
+  output is the same tensor the two-pass path wrote in place).
+- **OFF reproduces the baseline** (126,333 / 126,122; 24.38 s; 8.76 /
+  8.81 s) and its 5-update run is bit-identical to the baseline's in
+  every printed `update` + `[kl]` digit — the toggle is the only
+  difference.
+
+#### Kernel evidence (`torch.profiler`, CUDA activities)
+
+*Shape probe, isolated ffn.0 site (M = 8192·27, K = 128, N = 512),
+fp16, 100-iter event timing:* two-pass **508.7 µs** (= GEMM 235 µs +
+`bias_relu_kernel_p2<256>` 288 µs) vs fused **224.4 µs** vs bare
+`torch.mm` 217.9 µs. The fused call is ONE kernel,
+`cutlass_80_tensorop_f16_s16816gemm_relu_f16_64x64_32x6_tn_align8`
+(238 µs) — the same cutlass kernel cuBLAS already ran for the
+bias-free mm (235 µs), now with its epilogue switched on: **the Lt
+RELU_BIAS kernel runs at plain-GEMM speed on sm_120**, which is the
+gate the item was conditioned on. At M = 16384·27: two-pass 1037 µs
+vs fused 443 µs vs mm-only 725 µs (the plain-mm heuristic picks a
+worse algo at that M; Lt does not). trunk.0 / critic_mlp.0 (8192,
+384 → 256): 35.5 → 21.0 µs (Lt picks a `64x256_32x4` variant). The
+odd-K encoder first layers (K = 18 / 34 / 78): also one `align2`
+cutlass kernel each, 0.55–0.64× the two-pass time, so the gate does
+not exclude them. A bias view offset by ONE fp16 element (2 B) still
+fuses but drops to a `cutlass_75 … align1` kernel at 394 µs (1.8×), so
+`_lt_epilogue_ok` requires 16-B pointer alignment (satisfied by every
+flat view; pinned by the test).
+
+*Production minibatch (mb 16384, accum 2, fp16 flat, one fwd+bwd+clip+
+Adam), two profiles per mode in one process:* OFF **1021 kernels /
+30.97 ms** GPU; ON **1003 kernels / 29.70 ms (−1.27 ms, −4.1%)**. The
+18 missing launches are the nine ReLU sites × 2 micro: `bias_relu_
+kernel_p2` 18 launches / **1.24 ms → 0**. The ffn.0 GEMMs are the same
+`…s16816gemm_relu_f16_64x64_32x6_tn_align8` kernel at 176–222 µs in
+both modes (the 66 "gemm_relu"-named GEMMs total 5.68 vs 5.65 ms — the
+name is cuBLAS's epilogue-capable kernel, used for plain mm too);
+no `relu_`/`addmm` fallback kernels appear. Everything else in the
+top-14 (fmha fwd/bwd, the nt/nn GEMMs, reduce, cat, `relu_bwd`,
+`ln_bwd`) is identical to the launch and to ±0.02 ms.
+
+#### Numerics gate
+
+Class: fp16 last-rounding, NOT bit-identical (one rounding instead of
+two; bias as fp16). On the ffn.0 probe: max|two-pass − fused| 1.95e-3
+at output scale ~3 (6.6e-4 rel); vs an fp32 reference the fused result
+is the CLOSER one (max 1.28e-3 vs 2.12e-3 for the two-pass path).
+
+- (a) Gate: **321 passed** under the default (= ON) and **321** under
+  `BEAT_LT_EPILOGUE=0`, both on the pod against the final tree.
+- (b) `perf_numerics compare` (production fp16 flat config, 4096-row
+  synthetic minibatch). *Trained weights* (`runs/ctrl_trunk/trunk_
+  final.pt`): **PASS, worst_rel 1.75e-3** — logits max-diff 1.25e-1 on
+  168 (7.4e-4 rel), value 9.8e-3 on 7.15 (1.4e-3), every one of the 22
+  grad probes ≤ 1.75e-3 rel. *Random init*: logits 4.9e-4 on 0.377
+  (1.3e-3), value 1.7e-3, actor/critic grads 4e-3–4e-2 rel, but the
+  scale-relative verdict is a formal **FAIL (worst_rel 0.128)** on
+  `critic_q`/`critic_k` — tensors whose max|grad| is 1.0e-5 / 9.8e-6
+  (abs diff 1.3e-6 / 1.2e-6). That is the init noise floor 1.1's
+  isolation probe documented (|dW_k|max ≈ 7e-6 at init, cos 0.3–0.4
+  vs fp32 for EITHER fp16 arm); the trained-weight run is the one that
+  measures routing, and it passes.
+- (c) 5-update same-seed run, ON vs baseline (`runs/s25_on_five` vs
+  `runs/s25_base_five`), update 5: `acc 0.6555` vs 0.6584 (−0.003,
+  inside the ±0.004 single-seed drift floor from the 1.4 re-run),
+  `return −15.580` vs −15.607, `ent 46.486` vs 46.484, **`ev 0.502` vs
+  0.502**, `kl(mbN) 1.34e-2` vs 1.31e-2, `clipfrac 0.213` vs 0.208.
+  Update 1 differs already (`acc 0.6429` vs 0.6432): the rollout
+  forward's numerics changed, so a few rounding-boundary samples
+  differ from the first tick.
+  **`r1` moved — to exactly 0.0 (from 1.0e-6–2.4e-6) at every update,
+  and `kl(mb1)` 0.00e+00 (from ~1e-10).** `r1` is the mean |ratio − 1|
+  on the first minibatch, i.e. the rollout-vs-update logprob
+  consistency. It did not break; it became exact: the probe shows the
+  plain-mm heuristic choosing DIFFERENT cutlass kernels at the rollout
+  M (32768·27) and the update M (8192·27), and the Lt heuristic
+  choosing the same one, so the two forwards now agree bit-for-bit on
+  the ReLU sites — the ~1e-6 residual was algorithm choice by M, not
+  fp16 itself. (The non-ReLU GEMMs evidently already agreed.)
+- (d) `tests/test_lt_epilogue.py` (17 tests): the gate per production
+  site and its rejection of a 2-B-offset bias / strided x; fused vs
+  two-pass within 2e-3 rel and both within 2e-3 of fp32 at every site
+  (ReLU-zero disagreements only where the fp32 pre-activation is
+  < 2e-3); the backward against a same-mask reference in both modes
+  (dx 2e-3, dW/db 1e-4); whole-policy logits/value within 2e-2 and
+  NOT bit-identical (the toggle is live); on sm_80+ the fused call is
+  one `gemm` kernel with no `bias_relu` for ffn.0 and for the K=18
+  encoder shape, while a gate-rejected bias view still takes the
+  two-pass pair.
+
+#### Default: ON. Why
+
+Every instrument agrees and none is inside noise: +2.3% steps/s on 3
+vs 5 reps with zero overlap, −4.0% update phase, −1.5% rollout, −3.8%
+BPU, −13.5% BPF, one fewer full-tensor pass per ReLU site with the
+kernel evidence that the epilogue is free on this GPU. Numerics are
+the accepted fp16 last-rounding class, closer to fp32 than before, the
+trained-weight routing gate passes at 1.75e-3, EV/acc/return are at
+parity in the 5-update run, and the rollout/update consistency
+diagnostic improved. The sm_61 finding that motivated the split is
+recorded in the toggle comment and is not contradicted — it was a
+Pascal-era cuBLAS epilogue cost that sm_120 + cuBLAS 12.8 does not
+have.
+
+*Not done / notes:* `bias_relu_` and its `BEAT_GEMM_LEGACY` dispatch
+stay in `fp16_gemm.cu` (they are the OFF path and the non-16-B-aligned
+fallback); the 5090-only default has not been re-validated on the
+4090 pod (bench results are not comparable across pods anyway — the
+kernel-name probe is the 30-second check to run there). The
+random-init `perf_numerics` verdict is scale-relative per tensor and
+will keep flagging the ~1e-5 critic q/k grads for any fp16-class
+change; a trained checkpoint should be the documented input for that
+gate from now on.
