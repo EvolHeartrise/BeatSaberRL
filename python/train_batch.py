@@ -304,6 +304,14 @@ def parse_args():
                         "jointly with --gamma — gamma*lambda sets the "
                         "policy-gradient credit window, gamma alone the "
                         "value-target horizon)")
+    p.add_argument("--value-norm-beta", type=float, default=VALUE_NORM_BETA,
+                   help="value-target normalization EMA rate per UPDATE "
+                        "(default 0.01, halflife ~69 updates). It is "
+                        "update-indexed, so a T-rescaled recipe that "
+                        "doubles samples per update should double it to "
+                        "keep the halflife the same in samples (T=64: "
+                        "0.02; audit 2.6). Default is bit-identical to "
+                        "the old module constant.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-every", type=int, default=0)
     p.add_argument("--run-dir", type=str, default=None)
@@ -1323,17 +1331,16 @@ def main():
             # T1 value-norm stats (EMA, device-side, no syncs). Updated
             # BEFORE the targets are formed; b_val was unnormalized
             # with last update's stats — consistent to within one
-            # beta = VALUE_NORM_BETA step.
+            # beta = --value-norm-beta step (default VALUE_NORM_BETA).
             r_mu, r_var = returns.mean(), returns.var()
             if value_norm_init:
                 ret_mu.copy_(r_mu)
                 ret_var.copy_(r_var)
                 value_norm_init = False
             else:
-                ret_mu.mul_(1.0 - VALUE_NORM_BETA).add_(
-                    VALUE_NORM_BETA * r_mu)
-                ret_var.mul_(1.0 - VALUE_NORM_BETA).add_(
-                    VALUE_NORM_BETA * r_var)
+                vnb = args.value_norm_beta
+                ret_mu.mul_(1.0 - vnb).add_(vnb * r_mu)
+                ret_var.mul_(1.0 - vnb).add_(vnb * r_var)
             torch.sqrt(ret_var.clamp_min(1e-8), out=ret_sig)
 
         f_obs = b_obs.reshape(-1, OBS_DIM)
