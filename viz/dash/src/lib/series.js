@@ -110,7 +110,7 @@ export const PANELS = [
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
   "acc", "return", "ep_return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
-  "clipfrac_last", "kl_last_pos", "gnorm", "clipc",
+  "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest",
 ];
 export const DIFF_KEYS = ["acc", "return", "ep_return", "ent", "ev"];
 
