@@ -347,6 +347,30 @@ def parse_args():
                         "overrides BEAT_ENV_ORDER")
     p.add_argument("--no-env-order", dest="env_order", action="store_false",
                    help="disable the R12 permutation (identity ordering)")
+    # 2.2 of the 09-02 static audit (B §2, measured 2026-09-03): run
+    # the adapool critic on a side CUDA stream during the rollout so
+    # its GEMM/LN/SDPA kernels can overlap the env kernel. Same kernels
+    # in the same per-stream order -> bit-identical (pinned by
+    # tests/test_critic_stream.py and the 5-update same-seed run).
+    # MEASURED NULL-TO-NEGATIVE, default OFF: 125.9k vs 126.3k steps/s
+    # (-0.3%, 3 vs 3+2 reps), rollout 24.43 vs 24.40 s (+0.1%, noise),
+    # update 8.82 vs 8.75 s (+0.8% of the phase, 5 reps, not chased).
+    # The nsys timeline is why: the critic (2.1 ms/tick) never overlaps
+    # step_kernel — it finishes 0.15 ms BEFORE the env launch, hidden
+    # only behind the actor's own tail kernels (0.18 ms/tick of real
+    # concurrency), and when made eligible at the same instant as
+    # step_kernel (BEAT_CRITIC_LATE=1) the GPU ran it first, serially,
+    # 0.000 ms overlap in 31/31 ticks. That is the 2.3 NO-GO — see the
+    # audit doc's "2.2 results". Kept as the record of the experiment.
+    p.add_argument("--critic-stream", dest="critic_stream",
+                   action="store_true", default=False,
+                   help="rollout critic on a side CUDA stream (bit-"
+                        "identical; --env cuda). Measured -0.3%% steps/s "
+                        "2026-09-03: the GPU serializes it against the "
+                        "env kernel. Default off")
+    p.add_argument("--no-critic-stream", dest="critic_stream",
+                   action="store_false",
+                   help="inline critic (the pre-2.2 rollout)")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -842,6 +866,23 @@ def main():
             policy.flatten_fp16()
             print("--fp16: flat master/replica buffers (1-kernel "
                   "refresh)", flush=True)
+    # 2.2: the side stream exists only when asked for AND the critic is
+    # the adapool one on CUDA (the legacy linear_v0 value rides the
+    # fused head GEMM — nothing to move). The rollout loop passes
+    # critic_async=True and joins after the env launch; every other
+    # forward (bootstrap, diag, update) stays inline.
+    critic_stream_on = (args.critic_stream and device.type == "cuda"
+                        and policy.critic_arch != "linear_v0")
+    policy.critic_side_stream(critic_stream_on)
+    # 2.3 go/no-go probe (policy._critic_late): the side-stream launch
+    # is deferred until after the env kernel is enqueued, so the critic
+    # runs (or fails to) BESIDE step_kernel instead of before it
+    critic_late = critic_stream_on and os.environ.get(
+        "BEAT_CRITIC_LATE", "0") == "1"
+    policy._critic_late = critic_late
+    if critic_late:
+        print("[critic-stream] BEAT_CRITIC_LATE=1: side-stream launch "
+              "deferred until after the env kernel (2.3 probe)", flush=True)
     # (--fused-update was retired 2026-08-13 with the 138k arch: the
     # packed kernels were hard-wired to embed 64 / trunk 128 and the
     # eager fp16 path was the production path throughout v16.)
@@ -1075,8 +1116,13 @@ def main():
             f"(_env_order_on={eo_live})")
     eo = "" if eo_live is None else \
         f", env-order {'on' if eo_live else 'off'}"
+    # 2.2 state on the banner for the same reason env-order is: read
+    # off the policy (the fact), not off args (the request)
+    cs = (f", critic-stream "
+          f"{'on' if policy._critic_stream is not None else 'off'}")
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size}, device {device}{filt}{eo} ===", flush=True)
+          f"minibatch {mb_size}, device {device}{filt}{eo}{cs} ===",
+          flush=True)
 
     for update in range(start_update, num_updates):
         if leaf_from is not None:
@@ -1124,13 +1170,25 @@ def main():
                 # [kl] line's `entfull` label. Entropy consumes no RNG,
                 # so the sampling stream is bit-identical either way
                 # (policy.get_action_and_value docstring, 2026-07-28).
+                # critic_async: with --critic-stream the value is
+                # computed on the side stream and `v` is NOT readable
+                # until policy.critic_join() below (a no-op otherwise)
                 a, logp, _, v = policy.get_action_and_value(
-                    obs, need_entropy=(t == 0))
+                    obs, need_entropy=(t == 0), critic_async=True)
             if t == 0:
                 torch.mean(policy._ent_h, dim=0, out=ent_head)
                 policy._ent_h = None
             b_act[t], b_logp[t] = a, logp
-            b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
+            if v is None:
+                # BEAT_CRITIC_LATE probe only: enqueue the deferred
+                # critic HERE, after sampling and right before the env
+                # launch, so its side-stream event fires at the same
+                # instant step_kernel's own dependencies do and the two
+                # are eligible together (recording the event AFTER the
+                # env launch would make the side stream wait for
+                # step_kernel to finish — event semantics, not a
+                # scheduling fact; that was the first cut of the probe)
+                v = policy.critic_launch_deferred()
             if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
                 b_rew[t] = rew.to(b_rew.dtype)
@@ -1142,6 +1200,15 @@ def main():
                 b_done[t] = torch.as_tensor(
                     done.astype(np.float32), device=device)
                 obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
+            # 2.2: the b_val[t] write moved from BEFORE the env step to
+            # after it (2026-09-03) so the main stream enqueues the env
+            # kernel without waiting for the critic; the join makes the
+            # main stream wait on the side stream's event (device-side,
+            # no host sync) right before the value is consumed. With the
+            # side stream off this is the same copy, one launch later —
+            # b_val[t] has no other reader until GAE.
+            policy.critic_join()
+            b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
             for info in infos:
                 ep_returns.append(info["episode_return"])
             global_step += N
