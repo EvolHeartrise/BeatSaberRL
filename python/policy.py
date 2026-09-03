@@ -432,6 +432,29 @@ class NotePolicy(nn.Module):
         # (2026-09-02). Written unconditionally when entropy is asked
         # for — it is the same tensor the sum reduces, not extra work.
         self._ent_h = None
+        # 2.2 (2026-09-03, B §2 of the 09-02 static audit): rollout-only
+        # side stream for the adapool critic. The trainer creates it
+        # (critic_side_stream(True)); forward_stacked(critic_async=True)
+        # under no_grad then runs _critic on it, concurrently with the
+        # heads GEMM, sampling and — the point — the env kernel, and
+        # the caller MUST critic_join() before it reads the value.
+        # None = today's inline critic. Plain attrs, NOT in state_dict.
+        # Measured 2026-09-03 (audit doc, "2.2 results"): NULL — the
+        # GPU does not co-schedule the critic's CTAs beside the resident
+        # step_kernel wave; the trainer defaults it off.
+        self._critic_stream = None
+        self._critic_pending = None
+        self._critic_ev = None
+        # 2.3 go/no-go PROBE (BEAT_CRITIC_LATE=1 in the trainer): defer
+        # the side-stream launch until critic_launch_deferred(), which
+        # the trainer calls after sampling, right BEFORE the env launch
+        # — so the critic and step_kernel become eligible at the same
+        # instant and the timeline shows whether the GPU co-schedules
+        # GEMM CTAs beside the env blocks (2.3's mechanism) or
+        # serializes them.
+        # forward_stacked returns value=None in this mode. Not for
+        # production: measured 2026-09-03, see the audit doc.
+        self._critic_late = False
         # token-slice index buffers (device-tracked, not in state_dict)
         self.register_buffer(
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
@@ -454,11 +477,23 @@ class NotePolicy(nn.Module):
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, body, notes, note_mask
 
-    def forward_stacked(self, obs: torch.Tensor):
+    def forward_stacked(self, obs: torch.Tensor, critic_async: bool = False):
         """Trunk + ONE fused (trunk_dim -> 29K + 1) head GEMM: stacked
         logits (B, 29, K) + value (B,). The 29 per-head Linears + value
         head stay separate modules (state_dict unchanged); their weights
-        are concatenated per call."""
+        are concatenated per call.
+
+        critic_async=True (rollout only, no_grad, side stream set via
+        critic_side_stream): the adapool critic is enqueued on the side
+        stream as soon as its inputs exist — BEFORE the heads GEMM —
+        and the returned value is NOT safe to read until the caller's
+        critic_join(). Every other call (grad enabled, no side stream,
+        legacy critic, CPU) computes the value inline exactly as before.
+        Same kernels, same batch, same per-stream order, so the value
+        is bit-identical either way (tests/test_critic_stream.py)."""
+        if self._critic_pending is not None:
+            raise RuntimeError("forward_stacked: the previous async "
+                               "critic was never critic_join()ed")
         fp16 = self.fp16 and obs.is_cuda
         sabers, body, notes, note_mask = self._split(obs)
         if fp16:
@@ -526,6 +561,17 @@ class NotePolicy(nn.Module):
         h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
         if self._diag_stash:
             self._diag_h = h
+        value = None
+        side = (critic_async and self._critic_stream is not None
+                and not legacy and obs.is_cuda
+                and not torch.is_grad_enabled())
+        if side:
+            # 2.2: the critic's inputs (x_res, h, attn_bias) all exist
+            # here and nothing after this line feeds it, so the side
+            # stream can start now and overlap the heads GEMM, the
+            # sampling tail and the env kernel the caller launches next.
+            # (None under the BEAT_CRITIC_LATE probe: deferred launch.)
+            value = self._critic_async(x_res, h, attn_bias)
         tail = (list(self.heads) + [self.value_head] if legacy
                 else list(self.heads))
         if fp16 and not torch.is_grad_enabled():
@@ -555,8 +601,81 @@ class NotePolicy(nn.Module):
         if legacy:
             return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
                     out[:, -1])
-        return (out.view(B, N_ACTION_HEADS, self.n_gears),
-                self._critic(x_res, h, attn_bias))
+        if not side:
+            value = self._critic(x_res, h, attn_bias)
+        return out.view(B, N_ACTION_HEADS, self.n_gears), value
+
+    # -- 2.2: critic on a side stream (rollout only) ------------------------
+    def critic_side_stream(self, on: bool):
+        """Create (True) or drop (False) the rollout critic's side
+        stream. Trainer-only; a no-op request is harmless. A pending
+        async critic must have been joined first."""
+        assert self._critic_pending is None, "critic_join() first"
+        if on and self._critic_stream is None:
+            self._critic_stream = torch.cuda.Stream()
+            self._critic_ev = (torch.cuda.Event(), torch.cuda.Event())
+        elif not on:
+            self._critic_stream = None
+            self._critic_ev = None
+
+    def _critic_async(self, x_res, h, attn_bias):
+        """Enqueue _critic on the side stream. Stream semantics:
+        (1) the side stream waits on an event recorded on the current
+        stream AFTER x_res / h / attn_bias were produced (and after the
+        top-of-forward replica refresh, which is the first fp16 GEMM's
+        _half_params call on the current stream); (2) the three inputs
+        were allocated on the current stream's pool and are read by the
+        side stream, so the policy HOLDS them on _critic_pending until
+        critic_join() — a Python free before the join would let the
+        caching allocator hand their blocks to the next current-stream
+        kernel (the env step) while the side stream still reads them;
+        (3) the value is allocated on the side stream's pool and read
+        on the current stream after the join — record_stream(current)
+        makes the allocator defer its reuse past that read. No RNG is
+        consumed here, so the sampling stream is untouched."""
+        if self._critic_late:
+            self._critic_pending = (None, x_res, h, attn_bias)
+            return None
+        return self._critic_enqueue(x_res, h, attn_bias)
+
+    def critic_launch_deferred(self):
+        """BEAT_CRITIC_LATE probe: enqueue the deferred critic now (the
+        caller is about to launch the env kernel on the current stream).
+        Returns the value; critic_join() still applies."""
+        pend = self._critic_pending
+        assert pend is not None and pend[0] is None, "nothing deferred"
+        self._critic_pending = None
+        # no_grad is enforced HERE, not left to the caller: the trainer
+        # calls this outside its rollout no_grad block, and a grad-mode
+        # critic would chain every tick's activations onto b_val
+        # through copy_'s CopySlices (measured 2026-09-03: OOM at 20
+        # GiB by tick ~20 of the first rollout).
+        with torch.no_grad():
+            return self._critic_enqueue(*pend[1:])
+
+    def _critic_enqueue(self, x_res, h, attn_bias):
+        assert not torch.is_grad_enabled(), "async critic is no_grad-only"
+        cur = torch.cuda.current_stream(x_res.device)
+        side = self._critic_stream
+        ev_in, ev_out = self._critic_ev
+        ev_in.record(cur)
+        side.wait_event(ev_in)
+        with torch.cuda.stream(side):
+            val = self._critic(x_res, h, attn_bias)
+            val.record_stream(cur)
+        ev_out.record(side)
+        self._critic_pending = (ev_out, x_res, h, attn_bias)
+        return val
+
+    def critic_join(self):
+        """Make the current stream wait for the pending async critic
+        (no host sync) and release its inputs. No-op when nothing is
+        pending, so the trainer calls it unconditionally."""
+        pend = self._critic_pending
+        if pend is None:
+            return
+        torch.cuda.current_stream().wait_event(pend[0])
+        self._critic_pending = None
 
     def _critic(self, x_res: torch.Tensor, h: torch.Tensor,
                 attn_bias: torch.Tensor) -> torch.Tensor:
@@ -680,12 +799,15 @@ class NotePolicy(nn.Module):
         logits, value = self.forward_stacked(obs)
         return list(logits.unbind(1)), value
 
-    def get_action_and_value(self, obs, action=None, need_entropy=True):
+    def get_action_and_value(self, obs, action=None, need_entropy=True,
+                             critic_async=False):
         """need_entropy=False skips the entropy reduction (~5 kernels)
         for callers that discard it — the rollout and the GAE bootstrap.
         No RNG is consumed by entropy, so the sampling stream is
-        untouched either way (2026-07-28)."""
-        logits, value = self.forward_stacked(obs)                # (B, 12, 3)
+        untouched either way (2026-07-28). critic_async: see
+        forward_stacked — the caller must critic_join() before reading
+        the value."""
+        logits, value = self.forward_stacked(obs, critic_async=critic_async)
         logsm = torch.log_softmax(logits, dim=-1)
         probs = None
         if action is None:

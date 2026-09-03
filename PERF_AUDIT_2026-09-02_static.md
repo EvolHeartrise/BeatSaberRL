@@ -1009,3 +1009,172 @@ delete); `MAX_OBJECTS` stays 1536 and the (N, C) status block stays
 densest segments, but there is nothing left to gain from the pool
 itself. N=65536 / larger pools / `--mb-accum 1` now have ~20 GB of
 headroom.
+
+### 2.2 results (measured 2026-09-03)
+
+Same pod (`194.14.47.19`, RTX 5090, 170 SMs, torch 2.8.0.dev+cu128),
+same session, same production argv as 2.7 (`--num-envs 32768 --horizon
+32 --minibatches 64 --mb-accum 2 … --chart-pool 999999
+--mirror-augment`, env-order default ON). Baseline RE-MEASURED in this
+session at the pod's tree (= laptop HEAD `f2efa71`, every relevant file
+md5-matched); it reproduces the 2.7 table (126.3k, 5.76 GiB, identical
+5-update prints). Instruments: `train_batch --bench` (exec-true phase
+seconds, `[bench-mem]` peaks), 5-update same-seed run for bit-identity,
+full gate, `bench_policy_forward --fp16 --ns 32768`, and — the point of
+the item — an `nsys profile -t cuda` timeline of ONE update per arm
+(`nsys` 2024.6.2 apt-installed on the pod; `cuda_gpu_trace` CSV, an
+interval-intersection script over stream ids).
+
+**Change (`policy.py`, `train_batch.py`, `tests/test_critic_stream.py`,
+flag `--critic-stream` / `--no-critic-stream`, default OFF).**
+`forward_stacked(critic_async=True)` under no_grad records an event on
+the current stream right after the trunk readout `h` (so before the
+heads GEMM — the critic's inputs `x_res`, `h`, `attn_bias` all exist),
+a dedicated `torch.cuda.Stream` waits on it and runs `_critic` there,
+a second event is recorded on the side stream, and the value is
+returned unjoined; the trainer enqueues `venv.step(a)` without waiting
+and calls `policy.critic_join()` (a `wait_event` on the main stream, no
+host sync) right before `b_val[t]` is written — which moved from before
+the env launch to after it (same copy, one launch later, no other
+reader until GAE). Allocator semantics: the three main-pool inputs are
+HELD on `policy._critic_pending` until the join (a Python free before
+it would let the caching allocator hand their blocks to the env step
+while the side stream still reads them); the side-pool value gets
+`record_stream(main)`. The update-phase forward (grad enabled) is
+untouched and ignores `critic_async`; a missed join raises on the next
+forward. `BEAT_CRITIC_LATE=1` is the 2.3 probe (below): the side-stream
+launch is deferred to `critic_launch_deferred()`, which the trainer
+calls after sampling, right before the env launch, so the critic and
+`step_kernel` become eligible at the same instant. Gate **304 passed**
+(293 + 11), run on the pod against the final tree.
+
+#### Table (3 baseline reps vs 3 ON reps + 2 OFF reps; the probe's 2+2)
+
+| state | steps/s | rollout s / 4 upd | update s / 4 upd | peak GiB (rollout / update / resident@start) | BPF ms @32768 |
+|---|---|---|---|---|---|
+| baseline (`f2efa71`) | 126,344 / 126,185 / 126,365 — mean **126,298** | 24.38 / 24.41 / 24.40 | 8.75 / 8.77 / 8.73 | 5.76 (5.33 / 5.76 / 2.13) | 18.39 / 18.49 |
+| `--critic-stream` ON | 125,921 / 125,754 / 126,021 — mean **125,899 (−0.32%)** | 24.43 / 24.47 / 24.39 (+0.1%) | 8.82 / 8.81 / 8.83 (**+0.8%**) | 5.77 (5.33 / 5.77 / 2.14) | — |
+| `--no-critic-stream` OFF (new code) | 126,290 / 126,309 | 24.41 / 24.40 | 8.74 / 8.75 | 5.76 (5.33 / 5.76 / 2.13) | — |
+| probe v1 (`BEAT_CRITIC_LATE=1`, event after the env launch) | 125,893 / 125,923 | 24.40 / 24.40 | 8.85 / 8.84 | 5.77 | — |
+| probe v2 (`BEAT_CRITIC_LATE=1`, event before the env launch) | 125,780 / 126,027 | 24.46 / 24.42 | 8.82 / 8.80 | 5.77 | — |
+
+- **steps/s: NULL to slightly negative.** Rollout seconds — the sharp
+  instrument, the change touches nothing else — move +0.03 s on 24.4
+  (+0.1%, inside the 0.4–0.7% phase spread). The −0.3% on steps/s is
+  the update phase: +0.07 s / 4 updates (+0.8% of the phase) on all 5
+  side-stream reps vs all 5 inline reps (8.80–8.85 vs 8.73–8.77).
+  The update never touches the side stream; the likely cause is the
+  second allocator pool (the critic's ~0.7 GB of intermediates now
+  live in a side-stream pool the update's main-stream allocations
+  cannot reuse — peak 5.76 → 5.77), not chased. **Default OFF**; the
+  OFF arm reproduces the baseline (126,290 / 126,309, 24.41 / 24.40 s)
+  so the moved `b_val[t]` write is free.
+- **Bit-identity: PASS**, three ways. ON vs baseline 5-update runs
+  (`runs/s22_on_five` vs `runs/s22_base_five`): all 10 `update` +
+  `[kl]` lines identical in every printed digit (only
+  `ep_return(last100)` differs — the ring-buffer pop order, as in
+  every previous item). The probe-v1 5-update run: identical too.
+  `tests/test_critic_stream.py` (11 tests): `torch.equal` on logits,
+  value, sampled actions and logprobs between the side-stream and
+  inline paths on both dtype streams, flat and non-flat; the side
+  stream is actually used and the inputs are held until the join; the
+  grad-enabled forward ignores `critic_async`; a missed join raises;
+  24 ticks of main-stream allocate/fill/free churn between the async
+  forward and the join cannot corrupt the value; the deferred probe
+  path is grad-free and bit-identical.
+- **Ops note.** Probe v1's first cut called `critic_launch_deferred()`
+  outside the trainer's no_grad block: the critic built an autograd
+  graph, `b_val[t].copy_(v)` chained every tick's graph onto `b_val`
+  through CopySlices, and the first rollout OOM'd at 20 GiB by tick
+  ~20. The method now enforces `no_grad` itself and `_critic_enqueue`
+  asserts it.
+
+#### Timeline evidence (nsys, 1 update per arm, N=32768)
+
+Where the tick goes NOW (the B §0 table was derived from a 5.96 s
+update and is stale by ~1.7×): **tick 183.2 ms** = `step_kernel`
+164.4 ms (90%; 1024 × 32 threads, 255 regs, 0 smem; excl. the 1.9 ms
+reset launch; first post-reset tick 81.6 ms, steady 165–177) + 18.9 ms
+forward + sampling + env-step prep (10%). So the hideable slice for a
+two-chain design is ~10% of the rollout ≈ 7.5% of wall, not the 14%
+B §3 assumed.
+
+| arm | side-stream kernels | overlap with `step_kernel` | overlap with other main-stream kernels | where the critic sits | inter-step gap (fwd + tail) | tick |
+|---|---|---|---|---|---|---|
+| OFF | — (all 4,713 ops on stream 7) | — | — | inline, in the forward | 18.87 ms | 183.19 ms |
+| ON | 480 ops on stream 13 (15/tick), 64.4 ms busy over the 5.86 s rollout window | **0.00 ms, 32/32 ticks** | 5.66 ms total = **0.18 ms/tick** | starts 2.30 ms before the env launch, span 2.14 ms, **ends 0.15 ms before `step_kernel` starts** | 18.78 ms | 183.45 ms |
+| probe v1 (event after the env launch) | same | 0.00 ms | 0.00 ms | starts **+0.000 ms after each step end** — an event recorded after `step_kernel` completes when it does; a probe of event semantics, not of the scheduler; discarded | — | 183.31 ms |
+| probe v2 (critic and `step_kernel` eligible at the same instant) | same | **0.000 ms, 31/31 ticks** | 3.97 ms | **critic first**: starts −2.08 ms, span 2.07 ms, `step_kernel` starts 0.01 ms after the critic's last kernel | 18.70 ms | 183.06 ms |
+
+Side-stream kernel census (ON arm, per rollout; regs/thread, grid ×
+block, dyn smem): `fmha_cutlassF_f16_aligned_64x64_rf_sm80` 31 × =
+30.5 ms (118 regs, 1×4×32768 CTAs × 32×4 threads, 19 KB) — the Tq=1
+SDPA pool is HALF the critic; `cutlass_80_tensorop_f16_s16816gemm_relu
+_f16_64x64_32x6_tn_align8` 93 × = 17.6 ms (88 regs, 1024 × 128, 49 KB:
+critic_ln→q/kv and the value MLP); `ln_fwd_h_kernel` 31 × = 10.5 ms
+(38 regs, 1024 × 256); `…wmma…32x32_128x1` 1.5 ms (96 regs, 8192 ×
+128); `…256x128_32x3` 1.4 ms (232 regs, 256 × 256, 74 KB); `cat` 1.3;
+`bias_relu` 0.6; `gemvx` 0.5 (216 regs, 8192 × 32); copies 0.4.
+
+Reading: (1) in the shipped arm the critic is not on the env kernel's
+critical path at all — it runs BEFORE the env launch, entirely within
+the actor's own post-trunk tail (heads GEMM, log_softmax,
+exponential_, argmax, gather, randint, the env-order argsort, the
+b_obs cast), and that tail is throughput-bound: 2.1 ms of critic
+moved off the main stream bought 0.09 ms/tick (18.87 → 18.78), i.e.
+the two streams interleaved at kernel boundaries rather than
+co-executed (0.18 ms/tick of measured concurrency). (2) When the
+critic and `step_kernel` were handed to the hardware at the same
+instant (probe v2) it ran the critic grid to completion and only then
+dispatched the env wave — zero co-residency in 31/31 ticks, and no
+fill of the env kernel's straggler tail either (the critic was long
+gone). Across the three timelines: 0.00 ms of critic-beside-env
+execution in 95/95 ticks.
+
+#### Occupancy arithmetic (why the hardware cannot co-schedule here)
+
+`step_kernel` at N=32768: 1024 blocks × 1 warp, `__launch_bounds__
+(32, 1)` → 255 regs/thread → 8,192 regs per warp (256 × 32 after
+allocation rounding). Register cap: 65,536 / 8,192 = **8 warps/SM** →
+1,360 slots ≥ 1,024 blocks: the whole grid is ONE wave, 6 blocks/SM on
+166 SMs and 7 on 4 SMs, using 6 of 48 warp slots and 49,152 of 65,536
+registers (16,384 free), 0 of ~100 KB smem. By the SM-level count a
+critic CTA would fit: the 64×64 GEMM needs 4 warps × 3,072 = 12,288
+regs (+49 KB smem), the fmha 4 × 3,840 = 15,360, `ln_fwd` 8 × 1,280 =
+10,240 — only the 256×128 GEMM (8 × 7,424 = 59,392) does not. But the
+register file is physically four 16,384-register sub-partitions, a warp
+is pinned to one, and a CTA's warps are spread one per sub-partition:
+six 8,192-register env warps land 2/2/1/1, so **two sub-partitions are
+full** (three on the 7-block SMs) and no 4- or 8-warp CTA can be placed
+until env blocks retire. The only critic kernel with 1-warp CTAs is the
+0.5 ms `gemvx`. That matches the timeline exactly: nothing co-resides
+with the resident env wave, and the hardware's choice at a tie is to
+finish one grid before starting the other.
+
+#### 2.3 verdict
+
+**NO-GO for 2.3 (two-chain rollout).** Its mechanism — env(A) executing
+while policy(B)'s GEMM/attention CTAs co-reside on the same SMs — does
+not exist on this GPU at this kernel's register footprint: measured
+0.00 ms of overlap in every configuration (ON, probe v1, probe v2;
+95/95 ticks), with the register-file geometry above as the reason
+(6–7 resident 255-register warps fill 2–3 of the 4 sub-partitions per
+SM). Two chains could at best fill the env kernel's straggler tail,
+which none of the timelines shows being filled, and B §3's own
+N-scaling penalty (two N/2 launches ≈ 1.28 × one N launch if they
+serialize — and everything here serializes) makes it a likely net loss
+on top of the ~150-line, non-bit-reproducible rewrite. The hideable
+slice is also smaller than assumed: the forward + tail is 10% of the
+183 ms tick (≈ 7.5% of wall), not 14%. The only route to hiding the
+forward would be to change the env kernel's residency (fewer registers
+per env thread, or a warp-per-env layout freeing sub-partitions) —
+that is the retired candidate-B / BEAT_MIN_BLOCKS territory, not a
+trainer-side stream change.
+
+*Kept:* `--critic-stream` (default OFF, bit-identical, −0.3%) and the
+`BEAT_CRITIC_LATE` probe as the record of the experiment; the `b_val[t]`
+write now sits after the env launch in both modes (measured free).
+*Not done:* attributing the +0.8% update-phase cost of the second
+allocator pool (irrelevant with the flag off); a tail-fill probe would
+need the critic eligible mid-kernel (a device-side spin, not an event)
+and is not worth building given the sub-partition arithmetic.
