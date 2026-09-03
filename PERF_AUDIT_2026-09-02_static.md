@@ -1335,3 +1335,258 @@ random-init `perf_numerics` verdict is scale-relative per tensor and
 will keep flagging the ~1e-5 critic q/k grads for any fp16-class
 change; a trained checkpoint should be the documented input for that
 gate from now on.
+
+### 2.6 T=64 probes (2026-09-03)
+
+Two from-scratch T=64 arms on the re-bootstrapped pod (`194.14.47.19`,
+port 22705, RTX 5090, code = `0fdf055` + `a12c491`), compared at
+matched SAMPLES against the two T=32 runs of the 1.4 re-run
+(`ctrl_trunk`, `af50n_trunk`, previous container of the same pod,
+code `97af37c` — pre-2.7/2.2/2.5, so their VRAM is not comparable and
+their steps/s only roughly). Verdict first: **T=64 at matched samples
+LOSES to the T=32 filtered run at every point (−0.012 to −0.023 acc,
+3–5× the ±0.004 floor, one seed), and γ=0.98 loses further (−0.03 vs
+af50n) with a 4× fall plateau at 0.2–0.4 B samples.** The
+credit-window claim (C §1.3) does not survive its first test in this
+design; the design confounds T with the number of policy iterations
+(534 vs 1068), see "what this does and does not say".
+
+#### Recipe and ops
+
+`--value-norm-beta` flag added (`a12c491`, default 0.01 = the old
+module constant, bit-identical, 2 pins; pod gate **336** = 321 + 13
+`test_metrics_log` + 2). Base argv = `af50n_trunk`'s verbatim
+(v38 T=32 recipe, `--adv-filter 0.5`, seed 0) re-shaped to T=64:
+`--horizon 64 --minibatches 128` (batch 2,097,152, minibatch 16,384;
+filter keeps 1,048,576 rows → **64 optimizer steps/update**, the
+unfiltered T=32 recipe's count), `--mb-accum 2`, and the
+update-indexed schedules halved because each update holds 2× the
+samples: `--ent-tau 62 --warmup-updates 17 --ckpt-every 63
+--value-norm-beta 0.02`; `--total-steps 1119879168` = 534 updates =
+the 1068-update T=32 runs' 1.12 B samples. Arm A `--gamma 0.965
+--run-dir runs/t64_g965`, Arm B `--gamma 0.98 --run-dir runs/t64_g98`,
+chained by `/root/t64.sh` (A 18:24–19:55 UTC, B 19:55–21:26). The ent
+COEFFICIENT is matched in samples by construction (T=64's exponent
+is −u/62 = −2u/124 vs T=32's −2u/125; ratio 0.986–1.000 at every
+comparison point). Both trunks' 9 checkpoints + `metrics.jsonl` +
+logs are on the pod and in `~/beat-arena-volume-backup/beat-arena-t64/`
+(`trunk_final.pt` md5 verified both sides; 5-min rsync loop stopped
+after the final pull). No leaf cut, no bench. Pre-flight: a 5-update
+T=64 smoke (13.8 s/upd, peak 7.00 GiB, banner `warmup 17`, `tau=62`).
+Side confirmation for `0fdf055`: `metrics.jsonl` appeared next to
+`args.json` in both run dirs.
+
+#### Matched-sample table
+
+Comparison points: T=32 updates 300 / 500 / 776 / 1068 = T=64
+updates 150 / 250 / 388 / 534. "Window mean" = 30 T=32 updates = 15
+T=64 updates = 31.5 M samples (within-window acc sd 0.0006–0.0015).
+`return` is `b_rew.sum()/N` (per-env reward summed over the T-tick
+rollout), so the T=64 values are shown ÷2 as "return / tick ×32".
+`falls / 1 M steps` = `[fall]` count ÷ batch, over the window.
+`clipfrac`/`k3` are the last minibatch of the update; `afsd` =
+σ_kept/σ_full.
+
+| samples | metric | ctrl_trunk | af50n_trunk | T=64 γ=0.965 | T=64 γ=0.98 |
+|---|---|---|---|---|---|
+| **0.31 B** | update | 300 | 300 | 150 | 150 |
+|  | acc (point) | 0.8354 | 0.8324 | 0.8185 | 0.8112 |
+|  | acc (31.5 M-sample window mean) | **0.8322** | **0.8274** | **0.8167** | **0.8075** |
+|  | return / tick ×32 (per-env) | 2.067 | 1.971 | 1.163 | -1.517 |
+|  | ep_return(last100) | 43.1 | 28.2 | 19.8 | -3.4 |
+|  | ev | 0.890 | 0.861 | 0.833 | 0.823 |
+|  | entfull | 38.51 | 36.55 | 38.35 | 38.35 |
+|  | last-mb clipfrac | 0.590 | 0.590 | 0.577 | 0.519 |
+|  | last-mb k3 KL | 8.4e-02 | 8.0e-02 | 7.5e-02 | 5.6e-02 |
+|  | gnorm / clipc | 1.30 / 0.393 | 3.23 / 0.161 | 3.12 / 0.165 | 3.23 / 0.162 |
+|  | maxlr | 3.8 | 3.8 | 3.0 | 4.3 |
+|  | σ ratio (afsd) | – | 1.395 | 1.393 | 1.384 |
+|  | falls / 1 M steps (window) | 259 | 377 | 868 | 8321 |
+| **0.52 B** | update | 500 | 500 | 250 | 250 |
+|  | acc (point) | 0.8752 | 0.8677 | 0.8536 | 0.8416 |
+|  | acc (31.5 M-sample window mean) | **0.8720** | **0.8664** | **0.8496** | **0.8383** |
+|  | return / tick ×32 (per-env) | 3.895 | 3.913 | 3.390 | 2.783 |
+|  | ep_return(last100) | 78.3 | 87.3 | 70.3 | 52.5 |
+|  | ev | 0.961 | 0.953 | 0.924 | 0.919 |
+|  | entfull | 33.71 | 31.32 | 34.60 | 34.78 |
+|  | last-mb clipfrac | 0.566 | 0.636 | 0.593 | 0.574 |
+|  | last-mb k3 KL | 7.7e-02 | 1.1e-01 | 8.2e-02 | 7.3e-02 |
+|  | gnorm / clipc | 1.64 / 0.323 | 3.20 / 0.166 | 3.24 / 0.164 | 3.07 / 0.168 |
+|  | maxlr | 4.7 | 7.0 | 4.3 | 4.2 |
+|  | σ ratio (afsd) | – | 1.399 | 1.400 | 1.397 |
+|  | falls / 1 M steps (window) | 12 | 40 | 82 | 124 |
+| **0.81 B** | update | 776 | 776 | 388 | 388 |
+|  | acc (point) | 0.9013 | 0.9053 | 0.8859 | 0.8719 |
+|  | acc (31.5 M-sample window mean) | **0.8998** | **0.9029** | **0.8845** | **0.8709** |
+|  | return / tick ×32 (per-env) | 4.815 | 4.856 | 4.457 | 3.849 |
+|  | ep_return(last100) | 97.0 | 94.6 | 91.2 | 85.4 |
+|  | ev | 0.981 | 0.981 | 0.968 | 0.955 |
+|  | entfull | 28.07 | 26.00 | 30.11 | 31.48 |
+|  | last-mb clipfrac | 0.593 | 0.606 | 0.571 | 0.583 |
+|  | last-mb k3 KL | 8.8e-02 | 9.5e-02 | 7.5e-02 | 8.1e-02 |
+|  | gnorm / clipc | 1.52 / 0.342 | 3.57 / 0.144 | 3.71 / 0.144 | 2.99 / 0.174 |
+|  | maxlr | 6.5 | 4.0 | 3.9 | 4.7 |
+|  | σ ratio (afsd) | – | 1.403 | 1.402 | 1.397 |
+|  | falls / 1 M steps (window) | 15 | 9 | 22 | 34 |
+| **1.12 B** | update | 1068 | 1068 | 534 | 534 |
+|  | acc (point) | 0.9105 | 0.9210 | 0.9076 | 0.8849 |
+|  | acc (31.5 M-sample window mean) | **0.9115** | **0.9195** | **0.9049** | **0.8861** |
+|  | return / tick ×32 (per-env) | 5.175 | 5.244 | 5.127 | 4.527 |
+|  | ep_return(last100) | 105.8 | 117.8 | 112.1 | 92.9 |
+|  | ev | 0.987 | 0.989 | 0.984 | 0.972 |
+|  | entfull | 25.50 | 22.37 | 25.93 | 28.73 |
+|  | last-mb clipfrac | 0.574 | 0.618 | 0.602 | 0.551 |
+|  | last-mb k3 KL | 7.7e-02 | 9.8e-02 | 9.2e-02 | 6.9e-02 |
+|  | gnorm / clipc | 1.33 / 0.388 | 3.06 / 0.169 | 2.71 / 0.189 | 2.91 / 0.179 |
+|  | maxlr | 8.0 | 6.7 | 6.9 | 7.5 |
+|  | σ ratio (afsd) | – | 1.404 | 1.400 | 1.402 |
+|  | falls / 1 M steps (window) | 8 | 9 | 7 | 7 |
+
+Falls per 1 M steps per ~105 M-sample window (100 T=32 updates / 50 T=64 updates), window END in B samples:
+
+| window end | ctrl_trunk | af50n_trunk | T=64 γ=0.965 | T=64 γ=0.98 |
+|---|---|---|---|---|
+| 0.10 B | 21200 | 23040 | 27013 | 21839 |
+| 0.21 B | 4276 | 6510 | 12213 | 12653 |
+| 0.31 B | 463 | 746 | 2347 | 10039 |
+| 0.42 B | 93 | 141 | 479 | 2639 |
+| 0.52 B | 23 | 49 | 128 | 229 |
+| 0.63 B | 22 | 45 | 76 | 83 |
+| 0.73 B | 16 | 17 | 28 | 42 |
+| 0.84 B | 17 | 12 | 30 | 34 |
+| 0.94 B | 16 | 16 | 15 | 26 |
+| 1.05 B | 8 | 13 | 12 | 10 |
+| 1.12 B | 8 | 10 | 8 | 8 |
+
+| arm | batch | updates | wall first→last update (s) | s / 100 M samples (total) | THROUGHPUT steps/s (total) | steady s/upd → steps/s (last 20% of updates) | steady s / 100 M | peak-vram (allocator) | nvidia-smi max MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| ctrl_trunk | 1,048,576 | 1068 | 6,690 | 597 | 167,408 | 5.57 → 188,219 | 531 | 12.60 GiB | 24242 |
+| af50n_trunk | 1,048,576 | 1068 | 5,493 | 491 | 203,864 | 4.59 → 228,602 | 437 | 12.17 GiB | 24222 |
+| T=64 γ=0.965 | 2,097,152 | 534 | 5,449 | 487 | 205,519 | 9.14 → 229,349 | 436 | 7.00 GiB | 18468 |
+| T=64 γ=0.98 | 2,097,152 | 534 | 5,470 | 488 | 204,737 | 9.71 → 215,868 | 463 | 7.00 GiB | 18468 |
+
+Per-105 M-sample window MEANS of `acc` (window end in B samples), the
+number that carries the verdict; `ctrl−af50n` is the two-pod /
+two-code drift the 1.4 re-run used as its noise floor:
+
+| window end | ctrl | af50n | T=64 γ=.965 | T=64 γ=.98 | γ.965 − af50n | γ.98 − af50n | γ.98 − γ.965 | ctrl − af50n |
+|---|---|---|---|---|---|---|---|---|
+| 0.10 B | 0.6965 | 0.6913 | 0.6796 | 0.6515 | −0.0117 | −0.0398 | −0.0281 | +0.0052 |
+| 0.21 B | 0.7829 | 0.7751 | 0.7526 | 0.7097 | −0.0225 | −0.0654 | −0.0429 | +0.0078 |
+| 0.31 B | 0.8220 | 0.8179 | 0.8048 | 0.7928 | −0.0131 | −0.0252 | −0.0120 | +0.0040 |
+| 0.42 B | 0.8488 | 0.8441 | 0.8268 | 0.8207 | −0.0173 | −0.0234 | −0.0061 | +0.0047 |
+| 0.52 B | 0.8658 | 0.8613 | 0.8449 | 0.8349 | −0.0164 | −0.0264 | −0.0100 | +0.0045 |
+| 0.63 B | 0.8817 | 0.8769 | 0.8602 | 0.8467 | −0.0166 | −0.0302 | −0.0136 | +0.0048 |
+| 0.73 B | 0.8939 | 0.8908 | 0.8746 | 0.8579 | −0.0162 | −0.0329 | −0.0167 | +0.0031 |
+| 0.84 B | 0.8996 | 0.9016 | 0.8838 | 0.8699 | −0.0177 | −0.0317 | −0.0140 | −0.0020 |
+| 0.94 B | 0.9027 | 0.9059 | 0.8922 | 0.8763 | −0.0138 | −0.0296 | −0.0159 | −0.0033 |
+| 1.05 B | 0.9105 | 0.9130 | 0.8992 | 0.8818 | −0.0138 | −0.0312 | −0.0174 | −0.0025 |
+| 1.12 B | 0.9117 | 0.9179 | 0.9033 | 0.8860 | −0.0146 | −0.0319 | −0.0173 | −0.0061 |
+
+Whole-run falls: ctrl 2.74 M (2,447 / M), af50n 3.21 M (2,865 / M),
+T=64 γ=.965 4.44 M (3,965 / M), T=64 γ=.98 4.99 M (4,457 / M); all
+four end at 7.5–10 / M in the last 105 M window.
+
+Wall and VRAM: the T=32 rows are the previous container (pre-2.7
+ragged pool, pre-2.2, pre-2.5), so their allocator peaks (12.60 /
+12.17 GiB) are not comparable — T=32 on THIS code is **5.76 GiB**
+(bootstrap smoke, `129k` steps/s over 5 warm updates). Per-phase VRAM
+attribution needs `--bench`, which was not run (per brief); the
+allocator peak is the whole-run max. `steady` = last 20% of updates
+from the log timestamps. The two T=64 arms cost the SAME wall as
+af50n for the same samples (5,449 / 5,470 vs 5,493 s; 229k vs 229k
+steady steps/s): rollout cost per sample is unchanged and the
+filtered update does 64 steps per 2.1 M samples = af50n's 32 per
+1.05 M. Peak +1.24 GiB over T=32 (obs buffer doubles), as predicted.
+`nvidia-smi` max 18,468 MiB on both T=64 arms (24,2xx on the old
+container, ragged pool not yet landed).
+
+#### Verdicts (one seed per arm; floor ±0.004 per window)
+
+**(1) T=64 at γ=0.965 vs the T=32 filtered run at matched samples:
+NO — it loses, and not marginally.** Window-mean acc is −0.012 to
+−0.023 below `af50n_trunk` in all 11 windows and −0.007 to −0.030
+below `ctrl_trunk` in 10 of 11 (the exception, 0.84 B, is −0.016 vs
+ctrl too — every window is negative against both controls). The
+point values at 1.12 B: 0.9076 vs 0.9210 / 0.9105. That is 3–5× the
+drift floor with a constant sign, so it is a negative result, not a
+null. `ep_return(last100)` agrees in direction where it says anything
+(112 vs 118 / 106; a ±20% instrument). The early-phase mechanism is
+visible: T=64 has **2–3× the falls of af50n from 0.2 to 0.6 B samples**
+(12,213 / 2,347 / 479 / 128 vs 6,510 / 746 / 141 / 49 per M) and a
+lower `ev` at every window (0.819 vs 0.839 at 0.31 B, 0.956 vs 0.972
+at 0.73 B, 0.982 vs 0.989 at 1.12 B) — the longer trace bought a
+noisier target (Var(returns) grows with T, C §1.3's own caveat), the
+critic fits it later, and the policy spends 0.2–0.5 B samples falling
+more, which is where the acc gap opens (−0.0225 at 0.21 B) and then
+never closes. The gap is flat at ≈ −0.015 from 0.3 B on, i.e. the
+T=64 arm is not converging toward af50n at the end of the budget.
+
+*What this does and does not say.* The design matched SAMPLES and
+optimizer steps, so it also **halved the number of policy iterations**
+(534 vs 1068 rollout→update cycles). At matched samples "longer
+credit window" and "half as many policy updates" are the same knob
+here, and the result says the pair is net negative; it does not
+isolate the window. The clean isolation is `--num-envs 16384
+--horizon 64 --minibatches 64 --adv-filter 0.5` to 1068 updates: same
+batch (1,048,576), same update count, same steps, same schedules as
+af50n, only T (and the per-env sample count) change — that is the
+probe C §1.3 should have specified, at the same 1.5 h cost. Until it
+runs, T=32 stays the recipe.
+
+**(2) Does γ=0.98 add anything? NO — it costs accuracy and falls.**
+Window-mean acc is −0.006 to −0.043 below the γ=0.965 arm in every
+window (−0.017 over the last four) and −0.032 below af50n at 1.12 B
+(0.8849 vs 0.9210 point). Falls are the headline: a **plateau at
+10,039 / M in the 0.21–0.31 B window vs 2,347 (γ=.965) / 746
+(af50n)**, still 2,639 vs 479 / 141 at 0.42 B, converging only after
+0.6 B and matching at the end (8 / M). `return / tick` is NEGATIVE at
+0.31 B (−1.5 vs +1.2 / +2.0): the policy was accepting falls. This is
+the stated confound in action, not fixed here: at γ=0.98 the
+discounted note-reward stream is ~1.75× larger and the flat fall
+penalty (5.0, sized at γ=0.965) is relatively that much cheaper, and
+the value-norm EMA (halflife ~35 updates at β=0.02) spends the first
+~100 updates re-centring on the larger targets — `ev` is **0.50 in the
+first 105 M window vs 0.69 (γ=.965) / 0.71 (af50n)**, i.e. the critic
+took ~2× longer to become useful, exactly when the fall/no-fall
+distinction is being learned. The session's logged prediction ("γ .98
+falls −20–40%, acc ±0.003") was for the resume-from-trained design
+and does not transfer to from-scratch; here it is falls +330% at
+the 0.31 B window and acc −0.017. A from-scratch γ=0.98 arm would need
+the fall penalty rescaled (≈ ×1.75) to be a fair test; the
+resume-at-1000 ladder from the session note remains the right way to
+test the horizon on a trained agent.
+
+**(3) Entropy / clipfrac / KL signatures.**
+
+- **σ ratio:** identical, 1.384–1.402 on all three filtered arms —
+  the kept/full σ does not depend on T or γ.
+- **Entropy:** the filter's extra entropy drop at T=32 (af50n 3 nats
+  under ctrl from 0.5 B on) **does not appear at T=64**: the γ=0.965
+  arm tracks the UNFILTERED control, not af50n (`entfull` 26.5 vs
+  25.5 ctrl vs 22.7 af50n at 1.12 B; 34.0 / 32.7 / 29.6 at 0.63 B),
+  despite the same ent coefficient at every sample count. So the
+  extra sharpening the 1.4 re-run attributed to "kept rows are the
+  high-|A| states" is not intrinsic to the filter — it needs the
+  1068-iteration T=32 cadence to show, which is consistent with (1):
+  the number of policy iterations, not the trace, is what the T=64
+  arm gave up. γ=0.98 stays softer still (29.2 at 1.12 B, +2.7 over
+  γ=.965); its per-group entropies at 534 are all higher (spine 0.72
+  vs 0.68, legs 0.85/0.92 vs 0.76/0.79).
+- **Clipfrac / KL / gnorm:** γ=0.965 at T=64 is af50n's signature
+  unchanged — last-105 M means clipfrac 0.606 vs 0.611, k3 9.2e-2 vs
+  9.7e-2, gnorm 3.07 / clipc 0.174 vs 3.19 / 0.166. The update-phase
+  dynamics are the filter's and are T-invariant. γ=0.98 moves the
+  policy **less** per update (clipfrac 0.527, k3 6.1e-2, −13% /
+  −34%) at the same lr and gnorm — the larger-scale, noisier
+  advantages dilute the per-sample signal after normalization.
+- **Critic:** `ev` ordering is af50n ≥ ctrl > γ.965 > γ.98 at every
+  window after 0.2 B (1.12 B: 0.989 / 0.987 / 0.982 / 0.969); the
+  T=64 arms never catch up, and γ=0.98's early 0.50 is the value-norm
+  transient.
+- `maxlr` carries no signal (6.9 / 7.5 vs 6.7 / 8.0 at the end).
+
+**Not done:** the isolating probe (N=16384 × T=64 at 1068 updates); a
+second seed on anything here; leaf cut and bench on either T=64 trunk
+(resumable from `trunk_upd00504.pt` / `trunk_final.pt` in both run
+dirs, on the pod and in the backup); a fall-penalty-rescaled γ=0.98.
