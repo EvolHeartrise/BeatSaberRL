@@ -9,9 +9,12 @@ WS_GB=$(df -BG --output=avail /workspace | tail -1 | tr -dc 0-9)
 if [ "$WS_GB" -lt 40 ]; then
   echo "[pod_up] /workspace only ${WS_GB}G -> relocating to /data"
   mkdir -p /data
+  # 2026-09-03: the pod VOLUME disk (/workspace) survives a stop while
+  # the container disk (/data) does not, so a stale dangling symlink is
+  # the normal case on restart -- always (re)create the target.
+  mkdir -p /data/claude-teaches
   [ -L /workspace/claude-teaches ] || {
     rm -rf /workspace/claude-teaches
-    mkdir -p /data/claude-teaches
     ln -s /data/claude-teaches /workspace/claude-teaches; }
 else
   mkdir -p /workspace/claude-teaches
