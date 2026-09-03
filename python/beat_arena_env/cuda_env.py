@@ -19,8 +19,13 @@ net with engagements counted (`pop_pd_hits`): f32 floors at 1e-8
 (§20e), f64 at 1e-17 (§22 — the same floor Rust/torch f64 now carry).
 
 State is a structure-of-arrays of torch tensors mutated in place by the
-kernel; charts live in a padded (P, C) device pool and each env holds
-only a pool index, so reset never copies chart data. The step loop
+kernel; charts live in a RAGGED (CSR) device pool — every segment's
+objects back to back in one flat array per field, `note_off[P+1]` /
+`wall_off[P+1]` giving each segment's start (2026-09-03, audit 2.7;
+the padded (P, C) layout before it spent 7.6 GB at ~7% occupancy on
+the ranked pool) — and each env holds only a pool index, so reset
+never copies chart data. The per-env `status` / `wall_passed` arrays
+stay (N, C) / (N, W) with C = max objects per segment. The step loop
 performs ZERO host<->device syncs; episode returns go to a device ring
 buffer drained by pop_stats() once per PPO update.
 
@@ -158,7 +163,7 @@ _note_get = operator.attrgetter("hit_time", "color", "angle", "speed",
                                 "any_dir", "kind", "free_pre", "free_post")
 
 
-def _charts_to_tensors(charts, device, dtype, pad_to=None):
+def _charts_to_padded(charts, device, dtype, pad_to=None):
     """Pad a list[list[Note]] into per-field (P, C) tensors — env v10:
     episode tail = 0.5 + 1.5/min_speed (live head-plane miss boundary).
     Chart sin/cos are computed by numpy (the CRT libm — bitwise what
@@ -243,7 +248,7 @@ def _charts_to_tensors(charts, device, dtype, pad_to=None):
     }
 
 
-def _walls_to_tensors(walls, device, dtype, pad_to=None):
+def _walls_to_padded(walls, device, dtype, pad_to=None):
     """Pad a list[list[wall_tuple]] into per-field (P, W) tensors (env
     v17, spec §12). wall_tuple order: (t0, cx, cy, width, height,
     length, speed). Same chunk-stable contract as _charts_to_tensors:
@@ -277,6 +282,117 @@ def _walls_to_tensors(walls, device, dtype, pad_to=None):
         "wall_valid": t(valid, torch.bool),
         "n_walls": t(lens, torch.long),
     }
+
+
+# Ragged (CSR) pool layout (2026-09-03, audit 2.7). Per-OBJECT fields
+# are flat: notes (T,) / (T, 2) with T = total objects over the pool,
+# walls (Tw,) / (Tw, 2); `note_off` / `wall_off` are (P + 1,) int64
+# exclusive prefix sums (segment p's objects are [off[p], off[p + 1])).
+# Per-SEGMENT fields (n_notes, n_scoreable, last_hit, tail, min_speed,
+# n_walls) are (P,) as before. The kernel reads object i of chart cc at
+# note_off[cc] + i where it read cc * C + i; scan bounds (n_notes),
+# values and arithmetic are untouched, so the layouts are bit-identical
+# in every kernel output by construction.
+NOTE_OBJ_FIELDS = ("hit", "speed", "center", "dvec", "rot", "is_right",
+                   "any_dir", "valid", "is_bomb", "is_head", "is_link",
+                   "show_dir", "free_pre", "free_post", "good_hy", "bad_hy")
+WALL_OBJ_FIELDS = ("wall_t", "wall_cx", "wall_cy", "wall_w", "wall_h",
+                   "wall_len", "wall_speed", "wall_valid")
+
+
+def _offsets(counts):
+    off = torch.zeros(counts.shape[0] + 1, dtype=torch.int64,
+                      device=counts.device)
+    off[1:] = torch.cumsum(counts, 0)
+    return off
+
+
+def _flatten_block(pool, fields, valid_key, off_key, count_key):
+    if off_key in pool or valid_key not in pool:
+        return               # already ragged (or block absent)
+    mask = pool[valid_key]
+    for k in fields:
+        if k in pool:
+            pool[k] = pool[k][mask].contiguous()
+    pool[off_key] = _offsets(pool[count_key])
+
+
+def pad_to_ragged(pool):
+    """Padded (P, C) / (P, W) pool dict -> ragged, IN PLACE (returns the
+    dict). The valid mask selects each segment's objects in (p, j) order,
+    which is exactly CSR order; pads are dropped. Idempotent."""
+    _flatten_block(pool, NOTE_OBJ_FIELDS, "valid", "note_off", "n_notes")
+    _flatten_block(pool, WALL_OBJ_FIELDS, "wall_valid", "wall_off",
+                   "n_walls")
+    return pool
+
+
+def _unflatten_block(pool, fields, off_key, count_key, empty):
+    if off_key not in pool:
+        return
+    off, n = pool[off_key], pool[count_key]
+    P = n.shape[0]
+    C = max(1, int(n.max()) if P else 1)
+    j = torch.arange(C, device=n.device)
+    src = off[:-1, None] + j[None, :]                # (P, C) flat index
+    hit = j[None, :] < n[:, None]
+    src = torch.where(hit, src, torch.zeros_like(src))
+    for k in fields:
+        if k not in pool:
+            continue
+        a = pool[k]
+        pad = empty[k][0, 0]                          # per-field pad value
+        out = pad.expand(P, C, *a.shape[1:]).clone()
+        m = hit.reshape(P, C, *([1] * (a.dim() - 1)))
+        gathered = a[src.reshape(-1)].reshape(P, C, *a.shape[1:]) \
+            if a.shape[0] else out
+        pool[k] = torch.where(m, gathered, out)
+    del pool[off_key]
+
+
+def ragged_to_padded(pool):
+    """Inverse of pad_to_ragged (test / cache-migration tool, not a
+    runtime path): (P, C) with C = max objects, pads taken from what the
+    padded builders emit for an empty chart, so the round trip through
+    pad_to_ragged reproduces the padded builders' output exactly."""
+    dt = pool["hit"].dtype
+    dev = pool["hit"].device
+    _unflatten_block(pool, NOTE_OBJ_FIELDS, "note_off", "n_notes",
+                     _charts_to_padded([[]], dev, dt))
+    _unflatten_block(pool, WALL_OBJ_FIELDS, "wall_off", "n_walls",
+                     _walls_to_padded([[]], dev, dt))
+    return pool
+
+
+def cat_pools(parts):
+    """Concatenate ragged pool dicts along the segment axis (the chunked
+    ranked-pool build): per-object fields and per-segment fields cat,
+    offsets rebase by the running object total. Byte-identical to one
+    whole-list build (test_ranked_pool_chunked_pack)."""
+    out = {}
+    for k in parts[0]:
+        if k in ("note_off", "wall_off"):
+            base, chunks = 0, [parts[0][k][:1]]
+            for p in parts:
+                chunks.append(p[k][1:] + base)
+                base += int(p[k][-1])
+            out[k] = torch.cat(chunks)
+        else:
+            out[k] = torch.cat([p[k] for p in parts])
+    return out
+
+
+def _charts_to_tensors(charts, device, dtype):
+    """list[list[Note]] -> ragged pool dict (see pad_to_ragged). Built
+    through the padded path so every value is the byte the (P, C)
+    builder produced (its numpy sin/cos over the padded block included);
+    only the layout changes."""
+    return pad_to_ragged(_charts_to_padded(charts, device, dtype))
+
+
+def _walls_to_tensors(walls, device, dtype):
+    """list[list[wall_tuple]] -> ragged wall block (see pad_to_ragged)."""
+    return pad_to_ragged(_walls_to_padded(walls, device, dtype))
 
 
 def _generator_version():
@@ -317,8 +433,12 @@ def _pool_cache_path(cfg, seed, pool_size, dtype):
     Layout v11 (2026-08-03): the vectorized _charts_to_tensors landed
     (byte-identical, but a clean break beats any old-key/new-key
     aliasing) and the key narrowed from all-of-chart.py to the
-    generator symbols. v10 was the 0.5 + 1.5/min_speed tail rule."""
-    blob = repr(("v11", _generator_version(), repr(cfg), seed, pool_size,
+    generator symbols. v10 was the 0.5 + 1.5/min_speed tail rule.
+
+    Layout v12 (2026-09-03, audit 2.7): ragged (CSR) pool — the npz
+    holds flat per-object arrays + note_off / wall_off; v11 caches were
+    (P, C)-padded and are not reused."""
+    blob = repr(("v12", _generator_version(), repr(cfg), seed, pool_size,
                  str(dtype))).encode()
     key = hashlib.sha1(blob).hexdigest()[:16]
     cdir = os.path.join(os.path.dirname(os.path.dirname(
@@ -331,7 +451,8 @@ def _load_pool_cache(path, device):
     if not os.path.exists(path):
         return None
     data = np.load(path)
-    return {k: torch.as_tensor(data[k], device=device) for k in data.files}
+    return pad_to_ragged(
+        {k: torch.as_tensor(data[k], device=device) for k in data.files})
 
 
 def _fix_pool_tail(pool):
@@ -344,6 +465,10 @@ def _fix_pool_tail(pool):
         torch.isfinite(ms) & (ms > 0),
         0.5 + Z_MISS_TAIL / ms, torch.full_like(ms, 0.5))
     return pool
+
+
+def _max_count(counts):
+    return max(1, int(counts.max()) if counts.numel() else 1)
 
 
 class CudaBeatVecEnv:
@@ -440,14 +565,15 @@ class CudaBeatVecEnv:
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.gears = int(gears)
-        # pool=: prebuilt (P, C) tensor dict (ranked_pool.py) — unlike
+        # pool=: prebuilt tensor dict (ranked_pool.py; ragged, or padded
+        # (P, C) from an older builder — converted here) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is
         # the deterministic-sequential test mode)
         self._test_charts = charts is not None and pool is None
         if pool is not None:
-            self.pool = _fix_pool_tail(
+            self.pool = pad_to_ragged(_fix_pool_tail(
                 {k: v.to(self.device, dtype if v.is_floating_point() else
-                         v.dtype) for k, v in pool.items()})
+                         v.dtype) for k, v in pool.items()}))
         elif charts is None:
             cfg = ChartConfig(
                 chart_len_s=chart_len_s, colors=colors,
@@ -476,14 +602,18 @@ class CudaBeatVecEnv:
                 assert len(walls) == len(charts)
                 self.pool.update(
                     _walls_to_tensors(walls, self.device, dtype))
-        self.pool_size, self.C = self.pool["hit"].shape
+        # C / W: the max object count over the pool — the per-env
+        # status / wall_passed stride and the scan bound, exactly the
+        # padded width the (P, C) layout had (one host read, init only)
+        self.pool_size = int(self.pool["n_notes"].shape[0])
+        self.C = _max_count(self.pool["n_notes"])
         # env v17: pools without wall tensors (procedural generator,
-        # charts= test mode, pre-v17 caches) get an all-empty (P, 1)
-        # wall block — every wall lane inert, kernel behavior = v16
+        # charts= test mode, pre-v17 caches) get an all-empty wall
+        # block — every wall lane inert, kernel behavior = v16
         if "wall_t" not in self.pool:
             self.pool.update(_walls_to_tensors(
                 [[] for _ in range(self.pool_size)], self.device, dtype))
-        self.W = self.pool["wall_t"].shape[1]
+        self.W = _max_count(self.pool["n_walls"])
         if max_steps is None:
             max_steps = int(chart_len_s * 30) + 90
         self.max_steps = int(max_steps)
@@ -646,9 +776,10 @@ class CudaBeatVecEnv:
             p["is_head"], p["is_link"], p["show_dir"], p["free_pre"],
             p["free_post"],
             p["n_notes"], p["last_hit"], p["tail"], p["min_speed"],
+            p["note_off"],
             p["wall_t"], p["wall_cx"], p["wall_cy"], p["wall_w"],
             p["wall_h"], p["wall_len"], p["wall_speed"],
-            p["wall_valid"], p["n_walls"],
+            p["wall_valid"], p["n_walls"], p["wall_off"],
             self.wall_passed, self.first_wall, self.walls_in,
             self.in_wall_prev,
             self.env_order,
