@@ -3,7 +3,7 @@
 Slices every ranked ScoreSaber level (maps/scoresaber_catalog.json via
 the bench's warm chart_cache pickles; real-NJS speeds since 2026-07-30,
 speed_scale removed) into fixed-length windows and packs them into the
-(P, C) tensor dict CudaBeatVecEnv eats — training on the real catalog
+ragged (CSR) tensor dict CudaBeatVecEnv eats (cuda_env.pad_to_ragged) — training on the real catalog
 directly, no procedural generator, to probe the procedural->real gap
 behind the ~87% accuracy ceiling.
 
@@ -62,8 +62,12 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     # to the parser hash, so it must bump the pool key itself)
     # v5: 2026-08-23 — lead gap applies to k=0 (intro walls clipped to
     # >= lead_s; kills unavoidable first-tick wall charges)
+    # v6: 2026-09-03 — ragged (CSR) pool layout (audit 2.7): flat
+    # per-object arrays + note_off / wall_off instead of (P, C) padding
+    # (7,655 MB -> ~0.5 GB on the 93k-segment mirror pool; same bytes
+    # per object, so the v5 caches convert but are simply not reused)
     key = hashlib.sha1(
-        (f"{seg_len:g}_{ver}_v5_lead{lead_s:g}"
+        (f"{seg_len:g}_{ver}_v6_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
@@ -164,10 +168,11 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     # keeps the historical 1.5 s; the survival-drift postmortem
     # hypothesis #4 is that a long pre-note phase feeds the
     # survival-consolidation feedback loop.
-    """(P, C) pool dict on `device`. First call builds + caches the full
-    segment set (minutes); later calls load the npz (~seconds). `sample`
-    takes a seeded without-replacement subset (VRAM control; every leg
-    with the same seed/sample sees the same subset)."""
+    """Ragged pool dict on `device` (cuda_env.pad_to_ragged layout).
+    First call builds + caches the full segment set (minutes); later
+    calls load the npz (~seconds). `sample` takes a seeded
+    without-replacement subset (VRAM control; every leg with the same
+    seed/sample sees the same subset)."""
     catalog = catalog or os.path.join(_BASE, "maps",
                                       "scoresaber_catalog.json")
     import sys
@@ -176,37 +181,33 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
     cpath = _cache_path(seg_len, bs.parser_version(), catalog, lead_s,
                         mirror=mirror)
     if not os.path.exists(cpath):
-        from .cuda_env import _charts_to_tensors, _walls_to_tensors
+        from .cuda_env import (_charts_to_tensors, _walls_to_tensors,
+                               cat_pools)
         segs, seg_walls = _build_segments(seg_len, catalog, log,
                                           lead_s=lead_s, mirror=mirror)
         # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
         # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
         # arrays + the f32 outputs simultaneously (~5.5 GB at 46k
-        # segments — OOM-killed a 14 GB laptop). Chunks pad to the
-        # global C (pad_to) so per-field concatenation is byte-identical
-        # to the whole-pool call; each chunk's Notes are released as it
-        # is consumed.
-        cmax = max((len(s) for s in segs), default=1)
-        wmax = max((len(w) for w in seg_walls), default=1)
+        # segments — OOM-killed a 14 GB laptop). Each chunk is built
+        # padded and flattened to ragged on the spot (the padded
+        # scratch is per chunk); cat_pools rebases the offsets, byte-
+        # identical to the whole-pool call; each chunk's Notes are
+        # released as it is consumed.
         parts = []
         chunk = 2048
         for lo in range(0, len(segs), chunk):
             ch = segs[lo:lo + chunk]
             cw = seg_walls[lo:lo + chunk]
             segs[lo:lo + chunk] = [None] * len(ch)
-            part = _charts_to_tensors(ch, "cpu", dtype, pad_to=cmax)
-            part.update(_walls_to_tensors(cw, "cpu", dtype, pad_to=wmax))
+            part = _charts_to_tensors(ch, "cpu", dtype)
+            part.update(_walls_to_tensors(cw, "cpu", dtype))
             parts.append(part)
             del ch
         del segs
-        if not parts:                    # empty catalog: (0, 1) pool
+        if not parts:                    # empty catalog: P = 0 pool
             parts = [_charts_to_tensors([], "cpu", dtype)]
             parts[0].update(_walls_to_tensors([], "cpu", dtype))
-        pool = {}
-        for k in list(parts[0]):
-            pool[k] = torch.cat([p[k] for p in parts])
-            for p in parts:
-                del p[k]
+        pool = cat_pools(parts)
         del parts
         # tmp + atomic rename: the cache lives on a SHARED network
         # volume and other pods poll for it — a direct savez exposes a
@@ -220,27 +221,54 @@ def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
         log(f"[ranked-pool] cached -> {os.path.basename(cpath)}",
             flush=True)
     data = np.load(cpath)
-    P = data["hit"].shape[0]
+    P = data["n_notes"].shape[0]
     idx = None
     if sample is not None and sample < P:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(P, size=sample, replace=False))
-    out = {}
-    n_notes = data["n_notes"][idx] if idx is not None else data["n_notes"]
-    cmax = max(1, int(n_notes.max()))
-    # wall tensors trim on THEIR own ragged dim (W), not the note C
-    n_walls = data["n_walls"][idx] if idx is not None else data["n_walls"]
-    wmax = max(1, int(n_walls.max()))
-    for k in data.files:
-        a = data[k]
-        if idx is not None:
-            a = a[idx]
-        lim = wmax if k.startswith("wall_") else cmax
-        if a.ndim >= 2 and a.shape[1] > lim:
-            a = a[:, :lim]
-        out[k] = torch.as_tensor(a, device=device)
-    log(f"[ranked-pool] {out['hit'].shape[0]} segments on {device} "
-        f"(C={out['hit'].shape[1]}, "
+    arrs = _subset_ragged({k: data[k] for k in data.files}, idx)
+    out = {k: torch.as_tensor(a, device=device) for k, a in arrs.items()}
+    nn, nw = arrs["n_notes"], arrs["n_walls"]
+    log(f"[ranked-pool] {P if idx is None else len(idx)} segments on "
+        f"{device} (C={max(1, int(nn.max())) if nn.size else 1}, "
+        f"{int(nn.sum())} notes + {int(nw.sum())} walls ragged, "
         f"{sum(v.numel() * v.element_size() for v in out.values()) / 2**20:.0f}"
         f" MB)", flush=True)
+    return out
+
+
+def _gather_index(off, idx):
+    """Flat object indices of segments `idx` in a ragged block with
+    exclusive offsets `off` (P + 1,), in segment order — the CSR order
+    of the subset pool. Returns (index, new_offsets)."""
+    lens = off[idx + 1] - off[idx]
+    n_tot = int(lens.sum())
+    new_off = np.zeros(len(idx) + 1, np.int64)
+    np.cumsum(lens, out=new_off[1:])
+    gidx = (np.repeat(off[idx] - new_off[:-1], lens)
+            + np.arange(n_tot, dtype=np.int64))
+    return gidx, new_off
+
+
+def _subset_ragged(arrs, idx):
+    """Seeded-subsample a ragged pool (numpy dict): per-segment fields
+    take rows `idx`, per-object fields take each chosen segment's
+    object range, offsets are rebuilt. idx=None returns arrs as is."""
+    if idx is None:
+        return arrs
+    from .cuda_env import NOTE_OBJ_FIELDS, WALL_OBJ_FIELDS
+    gn, non = _gather_index(arrs["note_off"], idx)
+    gw, wof = _gather_index(arrs["wall_off"], idx)
+    out = {}
+    for k, a in arrs.items():
+        if k == "note_off":
+            out[k] = non
+        elif k == "wall_off":
+            out[k] = wof
+        elif k in NOTE_OBJ_FIELDS:
+            out[k] = a[gn]
+        elif k in WALL_OBJ_FIELDS:
+            out[k] = a[gw]
+        else:
+            out[k] = a[idx]
     return out

@@ -911,3 +911,101 @@ instrument for that and was not run. Combined with the −18% wall and
 `trunk_upd01000.pt` / `trunk_final.pt` in both run dirs); a second
 seed, which is what the +0.008 needs before anyone calls it a win;
 C §5 item 8 (diag on kept rows) is still open.
+
+### 2.7 results (measured 2026-09-03)
+
+Same pod (`194.14.47.19`, RTX 5090), same session, same production
+argv as Tier 0/1 (`--num-envs 32768 --horizon 32 --minibatches 64
+--mb-accum 2 … --chart-pool 999999 --mirror-augment`, env-order
+default ON). Baseline RE-MEASURED in this session at the pod's tree
+(= laptop HEAD `545590b`, every relevant file md5-matched), not
+taken from the Tier 1 table (which it reproduces: 126.0k, 12.60 GiB).
+Instruments: `train_batch --bench` (exec-true phase seconds, `[bench-
+mem]` per-phase peaks), 5-update same-seed run for bit-identity, full
+gate, plus an old-vs-new A/B with the kernel rebuilt each way.
+
+**Change (`cuda_env.py`, `ranked_pool.py`, `beat_arena_cuda.cu`).**
+Per-object pool fields are flat — one array per field holding every
+segment's objects back to back, `note_off[P+1]` / `wall_off[P+1]`
+int64 exclusive prefix sums — and the kernel reads `cb = p_note_off[cc]
++ i` (was `cc * C + i`) at the 4 note sites and `wb = p_wall_off[cc] +
+wi` (was `cc * P.W + wi`) at the 3 wall sites. Per-env `status` /
+`wall_passed` keep their (N, C) / (N, W) strides with C = W = max
+objects over the pool (what the padded width was: C=1489, W=444).
+`valid` / `wall_valid` are kept as all-true flat lanes so the kernel's
+branch structure is untouched. Built through the unchanged padded
+builders (`_charts_to_padded` / `_walls_to_padded`) + `pad_to_ragged`
+(mask-select in (p, j) order = CSR order), chunk-stitched by
+`cat_pools`; `load_ranked_pool`'s seeded subsample gathers object
+ranges (`_subset_ragged`). Cache keys bumped: ranked v5 → v6,
+procedural v11 → v12. `pool=` still accepts either layout (a padded
+dict is converted at construction), so pool sharing for 2.3 is intact.
+Tensor-list contract: +2 slots (`PNOFF`, `PWOFF`), with a
+`TORCH_CHECK` that the pool is ragged.
+
+#### Table (2 baseline reps + 2 A/B old reps vs 4 A/B new reps + 2 final reps)
+
+| state | steps/s | rollout s / 4 upd | update s / 4 upd | peak GiB (rollout / update / resident@rollout-start) | `[ranked-pool]` | gate |
+|---|---|---|---|---|---|---|
+| baseline (padded) | 126,219 / 126,341 / 126,537 / 126,372 — mean **126,367** | 24.42 / 24.37 / 24.34 / 24.38 | 8.75 / 8.77 / 8.74 / 8.75 | **12.60** (12.17 / 12.60 / 8.97) | `93472 segments (C=1489, 7655 MB)` | 283 |
+| ragged v1 (base loaded at top of `step_env`) — NOT shipped | 125,712 / 125,613 / 125,667 / 125,393 — mean 125,596 (**−0.6%**) | 24.57 / 24.60 / 24.59 / 24.63 | 8.73 / 8.73 / 8.72 / 8.75 | 5.76 (5.33 / 5.76 / 2.13) | `645 MB` | 293 |
+| **ragged final** (base loaded next to `nn`) | 126,396 / 126,307 / 126,399 / 126,285 / 126,244 / 126,361 — mean **126,332 (−0.03%, null)** | 24.34 / 24.37 / 24.39 / 24.39 / 24.38 / 24.39 | 8.77 / 8.77 / 8.73 / 8.76 / 8.78 / 8.74 | **5.76** (5.33 / 5.76 / 2.13) | `93472 segments (C=1489, 13596318 notes + 196250 walls ragged, 645 MB)` | **293** |
+
+- **Pool VRAM 7,655 → 645 MB (−7,010 MB, −91.6%).** 13.6M notes + 196k
+  walls over 93,472 segments (mean 145 objects vs C=1489: the padded
+  layout was 9.8% occupied on notes, 0.5% on walls). The audit's
+  "~0.5–0.7 GB" and "P ≈ 92k" both held.
+- **Peak 12.60 → 5.76 GiB (−6.84 GiB)**, every phase moving by the
+  same amount (rollout 12.17 → 5.33, update 12.60 → 5.76, resident at
+  rollout start 8.97 → 2.13): the pool was the single largest tensor,
+  as B §4 guessed, and nothing else changed. At N=32768 the trainer now
+  peaks at 5.76 GiB on a 32 GB card.
+- **steps/s: NULL.** The first cut cost a real −0.6% (4 reps, all in
+  the rollout: 24.4 → 24.6 s, update flat) — ptxas showed 12 B of spill
+  stores/loads in `step_kernel<float,true>` (41,504 B stack) where the
+  old build had 0 (41,488 B): `nb0 = p_note_off[c0]` loaded at the top
+  of `step_env` stayed live across the 8 dynamics substeps in a
+  255-register kernel. Loading it next to `nn = p_n_notes[c0]` (the old
+  layout's first pool touch) restored 41,488 B / 0 spill and 126.3k on
+  6 reps. So the residency probe's "step time flat across pool sizes"
+  held — the layout is free — but a live int64 across the physics
+  section is not. The `write_obs` bases (`nb`, `wbase`) sit next to
+  the existing `nn` / `msp` loads and did not need moving.
+- **Bit-identity: PASS.** 5-update same-seed run (`runs/r27_base_five`
+  vs `runs/r27_final_five`): all 10 `update` + `[kl]` lines identical
+  in every printed digit (`acc accL accR return ent ev r1 maxlr`,
+  `kl clipfrac gnorm clipc ent/head min entfull`). The only differing
+  column is `ep_return(last100)`, which is scheduling noise between
+  identical runs (the Tier-1 `t1_s11` log, same code as this
+  baseline, prints −6.510 at update 5 where the baseline printed
+  −6.558 with every other column equal — the ring-buffer pop order,
+  Tier 0.1 note).
+- **Pool equality: PASS, two ways.** (a) `tests/test_ragged_pool.py`
+  (7 tests): every per-object field equal per segment per object
+  (notes and walls, empty segments included), offsets consistent,
+  C/W = the padded width, `ragged_to_padded` round-trips exactly, a
+  padded dict handed to `pad_to_ragged` equals the native ragged
+  build, the subsample gather equals a from-scratch build of the
+  chosen segments, and on CUDA an env fed the padded dict and one fed
+  the ragged dict step bitwise-identically for 120 ticks (obs / reward
+  / done / status / wall_passed / counters). (b) On the pod, the OLD
+  8.0 GB v5 npz converted by `pad_to_ragged` vs the fresh v6 build
+  from the pickles: all 32 fields equal on `tobytes()`. (The new
+  ragged npz is 677 MB and built in 54 s; the padded one was 8.0 GB.)
+  `test_ranked_pool_chunked_pack.py` now pins both the padded chunk
+  contract and `cat_pools` (3 more parametrized cases).
+- **Rebuild confirmed.** `jit_cache` srchash `263a1b4f…` (.so of
+  09-02 19:50) → `246f75df…` (v1, 03:56:22) → `d3788ca2…` (final,
+  04:12:25); the final gate (293 passed, 04:15–04:17) and the final
+  five/bench runs print `d3788ca2…` at start and end, i.e. ran against
+  the new .so. `fast_load` picked up the .cu edit on the first import
+  each time (ninja build ~2.5 min).
+- Gate: **293 passed** (283 + 10 new).
+
+*Not done / notes:* the v5 padded npz (`ranked_e52ac58c96855bee.npz`,
+8.0 GB) is left in the pod's shared `pool_cache` (not this item's to
+delete); `MAX_OBJECTS` stays 1536 and the (N, C) status block stays
+48.8 MB at N=32768 — a follow-up could shrink C by capping the
+densest segments, but there is nothing left to gain from the pool
+itself. N=65536 / larger pools / `--mb-accum 1` now have ~20 GB of
+headroom.

@@ -4577,7 +4577,11 @@ struct Sim {
   // mode never writes, so the reset zeros stand — lanes stay 0).
   T* __restrict__ ground_imp;
   int64_t* __restrict__ chart_idx;
-  // chart pool (P, C), read-only
+  // chart pool, read-only. RAGGED (CSR) since 2026-09-03 (audit 2.7):
+  // every segment's objects back to back in one flat array per field,
+  // chart cc's object i at p_note_off[cc] + i (was cc * C + i in the
+  // padded (P, C) layout). C survives only as the per-env status
+  // stride / scan bound (max objects over the pool).
   const T *__restrict__ p_hit, *__restrict__ p_speed, *__restrict__ p_center,
       *__restrict__ p_dvec, *__restrict__ p_rot, *__restrict__ p_good_hy,
       *__restrict__ p_bad_hy;
@@ -4589,13 +4593,16 @@ struct Sim {
   const int64_t* __restrict__ p_n_notes;
   const T *__restrict__ p_last_hit, *__restrict__ p_tail,
       *__restrict__ p_min_speed;
-  // env v17 wall pool (P, W), read-only, indexed by the SAME chart_idx
+  const int64_t* __restrict__ p_note_off;  // (P + 1,) exclusive prefix
+  // env v17 wall pool, read-only, indexed by the SAME chart_idx; ragged
+  // like the notes: wall wi of chart cc at p_wall_off[cc] + wi
   const T *__restrict__ p_wall_t, *__restrict__ p_wall_cx,
       *__restrict__ p_wall_cy, *__restrict__ p_wall_w,
       *__restrict__ p_wall_h, *__restrict__ p_wall_len,
       *__restrict__ p_wall_speed;
   const bool* __restrict__ p_wall_valid;
   const int64_t* __restrict__ p_n_walls;
+  const int64_t* __restrict__ p_wall_off;  // (P + 1,)
   // env v17 per-env wall state: passed latches (E, W), passed-prefix
   // cursor, and the head-in-wall tick counter the wrapper reports
   bool* __restrict__ wall_passed;
@@ -4604,7 +4611,7 @@ struct Sim {
   // was the head inside a wall LAST tick — entry-edge state for the
   // once-per-entry WALL_PEN (lib.rs was_in_wall mirror)
   bool* __restrict__ in_wall_prev;
-  int W;  // wall pool second dim
+  int W;  // per-env wall_passed stride (max walls over the pool)
   // io
   const int64_t *__restrict__ actions, *__restrict__ cand;
   T* __restrict__ ret_buf;
@@ -4984,6 +4991,8 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   const int64_t cc = P.chart_idx[e];
   const int C = P.C;
   const int nn = (int)P.p_n_notes[cc];
+  const int64_t nb = P.p_note_off[cc];   // ragged pool: chart cc's base
+  const int64_t wbase = P.p_wall_off[cc];
   const T time_o = T(P.tick[e]) * T(DT);
   // v15 head-anchored track (contact spec §10)
   const T z_off = P.head[e * 3 + 2] - T(PLANE_Z0);
@@ -5012,7 +5021,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   };
   const T msp = P.p_min_speed[cc];
   for (int i = P.first_pending[e]; i < nn; i++) {
-    const int64_t cb = cc * C + i;
+    const int64_t cb = nb + i;
     if (!P.p_valid[cb] || P.status[e * C + i] != 0) continue;
     // sorted-chart early exit (lib.rs): the z lower bound alone beats
     // the worst kept distance for this and every later note
@@ -5028,7 +5037,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   }
   const int nw = (int)P.p_n_walls[cc];
   for (int wi = P.first_wall[e]; wi < nw; wi++) {
-    const int64_t wb = cc * P.W + wi;
+    const int64_t wb = wbase + wi;
     if (!P.p_wall_valid[wb] || P.wall_passed[e * P.W + wi]) continue;
     const T dzf = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
         - T(PLANE_Z0) - T(WALL_FRONT_OFF);
@@ -5042,7 +5051,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   for (int slot = 0; slot < n_sel; slot++) {
     float* nb2 = obs + OFF_NOTES + slot * NOTE_FEAT;
     if (sel_wall[slot]) {
-      const int64_t wb = cc * P.W + sel_idx[slot];
+      const int64_t wb = wbase + sel_idx[slot];
       const T zfu = (P.p_wall_t[wb] - time_o) * P.p_wall_speed[wb]
           - T(WALL_FRONT_OFF) + z_off;
       const T zf = tclamp(zfu, z_lo, P.z_clip_hi);
@@ -5071,7 +5080,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[17] = (float)(tclamp(zfu + P.p_wall_len[wb], z_lo,
                                P.z_clip_hi) / T(Z_SCALE));
     } else {
-      const int64_t cb = cc * C + sel_idx[slot];
+      const int64_t cb = nb + sel_idx[slot];
       const T z = tclamp((P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off,
                          z_lo, P.z_clip_hi);
       const bool bomb = P.p_is_bomb[cb];
@@ -5420,6 +5429,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   const T z_off = head_z - T(PLANE_Z0); // v15 head-anchored note track
   const T min_speed = P.p_min_speed[c0];
   const int nn = (int)P.p_n_notes[c0];
+  // ragged pool: chart c0's base. Loaded HERE, next to nn (the old
+  // layout's first pool touch), not at the top of step_env — holding
+  // it live across the dynamics substeps cost 12 B of spill in a
+  // 255-register kernel (measured 2026-09-03: -0.5% steps/s).
+  const int64_t nb0 = P.p_note_off[c0];
   int n_new[2] = {0, 0};
 
   // env v19 flail telemetry: on ticks whose next scoreable note is
@@ -5431,8 +5445,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   {
     T next_gap = T(2) * T(FLAIL_LEAD_S);
     for (int i = P.first_pending[e]; i < nn; i++) {
-      if (P.status[e * C + i] != 0 || !P.p_valid[c0 * C + i]) continue;
-      next_gap = P.p_hit[c0 * C + i] - time_new;
+      if (P.status[e * C + i] != 0 || !P.p_valid[nb0 + i]) continue;
+      next_gap = P.p_hit[nb0 + i] - time_new;
       break;
     }
     if (next_gap > T(FLAIL_LEAD_S)) {
@@ -5453,7 +5467,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   for (int i = P.first_pending[e]; i < nn; i++) {
     if (P.status[e * C + i] != 0) continue;
-    const int64_t cb = c0 * C + i;
+    const int64_t cb = nb0 + i;
     if (!P.p_valid[cb]) continue;
     // sorted hit_time + min_speed: beyond this bound so is every later
     if ((P.p_hit[cb] - time_new) * min_speed + z_off > reach_z) break;
@@ -5627,10 +5641,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // tick inside; >= 1 tick fully outside re-arms the charge.
   {
     const int nw = (int)P.p_n_walls[c0];
+    const int64_t wb0 = P.p_wall_off[c0];
     const T hx2 = P.head[e * 3], hy2 = P.head[e * 3 + 1];
     bool in_wall = false;
     for (int wi = P.first_wall[e]; wi < nw; wi++) {
-      const int64_t wb = c0 * P.W + wi;
+      const int64_t wb = wb0 + wi;
       if (!P.p_wall_valid[wb] || P.wall_passed[e * P.W + wi]) continue;
       const T dzf = (P.p_wall_t[wb] - time_new) * P.p_wall_speed[wb]
           - T(PLANE_Z0) - T(WALL_FRONT_OFF);
@@ -5832,10 +5847,10 @@ enum {
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
-  PNNOTES, PLASTHIT, PTAIL, PMINSP,
-  // env v17 wall pool (P, W) + per-env wall state
+  PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
+  // env v17 wall pool (ragged) + per-env wall state
   PWALLT, PWALLCX, PWALLCY, PWALLW, PWALLH, PWALLLEN, PWALLSP,
-  PWALLVALID, PNWALLS, TWALLPASS, TFIRSTW, TWALLSIN, TINWALLPREV,
+  PWALLVALID, PNWALLS, PWOFF, TWALLPASS, TFIRSTW, TWALLSIN, TINWALLPREV,
   TENVORD,
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
@@ -5859,6 +5874,14 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
   const int64_t N = q.size(0);
   const int64_t C = ts[TSTATUS].size(1);
   const int64_t cap = ts[RBUF].size(0);
+  // ragged pool contract: (P + 1,) int64 offsets, per-object fields flat
+  TORCH_CHECK(ts[PNOFF].scalar_type() == at::kLong
+              && ts[PNOFF].size(0) == ts[PNNOTES].size(0) + 1
+              && ts[PHIT].dim() == 1
+              && ts[PWOFF].scalar_type() == at::kLong
+              && ts[PWOFF].size(0) == ts[PNWALLS].size(0) + 1
+              && ts[PWALLT].dim() == 1,
+              "chart pool must be ragged (note_off/wall_off, flat fields)");
   AT_DISPATCH_FLOATING_TYPES(q.scalar_type(), "beat_arena_step_v10", [&] {
     Sim<scalar_t> P;
     P.p = ts[TP].data_ptr<scalar_t>();
@@ -5928,6 +5951,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.p_last_hit = ts[PLASTHIT].data_ptr<scalar_t>();
     P.p_tail = ts[PTAIL].data_ptr<scalar_t>();
     P.p_min_speed = ts[PMINSP].data_ptr<scalar_t>();
+    P.p_note_off = ts[PNOFF].data_ptr<int64_t>();
     P.p_wall_t = ts[PWALLT].data_ptr<scalar_t>();
     P.p_wall_cx = ts[PWALLCX].data_ptr<scalar_t>();
     P.p_wall_cy = ts[PWALLCY].data_ptr<scalar_t>();
@@ -5937,6 +5961,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.p_wall_speed = ts[PWALLSP].data_ptr<scalar_t>();
     P.p_wall_valid = ts[PWALLVALID].data_ptr<bool>();
     P.p_n_walls = ts[PNWALLS].data_ptr<int64_t>();
+    P.p_wall_off = ts[PWOFF].data_ptr<int64_t>();
     P.wall_passed = ts[TWALLPASS].data_ptr<bool>();
     P.first_wall = ts[TFIRSTW].data_ptr<int>();
     P.walls_in = ts[TWALLSIN].data_ptr<int>();
