@@ -35,6 +35,70 @@ _ext_failed = False
 _RELU_BWD_DIMS = ((64, 128) if _os.environ.get("BEAT_NO_WIDE_RELU_BWD")
                   == "1" else (64, 128, 256, 512))
 
+# cuBLASLt fused bias+ReLU epilogue for the Linear+ReLU sites (09-02
+# static audit A §5 / Tier 2.5, measured 2026-09-03). BEAT_LT_EPILOGUE=1
+# runs the forward as ONE `torch._addmm_activation(b16, x, w16.t())`
+# (cublasLt RELU_BIAS epilogue) instead of the two-pass bias-free
+# `torch.mm` + in-place `bias_relu_(y, b_fp32)`; the backward is
+# unchanged (relu_bwd from the saved post-ReLU y).
+#
+# History, so nobody re-runs the sm_61 conclusion: the two-pass split
+# was adopted in round-4 #2 (2026-07, GTX 1080 / sm_61, d=64) because
+# the cuBLAS bias epilogue there cost 33-59% of each addmm; the
+# 08-16 audit's Tier 1.1 fixed the bias_relu_ widths (2026-08-15) but
+# the planned cuBLASLt re-probe never ran. Numerics vs the two-pass
+# path: ONE fp16 rounding instead of two and the bias enters as the
+# fp16 replica instead of the fp32 master — fp16 last-rounding class
+# (~1e-3 rel on logits), NOT bit-identical; the fused result is the
+# CLOSER of the two to an fp32 reference (1.3e-3 vs 2.1e-3 max-abs on
+# the ffn.0 shape).
+#
+# Default ON, decided 2026-09-03 on the RTX 5090 (sm_120, torch
+# 2.8.0.dev+cu128): cublasLt runs the RELU_BIAS epilogue in the SAME
+# cutlass kernel at the same time as the bias-free mm (ffn.0 at
+# micro 8192: 224 us fused vs 218 us mm-only vs 509 us mm + bias_relu_),
+# so the whole bias_relu_ pass (288 us per ffn.0 call, 1.24 ms per
+# production minibatch) disappears. Measured: update phase 8.75 ->
+# 8.41 s/4 upd (-4.0%), rollout 24.40 -> 24.01 s (-1.6%; the rollout
+# forward runs the same sites at N=32768), --bench 126.3k -> 129.1k
+# steps/s (+2.3%), bench_policy_update 16384/accum 2 32.1 -> 30.9 ms,
+# bench_policy_forward @32768 18.4 -> 16.0 ms. Side effect: the
+# rollout-vs-update logprob consistency diagnostic r1 went from ~1e-6
+# to exactly 0 — the Lt heuristic picks the same kernel at both M, the
+# plain-mm heuristic did not. BEAT_LT_EPILOGUE=0 is the bisect hatch.
+_LT_EPILOGUE_DEFAULT = "1"
+_LT_EPILOGUE = (_os.environ.get("BEAT_LT_EPILOGUE", _LT_EPILOGUE_DEFAULT)
+                == "1")
+
+
+def _lt_epilogue_ok(x2, wh, bh):
+    """True when torch will actually route `_addmm_activation` to the
+    cublasLt epilogue: row-major contiguous operands with a contiguous
+    1-D bias. Anything else makes torch fall back to bias-copy +
+    GEMM(beta=1) + a separate relu_ (3 passes, worse than the 2 we
+    replace). Pointer alignment is not a routing condition (Lt picks
+    an align1/align2 kernel), but a 2-B-offset bias measured 1.8x
+    slower on the ffn.0 shape (2026-09-03 probe), so 16-B alignment is
+    required too — every flat replica view satisfies it (ALIGN = 16
+    elements in flatten_fp16_replicas). Odd K is fine: the encoder
+    first layers (K = 18 / 34 / 78) measured as ONE align2 cutlass
+    kernel at 0.55-0.64x the two-pass time."""
+    return (x2.is_contiguous() and wh.is_contiguous()
+            and bh.is_contiguous() and bh.dim() == 1
+            and x2.data_ptr() % 16 == 0 and wh.data_ptr() % 16 == 0
+            and bh.data_ptr() % 16 == 0)
+
+
+def _relu_forward(x2, wh, bh, b):
+    """relu(x2 @ wh.T + bias) on the fp16 stream, toggle-selected: the
+    fused cublasLt epilogue (bias = fp16 replica `bh`) or the two-pass
+    bias-free mm + bias_relu_ (bias = fp32 master `b`)."""
+    if _LT_EPILOGUE and _lt_epilogue_ok(x2, wh, bh):
+        return torch._addmm_activation(bh, x2, wh.t())
+    y = torch.mm(x2, wh.t())
+    _load().bias_relu_(y, b.detach())
+    return y
+
 
 def _load():
     global _ext, _ext_failed
@@ -414,16 +478,18 @@ def fp16_linear_nobias(x, w, b):
 
 
 class _Fp16LinearReLU(torch.autograd.Function):
-    """Linear + ReLU with the bias in a custom epilogue: bias-free mm,
-    then in-place y = relu(y + b_fp32) (csrc/fp16_gemm.cu bias_relu_).
-    Replaces the standalone ReLU pass at identical traffic while
-    dodging the slow sm_61 addmm bias epilogue."""
+    """Linear + ReLU with the bias in an epilogue. Two-pass (default
+    unless BEAT_LT_EPILOGUE=1): bias-free mm, then in-place
+    y = relu(y + b_fp32) (csrc/fp16_gemm.cu bias_relu_) — replaces the
+    standalone ReLU pass at identical traffic while dodging the slow
+    sm_61 addmm bias epilogue. Fused: one cublasLt GEMM with the
+    RELU_BIAS epilogue (see _LT_EPILOGUE). Either way the backward
+    only needs the saved post-ReLU y."""
     @staticmethod
     def forward(ctx, x, w, b):
-        wh, _ = _half_params(w, b)
+        wh, bh = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
-        y = torch.mm(x2, wh.t())
-        _load().bias_relu_(y, b.detach())
+        y = _relu_forward(x2, wh, bh, b)
         ctx.save_for_backward(x2, wh, y)
         return y.view(*x.shape[:-1], w.shape[0])
 
@@ -457,10 +523,9 @@ def fp16_linear_relu(x, w, b):
     """relu(x @ w.T + b) on the fp16 stream; requires the extension
     (callers gate on ext_ok())."""
     if not torch.is_grad_enabled():
-        wh, _ = _half_params(w, b)
+        wh, bh = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
-        y = torch.mm(x2, wh.t())
-        _load().bias_relu_(y, b.detach())
+        y = _relu_forward(x2, wh, bh, b)
         return y.view(*x.shape[:-1], w.shape[0])
     return _Fp16LinearReLU.apply(x, w, b)
 

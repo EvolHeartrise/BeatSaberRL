@@ -41,6 +41,9 @@ from fused_ln import FusedLayerNorm
 #   BEAT_NO_BIAS_FOLD=1   -> ffn.2 keeps its addmm bias epilogue
 #                            instead of folding into the next block's
 #                            fused residual+LN pass
+#   BEAT_LT_EPILOGUE=0/1  -> Linear+ReLU sites: two-pass mm+bias_relu_
+#                            vs ONE cublasLt RELU_BIAS GEMM (default 1
+#                            since 2026-09-03; the A/B: fp16_linear.py)
 import os as _os
 _NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
 _NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
