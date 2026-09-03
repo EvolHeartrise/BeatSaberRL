@@ -733,3 +733,181 @@ Dual-clip with the log-ratio clamp; value normalization T1; no value clipping; `
 7. Kept-set/full-set advantage σ ratio when filtering.
 8. Diag on kept rows when filtering.
 9. Per-position advantage variance (by t within the rollout).
+
+---
+
+### Tier 1 results — 1.4 + probe re-run (2026-09-02/03)
+
+Same pod (`194.14.47.19`, RTX 5090), code at `97af37c` (= `f4f6011`
++ 1.4). Two things: item 1.4 shipped and measured, then the 2026-08-31
+top-|A| 50% probe was re-run under the fixed normalization against a
+matched control on this pod and this code, so the four arms in the
+table are two different pods/codes but the two NEW arms differ only
+in `--adv-filter 0.5`.
+
+#### 1.4 — full-batch advantage stats under the filter (`97af37c`)
+
+When `adv_filter_on`, `a_mu`/`a_sd` are computed ONCE per update over
+the full flat `f_adv` (`adv_filter_stats`) and used in every minibatch;
+filter off keeps the per-minibatch stats. The kept/full σ ratio rides
+the once-per-update print sync as `afsd` on the `[kl]` line (C §5
+item 7); the banner says `full-batch adv norm`. No new host syncs.
+
+- **Filter-off bit-identity:** same-seed 5-update production-shape
+  runs before/after, every `update` and `[kl]` line identical to the
+  printed digit (upd 5: `acc 0.6480 return -16.910 ent 46.521 ev 0.412
+  r1 2.6e-06`, `kl 6.00e-10/1.18e-02 clipfrac 0.0000/0.1884 gnorm 0.368
+  clipc 1.000 entfull 46.547`); `ep_return(last100)` differs as it
+  always does (ring-buffer sampling). Gate **283** (279 + 4 pins).
+- **σ_kept/σ_full, measured:** 0.175 at update 1 (the untrained critic
+  makes every advantage a large negative and the top-|A| half is the
+  TIGHT cluster — the old normalization scaled that update's PG term
+  UP ×5.7, the one update where it went the other way), then 1.343 /
+  1.353 / 1.358 / 1.360 over updates 2–5, 1.385 at 10–100, **1.395 at
+  300 → 1.404 at 1068**. C §1.1's Gaussian 1.363 is right at the
+  start; the batch's tails thicken toward Laplace (1.39) as the policy
+  sharpens. The confound was real and its magnitude was predicted.
+- **Old-norm vs new-norm at update 5 (`--adv-filter 0.5`, same
+  session, same seed):** `gnorm` 0.386 → 0.580, `clipc` 1.000 →
+  0.870, last-mb clipfrac 0.123 → 0.138, k3 KL 8.6e-3 → 9.1e-3,
+  `ent` 46.476 → 46.467. (The Tier 0 "0.249 under the filter" was a
+  1-update-warmup run; the matched pair here uses the campaign's
+  `--warmup-updates 34`.)
+
+#### The re-run: recipe and ops
+
+Both arms: the 2026-08-31 argv verbatim (v38 T=32 recipe, seed 0,
+`--ckpt-every 125`) to **1068 updates** (`--total-steps 1119879168`,
+the update the old probe was paused at) with **`--warmup-updates 34`**
+— the old runs' `--total-steps 2359296000` gave warmup = round(0.015 ×
+2250) = 34, and warmup is the only thing `--total-steps` feeds on a
+trunk (constant lr after it; the ent curve is absolute-indexed), so
+this reproduces the old schedule exactly and still exits at 1068. Arm
+P (`runs/af50n_trunk`, `--adv-filter 0.5`) ran 22:10–23:41 UTC, Arm C
+(`runs/ctrl_trunk`) 23:41–01:33, chained by `/root/af50n.sh` (on the
+pod; not committed — it is the af50.sh pattern with the C leg and an
+nvidia-smi sampler). Both trunks' 9 checkpoints + logs are on the pod
+and in `~/beat-arena-volume-backup/beat-arena-af50n/` (5-min rsync
+loop, stopped after the final pull). No leaf, no bench (per brief).
+
+#### Matched-update table
+
+`ctrl-old` = `v38t32_trunk` (`beat-arena-v38t32/logs/t32_trunk.log`),
+`probe-old` = the 08-31 probe under the OLD normalization
+(`beat-arena-af50/logs/af50_trunk.log`) — both a different pod and
+pre-fp16-critic / pre-env-order / pre-uint8 code, and their logs
+predate the `[kl]` line, so `entfull`/clipfrac/KL are `–` there and
+their `ent` under the filter is KEPT-row entropy. `ctrl-new` = Arm C,
+`probe-new` = Arm P. `clipfrac`/`k3` are the last minibatch of the
+update; `afsd` = σ_kept/σ_full.
+
+| upd | arm | acc | return | ep_return(last100) | ev | ent | entfull | clipfrac | k3 KL | maxlr | afsd |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 300 | ctrl-old | 0.8325 | 2.045 | 32.6 | 0.883 | 38.61 | – | – | – | 5.3 | – |
+| 300 | probe-old | 0.8358 | 2.236 | 35.0 | 0.881 | 37.35 | – | – | – | 4.1 | – |
+| 300 | **ctrl-new** | 0.8354 | 2.067 | 43.1 | 0.890 | 38.54 | 38.51 | 0.590 | 8.4e-2 | 3.8 | – |
+| 300 | **probe-new** | 0.8324 | 1.971 | 28.2 | 0.861 | 36.31 | 36.56 | 0.590 | 8.0e-2 | 3.8 | 1.395 |
+| 500 | ctrl-old | 0.8708 | 3.651 | 75.7 | 0.958 | 33.42 | – | – | – | 4.5 | – |
+| 500 | probe-old | 0.8751 | 3.903 | 77.5 | 0.957 | 32.35 | – | – | – | 4.8 | – |
+| 500 | **ctrl-new** | 0.8752 | 3.895 | 78.3 | 0.961 | 33.75 | 33.71 | 0.566 | 7.7e-2 | 4.7 | – |
+| 500 | **probe-new** | 0.8677 | 3.913 | 87.3 | 0.953 | 30.97 | 31.32 | 0.636 | 1.07e-1 | 7.0 | 1.399 |
+| 776 | ctrl-old | 0.9009 | 4.883 | 102.3 | 0.983 | 28.14 | – | – | – | 7.5 | – |
+| 776 | probe-old | 0.9011 | 4.839 | 101.3 | 0.981 | 28.28 | – | – | – | 3.2 | – |
+| 776 | **ctrl-new** | 0.9013 | 4.815 | 97.0 | 0.981 | 28.10 | 28.07 | 0.593 | 8.8e-2 | 6.5 | – |
+| 776 | **probe-new** | 0.9053 | 4.856 | 94.6 | 0.981 | 25.86 | 26.00 | 0.606 | 9.5e-2 | 4.0 | 1.403 |
+| 1068 | ctrl-old | 0.9137 | 5.137 | 132.1 | 0.987 | 25.07 | – | – | – | 5.3 | – |
+| 1068 | probe-old | 0.9161 | 5.233 | 111.4 | 0.989 | 24.08 | – | – | – | 5.8 | – |
+| 1068 | **ctrl-new** | 0.9105 | 5.175 | 105.8 | 0.987 | 25.55 | 25.50 | 0.574 | 7.7e-2 | 8.0 | – |
+| 1068 | **probe-new** | **0.9210** | 5.244 | 117.8 | 0.989 | 22.14 | 22.37 | 0.618 | 9.8e-2 | 6.7 | 1.404 |
+
+Single-update `acc` has an update-to-update sd of 0.001–0.003, so
+the 30-update-window means are the numbers to compare: at 1068,
+**probe-new 0.9195 vs ctrl-new 0.9115 (+0.0080)**; at 776, 0.9029 vs
+0.8998 (+0.0031); at 500, 0.8664 vs 0.8720 (−0.0056); at 300, 0.8274
+vs 0.8322 (−0.0048). `ep_return(last100)` is a ±20% instrument (the
+two controls, same recipe and seed, read 132 vs 106 at 1068) and
+carries no signal here.
+
+**Wall and VRAM (this pod):**
+
+| arm | 1068 upd wall | s / 100 upd (upd 900→1000, steady) | steps/s (1068-upd total) | rollout / update s (enqueue-attributed) | peak-vram (allocator) | nvidia-smi max |
+|---|---|---|---|---|---|---|
+| ctrl-new (C) | 6,690 s | 559 | 167,408 | 3,491 / 3,168 | **12.60 GiB** | 24,242 MiB |
+| probe-new (P) | **5,493 s** | **456** | **203,864** | 3,423 / 2,039 | **12.17 GiB** | 24,222 MiB |
+
+P is **−17.9% wall** (−18.4% steady-state, +21.8% steps/s) — the
+08-31 number (−18% same-pod) reproduces exactly; the update phase
+halves (3,168 → 2,039 s; 32 vs 64 optimizer steps, the rest is the
+GAE/perm work that does not halve). Peak −0.43 GiB: with 1.2 + 1.3
+landed, C's peak is the update-phase 12.60 and P's half-size perm
+copies pull that under the 12.17 rollout peak, so P's peak IS the
+rollout. Driver-level VRAM (ranked pool 7.6 GB + env kernel) is
+identical.
+
+#### Verdict
+
+**Sample efficiency at matched updates: parity through ~700 updates,
+then a small lead for the filter.** Per-100-update mean of (P − C)
+acc: −0.005 / −0.008 / −0.004 / −0.005 / −0.005 / −0.005 / −0.003
+for updates 1–700, then +0.002 / +0.003 / +0.003 / **+0.006** for
+701–1068, i.e. the sign flips at ~700 and the lead is widening at the
+end (+0.0105 at the 1068 point, +0.0080 on the 30-update window).
+The noise floor I can measure: `ctrl-new − ctrl-old` (same recipe
+and seed, different pod and code) drifts **within ±0.004 per
+100-update window** (mean +0.0016), and the OLD probe's lead over its
+control was +0.002–0.003 from update 200 on — inside that floor. So
+the old "parity" reading held up as a null, and the new late lead is
+~2× the drift floor from ONE seed per arm with a mid-run sign flip:
+**call it "at least parity, probably slightly better late", not a
+win**. One caveat that matters for "better": P's entropy at 1068 is
+3.1 nats below C's (22.4 vs 25.5), so it is also further along the
+entropy anneal — part of the late acc lead may be the policy being
+sharper at that step rather than a better trunk; the leaf cut is the
+instrument for that and was not run. Combined with the −18% wall and
+−0.43 GiB, the filter stays in the recipe.
+
+**Did the signatures move as C §1.1 predicted?** Mixed:
+
+- **σ ratio — yes.** 1.36 predicted, 1.34–1.36 measured at updates
+  2–5 and 1.39–1.40 in steady state.
+- **Entropy — direction yes, framing no.** Removing the implicit
+  `ent_coef ×1.36` did lower the probe's entropy (P `entfull` 22.4 vs
+  the old probe's `ent` 24.1 at 1068, on a control that reads the
+  same, 25.5 vs 25.1), but the brief's expectation that P would sit
+  CLOSER to C than the old probe did is the opposite of what
+  happened: old probe − old control was −1.0 to −1.3 nats (−1.3 /
+  −1.1 / +0.1 / −1.0 at 300/500/776/1068); P − C is **−2.0 / −2.4 /
+  −2.1 / −3.1**. The old normalization's extra entropy pressure was
+  partly MASKING the filter's own entropy-lowering effect (the kept
+  rows are exactly the high-|A| states where the PG gradient is
+  strongest); with the PG term at full scale the policy sharpens
+  faster than the control on every group (spine 0.55 vs 0.69, legs
+  0.69–0.71 vs ~0.85 at 1068).
+- **Clipfrac / KL — no.** The prediction was a LOWER last-mb clipfrac
+  than the old probe's 0.25 at update 5. At update 5 it is 0.138 vs
+  0.123 (old-norm, same session). In the campaign both arms live at
+  **0.57–0.64** from update 300 on, and P is 0.00–0.07 ABOVE C with
+  k3 KL 8.0e-2 → 9.8e-2 vs C's 7.7e-2 → 8.8e-2 (+15–35%) — P moves
+  the policy further per update with half the optimizer steps, more
+  so than the old-norm probe did. In hindsight that is what full-scale
+  kept advantages must do under Adam: each kept sample carries +17%
+  per-sample signal (E|A| 0.93 vs 0.80) and the PG term's share of
+  the step rises; nothing in the fix reduces per-step movement.
+- **Grad clip (C §2.2, revisited).** Tier 0 read the 0.5 clip as an
+  inert warmup guard from `clipc` 1.000 at updates 3–5. Past update
+  ~100 it binds on essentially every step in BOTH arms: C `gnorm`
+  1.3–1.6 / `clipc` 0.32–0.39, P `gnorm` 3.0–3.6 / `clipc`
+  0.14–0.17 (P's gradient is ~2.3× C's, more than the 1.36 × 1.17 the
+  normalization alone accounts for). A uniform scale is nearly
+  invisible to Adam, so this is not a live regularizer either way,
+  but the "inert" reading was an update-≤5 artifact.
+- **Critic.** P's `ev` lags C early (0.861 vs 0.890 at 300, 0.953 vs
+  0.961 at 500) and matches from 776 on (0.981 / 0.989 vs 0.981 /
+  0.987) — the same shape the old probe showed; training the critic
+  on the top-|A| half only costs it early calibration.
+- `maxlr` carries no signal (3.8/7.0/4.0/6.7 vs 3.8/4.7/6.5/8.0).
+
+**Not done:** leaf cut and bench on either trunk (resumable from
+`trunk_upd01000.pt` / `trunk_final.pt` in both run dirs); a second
+seed, which is what the +0.008 needs before anyone calls it a win;
+C §5 item 8 (diag on kept rows) is still open.
