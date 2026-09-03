@@ -190,6 +190,27 @@ assuming full pre-swing, so per-component popups can differ on
 partial-swing cuts). Procedural-chart replays can't be converted — the
 viewer needs a real BeatSaver map to render.
 
+## Training dashboard (laptop, over the run archive)
+
+Since 2026-09-03 the trainer also writes one JSON line per update to
+`<run_dir>/metrics.jsonl` (`python/metrics_log.py`: the same host
+values as the `update` / `[kl]` / event lines, no extra sync, never
+fatal). `python/metrics_backfill.py` rebuilds the same file from every
+stdout log in `~/beat-arena-volume-backup` (all eras back to v11) and
+writes an `index.json` registry; `viz/dash/` is a Vite + Svelte + uPlot
+page over them — Live (auto-refreshing, x = samples | updates | wall),
+Compare (matched-sample small multiples, difference-vs-reference panel,
+matched-checkpoint table) and a sortable Runs table with bench/replay
+links. No backend:
+
+```bash
+python3 python/metrics_backfill.py           # metrics.jsonl + index.json
+(cd viz/dash && npm install && npm run build)
+python3 viz/dash/serve.py                    # http://127.0.0.1:8765/
+```
+
+See `viz/dash/README.md` for the field vocabulary and index schema.
+
 ## Watching replays
 
 ```bash
