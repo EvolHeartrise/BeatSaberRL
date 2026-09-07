@@ -45,7 +45,7 @@ UPDATE_FIELDS = (
     "kl_first", "kl_last", "clipfrac_first", "clipfrac_last",
     "gnorm", "clipc",
     "ent_spine", "ent_armL", "ent_armR", "ent_legL", "ent_legR",
-    "ent_min", "ent_min_head", "entfull", "afsd",
+    "ent_min", "ent_min_head", "entfull", "afsd", "clipfrac_head_last",
     # events
     "falls", "tilts", "lifts", "lifts_L", "lifts_R",
     "flail", "flail_L", "flail_R", "flail_ticks",
@@ -108,7 +108,7 @@ def update_record(update, num_updates, global_step, *, t=None,
                   fp16_scale=None, kl_first=None, kl_last=None,
                   cf_first=None, cf_last=None, gnorm=None, clipc=None,
                   ent_head=None, af_ratio=None, events=None,
-                  diag=None, ckpt=None, peak_vram=None):
+                  diag=None, ckpt=None, peak_vram=None, cfh_last=None):
     """The trainer's formatter: one per-update dict from host values.
 
     `update` is the 1-based index the `update` line prints. `events`
@@ -147,6 +147,7 @@ def update_record(update, num_updates, global_step, *, t=None,
         rec["ent_min_head"] = int(lo)
         rec["entfull"] = _num(total)
     rec["afsd"] = _num(af_ratio)
+    rec["clipfrac_head_last"] = _num(cfh_last)   # --head-clip only
     for k, v in (events or {}).items():
         if k in ("flail", "flail_L", "flail_R", "limitrest",
                  "limitrest_legs", "limitrest_spine", "limitrest_arms"):

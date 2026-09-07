@@ -101,6 +101,27 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     return loss.mean()
 
 
+def pg_loss_heads(ratio_h, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
+    """Per-head (sub-action) dual-clip PPO loss (2026-09-06, --head-clip).
+    `ratio_h` is (B, 29): each head's own pi_new/pi_old for the joint
+    it controls; `adv` (B,) is shared by every head. Each head is
+    clipped and dual-clipped on ITS ratio (Song et al. 2023,
+    arXiv:2301.10919, "sub-action loss"; the IPPO/MAPPO per-agent
+    ratio), so one head moving out of the trust region silences only
+    that head's gradient, not all 29. Reduction is SUM over heads, MEAN
+    over rows: at ratio 1 the gradient w.r.t. every head's log-prob is
+    -adv, exactly the joint-ratio loss's, so lr / ent_coef / vf_coef
+    keep their meaning (pinned by tests/test_head_clip.py)."""
+    a = adv.unsqueeze(-1)
+    pg1 = -a * ratio_h
+    pg2 = -a * torch.clamp(ratio_h, 1 - clip, 1 + clip)
+    standard = torch.max(pg1, pg2)
+    ceiling = -dual_clip_c * a
+    dual = torch.min(standard, ceiling)
+    loss = torch.where(a < 0, dual, standard)
+    return loss.sum(-1).mean()
+
+
 def adv_filter_indices(f_adv, train_n):
     """Top-advantage filter (arXiv:2606.23348 §V-E): indices of the
     train_n transitions to train on, ranked by |GAE advantage| —
@@ -179,7 +200,7 @@ def entropy_report(ent_head):
 
 
 def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
-                   af_ratio=None):
+                   af_ratio=None, cfh=None):
     """The `[kl]` diagnostic line (2026-09-02, Tier 0.3 of the 09-02
     static audit). `mb1/mbN` = first/last minibatch of THIS update, so
     the pair brackets the within-update drift over 64 optimizer steps.
@@ -190,12 +211,17 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
     minibatch's KEPT rows) and lags `ent` by one update. `af_ratio`
     (1.4, only when filtering) is sd(kept advantages) / sd(all), the
     measured size of the normalization confound C §1.1 predicted at
-    ~1.36 — printed as `afsd`."""
+    ~1.36 — printed as `afsd`. `cfh` (--head-clip only) is the
+    per-head clipfrac of the last minibatch: the share of (row, head)
+    pairs with |r_h - 1| > CLIP, i.e. the gradient actually silenced
+    under per-head clipping, printed as `cfh` next to the joint
+    clipfrac (which under --head-clip is a pure diagnostic)."""
     groups, lo, lo_v, total = entropy_report(ent_head)
     gs = "  ".join(f"{nm} {v:.3f}" for nm, v in groups)
     af = "" if af_ratio is None else f"  afsd {af_ratio:.3f}"
+    ch = "" if cfh is None else f"  cfh {cfh:.4f}"
     return (f"[kl] upd {update:>3}  kl(mb1/mbN) {klf:.2e}/{kll:.2e}"
-            f"  clipfrac {cff:.4f}/{cfl:.4f}"
+            f"  clipfrac {cff:.4f}/{cfl:.4f}{ch}"
             f"  gnorm {gnorm:.3f}  clipc {clipc:.3f}"
             f"  ent/head {gs}  min {lo_v:.3f} (h{lo})"
             f"  entfull {total:.3f}{af}")
@@ -261,6 +287,20 @@ def parse_args():
                    help="fraction of the rollout batch to train on, "
                         "selected by |advantage| rank (1.0 = off). "
                         "Rounded to a whole number of minibatches")
+    # Per-head clipping (2026-09-06, user): the joint 29-head product
+    # ratio makes CLIP=0.2 bind at a ~0.6% per-head change (0.2/29 in
+    # log space), and one head leaving the trust region zeroes the
+    # gradient of all 29 (clipfrac 0.43 on the last minibatch of the
+    # 09-03 T=64 run). With per-head ratios each head is clipped on its
+    # own pi_new/pi_old (pg_loss_heads). Costs a (T, N, 29) fp32
+    # per-head log-prob buffer (+243 MB at 32768x64) and its perm copy.
+    p.add_argument("--head-clip", action="store_true",
+                   help="clip each of the 29 action heads on its OWN "
+                        "probability ratio (sub-action PPO loss, "
+                        "arXiv:2301.10919) instead of the joint product "
+                        "ratio; kl/clipfrac on the [kl] line stay the "
+                        "joint diagnostics, `cfh` adds the per-head "
+                        "clipfrac")
     p.add_argument("--z-clip-hi", type=float, default=12.0,
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
@@ -698,6 +738,10 @@ def main():
     kl_last = torch.zeros((), device=device)
     cf_first = torch.zeros((), device=device)
     cf_last = torch.zeros((), device=device)
+    # --head-clip: per-head clipfrac of the last minibatch (share of
+    # (row, head) pairs outside 1 +/- CLIP); stays 0 otherwise
+    cfh_last = torch.zeros((), device=device)
+    head_clip = bool(args.head_clip)
     # 1.4 / C §5 item 7: sd(kept adv) / sd(full adv) when filtering,
     # written once per update by adv_filter_stats, read at the sync.
     af_ratio = torch.zeros((), device=device)
@@ -990,6 +1034,9 @@ def main():
     # needs a long index). Bit-identical.
     b_act = torch.zeros((T, N, A_DIM), dtype=torch.uint8, device=device)
     b_logp = torch.zeros((T, N), device=device)
+    # --head-clip: the 29 per-head old log-probs (their sum IS b_logp)
+    b_logp_h = (torch.zeros((T, N, A_DIM), device=device)
+                if head_clip else None)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
     # row T holds the bootstrap value: b_val[1:] IS the shifted value
@@ -1206,10 +1253,14 @@ def main():
                 # computed on the side stream and `v` is NOT readable
                 # until policy.critic_join() below (a no-op otherwise)
                 a, logp, _, v = policy.get_action_and_value(
-                    obs, need_entropy=(t == 0), critic_async=True)
+                    obs, need_entropy=(t == 0), critic_async=True,
+                    head_logp=head_clip)
             if t == 0:
                 torch.mean(policy._ent_h, dim=0, out=ent_head)
                 policy._ent_h = None
+            if head_clip:
+                b_logp_h[t] = logp
+                logp = logp.sum(-1)
             b_act[t], b_logp[t] = a, logp
             if v is None:
                 # BEAT_CRITIC_LATE probe only: enqueue the deferred
@@ -1346,6 +1397,7 @@ def main():
         f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, A_DIM)
         f_logp = b_logp.reshape(-1)
+        f_logp_h = b_logp_h.reshape(-1, A_DIM) if head_clip else None
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
 
@@ -1382,13 +1434,19 @@ def main():
             dn = min(2048, batch)
             policy._diag_stash = True
             _, dlogp, _, dval = policy.get_action_and_value(
-                f_obs[:dn], f_act[:dn], need_entropy=False)
+                f_obs[:dn], f_act[:dn], need_entropy=False,
+                head_logp=head_clip)
             policy._diag_stash = False
-            dratio = (dlogp - f_logp[:dn]).clamp(
-                max=LOG_RATIO_CLAMP).exp()
             da = f_adv[:dn]
             da = (da - da.mean()) / (da.std() + 1e-8)
-            d_pg = pg_loss_fn(dratio, da)
+            if head_clip:   # the same loss the update uses
+                dratio = (dlogp - f_logp_h[:dn]).clamp(
+                    max=LOG_RATIO_CLAMP).exp()
+                d_pg = pg_loss_heads(dratio, da)
+            else:
+                dratio = (dlogp - f_logp[:dn]).clamp(
+                    max=LOG_RATIO_CLAMP).exp()
+                d_pg = pg_loss_fn(dratio, da)
             d_v = 0.5 * ((dval - (f_ret[:dn] - ret_mu) / ret_sig)
                          ** 2).mean()
             dscale = fp16_scale if fp16_update else 1.0
@@ -1470,6 +1528,7 @@ def main():
                 perm = keep_idx[perm]
             p_obs, p_act = f_obs[perm], f_act[perm]
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
+            p_logp_h = f_logp_h[perm] if head_clip else None
             for s in range(0, train_n, mb_size):
                 # advantage stats over the FULL minibatch so --mb-accum
                 # K>1 is the same math as K=1 (each micro loss is a
@@ -1507,8 +1566,19 @@ def main():
                 for j in range(args.mb_accum):
                     sl = slice(s + j * micro, s + (j + 1) * micro)
                     _, newlogp, entropy, newval = \
-                        policy.get_action_and_value(p_obs[sl], p_act[sl])
-                    logratio = newlogp - p_logp[sl]
+                        policy.get_action_and_value(p_obs[sl], p_act[sl],
+                                                    head_logp=head_clip)
+                    if head_clip:
+                        # per-head log-ratios drive the loss; their sum
+                        # is the joint log-ratio the kl / clipfrac /
+                        # overflow diagnostics below keep reading, so
+                        # the [kl] line stays comparable across modes
+                        logratio_h = newlogp - p_logp_h[sl]
+                        ratio_h = logratio_h.clamp(
+                            max=LOG_RATIO_CLAMP).exp()
+                        logratio = logratio_h.sum(-1)
+                    else:
+                        logratio = newlogp - p_logp[sl]
                     ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
                     if fp16_update:
                         # overflow forensics (device-side, read at the
@@ -1533,6 +1603,12 @@ def main():
                                 cf_t.zero_()
                             kl_t.add_(kl_m, alpha=1.0 / args.mb_accum)
                             cf_t.add_(cf_m, alpha=1.0 / args.mb_accum)
+                        if head_clip and kl_slots[-1][1] is cf_last:
+                            cfh_m = ((ratio_h.detach() - 1.0).abs()
+                                     > CLIP).to(r_m1.dtype).mean()
+                            if j == 0:
+                                cfh_last.zero_()
+                            cfh_last.add_(cfh_m, alpha=1.0 / args.mb_accum)
                     if fp16_update and ep_i == 0 and s == 0 and j == 0:
                         # "same policy" fixed point: |ratio-1| at epoch
                         # 1 measures rollout/update precision
@@ -1540,7 +1616,8 @@ def main():
                         # per-update print sync)
                         ratio_diag = (ratio - 1.0).abs().mean().detach()
                     a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
-                    pg_loss = pg_loss_fn(ratio, a_mb)
+                    pg_loss = (pg_loss_heads(ratio_h, a_mb) if head_clip
+                               else pg_loss_fn(ratio, a_mb))
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
                     v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
@@ -1647,7 +1724,7 @@ def main():
         # last micro's action slice — a VIEW of p_act, which would keep
         # that storage alive through the del (measured: +0.23 GiB
         # resident at the next rollout start without it).
-        del p_obs, p_act, p_logp, p_adv, p_ret, perm, _
+        del p_obs, p_act, p_logp, p_logp_h, p_adv, p_ret, perm, _
         if adv_filter_on:
             del keep_idx
         if fp16_update:
@@ -1783,11 +1860,12 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio]),
+                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last]),
                 ent_head]).tolist()
             (ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v,
-             klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v, af_v) = _d[:14]
-            eh_v = _d[14:]
+             klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v, af_v,
+             cfh_v) = _d[:15]
+            eh_v = _d[15:]
             logr_max.zero_()
             gnorm_sum.zero_()
             clipc_sum.zero_()
@@ -1808,7 +1886,8 @@ def main():
                   f"{elapsed:6.1f}s{extra}", flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
-                                 af_v if adv_filter_on else None),
+                                 af_v if adv_filter_on else None,
+                                 cfh_v if head_clip else None),
                   flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
@@ -1818,11 +1897,11 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio]),
+                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last]),
                 ent_head]).tolist()
             (ent_v, ev_v, ret_v, klf_v, kll_v, cff_v, cfl_v,
-             gn_v, cc_v, af_v) = _d[:10]
-            eh_v = _d[10:]
+             gn_v, cc_v, af_v, cfh_v) = _d[:11]
+            eh_v = _d[11:]
             gnorm_sum.zero_()
             clipc_sum.zero_()
             opt_steps = 0
@@ -1834,7 +1913,8 @@ def main():
                   flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
-                                 af_v if adv_filter_on else None),
+                                 af_v if adv_filter_on else None,
+                                 cfh_v if head_clip else None),
                   flush=True)
 
         m_ckpt = m_vram = None
@@ -1882,7 +1962,8 @@ def main():
             fp16_scale=scale_v if fp16_update else None,
             kl_first=klf_v, kl_last=kll_v, cf_first=cff_v, cf_last=cfl_v,
             gnorm=gn_v, clipc=cc_v, ent_head=eh_v,
-            af_ratio=af_v if adv_filter_on else None, events=m_ev,
+            af_ratio=af_v if adv_filter_on else None,
+            cfh_last=cfh_v if head_clip else None, events=m_ev,
             diag=m_diag, ckpt=m_ckpt, peak_vram=m_vram)
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)

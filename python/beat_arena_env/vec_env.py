@@ -72,8 +72,11 @@ class BeatVecEnv:
     def pop_flail(self):
         """env v19 flail telemetry — CUDA-backend-only; this Rust-backed
         wrapper reports zeros so the trainer's [flail] line degrades
-        gracefully instead of branching on backend."""
-        return 0.0, 0
+        gracefully instead of branching on backend. Per-hand (L, R,
+        ticks) since the CUDA contract went per-hand on 2026-08-20 —
+        the 2-tuple stub had broken the rust-backend trainer path
+        (found 2026-09-06 by the --head-clip CPU smoke)."""
+        return 0.0, 0.0, 0
 
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
