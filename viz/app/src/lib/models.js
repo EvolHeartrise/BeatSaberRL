@@ -24,9 +24,8 @@
 //   blade    Saber.fbx "Blade" ×0.5 import, prefab z −0.08: r 0.018,
 //            z ∈ [0, 1.0] along the hand's +z (scene −z)
 //   handle   Saber.fbx "Handle": z ∈ [−0.16, 0] (behind the grip)
-//   headset  Headset.fbx at the scene's 0.35 scale: 0.29 m wide, pivot
-//            at the HMD tracking point, visor 0.094 m ahead, straps
-//            0.27 m behind
+// (The watch viewer's Headset.fbx was baked too and then removed on
+// 2026-09-06 by user request — the skeleton's head sphere stands alone.)
 import * as THREE from "three";
 import data from "./models.data.js";
 
@@ -44,7 +43,7 @@ function build(part) {
 
 export const PART_NAMES = [
   "note", "arrow", "dot", "chainHead", "chainLink", "linkDot", "bomb",
-  "blade", "handle", "headset",
+  "blade", "handle",
 ];
 
 // geometries built once per page (module scope), shared by every instance
@@ -121,8 +120,6 @@ export function noteColors(color) {
 
 // Bomb.mat: base (0.1415 gray), smoothness 0.95, fresnel rim.
 export const BOMB_COLOR = "#242424";
-// Headset.mat base (0.53 gray), smoothness 0.
-export const HEADSET_COLOR = "#878787";
 // Wall.mat: (1, 0.184, 0.184) at alpha 0.5; WallEdges emission 3.
 export const WALL_COLOR = "#ff2f2f", WALL_ALPHA = 0.5;
 

@@ -248,8 +248,9 @@ glyph (in the half away from the swing, apex past centre) and dot, the
 chain head (the note minus its swing-side portion, flat face toward the
 links) and 0.5 × 0.087 m links with their dots, the spiked bomb (~0.65 m
 over the spikes), the saber blade (r 0.018, 1 m) with its 0.16 m handle
-behind the grip, and the headset (0.29 m wide) on the head frame, plus
-ScoreSaber's default note colours and glyph colour rules. Meshes are
+behind the grip (the watch headset model was tried and removed the
+same day — the skeleton's head stays bare), plus ScoreSaber's default
+note colours and glyph colour rules. Meshes are
 baked from the watch clone's `Assets/Models` (Unity import scale, prefab
 child transforms and scene scale applied; Unity's x negation on FBX
 import + our z mirror) into `viz/app/src/lib/models.data.js` by

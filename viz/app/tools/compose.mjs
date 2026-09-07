@@ -19,7 +19,8 @@ const parts = {
   bomb:     { src: "bomb" },
   blade:    { src: "blade", pos: [0, 0, -0.08] },
   handle:   { src: "handle", pos: [0, 0, -0.08] },
-  headset:  { src: "headset", scale: [0.35, 0.35, 0.35] },
+  // headset (Player/Headset.fbx, scene scale 0.35) deliberately not baked
+  // since 2026-09-06 — the viewer shows the bare skeleton head
 };
 const out = {};
 let total = 0;
