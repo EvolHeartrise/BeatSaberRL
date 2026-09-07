@@ -42,3 +42,39 @@ mirroring this code exactly. Load-bearing files, all under
   loads as a replay directly (file open / drag-drop); the map is then
   fetched from BeatSaver via the hash in `levelID`
   (`custom_level_<HASH>`).
+
+## Models (2026-09-06) — embedded in our replay viewer
+
+`viz/app/src/lib/models.data.js` carries these meshes from the full
+clone's `Assets/Models` (not vendored here — see the clone path above),
+converted with headless Blender 5.0.1 (`viz/app/tools/export.py`, which
+dumps the raw mesh coordinates so Blender's FBX unit scale on the object
+is ignored exactly as Unity's `useFileScale: 0` ignores it) and composed
+by `viz/app/tools/compose.mjs`. Every visual size in our viewer follows
+the watch scene, which is the canonical reference. Transform ledger
+(Unity metres; then scene-local = Unity with x negated on import and z
+mirrored, i.e. a 180° rotation about y, so winding is preserved):
+
+| part | source | import scale | prefab / scene transform | result |
+|---|---|---|---|---|
+| note | `Objects/Cube.fbx` "Cube" | 1 | Note.prefab root, identity | ±0.25 m beveled cube |
+| arrow | `Objects/Note.fbx` "Arrow" | 0.25 | Note.prefab "Arrow": scale 2, rot z +90°, z −0.238 | triangle 0.309 wide, y ∈ [0.055, 0.152], z ∈ [0.238, 0.253] |
+| dot | `Objects/Note.fbx` "Dot" | 0.25 | Note.prefab "Dot": scale (0.35, 0.35, 1), z −0.215 | disc ø 0.175, z ∈ [0.215, 0.255] |
+| chainHead | `Objects/ChainHead.fbx` | 1 | via NoteHandler.SetMesh | y ∈ [−0.0435, 0.25], x/z ±0.25 |
+| chainLink | `Objects/ChainLink.fbx` | 1 | ChainLink.prefab root | 0.5 × 0.087 × 0.5 |
+| linkDot | `Objects/Note.fbx` "Dot" | 0.25 | ChainLink.prefab "Dot": scale (0.075, 0.075, 0.5), rot z +90°, z −0.235 | ø 0.0375 |
+| bomb | `Objects/Bomb.obj` | 1 | Bomb.prefab root | axis extent 0.32, spikes to r 0.345 |
+| blade | `Player/Saber.fbx` "Blade" | 0.5 | Saber.prefab "Blade": z −0.08 | r 0.018, z ∈ [0, 1.0] |
+| handle | `Player/Saber.fbx` "Handle" | 0.5 | Saber.prefab "Handle": z −0.08 | z ∈ [−0.16, 0] |
+| headset | `Player/Headset.fbx` | 1 | Previewer.unity "Headset": scale 0.35 under Player | 0.291 wide, visor +0.094, straps −0.272 |
+
+Note.prefab's cube is `Cube.fbx`; `Note.fbx`'s "Bloq" object is unused
+by the prefab (only its Arrow/Dot children are). Direction convention:
+`ObjectManager.DirectionAngles` = {up 180, down 0, left −90, right 90,
+…}, rotation applied as `AngleAxis(angle, forward)` — identical to our
+note frame's `angle − 270°` roll, so the baked glyphs need no extra
+roll. Colours: `ColorManager` defaults left (200, 20, 20) / right
+(40, 142, 210); `NoteManager.GetMaterialColors` with the scene's
+noteEmission 0.15, arrowSaturation 0.05, arrowBrightness 0.75,
+arrowGlowSaturation 0.5, arrowEmission 1.5; Bomb.mat base 0.1415 gray;
+Headset.mat base 0.53 gray; Wall.mat (1, 0.184, 0.184) α 0.5.

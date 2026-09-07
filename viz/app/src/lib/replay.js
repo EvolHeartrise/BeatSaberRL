@@ -57,9 +57,12 @@ export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 // object kinds (chart entry `kind`)
 export const KIND_NOTE = 0, KIND_BOMB = 1, KIND_CHAIN_HEAD = 2,
   KIND_CHAIN_LINK = 3;
-export const BOMB_RADIUS = 0.2; // visual (collision radius is 0.18)
-export const LINK_W = 0.4, LINK_H = 0.13, LINK_D = 0.13; // link slab visual
-export const HEAD_SQUASH = 0.5; // chain heads are ~half-height cubes
+// Visual sizes follow ScoreSaber's replay viewer models (src/lib/models.js
+// is the authority): bomb axis extent 0.324, spikes to r 0.345 (collision radius stays
+// 0.18), chain link 0.5 x 0.087 x 0.5 slab, chain head = the note minus
+// its swing-side portion (y in [-0.0435, 0.25] of the note frame).
+export const BOMB_RADIUS = 0.324;
+export const LINK_W = 0.5, LINK_H = 0.087, LINK_D = 0.5;
 
 // real-BS hitbox sizes (for the optional 'h' wireframe overlay). Since
 // env v7.4 hitboxes ROTATE with the object about the approach (z) axis
@@ -411,6 +414,8 @@ export function mirrorQ29(q) {
   return out;
 }
 
+// UI palette (HUD text, gauges, trails). The 3D objects use ScoreSaber's
+// default note colours instead — NOTE_COLORS in models.js.
 export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";

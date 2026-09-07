@@ -11,6 +11,7 @@
     F_R_HAND, F_R_SHANK, F_R_THIGH, F_R_FOOT, F_R_WRIST,
     SABER_DARK, framePoint,
   } from "./replay.js";
+  import { HEADSET_COLOR, modelGeo } from "./models.js";
 
   let { fk } = $props();
 
@@ -80,6 +81,12 @@
       shankGeo, LIMB],
   ]);
   const head = $derived(toScene(fk.p[F_HEAD]));
+  // the watch viewer's Headset.fbx at its scene scale (0.35: 0.29 m
+  // wide), pivot on the head frame's origin — the position the .dat
+  // export writes as the HMD pose — oriented by the head frame (its +z
+  // is the gaze, scene -z is the visor side of the model)
+  const headsetGeo = modelGeo("headset");
+  const headQuat = $derived(rotQuatScene(fk.r[F_HEAD]));
   const fists = $derived([0, 1].map((s) =>
     toScene(framePoint(fk, s === 0 ? F_L_HAND : F_R_HAND, [0, 0, 0.06]))));
   // feet: boxes at the §1.2 dims, oriented by the foot frames (at the
@@ -101,10 +108,14 @@
   <T.MeshStandardMaterial color={TRUNK} />
 </T.Mesh>
 
-<!-- head sphere (welded to the chest) -->
+<!-- head sphere (welded to the chest) wearing the headset model -->
 <T.Mesh position={[head.x, head.y, head.z]}>
   <T.SphereGeometry args={[0.09, 18, 14]} />
   <T.MeshStandardMaterial color={TRUNK} />
+</T.Mesh>
+<T.Mesh geometry={headsetGeo} position={[head.x, head.y, head.z]}
+  quaternion={headQuat}>
+  <T.MeshStandardMaterial color={HEADSET_COLOR} roughness={0.85} />
 </T.Mesh>
 
 <!-- fists -->
