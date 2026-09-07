@@ -803,13 +803,16 @@ class NotePolicy(nn.Module):
         return list(logits.unbind(1)), value
 
     def get_action_and_value(self, obs, action=None, need_entropy=True,
-                             critic_async=False):
+                             critic_async=False, head_logp=False):
         """need_entropy=False skips the entropy reduction (~5 kernels)
         for callers that discard it — the rollout and the GAE bootstrap.
         No RNG is consumed by entropy, so the sampling stream is
         untouched either way (2026-07-28). critic_async: see
         forward_stacked — the caller must critic_join() before reading
-        the value."""
+        the value. head_logp=True (2026-09-06, per-head clipping)
+        returns the (B, 29) PER-HEAD log-probs instead of their sum;
+        `.sum(-1)` of it is bit-identical to the default return (it is
+        the same gather, minus the same reduction)."""
         logits, value = self.forward_stacked(obs, critic_async=critic_async)
         logsm = torch.log_softmax(logits, dim=-1)
         probs = None
@@ -829,7 +832,9 @@ class NotePolicy(nn.Module):
             # Tier 1.3); gather needs an int64 index. Exact (integers),
             # (B, 29) — a tiny per-micro-batch cast.
             action = action.long()
-        logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
+        logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+        if not head_logp:
+            logprob = logprob.sum(-1)
         entropy = None
         if need_entropy:
             if probs is None:
