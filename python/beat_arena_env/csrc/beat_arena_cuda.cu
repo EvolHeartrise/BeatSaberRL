@@ -4721,9 +4721,13 @@ __device__ void store_state(const Dyn<T>& __restrict__ d, const Sim<T>& P,
 // Reset env e to the neutral state with a fresh chart (kernel phase E).
 
 // env v38 crouch ladder: (spine_p, hip_p, knee, ankle_p) f64 radians,
-// knee 0.3..1.5; root y 0.921..0.699. Values from the balance search
+// knee 0.3..2.1; root y 0.921..0.393. Values from the balance search
 // (c1/c2/c4 synergy params) — regenerate with gen_crouch_table.py.
-#define N_CROUCH 7
+// 2026-09-06: rows 8-10 (knee 1.7/1.9/2.1, spine-leaning, chest tilt
+// <= 32 deg) take the head to 1.30/1.23/1.06 m so the deep end of the
+// ladder clears the 1.20 m forced-duck wall bottom. Mirrors
+// constants.CROUCH_START_ROWS verbatim (test_crouch_table pins it).
+#define N_CROUCH 10
 __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
     {-0.03, 0.10499999999999998, 0.3, 0.195},
     {-0.05, 0.325, 0.5, 0.175},
@@ -4732,6 +4736,9 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
     {0.0, 0.605, 1.1, 0.49500000000000005},
     {0.0, 0.6891347618019847, 1.3, 0.6108652381980153},
     {0.15000000000000002, 0.8891347618019847, 1.5, 0.6108652381980153},
+    {0.51, 1.0891347618019847, 1.7, 0.6108652381980153},
+    {0.475, 1.3399999999999999, 1.9, 0.56},
+    {0.525, 1.7850000000000001, 2.1, 0.315},
 };
 template <typename T>
 __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,

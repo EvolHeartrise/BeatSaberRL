@@ -383,11 +383,18 @@ def joint_limits(hand):
 # env v38 crouch-rich start ladder (user, 2026-08-24): (spine_p,
 # hip_p, knee, ankle_p) f64 radians, mirrored VERBATIM in the .cu
 # CROUCH_ROWS (parity-bound literals). Physics-validated squat
-# synergy: each row's supported-survival under the probe controller
-# >= the standing reset's own 21/60; root y 0.921 -> 0.699. Reset
-# lerps adjacent rows for continuous depth, jitter applies on top,
-# sole-corner drop grounds the pose. Regenerate:
-# scratchpad/gen_crouch_table.py.
+# synergy; root y 0.921 -> 0.699 over rows 1-7. Reset lerps adjacent
+# rows for continuous depth, jitter applies on top, sole-corner drop
+# grounds the pose. 2026-09-06 (user): rows 8-10 (knee 1.7/1.9/2.1)
+# extend the ladder to head 1.304/1.227/1.064 m — the deep end clears
+# the 1.20 m forced-duck wall bottom (the T=64 duck study found the
+# policy never crouches; these spawns put crouched states in the data).
+# Rows 8-10 lean the spine (c2 0.25-0.3) with chest tilt capped at 32
+# deg (8 deg under the TILT termination); balance under the probe
+# controller (sup 9-11 / coast 4-8 of 60/40) equals the shipped knee-1.5
+# row (11/9), which is the effective acceptance rule (the 08-24 rows
+# measure 11-42 supported today, not the >= 55 the generator once
+# claimed). Regenerate: gen_crouch_table.py.
 CROUCH_START_ROWS = (
     (-0.03, 0.10499999999999998, 0.3, 0.195),
     (-0.05, 0.325, 0.5, 0.175),
@@ -396,4 +403,7 @@ CROUCH_START_ROWS = (
     (0.0, 0.605, 1.1, 0.49500000000000005),
     (0.0, 0.6891347618019847, 1.3, 0.6108652381980153),
     (0.15000000000000002, 0.8891347618019847, 1.5, 0.6108652381980153),
+    (0.51, 1.0891347618019847, 1.7, 0.6108652381980153),
+    (0.475, 1.3399999999999999, 1.9, 0.56),
+    (0.525, 1.7850000000000001, 2.1, 0.315),
 )
