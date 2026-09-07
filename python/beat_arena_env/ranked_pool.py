@@ -28,8 +28,10 @@ windows OVERLAP by exactly the lead gap (2026-09-06, user), the kept
 ranges [k*stride + lead_s, k*stride + seg_len) tile song time from
 lead_s on with no holes: every note past lead_s lands in exactly one
 window. Before this the stride equalled seg_len and the lead gaps were
-holes — 5.77% of the catalog's scoreable notes (373,887 of 6,476,219,
-measured 2026-09-06) were in no training window at all. The last
+holes — at the default lead 1.5 s that is 5.77% of the catalog's
+scoreable notes (373,887 of 6,476,219); the 2026-08/09 campaigns ran
+--lead-s 0.5, where the holes held 1.94% (125,768 notes). Measured
+2026-09-06. The last
 window is whatever is left: its content runs from lead_s to
 (last note - base), median ~15 s, and the episode ends at
 last_hit + tail, not at seg_len. Windows with < MIN_SCOREABLE
@@ -78,7 +80,8 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     # per object, so the v5 caches convert but are simply not reused)
     # v7: 2026-09-06 — window stride = seg_len - lead_s (overlap by the
     # lead gap): every note past lead_s is in exactly one window; the
-    # v6 pools had 5.77% of scoreable notes in no window
+    # v6 pools had 5.77% (lead 1.5) / 1.94% (lead 0.5) of scoreable
+    # notes in no window
     key = hashlib.sha1(
         (f"{seg_len:g}_{ver}_v7_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
