@@ -89,11 +89,6 @@ const [hmn, hmx] = modelBBox("handle");
 near(hmn[2], 0.0, 1e-3, "handle starts at the grip");
 near(HANDLE_LEN, 0.16, 1e-3, "handle length");
 
-const [hsmn, hsmx] = modelBBox("headset");
-near(hsmx[0] - hsmn[0], 0.2914, 1e-3, "headset width (0.35 scene scale)");
-near(hsmn[2], -0.094, 1e-3, "visor ahead of the pivot (scene -z)");
-near(hsmx[2], 0.2724, 1e-3, "straps behind the pivot");
-
 // ---- colours ---------------------------------------------------------------
 assert.deepEqual(NOTE_COLORS, ["#c81414", "#288ed2"]);
 for (const c of [0, 1]) {

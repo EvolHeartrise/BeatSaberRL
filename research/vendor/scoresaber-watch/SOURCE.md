@@ -66,7 +66,7 @@ mirrored, i.e. a 180° rotation about y, so winding is preserved):
 | bomb | `Objects/Bomb.obj` | 1 | Bomb.prefab root | axis extent 0.32, spikes to r 0.345 |
 | blade | `Player/Saber.fbx` "Blade" | 0.5 | Saber.prefab "Blade": z −0.08 | r 0.018, z ∈ [0, 1.0] |
 | handle | `Player/Saber.fbx` "Handle" | 0.5 | Saber.prefab "Handle": z −0.08 | z ∈ [−0.16, 0] |
-| headset | `Player/Headset.fbx` | 1 | Previewer.unity "Headset": scale 0.35 under Player | 0.291 wide, visor +0.094, straps −0.272 |
+| (headset) | `Player/Headset.fbx` | 1 | Previewer.unity "Headset": scale 0.35 under Player | 0.291 wide, visor +0.094, straps −0.272 — baked, then REMOVED from the viewer 2026-09-06 (user request); ledger kept for reference |
 
 Note.prefab's cube is `Cube.fbx`; `Note.fbx`'s "Bloq" object is unused
 by the prefab (only its Arrow/Dot children are). Direction convention:
