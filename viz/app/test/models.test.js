@@ -113,3 +113,49 @@ for (const c of [0, 1]) {
 }
 
 console.log(`models OK: ${PART_NAMES.length} parts`);
+
+// ---- cut debris: slicing the real models ------------------------------------
+import { sliceGeometry } from "../src/lib/models.js";
+function volume(g) { // signed volume of a closed non-indexed triangle soup
+  const p = g.attributes.position; let v = 0;
+  for (let t = 0; t < p.count; t += 3) {
+    const a = [p.getX(t), p.getY(t), p.getZ(t)], b = [p.getX(t + 1), p.getY(t + 1), p.getZ(t + 1)],
+      c = [p.getX(t + 2), p.getY(t + 2), p.getZ(t + 2)];
+    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
+  }
+  return v;
+}
+function indexedVolume(g) {
+  const p = g.attributes.position, idx = g.index.array; let v = 0;
+  for (let t = 0; t < idx.length; t += 3) {
+    const [i, j, k] = [idx[t], idx[t + 1], idx[t + 2]];
+    const a = [p.getX(i), p.getY(i), p.getZ(i)], b = [p.getX(j), p.getY(j), p.getZ(j)], c = [p.getX(k), p.getY(k), p.getZ(k)];
+    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
+  }
+  return v;
+}
+for (const part of ["note", "chainHead"]) {
+  const g = modelGeo(part), vol = indexedVolume(g);
+  assert.ok(vol > 0, `${part} is a closed outward-wound solid (vol ${vol})`);
+  for (const [p, n] of [[[0, 0, 0], [1, 0, 0]], [[0.05, -0.02, 0.1], [0.3, 1, 0.2]], [[0, 0.1, 0], [0, 1, 0]]]) {
+    const sides = sliceGeometry(g, p, n);
+    assert.ok(sides && sides.length === 2, `${part} slice ${n}`);
+    const [A, B] = sides;
+    assert.equal(A.sign, -1); assert.equal(B.sign, 1);
+    const va = volume(A.geo), vb = volume(B.geo);
+    assert.ok(va > 0 && vb > 0, `${part} halves closed (${va}, ${vb})`);
+    near(va + vb, vol, vol * 1e-3, `${part} halves sum to the whole`);
+    // every vertex on its own side of the plane
+    const nl = Math.hypot(...n);
+    for (const [S, sgn] of [[A, -1], [B, 1]]) {
+      const q = S.geo.attributes.position;
+      for (let i = 0; i < q.count; i++) {
+        const d = ((q.getX(i) - p[0]) * n[0] + (q.getY(i) - p[1]) * n[1] + (q.getZ(i) - p[2]) * n[2]) / nl;
+        assert.ok(d * sgn >= -1e-4, `${part} vertex on the wrong side (${d})`);
+      }
+    }
+  }
+  // a plane that misses the mesh -> null
+  assert.equal(sliceGeometry(g, [0, 5, 0], [0, 1, 0]), null, `${part} miss`);
+}
+console.log("slice OK");
