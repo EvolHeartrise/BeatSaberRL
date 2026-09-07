@@ -9,7 +9,25 @@ import { existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
 
-const EDGE = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+// browser binary: $PUPPETEER_EXECUTABLE_PATH, else Edge on the Windows
+// box, else the Chrome that `npx puppeteer browsers install chrome` put
+// under ~/.cache/puppeteer (Linux laptop)
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
+function findBrowser() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  const edge = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+  if (existsSync(edge)) return edge;
+  const root = resolve(homedir(), ".cache/puppeteer/chrome");
+  if (existsSync(root)) {
+    for (const v of readdirSync(root).sort().reverse()) {
+      const p = resolve(root, v, "chrome-linux64/chrome");
+      if (existsSync(p)) return p;
+    }
+  }
+  throw new Error("no browser found: set PUPPETEER_EXECUTABLE_PATH");
+}
+const EDGE = findBrowser();
 const dist = resolve("dist/index.html");
 const replay = resolve(process.argv[2] ??
   "../../python/replays/v10_scripted_ep00_seed0.jsonl");
@@ -24,7 +42,10 @@ mkdirSync("test/out", { recursive: true });
 const browser = await puppeteer.launch({
   executablePath: EDGE,
   headless: true,
-  args: ["--use-angle=swiftshader", "--disable-gpu-sandbox"],
+  // --no-sandbox: Ubuntu 24.04's AppArmor blocks Chrome's user-namespace
+  // sandbox for unprivileged users; this only ever loads our own local
+  // file, so the sandbox buys nothing here
+  args: ["--use-angle=swiftshader", "--disable-gpu-sandbox", "--no-sandbox"],
 });
 try {
   const page = await browser.newPage();

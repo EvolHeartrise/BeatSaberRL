@@ -241,6 +241,26 @@ Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
 q36 export. Non-"v10" replays are rejected — re-record from a current
 checkpoint.
 
+Since 2026-09-06 the objects are the REAL Beat Saber models as
+ScoreSaber's replay viewer renders them — the canonical reference for
+every visual size: the 0.5 m beveled note cube with the game's triangle
+glyph (in the half away from the swing, apex past centre) and dot, the
+chain head (the note minus its swing-side portion, flat face toward the
+links) and 0.5 × 0.087 m links with their dots, the spiked bomb (~0.65 m
+over the spikes), the saber blade (r 0.018, 1 m) with its 0.16 m handle
+behind the grip, and the headset (0.29 m wide) on the head frame, plus
+ScoreSaber's default note colours and glyph colour rules. Meshes are
+baked from the watch clone's `Assets/Models` (Unity import scale, prefab
+child transforms and scene scale applied; Unity's x negation on FBX
+import + our z mirror) into `viz/app/src/lib/models.data.js` by
+`viz/app/tools/export.py` (headless Blender 5.0) and `compose.mjs`;
+`viz/app/src/lib/models.js` builds the geometries and colours and
+`test/models.test.js` pins the reference sizes. The transform ledger is
+in `research/vendor/scoresaber-watch/SOURCE.md` ("Models"). GPL-3.0
+applies to the embedded meshes: `replay.html` is internal tooling; keep
+any redistribution GPL-compatible. `test/closeup-probe.mjs` screenshots
+the built viewer at chosen ticks for eyeballing.
+
 Reference points (env v10 P6 scripted bot — gravity-compensated
 PD-over-IK on the dynamic body; 5 eps each, gears 5, seeds 0-4,
 2026-07-31): easy (right-only, default dials) **36.4%** good cuts /

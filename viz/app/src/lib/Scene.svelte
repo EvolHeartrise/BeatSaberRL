@@ -17,6 +17,7 @@
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
   import BodyGauges from "./BodyGauges.svelte";
+  import { modelGeo } from "./models.js";
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {
@@ -88,7 +89,9 @@
   // held undisposed — every frame the flash is alive)
   const contactGeo = new THREE.SphereGeometry(1, 12, 8);
 
-  // pose-mode reference note: a static cube at a chosen cell, z = 0.
+  // pose-mode reference note: the real note model (neutral gray) at a
+  // chosen cell, z = 0, with its bounding-box outline.
+  const refNoteGeo = modelGeo("note");
   const refEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
   const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
@@ -149,8 +152,7 @@
   {@const ry = ROW_Y[pose.ref.row]}
   {@const refQ = frameQuatScene(noteFrame([rx, ry, zOff], 0, 1))}
   <T.Group position={[rx, ry, -zOff]} quaternion={refQ}>
-    <T.Mesh>
-      <T.BoxGeometry args={[BLOCK, BLOCK, BLOCK]} />
+    <T.Mesh geometry={refNoteGeo}>
       <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />
     </T.Mesh>
     <T.LineSegments geometry={refEdgesGeo}>

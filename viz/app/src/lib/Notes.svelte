@@ -11,12 +11,18 @@
     from "three/addons/geometries/ConvexGeometry.js";
   import { pb } from "./state.svelte.js";
   import {
-    BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB, HEAD_SQUASH,
+    BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
-    MISS_COL, REACH_Z, SABER_COLORS, Z_FAR, Z_MISS, activeArcs, activePosts,
+    MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs, activePosts,
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, noteCenter,
     noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
   } from "./replay.js";
+  // the REAL object models + colours, as ScoreSaber's replay viewer draws
+  // them (the canonical visual reference — see models.js)
+  import {
+    BOMB_COLOR, CHAIN_HEAD_H, CHAIN_HEAD_YC, NOTE_COLORS, WALL_ALPHA,
+    WALL_COLOR, modelGeo, noteColors,
+  } from "./models.js";
   import TextSprite from "./TextSprite.svelte";
 
   // env v15 head-anchored track: `zOff` = head_z - PLANE_Z0 of the body
@@ -31,13 +37,25 @@
   const arcs = $derived(activeArcs(pb.rep, time, zOff));
   const walls = $derived(pendingWalls(pb.rep, time, zOff));
 
+  // object meshes: the watch-viewer models (beveled 0.5 m cube, chain
+  // head/link, spiked bomb, glyphs already placed on the player face)
+  const noteGeo = modelGeo("note");
+  const headGeo = modelGeo("chainHead");
+  const linkGeo = modelGeo("chainLink");
+  const bombGeo = modelGeo("bomb");
+  const arrowGeo = modelGeo("arrow");
+  const dotGeo = modelGeo("dot");
+  const linkDotGeo = modelGeo("linkDot");
+  // in-reach outline cue (viewer-specific): the object's bounding box
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
-  const headGeo = new THREE.BoxGeometry(BLOCK, BLOCK * HEAD_SQUASH, BLOCK);
-  const linkGeo = new THREE.BoxGeometry(LINK_W, LINK_H, LINK_D);
-  const bombGeo = new THREE.SphereGeometry(BOMB_RADIUS, 20, 14);
   const edgesGeo = new THREE.EdgesGeometry(boxGeo);
-  const headEdgesGeo = new THREE.EdgesGeometry(headGeo);
-  const linkEdgesGeo = new THREE.EdgesGeometry(linkGeo);
+  const headEdgesGeo = new THREE.EdgesGeometry(
+    new THREE.BoxGeometry(BLOCK, CHAIN_HEAD_H, BLOCK).translate(0, CHAIN_HEAD_YC, 0));
+  const linkEdgesGeo = new THREE.EdgesGeometry(
+    new THREE.BoxGeometry(LINK_W, LINK_H, LINK_D));
+  // chain-head debris: the cube slices squashed/shifted onto the head's
+  // real span (y in [-0.0435, 0.25] of the note frame)
+  const HEAD_SQUASH = CHAIN_HEAD_H / BLOCK;
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
   // env v17 walls: one unit cube scaled per wall (w, h, l vary per wall)
@@ -48,7 +66,7 @@
   // undisposed) every frame it is on screen
   const arcGeo = new THREE.CylinderGeometry(0.035, 0.035, 1, 8, 1, true);
   const flashGeo = new THREE.SphereGeometry(1, 20, 14);
-  const WALL_COL = "#ff2f2f"; // classic BS translucent red
+  const WALL_COL = WALL_COLOR; // Wall.mat (1, 0.184, 0.184) @ alpha 0.5
 
   // real hitboxes ('h' overlay): good box shifted toward the player; the
   // small box is all the wrong-color saber can trigger. Env v7.4 rolls
@@ -134,17 +152,11 @@
     return [q.x, q.y, q.z, q.w];
   };
 
-  // Beat Saber-style low-poly arrow (pointing +x, rotated to the
-  // note's angle): a single 3-vertex triangle — no tail, white like
-  // the real game's glyphs
-  const arrowShape = new THREE.Shape();
-  arrowShape.moveTo(0.14, 0);
-  arrowShape.lineTo(-0.09, 0.12);
-  arrowShape.lineTo(-0.09, -0.12);
-  arrowShape.closePath();
-  const arrowGeo = new THREE.ShapeGeometry(arrowShape);
-  const dotGeo = new THREE.CircleGeometry(0.07, 12);   // low-poly BS dot
-  const GLYPH_COL = "#f0f2f8";                          // BS-white glyphs
+  // note/glyph colours per side (NoteManager.GetMaterialColors: note
+  // emission 0.15; near-white arrow at value 0.75 with a half-saturation
+  // glow). Materials are per instance (each mesh below declares its own)
+  // so the distance fade stays per note.
+  const NK = [noteColors(0), noteColors(1)];
 
   const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
@@ -178,7 +190,7 @@
       <T.MeshBasicMaterial
         color={WALL_COL}
         transparent
-        opacity={0.25 * alpha}
+        opacity={WALL_ALPHA * alpha}
         depthWrite={false}
       />
     </T.Mesh>
@@ -186,7 +198,7 @@
       <T.LineBasicMaterial
         color={WALL_COL}
         transparent
-        opacity={0.6 * alpha}
+        opacity={0.9 * alpha}
         depthWrite={false}
       />
     </T.LineSegments>
@@ -200,7 +212,7 @@
     <T.Mesh geometry={arcGeo} position={s.pos} quaternion={s.quat}
       scale={[1, s.len, 1]}>
       <T.MeshBasicMaterial
-        color={SABER_COLORS[a.color]}
+        color={NOTE_COLORS[a.color]}
         transparent
         opacity={0.22}
         depthWrite={false}
@@ -224,30 +236,41 @@
   {@const lam = noteLam(n, z)}
   {@const vq = frameQuatScene(noteFrame([cx, cy, z], noteRot(n), lam))}
   {#if n.kind === KIND_BOMB}
-    <!-- bomb: black sphere with a faint emissive rim, no glyph -->
-    <T.Mesh geometry={bombGeo} position={[cx, cy, -z]}>
+    <!-- bomb: the spiked Bomb.obj at the viewer's scale (~0.65 m over
+         the spikes), Bomb.mat dark gray, glossy; rides the note frame
+         like the notes do (its own rotation is a plain z-roll) -->
+    <T.Mesh geometry={bombGeo} position={[cx, cy, -z]} quaternion={vq}>
+      <!-- the watch scene lights its dark bomb from a bright environment;
+           on our black tunnel a little self-illumination + gloss keeps the
+           silhouette readable -->
       <T.MeshStandardMaterial
-        color="#14151b"
-        emissive="#3a2a33"
-        emissiveIntensity={0.7}
-        roughness={0.35}
+        color={BOMB_COLOR}
+        emissive="#3a3a44"
+        roughness={0.2}
+        metalness={0.4}
         transparent={alpha < 1}
         opacity={alpha}
       />
     </T.Mesh>
   {:else}
     {@const geo = n.kind === KIND_CHAIN_LINK ? linkGeo
-      : n.kind === KIND_CHAIN_HEAD ? headGeo : boxGeo}
+      : n.kind === KIND_CHAIN_HEAD ? headGeo : noteGeo}
     {@const edges = n.kind === KIND_CHAIN_LINK ? linkEdgesGeo
       : n.kind === KIND_CHAIN_HEAD ? headEdgesGeo : edgesGeo}
-    <!-- the whole visual (cube + glyph) rides the v7.6 note frame; the
-         glyph sits on the player-facing face along LOCAL z'. Inside the
-         frame the arrow's residual roll is the constant 270 deg (the
-         frame's up already carries angle - 270). -->
+    {@const k = NK[n.color]}
+    <!-- the whole visual (model + glyph) rides the v7.6 note frame. The
+         glyphs are baked in place on the player-facing (+z') face, in
+         the note frame where rotation 0 = a down note — the same
+         convention as the watch viewer (DirectionAngles: down = 0), so
+         the real Arrow mesh needs no extra roll: at rotation 0 its apex
+         points -y from the far (upper) half, exactly as in the game. -->
     <T.Group position={[cx, cy, -z]} quaternion={vq}>
       <T.Mesh geometry={geo}>
         <T.MeshStandardMaterial
-          color={SABER_COLORS[n.color]}
+          color={k.base}
+          emissive={k.emissive}
+          roughness={0.35}
+          metalness={0.1}
           transparent={alpha < 1}
           opacity={alpha}
         />
@@ -257,21 +280,17 @@
           <T.LineBasicMaterial color="#e8eaf0" />
         </T.LineSegments>
       {/if}
-      {#if n.kind !== KIND_CHAIN_LINK}
-        {#if n.any}
-          <T.Mesh geometry={dotGeo} position={[0, 0, HALF + 0.005]}>
-            <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
-          </T.Mesh>
-        {:else}
-          <T.Mesh
-            geometry={arrowGeo}
-            position={[0, 0, HALF + 0.005]}
-            rotation={[0, 0, 1.5 * Math.PI]}
-          >
-            <T.MeshBasicMaterial color={GLYPH_COL} transparent={alpha < 1} opacity={alpha} />
-          </T.Mesh>
-        {/if}
-      {/if}
+      <T.Mesh geometry={n.kind === KIND_CHAIN_LINK ? linkDotGeo
+        : n.any ? dotGeo : arrowGeo}>
+        <T.MeshStandardMaterial
+          color={k.arrowBase}
+          emissive={k.arrowGlow}
+          emissiveIntensity={0.55}
+          roughness={0.6}
+          transparent={alpha < 1}
+          opacity={alpha}
+        />
+      </T.Mesh>
     </T.Group>
   {/if}
   {#if n.fpre}
@@ -327,8 +346,8 @@
     {@const sc = Math.max(0.02, 1 - age * 2.4)}
     <T.Mesh geometry={linkGeo} position={[cx, cy, -zCut]}
       rotation={[0, 0, noteRot(n)]} scale={[sc, sc, sc]}>
-      <T.MeshStandardMaterial color={SABER_COLORS[n.color]} transparent
-        opacity={alpha} flatShading />
+      <T.MeshStandardMaterial color={NOTE_COLORS[n.color]} transparent
+        opacity={alpha} />
     </T.Mesh>
     <TextSprite
       text={"+" + o.points.toFixed(0)}
@@ -342,10 +361,12 @@
          tick): the two pieces separate along the plane normal, get
          carried along the sweep, tumble about the blade axis, fade.
          Off-center cuts produce honestly unequal chunks. Chain heads
-         reuse the split squashed to their half-height look. -->
+         reuse the split squashed and shifted onto the real head's span
+         (the note minus its swing-side portion). -->
     {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
     {@const sp = splitFor(i)}
     {@const squash = n.kind === KIND_CHAIN_HEAD ? HEAD_SQUASH : 1}
+    {@const yOff = n.kind === KIND_CHAIN_HEAD ? CHAIN_HEAD_YC : 0}
     {#each sp.sides as side}
       <T.Group
         position={[cx, cy, -zCut]}
@@ -356,13 +377,13 @@
           scale={[1, squash, 1]}
           position={[
             side.sign * age * 1.4 * sp.cp.n[0] + age * 0.9 * sp.cp.v[0],
-            side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1],
+            side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1] + yOff,
             -(side.sign * age * 1.4 * sp.cp.n[2] + age * 0.9 * sp.cp.v[2]),
           ]}
           quaternion={aaq(sp.cp.b, side.sign * age * 1.8)}
         >
           <T.MeshStandardMaterial
-            color={SABER_COLORS[n.color]}
+            color={NOTE_COLORS[n.color]}
             transparent
             opacity={alpha}
             flatShading
