@@ -122,22 +122,27 @@
 </T.Mesh>
 
 <!-- The TRACK: tunnel, hit-plane grid and the reach/miss datum planes all
-     belong to the note track, so under env v15 they ride the same
+     belong to the note track (hitbox mode only), so under env v15 they ride the same
      head-anchored offset the notes do (world +zOff -> scene -zOff). That
      keeps the hit plane under the notes at their hit time, and puts the
      miss plane back exactly on the sim's boundary, world z = head_z
      (= -Z_MISS + zOff). The floor above is real ground and stays put. -->
-<T.Group position={[0, 0, -zOff]}>
-  <T.LineSegments geometry={tunnelGeo}>
-    <T.LineBasicMaterial color="#1d212b" />
-  </T.LineSegments>
-  <T.LineSegments geometry={reachGeo}>
-    <T.LineBasicMaterial color="#2a3040" />
-  </T.LineSegments>
-  <T.LineSegments geometry={gridGeo}>
-    <T.LineBasicMaterial color="#39404f" />
-  </T.LineSegments>
-</T.Group>
+{#if pb.hitboxes}
+  <!-- the track datum (tunnel wireframe, hit-plane cell grid, reach and
+       miss/head planes) is a debugging overlay: shown only in hitbox
+       mode ('h'), like the collider wireframes -->
+  <T.Group position={[0, 0, -zOff]}>
+    <T.LineSegments geometry={tunnelGeo}>
+      <T.LineBasicMaterial color="#1d212b" />
+    </T.LineSegments>
+    <T.LineSegments geometry={reachGeo}>
+      <T.LineBasicMaterial color="#2a3040" />
+    </T.LineSegments>
+    <T.LineSegments geometry={gridGeo}>
+      <T.LineBasicMaterial color="#39404f" />
+    </T.LineSegments>
+  </T.Group>
+{/if}
 
 {#if pb.rep}
   <Notes {zOff} />
