@@ -224,7 +224,9 @@ Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
 wheel = zoom, right-drag = pan), compiled to that single static file —
 source in `viz/app/`, rebuild with `npm install && npm run build` and
 copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-step,
-+/− = speed, `h` = real-hitbox wireframes, drag the scrub bar. White
++/− = speed, `h` = hitbox mode (real-hitbox wireframes plus the track
+datum: the floating tunnel grid, hit-plane cells and the reach and
+miss/head planes — hidden otherwise since 2026-09-06), drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
 heads half-height cubes, links thin slabs ("+20" pops), arc grants

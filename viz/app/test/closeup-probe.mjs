@@ -21,6 +21,7 @@ await input.uploadFile(resolve(replay));
 await page.waitForFunction(() => /tick/i.test(document.body.innerText), { timeout: 15000 });
 await page.keyboard.press(" "); // pause if autoplay
 await page.keyboard.press("g"); // hide the gauge panels
+if (process.env.HITBOX) await page.keyboard.press("h"); // hitbox mode
 for (const t of ticksArg.split(",")) {
   const [tick, view] = t.split("@");
   await page.evaluate((tick) => { window.__pb && (window.__pb.cur = +tick); }, tick);
