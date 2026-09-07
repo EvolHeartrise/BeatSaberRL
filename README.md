@@ -176,7 +176,7 @@ Converts a JSONL v7 replay of a REAL map into a ScoreSaber replay
 page; the viewer fetches the map from BeatSaver by the embedded hash).
 Format reverse-engineered from the viewer's own source — vendored
 snapshot + annotated format notes in
-`research/vendor/scoresaber-watch/` (full clone: `D:\Git\scoresaber-watch`).
+`research/vendor/scoresaber-watch/` (full clone: `~/git projects/scoresaber-watch`).
 Pose frames come from the recorded joint state via the FK mirror —
 including the HEAD pose (position + rotation), which the viewer uses
 for real: first person is its default camera and its note-arrival

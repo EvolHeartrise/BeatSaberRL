@@ -10,7 +10,7 @@
 - Contents: `Assets/__Scripts` only (all C# app code, ~2 MB) + LICENSE +
   README. Unity assets/models/scenes (~200 MB of binaries) are NOT
   vendored — the FULL working clone (with git history) lives at
-  `D:\Git\scoresaber-watch` on this box; re-clone or copy from there if
+  `~/git projects/scoresaber-watch` on the Linux laptop (re-cloned 2026-09-06, same commit; the old Windows-box copy was at `D:\Git\scoresaber-watch`); re-clone or copy from there if
   the upstream ever disappears and a buildable project is needed.
 
 ## Why it's here
