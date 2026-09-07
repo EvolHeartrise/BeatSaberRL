@@ -18,11 +18,21 @@ sorted-time-windowed, so per-tick cost tracks the in-flight window,
 not C. C's real costs are global memory (N*C status bytes) and one
 O(C) zeroing per reset: both trivial.)
 
-Windows cover [k*seg_len, (k+1)*seg_len) in song time, notes rebased
-to window start; the first LEAD_S seconds of EVERY window are dropped
-(k > 0: those notes were mid-flight at the cut; k = 0 since
-2026-08-23: negative-shift intro walls otherwise reach the head on
-the first tick — an unavoidable charge). Windows with < MIN_SCOREABLE
+Windows are seg_len long and start every STRIDE = seg_len - lead_s
+seconds of song time (window k covers [k*stride, k*stride + seg_len)),
+notes rebased to window start; the first lead_s seconds of EVERY
+window are dropped (k > 0: those notes were mid-flight at the cut;
+k = 0 since 2026-08-23: negative-shift intro walls otherwise reach the
+head on the first tick — an unavoidable charge). Because consecutive
+windows OVERLAP by exactly the lead gap (2026-09-06, user), the kept
+ranges [k*stride + lead_s, k*stride + seg_len) tile song time from
+lead_s on with no holes: every note past lead_s lands in exactly one
+window. Before this the stride equalled seg_len and the lead gaps were
+holes — 5.77% of the catalog's scoreable notes (373,887 of 6,476,219,
+measured 2026-09-06) were in no training window at all. The last
+window is whatever is left: its content runs from lead_s to
+(last note - base), median ~15 s, and the episode ends at
+last_hit + tail, not at seg_len. Windows with < MIN_SCOREABLE
 scoreable objects or > MAX_OBJECTS total are dropped (counts are
 reported). Built once and cached as npz keyed on (parser version,
 seg_len, catalog bytes) — every sweep leg then pays only the npz load
@@ -66,8 +76,11 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     # per-object arrays + note_off / wall_off instead of (P, C) padding
     # (7,655 MB -> ~0.5 GB on the 93k-segment mirror pool; same bytes
     # per object, so the v5 caches convert but are simply not reused)
+    # v7: 2026-09-06 — window stride = seg_len - lead_s (overlap by the
+    # lead gap): every note past lead_s is in exactly one window; the
+    # v6 pools had 5.77% of scoreable notes in no window
     key = hashlib.sha1(
-        (f"{seg_len:g}_{ver}_v6_lead{lead_s:g}"
+        (f"{seg_len:g}_{ver}_v7_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
@@ -101,6 +114,23 @@ def _window_walls(wtups, lo, hi, base):
     return out
 
 
+def window_starts(last, seg_len, lead_s=LEAD_S):
+    """Song-time starts of the windows slicing a chart whose last
+    object is at `last`. Stride = seg_len - lead_s so the kept ranges
+    [base + lead_s, base + seg_len) tile [lead_s, inf) without holes or
+    double coverage; the object at `last` falls in the final window
+    (last >= final base + lead_s). Charts ending before lead_s get no
+    window. seg_len <= lead_s would give a non-positive stride and is
+    rejected. Pure function, pinned by tests/test_ranked_pool_windows.py."""
+    stride = seg_len - lead_s
+    if stride <= 0:
+        raise ValueError(f"seg_len {seg_len} must exceed lead_s {lead_s}")
+    if last < lead_s:
+        return []
+    n = int(np.floor((last - lead_s + 1e-6) / stride)) + 1
+    return [k * stride for k in range(n)]
+
+
 def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
                     mirror=False):
     import json
@@ -122,7 +152,7 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
         if not tup:
             continue
         last = tup[-1][0]
-        for k in range(int(np.ceil((last + 1e-6) / seg_len))):
+        for base in window_starts(last, seg_len, lead_s):
             # 2026-08-23 (user): lead gap applies to k=0 too. The
             # note-anchored parser shift (first note -> 2.0 s) can be
             # NEGATIVE, putting intro walls at t <= 0; without the gap
@@ -131,8 +161,10 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
             # WALL_PEN (measured 19-21 ms entry). Notes are unaffected
             # (none before 2.0 s); intro walls now start >= lead_s out,
             # making "nothing materializes mid-flight" uniform.
-            lo = k * seg_len + lead_s
-            hi = (k + 1) * seg_len
+            # 2026-09-06: bases step by seg_len - lead_s (window_starts),
+            # so this window's lead gap is the previous window's tail.
+            lo = base + lead_s
+            hi = base + seg_len
             win = [t for t in tup if lo <= t[0] < hi]
             if len(win) > MAX_OBJECTS:
                 dropped_fat += 1
@@ -140,7 +172,6 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
             if sum(1 for t in win if t[7] != KIND_BOMB) < MIN_SCOREABLE:
                 dropped_sparse += 1
                 continue
-            base = k * seg_len
             reb = [(t[0] - base,) + tuple(t[1:]) for t in win]
             wreb = _window_walls(wtups, lo, hi, base)
             segments.append([_tuple_note(t) for t in reb])
