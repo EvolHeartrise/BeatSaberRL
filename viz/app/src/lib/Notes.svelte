@@ -7,8 +7,6 @@
   // viewer).
   import { T } from "@threlte/core";
   import * as THREE from "three";
-  import { ConvexGeometry }
-    from "three/addons/geometries/ConvexGeometry.js";
   import { pb } from "./state.svelte.js";
   import {
     BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB,
@@ -21,7 +19,7 @@
   // them (the canonical visual reference — see models.js)
   import {
     BOMB_COLOR, CHAIN_HEAD_H, CHAIN_HEAD_YC, NOTE_COLORS, WALL_ALPHA,
-    WALL_COLOR, modelGeo, noteColors,
+    WALL_COLOR, modelGeo, noteColors, sliceGeometry,
   } from "./models.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -53,9 +51,6 @@
     new THREE.BoxGeometry(BLOCK, CHAIN_HEAD_H, BLOCK).translate(0, CHAIN_HEAD_YC, 0));
   const linkEdgesGeo = new THREE.EdgesGeometry(
     new THREE.BoxGeometry(LINK_W, LINK_H, LINK_D));
-  // chain-head debris: the cube slices squashed/shifted onto the head's
-  // real span (y in [-0.0435, 0.25] of the note frame)
-  const HEAD_SQUASH = CHAIN_HEAD_H / BLOCK;
   const failGeo = new THREE.EdgesGeometry(
     new THREE.PlaneGeometry(BLOCK, BLOCK));
   // env v17 walls: one unit cube scaled per wall (w, h, l vary per wall)
@@ -91,46 +86,16 @@
     return { good: n.any ? goodHbDotGeo : goodHbGeo, bad: badHbGeo };
   }
 
-  // ---- real cut splits: slice the cube by the ACTUAL cut plane -------------
+  // ---- real cut splits: slice the MODEL by the ACTUAL cut plane -----------
   // (reconstructed from the cutting blade's sweep — see cutPlaneLocal).
-  // Note-local frame maps to the scene group as (x, y, -z).
+  // Note-local frame maps to the scene group as (x, y, -z); the model
+  // geometries already live in that scene-local frame, so the plane is
+  // mirrored the same way. The glyph is not part of the debris.
   const toScene = ([x, y, z]) => new THREE.Vector3(x, y, -z);
   const CANONICAL = { p: [0, 0, 0], n: [1, 0, 0], v: [0, -1, 0], b: [0, 0, 1] };
-
-  const _corners = [];
-  for (const sx of [-HALF, HALF])
-    for (const sy of [-HALF, HALF])
-      for (const sz of [-HALF, HALF]) _corners.push([sx, sy, sz]);
-  const _edges = [];
-  for (let i = 0; i < 8; i++)
-    for (let j = i + 1; j < 8; j++)
-      if (_corners[i].filter((v, k) => v !== _corners[j][k]).length === 1)
-        _edges.push([i, j]);
-
-  function sliceCube(cp) {
-    const sd = _corners.map(
-      (c) => (c[0] - cp.p[0]) * cp.n[0] + (c[1] - cp.p[1]) * cp.n[1]
-        + (c[2] - cp.p[2]) * cp.n[2]);
-    const A = [], B = [];
-    _corners.forEach((c, i) => {
-      if (sd[i] <= 0) A.push(c);
-      if (sd[i] >= 0) B.push(c);
-    });
-    for (const [i, j] of _edges) {
-      if ((sd[i] < 0) !== (sd[j] < 0)) {
-        const t = sd[i] / (sd[i] - sd[j]);
-        const p = _corners[i].map(
-          (v, k) => v + t * (_corners[j][k] - v));
-        A.push(p);
-        B.push(p);
-      }
-    }
-    if (A.length < 4 || B.length < 4) return null;
-    return [
-      { geo: new ConvexGeometry(A.map(toScene)), sign: -1 },
-      { geo: new ConvexGeometry(B.map(toScene)), sign: 1 },
-    ];
-  }
+  const sliceModel = (kind, cp) => sliceGeometry(
+    kind === KIND_CHAIN_HEAD ? headGeo : noteGeo,
+    [cp.p[0], cp.p[1], -cp.p[2]], [cp.n[0], cp.n[1], -cp.n[2]]);
 
   // halves + frame per cut note, built once (cached per loaded replay)
   const _splitCache = new WeakMap();
@@ -139,8 +104,9 @@
     if (!m) _splitCache.set(pb.rep, (m = new Map()));
     if (!m.has(i)) {
       const cp = cutPlaneLocal(pb.rep, i) ?? CANONICAL;
-      let sides = sliceCube(cp);
-      if (!sides) sides = sliceCube({ ...cp, p: [0, 0, 0] }); // grazing plane
+      const kind = pb.rep.chart[i].kind;
+      let sides = sliceModel(kind, cp);
+      if (!sides) sides = sliceModel(kind, { ...cp, p: [0, 0, 0] }); // grazing plane
       m.set(i, { cp, sides: sides ?? [] });
     }
     return m.get(i);
@@ -357,16 +323,13 @@
       opacity={alpha}
     />
   {:else if o.kind === "good"}
-    <!-- the cube sliced by the ACTUAL cut plane (blade sweep at the cut
-         tick): the two pieces separate along the plane normal, get
-         carried along the sweep, tumble about the blade axis, fade.
-         Off-center cuts produce honestly unequal chunks. Chain heads
-         reuse the split squashed and shifted onto the real head's span
-         (the note minus its swing-side portion). -->
+    <!-- the real model (note or chain head, glyph excluded) sliced by
+         the ACTUAL cut plane (blade sweep at the cut tick): the two
+         pieces separate along the plane normal, get carried along the
+         sweep, tumble about the blade axis, fade. Off-center cuts
+         produce honestly unequal chunks. -->
     {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
     {@const sp = splitFor(i)}
-    {@const squash = n.kind === KIND_CHAIN_HEAD ? HEAD_SQUASH : 1}
-    {@const yOff = n.kind === KIND_CHAIN_HEAD ? CHAIN_HEAD_YC : 0}
     {#each sp.sides as side}
       <T.Group
         position={[cx, cy, -zCut]}
@@ -374,19 +337,20 @@
       >
         <T.Mesh
           geometry={side.geo}
-          scale={[1, squash, 1]}
           position={[
             side.sign * age * 1.4 * sp.cp.n[0] + age * 0.9 * sp.cp.v[0],
-            side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1] + yOff,
+            side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1],
             -(side.sign * age * 1.4 * sp.cp.n[2] + age * 0.9 * sp.cp.v[2]),
           ]}
           quaternion={aaq(sp.cp.b, side.sign * age * 1.8)}
         >
           <T.MeshStandardMaterial
             color={NOTE_COLORS[n.color]}
+            emissive={NK[n.color].emissive}
+            roughness={0.35}
+            metalness={0.1}
             transparent
             opacity={alpha}
-            flatShading
           />
         </T.Mesh>
       </T.Group>

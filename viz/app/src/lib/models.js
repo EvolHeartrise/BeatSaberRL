@@ -125,3 +125,79 @@ export const BOMB_COLOR = "#242424";
 export const HEADSET_COLOR = "#878787";
 // Wall.mat: (1, 0.184, 0.184) at alpha 0.5; WallEdges emission 3.
 export const WALL_COLOR = "#ff2f2f", WALL_ALPHA = 0.5;
+
+// ---- cut debris: slice a model by the real cut plane ----------------------
+// The note and chain-head meshes are convex, so the cross-section is a
+// convex polygon: clip every triangle against the plane (each side keeps
+// its 1-2 sub-triangles with interpolated normals) and cap each half with
+// a fan over the angle-sorted crossing points. Returns two non-indexed
+// geometries [{geo, sign: -1}, {geo, sign: +1}] (sign −1 = the side the
+// plane normal points away from), or null if the plane misses the mesh.
+// `p`/`n` are in the geometry's own (scene-local) frame.
+export function sliceGeometry(geo, p, n) {
+  const pos = geo.attributes.position, nrm = geo.attributes.normal;
+  const idx = geo.index ? geo.index.array : null;
+  const nl = Math.hypot(n[0], n[1], n[2]);
+  const N = [n[0] / nl, n[1] / nl, n[2] / nl];
+  const sdist = (v) => (v[0] - p[0]) * N[0] + (v[1] - p[1]) * N[1] + (v[2] - p[2]) * N[2];
+  const V = (i) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
+  const Nv = (i) => [nrm.getX(i), nrm.getY(i), nrm.getZ(i)];
+  const lerp = (a, b, t) => [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])];
+  const out = [{ p: [], n: [] }, { p: [], n: [] }]; // 0 = negative side, 1 = positive
+  const ring = []; // crossing points (duplicates welded below)
+  const push = (side, tri) => {
+    for (const [v, nn] of tri) { out[side].p.push(...v); out[side].n.push(...nn); }
+  };
+  const EPS = 1e-7;
+  const ntri = idx ? idx.length / 3 : pos.count / 3;
+  for (let t = 0; t < ntri; t++) {
+    const ids = idx ? [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]] : [3 * t, 3 * t + 1, 3 * t + 2];
+    const vs = ids.map(V), ns = ids.map(Nv), ds = vs.map(sdist);
+    const neg = [], posv = [];
+    // Sutherland–Hodgman around the triangle, keeping both sides
+    for (let i = 0; i < 3; i++) {
+      const j = (i + 1) % 3;
+      const a = [vs[i], ns[i]], b = [vs[j], ns[j]], da = ds[i], db = ds[j];
+      if (da <= EPS) neg.push(a);
+      if (da >= -EPS) posv.push(a);
+      if ((da < -EPS && db > EPS) || (da > EPS && db < -EPS)) {
+        const tt = da / (da - db);
+        const x = [lerp(a[0], b[0], tt), lerp(a[1], b[1], tt)];
+        neg.push(x); posv.push(x); ring.push(x[0]);
+      }
+    }
+    for (const [side, poly] of [[0, neg], [1, posv]])
+      for (let k = 1; k + 1 < poly.length; k++) push(side, [poly[0], poly[k], poly[k + 1]]);
+  }
+  if (!out[0].p.length || !out[1].p.length || ring.length < 3) return null;
+  // cap: weld crossing points, sort by angle in the plane, fan both ways
+  const key = (v) => v.map((x) => Math.round(x * 1e4)).join(",");
+  const seen = new Set(), pts = [];
+  for (const v of ring) { const k = key(v); if (!seen.has(k)) { seen.add(k); pts.push(v); } }
+  if (pts.length >= 3) {
+    const c = [0, 1, 2].map((k) => pts.reduce((s, v) => s + v[k], 0) / pts.length);
+    // in-plane basis
+    const ax = Math.abs(N[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const u = [N[1] * ax[2] - N[2] * ax[1], N[2] * ax[0] - N[0] * ax[2], N[0] * ax[1] - N[1] * ax[0]];
+    const ul = Math.hypot(...u); u[0] /= ul; u[1] /= ul; u[2] /= ul;
+    const w = [N[1] * u[2] - N[2] * u[1], N[2] * u[0] - N[0] * u[2], N[0] * u[1] - N[1] * u[0]];
+    const ang = (v) => Math.atan2(
+      (v[0] - c[0]) * w[0] + (v[1] - c[1]) * w[1] + (v[2] - c[2]) * w[2],
+      (v[0] - c[0]) * u[0] + (v[1] - c[1]) * u[1] + (v[2] - c[2]) * u[2]);
+    pts.sort((a, b) => ang(a) - ang(b));
+    const negN = [-N[0], -N[1], -N[2]];
+    for (let k = 0; k < pts.length; k++) {
+      const a = pts[k], b = pts[(k + 1) % pts.length];
+      // negative side's cap faces +N (outward from that half); winding CCW seen from +N
+      push(0, [[c, N], [a, N], [b, N]]);
+      push(1, [[c, negN], [b, negN], [a, negN]]);
+    }
+  }
+  return out.map((o, i) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(o.p, 3));
+    g.setAttribute("normal", new THREE.Float32BufferAttribute(o.n, 3));
+    g.computeBoundingSphere();
+    return { geo: g, sign: i === 0 ? -1 : 1 };
+  });
+}
