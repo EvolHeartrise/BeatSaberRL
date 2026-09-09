@@ -9,7 +9,7 @@
     F_CHEST, F_HEAD, F_L_HAND, F_L_SHANK, F_L_THIGH, F_L_FOOT,
     F_L_ELBOW, F_L_SHOULDER, F_L_WRIST, F_R_ELBOW, F_R_SHOULDER,
     F_R_HAND, F_R_SHANK, F_R_THIGH, F_R_FOOT, F_R_WRIST,
-    SABER_DARK, framePoint,
+    framePoint,
   } from "./replay.js";
 
   let { fk } = $props();
@@ -40,7 +40,13 @@
     return [q.x, q.y, q.z, q.w];
   }
 
-  const TRUNK = "#2a2f3b", LIMB = "#232733";
+  // White body (2026-09-09): trunk/head/pelvis white, legs and feet a
+  // half-step cooler so the limbs still read as separate volumes against
+  // it. The arms stay side-identifiable but only as a ~30% wash of the
+  // saber hues over white — the sabers themselves keep SABER_COLORS /
+  // SABER_DARK, so the blades remain the saturated red/blue on screen.
+  const TRUNK = "#f4f6fa", LIMB = "#e3e7ef";
+  const ARM = ["#f6d3d6", "#d0e7fa"]; // left/red-tinted, right/blue-tinted
 
   // Bone cylinders built ONCE: FK is rigid, so every segment's length is
   // the model constant (chest 0.43, upper arm 0.35, forearm 0.30, thigh
@@ -66,10 +72,10 @@
     // co-located frames and F_*_SHOULDER is the FIRST (yaw) one — an
     // extrusion along its local z ignores pitch/twist and misses the
     // elbow whenever the arm is off neutral
-    [seg(fk.p[F_L_SHOULDER], fk.p[F_L_ELBOW]), uarmGeo, SABER_DARK[0]],
-    [seg(fk.p[F_L_ELBOW], fk.p[F_L_WRIST]), farmGeo, SABER_DARK[0]],
-    [seg(fk.p[F_R_SHOULDER], fk.p[F_R_ELBOW]), uarmGeo, SABER_DARK[1]],
-    [seg(fk.p[F_R_ELBOW], fk.p[F_R_WRIST]), farmGeo, SABER_DARK[1]],
+    [seg(fk.p[F_L_SHOULDER], fk.p[F_L_ELBOW]), uarmGeo, ARM[0]],
+    [seg(fk.p[F_L_ELBOW], fk.p[F_L_WRIST]), farmGeo, ARM[0]],
+    [seg(fk.p[F_R_SHOULDER], fk.p[F_R_ELBOW]), uarmGeo, ARM[1]],
+    [seg(fk.p[F_R_ELBOW], fk.p[F_R_WRIST]), farmGeo, ARM[1]],
     [seg(fk.p[F_L_THIGH], framePoint(fk, F_L_THIGH, [0, -0.44, 0])),
       thighGeo, LIMB],
     [seg(fk.p[F_L_SHANK], framePoint(fk, F_L_SHANK, [0, -0.43, 0])),
@@ -111,7 +117,7 @@
 {#each fists as f, s (s)}
   <T.Mesh position={[f.x, f.y, f.z]}>
     <T.SphereGeometry args={[0.05, 14, 10]} />
-    <T.MeshStandardMaterial color={SABER_DARK[s]} />
+    <T.MeshStandardMaterial color={ARM[s]} />
   </T.Mesh>
 {/each}
 
@@ -119,13 +125,13 @@
 {#each [fk.p[F_L_SHOULDER], fk.p[F_R_SHOULDER]] as p, i (i)}
   <T.Mesh position={[p[0], p[1], -p[2]]}>
     <T.SphereGeometry args={[0.055, 14, 10]} />
-    <T.MeshStandardMaterial color={SABER_DARK[i]} />
+    <T.MeshStandardMaterial color={ARM[i]} />
   </T.Mesh>
 {/each}
 {#each [fk.p[F_L_ELBOW], fk.p[F_R_ELBOW]] as p, i (i)}
   <T.Mesh position={[p[0], p[1], -p[2]]}>
     <T.SphereGeometry args={[0.042, 12, 8]} />
-    <T.MeshStandardMaterial color={SABER_DARK[i]} />
+    <T.MeshStandardMaterial color={ARM[i]} />
   </T.Mesh>
 {/each}
 {#each [fk.p[F_L_THIGH], fk.p[F_R_THIGH], fk.p[F_L_SHANK], fk.p[F_R_SHANK]] as p, i (i)}
