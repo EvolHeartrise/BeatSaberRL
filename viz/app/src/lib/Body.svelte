@@ -42,11 +42,12 @@
 
   // White body (2026-09-09): trunk/head/pelvis white, legs and feet a
   // half-step cooler so the limbs still read as separate volumes against
-  // it. The arms stay side-identifiable but only as a ~30% wash of the
-  // saber hues over white — the sabers themselves keep SABER_COLORS /
-  // SABER_DARK, so the blades remain the saturated red/blue on screen.
+  // it. The arms carry a ~60% wash of the saber hues over white: clearly
+  // red/blue at a glance, still light enough to read as part of the white
+  // body. The sabers keep SABER_COLORS / SABER_DARK, so the blades stay
+  // the most saturated red/blue on screen.
   const TRUNK = "#f4f6fa", LIMB = "#e3e7ef";
-  const ARM = ["#f6d3d6", "#d0e7fa"]; // left/red-tinted, right/blue-tinted
+  const ARM = ["#eca7ac", "#a0cff5"]; // left/red-tinted, right/blue-tinted
 
   // Bone cylinders built ONCE: FK is rigid, so every segment's length is
   // the model constant (chest 0.43, upper arm 0.35, forearm 0.30, thigh
