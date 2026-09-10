@@ -85,6 +85,37 @@
   // pose; these lines are the static scenery datum
   const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
 
+  // ---- the player platform (replaces the old floor plane) -----------------
+  // ScoreSaber watch, Previewer.unity "Player/PlayerPlatform" — the same
+  // reference the object models came from. PlatformBody is a unit cube
+  // scaled (3, 0.05, 2) at local y -0.025, so its TOP FACE is the y = 0
+  // floor and the slab hangs 5 cm below it; Edges are four quads at local
+  // y +0.001, left/right at x +-1.49 (0.02 x 2) and front/back at
+  // z +-0.99 (3 x 0.02) — 2 cm strips inset 1 cm from the rim. All of it
+  // hangs off a Player root at world z -0.65, which is exactly where our
+  // own root sits (SPEC-v10 §1.2 pelvis anchor), so the reference's local
+  // coordinates transfer unchanged.
+  //
+  // Fixed in place, like the reference's: our pelvis root is free to move
+  // and a floor that slid around with it would stop being a ground datum.
+  const PLAT_Z = 0.65; // scene z of the slab center (world z -0.65)
+  const platBodyGeo = new THREE.BoxGeometry(3, 0.05, 2);
+  const platEdgeX = new THREE.PlaneGeometry(0.02, 2); // left/right strips
+  const platEdgeZ = new THREE.PlaneGeometry(3, 0.02); // front/back strips
+  const platEdges = [
+    [platEdgeX, [-1.49, 0.001, PLAT_Z]],
+    [platEdgeX, [1.49, 0.001, PLAT_Z]],
+    [platEdgeZ, [0, 0.001, PLAT_Z - 0.99]],
+    [platEdgeZ, [0, 0.001, PLAT_Z + 0.99]],
+  ];
+  // Platform.mat is _Color black, but its shader adds a fake-light term
+  // (_FakeLightColor white, _FakeLightDir) — the real slab is dark and lit,
+  // not a black hole, so it takes a dark toon surface here rather than a
+  // flat black one. The strips are PlayerPlatformEdge.mat, whose HDR
+  // _EmissionColor (0.562, 5.924, 9.164) normalizes to this cyan; they are
+  // unlit, like every other glow in the scene.
+  const PLAT_COL = "#12161f", PLAT_EDGE = "#45d4ff";
+
   // contact markers: one unit sphere scaled per marker (the radius varies
   // per contact, and radius-in-`args` geometry would be recreated — and
   // held undisposed — every frame the flash is alive)
@@ -126,11 +157,15 @@
 <T.DirectionalLight position={[4, 7, 6]} intensity={2.1} />
 <T.DirectionalLight position={[-5, 3, -4]} intensity={0.85} color="#9fc0ff" />
 
-<!-- the floor: y = 0 plane under the whole play area -->
-<T.Mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, (Z_MISS - Z_FAR) / 2]}>
-  <T.PlaneGeometry args={[2 * (GX1 + 0.8), Z_FAR + Z_MISS]} />
-  <T.MeshToonMaterial color="#0f1219" gradientMap={RAMP} />
+<!-- the player platform, at the y = 0 floor (see PLAT_Z above) -->
+<T.Mesh geometry={platBodyGeo} position={[0, -0.025, PLAT_Z]}>
+  <T.MeshToonMaterial color={PLAT_COL} gradientMap={RAMP} />
 </T.Mesh>
+{#each platEdges as [geo, pos], i (i)}
+  <T.Mesh geometry={geo} position={pos} rotation={[-Math.PI / 2, 0, 0]}>
+    <T.MeshBasicMaterial color={PLAT_EDGE} />
+  </T.Mesh>
+{/each}
 
 <!-- The TRACK: tunnel, hit-plane grid and the reach/miss datum planes all
      belong to the note track (hitbox mode only), so under env v15 they ride the same

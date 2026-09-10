@@ -153,6 +153,13 @@
   // record, so this one is matched by eye rather than derived.
   const IND_SIZE = 0.22;
 
+  // Cut debris falls: same g the sim runs at (SPEC-v10, "Gravity 9.81
+  // along -y"), applied in WORLD y on the debris group rather than inside
+  // it — the group carries the note's z-roll, so a drop added to the mesh
+  // offset would tilt with the note instead of pointing down.
+  const G = 9.81;
+  const drop = (age) => 0.5 * G * age * age;
+
   const quartOut = (t) => 1 - (1 - t) ** 4;
   // The game randomises endX per hit. A replay has to scrub to the same
   // picture every time, so the jitter is hashed off the note index instead.
@@ -385,7 +392,7 @@
     {@const sp = splitFor(i)}
     {#each sp.sides as side}
       <T.Group
-        position={[cx, cy, -zCut]}
+        position={[cx, cy - drop(age), -zCut]}
         rotation={[0, 0, noteRot(n)]}
       >
         <T.Mesh
