@@ -45,7 +45,10 @@
   const arrowGeo = modelGeo("arrow");
   const dotGeo = modelGeo("dot");
   const linkDotGeo = modelGeo("linkDot");
-  // in-reach outline cue (viewer-specific): the object's bounding box
+  // in-reach outline cue (viewer-specific): the object's bounding box.
+  // Hitbox mode only since 2026-09-09 — it switches on the moment a note
+  // crosses REACH_Z, which for a bot that cuts at the boundary is a
+  // one-frame white flash around the note just before the cut.
   const boxGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
   const edgesGeo = new THREE.EdgesGeometry(boxGeo);
   const headEdgesGeo = new THREE.EdgesGeometry(
@@ -245,7 +248,7 @@
           opacity={alpha}
         />
       </T.Mesh>
-      {#if inReach(zBase)}
+      {#if pb.hitboxes && inReach(zBase)}
         <T.LineSegments geometry={edges}>
           <T.LineBasicMaterial color="#e8eaf0" />
         </T.LineSegments>
