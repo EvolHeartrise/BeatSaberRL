@@ -1,5 +1,8 @@
-// Frame-by-frame video export: render exactly one frame per replay tick,
-// stamp each with its own timestamp, encode with WebCodecs and mux to WebM.
+// Frame-by-frame video export: render one frame per output frame, stamp each
+// with its own timestamp, encode with WebCodecs and mux to WebM. The output
+// frame rate is free — it is NOT tied to the replay's 30 ticks/s, since the
+// viewer interpolates between ticks, so 60 or 120 fps genuinely smooths the
+// motion rather than duplicating frames.
 // Nothing here is paced by wall clock, so a machine that cannot render 30 fps
 // live produces the same file as one that can — it just takes longer.
 //
@@ -8,7 +11,7 @@
 // frames slower than real time and it does not drop them, it stretches the
 // video. And capturing a live audio graph on a machine that is stalling gives
 // choppy audio because choppy audio is genuinely what was played. Both are
-// structural. Here the video timeline is arithmetic (frame i is at i/30 s)
+// structural. Here the video timeline is arithmetic (frame i is at i/fps s)
 // and the audio is copied out of the decoded song by array slice, so neither
 // can drift no matter how slow the render is.
 import { Muxer, ArrayBufferTarget } from "webm-muxer";
@@ -16,7 +19,6 @@ import { Muxer, ArrayBufferTarget } from "webm-muxer";
 export const CAN_EXPORT_EXACT =
   typeof VideoEncoder !== "undefined" && typeof AudioEncoder !== "undefined";
 
-const FPS = 30;      // one frame per replay tick (DT = 1/30)
 const RATE = 48000;  // Opus is natively 48 kHz
 const ACHUNK = 960;  // 20 ms of audio per AudioData
 const US = 1e6;
@@ -62,11 +64,13 @@ function drain(enc, max) {
   });
 }
 
-/** Render `ticks + 1` frames through `renderFrame(i)` and return a WebM Blob.
- * `renderFrame` must leave frame i in `canvas` synchronously. `song` is a
- * decoded AudioBuffer (or null) and `songStart` the song time at frame 0. */
+/** Render `frames` frames at `fps` through `renderFrame(i)` and return a WebM
+ * Blob. `renderFrame` must leave frame i in `canvas` synchronously — mapping
+ * a frame index onto a replay position is the caller's business, so nothing
+ * here needs to know the tick rate. `song` is a decoded AudioBuffer (or null)
+ * and `songStart` the song time at frame 0. */
 export async function exportExact({
-  canvas, ticks, renderFrame, song = null, songStart = 0,
+  canvas, frames, fps = 30, renderFrame, song = null, songStart = 0,
   onProgress = () => {},
 }) {
   // Even dimensions: VP9 4:2:0 needs them, and the live canvas is whatever
@@ -80,13 +84,12 @@ export async function exportExact({
   off.height = H;
   const g2d = off.getContext("2d", { alpha: false });
 
-  const frames = ticks + 1;
-  const audio = song ? audioSlice(song, songStart, frames / FPS) : null;
+  const audio = song ? audioSlice(song, songStart, frames / fps) : null;
 
   const target = new ArrayBufferTarget();
   const muxer = new Muxer({
     target,
-    video: { codec: "V_VP9", width: W, height: H, frameRate: FPS },
+    video: { codec: "V_VP9", width: W, height: H, frameRate: fps },
     ...(audio
       ? { audio: { codec: "A_OPUS", numberOfChannels: audio.ch,
                    sampleRate: RATE } }
@@ -102,8 +105,10 @@ export async function exportExact({
     codec: "vp09.00.10.08", // profile 0, level 1.0, 8-bit
     width: W,
     height: H,
-    bitrate: 8_000_000,
-    framerate: FPS,
+    // more frames want more bits, but not proportionally — consecutive
+    // frames are highly correlated, so the extra ones code cheaply
+    bitrate: Math.round(8_000_000 * Math.sqrt(fps / 30)),
+    framerate: fps,
     latencyMode: "quality",
   });
 
@@ -114,10 +119,10 @@ export async function exportExact({
     // buffer is not preserved across a compositing step
     g2d.drawImage(canvas, 0, 0, W, H);
     const vf = new VideoFrame(off, {
-      timestamp: Math.round((i * US) / FPS),
-      duration: Math.round(US / FPS),
+      timestamp: Math.round((i * US) / fps),
+      duration: Math.round(US / fps),
     });
-    vEnc.encode(vf, { keyFrame: i % (FPS * 2) === 0 });
+    vEnc.encode(vf, { keyFrame: i % Math.round(fps * 2) === 0 });
     vf.close();
     const wait = drain(vEnc, 8);
     if (wait) await wait;          // also yields, so the UI stays alive

@@ -322,8 +322,17 @@ MediaStreamDestination for the recorder. That gain node is where mute/volume
 live, since the element's own volume sits upstream of the tap and would
 otherwise bake a muted viewer into a silent file.
 
-Replays with no map export video-only. The frame-by-frame path always writes
-30 fps at 1x regardless of the speed control.
+Replays with no map export video-only. The frame rate is a dropdown next to
+the button (24 / 30 / 60 / 120): output frames are decoupled from the
+replay's 30 ticks/s — frame i renders at tick `i * 30 / fps`, which the
+viewer interpolates — so 60 fps genuinely smooths the motion rather than
+duplicating frames. The export always runs at 1x regardless of the speed
+control.
+
+Cut debris lives half the aftermath window (0.35 s of the 0.7 s; the window
+itself is the flying score's lifetime and has to stay) and separates at
+2.8 m/s per half, up from 1.4 — the same 0.98 m of travel as before, covered
+twice as fast rather than half as far.
 
 The scene also paints its own `#0b0d11` background as of 2026-09-09. Threlte
 builds its renderer with `alpha: true` and nothing had set `scene.background`,
