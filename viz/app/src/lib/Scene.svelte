@@ -14,6 +14,7 @@
     noteFrame, poseQ36, qAt, viewerTrackOffset,
   } from "./replay.js";
   import Body from "./Body.svelte";
+  import { RAMP } from "./toon.js";
   import Notes from "./Notes.svelte";
   import Saber from "./Saber.svelte";
   import BodyGauges from "./BodyGauges.svelte";
@@ -112,13 +113,23 @@
   {/if}
 </T.PerspectiveCamera>
 
-<T.AmbientLight intensity={1.1} />
-<T.DirectionalLight position={[3, 6, 5]} intensity={1.4} />
+<!-- Cel lighting (2026-09-09): the toon ramp turns dot(N, L) into three
+     flat bands, so the scene needs ONE dominant key to cut the terminator
+     and very little uniform fill — a bright ambient term lifts every band
+     at once and flattens the body back into a silhouette-less blob. The
+     hemisphere light replaces the old ambient: same job (keep the shadow
+     band off black) but sky-above / floor-below instead of uniform, which
+     is what grounds the white body on the dark stage. The back-left rim is
+     cool and weak; it lands almost entirely on the key's shadow side, so
+     it separates the body from the tunnel without washing out a band. -->
+<T.HemisphereLight args={["#dce4f2", "#1b1f28", 1.0]} />
+<T.DirectionalLight position={[4, 7, 6]} intensity={2.1} />
+<T.DirectionalLight position={[-5, 3, -4]} intensity={0.85} color="#9fc0ff" />
 
 <!-- the floor: y = 0 plane under the whole play area -->
 <T.Mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, (Z_MISS - Z_FAR) / 2]}>
   <T.PlaneGeometry args={[2 * (GX1 + 0.8), Z_FAR + Z_MISS]} />
-  <T.MeshStandardMaterial color="#12151c" />
+  <T.MeshToonMaterial color="#0f1219" gradientMap={RAMP} />
 </T.Mesh>
 
 <!-- The TRACK: tunnel, hit-plane grid and the reach/miss datum planes all
@@ -158,7 +169,8 @@
   {@const refQ = frameQuatScene(noteFrame([rx, ry, zOff], 0, 1))}
   <T.Group position={[rx, ry, -zOff]} quaternion={refQ}>
     <T.Mesh geometry={refNoteGeo}>
-      <T.MeshStandardMaterial color="#3a4050" transparent opacity={0.75} />
+      <T.MeshToonMaterial color="#3a4050" gradientMap={RAMP}
+        transparent opacity={0.75} />
     </T.Mesh>
     <T.LineSegments geometry={refEdgesGeo}>
       <T.LineBasicMaterial color="#e8eaf0" />

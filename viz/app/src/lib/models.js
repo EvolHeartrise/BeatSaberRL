@@ -121,7 +121,10 @@ export function noteColors(color) {
 // Bomb.mat: base (0.1415 gray), smoothness 0.95, fresnel rim.
 export const BOMB_COLOR = "#242424";
 // Wall.mat: (1, 0.184, 0.184) at alpha 0.5; WallEdges emission 3.
-export const WALL_COLOR = "#ff2f2f", WALL_ALPHA = 0.5;
+// WALL_ALPHA dropped 0.5 -> 0.34 with the 2026-09-09 cel pass: the walls
+// are unlit (MeshBasicMaterial) and no longer tone-mapped, so the old
+// value burned out into a flat red slab.
+export const WALL_COLOR = "#ff2f2f", WALL_ALPHA = 0.34;
 
 // ---- cut debris: slice a model by the real cut plane ----------------------
 // The note and chain-head meshes are convex, so the cross-section is a

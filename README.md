@@ -243,6 +243,13 @@ Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
 q36 export. Non-"v10" replays are rejected — re-record from a current
 checkpoint.
 
+Since 2026-09-09 the whole scene is cel shaded (`viz/app/src/lib/toon.js`):
+every solid is a `MeshToonMaterial` on one shared three-band ramp and is
+drawn twice — once as an inverted-hull ink outline, once banded — over a
+key/rim/hemisphere rig with tone mapping off, so the bands stay flat.
+The body is white (arms washed ~60% toward their saber hue), which is
+what the ink and the bands are tuned against.
+
 Since 2026-09-06 the objects are the REAL Beat Saber models as
 ScoreSaber's replay viewer renders them — the canonical reference for
 every visual size: the 0.5 m beveled note cube with the game's triangle

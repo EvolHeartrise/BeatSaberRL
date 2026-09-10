@@ -22,6 +22,7 @@
     WALL_COLOR, modelGeo, noteColors, sliceGeometry,
   } from "./models.js";
   import TextSprite from "./TextSprite.svelte";
+  import { OUTLINE_NOTE, RAMP } from "./toon.js";
 
   // env v15 head-anchored track: `zOff` = head_z - PLANE_Z0 of the body
   // being DRAWN this frame (Scene owns it, so notes and sabers can never
@@ -209,11 +210,10 @@
       <!-- the watch scene lights its dark bomb from a bright environment;
            on our black tunnel a little self-illumination + gloss keeps the
            silhouette readable -->
-      <T.MeshStandardMaterial
+      <T.MeshToonMaterial
         color={BOMB_COLOR}
+        gradientMap={RAMP}
         emissive="#3a3a44"
-        roughness={0.2}
-        metalness={0.4}
         transparent={alpha < 1}
         opacity={alpha}
       />
@@ -231,12 +231,16 @@
          the real Arrow mesh needs no extra roll: at rotation 0 its apex
          points -y from the far (upper) half, exactly as in the game. -->
     <T.Group position={[cx, cy, -z]} quaternion={vq}>
+      {#if alpha >= 1}
+        <!-- ink hull: opaque, so it is skipped while the note is still
+             fading in out of the tunnel -->
+        <T.Mesh geometry={geo} material={OUTLINE_NOTE} />
+      {/if}
       <T.Mesh geometry={geo}>
-        <T.MeshStandardMaterial
+        <T.MeshToonMaterial
           color={k.base}
+          gradientMap={RAMP}
           emissive={k.emissive}
-          roughness={0.35}
-          metalness={0.1}
           transparent={alpha < 1}
           opacity={alpha}
         />
@@ -248,11 +252,11 @@
       {/if}
       <T.Mesh geometry={n.kind === KIND_CHAIN_LINK ? linkDotGeo
         : n.any ? dotGeo : arrowGeo}>
-        <T.MeshStandardMaterial
+        <T.MeshToonMaterial
           color={k.arrowBase}
+          gradientMap={RAMP}
           emissive={k.arrowGlow}
           emissiveIntensity={0.55}
-          roughness={0.6}
           transparent={alpha < 1}
           opacity={alpha}
         />
@@ -296,8 +300,10 @@
     {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
     <T.Mesh geometry={flashGeo} position={[cx, cy, -zHit]}
       scale={BOMB_RADIUS + age * 1.2}>
+      <!-- 0.32, not the pre-cel 0.55: unlit overlays are no longer rolled
+           off by AgX tone mapping, so the old alpha reads as a solid disc -->
       <T.MeshBasicMaterial color="#ff4a4a" transparent
-        opacity={alpha * 0.55} depthWrite={false} />
+        opacity={alpha * 0.32} depthWrite={false} />
     </T.Mesh>
     <TextSprite
       text="bomb!"
@@ -312,8 +318,8 @@
     {@const sc = Math.max(0.02, 1 - age * 2.4)}
     <T.Mesh geometry={linkGeo} position={[cx, cy, -zCut]}
       rotation={[0, 0, noteRot(n)]} scale={[sc, sc, sc]}>
-      <T.MeshStandardMaterial color={NOTE_COLORS[n.color]} transparent
-        opacity={alpha} />
+      <T.MeshToonMaterial color={NOTE_COLORS[n.color]} gradientMap={RAMP}
+        transparent opacity={alpha} />
     </T.Mesh>
     <TextSprite
       text={"+" + o.points.toFixed(0)}
@@ -344,11 +350,10 @@
           ]}
           quaternion={aaq(sp.cp.b, side.sign * age * 1.8)}
         >
-          <T.MeshStandardMaterial
+          <T.MeshToonMaterial
             color={NOTE_COLORS[n.color]}
+            gradientMap={RAMP}
             emissive={NK[n.color].emissive}
-            roughness={0.35}
-            metalness={0.1}
             transparent
             opacity={alpha}
           />

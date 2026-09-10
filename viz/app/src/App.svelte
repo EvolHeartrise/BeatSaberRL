@@ -1,5 +1,6 @@
 <script>
   import { Canvas } from "@threlte/core";
+  import { NoToneMapping } from "three";
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
   import { pb, pose, lastTick, loadText, setPlaying, setSpeed, step,
@@ -97,7 +98,11 @@
 
 <main>
   <div id="stage" bind:this={wrap}>
-    <Canvas>
+    <!-- Threlte defaults to AgX tone mapping, which rolls the highlights
+         off and desaturates: it turns the toon ramp's three flat bands
+         into a soft gradient and mutes the saber red/blue. A cel look
+         wants the shaded values written straight through. -->
+    <Canvas toneMapping={NoToneMapping}>
       <Scene />
     </Canvas>
   </div>
