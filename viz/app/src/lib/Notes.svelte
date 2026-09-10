@@ -11,8 +11,9 @@
   import {
     BAD_COL, BLOCK, BOMB_RADIUS, DT, HALF, HB,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
-    MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs, activePosts,
-    aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, noteCenter,
+    MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs,
+    aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, landedPost,
+    noteCenter,
     noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
   } from "./replay.js";
   // the REAL object models + colours, as ScoreSaber's replay viewer draws
@@ -32,7 +33,6 @@
   const time = $derived(pb.cur * DT);
   const pend = $derived(pendingNotes(pb.rep, time, zOff));
   const after = $derived(aftermaths(pb.rep, time));
-  const posts = $derived(activePosts(pb.rep, time));
   const arcs = $derived(activeArcs(pb.rep, time, zOff));
   const walls = $derived(pendingWalls(pb.rep, time, zOff));
 
@@ -380,7 +380,8 @@
     </T.Mesh>
     <!-- links score a flat 20 in white (ScoreColorSettings.chainLinkColor) -->
     {@const ind = indicator(cx, cy, i, age, false, oz)}
-    <TextSprite text={o.points.toFixed(0)} color={IND_COL} size={IND_SIZE}
+    <TextSprite text={(o.points + landedPost(pb.rep, i, time)).toFixed(0)}
+      color={IND_COL} size={IND_SIZE}
       position={ind.pos} opacity={ind.alpha} />
   {:else if o.kind === "good"}
     <!-- the real model (note or chain head, glyph excluded) sliced by
@@ -414,8 +415,12 @@
         </T.Mesh>
       </T.Group>
     {/each}
+    <!-- ONE number per note, up to the full 115: the cut's own points plus
+         whatever follow-through has landed by now, so the score counts up in
+         flight instead of arriving as two competing popups -->
     {@const ind = indicator(cx, cy, i, age, false, oz)}
-    <TextSprite text={o.points.toFixed(0)} color={IND_COL} size={IND_SIZE}
+    <TextSprite text={(o.points + landedPost(pb.rep, i, time)).toFixed(0)}
+      color={IND_COL} size={IND_SIZE}
       position={ind.pos} opacity={ind.alpha} />
   {:else}
     <!-- bad cut / miss: outline + reason at the object's position when
@@ -446,19 +451,4 @@
   {/if}
 {/each}
 
-{#each posts as p (p.note + "@" + p.tick)}
-  {@const [cx, cy] = noteCenter(pb.rep.chart[p.note])}
-  <!-- Follow-through points. The game folds post-swing into the one flying
-       number per note; our sim awards them a few ticks later as their own
-       event, so they get their own smaller "+N" on the same flight path,
-       held a constant 0.28 m below it — offsetting only the start would
-       let the two converge, since every indicator eases to the same endY.
-       Zero-point follow-throughs are dropped: the note's own number
-       already says post-swing earned nothing. -->
-  {#if p.points > 0}
-    {@const ind = indicator(cx, cy, p.note, p.age, false, p.zOff)}
-    <TextSprite text={"+" + p.points.toFixed(0)} color={IND_COL}
-      size={IND_SIZE * 0.7} opacity={ind.alpha * 0.85}
-      position={[ind.pos[0], ind.pos[1] - 0.28, ind.pos[2]]} />
-  {/if}
-{/each}
+

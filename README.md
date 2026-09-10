@@ -237,9 +237,11 @@ score (115 scale, white) pops up in the note's lane at the player's plane
 and eases away down the tunnel on a quartic ease-out over 0.7 s — good
 hits sinking, bad ones rising — fading in over 0.1 s and out over the
 last 0.3 s. Misses read "MISS" and bad cuts/bombs an X, both in the
-reference's red; a bad cut keeps a small reason label under its X, and a
-post-swing award its own smaller "+N" below the note's number (the game
-folds post-swing into one number; the sim awards it separately). Env v10 (P6): the viewer draws the REAL
+reference's red, and a bad cut keeps a small reason label under its X.
+The sim scores a cut in two installments (pre-swing + accuracy at the cut,
+follow-through a few ticks later) but the indicator shows ONE number per
+note out of the full 115: it spawns with the cut's points and counts up
+when the follow-through lands (`landedPost`). Env v10 (P6): the viewer draws the REAL
 articulated skeleton (full-body FK from the replayed q36 — capsules at
 the SPEC-v10 collider dims, feet on their weld anchors), flashes
 yellow contact markers sized by impulse at self-collision events, and
