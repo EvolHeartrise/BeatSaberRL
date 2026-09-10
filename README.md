@@ -256,7 +256,13 @@ every solid is a `MeshToonMaterial` on one shared three-band ramp and is
 drawn twice — once as an inverted-hull ink outline, once banded — over a
 key/rim/hemisphere rig with tone mapping off, so the bands stay flat.
 The body is white (arms washed ~60% toward their saber hue), which is
-what the ink and the bands are tuned against. The saber trail is cut the
+what the ink and the bands are tuned against. The old full-width floor
+plane is gone since 2026-09-09 in favour of the game's player platform,
+lifted from the same reference (Previewer.unity "Player/PlayerPlatform"):
+a 3 x 0.05 x 2 m slab whose top face IS the y = 0 floor, with four 2 cm
+cyan glow strips inset 1 cm from its rim, fixed at world z -0.65 — which
+is where our own root sits. Cut debris falls under the sim's own g
+(9.81 -y) instead of drifting in a straight line. The saber trail is cut the
 same way: a 0.1 s ribbon swept between the tip path and the blade's base
 at the grip — the whole plane the blade passed through — in flat saber
 colour, three hard alpha steps and an ink border, sampled at `pb.cur` so
