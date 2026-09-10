@@ -88,6 +88,13 @@ def _make_one(job):
                 f"{round(walk.score)} != bench {entry['score']} "
                 f"(near-tie drift; replay is self-consistent)")
 
+    # stamp the map on the recording so the 3D viewer can pull this song's
+    # audio from BeatSaver and line it up (meta["shift"] is what
+    # first_note_s did to the clock; -shift is the song time at replay t=0)
+    from annotate_replay_audio import stamp
+    stamp(base + ".jsonl", entry["song_hash"], entry["difficulty"],
+          entry["song"], -meta["shift"])
+
     conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
                  entry["difficulty"], base + ".dat")
     d = decode_dat(base + ".dat")

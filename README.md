@@ -270,6 +270,40 @@ at the grip — the whole plane the blade passed through — in flat saber
 colour, three hard alpha steps and an ink border, sampled at `pb.cur` so
 it stays welded to the blade instead of lagging a tick behind it.
 
+## Song audio in the replay viewer
+
+Since 2026-09-09 the viewer plays the real song under a replay, pulled from
+BeatSaver at view time (both its hosts send `access-control-allow-origin: *`,
+so it works from the `file://` page):
+
+```bash
+$VENV/bin/python annotate_replay_audio.py 'replays/*.jsonl'
+```
+
+A recording only knows which song it is if it carries the ADDITIVE header
+field that writes: `"map": {hash, difficulty, song, audio_offset_s}`.
+`make_top10_replays.py` stamps new recordings itself. `audio_offset_s` is the
+song time at replay t=0 and is NOT optional — recordings re-base the chart so
+the first note lands at 2 s, and the real offsets across the replay library
+run from −0.04 s to +19.6 s.
+
+The annotator can be run over recordings made before the field existed
+because the header carries the whole chart: a candidate (map, difficulty)
+from the ScoreSaber catalog is re-parsed at the recording convention and its
+note times compared against the header's, so the map, the difficulty and the
+time base are all PROVEN before anything is written. A wrong guess can't
+silently desync the audio — the failure mode is "not annotated". 604 of the
+639 replays on disk annotate; the rest are synthetic charts with no song.
+
+Viewer side (`viz/app/src/lib/audio.js`): BeatSaver hash lookup → map `.zip`
+→ the audio file `Info.dat` names (`.egg` is Ogg Vorbis, so it needs an
+explicit MIME type) → a blob an `<audio>` element plays, cached in IndexedDB
+by map hash so re-viewing costs no download. The tick clock stays
+authoritative and the audio follows it — seeks when it drifts past 80 ms,
+`playbackRate` tracks the speed control, and it stays silent while the song
+time is still negative. Mute + volume sit in the bottom bar. The video export
+records the canvas only, so exported clips are still silent.
+
 Since 2026-09-06 the objects are the REAL Beat Saber models as
 ScoreSaber's replay viewer renders them — the canonical reference for
 every visual size: the 0.5 m beveled note cube with the game's triangle

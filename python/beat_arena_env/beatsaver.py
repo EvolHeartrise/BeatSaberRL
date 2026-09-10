@@ -459,7 +459,11 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         walls = [replace(w, start_time=w.start_time + shift) for w in walls]
 
     scoreable = [n for n in notes if n.kind != KIND_BOMB]
-    meta = {"bpm": bpm, "njs": njs, "speed": speed, "difficulty": difficulty,
+    # `shift` is what first_note_s did to the clock: chart_t = song_t + shift.
+    # The replay viewer needs it to line the song up with a recording (song
+    # time at replay t=0 is -shift); nothing else reads it.
+    meta = {"shift": shift,
+            "bpm": bpm, "njs": njs, "speed": speed, "difficulty": difficulty,
             "n_notes": len(scoreable), "n_bombs": len(notes) - len(scoreable),
             "n_walls": len(walls), "walls": walls,
             "dropped": dropped, "song_name": song_name,

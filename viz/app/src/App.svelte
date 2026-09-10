@@ -3,8 +3,9 @@
   import { NoToneMapping } from "three";
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
-  import { pb, pose, lastTick, loadText, setPlaying, setSpeed, step,
+  import { audio, pb, pose, lastTick, loadText, setPlaying, setSpeed, step,
     togglePose } from "./lib/state.svelte.js";
+  import { songBlob } from "./lib/audio.js";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
 
   let wrap; // canvas container, for video export
@@ -21,6 +22,76 @@
   const nBombs = $derived(pb.rep ? pb.rep.chart.length - scoreable : 0);
   // cached: the HUD re-renders every tick and maxScore is O(chart)
   const maxPts = $derived(pb.rep ? maxScore(pb.rep.chart) : 0);
+
+  // ---- song audio ---------------------------------------------------------
+  // Fetch the map's audio whenever a replay that names one is loaded. The
+  // blob URL is revoked on replacement; the flag guards a replay swapped out
+  // mid-download from clobbering the next one's state.
+  // $state, not a plain let: bind:this on a plain variable is not a tracked
+  // write, so the sync effect below would never learn the element arrived.
+  let audioEl = $state(null);
+  let blobUrl = null;
+  $effect(() => {
+    const m = pb.rep?.map;
+    if (!m) return;
+    let stale = false;
+    songBlob(m.hash, (stage) => { if (!stale) audio.msg = stage; })
+      .then((blob) => {
+        if (stale) return;
+        if (!audioEl) return;
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
+        blobUrl = URL.createObjectURL(blob);
+        audioEl.src = blobUrl;
+        audio.status = "ready";
+        audio.msg = "";
+      })
+      .catch((e) => {
+        if (stale) return;
+        audio.status = "error";
+        audio.msg = e.message;
+      });
+    return () => { stale = true; };
+  });
+
+  // The audio follows the replay clock; the clock NEVER follows the audio.
+  // The tick counter is authoritative — scrubbing, tick-stepping and the
+  // video export all drive it directly — so the element is nudged back
+  // whenever it drifts past SYNC_TOL rather than being trusted to keep time.
+  // This effect reads pb.cur, so it reconciles once per frame while playing.
+  const SYNC_TOL = 0.08;
+  $effect(() => {
+    // Every reactive read happens up front, before any early return: `||`
+    // short-circuits, so testing the element first would leave this effect
+    // subscribed to nothing on the run where the element is still null, and
+    // it would never run again.
+    const el = audioEl;
+    const ready = audio.status === "ready";
+    const want = audio.offset + pb.cur * DT; // song time for this frame
+    const rate = pb.speed, vol = audio.muted ? 0 : audio.vol;
+    const run = pb.playing && !pose.on;
+    if (!el || !ready) return;
+    el.playbackRate = rate; // setSpeed already clamps to [0.25, 4]
+    el.volume = vol;
+    if (want < 0) {
+      // the recording starts before the song does (the chart is re-based so
+      // the first note lands at 2 s, which can predate t=0 in song time)
+      if (!el.paused) el.pause();
+      el.currentTime = 0;
+      return;
+    }
+    if (Math.abs(el.currentTime - want) > SYNC_TOL) el.currentTime = want;
+    if (run) {
+      // may reject until the first user gesture; the next frame retries
+      if (el.paused) el.play().catch(() => {});
+    } else if (!el.paused) el.pause();
+  });
+
+  const audioLabel = $derived(
+    audio.status === "ready" ? (audio.song || "song")
+    : audio.status === "loading" ? (audio.msg || "song…")
+    : audio.status === "error" ? "no audio"
+    : audio.status === "none" ? "no song"
+    : "");
 
   function load(text, name) {
     try {
@@ -157,6 +228,34 @@
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}
       </button>
+      {#if pb.rep}
+        <!-- preservesPitch off: a speed change should sound like the game's
+             practice mode (pitch follows the rate), not a time-stretch -->
+        <audio
+          bind:this={audioEl}
+          preload="auto"
+          onloadedmetadata={(e) => { e.currentTarget.preservesPitch = false; }}
+        ></audio>
+        <span id="snd" title={audio.msg || audio.song}>
+          <button
+            class:on={audio.status === "ready" && !audio.muted}
+            disabled={audio.status !== "ready"}
+            onclick={() => (audio.muted = !audio.muted)}
+          >{audio.status === "ready" ? (audio.muted ? "🔇" : "🔊") : "🔈"}</button>
+          {#if audio.status === "ready"}
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.02"
+              value={audio.vol}
+              oninput={(e) => (audio.vol = +e.target.value)}
+            />
+          {:else}
+            <span class="dim">{audioLabel}</span>
+          {/if}
+        </span>
+      {/if}
       <input
         type="range"
         min="0"
@@ -210,6 +309,10 @@
   button:disabled { opacity: 0.5; cursor: default; }
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
+  #snd { display: flex; gap: 6px; align-items: center; }
+  #snd input[type="range"] { width: 70px; }
+  #snd .dim { color: #6b7180; font-size: 12px; max-width: 22ch; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
   #hud {
     font-variant-numeric: tabular-nums; color: #9aa0ae; padding: 5px 14px;
   }
