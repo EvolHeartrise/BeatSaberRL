@@ -9,7 +9,7 @@
   import * as THREE from "three";
   import { pb } from "./state.svelte.js";
   import {
-    BAD_COL, BLOCK, BOMB_RADIUS, DT, GOOD_COL, HALF, HB,
+    BAD_COL, BLOCK, BOMB_RADIUS, DT, HALF, HB,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
     MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs, activePosts,
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, noteCenter,
@@ -127,6 +127,56 @@
   // glow). Materials are per instance (each mesh below declares its own)
   // so the distance fade stays per note.
   const NK = [noteColors(0), noteColors(1)];
+
+  // ---- flying hit score ---------------------------------------------------
+  // Styled after ScoreSaber's watch viewer (ScoreManager.UpdateScoreIndicator
+  // + ScoreColorSettings), the same source as the object models. The numbers
+  // below are that component's serialized Previewer.unity fields:
+  //   indicatorStartZ -0.6; good end (y -0.25, z 6); bad end (y 1.8, z 7);
+  //   lifetime 0.7, fade in 0.1, fade out 0.3; endX = x +- 0.15 (random);
+  //   badColor (1, 0.051, 0.051); missString "<size=150%>MISS"; and the
+  //   default judgement (FormatMode.Numeric, a single white judgement at
+  //   threshold 0) = the bare score number, white, no prefix. Bad cuts and
+  //   bombs swap the number for an X mark (SetIconActive) in badColor.
+  // So the number pops up in the note's lane/row AT the player's plane and
+  // eases away down the tunnel on a quartic ease-out — good hits sinking,
+  // bad ones rising — fading in, then out. Our per-note scale is already the
+  // game's (KIND_MAX = 115 / 85 / 20), so the number reads as it would there.
+  const IND_START_Z = -0.6;
+  const IND_END_Y = -0.25, IND_END_Z = 6;
+  const IND_BAD_Y = 1.8, IND_BAD_Z = 7;
+  const IND_LIFE = 0.7, IND_FADE_IN = 0.1, IND_FADE_OUT = 0.3;
+  const IND_JITTER = 0.15;
+  const IND_COL = "#ffffff", IND_BAD_COL = "#ff0d0d";
+  // TMP fontSize 2.2 at the ScoreIndicator prefab's text scale. The exact
+  // world height depends on TMP font metrics, which the ledger does not
+  // record, so this one is matched by eye rather than derived.
+  const IND_SIZE = 0.22;
+
+  const quartOut = (t) => 1 - (1 - t) ** 4;
+  // The game randomises endX per hit. A replay has to scrub to the same
+  // picture every time, so the jitter is hashed off the note index instead.
+  const jitterX = (i) => {
+    const f = Math.sin((i + 1) * 12.9898) * 43758.5453;
+    return (2 * (f - Math.floor(f)) - 1) * IND_JITTER;
+  };
+  // `oz` is the frozen v15 track offset: the reference viewer starts the
+  // indicator at a fixed world z while its cut plane rides the head, which
+  // under v15 would leave the number behind whenever the head has moved.
+  // Carrying the offset keeps it at the player's plane, as intended.
+  function indicator(cx, cy, i, age, bad, oz) {
+    const e = quartOut(Math.min(1, age / IND_LIFE));
+    const endY = bad ? IND_BAD_Y : IND_END_Y;
+    const endZ = bad ? IND_BAD_Z : IND_END_Z;
+    const left = IND_LIFE - age;
+    const a = age < IND_FADE_IN ? age / IND_FADE_IN
+      : left < IND_FADE_OUT ? left / IND_FADE_OUT : 1;
+    return {
+      pos: [cx + jitterX(i) * e, cy + (endY - cy) * e,
+            -(IND_START_Z + (endZ - IND_START_Z) * e + oz)],
+      alpha: Math.max(0, Math.min(1, a)),
+    };
+  }
 
   const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
@@ -299,8 +349,10 @@
 {#each after as { n, i, o, age, alpha, zOff: oz } (n)}
   {@const [cx, cy] = noteCenter(n)}
   {#if o.kind === "bomb"}
-    <!-- bomb hit: red flash + label at the bomb's position at hit time -->
+    <!-- bomb hit: red flash at the bomb, X mark on the indicator (the
+         reference viewer shows the X for bombs and bad cuts alike) -->
     {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
+    {@const ind = indicator(cx, cy, i, age, true, oz)}
     <T.Mesh geometry={flashGeo} position={[cx, cy, -zHit]}
       scale={BOMB_RADIUS + age * 1.2}>
       <!-- 0.32, not the pre-cel 0.55: unlit overlays are no longer rolled
@@ -308,13 +360,8 @@
       <T.MeshBasicMaterial color="#ff4a4a" transparent
         opacity={alpha * 0.32} depthWrite={false} />
     </T.Mesh>
-    <TextSprite
-      text="bomb!"
-      color={MISS_COL}
-      size={0.16}
-      position={[cx, cy + BOMB_RADIUS + 0.15 + age * 0.4, -zHit]}
-      opacity={alpha}
-    />
+    <TextSprite text="X" color={IND_BAD_COL} size={IND_SIZE * 1.5}
+      position={ind.pos} opacity={ind.alpha} />
   {:else if o.kind === "good" && n.kind === KIND_CHAIN_LINK}
     <!-- link good cut: quick shrink/pop of the slab -->
     {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
@@ -324,13 +371,10 @@
       <T.MeshToonMaterial color={NOTE_COLORS[n.color]} gradientMap={RAMP}
         transparent opacity={alpha} />
     </T.Mesh>
-    <TextSprite
-      text={"+" + o.points.toFixed(0)}
-      color={GOOD_COL}
-      size={0.13}
-      position={[cx, cy + LINK_H + age * 0.5, 0.02 - oz]}
-      opacity={alpha}
-    />
+    <!-- links score a flat 20 in white (ScoreColorSettings.chainLinkColor) -->
+    {@const ind = indicator(cx, cy, i, age, false, oz)}
+    <TextSprite text={o.points.toFixed(0)} color={IND_COL} size={IND_SIZE}
+      position={ind.pos} opacity={ind.alpha} />
   {:else if o.kind === "good"}
     <!-- the real model (note or chain head, glyph excluded) sliced by
          the ACTUAL cut plane (blade sweep at the cut tick): the two
@@ -363,13 +407,9 @@
         </T.Mesh>
       </T.Group>
     {/each}
-    <TextSprite
-      text={"+" + o.points.toFixed(0)}
-      color={GOOD_COL}
-      size={0.16}
-      position={[cx, cy + HALF * 1.2 + age * 0.5, 0.02 - oz]}
-      opacity={alpha}
-    />
+    {@const ind = indicator(cx, cy, i, age, false, oz)}
+    <TextSprite text={o.points.toFixed(0)} color={IND_COL} size={IND_SIZE}
+      position={ind.pos} opacity={ind.alpha} />
   {:else}
     <!-- bad cut / miss: outline + reason at the object's position when
          the event fired. Since env v7.3 misses register at the head
@@ -384,24 +424,34 @@
       rotation={[0, 0, noteRot(n)]}>
       <T.LineBasicMaterial color={col} transparent opacity={alpha} />
     </T.LineSegments>
-    <TextSprite
-      text={o.reason.replace("_", " ")}
-      color={col}
-      size={0.14}
-      position={[cx, cy + HALF * 1.6, -zEv]}
-      opacity={alpha}
-    />
+    {@const ind = indicator(cx, cy, i, age, true, oz)}
+    <TextSprite text={o.kind === "miss" ? "MISS" : "X"} color={IND_BAD_COL}
+      size={IND_SIZE * 1.5} position={ind.pos} opacity={ind.alpha} />
+    {#if o.kind === "bad"}
+      <!-- viewer-only: the sim's reason for rejecting the cut, which the
+           game has no equivalent for — small, under the mark, riding it as
+           it recedes. Bad cuts only: a miss and a bomb carry the constant
+           reasons "miss"/"bomb", which the mark itself already says. -->
+      <TextSprite text={o.reason.replace("_", " ")} color={col} size={0.1}
+        bold={false} opacity={ind.alpha * 0.85}
+        position={[ind.pos[0], ind.pos[1] - IND_SIZE * 1.15, ind.pos[2]]} />
+    {/if}
   {/if}
 {/each}
 
 {#each posts as p (p.note + "@" + p.tick)}
   {@const [cx, cy] = noteCenter(pb.rep.chart[p.note])}
-  <TextSprite
-    text={"+" + p.points.toFixed(0) + " follow"}
-    color="#9ece6a"
-    size={0.11}
-    bold={false}
-    position={[cx, cy - HALF * 1.4 - p.age * 0.4, 0.02 - p.zOff]}
-    opacity={p.alpha}
-  />
+  <!-- Follow-through points. The game folds post-swing into the one flying
+       number per note; our sim awards them a few ticks later as their own
+       event, so they get their own smaller "+N" on the same flight path,
+       held a constant 0.28 m below it — offsetting only the start would
+       let the two converge, since every indicator eases to the same endY.
+       Zero-point follow-throughs are dropped: the note's own number
+       already says post-swing earned nothing. -->
+  {#if p.points > 0}
+    {@const ind = indicator(cx, cy, p.note, p.age, false, p.zOff)}
+    <TextSprite text={"+" + p.points.toFixed(0)} color={IND_COL}
+      size={IND_SIZE * 0.7} opacity={ind.alpha * 0.85}
+      position={[ind.pos[0], ind.pos[1] - 0.28, ind.pos[2]]} />
+  {/if}
 {/each}
