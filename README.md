@@ -322,6 +322,12 @@ MediaStreamDestination for the recorder. That gain node is where mute/volume
 live, since the element's own volume sits upstream of the tap and would
 otherwise bake a muted viewer into a silent file.
 
+`node test/export-probe.mjs [replay] [fps]` guards it: it runs a real export
+and fails if the file is blank. Structural checks cannot catch that — a
+broken exporter produced perfect frame counts, frame rate, duration, pixel
+format and audio track with 23k frames of pure black — but bytes-per-frame
+separates them cleanly (~0.5 kB blank vs ~13 kB with gameplay in it).
+
 Replays with no map export video-only. The frame rate is a dropdown next to
 the button (24 / 30 / 60 / 120): output frames are decoupled from the
 replay's 30 ticks/s — frame i renders at tick `i * 30 / fps`, which the

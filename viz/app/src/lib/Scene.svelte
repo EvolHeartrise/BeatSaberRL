@@ -36,6 +36,7 @@
   // hand the frame loop to the DOM shell so `export video` can step it
   gfx.advance = ctx.advance;
   gfx.renderMode = ctx.renderMode;
+  gfx.scheduler = ctx.scheduler;
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {

@@ -199,6 +199,7 @@
       const fps = pb.fps;
       const TPS = 1 / DT; // replay ticks per second
       const frames = Math.floor((lastTick() / TPS) * fps) + 1;
+      const t0 = performance.now(); // synthetic frame clock, monotonic
       // stop Threlte's own loop: from here the exporter owns the frame clock
       gfx.renderMode?.set("manual");
       const blob = await exportExact({
@@ -211,7 +212,15 @@
         renderFrame: (i) => {
           pb.cur = Math.min(lastTick(), (i * TPS) / fps);
           flushSync(); // derived pose + the $effects that refill GPU buffers
+          // advance() only sets Threlte's "this frame wants a render" flag —
+          // the render itself happens inside scheduler.run(), which is what
+          // its requestAnimationFrame loop calls. Calling only advance() here
+          // marked frames and drew none, so every captured frame was an
+          // unrendered (black) canvas. run() takes a timestamp; feeding it
+          // synthetic ones spaced 1/fps apart keeps task deltas deterministic
+          // instead of tied to how long the export actually takes.
           gfx.advance();
+          gfx.scheduler.run(t0 + (i * 1000) / fps);
         },
       });
       download(blob);
