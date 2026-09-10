@@ -14,6 +14,7 @@
     SABER_COLORS, SABER_DARK, SABER_LEN, V_MIN, fkSaber, tipOf, tipSpeed,
   } from "./replay.js";
   import { NOTE_COLORS, modelGeo, noteColors } from "./models.js";
+  import { OUTLINE_SABER, RAMP } from "./toon.js";
 
   let { s, fk } = $props();
 
@@ -87,16 +88,18 @@
 <!-- the saber model at the grip: blade (SaberBlade.mat = saber colour,
      fresnel glow) + handle (SaberHandle.mat, dark) -->
 <T.Group position={[sab[0], sab[1], -sab[2]]} quaternion={saberQuat}>
+  <T.Mesh geometry={bladeGeo} material={OUTLINE_SABER} />
   <T.Mesh geometry={bladeGeo}>
-    <T.MeshStandardMaterial
+    <T.MeshToonMaterial
       color={NOTE_COLORS[s]}
+      gradientMap={RAMP}
       emissive={k.arrowGlow}
       emissiveIntensity={0.6}
-      roughness={0.4}
     />
   </T.Mesh>
+  <T.Mesh geometry={handleGeo} material={OUTLINE_SABER} />
   <T.Mesh geometry={handleGeo}>
-    <T.MeshStandardMaterial color={SABER_DARK[s]} roughness={0.5} metalness={0.4} />
+    <T.MeshToonMaterial color={SABER_DARK[s]} gradientMap={RAMP} />
   </T.Mesh>
 </T.Group>
 {#if capable}
