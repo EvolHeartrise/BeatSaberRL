@@ -469,6 +469,11 @@ export function parseReplay(text) {
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
     trackAnchor: head.header.track_anchor ?? null,
+    // ADDITIVE header field written by python/annotate_replay_audio.py:
+    // {hash, difficulty, song, audio_offset_s} — the map this recording was
+    // played on, so the viewer can fetch its audio. Absent on synthetic
+    // charts and on anything recorded before the annotator existed.
+    map: head.header.map ?? null,
     // env v17 ADDITIVE header field: world-space wall AABBs, geometry
     // finished by the parser ({t, cx, cy, w, h, l, speed} per wall).
     // Pre-v17 recordings (field absent) render exactly as before.

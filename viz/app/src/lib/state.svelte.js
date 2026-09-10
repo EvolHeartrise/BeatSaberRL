@@ -12,6 +12,18 @@ export const pb = $state({
   hitboxes: false, // real v7 collision-volume wireframes ('h')
 });
 
+// Song audio (2026-09-09). `offset` is the song time at replay t = 0, from
+// the replay's own header — see lib/audio.js. status: off (no replay) |
+// none (replay carries no map) | loading | ready | error.
+export const audio = $state({
+  status: "off",
+  msg: "",
+  offset: 0,
+  song: "",
+  muted: false,
+  vol: 0.8,
+});
+
 // Manual pose mode (env v10): slider-driven FULL-BODY pose — 29 joint
 // angles (§1.4 actuated order) + the free root (position + yaw/pitch/
 // roll). Drives the same bodyFK preview path as replay playback; no
@@ -57,6 +69,10 @@ export function loadText(text, name) {
   pb.name = name.replace(/\.[^.]*$/, "");
   pb.cur = 0;
   pb.playing = true;
+  audio.song = rep.map?.song ?? "";
+  audio.offset = rep.map?.audio_offset_s ?? 0;
+  audio.status = rep.map ? "loading" : "none";
+  audio.msg = rep.map ? "" : "no map in this replay — annotate_replay_audio.py";
 }
 
 export function setPlaying(p) {
