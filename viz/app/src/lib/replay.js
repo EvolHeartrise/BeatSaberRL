@@ -458,8 +458,14 @@ export function parseReplay(text) {
         };
     }),
   );
+  // Follow-through awards indexed by note, so the flying hit score can add
+  // the ones that have landed without rescanning every post on the replay
+  // each frame (see landedPost).
+  const postsByNote = [];
+  for (const p of posts) (postsByNote[p.note] ??= []).push(p);
+
   return {
-    config: head.header.config, chart, ticks, outcomes, posts,
+    config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
     trackAnchor: head.header.track_anchor ?? null,
@@ -832,6 +838,20 @@ export function activePosts(rep, time) {
     });
   }
   return out;
+}
+
+/** Follow-through points awarded to note `i` that have LANDED by `time`.
+ * The sim scores a cut in two installments — pre-swing + accuracy at the
+ * cut, follow-through a few ticks later — but a note is worth one number
+ * (115 / 85 / 20, KIND_MAX). The viewer's flying score is created at the
+ * cut and adds this as it arrives, so it counts up in flight rather than
+ * being withheld until the swing finishes. */
+export function landedPost(rep, i, time) {
+  const list = rep.postsByNote?.[i];
+  if (!list) return 0;
+  let sum = 0;
+  for (const p of list) if (time >= (p.tick + 1) * DT) sum += p.points;
+  return sum;
 }
 
 /** Arc hint tubes visible at `time`: head/tail world positions of each
