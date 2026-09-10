@@ -18,7 +18,7 @@ export const pb = $state({
 // exporter drives the render loop one frame at a time, but it lives in the
 // DOM shell OUTSIDE the <Canvas>, so it cannot call useThrelte itself. Plain
 // object: nothing reactive depends on these.
-export const gfx = { advance: null, renderMode: null };
+export const gfx = { advance: null, renderMode: null, scheduler: null };
 
 // Song audio (2026-09-09). `offset` is the song time at replay t = 0, from
 // the replay's own header — see lib/audio.js. status: off (no replay) |
