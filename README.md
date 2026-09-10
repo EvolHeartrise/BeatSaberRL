@@ -249,10 +249,10 @@ drawn twice — once as an inverted-hull ink outline, once banded — over a
 key/rim/hemisphere rig with tone mapping off, so the bands stay flat.
 The body is white (arms washed ~60% toward their saber hue), which is
 what the ink and the bands are tuned against. The saber trail is cut the
-same way: a 0.2 s ribbon swept between the tip and the point 0.5 m down
-the blade (the game's own construction), flat saber colour in three hard
-alpha steps with an ink border, sampled at `pb.cur` so it stays welded to
-the blade instead of lagging a tick behind it.
+same way: a 0.1 s ribbon swept between the tip path and the blade's base
+at the grip — the whole plane the blade passed through — in flat saber
+colour, three hard alpha steps and an ink border, sampled at `pb.cur` so
+it stays welded to the blade instead of lagging a tick behind it.
 
 Since 2026-09-06 the objects are the REAL Beat Saber models as
 ScoreSaber's replay viewer renders them — the canonical reference for

@@ -55,11 +55,12 @@
   const k = noteColors(s);
 
   // ---- swept tip ribbon ---------------------------------------------------
-  // The trail is the surface the top of the blade swept, not a line through
-  // the tip: a quad strip between the tip path and the path of the point
-  // TRAIL_INNER metres back down the blade — the same construction the game
-  // uses. Cel-styled to match the rest of the scene: flat saber colour in
-  // three HARD alpha steps rather than a gradient, with a thin ink border.
+  // The trail is the surface the blade swept, not a line through the tip: a
+  // quad strip between the tip path and the path of the blade's base (the
+  // grip — the blade runs 1 m forward from the hand frame), so the ribbon
+  // is the whole plane the blade passed through. Cel-styled to match the
+  // rest of the scene: flat saber colour in three HARD alpha steps rather
+  // than a gradient, with a thin ink border.
   //
   // Two details make the steps hard and the head solid:
   //   - every quad owns its four vertices instead of sharing them with its
@@ -68,10 +69,14 @@
   //   - the newest sample is taken at pb.cur itself, not at the last whole
   //     tick, so the ribbon stays welded to the blade during playback (the
   //     old line lagged it by up to a tick).
-  const TRAIL_S = 0.2;               // history window, seconds
-  const TRAIL_TICKS = TRAIL_S / DT;  // 6 logged saber samples at 30 Hz
-  const SEGS = 18;                   // quads along the ribbon
-  const TRAIL_INNER = 0.5;           // ribbon width, in metres of blade
+  const TRAIL_S = 0.1;               // history window, seconds
+  const TRAIL_TICKS = TRAIL_S / DT;  // 3 logged saber samples at 30 Hz
+  // Resample at a fixed rate per logged tick rather than a fixed quad
+  // count: the smoothing below is a filter over SAMPLES, so pinning the
+  // sample density is what keeps its strength unchanged if the window
+  // length moves.
+  const PER_TICK = 3;
+  const SEGS = Math.round(TRAIL_TICKS * PER_TICK); // quads along the ribbon
   const STEPS = [0.42, 0.24, 0.1];   // head -> tail alpha, no interpolation
   // The logged sabers are 30 Hz and saberAt is linear between them, so a
   // fast swing samples as a chain of chords no matter how finely it is
@@ -142,9 +147,9 @@
       tipPath[i * 3] = tp[0];
       tipPath[i * 3 + 1] = tp[1];
       tipPath[i * 3 + 2] = -tp[2];
-      innPath[i * 3] = tp[0] - TRAIL_INNER * sa[3];
-      innPath[i * 3 + 1] = tp[1] - TRAIL_INNER * sa[4];
-      innPath[i * 3 + 2] = -(tp[2] - TRAIL_INNER * sa[5]);
+      innPath[i * 3] = sa[0]; // blade base = the grip / hand frame origin
+      innPath[i * 3 + 1] = sa[1];
+      innPath[i * 3 + 2] = -sa[2];
     }
     smoothPath(tipPath);
     smoothPath(innPath);
@@ -158,7 +163,7 @@
       const u = (q + 0.5) / SEGS; // 0 at the tail, 1 at the blade
       const al = STEPS[u > 2 / 3 ? 0 : u > 1 / 3 ? 1 : 2];
       for (let j = 0; j < 4; j++) paint(ribCol, v + j, RIB_RGB, al);
-      // borders: tip edge then inner edge (LineSegments draws vertex pairs)
+      // borders: tip edge then base edge (LineSegments draws vertex pairs)
       copy3(inkPos, w, tipPath, a);
       copy3(inkPos, w + 1, tipPath, b);
       copy3(inkPos, w + 2, innPath, a);
