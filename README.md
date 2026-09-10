@@ -301,8 +301,20 @@ explicit MIME type) → a blob an `<audio>` element plays, cached in IndexedDB
 by map hash so re-viewing costs no download. The tick clock stays
 authoritative and the audio follows it — seeks when it drifts past 80 ms,
 `playbackRate` tracks the speed control, and it stays silent while the song
-time is still negative. Mute + volume sit in the bottom bar. The video export
-records the canvas only, so exported clips are still silent.
+time is still negative. Mute + volume sit in the bottom bar.
+
+`export video` muxes that song in (VP9 + Opus): the element is tapped through
+WebAudio and forked, through a gain node to the speakers and straight to a
+MediaStreamDestination the recorder gets as a second track. The gain node is
+where mute/volume moved to, because the element's own volume sits upstream of
+the tap and would otherwise bake a muted viewer into a silent file. Replays
+with no map still export video-only.
+
+The scene also paints its own `#0b0d11` background as of 2026-09-09. Threlte
+builds its renderer with `alpha: true` and nothing had set `scene.background`,
+so the canvas was transparent and the dark stage was the `#stage` CSS behind
+it — invisible in the browser, but `captureStream` records the canvas, so
+exports came out black-keyed. Verified: `pix_fmt=yuv420p`, not `yuva420p`.
 
 Since 2026-09-06 the objects are the REAL Beat Saber models as
 ScoreSaber's replay viewer renders them — the canonical reference for

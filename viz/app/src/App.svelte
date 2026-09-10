@@ -71,7 +71,7 @@
     const run = pb.playing && !pose.on;
     if (!el || !ready) return;
     el.playbackRate = rate; // setSpeed already clamps to [0.25, 4]
-    el.volume = vol;
+    if (gain) gain.gain.value = vol; else el.volume = vol;
     if (want < 0) {
       // the recording starts before the song does (the chart is re-based so
       // the first note lands at 2 s, which can predate t=0 in song time)
@@ -85,6 +85,35 @@
       if (el.paused) el.play().catch(() => {});
     } else if (!el.paused) el.pause();
   });
+
+  // The recording's audio: tap the <audio> element through WebAudio and fork
+  // it — through a gain node to the speakers (what you hear) and straight to
+  // a MediaStreamDestination (what gets recorded). Two things to know:
+  //   - createMediaElementSource REROUTES the element permanently, so the
+  //     graph is built once and the speaker branch must stay connected or
+  //     the viewer goes silent;
+  //   - the element's own volume is upstream of the tap, so leaving the
+  //     mute/volume control on it would bake a muted viewer into a silent
+  //     export. The level moves into `gain`, which only feeds the speakers.
+  // Built lazily from the export click, which is the user gesture an
+  // AudioContext needs to start unsuspended.
+  let actx = null, tap = null, gain = null;
+  function audioTap() {
+    if (!audioEl || audio.status !== "ready") return null;
+    if (!actx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      actx = new AC();
+      const src = actx.createMediaElementSource(audioEl);
+      gain = actx.createGain();
+      tap = actx.createMediaStreamDestination();
+      src.connect(gain).connect(actx.destination);
+      src.connect(tap);
+      audioEl.volume = 1; // the level lives in `gain` from here on
+    }
+    actx.resume?.();
+    return tap;
+  }
 
   const audioLabel = $derived(
     audio.status === "ready" ? (audio.song || "song")
@@ -132,10 +161,22 @@
     const canvas = wrap && wrap.querySelector("canvas");
     if (!canvas || !("MediaRecorder" in window)) return;
     pb.exporting = true;
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-      ? "video/webm;codecs=vp9" : "video/webm";
-    const rec = new MediaRecorder(canvas.captureStream(30),
-      { mimeType: mime, videoBitsPerSecond: 3_000_000 });
+    // one stream: the canvas video plus the song, when the replay has one
+    const track = audioTap()?.stream.getAudioTracks()[0] ?? null;
+    const stream = new MediaStream([
+      ...canvas.captureStream(30).getVideoTracks(),
+      ...(track ? [track] : []),
+    ]);
+    const mime = [
+      track ? "video/webm;codecs=vp9,opus" : "video/webm;codecs=vp9",
+      track ? "video/webm;codecs=vp8,opus" : "video/webm",
+      "video/webm",
+    ].find((m) => MediaRecorder.isTypeSupported(m)) ?? "video/webm";
+    const rec = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: 3_000_000,
+      audioBitsPerSecond: 128_000,
+    });
     const chunks = [];
     rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     rec.onstop = () => {
