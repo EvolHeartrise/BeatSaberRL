@@ -43,11 +43,11 @@
   });
 </script>
 
-<T.Sprite {position} scale={[size * made.aspect, size, 1]} renderOrder={10}>
-  <T.SpriteMaterial
-    map={made.tex}
-    transparent
-    {opacity}
-    depthTest={false}
-  />
+<!-- Depth-tested (2026-09-09), so a label is occluded by whatever is in
+     front of it instead of floating over the whole scene — the reference
+     viewer's TMP shader behaves the same way (ZTest LEqual, ZWrite Off).
+     depthWrite stays off: the quad is mostly transparent, and writing depth
+     would let those empty pixels hide the geometry behind them. -->
+<T.Sprite {position} scale={[size * made.aspect, size, 1]}>
+  <T.SpriteMaterial map={made.tex} transparent {opacity} depthWrite={false} />
 </T.Sprite>
