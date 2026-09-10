@@ -192,16 +192,24 @@
     const mode = gfx.renderMode?.current;
     try {
       if (songData && !songBuf) songBuf = await decodeSong(songData);
+      // Output frames are decoupled from the replay's 30 ticks/s: frame i is
+      // at i/fps seconds, i.e. tick i*TPS/fps, which the viewer interpolates
+      // between logged ticks. So 60 fps genuinely smooths the motion instead
+      // of duplicating frames, and 24 subsamples it.
+      const fps = pb.fps;
+      const TPS = 1 / DT; // replay ticks per second
+      const frames = Math.floor((lastTick() / TPS) * fps) + 1;
       // stop Threlte's own loop: from here the exporter owns the frame clock
       gfx.renderMode?.set("manual");
       const blob = await exportExact({
         canvas,
-        ticks: lastTick(),
+        frames,
+        fps,
         song: songBuf,
         songStart: audio.offset,
         onProgress: (p) => { pb.exportPct = p; },
         renderFrame: (i) => {
-          pb.cur = i;
+          pb.cur = Math.min(lastTick(), (i * TPS) / fps);
           flushSync(); // derived pose + the $effects that refill GPU buffers
           gfx.advance();
         },
@@ -320,6 +328,16 @@
       <button onclick={() => setSpeed(pb.speed / 2)}>−</button>
       <span>{speedLabel}</span>
       <button onclick={() => setSpeed(pb.speed * 2)}>+</button>
+      <select
+        bind:value={pb.fps}
+        disabled={pb.exporting}
+        title="export frame rate — the replay itself is always 30 ticks/s, so
+               above that the viewer interpolates between them"
+      >
+        {#each [24, 30, 60, 120] as f (f)}
+          <option value={f}>{f} fps</option>
+        {/each}
+      </select>
       <button onclick={exportVideo} disabled={pb.exporting || !pb.rep}
         title={CAN_EXPORT_EXACT
           ? "renders frame by frame at 30 fps — not real time, so a slow "
@@ -405,10 +423,11 @@
     display: flex; gap: 10px; align-items: center; padding: 8px 14px;
     flex-wrap: wrap; justify-content: center; max-width: 94vw;
   }
-  button {
+  button, select {
     background: #232733; color: #cfd3dc; border: 1px solid #3a4050;
     border-radius: 6px; padding: 4px 12px; cursor: pointer; font: inherit;
   }
+  select { padding: 4px 6px; }
   button:hover { background: #2d3342; }
   button:disabled { opacity: 0.5; cursor: default; }
   button.on { border-color: #7aa2f7; color: #e8eaf0; }

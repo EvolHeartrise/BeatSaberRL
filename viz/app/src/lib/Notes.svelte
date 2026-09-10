@@ -9,7 +9,7 @@
   import * as THREE from "three";
   import { pb } from "./state.svelte.js";
   import {
-    BAD_COL, BLOCK, BOMB_RADIUS, DT, HALF, HB,
+    BAD_COL, BLOCK, BOMB_RADIUS, DT, FADE_S, HALF, HB,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
     MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs,
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, landedPost,
@@ -159,6 +159,21 @@
   // offset would tilt with the note instead of pointing down.
   const G = 9.81;
   const drop = (age) => 0.5 * G * age * age;
+
+  // Cut debris lives half the aftermath window (2026-09-09, user request).
+  // The window itself has to stay 0.7 s: it is the flying hit score's
+  // lifetime, matched to the reference viewer's indicatorLifetime. The pieces
+  // keep their speed and simply stop sooner, so they travel half as far.
+  const DEBRIS_S = FADE_S / 2;
+  // Debris kinematics, named so they are tunable rather than buried in the
+  // template. DEBRIS_V is per half, away from the cut plane, so the two part
+  // at twice that. It went 1.4 -> 2.8 m/s with the halved lifetime
+  // (2026-09-09, user request): 2.8 * 0.35 s is the same 0.98 m of travel the
+  // old 1.4 * 0.7 s gave, so the pieces cover the same ground twice as fast
+  // instead of covering half as much.
+  const DEBRIS_V = 2.8;      // m/s per half, along the cut-plane normal
+  const DEBRIS_SWEEP = 0.9;  // m/s carried along the blade's sweep
+  const DEBRIS_SPIN = 1.8;   // rad/s tumble about the blade axis
 
   const quartOut = (t) => 1 - (1 - t) ** 4;
   // The game randomises endX per hit. A replay has to scrub to the same
@@ -392,6 +407,7 @@
     {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
     {@const sp = splitFor(i)}
     {#each sp.sides as side}
+      {#if age < DEBRIS_S}
       <T.Group
         position={[cx, cy - drop(age), -zCut]}
         rotation={[0, 0, noteRot(n)]}
@@ -399,21 +415,25 @@
         <T.Mesh
           geometry={side.geo}
           position={[
-            side.sign * age * 1.4 * sp.cp.n[0] + age * 0.9 * sp.cp.v[0],
-            side.sign * age * 1.4 * sp.cp.n[1] + age * 0.9 * sp.cp.v[1],
-            -(side.sign * age * 1.4 * sp.cp.n[2] + age * 0.9 * sp.cp.v[2]),
+            side.sign * age * DEBRIS_V * sp.cp.n[0]
+              + age * DEBRIS_SWEEP * sp.cp.v[0],
+            side.sign * age * DEBRIS_V * sp.cp.n[1]
+              + age * DEBRIS_SWEEP * sp.cp.v[1],
+            -(side.sign * age * DEBRIS_V * sp.cp.n[2]
+              + age * DEBRIS_SWEEP * sp.cp.v[2]),
           ]}
-          quaternion={aaq(sp.cp.b, side.sign * age * 1.8)}
+          quaternion={aaq(sp.cp.b, side.sign * age * DEBRIS_SPIN)}
         >
           <T.MeshToonMaterial
             color={NOTE_COLORS[n.color]}
             gradientMap={RAMP}
             emissive={NK[n.color].emissive}
             transparent
-            opacity={alpha}
+            opacity={1 - age / DEBRIS_S}
           />
         </T.Mesh>
       </T.Group>
+      {/if}
     {/each}
     <!-- ONE number per note, up to the full 115: the cut's own points plus
          whatever follow-through has landed by now, so the score counts up in

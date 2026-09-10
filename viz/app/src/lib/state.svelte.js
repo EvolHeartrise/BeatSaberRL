@@ -9,6 +9,7 @@ export const pb = $state({
   speed: 1.0,
   exporting: false,
   exportPct: 0, // frame-by-frame export progress, 0..1
+  fps: 30, // export frame rate; the replay itself is always 30 ticks/s
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
 });
