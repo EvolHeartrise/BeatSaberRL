@@ -3,9 +3,11 @@
   import { NoToneMapping } from "three";
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
-  import { audio, pb, pose, lastTick, loadText, setPlaying, setSpeed, step,
-    togglePose } from "./lib/state.svelte.js";
+  import { audio, gfx, pb, pose, lastTick, loadText, setPlaying, setSpeed,
+    step, togglePose } from "./lib/state.svelte.js";
   import { songBlob } from "./lib/audio.js";
+  import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
+  import { flushSync } from "svelte";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
 
   let wrap; // canvas container, for video export
@@ -31,6 +33,8 @@
   // write, so the sync effect below would never learn the element arrived.
   let audioEl = $state(null);
   let blobUrl = null;
+  let songData = null;   // the fetched Blob, for the frame-by-frame export
+  let songBuf = null;    // decoded once, reused across exports
   $effect(() => {
     const m = pb.rep?.map;
     if (!m) return;
@@ -39,6 +43,8 @@
       .then((blob) => {
         if (stale) return;
         if (!audioEl) return;
+        songData = blob;
+        songBuf = null;
         if (blobUrl) URL.revokeObjectURL(blobUrl);
         blobUrl = URL.createObjectURL(blob);
         audioEl.src = blobUrl;
@@ -153,13 +159,67 @@
   const speedLabel = $derived(
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
 
-  // ---- video export (canvas.captureStream + MediaRecorder) -----------------
-  // Records one real-time playback pass at the current speed, downloads a
-  // .webm. Score popups/labels are in-scene sprites, so they're captured.
-  function exportVideo() {
+  // ---- video export -------------------------------------------------------
+  // Two paths. The frame-by-frame one is the default: it renders exactly one
+  // frame per replay tick and stamps each with its own timestamp, so the file
+  // is 30 fps no matter how long a frame took to draw, and the song is copied
+  // out of the decoded audio by array slice rather than recorded off the
+  // speakers. On a machine that cannot render 30 fps live, the old real-time
+  // pass could only produce a stretched video with choppy audio — that is
+  // what MediaRecorder does with late frames and a stalling audio graph, and
+  // no amount of tuning changes it. The real-time pass stays as the fallback
+  // for browsers without WebCodecs.
+  // Score popups/labels are in-scene sprites, so both paths capture them.
+  function download(blob) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (pb.name || "replay") + ".webm";
+    a.click();
+    // give the click a turn to be handled before the URL goes away
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }
+
+  async function exportVideo() {
     if (!pb.rep || pb.exporting) return;
     const canvas = wrap && wrap.querySelector("canvas");
-    if (!canvas || !("MediaRecorder" in window)) return;
+    if (!canvas) return;
+    if (!CAN_EXPORT_EXACT) return exportRealtime(canvas);
+
+    pb.exporting = true;
+    pb.exportPct = 0;
+    setPlaying(false);
+    const wasCur = pb.cur;
+    const mode = gfx.renderMode?.current;
+    try {
+      if (songData && !songBuf) songBuf = await decodeSong(songData);
+      // stop Threlte's own loop: from here the exporter owns the frame clock
+      gfx.renderMode?.set("manual");
+      const blob = await exportExact({
+        canvas,
+        ticks: lastTick(),
+        song: songBuf,
+        songStart: audio.offset,
+        onProgress: (p) => { pb.exportPct = p; },
+        renderFrame: (i) => {
+          pb.cur = i;
+          flushSync(); // derived pose + the $effects that refill GPU buffers
+          gfx.advance();
+        },
+      });
+      download(blob);
+    } catch (e) {
+      alert("export failed: " + (e?.message ?? e));
+    } finally {
+      if (mode) gfx.renderMode?.set(mode);
+      pb.cur = wasCur;
+      pb.exporting = false;
+      pb.exportPct = 0;
+    }
+  }
+
+  // Fallback: one real-time playback pass through MediaRecorder.
+  function exportRealtime(canvas) {
+    if (!("MediaRecorder" in window)) return;
     pb.exporting = true;
     // one stream: the canvas video plus the song, when the replay has one
     const track = audioTap()?.stream.getAudioTracks()[0] ?? null;
@@ -180,11 +240,7 @@
     const chunks = [];
     rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     rec.onstop = () => {
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
-      a.download = (pb.name || "replay") + ".webm";
-      a.click();
-      URL.revokeObjectURL(a.href);
+      download(new Blob(chunks, { type: "video/webm" }));
       pb.exporting = false;
     };
     pb.cur = 0;
@@ -194,6 +250,7 @@
       if (!pb.playing) { clearInterval(poll); rec.stop(); }
     }, 200);
   }
+
 </script>
 
 <svelte:window
@@ -263,8 +320,14 @@
       <button onclick={() => setSpeed(pb.speed / 2)}>−</button>
       <span>{speedLabel}</span>
       <button onclick={() => setSpeed(pb.speed * 2)}>+</button>
-      <button onclick={exportVideo} disabled={pb.exporting || !pb.rep}>
-        {pb.exporting ? "⏺ recording…" : "⏺ export video"}
+      <button onclick={exportVideo} disabled={pb.exporting || !pb.rep}
+        title={CAN_EXPORT_EXACT
+          ? "renders frame by frame at 30 fps — not real time, so a slow "
+            + "machine still gets a clean file"
+          : "no WebCodecs here: falls back to a real-time capture"}>
+        {pb.exporting
+          ? `⏺ ${Math.round(pb.exportPct * 100)}%`
+          : "⏺ export video"}
       </button>
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}

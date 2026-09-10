@@ -8,9 +8,16 @@ export const pb = $state({
   playing: false,
   speed: 1.0,
   exporting: false,
+  exportPct: 0, // frame-by-frame export progress, 0..1
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
 });
+
+// Threlte's render controls, published by Scene.svelte. The frame-by-frame
+// exporter drives the render loop one frame at a time, but it lives in the
+// DOM shell OUTSIDE the <Canvas>, so it cannot call useThrelte itself. Plain
+// object: nothing reactive depends on these.
+export const gfx = { advance: null, renderMode: null };
 
 // Song audio (2026-09-09). `offset` is the song time at replay t = 0, from
 // the replay's own header — see lib/audio.js. status: off (no replay) |

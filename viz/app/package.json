@@ -3,7 +3,7 @@
   "private": true,
   "version": "10.0.0",
   "type": "module",
-  "description": "Beat Arena 3D replay viewer (env v10 full-body dynamics: articulated 29-joint skeleton via full-body FK, contact markers, per-joint torque/omega gauges, foot reaction forces; real Beat Saber object models baked from ScoreSaber's replay viewer) \u2014 Svelte + Threlte SPA, built to a single static HTML file",
+  "description": "Beat Arena 3D replay viewer (env v10 full-body dynamics: articulated 29-joint skeleton via full-body FK, contact markers, per-joint torque/omega gauges, foot reaction forces; real Beat Saber object models baked from ScoreSaber's replay viewer) — Svelte + Threlte SPA, built to a single static HTML file",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -20,6 +20,7 @@
     "@threlte/core": "^8.0.0",
     "@threlte/extras": "^9.0.0",
     "fflate": "^0.8.2",
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "webm-muxer": "^5.1.4"
   }
 }

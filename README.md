@@ -303,12 +303,27 @@ authoritative and the audio follows it — seeks when it drifts past 80 ms,
 `playbackRate` tracks the speed control, and it stays silent while the song
 time is still negative. Mute + volume sit in the bottom bar.
 
-`export video` muxes that song in (VP9 + Opus): the element is tapped through
-WebAudio and forked, through a gain node to the speakers and straight to a
-MediaStreamDestination the recorder gets as a second track. The gain node is
-where mute/volume moved to, because the element's own volume sits upstream of
-the tap and would otherwise bake a muted viewer into a silent file. Replays
-with no map still export video-only.
+`export video` renders FRAME BY FRAME (`viz/app/src/lib/record.js`), not in
+real time: it steps Threlte's render loop once per replay tick, stamps each
+frame with its own timestamp and encodes VP9 + Opus through WebCodecs into a
+WebM (`webm-muxer`). So the file is exactly `ticks + 1` frames at 30 fps
+however long a frame took to draw, and the song is copied out of the decoded
+audio by array slice — with silence padded wherever the recording runs
+outside it — rather than recorded off the speakers.
+
+That replaced a `captureStream` + MediaRecorder pass, which cannot be tuned
+into correctness on a machine that can't render 30 fps live: MediaRecorder
+timestamps frames by ARRIVAL time, so late frames stretch the video instead
+of dropping, and capturing a stalling audio graph gives genuinely choppy
+audio. The real-time pass survives as the fallback for browsers without
+WebCodecs, and there it still muxes the song by tapping the element through
+WebAudio and forking it — via a gain node to the speakers, straight to a
+MediaStreamDestination for the recorder. That gain node is where mute/volume
+live, since the element's own volume sits upstream of the tap and would
+otherwise bake a muted viewer into a silent file.
+
+Replays with no map export video-only. The frame-by-frame path always writes
+30 fps at 1x regardless of the speed control.
 
 The scene also paints its own `#0b0d11` background as of 2026-09-09. Threlte
 builds its renderer with `alpha: true` and nothing had set `scene.background`,
