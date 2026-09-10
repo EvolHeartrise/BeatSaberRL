@@ -7,7 +7,7 @@
   import { T, useTask, useThrelte } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
-  import { pb, pose, lastTick, setPlaying } from "./state.svelte.js";
+  import { gfx, pb, pose, lastTick, setPlaying } from "./state.svelte.js";
   import {
     BLOCK, DT, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES,
     ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK, frameQuatScene,
@@ -31,7 +31,11 @@
   // three converts it back to the output colour space, so #0b0d11 in the
   // CSS is #0b0d11 in the framebuffer.
   const STAGE_BG = "#0b0d11"; // keep in step with #stage in App.svelte
-  useThrelte().scene.background = new THREE.Color(STAGE_BG);
+  const ctx = useThrelte();
+  ctx.scene.background = new THREE.Color(STAGE_BG);
+  // hand the frame loop to the DOM shell so `export video` can step it
+  gfx.advance = ctx.advance;
+  gfx.renderMode = ctx.renderMode;
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {
