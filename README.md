@@ -230,9 +230,16 @@ miss/head planes — hidden otherwise since 2026-09-06; plus each in-reach
 note's own bounding box, hidden otherwise since 2026-09-09), drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
-heads half-height cubes, links thin slabs ("+20" pops), arc grants
-faint tubes; green split = good cut; orange/red flash = bad cut / miss,
-labeled with the reason. Env v10 (P6): the viewer draws the REAL
+heads half-height cubes, links thin slabs, arc grants faint tubes; green
+split = good cut; orange/red flash = bad cut / miss. Since 2026-09-09 the
+flying hit scores follow the reference viewer's ScoreManager: the bare
+score (115 scale, white) pops up in the note's lane at the player's plane
+and eases away down the tunnel on a quartic ease-out over 0.7 s — good
+hits sinking, bad ones rising — fading in over 0.1 s and out over the
+last 0.3 s. Misses read "MISS" and bad cuts/bombs an X, both in the
+reference's red; a bad cut keeps a small reason label under its X, and a
+post-swing award its own smaller "+N" below the note's number (the game
+folds post-swing into one number; the sim awards it separately). Env v10 (P6): the viewer draws the REAL
 articulated skeleton (full-body FK from the replayed q36 — capsules at
 the SPEC-v10 collider dims, feet on their weld anchors), flashes
 yellow contact markers sized by impulse at self-collision events, and

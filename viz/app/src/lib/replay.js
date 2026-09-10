@@ -794,7 +794,10 @@ export function pendingWalls(rep, time, zOff = 0) {
   return out;
 }
 
-const FADE_S = 0.6;
+// 0.7 s, matching the reference viewer's indicatorLifetime: the flying hit
+// score (Notes.svelte) fades over exactly this window, so a shorter one
+// would cut its tail off. The cut debris and fail outlines share it.
+const FADE_S = 0.7;
 
 /** Resolved-note effects (0.6 s window): split halves / link pop /
  * bomb flash / fail outline. Each entry carries the v15 track offset
