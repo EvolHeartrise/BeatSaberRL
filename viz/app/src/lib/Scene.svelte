@@ -4,7 +4,7 @@
   // blades, and self-collision contact markers. World -> scene: (x, y, -z).
   // Env v7 world geometry: floor plane at y = 0; the 4x3 cell grid uses the
   // real 0.6 m lanes and non-uniform row heights.
-  import { T, useTask } from "@threlte/core";
+  import { T, useTask, useThrelte } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
   import { pb, pose, lastTick, setPlaying } from "./state.svelte.js";
@@ -19,6 +19,19 @@
   import Saber from "./Saber.svelte";
   import BodyGauges from "./BodyGauges.svelte";
   import { modelGeo } from "./models.js";
+
+  // ---- an OPAQUE stage ----------------------------------------------------
+  // Threlte builds its renderer with alpha: true, and nothing here had ever
+  // set a scene background, so the canvas was genuinely transparent — the
+  // dark stage on screen was the #stage CSS behind it. Invisible in the
+  // browser and fatal for `export video`, which records the canvas itself
+  // and so produced clips with a transparent (black-keyed) background.
+  // Painting the same colour INTO the scene makes those pixels opaque and
+  // changes nothing on screen: a Color background clears with alpha 1, and
+  // three converts it back to the output colour space, so #0b0d11 in the
+  // CSS is #0b0d11 in the framebuffer.
+  const STAGE_BG = "#0b0d11"; // keep in step with #stage in App.svelte
+  useThrelte().scene.background = new THREE.Color(STAGE_BG);
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
   useTask((delta) => {
