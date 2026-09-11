@@ -360,6 +360,10 @@
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}
       </button>
+      <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
+        title="per-joint dials, torque bars, foot forces and effort (g)">
+        📊 gauges
+      </button>
       <button class:on={pb.firstPerson}
         onclick={() => (pb.firstPerson = !pb.firstPerson)}
         title="camera on the body's head frame — what the headset sees (f)">

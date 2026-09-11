@@ -224,7 +224,7 @@ Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
 wheel = zoom, right-drag = pan), compiled to that single static file —
 source in `viz/app/`, rebuild with `npm install && npm run build` and
 copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-step,
-+/− = speed, `h` = hitbox mode (real-hitbox wireframes plus the track
++/− = speed, `g` (or the 📊 button) = gauge panels, `h` = hitbox mode (real-hitbox wireframes plus the track
 datum: the floating tunnel grid, hit-plane cells and the reach and
 miss/head planes — hidden otherwise since 2026-09-06; plus each in-reach
 note's own bounding box, hidden otherwise since 2026-09-09), `f` (or the
