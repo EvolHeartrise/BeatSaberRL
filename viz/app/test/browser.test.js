@@ -132,6 +132,23 @@ try {
   await page.waitForFunction(FP_ON, { timeout: 5000 });
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/first-person.png" });
+  // the two first-person sliders (fov, rotation smoothing) live in #fp
+  const fpSliders = await page.$$eval("#fp input[type=range]", (els) => els.length);
+  if (fpSliders !== 2) throw new Error(`expected 2 first-person sliders, got ${fpSliders}`);
+  const setFp = (idx, frac) => page.evaluate(({ idx, frac }) => {
+    const r = document.querySelectorAll("#fp input[type=range]")[idx];
+    const v = +r.min + frac * (+r.max - +r.min);
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+      .set.call(r, v);
+    r.dispatchEvent(new Event("input", { bubbles: true }));
+  }, { idx, frac });
+  await setFp(0, 1.0);  // fov 110°
+  await setFp(1, 0.4);  // smoothing 0.4 s
+  await new Promise((r) => setTimeout(r, 500));
+  const fpLabels = await page.$eval("#fp", (el) => el.textContent.replace(/\s+/g, " "));
+  if (!/110°/.test(fpLabels) || !/0\.40s/.test(fpLabels))
+    throw new Error("first-person sliders did not take: " + fpLabels);
+  await page.screenshot({ path: "test/out/first-person-wide-smooth.png" });
   await page.keyboard.press("f");
   await page.waitForFunction(`!(${FP_ON})`, { timeout: 5000 });
   await new Promise((r) => setTimeout(r, 300));

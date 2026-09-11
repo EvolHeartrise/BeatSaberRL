@@ -11,8 +11,8 @@
   import {
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
-    frameQuatScene, noteFrame, poseQ36, qAt, rotQuatScene,
-    viewerTrackOffset,
+    frameQuatScene, headQuats, noteFrame, poseQ36, qAt, quatNlerp,
+    rotQuatScene, smoothQuats, viewerTrackOffset,
   } from "./replay.js";
   import Body from "./Body.svelte";
   import { RAMP } from "./toon.js";
@@ -59,12 +59,27 @@
   const fkAll = $derived(q36 ? bodyFK(q36) : null);
 
   // ---- first-person camera ('f') --------------------------------------------
-  // 75° vertical is the ScoreSaber watch viewer's original first-person
-  // FOV (its current default is a smoothed chase camera 0.7 m behind the
-  // head at 70°, pitch forced upright then tilted 15° down — not a head
+  // FOV and rotation smoothing are bar sliders (pb.fpFov / pb.fpSmooth;
+  // the 75° default is the ScoreSaber watch viewer's original first-person
+  // FOV — its current default is a smoothed chase camera 0.7 m behind the
+  // head at 70°, pitch forced upright then tilted 15° down, not a head
   // cam). Near plane at 5 cm so a blade handle raised to the face still
-  // draws.
-  const FP_FOV = 75, FP_NEAR = 0.05;
+  // draws. The smoothed orientation comes from the replay's whole head
+  // track (FK once per replay, filtered once per slider value), then the
+  // fractional tick nlerps between two filtered ticks — so it stays a
+  // pure function of the tick. Pose mode and tau = 0 use the live frame.
+  const FP_NEAR = 0.05;
+  const fpTrack = $derived(pb.firstPerson && pb.rep ? headQuats(pb.rep) : null);
+  const fpSmoothed = $derived(
+    fpTrack ? smoothQuats(fpTrack, pb.fpSmooth) : null);
+  const fpQuat = $derived.by(() => {
+    if (!fkAll) return null;
+    if (pose.on || !fpSmoothed || !(pb.fpSmooth > 0))
+      return rotQuatScene(fkAll.r[F_HEAD]);
+    const n = fpSmoothed.length;
+    return quatNlerp(fpSmoothed[Math.min(tickIdx, n - 1)],
+      fpSmoothed[Math.min(tickIdx + 1, n - 1)], u);
+  });
 
   // ---- env v15 head-anchored note track (contact spec §10) -----------------
   // z_off = head_z - PLANE_Z0 of the body being DRAWN this frame, so the
@@ -181,18 +196,18 @@
      than moved: its controls rewrite its position every frame (damping
      runs update() whether or not input is enabled), and leaving it
      untouched also means toggling back lands exactly where you were.
-     No smoothing: the view is a pure function of the tick, so scrubbing
-     and the frame-by-frame export stay exact (the export records
-     whichever camera is the default). The gauges follow the active
-     camera; the head sphere is hidden while on (Body showHead). -->
-{#if fkAll}
+     The view is a pure function of the tick (smoothing included, see
+     fpQuat), so scrubbing and the frame-by-frame export stay exact (the
+     export records whichever camera is the default). The gauges follow
+     the active camera; the head sphere is hidden while on (Body
+     showHead). Mounted only while on: unmounting hands the default back
+     to the orbit camera. -->
+{#if fkAll && pb.firstPerson}
   {@const hp = fkAll.p[F_HEAD]}
-  <T.Group position={[hp[0], hp[1], -hp[2]]}
-    quaternion={rotQuatScene(fkAll.r[F_HEAD])}>
-    <T.PerspectiveCamera makeDefault={pb.firstPerson} fov={FP_FOV}
-      near={FP_NEAR}>
-      {#if pb.firstPerson && pb.gauges}
-        <BodyGauges fov={FP_FOV} />
+  <T.Group position={[hp[0], hp[1], -hp[2]]} quaternion={fpQuat}>
+    <T.PerspectiveCamera makeDefault fov={pb.fpFov} near={FP_NEAR}>
+      {#if pb.gauges}
+        <BodyGauges fov={pb.fpFov} />
       {/if}
     </T.PerspectiveCamera>
   </T.Group>

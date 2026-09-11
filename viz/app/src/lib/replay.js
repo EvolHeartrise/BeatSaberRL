@@ -155,6 +155,40 @@ export function rotQuatScene(m) {
     [m[0][2], m[1][2], m[2][2]],
   ]);
 }
+
+/** Short-arc normalized lerp of two [x, y, z, w] quaternions. */
+export function quatNlerp(a, b, u) {
+  const s = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0 ? -1 : 1;
+  const o = a.map((v, i) => v + (s * b[i] - v) * u);
+  const n = Math.hypot(o[0], o[1], o[2], o[3]);
+  return o.map((v) => v / n);
+}
+
+/** The first-person camera track: the head frame's scene quaternion at
+ * every tick (full-body FK per tick — cache per replay). Re-normalized:
+ * the logged root quaternion is unit only to ~1e-5 (JSONL float
+ * precision) and the filter below compounds it. */
+export function headQuats(rep) {
+  return rep.ticks.map((t) => {
+    const q = rotQuatScene(bodyFK(t.q).r[F_HEAD]);
+    const n = Math.hypot(q[0], q[1], q[2], q[3]);
+    return q.map((v) => v / n);
+  });
+}
+
+/** First-order smoothing of a per-tick quaternion track with time constant
+ * `tau` seconds: q_s[t] = nlerp(q_s[t-1], q[t], 1 - exp(-DT / tau)). A pure
+ * function of the track — scrubbing and the frame-by-frame export see the
+ * same camera as playback (watch's SmoothDamp is deliberately frame-rate
+ * dependent; this viewer's tick counter is authoritative). tau <= 0
+ * returns the input untouched. */
+export function smoothQuats(qs, tau) {
+  if (!(tau > 0) || qs.length === 0) return qs;
+  const a = 1 - Math.exp(-DT / tau);
+  const out = [qs[0]];
+  for (let i = 1; i < qs.length; i++) out.push(quatNlerp(out[i - 1], qs[i], a));
+  return out;
+}
 export const V_MIN = 1, DT = 1 / 30;
 
 // ============================================================================

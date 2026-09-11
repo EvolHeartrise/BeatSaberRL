@@ -230,7 +230,10 @@
   // the screen corners, above the floating bottom UI.
   const { size } = useThrelte();
   const HALF_H = $derived(Math.tan((fov / 2) * Math.PI / 180));
-  const SCALE_Y = 0.62;
+  // sprite size in camera units at z = -1: 0.62 was tuned for the 55°
+  // orbit camera, so scale it with the half-height to keep the same
+  // on-screen size on the first-person camera at any fov
+  const SCALE_Y = $derived(0.62 * HALF_H / Math.tan((55 / 2) * Math.PI / 180));
   const MARGIN = 0.015;
   const BOTTOM_UI_PX = 130;
 </script>

@@ -11,7 +11,7 @@ import {
   counts, cutPlaneLocal, effortAt, fkSaber, footForces, frameQuatScene,
   gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
   noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
-  rotQuatScene,
+  headQuats, quatNlerp, rotQuatScene, smoothQuats,
   saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
   trackOffsetOfFK, viewerTrackOffset,
 } from "../src/lib/replay.js";
@@ -566,6 +566,32 @@ try {
   assert.deepEqual(rotQuatScene(m), frameQuatScene(
     [0, 1, 2].map((j) => [m[0][j], m[1][j], m[2][j]])));
   console.log("rotQuatScene: identity, yaw, head frame OK");
+}
+
+// ---- first-person head track + smoothing ------------------------------------
+{
+  const track = headQuats(rep);
+  assert.equal(track.length, rep.ticks.length);
+  track.forEach((q) => assert.ok(Math.abs(Math.hypot(...q) - 1) < 1e-12));
+  assert.equal(smoothQuats(track, 0), track, "tau 0 is the identity");
+  const I = [0, 0, 0, 1], c = Math.SQRT1_2, Y90 = [0, c, 0, c];
+  // (re-normalization rounds at the last bit: compare to 1e-12)
+  const near = (q, r) => q.forEach((v, i) => assert.ok(Math.abs(v - r[i]) < 1e-12, `${q} vs ${r}`));
+  // a constant track is unchanged
+  smoothQuats(Array(20).fill(Y90), 0.3).forEach((q) => near(q, Y90));
+  // a step I -> Y90 relaxes monotonically toward Y90 and gets there
+  const step = [I, ...Array(200).fill(Y90)];
+  const sm = smoothQuats(step, 0.2);
+  const dots = sm.map((q) => q[1] * Y90[1] + q[3] * Y90[3]);
+  for (let i = 1; i < dots.length; i++) assert.ok(dots[i] >= dots[i - 1] - 1e-12);
+  assert.ok(dots[1] < 0.9, "first filtered tick is still mostly the old pose");
+  assert.ok(1 - dots[200] < 1e-6, "converged");
+  // the first-tick fraction is exactly 1 - exp(-DT/tau) along the arc
+  const a = 1 - Math.exp(-DT / 0.2);
+  near(sm[1], quatNlerp(I, Y90, a));
+  // short arc: nlerp toward -q is the same as toward q
+  near(quatNlerp(I, Y90.map((v) => -v), 0.5), quatNlerp(I, Y90, 0.5));
+  console.log("first-person head track: smoothing OK");
 }
 
 // replays from retired parameterizations are rejected with the friendly
