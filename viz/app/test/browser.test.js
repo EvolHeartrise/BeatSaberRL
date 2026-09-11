@@ -185,6 +185,30 @@ try {
     console.log("no v15 recording at " + replayV15 + " — skipped");
   }
 
+  // ---- export 'stop & save': start a frame-by-frame export, cut it off
+  // after a moment, and expect the exporter to finalize and return to
+  // idle with no page errors or alert() dialogs (a dialog would hang the
+  // page, so it is auto-dismissed and counted as an error).
+  page.on("dialog", (d) => { errors.push("dialog: " + d.message()); d.dismiss(); });
+  const canExact = await page.evaluate(
+    () => typeof VideoEncoder !== "undefined" && typeof AudioEncoder !== "undefined");
+  if (canExact) {
+    const clickBar = (text) => page.evaluate((text) =>
+      [...document.querySelectorAll("#bar button")]
+        .find((b) => b.textContent.includes(text)).click(), text);
+    await clickBar("export video");
+    await page.waitForFunction(() => [...document.querySelectorAll("#bar button")]
+      .some((b) => b.textContent.includes("stop & save")), { timeout: 10000 });
+    await new Promise((r) => setTimeout(r, 1500));
+    await page.screenshot({ path: "test/out/exporting.png" });
+    await clickBar("stop & save");
+    await page.waitForFunction(() => [...document.querySelectorAll("#bar button")]
+      .some((b) => b.textContent.includes("export video")), { timeout: 30000 });
+    console.log("export stop & save: exporter returned to idle");
+  } else {
+    console.log("no WebCodecs in this browser — export stop test skipped");
+  }
+
   const webgl = await page.evaluate(() => {
     const cv = document.querySelector("#stage canvas");
     return !!(cv.getContext("webgl2") || cv.getContext("webgl"));

@@ -157,6 +157,13 @@
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
   }
 
+  // exported length so far, as m:ss — the export is scrubbed from t = 0,
+  // so this is how much of the replay the file will contain if stopped now
+  const mmss = (s) =>
+    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  const exportLabel = $derived(
+    `⏺ ${Math.round(pb.exportPct * 100)}% · ${mmss(pb.exportPct * lastTick() * DT)}`);
+
   const speedLabel = $derived(
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
 
@@ -188,6 +195,7 @@
 
     pb.exporting = true;
     pb.exportPct = 0;
+    pb.exportStop = false;
     setPlaying(false);
     const wasCur = pb.cur;
     const mode = gfx.renderMode?.current;
@@ -210,6 +218,9 @@
         song: songBuf,
         songStart: audio.offset,
         onProgress: (p) => { pb.exportPct = p; },
+        // 'stop & save': the exporter ends at the next frame and still
+        // finalizes a complete file of everything rendered so far
+        shouldStop: () => pb.exportStop,
         renderFrame: (i) => {
           pb.cur = Math.min(lastTick(), (i * TPS) / fps);
           flushSync(); // derived pose + the $effects that refill GPU buffers
@@ -232,6 +243,7 @@
       pb.cur = wasCur;
       pb.exporting = false;
       pb.exportPct = 0;
+      pb.exportStop = false;
     }
   }
 
@@ -239,6 +251,7 @@
   function exportRealtime(canvas) {
     if (!("MediaRecorder" in window)) return;
     pb.exporting = true;
+    pb.exportStop = false;
     // one stream: the canvas video plus the song, when the replay has one
     const track = audioTap()?.stream.getAudioTracks()[0] ?? null;
     const stream = new MediaStream([
@@ -260,12 +273,13 @@
     rec.onstop = () => {
       download(new Blob(chunks, { type: "video/webm" }));
       pb.exporting = false;
+      pb.exportStop = false;
     };
     pb.cur = 0;
     setPlaying(true);
     rec.start();
     const poll = setInterval(() => { // playback auto-pauses at the end
-      if (!pb.playing) { clearInterval(poll); rec.stop(); }
+      if (!pb.playing || pb.exportStop) { clearInterval(poll); rec.stop(); }
     }, 200);
   }
 
@@ -353,10 +367,16 @@
           ? "renders frame by frame at 30 fps — not real time, so a slow "
             + "machine still gets a clean file"
           : "no WebCodecs here: falls back to a real-time capture"}>
-        {pb.exporting
-          ? `⏺ ${Math.round(pb.exportPct * 100)}%`
-          : "⏺ export video"}
+        {pb.exporting ? exportLabel : "⏺ export video"}
       </button>
+      {#if pb.exporting}
+        <button class="stop" onclick={() => (pb.exportStop = true)}
+          disabled={pb.exportStop}
+          title="end the export here and save a complete file of everything
+                 rendered so far (the song is cut to match)">
+          {pb.exportStop ? "■ saving…" : "■ stop & save"}
+        </button>
+      {/if}
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}
       </button>
@@ -466,6 +486,7 @@
   button:hover { background: #2d3342; }
   button:disabled { opacity: 0.5; cursor: default; }
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
+  button.stop { border-color: #e06c75; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
   #snd { display: flex; gap: 6px; align-items: center; }
   #fp { display: flex; gap: 10px; align-items: center; color: #9aa0ae;
