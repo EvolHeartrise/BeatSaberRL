@@ -144,7 +144,7 @@
   function onKey(e) {
     // keys aimed at the pose panel's own controls stay there (slider
     // arrow-key nudges must not step the replay)
-    if (e.target && e.target.closest && e.target.closest("#pose")) return;
+    if (e.target && e.target.closest && e.target.closest("#pose, #fp")) return;
     if (e.key === "p") { togglePose(); return; }
     if (e.key === " ") { e.preventDefault(); setPlaying(!pb.playing); }
     else if (e.key === "ArrowRight") step(1);
@@ -365,6 +365,22 @@
         title="camera on the body's head frame — what the headset sees (f)">
         👁 first-person
       </button>
+      {#if pb.firstPerson}
+        <span id="fp">
+          <label title="first-person vertical field of view">
+            fov <input type="range" min="40" max="110" step="1"
+              value={pb.fpFov} oninput={(e) => (pb.fpFov = +e.target.value)} />
+            <span>{pb.fpFov}°</span>
+          </label>
+          <label title="head-rotation smoothing time constant — 0 = the exact
+                 head frame; a per-tick filter over the recorded head track, so
+                 scrubbing and the export match playback">
+            smooth <input type="range" min="0" max="1" step="0.05"
+              value={pb.fpSmooth} oninput={(e) => (pb.fpSmooth = +e.target.value)} />
+            <span>{pb.fpSmooth.toFixed(2)}s</span>
+          </label>
+        </span>
+      {/if}
       {#if pb.rep}
         <!-- preservesPitch off: a speed change should sound like the game's
              practice mode (pitch follows the rate), not a time-stretch -->
@@ -448,6 +464,11 @@
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
   #snd { display: flex; gap: 6px; align-items: center; }
+  #fp { display: flex; gap: 10px; align-items: center; color: #9aa0ae;
+    font-size: 12px; font-variant-numeric: tabular-nums; }
+  #fp label { display: flex; gap: 4px; align-items: center; }
+  #fp label > span { min-width: 4ch; color: #cfd3dc; }
+  #fp input[type="range"] { width: 80px; }
   #snd input[type="range"] { width: 70px; }
   #snd .dim { color: #6b7180; font-size: 12px; max-width: 22ch; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }

@@ -13,6 +13,8 @@ export const pb = $state({
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
   firstPerson: false, // camera on the body's head frame ('f')
+  fpFov: 75, // first-person vertical field of view, degrees
+  fpSmooth: 0, // first-person head-rotation smoothing, seconds (0 = exact)
 });
 
 // Threlte's render controls, published by Scene.svelte. The frame-by-frame
