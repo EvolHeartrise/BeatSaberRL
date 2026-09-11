@@ -11,6 +11,7 @@ import {
   counts, cutPlaneLocal, effortAt, fkSaber, footForces, frameQuatScene,
   gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
   noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
+  rotQuatScene,
   saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
   trackOffsetOfFK, viewerTrackOffset,
 } from "../src/lib/replay.js";
@@ -547,6 +548,24 @@ try {
   assert.equal(viewerTrackOffset(null, false, fk), 0);
   assert.equal(viewerTrackOffset(withFlag, false, null), 0);
   console.log("synthetic head-anchored track: analytic z_off matches");
+}
+
+// ---- rotQuatScene: the body-rotation twin of frameQuatScene -------------
+{
+  const I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  assert.deepEqual(rotQuatScene(I), [0, 0, 0, 1]);
+  // +90° yaw about world y (gaze +z -> +x): in the z-flipped scene that
+  // is a -90° yaw, quaternion (0, -sin 45°, 0, cos 45°)
+  const c = Math.SQRT1_2;
+  const Ry = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]];
+  const q = rotQuatScene(Ry);
+  [0, -c, 0, c].forEach((v, i) =>
+    assert.ok(Math.abs(q[i] - v) < 1e-12, `yaw q[${i}] = ${q[i]}`));
+  // and on a real head frame it is frameQuatScene of the matrix's columns
+  const m = bodyFK(rep.ticks[Math.min(100, rep.ticks.length - 1)].q).r[F_HEAD];
+  assert.deepEqual(rotQuatScene(m), frameQuatScene(
+    [0, 1, 2].map((j) => [m[0][j], m[1][j], m[2][j]])));
+  console.log("rotQuatScene: identity, yaw, head frame OK");
 }
 
 // replays from retired parameterizations are rejected with the friendly

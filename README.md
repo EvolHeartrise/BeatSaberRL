@@ -227,7 +227,13 @@ copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-st
 +/− = speed, `h` = hitbox mode (real-hitbox wireframes plus the track
 datum: the floating tunnel grid, hit-plane cells and the reach and
 miss/head planes — hidden otherwise since 2026-09-06; plus each in-reach
-note's own bounding box, hidden otherwise since 2026-09-09), drag the scrub bar. White
+note's own bounding box, hidden otherwise since 2026-09-09), `f` (or the
+👁 button) = first-person since 2026-09-11: the camera rides the FK head
+frame — origin and rotation, gaze = head local +z, 75° vertical FOV, no
+smoothing, so scrubbing and the frame-by-frame export stay exact and the
+export records whichever camera is active; the head sphere is hidden
+while it is on, the gauges move to that camera, and the orbit camera
+keeps its place for when you toggle back — drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
 heads half-height cubes, links thin slabs, arc grants faint tubes; green

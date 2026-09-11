@@ -2,7 +2,8 @@
 // dist/index.html in Edge, uploads a real v10 replay through the file
 // input, plays a second, and asserts the HUD advanced with zero page
 // errors. Also drives the v10 manual-pose panel (root + 29 joints) and
-// screenshots the articulated skeleton + per-joint gauges/forces.
+// screenshots the articulated skeleton + per-joint gauges/forces, and
+// toggles the first-person (head-frame) camera on and back off.
 // Screenshots land in test/out/ for eyeball verification.
 // Run: node test/browser.test.js [path-to-replay.jsonl]
 import { existsSync, mkdirSync } from "node:fs";
@@ -119,6 +120,22 @@ try {
   const hud = await page.$eval("#hud", (el) => el.textContent);
   console.log("HUD:", hud.replace(/\s+/g, " ").trim());
   if (!/t\s+[1-9]?\d\.\d+s/.test(hud)) throw new Error("time not advancing");
+
+  // ---- first-person ('f'): the camera rides the head frame. The bar
+  // button lights up, the frame renders with no page errors, and 'f'
+  // again returns to the orbit camera.
+  // (a string expression: waitForFunction cannot be handed a closure)
+  const FP_ON = `[...document.querySelectorAll("#bar button")]
+    .some((b) => b.textContent.includes("first-person")
+      && b.classList.contains("on"))`;
+  await page.keyboard.press("f");
+  await page.waitForFunction(FP_ON, { timeout: 5000 });
+  await new Promise((r) => setTimeout(r, 500));
+  await page.screenshot({ path: "test/out/first-person.png" });
+  await page.keyboard.press("f");
+  await page.waitForFunction(`!(${FP_ON})`, { timeout: 5000 });
+  await new Promise((r) => setTimeout(r, 300));
+  await page.screenshot({ path: "test/out/after-first-person.png" });
 
   // ---- env v15 head-anchored track: same bundle, a replay whose header
   // carries "track_anchor": "head". The notes and the tunnel/grid/reach

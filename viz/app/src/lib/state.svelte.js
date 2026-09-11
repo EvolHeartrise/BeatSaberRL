@@ -12,6 +12,7 @@ export const pb = $state({
   fps: 30, // export frame rate; the replay itself is always 30 ticks/s
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
+  firstPerson: false, // camera on the body's head frame ('f')
 });
 
 // Threlte's render controls, published by Scene.svelte. The frame-by-frame

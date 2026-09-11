@@ -9,11 +9,13 @@
     F_CHEST, F_HEAD, F_L_HAND, F_L_SHANK, F_L_THIGH, F_L_FOOT,
     F_L_ELBOW, F_L_SHOULDER, F_L_WRIST, F_R_ELBOW, F_R_SHOULDER,
     F_R_HAND, F_R_SHANK, F_R_THIGH, F_R_FOOT, F_R_WRIST,
-    framePoint,
+    framePoint, rotQuatScene,
   } from "./replay.js";
   import { OUTLINE_BODY, RAMP } from "./toon.js";
 
-  let { fk } = $props();
+  // showHead: off in first-person, where the camera sits at the head's
+  // centre — inside the sphere and its inverted-hull outline
+  let { fk, showHead = true } = $props();
 
   const Y = new THREE.Vector3(0, 1, 0);
   const toScene = (p) => new THREE.Vector3(p[0], p[1], -p[2]);
@@ -31,17 +33,6 @@
              len: dir.length() };
   }
 
-  // scene quaternion of a world frame rotation (conjugated by
-  // S = diag(1,1,-1), same rule as frameQuatScene)
-  function rotQuatScene(m) {
-    const e = new THREE.Matrix4().set(
-      m[0][0], m[0][1], -m[0][2], 0,
-      m[1][0], m[1][1], -m[1][2], 0,
-      -m[2][0], -m[2][1], m[2][2], 0,
-      0, 0, 0, 1);
-    const q = new THREE.Quaternion().setFromRotationMatrix(e);
-    return [q.x, q.y, q.z, q.w];
-  }
 
   // White body (2026-09-09): trunk/head/pelvis white, legs and feet a
   // half-step cooler so the limbs still read as separate volumes against
@@ -104,7 +95,7 @@
     bone(shankGeo, seg(fk.p[F_R_SHANK],
       framePoint(fk, F_R_SHANK, [0, -0.43, 0])), LIMB),
     // head sphere (welded to the chest)
-    ball(headGeo, fk.p[F_HEAD], TRUNK),
+    ...(showHead ? [ball(headGeo, fk.p[F_HEAD], TRUNK)] : []),
     // fists
     ball(fistGeo, framePoint(fk, F_L_HAND, [0, 0, 0.06]), ARM[0]),
     ball(fistGeo, framePoint(fk, F_R_HAND, [0, 0, 0.06]), ARM[1]),

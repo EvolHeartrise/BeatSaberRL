@@ -143,6 +143,18 @@ export function frameQuatScene(f) {
   const s = 2 * Math.sqrt(1 + m22 - m00 - m11);
   return [(m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s];
 }
+
+/** Scene quaternion [x, y, z, w] of a world-from-body ROTATION MATRIX
+ * (row-major, its columns are the body axes in world coords — bodyFK's
+ * `r` entries). Same S M S conjugation as frameQuatScene, which takes the
+ * axes as rows; so this is frameQuatScene of the transpose. */
+export function rotQuatScene(m) {
+  return frameQuatScene([
+    [m[0][0], m[1][0], m[2][0]],
+    [m[0][1], m[1][1], m[2][1]],
+    [m[0][2], m[1][2], m[2][2]],
+  ]);
+}
 export const V_MIN = 1, DT = 1 / 30;
 
 // ============================================================================
