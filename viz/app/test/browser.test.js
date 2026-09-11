@@ -121,6 +121,16 @@ try {
   console.log("HUD:", hud.replace(/\s+/g, " ").trim());
   if (!/t\s+[1-9]?\d\.\d+s/.test(hud)) throw new Error("time not advancing");
 
+  // ---- gauges button: mirrors the 'g' key (the panels are on at load)
+  const GAUGES_ON = `[...document.querySelectorAll("#bar button")]
+    .some((b) => b.textContent.includes("gauges") && b.classList.contains("on"))`;
+  if (!(await page.evaluate(GAUGES_ON))) throw new Error("gauges button not lit at load");
+  await page.evaluate(() => [...document.querySelectorAll("#bar button")]
+    .find((b) => b.textContent.includes("gauges")).click());
+  await page.waitForFunction(`!(${GAUGES_ON})`, { timeout: 5000 });
+  await page.keyboard.press("g"); // the key toggles the same flag back on
+  await page.waitForFunction(GAUGES_ON, { timeout: 5000 });
+
   // ---- first-person ('f'): the camera rides the head frame. The bar
   // button lights up, the frame renders with no page errors, and 'f'
   // again returns to the orbit camera.
