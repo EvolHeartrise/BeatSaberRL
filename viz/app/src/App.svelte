@@ -154,6 +154,7 @@
     else if (e.key === "r") { pb.cur = 0; setPlaying(true); }
     else if (e.key === "g") pb.gauges = !pb.gauges;
     else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
+    else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
   }
 
   const speedLabel = $derived(
@@ -358,6 +359,11 @@
       </button>
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}
+      </button>
+      <button class:on={pb.firstPerson}
+        onclick={() => (pb.firstPerson = !pb.firstPerson)}
+        title="camera on the body's head frame — what the headset sees (f)">
+        👁 first-person
       </button>
       {#if pb.rep}
         <!-- preservesPitch off: a speed change should sound like the game's

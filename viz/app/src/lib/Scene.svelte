@@ -9,9 +9,10 @@
   import * as THREE from "three";
   import { gfx, pb, pose, lastTick, setPlaying } from "./state.svelte.js";
   import {
-    BLOCK, DT, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, ROW_EDGES,
-    ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK, frameQuatScene,
-    noteFrame, poseQ36, qAt, viewerTrackOffset,
+    BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z,
+    ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
+    frameQuatScene, noteFrame, poseQ36, qAt, rotQuatScene,
+    viewerTrackOffset,
   } from "./replay.js";
   import Body from "./Body.svelte";
   import { RAMP } from "./toon.js";
@@ -56,6 +57,14 @@
     ? poseQ36(pose)
     : (pb.rep ? qAt(pb.rep, tickIdx, u) : null));
   const fkAll = $derived(q36 ? bodyFK(q36) : null);
+
+  // ---- first-person camera ('f') --------------------------------------------
+  // 75° vertical is the ScoreSaber watch viewer's original first-person
+  // FOV (its current default is a smoothed chase camera 0.7 m behind the
+  // head at 70°, pitch forced upright then tilted 15° down — not a head
+  // cam). Near plane at 5 cm so a blade handle raised to the face still
+  // draws.
+  const FP_FOV = 75, FP_NEAR = 0.05;
 
   // ---- env v15 head-anchored note track (contact spec §10) -----------------
   // z_off = head_z - PLANE_Z0 of the body being DRAWN this frame, so the
@@ -157,10 +166,37 @@
     target={[0, 1.4, -1.5]}
     maxDistance={25}
   />
-  {#if (pb.rep || pose.on) && pb.gauges}
+  {#if (pb.rep || pose.on) && pb.gauges && !pb.firstPerson}
     <BodyGauges />
   {/if}
 </T.PerspectiveCamera>
+
+<!-- First-person ('f'): a SECOND camera parented to the FK head frame, so
+     it rides the body exactly — origin and rotation. SPEC-v10 §replay:
+     head local +z is the gaze and +y is up; a three camera looks down
+     its local -z, and the S = diag(1,1,-1) scene conjugation turns a
+     world +z gaze into scene -z, so the head frame's scene quaternion IS
+     the camera's, with no extra turn. It is the default camera only
+     while the mode is on. The orbit camera above is left alone rather
+     than moved: its controls rewrite its position every frame (damping
+     runs update() whether or not input is enabled), and leaving it
+     untouched also means toggling back lands exactly where you were.
+     No smoothing: the view is a pure function of the tick, so scrubbing
+     and the frame-by-frame export stay exact (the export records
+     whichever camera is the default). The gauges follow the active
+     camera; the head sphere is hidden while on (Body showHead). -->
+{#if fkAll}
+  {@const hp = fkAll.p[F_HEAD]}
+  <T.Group position={[hp[0], hp[1], -hp[2]]}
+    quaternion={rotQuatScene(fkAll.r[F_HEAD])}>
+    <T.PerspectiveCamera makeDefault={pb.firstPerson} fov={FP_FOV}
+      near={FP_NEAR}>
+      {#if pb.firstPerson && pb.gauges}
+        <BodyGauges fov={FP_FOV} />
+      {/if}
+    </T.PerspectiveCamera>
+  </T.Group>
+{/if}
 
 <!-- Cel lighting (2026-09-09): the toon ramp turns dot(N, L) into three
      flat bands, so the scene needs ONE dominant key to cut the terminator
@@ -241,7 +277,7 @@
 
 {#if fkAll}
   <!-- the articulated v10 body + blades -->
-  <Body fk={fkAll} />
+  <Body fk={fkAll} showHead={!pb.firstPerson} />
   <Saber s={0} fk={fkAll} />
   <Saber s={1} fk={fkAll} />
 {/if}

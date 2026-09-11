@@ -21,6 +21,10 @@
     TAU_MAX, effortAt, footForces, lerp, tauOf,
   } from "./replay.js";
 
+  // the fov of the camera these sprites hang off (the corner placement
+  // below is in camera space, so a wider camera needs a wider anchor)
+  let { fov = 55 } = $props();
+
   const W = 252;
   const ROW_H = 25, HEAD_H = 20, PAD = 10;
   const NEAR = 10 * Math.PI / 180; // limit-proximity warning band
@@ -221,11 +225,11 @@
 
   $effect(() => () => panels.forEach((g) => g.tex.dispose()));
 
-  // camera-space placement: at z = -1 with fov 55 the view half-height
-  // is tan(27.5°); anchor the panels to the screen corners, above the
-  // floating bottom UI.
+  // camera-space placement: at z = -1 the view half-height is
+  // tan(fov / 2) (0.52 for the orbit camera's 55°); anchor the panels to
+  // the screen corners, above the floating bottom UI.
   const { size } = useThrelte();
-  const HALF_H = Math.tan((55 / 2) * Math.PI / 180);
+  const HALF_H = $derived(Math.tan((fov / 2) * Math.PI / 180));
   const SCALE_Y = 0.62;
   const MARGIN = 0.015;
   const BOTTOM_UI_PX = 130;
