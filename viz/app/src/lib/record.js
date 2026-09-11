@@ -68,10 +68,17 @@ function drain(enc, max) {
  * Blob. `renderFrame` must leave frame i in `canvas` synchronously — mapping
  * a frame index onto a replay position is the caller's business, so nothing
  * here needs to know the tick rate. `song` is a decoded AudioBuffer (or null)
- * and `songStart` the song time at frame 0. */
+ * and `songStart` the song time at frame 0.
+ *
+ * `shouldStop()` is polled once per frame: when it returns true the export
+ * ends early and STILL produces a complete file — every frame rendered so
+ * far, with the song cut to exactly that length. (The audio is sliced after
+ * the video loop for this reason: its length is the number of frames
+ * actually rendered, not the number asked for.) A 6-minute replay that only
+ * needs its first 3 minutes exported does not have to pay for the rest. */
 export async function exportExact({
   canvas, frames, fps = 30, renderFrame, song = null, songStart = 0,
-  onProgress = () => {},
+  onProgress = () => {}, shouldStop = () => false,
 }) {
   // Even dimensions: VP9 4:2:0 needs them, and the live canvas is whatever
   // size the window happens to be. Copying through a 2D canvas also pins the
@@ -84,14 +91,16 @@ export async function exportExact({
   off.height = H;
   const g2d = off.getContext("2d", { alpha: false });
 
-  const audio = song ? audioSlice(song, songStart, frames / fps) : null;
+  // the muxer needs to know about the audio track up front; the slice
+  // itself waits for the final frame count (see the stop note above)
+  const ch = song ? Math.min(2, song.numberOfChannels) : 0;
 
   const target = new ArrayBufferTarget();
   const muxer = new Muxer({
     target,
     video: { codec: "V_VP9", width: W, height: H, frameRate: fps },
-    ...(audio
-      ? { audio: { codec: "A_OPUS", numberOfChannels: audio.ch,
+    ...(song
+      ? { audio: { codec: "A_OPUS", numberOfChannels: ch,
                    sampleRate: RATE } }
       : {}),
   });
@@ -112,9 +121,11 @@ export async function exportExact({
     latencyMode: "quality",
   });
 
+  let done = 0; // frames actually rendered + queued
   for (let i = 0; i < frames; i++) {
-    if (failed) break;
+    if (failed || shouldStop()) break;
     renderFrame(i);
+    done = i + 1;
     // read the WebGL canvas in the SAME task as the render: the drawing
     // buffer is not preserved across a compositing step
     g2d.drawImage(canvas, 0, 0, W, H);
@@ -129,6 +140,7 @@ export async function exportExact({
     if (i % 10 === 0) onProgress(i / frames);
   }
 
+  const audio = song && done > 0 ? audioSlice(song, songStart, done / fps) : null;
   if (audio && !failed) {
     const aEnc = new AudioEncoder({
       output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),

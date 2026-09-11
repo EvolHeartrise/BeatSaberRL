@@ -342,7 +342,12 @@ the button (24 / 30 / 60 / 120): output frames are decoupled from the
 replay's 30 ticks/s — frame i renders at tick `i * 30 / fps`, which the
 viewer interpolates — so 60 fps genuinely smooths the motion rather than
 duplicating frames. The export always runs at 1x regardless of the speed
-control.
+control. Since 2026-09-11 a `■ stop & save` button sits next to the
+progress readout (which shows percent and the exported length as m:ss):
+it ends the export at the next frame and still writes a complete file of
+everything rendered so far, with the song cut to match — so the first
+3 minutes of a 6-minute replay cost 3 minutes of rendering, not 6. The
+real-time fallback path stops its recorder the same way.
 
 Cut debris lives half the aftermath window (0.35 s of the 0.7 s; the window
 itself is the flying score's lifetime and has to stay) and separates at
