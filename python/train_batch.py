@@ -2086,7 +2086,6 @@ def main():
                   f"{global_step:>9}  acc {acc_now:.4f}  "
                   f"accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"return {ret_v:7.3f}  "
-                  f"ep_return(last100) {recent:8.3f}  "
                   f"ent {ent_v:.3f}  ev {ev_v:.3f}  {rate:8,.0f} steps/s  "
                   f"{elapsed:6.1f}s{extra}", flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
@@ -2114,7 +2113,7 @@ def main():
             print(f"update {update+1:>3}/{num_updates}  steps {global_step:>9}  "
                   f"acc {acc_now:.4f}  accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"return {ret_v:7.3f}  "
-                  f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
+                  f"ent {ent_v:.3f}  "
                   f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s  "
                   f"pn {pna_v:.1f}/{pnc_v:.1f}",
                   flush=True)
@@ -2163,7 +2162,11 @@ def main():
         write_metrics(
             update + 1, num_updates, global_step, t=time.time(),
             elapsed=elapsed, rate=rate, acc=acc_now, acc_l=acc_l,
-            acc_r=acc_r, ret=ret_v, recent=recent, ent=ent_v, ev=ev_v,
+            # ep_return(last100) dropped from the line and the record
+            # (2026-09-12, user: too noisy; `return` over the update is
+            # the stable population measure). Checkpoints still carry
+            # recent_return for old tooling.
+            acc_r=acc_r, ret=ret_v, ent=ent_v, ev=ev_v,
             r1=r1_v if fp16_update else None,
             maxlr=lmax_v if fp16_update else None,
             fp16_overflow=int(inf_v) if fp16_update else None,
