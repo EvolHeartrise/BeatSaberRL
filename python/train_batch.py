@@ -301,6 +301,26 @@ def parse_args():
                         "ratio; kl/clipfrac on the [kl] line stay the "
                         "joint diagnostics, `cfh` adds the per-head "
                         "clipfrac")
+    p.add_argument("--head-clip-eps", type=float, default=None,
+                   help="--head-clip only: per-head clip epsilon "
+                        "(default = the joint CLIP, 0.2). The 09-06 "
+                        "design note: if per-head KL runs away, 0.1-0.15 "
+                        "is the knob")
+    # Decoupled weight decay (2026-09-12, AdamW semantics, motivated by
+    # the parameter-norm census in research/param-norms-2026-09-11):
+    # the 2-D weights random-walk outward with optimizer steps under
+    # plain Adam (actor norm^2 +6,150 per 1,000 updates, LN gains
+    # 1.0 -> 0.32), which silently decays the effective lr on every
+    # LN-fed matrix. Applied as p *= 1 - lr_group * wd right before
+    # opt.step(), exactly what torch.optim.AdamW does, on ndim >= 2
+    # params only (LN gains and biases undecayed). The critic group
+    # decays at its own (x3) lr, as AdamW would. Keeps the 2-group Adam
+    # state format, so --resume of Adam checkpoints stays exact.
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="decoupled (AdamW-style) weight decay on 2-D "
+                        "weights; 0 = plain Adam (every run before "
+                        "2026-09-12). Time constant 1/(lr*wd) optimizer "
+                        "steps: 0.1 at lr 7e-4 = 14k steps")
     p.add_argument("--z-clip-hi", type=float, default=12.0,
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
@@ -742,6 +762,11 @@ def main():
     # (row, head) pairs outside 1 +/- CLIP); stays 0 otherwise
     cfh_last = torch.zeros((), device=device)
     head_clip = bool(args.head_clip)
+    head_clip_eps = (args.head_clip_eps if args.head_clip_eps is not None
+                     else CLIP)
+    if head_clip:
+        print(f"--head-clip: per-head dual-clip PPO, eps {head_clip_eps} "
+              f"(joint kl/clipfrac stay diagnostic)", flush=True)
     # 1.4 / C §5 item 7: sd(kept adv) / sd(full adv) when filtering,
     # written once per update by adv_filter_stats, read at the sync.
     af_ratio = torch.zeros((), device=device)
@@ -978,6 +1003,35 @@ def main():
             raise SystemExit(
                 f"--resume optimizer state does not match this policy "
                 f"arch (pre-scale checkpoints were retired). [{e}]")
+
+    # --weight-decay: per optimizer group, the ndim >= 2 params it will
+    # decay at that group's live lr (see the flag's comment)
+    wd = float(args.weight_decay)
+    wd_groups = []
+    if wd > 0.0:
+        for g in opt.param_groups:
+            ps = [p_ for p_ in g["params"] if p_.ndim >= 2]
+            if ps:
+                wd_groups.append((g, ps))
+        n_wd = sum(p_.numel() for _, ps in wd_groups for p_ in ps)
+        print(f"--weight-decay {wd:g}: decoupled decay on "
+              f"{n_wd:,} params in {len(wd_groups)} group(s); "
+              f"time constant {1.0 / (args.lr * wd):,.0f} optimizer "
+              f"steps at lr {args.lr:g} (critic x{args.critic_lr_mult:g})",
+              flush=True)
+    # parameter norms for the per-update line/metrics (actor vs critic),
+    # read at the print sync like everything else
+    _pn_actor_params = [p_ for n_, p_ in policy.named_parameters()
+                        if not n_.startswith(("critic_", "value_head"))]
+    _pn_critic_params = [p_ for n_, p_ in policy.named_parameters()
+                         if n_.startswith(("critic_", "value_head"))]
+
+    @torch.no_grad()
+    def param_norms():
+        pa = torch.stack(torch._foreach_norm(_pn_actor_params)).norm()
+        pc = (torch.stack(torch._foreach_norm(_pn_critic_params)).norm()
+              if _pn_critic_params else torch.zeros((), device=device))
+        return pa, pc
 
     # Flat grad buffer (2026-07-28): every p.grad is a view into ONE
     # contiguous buffer, so zero/unscale/overflow-mul/nan_to_num/clip
@@ -1442,7 +1496,7 @@ def main():
             if head_clip:   # the same loss the update uses
                 dratio = (dlogp - f_logp_h[:dn]).clamp(
                     max=LOG_RATIO_CLAMP).exp()
-                d_pg = pg_loss_heads(dratio, da)
+                d_pg = pg_loss_heads(dratio, da, clip=head_clip_eps)
             else:
                 dratio = (dlogp - f_logp[:dn]).clamp(
                     max=LOG_RATIO_CLAMP).exp()
@@ -1605,7 +1659,7 @@ def main():
                             cf_t.add_(cf_m, alpha=1.0 / args.mb_accum)
                         if head_clip and kl_slots[-1][1] is cf_last:
                             cfh_m = ((ratio_h.detach() - 1.0).abs()
-                                     > CLIP).to(r_m1.dtype).mean()
+                                     > head_clip_eps).to(r_m1.dtype).mean()
                             if j == 0:
                                 cfh_last.zero_()
                             cfh_last.add_(cfh_m, alpha=1.0 / args.mb_accum)
@@ -1616,8 +1670,9 @@ def main():
                         # per-update print sync)
                         ratio_diag = (ratio - 1.0).abs().mean().detach()
                     a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
-                    pg_loss = (pg_loss_heads(ratio_h, a_mb) if head_clip
-                               else pg_loss_fn(ratio, a_mb))
+                    pg_loss = (pg_loss_heads(ratio_h, a_mb,
+                                             clip=head_clip_eps)
+                               if head_clip else pg_loss_fn(ratio, a_mb))
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
                     v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
@@ -1712,6 +1767,13 @@ def main():
                     clipc_sum.add_((MAX_GRAD_NORM / (tn.detach() + 1e-6)
                                     ).clamp(max=1.0))
                     opt_steps += 1
+                if wd_groups:
+                    # decoupled decay, one foreach kernel per group,
+                    # scalar from the host (no sync); lr is what the
+                    # schedule loop set this update
+                    with torch.no_grad():
+                        for g_, ps_ in wd_groups:
+                            torch._foreach_mul_(ps_, 1.0 - g_["lr"] * wd)
                 opt.step()
                 bump_weights_version()  # invalidate fp16 replica caches
         # Tier 1.2 (2026-09-02 audit A §3): the permuted copies (p_obs
@@ -1842,6 +1904,7 @@ def main():
                   else float("nan"))
         elapsed = time.time() - start
         rate = (global_step - steps_before) / elapsed
+        pn_a, pn_c = param_norms()
         if fp16_update:
             # ONE host sync (same as the .item() it replaces) reads the
             # loss, the overflow audit, the ratio diagnostic, the
@@ -1860,17 +1923,19 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last]),
+                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last,
+                     pn_a, pn_c]),
                 ent_head]).tolist()
             (ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v,
              klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v, af_v,
-             cfh_v) = _d[:15]
-            eh_v = _d[15:]
+             cfh_v, pna_v, pnc_v) = _d[:17]
+            eh_v = _d[17:]
             logr_max.zero_()
             gnorm_sum.zero_()
             clipc_sum.zero_()
             opt_steps = 0
-            extra = f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}"
+            extra = (f"  r1 {r1_v:.1e}  maxlr {lmax_v:.1f}  "
+                     f"pn {pna_v:.1f}/{pnc_v:.1f}")
             if inf_v > 0:
                 inf_count.zero_()
                 extra += (f"  [fp16] {int(inf_v)} overflow step(s) "
@@ -1897,11 +1962,12 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last]),
+                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last,
+                     pn_a, pn_c]),
                 ent_head]).tolist()
             (ent_v, ev_v, ret_v, klf_v, kll_v, cff_v, cfl_v,
-             gn_v, cc_v, af_v, cfh_v) = _d[:11]
-            eh_v = _d[11:]
+             gn_v, cc_v, af_v, cfh_v, pna_v, pnc_v) = _d[:13]
+            eh_v = _d[13:]
             gnorm_sum.zero_()
             clipc_sum.zero_()
             opt_steps = 0
@@ -1909,7 +1975,8 @@ def main():
                   f"acc {acc_now:.4f}  accL {acc_l:.4f}  accR {acc_r:.4f}  "
                   f"return {ret_v:7.3f}  "
                   f"ep_return(last100) {recent:8.3f}  ent {ent_v:.3f}  "
-                  f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s",
+                  f"ev {ev_v:.3f}  {rate:8,.0f} steps/s  {elapsed:6.1f}s  "
+                  f"pn {pna_v:.1f}/{pnc_v:.1f}",
                   flush=True)
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
@@ -1964,6 +2031,7 @@ def main():
             gnorm=gn_v, clipc=cc_v, ent_head=eh_v,
             af_ratio=af_v if adv_filter_on else None,
             cfh_last=cfh_v if head_clip else None, events=m_ev,
+            pnorm_actor=pna_v, pnorm_critic=pnc_v,
             diag=m_diag, ckpt=m_ckpt, peak_vram=m_vram)
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)

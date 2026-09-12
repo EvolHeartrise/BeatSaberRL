@@ -44,6 +44,8 @@ UPDATE_FIELDS = (
     # [kl]
     "kl_first", "kl_last", "clipfrac_first", "clipfrac_last",
     "gnorm", "clipc",
+    # parameter norms (2026-09-12): L2 over the actor / critic params
+    "pnorm_actor", "pnorm_critic",
     "ent_spine", "ent_armL", "ent_armR", "ent_legL", "ent_legR",
     "ent_min", "ent_min_head", "entfull", "afsd", "clipfrac_head_last",
     # events
@@ -108,7 +110,8 @@ def update_record(update, num_updates, global_step, *, t=None,
                   fp16_scale=None, kl_first=None, kl_last=None,
                   cf_first=None, cf_last=None, gnorm=None, clipc=None,
                   ent_head=None, af_ratio=None, events=None,
-                  diag=None, ckpt=None, peak_vram=None, cfh_last=None):
+                  diag=None, ckpt=None, peak_vram=None, cfh_last=None,
+                  pnorm_actor=None, pnorm_critic=None):
     """The trainer's formatter: one per-update dict from host values.
 
     `update` is the 1-based index the `update` line prints. `events`
@@ -139,6 +142,8 @@ def update_record(update, num_updates, global_step, *, t=None,
     rec["clipfrac_last"] = _num(cf_last)
     rec["gnorm"] = _num(gnorm)
     rec["clipc"] = _num(clipc)
+    rec["pnorm_actor"] = _num(pnorm_actor)
+    rec["pnorm_critic"] = _num(pnorm_critic)
     if ent_head:
         groups, lo, lo_v, total = entropy_groups(ent_head)
         for nm, v in groups.items():
@@ -187,6 +192,9 @@ _RE_KV = {
     "r1": re.compile(r"(?<![\w_])r1 (\S+)"),
     "maxlr": re.compile(r"(?<![\w_])maxlr (\S+)"),
     "fp16_scale": re.compile(r"(?<![\w_])scale (\d+)"),
+    # `pn <actor>/<critic>` (2026-09-12): parameter L2 norms
+    "pnorm_actor": re.compile(r"(?<![\w_])pn ([\d.]+)/"),
+    "pnorm_critic": re.compile(r"(?<![\w_])pn [\d.]+/([\d.]+)"),
 }
 _RE_SPS = re.compile(r"([\d,]+) steps/s\s+([\d.]+)s")
 _RE_OVERFLOW = re.compile(r"\[fp16\] (\d+) overflow step")
