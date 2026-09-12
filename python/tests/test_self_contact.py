@@ -131,11 +131,16 @@ def test_cuda_pricing_matches_telemetry():
     act = torch.as_tensor([_press_act()] * n)
     tot0 = torch.zeros(n, dtype=torch.float64)
     tot1 = torch.zeros(n, dtype=torch.float64)
+    # stop at termination like the Rust runner: with auto_reset off the
+    # kernel keeps the telemetry accumulating on done envs while no
+    # reward is paid, so post-done ticks would break the identity
     for _ in range(TICKS):
-        _o, r0, _d, _ = e0.step(act)
-        _o, r1, _d, _ = e1.step(act)
+        _o, r0, d0, _ = e0.step(act)
+        _o, r1, _d1, _ = e1.step(act)
         tot0 += r0.double().cpu()
         tot1 += r1.double().cpu()
+        if bool(d0.any()):
+            break
     imp0, ct0, t0 = e0.pop_self_contact()
     imp1, ct1, t1 = e1.pop_self_contact()
     assert t0 == t1 and t0 > 0 and imp0 > 0.0 and ct0 > 0
