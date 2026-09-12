@@ -79,6 +79,17 @@ $VENV/bin/python train_batch.py --num-envs 1024
 $VENV/bin/python train_batch.py --env rust --num-envs 512
 ```
 
+**Optimizer: hybrid Muon is the default since 2026-09-12** (`--optimizer
+muon`): Newton-Schulz Muon on the 26 hidden matrices, Adam on the encoder
+input layers, the 29 heads, the critic's final layer, biases and LN gains;
+updates RMS-matched so `--lr 7e-4` (critic ×3) carries over. v40 probes
+(from scratch, 1.12B samples, same pod): 0.9409 vs Adam's 0.9099 training
+acc, +10% return, half the falls, no throughput cost, seed-1 replication
+within 0.3 pts. Muon at 2× lr lost; AdamW-style `--weight-decay` (0.03 a
+wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
+tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
+automatically (exact resume); `--optimizer adam` forces the old path.
+
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
 and the transformer the only policy — the Python sim, pool encoder, and
 serial trainer were deleted (surface-area reduction). The tensor-op
