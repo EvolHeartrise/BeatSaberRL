@@ -41,7 +41,7 @@ second (`?archive=/some/prefix/` overrides). Development:
 ## Views
 
 - **Live** — the most recently updated run (or any run from the
-  selector). Panels: acc (+accL/accR), return, entropy
+  selector). Panels: acc (+accL/accR), return, self-contact (impulse / % ticks, env v41), entropy
   (+entfull), ev, steps/s, falls+tilts per 1M samples, clipfrac
   first/last, KL first/last (log), gnorm+clipc, per-group entropies,
   lifts per 1M, flail, limit-rest, fp16 r1/maxlr, checkpoint peak VRAM.

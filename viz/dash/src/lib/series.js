@@ -65,6 +65,8 @@ const DERIVED = {
   // become gaps rather than dragging the axis to -inf (2026-09-03)
   falls_per_1m_pos: (r, i, recs) => { const v = per1M(r, "falls", batchOf(recs, i)); return v > 0 ? v : null; },
   tilts_per_1m_pos: (r, i, recs) => { const v = per1M(r, "tilts", batchOf(recs, i)); return v > 0 ? v : null; },
+  // env v41 [contact]: share of env-ticks with body-on-body contact, in %
+  contact_pct: (r) => (r.contact_frac == null ? null : r.contact_frac * 100),
 };
 
 export function seriesValues(recs, key) {
@@ -102,6 +104,8 @@ export const PANELS = [
   { id: "lifts", title: "foot lifts per 1M samples", series: ["lifts_per_1m"] },
   { id: "flail", title: "flail (rad / idle tick)", series: ["flail", "flail_L", "flail_R"] },
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
+  { id: "contact", title: "self-contact impulse (N·s / env-tick, env v41)", series: ["contact"] },
+  { id: "contact_pct", title: "self-contact: % of env-ticks with body-on-body contact", series: ["contact_pct"] },
   { id: "fp16", title: "fp16 ratio diag r1 · max log-ratio", series: ["r1", "maxlr"] },
   { id: "vram", title: "peak VRAM at checkpoints (GiB)", series: ["peak_vram"] },
 ];
@@ -110,6 +114,7 @@ export const PANELS = [
 export const COMPARE_KEYS = [
   "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "lifts_per_1m",
+  "contact", "contact_pct",
 ];
 // ep_return dropped from every view 2026-09-12 (user: too noisy; the
 // trainer no longer emits it — `return` over the update is the measure)
@@ -125,6 +130,7 @@ export const LABELS = {
   ent_spine: "spine", ent_armL: "armL", ent_armR: "armR", ent_legL: "legL", ent_legR: "legR",
   flail: "flail", flail_L: "flail L", flail_R: "flail R",
   limitrest: "total", limitrest_legs: "legs", limitrest_spine: "spine", limitrest_arms: "arms",
+  contact: "N·s / tick", contact_pct: "% ticks in contact",
   r1: "r1", maxlr: "maxlr", peak_vram: "peak VRAM",
 };
 export const label = (k) => LABELS[k] ?? k;
