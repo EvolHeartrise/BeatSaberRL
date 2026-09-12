@@ -77,7 +77,7 @@
     const last = recs[recs.length - 1].steps;
     return [1, 2, 3, 4, 5].map((i) => Math.round((last * i) / 5));
   });
-  const TABLE_KEYS = ["acc", "return", "ep_return", "ent", "ev"];
+  const TABLE_KEYS = ["acc", "return", "ent", "ev"];
 
   function toggle(id) {
     selected = selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id];
