@@ -52,6 +52,9 @@ UPDATE_FIELDS = (
     "falls", "tilts", "lifts", "lifts_L", "lifts_R",
     "flail", "flail_L", "flail_R", "flail_ticks",
     "limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms",
+    # env v41 [contact]: mean self-collision impulse per env-tick (N.s)
+    # and the fraction of env-ticks with any body-on-body contact
+    "contact", "contact_frac",
     "pd_net", "envelope",
     # [diag]
     "diag_gradcos", "diag_gpi", "diag_gv", "diag_dormant",
@@ -155,7 +158,8 @@ def update_record(update, num_updates, global_step, *, t=None,
     rec["clipfrac_head_last"] = _num(cfh_last)   # --head-clip only
     for k, v in (events or {}).items():
         if k in ("flail", "flail_L", "flail_R", "limitrest",
-                 "limitrest_legs", "limitrest_spine", "limitrest_arms"):
+                 "limitrest_legs", "limitrest_spine", "limitrest_arms",
+                 "contact", "contact_frac"):
             rec[k] = _num(v)
         else:
             rec[k] = _int(v)
@@ -213,6 +217,8 @@ _RE_FLAIL = re.compile(
 _RE_LIMITREST = re.compile(
     r"^\[limitrest\] (\S+) N\*m\*s/tick \(legs (\S+) / spine (\S+) / "
     r"arms (\S+)\)")
+_RE_CONTACT = re.compile(
+    r"^\[contact\] (\S+) N\*s/tick \((\S+)% of env-ticks in self-contact\)")
 _RE_PDNET = re.compile(r"^\[pd-net\] (\d+) f32 pivot-floor")
 _RE_ENVELOPE = re.compile(r"^\[envelope\] (\d+) root-escape")
 _RE_DIAG = re.compile(
@@ -435,6 +441,14 @@ def parse_log(text, t_end=None):
             seg._pending["limitrest_spine"] = _num(m.group(3))
             seg._pending["limitrest_arms"] = _num(m.group(4))
             seg._count("limitrest")
+            continue
+        m = _RE_CONTACT.match(line)
+        if m:
+            seg._pending["contact"] = _num(m.group(1))
+            pct = _num(m.group(2))
+            seg._pending["contact_frac"] = (pct / 100.0
+                                            if pct is not None else None)
+            seg._count("contact")
             continue
         m = _RE_PDNET.match(line)
         if m:

@@ -493,7 +493,7 @@ class CudaBeatVecEnv:
                  limit_arms=False,
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
-                 z_clip_hi=12.0):
+                 z_clip_hi=12.0, self_contact_coef=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -542,6 +542,9 @@ class CudaBeatVecEnv:
         # v28: obs z-lane upper clamp (m), runtime per-run (arg wins;
         # the rust twin reads BEAT_Z_CLIP_HI instead)
         self.z_clip_hi = float(z_clip_hi)
+        # env v41 (2026-09-12): price on the tick-summed self-collision
+        # impulse (N.s); 0 = off. Telemetry accumulates regardless.
+        self.self_contact_coef = float(self_contact_coef)
         self.start_pose_jitter = float(start_pose_jitter)
         assert start_pose_jitter == 0.0 or foot_contact, \
             "start_pose_jitter fights the v10 foot welds; contact mode only"
@@ -697,6 +700,10 @@ class CudaBeatVecEnv:
         # pop_limit_rest; reset_env leaves them alone (flail pattern).
         self.limit_rest = z(N, 3)
         self.limit_rest_ticks = z(N, dt=torch.int32)
+        # env v41 self-contact telemetry per env: [impulse sum (N.s),
+        # ticks with contact, ticks]; popped + zeroed by
+        # pop_self_contact, untouched by reset_env
+        self.sc_stat = z(N, 3)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -770,6 +777,7 @@ class CudaBeatVecEnv:
             self._pose_jit,
             self._foot_pot,
             self._bp_pos, self._bp_vel,
+            self.sc_stat,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -800,7 +808,7 @@ class CudaBeatVecEnv:
                        int(self.limit_arms),
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
-                       self.z_clip_hi)
+                       self.z_clip_hi, self.self_contact_coef)
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
@@ -1000,6 +1008,15 @@ class CudaBeatVecEnv:
         self.limit_rest.zero_()
         self.limit_rest_ticks.zero_()
         return legs, spine, arms, ticks
+
+    def pop_self_contact(self):
+        """env v41 self-contact telemetry since the last pop: (summed
+        self-collision impulse in N.s, env-ticks with any contact,
+        env-ticks). Accumulates regardless of self_contact_coef. Sums
+        the per-env accumulators and zeroes them — one sync."""
+        s = self.sc_stat.sum(dim=0).tolist()
+        self.sc_stat.zero_()
+        return float(s[0]), int(s[1]), int(s[2])
 
     def pop_acc(self):
         """Training-accuracy telemetry since the last pop, PER HAND

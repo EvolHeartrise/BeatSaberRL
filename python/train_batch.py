@@ -342,6 +342,17 @@ def parse_args():
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
+    # env v41 (2026-09-12, user): self-contact penalty. Greedy replays of
+    # the v40 policies: 10-13% of ticks carry a body-on-body contact,
+    # dominated by hands/forearms hitting the head and torso; summed
+    # impulse ~0.18 N.s/tick (Muon) vs 0.58 (Adam). coef 0.05 prices
+    # that at ~0.009/tick, ~5% of mean reward/tick.
+    p.add_argument("--self-contact-coef", type=float, default=0.0,
+                   help="env v41: per-tick price on the summed "
+                        "self-collision impulse (N.s) — body-on-body "
+                        "only, blades collide with nothing; 0 = off "
+                        "(every run before 2026-09-12). Telemetry "
+                        "([contact] line, metrics) accumulates always")
     p.add_argument("--z-clip-hi", type=float, default=12.0,
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
@@ -967,6 +978,7 @@ def main():
                       start_pose_jitter=args.start_pose_jitter,
                       crouch_start_prob=args.crouch_start_prob,
                       z_clip_hi=args.z_clip_hi,
+                      self_contact_coef=args.self_contact_coef,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -990,6 +1002,7 @@ def main():
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi,
+            self_contact_coef=args.self_contact_coef,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -1006,6 +1019,7 @@ def main():
             foot_hinge_r=args.foot_hinge_r,
             foot_shape_coef=args.foot_shape_coef,
             iso_coef=args.iso_coef,
+            self_contact_coef=args.self_contact_coef,
             seed=args.seed)
 
     if resume_ckpt is not None:
@@ -2042,6 +2056,17 @@ def main():
                       f"N*m*s/tick (legs {lr_l / lr_t:.4f} / spine "
                       f"{lr_s / lr_t:.4f} / arms {lr_a / lr_t:.4f})",
                       flush=True)
+        # env v41 self-contact telemetry: mean self-collision impulse
+        # per env-tick (N.s) and the share of env-ticks with any
+        # body-on-body contact — accumulates at coef 0 too, so the
+        # behavior is visible before it is priced.
+        if hasattr(venv, "pop_self_contact"):
+            sc_imp, sc_ct, sc_t = venv.pop_self_contact()
+            if sc_t:
+                m_ev.update(contact=sc_imp / sc_t, contact_frac=sc_ct / sc_t)
+                print(f"[contact] {sc_imp / sc_t:.4f} N*s/tick "
+                      f"({100.0 * sc_ct / sc_t:.2f}% of env-ticks in "
+                      f"self-contact)", flush=True)
         # 2026-08-20 THE metric (user decision): training accuracy =
         # note score credited / (115 * good cuts) since the last pop.
         # Event-flow ratio — no completion window, no wave phase, no

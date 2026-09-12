@@ -4649,6 +4649,18 @@ struct Sim {
   // pre-v34 rewards).
   T limit_coef;
   int limit_arms;  // env v35: price arm limit rows too (0 = postural only)
+  // env v41 (2026-09-12, user): SELF-CONTACT penalty — per-tick price on
+  // the tick-summed self-collision row impulses (s.c_lam over the 55
+  // capsule pairs, N.s; the same lambdas the replay "contacts" carry).
+  // Impulse-weighted: a graze is near-free, a forearm slammed into the
+  // head pays its momentum. Blades collide with nothing, so this is
+  // body-on-body only. 0 = off (bitwise pre-v41 rewards). Telemetry
+  // sc_stat[e] = [impulse sum, ticks with contact, ticks] accumulates
+  // regardless of the coefficient (limit_rest pattern; popped + zeroed
+  // by the wrapper's pop_self_contact). lib.rs Core::self_contact_coef
+  // mirror.
+  T self_contact_coef;
+  T* __restrict__ sc_stat;
   // env v37: bomb-like wall despawn on charge (training-only flag)
   int wall_despawn;
   // env v22: previous tick's total hinged foot deviation, per env
@@ -5196,8 +5208,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   T gimp[4] = {T(0), T(0), T(0), T(0)};
   // env v34 limit-rest: this tick's limit-row impulse buckets
   T lrest_legs = T(0), lrest_spine = T(0), lrest_arms = T(0);
+  // env v41: this tick's self-collision row impulse (all pairs)
+  T sc_imp = T(0);
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
+    for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
         gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
@@ -5313,6 +5328,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   P.limit_rest[e * 3 + 1] += lrest_spine;
   P.limit_rest[e * 3 + 2] += lrest_arms;
   P.limit_rest_ticks[e] += 1;
+  // env v41: self-contact penalty + always-on telemetry (lib.rs mirror)
+  reward -= P.self_contact_coef * sc_imp;
+  P.sc_stat[e * 3 + 0] += sc_imp;
+  P.sc_stat[e * 3 + 1] += sc_imp > T(0) ? T(1) : T(0);
+  P.sc_stat[e * 3 + 2] += T(1);
   // FOOT-LIFT penalty (2026-08-20): flat FOOT_LIFT_PEN the tick a
   // foot leaves the ground — edge on the tick-summed ground normal
   // impulse (gimp buckets [L_heel, L_toe, R_heel, R_toe]), per foot.
@@ -5852,6 +5872,7 @@ enum {
   TFLAILR, TFLAILT,
   TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
+  TSCSTAT,  // env v41 self-contact telemetry (N, 3)
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -5871,7 +5892,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
-          double z_clip_hi) {
+          double z_clip_hi, double self_contact_coef) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -5937,6 +5958,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.limit_rest = ts[TLIMREST].data_ptr<scalar_t>();
     P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();
+    P.sc_stat = ts[TSCSTAT].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
@@ -5996,6 +6018,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.iso_coef = (scalar_t)iso_coef;
     P.limit_coef = (scalar_t)limit_coef;
     P.limit_arms = (int)limit_arms;
+    P.self_contact_coef = (scalar_t)self_contact_coef;
     P.wall_despawn = (int)wall_despawn;
     P.z_clip_hi = (scalar_t)z_clip_hi;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();

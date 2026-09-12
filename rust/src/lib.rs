@@ -1103,6 +1103,15 @@ struct Core {
     // observable at coef 0.
     limit_rest_sum: [f64; 3],
     limit_rest_ticks: u64,
+    // env v41 (2026-09-12, user): self-contact penalty — price on the
+    // tick-summed self-collision row impulses (Body::contact_imp over
+    // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
+    // self_contact_coef mirror.
+    self_contact_coef: f64,
+    // cumulative self-contact telemetry until popped
+    // (pop_self_contact): [impulse sum, ticks with contact, ticks] —
+    // accumulated REGARDLESS of the coefficient.
+    sc_stat: [f64; 3],
     // the previous tick's pot (reset to 0 — resets start on-target)
     prev_foot_pot: f64,
     n_scoreable: u32, // chart objects that are not bombs
@@ -1182,6 +1191,8 @@ impl Core {
             wall_despawn: false,
             limit_rest_sum: [0.0; 3],
             limit_rest_ticks: 0,
+            self_contact_coef: 0.0,
+            sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
             n_scoreable: 0,
             flail_rad: 0.0,
@@ -1596,6 +1607,16 @@ impl Core {
         self.limit_rest_sum[1] += self.body.limit_imp[1];
         self.limit_rest_sum[2] += self.body.limit_imp[2];
         self.limit_rest_ticks += 1;
+        // env v41: self-contact penalty + always-on telemetry. The
+        // solver clamps contact rows to λ ≥ 0, so the pair sum is the
+        // tick's total self-collision impulse (CUDA sc_imp mirror).
+        let sc_imp: f64 = self.body.contact_imp.iter().map(|l| l.max(0.0)).sum();
+        reward -= self.self_contact_coef * sc_imp;
+        self.sc_stat[0] += sc_imp;
+        if sc_imp > 0.0 {
+            self.sc_stat[1] += 1.0;
+        }
+        self.sc_stat[2] += 1.0;
         // FOOT-LIFT penalty (2026-08-20): flat charge per lift event
         // this tick (see Body::tick edge detection)
         reward += FOOT_LIFT_PEN * self.body.foot_lifts_tick as f64;
@@ -2068,12 +2089,13 @@ impl RawBeatSim {
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, iso_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
-                        wall_despawn=false))]
+                        wall_despawn=false, self_contact_coef=0.0))]
     fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
            foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
-           limit_arms: bool, wall_despawn: bool) -> Self {
+           limit_arms: bool, wall_despawn: bool,
+           self_contact_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
@@ -2085,7 +2107,17 @@ impl RawBeatSim {
         core.limit_coef = limit_coef;
         core.limit_arms = limit_arms;
         core.wall_despawn = wall_despawn;
+        core.self_contact_coef = self_contact_coef;
         RawBeatSim { core }
+    }
+
+    /// env v41 self-contact telemetry since the last pop: (summed
+    /// self-collision impulse N·s, ticks with contact, env-ticks). CUDA
+    /// `pop_self_contact` mirror.
+    fn pop_self_contact(&mut self) -> (f64, u64, u64) {
+        let s = self.core.sc_stat;
+        self.core.sc_stat = [0.0; 3];
+        (s[0], s[1] as u64, s[2] as u64)
     }
 
     /// chart: list of (hit_time, x, y, color, angle_rad, speed, any_dir,
@@ -2586,14 +2618,16 @@ impl VecBeatSim {
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         iso_coef=0.0, limit_coef=0.0,
-                        limit_arms=false, wall_despawn=false))]
+                        limit_arms=false, wall_despawn=false,
+                        self_contact_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
            foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
-           limit_arms: bool, wall_despawn: bool) -> Self {
+           limit_arms: bool, wall_despawn: bool,
+           self_contact_coef: f64) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2608,6 +2642,7 @@ impl VecBeatSim {
                     c.limit_coef = limit_coef;
                     c.limit_arms = limit_arms;
                     c.wall_despawn = wall_despawn;
+                    c.self_contact_coef = self_contact_coef;
                     c
                 })
                 .collect(),
@@ -2789,6 +2824,20 @@ impl VecBeatSim {
             s.limit_rest_ticks = 0;
         }
         (lg, sp, ar, tk)
+    }
+
+    /// env v41 self-contact telemetry summed over all envs since the
+    /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
+    /// `pop_self_contact` mirror.
+    fn pop_self_contact(&mut self) -> (f64, u64, u64) {
+        let (mut imp, mut ct, mut tk) = (0.0f64, 0.0f64, 0.0f64);
+        for s in self.sims.iter_mut() {
+            imp += s.sc_stat[0];
+            ct += s.sc_stat[1];
+            tk += s.sc_stat[2];
+            s.sc_stat = [0.0; 3];
+        }
+        (imp, ct as u64, tk as u64)
     }
 
     /// FALL terminations summed over all envs since the last pop
