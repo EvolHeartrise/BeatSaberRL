@@ -321,6 +321,22 @@ def parse_args():
                         "weights; 0 = plain Adam (every run before "
                         "2026-09-12). Time constant 1/(lr*wd) optimizer "
                         "steps: 0.1 at lr 7e-4 = 14k steps")
+    # Hybrid Muon (2026-09-12 probe; sessions/2026-09-10-pufferlib-5-
+    # evaluation.md "Muon deep dive"): Muon (Jordan 2024) on the HIDDEN
+    # 2-D matrices — attention q/k/v/out, FFN, trunk, critic attention +
+    # hidden MLP layers — and the existing Adam on everything else (the
+    # three encoder input layers, the 29 heads, the critic's final 1-row
+    # layer, biases, LN gains). Updates are RMS-matched to Adam's
+    # (0.2*sqrt(max(A,B)) scale, Moonshot arXiv 2502.16982) so --lr and
+    # --critic-lr-mult keep their meaning. --weight-decay applies to the
+    # Muon groups too. Checkpoints carry the Muon momentum under "muon";
+    # --resume into --optimizer muon needs such a checkpoint.
+    p.add_argument("--optimizer", choices=["adam", "muon"], default="adam",
+                   help="adam (every run before 2026-09-12) or muon = "
+                        "hybrid Muon on hidden matrices + Adam elsewhere")
+    p.add_argument("--muon-momentum", type=float, default=0.95,
+                   help="Muon Nesterov momentum (Jordan default 0.95; "
+                        "raise it under noisier gradients)")
     p.add_argument("--z-clip-hi", type=float, default=12.0,
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
@@ -625,6 +641,93 @@ def parse_args():
                         "limits, root dropped so no sole corner clips the "
                         "ground. Teaches knee bend / balance variety")
     return p.parse_args()
+
+
+MUON_NS_COEFS = (3.4445, -4.7750, 2.0315)   # Jordan's quintic, 5 steps
+
+
+@torch.no_grad()
+def newton_schulz5(g, steps=5, eps=1e-7):
+    """Orthogonalize a 2-D gradient: the nearest orthogonal matrix by five
+    quintic Newton-Schulz iterations (singular values land in ~(0.7, 1.3)).
+    Tall matrices are transposed so the iteration runs on the small
+    Gram matrix. fp32 here — the matrices are <= 512 wide."""
+    x = g / (g.norm() + eps)
+    tall = x.shape[0] > x.shape[1]
+    if tall:
+        x = x.T
+    a, b, c = MUON_NS_COEFS
+    for _ in range(steps):
+        s = x @ x.T
+        x = a * x + (b * s + c * (s @ s)) @ x
+    return x.T if tall else x
+
+
+class Muon:
+    """The Muon half of the hybrid optimizer (--optimizer muon): Nesterov
+    momentum -> Newton-Schulz orthogonalization -> RMS-matched scale
+    0.2*sqrt(max(A, B)) -> SGD step. `param_groups` mirrors
+    torch.optim's list-of-dicts (params, lr, lr_mult) so the schedule
+    loop and --weight-decay treat it like the Adam groups. Gradients are
+    read from p.grad (the flat fp32 buffer's views), after the trainer's
+    unscale / overflow-zero / global clip."""
+
+    def __init__(self, param_groups, momentum=0.95):
+        self.param_groups = param_groups
+        self.momentum = float(momentum)
+        self.state = {p: torch.zeros_like(p)
+                      for g in param_groups for p in g["params"]}
+
+    def _params(self):
+        return [p for g in self.param_groups for p in g["params"]]
+
+    @torch.no_grad()
+    def step(self):
+        mu = self.momentum
+        for g in self.param_groups:
+            lr = float(g["lr"])
+            for p in g["params"]:
+                if p.grad is None:
+                    continue
+                buf = self.state[p]
+                buf.mul_(mu).add_(p.grad)
+                upd = p.grad.add(buf, alpha=mu)          # Nesterov
+                o = newton_schulz5(upd)
+                scale = 0.2 * math.sqrt(max(p.shape[0], p.shape[1]))
+                p.add_(o, alpha=-lr * scale)
+
+    def zero_grad(self):
+        for p in self._params():
+            p.grad = None
+
+    def state_dict(self):
+        return {"momentum": self.momentum,
+                "bufs": [self.state[p].detach().cpu() for p in self._params()]}
+
+    def load_state_dict(self, sd):
+        ps = self._params()
+        if len(sd["bufs"]) != len(ps):
+            raise ValueError(f"muon state has {len(sd['bufs'])} buffers, "
+                             f"policy has {len(ps)} muon params")
+        for p, src in zip(ps, sd["bufs"]):
+            self.state[p].copy_(src.to(p.device))
+
+
+def muon_param_names(policy):
+    """Which params Muon owns: hidden 2-D matrices only. Encoder input
+    layers (note/saber/body_mlp), the 29 heads, the critic's final
+    1-row layer, biases and LN gains stay on Adam (Jordan's rule)."""
+    names = []
+    for n, p in policy.named_parameters():
+        if p.ndim != 2:
+            continue
+        if n.startswith(("note_mlp", "saber_mlp", "body_mlp", "heads.",
+                         "value_head")):
+            continue
+        if p.shape[0] == 1:               # critic_mlp's final layer
+            continue
+        names.append(n)
+    return names
 
 
 def cpu_state(policy):
@@ -973,10 +1076,15 @@ def main():
     # legacy value_head) form their own group with an lr multiplier the
     # schedule loop re-applies every update via the "lr_mult" key
     # (extra param_group keys survive state_dict round trips).
+    # --optimizer muon: the hidden matrices leave the Adam groups
+    muon_names = (set(muon_param_names(policy))
+                  if args.optimizer == "muon" else set())
     crit_p = [p for n, p in policy.named_parameters()
-              if n.startswith(("critic_", "value_head"))]
+              if n.startswith(("critic_", "value_head"))
+              and n not in muon_names]
     main_p = [p for n, p in policy.named_parameters()
-              if not n.startswith(("critic_", "value_head"))]
+              if not n.startswith(("critic_", "value_head"))
+              and n not in muon_names]
     opt = torch.optim.Adam(
         [{"params": main_p, "lr": args.lr, "lr_mult": 1.0},
          {"params": crit_p, "lr": args.lr * args.critic_lr_mult,
@@ -1004,12 +1112,40 @@ def main():
                 f"--resume optimizer state does not match this policy "
                 f"arch (pre-scale checkpoints were retired). [{e}]")
 
+    muon = None
+    if args.optimizer == "muon":
+        m_main = [p for n, p in policy.named_parameters()
+                  if n in muon_names
+                  and not n.startswith(("critic_", "value_head"))]
+        m_crit = [p for n, p in policy.named_parameters()
+                  if n in muon_names
+                  and n.startswith(("critic_", "value_head"))]
+        muon = Muon(
+            [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
+             {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
+              "lr_mult": args.critic_lr_mult}],
+            momentum=args.muon_momentum)
+        if resume_ckpt is not None:
+            if not resume_ckpt.get("muon"):
+                raise SystemExit("--resume into --optimizer muon needs a "
+                                 "checkpoint saved by a muon run")
+            muon.load_state_dict(resume_ckpt["muon"])
+        n_m = sum(p.numel() for p in m_main + m_crit)
+        n_a = sum(p.numel() for g in opt.param_groups for p in g["params"])
+        print(f"--optimizer muon: Muon on {len(muon_names)} hidden "
+              f"matrices ({n_m:,} params; momentum {args.muon_momentum}, "
+              f"RMS-matched 0.2*sqrt(max(A,B))), Adam on the remaining "
+              f"{n_a:,} params", flush=True)
+    # every lr-carrying group (Adam's two, plus Muon's two when on): the
+    # schedule loop and --weight-decay walk this list
+    all_groups = list(opt.param_groups) + (muon.param_groups if muon else [])
+
     # --weight-decay: per optimizer group, the ndim >= 2 params it will
     # decay at that group's live lr (see the flag's comment)
     wd = float(args.weight_decay)
     wd_groups = []
     if wd > 0.0:
-        for g in opt.param_groups:
+        for g in all_groups:
             ps = [p_ for p_ in g["params"] if p_.ndim >= 2]
             if ps:
                 wd_groups.append((g, ps))
@@ -1268,7 +1404,7 @@ def main():
             lr_now = args.lr * (update + 1) / warmup_updates
         else:
             lr_now = args.lr                # the trunk: constant, forever
-        for g in opt.param_groups:
+        for g in all_groups:
             g["lr"] = lr_now * g.get("lr_mult", 1.0)
         if leaf_from is not None:
             ent_now = ent_start
@@ -1616,6 +1752,8 @@ def main():
                     flat_grad.zero_()
                 else:
                     opt.zero_grad(set_to_none=True)
+                    if muon is not None:
+                        muon.zero_grad()
                 micro = mb_size // args.mb_accum
                 for j in range(args.mb_accum):
                     sl = slice(s + j * micro, s + (j + 1) * micro)
@@ -1775,6 +1913,8 @@ def main():
                         for g_, ps_ in wd_groups:
                             torch._foreach_mul_(ps_, 1.0 - g_["lr"] * wd)
                 opt.step()
+                if muon is not None:
+                    muon.step()
                 bump_weights_version()  # invalidate fp16 replica caches
         # Tier 1.2 (2026-09-02 audit A §3): the permuted copies (p_obs
         # 1.25 GB + p_act at production shape) are dead once the epoch
@@ -1997,6 +2137,7 @@ def main():
                         "value_norm": {"mu": float(ret_mu),
                                        "var": float(ret_var)},
                         "optimizer": cpu_opt_state(opt),
+                        "muon": muon.state_dict() if muon else None,
                         "args": args_snapshot,
                         "wsd_role": ("leaf" if leaf_from is not None
                                      else "trunk"),
@@ -2049,6 +2190,7 @@ def main():
                 "value_norm": {"mu": float(ret_mu),
                                "var": float(ret_var)},
                 "optimizer": cpu_opt_state(opt),
+                        "muon": muon.state_dict() if muon else None,
                 "args": args_snapshot,
                 "wsd_role": ("leaf" if leaf_from is not None
                              else "trunk"),
