@@ -41,7 +41,7 @@ second (`?archive=/some/prefix/` overrides). Development:
 ## Views
 
 - **Live** — the most recently updated run (or any run from the
-  selector). Panels: acc (+accL/accR), return, ep_return, entropy
+  selector). Panels: acc (+accL/accR), return, entropy
   (+entfull), ev, steps/s, falls+tilts per 1M samples, clipfrac
   first/last, KL first/last (log), gnorm+clipc, per-group entropies,
   lifts per 1M, flail, limit-rest, fp16 r1/maxlr, checkpoint peak VRAM.
@@ -56,7 +56,7 @@ second (`?archive=/some/prefix/` overrides). Development:
   (run − reference at matched x, reference interpolated onto each run's
   grid, rolling mean over N points); a **matched-samples table** at
   chosen sample counts (default: the reference's checkpointed sample
-  counts) with per-run acc / return / ep_return / ent / ev and the
+  counts) with per-run acc / return / ent / ev and the
   delta vs the reference.
 - **Runs** — sortable table from index.json: campaign, run, status,
   samples, updates, wall, steps/s, peak VRAM, final acc/return/ent,

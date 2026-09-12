@@ -91,7 +91,6 @@ export function hasAny(recs, key) {
 export const PANELS = [
   { id: "acc", title: "accuracy (note score / 115·cuts)", series: ["acc", "accL", "accR"] },
   { id: "return", title: "return (reward per env this update)", series: ["return"] },
-  { id: "ep_return", title: "ep_return (last 100 episodes)", series: ["ep_return"] },
   { id: "ent", title: "entropy (ent: last minibatch · entfull: full batch)", series: ["ent", "entfull"] },
   { id: "ev", title: "explained variance", series: ["ev"] },
   { id: "sps", title: "steps / s (thousands)", series: ["sps_k"] },
@@ -109,13 +108,15 @@ export const PANELS = [
 
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
-  "acc", "return", "ep_return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
+  "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "lifts_per_1m",
 ];
-export const DIFF_KEYS = ["acc", "return", "ep_return", "ent", "ev"];
+// ep_return dropped from every view 2026-09-12 (user: too noisy; the
+// trainer no longer emits it — `return` over the update is the measure)
+export const DIFF_KEYS = ["acc", "return", "ent", "ev"];
 
 export const LABELS = {
-  acc: "acc", accL: "accL", accR: "accR", return: "return", ep_return: "ep_return",
+  acc: "acc", accL: "accL", accR: "accR", return: "return",
   ent: "ent", entfull: "entfull", ev: "ev", sps_k: "steps/s (k)",
   falls_per_1m: "falls / 1M", tilts_per_1m: "tilts / 1M", lifts_per_1m: "lifts / 1M",
   falls_per_1m_pos: "falls / 1M (log)", tilts_per_1m_pos: "tilts / 1M (log)",
