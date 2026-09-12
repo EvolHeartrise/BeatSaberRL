@@ -331,9 +331,14 @@ def parse_args():
     # --critic-lr-mult keep their meaning. --weight-decay applies to the
     # Muon groups too. Checkpoints carry the Muon momentum under "muon";
     # --resume into --optimizer muon needs such a checkpoint.
-    p.add_argument("--optimizer", choices=["adam", "muon"], default="adam",
-                   help="adam (every run before 2026-09-12) or muon = "
-                        "hybrid Muon on hidden matrices + Adam elsewhere")
+    # DEFAULT muon since 2026-09-12 (user decision after the v40 probes:
+    # 0.9409 vs Adam 0.9099 training acc at matched 1.12B samples, seed 1
+    # tracking seed 0). Every run before that date was Adam. Left None so
+    # a --resume of an Adam-era checkpoint can fall back to adam.
+    p.add_argument("--optimizer", choices=["adam", "muon"], default=None,
+                   help="muon (default, the recipe since 2026-09-12) = "
+                        "hybrid Muon on hidden matrices + Adam elsewhere; "
+                        "adam = every run before that date")
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
@@ -788,6 +793,17 @@ def main():
         args.ent_tau = sched.get("ent_tau", 0)
         if args.run_dir is None:      # continue in the checkpoint's run dir
             args.run_dir = os.path.dirname(os.path.abspath(args.resume))
+    if args.optimizer is None:
+        # resolved BEFORE args_snapshot so args.json records the truth:
+        # resuming an Adam-era checkpoint (no "muon" state) keeps Adam so
+        # the resume stays exact; everything else is muon by default
+        if resume_ckpt is not None and not resume_ckpt.get("muon"):
+            args.optimizer = "adam"
+            print("--optimizer: resuming an Adam-era checkpoint -> adam "
+                  "(to switch, warm-start with --init-from --optimizer "
+                  "muon)", flush=True)
+        else:
+            args.optimizer = "muon"
     if args.run_dir is None:
         args.run_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
