@@ -90,6 +90,20 @@ wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
 tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
 automatically (exact resume); `--optimizer adam` forces the old path.
 
+**Architecture: embed 192 / trunk 384 is the default since 2026-09-13**
+(2,414,930 params, 1.90M actor + 0.52M critic; was 128/256 = 1.09M).
+The v40_w192 probe (from scratch under Muon, lr 5.7e-4 = 7e-4·√(128/192),
+matched 1.12B samples) gained +0.45 pt training acc, reached 0.91 at
+update 406 vs 513, halved falls, and its cd300 leaf benched 2,353,043 upp
+/ 16,420 wpp vs 2,275,937 / 16,034 for the narrow model on the same pod
+(+3.4%, the gain growing with map difficulty), at +15% wall. **Use
+`--lr 5.7e-4` with the wide arch**; scripts that still say 7e-4 carry the
+narrow width's value. Checkpoints carry their own arch, so older 128/256
+checkpoints still load for benches, replays and leaves. Watch on long
+wide trunks: the fp16 diag `r1` runs ~1.8× the narrow model's and rises;
+if it passes 1e-2 or `clipfrac` on the first minibatch leaves 0, move the
+head GEMM to fp32.
+
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
 and the transformer the only policy — the Python sim, pool encoder, and
 serial trainer were deleted (surface-area reduction). The tensor-op
