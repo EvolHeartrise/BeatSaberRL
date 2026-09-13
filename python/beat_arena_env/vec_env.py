@@ -83,6 +83,12 @@ class BeatVecEnv:
         N.s, ticks with contact, env-ticks) — forwarded to the Rust sim."""
         return self.sim.pop_self_contact()
 
+    def pop_activation(self):
+        """Activation telemetry since the last pop (sum total, sum
+        spine, sum arms, sum legs, env-ticks) — forwarded to the Rust
+        sim."""
+        return self.sim.pop_activation()
+
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
         self.sim.set_chart(i, [note_tuple(n) for n in generate_chart(self.cfg, rng)])

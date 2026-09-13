@@ -101,10 +101,12 @@ class RustBeatEnv(gym.Env):
             # per-tick FIELD would retire every reader for no reason —
             # schema growth is versioned here instead. Absent/1 = the
             # pre-2026-08-13 record (no "head"); 2 = per-tick "head"
-            # (FK head pose) present on every tick. Readers must treat a
+            # (FK head pose) present on every tick; 3 = per-tick
+            # "activation" [total, spine, arms, legs] replaces the P6
+            # "effort" work reading (2026-09-13). Readers must treat a
             # HIGHER rev as "fields I do not know about are present",
             # never as an error.
-            "record_rev": 2,
+            "record_rev": 3,
             # env v15 (contact spec §10), ADDITIVE: the note track is
             # head-anchored — viewers must add head_z - PLANE_Z0 to
             # every note's world z. Absent on pre-v15 recordings
@@ -151,9 +153,13 @@ class RustBeatEnv(gym.Env):
         # P6 ADDITIVE fields (version stays "v10"; readers must treat
         # them as optional): "feet" = per-foot [L, R] tick-summed weld
         # impulses [jx, jy, jz, jax, jay, jaz] (N·s; ground reaction —
-        # vertical force ≈ jy/DT), "effort" = the tick's positive
-        # mechanical work (J). τ per joint is NOT logged: it is exactly
-        # gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
+        # vertical force ≈ jy/DT). τ per joint is NOT logged: it is
+        # exactly gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
+        # record_rev 3 (2026-09-13): the P6 "effort" (positive work, J)
+        # field is GONE; "activation" = this tick's commanded |gear
+        # fraction| summed [total, spine, arms, legs] (the --iso-coef
+        # base — derivable from "action" too; logged for the viewer
+        # meter and energy-conservation stats).
         # record_rev 2 ADDITIVE field: "head" = the FK head frame's
         # world pose [px, py, pz, qw, qx, qy, qz] (quaternion scalar-
         # first, like q's root block). Derivable from q by a tree walk
@@ -188,7 +194,7 @@ class RustBeatEnv(gym.Env):
                       for k, w in enumerate(wf)]
                      for wf, g in zip(self.sim.weld_impulses(),
                                       self.sim.ground_reaction())],
-            "effort": round(self.sim.last_effort(), 4),
+            "activation": [round(v, 4) for v in self.sim.last_activation()],
             "events": [
                 {"miss": {"note": int(i)}} if code == 4 else
                 {"post": {"note": int(i), "points": round(float(pts), 2)}}

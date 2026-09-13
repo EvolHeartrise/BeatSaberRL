@@ -1,8 +1,9 @@
 """P3 gate — env v10 integration (SPEC-v10 §7 P3).
 
 Covers: obs length 340 + every §5 block offset; determinism (seed +
-action stream => identical rewards/events, all object kinds); effort
-wiring vs the §4 work formula; live REACH/miss gates moving with the
+action stream => identical rewards/events, all object kinds); (the §4
+effort-wiring case retired with the work reading 2026-09-13; activation
+telemetry is covered in test_v10_bot.py); live REACH/miss gates moving with the
 pose; replay v10 round-trip; and the play-a-chart gate — a
 deterministic scripted-torque sequence achieving a good cut through
 the full dynamics -> blade sweep -> cut -> score loop.
@@ -303,8 +304,9 @@ def test_replay_v10_roundtrip(tmp_path):
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
     assert head["header"]["version"] == "v10"
-    # additive per-tick schema revision (§6): 2 = "head" on every tick
-    assert head["header"]["record_rev"] == 2
+    # additive per-tick schema revision (§6): 2 = "head" on every tick,
+    # 3 = "activation" replaced the P6 "effort" field (2026-09-13)
+    assert head["header"]["record_rev"] == 3
     assert head["header"]["config"]["gears"] == 3
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c

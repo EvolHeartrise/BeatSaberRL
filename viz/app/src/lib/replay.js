@@ -9,10 +9,13 @@
 // per-hand FK sabers [wrist(3), blade(3)] (viewer convenience — the
 // skeleton is drawn from full-body FK over q), 29 gear-id actions,
 // contact events {pair, p, j} (§2 pair ids, tick-summed impulse), and
-// the P6 ADDITIVE fields "feet" (per-foot tick-summed weld impulses
-// [jx,jy,jz,jax,jay,jaz]; vertical reaction N ≈ jy/DT) and "effort"
-// (positive mechanical work, J) — additive: readers must tolerate
-// their absence. Applied torque is NOT logged; it is exactly
+// the P6 ADDITIVE field "feet" (per-foot tick-summed weld impulses
+// [jx,jy,jz,jax,jay,jaz]; vertical reaction N ≈ jy/DT) and, since
+// record_rev 3 (2026-09-13), "activation" = the tick's commanded
+// Σ|gear fraction| as [total, spine, arms, legs] (the --iso-coef base;
+// it replaced the P6 "effort" work reading) — additive: readers must
+// tolerate their absence, and activation is derived from "action" when
+// the field is missing. Applied torque is NOT logged; it is exactly
 // gearTable(config.gears)[action[j]] * TAU_MAX29[j].
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
@@ -807,10 +810,24 @@ export function footForces(rep, tickIdx) {
   return [t.feet[0][1] / DT, t.feet[1][1] / DT];
 }
 
-/** Effort (J of positive work) at a tick; null when absent. */
-export function effortAt(rep, tickIdx) {
+/** Joint activation at a tick as [total, spine, arms, legs] — the
+ *  commanded Σ|gear fraction| (0..29 total; the --iso-coef base). Reads
+ *  the record_rev 3 "activation" field, else derives it from the logged
+ *  action + gear table (older recordings); null only without either. */
+export function activationAt(rep, tickIdx) {
   const t = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)];
-  return t.effort ?? null;
+  if (Array.isArray(t.activation) && t.activation.length === 4) {
+    return t.activation;
+  }
+  if (!Array.isArray(t.action)) return null;
+  const table = gearTable(rep.config?.gears ?? 3);
+  const out = [0, 0, 0, 0];
+  t.action.forEach((a, j) => {
+    const f = Math.abs(table[a] ?? 0);
+    out[0] += f;
+    out[j < 3 ? 1 : j < 17 ? 2 : 3] += f;
+  });
+  return out;
 }
 
 /** Objects still flying at `time`, with their world z. Bombs that were

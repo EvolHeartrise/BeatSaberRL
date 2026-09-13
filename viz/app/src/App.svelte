@@ -381,7 +381,7 @@
         {pose.on ? "🧍 posing" : "🧍 pose"}
       </button>
       <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
-        title="per-joint dials, torque bars, foot forces and effort (g)">
+        title="per-joint dials, torque bars, foot forces and joint activation (g)">
         📊 gauges
       </button>
       <button class:on={pb.firstPerson}

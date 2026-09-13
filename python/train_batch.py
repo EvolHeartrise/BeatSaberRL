@@ -2088,6 +2088,20 @@ def main():
                       f"N*m*s/tick (legs {lr_l / lr_t:.4f} / spine "
                       f"{lr_s / lr_t:.4f} / arms {lr_a / lr_t:.4f})",
                       flush=True)
+        # activation telemetry (2026-09-13, user: energy-conservation
+        # stats over training): mean commanded |gear fraction| summed
+        # over the 29 joints per env-tick (0..29; the --iso-coef base),
+        # spine / arms / legs split. Accumulates at coef 0 too.
+        if hasattr(venv, "pop_activation"):
+            ac_t, ac_s, ac_a, ac_l, ac_n = venv.pop_activation()
+            if ac_n:
+                m_ev.update(activation=ac_t / ac_n,
+                            activation_spine=ac_s / ac_n,
+                            activation_arms=ac_a / ac_n,
+                            activation_legs=ac_l / ac_n)
+                print(f"[activation] {ac_t / ac_n:.4f} /env-tick (spine "
+                      f"{ac_s / ac_n:.4f} / arms {ac_a / ac_n:.4f} / legs "
+                      f"{ac_l / ac_n:.4f})", flush=True)
         # env v41 self-contact telemetry: mean self-collision impulse
         # per env-tick (N.s) and the share of env-ticks with any
         # body-on-body contact — accumulates at coef 0 too, so the

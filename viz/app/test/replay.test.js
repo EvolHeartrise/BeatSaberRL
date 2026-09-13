@@ -8,7 +8,7 @@ import {
   JOINT_NAMES, KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LOOK_VERT,
   N_JOINTS, OMEGA_CAP, PAIRS, PLANE_Z0, ROOT_POS0, TAU_MAX, Z_FAR, Z_MISS,
   activeArcs, activeContacts, activePosts, aftermaths, bodyFK, clampQ29,
-  counts, cutPlaneLocal, effortAt, fkSaber, footForces, frameQuatScene,
+  activationAt, counts, cutPlaneLocal, fkSaber, footForces, frameQuatScene,
   gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
   noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
   headQuats, quatNlerp, rotQuatScene, smoothQuats,
@@ -114,11 +114,22 @@ for (const t of rep.ticks) {
 }
 // additive P6 fields present in fresh recordings
 assert.ok(rep.ticks.every((t) => t.feet && t.feet.length === 2));
-assert.ok(rep.ticks.every((t) => typeof t.effort === "number"));
 {
   const ff = footForces(rep, 30);
   assert.ok(ff && ff.length === 2 && ff.every(Number.isFinite));
-  assert.ok(effortAt(rep, 30) >= 0);
+  // activation: the record_rev 3 field when present, else derived from
+  // the logged action + gear table — [total, spine, arms, legs], and
+  // the groups partition the total
+  const act = activationAt(rep, 30);
+  assert.ok(act && act.length === 4 && act.every((v) => v >= 0));
+  assert.ok(Math.abs(act[0] - (act[1] + act[2] + act[3])) < 1e-9);
+  const withField = { config: rep.config,
+    ticks: [{ ...rep.ticks[30], activation: [3.5, 0.5, 2, 1] }] };
+  assert.deepEqual(activationAt(withField, 0), [3.5, 0.5, 2, 1]);
+  const derived = { config: { gears: 5 },
+    ticks: [{ action: [3, ...Array(9).fill(0), 1, ...Array(9).fill(0),
+                       2, ...Array(8).fill(0)] }] };
+  assert.deepEqual(activationAt(derived, 0), [2.25, 0.25, 1, 1]);
   // some tick actually carries the body weight through the welds
   const peak = Math.max(...rep.ticks.map((_, k) =>
     footForces(rep, k).reduce((a, b) => a + b, 0)));
@@ -126,9 +137,10 @@ assert.ok(rep.ticks.every((t) => typeof t.effort === "number"));
   // ...and absence degrades to null, not a crash
   const stripped = { ticks: [{ ...rep.ticks[0] }] };
   delete stripped.ticks[0].feet;
-  delete stripped.ticks[0].effort;
+  delete stripped.ticks[0].activation;
+  delete stripped.ticks[0].action;
   assert.equal(footForces(stripped, 0), null);
-  assert.equal(effortAt(stripped, 0), null);
+  assert.equal(activationAt(stripped, 0), null);
 }
 
 // contact markers: the recorded episode has self-collision events and

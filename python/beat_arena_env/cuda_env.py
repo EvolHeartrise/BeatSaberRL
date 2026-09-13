@@ -3,7 +3,7 @@ step (P5).
 
 rust/src/lib.rs remains THE reference implementation; this backend runs
 the whole v10 step — 8 constrained dynamics substeps (SPEC-v10 §3),
-gear->torque actuation, work-based effort, swept-surface judgment,
+gear->torque actuation, activation telemetry, swept-surface judgment,
 auto-reset, the obs write — inside one custom CUDA kernel
 (csrc/beat_arena_cuda.cu), one THREAD per env (P5 parallelization
 decision: the Rust expression trees transcribe serially per thread, so
@@ -655,11 +655,10 @@ class CudaBeatVecEnv:
         self.score_pre = z(N)
         self.score_acc = z(N)
         self.score_post = z(N)
-        # contact aggregation + effort (obs bits / parity introspection)
+        # contact aggregation (obs bits / parity introspection)
         self.contact_imp = z(N, NUM_PAIRS)
         self.contact_pt = z(N, NUM_PAIRS, 3)
         self.contact_arm = z(N, 2, dt=torch.bool)
-        self.effort_j = z(N)
         # Cholesky pivot-floor engagements (§20e f32 / §22 f64)
         self._pd_hits = z(1, dt=torch.int32)
         self._pd_popped = 0
@@ -703,6 +702,12 @@ class CudaBeatVecEnv:
         # ticks with contact, ticks]; popped + zeroed by
         # pop_self_contact, untouched by reset_env
         self.sc_stat = z(N, 3)
+        # activation telemetry per env (2026-09-13, replaces the retired
+        # positive-work reading): [sum total, sum spine, sum arms, sum
+        # legs, ticks] of the commanded |gear fraction| (total = the
+        # --iso-coef base); popped + zeroed by pop_activation, untouched
+        # by reset_env
+        self.act_stat = z(N, 5)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -766,7 +771,7 @@ class CudaBeatVecEnv:
             self.good, self.bad, self.miss, self.bombs, self.score,
             self.score_pre, self.score_acc, self.score_post,
             self.contact_imp, self.contact_pt, self.contact_arm,
-            self.effort_j, self._pd_hits, self._env_hits, self._fall_hits,
+            self._pd_hits, self._env_hits, self._fall_hits,
             self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
             self.acc_pts, self.acc_cuts,
@@ -777,6 +782,7 @@ class CudaBeatVecEnv:
             self._foot_pot,
             self._bp_pos, self._bp_vel,
             self.sc_stat,
+            self.act_stat,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -908,9 +914,6 @@ class CudaBeatVecEnv:
     def components(self):
         return (self.score_pre, self.score_acc, self.score_post)
 
-    def last_effort(self):
-        return self.effort_j
-
     def contacts(self):
         """(imp (N,55) tick-summed lambda, point (N,55,3) last substep).
         Requires want_contacts=True at construction — the kernel skips
@@ -1016,6 +1019,17 @@ class CudaBeatVecEnv:
         s = self.sc_stat.sum(dim=0).tolist()
         self.sc_stat.zero_()
         return float(s[0]), int(s[1]), int(s[2])
+
+    def pop_activation(self):
+        """Activation telemetry since the last pop: (sum total, sum
+        spine, sum arms, sum legs, env-ticks) of the commanded |gear
+        fraction| per tick — total is exactly the --iso-coef base;
+        accumulates regardless of the coefficient. Sums the per-env
+        accumulators and zeroes them — one sync."""
+        s = self.act_stat.sum(dim=0).tolist()
+        self.act_stat.zero_()
+        return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
+                int(s[4]))
 
     def pop_acc(self):
         """Training-accuracy telemetry since the last pop, PER HAND

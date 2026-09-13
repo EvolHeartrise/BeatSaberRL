@@ -85,13 +85,13 @@ const ALIVE_BONUS: f64 = 0.002;
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
 const REWARD_BOMB: f64 = -1.5;
-// env v10 "effort" (SPEC-v10 §4): positive mechanical work per tick,
-//   effort_j = sum_substeps sum_j max(tau_j*qd_j, 0)*h
-// with the POST-SOLVE substep velocity. TELEMETRY ONLY since 2026-09-13:
-// the per-joule price (effort_coef, default 4e-4) was retired — every
-// recipe since v23 ran it at 0. Movement is priced by iso_coef
-// (activation) and limit_coef (limit rest); last_effort() still reports
-// the work for replays and tests.
+// Movement is priced by iso_coef (env v23 activation: the commanded
+// Σ|gear fraction| over the 29 joints per tick) and limit_coef (limit
+// rest). The v10 positive-work "effort" price AND its telemetry were
+// retired 2026-09-13; the energy telemetry is now the activation itself
+// — per tick [total, spine, arms, legs] via last_activation() (replay
+// "activation" field, viewer meter) and the per-update accumulator
+// pop_activation() (trainer `[activation]` line, dashboard).
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;
@@ -650,13 +650,16 @@ struct Body {
     contact_arm: [bool; 2],          // any active contact row touching the arm
     contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
     contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
-    effort_j: f64,                   // last tick's positive work (J)
     // env v23 activation (user direction 2026-08-17): this tick's
     // commanded |gear fraction| summed over the 29 joints — the
     // muscle-activation analog (Σ|tau_j|/tau_max_j, constant over the
     // tick since tau is held). Priced by Core::iso_coef; isometric
     // holds and limit-jamming pay it, coast is the only free command.
     act_frac: f64,
+    // the same sum split [spine (joints 0..3), arms (3..17), legs
+    // (17..29)] — telemetry only (2026-09-13, replaces the retired
+    // positive-work reading); act_frac is the priced total.
+    act_group: [f64; 3],
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -743,8 +746,8 @@ impl Body {
             contact_arm: [false; 2],
             contact_imp: [0.0; NUM_PAIRS],
             contact_pt: [[0.0; 3]; NUM_PAIRS],
-            effort_j: 0.0,
             act_frac: 0.0,
+            act_group: [0.0; 3],
             escaped: false,
             foot_contact,
             fell: false,
@@ -787,8 +790,8 @@ impl Body {
         self.axis = [None; 2];
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
-        self.effort_j = 0.0;
         self.act_frac = 0.0;
+        self.act_group = [0.0; 3];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -842,17 +845,21 @@ impl Body {
     }
 
     /// One 30 Hz control tick: gear ids -> torques, 8 × substep at
-    /// h = 1/240 (SPEC-v10 §3/§4), accumulating positive work and
+    /// h = 1/240 (SPEC-v10 §3/§4), accumulating activation and
     /// contact impulses, then FK-cache refresh + finite-diff wrist vel.
     fn tick(&mut self, actions: &[u8; NQ], gear: &[f64; 7]) {
         let mut act = 0.0;
+        let mut grp = [0.0f64; 3];
         for j in 0..NQ {
             let a = actions[j] as usize;
             let frac = if a < 7 { gear[a] } else { 0.0 };
             self.tau[j] = frac * MODEL.tau_max[j];
-            act += frac.abs();
+            let f = frac.abs();
+            act += f;
+            grp[if j < 3 { 0 } else if j < 17 { 1 } else { 2 }] += f;
         }
         self.act_frac = act;
+        self.act_group = grp;
         let prev_wrist = self.wrist;
         // env v24: last tick's §8 body-point positions (ws.p holds the
         // previous refresh_fk), the finite-diff base for body_pt_vel
@@ -875,18 +882,9 @@ impl Body {
         // bounces back has still stopped being the standing task.
         let mut fell = false;
         let mut tilted = false;
-        let mut effort = 0.0;
         for _ in 0..N_SUB {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
-            // SPEC-v10 §4: positive mechanical work at the post-solve
-            // substep velocity (tau constant over the tick)
-            for j in 0..NQ {
-                let p = self.tau[j] * self.st.v[6 + j];
-                if p > 0.0 {
-                    effort += p * H_SUB;
-                }
-            }
 
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
@@ -945,7 +943,6 @@ impl Body {
                 }
             }
         }
-        self.effort_j = effort;
         self.escaped = self.ws.env_hits != env_hits0;
         // contact spec §4 (per-TICK since 2026-08-20): root below the
         // floor threshold at the end of the tick
@@ -1103,6 +1100,12 @@ struct Core {
     // observable at coef 0.
     limit_rest_sum: [f64; 3],
     limit_rest_ticks: u64,
+    // activation telemetry (2026-09-13, replaces the retired work
+    // reading): Σ over ticks of [total, spine, arms, legs] commanded
+    // |gear fraction| + the tick count, until popped (pop_activation;
+    // limit_rest pattern). Total is exactly the iso-priced quantity.
+    act_sum: [f64; 4],
+    act_ticks: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
@@ -1190,6 +1193,8 @@ impl Core {
             wall_despawn: false,
             limit_rest_sum: [0.0; 3],
             limit_rest_ticks: 0,
+            act_sum: [0.0; 4],
+            act_ticks: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
@@ -1595,9 +1600,14 @@ impl Core {
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
         let gear = self.gear;
         self.body.tick(actions, &gear);
-        // (body.effort_j — positive work — is telemetry only; the v10
-        // work price was retired 2026-09-13)
+        // env v23 activation price (the v10 work price was retired
+        // 2026-09-13) + always-on activation telemetry
         reward -= self.iso_coef * self.body.act_frac;
+        self.act_sum[0] += self.body.act_frac;
+        self.act_sum[1] += self.body.act_group[0];
+        self.act_sum[2] += self.body.act_group[1];
+        self.act_sum[3] += self.body.act_group[2];
+        self.act_ticks += 1;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
@@ -2010,7 +2020,7 @@ impl Core {
         // into `done` BEFORE the tracker resolution so the pending
         // follow-throughs are drained exactly as on any other terminal
         // tick; the reward is zeroed AFTER (this tick's physics reward
-        // is garbage, so none of it — effort, cuts, follow-through —
+        // is garbage, so none of it — activation, cuts, follow-through —
         // reaches the policy).
         // env v11 FALL termination (unilateral-contact spec §4): in
         // contact mode a root below FALL_ROOT_Y ends the episode with a
@@ -2347,11 +2357,22 @@ impl RawBeatSim {
         body.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
     }
 
-    /// Last tick's effort in JOULES (positive mechanical work, SPEC-v10
-    /// §4). Telemetry only (replay field, viewer meter, tests) — the
-    /// work price was retired 2026-09-13; nothing charges for this.
-    fn last_effort(&self) -> f64 {
-        self.core.body.effort_j
+    /// Last tick's joint activation — commanded Σ|gear fraction| as
+    /// (total, spine, arms, legs); total is the iso-priced quantity.
+    /// Telemetry (replay "activation" field, viewer meter, tests).
+    fn last_activation(&self) -> (f64, f64, f64, f64) {
+        let b = &self.core.body;
+        (b.act_frac, b.act_group[0], b.act_group[1], b.act_group[2])
+    }
+
+    /// Activation telemetry since the last pop: (Σ total, Σ spine,
+    /// Σ arms, Σ legs, env-ticks). CUDA `pop_activation` mirror.
+    fn pop_activation(&mut self) -> (f64, f64, f64, f64, u64) {
+        let s = self.core.act_sum;
+        let t = self.core.act_ticks;
+        self.core.act_sum = [0.0; 4];
+        self.core.act_ticks = 0;
+        (s[0], s[1], s[2], s[3], t)
     }
 
     /// f64 Cholesky pivot-floor engagements since the last pop
@@ -2827,6 +2848,23 @@ impl VecBeatSim {
         (lg, sp, ar, tk)
     }
 
+    /// Activation telemetry summed over all envs since the last pop:
+    /// (Σ total, Σ spine, Σ arms, Σ legs, env-ticks). CUDA
+    /// `pop_activation` mirror.
+    fn pop_activation(&mut self) -> (f64, f64, f64, f64, u64) {
+        let mut acc = [0.0f64; 4];
+        let mut tk = 0u64;
+        for s in self.sims.iter_mut() {
+            for k in 0..4 {
+                acc[k] += s.act_sum[k];
+            }
+            tk += s.act_ticks;
+            s.act_sum = [0.0; 4];
+            s.act_ticks = 0;
+        }
+        (acc[0], acc[1], acc[2], acc[3], tk)
+    }
+
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
@@ -3010,47 +3048,30 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod env_tests {
     use super::*;
 
-    /// SPEC-v10 §4 effort wiring: Body::tick's accumulated positive
-    /// work equals an independent loop over the same normative pipeline
-    /// BITWISE (identical expression tree), and coasting is exactly
-    /// free. (Telemetry only since 2026-09-13 — the reward no longer
-    /// charges for it; last_effort() feeds the replay meter.)
+    /// Activation telemetry wiring: Body::tick's act_frac is the
+    /// commanded Σ|gear fraction| (the env v23 iso-price base) and the
+    /// [spine, arms, legs] groups partition it exactly; coasting reads
+    /// 0 everywhere.
     #[test]
-    fn effort_is_positive_work() {
+    fn activation_is_commanded_gear_fraction() {
         let gear = gear_signed(5);
         let mut acts = [0u8; NQ];
-        acts[15] = 1; // r wrist bend, full +
+        acts[0] = 3;  // spine pitch, +1/4
         acts[10] = 2; // r arm pitch, full −
-        acts[0] = 3; // spine pitch, +1/4
-        let mut tau = [0.0; NQ];
-        for j in 0..NQ {
-            tau[j] = gear[acts[j] as usize] * MODEL.tau_max[j];
-        }
-        // independent mirror of the tick loop
-        let mut st = State::neutral(MODEL);
-        let mut ws = Workspace::new(MODEL);
-        let mut cs = ConstraintSet::new(MODEL, true, true);
-        let mut effort = 0.0;
-        for _ in 0..N_SUB {
-            substep_constrained(MODEL, &mut st, &tau, H_SUB, &mut ws, &mut cs);
-            for j in 0..NQ {
-                let p = tau[j] * st.v[6 + j];
-                if p > 0.0 {
-                    effort += p * H_SUB;
-                }
-            }
-        }
+        acts[15] = 1; // r wrist bend, full +
+        acts[20] = 4; // l knee, −1/4
         let mut body = Body::new(false);
         body.tick(&acts, &gear);
-        assert!(effort > 0.0, "driven joints must do positive work");
-        assert_eq!(body.effort_j, effort, "effort expression trees diverge");
-        // trajectory parity too (the mirror IS the pipeline)
-        for j in 0..NQ {
-            assert_eq!(body.st.q[j], st.q[j]);
-        }
+        let expect: f64 = acts.iter().map(|&a| gear[a as usize].abs()).sum();
+        assert_eq!(body.act_frac, expect, "total is the joint-order sum");
+        assert_eq!(body.act_group[0], gear[3].abs(), "spine");
+        assert_eq!(body.act_group[1], gear[2].abs() + gear[1].abs(), "arms");
+        assert_eq!(body.act_group[2], gear[4].abs(), "legs");
+        assert_eq!(body.act_group.iter().sum::<f64>(), body.act_frac);
         let mut b2 = Body::new(false);
         b2.tick(&[0u8; NQ], &gear);
-        assert_eq!(b2.effort_j, 0.0, "coast must be exactly free");
+        assert_eq!(b2.act_frac, 0.0, "coast must read zero activation");
+        assert_eq!(b2.act_group, [0.0; 3]);
     }
 
     /// B4: once an episode is done, re-stepping it WITHOUT a chart

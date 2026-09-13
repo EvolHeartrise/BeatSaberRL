@@ -52,6 +52,9 @@ UPDATE_FIELDS = (
     "falls", "tilts", "lifts", "lifts_L", "lifts_R",
     "flail", "flail_L", "flail_R", "flail_ticks",
     "limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms",
+    # [activation] (2026-09-13): mean commanded |gear fraction| summed
+    # over the 29 joints per env-tick (the --iso-coef base) + groups
+    "activation", "activation_spine", "activation_arms", "activation_legs",
     # env v41 [contact]: mean self-collision impulse per env-tick (N.s)
     # and the fraction of env-ticks with any body-on-body contact
     "contact", "contact_frac",
@@ -159,7 +162,8 @@ def update_record(update, num_updates, global_step, *, t=None,
     for k, v in (events or {}).items():
         if k in ("flail", "flail_L", "flail_R", "limitrest",
                  "limitrest_legs", "limitrest_spine", "limitrest_arms",
-                 "contact", "contact_frac"):
+                 "activation", "activation_spine", "activation_arms",
+                 "activation_legs", "contact", "contact_frac"):
             rec[k] = _num(v)
         else:
             rec[k] = _int(v)
@@ -217,6 +221,9 @@ _RE_FLAIL = re.compile(
 _RE_LIMITREST = re.compile(
     r"^\[limitrest\] (\S+) N\*m\*s/tick \(legs (\S+) / spine (\S+) / "
     r"arms (\S+)\)")
+_RE_ACTIVATION = re.compile(
+    r"^\[activation\] (\S+) /env-tick \(spine (\S+) / arms (\S+) / "
+    r"legs (\S+)\)")
 _RE_CONTACT = re.compile(
     r"^\[contact\] (\S+) N\*s/tick \((\S+)% of env-ticks in self-contact\)")
 _RE_PDNET = re.compile(r"^\[pd-net\] (\d+) f32 pivot-floor")
@@ -441,6 +448,14 @@ def parse_log(text, t_end=None):
             seg._pending["limitrest_spine"] = _num(m.group(3))
             seg._pending["limitrest_arms"] = _num(m.group(4))
             seg._count("limitrest")
+            continue
+        m = _RE_ACTIVATION.match(line)
+        if m:
+            seg._pending["activation"] = _num(m.group(1))
+            seg._pending["activation_spine"] = _num(m.group(2))
+            seg._pending["activation_arms"] = _num(m.group(3))
+            seg._pending["activation_legs"] = _num(m.group(4))
+            seg._count("activation")
             continue
         m = _RE_CONTACT.match(line)
         if m:
