@@ -4620,7 +4620,6 @@ struct Sim {
   T* __restrict__ reward;
   bool* __restrict__ done;
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
-  T effort_coef;
   T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
   // v28 probe (2026-08-20): obs z-lane upper clamp (m), RUNTIME so one
   // binary serves every era (old ckpts bench at 12; the rust twin
@@ -4639,7 +4638,8 @@ struct Sim {
   T foot_shape_coef;
   // env v23: per-tick activation price on the commanded Σ|gear frac|
   // over the 29 joints (lib.rs mirror). Velocity-blind by design:
-  // effort_coef prices speed (work), this prices force. 0 = off.
+  // this prices force, not work (the v10 work price is retired;
+  // P.effort stays as telemetry). 0 = off.
   T iso_coef;
   // env v34: per-tick price on the postural limit-rest impulse (the
   // limit_rest accumulation above; lib.rs Core::limit_coef mirror).
@@ -5318,7 +5318,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   }
 
   T reward = T(0);
-  reward -= P.effort_coef * effort;
+  // (effort — positive work — is telemetry only via P.effort[e]; the
+  // v10 work price was retired 2026-09-13, lib.rs mirror)
   reward -= P.iso_coef * T(act);
   // env v34: limit-rest penalty + always-on telemetry (accumulates at
   // coef 0 too, so stop-resting is observable before it is priced)
@@ -5884,7 +5885,7 @@ enum {
 };
 
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
-          int64_t mode, int64_t max_steps, double effort_coef,
+          int64_t mode, int64_t max_steps,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
@@ -6009,7 +6010,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.max_steps = (int)max_steps;
     P.cap = (int)cap;
     P.mode = (int)mode;
-    P.effort_coef = (scalar_t)effort_coef;
     P.fall_const = (scalar_t)fall_const;
     P.foot_z_coef = (scalar_t)foot_z_coef;
     P.foot_x_coef = (scalar_t)foot_x_coef;

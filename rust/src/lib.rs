@@ -85,12 +85,13 @@ const ALIVE_BONUS: f64 = 0.002;
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
 const REWARD_BOMB: f64 = -1.5;
-// env v10 effort (SPEC-v10 §4): positive mechanical work,
-//   effort_tick = effort_coef * sum_substeps sum_j max(tau_j*qd_j, 0)*h
-// with the POST-SOLVE substep velocity (end of the substep, after the
-// clamp passes). Replaces the v7.9 EFFORT_COST table. Default coef
-// 4e-4 per joule (SPEC-v10 §4 calibration; flagged for P7 re-tune).
-const EFFORT_COEF_DEFAULT: f64 = 4e-4;
+// env v10 "effort" (SPEC-v10 §4): positive mechanical work per tick,
+//   effort_j = sum_substeps sum_j max(tau_j*qd_j, 0)*h
+// with the POST-SOLVE substep velocity. TELEMETRY ONLY since 2026-09-13:
+// the per-joule price (effort_coef, default 4e-4) was retired — every
+// recipe since v23 ran it at 0. Movement is priced by iso_coef
+// (activation) and limit_coef (limit rest); last_effort() still reports
+// the work for replays and tests.
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
 const GOOD_HALF_X: f64 = 0.4;
@@ -1027,7 +1028,6 @@ impl Body {
 
 struct Core {
     max_steps: u32,
-    effort_coef: f64, // per-joule work price (0 = free movement)
     gear: [f64; 7],   // env v8: action id -> signed torque fraction
     wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
@@ -1078,8 +1078,8 @@ struct Core {
     // would make a parked pose free). 0.0 = off.
     foot_shape_coef: f64,
     // env v23: per-tick activation price on Body::act_frac (0 = the
-    // pre-v23 reward verbatim; velocity-blind by design — the work
-    // term effort_coef prices speed, this prices force)
+    // pre-v23 reward verbatim; velocity-blind by design — this prices
+    // force, not work; the retired v10 work price is gone)
     iso_coef: f64,
     // env v34 (2026-08-21): per-tick price on the joint-limit-row
     // impulse the postural stops carried (Body::limit_imp, [legs,
@@ -1158,11 +1158,10 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32, effort_coef: f64, wide_acc: bool,
+    fn new_core(max_steps: u32, wide_acc: bool,
                 gears: u8, foot_contact: bool) -> Self {
         Core {
             max_steps,
-            effort_coef,
             gear: gear_signed(gears),
             wide_acc,
             chart: Vec::new(),
@@ -1596,7 +1595,8 @@ impl Core {
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
         let gear = self.gear;
         self.body.tick(actions, &gear);
-        reward -= self.effort_coef * self.body.effort_j;
+        // (body.effort_j — positive work — is telemetry only; the v10
+        // work price was retired 2026-09-13)
         reward -= self.iso_coef * self.body.act_frac;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
@@ -2083,20 +2083,20 @@ impl RawBeatSim {
     /// contact-only), true = unilateral frictional ground contact on
     /// the 8 sole corners.
     #[new]
-    #[pyo3(signature = (max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
+    #[pyo3(signature = (max_steps=690,
                         wide_acc=false, gears=3, foot_contact=false,
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, iso_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
                         wall_despawn=false, self_contact_coef=0.0))]
-    fn new(max_steps: u32, effort_coef: f64, wide_acc: bool,
+    fn new(max_steps: u32, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
            foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: f64) -> Self {
-        let mut core = Core::new_core(max_steps, effort_coef, wide_acc,
+        let mut core = Core::new_core(max_steps, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
@@ -2348,7 +2348,8 @@ impl RawBeatSim {
     }
 
     /// Last tick's effort in JOULES (positive mechanical work, SPEC-v10
-    /// §4) — the reward charged effort_coef × this. Test introspection.
+    /// §4). Telemetry only (replay field, viewer meter, tests) — the
+    /// work price was retired 2026-09-13; nothing charges for this.
     fn last_effort(&self) -> f64 {
         self.core.body.effort_j
     }
@@ -2612,7 +2613,7 @@ impl VecBeatSim {
     /// contact-only), true = unilateral frictional ground contact on
     /// the 8 sole corners.
     #[new]
-    #[pyo3(signature = (n, max_steps=690, effort_coef=EFFORT_COEF_DEFAULT,
+    #[pyo3(signature = (n, max_steps=690,
                         combo_walk=false, return_events=true, wide_acc=false,
                         gears=3, foot_contact=false, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
@@ -2621,7 +2622,7 @@ impl VecBeatSim {
                         limit_arms=false, wall_despawn=false,
                         self_contact_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
-    fn new(n: usize, max_steps: u32, effort_coef: f64, combo_walk: bool,
+    fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
@@ -2631,7 +2632,7 @@ impl VecBeatSim {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
-                    let mut c = Core::new_core(max_steps, effort_coef,
+                    let mut c = Core::new_core(max_steps,
                                                wide_acc, gears, foot_contact);
                     c.fall_const = fall_const;
                     c.foot_z_coef = foot_z_coef;
@@ -3012,8 +3013,8 @@ mod env_tests {
     /// SPEC-v10 §4 effort wiring: Body::tick's accumulated positive
     /// work equals an independent loop over the same normative pipeline
     /// BITWISE (identical expression tree), and coasting is exactly
-    /// free. (The P3 Python gate checks the reward identity
-    /// reward_effort = −coef × last_effort on top of this.)
+    /// free. (Telemetry only since 2026-09-13 — the reward no longer
+    /// charges for it; last_effort() feeds the replay meter.)
     #[test]
     fn effort_is_positive_work() {
         let gear = gear_signed(5);
@@ -3063,7 +3064,7 @@ mod env_tests {
         acts[3] = 2;
 
         // empty chart = the bench's idle slot: done on the FIRST tick
-        let mut core = Core::new_core(100_000_000, 4e-4, false, 5, false);
+        let mut core = Core::new_core(100_000_000, false, 5, false);
         core.set_chart_notes(Vec::new());
         assert!(!core.finished, "install must clear the latch");
         let (_r0, d0) = core.step_inner(&acts);
@@ -3109,7 +3110,7 @@ mod env_tests {
             .map(|i| (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
-        let mut core = Core::new_core(690, 4e-4, false, 5, false);
+        let mut core = Core::new_core(690, false, 5, false);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         let mut first_done = None;
@@ -3145,9 +3146,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        // effort_coef > 0 so the physics reward would otherwise be
-        // strictly negative — the zeroing is observable
-        let mut core = Core::new_core(690, 4e-4, false, 3, false);
+        let mut core = Core::new_core(690, false, 3, false);
         core.set_chart_notes(chart);
         core.body.st.p = ESC_P;
         core.body.st.quat = ESC_QUAT;
@@ -3192,7 +3191,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, 4e-4, false, 5, false);
+        let mut core = Core::new_core(690, false, 5, false);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[10] = 1;
@@ -3231,7 +3230,7 @@ mod env_tests {
             .collect();
         chart.push((9.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_BOMB,
                     false, false));
-        let mut core = Core::new_core(690, 4e-4, false, 5, true);
+        let mut core = Core::new_core(690, false, 5, true);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[17] = 1; // l_hip_pitch, full +
@@ -3280,7 +3279,7 @@ mod env_tests {
     fn ground_reaction_carries_weight_in_contact_mode() {
         let chart: Vec<ChartTuple> = vec![(8.0, 0.0, 1.0, 0, 0.0, 6.0,
                                            false, KIND_NOTE, false, false)];
-        let mut core = Core::new_core(690, 4e-4, false, 5, true);
+        let mut core = Core::new_core(690, false, 5, true);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         // ticks 1-3: the first tick still carries the reset's settling
@@ -3322,7 +3321,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, 4e-4, false, 5, false);
+        let mut core = Core::new_core(690, false, 5, false);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[17] = 1;

@@ -479,7 +479,7 @@ a **new f32-only** `__global__` selected at launch time.
 ### 4.1 pybind signature
 
 Current: `void step(std::vector<at::Tensor> ts, at::Tensor actions,
-at::Tensor cand, int64_t mode, int64_t max_steps, double effort_coef,
+at::Tensor cand, int64_t mode, int64_t max_steps,
 bool wide_acc, bool auto_reset, int64_t gears, bool want_contacts,
 bool foot_contact, double fall_const)` (`:5181-5185`). Add **one trailing
 parameter with a pybind default** so every existing caller stays
@@ -550,7 +550,7 @@ with `kernel_variant=None` appended to the constructor signature
 ```python
     def _launch(self, actions, cand, mode):
         self._ext.step(self._tensors, actions, cand, mode,
-                       self.max_steps, self.effort_coef, self.wide_acc,
+                       self.max_steps, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
                        self.foot_contact, self.fall_const,
                        self.kernel_variant)          # <-- new, default 0

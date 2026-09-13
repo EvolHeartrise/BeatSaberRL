@@ -12,7 +12,7 @@ Coast becomes the only free command.
     python v23_iso_probe.py
 
 Changes vs the v22 recipe (user's call: activation INSTEAD of work):
-  --effort-coef 0      the work price is OFF for this probe
+       the work price is OFF for this probe
   --iso-coef 5e-4      ~6.5e-3/tick at the measured v22 baseline
                        activation (~13) ~ 5 return per 25 s segment —
                        the same order as the x-rent that moved the
@@ -51,7 +51,7 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--ranked-maps", "--seg-len", "25",
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
-          "--effort-coef", "0", "--iso-coef", "5e-4",
+          "--iso-coef", "5e-4",
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",
           "--lead-s", "0.5", "--lr", "7e-4",
           "--start-pose-jitter", "0.15", "--foot-z-coef", "0.01",

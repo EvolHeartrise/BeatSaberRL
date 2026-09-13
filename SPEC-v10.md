@@ -401,7 +401,14 @@ identity orientation (6 bilateral rows each).
 - **Torque**: `τ_j = gear_signed[a_j] × τ_max[j]`, held constant for the
   tick's 8 substeps. No feed-forward gravity compensation — holding a pose
   against gravity costs gear effort (by design).
-- **Effort cost** (replaces the v7.9 EFFORT_COST table): positive
+- **Effort cost** — **RETIRED 2026-09-13.** The work price below and its
+  `effort_coef` knob are gone from both sims, the trainer and every
+  wrapper (every recipe since v23 ran it at 0 and it kept being read as
+  a live penalty). The positive-work quantity is still accumulated as
+  telemetry (`last_effort()`, replay "effort" field, viewer meter). The
+  live movement prices are `--iso-coef` (activation, §v23) and
+  `--limit-coef --limit-arms` (limit rest, §v34/v35). Historical text:
+  (replaces the v7.9 EFFORT_COST table): positive
   mechanical work,
   `effort_tick = effort_coef × Σ_{s=1..8} Σ_{j=0..28} max(τ_j·q̇_j^{(s)}, 0)·h`
   with `q̇^{(s)}` the post-solve substep velocity. (The per-substep sum IS
@@ -678,7 +685,7 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
    the torso/thigh envelope.
 8. **effort_coef 4e-4** — derived (§4), but the work economy under gravity
    is new; explicitly flagged for P7 re-tuning rather than pretending the
-   calibration is exact.
+   calibration is exact. (Retired 2026-09-13 — see §4.)
 9. **Obs total 340**, below the proposal's 380–420 ballpark (that estimate
    assumed wider cos/sin use; only the two wrist rolls wrap).
 10. **MJCF multi-joint composition order**: the twin declares stacked
@@ -810,8 +817,9 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        velocity** (after the step-11 clamps and step-12 envelope) —
        the velocity that integrates positions next substep. Pinned
        bitwise against an independent pipeline mirror in
-       `lib.rs env_tests::effort_is_positive_work`; the Python gate
-       checks the reward identity `r_effort = −coef × last_effort`.
+       `lib.rs env_tests::effort_is_positive_work`. (The Python reward
+       identity gate `r_effort = −coef × last_effort` was deleted with
+       the price on 2026-09-13; the work is telemetry only.)
     c. **Obs contact bits count ASSEMBLED rows** (gap < margin, λ may
        be 0 — the §5 "active contact row" as the solver defines
        active); replay `contacts` keep the stricter nonzero
@@ -830,7 +838,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        joint-state form died with the kinematic body).
     f. **effort_coef defaults to 4e-4** (the §4 literal) in the Rust
        ctors and Python wrappers; 0 still = free movement (knob
-       semantics carried).
+       semantics carried). RETIRED 2026-09-13: the knob no longer
+       exists; movement is priced by iso_coef / limit_coef.
     g. **P2 gates stay cargo tests** — P3 integrates the engine
        BEHIND the env FFI without raw dynamics bindings, so the
        planned `test_v10_contacts.py` wrapper (§17e) is dropped;

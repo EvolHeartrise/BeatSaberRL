@@ -66,7 +66,7 @@ import torch
 
 from .chart import ChartConfig, generate_chart
 from .constants import (
-    BAD_HALF, BAD_HALF_Y_LINK, EFFORT_COEF, FOLLOW_TIMEOUT, GOOD_HALF_Y,
+    BAD_HALF, BAD_HALF_Y_LINK, FOLLOW_TIMEOUT, GOOD_HALF_Y,
     GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BOMB, KIND_CHAIN_HEAD,
     KIND_CHAIN_LINK, N_JOINTS, NV, OBS_DIM, note_center,
 )
@@ -481,7 +481,7 @@ class CudaBeatVecEnv:
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, seed=0, effort_coef=EFFORT_COEF,
+                 bomb_prob=0.125, seed=0,
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, wide_acc=False, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
@@ -564,7 +564,6 @@ class CudaBeatVecEnv:
         self.push_prob = float(push_prob)
         self.push_vmax = float(push_vmax)
         self.start_jitter = float(start_jitter)
-        self.effort_coef = float(effort_coef)
         self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.gears = int(gears)
@@ -799,7 +798,7 @@ class CudaBeatVecEnv:
         if self.start_pose_jitter > 0.0 or self.crouch_start_prob > 0.0:
             self._pose_jit.uniform_(-1.0, 1.0)
         self._ext.step(self._tensors, actions, cand, mode,
-                       self.max_steps, self.effort_coef, self.wide_acc,
+                       self.max_steps, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,

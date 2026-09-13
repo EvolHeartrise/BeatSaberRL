@@ -15,7 +15,7 @@ ZERO_ACT = [0] * N_JOINTS
 
 
 def _sim(chart, **kw):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    wide_acc=False, gears=5,
                                    foot_contact=True, **kw)
     sim.set_chart([note_tuple(n) for n in chart])

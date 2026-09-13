@@ -71,7 +71,6 @@ def main():
            "--lr", "0.00296092",
            "--ent-coef", "0.0331038", "--ent-final", "0.013929",
            "--gamma", "0.914958", "--gae-lambda", "0.980024",
-           "--effort-coef", "0.240844",
            "--total-steps", str(TOTAL_STEPS),
            "--ckpt-every", str(CKPT_EVERY),
            "--run-dir", RUN_DIR]

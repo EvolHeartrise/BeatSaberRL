@@ -54,22 +54,19 @@ def _charts(cfg_kw, seeds):
             for s in seeds]
 
 
-def _rust_sims(charts, gears, max_steps, wide_acc=False, effort_coef=4e-4):
+def _rust_sims(charts, gears, max_steps, wide_acc=False):
     sims = []
     for ch in charts:
         sim = beat_arena_rs.RawBeatSim(max_steps=max_steps,
-                                       effort_coef=effort_coef,
                                        wide_acc=wide_acc, gears=gears)
         sim.set_chart([note_tuple(n) for n in ch])
         sims.append(sim)
     return sims
 
 
-def _cenv(charts, gears, max_steps, dtype=torch.float64, wide_acc=False,
-          effort_coef=4e-4):
+def _cenv(charts, gears, max_steps, dtype=torch.float64, wide_acc=False):
     return CudaBeatVecEnv(len(charts), charts=charts, max_steps=max_steps,
-                          gears=gears, wide_acc=wide_acc,
-                          effort_coef=effort_coef, device="cuda",
+                          gears=gears, wide_acc=wide_acc, device="cuda",
                           dtype=dtype, auto_reset=False,
                           want_contacts=True)
 

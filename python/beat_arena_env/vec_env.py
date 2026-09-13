@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import EFFORT_COEF, OBS_DIM
+from .constants import OBS_DIM
 
 from beat_arena_rs import VecBeatSim
 
@@ -27,7 +27,7 @@ class BeatVecEnv:
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, effort_coef=EFFORT_COEF, wide_acc=False,
+                 bomb_prob=0.125, wide_acc=False,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, iso_coef=0.0, self_contact_coef=0.0,
                  gears=3, seed=0, foot_contact=False, fall_const=5.0):
@@ -47,8 +47,7 @@ class BeatVecEnv:
         # (live head plane, env v10) past the last note
         # return_events=False: the event list is discarded below; skip
         # materializing it into Python tuples every step
-        self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
-                              effort_coef=effort_coef, return_events=False,
+        self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90, return_events=False,
                               wide_acc=wide_acc, gears=gears,
                               foot_contact=foot_contact,
                               fall_const=fall_const,

@@ -45,7 +45,6 @@ BASE = ["--num-envs", "1024", "--horizon", "128",
         "--lr", "0.00296092",
         "--gamma", "0.914958",
         "--gae-lambda", "0.980024",
-        "--effort-coef", "0.240844",
         "--total-steps", str(TOTAL_STEPS)]
 
 ENT = {"rise": ("0.013929", "0.0331038"),

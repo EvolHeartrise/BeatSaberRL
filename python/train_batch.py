@@ -544,9 +544,10 @@ def parse_args():
                    help="P(a generated note turns into a dot)")
     p.add_argument("--bomb-prob", type=float, default=0.125,
                    help="P(bomb) per generation tick")
-    p.add_argument("--effort-coef", type=float, default=1.0,
-                   help="scales the tiered per-joint effort cost "
-                        "(EFFORT_COST; 0 = free movement)")
+    # (the v10 "effort" work price and its --effort-coef flag were RETIRED
+    # 2026-09-13: every recipe since v23 ran it at 0; the live movement
+    # prices are --iso-coef (activation) and --limit-coef/--limit-arms
+    # (limit rest). Per-tick positive work survives as replay telemetry.)
     # wide-acc training reward (2026-07-29, user-directed): acc_train =
     # 30*clamp(1 - d/0.6), unrounded — effectively DOUBLING the acc
     # component's range and reward vs the real round(15*(1 - d/0.3)).
@@ -646,8 +647,8 @@ def parse_args():
                         "sum of commanded |gear fraction| over the 29 "
                         "joints (muscle-activation analog: isometric "
                         "holds and limit-jamming pay, coast is free; "
-                        "velocity-blind, unlike --effort-coef's "
-                        "positive-work price). 0 = off")
+                        "velocity-blind by design — force, not work, "
+                        "is what is priced). 0 = off")
     p.add_argument("--foot-x-coef", type=float, default=0.0,
                    help="env v21: per-tick penalty coefficient on each "
                         "foot's |world_x - its_stance_x| (per-side "
@@ -972,7 +973,6 @@ def main():
                                 mirror=args.mirror_augment)
         venv = VecCls(N, pool=pool,
                       max_steps=int(args.seg_len * 30) + 90,
-                      effort_coef=args.effort_coef,
                       wide_acc=args.wide_acc, gears=args.gears,
                       foot_contact=args.foot_contact,
                       fall_const=args.fall_pen,
@@ -1000,7 +1000,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
+            wide_acc=args.wide_acc,
             gears=args.gears, foot_contact=args.foot_contact,
             fall_const=args.fall_pen,
             push_prob=args.push_prob, push_vmax=args.push_vmax,
@@ -1023,7 +1023,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            effort_coef=args.effort_coef, wide_acc=args.wide_acc,
+            wide_acc=args.wide_acc,
             foot_contact=args.foot_contact, fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,

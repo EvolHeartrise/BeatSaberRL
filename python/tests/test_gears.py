@@ -27,9 +27,9 @@ R_DEV = 16
 L_DEV = 9
 
 
-def _sim(gears, effort_coef=0.0):
+def _sim(gears):
     """A sim whose only note is far away — pure body dynamics."""
-    sim = RawBeatSim(max_steps=690, effort_coef=effort_coef, gears=gears)
+    sim = RawBeatSim(max_steps=690, gears=gears)
     n = Note(hit_time=15.0, col=0, row=0, color=1, angle=0.0, speed=4.0)
     sim.set_chart([note_tuple(n)])
     # env v20: this script is calibrated to the pre-v20 zero-arm pose;
@@ -110,7 +110,7 @@ def test_ternary_prefix_identical_across_k():
     acts = rng.integers(0, 3, size=(90, N_JOINTS))
     streams = {}
     for k in (3, 5, 7):
-        sim = _sim(k, effort_coef=4e-4)
+        sim = _sim(k)
         obs_l, rew_l = [], []
         for a in acts:
             obs, r, _, _ = sim.step([int(x) for x in a])
@@ -120,29 +120,6 @@ def test_ternary_prefix_identical_across_k():
     for k in (5, 7):
         np.testing.assert_array_equal(streams[3][0], streams[k][0])
         assert streams[3][1] == streams[k][1]
-
-
-def test_effort_scales_with_gear():
-    """Env v10 effort = coef x positive mechanical work: coast is free;
-    a quarter-gear tick does less work than a full-gear tick (quarter
-    torque AND slower resulting motion); the reward identity
-    r = -coef x last_effort holds exactly."""
-    def one_tick(gears, aid, coef=1.0):
-        sim = _sim(gears, effort_coef=coef)
-        act = list(COAST)
-        act[R_BEND] = aid
-        _, r, _, _ = sim.step(act)
-        return r, sim.last_effort()
-
-    r0, j0 = one_tick(5, 0)
-    assert r0 == 0.0 and j0 == 0.0
-    r_full, j_full = one_tick(5, 1)
-    r_quarter, j_quarter = one_tick(5, 3)
-    assert 0.0 < j_quarter < j_full
-    assert r_full == pytest.approx(-j_full, abs=1e-15)
-    assert r_quarter == pytest.approx(-j_quarter, abs=1e-15)
-    _, j_eighth = one_tick(7, 5)
-    assert 0.0 < j_eighth < j_quarter
 
 
 def test_env_action_space_and_header():
@@ -223,7 +200,7 @@ def test_gears_cuda_parity():
                              auto_reset=False, gears=k,
                              want_contacts=True)
         env.reset()
-        sim = RawBeatSim(max_steps=690, effort_coef=4e-4, gears=k)
+        sim = RawBeatSim(max_steps=690, gears=k)
         sim.set_chart([note_tuple(n_far)])
         a = list(COAST)
         a[R_BEND] = 1
