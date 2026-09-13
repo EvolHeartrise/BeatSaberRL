@@ -514,9 +514,13 @@ def parse_args():
                         "gradient steps as overflow-zeroed")
     # model arch (ignored with --init-from: the checkpoint's arch wins)
     # v17 scaled arch (2026-08-13, user-approved): 861,202 params at
-    # gears 5 (was 138,642). The flags remain for ablations.
-    p.add_argument("--embed", type=int, default=128)
-    p.add_argument("--trunk-dim", type=int, default=256)
+    # gears 5 (was 138,642). Widened 2026-09-13 (user decision after the
+    # v40_w192 probe): embed 192 / trunk 384 = 2,414,930 params, +0.45 pt
+    # trunk acc at matched 1.12B samples under Muon, cd300 bench +3.4%
+    # upp (2,353,043, pod best), +15% wall; lr 5.7e-4 (7e-4 * sqrt(128/192)).
+    # Checkpoints carry their own arch, so 128/256 ckpts still load.
+    p.add_argument("--embed", type=int, default=192)
+    p.add_argument("--trunk-dim", type=int, default=384)
     p.add_argument("--n-blocks", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
