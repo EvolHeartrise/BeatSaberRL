@@ -48,13 +48,16 @@ verbatim, legs 2×6), de Leva masses on the v9 anchor geometry, feet
 welded to the floor, 12-collider self-contact — integrated by a
 hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
-are **29 gear heads** (τ = gear_fraction × τ_max); per-tick positive
-mechanical work ("effort") is telemetry only — the 4e-4/J work price was
-retired 2026-09-13, movement is priced by `--iso-coef` (activation) and
-`--limit-coef --limit-arms` (limit rest); the reach/miss gates and note look-at follow
+are **29 gear heads** (τ = gear_fraction × τ_max); movement is priced by
+`--iso-coef` (joint activation: the commanded Σ|gear fraction| per tick)
+and `--limit-coef --limit-arms` (limit rest) — the v10 positive-work
+"effort" price and its telemetry were retired 2026-09-13, and the
+activation itself is the energy telemetry (replay `activation`
+[total, spine, arms, legs] per tick, the trainer's `[activation]` line,
+the dashboard panel); the reach/miss gates and note look-at follow
 the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
 root twist + ω29 + contact events; since P6 additive per-tick "feet"
-weld impulses + "effort"). Gravity is real and nothing holds the body
+weld impulses; record_rev 3 "activation"). Gravity is real and nothing holds the body
 up — posture is the policy's problem now. ALL v9 checkpoints,
 replays, and records are retired. The viewer and scripted bot are v10
 (P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` — the whole
@@ -286,7 +289,9 @@ yellow contact markers sized by impulse at self-collision events, and
 the `g` gauges are per-joint dials for all 29 joints (grouped spine /
 arms / legs: limit arcs, ω, near-limit orange, applied-τ bars derived
 from the logged gear actions) plus per-foot vertical ground-reaction
-N and the effort-per-tick meter (from the additive replay fields).
+N and the joint-activation meter (total/29 with the spine / arms /
+legs split; from the replay's `activation` field, derived from the
+logged actions on older recordings).
 Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
 q36 export. Non-"v10" replays are rejected — re-record from a current
 checkpoint.

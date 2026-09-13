@@ -6,7 +6,9 @@
   // (τ = gear_fraction × τ_max from the tick's logged action — τ is
   // exactly derivable, not separately logged). NEW force block: per-
   // foot vertical ground reaction (N, from the additive "feet" weld
-  // impulses) and the effort-per-tick meter (J of positive work).
+  // impulses) and the joint-activation meter (commanded Σ|gear
+  // fraction|, 0..29 — the --iso-coef base; record_rev 3 "activation"
+  // field, derived from the action for older replays).
   //
   // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
   // screen-fixed under orbiting, show up in exported videos, and need
@@ -18,7 +20,7 @@
   import { pb, pose } from "./state.svelte.js";
   import {
     DT, GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
-    TAU_MAX, effortAt, footForces, lerp, tauOf,
+    TAU_MAX, activationAt, footForces, lerp, tauOf,
   } from "./replay.js";
 
   // the fov of the camera these sprites hang off (the corner placement
@@ -34,7 +36,7 @@
     { groups: [0, 1, 3], forces: false },  // spine, L arm, L leg
     { groups: [2, 4], forces: true },      // R arm, R leg + forces
   ];
-  const FORCES_H = 92;
+  const FORCES_H = 112;  // 2 foot rows + activation bar + group line
   const panelH = (p) =>
     2 * PAD +
     p.groups.reduce((a, g) => a + HEAD_H + GROUPS[g].joints.length * ROW_H, 0) +
@@ -129,7 +131,7 @@
     }
   }
 
-  function forcesBlock(ctx, y0, feet, effort) {
+  function forcesBlock(ctx, y0, feet, act) {
     label(ctx, "forces", PAD, y0 + 8, "#e8eaf0", 12, true);
     let y = y0 + HEAD_H + 4;
     // per-foot vertical reaction bars, full scale 1200 N
@@ -158,8 +160,9 @@
       }
       y += 24;
     }
-    // effort meter (J of positive work this tick), full scale 40 J
-    label(ctx, "effort", PAD, y, "#9aa0ae", 11);
+    // joint-activation meter: commanded Σ|gear fraction| this tick,
+    // full scale 29 (every joint at full gear); the --iso-coef base
+    label(ctx, "activ.", PAD, y, "#9aa0ae", 11);
     const bx0 = 60, bx1 = W - 64;
     ctx.strokeStyle = "#3a4050";
     ctx.lineWidth = 5;
@@ -167,21 +170,24 @@
     ctx.moveTo(bx0, y);
     ctx.lineTo(bx1, y);
     ctx.stroke();
-    if (effort !== null) {
-      const t = Math.max(0, Math.min(1, effort / 40));
+    if (act !== null) {
+      const t = Math.max(0, Math.min(1, act[0] / 29));
       ctx.strokeStyle = "#c5b3f0";
       ctx.lineWidth = 6;
       ctx.beginPath();
       ctx.moveTo(bx0, y);
       ctx.lineTo(bx0 + t * (bx1 - bx0), y);
       ctx.stroke();
-      label(ctx, `${effort.toFixed(1)} J`, W - 58, y, "#cfd3dc", 11);
+      label(ctx, `${act[0].toFixed(1)}/29`, W - 58, y, "#cfd3dc", 11);
+      // group split on the next line: spine / arms / legs
+      label(ctx, `spine ${act[1].toFixed(1)}  arms ${act[2].toFixed(1)}  `
+        + `legs ${act[3].toFixed(1)}`, bx0, y + 20, "#9aa0ae", 10);
     } else {
       label(ctx, "n/a", W - 58, y, "#6b7180", 11);
     }
   }
 
-  function draw(panel, q29, om29, tau29, feet, effort) {
+  function draw(panel, q29, om29, tau29, feet, act) {
     const { ctx, groups, forces, h } = panel;
     ctx.clearRect(0, 0, W, h);
     ctx.fillStyle = "rgba(11,13,17,0.72)";
@@ -199,7 +205,7 @@
         y += ROW_H;
       }
     }
-    if (forces) forcesBlock(ctx, y, feet, effort);
+    if (forces) forcesBlock(ctx, y, feet, act);
     panel.tex.needsUpdate = true;
   }
 
@@ -220,7 +226,7 @@
     const tau29 = tauOf(pb.rep.ticks[k1].action, pb.rep.config.gears ?? 3);
     draw(panels[0], q29, om29, tau29, null, null);
     draw(panels[1], q29, om29, tau29, footForces(pb.rep, k1),
-      effortAt(pb.rep, k1));
+      activationAt(pb.rep, k1));
   });
 
   $effect(() => () => panels.forEach((g) => g.tex.dispose()));

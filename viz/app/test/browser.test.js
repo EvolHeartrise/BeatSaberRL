@@ -102,7 +102,7 @@ try {
 
   // ---- skeleton + gauges + contact-marker eyeball shots ('h' hitboxes on):
   // scrub to a mid-episode tick (the bot swinging, weight on the welds —
-  // gauges show τ bars, foot N and effort) and to a late tick.
+  // gauges show τ bars, foot N and joint activation) and to a late tick.
   await page.keyboard.press("h");
   const scrub = (tick) => page.evaluate((tick) => {
     const r = document.querySelector("#bottom input[type=range]");

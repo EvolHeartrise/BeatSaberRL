@@ -4,7 +4,7 @@
 // dense Cholesky -> constraint solve [12 x weld-block / contacts /
 // limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
 // 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
-// + gear->tau, work-based effort, blade sweep/cut judgment, scoring,
+// + gear->tau, activation telemetry, blade sweep/cut judgment, scoring,
 // obs write (OBS_DIM below) — a semantics-exact transcription of rust/src/lib.rs +
 // rust/src/dynamics/{model,fk,algo,collide,solver,step}.rs. The Rust
 // crate remains THE reference implementation.
@@ -4525,7 +4525,13 @@ struct Sim {
   // contact aggregation (obs bits + parity introspection)
   T *__restrict__ contact_imp, *__restrict__ contact_pt;
   bool* __restrict__ contact_arm;
-  T* __restrict__ effort;
+  // activation telemetry (2026-09-13, replaces the retired positive-
+  // work reading): per env [Σ total, Σ spine, Σ arms, Σ legs, ticks]
+  // of the commanded |gear fraction| (total = the iso-priced sum),
+  // accumulated regardless of iso_coef; popped + zeroed by the
+  // wrapper's pop_activation, NOT touched by reset_env (limit_rest
+  // pattern). lib.rs Core::act_sum mirror.
+  T* __restrict__ act_stat;
   int* __restrict__ pd_hits;  // f32 pivot-floor engagements (§20e)
   int* __restrict__ env_hits;  // pre-integration root-envelope hits (§23)
   // env v11 FALL terminations (unilateral-contact spec §4), counted per
@@ -4638,8 +4644,8 @@ struct Sim {
   T foot_shape_coef;
   // env v23: per-tick activation price on the commanded Σ|gear frac|
   // over the 29 joints (lib.rs mirror). Velocity-blind by design:
-  // this prices force, not work (the v10 work price is retired;
-  // P.effort stays as telemetry). 0 = off.
+  // this prices force, not work (the v10 work price and its telemetry
+  // are retired; act_stat above carries the activation). 0 = off.
   T iso_coef;
   // env v34: per-tick price on the postural limit-rest impulse (the
   // limit_rest accumulation above; lib.rs Core::limit_coef mirror).
@@ -4849,7 +4855,6 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
       P.contact_imp[e * NUM_PAIRS + pr] = T(0);
   for (int k = 0; k < N_GROUND_IMP_LANES; k++)
     P.ground_imp[e * N_GROUND_IMP_LANES + k] = T(0);
-  P.effort[e] = T(0);
   P.foot_pot[e] = T(0);
   P.chart_idx[e] = chart;
   P.tick[e] = 0;
@@ -5175,18 +5180,22 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
 
   // gear ids -> torques (lib.rs Body::tick); act accumulates the v23
-  // commanded activation Σ|frac| in double, matching lib.rs' f64 sum
+  // commanded activation Σ|frac| in double, matching lib.rs' f64 sum;
+  // act_grp splits the same terms [spine, arms, legs] for telemetry
   T tau[NQ];
   const double* gr = gear_row(P.gears);
   double act = 0.0;
+  double act_grp[3] = {0.0, 0.0, 0.0};
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
     const double frac = a < 7 ? gr[a] : 0.0;
     tau[j] = T(frac) * T(TAU_MAX[j]);
-    act += fabs(frac);
+    const double f = fabs(frac);
+    act += f;
+    act_grp[j < 3 ? 0 : (j < 17 ? 1 : 2)] += f;
   }
 
-  // 8 substeps, accumulating positive work + contact aggregation
+  // 8 substeps + contact aggregation
   load_state(d, P, e);
   d.pd_bad = false;
   d.env_bad = false;
@@ -5195,7 +5204,6 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   if (P.want_contacts)
     for (int pr = 0; pr < NUM_PAIRS; pr++)
       P.contact_imp[e * NUM_PAIRS + pr] = T(0);
-  T effort = T(0);
   // env v11 FALL (contact spec §4): per-TICK on the end-of-tick root
   // height since 2026-08-20 (user — consistent with the tilt check; a
   // mid-tick dip that recovers within the tick no longer terminates).
@@ -5226,11 +5234,6 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       if (lj < 3) lrest_spine += ll;
       else if (lj >= 17) lrest_legs += ll;
       else lrest_arms += ll;   // env v35 bucket (priced iff limit_arms)
-    }
-    // SPEC-v10 §4 effort: positive work at the END-of-substep velocity
-    for (int j = 0; j < NQ; j++) {
-      const T pw = tau[j] * d.v[VOFF + j];
-      if (pw > T(0)) effort += pw * T(H_SUB);
     }
     // contact aggregation: obs bits see every ACTIVE row; replay-grade
     // impulses sum the row lambdas; point = last substep's (introspection
@@ -5289,7 +5292,6 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   if constexpr (FC)
     for (int k = 0; k < N_GROUND_IMP_LANES; k++)
       P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
-  P.effort[e] = effort;
   P.contact_arm[e * 2] = arm_l;
   P.contact_arm[e * 2 + 1] = arm_r;
   store_state(d, P, e);
@@ -5318,9 +5320,14 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   }
 
   T reward = T(0);
-  // (effort — positive work — is telemetry only via P.effort[e]; the
-  // v10 work price was retired 2026-09-13, lib.rs mirror)
+  // env v23 activation price (the v10 work price was retired
+  // 2026-09-13) + always-on activation telemetry (lib.rs mirror)
   reward -= P.iso_coef * T(act);
+  P.act_stat[e * 5 + 0] += T(act);
+  P.act_stat[e * 5 + 1] += T(act_grp[0]);
+  P.act_stat[e * 5 + 2] += T(act_grp[1]);
+  P.act_stat[e * 5 + 3] += T(act_grp[2]);
+  P.act_stat[e * 5 + 4] += T(1);
   // env v34: limit-rest penalty + always-on telemetry (accumulates at
   // coef 0 too, so stop-resting is observable before it is priced)
   reward -= P.limit_coef * (lrest_legs + lrest_spine
@@ -5869,11 +5876,12 @@ enum {
   TTRACC, TTRAGE, TTRCNT, TTRACT, TTRPTR,
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
-  TCIMP, TCPT, TCARM, TEFF, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
+  TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
   TFLAILR, TFLAILT,
   TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
+  TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -5945,7 +5953,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.contact_imp = ts[TCIMP].data_ptr<scalar_t>();
     P.contact_pt = ts[TCPT].data_ptr<scalar_t>();
     P.contact_arm = ts[TCARM].data_ptr<bool>();
-    P.effort = ts[TEFF].data_ptr<scalar_t>();
     P.pd_hits = ts[TPD].data_ptr<int>();
     P.env_hits = ts[TENV].data_ptr<int>();
     P.fall_hits = ts[TFALL].data_ptr<int>();
@@ -5960,6 +5967,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.limit_rest = ts[TLIMREST].data_ptr<scalar_t>();
     P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();
     P.sc_stat = ts[TSCSTAT].data_ptr<scalar_t>();
+    P.act_stat = ts[TACTSTAT].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

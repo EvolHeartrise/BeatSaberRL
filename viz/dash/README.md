@@ -44,7 +44,9 @@ second (`?archive=/some/prefix/` overrides). Development:
   selector). Panels: acc (+accL/accR), return, self-contact (impulse / % ticks, env v41), entropy
   (+entfull), ev, steps/s, falls+tilts per 1M samples, clipfrac
   first/last, KL first/last (log), gnorm+clipc, per-group entropies,
-  lifts per 1M, flail, limit-rest, fp16 r1/maxlr, checkpoint peak VRAM.
+  lifts per 1M, flail, limit-rest, joint activation (total / spine /
+  arms / legs — the energy-conservation stat), fp16 r1/maxlr,
+  checkpoint peak VRAM.
   Panels an era did not measure are marked "no data". X axis:
   samples | updates | wall-clock (hours; from `t` stamps, else
   cumulative `elapsed`). Auto-refresh every 30 s re-fetches index.json
@@ -91,6 +93,8 @@ See `UPDATE_FIELDS` in `python/metrics_log.py`: `upd`, `n_upd`,
 `clipfrac_last`, `gnorm`, `clipc`, `ent_spine` … `ent_legR`,
 `ent_min`, `ent_min_head`, `entfull`, `afsd`, `falls`, `tilts`,
 `lifts`(+`_L`/`_R`), `flail`(+`_L`/`_R`/`_ticks`), `limitrest`
-(+`_legs`/`_spine`/`_arms`), `pd_net`, `envelope`, `diag_*`,
+(+`_legs`/`_spine`/`_arms`), `activation` (+`_spine`/`_arms`/`_legs`:
+mean commanded Σ|gear fraction| per env-tick, the `--iso-coef` base —
+the energy-conservation stat since 2026-09-13), `pd_net`, `envelope`, `diag_*`,
 `vram_*`, `ckpt`, `peak_vram`. Absent = not measured in that era
 (or printed as nan). Tests: `python/tests/test_metrics_log.py`.

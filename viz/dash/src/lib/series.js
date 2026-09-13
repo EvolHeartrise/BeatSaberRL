@@ -104,6 +104,7 @@ export const PANELS = [
   { id: "lifts", title: "foot lifts per 1M samples", series: ["lifts_per_1m"] },
   { id: "flail", title: "flail (rad / idle tick)", series: ["flail", "flail_L", "flail_R"] },
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
+  { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
   { id: "contact", title: "self-contact impulse (N·s / env-tick, env v41)", series: ["contact"] },
   { id: "contact_pct", title: "self-contact: % of env-ticks with body-on-body contact", series: ["contact_pct"] },
   { id: "fp16", title: "fp16 ratio diag r1 · max log-ratio", series: ["r1", "maxlr"] },
@@ -114,6 +115,7 @@ export const PANELS = [
 export const COMPARE_KEYS = [
   "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "lifts_per_1m",
+  "activation", "activation_spine", "activation_arms", "activation_legs",
   "contact", "contact_pct",
 ];
 // ep_return dropped from every view 2026-09-12 (user: too noisy; the
@@ -130,6 +132,7 @@ export const LABELS = {
   ent_spine: "spine", ent_armL: "armL", ent_armR: "armR", ent_legL: "legL", ent_legR: "legR",
   flail: "flail", flail_L: "flail L", flail_R: "flail R",
   limitrest: "total", limitrest_legs: "legs", limitrest_spine: "spine", limitrest_arms: "arms",
+  activation: "activation", activation_spine: "act. spine", activation_arms: "act. arms", activation_legs: "act. legs",
   contact: "N·s / tick", contact_pct: "% ticks in contact",
   r1: "r1", maxlr: "maxlr", peak_vram: "peak VRAM",
 };

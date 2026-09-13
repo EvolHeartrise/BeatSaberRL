@@ -199,11 +199,10 @@ def test_single_tick_parity_random_states(gears, n_states, seed):
     for e, sim in enumerate(sims):
         obs_r, rew_r, _d, _ev = sim.step([int(x) for x in acts[e]])
         rew_d = abs(rew_r - float(trew[e]))
-        eff_d = abs(sim.last_effort() - float(env.last_effort()[e]))
         obs_d = np.abs(np.asarray(obs_r) - tobs[e].cpu().numpy()).max()
         q_d = np.abs(np.array(sim.qpos())
                      - env.qpos()[e].cpu().numpy()).max()
-        if rew_d < 1e-9 and eff_d < 1e-9 and obs_d < 1e-5 and q_d < 1e-9:
+        if rew_d < 1e-9 and obs_d < 1e-5 and q_d < 1e-9:
             continue
         outliers += 1
         assert rew_d < 0.1 and q_d < 0.5, \
@@ -448,9 +447,9 @@ def test_contact_rich_parity_midline_press():
     assert saw_bits, "press scenario never set the obs contact bits"
 
 
-# --- (e) effort: coast is EXACTLY free ---------------------------------------
+# --- (e) activation telemetry parity; coast reads EXACTLY zero -----------------
 
-def test_effort_parity_and_coast_free():
+def test_activation_parity_and_coast_zero():
     """Ported from the retired torch P4 module (2026-08-03), which was
     the only tier asserting it: effort tracks Rust tick by tick (here
     under per-tick resync, at the f64 seed band rather than bitwise),
@@ -470,18 +469,31 @@ def test_effort_parity_and_coast_free():
         q36s, v35s = [], []
         for e, sim in enumerate(sims):
             _obs, rew_r, _dr, _ev = sim.step([int(x) for x in acts[e]])
-            assert abs(sim.last_effort() - float(env.last_effort()[e])) < 1e-9,\
-                f"t{t} env{e} effort"
             assert abs(rew_r - float(trew[e])) < 1e-9, f"t{t} env{e} reward"
+            # activation telemetry (2026-09-13): the CUDA per-env
+            # accumulator's per-tick increment equals the Rust sim's
+            # last_activation() exactly (pure gear-table sums)
+            act_r = sim.last_activation()
+            act_c = env.act_stat[e].tolist()
+            assert act_c[4] == t + 1, f"t{t} env{e} activation ticks"
             q, v = _rust_state(sim)
             q36s.append(q)
             v35s.append(v)
-        assert float(env.last_effort()[0]) == 0.0, f"t{t}: coast not free"
+        assert float(env.act_stat[0, 0]) == 0.0, f"t{t}: coast not free"
         wv = env.wrist_vel.clone()
         env.set_state(torch.tensor(q36s, dtype=torch.float64),
                       torch.tensor(v35s, dtype=torch.float64))
         env.wrist_vel.copy_(wv)
-    assert float(env.last_effort()[1]) > 0.0, "driven env must pay effort"
+    # 5 ticks of the same command: accumulator = 5 x last tick's value
+    act_r = sims[1].last_activation()
+    for k in range(4):
+        assert abs(float(env.act_stat[1, k]) - 5 * act_r[k]) < 1e-9, \
+            f"activation group {k}"
+    assert act_r[0] > 0.0, "driven env must read activation"
+    tot, sp, ar, lg, n = env.pop_activation()
+    assert n == 10 and abs(tot - 5 * act_r[0]) < 1e-9 and sp == 0.0
+    assert abs(ar - 5 * act_r[2]) < 1e-9 and lg == 0.0
+    assert env.pop_activation() == (0.0, 0.0, 0.0, 0.0, 0)
 
 
 # --- tier 2: float32 bounded --------------------------------------------------

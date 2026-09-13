@@ -5,7 +5,7 @@ Covers the v10 additions under the bot: the full-body FK mirror
 gravity-compensation torques (vs a finite-difference gradient of the
 potential), the constrained-stance feedforward, the P6 additive
 introspection (`weld_impulses`) and the additive replay fields
-("feet", "effort"). The bot's solvability gate itself lives in
+("feet", "activation"). The bot's solvability gate itself lives in
 test_env.py::test_scripted_bot_solves_easy (the v9 slot).
 """
 
@@ -17,7 +17,7 @@ import pytest
 
 from beat_arena_env import RustBeatEnv
 from beat_arena_env.constants import (
-    DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0,
+    DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0, gear_table,
 )
 from beat_arena_env.kinematics import (
     F_HEAD, F_L_WRIST, F_R_WRIST, FRAMES, blade_of, com_of, fk_body,
@@ -144,8 +144,10 @@ def test_weld_impulses_carry_body_weight():
 
 
 def test_replay_additive_fields(tmp_path):
-    """Replay v10 stays v10; "feet" and "effort" ride along additively
-    and reconstruct from the sim getters."""
+    """Replay v10 stays v10; "feet" and "activation" ride along
+    additively and reconstruct from the sim getters / the logged
+    actions (activation = Σ|gear fraction| of the tick's action,
+    [total, spine, arms, legs])."""
     path = str(tmp_path / "ep.jsonl")
     env = RustBeatEnv(seed=2, chart_len_s=4.0, gears=5)
     env.set_record(path)
@@ -157,12 +159,21 @@ def test_replay_additive_fields(tmp_path):
     lines = [json.loads(l) for l in open(path) if l.strip()]
     head, ticks = lines[0], lines[1:]
     assert head["header"]["version"] == "v10"
+    assert head["header"]["record_rev"] >= 3
+    gear = [abs(g) for g in gear_table(5)]
     for t in ticks:
         assert len(t["feet"]) == 2 and all(len(f) == 6 for f in t["feet"])
-        assert t["effort"] >= 0.0
-    # some tick carries weight through the welds and bills effort
+        a = t["activation"]
+        assert len(a) == 4 and all(v >= 0.0 for v in a)
+        act = t["action"]
+        assert a[0] == pytest.approx(sum(gear[x] for x in act), abs=1e-3)
+        assert a[1] == pytest.approx(sum(gear[x] for x in act[:3]), abs=1e-3)
+        assert a[2] == pytest.approx(sum(gear[x] for x in act[3:17]), abs=1e-3)
+        assert a[3] == pytest.approx(sum(gear[x] for x in act[17:]), abs=1e-3)
+        assert "effort" not in t
+    # some tick carries weight through the welds and commands torque
     assert max(t["feet"][0][1] + t["feet"][1][1] for t in ticks) > 0.5
-    assert max(t["effort"] for t in ticks) > 0.0
+    assert max(t["activation"][0] for t in ticks) > 0.0
 
 
 # --- the COM helper -----------------------------------------------------------

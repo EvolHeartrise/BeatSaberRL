@@ -401,13 +401,19 @@ identity orientation (6 bilateral rows each).
 - **Torque**: `τ_j = gear_signed[a_j] × τ_max[j]`, held constant for the
   tick's 8 substeps. No feed-forward gravity compensation — holding a pose
   against gravity costs gear effort (by design).
-- **Effort cost** — **RETIRED 2026-09-13.** The work price below and its
-  `effort_coef` knob are gone from both sims, the trainer and every
-  wrapper (every recipe since v23 ran it at 0 and it kept being read as
-  a live penalty). The positive-work quantity is still accumulated as
-  telemetry (`last_effort()`, replay "effort" field, viewer meter). The
-  live movement prices are `--iso-coef` (activation, §v23) and
-  `--limit-coef --limit-arms` (limit rest, §v34/v35). Historical text:
+- **Effort cost** — **RETIRED 2026-09-13, telemetry included.** The work
+  price below, its `effort_coef` knob and the positive-work reading are
+  gone from both sims, the trainer, every wrapper, the replay and the
+  viewer (every recipe since v23 ran the price at 0 and it kept being
+  read as a live penalty). The energy telemetry is now the **joint
+  activation** the live price is based on: per tick the commanded
+  Σ|gear fraction| over the 29 joints, reported as [total, spine (joints
+  0..3), arms (3..17), legs (17..29)] — `last_activation()` / replay
+  `activation` (record_rev 3) / viewer meter per tick, and
+  `pop_activation()` → the trainer's `[activation]` line and the
+  dashboard panel per update. The live movement prices are `--iso-coef`
+  (activation total, §v23) and `--limit-coef --limit-arms` (limit rest,
+  §v34/v35). Historical text:
   (replaces the v7.9 EFFORT_COST table): positive
   mechanical work,
   `effort_tick = effort_coef × Σ_{s=1..8} Σ_{j=0..28} max(τ_j·q̇_j^{(s)}, 0)·h`
@@ -425,7 +431,7 @@ identity orientation (6 bilateral rows each).
 - **Root-escape termination (ADDED 2026-08-03 — §3 step 12, Divergences
   §23)**: if the pre-step-10 root-velocity envelope engages on ANY of a
   tick's 8 substeps, that tick's reward is **exactly 0** (it overrides
-  every other term — effort, cuts, misses, follow-through) and the
+  every other term — activation price, cuts, misses, follow-through) and the
   episode ends (`done = true`, auto-reset as usual). The state left the
   kinematically reachable envelope, so the tick's observation and reward
   are solver artifact, not play. Measured incidence: 0 on a converged
@@ -487,7 +493,8 @@ Header line: `{"header": {"version": "v10", "record_rev": 2,
 Viewers reject non-"v10" versions (all v9 replays/checkpoints retire,
 house pattern). `version` names the BODY generation only; the per-tick
 record grows ADDITIVELY under `record_rev` (absent/1 = pre-`head`,
-2 = `head` present), so a new field never retires a reader.
+2 = `head` present, 3 = `activation` present and the P6 `effort` field
+gone), so a new field never retires a reader.
 
 Per-tick record:
 
@@ -501,8 +508,18 @@ Per-tick record:
  "action": [<29 gear ids>],
  "reward": 0.0,
  "contacts": [{"pair": 12, "p": [x, y, z], "j": 0.42}],
+ "feet": [[jx, jy, jz, jax, jay, jaz], [jx, jy, jz, jax, jay, jaz]],
+ "activation": [total, spine, arms, legs],
  "events": [ ... ]}
 ```
+
+- `activation` (record_rev 3, ADDITIVE, 2026-09-13): this tick's commanded
+  joint activation Σ|gear fraction| — `[total, spine, arms, legs]`
+  (total 0..29 = the `--iso-coef` base; groups partition it by joint
+  order 0..3 / 3..17 / 17..29). Exactly derivable from `action` +
+  `gear_table(config.gears)`, logged so viewers and energy-conservation
+  tooling read it without the table; the viewer derives it for older
+  recordings. It REPLACED the P6 `effort` (positive work, J) field.
 
 - `q`: 36 position coords — root position, root quaternion **wxyz (scalar
   first)**, then the 29 joints. `twist`: root world-frame linear + angular
@@ -595,8 +612,9 @@ mujoco is absent; `mjcf/body_v10.xml`):
 
 **P3 — env integration** (`python/tests/test_v10_env.py`): obs length 340 +
 every §5 offset; determinism (seed + action stream ⇒ identical rewards/
-events, all object kinds); effort vs a hand-computed one-joint case
-≤ 1e-12; live REACH/miss gates move with a crouched/leaning pose; replay
+events, all object kinds); (the effort-vs-hand-computed case retired
+with the work reading 2026-09-13 — activation is checked against the
+logged actions in `test_v10_bot.py`); live REACH/miss gates move with a crouched/leaning pose; replay
 v10 round-trip (counters + score match the sim); scripted-torque chart
 smoke: ≥ 1 good cut. Scenario tests re-authored on the dynamic body (v9's
 `set_joints` pose-family tests are retired with the kinematic body; the
@@ -813,13 +831,12 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        (`tests_fk::v9_fk_continuity` references `crate::fk`); nothing
        live calls it. `kinematics.py` remains its Python mirror,
        banner-marked v9-legacy (its IK feeds the P6 bot rebuild).
-    b. **Effort's "post-solve substep velocity" = the END-of-substep
-       velocity** (after the step-11 clamps and step-12 envelope) —
-       the velocity that integrates positions next substep. Pinned
-       bitwise against an independent pipeline mirror in
-       `lib.rs env_tests::effort_is_positive_work`. (The Python reward
-       identity gate `r_effort = −coef × last_effort` was deleted with
-       the price on 2026-09-13; the work is telemetry only.)
+    b. **Effort's "post-solve substep velocity"** — RETIRED with the
+       work reading 2026-09-13 (was: the END-of-substep velocity after
+       the step-11 clamps and step-12 envelope, pinned bitwise in
+       `lib.rs env_tests::effort_is_positive_work`). The activation
+       telemetry that replaced it is pinned by
+       `lib.rs env_tests::activation_is_commanded_gear_fraction`.
     c. **Obs contact bits count ASSEMBLED rows** (gap < margin, λ may
        be 0 — the §5 "active contact row" as the solver defines
        active); replay `contacts` keep the stricter nonzero
@@ -833,7 +850,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        root pos + quat wxyz + 29 joints; v35), used by the pose
        tooling and every re-authored scenario test. RawBeatSim gains
        `obs()` (no-step introspection), `qpos()/twist()/omega()/
-       sabers()/contacts()/last_effort()`; `sabers()` returns the §6
+       sabers()/contacts()/last_activation()` (`last_effort()` retired
+       2026-09-13); `sabers()` returns the §6
        viewer form `[wrist(3), blade(3)]` per hand (the v9 17-wide
        joint-state form died with the kinematic body).
     f. **effort_coef defaults to 4e-4** (the §4 literal) in the Rust
@@ -880,7 +898,7 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
 20. **P4 torch-mirror notes (2026-07-31; the mirror was REMOVED
     2026-08-03 — this entry is the record of what it proved, not a
     live tier)** — the f64 CPU parity bar was
-    met EXACTLY (bitwise obs/reward/done/status/state/effort/contact
+    met EXACTLY (bitwise obs/reward/done/status/state/effort (then)/contact
     impulses across the gears 3/5/7 matrix, trajectories and full
     episodes); the transcription discipline required two measured
     torch-CPU deviations to be engineered around, and one Rust

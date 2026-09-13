@@ -44,12 +44,13 @@ REWARD_BAD = -0.5      # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 REWARD_BOMB = -1.5     # hitting a bomb (passing one is free) — env v7.8
 
-# env v10 "effort" (positive mechanical work per tick,
-# sum_substeps sum_j max(tau_j*qdot_j, 0)*h) is TELEMETRY ONLY since
-# 2026-09-13: the EFFORT_COEF price (4e-4/J) was retired — every recipe
-# since v23 ran it at 0 and it kept being mistaken for a live penalty.
-# Both sims still accumulate the work (replay "effort" field, viewer
-# meter); nothing multiplies it into the reward.
+# Movement is priced by --iso-coef (env v23 activation: the commanded
+# Σ|gear fraction| over the 29 joints per tick) and --limit-coef /
+# --limit-arms (limit rest). The v10 "effort" work price and its
+# telemetry were retired 2026-09-13; the energy telemetry is the
+# activation itself — per tick [total, spine, arms, legs] in the replay
+# ("activation" field, viewer meter) and per update in the trainer's
+# `[activation]` line / dashboard panel.
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 GOOD_HALF_X = 0.4

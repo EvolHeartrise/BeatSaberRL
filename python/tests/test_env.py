@@ -337,7 +337,7 @@ def test_good_swing_cut_scores_integer_points():
     # blade plane sits ~0.2 m behind the note center); v10 measured 26
     assert 15.0 <= pts <= 45.0
     assert pts == int(pts)                    # real BS scores are integers
-    # coast tick: zero torque => zero effort, reward is exactly pts/115
+    # coast tick: zero torque => zero activation price, reward is exactly pts/115
     assert r == pytest.approx(pts / 115.0, abs=1e-9)
 
 
