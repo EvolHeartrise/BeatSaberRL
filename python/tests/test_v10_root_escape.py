@@ -77,8 +77,8 @@ TICK_DP_BOUND = N_SUB * H_SUB * ROOT_V_MAX      # 1.6 m
 NEUTRAL_V = [0.0] * NV
 
 
-def _rust_sim(gears=3, effort_coef=4e-4):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=effort_coef,
+def _rust_sim(gears=3):
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    wide_acc=False, gears=gears)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim
@@ -129,7 +129,7 @@ def test_vec_sim_pop_envelope_hits_zero_in_ordinary_motion():
     """VecBeatSim carries the same popped counter (it has no set_joints,
     so the escape path is pinned on RawBeatSim above); here it must stay
     silent across a healthy multi-env rollout."""
-    vec = beat_arena_rs.VecBeatSim(4, max_steps=6900, effort_coef=4e-4,
+    vec = beat_arena_rs.VecBeatSim(4, max_steps=6900,
                                    wide_acc=False, gears=5)
     for i in range(4):
         vec.set_chart(i, [note_tuple(FAR_NOTE)])
@@ -153,7 +153,7 @@ def test_vec_sim_pop_envelope_hits_zero_in_ordinary_motion():
 def test_cuda_escape_terminates_bounded_and_counted(dtype):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     env = CudaBeatVecEnv(2, charts=[[FAR_NOTE], [FAR_NOTE]], max_steps=6900,
-                         gears=3, wide_acc=False, effort_coef=4e-4,
+                         gears=3, wide_acc=False,
                          dtype=dtype, auto_reset=False)
     env.reset()
     assert env.pop_envelope_hits() == 0
@@ -185,7 +185,7 @@ def test_cuda_f64_escape_matches_rust_closely():
     zeroed reward, engagement) which must match Rust exactly."""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     env = CudaBeatVecEnv(1, charts=[[FAR_NOTE]], max_steps=6900, gears=3,
-                         wide_acc=False, effort_coef=4e-4,
+                         wide_acc=False,
                          dtype=torch.float64, auto_reset=False)
     env.reset()
     env.set_state(torch.tensor([ESC_Q36], dtype=torch.float64),

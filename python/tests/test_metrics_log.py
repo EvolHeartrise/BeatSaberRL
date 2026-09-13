@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import metrics_log as ml  # noqa: E402
 
 AF50N_HEAD = """\
-argv: --num-envs 32768 --horizon 32 --minibatches 64 --mb-accum 2 --foot-contact --gears 5 --ranked-maps --seg-len 25 --chart-pool 999999 --mirror-augment --gamma 0.965 --gae-lambda 0.98 --z-clip-hi 40 --effort-coef 0 --iso-coef 5e-4 --ent-coef 0.03 --ent-tau 125 --lead-s 0.5 --lr 7e-4 --start-pose-jitter 0.15 --foot-z-coef 0.01 --foot-x-coef 0.01 --foot-hinge-r 0.12 --foot-shape-coef 0.05 --limit-coef 5e-3 --limit-arms --crouch-start-prob 0.25 --seed 0 --ent-final 1e-3 --wall-despawn --warmup-updates 34 --total-steps 1119879168 --ckpt-every 125 --adv-filter 0.5 --run-dir runs/af50n_trunk
+argv: --num-envs 32768 --horizon 32 --minibatches 64 --mb-accum 2 --foot-contact --gears 5 --ranked-maps --seg-len 25 --chart-pool 999999 --mirror-augment --gamma 0.965 --gae-lambda 0.98 --z-clip-hi 40 --iso-coef 5e-4 --ent-coef 0.03 --ent-tau 125 --lead-s 0.5 --lr 7e-4 --start-pose-jitter 0.15 --foot-z-coef 0.01 --foot-x-coef 0.01 --foot-hinge-r 0.12 --foot-shape-coef 0.05 --limit-coef 5e-3 --limit-arms --crouch-start-prob 0.25 --seed 0 --ent-final 1e-3 --wall-despawn --warmup-updates 34 --total-steps 1119879168 --ckpt-every 125 --adv-filter 0.5 --run-dir runs/af50n_trunk
 config: {'adv_filter': 0.5, 'bench': False, 'bomb_prob': 0.125, 'chart_len': 20.0}
 --env not given: defaulting to 'cuda'
 [ranked-pool] 93472 segments on cuda (C=1489, 7655 MB)

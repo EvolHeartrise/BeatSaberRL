@@ -240,7 +240,10 @@ checkpoints/replays retire (hard replace).
   every non-coast joint action costs its tier per tick — shoulder
   pitch/yaw/twist `2e-4`, elbow `1.3e-4`, wrist roll/bend `0.7e-4`
   (`EFFORT_COST`), scaled by the env's `effort_coef` (default 1.0;
-  0 = free movement). A metabolic proxy (proximal joints move more
+  0 = free movement). **RETIRED 2026-09-13** (with its v10 work-price
+  successor): the live movement prices are `--iso-coef` (activation)
+  and `--limit-coef --limit-arms` (limit rest); the text below is
+  history. A metabolic proxy (proximal joints move more
   mass): calibrated so one accuracy point (1/115 ≈ 0.0087) dwarfs the
   effort of earning it — a typical played episode's total effort is
   ~0.5-1.0 against a ~+40 return; stillness becomes the cheap default

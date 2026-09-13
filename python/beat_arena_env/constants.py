@@ -9,8 +9,10 @@ Env v10 (P3, 2026-07-31): the v9 kinematic body is RETIRED — the body
 is the SPEC-v10 full humanoid (floating pelvis + 29 actuated revolute
 DoF, foot welds, self-collision) integrated at 8 × 1/240 s per 30 Hz
 control tick. Actions are 29 gear heads (tau_j = gear_fraction ×
-TAU_MAX[j]); effort is positive mechanical work × EFFORT_COEF (the
-v7.9 EFFORT_COST table is gone). Obs is the SPEC-v10 §5 340-lane
+TAU_MAX[j]); per-tick positive mechanical work is TELEMETRY only — the
+v10 work price (EFFORT_COEF) and the v7.9 EFFORT_COST table are both
+retired; movement is priced by --iso-coef (activation) and --limit-coef
+(limit rest). Obs is the SPEC-v10 §5 340-lane
 layout. World geometry, judgment, scoring, chart generation are
 UNCHANGED from env v7-v9.
 """
@@ -42,12 +44,12 @@ REWARD_BAD = -0.5      # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 REWARD_BOMB = -1.5     # hitting a bomb (passing one is free) — env v7.8
 
-# env v10 effort (SPEC-v10 §4): reward -= EFFORT_COEF * positive
-# mechanical work sum_substeps sum_j max(tau_j*qdot_j, 0)*h (post-solve
-# substep velocities; tau constant over the tick). 4e-4 per joule —
-# derived calibration against the v9 per-swing bill; flagged for P7
-# re-tune (the gravity/work economy is a known behavioral break).
-EFFORT_COEF = 4e-4
+# env v10 "effort" (positive mechanical work per tick,
+# sum_substeps sum_j max(tau_j*qdot_j, 0)*h) is TELEMETRY ONLY since
+# 2026-09-13: the EFFORT_COEF price (4e-4/J) was retired — every recipe
+# since v23 ran it at 0 and it kept being mistaken for a live penalty.
+# Both sims still accumulate the work (replay "effort" field, viewer
+# meter); nothing multiplies it into the reward.
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 GOOD_HALF_X = 0.4

@@ -17,7 +17,7 @@ import pytest
 from beat_arena_env import Note, RustBeatEnv
 from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import (
-    A_L_ARM, A_R_ARM, DT, EFFORT_COEF, HAND_FEAT, JOINT_LIMITS, N_JOINTS,
+    A_L_ARM, A_R_ARM, DT, HAND_FEAT, JOINT_LIMITS, N_JOINTS,
     N_NOTE_SLOTS, NOTE_FEAT, NV, NQPOS, OBS_DIM, OFF_CONTACT, OFF_HAND_L,
     OFF_HAND_R, OFF_HEAD, OFF_NOTES, OFF_NOTE_MASK, OFF_Q, OFF_QD,
     OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VANG, OFF_ROOT_VLIN, OMEGA_CAP,
@@ -216,36 +216,6 @@ def test_determinism_all_kinds():
 
     a, b = run(), run()
     assert a == b
-
-
-# --- effort (SPEC-v10 §4 wiring) ---------------------------------------------
-
-def test_effort_is_priced_positive_work():
-    """reward_effort = -effort_coef x last_effort (identity, both sims
-    share one trajectory since scoring never feeds back into physics);
-    coasting is exactly free; a one-joint drive does positive work.
-    The formula itself (sum_substeps max(tau*qd, 0)*h vs an independent
-    pipeline mirror, bitwise) is pinned Rust-side
-    (lib.rs env_tests::effort_is_positive_work)."""
-    far = [_note(50.0, 0.9, 1.4)]
-    free = _sim(far, effort_coef=0.0)
-    paid = _sim(far, effort_coef=EFFORT_COEF)
-    _, r_free, _, _ = free.step(COAST)
-    _, r_paid, _, _ = paid.step(COAST)
-    assert r_free == 0.0 and r_paid == 0.0          # coast exactly free
-    assert paid.last_effort() == 0.0
-    a = list(COAST)
-    a[A_R_ARM] = 2                                  # r arm pitch, full -
-    _, r_free, _, _ = free.step(a)
-    _, r_paid, _, _ = paid.step(a)
-    j_free, j_paid = free.last_effort(), paid.last_effort()
-    assert j_free == j_paid > 0.0                   # same trajectory
-    assert r_free == 0.0
-    assert r_paid == pytest.approx(-EFFORT_COEF * j_paid, abs=1e-15)
-    # one more tick: torque against capped/limited motion still bills
-    # only POSITIVE work
-    _, r2, _, _ = paid.step(a)
-    assert r2 == pytest.approx(-EFFORT_COEF * paid.last_effort(), abs=1e-15)
 
 
 # --- live gates (SPEC-v10 §4) ------------------------------------------------

@@ -21,7 +21,7 @@ import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
 from .constants import (
-    EFFORT_COEF, EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
+    EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
 )
 
 from beat_arena_rs import RawBeatSim
@@ -34,7 +34,7 @@ class RustBeatEnv(gym.Env):
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
-                 bomb_prob=0.125, effort_coef=EFFORT_COEF,
+                 bomb_prob=0.125,
                  external_chart=None, wide_acc=False, gears=3, seed=0,
                  foot_contact=False, fall_const=5.0,
                  external_walls=None):
@@ -71,11 +71,10 @@ class RustBeatEnv(gym.Env):
         # unrounded — double the real range and reward); default False so
         # bench/eval/replay paths keep real scoring
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
-        self.sim = RawBeatSim(max_steps=max_steps, effort_coef=effort_coef,
+        self.sim = RawBeatSim(max_steps=max_steps,
                               wide_acc=wide_acc, gears=gears,
                               foot_contact=foot_contact,
                               fall_const=fall_const)
-        self.effort_coef = effort_coef
         self.wide_acc = wide_acc
         self.gears = gears
         self.foot_contact = bool(foot_contact)
@@ -120,7 +119,6 @@ class RustBeatEnv(gym.Env):
                 "extra_prob": self.cfg.extra_prob,
                 "dot_prob": self.cfg.dot_prob,
                 "bomb_prob": self.cfg.bomb_prob,
-                "effort_coef": self.effort_coef,
                 "gears": self.gears,       # env v8 action-table size
             },
             # explicit world positions (meters), object kinds and arc

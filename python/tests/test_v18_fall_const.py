@@ -34,7 +34,7 @@ DENSE = [Note(hit_time=5.0 + 0.5 * i, col=2, row=1, x=0.3, y=1.4,
 
 def _fall_reward(chart, fall_const=None):
     kw = {} if fall_const is None else {"fall_const": fall_const}
-    sim = beat_arena_rs.RawBeatSim(max_steps=600, effort_coef=0.0,
+    sim = beat_arena_rs.RawBeatSim(max_steps=600,
                                    wide_acc=False, gears=5,
                                    foot_contact=True, **kw)
     sim.set_chart([note_tuple(n) for n in chart], [])

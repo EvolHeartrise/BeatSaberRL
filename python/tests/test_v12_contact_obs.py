@@ -17,7 +17,7 @@ ZERO_ACT = [0] * N_JOINTS  # gear 0 = zero torque on every joint
 
 
 def _sim(foot_contact):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    wide_acc=False, gears=5,
                                    foot_contact=foot_contact)
     sim.set_chart([note_tuple(FAR_NOTE)])

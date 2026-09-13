@@ -63,7 +63,6 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--ranked-maps", "--seg-len", "25",
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
-          "--effort-coef", "1e-4",
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",
           "--lead-s", "0.5", "--lr", "7e-4"]
 

@@ -36,8 +36,7 @@ CKPT_EVERY = 95  # updates; 95*131072 = 12.45M steps -> 3 ckpts + final
 
 HYPERS = {"lr": 0.00296092,
           "ent_coef": 0.0331038, "ent_final": 0.013929,
-          "gamma": 0.914958, "gae_lambda": 0.980024,
-          "effort_coef": 4e-4}
+          "gamma": 0.914958, "gae_lambda": 0.980024}
 
 
 def bench(ck, out):
@@ -75,7 +74,6 @@ def main():
                "--ent-final", f"{h['ent_final']:.6g}",
                "--gamma", f"{h['gamma']:.6g}",
                "--gae-lambda", f"{h['gae_lambda']:.6g}",
-               "--effort-coef", f"{h['effort_coef']:.6g}",
                "--total-steps", str(TOTAL_STEPS),
                "--ckpt-every", str(CKPT_EVERY),
                "--run-dir", RUN_DIR]

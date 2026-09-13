@@ -38,7 +38,6 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--foot-contact", "--gears", "5", "--seed", "0",
           "--ranked-maps", "--seg-len", "25", "--chart-pool", "24576",
           "--gamma", "0.965", "--gae-lambda", "0.98",
-          "--effort-coef", "1e-4",
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",
           "--lead-s", "0.5"]
 

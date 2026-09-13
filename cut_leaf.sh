@@ -98,7 +98,7 @@ mkdir -p "$LEAF_DIR"
 python train_batch.py \
   --num-envs 16384 --horizon 8 --foot-contact --gears 5 --seed 0 \
   --ranked-maps --seg-len 25 --chart-pool 24576 \
-  --gamma 0.965 --gae-lambda 0.98 --effort-coef 1e-4 --ent-coef 0.03 \
+  --gamma 0.965 --gae-lambda 0.98 --ent-coef 0.03 \
   --resume "$TRUNK_DIR/$CKPT_NAME" \
   --cooldown-updates $COOLDOWN --ent-final $ENT_FINAL \
   --run-dir "$LEAF_DIR" 2>&1 | tee "$LEAF_DIR/leaf_train.log" | tail -3

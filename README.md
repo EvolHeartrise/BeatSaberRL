@@ -48,8 +48,10 @@ verbatim, legs 2×6), de Leva masses on the v9 anchor geometry, feet
 welded to the floor, 12-collider self-contact — integrated by a
 hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
-are **29 gear heads** (τ = gear_fraction × τ_max); effort is positive
-mechanical work (4e-4/J); the reach/miss gates and note look-at follow
+are **29 gear heads** (τ = gear_fraction × τ_max); per-tick positive
+mechanical work ("effort") is telemetry only — the 4e-4/J work price was
+retired 2026-09-13, movement is priced by `--iso-coef` (activation) and
+`--limit-coef --limit-arms` (limit rest); the reach/miss gates and note look-at follow
 the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
 root twist + ω29 + contact events; since P6 additive per-tick "feet"
 weld impulses + "effort"). Gravity is real and nothing holds the body
@@ -130,9 +132,11 @@ Difficulty dials (generator v2, SPEC §Chart generation — colors is
 always both since 2026-07-26; the `--colors` flag is gone):
 doubles the note stream; per-tick probabilities `--note-prob 0.25
 --extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
-the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. Since env
-v7.9 non-coast joint actions pay a tiny tiered effort cost
-(`--effort-coef` scales it; 0 = off). **Accuracy is judged against the
+the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. The v7.9
+tiered effort cost and its v10 work-price successor (`--effort-coef`) are
+RETIRED (2026-09-13; every recipe since v23 ran it at 0) — the live
+movement prices are `--iso-coef` (activation) and `--limit-coef
+--limit-arms` (limit rest). **Accuracy is judged against the
 infinite cutting plane since 2026-07-29** (user-caught v7.4-class fix:
 the swept-surface distance used before conflated timing with lateral
 error and capped accuracy at 0.870 = 100/115). **Real maps play at

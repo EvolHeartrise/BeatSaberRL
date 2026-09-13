@@ -88,7 +88,6 @@ SPACE = {
         # cut-plane scoring; keep widening until the optimum is
         # interior. At 128 a full-motion tick costs ~4x a note's
         # reward, so a floor above that would be physics, not bounds.
-        "effort_coef": dict(distribution="log_normal", min=0.002, max=128.0, scale=0.5),
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
     },
 }
@@ -108,7 +107,6 @@ def run_leg(idx, h, run_dir):
            "--ent-final", f"{h['ent_final']:.6g}",
            "--gamma", f"{h['gamma']:.6g}",
            "--gae-lambda", f"{h['gae_lambda']:.6g}",
-           "--effort-coef", f"{h['effort_coef']:.6g}",
            "--total-steps", str(int(h["total_steps"])),
            "--run-dir", run_dir]
     t0 = time.time()
@@ -179,7 +177,6 @@ def main():
         print(f"[run {idx:03d}] lr {h['lr']:.2e} ent {h['ent_coef']:.2e}"
               f"->{h['ent_final']:.2e} gamma {h['gamma']:.4f} "
               f"lam {h['gae_lambda']:.4f} "
-              f"effort {h['effort_coef']:.2f} "
               f"steps {h['total_steps']/1e6:.0f}M", flush=True)
         res = run_leg(idx, h, run_dir)
         if res is None:

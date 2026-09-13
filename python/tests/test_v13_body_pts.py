@@ -13,7 +13,7 @@ FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
 
 
 def _reset_obs(foot_contact):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    wide_acc=False, gears=5,
                                    foot_contact=foot_contact)
     return np.asarray(sim.set_chart([note_tuple(FAR_NOTE)]),
@@ -60,7 +60,7 @@ def test_body_pt_lanes_present_in_weld_mode():
     q36 = [0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start()
     obs2 = []
     for fc in (False, True):
-        sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+        sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                        wide_acc=False, gears=5,
                                        foot_contact=fc)
         sim.set_chart([note_tuple(FAR_NOTE)])
@@ -76,7 +76,7 @@ def test_body_pt_lanes_track_motion():
     moves (coupled dynamics through the root), so assert the LEFT foot
     lane moves MORE than the right, and elbows move with hip torque far
     less than feet."""
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, effort_coef=4e-4,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    wide_acc=False, gears=5,
                                    foot_contact=False)
     sim.set_chart([note_tuple(FAR_NOTE)])
