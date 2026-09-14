@@ -49,7 +49,7 @@ welded to the floor, 12-collider self-contact — integrated by a
 hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
 are **29 gear heads** (τ = gear_fraction × τ_max); movement is priced by
-`--iso-coef` (joint activation: the commanded Σ|gear fraction| per tick)
+`--energy-coef` (env v43: the applied Σ|τ| per tick; the v23 `--iso-coef` fraction price is retired)
 and `--limit-coef --limit-arms` (limit rest) — the v10 positive-work
 "effort" price and its telemetry were retired 2026-09-13, and the
 activation itself is the energy telemetry (replay `activation`
@@ -105,8 +105,21 @@ wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
 tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
 automatically (exact resume); `--optimizer adam` forces the old path.
 
+Env v43 (2026-09-14, user-directed): **torque energy price**. The v23
+fraction "activation" price (`--iso-coef`, retired) charged every joint the
+same per gear regardless of strength; the new price is human-like energy:
+`reward -= energy_coef × Σ_j |τ_j|` with τ_j the applied torque (gear
+fraction × TAU_MAX[j]), so trunk/leg torque is dear and wrist torque
+near-free (metabolic cost ∝ activation × muscle volume, and τ_max ∝
+muscle cross-section). `--energy-coef 7.5e-6` (reward per N·m·tick) is
+calibrated so the bill matches the old one at the 2026-09-14 leaves'
+~400 N·m/tick. Velocity-blind: force, not work. Telemetry: per-tick
+`torque` [total, spine, arms, legs] in replays (record_rev 4), the
+trainer's `[torque]` line, and a dashboard panel; the activation
+telemetry stays. Both sims + parity gate.
+
 **Recipe since 2026-09-14 (user decision): env v42 hilt grip + `--note-geo`
-are part of the default recipe.** Their first probe (v42_hilt_geo, both
+are part of the default recipe, and since env v43 so is `--energy-coef 7.5e-6` in place of `--iso-coef 5e-4`.** Their first probe (v42_hilt_geo, both
 together on the winning recipe) matched the old trunk on training accuracy
 (0.9442 vs 0.9466) but benched 2,174,065 upp vs the old geometry's
 2,353,043 (−7.6%, concentrated on 2–8★ maps: falls on a few easy full-length
@@ -168,7 +181,7 @@ doubles the note stream; per-tick probabilities `--note-prob 0.25
 the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. The v7.9
 tiered effort cost and its v10 work-price successor (`--effort-coef`) are
 RETIRED (2026-09-13; every recipe since v23 ran it at 0) — the live
-movement prices are `--iso-coef` (activation) and `--limit-coef
+movement prices are `--energy-coef` (env v43 torque energy, since 2026-09-14; was `--iso-coef` activation) and `--limit-coef
 --limit-arms` (limit rest). **Accuracy is judged against the
 infinite cutting plane since 2026-07-29** (user-caught v7.4-class fix:
 the swept-surface distance used before conflated timing with lateral

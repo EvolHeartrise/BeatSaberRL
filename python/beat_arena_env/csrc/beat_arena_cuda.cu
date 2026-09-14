@@ -4,7 +4,7 @@
 // dense Cholesky -> constraint solve [12 x weld-block / contacts /
 // limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
 // 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
-// + gear->tau, activation telemetry, blade sweep/cut judgment, scoring,
+// + gear->tau, activation + torque telemetry, blade sweep/cut judgment, scoring,
 // obs write (OBS_DIM below) — a semantics-exact transcription of rust/src/lib.rs +
 // rust/src/dynamics/{model,fk,algo,collide,solver,step}.rs. The Rust
 // crate remains THE reference implementation.
@@ -4529,11 +4529,16 @@ struct Sim {
   bool* __restrict__ contact_arm;
   // activation telemetry (2026-09-13, replaces the retired positive-
   // work reading): per env [Σ total, Σ spine, Σ arms, Σ legs, ticks]
-  // of the commanded |gear fraction| (total = the iso-priced sum),
-  // accumulated regardless of iso_coef; popped + zeroed by the
+  // of the commanded |gear fraction| (the retired v23 iso-price base),
+  // accumulated always; popped + zeroed by the
   // wrapper's pop_activation, NOT touched by reset_env (limit_rest
   // pattern). lib.rs Core::act_sum mirror.
   T* __restrict__ act_stat;
+  // env v43 torque telemetry (2026-09-14): per env [Σ total, Σ spine,
+  // Σ arms, Σ legs, ticks] of the applied |τ| in N·m (total = the
+  // energy-priced sum); act_stat pattern (popped by pop_torque, not
+  // touched by reset_env). lib.rs Core::tau_sum mirror.
+  T* __restrict__ tau_stat;
   int* __restrict__ pd_hits;  // f32 pivot-floor engagements (§20e)
   int* __restrict__ env_hits;  // pre-integration root-envelope hits (§23)
   // env v11 FALL terminations (unilateral-contact spec §4), counted per
@@ -4644,11 +4649,12 @@ struct Sim {
   // potential-based delta-shaping coefficient (lib.rs mirror).
   T foot_hinge_r;
   T foot_shape_coef;
-  // env v23: per-tick activation price on the commanded Σ|gear frac|
-  // over the 29 joints (lib.rs mirror). Velocity-blind by design:
-  // this prices force, not work (the v10 work price and its telemetry
-  // are retired; act_stat above carries the activation). 0 = off.
-  T iso_coef;
+  // env v43 (2026-09-14, user): per-tick ENERGY price on the applied
+  // Σ|τ_j| = Σ|frac_j|·τ_max[j] (N·m; lib.rs Core::energy_coef mirror).
+  // Replaced the v23 fraction price: a joint pays in proportion to its
+  // torque limit (the human muscle-volume weighting). Velocity-blind:
+  // force, not work. 0 = off. 7.5e-6 ≈ the old 5e-4 fraction bill.
+  T energy_coef;
   // env v34: per-tick price on the postural limit-rest impulse (the
   // limit_rest accumulation above; lib.rs Core::limit_coef mirror).
   // Proportional to the CARRIED impulse: a knee-locked stand (near-
@@ -5182,19 +5188,27 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
 
   // gear ids -> torques (lib.rs Body::tick); act accumulates the v23
-  // commanded activation Σ|frac| in double, matching lib.rs' f64 sum;
+  // commanded activation Σ|frac| (telemetry) in double, matching lib.rs;
   // act_grp splits the same terms [spine, arms, legs] for telemetry
   T tau[NQ];
   const double* gr = gear_row(P.gears);
   double act = 0.0;
   double act_grp[3] = {0.0, 0.0, 0.0};
+  // env v43 energy base: Σ|frac·τ_max| in double, joint order, matching
+  // lib.rs Body::tick's f64 sum exactly (abs commutes with the product)
+  double tau_abs = 0.0;
+  double tau_grp[3] = {0.0, 0.0, 0.0};
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
     const double frac = a < 7 ? gr[a] : 0.0;
     tau[j] = T(frac) * T(TAU_MAX[j]);
     const double f = fabs(frac);
     act += f;
-    act_grp[j < 3 ? 0 : (j < 17 ? 1 : 2)] += f;
+    const int g = j < 3 ? 0 : (j < 17 ? 1 : 2);
+    act_grp[g] += f;
+    const double t = fabs(frac * TAU_MAX[j]);
+    tau_abs += t;
+    tau_grp[g] += t;
   }
 
   // 8 substeps + contact aggregation
@@ -5322,14 +5336,20 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   }
 
   T reward = T(0);
-  // env v23 activation price (the v10 work price was retired
-  // 2026-09-13) + always-on activation telemetry (lib.rs mirror)
-  reward -= P.iso_coef * T(act);
+  // env v43 energy price on the applied Σ|τ| (the v23 fraction price
+  // retired 2026-09-14) + always-on activation and torque telemetry
+  // (lib.rs mirror; both accumulate at coef 0)
+  reward -= P.energy_coef * T(tau_abs);
   P.act_stat[e * 5 + 0] += T(act);
   P.act_stat[e * 5 + 1] += T(act_grp[0]);
   P.act_stat[e * 5 + 2] += T(act_grp[1]);
   P.act_stat[e * 5 + 3] += T(act_grp[2]);
   P.act_stat[e * 5 + 4] += T(1);
+  P.tau_stat[e * 5 + 0] += T(tau_abs);
+  P.tau_stat[e * 5 + 1] += T(tau_grp[0]);
+  P.tau_stat[e * 5 + 2] += T(tau_grp[1]);
+  P.tau_stat[e * 5 + 3] += T(tau_grp[2]);
+  P.tau_stat[e * 5 + 4] += T(1);
   // env v34: limit-rest penalty + always-on telemetry (accumulates at
   // coef 0 too, so stop-resting is observable before it is priced)
   reward -= P.limit_coef * (lrest_legs + lrest_spine
@@ -5888,6 +5908,7 @@ enum {
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
+  TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -5903,7 +5924,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           bool wide_acc, bool auto_reset, int64_t gears,
           bool want_contacts, bool foot_contact, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
-          double foot_shape_coef, double iso_coef, double limit_coef,
+          double foot_shape_coef, double energy_coef, double limit_coef,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
@@ -5974,6 +5995,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();
     P.sc_stat = ts[TSCSTAT].data_ptr<scalar_t>();
     P.act_stat = ts[TACTSTAT].data_ptr<scalar_t>();
+    P.tau_stat = ts[TTAUSTAT].data_ptr<scalar_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
@@ -6029,7 +6051,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_x_coef = (scalar_t)foot_x_coef;
     P.foot_hinge_r = (scalar_t)foot_hinge_r;
     P.foot_shape_coef = (scalar_t)foot_shape_coef;
-    P.iso_coef = (scalar_t)iso_coef;
+    P.energy_coef = (scalar_t)energy_coef;
     P.limit_coef = (scalar_t)limit_coef;
     P.limit_arms = (int)limit_arms;
     P.self_contact_coef = (scalar_t)self_contact_coef;

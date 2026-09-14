@@ -424,7 +424,7 @@ identity orientation (6 bilateral rows each).
   0..3), arms (3..17), legs (17..29)] — `last_activation()` / replay
   `activation` (record_rev 3) / viewer meter per tick, and
   `pop_activation()` → the trainer's `[activation]` line and the
-  dashboard panel per update. The live movement prices are `--iso-coef`
+  dashboard panel per update. The live movement prices are `--energy-coef` (env v43: Σ|τ| per tick, N·m; replaced `--iso-coef`)
   (activation total, §v23) and `--limit-coef --limit-arms` (limit rest,
   §v34/v35). Historical text:
   (replaces the v7.9 EFFORT_COST table): positive
@@ -444,7 +444,7 @@ identity orientation (6 bilateral rows each).
 - **Root-escape termination (ADDED 2026-08-03 — §3 step 12, Divergences
   §23)**: if the pre-step-10 root-velocity envelope engages on ANY of a
   tick's 8 substeps, that tick's reward is **exactly 0** (it overrides
-  every other term — activation price, cuts, misses, follow-through) and the
+  every other term — energy price (env v43: Σ|τ|), cuts, misses, follow-through) and the
   episode ends (`done = true`, auto-reset as usual). The state left the
   kinematically reachable envelope, so the tick's observation and reward
   are solver artifact, not play. Measured incidence: 0 on a converged
@@ -528,7 +528,9 @@ Per-tick record:
 
 - `activation` (record_rev 3, ADDITIVE, 2026-09-13): this tick's commanded
   joint activation Σ|gear fraction| — `[total, spine, arms, legs]`
-  (total 0..29 = the `--iso-coef` base; groups partition it by joint
+  (total 0..29 = the retired v23 `--iso-coef` base; groups partition it by joint
+  group). record_rev 4 (env v43, 2026-09-14): per-tick `torque` = applied Σ|τ|
+  [total, spine, arms, legs] in N·m — the `--energy-coef` base (additive; joint
   order 0..3 / 3..17 / 17..29). Exactly derivable from `action` +
   `gear_table(config.gears)`, logged so viewers and energy-conservation
   tooling read it without the table; the viewer derives it for older
@@ -870,7 +872,7 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
     f. **effort_coef defaults to 4e-4** (the §4 literal) in the Rust
        ctors and Python wrappers; 0 still = free movement (knob
        semantics carried). RETIRED 2026-09-13: the knob no longer
-       exists; movement is priced by iso_coef / limit_coef.
+       exists; movement is priced by energy_coef (env v43, Σ|τ|) / limit_coef.
     g. **P2 gates stay cargo tests** — P3 integrates the engine
        BEHIND the env FFI without raw dynamics bindings, so the
        planned `test_v10_contacts.py` wrapper (§17e) is dropped;

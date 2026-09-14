@@ -11,7 +11,7 @@ DoF, foot welds, self-collision) integrated at 8 × 1/240 s per 30 Hz
 control tick. Actions are 29 gear heads (tau_j = gear_fraction ×
 TAU_MAX[j]); per-tick positive mechanical work is TELEMETRY only — the
 v10 work price (EFFORT_COEF) and the v7.9 EFFORT_COST table are both
-retired; movement is priced by --iso-coef (activation) and --limit-coef
+retired; movement is priced by --energy-coef (env v43: Σ|τ|) and --limit-coef
 (limit rest). Obs is the SPEC-v10 §5 340-lane
 layout. World geometry, judgment, scoring, chart generation are
 UNCHANGED from env v7-v9.
@@ -44,13 +44,16 @@ REWARD_BAD = -0.5      # = miss since 2026-07-20 (real-BS severity parity)
 REWARD_MISS = -0.5
 REWARD_BOMB = -1.5     # hitting a bomb (passing one is free) — env v7.8
 
-# Movement is priced by --iso-coef (env v23 activation: the commanded
-# Σ|gear fraction| over the 29 joints per tick) and --limit-coef /
-# --limit-arms (limit rest). The v10 "effort" work price and its
-# telemetry were retired 2026-09-13; the energy telemetry is the
-# activation itself — per tick [total, spine, arms, legs] in the replay
-# ("activation" field, viewer meter) and per update in the trainer's
-# `[activation]` line / dashboard panel.
+# Movement is priced by --energy-coef (env v43, 2026-09-14, user: the
+# applied Σ|τ_j| = Σ|gear fraction_j| × TAU_MAX[j] per tick, N·m — a
+# human-like force/energy price; it replaced the v23 fraction
+# "activation" price, so a spine full gear costs 600/1.06× a wrist full
+# gear; default 7.5e-6 reward per N·m·tick ≈ the old 5e-4 fraction bill
+# at ~400 N·m/tick) and --limit-coef (limit rest, N·m·s). Telemetry:
+# activation (Σ|fraction|, [total, spine, arms, legs]) and torque
+# (Σ|τ|, same split) per tick in the replay ("activation"/"torque"
+# fields, record_rev 3/4) and per update in the trainer's `[activation]`
+# / `[torque]` lines and dashboard panels.
 
 # --- hitboxes (env v7 — real BS, axis-aligned, NOT the visual cube) ----------
 GOOD_HALF_X = 0.4

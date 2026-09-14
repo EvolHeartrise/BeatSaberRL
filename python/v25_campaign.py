@@ -31,7 +31,7 @@ COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--ranked-maps", "--seg-len", "25",
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
-          "--iso-coef", "5e-4",
+          "--energy-coef", "7.5e-6",  # env v43: was --iso-coef 5e-4 (retired 2026-09-14)
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",
           "--lead-s", "0.5", "--lr", "7e-4",
           "--start-pose-jitter", "0.15", "--foot-z-coef", "0.01",

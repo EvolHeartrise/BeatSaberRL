@@ -85,8 +85,10 @@ const ALIVE_BONUS: f64 = 0.002;
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
 const REWARD_BOMB: f64 = -1.5;
-// Movement is priced by iso_coef (env v23 activation: the commanded
-// Σ|gear fraction| over the 29 joints per tick) and limit_coef (limit
+// Movement is priced by energy_coef (env v43, 2026-09-14: the applied
+// Σ|τ_j| = Σ|gear fraction_j| × τ_max[j] over the 29 joints per tick —
+// a human-like force/energy price that replaced the v23 fraction
+// "activation" price, so a spine gear costs 600/1.06× a wrist gear) and limit_coef (limit
 // rest). The v10 positive-work "effort" price AND its telemetry were
 // retired 2026-09-13; the energy telemetry is now the activation itself
 // — per tick [total, spine, arms, legs] via last_activation() (replay
@@ -671,13 +673,19 @@ struct Body {
     // env v23 activation (user direction 2026-08-17): this tick's
     // commanded |gear fraction| summed over the 29 joints — the
     // muscle-activation analog (Σ|tau_j|/tau_max_j, constant over the
-    // tick since tau is held). Priced by Core::iso_coef; isometric
-    // holds and limit-jamming pay it, coast is the only free command.
+    // tick since tau is held). Telemetry since env v43 (the price
+    // moved to Body::tau_abs / Core::energy_coef); coast reads 0.
     act_frac: f64,
     // the same sum split [spine (joints 0..3), arms (3..17), legs
     // (17..29)] — telemetry only (2026-09-13, replaces the retired
     // positive-work reading); act_frac is the priced total.
     act_group: [f64; 3],
+    // env v43 (2026-09-14, user): this tick's applied Σ|τ_j| in N·m
+    // (= Σ|frac_j|·τ_max[j], the energy-priced total) and its
+    // [spine, arms, legs] split — same joint-order summation as
+    // act_frac; CUDA computes the identical double sum.
+    tau_abs: f64,
+    tau_group: [f64; 3],
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -766,6 +774,8 @@ impl Body {
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             act_frac: 0.0,
             act_group: [0.0; 3],
+            tau_abs: 0.0,
+            tau_group: [0.0; 3],
             escaped: false,
             foot_contact,
             fell: false,
@@ -810,6 +820,8 @@ impl Body {
         self.contact_imp = [0.0; NUM_PAIRS];
         self.act_frac = 0.0;
         self.act_group = [0.0; 3];
+        self.tau_abs = 0.0;
+        self.tau_group = [0.0; 3];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -868,16 +880,26 @@ impl Body {
     fn tick(&mut self, actions: &[u8; NQ], gear: &[f64; 7]) {
         let mut act = 0.0;
         let mut grp = [0.0f64; 3];
+        let mut tau_abs = 0.0;
+        let mut tgrp = [0.0f64; 3];
         for j in 0..NQ {
             let a = actions[j] as usize;
             let frac = if a < 7 { gear[a] } else { 0.0 };
             self.tau[j] = frac * MODEL.tau_max[j];
             let f = frac.abs();
             act += f;
-            grp[if j < 3 { 0 } else if j < 17 { 1 } else { 2 }] += f;
+            let g = if j < 3 { 0 } else if j < 17 { 1 } else { 2 };
+            grp[g] += f;
+            // env v43 energy base: |τ_j| = |frac·τ_max| (abs commutes with
+            // the product exactly; same expression tree as the kernel)
+            let t = (frac * MODEL.tau_max[j]).abs();
+            tau_abs += t;
+            tgrp[g] += t;
         }
         self.act_frac = act;
         self.act_group = grp;
+        self.tau_abs = tau_abs;
+        self.tau_group = tgrp;
         let prev_wrist = self.wrist;
         // env v24: last tick's §8 body-point positions (ws.p holds the
         // previous refresh_fk), the finite-diff base for body_pt_vel
@@ -1092,10 +1114,14 @@ struct Core {
     // terms remain the anti-parking objective (delta shaping alone
     // would make a parked pose free). 0.0 = off.
     foot_shape_coef: f64,
-    // env v23: per-tick activation price on Body::act_frac (0 = the
-    // pre-v23 reward verbatim; velocity-blind by design — this prices
-    // force, not work; the retired v10 work price is gone)
-    iso_coef: f64,
+    // env v43 (2026-09-14, user): per-tick ENERGY price on Body::tau_abs
+    // (Σ|τ| in N·m; reward -= energy_coef × Σ|τ|). Replaced the v23
+    // fraction price (iso_coef, retired): a joint pays in proportion to
+    // its torque limit, so trunk/leg torque is dear and wrist torque
+    // near-free — the human muscle-volume weighting. Velocity-blind:
+    // force, not work. 0 = off. Calibration: Σ|τ| ≈ 400 N·m/tick on the
+    // 2026-09-14 leaves, so 7.5e-6 matches the old 5e-4 fraction bill.
+    energy_coef: f64,
     // env v34 (2026-08-21): per-tick price on the joint-limit-row
     // impulse the postural stops carried (Body::limit_imp, [legs,
     // spine] N·m·s). 0 = the pre-v34 reward verbatim. Proportional to
@@ -1121,9 +1147,14 @@ struct Core {
     // activation telemetry (2026-09-13, replaces the retired work
     // reading): Σ over ticks of [total, spine, arms, legs] commanded
     // |gear fraction| + the tick count, until popped (pop_activation;
-    // limit_rest pattern). Total is exactly the iso-priced quantity.
+    // limit_rest pattern). Total was the v23 iso-priced quantity.
     act_sum: [f64; 4],
     act_ticks: u64,
+    // env v43 torque telemetry: Σ over ticks of [total, spine, arms,
+    // legs] applied |τ| (N·m) + the tick count, until popped
+    // (pop_torque; act_sum pattern). Total is the energy-priced quantity.
+    tau_sum: [f64; 4],
+    tau_ticks: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
@@ -1205,7 +1236,7 @@ impl Core {
             foot_x_coef: 0.0,
             foot_hinge_r: 0.0,
             foot_shape_coef: 0.0,
-            iso_coef: 0.0,
+            energy_coef: 0.0,
             limit_coef: 0.0,
             limit_arms: false,
             wall_despawn: false,
@@ -1213,6 +1244,8 @@ impl Core {
             limit_rest_ticks: 0,
             act_sum: [0.0; 4],
             act_ticks: 0,
+            tau_sum: [0.0; 4],
+            tau_ticks: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
@@ -1618,14 +1651,20 @@ impl Core {
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
         let gear = self.gear;
         self.body.tick(actions, &gear);
-        // env v23 activation price (the v10 work price was retired
-        // 2026-09-13) + always-on activation telemetry
-        reward -= self.iso_coef * self.body.act_frac;
+        // env v43 energy price on the applied Σ|τ| (the v23 fraction
+        // price retired 2026-09-14) + always-on activation and torque
+        // telemetry (accumulate at coef 0 too)
+        reward -= self.energy_coef * self.body.tau_abs;
         self.act_sum[0] += self.body.act_frac;
         self.act_sum[1] += self.body.act_group[0];
         self.act_sum[2] += self.body.act_group[1];
         self.act_sum[3] += self.body.act_group[2];
         self.act_ticks += 1;
+        self.tau_sum[0] += self.body.tau_abs;
+        self.tau_sum[1] += self.body.tau_group[0];
+        self.tau_sum[2] += self.body.tau_group[1];
+        self.tau_sum[3] += self.body.tau_group[2];
+        self.tau_ticks += 1;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
@@ -2116,13 +2155,13 @@ impl RawBeatSim {
                         wide_acc=false, gears=3, foot_contact=false,
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
-                        foot_shape_coef=0.0, iso_coef=0.0,
+                        foot_shape_coef=0.0, energy_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
                         wall_despawn=false, self_contact_coef=0.0))]
     fn new(max_steps: u32, wide_acc: bool,
            gears: u8, foot_contact: bool, fall_const: f64,
            foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
+           foot_shape_coef: f64, energy_coef: f64, limit_coef: f64,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: f64) -> Self {
         let mut core = Core::new_core(max_steps, wide_acc,
@@ -2132,7 +2171,7 @@ impl RawBeatSim {
         core.foot_x_coef = foot_x_coef;
         core.foot_hinge_r = foot_hinge_r;
         core.foot_shape_coef = foot_shape_coef;
-        core.iso_coef = iso_coef;
+        core.energy_coef = energy_coef;
         core.limit_coef = limit_coef;
         core.limit_arms = limit_arms;
         core.wall_despawn = wall_despawn;
@@ -2377,7 +2416,8 @@ impl RawBeatSim {
     }
 
     /// Last tick's joint activation — commanded Σ|gear fraction| as
-    /// (total, spine, arms, legs); total is the iso-priced quantity.
+    /// (total, spine, arms, legs); the v23 fraction base (telemetry only
+    /// since env v43).
     /// Telemetry (replay "activation" field, viewer meter, tests).
     fn last_activation(&self) -> (f64, f64, f64, f64) {
         let b = &self.core.body;
@@ -2391,6 +2431,24 @@ impl RawBeatSim {
         let t = self.core.act_ticks;
         self.core.act_sum = [0.0; 4];
         self.core.act_ticks = 0;
+        (s[0], s[1], s[2], s[3], t)
+    }
+
+    /// Last tick's applied joint torque — Σ|τ_j| in N·m as (total,
+    /// spine, arms, legs); total is the env v43 energy-priced quantity.
+    /// Telemetry (replay "torque" field, tests).
+    fn last_torque(&self) -> (f64, f64, f64, f64) {
+        let b = &self.core.body;
+        (b.tau_abs, b.tau_group[0], b.tau_group[1], b.tau_group[2])
+    }
+
+    /// Torque telemetry since the last pop: (Σ total, Σ spine, Σ arms,
+    /// Σ legs, env-ticks) of applied |τ| (N·m). CUDA `pop_torque` mirror.
+    fn pop_torque(&mut self) -> (f64, f64, f64, f64, u64) {
+        let s = self.core.tau_sum;
+        let t = self.core.tau_ticks;
+        self.core.tau_sum = [0.0; 4];
+        self.core.tau_ticks = 0;
         (s[0], s[1], s[2], s[3], t)
     }
 
@@ -2658,7 +2716,7 @@ impl VecBeatSim {
                         gears=3, foot_contact=false, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
-                        iso_coef=0.0, limit_coef=0.0,
+                        energy_coef=0.0, limit_coef=0.0,
                         limit_arms=false, wall_despawn=false,
                         self_contact_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
@@ -2666,7 +2724,7 @@ impl VecBeatSim {
            return_events: bool, wide_acc: bool, gears: u8,
            foot_contact: bool, fall_const: f64, foot_z_coef: f64,
            foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, iso_coef: f64, limit_coef: f64,
+           foot_shape_coef: f64, energy_coef: f64, limit_coef: f64,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: f64) -> Self {
         VecBeatSim {
@@ -2679,7 +2737,7 @@ impl VecBeatSim {
                     c.foot_x_coef = foot_x_coef;
                     c.foot_hinge_r = foot_hinge_r;
                     c.foot_shape_coef = foot_shape_coef;
-                    c.iso_coef = iso_coef;
+                    c.energy_coef = energy_coef;
                     c.limit_coef = limit_coef;
                     c.limit_arms = limit_arms;
                     c.wall_despawn = wall_despawn;
@@ -2884,6 +2942,23 @@ impl VecBeatSim {
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
 
+    /// Torque telemetry (env v43) summed over all envs since the last
+    /// pop: (Σ total, Σ spine, Σ arms, Σ legs, env-ticks) of applied
+    /// |τ| in N·m. CUDA `pop_torque` mirror.
+    fn pop_torque(&mut self) -> (f64, f64, f64, f64, u64) {
+        let mut acc = [0.0f64; 4];
+        let mut tk = 0u64;
+        for s in self.sims.iter_mut() {
+            for k in 0..4 {
+                acc[k] += s.tau_sum[k];
+            }
+            tk += s.tau_ticks;
+            s.tau_sum = [0.0; 4];
+            s.tau_ticks = 0;
+        }
+        (acc[0], acc[1], acc[2], acc[3], tk)
+    }
+
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
@@ -3068,7 +3143,7 @@ mod env_tests {
     use super::*;
 
     /// Activation telemetry wiring: Body::tick's act_frac is the
-    /// commanded Σ|gear fraction| (the env v23 iso-price base) and the
+    /// commanded Σ|gear fraction| (the v23 fraction base, telemetry) and the
     /// [spine, arms, legs] groups partition it exactly; coasting reads
     /// 0 everywhere.
     #[test]
@@ -3087,10 +3162,31 @@ mod env_tests {
         assert_eq!(body.act_group[1], gear[2].abs() + gear[1].abs(), "arms");
         assert_eq!(body.act_group[2], gear[4].abs(), "legs");
         assert_eq!(body.act_group.iter().sum::<f64>(), body.act_frac);
+        // env v43 torque base: Σ|frac|·τ_max, same partition
+        let tq: f64 = (0..NQ)
+            .map(|j| (gear[acts[j] as usize] * MODEL.tau_max[j]).abs())
+            .sum();
+        assert_eq!(body.tau_abs, tq, "torque total is the joint-order sum");
+        assert_eq!(body.tau_group[0], (gear[3] * MODEL.tau_max[0]).abs());
+        assert_eq!(body.tau_group[1],
+                   (gear[2] * MODEL.tau_max[10]).abs()
+                       + (gear[1] * MODEL.tau_max[15]).abs());
+        assert_eq!(body.tau_group[2], (gear[4] * MODEL.tau_max[20]).abs());
+        // a wrist full gear is priced 1.06/600 of a spine full gear
+        let mut w = [0u8; NQ];
+        w[7] = 1;
+        let mut bw = Body::new(false);
+        bw.tick(&w, &gear);
+        let mut sp = [0u8; NQ];
+        sp[0] = 1;
+        let mut bs = Body::new(false);
+        bs.tick(&sp, &gear);
+        assert!((bw.tau_abs / bs.tau_abs - MODEL.tau_max[7] / MODEL.tau_max[0]).abs() < 1e-12);
         let mut b2 = Body::new(false);
         b2.tick(&[0u8; NQ], &gear);
         assert_eq!(b2.act_frac, 0.0, "coast must read zero activation");
         assert_eq!(b2.act_group, [0.0; 3]);
+        assert_eq!(b2.tau_abs, 0.0, "coast must read zero torque");
     }
 
     /// B4: once an episode is done, re-stepping it WITHOUT a chart
