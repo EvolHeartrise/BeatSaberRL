@@ -489,7 +489,7 @@ class CudaBeatVecEnv:
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
-                 foot_shape_coef=0.0, iso_coef=0.0, limit_coef=0.0,
+                 foot_shape_coef=0.0, energy_coef=0.0, limit_coef=0.0,
                  limit_arms=False,
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
@@ -533,7 +533,7 @@ class CudaBeatVecEnv:
         # based delta-shaping coefficient (see lib.rs field comments)
         self.foot_hinge_r = float(foot_hinge_r)
         self.foot_shape_coef = float(foot_shape_coef)
-        self.iso_coef = float(iso_coef)
+        self.energy_coef = float(energy_coef)
         self.limit_coef = float(limit_coef)
         self.limit_arms = bool(limit_arms)
         # env v37: bomb-like wall despawn on charge (training-only aid;
@@ -705,9 +705,14 @@ class CudaBeatVecEnv:
         # activation telemetry per env (2026-09-13, replaces the retired
         # positive-work reading): [sum total, sum spine, sum arms, sum
         # legs, ticks] of the commanded |gear fraction| (total = the
-        # --iso-coef base); popped + zeroed by pop_activation, untouched
+        # retired v23 iso-price base); popped + zeroed by pop_activation, untouched
         # by reset_env
         self.act_stat = z(N, 5)
+        # env v43 torque telemetry per env: [sum total, sum spine, sum
+        # arms, sum legs, ticks] of the applied |tau| in N.m (total = the
+        # --energy-coef base); popped + zeroed by pop_torque, untouched
+        # by reset_env
+        self.tau_stat = z(N, 5)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -783,6 +788,7 @@ class CudaBeatVecEnv:
             self._bp_pos, self._bp_vel,
             self.sc_stat,
             self.act_stat,
+            self.tau_stat,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -809,7 +815,7 @@ class CudaBeatVecEnv:
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
                        self.foot_hinge_r, self.foot_shape_coef,
-                       self.iso_coef, self.limit_coef,
+                       self.energy_coef, self.limit_coef,
                        int(self.limit_arms),
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
@@ -1023,11 +1029,21 @@ class CudaBeatVecEnv:
     def pop_activation(self):
         """Activation telemetry since the last pop: (sum total, sum
         spine, sum arms, sum legs, env-ticks) of the commanded |gear
-        fraction| per tick — total is exactly the --iso-coef base;
+        fraction| per tick — the retired v23 --iso-coef base (telemetry);
         accumulates regardless of the coefficient. Sums the per-env
         accumulators and zeroes them — one sync."""
         s = self.act_stat.sum(dim=0).tolist()
         self.act_stat.zero_()
+        return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
+                int(s[4]))
+
+    def pop_torque(self):
+        """env v43 torque telemetry since the last pop: (sum total, sum
+        spine, sum arms, sum legs, env-ticks) of the applied |tau| in
+        N.m per tick — total is exactly the --energy-coef base;
+        accumulates regardless of the coefficient. One sync."""
+        s = self.tau_stat.sum(dim=0).tolist()
+        self.tau_stat.zero_()
         return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
                 int(s[4]))
 

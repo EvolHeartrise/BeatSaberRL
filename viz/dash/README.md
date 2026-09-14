@@ -44,7 +44,8 @@ second (`?archive=/some/prefix/` overrides). Development:
   selector). Panels: acc (+accL/accR), return, self-contact (impulse / % ticks, env v41), entropy
   (+entfull), ev, steps/s, falls+tilts per 1M samples, clipfrac
   first/last, KL first/last (log), gnorm+clipc, per-group entropies,
-  lifts per 1M, flail, limit-rest, joint activation (total / spine /
+  lifts per 1M, flail, limit-rest, joint torque Σ|τ| (N·m / env-tick,
+  total / spine / arms / legs — the env v43 energy-price base), joint activation (total / spine /
   arms / legs — the energy-conservation stat), fp16 r1/maxlr,
   checkpoint peak VRAM.
   Panels an era did not measure are marked "no data". X axis:
@@ -63,7 +64,7 @@ second (`?archive=/some/prefix/` overrides). Development:
 - **Compare** — tick any runs (filter box), align on samples (default)
   / updates / wall; small multiples per metric (acc, return, ent, entfull,
   ev, steps/s, falls / 1M and tilts / 1M on log axes, clipfrac, KL, gnorm,
-  clipc, limit rest, flail, lifts, self-contact, activation); a **difference panel**
+  clipc, limit rest, flail, lifts, self-contact, activation, torque); a **difference panel**
   (run − reference at matched x, reference interpolated onto each run's
   grid, rolling mean over N points); a **matched-samples table** at
   chosen sample counts (default: the reference's checkpointed sample
@@ -102,7 +103,7 @@ See `UPDATE_FIELDS` in `python/metrics_log.py`: `upd`, `n_upd`,
 `clipfrac_last`, `gnorm`, `clipc`, `ent_spine` … `ent_legR`,
 `ent_min`, `ent_min_head`, `entfull`, `afsd`, `falls`, `tilts`,
 `lifts`(+`_L`/`_R`), `flail`(+`_L`/`_R`/`_ticks`), `limitrest`
-(+`_legs`/`_spine`/`_arms`), `activation` (+`_spine`/`_arms`/`_legs`:
+(+`_legs`/`_spine`/`_arms`), `torque` (+`_spine`/`_arms`/`_legs`: applied Σ|τ| N·m per env-tick, env v43), `activation` (+`_spine`/`_arms`/`_legs`:
 mean commanded Σ|gear fraction| per env-tick, the `--iso-coef` base —
 the energy-conservation stat since 2026-09-13), `pd_net`, `envelope`, `diag_*`,
 `vram_*`, `ckpt`, `peak_vram`. Absent = not measured in that era

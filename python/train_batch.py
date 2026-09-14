@@ -558,9 +558,10 @@ def parse_args():
     p.add_argument("--bomb-prob", type=float, default=0.125,
                    help="P(bomb) per generation tick")
     # (the v10 "effort" work price and its --effort-coef flag were RETIRED
-    # 2026-09-13: every recipe since v23 ran it at 0; the live movement
-    # prices are --iso-coef (activation) and --limit-coef/--limit-arms
-    # (limit rest). Per-tick positive work survives as replay telemetry.)
+    # 2026-09-13: every recipe since v23 ran it at 0. The v23 fraction
+    # "activation" price (--iso-coef) was retired 2026-09-14 for the env
+    # v43 torque energy price; the live movement prices are --energy-coef
+    # (Σ|τ|) and --limit-coef/--limit-arms (limit rest).)
     # wide-acc training reward (2026-07-29, user-directed): acc_train =
     # 30*clamp(1 - d/0.6), unrounded — effectively DOUBLING the acc
     # component's range and reward vs the real round(15*(1 - d/0.3)).
@@ -655,13 +656,20 @@ def parse_args():
     p.add_argument("--wall-despawn", action="store_true",
                    help="env v37: walls despawn on the charged hit "
                         "(bomb-like; training-only credit aid)")
-    p.add_argument("--iso-coef", type=float, default=0.0,
-                   help="env v23: per-tick activation cost — iso_coef * "
-                        "sum of commanded |gear fraction| over the 29 "
-                        "joints (muscle-activation analog: isometric "
-                        "holds and limit-jamming pay, coast is free; "
-                        "velocity-blind by design — force, not work, "
-                        "is what is priced). 0 = off")
+    p.add_argument("--energy-coef", type=float, default=7.5e-6,
+                   help="env v43 (2026-09-14, user): per-tick ENERGY cost "
+                        "in reward per N*m*tick — energy_coef * sum over "
+                        "the 29 joints of the applied |tau_j| (= |gear "
+                        "fraction| x TAU_MAX[j]). Replaces the v23 "
+                        "fraction price (--iso-coef, retired): a joint pays "
+                        "in proportion to its torque limit, the human "
+                        "muscle-volume weighting (a spine full gear costs "
+                        "600/1.06x a wrist full gear). Isometric holds and "
+                        "limit-jamming pay, coast is free; velocity-blind "
+                        "(force, not work). DEFAULT 7.5e-6: calibrated so "
+                        "the bill matches the old 5e-4 fraction price at "
+                        "the 2026-09-14 leaves' ~400 N*m/tick (~0.003 "
+                        "reward/tick). 0 = off")
     p.add_argument("--foot-x-coef", type=float, default=0.0,
                    help="env v21: per-tick penalty coefficient on each "
                         "foot's |world_x - its_stance_x| (per-side "
@@ -995,7 +1003,7 @@ def main():
                       foot_x_coef=args.foot_x_coef,
                       foot_hinge_r=args.foot_hinge_r,
                       foot_shape_coef=args.foot_shape_coef,
-                      iso_coef=args.iso_coef,
+                      energy_coef=args.energy_coef,
                       limit_coef=args.limit_coef,
                       limit_arms=args.limit_arms,
                       wall_despawn=args.wall_despawn,
@@ -1022,7 +1030,7 @@ def main():
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
             foot_shape_coef=args.foot_shape_coef,
-            iso_coef=args.iso_coef,
+            energy_coef=args.energy_coef,
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi,
@@ -1042,7 +1050,7 @@ def main():
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
             foot_shape_coef=args.foot_shape_coef,
-            iso_coef=args.iso_coef,
+            energy_coef=args.energy_coef,
             self_contact_coef=args.self_contact_coef,
             seed=args.seed)
 
@@ -2105,7 +2113,7 @@ def main():
                       flush=True)
         # activation telemetry (2026-09-13, user: energy-conservation
         # stats over training): mean commanded |gear fraction| summed
-        # over the 29 joints per env-tick (0..29; the --iso-coef base),
+        # over the 29 joints per env-tick (0..29; the retired v23 base),
         # spine / arms / legs split. Accumulates at coef 0 too.
         if hasattr(venv, "pop_activation"):
             ac_t, ac_s, ac_a, ac_l, ac_n = venv.pop_activation()
@@ -2117,6 +2125,20 @@ def main():
                 print(f"[activation] {ac_t / ac_n:.4f} /env-tick (spine "
                       f"{ac_s / ac_n:.4f} / arms {ac_a / ac_n:.4f} / legs "
                       f"{ac_l / ac_n:.4f})", flush=True)
+        # env v43 torque telemetry (2026-09-14, user): mean applied
+        # sum |tau| over the 29 joints per env-tick in N*m — the
+        # --energy-coef base — spine / arms / legs split. Accumulates
+        # at coef 0 too.
+        if hasattr(venv, "pop_torque"):
+            tq_t, tq_s, tq_a, tq_l, tq_n = venv.pop_torque()
+            if tq_n:
+                m_ev.update(torque=tq_t / tq_n,
+                            torque_spine=tq_s / tq_n,
+                            torque_arms=tq_a / tq_n,
+                            torque_legs=tq_l / tq_n)
+                print(f"[torque] {tq_t / tq_n:.3f} N*m/env-tick (spine "
+                      f"{tq_s / tq_n:.3f} / arms {tq_a / tq_n:.3f} / legs "
+                      f"{tq_l / tq_n:.3f})", flush=True)
         # env v41 self-contact telemetry: mean self-collision impulse
         # per env-tick (N.s) and the share of env-ticks with any
         # body-on-body contact — accumulates at coef 0 too, so the

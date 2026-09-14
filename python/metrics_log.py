@@ -53,8 +53,11 @@ UPDATE_FIELDS = (
     "flail", "flail_L", "flail_R", "flail_ticks",
     "limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms",
     # [activation] (2026-09-13): mean commanded |gear fraction| summed
-    # over the 29 joints per env-tick (the --iso-coef base) + groups
+    # over the 29 joints per env-tick (the retired v23 iso base) + groups
     "activation", "activation_spine", "activation_arms", "activation_legs",
+    # [torque] (env v43, 2026-09-14): mean applied sum |tau| over the 29
+    # joints per env-tick in N*m (the --energy-coef base) + groups
+    "torque", "torque_spine", "torque_arms", "torque_legs",
     # env v41 [contact]: mean self-collision impulse per env-tick (N.s)
     # and the fraction of env-ticks with any body-on-body contact
     "contact", "contact_frac",
@@ -163,7 +166,8 @@ def update_record(update, num_updates, global_step, *, t=None,
         if k in ("flail", "flail_L", "flail_R", "limitrest",
                  "limitrest_legs", "limitrest_spine", "limitrest_arms",
                  "activation", "activation_spine", "activation_arms",
-                 "activation_legs", "contact", "contact_frac"):
+                 "activation_legs", "torque", "torque_spine",
+                 "torque_arms", "torque_legs", "contact", "contact_frac"):
             rec[k] = _num(v)
         else:
             rec[k] = _int(v)
@@ -223,6 +227,9 @@ _RE_LIMITREST = re.compile(
     r"arms (\S+)\)")
 _RE_ACTIVATION = re.compile(
     r"^\[activation\] (\S+) /env-tick \(spine (\S+) / arms (\S+) / "
+    r"legs (\S+)\)")
+_RE_TORQUE = re.compile(
+    r"^\[torque\] (\S+) N\*m/env-tick \(spine (\S+) / arms (\S+) / "
     r"legs (\S+)\)")
 _RE_CONTACT = re.compile(
     r"^\[contact\] (\S+) N\*s/tick \((\S+)% of env-ticks in self-contact\)")
@@ -456,6 +463,14 @@ def parse_log(text, t_end=None):
             seg._pending["activation_arms"] = _num(m.group(3))
             seg._pending["activation_legs"] = _num(m.group(4))
             seg._count("activation")
+            continue
+        m = _RE_TORQUE.match(line)
+        if m:
+            seg._pending["torque"] = _num(m.group(1))
+            seg._pending["torque_spine"] = _num(m.group(2))
+            seg._pending["torque_arms"] = _num(m.group(3))
+            seg._pending["torque_legs"] = _num(m.group(4))
+            seg._count("torque")
             continue
         m = _RE_CONTACT.match(line)
         if m:

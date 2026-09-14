@@ -46,6 +46,7 @@ WSD TRUNK: warmup 34 updates -> constant lr 0.0007, ent 0.03 -> floor 0.001 exp(
 [flail] 1.9150 rad/idle-tick (L 0.9561 / R 0.9588; 193862 note-free env-ticks)
 [limitrest] 16.1259 N*m*s/tick (legs 7.6030 / spine 7.1072 / arms 1.4157)
 [activation] 9.8123 /env-tick (spine 1.0210 / arms 5.6413 / legs 3.1500)
+[torque] 391.125 N*m/env-tick (spine 69.900 / arms 93.600 / legs 227.625)
 update   1/1068  steps   1048576  acc 0.6432  accL 0.6512  accR 0.6359  return -15.622  ep_return(last100)   -6.598  ent 46.560  ev 0.000   135,551 steps/s     7.7s  r1 2.7e-06  maxlr 0.6
 [kl] upd   1  kl(mb1/mbN) 6.62e-10/7.02e-03  clipfrac 0.0000/0.0906  gnorm 0.441  clipc 0.945  ent/head spine 1.603  armL 1.605  armR 1.605  legL 1.604  legR 1.606  min 1.597 (h20)  entfull 46.548  afsd 0.175
 [tilt] 60000 tilt termination(s) this update (chest up-axis fwd>40 / back>20 / lateral>40 deg; flat fall_const)
@@ -53,6 +54,7 @@ update   1/1068  steps   1048576  acc 0.6432  accL 0.6512  accR 0.6359  return -
 [flail] 1.9000 rad/idle-tick (L 0.9500 / R 0.9500; 193000 note-free env-ticks)
 [limitrest] 16.0000 N*m*s/tick (legs 7.6000 / spine 7.1000 / arms 1.4000)
 [activation] 9.8000 /env-tick (spine 1.0000 / arms 5.6000 / legs 3.2000)
+[torque] 390.000 N*m/env-tick (spine 70.000 / arms 93.000 / legs 227.000)
 update   2/1068  steps   2097152  acc 0.6534  accL 0.6598  accR 0.6471  return -17.464  ep_return(last100)   -6.583  ent 46.555  ev 0.001   141,518 steps/s    14.8s  r1 2.2e-06  maxlr 0.6
 [kl] upd   2  kl(mb1/mbN) 1.00e-09/8.00e-03  clipfrac 0.0000/0.1000  gnorm 0.450  clipc 0.940  ent/head spine 1.600  armL 1.600  armR 1.600  legL 1.600  legR 1.600  min 1.590 (h3)  entfull 46.400  afsd 0.180
 [ckpt] trunk_upd00002.pt  peak-vram 12.17 GiB
@@ -93,6 +95,10 @@ def test_af50n_era_full_join():
     assert r1["activation"] == 9.8123 and r1["activation_spine"] == 1.021
     assert r1["activation_arms"] == 5.6413 and r1["activation_legs"] == 3.15
     assert r2["activation"] == 9.8 and r2["activation_legs"] == 3.2
+    # [torque] (env v43): applied sum|tau| N*m per env-tick + groups
+    assert r1["torque"] == 391.125 and r1["torque_spine"] == 69.9
+    assert r1["torque_arms"] == 93.6 and r1["torque_legs"] == 227.625
+    assert r2["torque"] == 390.0 and r2["torque_legs"] == 227.0
     # update 2 had no [fall] line -> structural zero (era prints it)
     assert r2["falls"] == 0 and r2["tilts"] == 60000
     # [diag] attaches by its explicit upd index
@@ -302,7 +308,9 @@ def test_update_record_roundtrip_and_schema():
                 "limitrest_legs": 7.6, "limitrest_spine": 7.1,
                 "limitrest_arms": 1.4, "activation": 9.8,
                 "activation_spine": 1.0, "activation_arms": 5.6,
-                "activation_legs": 3.2},
+                "activation_legs": 3.2, "torque": 390.0,
+                "torque_spine": 70.0, "torque_arms": 93.0,
+                "torque_legs": 227.0},
         ckpt="trunk_upd00007.pt", peak_vram=12.17)
     assert set(rec) <= set(ml.UPDATE_FIELDS)
     assert rec["upd"] == 7 and rec["steps"] == 7340032
@@ -346,7 +354,9 @@ def test_formatter_parser_agree_on_fields():
                 "limitrest_legs": 7.603, "limitrest_spine": 7.1072,
                 "limitrest_arms": 1.4157, "activation": 9.8123,
                 "activation_spine": 1.021, "activation_arms": 5.6413,
-                "activation_legs": 3.15})
+                "activation_legs": 3.15, "torque": 391.125,
+                "torque_spine": 69.9, "torque_arms": 93.6,
+                "torque_legs": 227.625})
     parsed = ml.parse_log(AF50N_HEAD)[0].updates[0]
     for k in ("upd", "n_upd", "steps", "elapsed", "sps", "acc", "accL",
               "accR", "return", "ep_return", "ent", "ev", "r1", "maxlr",
@@ -356,7 +366,8 @@ def test_formatter_parser_agree_on_fields():
               "flail_L", "flail_R", "flail_ticks", "limitrest",
               "limitrest_legs", "limitrest_spine", "limitrest_arms",
               "activation", "activation_spine", "activation_arms",
-              "activation_legs"):
+              "activation_legs", "torque", "torque_spine",
+              "torque_arms", "torque_legs"):
         assert rec[k] == pytest.approx(parsed[k]), k
     for g in ("spine", "armL", "armR", "legL", "legR"):
         assert rec["ent_" + g] == pytest.approx(parsed["ent_" + g],

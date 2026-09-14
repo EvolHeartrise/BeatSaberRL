@@ -15,7 +15,10 @@
 // Σ|gear fraction| as [total, spine, arms, legs] (the --iso-coef base;
 // it replaced the P6 "effort" work reading) — additive: readers must
 // tolerate their absence, and activation is derived from "action" when
-// the field is missing. Applied torque is NOT logged; it is exactly
+// the field is missing. Since record_rev 4 (env v43, 2026-09-14) the
+// tick also carries "torque" = applied Σ|τ| as [total, spine, arms,
+// legs] in N·m (the --energy-coef base) — additive, ignored by this
+// viewer; per-joint torque is exactly
 // gearTable(config.gears)[action[j]] * TAU_MAX29[j].
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,

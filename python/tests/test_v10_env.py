@@ -305,8 +305,9 @@ def test_replay_v10_roundtrip(tmp_path):
     head, ticks = lines[0], lines[1:]
     assert head["header"]["version"] == "v10"
     # additive per-tick schema revision (§6): 2 = "head" on every tick,
-    # 3 = "activation" replaced the P6 "effort" field (2026-09-13)
-    assert head["header"]["record_rev"] == 3
+    # 3 = "activation" replaced the P6 "effort" field (2026-09-13),
+    # 4 = "torque" [total, spine, arms, legs] applied |tau| (env v43)
+    assert head["header"]["record_rev"] == 4
     assert head["header"]["config"]["gears"] == 3
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c
