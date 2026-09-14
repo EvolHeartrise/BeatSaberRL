@@ -20,7 +20,7 @@ from beat_arena_env.constants import GOOD_HALF_X, HANDLE_LEN, N_JOINTS
 
 from beat_arena_rs import RawBeatSim
 
-from test_env import _set_flat, _coast, _codes, DT
+from test_env import _park, _set_flat, _coast, _codes, DT
 
 TICKS = 8
 COAST = [0] * N_JOINTS
@@ -31,7 +31,8 @@ def _flat_sim():
     sim.set_chart([note_tuple(Note(hit_time=50.0, col=2, row=1, x=0.3,
                                    y=1.4, color=1, angle=4.712,
                                    speed=4.0))])
-    _set_flat(sim, 1, 0.0)
+    _park(sim, 0)          # left blade far away (its wrong-hand box would
+    _set_flat(sim, 1, 0.0)  # otherwise touch a note between the hands)
     return sim
 
 
@@ -67,16 +68,20 @@ def test_handle_does_not_cut_but_blade_does():
 
     sim = RawBeatSim(max_steps=690)
     sim.set_chart([note_tuple(n_handle)])
+    _park(sim, 0)
     _set_flat(sim, 1, 0.0)
-    assert [c for c in _run(sim) if c[1] in (0, 1, 2)] == [], \
-        "a note within the handle segment must not be cut"
+    # cut codes 0..3 (good / slow / angle / wrong hand); 4 = the miss the
+    # uncut note then registers past the head plane, which is the point
+    assert [c for c in _run(sim) if c[0] == 0 and c[1] <= 3] == [], \
+        "a note within the handle segment must not be cut (any cut code)"
 
     sim = RawBeatSim(max_steps=690)
     sim.set_chart([note_tuple(n_blade)])
+    _park(sim, 0)
     _set_flat(sim, 1, 0.0)
-    cuts = [c for c in _run(sim) if c[1] in (0, 1, 2)]
-    assert cuts and cuts[0][0] == 0, \
-        f"a note 5 cm into the blade segment must be cut, got {cuts}"
+    cuts = [c for c in _run(sim) if c[0] == 0 and c[1] <= 3]
+    assert cuts and cuts[0][1] == 1, \
+        f"a note 5 cm into the blade must be cut (static blade -> slow), got {cuts}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -97,7 +102,7 @@ def test_cuda_handle_does_not_cut_but_blade_does():
     act = torch.zeros((2, N_JOINTS), dtype=torch.long)
     for _ in range(TICKS):
         env.step(act)
-    # per-env cut counters (good + bad), the same readout the parity gate
-    # uses against sim.good_cuts / bad_cuts
+    # per-env cut counters (good + bad of ANY code), the same readout the
+    # parity gate uses against sim.good_cuts / bad_cuts
     cut = [int(env.good[e]) + int(env.bad[e]) > 0 for e in range(2)]
     assert cut == [False, True], f"CUDA handle/blade cut pattern {cut}"
