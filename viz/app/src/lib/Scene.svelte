@@ -7,7 +7,8 @@
   import { T, useTask, useThrelte } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
-  import { gfx, pb, pose, lastTick, setPlaying } from "./state.svelte.js";
+  import { gfx, pb, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
+  import { followClock } from "./sync.js";
   import {
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
@@ -40,9 +41,21 @@
   gfx.scheduler = ctx.scheduler;
 
   // ---- playback clock (30 ticks/s of replay time) --------------------------
+  // The SONG is the master clock whenever one is sounding: this eases pb.cur
+  // onto it instead of letting the two free-run apart and then yanking the
+  // audio element back into line, which is what used to chop the sound
+  // (lib/sync.js). With no song — or while it is paused, seeking, buffering,
+  // or during a video export — followClock falls back to the frame delta,
+  // i.e. exactly the old behaviour.
   useTask((delta) => {
     if (!pb.playing || !pb.rep) return;
-    pb.cur += delta * 30 * pb.speed;
+    pb.cur = followClock({
+      cur: pb.cur,
+      target: songClock.tick?.() ?? null,
+      delta,
+      speed: pb.speed,
+    });
+    if (pb.cur < 0) pb.cur = 0;
     if (pb.cur >= lastTick()) {
       pb.cur = lastTick();
       setPlaying(false);

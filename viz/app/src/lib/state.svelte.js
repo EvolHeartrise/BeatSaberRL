@@ -5,6 +5,8 @@ export const pb = $state({
   rep: null,
   name: "",
   cur: 0, // fractional tick
+  seek: 0, // bumped whenever `cur` JUMPS (scrub/step/restart/load) rather
+           // than advancing — the only time the song is allowed to seek
   playing: false,
   speed: 1.0,
   exporting: false,
@@ -23,6 +25,14 @@ export const pb = $state({
 // DOM shell OUTSIDE the <Canvas>, so it cannot call useThrelte itself. Plain
 // object: nothing reactive depends on these.
 export const gfx = { advance: null, renderMode: null, scheduler: null };
+
+// The SONG's clock, published by App.svelte for Scene.svelte's frame loop
+// (see lib/sync.js): `tick()` returns the replay tick the song is sounding
+// right now, or null when the song is not the master clock (no song, paused,
+// seeking, still buffering, or a video export in progress). Plain object on
+// purpose — the frame loop calls it every tick and must not turn the <audio>
+// element into a reactive dependency of the render.
+export const songClock = { tick: null };
 
 // Song audio (2026-09-09). `offset` is the song time at replay t = 0, from
 // the replay's own header — see lib/audio.js. status: off (no replay) |
@@ -80,6 +90,7 @@ export function loadText(text, name) {
   pb.rep = rep;
   pb.name = name.replace(/\.[^.]*$/, "");
   pb.cur = 0;
+  pb.seek++;
   pb.playing = true;
   audio.song = rep.map?.song ?? "";
   audio.offset = rep.map?.audio_offset_s ?? 0;
@@ -95,7 +106,20 @@ export function setSpeed(s) {
   pb.speed = Math.min(4, Math.max(0.25, s));
 }
 
+// Every deliberate JUMP of the clock goes through here, so the audio effect
+// knows the difference between "the clock moved because time passed" (never
+// seek the song) and "the user moved it" (seek it, exactly once).
+export function seekTo(tick) {
+  pb.cur = Math.min(Math.max(tick, 0), lastTick());
+  pb.seek++;
+}
+
 export function step(d) {
   pb.playing = false;
-  pb.cur = Math.min(Math.max(pb.cur + d, 0), lastTick());
+  seekTo(pb.cur + d);
+}
+
+export function restart() {
+  seekTo(0);
+  setPlaying(true);
 }
