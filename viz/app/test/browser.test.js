@@ -46,7 +46,10 @@ const browser = await puppeteer.launch({
   // --no-sandbox: Ubuntu 24.04's AppArmor blocks Chrome's user-namespace
   // sandbox for unprivileged users; this only ever loads our own local
   // file, so the sandbox buys nothing here
-  args: ["--use-angle=swiftshader", "--disable-gpu-sandbox", "--no-sandbox"],
+  // autoplay-policy: the live A/V sync check below needs the song to
+  // actually start without a click on the page itself
+  args: ["--use-angle=swiftshader", "--disable-gpu-sandbox", "--no-sandbox",
+         "--autoplay-policy=no-user-gesture-required"],
 });
 try {
   const page = await browser.newPage();
@@ -181,6 +184,55 @@ try {
     console.log("HUD (v15):", hud15.replace(/\s+/g, " ").trim());
     if (!/tick\s*60\b/.test(hud15))
       throw new Error("v15 replay did not scrub");
+
+    // ---- live A/V sync: the song must RUN, not be seeked about.
+    // This replay names a map, so if BeatSaver is reachable the viewer has a
+    // real song here. The 2026-09-14 chop was one el.currentTime write per
+    // animation frame; the fix seeks only on a deliberate jump, so a couple
+    // of seconds of plain playback must produce ~no seeks at all. Skipped
+    // (not failed) when there is no network, or when autoplay never starts.
+    const ready = await page.evaluate(() => !!document.querySelector(
+      "#snd input[type=range]"));
+    if (ready) {
+      await page.evaluate(() => {
+        const a = document.querySelector("audio");
+        window.__seeks = 0;
+        a.addEventListener("seeking", () => { window.__seeks++; });
+      });
+      await page.keyboard.press("r"); // restart: exactly one deliberate seek
+      await new Promise((r) => setTimeout(r, 300));
+      const t0 = await page.evaluate(() => {
+        window.__seeks = 0; // the restart's own seek is not drift
+        return document.querySelector("audio").currentTime;
+      });
+      const wall0 = Date.now();
+      await new Promise((r) => setTimeout(r, 2000));
+      const wall = (Date.now() - wall0) / 1000;
+      const { seeks, t1, rate } = await page.evaluate(() => ({
+        seeks: window.__seeks,
+        t1: document.querySelector("audio").currentTime,
+        rate: document.querySelector("audio").playbackRate,
+      }));
+      if (t1 - t0 > 0.5) {
+        console.log(`live sync: song advanced ${(t1 - t0).toFixed(2)}s of ` +
+          `${wall.toFixed(2)}s wall with ${seeks} seek(s), ` +
+          `rate ${rate.toFixed(3)}`);
+        // a song that runs free covers real time; one being seeked about
+        // spends its life re-buffering and falls behind the wall clock
+        if ((t1 - t0) / wall < 0.6)
+          throw new Error(`the song only advanced ${(t1 - t0).toFixed(2)}s in ` +
+            `${wall.toFixed(2)}s — it is stalling, not playing`);
+        if (seeks > 2)
+          throw new Error(`the song was seeked ${seeks} times during plain ` +
+            "playback — that is the chop");
+        if (Math.abs(rate - 1) > 0.05)
+          throw new Error("playbackRate left far from 1: " + rate);
+      } else {
+        console.log("live sync: the song never sounded here — check skipped");
+      }
+    } else {
+      console.log("live sync: no song loaded (offline?) — check skipped");
+    }
   } else {
     console.log("no v15 recording at " + replayV15 + " — skipped");
   }

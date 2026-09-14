@@ -3,9 +3,10 @@
   import { NoToneMapping } from "three";
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
-  import { audio, gfx, pb, pose, lastTick, loadText, setPlaying, setSpeed,
-    step, togglePose } from "./lib/state.svelte.js";
+  import { audio, gfx, pb, pose, songClock, lastTick, loadText, restart,
+    seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
   import { songBlob } from "./lib/audio.js";
+  import { NO_NUDGE, syncAction } from "./lib/sync.js";
   import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
   import { flushSync } from "svelte";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
@@ -59,12 +60,29 @@
     return () => { stale = true; };
   });
 
-  // The audio follows the replay clock; the clock NEVER follows the audio.
-  // The tick counter is authoritative — scrubbing, tick-stepping and the
-  // video export all drive it directly — so the element is nudged back
-  // whenever it drifts past SYNC_TOL rather than being trusted to keep time.
-  // This effect reads pb.cur, so it reconciles once per frame while playing.
-  const SYNC_TOL = 0.08;
+  // ---- live A/V sync ------------------------------------------------------
+  // The SONG is the master clock: once playing it runs free, Scene.svelte's
+  // frame loop eases pb.cur onto it (songClock below), and the only thing
+  // ever done to a sounding element is a ±2% playbackRate nudge. It is
+  // seeked only while it is SILENT (paused) or on a deliberate jump —
+  // scrub, tick-step, restart, a new replay, all of which bump pb.seek —
+  // plus one last-resort seek if the clocks end up more than 0.5 s apart.
+  //
+  // It used to be the other way round: pb.cur was authoritative and this
+  // effect wrote `el.currentTime = want` on any frame where the two were
+  // more than 80 ms apart. That is what chopped the sound, and it re-armed
+  // itself every frame — see the header of lib/sync.js.
+  //
+  // This effect reads pb.cur, so it still reconciles once per frame while
+  // playing; the difference is that nearly every one of those frames is now
+  // a no-op.
+  let nudge = NO_NUDGE;   // active playbackRate window, {rate, until}
+  let seenSeek = -1;      // last pb.seek acted on
+  const setRate = (el, r) => {
+    // never write the same rate twice: a playbackRate write resets the
+    // element's resampler, so a per-frame write is its own little glitch
+    if (Math.abs(el.playbackRate - r) > 1e-6) el.playbackRate = r;
+  };
   $effect(() => {
     // Every reactive read happens up front, before any early return: `||`
     // short-circuits, so testing the element first would leave this effect
@@ -74,22 +92,87 @@
     const ready = audio.status === "ready";
     const want = audio.offset + pb.cur * DT; // song time for this frame
     const rate = pb.speed, vol = audio.muted ? 0 : audio.vol;
-    const run = pb.playing && !pose.on;
+    const seek = pb.seek, exporting = pb.exporting;
+    const run = pb.playing && !pose.on && !exporting;
     if (!el || !ready) return;
-    el.playbackRate = rate; // setSpeed already clamps to [0.25, 4]
     if (gain) gain.gain.value = vol; else el.volume = vol;
+
+    // the frame-by-frame export owns the clock and gets its audio from the
+    // decoded buffer by array slice — the element stays out of it entirely
+    if (exporting) {
+      if (!el.paused) el.pause();
+      return;
+    }
+
+    const jumped = seek !== seenSeek;
+    seenSeek = seek;
+
     if (want < 0) {
       // the recording starts before the song does (the chart is re-based so
       // the first note lands at 2 s, which can predate t=0 in song time)
       if (!el.paused) el.pause();
-      el.currentTime = 0;
+      if (el.currentTime !== 0) el.currentTime = 0;
+      setRate(el, rate); // setSpeed already clamps to [0.25, 4]
+      nudge = NO_NUDGE;
       return;
     }
-    if (Math.abs(el.currentTime - want) > SYNC_TOL) el.currentTime = want;
-    if (run) {
-      // may reject until the first user gesture; the next frame retries
-      if (el.paused) el.play().catch(() => {});
-    } else if (!el.paused) el.pause();
+
+    if (el.duration && want >= el.duration) {
+      // the song ran out before the replay did. Leave the element alone: a
+      // play() on an ended element seeks back to 0 and starts the song over,
+      // and seeking it to a time past its duration only re-arms that.
+      if (!el.paused) el.pause();
+      setRate(el, rate);
+      nudge = NO_NUDGE;
+      return;
+    }
+
+    if (!run) {
+      if (!el.paused) el.pause();
+      setRate(el, rate);
+      // a silent element can be seeked for free, so park it exactly on the
+      // frame being shown: pausing, scrubbing and stepping all land here,
+      // and playback must resume from what is on screen
+      if (Math.abs(el.currentTime - want) > 0.01) el.currentTime = want;
+      nudge = NO_NUDGE;
+      return;
+    }
+
+    if (jumped) {
+      // the user moved the clock: one deliberate seek, then hands off
+      el.currentTime = want;
+      nudge = NO_NUDGE;
+      setRate(el, rate);
+    } else if (!el.seeking && el.readyState >= 2) {
+      // HAVE_CURRENT_DATA or better, and not mid-seek: currentTime means
+      // something, so the drift reading is real
+      const act = syncAction({ sim: want, audio: el.currentTime,
+                               now: performance.now(), active: nudge });
+      if (act.action === "seek") el.currentTime = want; // hopelessly apart
+      nudge = act.action === "nudge"
+        ? { rate: act.rate, until: act.until } : NO_NUDGE;
+      setRate(el, rate * nudge.rate);
+    }
+    // may reject until the first user gesture; the next frame retries
+    if (el.paused && !el.ended) el.play().catch(() => {});
+  });
+
+  // The song's clock, for Scene.svelte's frame loop. Null whenever the song
+  // is not actually sounding — then the replay clock free-runs on the frame
+  // delta, which is the no-song behaviour the viewer always had.
+  $effect(() => {
+    const el = audioEl;
+    songClock.tick = () => {
+      if (!el || audio.status !== "ready" || pb.exporting) return null;
+      // Mid-seek the element is silent but its official playback position is
+      // already AT the target, so the replay holds there for the fraction of
+      // a second the seek takes. Letting it free-run instead would leave it
+      // ahead of the song by however long the seek took, and the follow
+      // filter would then yank it backwards once the sound returned.
+      if (!el.seeking && (el.paused || el.readyState < 2)) return null;
+      return (el.currentTime - audio.offset) / DT;
+    };
+    return () => { songClock.tick = null; };
   });
 
   // The recording's audio: tap the <audio> element through WebAudio and fork
@@ -151,7 +234,7 @@
     else if (e.key === "ArrowLeft") step(-1);
     else if (e.key === "+" || e.key === "=") setSpeed(pb.speed * 2);
     else if (e.key === "-") setSpeed(pb.speed / 2);
-    else if (e.key === "r") { pb.cur = 0; setPlaying(true); }
+    else if (e.key === "r") restart();
     else if (e.key === "g") pb.gauges = !pb.gauges;
     else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
@@ -240,7 +323,7 @@
       alert("export failed: " + (e?.message ?? e));
     } finally {
       if (mode) gfx.renderMode?.set(mode);
-      pb.cur = wasCur;
+      seekTo(wasCur); // put the (silent) element back where the view is
       pb.exporting = false;
       pb.exportPct = 0;
       pb.exportStop = false;
@@ -275,7 +358,7 @@
       pb.exporting = false;
       pb.exportStop = false;
     };
-    pb.cur = 0;
+    seekTo(0);
     setPlaying(true);
     rec.start();
     const poll = setInterval(() => { // playback auto-pauses at the end
@@ -348,7 +431,7 @@
       <button onclick={() => setPlaying(!pb.playing)}>
         {pb.playing ? "⏸ pause" : "▶ play"}
       </button>
-      <button onclick={() => { pb.cur = 0; setPlaying(true); }}>↺ restart</button>
+      <button onclick={restart}>↺ restart</button>
       <button onclick={() => setSpeed(pb.speed / 2)}>−</button>
       <span>{speedLabel}</span>
       <button onclick={() => setSpeed(pb.speed * 2)}>+</button>
@@ -439,7 +522,7 @@
         max={lastTick()}
         step="1"
         value={tickIdx}
-        oninput={(e) => { setPlaying(false); pb.cur = +e.target.value; }}
+        oninput={(e) => { setPlaying(false); seekTo(+e.target.value); }}
       />
     </div>
   </div>
