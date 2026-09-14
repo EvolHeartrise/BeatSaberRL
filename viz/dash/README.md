@@ -61,7 +61,9 @@ second (`?archive=/some/prefix/` overrides). Development:
   also survives the 30 s refresh; a view showing the full run keeps
   extending to the new tail.
 - **Compare** — tick any runs (filter box), align on samples (default)
-  / updates / wall; small multiples per metric; a **difference panel**
+  / updates / wall; small multiples per metric (acc, return, ent, entfull,
+  ev, steps/s, falls / 1M and tilts / 1M on log axes, clipfrac, KL, gnorm,
+  clipc, limit rest, flail, lifts, self-contact, activation); a **difference panel**
   (run − reference at matched x, reference interpolated onto each run's
   grid, rolling mean over N points); a **matched-samples table** at
   chosen sample counts (default: the reference's checkpointed sample
