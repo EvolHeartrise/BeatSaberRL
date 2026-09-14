@@ -3,6 +3,12 @@
   // color, dash?}] — each on its own x grid; uPlot.join aligns them on
   // the union with nulls, spanGaps draws through. Charts sharing a
   // `syncKey` share the cursor.
+  //
+  // Data refreshes UPDATE the existing plot instead of rebuilding it
+  // (2026-09-14, user request): a manual drag-zoom survives the live
+  // tab's 30 s refresh, and `xRange` ([min, max] or null) pins the x
+  // scale to a window, e.g. "the last 250 updates", re-applied after
+  // every data update so the view follows the run.
   import uPlot from "uplot";
 
   let {
@@ -13,21 +19,33 @@
     height = 230,
     syncKey = "dash",
     legendValues = true,
+    xRange = null,
   } = $props();
 
   let el;
   let u = null;
+  let sig = "";           // series structure the live plot was built for
+  let xExtent = [0, 0];   // full data extent at the last (re)build/update
 
   function css(name, fallback) {
     const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     return v || fallback;
   }
 
-  function build() {
-    if (!el) return;
+  function validOf(ds) {
+    return ds.filter((d) => d && d.x && d.x.length);
+  }
+  function signature(valid) {
+    return JSON.stringify([title, xLabel, log, height, syncKey, valid.map((d) => [d.label, d.color, d.dash ?? null])]);
+  }
+  function extentOf(data) {
+    const xs = data[0];
+    return xs.length ? [xs[0], xs[xs.length - 1]] : [0, 0];
+  }
+
+  function build(valid) {
     if (u) { u.destroy(); u = null; }
-    const valid = datasets.filter((d) => d && d.x && d.x.length);
-    if (!valid.length) return;
+    if (!el || !valid.length) return;
     const data = uPlot.join(valid.map((d) => [d.x, d.y]));
     const fg = css("--fg", "#222");
     const grid = css("--grid", "rgba(128,128,128,0.25)");
@@ -59,6 +77,27 @@
       series,
     };
     u = new uPlot(opts, data, el);
+    xExtent = extentOf(data);
+  }
+
+  // Same series structure, new points: keep the plot. If the user had
+  // the full extent in view, let uPlot re-range so the new tail shows;
+  // if they had zoomed, keep their window (resetScales = false).
+  function update(valid) {
+    const data = uPlot.join(valid.map((d) => [d.x, d.y]));
+    const eps = 1e-9;
+    const sx = u.scales.x;
+    const wasFull = sx.min == null || sx.max == null
+      || (sx.min <= xExtent[0] + eps && sx.max >= xExtent[1] - eps);
+    u.setData(data, wasFull);
+    xExtent = extentOf(data);
+  }
+
+  function applyRange() {
+    if (!u || !xRange) return;
+    const [lo, hi] = xRange;
+    if (lo == null || hi == null || !(hi > lo)) return;
+    u.setScale("x", { min: lo, max: hi });
   }
 
   function fmtTick(v) {
@@ -81,11 +120,22 @@
     return v.toFixed(4);
   }
 
+  // data / structure / window changes: update in place when only the
+  // points changed, rebuild when the series set or the options did
   $effect(() => {
-    // re-read every reactive input so the chart rebuilds on change
-    void datasets; void title; void log; void height; void xLabel;
-    build();
-    return () => { if (u) { u.destroy(); u = null; } };
+    void xRange;
+    const valid = validOf(datasets);
+    const s = signature(valid);
+    if (!el) return;
+    if (u && s === sig) update(valid);
+    else { build(valid); sig = s; }
+    applyRange();
+  });
+
+  // lifetime: destroy on unmount only (not on every data change)
+  $effect(() => {
+    void el;
+    return () => { if (u) { u.destroy(); u = null; sig = ""; } };
   });
 
   $effect(() => {
