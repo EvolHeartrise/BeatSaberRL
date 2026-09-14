@@ -524,8 +524,11 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
-    p.add_argument("--note-geo", action="store_true",
-                   help="hand-relative geometry lanes on the note tokens "
+    p.add_argument("--note-geo", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="DEFAULT ON since 2026-09-14 (user decision: part of "
+                        "the recipe with env v42; --no-note-geo opts out). "
+                        "Hand-relative geometry lanes on the note tokens "
                         "(2026-09-14, research/2026-09-14-architecture-"
                         "brainstorm.md #1): per (hand, note) the wrist->"
                         "note offset, distance, seconds-to-plane and the "
