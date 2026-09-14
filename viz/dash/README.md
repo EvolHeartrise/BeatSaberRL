@@ -52,7 +52,14 @@ second (`?archive=/some/prefix/` overrides). Development:
   cumulative `elapsed`). Auto-refresh every 30 s re-fetches index.json
   and the run's metrics.jsonl; the status line shows "last update N /
   total · samples · T ago" (T from the record's `t`, i.e. the log's
-  mtime for backfilled runs).
+  mtime for backfilled runs). **Window lock** (2026-09-14): "window:
+  last N" pins every panel's x axis to the most recent N units of the
+  current x mode (M samples / updates / hours; 0 or "all" = whole run),
+  remembered per mode in localStorage, re-applied after each refresh so
+  the view follows the run. Refreshes now update the plots in place
+  instead of rebuilding them, so a manual drag-zoom (with the lock off)
+  also survives the 30 s refresh; a view showing the full run keeps
+  extending to the new tail.
 - **Compare** — tick any runs (filter box), align on samples (default)
   / updates / wall; small multiples per metric; a **difference panel**
   (run − reference at matched x, reference interpolated onto each run's

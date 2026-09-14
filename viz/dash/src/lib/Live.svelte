@@ -17,6 +17,29 @@
   const x = $derived(recs ? xValues(recs, xMode) : []);
   const xLabel = $derived(X_MODES.find((m) => m.key === xMode)?.label ?? xMode);
 
+  // Window lock (2026-09-14, user request): pin every chart's x range to
+  // the most recent W units of the current x mode so a refresh never
+  // resets the zoom. W is entered in the mode's display unit (M samples,
+  // updates, hours) and remembered per mode in localStorage; 0 = all.
+  const WIN_UNIT = { samples: { label: "M samples", mult: 1e6 }, updates: { label: "updates", mult: 1 }, wall: { label: "h", mult: 1 } };
+  const WIN_KEY = "dash.live.window";
+  function loadWin() {
+    try { const v = JSON.parse(localStorage.getItem(WIN_KEY) || "{}"); return { samples: 0, updates: 0, wall: 0, ...v }; }
+    catch { return { samples: 0, updates: 0, wall: 0 }; }
+  }
+  let win = $state(loadWin());
+  function setWin(v) {
+    const n = Math.max(0, Number(v) || 0);
+    win = { ...win, [xMode]: n };
+    try { localStorage.setItem(WIN_KEY, JSON.stringify(win)); } catch {}
+  }
+  const xRange = $derived.by(() => {
+    const W = (win[xMode] || 0) * WIN_UNIT[xMode].mult;
+    if (!W || !x.length) return null;
+    const hi = x[x.length - 1];
+    return [Math.max(x[0], hi - W), hi];
+  });
+
   // "T seconds ago": the record's own epoch stamp when it has one, else
   // the run's t_last from the index (log mtime)
   const lastT = $derived(last?.t ?? run?.t_last ?? null);
@@ -77,6 +100,12 @@
       <button class:on={xMode === m.key} onclick={() => (xMode = m.key)}>{m.label}</button>
     {/each}
   </span>
+  <label class="win" title="pin the x axis to the most recent window; 0 = whole run. Remembered per x mode. A manual drag-zoom also survives refreshes now.">
+    window: last
+    <input type="number" min="0" step="any" value={win[xMode]} onchange={(e) => setWin(e.target.value)} />
+    {WIN_UNIT[xMode].label}
+    <button class:on={!win[xMode]} onclick={() => setWin(0)}>all</button>
+  </label>
   <label class="auto"><input type="checkbox" bind:checked={auto} /> auto-refresh 30 s</label>
   <button onclick={refresh} disabled={refreshing}>{refreshing ? "…" : "refresh now"}</button>
 </div>
@@ -102,7 +131,7 @@
   <div class="grid">
     {#each panels as p (p.id)}
       <div class="cell">
-        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} />
+        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} />
       </div>
     {/each}
   </div>
@@ -116,6 +145,7 @@
   .status b { color: var(--fg); }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 10px; }
   .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
-  .xmode button.on { background: var(--accent); color: #fff; }
+  .xmode button.on, .win button.on { background: var(--accent); color: #fff; }
+  .win input { width: 6em; }
   select { max-width: 52vw; }
 </style>
