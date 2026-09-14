@@ -95,13 +95,9 @@ def test_cuda_handle_does_not_cut_but_blade_does():
     env.set_state(torch.tensor([q36] * 2, dtype=torch.float64),
                   torch.tensor([v35] * 2, dtype=torch.float64))
     act = torch.zeros((2, N_JOINTS), dtype=torch.long)
-    cut = [False, False]
     for _ in range(TICKS):
-        _o, _r, _d, ev = env.step(act)
-        for e in range(2):
-            for item in (ev[e] if ev is not None else []):
-                kind = item[0] if isinstance(item, (list, tuple)) else item.get("kind", 0)
-                code = item[1] if isinstance(item, (list, tuple)) else item.get("code", 0)
-                if kind == 0 and code in (0, 1, 2):
-                    cut[e] = True
+        env.step(act)
+    # per-env cut counters (good + bad), the same readout the parity gate
+    # uses against sim.good_cuts / bad_cuts
+    cut = [int(env.good[e]) + int(env.bad[e]) > 0 for e in range(2)]
     assert cut == [False, True], f"CUDA handle/blade cut pattern {cut}"
