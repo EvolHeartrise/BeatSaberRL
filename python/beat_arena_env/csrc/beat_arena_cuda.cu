@@ -1504,8 +1504,10 @@ constexpr double GOOD_Z_SHIFT = -0.25;
 constexpr double BAD_HALF = 0.175;
 constexpr double BOMB_RADIUS = 0.18;
 constexpr double SABER_LEN = 1.0;
+// env v42 hilt grip: blade spans [HANDLE_LEN, HANDLE_LEN + SABER_LEN] from the wrist
+constexpr double HANDLE_LEN = 0.16;
 constexpr int N_BLADE_SAMPLES = 8;
-constexpr double REACH_PAST_SHOULDER = 0.65 + 1.0 + 0.75;
+constexpr double REACH_PAST_SHOULDER = 0.65 + HANDLE_LEN + 1.0 + 0.75;
 constexpr double PRE_FULL = 1.7453292519943295;
 constexpr double POST_FULL = 1.0471975511965976;
 constexpr double PTS_PRE = 70.0;
@@ -5447,12 +5449,16 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
   const T time_new = T(P.tick[e] + 1) * T(DT);
 
-  // both sabers' swept surfaces this tick
-  T t0s[2][3], t1s[2][3];
+  // both sabers' swept surfaces this tick: blade BASE (wrist + HANDLE_LEN
+  // * dir, env v42 hilt grip) to tip (wrist + (HANDLE_LEN + SABER_LEN) *
+  // dir); the handle does not cut
+  T b0s[2][3], b1s[2][3], t0s[2][3], t1s[2][3];
   for (int h = 0; h < 2; h++)
     for (int k = 0; k < 3; k++) {
-      t0s[h][k] = prev_w[h][k] + T(SABER_LEN) * prev_d[h][k];
-      t1s[h][k] = new_w[h][k] + T(SABER_LEN) * new_d[h][k];
+      b0s[h][k] = prev_w[h][k] + T(HANDLE_LEN) * prev_d[h][k];
+      b1s[h][k] = new_w[h][k] + T(HANDLE_LEN) * new_d[h][k];
+      t0s[h][k] = prev_w[h][k] + T(HANDLE_LEN + SABER_LEN) * prev_d[h][k];
+      t1s[h][k] = new_w[h][k] + T(HANDLE_LEN + SABER_LEN) * new_d[h][k];
     }
 
   // live gates (SPEC-v10 §4)
@@ -5523,7 +5529,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 
     if (bomb) {
       for (int h = 0; h < 2; h++) {
-        if (sweep_dist(prev_w[h], t0s[h], t1s[h], new_w[h], center)
+        if (sweep_dist(b0s[h], t0s[h], t1s[h], b1s[h], center)
             <= T(BOMB_RADIUS)) {
           P.status[e * C + i] = 2;
           P.bombs[e] += 1;
@@ -5548,13 +5554,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
                      center[1] + T(GOOD_Z_SHIFT) * frame[2][1],
                      center[2] + T(GOOD_Z_SHIFT) * frame[2][2]};
     const T good_h[3] = {T(GOOD_HALF_X), P.p_good_hy[cb], T(GOOD_HALF_Z)};
-    if (sweep_hits_box(prev_w[m], t0s[m], t1s[m], new_w[m], gc, good_h,
+    if (sweep_hits_box(b0s[m], t0s[m], t1s[m], b1s[m], gc, good_h,
                        frame)) {
       // contact point: closest-passing blade sample; strict < like Rust
       T d_seg = std::numeric_limits<T>::infinity();
       T s_star = T(0);
       for (int jj = 1; jj <= N_BLADE_SAMPLES; jj++) {
-        const T rr = (T(jj) / T(N_BLADE_SAMPLES)) * T(SABER_LEN);
+        const T rr = T(HANDLE_LEN) + (T(jj) / T(N_BLADE_SAMPLES)) * T(SABER_LEN);
         T p0[3], p1[3];
         for (int k = 0; k < 3; k++) {
           p0[k] = prev_w[m][k] + rr * prev_d[m][k];
@@ -5574,8 +5580,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       // cut-plane accuracy (2026-07-29 rule)
       T tip_move[3], cw[3], pn[3];
       for (int k = 0; k < 3; k++) {
-        tip_move[k] = new_w[m][k] + T(SABER_LEN) * new_d[m][k]
-                      - prev_w[m][k] - T(SABER_LEN) * prev_d[m][k];
+        tip_move[k] = new_w[m][k] + T(HANDLE_LEN + SABER_LEN) * new_d[m][k]
+                      - prev_w[m][k] - T(HANDLE_LEN + SABER_LEN) * prev_d[m][k];
         cw[k] = center[k] - new_w[m][k];
       }
       cross3(new_d[m], tip_move, pn);
@@ -5646,8 +5652,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       }
     } else {
       const T bad_h[3] = {T(BAD_HALF), P.p_bad_hy[cb], T(BAD_HALF)};
-      if (sweep_hits_box(prev_w[1 - m], t0s[1 - m], t1s[1 - m],
-                         new_w[1 - m], center, bad_h, frame)) {
+      if (sweep_hits_box(b0s[1 - m], t0s[1 - m], t1s[1 - m],
+                         b1s[1 - m], center, bad_h, frame)) {
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
         reward += T(REWARD_BAD);

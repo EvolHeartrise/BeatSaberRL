@@ -12,7 +12,7 @@ import {
   gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
   noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
   headQuats, quatNlerp, rotQuatScene, smoothQuats,
-  saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
+  baseOf, handleLen, reachZ, saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
   trackOffsetOfFK, viewerTrackOffset,
 } from "../src/lib/replay.js";
 
@@ -194,6 +194,11 @@ for (let k = 0; k < last; k += 7) {
   for (const s of [0, 1]) {
     const sab = saberAt(rep, k, 0.5, s);
     const tip = tipOf(sab);
+    // env v42 hilt grip: tipOf/baseOf take the handle length; the blade
+    // segment is [h, h + SABER_LEN] along the unit dir from the hand
+    const tipH = tipOf(sab, 0.16), baseH = baseOf(sab, 0.16);
+    assert.ok(Math.abs(Math.hypot(tipH[0] - sab[0], tipH[1] - sab[1], tipH[2] - sab[2]) - 1.16) < 1e-9, `v42 tip 1.16 m from the hand at ${k}`);
+    assert.ok(Math.abs(Math.hypot(baseH[0] - sab[0], baseH[1] - sab[1], baseH[2] - sab[2]) - 0.16) < 1e-9, `v42 base 0.16 m from the hand at ${k}`);
     assert.ok([...sab, ...tip, tipSpeed(rep, k, s)].every(Number.isFinite),
       `NaN in saber math at tick ${k}`);
     assert.ok(Math.abs(Math.hypot(sab[3], sab[4], sab[5]) - 1) < 1e-9,
@@ -619,3 +624,10 @@ assert.throws(
   /version v9/);
 
 console.log("replay.js smoke test OK");
+
+// env v42: recordings without config.handle_len render as before (0);
+// the reach datum follows the handle
+assert.strictEqual(handleLen(rep), rep.config?.handle_len ?? 0, "handleLen reads the header");
+assert.ok(Math.abs(reachZ({ config: { handle_len: 0.16 } }) - 1.91) < 1e-9, "reach 1.91 on v42");
+assert.ok(Math.abs(reachZ({ config: {} }) - 1.75) < 1e-9, "reach 1.75 pre-v42");
+console.log("replay.js v42 handle test OK");

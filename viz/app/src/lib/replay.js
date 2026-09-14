@@ -45,6 +45,13 @@ export const Z_FAR = 12.0;
 // env v10: REACH/miss are LIVE-POSE gates in the sim; the viewer keeps
 // the reference-pose planes (1.75 / -0.65) for the static scenery only
 export const SABER_LEN = 1.0, REACH_Z = 1.75, Z_MISS = 0.65;
+// env v42 "hilt grip" (2026-09-14): the blade base sits handle_len in
+// front of the hand along the blade dir (0.16 m on v42 recordings, the
+// header's config.handle_len); pre-v42 recordings carry no field = 0,
+// so they render exactly as before. The reference reach plane moves by
+// the same amount.
+export const handleLen = (rep) => rep?.config?.handle_len ?? 0;
+export const reachZ = (rep) => REACH_Z + handleLen(rep);
 // env v15: the reference body plane the head-anchored track is measured
 // from (head z at the reference pose). Z_MISS === -PLANE_Z0.
 export const PLANE_Z0 = -0.65;
@@ -666,13 +673,18 @@ export function saberAt(rep, tickIdx, u, s) {
   return out;
 }
 
-/** Blade tip in WORLD coords [x, y, z] from a 6-field saber. */
-export function tipOf(sab) {
+/** Blade tip in WORLD coords [x, y, z] from a 6-field saber; `h` = the
+ * handle length (env v42: the blade runs [h, h + SABER_LEN] from the hand). */
+export function tipOf(sab, h = 0) {
   return [
-    sab[0] + SABER_LEN * sab[3],
-    sab[1] + SABER_LEN * sab[4],
-    sab[2] + SABER_LEN * sab[5],
+    sab[0] + (h + SABER_LEN) * sab[3],
+    sab[1] + (h + SABER_LEN) * sab[4],
+    sab[2] + (h + SABER_LEN) * sab[5],
   ];
+}
+/** Blade BASE in WORLD coords: the hand for pre-v42, hand + h * dir since. */
+export function baseOf(sab, h = 0) {
+  return [sab[0] + h * sab[3], sab[1] + h * sab[4], sab[2] + h * sab[5]];
 }
 
 const _dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -704,7 +716,8 @@ export function cutPlaneLocal(rep, noteIdx) {
   const [cx, cy] = noteCenter(n);
   const center = [cx, cy, zCut];
   // contact fraction: closest point of the tick-k blade line to center
-  const s = Math.min(Math.max(_dot(_sub(center, cw), cd), 0), SABER_LEN);
+  const h = handleLen(rep); // v42: the cutting segment is [h, h + SABER_LEN]
+  const s = Math.min(Math.max(_dot(_sub(center, cw), cd), h), h + SABER_LEN);
   const p1 = [0, 1, 2].map((i) => cw[i] + s * cd[i]);
   const p0 = [0, 1, 2].map((i) => pw[i] + s * pd[i]);
   const sweep = _sub(p1, p0);
@@ -730,8 +743,9 @@ export function cutPlaneLocal(rep, noteIdx) {
 export function tipSpeed(rep, tickIdx, s) {
   const k = Math.min(tickIdx, rep.ticks.length - 1);
   const k0 = Math.max(0, k - 1);
-  const t1 = tipOf(rep.ticks[k].sabers[s]);
-  const t0 = tipOf(rep.ticks[k0].sabers[s]);
+  const h = handleLen(rep);
+  const t1 = tipOf(rep.ticks[k].sabers[s], h);
+  const t0 = tipOf(rep.ticks[k0].sabers[s], h);
   if (k === k0) return 0;
   return Math.hypot(t1[0] - t0[0], t1[1] - t0[1], t1[2] - t0[2]) / DT;
 }

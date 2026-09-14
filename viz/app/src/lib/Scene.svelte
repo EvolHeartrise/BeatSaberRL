@@ -10,7 +10,7 @@
   import { gfx, pb, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
   import { followClock } from "./sync.js";
   import {
-    BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z,
+    BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, reachZ,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
     frameQuatScene, headQuats, noteFrame, poseQ36, qAt, quatNlerp,
     rotQuatScene, smoothQuats, viewerTrackOffset,
@@ -138,7 +138,8 @@
   // blade-reach region: reference-pose miss plane (z = -0.65) to
   // reference max reach (z = 1.75) — the sim's live gates move with the
   // pose; these lines are the static scenery datum
-  const reachGeo = segs([...rect(REACH_Z), ...rect(-Z_MISS)]);
+  // (env v42: the reach datum moves out by the recording's handle length)
+  const reachGeo = $derived(segs([...rect(reachZ(pb.rep)), ...rect(-Z_MISS)]));
 
   // ---- the player platform (replaces the old floor plane) -----------------
   // ScoreSaber watch, Previewer.unity "Player/PlayerPlatform" — the same

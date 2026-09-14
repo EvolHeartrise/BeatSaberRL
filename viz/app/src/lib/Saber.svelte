@@ -10,7 +10,8 @@
   import * as THREE from "three";
   import { pb, pose } from "./state.svelte.js";
   import {
-    DT, SABER_DARK, SABER_LEN, V_MIN, fkSaber, saberAt, tipOf, tipSpeed,
+    DT, SABER_DARK, SABER_LEN, V_MIN, baseOf, fkSaber, handleLen, saberAt,
+    tipOf, tipSpeed,
   } from "./replay.js";
   import { NOTE_COLORS, modelGeo, noteColors } from "./models.js";
   import { OUTLINE_SABER, RAMP } from "./toon.js";
@@ -23,7 +24,11 @@
   const tickIdx = $derived(pb.rep
     ? Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1) : 0);
   const sab = $derived(fkSaber(fk, s)); // [w(3), blade(3)] from body FK
-  const tip = $derived(tipOf(sab)); // world coords
+  // env v42 hilt grip: the blade base is `hl` in front of the hand along
+  // the blade dir (0 on pre-v42 recordings, from the header config)
+  const hl = $derived(handleLen(pb.rep));
+  const base = $derived(baseOf(sab, hl)); // world coords
+  const tip = $derived(tipOf(sab, hl)); // world coords
   const capable = $derived(
     !pose.on && !!pb.rep && tipSpeed(pb.rep, tickIdx, s) >= V_MIN);
 
@@ -38,7 +43,7 @@
              len: dir.length() };
   }
 
-  const blade = $derived(seg([sab[0], sab[1], sab[2]], tip));
+  const blade = $derived(seg(base, tip));
 
   // the saber model: blade along scene -z from the grip, handle behind it.
   // Orientation = the rotation taking local -z onto the blade direction
@@ -143,13 +148,14 @@
       const t = t0 + (cur - t0) * (i / SEGS);
       const k = Math.min(Math.floor(t), pb.rep.ticks.length - 1);
       const sa = saberAt(pb.rep, k, t - k, s);
-      const tp = tipOf(sa);
+      const tp = tipOf(sa, hl);
+      const bp = baseOf(sa, hl); // blade base (v42: hl past the grip)
       tipPath[i * 3] = tp[0];
       tipPath[i * 3 + 1] = tp[1];
       tipPath[i * 3 + 2] = -tp[2];
-      innPath[i * 3] = sa[0]; // blade base = the grip / hand frame origin
-      innPath[i * 3 + 1] = sa[1];
-      innPath[i * 3 + 2] = -sa[2];
+      innPath[i * 3] = bp[0];
+      innPath[i * 3 + 1] = bp[1];
+      innPath[i * 3 + 2] = -bp[2];
     }
     smoothPath(tipPath);
     smoothPath(innPath);
@@ -196,9 +202,12 @@
   <T.LineBasicMaterial vertexColors transparent depthWrite={false} />
 </T.LineSegments>
 
-<!-- the saber model at the grip: blade (SaberBlade.mat = saber colour,
-     fresnel glow) + handle (SaberHandle.mat, dark) -->
-<T.Group position={[sab[0], sab[1], -sab[2]]} quaternion={saberQuat}>
+<!-- the saber model: blade (SaberBlade.mat = saber colour, fresnel glow)
+     + handle (SaberHandle.mat, dark). The model's blade starts at its
+     origin with the handle behind it, so the group sits at the blade BASE:
+     the grip for pre-v42 recordings, hl in front of the hand on v42 (the
+     handle's bottom then lands on the hand, per the user's spec) -->
+<T.Group position={[base[0], base[1], -base[2]]} quaternion={saberQuat}>
   <T.Mesh geometry={bladeGeo} material={OUTLINE_SABER} />
   <T.Mesh geometry={bladeGeo}>
     <T.MeshToonMaterial

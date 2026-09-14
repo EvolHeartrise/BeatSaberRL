@@ -64,6 +64,14 @@ BAD_HALF_Y_LINK = 0.05
 BOMB_RADIUS = 0.18
 
 SABER_LEN = 1.0       # m (real Beat Saber); blade = hand frame +z
+# env v42 (2026-09-14, user-directed) "hilt grip": the hand holds the
+# HANDLE, not the blade's base. The 0.16 m handle (the real Saber.fbx
+# "Handle", viz/app models.js) spans [0, HANDLE_LEN] along the hand
+# frame +z from the wrist origin; the cutting blade spans
+# [HANDLE_LEN, HANDLE_LEN + SABER_LEN]. The handle does not cut. Obs
+# (wrist pos + blade dir) and actions unchanged; every pre-v42
+# checkpoint plays a different game on this geometry.
+HANDLE_LEN = 0.16
 
 # --- v10 body (SPEC-v10 §1; mirror of rust/src/dynamics/model.rs) ------------
 N_JOINTS = 29          # actuated DoF = action heads (was 14 = 2×7 in v9)
@@ -185,8 +193,8 @@ N_BLADE_SAMPLES = 8   # contact-point/velocity samples along the blade
 #   reach_z(t) = max_hand(shoulder_z(t)) + REACH_PAST_SHOULDER
 #   miss when note z < head_z(t)
 # reproducing v9's REACH_Z 1.75 and -Z_MISS -0.65 at the reference pose.
-REACH_PAST_SHOULDER = 0.65 + 1.0 + 0.75
-REACH_Z0 = SHOULDER0[0][2] + REACH_PAST_SHOULDER    # 1.75 at reference
+REACH_PAST_SHOULDER = 0.65 + HANDLE_LEN + 1.0 + 0.75   # v42: + the handle
+REACH_Z0 = SHOULDER0[0][2] + REACH_PAST_SHOULDER    # 1.91 at reference (1.75 pre-v42)
 Z_MISS0 = -HEAD0[2]                                 # 0.65 at reference
 
 # --- scoring (real Beat Saber 115 points per note) ---------------------------
