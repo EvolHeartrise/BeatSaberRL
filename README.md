@@ -105,6 +105,16 @@ wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
 tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
 automatically (exact resume); `--optimizer adam` forces the old path.
 
+**`--note-geo` (2026-09-14, research/2026-09-14-architecture-brainstorm.md #1):**
+hand-relative geometry lanes on the note tokens — per (hand, note) the
+wrist→note offset in metres, its length, seconds to the head plane, and
+the swing-direction · cut-direction and blade · cut-direction dots (14
+lanes, wall rows masked), computed inside the policy from lanes the obs
+already carries and appended to the 18 note lanes before `note_mlp`
+(+2,688 params). Obs/env untouched; the `note_geo` arch marker is stamped
+so bench/replay rebuild it; pre-flag checkpoints load unchanged. First
+probe: v42_hilt_geo (with env v42) on the winning recipe.
+
 **Architecture: embed 192 / trunk 384 is the default since 2026-09-13**
 (2,414,930 params, 1.90M actor + 0.52M critic; was 128/256 = 1.09M).
 The v40_w192 probe (from scratch under Muon, lr 5.7e-4 = 7e-4·√(128/192),

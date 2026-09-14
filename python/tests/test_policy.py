@@ -115,3 +115,75 @@ def test_vec_matches_single():
     assert vec.counters(0) == (single.good_cuts, single.bad_cuts,
                                single.misses, single.n_notes, single.score,
                                single.bombs_hit)
+
+
+# --- hand-relative note geometry lanes (2026-09-14, --note-geo) ----------
+
+def test_note_geo_normalizers_pinned():
+    """policy._note_geo de-normalizes obs lanes with its own copies of the
+    sim's normalizers; pin them to constants.py so an obs change cannot
+    silently skew the geometry."""
+    import policy as P
+    from beat_arena_env import constants as C
+    assert P._Z_SCALE == C.Z_SCALE and P._V_NORM == C.V_NORM
+    if hasattr(C, "Y_NORM"):
+        assert P._Y_NORM == C.Y_NORM
+    if hasattr(C, "X_NORM"):
+        assert P._X_NORM == C.X_NORM
+    # hand block lanes inside the 32-lane saber token: q(8)+qd(7) then
+    # [wrist pos(3), wrist vel(3), blade(3), meter, post_rem]
+    assert (P._S_WPOS, P._S_WVEL, P._S_BLADE) == (15, 18, 21)
+    assert P._SABER_L_IDX[15:26] == tuple(range(C.OFF_HAND_L, C.OFF_HAND_L + 11))
+    assert P.NOTE_GEO_FEAT == 14
+
+
+def test_note_geo_lanes_geometry():
+    """A hand-crafted obs: left wrist at (0.2, -0.3, -0.5) head-relative
+    x/y and world z, moving +x at 3 m/s with the blade along +y; note slot
+    0 at head-relative (0.5, 0.15), world z 4.0, speed 16 m/s, cut
+    direction (cos, sin) = (1, 0). The 14 lanes must be the metre-space
+    offset/2, |dp|/2, z/speed, and the two direction dots."""
+    import policy as P
+    from beat_arena_env import constants as C
+    obs = torch.zeros(1, OBS_DIM)
+    hl = C.OFF_HAND_L
+    obs[0, hl:hl + 3] = torch.tensor([0.2, -0.3 / 0.75, -0.5])
+    obs[0, hl + 3:hl + 6] = torch.tensor([3.0 / C.V_NORM, 0.0, 0.0])
+    obs[0, hl + 6:hl + 9] = torch.tensor([0.0, 1.0, 0.0])
+    n0 = OFF_NOTES
+    obs[0, n0:n0 + 4] = torch.tensor([0.5, 0.15 / 0.75, 4.0 / C.Z_SCALE,
+                                      -16.0 / C.Z_SCALE])
+    obs[0, n0 + 6], obs[0, n0 + 7] = 1.0, 0.0
+    obs[0, OFF_NOTE_MASK] = 1.0
+    pol = NotePolicy(note_geo=True)
+    sabers, body, notes, mask = pol._split(obs)
+    geo = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT))
+    assert geo.shape == (1, N_NOTE_SLOTS, P.NOTE_GEO_FEAT)
+    g = geo[0, 0]
+    dp = torch.tensor([0.5 - 0.2, 0.15 - (-0.3), 4.0 - (-0.5)]) * 0.5
+    assert torch.allclose(g[0:3], dp, atol=1e-5)
+    assert abs(g[3] - dp.norm()) < 1e-5
+    assert abs(g[4] - 4.0 / 16.0) < 1e-5              # seconds to plane
+    assert abs(g[5] - 3.0 / (3.0 + 0.05)) < 1e-5      # vhat.cutd, +x vs (1,0)
+    assert abs(g[6]) < 1e-6                            # blade +y . (1,0) = 0
+    # right hand sits at the origin with zero velocity: its dots are ~0
+    assert abs(g[7 + 5]) < 1e-6
+    # wall rows have no cut direction: dots masked to 0
+    obs[0, n0 + 14] = 1.0
+    sabers, body, notes, mask = pol._split(obs)
+    g2 = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT))[0, 0]
+    assert g2[5] == 0 and g2[6] == 0 and torch.allclose(g2[0:3], dp, atol=1e-5)
+
+
+def test_note_geo_forward_and_arch_marker():
+    torch.manual_seed(0)
+    pol = NotePolicy(note_geo=True)
+    assert pol.arch["note_geo"] is True
+    assert pol.note_mlp[0].in_features == NOTE_FEAT + 14
+    obs = _obs_batch()
+    logits, value = pol(obs)
+    assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]
+    assert torch.isfinite(value).all()
+    # the default model is untouched
+    assert NotePolicy().note_mlp[0].in_features == NOTE_FEAT
+    assert NotePolicy().arch["note_geo"] is False

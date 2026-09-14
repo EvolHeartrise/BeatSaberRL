@@ -167,6 +167,58 @@ _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(_BPV + 6, _BPV + 18)))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
+
+# --- hand-relative note geometry (2026-09-14, research/2026-09-14-
+# architecture-brainstorm.md #1; user order) ---------------------------
+# Per (hand, note) pair, computed from lanes the obs ALREADY carries and
+# appended to the 18 note lanes before note_mlp, so the wrist->note
+# relation is an input instead of something attention has to assemble:
+#   dp (3)   wrist->note offset in METRES / 2  (x, y are both head-relative
+#            in the obs since env v38 — same frame, same normalizers; z
+#            is world z on both sides)
+#   |dp| (1) / 2
+#   t_plane (1)  note z / speed = seconds until the note reaches the head
+#            plane, clipped to [-0.5, 3], / 1.0
+#   v.d (1)  unit wrist-velocity . required cut direction (cos_a, sin_a, 0)
+#   b.d (1)  blade direction . required cut direction
+# = 7 per hand -> 14 lanes; the dot lanes are masked to 0 on wall rows
+# (walls have no cut direction). Obs, env, kernel untouched; only
+# note_mlp.0.weight widens (18 -> 32 input columns).
+NOTE_GEO_FEAT = 14
+# obs normalizers, pinned against beat_arena_env.constants in
+# tests/test_policy.py (the obs is written by the Rust/CUDA sims)
+_X_NORM, _Y_NORM, _Z_SCALE, _V_NORM = 1.0, 0.75, 8.0, 6.0
+# saber_feat lane order: q(8) qd(7) then the 11-lane hand block
+# [wrist pos(3), wrist vel(3), blade dir(3), meter, post_rem]
+_S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
+
+
+def _note_geo(notes: torch.Tensor, sabers: torch.Tensor) -> torch.Tensor:
+    """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
+    (B, 24, 14) geometry lanes (fp32; the caller casts with the notes)."""
+    npos = torch.stack([notes[..., 0] * _X_NORM, notes[..., 1] * _Y_NORM,
+                        notes[..., 2] * _Z_SCALE], -1)          # (B,24,3) m
+    cutd = torch.stack([notes[..., 6], notes[..., 7],
+                        torch.zeros_like(notes[..., 6])], -1)   # (B,24,3)
+    not_wall = 1.0 - notes[..., 14:15]                          # (B,24,1)
+    # seconds to the head plane: z / speed with speed = -lane3 * Z_SCALE
+    speed = (-notes[..., 3:4] * _Z_SCALE).clamp_min(1e-3)
+    tpl = (notes[..., 2:3] * _Z_SCALE / speed).clamp(-0.5, 3.0)
+    feats = []
+    for hnd in range(2):
+        w = sabers[:, hnd]                                       # (B,32)
+        wpos = torch.stack([w[:, _S_WPOS] * _X_NORM,
+                            w[:, _S_WPOS + 1] * _Y_NORM,
+                            w[:, _S_WPOS + 2]], -1)              # (B,3) m
+        dp = (npos - wpos[:, None]) * 0.5                        # (B,24,3)
+        dist = dp.norm(dim=-1, keepdim=True)
+        v = w[:, _S_WVEL:_S_WVEL + 3] * _V_NORM                  # (B,3) m/s
+        vhat = v / (v.norm(dim=-1, keepdim=True) + 0.05)
+        vdot = (vhat[:, None] * cutd).sum(-1, keepdim=True) * not_wall
+        bdot = (w[:, _S_BLADE:_S_BLADE + 3][:, None] * cutd).sum(
+            -1, keepdim=True) * not_wall
+        feats += [dp, dist, tpl, vdot, bdot]
+    return torch.cat(feats, -1)
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —
 # spine 3, arm_l 7, arm_r 7, leg_l 6, leg_r 6); K = n_gears options
 # per head (env v8 gear tables). This module constant is the K=3
@@ -365,7 +417,7 @@ class NotePolicy(nn.Module):
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
-                 critic: str = "adapool_v1"):
+                 critic: str = "adapool_v1", note_geo: bool = False):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
@@ -384,8 +436,11 @@ class NotePolicy(nn.Module):
                      "n_blocks": n_blocks, "n_heads": n_heads,
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
                      "ffn_mult": ffn_mult, "critic": critic,
-                     "n_action_heads": N_ACTION_HEADS, "body_token": True}
-        self.note_mlp = _mlp([NOTE_FEAT, embed, embed])
+                     "n_action_heads": N_ACTION_HEADS, "body_token": True,
+                     "note_geo": bool(note_geo)}
+        self.note_geo = bool(note_geo)
+        self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
+                              embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
         # is_right]; the body token gets its own encoder
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
@@ -499,10 +554,15 @@ class NotePolicy(nn.Module):
                                "critic was never critic_join()ed")
         fp16 = self.fp16 and obs.is_cuda
         sabers, body, notes, note_mask = self._split(obs)
+        B = obs.shape[0]
+        if self.note_geo:
+            # fp32 geometry from the fp32 obs slices, then one cast+copy
+            notes = torch.cat(
+                [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT))],
+                dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
         emb = _seq(self.note_mlp, notes)                             # (B, 16, 64)
-        B = obs.shape[0]
         dt = torch.float16 if fp16 else obs.dtype
         # hand-id one-hot is a constant: cached per (device, dtype)
         # instead of a fresh eye() alloc every forward (2026-07-28)
@@ -878,6 +938,8 @@ def load_policy(ckpt) -> NotePolicy:
         n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
         # pre-2026-08-19 checkpoints carry no critic marker: they are
         # the Linear(trunk,1) era, still loadable for bench/replay
-        critic=arch.get("critic", "linear_v0"))
+        critic=arch.get("critic", "linear_v0"),
+        # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
+        note_geo=arch.get("note_geo", False))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
