@@ -124,9 +124,17 @@ together on the winning recipe) matched the old trunk on training accuracy
 (0.9442 vs 0.9466) but benched 2,174,065 upp vs the old geometry's
 2,353,043 (−7.6%, concentrated on 2–8★ maps: falls on a few easy full-length
 maps and a ~0.5-pt/cut drop in the 15-pt accuracy component); the two
-changes were not separated. The user's call: keep both, the changes have
-not fully proven themselves yet. New reference numbers on the new game:
-trunk 0.9442, cd300 leaf 0.9642, bench 2,174,065 upp / 15,719 wpp.
+changes were not separated. The user's call: keep both. The v43 energy
+price then recovered all of it and more: `v43_energy` (same game + the
+torque price, 2026-09-14) trunk 0.9489, cd300 leaf 0.9685 (final-50) /
+0.9692 last, bench **2,405,918 upp / 17,099 wpp** — +10.7% vs v42_hilt_geo
+(+0.5 pt accuracy per level, uniform across difficulty) and +2.2% vs the
+old geometry's 2,353,043, the first run to beat it. Those are the
+reference numbers now. Posture moved the way the user hoped, partly:
+knees 47°/43° (was 49–55°), head +2 cm, spine activation −60%; arm
+activation +38% (the arms are nearly free per N·m). Open: how much of the
+gain is the energy model vs. "arms became free" (control: fraction price
+with the arms exempt). Watch: 8 hard-map early falls per bench (acc<0.5).
 
 **`--note-geo` (2026-09-14, research/2026-09-14-architecture-brainstorm.md #1; DEFAULT ON, `--no-note-geo` opts out):**
 hand-relative geometry lanes on the note tokens — per (hand, note) the
