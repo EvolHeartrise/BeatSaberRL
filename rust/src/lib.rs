@@ -3378,11 +3378,12 @@ mod env_tests {
     }
 
     /// Live gates at the reference pose reproduce the v9 constants:
-    /// reach 1.75, miss boundary −0.65 (SPEC-v10 §4).
+    /// reach 1.75 + the env v42 handle (0.16) = 1.91, miss boundary −0.65
+    /// (SPEC-v10 §4).
     #[test]
     fn live_gates_reference_values() {
         let body = Body::new(false);
-        assert!((body.reach_z() - 1.75).abs() < 1e-12);
+        assert!((body.reach_z() - (1.75 + HANDLE_LEN)).abs() < 1e-12);
         assert!((body.head[2] - (-0.65)).abs() < 1e-12);
     }
 }
