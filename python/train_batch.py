@@ -524,6 +524,16 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
+    p.add_argument("--note-geo", action="store_true",
+                   help="hand-relative geometry lanes on the note tokens "
+                        "(2026-09-14, research/2026-09-14-architecture-"
+                        "brainstorm.md #1): per (hand, note) the wrist->"
+                        "note offset, distance, seconds-to-plane and the "
+                        "swing/blade . cut-direction dots (14 lanes) are "
+                        "computed from the obs inside the policy and "
+                        "appended to the 18 note lanes before note_mlp. "
+                        "Obs/env untouched; arch marker 'note_geo' is "
+                        "stamped so bench/replay tools rebuild it")
     # env config (generator v2 dials, SPEC.md §Chart generation)
     # --colors REMOVED (2026-07-26, user decision): the right-only
     # default silently trained gen3's 5B run one-handed (49.9% of
@@ -1045,7 +1055,8 @@ def main():
                 n_blocks=policy.arch["n_blocks"],
                 n_heads=policy.arch["n_heads"],
                 n_gears=policy.arch["n_gears"],
-                ffn_mult=policy.arch["ffn_mult"], critic="adapool_v1")
+                ffn_mult=policy.arch["ffn_mult"], critic="adapool_v1",
+                note_geo=policy.arch.get("note_geo", False))
             missing, unexpected = fresh.load_state_dict(
                 policy.state_dict(), strict=False)
             assert (all(k.startswith("critic_") for k in missing)
@@ -1059,7 +1070,8 @@ def main():
     else:
         policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
-                            n_gears=args.gears, ffn_mult=args.ffn_mult)
+                            n_gears=args.gears, ffn_mult=args.ffn_mult,
+                            note_geo=args.note_geo)
     policy.critic_detach = args.critic_detach
     if args.critic_detach:
         print("--critic-detach: value-loss gradients stop at the "
