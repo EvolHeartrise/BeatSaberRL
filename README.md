@@ -105,7 +105,17 @@ wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
 tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
 automatically (exact resume); `--optimizer adam` forces the old path.
 
-**`--note-geo` (2026-09-14, research/2026-09-14-architecture-brainstorm.md #1):**
+**Recipe since 2026-09-14 (user decision): env v42 hilt grip + `--note-geo`
+are part of the default recipe.** Their first probe (v42_hilt_geo, both
+together on the winning recipe) matched the old trunk on training accuracy
+(0.9442 vs 0.9466) but benched 2,174,065 upp vs the old geometry's
+2,353,043 (−7.6%, concentrated on 2–8★ maps: falls on a few easy full-length
+maps and a ~0.5-pt/cut drop in the 15-pt accuracy component); the two
+changes were not separated. The user's call: keep both, the changes have
+not fully proven themselves yet. New reference numbers on the new game:
+trunk 0.9442, cd300 leaf 0.9642, bench 2,174,065 upp / 15,719 wpp.
+
+**`--note-geo` (2026-09-14, research/2026-09-14-architecture-brainstorm.md #1; DEFAULT ON, `--no-note-geo` opts out):**
 hand-relative geometry lanes on the note tokens — per (hand, note) the
 wrist→note offset in metres, its length, seconds to the head plane, and
 the swing-direction · cut-direction and blade · cut-direction dots (14
