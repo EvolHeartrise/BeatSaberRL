@@ -105,6 +105,10 @@ const BAD_HALF_Y_LINK: f64 = 0.05;
 const BOMB_RADIUS: f64 = 0.18;
 
 const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
+// env v42 "hilt grip" (2026-09-14, user-directed): the hand holds the
+// 0.16 m handle; the cutting blade spans [HANDLE_LEN, HANDLE_LEN +
+// SABER_LEN] along the blade dir from the wrist. The handle does not cut.
+const HANDLE_LEN: f64 = 0.16;
 
 // env v8 gears: action id -> signed torque fraction of tau_max (v10:
 // the gear scales TORQUE, SPEC-v10 §4). Id 0 = coast, 1/2 = +/-full at
@@ -125,10 +129,11 @@ fn gear_signed(gears: u8) -> [f64; 7] {
 
 const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
 // live broad-phase reach gate (SPEC-v10 §4): note_z <=
-// max_hand(shoulder_z(t)) + 0.65 + 1.0 + 0.75 — the arm span past the
-// shoulder (0.65) + blade (1.0) + good-box near-face reach (0.75).
-// At the reference pose (shoulder_z = -0.65) this is v9's REACH_Z 1.75.
-const REACH_PAST_SHOULDER: f64 = 0.65 + 1.0 + 0.75;
+// max_hand(shoulder_z(t)) + 0.65 + 0.16 + 1.0 + 0.75 — the arm span past
+// the shoulder (0.65) + handle (0.16, v42) + blade (1.0) + good-box
+// near-face reach (0.75). At the reference pose (shoulder_z = -0.65)
+// this is 1.91 (v9's REACH_Z 1.75 before the v42 handle).
+const REACH_PAST_SHOULDER: f64 = 0.65 + HANDLE_LEN + 1.0 + 0.75;
 // miss boundary: note consumed as missed past the LIVE head plane
 // z < head_z(t) (v9's -Z_MISS = -0.65 at the reference pose). The
 // episode tail must cover the slowest object's trip from the hit plane
@@ -530,25 +535,38 @@ fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
     (px * px + py * py + pz * pz).sqrt()
 }
 
-/// The swept blade surface over one tick: quad (w0->t0) to (w1->t1),
-/// split into triangles (w0, t0, t1) and (w0, t1, w1).
+/// The swept blade surface over one tick: quad (b0->t0) to (b1->t1),
+/// split into triangles (b0, t0, t1) and (b0, t1, b1), where b = the
+/// blade BASE (wrist + HANDLE_LEN * dir, env v42) and t = the tip
+/// (wrist + (HANDLE_LEN + SABER_LEN) * dir). The handle [wrist, b) is
+/// not part of the surface: it does not cut.
 fn sweep_tris(
     w0: [f64; 3],
     d0: [f64; 3],
     w1: [f64; 3],
     d1: [f64; 3],
 ) -> [[[f64; 3]; 3]; 2] {
+    let b0 = [
+        w0[0] + HANDLE_LEN * d0[0],
+        w0[1] + HANDLE_LEN * d0[1],
+        w0[2] + HANDLE_LEN * d0[2],
+    ];
+    let b1 = [
+        w1[0] + HANDLE_LEN * d1[0],
+        w1[1] + HANDLE_LEN * d1[1],
+        w1[2] + HANDLE_LEN * d1[2],
+    ];
     let t0 = [
-        w0[0] + SABER_LEN * d0[0],
-        w0[1] + SABER_LEN * d0[1],
-        w0[2] + SABER_LEN * d0[2],
+        w0[0] + (HANDLE_LEN + SABER_LEN) * d0[0],
+        w0[1] + (HANDLE_LEN + SABER_LEN) * d0[1],
+        w0[2] + (HANDLE_LEN + SABER_LEN) * d0[2],
     ];
     let t1 = [
-        w1[0] + SABER_LEN * d1[0],
-        w1[1] + SABER_LEN * d1[1],
-        w1[2] + SABER_LEN * d1[2],
+        w1[0] + (HANDLE_LEN + SABER_LEN) * d1[0],
+        w1[1] + (HANDLE_LEN + SABER_LEN) * d1[1],
+        w1[2] + (HANDLE_LEN + SABER_LEN) * d1[2],
     ];
-    [[w0, t0, t1], [w0, t1, w1]]
+    [[b0, t0, t1], [b0, t1, b1]]
 }
 
 // Env v7.4: hitboxes ROTATE with the object about the approach (z)
@@ -1820,7 +1838,8 @@ impl Core {
                 let mut d_seg = f64::INFINITY;
                 let mut s_star = 0.0;
                 for j in 1..=N_BLADE_SAMPLES {
-                    let r = (j as f64 / N_BLADE_SAMPLES as f64) * SABER_LEN;
+                    // env v42: samples along the BLADE, [HANDLE_LEN, HANDLE_LEN + SABER_LEN]
+                    let r = HANDLE_LEN + (j as f64 / N_BLADE_SAMPLES as f64) * SABER_LEN;
                     let p0 = [
                         prev_pos[m][0] + r * prev_dir[m][0],
                         prev_pos[m][1] + r * prev_dir[m][1],
@@ -1850,12 +1869,12 @@ impl Core {
                 // plane (blade dir x tip movement; stab fallback = blade
                 // line) — the 2026-07-29 cut-plane rule, unchanged
                 let tip_move = [
-                    wrist_m[0] + SABER_LEN * blade_m[0]
-                        - prev_pos[m][0] - SABER_LEN * prev_dir[m][0],
-                    wrist_m[1] + SABER_LEN * blade_m[1]
-                        - prev_pos[m][1] - SABER_LEN * prev_dir[m][1],
-                    wrist_m[2] + SABER_LEN * blade_m[2]
-                        - prev_pos[m][2] - SABER_LEN * prev_dir[m][2],
+                    wrist_m[0] + (HANDLE_LEN + SABER_LEN) * blade_m[0]
+                        - prev_pos[m][0] - (HANDLE_LEN + SABER_LEN) * prev_dir[m][0],
+                    wrist_m[1] + (HANDLE_LEN + SABER_LEN) * blade_m[1]
+                        - prev_pos[m][1] - (HANDLE_LEN + SABER_LEN) * prev_dir[m][1],
+                    wrist_m[2] + (HANDLE_LEN + SABER_LEN) * blade_m[2]
+                        - prev_pos[m][2] - (HANDLE_LEN + SABER_LEN) * prev_dir[m][2],
                 ];
                 let cw = [
                     center[0] - wrist_m[0],

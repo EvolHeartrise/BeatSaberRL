@@ -11,7 +11,7 @@
   import {
     BAD_COL, BLOCK, BOMB_RADIUS, DT, FADE_S, HALF, HB,
     KIND_BOMB, KIND_CHAIN_HEAD, KIND_CHAIN_LINK, LINK_D, LINK_H, LINK_W,
-    MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs,
+    MISS_COL, REACH_Z, Z_FAR, Z_MISS, activeArcs, reachZ,
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, landedPost,
     noteCenter,
     noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
@@ -200,7 +200,7 @@
     };
   }
 
-  const inReach = (z) => z <= REACH_Z && z >= -Z_MISS;
+  const inReach = (z) => z <= reachZ(pb.rep) && z >= -Z_MISS; // v42: + handle
   const fade = (z) => Math.min(1, (Z_FAR - z) / 2);
 
   // arc hint tube: y-aligned cylinder -> segment between two world points

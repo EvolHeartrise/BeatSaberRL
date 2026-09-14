@@ -69,6 +69,16 @@ witness through P4/P5 and was REMOVED 2026-08-03 (surface-area
 reduction — every physics change had been landing tri-tier); Rust is
 the reference and `tests/test_v10_parity_cuda.py` is the live gate.
 
+Env v42 (2026-09-14, user-directed): **hilt grip**. The hand now holds
+the saber's 0.16 m handle (the real Saber.fbx "Handle" the viewer draws)
+instead of the blade's base: the cutting blade spans 0.16–1.16 m along
+the blade axis from the wrist, the handle 0–0.16 m does not cut, and the
+reach gate grows by the same 0.16 m (1.91 m at the reference pose). Obs,
+actions, checkpoints and the replay format are unchanged (recordings
+carry `config.handle_len` so the viewer places the saber correctly for
+both eras). Every pre-v42 checkpoint plays a different game on this
+geometry — their bench numbers are not comparable; retrain.
+
 ## Quick start
 
 Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.

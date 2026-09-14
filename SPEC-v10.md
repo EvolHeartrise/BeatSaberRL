@@ -105,7 +105,20 @@ the shoulder and wrist clusters** — both are normative:
   `R_wrist = R_z(roll) · R_y(dev) · R_x(−bend)` — axes (0,0,1) roll,
   (0,1,0) dev, (−1,0,0) bend. Blade = hand-frame +z unit vector
   = `M_f · R_z(ψ)·R_y(v)·R_x(−φ) · e_z` — v9 verbatim. Wrist world position
-  = hand frame origin. Blade tip = wrist + 1.0·blade.
+  = hand frame origin. **Env v42 (2026-09-14, user-directed) "hilt
+  grip":** the hand holds the 0.16 m handle (`HANDLE_LEN`, the real
+  Saber.fbx "Handle"), so the cutting blade spans
+  `[HANDLE_LEN, HANDLE_LEN + SABER_LEN]` = [0.16, 1.16] m along `blade`
+  from the wrist: blade base = wrist + 0.16·blade, tip = wrist +
+  1.16·blade; the handle [0, 0.16) does not cut (swept surface, contact
+  samples, cut-plane tip motion and the bomb sweep all start at the
+  base). The broad-phase reach gate grows by the same 0.16 m
+  (`REACH_PAST_SHOULDER` = 0.65 + 0.16 + 1.0 + 0.75; 1.91 at the
+  reference pose, 1.75 before v42). Obs (wrist + blade dir), actions,
+  checkpoints and the replay format are unchanged; the replay header's
+  `config.handle_len` (0.16; absent on pre-v42 recordings) tells the
+  viewer where to draw the saber. Pre-v42 checkpoints play a different
+  game on this geometry. (Pre-v42: blade tip = wrist + 1.0·blade.)
 - **Hip** (pelvis→thigh, anchor (±0.10,0,0)): stacking order
   pitch→yaw→roll = actuated order.
   `R_hip = R_x(−pitch) · R_y(yaw) · R_z(roll)` — axes (−1,0,0), (0,1,0),

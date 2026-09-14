@@ -20,7 +20,7 @@ import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
-from .constants import (
+from .constants import (HANDLE_LEN, 
     EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
 )
 
@@ -122,6 +122,9 @@ class RustBeatEnv(gym.Env):
                 "dot_prob": self.cfg.dot_prob,
                 "bomb_prob": self.cfg.bomb_prob,
                 "gears": self.gears,       # env v8 action-table size
+                # env v42 hilt grip: blade base sits HANDLE_LEN in front
+                # of the wrist along the blade dir; absent = 0 (pre-v42)
+                "handle_len": HANDLE_LEN,
             },
             # explicit world positions (meters), object kinds and arc
             # grants; the viewer derives everything from these
