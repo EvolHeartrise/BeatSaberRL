@@ -129,7 +129,7 @@
       <h3>small multiples — {loaded.length} run{loaded.length === 1 ? "" : "s"}</h3>
       <div class="grid">
         {#each smalls as p (p.key)}
-          <div class="cell"><Chart title={label(p.key)} datasets={p.datasets} {xLabel} log={p.key === "kl_last_pos" || p.key === "falls_per_1m_pos"} height={200} syncKey={"cmp-" + xMode} /></div>
+          <div class="cell"><Chart title={label(p.key)} datasets={p.datasets} {xLabel} log={p.key === "kl_last_pos" || p.key === "falls_per_1m_pos" || p.key === "tilts_per_1m_pos"} height={200} syncKey={"cmp-" + xMode} /></div>
         {/each}
       </div>
 
