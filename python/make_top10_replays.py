@@ -18,6 +18,8 @@ in rank order regardless of completion order.
 """
 
 import argparse
+import numpy as np
+import math
 import json
 import multiprocessing
 import os
@@ -41,15 +43,34 @@ def slug(s, n=24):
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:n].lower() or "song"
 
 
-_W = {}          # per-process state: {"policy", "dev", "fc"} (set by _worker_init)
+_W = {}          # per-process state: {"policy", "dev", "fc", "push"} (set by _worker_init)
 
 
-def _worker_init(ckpt_path, device, foot_contact=False):
+def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0)):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
     _W["fc"] = foot_contact
+    _W["push"] = push
+
+
+def _kick(env, rng, vmax):
+    """env v18 perturbation replayed on the Rust sim (2026-09-14, user
+    request: 'the winning checkpoint with the random pushes turned on'):
+    the CUDA trainer's per-tick horizontal root-velocity kick, |dv| ~
+    U(0, vmax) m/s, direction uniform in the x-z plane. The Rust sim has
+    no push path, so the kick goes through the tooling hook set_joints
+    (which also zeroes the finite-difference wrist/body-point velocities
+    for one tick — a one-tick obs artifact, not a physics change)."""
+    q = list(env.sim.qpos())
+    v = list(env.sim.twist()) + list(env.sim.omega())
+    mag = rng.random() * vmax
+    ang = rng.random() * 2.0 * math.pi
+    v[0] += mag * math.cos(ang)
+    v[2] += mag * math.sin(ang)
+    env.sim.set_joints(q, v)
+    return mag
 
 
 def _make_one(job):
@@ -67,8 +88,15 @@ def _make_one(job):
     env.set_record(base + ".jsonl")
     obs, _ = env.reset()
     walk = scoresaber.ComboTracker()
+    push_prob, push_vmax, push_seed = _W.get("push", (0.0, 0.0, 0))
+    rng = np.random.default_rng(push_seed + rank)
+    n_push, tick = 0, 0
     done = False
     while not done:
+        if push_prob > 0.0 and rng.random() < push_prob:
+            _kick(env, rng, push_vmax)
+            n_push += 1
+        tick += 1
         with torch.no_grad():
             logits, _ = policy(
                 torch.as_tensor(obs, dtype=torch.float32,
@@ -103,7 +131,10 @@ def _make_one(job):
     line = (f"[{rank:2}/{n_top}] {entry['pp']:6.1f}pp "
             f"{entry['stars']:5.2f}* acc {entry['accuracy']:.3f} "
             f"{'FC ' if entry['full_combo'] else ''}"
-            f"{entry['song'][:34]!r} -> {base}.dat OK")
+            f"{entry['song'][:34]!r} -> {base}.dat OK"
+            + (f"  [pushes: {n_push} in {tick} ticks, replay score "
+               f"{round(walk.score)} vs bench {entry['score']}]"
+               if push_prob > 0.0 else ""))
     return base, line, warn
 
 
@@ -131,6 +162,14 @@ def main():
                    help="env v11 contact physics — MUST match how the "
                         "checkpoint was trained (a v12+/contact ckpt "
                         "replayed under welds is a different game)")
+    p.add_argument("--push-prob", type=float, default=0.0,
+                   help="replay the env v18 perturbation: per-tick "
+                        "probability of a horizontal root-velocity kick "
+                        "(training default 0.00333; 0 = off). The bench "
+                        "verification is skipped-as-warning when > 0")
+    p.add_argument("--push-vmax", type=float, default=0.15,
+                   help="max kick magnitude m/s (training default 0.15)")
+    p.add_argument("--push-seed", type=int, default=0)
     p.add_argument("--device", type=str, default=None,
                    help="forward device (default: cuda if available). "
                         "Matching the bench's device maximizes exact "
@@ -161,14 +200,17 @@ def main():
                                  mp_context=ctx,
                                  initializer=_worker_init,
                                  initargs=(args.ckpt, device,
-                                           args.foot_contact)) as ex:
+                                           args.foot_contact,
+                                           (args.push_prob, args.push_vmax,
+                                            args.push_seed))) as ex:
             for base, line, warn in ex.map(_make_one, jobs):
                 if warn:
                     print(warn, flush=True)
                 print(line, flush=True)
                 made.append(base)
     else:
-        _worker_init(args.ckpt, device, args.foot_contact)
+        _worker_init(args.ckpt, device, args.foot_contact,
+                     (args.push_prob, args.push_vmax, args.push_seed))
         for job in jobs:
             base, line, warn = _make_one(job)
             if warn:
