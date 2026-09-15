@@ -262,20 +262,21 @@ _OBS_BLOCKS = (
     # finite difference across the tick, /V_NORM; zero at reset and
     # after a set_state refresh. Foot world velocity is the slip signal.
     ("body_pt_vel", 18),
-    # env v44 (user order 2026-09-14): per-hand PREVIOUS-NOTE block —
-    # the most recently RESOLVED scoreable note attributed to the hand
-    # (cut good/bad -> the cutting hand; miss -> the note's colour;
-    # bombs/walls never). Live note lanes minus z/vz/walls in the same
-    # head-relative frame + normalizers, plus bookkeeping:
-    #  0 x_rel, 1 y_rel, 2 is_left, 3 is_right, 4 dir_cos, 5 dir_sin,
-    #  6 is_chain_head, 7 is_chain_link, 8 free_pre, 9 free_post,
-    #  10 t_since = min(ticks since resolution, 90)/90, 11 cut_good,
-    #  12 missed, 13 valid. All-zero until the hand's first resolution.
-    ("prev_l", 14),
-    ("prev_r", 14),
+    # env v45 (user order 2026-09-15; replaces the same-day v44 block):
+    # per-hand PREVIOUS-NOTE block — for hand s, the most recently
+    # RESOLVED scoreable note OF THAT HAND'S COLOUR (colour 0 -> L,
+    # 1 -> R) regardless of which saber resolved it and regardless of
+    # outcome (good / bad / wrong-hand cut / miss all record on the
+    # note's colour; bombs and walls never). Lanes, head-relative
+    # frame + entity normalizers, x/y against the LIVE head each tick:
+    #  0 x_rel, 1 y_rel, 2 dir_cos, 3 dir_sin (zero on dot notes,
+    #  tangent on chain links), 4 valid. All-zero until a note of that
+    #  colour has resolved. Purpose (user): parity control, wind-up
+    #  positioning, holding the saber at the right spot through gaps.
+    ("prev_l", 5),
+    ("prev_r", 5),
 )
-PREV_FEAT = 14
-PREV_T_CLIP_TICKS = 90   # 3 s at 30 Hz
+PREV_FEAT = 5
 OBS_OFF = {}
 _off = 0
 for _name, _len in _OBS_BLOCKS:
@@ -297,9 +298,9 @@ OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 534 (env v19)
 OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 558 (env v19)
 OFF_BODY_PTS = OBS_OFF["body_pts"]      # 562 (env v19)
 OFF_BODY_PT_VEL = OBS_OFF["body_pt_vel"]  # 580 (env v24)
-OFF_PREV_L = OBS_OFF["prev_l"]          # 598 (env v44)
-OFF_PREV_R = OBS_OFF["prev_r"]          # 612 (env v44)
-assert OBS_DIM == 626, "spec §12 (env v44 prev-note blocks): OBS_DIM must be 626"
+OFF_PREV_L = OBS_OFF["prev_l"]          # 598 (env v45)
+OFF_PREV_R = OBS_OFF["prev_r"]          # 603 (env v45)
+assert OBS_DIM == 608, "spec §12 (env v45 prev-note blocks): OBS_DIM must be 608"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

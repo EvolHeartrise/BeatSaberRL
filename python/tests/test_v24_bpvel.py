@@ -46,7 +46,7 @@ def _pos_raw(obs):
 def test_obs_dim_and_reset_zero():
     env = _env()
     obs = env.reset()
-    assert obs.shape[1] == OBS_DIM == 626
+    assert obs.shape[1] == OBS_DIM == 608
     assert _vel_lanes(obs).abs().max().item() == 0.0
 
 
