@@ -118,6 +118,24 @@ calibrated so the bill matches the old one at the 2026-09-14 leaves'
 trainer's `[torque]` line, and a dashboard panel; the activation
 telemetry stays. Both sims + parity gate.
 
+Env v44 (2026-09-14, user-directed): **per-hand previous-note obs block**.
+The user's hypothesis: a hand that can see the note it just resolved
+flails less in the idle stretches between its notes. Two 14-lane blocks
+appended to the obs (598..611 left hand, 612..625 right; OBS_DIM 598 →
+626, every earlier offset unchanged), each describing the most recently
+RESOLVED scoreable note attributed to that hand — a cut (good or bad)
+attributes to the hand that cut it, a miss to the hand of the note's
+colour, bombs and walls never. Lanes: the live note lanes minus z/vz
+(head-relative x/y recomputed against the live head each tick, is_left /
+is_right, cut-direction cos/sin — zero on dot notes, tangent on chain
+links — is_chain_head, is_chain_link, free_pre, free_post) plus
+t_since = min(ticks since resolution, 90)/90, cut_good, missed (bad cut
+= both 0) and valid (the block is all-zero until the hand's first
+resolution). The policy routes each block into its saber token
+(SABER_FEAT 32 → 46). Default-on, no flag; rewards and dynamics are
+byte-identical to v43. Checkpoints before v44 are refused by
+`load_policy` (obs 598). Both sims + parity gate; tests/test_v44_prev_note.py.
+
 **Recipe since 2026-09-14 (user decision): env v42 hilt grip + `--note-geo`
 are part of the default recipe, and since env v43 so is `--energy-coef 7.5e-6` in place of `--iso-coef 5e-4`.** Their first probe (v42_hilt_geo, both
 together on the winning recipe) matched the old trunk on training accuracy

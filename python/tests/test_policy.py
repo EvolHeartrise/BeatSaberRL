@@ -64,7 +64,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 598   # env v24: body-point velocity lanes
+    assert OBS_DIM == 626   # env v44: prev-note blocks
     assert N_ACTION_HEADS == N_JOINTS == 29
 
 

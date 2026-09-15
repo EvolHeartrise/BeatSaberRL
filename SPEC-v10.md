@@ -499,6 +499,39 @@ hand's q/q̇ slices + derived block + hand one-hot, the ONE body token from
 root block + spine/leg q/q̇ + head + contact bits; 29 action heads via the
 fused (trunk → 29·K + 1) GEMM.
 
+### 5.1 Later obs blocks (appended, offsets are a contract)
+
+The v10 table above is the 340-lane core. Later envs APPEND blocks (the
+block table lives in `constants.py::_OBS_BLOCKS`; every engine derives
+its offsets from it): env v12 ground-contact lanes (4), v13 body points
+(18), v17/v18 the 24×18 entity window + mask, v19 the follow-through
+lane in each hand block, v24 body-point velocities (18) → OBS_DIM 598.
+
+**Env v44 (2026-09-14) — per-hand previous-note blocks, OBS_DIM 626.**
+Two 14-lane blocks at 598 (left hand) and 612 (right hand), each the
+most recently RESOLVED scoreable note attributed to that hand:
+
+| lane | content |
+|---|---|
+| 0, 1 | (x − head_x)/1, (y − head_y)/0.75 — the note's world position against the LIVE head, the entity-lane rule (v38) |
+| 2, 3 | is_left, is_right (the note's colour) |
+| 4, 5 | dir_cos, dir_sin — zero on dot notes, Bézier tangent on chain links (the entity `show_dir` rule) |
+| 6, 7 | is_chain_head, is_chain_link |
+| 8, 9 | free_pre, free_post |
+| 10 | t_since = min(ticks since resolution, 90)/90 — 0 on the obs of the resolving step, 1.0 at 3 s or more (integer tick arithmetic, bitwise on both engines) |
+| 11 | cut_good (1 = scored) |
+| 12 | missed (1 = passed the miss boundary); a bad cut / wrong-hand cut reads 0 on both 11 and 12 |
+| 13 | valid — 1 once any note has resolved for that hand; the whole block is 0 before |
+
+Attribution: a good or bad cut → the hand that cut it (the wrong-hand
+box attributes to the OTHER hand); a miss → the hand of the note's
+colour; bombs (hit or passed) and walls never update it. Within one
+tick the judge loop walks chart order, so a hand's record is the
+latest-hit_time note resolved for it that tick. Reset with the episode.
+State per hand: chart index, the obs tick of resolution (tick + 1 at
+judgment), outcome. Observation-only: rewards, dynamics and the replay
+record are unchanged.
+
 ## 6. Replay v10 (JSONL)
 
 Header line: `{"header": {"version": "v10", "record_rev": 2,

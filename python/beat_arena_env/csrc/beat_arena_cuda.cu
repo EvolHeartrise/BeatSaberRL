@@ -971,8 +971,17 @@ constexpr int OFF_BODY_PTS = OFF_GROUND_IMP + N_GROUND_IMP_LANES;    // 562
 constexpr int N_BODY_PTS = 6;
 // env v24: world velocities of the §8 points (lib.rs mirror)
 constexpr int OFF_BODY_PT_VEL = OFF_BODY_PTS + 3 * N_BODY_PTS;       // 580
-constexpr int OBS_DIM = OFF_BODY_PT_VEL + 3 * N_BODY_PTS;            // 598
-static_assert(OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598");
+// env v44 (2026-09-14, user order): per-hand PREVIOUS-NOTE blocks
+// appended after the v24 block (lib.rs OFF_PREV_L comment = the lane
+// contract: x_rel, y_rel, is_left, is_right, dir_cos, dir_sin,
+// is_chain_head, is_chain_link, free_pre, free_post, t_since,
+// cut_good, missed, valid).
+constexpr int PREV_FEAT = 14;
+constexpr int PREV_T_CLIP_TICKS = 90;  // 3 s at 30 Hz
+constexpr int OFF_PREV_L = OFF_BODY_PT_VEL + 3 * N_BODY_PTS;          // 598
+constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 612
+constexpr int OBS_DIM = OFF_PREV_R + PREV_FEAT;                       // 626
+static_assert(OBS_DIM == 626, "spec §12 (env v44 prev-note blocks): OBS_DIM must be 626");
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
@@ -4515,6 +4524,12 @@ struct Sim {
   int* __restrict__ tick;
   uint8_t* __restrict__ status;
   int* __restrict__ first_pending;
+  // env v44 per-hand previous-note record [(e,L),(e,R)]: chart index,
+  // obs tick of resolution (= tick+1 at judgment), outcome 0 none /
+  // 1 good / 2 bad (incl. wrong-hand) / 3 miss (lib.rs prev_* mirror)
+  int* __restrict__ prev_idx;
+  int* __restrict__ prev_tick;
+  uint8_t* __restrict__ prev_out;
   // R12 warp-coherence permutation: thread gid serves env env_order[gid]
   // (identity unless the host sorts it — see cuda_env.step). A bijection
   // on the thread->env assignment only; all P.*[e] addressing unchanged.
@@ -4877,6 +4892,11 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.score_acc[e] = T(0);
   P.score_post[e] = T(0);
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
+  for (int s = 0; s < 2; s++) {  // env v44
+    P.prev_idx[e * 2 + s] = 0;
+    P.prev_tick[e * 2 + s] = 0;
+    P.prev_out[e * 2 + s] = 0;
+  }
   // env v17 wall state
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
@@ -5168,6 +5188,37 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     for (int k = 0; k < 3; k++)
       obs[base + k] = (float)(
           P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3 + k] / T(V_NORM));
+  }
+  // env v44: per-hand previous-note blocks — lib.rs write_obs loop
+  // transcribed (zero until the hand's first resolution; x/y against
+  // the LIVE head; t_since in integer ticks for bitwise agreement)
+  {
+    const int pbases[2] = {OFF_PREV_L, OFF_PREV_R};
+    for (int s = 0; s < 2; s++) {
+      const int ps = e * 2 + s;
+      if (P.prev_out[ps] == 0) continue;
+      const int base = pbases[s];
+      const int64_t cb = nb + P.prev_idx[ps];
+      obs[base] = (float)((P.p_center[cb * 2] - P.head[e * 3]) / T(X_NORM));
+      obs[base + 1] = (float)((P.p_center[cb * 2 + 1] - P.head[e * 3 + 1])
+                              / T(Y_NORM));
+      obs[base + 2 + (P.p_is_right[cb] ? 1 : 0)] = 1.f;
+      if (P.p_show_dir[cb]) {
+        obs[base + 4] = (float)P.p_dvec[cb * 2];
+        obs[base + 5] = (float)P.p_dvec[cb * 2 + 1];
+      }
+      obs[base + 6] = P.p_is_head[cb] ? 1.f : 0.f;
+      obs[base + 7] = P.p_is_link[cb] ? 1.f : 0.f;
+      obs[base + 8] = P.p_free_pre[cb] ? 1.f : 0.f;
+      obs[base + 9] = P.p_free_post[cb] ? 1.f : 0.f;
+      int since = P.tick[e] - P.prev_tick[ps];
+      if (since < 0) since = 0;
+      if (since > PREV_T_CLIP_TICKS) since = PREV_T_CLIP_TICKS;
+      obs[base + 10] = (float)since / (float)PREV_T_CLIP_TICKS;
+      obs[base + 11] = (P.prev_out[ps] == 1) ? 1.f : 0.f;
+      obs[base + 12] = (P.prev_out[ps] == 3) ? 1.f : 0.f;
+      obs[base + 13] = 1.f;
+    }
   }
 }
 
@@ -5541,6 +5592,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.status[e * C + i] = 3;
         P.miss[e] += 1;
         reward += T(REWARD_MISS);
+        // env v44: a miss attributes to the note's colour
+        const int h = P.p_is_right[cb] ? 1 : 0;
+        P.prev_idx[e * 2 + h] = i;
+        P.prev_tick[e * 2 + h] = P.tick[e] + 1;
+        P.prev_out[e * 2 + h] = 3;
       }
       continue;
     }
@@ -5625,6 +5681,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         const T cosv = -vly / tmax(v2, T(1e-9));
         code = cosv >= T(COS_TOL) ? 0 : 2;
       }
+      // env v44: the matching hand cut it (good or bad)
+      P.prev_idx[e * 2 + m] = i;
+      P.prev_tick[e * 2 + m] = P.tick[e] + 1;
+      P.prev_out[e * 2 + m] = (code == 0) ? 1 : 2;
       if (code == 0) {
         P.status[e * C + i] = 1;
         P.good[e] += 1;
@@ -5677,6 +5737,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
         reward += T(REWARD_BAD);
+        // env v44: attributed to the hand that cut it
+        P.prev_idx[e * 2 + (1 - m)] = i;
+        P.prev_tick[e * 2 + (1 - m)] = P.tick[e] + 1;
+        P.prev_out[e * 2 + (1 - m)] = 2;
       }
     }
   }
@@ -5909,6 +5973,7 @@ enum {
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
   TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
+  TPREVIDX, TPREVTICK, TPREVOUT, // env v44 prev-note record (N, 2) — 2026-09-14
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -5996,6 +6061,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.sc_stat = ts[TSCSTAT].data_ptr<scalar_t>();
     P.act_stat = ts[TACTSTAT].data_ptr<scalar_t>();
     P.tau_stat = ts[TTAUSTAT].data_ptr<scalar_t>();
+    P.prev_idx = ts[TPREVIDX].data_ptr<int>();
+    P.prev_tick = ts[TPREVTICK].data_ptr<int>();
+    P.prev_out = ts[TPREVOUT].data_ptr<uint8_t>();
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

@@ -277,7 +277,29 @@ const N_BODY_PTS: usize = 6;
 // to ask of the network — and foot world velocity is exactly the slip
 // signal (same legibility lesson as the v19 post_rem lane).
 const OFF_BODY_PT_VEL: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 580
-const OBS_DIM: usize = OFF_BODY_PT_VEL + 3 * N_BODY_PTS; // 598 (env v24)
+// env v44 (user order 2026-09-14): per-hand PREVIOUS-NOTE block — the
+// most recently RESOLVED scoreable note attributed to each hand (a cut,
+// good or bad, attributes to the hand that cut it; a miss to the hand
+// of the note's colour; bombs and walls never update it). The live
+// note lanes minus z/vz/walls, in the SAME head-relative frame and
+// normalizers as the entity block (x/y recomputed from the note's
+// world position against the LIVE head each tick), plus bookkeeping:
+//   0 x_rel, 1 y_rel, 2 is_left, 3 is_right, 4 dir_cos, 5 dir_sin
+//   (zero on dot notes, tangent on chain links — the entity rule),
+//   6 is_chain_head, 7 is_chain_link, 8 free_pre, 9 free_post,
+//   10 t_since = min(ticks since resolution, 90)/90 (0 on the tick
+//   the note resolved; 1.0 = 3 s or more), 11 cut_good, 12 missed
+//   (bad cut / wrong-hand = both 0), 13 valid (1 once any note has
+//   resolved for that hand; the whole block is 0 before).
+// APPENDED after the v24 block so every earlier offset is unchanged:
+// L block at 598, R block at 612. Within a tick, later chart indices
+// overwrite earlier ones (the judge loop walks chart order), so the
+// record is the latest-hit_time note resolved for that hand.
+const PREV_FEAT: usize = 14;
+const PREV_T_CLIP_TICKS: u32 = 90; // 3 s at 30 Hz
+const OFF_PREV_L: usize = OFF_BODY_PT_VEL + 3 * N_BODY_PTS; // 598
+const OFF_PREV_R: usize = OFF_PREV_L + PREV_FEAT; // 612
+const OBS_DIM: usize = OFF_PREV_R + PREV_FEAT; // 626 (env v44)
 // §8 body-point frames + their obs y-centering (shared by the position
 // lanes, the velocity finite-diff and the foot reward terms' docs)
 const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
@@ -285,7 +307,7 @@ const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
     (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
     (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
 ];
-const _: () = assert!(OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598");
+const _: () = assert!(OBS_DIM == 626, "spec §12 (env v44 prev-note blocks): OBS_DIM must be 626");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
@@ -1078,6 +1100,13 @@ struct Core {
     body: Body,
     trackers: [Vec<Tracker>; 2],
     status: Vec<u8>, // 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed
+    // env v44 per-hand previous-note record (see OFF_PREV_L): chart
+    // index, the obs tick it resolved on (= tick + 1 at judgment, so
+    // the resolving step's own obs reads t_since 0), outcome 0 none /
+    // 1 good / 2 bad (incl. wrong-hand) / 3 miss.
+    prev_idx: [u32; 2],
+    prev_tick: [u32; 2],
+    prev_out: [u8; 2],
     good_cuts: u32,
     bad_cuts: u32,
     misses: u32,
@@ -1225,6 +1254,9 @@ impl Core {
             body: Body::new(foot_contact),
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
+            prev_idx: [0, 0],
+            prev_tick: [0, 0],
+            prev_out: [0, 0],
             good_cuts: 0,
             bad_cuts: 0,
             misses: 0,
@@ -1335,6 +1367,9 @@ impl Core {
         self.body.reset();
         self.trackers = [Vec::new(), Vec::new()];
         self.status = vec![0; self.chart.len()];
+        self.prev_idx = [0, 0];
+        self.prev_tick = [0, 0];
+        self.prev_out = [0, 0];
         self.wall_passed = vec![false; self.walls.len()];
         self.first_wall = 0;
         self.walls_in = 0;
@@ -1611,6 +1646,37 @@ impl Core {
                     (self.body.body_pt_vel[i][k] / V_NORM) as f32;
             }
         }
+        // env v44: per-hand previous-note blocks (lane list at
+        // OFF_PREV_L). Zero until a note has resolved for the hand.
+        // x/y are recomputed against the LIVE head (entity-lane rule);
+        // t_since is integer tick arithmetic so both engines agree
+        // bitwise. The CUDA write_obs transcribes this loop.
+        for (s, base) in [(0usize, OFF_PREV_L), (1usize, OFF_PREV_R)] {
+            if self.prev_out[s] == 0 {
+                continue;
+            }
+            let n = &self.chart[self.prev_idx[s] as usize];
+            obs[base] = ((n.x - self.body.head[0]) / X_NORM) as f32;
+            obs[base + 1] = ((n.y - self.body.head[1]) / Y_NORM) as f32;
+            obs[base + 2 + n.color as usize] = 1.0;
+            let show_dir = !n.any_dir || n.kind == KIND_CHAIN_LINK;
+            if show_dir {
+                obs[base + 4] = n.cos_a as f32;
+                obs[base + 5] = n.sin_a as f32;
+            }
+            obs[base + 6] = (n.kind == KIND_CHAIN_HEAD) as u8 as f32;
+            obs[base + 7] = (n.kind == KIND_CHAIN_LINK) as u8 as f32;
+            obs[base + 8] = n.free_pre as u8 as f32;
+            obs[base + 9] = n.free_post as u8 as f32;
+            let since = self
+                .tick
+                .saturating_sub(self.prev_tick[s])
+                .min(PREV_T_CLIP_TICKS);
+            obs[base + 10] = since as f32 / PREV_T_CLIP_TICKS as f32;
+            obs[base + 11] = (self.prev_out[s] == 1) as u8 as f32;
+            obs[base + 12] = (self.prev_out[s] == 3) as u8 as f32;
+            obs[base + 13] = 1.0;
+        }
     }
 
     fn build_obs(&self) -> [f32; OBS_DIM] {
@@ -1819,6 +1885,11 @@ impl Core {
                     self.misses += 1;
                     reward += REWARD_MISS;
                     self.events_buf.push((i as u32, 4, 0.0, 0.0, 0.0));
+                    // env v44: a miss attributes to the note's colour
+                    let h = n.color as usize;
+                    self.prev_idx[h] = i as u32;
+                    self.prev_tick[h] = self.tick + 1;
+                    self.prev_out[h] = 3;
                 }
                 continue;
             }
@@ -1941,6 +2012,10 @@ impl Core {
                     let cosv = -vly / v2_mag.max(1e-9);
                     if cosv >= COS_TOL { 0 } else { 2 } // ok / angle
                 };
+                // env v44: the matching hand cut it (good or bad)
+                self.prev_idx[m] = i as u32;
+                self.prev_tick[m] = self.tick + 1;
+                self.prev_out[m] = if code == 0 { 1 } else { 2 };
                 if code == 0 {
                     self.status[i] = 1;
                     self.good_cuts += 1;
@@ -2000,6 +2075,10 @@ impl Core {
                     self.bad_cuts += 1;
                     reward += REWARD_BAD;
                     self.events_buf.push((i as u32, 3, 0.0, 0.0, 0.0)); // wrong_hand
+                    // env v44: attributed to the hand that cut it
+                    self.prev_idx[1 - m] = i as u32;
+                    self.prev_tick[1 - m] = self.tick + 1;
+                    self.prev_out[1 - m] = 2;
                 }
             }
         }
@@ -2393,6 +2472,16 @@ impl RawBeatSim {
     /// 4 bomb passed clean.
     fn status(&self) -> Vec<u8> {
         self.core.status.clone()
+    }
+
+    /// env v44 introspection: per hand [L, R] the previous-note record
+    /// (chart index, obs tick of resolution, outcome 0 none / 1 good /
+    /// 2 bad / 3 miss).
+    fn prev_note(&self) -> [(u32, u32, u8); 2] {
+        [
+            (self.core.prev_idx[0], self.core.prev_tick[0], self.core.prev_out[0]),
+            (self.core.prev_idx[1], self.core.prev_tick[1], self.core.prev_out[1]),
+        ]
     }
 
     /// TEST/TOOLING HOOK (env v10): overwrite the FULL generalized
