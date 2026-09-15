@@ -365,6 +365,24 @@ Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
 q36 export. Non-"v10" replays are rejected — re-record from a current
 checkpoint.
 
+Since 2026-09-14 a map card sits in the TOP-LEFT corner of the render area
+(`viz/app/src/lib/MapCard.svelte`, a DOM overlay over the canvas like the
+pose panel — so it is NOT captured by `export video`): cover art, song name,
+sub name, "by <song author> · mapped by <mapper>", the difficulty as a badge
+and a link to the map on BeatSaver. `m` (or the 💿 button) toggles it; the
+choice is remembered in localStorage and it defaults ON. A replay header only
+carries `map = {hash, difficulty, song, audio_offset_s}`, so everything else
+is looked up once per hash from the same BeatSaver API the song audio uses
+(`GET api.beatsaver.com/maps/hash/<hash>`, cached in memory and in
+localStorage under `beat-arena.mapmeta.v1`, and the request is debounced and
+stale-guarded so clicking through replays cannot show one map's metadata over
+another's). Offline — or for a hash BeatSaver does not have — the card shows
+what the header knows (song, difficulty badge, hash prefix) under a muted
+"metadata unavailable"; a replay with no `map` at all draws no card. The
+local map cache (`python/maps/scoresaber/<hash>/`) is NOT a fallback: it has
+no cover art, and the viewer is a single `file://` page that cannot read the
+repo without a server.
+
 Since 2026-09-09 the whole scene is cel shaded (`viz/app/src/lib/toon.js`):
 every solid is a `MeshToonMaterial` on one shared three-band ramp and is
 drawn twice — once as an inverted-hull ink outline, once banded — over a
