@@ -152,9 +152,11 @@
 <style>
   /* container passes pointer events through; the panel itself is live */
   #pose {
-    position: absolute; top: 64px; left: 12px; z-index: 3;
+    /* --panel-top is set by App.svelte: the map card owns the very
+       top-left corner when it is showing, so start below it */
+    position: absolute; top: var(--panel-top, 64px); left: 12px; z-index: 3;
     pointer-events: none;
-    max-height: calc(100vh - 220px);
+    max-height: calc(100vh - var(--panel-top, 64px) - 156px);
   }
   .pp {
     pointer-events: auto;

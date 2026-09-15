@@ -3,8 +3,10 @@
   import { NoToneMapping } from "three";
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
+  import MapCard from "./lib/MapCard.svelte";
   import { audio, gfx, pb, pose, songClock, lastTick, loadText, restart,
-    seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
+    seekTo, setPlaying, setSpeed, step, toggleMapCard,
+    togglePose } from "./lib/state.svelte.js";
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
   import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
@@ -18,6 +20,7 @@
   const tickIdx = $derived(
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
   const time = $derived(pb.cur * DT);
+  const cardShown = $derived(pb.mapCard && !!pb.rep?.map);
   const c = $derived(pb.rep ? counts(pb.rep, tickIdx) : null);
   // bombs are not scoreable — they resolve silently unless hit
   const scoreable = $derived(
@@ -238,6 +241,7 @@
     else if (e.key === "g") pb.gauges = !pb.gauges;
     else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
+    else if (e.key === "m") toggleMapCard();
   }
 
   // exported length so far, as m:ss — the export is scrubbed from t = 0,
@@ -380,7 +384,9 @@
   }}
 />
 
-<main>
+<!-- the pose panel shares the top-left corner with the map card, so it
+     starts below whichever of the two is showing -->
+<main style="--panel-top: {cardShown ? '150px' : '64px'}">
   <div id="stage" bind:this={wrap}>
     <!-- Threlte defaults to AgX tone mapping, which rolls the highlights
          off and desaturates: it turns the toon ramp's three flat bands
@@ -407,6 +413,10 @@
       onchange={(e) => onFiles(e.target.files)}
     />
   </div>
+
+  {#if pb.mapCard}
+    <MapCard />
+  {/if}
 
   {#if pose.on}
     <PosePanel />
@@ -466,6 +476,11 @@
       <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
         title="per-joint dials, torque bars, foot forces and joint activation (g)">
         📊 gauges
+      </button>
+      <button class:on={pb.mapCard} onclick={toggleMapCard}
+        title="map card: cover art, song, author, mapper and the BeatSaver
+               link, top-left over the scene (m)">
+        💿 map info
       </button>
       <button class:on={pb.firstPerson}
         onclick={() => (pb.firstPerson = !pb.firstPerson)}
