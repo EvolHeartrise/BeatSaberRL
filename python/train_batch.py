@@ -294,6 +294,12 @@ def parse_args():
     # 09-03 T=64 run). With per-head ratios each head is clipped on its
     # own pi_new/pi_old (pg_loss_heads). Costs a (T, N, 29) fp32
     # per-head log-prob buffer (+243 MB at 32768x64) and its perm copy.
+    p.add_argument("--clip", type=float, default=CLIP,
+                   help="joint PPO ratio clip epsilon (the CLIP constant, "
+                        "0.2 since the start; also the default per-head "
+                        "eps under --head-clip and the clipfrac threshold "
+                        "in the [kl] diagnostics). 2026-09-15 user probe: "
+                        "0.3")
     p.add_argument("--head-clip", action="store_true",
                    help="clip each of the 29 action heads on its OWN "
                         "probability ratio (sub-action PPO loss, "
@@ -803,6 +809,10 @@ def cpu_opt_state(opt):
 
 def main():
     args = parse_args()
+    global CLIP
+    CLIP = float(args.clip)
+    if CLIP != 0.2:
+        print(f"--clip {CLIP}: joint PPO clip epsilon (default 0.2)")
     # env v21 (2026-08-16, user decision): weld mode is REMOVED from the
     # production surface — contact is the only mode this trainer runs.
     if not args.foot_contact:
@@ -1721,7 +1731,7 @@ def main():
             else:
                 dratio = (dlogp - f_logp[:dn]).clamp(
                     max=LOG_RATIO_CLAMP).exp()
-                d_pg = pg_loss_fn(dratio, da)
+                d_pg = pg_loss_fn(dratio, da, clip=CLIP)
             d_v = 0.5 * ((dval - (f_ret[:dn] - ret_mu) / ret_sig)
                          ** 2).mean()
             dscale = fp16_scale if fp16_update else 1.0
@@ -1895,7 +1905,7 @@ def main():
                     a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
                     pg_loss = (pg_loss_heads(ratio_h, a_mb,
                                              clip=head_clip_eps)
-                               if head_clip else pg_loss_fn(ratio, a_mb))
+                               if head_clip else pg_loss_fn(ratio, a_mb, clip=CLIP))
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
                     v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
