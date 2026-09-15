@@ -262,7 +262,20 @@ _OBS_BLOCKS = (
     # finite difference across the tick, /V_NORM; zero at reset and
     # after a set_state refresh. Foot world velocity is the slip signal.
     ("body_pt_vel", 18),
+    # env v44 (user order 2026-09-14): per-hand PREVIOUS-NOTE block —
+    # the most recently RESOLVED scoreable note attributed to the hand
+    # (cut good/bad -> the cutting hand; miss -> the note's colour;
+    # bombs/walls never). Live note lanes minus z/vz/walls in the same
+    # head-relative frame + normalizers, plus bookkeeping:
+    #  0 x_rel, 1 y_rel, 2 is_left, 3 is_right, 4 dir_cos, 5 dir_sin,
+    #  6 is_chain_head, 7 is_chain_link, 8 free_pre, 9 free_post,
+    #  10 t_since = min(ticks since resolution, 90)/90, 11 cut_good,
+    #  12 missed, 13 valid. All-zero until the hand's first resolution.
+    ("prev_l", 14),
+    ("prev_r", 14),
 )
+PREV_FEAT = 14
+PREV_T_CLIP_TICKS = 90   # 3 s at 30 Hz
 OBS_OFF = {}
 _off = 0
 for _name, _len in _OBS_BLOCKS:
@@ -284,7 +297,9 @@ OFF_NOTE_MASK = OBS_OFF["note_mask"]    # 534 (env v19)
 OFF_GROUND_IMP = OBS_OFF["ground_imp"]  # 558 (env v19)
 OFF_BODY_PTS = OBS_OFF["body_pts"]      # 562 (env v19)
 OFF_BODY_PT_VEL = OBS_OFF["body_pt_vel"]  # 580 (env v24)
-assert OBS_DIM == 598, "spec §12 (env v24 body_pt_vel lanes): OBS_DIM must be 598"
+OFF_PREV_L = OBS_OFF["prev_l"]          # 598 (env v44)
+OFF_PREV_R = OBS_OFF["prev_r"]          # 612 (env v44)
+assert OBS_DIM == 626, "spec §12 (env v44 prev-note blocks): OBS_DIM must be 626"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

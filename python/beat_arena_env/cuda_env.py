@@ -647,6 +647,11 @@ class CudaBeatVecEnv:
         self.tick = z(N, dt=torch.int32)
         # 0 pending, 1 good, 2 bad/bomb-hit, 3 missed, 4 bomb passed clean
         self.status = z(N, C, dt=torch.uint8)
+        # env v44 per-hand previous-note record [L, R]: chart index,
+        # obs tick of resolution, outcome (0 none/1 good/2 bad/3 miss)
+        self.prev_idx = z(N, 2, dt=torch.int32)
+        self.prev_tick = z(N, 2, dt=torch.int32)
+        self.prev_out = z(N, 2, dt=torch.uint8)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -789,6 +794,7 @@ class CudaBeatVecEnv:
             self.sc_stat,
             self.act_stat,
             self.tau_stat,
+            self.prev_idx, self.prev_tick, self.prev_out,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
