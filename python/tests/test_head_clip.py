@@ -61,7 +61,7 @@ def test_one_head_out_of_region_silences_only_itself():
     old = _lp(B, 3)
     adv = torch.ones(B, dtype=torch.float64)          # positive advantages
     new = old.clone()
-    new[:, 7] += 0.4                                   # head 7 ratio e^0.4 = 1.49 > 1.2
+    new[:, 7] += 0.4                                   # head 7 ratio e^0.4 = 1.49 > 1 + CLIP (1.3)
     nh = new.clone().requires_grad_(True)
     pg_loss_heads((nh - old).exp(), adv).backward()
     g = nh.grad

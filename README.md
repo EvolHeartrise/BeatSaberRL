@@ -182,8 +182,31 @@ wide trunks: the fp16 diag `r1` runs ~1.8× the narrow model's and rises;
 if it passes 1e-2 or `clipfrac` on the first minibatch leaves 0, move the
 head GEMM to fp32.
 
+**Recipe since 2026-09-15 (user decision): `--clip 0.3` and `--trunk-arch
+simba` are the trainer defaults.** The full recipe is Muon + wide arch
+192/384 + env v45 (v42 hilt grip, `--note-geo`, v43 torque energy price,
+v45 per-hand previous-note block) + `--clip 0.3` + `--trunk-arch simba`;
+the pod BASE string needs no clip/trunk flags once these defaults land
+(explicit flags are harmless). Reference numbers are `v45_simba_c03`
+(pod igc6hvsqagfnrf, 2026-09-15): trunk final-50 **0.9607**, cd300 leaf
+**0.9721**, bench **2,495,323 upp / 17,894 wpp**. How they were chosen:
+the clip ladder on env v45 — 0.2 → 0.3 gave +0.8 pt trunk and +1.7% bench
+(2,445,676 vs the v43-recipe 2,405,918), while 0.4 LOST −8.9% on the bench
+(2,227,709; 51 catastrophic levels) even though its leaf training acc
+(0.9697) barely moved, so training acc cannot rank clip settings on its
+own; 0.25 was started but the pod was lost before it finished. Then the
+SimBa trunk at clip 0.3: +0.66 pt trunk (0.9607 vs 0.9541), leaf 0.9721
+vs 0.9712, bench +2.0% with the gain growing with star rating (+0.10 at
+4–8★, +0.26 at 10–12★, +0.66 at 12–14★), srank of `h` 249/384 vs 204 at
+trunk end, calmer gradients (gnorm 2.2–2.4 vs 3.0–3.1), −15% torque.
+Open items: the leaf entropy floor is slightly higher under SimBa (9.8 vs
+8.5 — LN2 keeps the heads warmer through cooldown; a leaf-side knob), and
+the catastrophic-fall count went 6 → 20 levels below 50% (the per-seed
+early-fall lottery on ~20 hard maps, ~2,000 pp either way) — the next
+loss item, with the wrist τmax ceiling from the dead-gear census.
+
 **`--trunk-arch simba` (2026-09-15, research/2026-09-14-architecture-brainstorm.md
-#2; default `mlp`, probe pending):** the readout trunk that turns the three
+#2; DEFAULT since 2026-09-15, `--trunk-arch mlp` reproduces the older layout):** the readout trunk that turns the three
 lead tokens (576 lanes) into the 384-lane feature `h` is a plain
 Linear-ReLU-Linear — the one stage in the network with neither a
 LayerNorm nor a skip (the blocks are pre-LN residual, the critic pool has

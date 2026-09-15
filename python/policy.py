@@ -427,6 +427,10 @@ class NotePolicy(nn.Module):
     # trunk 256 -> ~861k params at gears 5 (was 138,642). The 138k arch
     # and its fused update kernels were retired with it (no conversion,
     # house pattern); training runs the eager fp16 path.
+    # Recipe since 2026-09-15: the TRAINER defaults are embed 192 /
+    # trunk 384 and trunk_arch "simba" (train_batch.py); the ctor keeps
+    # the historical defaults (128/256, "mlp") so checkpoint loading and
+    # tests that construct explicitly are unaffected.
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,

@@ -51,7 +51,7 @@ A_DIM = len(HEAD_SIZES)  # 29 factored joint heads (env v10)
 
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP = 0.2
+CLIP = 0.3  # 0.3 since 2026-09-15 (user decision after the clip ladder)
 DUAL_CLIP_C = 3.0
 VF_COEF = 0.5
 # value-target normalization EMA rate, per update (2026-08-19 critic
@@ -289,17 +289,20 @@ def parse_args():
                         "Rounded to a whole number of minibatches")
     # Per-head clipping (2026-09-06, user): the joint 29-head product
     # ratio makes CLIP=0.2 bind at a ~0.6% per-head change (0.2/29 in
-    # log space), and one head leaving the trust region zeroes the
+    # log space; ~1.0% at the 0.3 recipe value since 2026-09-15), and
+    # one head leaving the trust region zeroes the
     # gradient of all 29 (clipfrac 0.43 on the last minibatch of the
     # 09-03 T=64 run). With per-head ratios each head is clipped on its
     # own pi_new/pi_old (pg_loss_heads). Costs a (T, N, 29) fp32
     # per-head log-prob buffer (+243 MB at 32768x64) and its perm copy.
     p.add_argument("--clip", type=float, default=CLIP,
-                   help="joint PPO ratio clip epsilon (the CLIP constant, "
-                        "0.2 since the start; also the default per-head "
-                        "eps under --head-clip and the clipfrac threshold "
-                        "in the [kl] diagnostics). 2026-09-15 user probe: "
-                        "0.3")
+                   help="joint PPO ratio clip epsilon (the CLIP constant; "
+                        "0.3 since 2026-09-15 — the ladder: 0.3 beat 0.2 "
+                        "by +1.7% bench, 0.4 lost −8.9% while training acc "
+                        "barely moved; 0.2 was the value from the start). "
+                        "Also the default per-head eps under --head-clip "
+                        "and the clipfrac threshold in the [kl] "
+                        "diagnostics")
     p.add_argument("--head-clip", action="store_true",
                    help="clip each of the 29 action heads on its OWN "
                         "probability ratio (sub-action PPO loss, "
@@ -309,7 +312,7 @@ def parse_args():
                         "clipfrac")
     p.add_argument("--head-clip-eps", type=float, default=None,
                    help="--head-clip only: per-head clip epsilon "
-                        "(default = the joint CLIP, 0.2). The 09-06 "
+                        "(default = the joint CLIP, 0.3). The 09-06 "
                         "design note: if per-head KL runs away, 0.1-0.15 "
                         "is the knob")
     # Decoupled weight decay (2026-09-12, AdamW semantics, motivated by
@@ -530,13 +533,15 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
-    p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="mlp",
+    p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="simba",
                    help="readout-trunk layout (2026-09-15, brainstorm item "
-                        "2): mlp = plain Linear-ReLU-Linear (every run so "
-                        "far); simba = Linear projection -> residual block "
+                        "2). simba = DEFAULT since 2026-09-15 (user "
+                        "decision: +0.66 pt trunk, +2.0% bench at matched "
+                        "clip 0.3): Linear projection -> residual block "
                         "x + fc2(relu(fc1(LN x))) -> LN (SimBa 2410.09754). "
-                        "Fresh construction only; resumes take the arch "
-                        "from the checkpoint.")
+                        "mlp = plain Linear-ReLU-Linear, reproduces the "
+                        "pre-09-15 layout. Fresh construction only; "
+                        "resumes take the arch from the checkpoint.")
     p.add_argument("--trunk-hidden", type=int, default=None,
                    help="--trunk-arch simba: hidden width of the residual "
                         "block (default = --trunk-dim; +149,376 params at "
@@ -822,8 +827,8 @@ def main():
     args = parse_args()
     global CLIP
     CLIP = float(args.clip)
-    if CLIP != 0.2:
-        print(f"--clip {CLIP}: joint PPO clip epsilon (default 0.2)")
+    if CLIP != 0.3:
+        print(f"--clip {CLIP}: joint PPO clip epsilon (default 0.3)")
     # env v21 (2026-08-16, user decision): weld mode is REMOVED from the
     # production surface — contact is the only mode this trainer runs.
     if not args.foot_contact:
