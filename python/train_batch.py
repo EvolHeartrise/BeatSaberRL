@@ -530,6 +530,17 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=3)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
+    p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="mlp",
+                   help="readout-trunk layout (2026-09-15, brainstorm item "
+                        "2): mlp = plain Linear-ReLU-Linear (every run so "
+                        "far); simba = Linear projection -> residual block "
+                        "x + fc2(relu(fc1(LN x))) -> LN (SimBa 2410.09754). "
+                        "Fresh construction only; resumes take the arch "
+                        "from the checkpoint.")
+    p.add_argument("--trunk-hidden", type=int, default=None,
+                   help="--trunk-arch simba: hidden width of the residual "
+                        "block (default = --trunk-dim; +149,376 params at "
+                        "192/384; 1536 = the ffn x4 rung, +1,035,264)")
     p.add_argument("--note-geo", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="DEFAULT ON since 2026-09-14 (user decision: part of "
@@ -1092,7 +1103,9 @@ def main():
         policy = NotePolicy(embed=args.embed, trunk_dim=args.trunk_dim,
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
-                            note_geo=args.note_geo)
+                            note_geo=args.note_geo,
+                            trunk_arch=args.trunk_arch,
+                            trunk_hidden=args.trunk_hidden)
     policy.critic_detach = args.critic_detach
     if args.critic_detach:
         print("--critic-detach: value-loss gradients stop at the "
@@ -1103,6 +1116,11 @@ def main():
                          f"policy action tables must match")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
+    n_trunk = sum(p_.numel() for n_, p_ in policy.named_parameters()
+                  if n_.startswith("trunk"))
+    print(f"readout trunk: {policy.arch.get('trunk_arch', 'mlp')} "
+          f"(hidden {policy.arch.get('trunk_hidden')}) — {n_trunk:,} params",
+          flush=True)
     policy = policy.to(device)
     policy.fp16 = args.fp16 == "all"
     if args.fp16 != "off":
@@ -1267,16 +1285,18 @@ def main():
         # region is everything before the first head. Per-group
         # boundaries feed the [diag] per-layer grad norms.
         shared_end = name_off.get("heads.0.weight", off)
+        # the trunk group's first param by NAME PREFIX (mlp: trunk.0.weight;
+        # simba: trunk_proj.weight, 2026-09-15) so both layouts slice right
+        trunk_start = min((o_ for n_, o_ in name_off.items()
+                           if n_.startswith("trunk")), default=shared_end)
         diag_groups = [("enc", 0, name_off.get("blocks.0.ln_attn.weight",
                                                shared_end))]
         for i in range(len(policy.blocks)):
             lo = name_off.get(f"blocks.{i}.ln_attn.weight")
-            hi = name_off.get(f"blocks.{i + 1}.ln_attn.weight",
-                              name_off.get("trunk.0.weight", shared_end))
+            hi = name_off.get(f"blocks.{i + 1}.ln_attn.weight", trunk_start)
             if lo is not None:
                 diag_groups.append((f"blk{i}", lo, hi))
-        diag_groups.append(("trunk", name_off.get("trunk.0.weight",
-                                                  shared_end), shared_end))
+        diag_groups.append(("trunk", trunk_start, shared_end))
 
     obs = torch.as_tensor(venv.reset(), dtype=torch.float32, device=device)
 

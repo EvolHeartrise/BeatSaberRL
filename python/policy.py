@@ -430,12 +430,14 @@ class NotePolicy(nn.Module):
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
-                 critic: str = "adapool_v1", note_geo: bool = False):
+                 critic: str = "adapool_v1", note_geo: bool = False,
+                 trunk_arch: str = "mlp", trunk_hidden: int | None = None):
         super().__init__()
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
         assert critic in ("linear_v0", "adapool_v1"), critic
+        assert trunk_arch in ("mlp", "simba"), trunk_arch
         self.encoder = encoder
         self.embed = embed
         self.n_heads = n_heads
@@ -450,8 +452,16 @@ class NotePolicy(nn.Module):
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
                      "ffn_mult": ffn_mult, "critic": critic,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True,
-                     "note_geo": bool(note_geo)}
+                     "note_geo": bool(note_geo),
+                     # 2026-09-15 (brainstorm item 2): readout-trunk
+                     # layout. "mlp" = the plain Linear-ReLU-Linear every
+                     # checkpoint before this date used (absent marker =
+                     # mlp); "simba" = residual + LayerNorm block, below.
+                     "trunk_arch": trunk_arch,
+                     "trunk_hidden": (int(trunk_hidden) if trunk_hidden
+                                      else trunk_dim)}
         self.note_geo = bool(note_geo)
+        self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
                               embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
@@ -461,7 +471,27 @@ class NotePolicy(nn.Module):
         self.blocks = nn.ModuleList(
             Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
         # readout = [saber_L, saber_R, body] output embeddings
-        self.trunk = _mlp([3 * embed, trunk_dim, trunk_dim])
+        if trunk_arch == "mlp":
+            self.trunk = _mlp([3 * embed, trunk_dim, trunk_dim])
+        else:
+            # SimBa-style readout trunk (2026-09-15, brainstorm item 2;
+            # SimBa 2410.09754 / SimBaV2 2502.15280, Creus Castanyer
+            # 2506.15544, Kumar 2010.14498): the plain trunk was the
+            # ONE stage with neither normalization nor a skip, and it
+            # produces the feature h whose effective rank the [diag]
+            # line tracks. Layout: projection -> one residual block
+            # x + fc2(relu(fc1(LN1 x))) -> LN2 -> h. H = trunk_hidden
+            # (default trunk_dim: +149,376 params at 192/384; 1536 =
+            # +1,035,264). Registered in the same parameters() slot as
+            # `trunk` so the flat-grad diag groups (encoder -> blocks ->
+            # trunk -> heads -> critic) keep their order; the trainer's
+            # diag looks the trunk group up by name prefix.
+            H = int(trunk_hidden) if trunk_hidden else trunk_dim
+            self.trunk_proj = nn.Linear(3 * embed, trunk_dim)
+            self.trunk_ln1 = FusedLayerNorm(trunk_dim)
+            self.trunk_fc1 = nn.Linear(trunk_dim, H)
+            self.trunk_fc2 = nn.Linear(H, trunk_dim)
+            self.trunk_ln2 = FusedLayerNorm(trunk_dim)
         # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
@@ -547,6 +577,24 @@ class NotePolicy(nn.Module):
             -1, N_NOTE_SLOTS, NOTE_FEAT)                             # (B, 24, 18)
         note_mask = obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS]
         return sabers, body, notes, note_mask
+
+    def _trunk(self, x: torch.Tensor) -> torch.Tensor:
+        """Readout trunk: (B, 3*embed) -> (B, trunk_dim) feature h.
+        mlp: the plain Linear-ReLU-Linear (unchanged bits). simba:
+        proj -> LN1 -> fc1 -> ReLU -> fc2 -> residual add + LN2, with
+        the add+LN2 taken through FusedLayerNorm.forward_add (one fused
+        pass on the CUDA path when the kernel is eligible — its row
+        width must be <= 256, so at trunk_dim 384 both LNs run the
+        stock fp32-stats fallback; the residual sum is then a plain
+        add). Same helpers as the blocks, so the fp16 stream (fp16
+        activations, fp32 LN stats/affine) is honoured end to end."""
+        if self.trunk_arch == "mlp":
+            return _seq(self.trunk, x)
+        x = _lin(self.trunk_proj, x)
+        d = _lin(self.trunk_fc2, F.relu(_lin(self.trunk_fc1,
+                                              self.trunk_ln1(x))))
+        _, h = self.trunk_ln2.forward_add(x, d)
+        return h
 
     def forward_stacked(self, obs: torch.Tensor, critic_async: bool = False):
         """Trunk + ONE fused (trunk_dim -> 29K + 1) head GEMM: stacked
@@ -634,7 +682,7 @@ class NotePolicy(nn.Module):
         x_res = None
         if not legacy:
             tokens, x_res = tokens
-        h = _seq(self.trunk, tokens.reshape(B, -1))     # saber+body readout
+        h = self._trunk(tokens.reshape(B, -1))          # saber+body readout
         if self._diag_stash:
             self._diag_h = h
         value = None
@@ -955,6 +1003,9 @@ def load_policy(ckpt) -> NotePolicy:
         # the Linear(trunk,1) era, still loadable for bench/replay
         critic=arch.get("critic", "linear_v0"),
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
-        note_geo=arch.get("note_geo", False))
+        note_geo=arch.get("note_geo", False),
+        # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
+        trunk_arch=arch.get("trunk_arch", "mlp"),
+        trunk_hidden=arch.get("trunk_hidden"))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
