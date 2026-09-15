@@ -82,8 +82,11 @@ def _cache_path(seg_len, ver, catalog_path, lead_s, mirror=False):
     # lead gap): every note past lead_s is in exactly one window; the
     # v6 pools had 5.77% (lead 1.5) / 1.94% (lead 0.5) of scoreable
     # notes in no window
+    # v8: 2026-09-15 — whole-level mode (seg_len <= 0): one window per
+    # level, no MAX_OBJECTS drop; keyed separately from any seg_len
     key = hashlib.sha1(
-        (f"{seg_len:g}_{ver}_v7_lead{lead_s:g}"
+        (("whole_level_v8" if seg_len <= 0 else f"{seg_len:g}")
+         + f"_{ver}_v7_lead{lead_s:g}"
          + ("_mirror" if mirror else "")).encode() + cat
     ).hexdigest()[:16]
     cdir = os.path.join(_BASE, "pool_cache")
@@ -155,7 +158,15 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
         if not tup:
             continue
         last = tup[-1][0]
-        for base in window_starts(last, seg_len, lead_s):
+        whole = seg_len <= 0
+        # 2026-09-15 (user): whole-level mode — the episode IS the level:
+        # one window from song start (the parser already anchors the
+        # first note at 2.0 s >= lead_s) to the last object; the
+        # per-window object cap does not apply (the CUDA env's only
+        # per-env per-object tensor is the 1-byte status array).
+        bases = ([0.0] if last >= lead_s else []) if whole \
+            else window_starts(last, seg_len, lead_s)
+        for base in bases:
             # 2026-08-23 (user): lead gap applies to k=0 too. The
             # note-anchored parser shift (first note -> 2.0 s) can be
             # NEGATIVE, putting intro walls at t <= 0; without the gap
@@ -167,9 +178,9 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
             # 2026-09-06: bases step by seg_len - lead_s (window_starts),
             # so this window's lead gap is the previous window's tail.
             lo = base + lead_s
-            hi = base + seg_len
+            hi = float("inf") if whole else base + seg_len
             win = [t for t in tup if lo <= t[0] < hi]
-            if len(win) > MAX_OBJECTS:
+            if not whole and len(win) > MAX_OBJECTS:
                 dropped_fat += 1
                 continue
             if sum(1 for t in win if t[7] != KIND_BOMB) < MIN_SCOREABLE:
@@ -187,13 +198,28 @@ def _build_segments(seg_len, catalog_path, log, lead_s=LEAD_S,
             log(f"[ranked-pool] {i + 1}/{len(catalog)} levels -> "
                 f"{len(segments)} segments", flush=True)
     n_wall_segs = sum(1 for w in seg_walls if w)
-    log(f"[ranked-pool] {len(segments)} segments of {seg_len:g}s "
+    n_max = max((len(sg) for sg in segments), default=0)
+    log(f"[ranked-pool] {len(segments)} segments of "
+        f"{'WHOLE LEVELS' if seg_len <= 0 else f'{seg_len:g}s'} "
         f"({n_wall_segs} with walls; dropped {dropped_sparse} sparse, "
-        f"{dropped_fat} >{MAX_OBJECTS}-object)", flush=True)
+        f"{dropped_fat} >{MAX_OBJECTS}-object; max {n_max} objects)",
+        flush=True)
     return segments, seg_walls
 
 
-def load_ranked_pool(seg_len=25.0, sample=None, seed=0,
+def pool_max_steps(pool, tick_hz=30, margin_ticks=90):
+    """Episode tick limit for a pool: the longest level's last object
+    plus its tail, plus the same margin the segment formula uses
+    (int(seg_len * 30) + 90). Whole-level mode needs this because there
+    is no seg_len to derive it from; for segment pools it is <= the
+    formula's value."""
+    if int(pool["n_notes"].shape[0]) == 0:
+        return margin_ticks
+    end = (pool["last_hit"].double() + pool["tail"].double()).max().item()
+    return int(end * tick_hz) + margin_ticks
+
+
+def load_ranked_pool(seg_len=25.0, sample=None, seed=0,   # seg_len <= 0: whole levels
                      device="cuda", dtype=torch.float32,
                      catalog=None, log=print, lead_s=LEAD_S,
                      mirror=False):
