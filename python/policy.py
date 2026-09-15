@@ -132,12 +132,13 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # OBS_DIM 578 -> 580, offsets past the hands +2. Env v24: 18-lane
 # body-point VELOCITY block at 580..598, routed like the positions
 # (elbow vels to their saber tokens, knee + foot vels to BODY),
-# OBS_DIM 580 -> 598. Env v44 (2026-09-14, user order): two 14-lane
-# per-hand PREVIOUS-NOTE blocks appended at 598..626 (the last
-# resolved note per hand: head-relative x/y, colour, cut direction,
-# chain/free flags, t_since, outcome, valid) — routed into the saber
-# tokens, OBS_DIM 598 -> 626, SABER_FEAT 32 -> 46.
-OBS_DIM = 626
+# OBS_DIM 580 -> 598. Env v45 (2026-09-15, user order; replaces the
+# same-day v44 block): two 5-lane per-hand PREVIOUS-NOTE blocks
+# appended at 598..608 — for each hand the last resolved note OF THAT
+# HAND'S COLOUR regardless of who cut it: head-relative x/y, cut
+# direction cos/sin, valid — routed into the saber tokens, OBS_DIM
+# 598 -> 608, SABER_FEAT 32 -> 37.
+OBS_DIM = 608
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 OFF_NOTES = 102
@@ -151,18 +152,18 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 534
 # + contact bits (2) + ground-contact lanes (4, env v12) + knee/foot
 # positions (12, env v13) + knee/foot velocities (12, env v24) = 78
 # features. Each saber token gains its arm's elbow position (3, env
-# v13) and elbow velocity (3, env v24): 26 -> 32; and its hand's
-# previous-note block (14, env v44): 32 -> 46, appended LAST so the
+# v13) and elbow velocity (3, env v24): 26 -> 32; and its colour's
+# previous-note block (5, env v45): 32 -> 37, appended LAST so the
 # note-geo lane constants (_S_WPOS/_S_WVEL/_S_BLADE) stay valid.
-SABER_FEAT = 46
-PREV_FEAT = 14
+SABER_FEAT = 37
+PREV_FEAT = 5
 BODY_FEAT = 78
 # derived from the window size so a future slot change can't skew them
 _GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
 _BP = _GI + 4                           # body_pts block (18)
 _BPV = _BP + 18                         # body_pt_vel block (18, env v24)
-_PREV_L = _BPV + 18                     # prev-note L block (14, env v44)
-_PREV_R = _PREV_L + PREV_FEAT           # prev-note R block (14, env v44)
+_PREV_L = _BPV + 18                     # prev-note L block (5, env v45)
+_PREV_R = _PREV_L + PREV_FEAT           # prev-note R block (5, env v45)
 assert _PREV_R + PREV_FEAT == OBS_DIM
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
                 + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3))
@@ -940,12 +941,12 @@ def load_policy(ckpt) -> NotePolicy:
             or "ffn_mult" not in arch
             or not arch.get("body_token", False)):
         raise SystemExit(
-            f"checkpoint is not env v44 era (needs arch obs_dim="
+            f"checkpoint is not env v45 era (needs arch obs_dim="
             f"{OBS_DIM}, n_action_heads=29, ffn_mult, body_token=True; "
-            f"got {dict(arch)}). Env v44 (2026-09-14) appended the "
-            "per-hand previous-note blocks (obs 598 -> 626); every "
-            "earlier checkpoint plays a different obs — retrain, no "
-            "conversion.")
+            f"got {dict(arch)}). Env v45 (2026-09-15) appended the "
+            "per-hand previous-note blocks v2 (obs 598 -> 608; the "
+            "same-day v44 block was 626); every earlier checkpoint "
+            "plays a different obs — retrain, no conversion.")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],

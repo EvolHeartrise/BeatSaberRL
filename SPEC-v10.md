@@ -507,30 +507,32 @@ its offsets from it): env v12 ground-contact lanes (4), v13 body points
 (18), v17/v18 the 24×18 entity window + mask, v19 the follow-through
 lane in each hand block, v24 body-point velocities (18) → OBS_DIM 598.
 
-**Env v44 (2026-09-14) — per-hand previous-note blocks, OBS_DIM 626.**
-Two 14-lane blocks at 598 (left hand) and 612 (right hand), each the
-most recently RESOLVED scoreable note attributed to that hand:
+**Env v45 (2026-09-15) — per-hand previous-note blocks v2, OBS_DIM 608.**
+(Replaces the same-day env v44 block — 14 lanes, OBS_DIM 626 — retired at
+the user's direction before its first probe finished.) Two 5-lane blocks
+at 598 (left hand) and 603 (right hand). Block s describes the most
+recently RESOLVED scoreable note OF THAT HAND'S COLOUR (colour 0 → left
+block, colour 1 → right block), regardless of which saber resolved it
+and regardless of outcome. Purpose, in the user's words: parity control,
+wind-up positioning, and holding the saber at the right spot through
+gaps in the song to swing at the next note.
 
 | lane | content |
 |---|---|
 | 0, 1 | (x − head_x)/1, (y − head_y)/0.75 — the note's world position against the LIVE head, the entity-lane rule (v38) |
-| 2, 3 | is_left, is_right (the note's colour) |
-| 4, 5 | dir_cos, dir_sin — zero on dot notes, Bézier tangent on chain links (the entity `show_dir` rule) |
-| 6, 7 | is_chain_head, is_chain_link |
-| 8, 9 | free_pre, free_post |
-| 10 | t_since = min(ticks since resolution, 90)/90 — 0 on the obs of the resolving step, 1.0 at 3 s or more (integer tick arithmetic, bitwise on both engines) |
-| 11 | cut_good (1 = scored) |
-| 12 | missed (1 = passed the miss boundary); a bad cut / wrong-hand cut reads 0 on both 11 and 12 |
-| 13 | valid — 1 once any note has resolved for that hand; the whole block is 0 before |
+| 2, 3 | dir_cos, dir_sin — zero on dot notes, Bézier tangent on chain links (the entity `show_dir` rule) |
+| 4 | valid — 1 once any note of that colour has resolved; the whole block is 0 before |
 
-Attribution: a good or bad cut → the hand that cut it (the wrong-hand
-box attributes to the OTHER hand); a miss → the hand of the note's
-colour; bombs (hit or passed) and walls never update it. Within one
-tick the judge loop walks chart order, so a hand's record is the
-latest-hit_time note resolved for it that tick. Reset with the episode.
-State per hand: chart index, the obs tick of resolution (tick + 1 at
-judgment), outcome. Observation-only: rewards, dynamics and the replay
-record are unchanged.
+Attribution is by NOTE COLOUR only: a good cut, a bad cut (slow /
+angle), a wrong-hand cut (the other saber's sweep in the bad box) and a
+miss all record on the block of the note's colour and never on the
+other block; bombs (hit or passed) and walls never update anything.
+Within one tick the judge loop walks chart order, so a block is the
+latest-hit_time note of its colour resolved so far. Reset with the
+episode. State per colour: chart index + valid. No colour one-hot (a
+block is always its own colour), no time-since, no outcome, no chain /
+free flags. Observation-only: rewards, dynamics and the replay record
+are unchanged.
 
 ## 6. Replay v10 (JSONL)
 

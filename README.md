@@ -118,23 +118,27 @@ calibrated so the bill matches the old one at the 2026-09-14 leaves'
 trainer's `[torque]` line, and a dashboard panel; the activation
 telemetry stays. Both sims + parity gate.
 
-Env v44 (2026-09-14, user-directed): **per-hand previous-note obs block**.
-The user's hypothesis: a hand that can see the note it just resolved
-flails less in the idle stretches between its notes. Two 14-lane blocks
-appended to the obs (598..611 left hand, 612..625 right; OBS_DIM 598 →
-626, every earlier offset unchanged), each describing the most recently
-RESOLVED scoreable note attributed to that hand — a cut (good or bad)
-attributes to the hand that cut it, a miss to the hand of the note's
-colour, bombs and walls never. Lanes: the live note lanes minus z/vz
-(head-relative x/y recomputed against the live head each tick, is_left /
-is_right, cut-direction cos/sin — zero on dot notes, tangent on chain
-links — is_chain_head, is_chain_link, free_pre, free_post) plus
-t_since = min(ticks since resolution, 90)/90, cut_good, missed (bad cut
-= both 0) and valid (the block is all-zero until the hand's first
-resolution). The policy routes each block into its saber token
-(SABER_FEAT 32 → 46). Default-on, no flag; rewards and dynamics are
-byte-identical to v43. Checkpoints before v44 are refused by
-`load_policy` (obs 598). Both sims + parity gate; tests/test_v44_prev_note.py.
+Env v45 (2026-09-15, user-directed; replaces the same-day env v44
+block): **per-hand previous-note obs block v2**. The user's purpose:
+"parity control, wind up positioning, and gaps in the song for holding
+saber position at the correct spot to swing at the next note" — a hand
+that can see the note it last dealt with flails less and winds up
+better. Two 5-lane blocks appended to the obs (598..602 left hand,
+603..607 right; OBS_DIM 598 → 608, every earlier offset unchanged).
+Block s is the most recently RESOLVED scoreable note OF THAT HAND'S
+COLOUR — regardless of which saber resolved it and regardless of
+outcome (good cut, slow/angle cut, wrong-hand cut and miss all record on
+the note's colour; bombs and walls never). Lanes: head-relative x/y
+(recomputed against the live head each tick), cut-direction cos/sin
+(zero on dot notes, tangent on chain links), valid (the block is
+all-zero until a note of that colour has resolved). v44's colour
+one-hot, chain/free flags, time-since and outcome lanes were dropped at
+the user's direction (a block is always its own colour; the memory is
+positional). The policy routes each block into its saber token
+(SABER_FEAT 32 → 37). Default-on, no flag; rewards and dynamics are
+byte-identical to v43. Checkpoints before v45 (obs 598 / 626) are
+refused by `load_policy`. Both sims + parity gate;
+tests/test_v45_prev_note.py.
 
 **Recipe since 2026-09-14 (user decision): env v42 hilt grip + `--note-geo`
 are part of the default recipe, and since env v43 so is `--energy-coef 7.5e-6` in place of `--iso-coef 5e-4`.** Their first probe (v42_hilt_geo, both
