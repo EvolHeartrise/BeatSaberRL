@@ -629,7 +629,11 @@ def parse_args():
                         "§11: shorter keeps note data in the mix when "
                         "falls spike, damping survival-drift)")
     p.add_argument("--seg-len", type=float, default=25.0,
-                   help="ranked-maps segment length in song seconds")
+                   help="ranked-maps segment length in song seconds; "
+                        "0 = WHOLE-LEVEL episodes (2026-09-15 probe: "
+                        "one window per level from song start, no "
+                        "per-window object cap, episode limit from "
+                        "the longest level)")
     p.add_argument("--mirror-augment", action="store_true",
                    help="double the ranked-maps pool with left-right "
                         "mirrored copies of every segment (handedness-"
@@ -1018,8 +1022,19 @@ def main():
                                 sample=args.chart_pool, seed=args.seed,
                                 device=device, lead_s=args.lead_s,
                                 mirror=args.mirror_augment)
+        # whole-level mode (--seg-len 0, 2026-09-15): the episode limit
+        # comes from the longest level in the pool, not from seg_len
+        if args.seg_len <= 0:
+            from beat_arena_env.ranked_pool import pool_max_steps
+            pool_steps = pool_max_steps(pool)
+            print(f"[ranked-pool] WHOLE-LEVEL episodes: max_steps "
+                  f"{pool_steps} ({pool_steps / 30:.0f} s incl. tail + "
+                  f"margin), {int(pool['n_notes'].shape[0])} levels in "
+                  f"the pool", flush=True)
+        else:
+            pool_steps = int(args.seg_len * 30) + 90
         venv = VecCls(N, pool=pool,
-                      max_steps=int(args.seg_len * 30) + 90,
+                      max_steps=pool_steps,
                       wide_acc=args.wide_acc, gears=args.gears,
                       foot_contact=args.foot_contact,
                       fall_const=args.fall_pen,
