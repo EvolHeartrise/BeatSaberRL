@@ -283,23 +283,28 @@ def test_cuda_miss_block_matches_rust():
     env.reset()
     sim = _sim([note_tuple(x) for x in chart])
     zero = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
+    from tests.test_v10_parity_cuda import _rust_state
     for _ in range(130):
         tobs, *_ = env.step(zero)
         robs, *_ = sim.step(COAST)
-        # bitwise on the discrete + tick lanes; the head-relative x/y
-        # lanes are compared to the free-running Rust-vs-CUDA physics
-        # drift band (~1e-3 over 130 unsynced coast ticks on the pod
-        # gate, 2026-09-15 — the base parity gate resyncs state every
-        # tick for exactly this reason; the lockstep test below covers
-        # the tight comparison). The lanes themselves are the same
-        # expression on both engines (note world x/y minus the LIVE
-        # head, entity normalizers).
+        # Discrete + tick lanes bitwise. The head-relative x/y lanes are
+        # the same expression on both engines (note world x/y minus the
+        # LIVE head, entity normalizers), but the two physics engines
+        # drift apart under free-running coast (~1e-2 by tick 130 on the
+        # pod gate, 2026-09-15), so — exactly like the base parity gate
+        # — the CUDA state is resynced from Rust after every tick and
+        # the lanes are compared over one tick of divergence only.
         c = tobs[0, OFF_PREV_L:OBS_DIM].cpu().numpy()
         r = np.asarray(robs)[OFF_PREV_L:OBS_DIM]
         np.testing.assert_array_equal(c[2:14], r[2:14])
         np.testing.assert_array_equal(c[16:28], r[16:28])
         np.testing.assert_allclose(c[[0, 1, 14, 15]], r[[0, 1, 14, 15]],
-                                   atol=5e-3)
+                                   atol=1e-4)
+        q, v = _rust_state(sim)
+        wv = env.wrist_vel.clone()
+        env.set_state(torch.tensor([q], dtype=torch.float64),
+                      torch.tensor([v], dtype=torch.float64))
+        env.wrist_vel.copy_(wv)
     assert int(env.prev_out[0, 1]) == 3 and int(env.prev_idx[0, 1]) == 0
     assert int(env.prev_tick[0, 1]) == sim.prev_note()[1][1]
     assert sim.prev_note()[1][2] == 3
