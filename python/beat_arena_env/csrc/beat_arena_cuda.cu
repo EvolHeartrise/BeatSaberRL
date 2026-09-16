@@ -4817,7 +4817,6 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
     {0.475, 1.3399999999999999, 1.9, 0.56},
     {0.525, 1.7850000000000001, 2.1, 0.315},
 };
-template <typename T>
 // bench combo walk (lib.rs ComboWalk::consume, applied at the event
 // sites): break = slow / angle / wrong-hand / miss / bomb hit / wall
 // ENTRY; cut = promote-before-commit, pin the multiplier, combo up,
