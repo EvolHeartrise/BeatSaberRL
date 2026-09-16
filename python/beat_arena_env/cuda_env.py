@@ -494,7 +494,7 @@ class CudaBeatVecEnv:
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
-                 combo_walk=False):
+                 combo_walk=False, bench_refill=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -669,6 +669,14 @@ class CudaBeatVecEnv:
         # bench's counters. Off (training): the tensors are untouched
         # and the note-multiplier plane is a 1x1 dummy.
         self.combo_walk = bool(combo_walk)
+        # bench slot refill (2026-09-16): the kernel snapshots a finished
+        # level into bench_rec and resets the slot onto _bench_cand[e]
+        # (>= 0) in the same tick, or freezes it (< 0). Host bookkeeping:
+        # set_next_chart / pop_bench_rows. Requires combo_walk.
+        self.bench_refill = bool(bench_refill)
+        assert not self.bench_refill or self.combo_walk, \
+            "bench_refill needs combo_walk=True"
+        self._bench_cand = None
         self.cw_mult = z(N, dt=torch.int32)
         self.cw_prog = z(N, dt=torch.int32)
         self.cw_combo = z(N, dt=torch.int32)
@@ -678,6 +686,8 @@ class CudaBeatVecEnv:
         self.cw_note_mult = (z(N, C, dt=torch.uint8) if self.combo_walk
                              else z(1, 1, dt=torch.uint8))
         self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
+        self.bench_rec = z(N, 14)
+        self.bench_flag = z(N, dt=torch.uint8)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -824,6 +834,7 @@ class CudaBeatVecEnv:
             self.tau_scale, self._tau_jit, self.ep_rec, self.ep_flag,
             self.cw_mult, self.cw_prog, self.cw_combo, self.cw_maxc,
             self.cw_breaks, self.cw_score, self.cw_note_mult, self.tr_msum,
+            self.bench_rec, self.bench_flag,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -858,7 +869,8 @@ class CudaBeatVecEnv:
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
                        self.z_clip_hi, self.self_contact_coef,
-                       self.tau_rand, int(self.combo_walk))
+                       self.tau_rand, int(self.combo_walk),
+                       int(self.bench_refill))
 
     # -- env v46: torque-limit scales ---------------------------------------
     def set_tau_scale(self, s16):
@@ -886,6 +898,34 @@ class CudaBeatVecEnv:
         self.ep_flag.zero_()
         return rows
 
+    # -- bench slot refill ---------------------------------------------------
+    def set_next_chart(self, cand):
+        """(N,) int64 on the device: the pool chart each slot starts when
+        its current level ends (-1 = none: the slot freezes). Read by the
+        kernel at that slot's `done`, so update it right after popping the
+        slot's row and before the next step."""
+        assert self.bench_refill, "bench_refill=False at construction"
+        cand = torch.as_tensor(cand, device=self.device, dtype=torch.int64)
+        assert cand.shape == (self.num_envs,)
+        self._bench_cand = cand.contiguous()
+
+    def pop_bench_rows(self):
+        """Levels that finished since the last pop: (env ids (M,) int64
+        numpy, rows (M, 14) float64 numpy) with the row layout of the
+        kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
+        post, flail_rad, flail_ticks, cw_score, cw_maxc, cw_breaks,
+        chart_idx]. One row per env — pop every tick (a level lasts >= 60
+        ticks, so no slot can finish twice between pops)."""
+        flags = self.bench_flag.bool()
+        n = int(flags.sum().item())
+        if n == 0:
+            return (np.zeros((0,), dtype=np.int64),
+                    np.zeros((0, 14), dtype=np.float64))
+        ids = flags.nonzero(as_tuple=False).squeeze(1)
+        rows = self.bench_rec[ids].double().cpu().numpy()
+        self.bench_flag.zero_()
+        return ids.cpu().numpy(), rows
+
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""
         N = self.num_envs
@@ -898,7 +938,13 @@ class CudaBeatVecEnv:
     def reset(self):
         if self.combo_walk:   # the freeze keys on done: clear stale flags
             self._done.zero_()
-        self._launch(self._zero_act, self._cand(), 1)
+        if self.bench_refill:
+            assert self._bench_cand is not None, "set_next_chart() first"
+            assert bool((self._bench_cand >= 0).all()), \
+                "every slot needs a first level for reset()"
+            self._launch(self._zero_act, self._bench_cand, 1)
+        else:
+            self._launch(self._zero_act, self._cand(), 1)
         self._episode += 1
         return self._obs
 
@@ -926,7 +972,10 @@ class CudaBeatVecEnv:
             self._kick(torch.rand(self.num_envs, device=self.device,
                                   dtype=self.dtype) < self.push_prob,
                        self.push_vmax)
-        cand = self._cand() if self.auto_reset else self._zero_cand
+        if self.bench_refill:
+            cand = self._bench_cand
+        else:
+            cand = self._cand() if self.auto_reset else self._zero_cand
         if self._env_order_on:
             # R12: group envs by DYNAMICS state — ground-contact config
             # (heel/toe bitmask, the substep's ng branch driver) then

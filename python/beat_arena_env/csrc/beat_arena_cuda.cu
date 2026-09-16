@@ -4566,6 +4566,17 @@ struct Sim {
   uint8_t* __restrict__ cw_note_mult; // (N, C) pinned cut-time multiplier
   int* __restrict__ tr_msum;          // (N, 2, N_TRACKERS) sum of the pinned
                                       // multipliers of a tracker's notes
+  // bench slot refill (2026-09-16): at `done` the finished level's bench
+  // counters are snapshotted into bench_rec (N, BENCH_REC) + a flag, its
+  // flail accumulators cleared, and the slot resets IN-KERNEL onto
+  // cand[e] (>= 0: the host's next level for this slot) or stays frozen
+  // (cand < 0: queue exhausted — the combo_walk early-out above keeps it
+  // idle at ~zero cost). Row: [good, bad, miss, score, bombs, pre, acc,
+  // post, flail_rad(2 hands), flail_ticks, cw_score, cw_maxc, cw_breaks,
+  // chart_idx].
+  bool bench_refill;
+  T* __restrict__ bench_rec;
+  uint8_t* __restrict__ bench_flag;
   // R12 warp-coherence permutation: thread gid serves env env_order[gid]
   // (identity unless the host sorts it — see cuda_env.step). A bijection
   // on the thread->env assignment only; all P.*[e] addressing unchanged.
@@ -4823,6 +4834,8 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
 // score += pts x mult; follow-through points commit at the pinned
 // multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
 // on the event bus before multiplying — mirrored with the (float) cast.
+constexpr int BENCH_REC = 14;
+
 template <typename T>
 __device__ __forceinline__ void cw_break(const Sim<T>& P, int e) {
   if (!P.combo_walk) return;
@@ -6000,7 +6013,38 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       P.ep_flag[e] = 1;
     }
   }
-  if (done && P.auto_reset) reset_env(d, P, e, P.cand[e]);
+  if (P.bench_refill && done) {
+    // bench slot refill: snapshot this level's result, then either
+    // start the slot's next level now (same tick, fresh reset state)
+    // or leave it frozen. done stays latched on a frozen slot; a
+    // refilled slot must NOT read as done next tick (the combo_walk
+    // early-out keys on it).
+    T* r = P.bench_rec + (size_t)e * BENCH_REC;
+    r[0] = T(P.good[e]);
+    r[1] = T(P.bad[e]);
+    r[2] = T(P.miss[e]);
+    r[3] = P.score[e];
+    r[4] = T(P.bombs[e]);
+    r[5] = P.score_pre[e];
+    r[6] = P.score_acc[e];
+    r[7] = P.score_post[e];
+    r[8] = P.flail_rad[e * 2] + P.flail_rad[e * 2 + 1];
+    r[9] = T(P.flail_ticks[e]);
+    r[10] = P.cw_score[e];
+    r[11] = T(P.cw_maxc[e]);
+    r[12] = T(P.cw_breaks[e]);
+    r[13] = T(P.chart_idx[e]);
+    P.bench_flag[e] = 1;
+    P.flail_rad[e * 2] = T(0);
+    P.flail_rad[e * 2 + 1] = T(0);
+    P.flail_ticks[e] = 0;
+    if (P.cand[e] >= 0) {
+      reset_env(d, P, e, P.cand[e]);
+      P.done[e] = 0;
+    }
+  } else if (done && P.auto_reset) {
+    reset_env(d, P, e, P.cand[e]);
+  }
 }
 
 // FC = env v11 foot_mode (see GROUND_CORNERS): FALSE is the v10 kernel,
@@ -6094,6 +6138,7 @@ enum {
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
   TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,22), flag (N) — 2026-09-16
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
+  TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -6114,7 +6159,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
           double z_clip_hi, double self_contact_coef, double tau_rand,
-          int64_t combo_walk) {
+          int64_t combo_walk, int64_t bench_refill) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -6196,6 +6241,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.cw_score = ts[TCWSCORE].data_ptr<scalar_t>();
     P.cw_note_mult = ts[TCWNOTEMULT].data_ptr<uint8_t>();
     P.tr_msum = ts[TTRMSUM].data_ptr<int>();
+    P.bench_rec = ts[TBENCHREC].data_ptr<scalar_t>();
+    P.bench_flag = ts[TBENCHFLAG].data_ptr<uint8_t>();
+    P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
