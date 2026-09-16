@@ -51,8 +51,11 @@ def _play(charts, n_slots, device="cuda"):
                          combo_walk=True, bench_refill=True, seed=0)
     current = [q.pop(0) for q in queues]
     cand = np.array([(q[0] if q else -1) for q in queues], dtype=np.int64)
-    env.set_next_chart(torch.as_tensor(cand, device=device))
+    # reset() starts each slot on the candidate chart: first the FIRST
+    # level, then the candidate array holds the NEXT level
+    env.set_next_chart(torch.as_tensor(np.array(current), device=device))
     env.reset()
+    env.set_next_chart(torch.as_tensor(cand, device=device))
     acts = torch.zeros((n, N_JOINTS), dtype=torch.int64, device=device)
     rows_by_chart = {}
     tick = 0
