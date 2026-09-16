@@ -58,6 +58,29 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
 from beat_arena_env.mirror import mirror_tuples, mirror_walls
+
+
+def _cgroup_cpu_quota():
+    """Whole CPUs the container may use (cgroup v2 cpu.max), or None."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota == "max":
+            return None
+        return max(1, int(round(int(quota) / int(period))))
+    except (OSError, ValueError):
+        return None
+
+
+# rayon sizes its pool to the VISIBLE cores (64 on a RunPod host) even when
+# the container's cgroup quota is 13.6: threads beyond the quota just get
+# throttled. Measured 2026-09-16 (1,500 levels, 4,096x2): 14 threads cut
+# step_into 6% vs auto. Must be set before the Rust module spins its pool.
+if "RAYON_NUM_THREADS" not in os.environ:
+    _q = _cgroup_cpu_quota()
+    if _q is not None and _q < (os.cpu_count() or _q):
+        os.environ["RAYON_NUM_THREADS"] = str(_q)
+
 import beat_arena_rs
 try:  # f32 build of the same sources (../rust32), the default bench engine
     import beat_arena_rs32
@@ -174,7 +197,7 @@ def parse_args():
                         "flag is accepted so older drivers keep running. "
                         "(Weld-era checkpoints predate env v11 and are "
                         "archival.)")
-    p.add_argument("--groups", type=int, default=1,
+    p.add_argument("--groups", type=int, default=2,
                    help="--sim rust: split --num-envs into this many equal "
                         "groups that alternate — each group's GPU forward "
                         "runs while the CPU steps the next group's sim "
