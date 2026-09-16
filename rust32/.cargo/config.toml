@@ -1,0 +1,11 @@
+# target-cpu=native for the f32 build too (bench-opt item 1, 2026-09-16):
+# until now only ../rust/.cargo/config.toml set it, and cargo reads config
+# from the INVOCATION directory upward — not the manifest's — so the
+# rust32 build (the bench's default engine) compiled with rustflags [].
+# Same bit-safety argument as ../rust: Rust emits no fast-math flags, so
+# LLVM neither contracts a*b+c into FMA nor reassociates FP reductions;
+# verified bitwise identical on the recorded replay trace
+# (python/tools/cpu_trace.py). Build from THIS directory (setup_pod.sh
+# does `cd rust32`) so cargo picks this file up.
+[build]
+rustflags = ["-C", "target-cpu=native"]
