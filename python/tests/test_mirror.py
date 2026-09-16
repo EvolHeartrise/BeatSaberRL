@@ -78,7 +78,7 @@ def test_pool_mirror_doubles_segments(tmp_path):
     def fake_build(*a, **k):
         calls.append(k)
 
-    # exercise the real windowing path on a synthetic 2-note chart via
+    # exercise the mirror path on a synthetic 2-note chart via
     # the internal helpers instead: rebased window -> pair check
     reb = [_note(x=0.3, color=0, angle=LEFT),
            _note(x=-0.9, color=1, angle=UP)]
@@ -92,6 +92,6 @@ def test_pool_mirror_doubles_segments(tmp_path):
     # normal pools on the shared volume)
     cat = tmp_path / "cat.json"
     cat.write_text("[]", encoding="utf-8")
-    a = rp._cache_path(25.0, 99, str(cat), 0.5, mirror=False)
-    b = rp._cache_path(25.0, 99, str(cat), 0.5, mirror=True)
+    a = rp._cache_path(99, str(cat), 0.5, mirror=False)
+    b = rp._cache_path(99, str(cat), 0.5, mirror=True)
     assert a != b

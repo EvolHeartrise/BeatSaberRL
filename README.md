@@ -182,14 +182,17 @@ wide trunks: the fp16 diag `r1` runs ~1.8× the narrow model's and rises;
 if it passes 1e-2 or `clipfrac` on the first minibatch leaves 0, move the
 head GEMM to fp32.
 
-**Recipe since 2026-09-15 (user decision): `--clip 0.3` and `--trunk-arch
-simba` are the trainer defaults.** The full recipe is Muon + wide arch
-192/384 + env v45 (v42 hilt grip, `--note-geo`, v43 torque energy price,
-v45 per-hand previous-note block) + `--clip 0.3` + `--trunk-arch simba`;
-the pod BASE string needs no clip/trunk flags once these defaults land
-(explicit flags are harmless). Reference numbers are `v45_simba_c03`
-(pod igc6hvsqagfnrf, 2026-09-15): trunk final-50 **0.9607**, cd300 leaf
-**0.9721**, bench **2,495,323 upp / 17,894 wpp**. How they were chosen:
+**Recipe since 2026-09-16 (user decisions 09-15/09-16): `--clip 0.3`,
+`--trunk-arch simba`, and whole-level episodes (the only ranked-pool
+mode since 2026-09-16).** The full recipe is Muon + wide arch 192/384 +
+env v45 (v42 hilt grip, `--note-geo`, v43 torque energy price, v45
+per-hand previous-note block) + `--clip 0.3` + `--trunk-arch simba` +
+`--ranked-maps` whole-level episodes; the pod BASE string needs no
+clip/trunk/segment flags (there is no segment flag any more). Reference
+numbers are `v46_whole` (pod igc6hvsqagfnrf, 2026-09-16): trunk final-50
+**0.9601**, cd300 leaf **0.9728**, bench **2,583,201 upp / 18,271 wpp**
+(previous: `v45_simba_c03` on 25-s segments, 0.9607 / 0.9721 /
+2,495,323 / 17,894). How they were chosen:
 the clip ladder on env v45 — 0.2 → 0.3 gave +0.8 pt trunk and +1.7% bench
 (2,445,676 vs the v43-recipe 2,405,918), while 0.4 LOST −8.9% on the bench
 (2,227,709; 51 catastrophic levels) even though its leaf training acc
@@ -201,9 +204,31 @@ vs 0.9712, bench +2.0% with the gain growing with star rating (+0.10 at
 trunk end, calmer gradients (gnorm 2.2–2.4 vs 3.0–3.1), −15% torque.
 Open items: the leaf entropy floor is slightly higher under SimBa (9.8 vs
 8.5 — LN2 keeps the heads warmer through cooldown; a leaf-side knob), and
-the catastrophic-fall count went 6 → 20 levels below 50% (the per-seed
-early-fall lottery on ~20 hard maps, ~2,000 pp either way) — the next
-loss item, with the wrist τmax ceiling from the dead-gear census.
+the wrist τmax ceiling from the dead-gear census. The catastrophic-fall
+lottery (6 → 20 levels below 50% on the segment-trained SimBa leaf) was
+fixed by whole-level episodes (below): 20 → 4.
+
+**Whole-level episodes (the only mode since 2026-09-16, user decision):**
+`--ranked-maps` training used to slice every level into 25-s windows
+(stride 25 − lead, ≤ 1,536 objects per window, ~690-tick episodes,
+`--seg-len`). Now one episode = one level, played from song time 0 to
+its last object + tail; the pool holds every ranked level once (12,192
+entries with `--mirror-augment`, 654 MB ragged, max 5,586 objects), the
+episode limit is the longest level's end + 90 ticks (18,075 ticks,
+602 s), and the only per-env per-object tensor is the 1-byte status
+array (181 MB at 32k envs). Front padding is exactly the bench parser's
+2.0-s first-note anchor — nothing is added — so every episode starts
+with a 2-s no-note lead (the 25-s windows mostly started at 0.5 s; the
+untrained policy falls before the first note, so training acc prints
+NaN for the first ~20 updates — expected). The probe (`v46_whole`, same
+recipe otherwise): trunk final-50 0.9601 vs 0.9605 on segments
+(identical), leaf 0.9728 vs 0.9721, bench **2,583,201 vs 2,495,323 upp
+(+3.5%)**, catastrophic levels 20 → 4, full combos +12%, misses −15%,
+median +0.09 pt uniform across 2–12★ and across every duration bucket;
+throughput identical. A bench-faithfulness gain: the leaf trains on the
+episode structure the bench plays. The window machinery
+(`window_starts`, `MAX_OBJECTS`, `--seg-len`) is gone; the pool cache
+key is frozen at the whole-level form so existing caches are reused.
 
 **`--trunk-arch simba` (2026-09-15, research/2026-09-14-architecture-brainstorm.md
 #2; DEFAULT since 2026-09-15, `--trunk-arch mlp` reproduces the older layout):** the readout trunk that turns the three
@@ -313,7 +338,7 @@ Those figures are the KINEMATIC (v7) era and no longer apply: on the
 v10 dynamic body a full 6,097-difficulty bench measures **~18 min
 (~343 levels/min) on a 5090** (2026-08-31). The 7-10 min/checkpoint
 quoted in the 2026-08-08 migration notes is the v10/v11 env on a 4090
-and is also stale — walls and MAX_OBJECTS 1536 landed after it. Rate
+and is also stale — walls and the (since-retired) 1,536-object window cap landed after it. Rate
 is very uneven across the catalog (a high-star stretch runs ~134
 levels/min), so do NOT extrapolate a total from a short sample.
 

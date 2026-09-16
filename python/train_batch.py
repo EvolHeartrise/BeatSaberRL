@@ -615,28 +615,23 @@ def parse_args():
                         "checkpoints and bench numbers do not carry "
                         "across the weld/contact boundary")
     p.add_argument("--ranked-maps", action="store_true",
-                   help="train on SEGMENTS of the real ranked ScoreSaber "
+                   help="train on WHOLE LEVELS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
                         "parsing protocol, real NJS speeds since "
                         "2026-07-30) instead of the procedural "
-                        "generator. --chart-pool becomes the segment "
+                        "generator. --chart-pool becomes the level "
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
     p.add_argument("--lead-s", type=float, default=1.5,
-                   help="ranked-maps segment head gap (s) — the earliest "
+                   help="ranked-maps front gap (s) — notes before it are "
+                        "dropped, walls clipped to it; the earliest "
                         "first note of an episode (env v16, contact spec "
                         "§11: shorter keeps note data in the mix when "
                         "falls spike, damping survival-drift)")
-    p.add_argument("--seg-len", type=float, default=25.0,
-                   help="ranked-maps segment length in song seconds; "
-                        "0 = WHOLE-LEVEL episodes (2026-09-15 probe: "
-                        "one window per level from song start, no "
-                        "per-window object cap, episode limit from "
-                        "the longest level)")
     p.add_argument("--mirror-augment", action="store_true",
                    help="double the ranked-maps pool with left-right "
-                        "mirrored copies of every segment (handedness-"
+                        "mirrored copies of every level (handedness-"
                         "bias regularizer, 2026-08-14; --chart-pool "
                         "subsamples the doubled pool)")
     p.add_argument("--fall-pen", type=float, default=5.0,
@@ -1018,21 +1013,17 @@ def main():
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
-        pool = load_ranked_pool(seg_len=args.seg_len,
-                                sample=args.chart_pool, seed=args.seed,
+        from beat_arena_env.ranked_pool import pool_max_steps
+        pool = load_ranked_pool(sample=args.chart_pool, seed=args.seed,
                                 device=device, lead_s=args.lead_s,
                                 mirror=args.mirror_augment)
-        # whole-level mode (--seg-len 0, 2026-09-15): the episode limit
-        # comes from the longest level in the pool, not from seg_len
-        if args.seg_len <= 0:
-            from beat_arena_env.ranked_pool import pool_max_steps
-            pool_steps = pool_max_steps(pool)
-            print(f"[ranked-pool] WHOLE-LEVEL episodes: max_steps "
-                  f"{pool_steps} ({pool_steps / 30:.0f} s incl. tail + "
-                  f"margin), {int(pool['n_notes'].shape[0])} levels in "
-                  f"the pool", flush=True)
-        else:
-            pool_steps = int(args.seg_len * 30) + 90
+        # whole-level episodes (the only mode since 2026-09-16): the
+        # episode limit comes from the longest level in the pool
+        pool_steps = pool_max_steps(pool)
+        print(f"[ranked-pool] WHOLE-LEVEL episodes: max_steps "
+              f"{pool_steps} ({pool_steps / 30:.0f} s incl. tail + "
+              f"margin), {int(pool['n_notes'].shape[0])} levels in "
+              f"the pool", flush=True)
         venv = VecCls(N, pool=pool,
                       max_steps=pool_steps,
                       wide_acc=args.wide_acc, gears=args.gears,

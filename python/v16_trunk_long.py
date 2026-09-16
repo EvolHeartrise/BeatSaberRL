@@ -27,7 +27,7 @@ TRAIN_TIMEOUT = 42_000
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--foot-contact", "--gears", "5",
           "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "24576",
           "--gamma", "0.965", "--gae-lambda", "0.98",
           "--ent-coef", "0.03",

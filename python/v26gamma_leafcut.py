@@ -25,7 +25,7 @@ COOLDOWN = 400
 # the v26 gamma recipe (v25 verbatim except gamma 0.99)
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--foot-contact", "--gears", "5", "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.99", "--gae-lambda", "0.98",
           "--energy-coef", "7.5e-6",  # env v43: was --iso-coef 5e-4 (retired 2026-09-14)

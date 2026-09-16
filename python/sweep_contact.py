@@ -51,7 +51,7 @@ from copy import deepcopy
 from protein_sweep import Protein
 
 PY = sys.executable
-SEG_LEN = 25.0
+# SEG_LEN retired 2026-09-16: whole-level episodes are the only pool mode
 SEG_POOL = 24576
 NUM_ENVS, HORIZON = 16384, 8
 FAIL_SCORE = -120.0
@@ -111,7 +111,7 @@ def run_leg(idx, h, run_dir):
            "--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
            "--foot-contact", "--gears", "5",
            "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", "--seg-len", f"{SEG_LEN:g}",
+           "--ranked-maps", 
            "--chart-pool", str(SEG_POOL),
            "--lr", f"{h['lr']:.6g}",
            "--ent-coef", f"{h['ent_coef']:.6g}",

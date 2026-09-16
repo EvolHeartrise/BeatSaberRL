@@ -37,9 +37,10 @@ def env_phase(num_envs, iters, policy, pool_sample=999999):
     # pool_sample small (e.g. 64) makes every pool read L2-resident —
     # the pool-residency probe that decides whether pool-layout work
     # (audit Tier 3.1/3.2) can matter at all
-    pool = load_ranked_pool(seg_len=25, sample=pool_sample, seed=0,
+    pool = load_ranked_pool(sample=pool_sample, seed=0,
                             device=device, lead_s=0.5, mirror=True)
-    venv = CudaBeatVecEnv(num_envs, pool=pool, max_steps=25 * 30 + 90,
+    from beat_arena_env.ranked_pool import pool_max_steps
+    venv = CudaBeatVecEnv(num_envs, pool=pool, max_steps=pool_max_steps(pool),
                           foot_contact=True, gears=5, seed=0,
                           device=device)
     venv.reset()

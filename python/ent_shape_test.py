@@ -40,7 +40,7 @@ TOTAL_STEPS = 176_508_300   # run 085's budget, verbatim
 # run 085 hypers exactly as the sweep driver passed them (%.6g)
 BASE = ["--num-envs", "1024", "--horizon", "128",
         "--lr-decay", "cosine",
-        "--ranked-maps", "--seg-len", "25",
+        "--ranked-maps", 
         "--chart-pool", "24576",
         "--lr", "0.00296092",
         "--gamma", "0.914958",

@@ -67,7 +67,7 @@ def main():
         cmd = [PY, "train_batch.py",
                "--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
                "--lr-decay", "cosine", "--seed", "0",
-               "--ranked-maps", "--seg-len", "25",
+               "--ranked-maps", 
                "--chart-pool", "24576",
                "--gears", "5",
                "--lr", f"{h['lr']:.6g}",
