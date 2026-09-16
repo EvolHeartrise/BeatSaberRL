@@ -45,8 +45,12 @@ def test_param_deltas_exact():
     assert _trunk_params(s384) - _trunk_params(mlp) == 149_376
     assert _trunk_params(s1536) - _trunk_params(mlp) == 1_035_264
     tot = lambda p: sum(x.numel() for x in p.parameters())  # noqa: E731
-    assert tot(mlp) == 2_418_578
-    assert tot(s384) == 2_567_954
+    # env v46 (2026-09-16) widened the encoders: saber 37 -> 44 lanes
+    # (+7 x 192 x 2 tokens... one shared saber_mlp: +1,344) and body
+    # 78 -> 87 (+9 x 192 = 1,728): totals +3,072 over the v45 counts
+    # (2,418,578 / 2,567,954)
+    assert tot(mlp) == 2_421_650
+    assert tot(s384) == 2_571_026
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
     assert names == {"trunk_proj.weight", "trunk_proj.bias",

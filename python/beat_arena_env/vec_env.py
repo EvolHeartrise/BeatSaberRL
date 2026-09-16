@@ -94,6 +94,11 @@ class BeatVecEnv:
         sum legs, env-ticks) of applied |tau| in N.m — CUDA mirror."""
         return self.sim.pop_torque()
 
+    def set_tau_scale(self, s16):
+        """env v46: fix the 16 per-axis torque-limit scales on every env
+        (CUDA set_tau_scale mirror; the Rust backend never randomizes)."""
+        self.sim.set_tau_scale([float(x) for x in s16])
+
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
         self.sim.set_chart(i, [note_tuple(n) for n in generate_chart(self.cfg, rng)])

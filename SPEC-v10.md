@@ -147,6 +147,13 @@ position and 6 velocity coords are separate and unactuated):
 arm_r[same], leg_l[hip_pitch,hip_yaw,hip_roll,knee,ankle_pitch,ankle_roll],
 leg_r[same]**.
 
+Env v46 (2026-09-16): the torque limits are SCALED per env — τ_max,j =
+TAU_MAX[j] · s[axis(j)] with 16 axes (spine 3, arm 7 shared by both arms,
+leg 6 shared by both legs; `constants.TAU_AXIS_OF_JOINT`), s = 1.0 when
+randomization is off (bit-identical to the table). Both engines apply
+the scale in the same expression tree: τ_j = frac · TAU_MAX[j] · s, and
+the energy base |frac · TAU_MAX[j] · s|.
+
 Arm joint limits are v9 verbatim (per-hand mirrored where noted; values in
 rad). New-joint limits from anatomical range tables. τ_max derivation §1.5;
 damping b in N·m·s/rad; ω cap in rad/s.
@@ -522,6 +529,17 @@ gaps in the song to swing at the next note.
 | 0, 1 | (x − head_x)/1, (y − head_y)/0.75 — the note's world position against the LIVE head, the entity-lane rule (v38) |
 | 2, 3 | dir_cos, dir_sin — zero on dot notes, Bézier tangent on chain links (the entity `show_dir` rule) |
 | 4 | valid — 1 once any note of that colour has resolved; the whole block is 0 before |
+
+**Env v46 (2026-09-16) — torque-limit scale lanes, OBS_DIM 624.** 16 lanes
+at 608..624, one per axis in axis order (spine pitch/yaw/roll; arm
+pitch/yaw/twist/elbow/wrist roll/bend/dev; hip pitch/yaw/roll, knee,
+ankle pitch/roll), value (s − 1) / 0.25 where s is the env's per-axis
+torque-limit scale for the current episode (§1.4 note); all 0 when
+randomization is off. Drawn at every reset by the CUDA env (U(1 − r,
+1 + r), r = `--tau-rand`, seeded generator); the Rust sim takes them
+explicitly (`set_tau_scale`). Routed by the policy: arm lanes into both
+saber tokens, spine + leg lanes into the body token. The replay header
+records the episode's scales (`tau_scale`, record_rev 5).
 
 Attribution is by NOTE COLOUR only: a good cut, a bad cut (slow /
 angle), a wrong-hand cut (the other saber's sweep in the bad box) and a

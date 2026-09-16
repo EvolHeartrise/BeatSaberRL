@@ -1,4 +1,4 @@
-"""env v45: per-hand PREVIOUS-NOTE obs blocks v2 (598..607, OBS_DIM 608).
+"""env v45: per-hand PREVIOUS-NOTE obs blocks v2 (598..607, OBS_DIM 608 -> 624 since env v46).
 
 Contract (both engines): block s is the most recently RESOLVED scoreable
 note OF THAT HAND'S COLOUR (colour 0 -> L, 1 -> R), regardless of which
@@ -69,13 +69,13 @@ def _expect_block(sim, note):
 # --- layout ------------------------------------------------------------------
 
 def test_layout_contract():
-    assert OBS_DIM == 608 and PREV_FEAT == 5
+    assert OBS_DIM == 624 and PREV_FEAT == 5
     assert OFF_PREV_L == 598 and OFF_PREV_R == 603
     from policy import (OBS_DIM as P_OBS, SABER_FEAT, _SABER_L_IDX,
                         _SABER_R_IDX)
-    assert P_OBS == OBS_DIM and SABER_FEAT == 37
-    assert _SABER_L_IDX[-PREV_FEAT:] == tuple(range(598, 603))
-    assert _SABER_R_IDX[-PREV_FEAT:] == tuple(range(603, 608))
+    assert P_OBS == OBS_DIM and SABER_FEAT == 44   # 37 + 7 tau arm lanes (env v46)
+    assert _SABER_L_IDX[-(PREV_FEAT + 7):-7] == tuple(range(598, 603))   # tau arm lanes follow (env v46)
+    assert _SABER_R_IDX[-(PREV_FEAT + 7):-7] == tuple(range(603, 608))
 
 
 def test_reset_all_zero():
@@ -275,7 +275,7 @@ def test_wrong_hand_cut_records_on_the_note_colour_not_the_cutter():
 def test_policy_arch_marker_forward_and_refusal():
     from policy import NotePolicy, load_policy
     pol = NotePolicy()
-    assert pol.arch["obs_dim"] == 608
+    assert pol.arch["obs_dim"] == 624
     sim = _sim([note_tuple(Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4,
                                 color=1, angle=DOWN, speed=4.0)),
                 note_tuple(FAR_NOTE)])

@@ -137,8 +137,12 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # appended at 598..608 — for each hand the last resolved note OF THAT
 # HAND'S COLOUR regardless of who cut it: head-relative x/y, cut
 # direction cos/sin, valid — routed into the saber tokens, OBS_DIM
-# 598 -> 608, SABER_FEAT 32 -> 37.
-OBS_DIM = 608
+# 598 -> 608, SABER_FEAT 32 -> 37. Env v46 (2026-09-16, user design):
+# 16 torque-limit SCALE lanes appended at 608..624 — one per axis
+# (spine 3, arm 7 shared L/R, leg 6 shared L/R), (s − 1)/0.25; the 7
+# arm lanes go into BOTH saber tokens (37 -> 44), spine + leg lanes
+# into the body token (78 -> 87). OBS_DIM 608 -> 624.
+OBS_DIM = 624
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 OFF_NOTES = 102
@@ -155,29 +159,38 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 534
 # v13) and elbow velocity (3, env v24): 26 -> 32; and its colour's
 # previous-note block (5, env v45): 32 -> 37, appended LAST so the
 # note-geo lane constants (_S_WPOS/_S_WVEL/_S_BLADE) stay valid.
-SABER_FEAT = 37
+SABER_FEAT = 44
 PREV_FEAT = 5
-BODY_FEAT = 78
+TAU_FEAT = 16
+BODY_FEAT = 87
 # derived from the window size so a future slot change can't skew them
 _GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
 _BP = _GI + 4                           # body_pts block (18)
 _BPV = _BP + 18                         # body_pt_vel block (18, env v24)
 _PREV_L = _BPV + 18                     # prev-note L block (5, env v45)
 _PREV_R = _PREV_L + PREV_FEAT           # prev-note R block (5, env v45)
-assert _PREV_R + PREV_FEAT == OBS_DIM
+_TAU = _PREV_R + PREV_FEAT              # tau-scale lanes (16, env v46)
+assert _TAU + TAU_FEAT == OBS_DIM
+# env v46 routing: arm axes (7) to both saber tokens; spine (3) + leg (6)
+# axes to the body token — all appended LAST in their tokens
+_TAU_ARM = tuple(range(_TAU + 3, _TAU + 10))
+_TAU_BODY = tuple(range(_TAU, _TAU + 3)) + tuple(range(_TAU + 10, _TAU + 16))
 _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
                 + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3))
                 + tuple(range(_BPV, _BPV + 3))
-                + tuple(range(_PREV_L, _PREV_L + PREV_FEAT)))
+                + tuple(range(_PREV_L, _PREV_L + PREV_FEAT))
+                + _TAU_ARM)
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
                 + tuple(range(86, 97)) + tuple(range(_BP + 3, _BP + 6))
                 + tuple(range(_BPV + 3, _BPV + 6))
-                + tuple(range(_PREV_R, _PREV_R + PREV_FEAT)))
+                + tuple(range(_PREV_R, _PREV_R + PREV_FEAT))
+                + _TAU_ARM)
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(97, 102))
              + tuple(range(_GI, _GI + 4))
              + tuple(range(_BP + 6, _BP + 18))
-             + tuple(range(_BPV + 6, _BPV + 18)))
+             + tuple(range(_BPV + 6, _BPV + 18))
+             + _TAU_BODY)
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 
@@ -993,11 +1006,11 @@ def load_policy(ckpt) -> NotePolicy:
             or "ffn_mult" not in arch
             or not arch.get("body_token", False)):
         raise SystemExit(
-            f"checkpoint is not env v45 era (needs arch obs_dim="
+            f"checkpoint is not env v46 era (needs arch obs_dim="
             f"{OBS_DIM}, n_action_heads=29, ffn_mult, body_token=True; "
-            f"got {dict(arch)}). Env v45 (2026-09-15) appended the "
-            "per-hand previous-note blocks v2 (obs 598 -> 608; the "
-            "same-day v44 block was 626); every earlier checkpoint "
+            f"got {dict(arch)}). Env v46 (2026-09-16) appended the 16 "
+            "torque-limit scale lanes (obs 608 -> 624; v45 was 608, "
+            "the same-day v44 block 626); every earlier checkpoint "
             "plays a different obs — retrain, no conversion.")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],

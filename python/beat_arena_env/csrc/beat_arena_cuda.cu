@@ -978,8 +978,23 @@ constexpr int OFF_BODY_PT_VEL = OFF_BODY_PTS + 3 * N_BODY_PTS;       // 580
 constexpr int PREV_FEAT = 5;
 constexpr int OFF_PREV_L = OFF_BODY_PT_VEL + 3 * N_BODY_PTS;          // 598
 constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
-constexpr int OBS_DIM = OFF_PREV_R + PREV_FEAT;                       // 608
-static_assert(OBS_DIM == 608, "spec §12 (env v45 prev-note blocks): OBS_DIM must be 608");
+// env v46 (user design 2026-09-16): per-env joint torque-limit scales,
+// one per AXIS (16: spine 3, arm 7 shared L/R, leg 6 shared L/R), as
+// (s - 1) / TAU_RAND_NORM lanes (lib.rs OFF_TAU mirror). Drawn at every
+// reset when tau_rand > 0 from the wrapper-supplied tau_jit U(-1,1)
+// buffer (pose_jit precedent); otherwise whatever the wrapper wrote
+// (set_tau_scale; default 1.0 => lanes 0, torque bit-identical).
+constexpr int TAU_FEAT = 16;
+constexpr double TAU_RAND_NORM = 0.25;
+constexpr int OFF_TAU = OFF_PREV_R + PREV_FEAT;                       // 608
+constexpr int OBS_DIM = OFF_TAU + TAU_FEAT;                           // 624
+static_assert(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
+__device__ constexpr int TAU_AXIS[NQ] = {
+    0, 1, 2,
+    3, 4, 5, 6, 7, 8, 9,
+    3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15,
+    10, 11, 12, 13, 14, 15};
 constexpr double KNEE_Y0 = 0.50;  // hip 0.94 − thigh 0.44
 constexpr double FOOT_Y0 = 0.07;  // ankle height at reference (spec §2)
 // ≈ one tick of full-body weight (M_TOTAL·g·DT = 24.53 N·s), rounded to
@@ -4527,6 +4542,16 @@ struct Sim {
   // + valid (lib.rs prev_idx / prev_valid mirror)
   int* __restrict__ prev_idx;
   uint8_t* __restrict__ prev_valid;
+  // env v46: per-env axis torque-limit scales (N, 16), the wrapper's
+  // U(-1,1) draw buffer (N, 16) consumed at reset when tau_rand > 0,
+  // the half-range, and the per-episode outcome record (N, 22) +
+  // flag written at `done` for the trainer's tau_draws log:
+  // [s0..s15, ep_ticks, ep_return, fell, good_cuts, score_pts, chart]
+  T* __restrict__ tau_scale;
+  const T* __restrict__ tau_jit;
+  T tau_rand;
+  T* __restrict__ ep_rec;
+  uint8_t* __restrict__ ep_flag;
   // R12 warp-coherence permutation: thread gid serves env env_order[gid]
   // (identity unless the host sorts it — see cuda_env.step). A bijection
   // on the thread->env assignment only; all P.*[e] addressing unchanged.
@@ -4893,6 +4918,13 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
     P.prev_idx[e * 2 + s] = 0;
     P.prev_valid[e * 2 + s] = 0;
   }
+  // env v46: fresh body for the new map — one scale per axis, both
+  // sides share it; only when randomization is on (set_tau_scale's
+  // explicit values persist otherwise)
+  if (P.tau_rand > T(0))
+    for (int a = 0; a < TAU_FEAT; a++)
+      P.tau_scale[e * TAU_FEAT + a] =
+          T(1) + P.tau_rand * P.tau_jit[e * TAU_FEAT + a];
   // env v17 wall state
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
@@ -5205,6 +5237,10 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       obs[base + 4] = 1.f;
     }
   }
+  // env v46: torque-limit scale lanes (lib.rs write_obs mirror)
+  for (int a = 0; a < TAU_FEAT; a++)
+    obs[OFF_TAU + a] = (float)(((double)P.tau_scale[e * TAU_FEAT + a] - 1.0)
+                               / TAU_RAND_NORM);
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
@@ -5237,12 +5273,14 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
     const double frac = a < 7 ? gr[a] : 0.0;
-    tau[j] = T(frac) * T(TAU_MAX[j]);
+    // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
+    const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
+    tau[j] = T(frac) * T(TAU_MAX[j]) * T(ts);
     const double f = fabs(frac);
     act += f;
     const int g = j < 3 ? 0 : (j < 17 ? 1 : 2);
     act_grp[g] += f;
-    const double t = fabs(frac * TAU_MAX[j]);
+    const double t = fabs(frac * TAU_MAX[j] * ts);
     tau_abs += t;
     tau_grp[g] += t;
   }
@@ -5872,6 +5910,19 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   if (done) {
     const int pos = atomicAdd(P.ret_total, 1);
     P.ret_buf[pos % P.cap] = ep;
+    // env v46 tau_draws record (only while randomizing): the body this
+    // episode played and how it went; the wrapper pops + clears flags
+    if (P.tau_rand > T(0)) {
+      T* r = P.ep_rec + (size_t)e * 22;
+      for (int a = 0; a < TAU_FEAT; a++) r[a] = P.tau_scale[e * TAU_FEAT + a];
+      r[16] = T(tick_new);
+      r[17] = ep;
+      r[18] = (fell || tilted) ? T(1) : T(0);
+      r[19] = T(P.good[e]);
+      r[20] = P.score[e];
+      r[21] = T(P.chart_idx[e]);
+      P.ep_flag[e] = 1;
+    }
   }
   if (done && P.auto_reset) reset_env(d, P, e, P.cand[e]);
 }
@@ -5958,6 +6009,7 @@ enum {
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
   TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
+  TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,22), flag (N) — 2026-09-16
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -5977,7 +6029,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
-          double z_clip_hi, double self_contact_coef) {
+          double z_clip_hi, double self_contact_coef, double tau_rand) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -6047,6 +6099,11 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.tau_stat = ts[TTAUSTAT].data_ptr<scalar_t>();
     P.prev_idx = ts[TPREVIDX].data_ptr<int>();
     P.prev_valid = ts[TPREVVALID].data_ptr<uint8_t>();
+    P.tau_scale = ts[TTAUSCALE].data_ptr<scalar_t>();
+    P.tau_jit = ts[TTAUJIT].data_ptr<scalar_t>();
+    P.ep_rec = ts[TEPREC].data_ptr<scalar_t>();
+    P.ep_flag = ts[TEPFLAG].data_ptr<uint8_t>();
+    P.tau_rand = (scalar_t)tau_rand;
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();

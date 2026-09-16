@@ -20,7 +20,7 @@ import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
-from .constants import (HANDLE_LEN, 
+from .constants import (TAU_FEAT, HANDLE_LEN, 
     EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
 )
 
@@ -78,6 +78,9 @@ class RustBeatEnv(gym.Env):
         self.wide_acc = wide_acc
         self.gears = gears
         self.foot_contact = bool(foot_contact)
+        # env v46: explicit per-axis torque-limit scales (all 1.0 = the
+        # v45 body); recorded in the replay header (record_rev 5)
+        self.tau_scale = [1.0] * TAU_FEAT
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
@@ -85,6 +88,14 @@ class RustBeatEnv(gym.Env):
         # spine(3), arm_l(7), arm_r(7), leg_l(6), leg_r(6); id 0 coast,
         # 1/2 = +/-full, finer +/- gear pairs append (constants.gear_table)
         self.action_space = gym.spaces.MultiDiscrete([gears] * N_JOINTS)
+
+    def set_tau_scale(self, s16):
+        """env v46: fix the 16 per-axis torque-limit scales (spine 3, arm 7
+        shared L/R, leg 6 shared L/R) for every later episode."""
+        s = [float(x) for x in s16]
+        assert len(s) == TAU_FEAT, "tau scale must have 16 axis values"
+        self.sim.set_tau_scale(s)
+        self.tau_scale = s
 
     # -- recording (JSONL v10 — SPEC-v10 §6, same format the viewer reads) ----
     def set_record(self, path: str):
@@ -107,8 +118,11 @@ class RustBeatEnv(gym.Env):
             # [total, spine, arms, legs] applied |tau| in N.m (env v43
             # energy-price base, 2026-09-14). Readers must treat a
             # HIGHER rev as "fields I do not know about are present",
-            # never as an error.
-            "record_rev": 4,
+            # never as an error. 5 = header "tau_scale" (env v46, the 16
+            # per-axis torque-limit scales this episode played with;
+            # 2026-09-16) — a HEADER field, per-tick record unchanged.
+            "record_rev": 5,
+            "tau_scale": [round(v, 6) for v in self.tau_scale],
             # env v15 (contact spec §10), ADDITIVE: the note track is
             # head-anchored — viewers must add head_z - PLANE_Z0 to
             # every note's world z. Absent on pre-v15 recordings

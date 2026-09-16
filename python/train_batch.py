@@ -640,6 +640,16 @@ def parse_args():
                         "the 3-arm-probe winner (2026-08-15: falls/update "
                         "8-10k -> ~35, bench zeros 35 -> 2); the legacy "
                         "remaining-notes charge is REMOVED")
+    p.add_argument("--tau-rand", type=float, default=0.0,
+                   help="env v46 (user design 2026-09-16): per-env "
+                        "randomized joint torque limits — at every "
+                        "episode reset each of the 16 axes (spine 3, arm "
+                        "7 shared L/R, leg 6 shared L/R) draws a scale "
+                        "U(1-r, 1+r) applied to tau_max; the scales are "
+                        "in the obs (lanes 608..624). 0 = off (all 1.0, "
+                        "bit-identical to v45). Episode outcomes per "
+                        "body are logged to <run-dir>/tau_draws.f32 "
+                        "(tau_regress.py). CUDA env only")
     p.add_argument("--push-prob", type=float, default=0.00333,
                    help="env v18 perturbation training (DEFAULT = probe "
                         "winner, ~1 kick / 10 s / env): per-(env,tick) "
@@ -1043,6 +1053,7 @@ def main():
                       crouch_start_prob=args.crouch_start_prob,
                       z_clip_hi=args.z_clip_hi,
                       self_contact_coef=args.self_contact_coef,
+                      tau_rand=args.tau_rand,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -1508,6 +1519,14 @@ def main():
                   flush=True)
             metrics_f = False
 
+    # env v46 body-draw log state
+    tau_draws_path = os.path.join(args.run_dir, "tau_draws.f32")
+    tau_n_episodes = 0
+    tau_recent = []
+    if args.tau_rand > 0.0:
+        print(f"--tau-rand {args.tau_rand}: per-env joint torque limits "
+              f"drawn U(1-r, 1+r) per axis at every reset (16 axes, L/R "
+              f"shared); episode log -> {tau_draws_path}", flush=True)
     for update in range(start_update, num_updates):
         if leaf_from is not None:
             # leaf cooldown: 1-sqrt decay to the floor (EPFL 2405.18392:
@@ -2180,6 +2199,38 @@ def main():
                 print(f"[torque] {tq_t / tq_n:.3f} N*m/env-tick (spine "
                       f"{tq_s / tq_n:.3f} / arms {tq_a / tq_n:.3f} / legs "
                       f"{tq_l / tq_n:.3f})", flush=True)
+        # env v46 body-draw log: every episode that ended this update
+        # -> (s0..s15, ticks, return, fell, cuts, pts, chart) appended to
+        # <run-dir>/tau_draws.f32 (raw float32 rows, 22 cols; reader:
+        # tau_regress.py); a [tau] line every 25 updates with the
+        # least-squares slope of fall rate on each group's mean scale
+        if args.tau_rand > 0.0 and hasattr(venv, "pop_episodes"):
+            rows = venv.pop_episodes()
+            if rows.shape[0]:
+                with open(tau_draws_path, "ab") as f:
+                    f.write(np.ascontiguousarray(rows, dtype=np.float32)
+                            .tobytes())
+                tau_n_episodes += int(rows.shape[0])
+                tau_recent.append(rows)
+                if len(tau_recent) > 400:
+                    tau_recent.pop(0)
+            m_ev.update(tau_episodes=tau_n_episodes)
+            if update % 25 == 0 and tau_recent:
+                R = np.concatenate(tau_recent)
+                R = R[R[:, 16] >= 60]           # skip lead-only episodes
+                if R.shape[0] >= 200:
+                    from beat_arena_env.constants import TAU_GROUPS
+                    fell = R[:, 18]
+                    parts = []
+                    for g, axes in TAU_GROUPS.items():
+                        x = (R[:, list(axes)].mean(1) - 1.0) / 0.25
+                        xc = x - x.mean()
+                        den = float((xc * xc).sum())
+                        slope = float((xc * (fell - fell.mean())).sum() / den) if den > 0 else 0.0
+                        parts.append(f"{g} {slope:+.4f}")
+                    print(f"[tau] {tau_n_episodes:,} episodes logged | fall rate "
+                          f"{fell.mean():.4f} over the last {R.shape[0]:,} | "
+                          f"d(fall)/d(+25%) " + "  ".join(parts), flush=True)
         # env v41 self-contact telemetry: mean self-collision impulse
         # per env-tick (N.s) and the share of env-ticks with any
         # body-on-body contact — accumulates at coef 0 too, so the

@@ -31,6 +31,7 @@ import torch
 
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
+from beat_arena_env.constants import parse_tau_scale
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
 from policy import load_policy
@@ -46,13 +47,15 @@ def slug(s, n=24):
 _W = {}          # per-process state: {"policy", "dev", "fc", "push"} (set by _worker_init)
 
 
-def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0)):
+def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0),
+                 tau_scale=None):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
     _W["fc"] = foot_contact
     _W["push"] = push
+    _W["tau"] = tau_scale   # env v46 fixed body (None = all 1.0)
 
 
 def _kick(env, rng, vmax):
@@ -85,6 +88,8 @@ def _make_one(job):
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
                       foot_contact=_W["fc"],
                       external_walls=meta["walls"])
+    if _W.get("tau") is not None:
+        env.set_tau_scale(_W["tau"])
     env.set_record(base + ".jsonl")
     obs, _ = env.reset()
     walk = scoresaber.ComboTracker()
@@ -158,6 +163,10 @@ def main():
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
+    p.add_argument("--tau-scale", type=str, default=None,
+                   help="env v46: fixed per-axis torque-limit scales (16 "
+                        "floats or group shorthand, see bench_scoresaber "
+                        "--tau-scale); default = the v45 body")
     p.add_argument("--foot-contact", action="store_true",
                    help="env v11 contact physics — MUST match how the "
                         "checkpoint was trained (a v12+/contact ckpt "
@@ -202,7 +211,9 @@ def main():
                                  initargs=(args.ckpt, device,
                                            args.foot_contact,
                                            (args.push_prob, args.push_vmax,
-                                            args.push_seed))) as ex:
+                                            args.push_seed),
+                                           parse_tau_scale(args.tau_scale)
+                                           if args.tau_scale else None)) as ex:
             for base, line, warn in ex.map(_make_one, jobs):
                 if warn:
                     print(warn, flush=True)
@@ -210,7 +221,9 @@ def main():
                 made.append(base)
     else:
         _worker_init(args.ckpt, device, args.foot_contact,
-                     (args.push_prob, args.push_vmax, args.push_seed))
+                     (args.push_prob, args.push_vmax, args.push_seed),
+                     parse_tau_scale(args.tau_scale) if args.tau_scale
+                     else None)
         for job in jobs:
             base, line, warn = _make_one(job)
             if warn:

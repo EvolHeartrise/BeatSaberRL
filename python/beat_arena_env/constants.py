@@ -275,8 +275,68 @@ _OBS_BLOCKS = (
     #  positioning, holding the saber at the right spot through gaps.
     ("prev_l", 5),
     ("prev_r", 5),
+    # env v46 (user design 2026-09-16): per-env JOINT TORQUE-LIMIT
+    # SCALES. At every episode reset the env draws one scale per AXIS
+    # (16: spine 3, arm 7 shared by both arms, leg 6 shared by both
+    # legs — the user: "the left side must always match the right"),
+    # s_a ~ U(1 - r, 1 + r) with r = --tau-rand (0 = off => all 1.0),
+    # and applies tau_max_j = TAU_MAX[j] * s[axis(j)] to torque, the
+    # energy price and the [torque] telemetry. Lanes = (s - 1) /
+    # TAU_RAND_NORM (0.25, fixed), axis order below; all-zero when off.
+    # Routed: arm lanes -> BOTH saber tokens, spine + leg -> body token.
+    ("tau_scale", 16),
 )
 PREV_FEAT = 5
+TAU_FEAT = 16
+TAU_RAND_NORM = 0.25
+# axis -> joints: spine a (0..2) -> [a]; arm a (0..6) -> [3+a, 10+a];
+# leg a (0..5) -> [17+a, 23+a]
+TAU_AXIS_JOINTS = tuple(
+    [(a,) for a in range(3)]
+    + [(3 + a, 10 + a) for a in range(7)]
+    + [(17 + a, 23 + a) for a in range(6)])
+TAU_AXIS_OF_JOINT = tuple(
+    next(a for a, js in enumerate(TAU_AXIS_JOINTS) if j in js)
+    for j in range(N_JOINTS))
+TAU_AXIS_NAMES = ("spine_pitch", "spine_yaw", "spine_roll",
+                  "arm_pitch", "arm_yaw", "arm_twist", "elbow",
+                  "wrist_roll", "wrist_bend", "wrist_dev",
+                  "hip_pitch", "hip_yaw", "hip_roll", "knee",
+                  "ankle_pitch", "ankle_roll")
+# --tau-scale group shorthand (bench / replay tooling)
+TAU_GROUPS = {"spine": (0, 1, 2), "arms": (3, 4, 5, 6),
+              "wrists": (7, 8, 9), "legs": (10, 11, 12, 14, 15),
+              "knees": (13,)}
+
+
+def parse_tau_scale(spec):
+    """'--tau-scale' text -> list of 16 floats. Either 16 comma-separated
+    floats in axis order, or group shorthand 'spine=1.25,wrists=0.8'
+    (groups: TAU_GROUPS; unspecified axes = 1.0). None/'' -> all 1.0."""
+    if spec is None or str(spec).strip() == "":
+        return [1.0] * TAU_FEAT
+    parts = [t.strip() for t in str(spec).split(",") if t.strip()]
+    if all("=" not in t for t in parts):
+        vals = [float(t) for t in parts]
+        if len(vals) != TAU_FEAT:
+            raise ValueError(f"--tau-scale needs {TAU_FEAT} floats or "
+                             f"group=value pairs, got {len(vals)}")
+        return vals
+    out = [1.0] * TAU_FEAT
+    for t in parts:
+        k, v = t.split("=", 1)
+        k = k.strip().lower()
+        if k not in TAU_GROUPS:
+            raise ValueError(f"--tau-scale: unknown group {k!r} "
+                             f"(groups: {sorted(TAU_GROUPS)})")
+        for a in TAU_GROUPS[k]:
+            out[a] = float(v)
+    return out
+
+
+def expand_tau_scale(s16):
+    """16 axis scales -> 29 per-joint scales (both sides share an axis)."""
+    return tuple(float(s16[TAU_AXIS_OF_JOINT[j]]) for j in range(N_JOINTS))
 OBS_OFF = {}
 _off = 0
 for _name, _len in _OBS_BLOCKS:
@@ -300,7 +360,8 @@ OFF_BODY_PTS = OBS_OFF["body_pts"]      # 562 (env v19)
 OFF_BODY_PT_VEL = OBS_OFF["body_pt_vel"]  # 580 (env v24)
 OFF_PREV_L = OBS_OFF["prev_l"]          # 598 (env v45)
 OFF_PREV_R = OBS_OFF["prev_r"]          # 603 (env v45)
-assert OBS_DIM == 608, "spec §12 (env v45 prev-note blocks): OBS_DIM must be 608"
+OFF_TAU = OBS_OFF["tau_scale"]          # 608 (env v46)
+assert OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec
