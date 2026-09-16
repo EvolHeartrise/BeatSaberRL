@@ -44,7 +44,9 @@ cd "$REPO/rust"
 CARGO_TARGET_DIR=/root/cargo-target VIRTUAL_ENV=$VENV \
     "$VENV/bin/maturin" develop --release 2>&1 | tail -2
 # f32 build of the same sources (module beat_arena_rs32) — the bench's
-# default engine since 2026-09-16 (training runs f32)
+# default engine since 2026-09-16 (training runs f32). The `cd` matters:
+# cargo reads .cargo/config.toml from the invocation dir upward, and
+# rust32/.cargo/config.toml is what gives this build target-cpu=native
 cd "$REPO/rust32"
 CARGO_TARGET_DIR=/root/cargo-target VIRTUAL_ENV=$VENV \
     "$VENV/bin/maturin" develop --release 2>&1 | tail -2
