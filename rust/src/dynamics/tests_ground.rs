@@ -438,3 +438,57 @@ fn v14_settled_cop_matches_com_projection() {
             "CoP ({:.4}, {:.4}) left the support hull", cop[0], cop[1]);
     assert!(gap < 0.04, "CoP-CoM gap {:.1} mm: moment balance broken", gap * 1e3);
 }
+
+/// bench-opt item 2 (2026-09-16): the ground rows' support dots are
+/// BITWISE the dense 35-wide dots, on LIVE rows of a random-gear
+/// contact-mode trajectory (corners come and go, both feet, falls) —
+/// against the post-solve v AND each row's own M⁻¹Jᵀ column (the two
+/// shipping consumers: PGS residual and effective mass) — and every
+/// column outside a row's support is the +0.0 bit pattern.
+#[test]
+fn ground_support_dot_bitwise() {
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    let mut cs = contact_set(m);
+    let mut rng = super::testutil::Rng(0x5EED_0000_0000_17E2);
+    let mut tau = [0.0; NQ];
+    let (mut checked, mut left_rows, mut right_rows) = (0usize, 0usize, 0usize);
+    for tick in 0..480 {
+        if tick % 8 == 0 {
+            for j in 0..NQ {
+                let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
+                tau[j] = g * m.tau_max[j];
+            }
+        }
+        substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+        let nv = st.v.len();
+        let mut probe = vec![0.0; nv];
+        for i in 0..nv {
+            // a signed-zero-rich finite vector: exact zeros on odd columns
+            probe[i] = if i % 2 == 1 { -0.0 } else { st.v[i] };
+        }
+        let lefts: Vec<bool> = cs.ground_contacts.iter().map(|g| g.frame == GROUND_FRAMES[0]).collect();
+        for src in [&st.v[..], &probe[..]] {
+            for (g, (dense, sup, zeros)) in cs.ground_dot_ref_vs_support(src).into_iter().enumerate() {
+                assert!(zeros, "substep {tick}: ground row {g} has a non-+0.0 word off its support");
+                assert_eq!(dense.to_bits(), sup.to_bits(), "substep {tick}: ground row {g} dot vs v");
+                checked += 1;
+            }
+        }
+        for g in 0..cs.ground_rows() {
+            let row = cs.ground_row(0) + g;
+            let mr = cs.row_minvjt(row).to_vec();
+            let (dense, sup, _) = cs.ground_dot_ref_vs_support(&mr)[g];
+            assert_eq!(dense.to_bits(), sup.to_bits(), "substep {tick}: ground row {g} diag dot");
+            assert_eq!(sup.to_bits(), cs.row_diag(row).to_bits(), "substep {tick}: live diag");
+            if lefts[g / GROUND_ROWS_PER_CORNER] {
+                left_rows += 1;
+            } else {
+                right_rows += 1;
+            }
+        }
+    }
+    println!("item-2 ground support: {checked} v-dots, {left_rows} left / {right_rows} right diag rows bitwise");
+    assert!(left_rows > 0 && right_rows > 0, "trajectory must exercise both feet");
+}
