@@ -553,7 +553,10 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     current = [q.pop(0) for q in queues]          # level playing per slot
     cand_host = np.array([(q[0] if q else -1) for q in queues],
                          dtype=np.int64)
-    env.set_next_chart(torch.as_tensor(cand_host, device=device))
+    # reset() starts every slot on the chart in the candidate array, so
+    # it holds the FIRST level now and the NEXT level from then on
+    env.set_next_chart(torch.as_tensor(np.array(current, dtype=np.int64),
+                                       device=device))
     CH = 2048                                # the rust path's batch shape
     fwd = (None if args.no_graphs else _GraphedArgmax(policy, CH, device))
     buf = torch.zeros((CH, OBS_DIM), device=device)
@@ -561,6 +564,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     data["sim_dtype"] = args.sim_dtype
     data["forward_chunk"] = CH
     obs = env.reset()
+    env.set_next_chart(torch.as_tensor(cand_host, device=device))
     acts = torch.zeros((n_slots, N_JOINTS), dtype=torch.int64, device=device)
     n_sc_pool = env.pool["n_scoreable"].cpu().numpy()
     active = np.ones(n_slots, dtype=bool)         # slot has a live level
