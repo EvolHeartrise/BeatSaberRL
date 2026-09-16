@@ -300,7 +300,25 @@ const OFF_BODY_PT_VEL: usize = OFF_BODY_PTS + 3 * N_BODY_PTS; // 580
 const PREV_FEAT: usize = 5;
 const OFF_PREV_L: usize = OFF_BODY_PT_VEL + 3 * N_BODY_PTS; // 598
 const OFF_PREV_R: usize = OFF_PREV_L + PREV_FEAT; // 603
-const OBS_DIM: usize = OFF_PREV_R + PREV_FEAT; // 608 (env v45)
+// env v46 (user design 2026-09-16): per-env joint torque-limit SCALES,
+// one per AXIS (16: spine 3, arm 7 shared L/R, leg 6 shared L/R), as
+// (s − 1) / TAU_RAND_NORM lanes appended after the prev-note blocks.
+// The Rust sim has no per-episode RNG (jitter/pushes/crouch starts are
+// CUDA-only training features), so here the scales are EXPLICIT
+// (set_tau_scale; default all 1.0 → lanes 0, torque bit-identical to
+// v45 since x * 1.0 is exact). The CUDA kernel draws them at reset.
+const TAU_FEAT: usize = 16;
+const TAU_RAND_NORM: f64 = 0.25;
+const OFF_TAU: usize = OFF_PREV_R + PREV_FEAT; // 608
+const OBS_DIM: usize = OFF_TAU + TAU_FEAT; // 624 (env v46)
+// joint -> axis (constants.TAU_AXIS_OF_JOINT mirror)
+const TAU_AXIS: [usize; NQ] = [
+    0, 1, 2,
+    3, 4, 5, 6, 7, 8, 9,
+    3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15,
+    10, 11, 12, 13, 14, 15,
+];
 // §8 body-point frames + their obs y-centering (shared by the position
 // lanes, the velocity finite-diff and the foot reward terms' docs)
 const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
@@ -308,7 +326,7 @@ const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
     (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
     (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
 ];
-const _: () = assert!(OBS_DIM == 608, "spec §12 (env v45 prev-note blocks): OBS_DIM must be 608");
+const _: () = assert!(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
 const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
@@ -678,6 +696,10 @@ struct Body {
     ws: Workspace,
     cs: ConstraintSet,
     tau: [f64; NQ], // this tick's applied torques (constant across substeps)
+    // env v46: per-axis torque-limit scales (16) + their per-joint
+    // expansion; NOT touched by reset() (explicit via set_tau_scale)
+    tau_axis: [f64; TAU_FEAT],
+    tau_scale: [f64; NQ],
     // FK caches (refreshed after every tick / state write)
     wrist: [[f64; 3]; 2],
     blade: [[f64; 3]; 2],
@@ -799,6 +821,8 @@ impl Body {
             act_group: [0.0; 3],
             tau_abs: 0.0,
             tau_group: [0.0; 3],
+            tau_axis: [1.0; TAU_FEAT],
+            tau_scale: [1.0; NQ],
             escaped: false,
             foot_contact,
             fell: false,
@@ -815,6 +839,15 @@ impl Body {
         };
         b.refresh_fk();
         b
+    }
+
+    /// env v46: set the 16 axis scales (both sides of an axis share one
+    /// value) and expand them per joint. Persists across resets.
+    fn set_tau_axis(&mut self, s: &[f64; TAU_FEAT]) {
+        self.tau_axis = *s;
+        for j in 0..NQ {
+            self.tau_scale[j] = s[TAU_AXIS[j]];
+        }
     }
 
     fn reset(&mut self) {
@@ -908,14 +941,16 @@ impl Body {
         for j in 0..NQ {
             let a = actions[j] as usize;
             let frac = if a < 7 { gear[a] } else { 0.0 };
-            self.tau[j] = frac * MODEL.tau_max[j];
+            // env v46: τ_max scaled per env (s = 1.0 is exact: bit-
+            // identical to v45); same expression tree as the kernel
+            self.tau[j] = frac * MODEL.tau_max[j] * self.tau_scale[j];
             let f = frac.abs();
             act += f;
             let g = if j < 3 { 0 } else if j < 17 { 1 } else { 2 };
             grp[g] += f;
-            // env v43 energy base: |τ_j| = |frac·τ_max| (abs commutes with
-            // the product exactly; same expression tree as the kernel)
-            let t = (frac * MODEL.tau_max[j]).abs();
+            // env v43 energy base: |τ_j| = |frac·τ_max·s| (abs commutes
+            // with the product exactly; same expression tree as the kernel)
+            let t = (frac * MODEL.tau_max[j] * self.tau_scale[j]).abs();
             tau_abs += t;
             tgrp[g] += t;
         }
@@ -1661,6 +1696,11 @@ impl Core {
                 obs[base + 3] = n.sin_a as f32;
             }
             obs[base + 4] = 1.0;
+        }
+        // env v46: torque-limit scale lanes, (s − 1) / TAU_RAND_NORM
+        // (exactly 0 at s = 1.0); the CUDA writer transcribes this loop
+        for a in 0..TAU_FEAT {
+            obs[OFF_TAU + a] = ((self.body.tau_axis[a] - 1.0) / TAU_RAND_NORM) as f32;
         }
     }
 
@@ -2487,6 +2527,21 @@ impl RawBeatSim {
         body.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
     }
 
+    /// env v46: set the 16 per-axis torque-limit scales (spine 3, arm 7,
+    /// leg 6; each arm/leg axis applies to BOTH sides). Persists across
+    /// resets; all-1.0 = the v45 body (bit-identical rewards/dynamics).
+    fn set_tau_scale(&mut self, s: Vec<f64>) {
+        assert_eq!(s.len(), TAU_FEAT, "tau scale must have 16 axis values");
+        let mut a = [1.0f64; TAU_FEAT];
+        a.copy_from_slice(&s);
+        self.core.body.set_tau_axis(&a);
+    }
+
+    /// env v46: the current 16 axis scales (replay header field).
+    fn tau_scale(&self) -> Vec<f64> {
+        self.core.body.tau_axis.to_vec()
+    }
+
     /// Last tick's joint activation — commanded Σ|gear fraction| as
     /// (total, spine, arms, legs); the v23 fraction base (telemetry only
     /// since env v43).
@@ -3012,6 +3067,17 @@ impl VecBeatSim {
             s.act_ticks = 0;
         }
         (acc[0], acc[1], acc[2], acc[3], tk)
+    }
+
+    /// env v46: set the 16 per-axis torque-limit scales on EVERY env
+    /// (bench / eval at a fixed body). RawBeatSim.set_tau_scale mirror.
+    fn set_tau_scale(&mut self, s: Vec<f64>) {
+        assert_eq!(s.len(), TAU_FEAT, "tau scale must have 16 axis values");
+        let mut a = [1.0f64; TAU_FEAT];
+        a.copy_from_slice(&s);
+        for c in self.sims.iter_mut() {
+            c.body.set_tau_axis(&a);
+        }
     }
 
     /// Torque telemetry (env v43) summed over all envs since the last

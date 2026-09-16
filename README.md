@@ -49,7 +49,8 @@ welded to the floor, 12-collider self-contact — integrated by a
 hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
 are **29 gear heads** (τ = gear_fraction × τ_max); movement is priced by
-`--energy-coef` (env v43: the applied Σ|τ| per tick; the v23 `--iso-coef` fraction price is retired)
+`--energy-coef` (env v43: the applied Σ|τ| per tick; the v23 `--iso-coef` fraction price is retired);
+`--tau-rand` (env v46: per-env randomized joint torque limits, symmetric L/R, scales in the obs — see the env v46 paragraph)
 and `--limit-coef --limit-arms` (limit rest) — the v10 positive-work
 "effort" price and its telemetry were retired 2026-09-13, and the
 activation itself is the energy telemetry (replay `activation`
@@ -229,6 +230,34 @@ throughput identical. A bench-faithfulness gain: the leaf trains on the
 episode structure the bench plays. The window machinery
 (`window_starts`, `MAX_OBJECTS`, `--seg-len`) is gone; the pool cache
 key is frozen at the whole-level form so existing caches are reused.
+
+**Env v46 (2026-09-16, user design) — per-env randomized joint torque
+limits, in the observation.** `--tau-rand r` (default 0 = off): at every
+episode reset each env draws one scale per AXIS, s_a ~ U(1 − r, 1 + r),
+for 16 axes — spine 3, arm 7 shared by BOTH arms, leg 6 shared by BOTH
+legs (the user: the left side must always match the right) — and plays
+that level with τ_max,j = TAU_MAX[j] · s[axis(j)]. The scales feed the
+torque, the energy price (Σ|τ| — a joint 25% stronger costs 25% more for
+the same gear; the price stays per newton-metre by design, so the
+trained policy under-uses strong bodies — a stated bias in the sweep
+below) and the `[torque]` telemetry; activation (gear fractions) is
+unchanged. The 16 lanes (s − 1)/0.25 are appended at obs 608..624
+(OBS_DIM 608 → 624; policy: arm lanes into both saber tokens 37 → 44,
+spine + leg lanes into the body token 78 → 87); at r = 0 every scale is
+1.0, the lanes are 0 and the sims are bit-identical to v45. Purpose:
+learn a body-conditioned policy, then sweep the bench over fixed bodies
+to find the optimal τ_max — `bench_scoresaber.py --tau-scale` (16 floats
+or `spine=1.25,arms=1,wrists=0.8,legs=1,knees=1.1`) and
+`make_top10_replays.py --tau-scale` play a fixed body (`set_tau_scale`
+on every engine; the replay header records it, `record_rev` 5). While
+randomizing, the trainer logs every finished episode's body and outcome
+to `<run-dir>/tau_draws.f32` (raw float32 rows: s0..s15, ep_ticks,
+ep_return, fell, good_cuts, score_pts, chart_idx) and prints a `[tau]`
+line every 25 updates with the fall-rate slope per group;
+`tau_regress.py <file>` gives per-axis ridge coefficients (fall rate,
+accuracy, return) with bootstrap CIs. The CUDA env draws from its seeded
+generator (reproducible per seed); the Rust sim has no per-episode RNG
+and takes scales explicitly. Probe pending.
 
 **`--trunk-arch simba` (2026-09-15, research/2026-09-14-architecture-brainstorm.md
 #2; DEFAULT since 2026-09-15, `--trunk-arch mlp` reproduces the older layout):** the readout trunk that turns the three

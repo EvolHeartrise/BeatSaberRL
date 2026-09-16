@@ -56,7 +56,7 @@ import torch
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
-from beat_arena_env.constants import N_JOINTS, OBS_DIM
+from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
 from beat_arena_env.mirror import mirror_tuples, mirror_walls
 from beat_arena_rs import VecBeatSim
 from cuda_graphs import _Graphed, copy_static
@@ -104,11 +104,15 @@ class _Group:
     __slots__ = ("n", "sim", "fwd", "obs_t", "obs_buf", "act_t", "act_np",
                  "slots", "free", "n_active", "ev", "issued")
 
-    def __init__(self, n, fwd, device, gears=3, foot_contact=False):
+    def __init__(self, n, fwd, device, gears=3, foot_contact=False,
+                 tau_scale=None):
         self.n = n
         self.sim = VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
                               return_events=False, gears=gears,
                               foot_contact=foot_contact)
+        # env v46: fixed body for the whole bench (all 1.0 = the v45 body)
+        if tau_scale is not None:
+            self.sim.set_tau_scale([float(x) for x in tau_scale])
         for i in range(n):
             self.sim.set_chart(i, [])
         self.fwd = fwd
@@ -150,6 +154,15 @@ def parse_args():
     # (--pipeline was retired 2026-08-13 with the fused per-sample
     # forward: the two-group split needed its batch invariance; cuBLAS
     # forwards are width-sensitive, so the bench runs one group now)
+    p.add_argument("--tau-scale", type=str, default=None,
+                   help="env v46: fixed per-axis torque-limit scales for "
+                        "the whole bench — 16 comma-separated floats "
+                        "(axis order: spine pitch/yaw/roll, arm pitch/"
+                        "yaw/twist/elbow/wrist roll/bend/dev, hip pitch/"
+                        "yaw/roll, knee, ankle pitch/roll) or group "
+                        "shorthand spine=1.25,arms=1,wrists=0.8,legs=1,"
+                        "knees=1.1 (unspecified = 1.0). Default: the "
+                        "v45 body (all 1.0)")
     p.add_argument("--foot-contact", action="store_true", default=True,
                    help="DEPRECATED NO-OP (2026-08-16): contact mode is "
                         "the only physics the bench runs — every "
@@ -455,6 +468,7 @@ def main():
         "model_hash": mhash, "arch": ckpt.get("arch"),
         "global_step": ckpt.get("global_step"),
         "foot_contact": args.foot_contact,   # physics-regime provenance
+        "tau_scale": parse_tau_scale(args.tau_scale),  # env v46 body
         "mirror": args.mirror,               # charts left-right reflected
     }
     if bool(data.get("mirror")) != args.mirror:
@@ -545,7 +559,8 @@ def main():
         fwd_g = (None if args.no_graphs or device.type != "cuda"
                  else _GraphedArgmax(policy, n_g, device))
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
-                             foot_contact=args.foot_contact))
+                             foot_contact=args.foot_contact,
+                             tau_scale=parse_tau_scale(args.tau_scale)))
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): different forward paths
     # differ by ~4e-7 in the logits, enough to flip near-tie argmaxes —

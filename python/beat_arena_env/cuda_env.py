@@ -65,7 +65,7 @@ import numpy as np
 import torch
 
 from .chart import ChartConfig, generate_chart
-from .constants import (
+from .constants import (TAU_FEAT, 
     BAD_HALF, BAD_HALF_Y_LINK, FOLLOW_TIMEOUT, GOOD_HALF_Y,
     GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BOMB, KIND_CHAIN_HEAD,
     KIND_CHAIN_LINK, N_JOINTS, NV, OBS_DIM, note_center,
@@ -493,7 +493,7 @@ class CudaBeatVecEnv:
                  limit_arms=False,
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
-                 z_clip_hi=12.0, self_contact_coef=0.0):
+                 z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -651,6 +651,17 @@ class CudaBeatVecEnv:
         # chart index of the last resolved note of that colour + valid
         self.prev_idx = z(N, 2, dt=torch.int32)
         self.prev_valid = z(N, 2, dt=torch.uint8)
+        # env v46: per-env axis torque-limit scales (N, 16; 1.0 = the
+        # v45 body), the U(-1,1) draw buffer the kernel consumes at
+        # reset when tau_rand > 0 (refilled per launch from self._gen),
+        # and the per-episode outcome record (N, 22) + done flags the
+        # trainer pops for tau_draws (see pop_episodes)
+        self.tau_rand = float(tau_rand)
+        assert 0.0 <= self.tau_rand < 1.0, "tau_rand in [0, 1)"
+        self.tau_scale = torch.ones((N, TAU_FEAT), device=dv, dtype=dtype)
+        self._tau_jit = z(N, TAU_FEAT)
+        self.ep_rec = z(N, 22)
+        self.ep_flag = z(N, dt=torch.uint8)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -794,6 +805,7 @@ class CudaBeatVecEnv:
             self.act_stat,
             self.tau_stat,
             self.prev_idx, self.prev_valid,
+            self.tau_scale, self._tau_jit, self.ep_rec, self.ep_flag,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -814,6 +826,9 @@ class CudaBeatVecEnv:
     def _launch(self, actions, cand, mode):
         if self.start_pose_jitter > 0.0 or self.crouch_start_prob > 0.0:
             self._pose_jit.uniform_(-1.0, 1.0)
+        if self.tau_rand > 0.0:
+            # seeded generator: the body draws are reproducible per seed
+            self._tau_jit.uniform_(-1.0, 1.0, generator=self._gen)
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,
@@ -824,7 +839,34 @@ class CudaBeatVecEnv:
                        int(self.limit_arms),
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
-                       self.z_clip_hi, self.self_contact_coef)
+                       self.z_clip_hi, self.self_contact_coef,
+                       self.tau_rand)
+
+    # -- env v46: torque-limit scales ---------------------------------------
+    def set_tau_scale(self, s16):
+        """Fix the 16 per-axis torque-limit scales on EVERY env (bench /
+        eval at a chosen body; RawBeatSim.set_tau_scale mirror). Needs
+        tau_rand == 0, otherwise the next reset redraws them. Takes effect
+        on the next step (torque + obs lanes)."""
+        assert self.tau_rand == 0.0, "set_tau_scale needs tau_rand == 0"
+        s = torch.as_tensor(list(s16), dtype=self.tau_scale.dtype,
+                            device=self.device)
+        assert s.numel() == TAU_FEAT, "tau scale must have 16 axis values"
+        self.tau_scale.copy_(s.reshape(1, TAU_FEAT).expand_as(self.tau_scale))
+
+    def pop_episodes(self):
+        """Episodes that ended since the last pop, as an (M, 22) float32
+        numpy array: [s0..s15, ep_ticks, ep_return, fell, good_cuts,
+        score_pts, chart_idx] (the kernel writes a row at `done` while
+        tau_rand > 0; an env ending twice inside one pop keeps the later
+        row — logging-grade). Two syncs; call once per update."""
+        flags = self.ep_flag.bool()
+        n = int(flags.sum().item())
+        if n == 0:
+            return np.zeros((0, 22), dtype=np.float32)
+        rows = self.ep_rec[flags].float().cpu().numpy()
+        self.ep_flag.zero_()
+        return rows
 
     def _cand(self):
         """Fresh chart index per env (used only for envs that reset)."""

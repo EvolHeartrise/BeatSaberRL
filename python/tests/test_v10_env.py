@@ -57,7 +57,7 @@ def _q36(joints=None):
 def test_obs_length_and_reset_layout():
     sim = _sim([_note(5.0, 0.3, 1.4)])
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
-    assert obs.shape == (OBS_DIM,) == (608,)   # env v45: prev-note blocks
+    assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 86,
@@ -306,8 +306,10 @@ def test_replay_v10_roundtrip(tmp_path):
     assert head["header"]["version"] == "v10"
     # additive per-tick schema revision (§6): 2 = "head" on every tick,
     # 3 = "activation" replaced the P6 "effort" field (2026-09-13),
-    # 4 = "torque" [total, spine, arms, legs] applied |tau| (env v43)
-    assert head["header"]["record_rev"] == 4
+    # 4 = "torque" [total, spine, arms, legs] applied |tau| (env v43),
+    # 5 = header "tau_scale" (env v46 per-axis torque-limit scales)
+    assert head["header"]["record_rev"] == 5
+    assert head["header"]["tau_scale"] == [1.0] * 16
     assert head["header"]["config"]["gears"] == 3
     assert len(head["header"]["chart"]) == len(env.chart)
     assert all("x" in c and "y" in c and "kind" in c

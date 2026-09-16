@@ -64,7 +64,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 608   # env v45: prev-note blocks
+    assert OBS_DIM == 624   # env v46: tau-scale lanes
     assert N_ACTION_HEADS == N_JOINTS == 29
 
 
