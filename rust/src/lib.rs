@@ -26,6 +26,16 @@
 //! Chart generation stays in Python (single source of truth, once per
 //! episode); the chart is injected via `set_chart`.
 
+/// Scalar type of the whole sim (physics + env layer). Default f64 is the
+/// exact-parity regime every Rust test is pinned to; `--features f32`
+/// (the `beat_arena_rs32` build, see ../rust32) mirrors the CUDA training
+/// kernel's f32 instantiation — the bench's default engine, because
+/// training runs f32.
+#[cfg(not(feature = "f32"))]
+pub type Real = f64;
+#[cfg(feature = "f32")]
+pub type Real = f32;
+
 use numpy::{PyArray1, PyReadonlyArray2, PyReadwriteArray2, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -60,16 +70,16 @@ fn dbg_stats_dict(s: &DbgStats) -> HashMap<String, u64> {
     out
 }
 
-const DT: f64 = 1.0 / 30.0;
-const V_NORM: f64 = 6.0; // wrist-velocity obs normalizer (m/s)
-const V_MIN_CUT: f64 = 1.0;
-const ACC_NORM: f64 = 0.3; // real BS accuracy normalizer (m)
-const COS_TOL: f64 = 0.5;
+const DT: Real = 1.0 / 30.0;
+const V_NORM: Real = 6.0; // wrist-velocity obs normalizer (m/s)
+const V_MIN_CUT: Real = 1.0;
+const ACC_NORM: Real = 0.3; // real BS accuracy normalizer (m)
+const COS_TOL: Real = 0.5;
 // lanes at x = -0.9 .. 0.9 (0.6 m pitch), rows at y = 0.85/1.40/1.90 —
 // positions arrive PRE-RESOLVED in the chart tuple (constants.py owns them)
-const Y_CENTER: f64 = 1.40; // obs y normalization
-const REWARD_BAD: f64 = -0.5;
-const REWARD_MISS: f64 = -0.5;
+const Y_CENTER: Real = 1.40; // obs y normalization
+const REWARD_BAD: Real = -0.5;
+const REWARD_MISS: Real = -0.5;
 // env v12 (unilateral-contact spec §7, 2026-08-09): per-tick survival
 // bonus, CONTACT MODE ONLY. The v11.1 fall pricing left survival-time
 // flat BEFORE the first note (every pre-first-note fall prices the full
@@ -78,13 +88,13 @@ const REWARD_MISS: f64 = -0.5;
 // (0.06/s) keeps a full 3-min chart's worth (~+11) well under the note
 // stream's scale (~|70|+), so it cannot out-bid hitting notes; it is
 // overridden on fall/escape ticks (the terminal pricing wins).
-const ALIVE_BONUS: f64 = 0.002;
+const ALIVE_BONUS: Real = 0.002;
 // env v7.8 (2026-07-24, user-priced): a combo break on ScoreSaber costs
 // ~4 notes of multiplier; -0.5 made bombs the CHEAPEST error in the gym
 // (miss = -0.5 + ~1.0 forgone points) while the referee prices all
 // breaks equally — both the 598M and gen2 policies equilibrated at
 // ~12% bombs eaten under -0.5, flat across budget and distribution
-const REWARD_BOMB: f64 = -1.5;
+const REWARD_BOMB: Real = -1.5;
 // Movement is priced by energy_coef (env v43, 2026-09-14: the applied
 // Σ|τ_j| = Σ|gear fraction_j| × τ_max[j] over the 29 joints per tick —
 // a human-like force/energy price that replaced the v23 fraction
@@ -96,32 +106,32 @@ const REWARD_BOMB: f64 = -1.5;
 // pop_activation() (trainer `[activation]` line, dashboard).
 
 // --- hitboxes (env v7 — real BS, axis-aligned) -------------------------------
-const GOOD_HALF_X: f64 = 0.4;
-const GOOD_HALF_Y: f64 = 0.25;
-const GOOD_HALF_Y_DOT: f64 = 0.4;
-const GOOD_HALF_Y_LINK: f64 = 0.1;
-const GOOD_HALF_Z: f64 = 0.5;
-const GOOD_Z_SHIFT: f64 = -0.25; // box center = note_z + shift (toward player)
-const BAD_HALF: f64 = 0.175;
-const BAD_HALF_Y_LINK: f64 = 0.05;
-const BOMB_RADIUS: f64 = 0.18;
+const GOOD_HALF_X: Real = 0.4;
+const GOOD_HALF_Y: Real = 0.25;
+const GOOD_HALF_Y_DOT: Real = 0.4;
+const GOOD_HALF_Y_LINK: Real = 0.1;
+const GOOD_HALF_Z: Real = 0.5;
+const GOOD_Z_SHIFT: Real = -0.25; // box center = note_z + shift (toward player)
+const BAD_HALF: Real = 0.175;
+const BAD_HALF_Y_LINK: Real = 0.05;
+const BOMB_RADIUS: Real = 0.18;
 
-const SABER_LEN: f64 = 1.0; // m (real Beat Saber)
+const SABER_LEN: Real = 1.0; // m (real Beat Saber)
 // env v42 "hilt grip" (2026-09-14, user-directed): the hand holds the
 // 0.16 m handle; the cutting blade spans [HANDLE_LEN, HANDLE_LEN +
 // SABER_LEN] along the blade dir from the wrist. The handle does not cut.
-const HANDLE_LEN: f64 = 0.16;
+const HANDLE_LEN: Real = 0.16;
 
 // env v8 gears: action id -> signed torque fraction of tau_max (v10:
 // the gear scales TORQUE, SPEC-v10 §4). Id 0 = coast, 1/2 = +/-full at
 // EVERY table size (K=3 is the ternary era's prefix); finer gears
 // append as +/- pairs. MIRROR of constants.gear_table — the max table
 // (K=7) is stored, a sim's `gears` field bounds the valid ids.
-const GEAR_SIGNED: [f64; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
+const GEAR_SIGNED: [Real; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
                                0.125, -0.125];
-const GEAR_SIGNED_5: [f64; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
+const GEAR_SIGNED_5: [Real; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
 
-fn gear_signed(gears: u8) -> [f64; 7] {
+fn gear_signed(gears: u8) -> [Real; 7] {
     match gears {
         5 => GEAR_SIGNED_5,
         7 => GEAR_SIGNED,
@@ -135,7 +145,7 @@ const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
 // the shoulder (0.65) + handle (0.16, v42) + blade (1.0) + good-box
 // near-face reach (0.75). At the reference pose (shoulder_z = -0.65)
 // this is 1.91 (v9's REACH_Z 1.75 before the v42 handle).
-const REACH_PAST_SHOULDER: f64 = 0.65 + HANDLE_LEN + 1.0 + 0.75;
+const REACH_PAST_SHOULDER: Real = 0.65 + HANDLE_LEN + 1.0 + 0.75;
 // miss boundary: note consumed as missed past the LIVE head plane
 // z < head_z(t) (v9's -Z_MISS = -0.65 at the reference pose). The
 // episode tail must cover the slowest object's trip from the hit plane
@@ -143,7 +153,7 @@ const REACH_PAST_SHOULDER: f64 = 0.65 + HANDLE_LEN + 1.0 + 0.75;
 // z < -1.5 on the welded-feet body (waist z -0.65, head lever 1.09 m
 // fully folded back still > -1.8, and the spine/hip limits stop far
 // short) — P3 divergence note, SPEC-v10 Divergences §18.
-const Z_MISS_TAIL: f64 = 1.5;
+const Z_MISS_TAIL: Real = 1.5;
 // env v11 FALL termination (unilateral-contact spec §4), CONTACT MODE
 // ONLY: with the feet no longer welded the root can go to the floor, and
 // a fallen body's observations/rewards are not the task. Reference-pose
@@ -155,7 +165,7 @@ const Z_MISS_TAIL: f64 = 1.5;
 // minimum. Reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
-const FALL_ROOT_Y: f64 = 0.25;
+const FALL_ROOT_Y: Real = 0.25;
 // TILT termination (2026-08-20), contact mode only: CHEST up-axis
 // tilted more than 40 deg FORWARD, 20 deg BACKWARD (asymmetric
 // sagittal, user 2026-08-20 — the tight back bound targets the v30
@@ -164,27 +174,27 @@ const FALL_ROOT_Y: f64 = 0.25;
 // fall (flat -fall_const). Per-TICK check. Tangent-squared form;
 // forward = up_z > 0 (body faces +z); also trips whenever
 // up_y <= 0 (past horizontal).
-const TILT_TAN2_FWD: f64 = 0.7040881910418472; // tan^2(40 deg)
-const TILT_TAN2_BACK: f64 = 0.1324743314317942; // tan^2(20 deg) — 2026-08-21: briefly 10 deg, reverted to 20 same day (user)
-const TILT_TAN2_ROLL: f64 = 0.7040881910418472; // tan^2(40 deg)
+const TILT_TAN2_FWD: Real = 0.7040881910418472; // tan^2(40 deg)
+const TILT_TAN2_BACK: Real = 0.1324743314317942; // tan^2(20 deg) — 2026-08-21: briefly 10 deg, reverted to 20 same day (user)
+const TILT_TAN2_ROLL: Real = 0.7040881910418472; // tan^2(40 deg)
 // FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
 // the TICK a foot leaves the ground (edge: that foot's tick-summed
 // ground normal impulse hits zero after a grounded tick), per foot.
-const FOOT_LIFT_PEN: f64 = -0.1;
+const FOOT_LIFT_PEN: Real = -0.1;
 
 // --- scoring (real Beat Saber 115, integer components) -----------------------
-const PRE_FULL: f64 = 1.7453292519943295; // 100 deg
-const POST_FULL: f64 = 1.0471975511965976; // 60 deg
-const PTS_PRE: f64 = 70.0;
-const PTS_POST: f64 = 30.0;
-const PTS_ACC: f64 = 15.0;
-const SCORE_MAX: f64 = 115.0;
-const CHAIN_LINK_PTS: f64 = 20.0;
-const SWING_BREAK: f64 = 0.005; // rad/tick below which the swing chain breaks
+const PRE_FULL: Real = 1.7453292519943295; // 100 deg
+const POST_FULL: Real = 1.0471975511965976; // 60 deg
+const PTS_PRE: Real = 70.0;
+const PTS_POST: Real = 30.0;
+const PTS_ACC: Real = 15.0;
+const SCORE_MAX: Real = 115.0;
+const CHAIN_LINK_PTS: Real = 20.0;
+const SWING_BREAK: Real = 0.005; // rad/tick below which the swing chain breaks
 const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 // env v19 flail telemetry: a tick is "note-free" when the next pending
 // chart object is further out than this (s). Telemetry only.
-const FLAIL_LEAD_S: f64 = 1.0;
+const FLAIL_LEAD_S: Real = 1.0;
 // env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
 // env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
@@ -192,7 +202,7 @@ const FLAIL_LEAD_S: f64 = 1.0;
 // via the fk_body mirror: foot up-vector exactly (0,1,0)). CONTACT
 // MODE ONLY: in weld mode the feet are welded at the v10 reference,
 // and a leg stance would fight the welds.
-const Q_START_LEG: [(usize, f64); 4] = [
+const Q_START_LEG: [(usize, Real); 4] = [
     (19, -0.13962634015954636),  // l_hip_roll  -8 deg
     (22, 0.13962634015954636),   // l_ankle_roll +8 deg (counter)
     (25, 0.13962634015954636),   // r_hip_roll  +8 deg
@@ -201,9 +211,9 @@ const Q_START_LEG: [(usize, f64); 4] = [
 // The wide stance's foot X positions (fk_body of the v21 start pose;
 // the root ground-drop does not move X). Per-foot penalty targets:
 // left foot -> -FOOT_X0, right foot -> +FOOT_X0.
-const FOOT_X0: f64 = 0.22108059783525694;
+const FOOT_X0: Real = 0.22108059783525694;
 
-const Q_START_ARM: [(usize, f64); 6] = [
+const Q_START_ARM: [(usize, Real); 6] = [
     (3, -1.3962634015954636),
     (6, 1.7453292519943295),
     (8, 1.2217304763960306),
@@ -226,8 +236,8 @@ const KIND_CHAIN_LINK: u8 = 3;
 // The viewer builds wall front faces 0.25 m behind the note plane
 // ("walls just built like that" — WallManager.cs UpdateVisual), so a
 // wall's front reaches the head 0.4/NJS s after its nominal time.
-const WALL_PEN: f64 = -1.5; // 2026-08-22: -0.5 -> -1.5 (bomb parity, user)
-const WALL_FRONT_OFF: f64 = 0.25;
+const WALL_PEN: Real = -1.5; // 2026-08-22: -0.5 -> -1.5 (bomb parity, user)
+const WALL_FRONT_OFF: Real = 0.25;
 
 // --- obs layout v17 (spec §12d; offsets DERIVED, order is a contract) --------
 // The 16 slots are a SHARED entity window (notes + walls), filled
@@ -308,7 +318,7 @@ const OFF_PREV_R: usize = OFF_PREV_L + PREV_FEAT; // 603
 // (set_tau_scale; default all 1.0 → lanes 0, torque bit-identical to
 // v45 since x * 1.0 is exact). The CUDA kernel draws them at reset.
 const TAU_FEAT: usize = 16;
-const TAU_RAND_NORM: f64 = 0.25;
+const TAU_RAND_NORM: Real = 0.25;
 const OFF_TAU: usize = OFF_PREV_R + PREV_FEAT; // 608
 const OBS_DIM: usize = OFF_TAU + TAU_FEAT; // 624 (env v46)
 // joint -> axis (constants.TAU_AXIS_OF_JOINT mirror)
@@ -321,30 +331,30 @@ const TAU_AXIS: [usize; NQ] = [
 ];
 // §8 body-point frames + their obs y-centering (shared by the position
 // lanes, the velocity finite-diff and the foot reward terms' docs)
-const BODY_PTS: [(usize, f64); N_BODY_PTS] = [
+const BODY_PTS: [(usize, Real); N_BODY_PTS] = [
     (F_L_ELBOW, Y_CENTER), (F_R_ELBOW, Y_CENTER),
     (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
     (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
 ];
 const _: () = assert!(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
-const KNEE_Y0: f64 = 0.50; // hip 0.94 − thigh 0.44
-const FOOT_Y0: f64 = 0.07; // ankle height at reference (contact spec §2)
+const KNEE_Y0: Real = 0.50; // hip 0.94 − thigh 0.44
+const FOOT_Y0: Real = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
 // = 24.53 N·s, rounded to a spec literal both engines share. A settled
 // two-foot stance sums to ≈ 1.0 across the four lanes.
-const GROUND_IMP_NORM: f64 = 24.5;
+const GROUND_IMP_NORM: Real = 24.5;
 const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 102);
 
-const X_NORM: f64 = 1.0;
-const Y_NORM: f64 = 0.75;
-const Z_SCALE: f64 = 8.0;
-const Z_CLIP: (f64, f64) = (-0.65, 12.0); // lo = PLANE_Z0 = the head/miss boundary (2026-08-22; was -3.0, briefly 0.0 — see .cu note)
+const X_NORM: Real = 1.0;
+const Y_NORM: Real = 0.75;
+const Z_SCALE: Real = 8.0;
+const Z_CLIP: (Real, Real) = (-0.65, 12.0); // lo = PLANE_Z0 = the head/miss boundary (2026-08-22; was -3.0, briefly 0.0 — see .cu note)
 // v28 probe (2026-08-20): the obs z-lane upper clamp is runtime-
 // overridable via BEAT_Z_CLIP_HI (meters; default Z_CLIP.1 = the
 // pre-v28 era) so one binary serves every checkpoint era — the CUDA
 // twin takes it as a step parameter instead. Read once per process.
-fn z_clip_hi() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+fn z_clip_hi() -> Real {
+    static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("BEAT_Z_CLIP_HI")
             .ok()
@@ -352,9 +362,9 @@ fn z_clip_hi() -> f64 {
             .unwrap_or(Z_CLIP.1)
     })
 }
-const ROOT_Y0: f64 = 0.94; // reference root height (obs centering)
-const HEAD_Y0: f64 = 1.70; // reference head height (obs centering)
-const PLANE_Z0: f64 = -0.65; // reference body plane (obs centering)
+const ROOT_Y0: Real = 0.94; // reference root height (obs centering)
+const HEAD_Y0: Real = 1.70; // reference head height (obs centering)
+const PLANE_Z0: Real = -0.65; // reference body plane (obs centering)
 // env v15 (contact spec §10): the note track is head-anchored in z —
 // every note's world z carries the offset head_z − PLANE_Z0 (zero at
 // the reference pose). Real-BS room semantics: walking toward the
@@ -362,12 +372,12 @@ const PLANE_Z0: f64 = -0.65; // reference body plane (obs centering)
 // distance (and therefore hit/miss timing) is invariant to root z.
 // Applied at every note-z evaluation: obs lane, broad-phase bound,
 // judgment. x/y stay world-fixed (lanes are body-independent).
-const ROOT_VLIN_NORM: f64 = 6.0;
-const ROOT_VANG_NORM: f64 = 16.0;
+const ROOT_VLIN_NORM: Real = 6.0;
+const ROOT_VANG_NORM: Real = 16.0;
 
 /// Real BS scores are integers; explicit floor(x + 0.5) so every
 /// implementation (Rust, torch, Python tools) agrees on halves.
-fn round_pts(x: f64) -> f64 {
+fn round_pts(x: Real) -> Real {
     (x + 0.5).floor()
 }
 
@@ -377,25 +387,25 @@ fn round_pts(x: f64) -> f64 {
 /// tests the head point. Half-extents precomputed for the AABB test.
 #[derive(Clone, Copy)]
 struct Wall {
-    start_time: f64, // front face crosses the note plane (nominal, s)
-    cx: f64,         // box center x (m, world)
-    cy: f64,         // box center y (m, world)
-    half_w: f64,
-    half_h: f64,
-    len: f64,        // full z extent (m)
-    speed: f64,      // approach speed (m/s)
+    start_time: Real, // front face crosses the note plane (nominal, s)
+    cx: Real,         // box center x (m, world)
+    cy: Real,         // box center y (m, world)
+    half_w: Real,
+    half_h: Real,
+    len: Real,        // full z extent (m)
+    speed: Real,      // approach speed (m/s)
 }
 
 #[derive(Clone, Copy)]
 struct Note {
-    hit_time: f64,
-    x: f64, // world position at the hit plane (meters)
-    y: f64,
+    hit_time: Real,
+    x: Real, // world position at the hit plane (meters)
+    y: Real,
     color: u8,
     // required swing direction (0 = +x, CCW), stored as its sin/cos pair
-    sin_a: f64,
-    cos_a: f64,
-    speed: f64,     // approach speed toward the plane (m/s)
+    sin_a: Real,
+    cos_a: Real,
+    speed: Real,     // approach speed toward the plane (m/s)
     any_dir: bool,  // dot note / chain link: any swing direction scores
     kind: u8,       // KIND_NOTE / _BOMB / _CHAIN_HEAD / _CHAIN_LINK
     free_pre: bool, // arc tail: full 70 pre-swing granted
@@ -408,11 +418,11 @@ struct Note {
 // `fk()` survives as a #[cfg(test)] reference implementation for that
 // gate (SPEC-v10 Divergences §18). Nothing in the live env calls it.
 #[cfg(test)]
-const SHOULDER: [[f64; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
+const SHOULDER: [[Real; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
 #[cfg(test)]
-const L_UPPER: f64 = 0.35;
+const L_UPPER: Real = 0.35;
 #[cfg(test)]
-const L_FORE: f64 = 0.30;
+const L_FORE: Real = 0.30;
 
 /// v9 forward kinematics: (elbow, wrist, blade unit dir, (cos, sin) of
 /// roll) from q = [pitch, yaw, twist, elbow, roll, bend, dev].
@@ -420,7 +430,7 @@ const L_FORE: f64 = 0.30;
 /// M·(0, sin e, cos e); blade = Rz(roll)·Ry(dev)·Rx(−bend)·e_z in the
 /// forearm frame M_f = M·R_x(−elbow).
 #[cfg(test)]
-pub fn fk(hand: usize, q: &[f64; 7]) -> ([f64; 3], [f64; 3], [f64; 3], (f64, f64)) {
+pub fn fk(hand: usize, q: &[Real; 7]) -> ([Real; 3], [Real; 3], [Real; 3], (Real, Real)) {
     let (sp, cp) = q[0].sin_cos();
     let (sy, cy) = q[1].sin_cos();
     let (st, ct) = q[2].sin_cos();
@@ -454,13 +464,13 @@ pub fn fk(hand: usize, q: &[f64; 7]) -> ([f64; 3], [f64; 3], [f64; 3], (f64, f64
     (e, w, b, (cr, sr))
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+fn sub(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+fn dot3(a: [Real; 3], b: [Real; 3]) -> Real {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+fn cross3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -470,7 +480,7 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 /// Triangle vs axis-aligned box (Akenine-Möller SAT). Verts are given
 /// RELATIVE to the box center; h = half extents.
-fn tri_box_overlap(v: [[f64; 3]; 3], h: [f64; 3]) -> bool {
+fn tri_box_overlap(v: [[Real; 3]; 3], h: [Real; 3]) -> bool {
     // box-axis tests
     for k in 0..3 {
         let lo = v[0][k].min(v[1][k]).min(v[2][k]);
@@ -506,13 +516,13 @@ fn tri_box_overlap(v: [[f64; 3]; 3], h: [f64; 3]) -> bool {
 /// Closest distance from point p to triangle (a, b, c) (Ericson,
 /// Real-Time Collision Detection §5.1.5). Handles degenerate triangles
 /// via the edge/vertex regions.
-fn tri_point_dist(a: [f64; 3], b: [f64; 3], c: [f64; 3], p: [f64; 3]) -> f64 {
+fn tri_point_dist(a: [Real; 3], b: [Real; 3], c: [Real; 3], p: [Real; 3]) -> Real {
     let ab = sub(b, a);
     let ac = sub(c, a);
     let ap = sub(p, a);
     let d1 = dot3(ab, ap);
     let d2 = dot3(ac, ap);
-    let dist = |q: [f64; 3]| {
+    let dist = |q: [Real; 3]| {
         let d = sub(p, q);
         dot3(d, d).sqrt()
     };
@@ -563,7 +573,7 @@ fn tri_point_dist(a: [f64; 3], b: [f64; 3], c: [f64; 3], p: [f64; 3]) -> f64 {
     ])
 }
 
-fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+fn seg_point_dist3(a: [Real; 3], b: [Real; 3], c: [Real; 3]) -> Real {
     let ab = sub(b, a);
     let denom = dot3(ab, ab);
     let ac = sub(c, a);
@@ -584,11 +594,11 @@ fn seg_point_dist3(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 /// (wrist + (HANDLE_LEN + SABER_LEN) * dir). The handle [wrist, b) is
 /// not part of the surface: it does not cut.
 fn sweep_tris(
-    w0: [f64; 3],
-    d0: [f64; 3],
-    w1: [f64; 3],
-    d1: [f64; 3],
-) -> [[[f64; 3]; 3]; 2] {
+    w0: [Real; 3],
+    d0: [Real; 3],
+    w1: [Real; 3],
+    d1: [Real; 3],
+) -> [[[Real; 3]; 3]; 2] {
     let b0 = [
         w0[0] + HANDLE_LEN * d0[0],
         w0[1] + HANDLE_LEN * d0[1],
@@ -616,19 +626,19 @@ fn sweep_tris(
 // axis by rot = angle - 270 deg. Env v7.6: plain notes additionally
 // billboard toward the player's head as they approach; env v10 the
 // head anchor is the LIVE FK head position (SPEC-v10 §4).
-const LOOK_VERT: f64 = 0.8; // verticalLookStrength: head.y 80% toward note.y
-const LOOK_DIST: f64 = 8.0; // full head-facing at z=0, none beyond 8 m
+const LOOK_VERT: Real = 0.8; // verticalLookStrength: head.y 80% toward note.y
+const LOOK_DIST: Real = 8.0; // full head-facing at z=0, none beyond 8 m
 
 /// Orthonormal note frame columns (x', y', z'): z' = the blended
 /// forward, up from the z-roll, x' = up x z'. `head` is the live FK
 /// head position (env v10).
 fn note_frame(
-    p: [f64; 3],
-    cos_r: f64,
-    sin_r: f64,
-    lam: f64,
-    head: [f64; 3],
-) -> [[f64; 3]; 3] {
+    p: [Real; 3],
+    cos_r: Real,
+    sin_r: Real,
+    lam: Real,
+    head: [Real; 3],
+) -> [[Real; 3]; 3] {
     let up = [-sin_r, cos_r, 0.0];
     let hp = [head[0], head[1] + LOOK_VERT * (p[1] - head[1]), head[2]];
     let d = sub(p, hp);
@@ -648,16 +658,16 @@ fn note_frame(
 }
 
 /// p relative to `center`, expressed in the note frame.
-fn to_frame(p: [f64; 3], center: [f64; 3], f: &[[f64; 3]; 3]) -> [f64; 3] {
+fn to_frame(p: [Real; 3], center: [Real; 3], f: &[[Real; 3]; 3]) -> [Real; 3] {
     let q = sub(p, center);
     [dot3(q, f[0]), dot3(q, f[1]), dot3(q, f[2])]
 }
 
 fn sweep_hits_box(
-    tris: &[[[f64; 3]; 3]; 2],
-    center: [f64; 3],
-    h: [f64; 3],
-    frame: &[[f64; 3]; 3],
+    tris: &[[[Real; 3]; 3]; 2],
+    center: [Real; 3],
+    h: [Real; 3],
+    frame: &[[Real; 3]; 3],
 ) -> bool {
     for t in tris {
         let rel = [
@@ -672,7 +682,7 @@ fn sweep_hits_box(
     false
 }
 
-fn sweep_dist(tris: &[[[f64; 3]; 3]; 2], p: [f64; 3]) -> f64 {
+fn sweep_dist(tris: &[[[Real; 3]; 3]; 2], p: [Real; 3]) -> Real {
     tri_point_dist(tris[0][0], tris[0][1], tris[0][2], p)
         .min(tri_point_dist(tris[1][0], tris[1][1], tris[1][2], p))
 }
@@ -681,13 +691,13 @@ fn sweep_dist(tris: &[[[f64; 3]; 3]; 2], p: [f64; 3]) -> f64 {
 #[derive(Clone, Copy)]
 struct Tracker {
     note: u32,
-    acc: f64,
+    acc: Real,
     age: u32,
 }
 
-type ChartTuple = (f64, f64, f64, u8, f64, f64, bool, u8, bool, bool);
+type ChartTuple = (Real, Real, Real, u8, Real, Real, bool, u8, bool, bool);
 // wall_tuple order (chart.py): (t0, cx, cy, width, height, length, speed)
-type WallTuple = (f64, f64, f64, f64, f64, f64, f64);
+type WallTuple = (Real, Real, Real, Real, Real, Real, Real);
 
 /// The v10 physical body: dynamics state + solver buffers + the derived
 /// per-tick caches the judgment/obs layers consume. One per env.
@@ -695,42 +705,42 @@ struct Body {
     st: State,
     ws: Workspace,
     cs: ConstraintSet,
-    tau: [f64; NQ], // this tick's applied torques (constant across substeps)
+    tau: [Real; NQ], // this tick's applied torques (constant across substeps)
     // env v46: per-axis torque-limit scales (16) + their per-joint
     // expansion; NOT touched by reset() (explicit via set_tau_scale)
-    tau_axis: [f64; TAU_FEAT],
-    tau_scale: [f64; NQ],
+    tau_axis: [Real; TAU_FEAT],
+    tau_scale: [Real; NQ],
     // FK caches (refreshed after every tick / state write)
-    wrist: [[f64; 3]; 2],
-    blade: [[f64; 3]; 2],
-    head: [f64; 3],
-    shoulder_z: [f64; 2],
+    wrist: [[Real; 3]; 2],
+    blade: [[Real; 3]; 2],
+    head: [Real; 3],
+    shoulder_z: [Real; 2],
     // judgment caches
-    wrist_vel: [[f64; 3]; 2], // finite difference across the last tick
+    wrist_vel: [[Real; 3]; 2], // finite difference across the last tick
     // env v24: §8 body-point world velocities, same finite-diff scheme
-    body_pt_vel: [[f64; 3]; N_BODY_PTS],
-    swing_acc: [f64; 2],      // arc of the current continuous swing (rad)
-    axis: [Option<[f64; 3]>; 2], // last tick's rotation axis (unit)
+    body_pt_vel: [[Real; 3]; N_BODY_PTS],
+    swing_acc: [Real; 2],      // arc of the current continuous swing (rad)
+    axis: [Option<[Real; 3]>; 2], // last tick's rotation axis (unit)
     // per-tick contact aggregation (obs bits + replay events)
     contact_arm: [bool; 2],          // any active contact row touching the arm
-    contact_imp: [f64; NUM_PAIRS],   // tick-summed normal impulse per pair
-    contact_pt: [[f64; 3]; NUM_PAIRS], // last substep's contact point
+    contact_imp: [Real; NUM_PAIRS],   // tick-summed normal impulse per pair
+    contact_pt: [[Real; 3]; NUM_PAIRS], // last substep's contact point
     // env v23 activation (user direction 2026-08-17): this tick's
     // commanded |gear fraction| summed over the 29 joints — the
     // muscle-activation analog (Σ|tau_j|/tau_max_j, constant over the
     // tick since tau is held). Telemetry since env v43 (the price
     // moved to Body::tau_abs / Core::energy_coef); coast reads 0.
-    act_frac: f64,
+    act_frac: Real,
     // the same sum split [spine (joints 0..3), arms (3..17), legs
     // (17..29)] — telemetry only (2026-09-13, replaces the retired
     // positive-work reading); act_frac is the priced total.
-    act_group: [f64; 3],
+    act_group: [Real; 3],
     // env v43 (2026-09-14, user): this tick's applied Σ|τ_j| in N·m
     // (= Σ|frac_j|·τ_max[j], the energy-priced total) and its
     // [spine, arms, legs] split — same joint-order summation as
     // act_frac; CUDA computes the identical double sum.
-    tau_abs: f64,
-    tau_group: [f64; 3],
+    tau_abs: Real,
+    tau_group: [Real; 3],
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -768,12 +778,12 @@ struct Body {
     // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
     // λ is the constraint impulse ON the body (world frame): the ground
     // reaction; vertical force ≈ weld_imp[1 or 7] / DT.
-    weld_imp: [f64; 12],
+    weld_imp: [Real; 12],
     // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
     // front/back sole-corner pair — [L_heel, L_toe, R_heel, R_toe]
     // (N·s). Contact mode only; stays 0 under welds. Feeds the four
     // OFF_GROUND_IMP obs lanes.
-    ground_imp: [f64; 4],
+    ground_imp: [Real; 4],
     // env v34 (2026-08-21): tick-summed joint-limit-row impulses
     // (N·m·s) the stops carried, bucketed [legs, spine]. Scope is
     // POSTURAL joints only — spine 0..3 and legs 17..29; the 14 arm
@@ -783,14 +793,14 @@ struct Body {
     // notes). Priced by Core::limit_coef; resting a pose on its
     // stops shows up as sustained λ-flow here, an active hold does
     // not.
-    limit_imp: [f64; 3],
+    limit_imp: [Real; 3],
     // replay fix (2026-08-17): tick-summed ground-reaction impulse per
     // foot [L, R] x [x friction, y normal, z friction] (N·s, world
     // frame) — ALL rows of every active sole corner, not just the §7
     // normal buckets. Contact mode only; stays 0 under welds. Feeds
     // the replay "feet" lanes, which read all-zero in contact mode
     // while they were wired to the retired welds' impulses.
-    foot_grf: [[f64; 3]; 2],
+    foot_grf: [[Real; 3]; 2],
 }
 
 const MODEL: &Model = &HUMANOID;
@@ -843,7 +853,7 @@ impl Body {
 
     /// env v46: set the 16 axis scales (both sides of an axis share one
     /// value) and expand them per joint. Persists across resets.
-    fn set_tau_axis(&mut self, s: &[f64; TAU_FEAT]) {
+    fn set_tau_axis(&mut self, s: &[Real; TAU_FEAT]) {
         self.tau_axis = *s;
         for j in 0..NQ {
             self.tau_scale[j] = s[TAU_AXIS[j]];
@@ -897,7 +907,7 @@ impl Body {
         // share this expression tree).
         if self.foot_contact {
             use dynamics::collide::{GROUND_CORNERS, GROUND_FRAMES};
-            let mut min_y = f64::INFINITY;
+            let mut min_y = Real::INFINITY;
             for fr in GROUND_FRAMES {
                 let (r, p) = (&self.ws.r[fr], &self.ws.p[fr]);
                 for c in &GROUND_CORNERS {
@@ -933,11 +943,11 @@ impl Body {
     /// One 30 Hz control tick: gear ids -> torques, 8 × substep at
     /// h = 1/240 (SPEC-v10 §3/§4), accumulating activation and
     /// contact impulses, then FK-cache refresh + finite-diff wrist vel.
-    fn tick(&mut self, actions: &[u8; NQ], gear: &[f64; 7]) {
+    fn tick(&mut self, actions: &[u8; NQ], gear: &[Real; 7]) {
         let mut act = 0.0;
-        let mut grp = [0.0f64; 3];
+        let mut grp = [0.0 as Real; 3];
         let mut tau_abs = 0.0;
-        let mut tgrp = [0.0f64; 3];
+        let mut tgrp = [0.0 as Real; 3];
         for j in 0..NQ {
             let a = actions[j] as usize;
             let frac = if a < 7 { gear[a] } else { 0.0 };
@@ -961,7 +971,7 @@ impl Body {
         let prev_wrist = self.wrist;
         // env v24: last tick's §8 body-point positions (ws.p holds the
         // previous refresh_fk), the finite-diff base for body_pt_vel
-        let mut prev_bp = [[0.0f64; 3]; N_BODY_PTS];
+        let mut prev_bp = [[0.0 as Real; 3]; N_BODY_PTS];
         for (i, (f, _)) in BODY_PTS.iter().enumerate() {
             prev_bp[i] = self.ws.p[*f];
         }
@@ -1116,22 +1126,22 @@ impl Body {
     }
 
     /// Live broad-phase reach gate (SPEC-v10 §4).
-    fn reach_z(&self) -> f64 {
+    fn reach_z(&self) -> Real {
         self.shoulder_z[0].max(self.shoulder_z[1]) + REACH_PAST_SHOULDER
     }
 }
 
 struct Core {
     max_steps: u32,
-    gear: [f64; 7],   // env v8: action id -> signed torque fraction
+    gear: [Real; 7],   // env v8: action id -> signed torque fraction
     wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
-    tail_s: f64, // episode tail after the last hit_time (covers miss exit)
-    min_speed: f64, // slowest object; (hit_time-t)*min_speed > reach_z is a
+    tail_s: Real, // episode tail after the last hit_time (covers miss exit)
+    min_speed: Real, // slowest object; (hit_time-t)*min_speed > reach_z is a
                     // conservative exact "beyond reach" bound for a sorted chart
     // state
     tick: u32,
-    time: f64,
+    time: Real,
     first_pending: usize, // smallest index with status 0 (monotone per episode)
     body: Body,
     trackers: [Vec<Tracker>; 2],
@@ -1153,22 +1163,22 @@ struct Core {
     tilts: u32,
     // env v18 constant fall pricing (2026-08-15, sole mode): flat
     // -fall_const terminal reward on a fall (see fell block).
-    fall_const: f64,
+    fall_const: Real,
     // env v20 (2026-08-16, user direction): per-tick penalty
     // foot_z_coef * (|lfoot_z - PLANE_Z0| + |rfoot_z - PLANE_Z0|) —
     // linear in each foot's world-z distance from the reference
     // ("standard starting") foot z. Targets the shimmy toward/away
     // from the note plane. 0.0 = off (the pre-v20 reward verbatim).
-    foot_z_coef: f64,
+    foot_z_coef: Real,
     // env v21: the X twin — per-tick foot_x_coef * (|lfoot_x -
     // (-FOOT_X0)| + |rfoot_x - FOOT_X0|), each foot priced against its
     // OWN side's wide-stance x. 0.0 = off.
-    foot_x_coef: f64,
+    foot_x_coef: Real,
     // env v22 (user direction 2026-08-16): the foot penalties become
     // HINGED — deviation inside this radius is free ("target AREAS"),
     // rent applies only to the excess. 0.0 = the v21 pure-linear
     // behavior verbatim.
-    foot_hinge_r: f64,
+    foot_hinge_r: Real,
     // env v22: potential-based delta shaping (Ng et al. 1999,
     // undiscounted variant — round trips telescope to exactly zero):
     // each tick, reward += coef * (prev_pot - pot) where pot = the
@@ -1176,7 +1186,7 @@ struct Core {
     // credit assignment onto the tick that moved a foot; the RENT
     // terms remain the anti-parking objective (delta shaping alone
     // would make a parked pose free). 0.0 = off.
-    foot_shape_coef: f64,
+    foot_shape_coef: Real,
     // env v43 (2026-09-14, user): per-tick ENERGY price on Body::tau_abs
     // (Σ|τ| in N·m; reward -= energy_coef × Σ|τ|). Replaced the v23
     // fraction price (iso_coef, retired): a joint pays in proportion to
@@ -1184,14 +1194,14 @@ struct Core {
     // near-free — the human muscle-volume weighting. Velocity-blind:
     // force, not work. 0 = off. Calibration: Σ|τ| ≈ 400 N·m/tick on the
     // 2026-09-14 leaves, so 7.5e-6 matches the old 5e-4 fraction bill.
-    energy_coef: f64,
+    energy_coef: Real,
     // env v34 (2026-08-21): per-tick price on the joint-limit-row
     // impulse the postural stops carried (Body::limit_imp, [legs,
     // spine] N·m·s). 0 = the pre-v34 reward verbatim. Proportional to
     // the CARRIED impulse, so a knee-locked stand (near-zero moment on
     // the stop) is near-free while a crouch parked on hip/knee stops
     // pays its full gravity moment.
-    limit_coef: f64,
+    limit_coef: Real,
     // env v35: widen pricing scope to the 14 arm joints too
     limit_arms: bool,
     // env v37 (user, 2026-08-23): training-only credit-assignment aid —
@@ -1205,30 +1215,30 @@ struct Core {
     // fall_hits pattern): λ-flow sums [legs, spine] and the tick count
     // — accumulated REGARDLESS of limit_coef so stop-resting is
     // observable at coef 0.
-    limit_rest_sum: [f64; 3],
+    limit_rest_sum: [Real; 3],
     limit_rest_ticks: u64,
     // activation telemetry (2026-09-13, replaces the retired work
     // reading): Σ over ticks of [total, spine, arms, legs] commanded
     // |gear fraction| + the tick count, until popped (pop_activation;
     // limit_rest pattern). Total was the v23 iso-priced quantity.
-    act_sum: [f64; 4],
+    act_sum: [Real; 4],
     act_ticks: u64,
     // env v43 torque telemetry: Σ over ticks of [total, spine, arms,
     // legs] applied |τ| (N·m) + the tick count, until popped
     // (pop_torque; act_sum pattern). Total is the energy-priced quantity.
-    tau_sum: [f64; 4],
+    tau_sum: [Real; 4],
     tau_ticks: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
     // self_contact_coef mirror.
-    self_contact_coef: f64,
+    self_contact_coef: Real,
     // cumulative self-contact telemetry until popped
     // (pop_self_contact): [impulse sum, ticks with contact, ticks] —
     // accumulated REGARDLESS of the coefficient.
-    sc_stat: [f64; 3],
+    sc_stat: [Real; 3],
     // the previous tick's pot (reset to 0 — resets start on-target)
-    prev_foot_pot: f64,
+    prev_foot_pot: Real,
     n_scoreable: u32, // chart objects that are not bombs
     // env v19 flail telemetry (CUDA-backend mirror, telemetry only):
     // blade arc (rad) accrued on note-free ticks (next pending chart
@@ -1236,7 +1246,7 @@ struct Core {
     // tracker, plus the count of those ticks. PER-EPISODE here (zeroed
     // by reset_state, read per level by the bench); the CUDA twin is
     // pop-based instead — each matches its consumer.
-    flail_rad: f64,
+    flail_rad: Real,
     flail_ticks: u32,
     // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
     // latches once the back face clears the head (monotone per wall);
@@ -1264,10 +1274,10 @@ struct Core {
     // Set where done is computed true, CLEARED in reset_state (the single
     // funnel every chart install goes through).
     finished: bool,
-    score: f64,       // summed points; max = 115*notes + 85*heads + 20*links
-    score_pre: f64,
-    score_acc: f64,
-    score_post: f64,
+    score: Real,       // summed points; max = 115*notes + 85*heads + 20*links
+    score_pre: Real,
+    score_acc: Real,
+    score_post: Real,
     // reusable event buffer: cleared and refilled in place each tick.
     events_buf: Vec<(u32, u8, f32, f32, f32)>,
 }
@@ -1281,7 +1291,7 @@ impl Core {
             wide_acc,
             chart: Vec::new(),
             tail_s: 0.5,
-            min_speed: f64::INFINITY,
+            min_speed: Real::INFINITY,
             tick: 0,
             time: 0.0,
             first_pending: 0,
@@ -1383,7 +1393,7 @@ impl Core {
             .chart
             .iter()
             .map(|n| n.speed)
-            .fold(f64::INFINITY, f64::min);
+            .fold(Real::INFINITY, Real::min);
         self.min_speed = min_speed;
         self.tail_s = if min_speed.is_finite() {
             0.5 + Z_MISS_TAIL / min_speed
@@ -1500,7 +1510,7 @@ impl Core {
             // tracker reads 1.0. Summed in spawn order — the CUDA
             // ring walk from tr_ptr must add in this same order for
             // bitwise obs parity.
-            let mut rem = 0.0f64;
+            let mut rem = 0.0 as Real;
             for tr in &self.trackers[s] {
                 rem += 1.0 - (tr.acc / POST_FULL).min(1.0);
             }
@@ -1528,12 +1538,12 @@ impl Core {
         // scanned entity (strict-< displacement). Scan order: notes in
         // chart order, then walls — the CUDA mirror transcribes the
         // same comparison order (§5 parity).
-        let mut sel = [(f64::INFINITY, false, 0usize); N_NOTE_SLOTS];
+        let mut sel = [(Real::INFINITY, false, 0usize); N_NOTE_SLOTS];
         let mut n_sel = 0usize;
         fn insert(
-            sel: &mut [(f64, bool, usize); N_NOTE_SLOTS],
+            sel: &mut [(Real, bool, usize); N_NOTE_SLOTS],
             n_sel: &mut usize,
-            cand: (f64, bool, usize),
+            cand: (Real, bool, usize),
         ) {
             if *n_sel == N_NOTE_SLOTS && cand.0 >= sel[N_NOTE_SLOTS - 1].0 {
                 return;
@@ -1715,7 +1725,7 @@ impl Core {
     // v17; note id = u32::MAX). The f32 is points awarded.
     // Events land in self.events_buf (cleared here), in the same order the
     // v9 sim produced them — order is the ComboWalk contract.
-    fn step_inner(&mut self, actions: &[u8; NQ]) -> (f64, bool) {
+    fn step_inner(&mut self, actions: &[u8; NQ]) -> (Real, bool) {
         // B4 early-out (2026-08-03): the episode already ended and no
         // chart was installed since, so `done` is structurally pinned true
         // (see the `finished` field comment). Skip the whole tick —
@@ -1736,7 +1746,7 @@ impl Core {
         let mut reward = 0.0;
         self.events_buf.clear();
         // per arm this tick: (swing delta, did the chain continue)
-        let mut deltas = [0.0f64; 2];
+        let mut deltas = [0.0 as Real; 2];
         let mut continued = [false; 2];
 
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
@@ -1768,7 +1778,7 @@ impl Core {
         // env v41: self-contact penalty + always-on telemetry. The
         // solver clamps contact rows to λ ≥ 0, so the pair sum is the
         // tick's total self-collision impulse (CUDA sc_imp mirror).
-        let sc_imp: f64 = self.body.contact_imp.iter().map(|l| l.max(0.0)).sum();
+        let sc_imp: Real = self.body.contact_imp.iter().map(|l| l.max(0.0)).sum();
         reward -= self.self_contact_coef * sc_imp;
         self.sc_stat[0] += sc_imp;
         if sc_imp > 0.0 {
@@ -1777,7 +1787,7 @@ impl Core {
         self.sc_stat[2] += 1.0;
         // FOOT-LIFT penalty (2026-08-20): flat charge per lift event
         // this tick (see Body::tick edge detection)
-        reward += FOOT_LIFT_PEN * self.body.foot_lifts_tick as f64;
+        reward += FOOT_LIFT_PEN * self.body.foot_lifts_tick as Real;
         // env v20/v21/v22 foot terms: ws.p holds this tick's FK (the
         // same source the §8 body_pts obs lanes read). Hinged rent
         // (free inside foot_hinge_r, the v21 pure-linear behavior at
@@ -1786,7 +1796,7 @@ impl Core {
             || self.foot_shape_coef > 0.0
         {
             let r = self.foot_hinge_r;
-            let h = |v: f64| (v.abs() - r).max(0.0);
+            let h = |v: Real| (v.abs() - r).max(0.0);
             let lf = &self.body.ws.p[F_L_FOOT];
             let rf = &self.body.ws.p[F_R_FOOT];
             let hx = h(lf[0] + FOOT_X0) + h(rf[0] - FOOT_X0);
@@ -1851,7 +1861,7 @@ impl Core {
             self.trackers[s] = trs;
         }
 
-        self.time = (self.tick + 1) as f64 * DT;
+        self.time = (self.tick + 1) as Real * DT;
 
         // env v19 flail telemetry (CUDA mirror, telemetry only): on
         // ticks whose next pending chart object is > FLAIL_LEAD_S out,
@@ -1969,11 +1979,11 @@ impl Core {
                 // finite-difference velocity is the contact velocity
                 let wrist_m = self.body.wrist[m];
                 let blade_m = self.body.blade[m];
-                let mut d_seg = f64::INFINITY;
+                let mut d_seg = Real::INFINITY;
                 let mut s_star = 0.0;
                 for j in 1..=N_BLADE_SAMPLES {
                     // env v42: samples along the BLADE, [HANDLE_LEN, HANDLE_LEN + SABER_LEN]
-                    let r = HANDLE_LEN + (j as f64 / N_BLADE_SAMPLES as f64) * SABER_LEN;
+                    let r = HANDLE_LEN + (j as Real / N_BLADE_SAMPLES as Real) * SABER_LEN;
                     let p0 = [
                         prev_pos[m][0] + r * prev_dir[m][0],
                         prev_pos[m][1] + r * prev_dir[m][1],
@@ -2262,11 +2272,11 @@ impl RawBeatSim {
                         limit_coef=0.0, limit_arms=false,
                         wall_despawn=false, self_contact_coef=0.0))]
     fn new(max_steps: u32, wide_acc: bool,
-           gears: u8, foot_contact: bool, fall_const: f64,
-           foot_z_coef: f64, foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, energy_coef: f64, limit_coef: f64,
+           gears: u8, foot_contact: bool, fall_const: Real,
+           foot_z_coef: Real, foot_x_coef: Real, foot_hinge_r: Real,
+           foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: f64) -> Self {
+           self_contact_coef: Real) -> Self {
         let mut core = Core::new_core(max_steps, wide_acc,
                                       gears, foot_contact);
         core.fall_const = fall_const;
@@ -2285,7 +2295,7 @@ impl RawBeatSim {
     /// env v41 self-contact telemetry since the last pop: (summed
     /// self-collision impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
-    fn pop_self_contact(&mut self) -> (f64, u64, u64) {
+    fn pop_self_contact(&mut self) -> (Real, u64, u64) {
         let s = self.core.sc_stat;
         self.core.sc_stat = [0.0; 3];
         (s[0], s[1] as u64, s[2] as u64)
@@ -2319,7 +2329,7 @@ impl RawBeatSim {
         &mut self,
         py: Python<'py>,
         actions: Vec<u8>,
-    ) -> (Bound<'py, PyArray1<f32>>, f64, bool, Vec<(u32, u8, f32, f32, f32)>) {
+    ) -> (Bound<'py, PyArray1<f32>>, Real, bool, Vec<(u32, u8, f32, f32, f32)>) {
         assert_eq!(actions.len(), NQ);
         assert!(actions.iter().all(|&a| a <= 6)); // gear ids 0..=6
         let mut acts = [0u8; NQ];
@@ -2341,7 +2351,7 @@ impl RawBeatSim {
 
     /// Replay v10 `q`: the 36 position coordinates — root position (3),
     /// root quaternion wxyz (4), then the 29 joint angles (§1.4 order).
-    fn qpos(&self) -> Vec<f64> {
+    fn qpos(&self) -> Vec<Real> {
         let st = &self.core.body.st;
         let mut out = Vec::with_capacity(36);
         out.extend_from_slice(&st.p);
@@ -2353,9 +2363,9 @@ impl RawBeatSim {
     /// World center of mass from the §1.2 mass model (introspection —
     /// balance forensics). Σ mᵢ (pᵢ + Rᵢ·comᵢ) / M over the base +
     /// every mass-carrying frame, current FK.
-    fn com(&self) -> [f64; 3] {
+    fn com(&self) -> [Real; 3] {
         let b = &self.core.body;
-        let mut acc = [0.0f64; 3];
+        let mut acc = [0.0 as Real; 3];
         let mut mass = MODEL.base_mass;
         let r0 = dynamics::fk::quat_to_rot(b.st.quat);
         for k in 0..3 {
@@ -2385,7 +2395,7 @@ impl RawBeatSim {
 
     /// World positions of the 8 sole corners (contact spec §2 normative
     /// order), current FK. Introspection — support-polygon forensics.
-    fn sole_corners(&self) -> Vec<[f64; 3]> {
+    fn sole_corners(&self) -> Vec<[Real; 3]> {
         use dynamics::collide::{CORNERS_PER_FOOT, GROUND_CORNERS, GROUND_FRAMES};
         let b = &self.core.body;
         let mut out = Vec::with_capacity(8);
@@ -2405,19 +2415,19 @@ impl RawBeatSim {
     }
 
     /// Replay v10 `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
-    fn twist(&self) -> [f64; 6] {
+    fn twist(&self) -> [Real; 6] {
         let v = &self.core.body.st.v;
         [v[0], v[1], v[2], v[3], v[4], v[5]]
     }
 
     /// Replay v10 `omega`: the 29 joint rates (§1.4 order).
-    fn omega(&self) -> Vec<f64> {
+    fn omega(&self) -> Vec<Real> {
         self.core.body.st.v[6..].to_vec()
     }
 
     /// Replay v10 `sabers`: per hand [L, R] the FK wrist position and
     /// unit blade direction — [wx, wy, wz, bx, by, bz].
-    fn sabers(&self) -> [[f64; 6]; 2] {
+    fn sabers(&self) -> [[Real; 6]; 2] {
         [0, 1].map(|s| {
             let w = self.core.body.wrist[s];
             let b = self.core.body.blade[s];
@@ -2445,7 +2455,7 @@ impl RawBeatSim {
     /// world-aligned frames, head local +z = the gaze direction down
     /// the note track (the same local-+z-is-forward convention `blade`
     /// uses for the hands).
-    fn head_pose(&self) -> [f64; 7] {
+    fn head_pose(&self) -> [Real; 7] {
         let ws = &self.core.body.ws;
         let p = ws.p[F_HEAD];
         let q = dynamics::fk::rot_to_quat(&ws.r[F_HEAD]);
@@ -2453,14 +2463,14 @@ impl RawBeatSim {
     }
 
     /// Blade unit directions [[x, y, z]; 2] (FK cache).
-    fn blades(&self) -> [[f64; 3]; 2] {
+    fn blades(&self) -> [[Real; 3]; 2] {
         [0, 1].map(|s| self.core.body.blade[s])
     }
 
     /// Replay v10 `contacts` of the LAST tick: (pair_id, px, py, pz, j)
     /// per live pair with nonzero tick-summed normal impulse (N·s);
     /// the point is the last substep's world contact point.
-    fn contacts(&self) -> Vec<(u32, f64, f64, f64, f64)> {
+    fn contacts(&self) -> Vec<(u32, Real, Real, Real, Real)> {
         let b = &self.core.body;
         (0..NUM_PAIRS)
             .filter(|&p| b.contact_imp[p] != 0.0)
@@ -2475,7 +2485,7 @@ impl RawBeatSim {
     /// per foot [L, R]: [jx, jy, jz, jax, jay, jaz] (N·s / N·m·s, world
     /// frame) — the ground reaction through each welded foot. Vertical
     /// reaction force ≈ j[1] / DT.
-    fn weld_impulses(&self) -> [[f64; 6]; 2] {
+    fn weld_impulses(&self) -> [[Real; 6]; 2] {
         let w = &self.core.body.weld_imp;
         [
             [w[0], w[1], w[2], w[3], w[4], w[5]],
@@ -2488,7 +2498,7 @@ impl RawBeatSim {
     /// [jx, jy, jz] (N·s, world frame) — jy sums the sole corners'
     /// normal rows, jx/jz their friction rows. Vertical reaction force
     /// ≈ jy / DT. Zero under welds (no ground rows exist there).
-    fn ground_reaction(&self) -> [[f64; 3]; 2] {
+    fn ground_reaction(&self) -> [[Real; 3]; 2] {
         self.core.body.foot_grf
     }
 
@@ -2512,7 +2522,7 @@ impl RawBeatSim {
     /// joints), v: 35 velocity coords (root linear world, root angular
     /// world, 29 joint rates). FK caches refresh; the finite-diff wrist
     /// velocity resets; swing accumulators are left untouched.
-    fn set_joints(&mut self, q: Vec<f64>, v: Vec<f64>) {
+    fn set_joints(&mut self, q: Vec<Real>, v: Vec<Real>) {
         assert_eq!(q.len(), 3 + 4 + NQ, "q must be 36 (root pose + 29)");
         assert_eq!(v.len(), NV, "v must be 35 (root twist + 29)");
         let body = &mut self.core.body;
@@ -2530,15 +2540,15 @@ impl RawBeatSim {
     /// env v46: set the 16 per-axis torque-limit scales (spine 3, arm 7,
     /// leg 6; each arm/leg axis applies to BOTH sides). Persists across
     /// resets; all-1.0 = the v45 body (bit-identical rewards/dynamics).
-    fn set_tau_scale(&mut self, s: Vec<f64>) {
+    fn set_tau_scale(&mut self, s: Vec<Real>) {
         assert_eq!(s.len(), TAU_FEAT, "tau scale must have 16 axis values");
-        let mut a = [1.0f64; TAU_FEAT];
+        let mut a = [1.0 as Real; TAU_FEAT];
         a.copy_from_slice(&s);
         self.core.body.set_tau_axis(&a);
     }
 
     /// env v46: the current 16 axis scales (replay header field).
-    fn tau_scale(&self) -> Vec<f64> {
+    fn tau_scale(&self) -> Vec<Real> {
         self.core.body.tau_axis.to_vec()
     }
 
@@ -2546,14 +2556,14 @@ impl RawBeatSim {
     /// (total, spine, arms, legs); the v23 fraction base (telemetry only
     /// since env v43).
     /// Telemetry (replay "activation" field, viewer meter, tests).
-    fn last_activation(&self) -> (f64, f64, f64, f64) {
+    fn last_activation(&self) -> (Real, Real, Real, Real) {
         let b = &self.core.body;
         (b.act_frac, b.act_group[0], b.act_group[1], b.act_group[2])
     }
 
     /// Activation telemetry since the last pop: (Σ total, Σ spine,
     /// Σ arms, Σ legs, env-ticks). CUDA `pop_activation` mirror.
-    fn pop_activation(&mut self) -> (f64, f64, f64, f64, u64) {
+    fn pop_activation(&mut self) -> (Real, Real, Real, Real, u64) {
         let s = self.core.act_sum;
         let t = self.core.act_ticks;
         self.core.act_sum = [0.0; 4];
@@ -2564,14 +2574,14 @@ impl RawBeatSim {
     /// Last tick's applied joint torque — Σ|τ_j| in N·m as (total,
     /// spine, arms, legs); total is the env v43 energy-priced quantity.
     /// Telemetry (replay "torque" field, tests).
-    fn last_torque(&self) -> (f64, f64, f64, f64) {
+    fn last_torque(&self) -> (Real, Real, Real, Real) {
         let b = &self.core.body;
         (b.tau_abs, b.tau_group[0], b.tau_group[1], b.tau_group[2])
     }
 
     /// Torque telemetry since the last pop: (Σ total, Σ spine, Σ arms,
     /// Σ legs, env-ticks) of applied |τ| (N·m). CUDA `pop_torque` mirror.
-    fn pop_torque(&mut self) -> (f64, f64, f64, f64, u64) {
+    fn pop_torque(&mut self) -> (Real, Real, Real, Real, u64) {
         let s = self.core.tau_sum;
         let t = self.core.tau_ticks;
         self.core.tau_sum = [0.0; 4];
@@ -2631,7 +2641,7 @@ impl RawBeatSim {
 
     /// env v34 limit-rest telemetry since the last pop: (legs λ-flow
     /// N·m·s, spine λ-flow, env-ticks). CUDA `pop_limit_rest` mirror.
-    fn pop_limit_rest(&mut self) -> (f64, f64, f64, u64) {
+    fn pop_limit_rest(&mut self) -> (Real, Real, Real, u64) {
         let s = self.core.limit_rest_sum;
         let t = self.core.limit_rest_ticks;
         self.core.limit_rest_sum = [0.0; 3];
@@ -2722,17 +2732,17 @@ impl RawBeatSim {
         self.core.tick
     }
     #[getter]
-    fn time(&self) -> f64 {
+    fn time(&self) -> Real {
         self.core.time
     }
     /// Summed points across all scored cuts.
     #[getter]
-    fn score(&self) -> f64 {
+    fn score(&self) -> Real {
         self.core.score
     }
     /// (pre_swing, accuracy, follow_through) point totals — the score
     /// decomposition; score − sum = chain-link flat points.
-    fn score_components(&self) -> (f64, f64, f64) {
+    fn score_components(&self) -> (Real, Real, Real) {
         (self.core.score_pre, self.core.score_acc, self.core.score_post)
     }
 }
@@ -2750,7 +2760,7 @@ struct ComboWalk {
     combo: u32,
     max_combo: u32,
     breaks: u32,
-    score: f64,
+    score: Real,
     note_mult: Vec<u32>, // 0 = not cut yet
 }
 
@@ -2791,7 +2801,7 @@ impl ComboWalk {
                 self.note_mult[i] = self.multiplier;
                 self.combo += 1;
                 self.max_combo = self.max_combo.max(self.combo);
-                self.score += pts as f64 * self.multiplier as f64;
+                self.score += pts as Real * self.multiplier as Real;
             }
             5 => {
                 // follow-through: the note's cut-time multiplier
@@ -2800,7 +2810,7 @@ impl ComboWalk {
                 } else {
                     self.note_mult[i]
                 };
-                self.score += pts as f64 * m as f64;
+                self.score += pts as Real * m as Real;
             }
             7 => {}
             // 7 = head-in-wall drain tick: NO combo effect (spec §12b —
@@ -2849,11 +2859,11 @@ impl VecBeatSim {
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, wide_acc: bool, gears: u8,
-           foot_contact: bool, fall_const: f64, foot_z_coef: f64,
-           foot_x_coef: f64, foot_hinge_r: f64,
-           foot_shape_coef: f64, energy_coef: f64, limit_coef: f64,
+           foot_contact: bool, fall_const: Real, foot_z_coef: Real,
+           foot_x_coef: Real, foot_hinge_r: Real,
+           foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: f64) -> Self {
+           self_contact_coef: Real) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
@@ -2888,7 +2898,7 @@ impl VecBeatSim {
     }
 
     /// (multiplied_score, max_combo, breaks) of env i's combo walk.
-    fn combo(&self, i: usize) -> (f64, u32, u32) {
+    fn combo(&self, i: usize) -> (Real, u32, u32) {
         let w = &self.walks.as_ref().expect("combo_walk not enabled")[i];
         (w.score, w.max_combo, w.breaks)
     }
@@ -2977,7 +2987,7 @@ impl VecBeatSim {
     }
 
     /// (good, bad, miss, n_scoreable, score, bombs_hit) for env i.
-    fn counters(&self, i: usize) -> (u32, u32, u32, u32, f64, u32) {
+    fn counters(&self, i: usize) -> (u32, u32, u32, u32, Real, u32) {
         let s = &self.sims[i];
         (
             s.good_cuts,
@@ -2990,7 +3000,7 @@ impl VecBeatSim {
     }
 
     /// (pre_swing, accuracy, follow_through) point totals for env i.
-    fn components(&self, i: usize) -> (f64, f64, f64) {
+    fn components(&self, i: usize) -> (Real, Real, Real) {
         let s = &self.sims[i];
         (s.score_pre, s.score_acc, s.score_post)
     }
@@ -2999,7 +3009,7 @@ impl VecBeatSim {
     /// rad accrued by follow-through-idle hands on note-free ticks,
     /// count of note-free ticks). Read at done, before set_chart
     /// resets it — same lifecycle as counters(). ADDITIVE getter.
-    fn flail(&self, i: usize) -> (f64, u32) {
+    fn flail(&self, i: usize) -> (Real, u32) {
         let s = &self.sims[i];
         (s.flail_rad, s.flail_ticks)
     }
@@ -3039,8 +3049,8 @@ impl VecBeatSim {
     /// env v34 limit-rest telemetry summed over all envs since the last
     /// pop: (legs λ-flow N·m·s, spine λ-flow, env-ticks). CUDA
     /// `pop_limit_rest` mirror.
-    fn pop_limit_rest(&mut self) -> (f64, f64, f64, u64) {
-        let (mut lg, mut sp, mut ar, mut tk) = (0.0f64, 0.0f64, 0.0f64, 0u64);
+    fn pop_limit_rest(&mut self) -> (Real, Real, Real, u64) {
+        let (mut lg, mut sp, mut ar, mut tk) = (0.0 as Real, 0.0 as Real, 0.0 as Real, 0u64);
         for s in self.sims.iter_mut() {
             lg += s.limit_rest_sum[0];
             sp += s.limit_rest_sum[1];
@@ -3055,8 +3065,8 @@ impl VecBeatSim {
     /// Activation telemetry summed over all envs since the last pop:
     /// (Σ total, Σ spine, Σ arms, Σ legs, env-ticks). CUDA
     /// `pop_activation` mirror.
-    fn pop_activation(&mut self) -> (f64, f64, f64, f64, u64) {
-        let mut acc = [0.0f64; 4];
+    fn pop_activation(&mut self) -> (Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 4];
         let mut tk = 0u64;
         for s in self.sims.iter_mut() {
             for k in 0..4 {
@@ -3071,9 +3081,9 @@ impl VecBeatSim {
 
     /// env v46: set the 16 per-axis torque-limit scales on EVERY env
     /// (bench / eval at a fixed body). RawBeatSim.set_tau_scale mirror.
-    fn set_tau_scale(&mut self, s: Vec<f64>) {
+    fn set_tau_scale(&mut self, s: Vec<Real>) {
         assert_eq!(s.len(), TAU_FEAT, "tau scale must have 16 axis values");
-        let mut a = [1.0f64; TAU_FEAT];
+        let mut a = [1.0 as Real; TAU_FEAT];
         a.copy_from_slice(&s);
         for c in self.sims.iter_mut() {
             c.body.set_tau_axis(&a);
@@ -3083,8 +3093,8 @@ impl VecBeatSim {
     /// Torque telemetry (env v43) summed over all envs since the last
     /// pop: (Σ total, Σ spine, Σ arms, Σ legs, env-ticks) of applied
     /// |τ| in N·m. CUDA `pop_torque` mirror.
-    fn pop_torque(&mut self) -> (f64, f64, f64, f64, u64) {
-        let mut acc = [0.0f64; 4];
+    fn pop_torque(&mut self) -> (Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 4];
         let mut tk = 0u64;
         for s in self.sims.iter_mut() {
             for k in 0..4 {
@@ -3100,8 +3110,8 @@ impl VecBeatSim {
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
-    fn pop_self_contact(&mut self) -> (f64, u64, u64) {
-        let (mut imp, mut ct, mut tk) = (0.0f64, 0.0f64, 0.0f64);
+    fn pop_self_contact(&mut self) -> (Real, u64, u64) {
+        let (mut imp, mut ct, mut tk) = (0.0 as Real, 0.0 as Real, 0.0 as Real);
         for s in self.sims.iter_mut() {
             imp += s.sc_stat[0];
             ct += s.sc_stat[1];
@@ -3270,6 +3280,7 @@ impl VecBeatSim {
 }
 
 #[pymodule]
+#[cfg_attr(feature = "f32", pyo3(name = "beat_arena_rs32"))]
 fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawBeatSim>()?;
     m.add_class::<VecBeatSim>()?;
@@ -3294,14 +3305,14 @@ mod env_tests {
         acts[20] = 4; // l knee, −1/4
         let mut body = Body::new(false);
         body.tick(&acts, &gear);
-        let expect: f64 = acts.iter().map(|&a| gear[a as usize].abs()).sum();
+        let expect: Real = acts.iter().map(|&a| gear[a as usize].abs()).sum();
         assert_eq!(body.act_frac, expect, "total is the joint-order sum");
         assert_eq!(body.act_group[0], gear[3].abs(), "spine");
         assert_eq!(body.act_group[1], gear[2].abs() + gear[1].abs(), "arms");
         assert_eq!(body.act_group[2], gear[4].abs(), "legs");
-        assert_eq!(body.act_group.iter().sum::<f64>(), body.act_frac);
+        assert_eq!(body.act_group.iter().sum::<Real>(), body.act_frac);
         // env v43 torque base: Σ|frac|·τ_max, same partition
-        let tq: f64 = (0..NQ)
+        let tq: Real = (0..NQ)
             .map(|j| (gear[acts[j] as usize] * MODEL.tau_max[j]).abs())
             .sum();
         assert_eq!(body.tau_abs, tq, "torque total is the joint-order sum");
@@ -3381,7 +3392,7 @@ mod env_tests {
         // three notes, all far past reach: they resolve as misses and the
         // episode ends in the v10 tail
         let chart: Vec<ChartTuple> = (0u8..3)
-            .map(|i| (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
+            .map(|i| (1.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
         let mut core = Core::new_core(690, false, 5, false);
@@ -3416,7 +3427,7 @@ mod env_tests {
         // empty-chart disjunct; the notes are far in the future
         let chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
-                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                (8.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
                  KIND_NOTE, false, false)
             })
             .collect();
@@ -3461,7 +3472,7 @@ mod env_tests {
     fn healthy_env_never_escapes() {
         let chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
-                (1.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                (1.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
                  KIND_NOTE, false, false)
             })
             .collect();
@@ -3498,7 +3509,7 @@ mod env_tests {
         // the assert was stale from 2026-08-13 to 2026-08-17.)
         let mut chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
-                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                (8.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
                  KIND_NOTE, false, false)
             })
             .collect();
@@ -3591,7 +3602,7 @@ mod env_tests {
     fn weld_mode_never_falls() {
         let chart: Vec<ChartTuple> = (0u8..3)
             .map(|i| {
-                (8.0 + i as f64 * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
+                (8.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
                  KIND_NOTE, false, false)
             })
             .collect();

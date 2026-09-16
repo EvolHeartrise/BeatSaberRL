@@ -24,6 +24,11 @@ introspect = []
 # with enabled = 0, so the Python side never conditionalizes.
 stats = []
 
+# f32 scalar build (the CUDA training kernel's f32 instantiation). Built
+# as the separate `beat_arena_rs32` module by ../rust32 — this crate's
+# default f64 build and its tests are untouched.
+f32 = []
+
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"

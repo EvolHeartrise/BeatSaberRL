@@ -16,6 +16,7 @@
 //! solver.rs's ground block). Weld mode stays the DEFAULT and is bitwise
 //! unchanged — `tests_ground.rs` gates both halves.
 
+use crate::Real;
 pub mod algo;
 pub mod collide;
 pub mod fk;
@@ -52,10 +53,10 @@ use model::Model;
 /// only. Root quaternion wxyz (scalar first), replay v10 convention.
 #[derive(Clone)]
 pub struct State {
-    pub p: [f64; 3],
-    pub quat: [f64; 4],
-    pub q: Vec<f64>,
-    pub v: Vec<f64>,
+    pub p: [Real; 3],
+    pub quat: [Real; 4],
+    pub q: Vec<Real>,
+    pub v: Vec<Real>,
 }
 
 impl State {
@@ -144,17 +145,17 @@ impl DbgStats {
 pub struct Workspace {
     // FK
     pub r0: fk::Mat3,
-    pub p0: [f64; 3],
+    pub p0: [Real; 3],
     pub r: Vec<fk::Mat3>,   // world rotation per frame
-    pub p: Vec<[f64; 3]>,   // world origin per frame
-    pub axw: Vec<[f64; 3]>, // world revolute axis per frame
+    pub p: Vec<[Real; 3]>,   // world origin per frame
+    pub axw: Vec<[Real; 3]>, // world revolute axis per frame
     // dense matrices (row-major nv×nv)
-    pub m: Vec<f64>, // mass matrix
-    pub l: Vec<f64>, // Cholesky factor (lower)
+    pub m: Vec<Real>, // mass matrix
+    pub l: Vec<Real>, // Cholesky factor (lower)
     // vectors (nv)
-    pub c: Vec<f64>,     // RNEA output / bias forces
-    pub rhs: Vec<f64>,   // tau − c, then the accel after the solve
-    pub vstar: Vec<f64>, // unconstrained post-solve velocity
+    pub c: Vec<Real>,     // RNEA output / bias forces
+    pub rhs: Vec<Real>,   // tau − c, then the accel after the solve
+    pub vstar: Vec<Real>, // unconstrained post-solve velocity
     // M⁻¹e_j scratch (clamp impulses, P2 rows).
     //
     // R23d REVERTED (2026-08-07, measured negative): solving step 11's
@@ -168,7 +169,7 @@ pub struct Workspace {
     // slice, not a runtime-offset window into a buffer the caller reads
     // back through a second pointer. Do not retry without an aliasing
     // argument. (Same family as R23f, which cost −2.71%.)
-    pub sol: Vec<f64>,
+    pub sol: Vec<Real>,
     pub hit: Vec<bool>,     // per-joint limit-hit flags (step 11)
     // f64 Cholesky pivot-floor engagements (SPEC-v10 Divergences §22),
     // cumulative until the owner pops it (lib.rs pop_pd_hits)
@@ -193,22 +194,22 @@ pub struct Workspace {
     #[cfg(test)]
     pub poison_m_upper: bool,
     pub cached: Vec<bool>,  // step 11: M⁻¹e_j column cached?
-    pub solcache: Vec<f64>, // step 11: cached M⁻¹e_j columns (nq×nv)
+    pub solcache: Vec<Real>, // step 11: cached M⁻¹e_j columns (nq×nv)
     // RNEA / velocity-pass scratch, per frame
-    om: Vec<[f64; 3]>, // body angular velocity
-    al: Vec<[f64; 3]>, // body angular acceleration
+    om: Vec<[Real; 3]>, // body angular velocity
+    al: Vec<[Real; 3]>, // body angular acceleration
     // frame-origin (material point) velocity. R23e: `rnea` no longer
     // propagates or stores this — its force/moment block reads only
     // ao/om/al — so the ONLY writers/readers left are `momentum` and
     // `energy`, each of which rebuilds the whole chain in its own
     // topological loop before reading it.
-    vo: Vec<[f64; 3]>,
-    ao: Vec<[f64; 3]>, // frame-origin acceleration
-    f: Vec<[f64; 3]>,  // backward pass: net force
-    n: Vec<[f64; 3]>,  // backward pass: net moment about frame origin
+    vo: Vec<[Real; 3]>,
+    ao: Vec<[Real; 3]>, // frame-origin acceleration
+    f: Vec<[Real; 3]>,  // backward pass: net force
+    n: Vec<[Real; 3]>,  // backward pass: net moment about frame origin
     // CRBA composite scratch, per frame
-    cm: Vec<f64>,       // composite mass
-    cc: Vec<[f64; 3]>,  // composite COM (world)
+    cm: Vec<Real>,       // composite mass
+    cc: Vec<[Real; 3]>,  // composite COM (world)
     ci: Vec<fk::Mat3>,  // composite inertia about the COM (world)
 }
 

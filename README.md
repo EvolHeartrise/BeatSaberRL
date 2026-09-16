@@ -304,7 +304,19 @@ envs) builds once with:
 
 ```bash
 cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
+cd ../rust32 && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
+
+`rust32/` (2026-09-16) compiles the SAME `rust/src` with `Real = f32`
+(`--features f32`) and exports it as `beat_arena_rs32`. It mirrors the
+CUDA kernel's f32 instantiation — the regime training runs — including
+the f32 Cholesky pivot floor (1e-8, counted only on pivots ≤ 0) and a
+1e-5 broad-phase slack. `bench_scoresaber.py --sim rust` uses it by
+default (`--sim-dtype f32`); `--sim-dtype f64` selects the original
+build, which every Rust unit test pins. Bench results never merge
+across dtypes (files written before this carry no `sim_dtype` and are
+f64). Sim-only throughput, 64 real charts, 8-core laptop: f64 279k vs
+f32 601k env-steps/s (2.15×).
 
 Difficulty dials (generator v2, SPEC §Chart generation — colors is
 always both since 2026-07-26; the `--colors` flag is gone):

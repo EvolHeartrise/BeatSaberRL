@@ -43,6 +43,11 @@ fi
 cd "$REPO/rust"
 CARGO_TARGET_DIR=/root/cargo-target VIRTUAL_ENV=$VENV \
     "$VENV/bin/maturin" develop --release 2>&1 | tail -2
+# f32 build of the same sources (module beat_arena_rs32) — the bench's
+# default engine since 2026-09-16 (training runs f32)
+cd "$REPO/rust32"
+CARGO_TARGET_DIR=/root/cargo-target VIRTUAL_ENV=$VENV \
+    "$VENV/bin/maturin" develop --release 2>&1 | tail -2
 
 # 4. Verify: sim imports, CUDA extensions load (fast path if the volume's
 #    build dirs match this image), full gate suite

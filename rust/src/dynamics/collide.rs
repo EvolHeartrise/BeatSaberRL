@@ -8,6 +8,7 @@
 //! mirrors (P4/P5) replicate it literally (same comparisons, same order),
 //! so do not "simplify" it.
 
+use crate::Real;
 use super::fk::{add3, dot3, mat_vec, scale3, sub3};
 use super::model::{
     F_CHEST, F_HEAD, F_L_FOOT, F_L_HAND, F_L_ELBOW, F_L_SHANK, F_L_THIGH, F_L_UARM, F_R_FOOT,
@@ -16,20 +17,20 @@ use super::model::{
 use super::Workspace;
 
 /// Contact margin: a constraint row activates when gap < MARGIN (§2).
-pub const MARGIN: f64 = 0.01;
+pub const MARGIN: Real = 0.01;
 /// Penetration slop: Baumgarte pushes only beyond it (§3 step 8).
-pub const SLOP: f64 = 0.005;
+pub const SLOP: Real = 0.005;
 
 /// One collider: a capsule (segment a–b, radius r) rigidly attached to a
 /// body frame. Spheres are zero-length capsules (a == b).
 pub struct Collider {
     pub frame: usize,  // body frame index (model.rs HUMANOID_FRAMES)
-    pub a: [f64; 3],   // segment start, in the body frame
-    pub b: [f64; 3],   // segment end, in the body frame
-    pub radius: f64,
+    pub a: [Real; 3],   // segment start, in the body frame
+    pub b: [Real; 3],   // segment end, in the body frame
+    pub radius: Real,
 }
 
-const fn col(frame: usize, a: [f64; 3], b: [f64; 3], radius: f64) -> Collider {
+const fn col(frame: usize, a: [Real; 3], b: [Real; 3], radius: Real) -> Collider {
     Collider { frame, a, b, radius }
 }
 
@@ -91,7 +92,7 @@ pub const EXCLUDED_PAIRS: [(usize, usize); 11] = [
 
 /// Degeneracy threshold of the segment–segment routine (squared-length
 /// and denominator guard — Ericson's EPSILON).
-pub const SEG_EPS: f64 = 1e-12;
+pub const SEG_EPS: Real = 1e-12;
 
 // ---------------------------------------------------------------------
 // R11 broad phase. Mean contact count is 0.11/tick, so ~all 55 pairs are
@@ -119,19 +120,28 @@ pub const SEG_EPS: f64 = 1e-12;
 /// 1e-9 slack adds 2·T·1e-9 ≥ 2e-10 to the squared threshold, six orders
 /// above that 1e-16 bound and above the ≤1 ulp (≤1e-17) error of
 /// evaluating the table entry itself in a different association order.
-const fn dist_rej2() -> [f64; NUM_PAIRS] {
-    let mut t = [0.0f64; NUM_PAIRS];
+/// The linear slack in `dist_rej2`. f64: 1e-9 (the proof above). f32:
+/// the same argument with ulp(0.4) ≈ 3e-8 and FK rounding ~1e-7, so
+/// 1e-5 — still two decades above every rounding term and a 1e-5 m
+/// change to a threshold that only decides whether the exact narrow
+/// phase runs at all.
+#[cfg(not(feature = "f32"))]
+const DIST_SLACK: Real = 1e-9;
+#[cfg(feature = "f32")]
+const DIST_SLACK: Real = 1e-5;
+const fn dist_rej2() -> [Real; NUM_PAIRS] {
+    let mut t = [0.0 as Real; NUM_PAIRS];
     let mut k = 0;
     while k < NUM_PAIRS {
         let (ia, ib) = PAIRS[k];
-        let s = COLLIDERS[ia].radius + COLLIDERS[ib].radius + MARGIN + 1e-9;
+        let s = COLLIDERS[ia].radius + COLLIDERS[ib].radius + MARGIN + DIST_SLACK;
         t[k] = s * s;
         k += 1;
     }
     t
 }
 /// `(r_a + r_b + MARGIN + 1e-9)²` per pair id — see `dist_rej2`.
-pub const DIST_REJ2: [f64; NUM_PAIRS] = dist_rej2();
+pub const DIST_REJ2: [Real; NUM_PAIRS] = dist_rej2();
 
 /// Part 2 — bounding-sphere radius per collider (port of CUDA K4d):
 /// half the segment length plus the radius, so every point of the
@@ -139,7 +149,7 @@ pub const DIST_REJ2: [f64; NUM_PAIRS] = dist_rej2();
 /// The segment is rigid, so the world half-length equals this
 /// body-frame one. Literal table (no const √); `hlr_table_bounds_geometry`
 /// pins each entry against the §2 collider geometry.
-pub const HLR: [f64; NUM_COLLIDERS] = [
+pub const HLR: [Real; NUM_COLLIDERS] = [
     /*  0 torso   */ 0.365, /*  1 head    */ 0.09,
     /*  2 uarm_l  */ 0.22, /*  3 uarm_r  */ 0.22,
     /*  4 farm_l  */ 0.19, /*  5 farm_r  */ 0.19,
@@ -164,8 +174,8 @@ pub const HLR: [f64; NUM_COLLIDERS] = [
 ///   · the ≤1e-15 relative non-orthonormality of the FK rotation, the
 ///     only thing that can make the world segment longer than the body
 ///     segment whose half-length HLR was built from.
-const fn mid_rej2() -> [f64; NUM_PAIRS] {
-    let mut t = [0.0f64; NUM_PAIRS];
+const fn mid_rej2() -> [Real; NUM_PAIRS] {
+    let mut t = [0.0 as Real; NUM_PAIRS];
     let mut k = 0;
     while k < NUM_PAIRS {
         let (ia, ib) = PAIRS[k];
@@ -176,7 +186,7 @@ const fn mid_rej2() -> [f64; NUM_PAIRS] {
     t
 }
 /// `(HLR_a + HLR_b + MARGIN)²·1.02` per pair id — see `mid_rej2`.
-pub const MID_REJ2: [f64; NUM_PAIRS] = mid_rej2();
+pub const MID_REJ2: [Real; NUM_PAIRS] = mid_rej2();
 
 /// Closest points between segments p1–q1 and p2–q2 (Ericson, "Real-Time
 /// Collision Detection", §5.1.9 `ClosestPtSegmentSegment`), returning
@@ -187,11 +197,11 @@ pub const MID_REJ2: [f64; NUM_PAIRS] = mid_rej2();
 ///   4. general (incl. parallel: denom == 0 → s = 0).
 #[allow(clippy::many_single_char_names)]
 pub fn seg_seg_closest(
-    p1: [f64; 3],
-    q1: [f64; 3],
-    p2: [f64; 3],
-    q2: [f64; 3],
-) -> (f64, f64, [f64; 3], [f64; 3], f64) {
+    p1: [Real; 3],
+    q1: [Real; 3],
+    p2: [Real; 3],
+    q2: [Real; 3],
+) -> (Real, Real, [Real; 3], [Real; 3], Real) {
     let d1 = sub3(q1, p1);
     let d2 = sub3(q2, p2);
     let r = sub3(p1, p2);
@@ -251,12 +261,12 @@ pub struct Contact {
     /// Normative pair id (row index in PAIRS).
     pub pair: usize,
     /// World contact point: midpoint of the two surface points.
-    pub point: [f64; 3],
+    pub point: [Real; 3],
     /// Unit normal, from collider PAIRS[pair].0 toward PAIRS[pair].1
     /// (positive relative velocity along it = separating).
-    pub normal: [f64; 3],
+    pub normal: [Real; 3],
     /// Signed gap = centerline distance − radius sum (< 0 penetrating).
-    pub gap: f64,
+    pub gap: Real,
 }
 
 /// Narrow phase over the 55-pair table in PAIR-ID ORDER (normative —
@@ -272,11 +282,11 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
     // each of the 24 endpoint transforms ~9× per substep. Bitwise: the
     // expression per endpoint is character-identical, only hoisted, so
     // every p1/q1/p2/q2 below is the same f64 it was before.
-    let mut wa = [[0.0f64; 3]; NUM_COLLIDERS];
-    let mut wb = [[0.0f64; 3]; NUM_COLLIDERS];
+    let mut wa = [[0.0 as Real; 3]; NUM_COLLIDERS];
+    let mut wb = [[0.0 as Real; 3]; NUM_COLLIDERS];
     // bounding-sphere centres for the R11 part-2 reject: 36 mul+add for
     // the whole roster, against 55 segment–segment solves
-    let mut mid = [[0.0f64; 3]; NUM_COLLIDERS];
+    let mut mid = [[0.0 as Real; 3]; NUM_COLLIDERS];
     for (ci, c) in COLLIDERS.iter().enumerate() {
         wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
         wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));
@@ -335,7 +345,7 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
 /// Order within a foot is NORMATIVE (contact spec §2): (x−,z−), (x−,z+),
 /// (x+,z−), (x+,z+).
 #[rustfmt::skip]
-pub const GROUND_CORNERS: [[f64; 3]; 4] = [
+pub const GROUND_CORNERS: [[Real; 3]; 4] = [
     /* 0 (x−,z−) */ [-0.045, -0.070, -0.075],
     /* 1 (x−,z+) */ [-0.045, -0.070,  0.175],
     /* 2 (x+,z−) */ [ 0.045, -0.070, -0.075],
@@ -367,9 +377,9 @@ pub struct GroundContact {
     /// Body frame the corner is rigidly attached to.
     pub frame: usize,
     /// World corner position (the contact point).
-    pub point: [f64; 3],
+    pub point: [Real; 3],
     /// Signed gap = the corner's world y (< 0 penetrating).
-    pub gap: f64,
+    pub gap: Real,
 }
 
 /// MIRROR: ground narrow phase, contact spec §2. 8 fixed corners against
@@ -407,8 +417,8 @@ pub fn ground_phase(ws: &Workspace, out: &mut Vec<GroundContact>) {
 #[cfg(test)]
 pub fn narrow_phase_dense(ws: &Workspace, out: &mut Vec<Contact>) {
     out.clear();
-    let mut wa = [[0.0f64; 3]; NUM_COLLIDERS];
-    let mut wb = [[0.0f64; 3]; NUM_COLLIDERS];
+    let mut wa = [[0.0 as Real; 3]; NUM_COLLIDERS];
+    let mut wb = [[0.0 as Real; 3]; NUM_COLLIDERS];
     for (ci, c) in COLLIDERS.iter().enumerate() {
         wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
         wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));

@@ -5,6 +5,7 @@
 //! here is re-derived, and no other module carries its own copy (the v9
 //! "6-initializer zero-fill" bug class is the cautionary tale).
 
+use crate::Real;
 /// One kinematic frame: a revolute DoF (`coord >= 0`) or a welded body
 /// frame (`coord == -1`; head only, in the humanoid). Frames are listed
 /// in CHAIN (stacking, topological) order; `coord` maps each frame to
@@ -15,12 +16,12 @@
 #[derive(Clone, Copy)]
 pub struct Frame {
     pub parent: i32,       // frame index; -1 = base (pelvis, or world)
-    pub anchor: [f64; 3],  // frame origin offset in the PARENT frame
-    pub axis: [f64; 3],    // revolute axis (unit, local); fixed: unused
+    pub anchor: [Real; 3],  // frame origin offset in the PARENT frame
+    pub axis: [Real; 3],    // revolute axis (unit, local); fixed: unused
     pub coord: i32,        // actuated coordinate index; -1 = welded
-    pub mass: f64,         // body mass attached to this frame (0 = none)
-    pub com: [f64; 3],     // in this frame
-    pub inertia: [f64; 3], // principal diagonal about the COM, frame axes
+    pub mass: Real,         // body mass attached to this frame (0 = none)
+    pub com: [Real; 3],     // in this frame
+    pub inertia: [Real; 3], // principal diagonal about the COM, frame axes
 }
 
 /// A rigid-body model the dynamics core is generic over: the humanoid
@@ -29,16 +30,16 @@ pub struct Frame {
 #[derive(Clone, Copy)]
 pub struct Model {
     pub free_base: bool, // 6-DoF free joint on the base body
-    pub base_mass: f64,  // base body (pelvis); 0 for fixed-base models
-    pub base_com: [f64; 3],
-    pub base_inertia: [f64; 3],
-    pub base_pos0: [f64; 3], // reference (neutral) base position
+    pub base_mass: Real,  // base body (pelvis); 0 for fixed-base models
+    pub base_com: [Real; 3],
+    pub base_inertia: [Real; 3],
+    pub base_pos0: [Real; 3], // reference (neutral) base position
     pub frames: &'static [Frame],
     pub nq: usize, // actuated coordinate count
-    pub limits: &'static [(f64, f64)],
-    pub omega_cap: &'static [f64],
-    pub tau_max: &'static [f64],
-    pub damping: &'static [f64], // b: tau_damp = -b * qdot (§1.5)
+    pub limits: &'static [(Real, Real)],
+    pub omega_cap: &'static [Real],
+    pub tau_max: &'static [Real],
+    pub damping: &'static [Real], // b: tau_damp = -b * qdot (§1.5)
     // P1 divergence (SPEC-v10 Divergences §12): per-DoF armature
     // (reflected rotor) inertia, added to M's diagonal AND to RNEA's
     // qdd term (MuJoCo semantics — the MJCF twin mirrors it via the
@@ -48,8 +49,8 @@ pub struct Model {
     // clamp the yaw and twist world axes are anti-parallel through the
     // same point (null vector yaw=twist=1), and the §3 no-pivot
     // Cholesky dies. armature = I_ref/100 (1 % reflected inertia).
-    pub armature: &'static [f64],
-    pub gravity: [f64; 3],
+    pub armature: &'static [Real],
+    pub gravity: [Real; 3],
 }
 
 impl Model {
@@ -63,7 +64,7 @@ impl Model {
     }
 }
 
-pub const G: f64 = 9.81; // m/s^2, along -y (SPEC-v10 header)
+pub const G: Real = 9.81; // m/s^2, along -y (SPEC-v10 header)
 
 pub const NQ: usize = 29;
 pub const NV: usize = 35;
@@ -96,17 +97,17 @@ pub const A_L_ARM: usize = 3; // l arm block start (7 coords)
 pub const A_R_ARM: usize = 10; // r arm block start (7 coords)
 
 // §1.2 bodies (masses kg, COMs m, inertia diagonals kg·m^2).
-const M_CHEST: f64 = 24.20;
-const COM_CHEST: [f64; 3] = [0.0, 0.215, 0.0];
-const I_CHEST: [f64; 3] = [0.957507, 0.254964, 0.957507];
-const M_HEAD: f64 = 5.20;
-const I_HEAD: [f64; 3] = [0.016848, 0.016848, 0.016848];
-const M_UARM: f64 = 2.00;
-const COM_UARM: [f64; 3] = [0.0, 0.0, 0.175];
-const I_UARM: [f64; 3] = [0.029222, 0.029222, 0.001966];
-const M_FARM: f64 = 1.20;
-const COM_FARM: [f64; 3] = [0.0, 0.0, 0.15];
-const I_FARM: [f64; 3] = [0.013056, 0.013056, 0.000931];
+const M_CHEST: Real = 24.20;
+const COM_CHEST: [Real; 3] = [0.0, 0.215, 0.0];
+const I_CHEST: [Real; 3] = [0.957507, 0.254964, 0.957507];
+const M_HEAD: Real = 5.20;
+const I_HEAD: [Real; 3] = [0.016848, 0.016848, 0.016848];
+const M_UARM: Real = 2.00;
+const COM_UARM: [Real; 3] = [0.0, 0.0, 0.175];
+const I_UARM: [Real; 3] = [0.029222, 0.029222, 0.001966];
+const M_FARM: Real = 1.20;
+const COM_FARM: [Real; 3] = [0.0, 0.0, 0.15];
+const I_FARM: [Real; 3] = [0.013056, 0.013056, 0.000931];
 // Hand mass (user direction 2026-08-18): 0.35 kg fist, NO controller
 // mass (was 0.61 = 0.46 fist + 0.15 controller). Real Beat Saber
 // players exploit controller movement/angular prediction to make
@@ -115,39 +116,39 @@ const I_FARM: [f64; 3] = [0.013056, 0.013056, 0.000931];
 // literal composite mass over-prices swings and was feeding vertical
 // body jitter during play. Inertia rescaled with the mass
 // (0.000460 x 0.35/0.61).
-const M_HAND: f64 = 0.35;
-const COM_HAND: [f64; 3] = [0.0, 0.0, 0.06];
-const I_HAND: [f64; 3] = [0.000264, 0.000264, 0.000264];
-const M_THIGH: f64 = 10.60;
-const COM_THIGH: [f64; 3] = [0.0, -0.22, 0.0];
-const I_THIGH: [f64; 3] = [0.250198, 0.018493, 0.250198];
-const M_SHANK: f64 = 3.20;
-const COM_SHANK: [f64; 3] = [0.0, -0.215, 0.0];
-const I_SHANK: [f64; 3] = [0.065964, 0.003161, 0.065964];
-const M_FOOT: f64 = 1.00;
-const COM_FOOT: [f64; 3] = [0.0, -0.035, 0.05];
-const I_FOOT: [f64; 3] = [0.005617, 0.005883, 0.001083];
+const M_HAND: Real = 0.35;
+const COM_HAND: [Real; 3] = [0.0, 0.0, 0.06];
+const I_HAND: [Real; 3] = [0.000264, 0.000264, 0.000264];
+const M_THIGH: Real = 10.60;
+const COM_THIGH: [Real; 3] = [0.0, -0.22, 0.0];
+const I_THIGH: [Real; 3] = [0.250198, 0.018493, 0.250198];
+const M_SHANK: Real = 3.20;
+const COM_SHANK: [Real; 3] = [0.0, -0.215, 0.0];
+const I_SHANK: [Real; 3] = [0.065964, 0.003161, 0.065964];
+const M_FOOT: Real = 1.00;
+const COM_FOOT: [Real; 3] = [0.0, -0.035, 0.05];
+const I_FOOT: [Real; 3] = [0.005617, 0.005883, 0.001083];
 
-const ZERO3: [f64; 3] = [0.0, 0.0, 0.0];
-const AX: [f64; 3] = [1.0, 0.0, 0.0];
-const AXN: [f64; 3] = [-1.0, 0.0, 0.0];
-const AY: [f64; 3] = [0.0, 1.0, 0.0];
-const AZ: [f64; 3] = [0.0, 0.0, 1.0];
+const ZERO3: [Real; 3] = [0.0, 0.0, 0.0];
+const AX: [Real; 3] = [1.0, 0.0, 0.0];
+const AXN: [Real; 3] = [-1.0, 0.0, 0.0];
+const AY: [Real; 3] = [0.0, 1.0, 0.0];
+const AZ: [Real; 3] = [0.0, 0.0, 1.0];
 
 /// Massless intermediate frame of a stacked-revolute cluster.
-const fn rev(parent: i32, anchor: [f64; 3], axis: [f64; 3], coord: i32) -> Frame {
+const fn rev(parent: i32, anchor: [Real; 3], axis: [Real; 3], coord: i32) -> Frame {
     Frame { parent, anchor, axis, coord, mass: 0.0, com: ZERO3, inertia: ZERO3 }
 }
 
 /// Cluster-terminal revolute frame carrying the body's mass.
 const fn revb(
     parent: i32,
-    anchor: [f64; 3],
-    axis: [f64; 3],
+    anchor: [Real; 3],
+    axis: [Real; 3],
     coord: i32,
-    mass: f64,
-    com: [f64; 3],
-    inertia: [f64; 3],
+    mass: Real,
+    com: [Real; 3],
+    inertia: [Real; 3],
 ) -> Frame {
     Frame { parent, anchor, axis, coord, mass, com, inertia }
 }
@@ -214,7 +215,7 @@ pub const HUMANOID_FRAMES: [Frame; 30] = [
 // spine[pitch,yaw,roll], arm_l[pitch,yaw,twist,elbow,roll,bend,dev],
 // arm_r[same], leg_l[hp,hy,hr,knee,ap,ar], leg_r[same].
 #[rustfmt::skip]
-pub const HUMANOID_LIMITS: [(f64, f64); NQ] = [
+pub const HUMANOID_LIMITS: [(Real, Real); NQ] = [
     (-0.3490658503988659, 0.7853981633974483),   //  0 spine_pitch
     (-0.6981317007977318, 0.6981317007977318),   //  1 spine_yaw
     (-0.5235987755982988, 0.5235987755982988),   //  2 spine_roll
@@ -247,7 +248,7 @@ pub const HUMANOID_LIMITS: [(f64, f64); NQ] = [
 ];
 
 #[rustfmt::skip]
-pub const HUMANOID_TAU_MAX: [f64; NQ] = [
+pub const HUMANOID_TAU_MAX: [Real; NQ] = [
     600.00, 239.95, 375.00,                          // spine
     85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,  // arm_l
     85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,  // arm_r
@@ -259,7 +260,7 @@ pub const HUMANOID_TAU_MAX: [f64; NQ] = [
 // (§1.4; 40 -> 50 per user 2026-08-18 — with the fist-only hand the
 // full-gear bend swing was cap-clipped mid-arc).
 #[rustfmt::skip]
-pub const HUMANOID_OMEGA_CAP: [f64; NQ] = [
+pub const HUMANOID_OMEGA_CAP: [Real; NQ] = [
     16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
@@ -269,7 +270,7 @@ pub const HUMANOID_OMEGA_CAP: [f64; NQ] = [
 
 // b = 0.6 · I_ref (pre-clamp), §1.5 table values verbatim.
 #[rustfmt::skip]
-pub const HUMANOID_DAMPING: [f64; NQ] = [
+pub const HUMANOID_DAMPING: [Real; NQ] = [
     4.3140, 1.1998, 3.6471,
     0.42689, 0.42689, 0.07292, 0.07174, 0.00159, 0.00159, 0.00159,
     0.42689, 0.42689, 0.07292, 0.07174, 0.00159, 0.00159, 0.00159,
@@ -279,7 +280,7 @@ pub const HUMANOID_DAMPING: [f64; NQ] = [
 
 // armature = I_ref[j] / 100 (§1.5 I_ref column, pre-clamp, verbatim).
 #[rustfmt::skip]
-pub const HUMANOID_ARMATURE: [f64; NQ] = [
+pub const HUMANOID_ARMATURE: [Real; NQ] = [
     0.071900, 0.019996, 0.060786,
     0.0071149, 0.0071149, 0.0012154, 0.0011957, 0.000026556, 0.000026556, 0.000026556,
     0.0071149, 0.0071149, 0.0012154, 0.0011957, 0.000026556, 0.000026556, 0.000026556,
