@@ -197,6 +197,9 @@ def parse_args():
                    help="--sim cuda: parallel slots (each plays a queue "
                         "of levels, longest-first; 0 = one slot per "
                         "level). 4096 measured fastest 2026-09-16")
+    p.add_argument("--cuda-pop-every", type=int, default=30,
+                   help="--sim cuda: ticks between host pops of finished "
+                        "levels (one GPU sync each); must stay < 60")
     p.add_argument("--sim", choices=["rust", "cuda"], default="rust",
                    help="rust (default, the reference): the threaded Rust "
                         "CPU sim at --num-envs with the policy batched on "
@@ -535,6 +538,8 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     # level in-kernel the same tick, so the wave's tick count is ~the
     # total work / N + the last level's tail instead of the longest
     # level's length. Levels in `slots` are indexed by position.
+    if not 1 <= args.cuda_pop_every < 60:
+        sys.exit("--cuda-pop-every must be in [1, 60)")
     exp_ticks = [int(sl["last_hit_s"] * 30) + 60 for sl in slots]
     n_slots = args.cuda_slots if args.cuda_slots > 0 else n_lv
     queues, makespan, ideal = plan_slots(exp_ticks, n_slots)
@@ -596,6 +601,17 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
         acts.index_copy_(0, active_idx, out)
         obs, _, _done, _ = env.step(acts)
         tick += 1
+        # pop finished levels every --cuda-pop-every ticks (one host sync
+        # each). Safe below 60: a level lasts >= 60 ticks, so no slot can
+        # finish twice between pops, and the kernel's refill reads
+        # cand[e] = that slot's next level, advanced here in time.
+        if tick % 300 == 0 and not args.quiet:
+            el = time.perf_counter() - t0
+            print(f"[cuda-bench] tick {tick}  levels done {n_done_levels}/"
+                  f"{n_lv}  active slots {int(active.sum())}/{n_slots}  "
+                  f"{el:.0f}s", flush=True)
+        if tick % args.cuda_pop_every:
+            continue
         ids, rows = env.pop_bench_rows()
         if len(ids):
             for e, r in zip(ids.tolist(), rows):
@@ -632,11 +648,6 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
             env.set_next_chart(torch.as_tensor(cand_host, device=device))
             active_idx = torch.as_tensor(np.flatnonzero(active),
                                          device=device)
-        if tick % 300 == 0 and not args.quiet:
-            el = time.perf_counter() - t0
-            print(f"[cuda-bench] tick {tick}  levels done {n_done_levels}/"
-                  f"{n_lv}  active slots {int(active.sum())}/{n_slots}  "
-                  f"{el:.0f}s", flush=True)
     wall = time.perf_counter() - t0
     for lv, slot in enumerate(slots):
         lid = slot["entry"]["leaderboard_id"]
@@ -657,7 +668,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
         "useful_env_steps_per_s": round(useful / wall),
         "ideal_ticks": round(ideal), "planned_makespan_ticks": round(makespan),
         "scheduler": "LPT longest-first, level = position in the task list",
-        "max_steps": max_steps,
+        "max_steps": max_steps, "pop_every": args.cuda_pop_every,
         # the reproducibility record: slot k's level positions in play order
         "assignment": [[current_lv for current_lv in q]
                        for q in plan_slots(exp_ticks, n_slots)[0]]}
