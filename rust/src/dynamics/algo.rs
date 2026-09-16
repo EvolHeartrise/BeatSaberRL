@@ -777,6 +777,42 @@ pub fn chol_back_t<const W: usize>(n: usize, l: &[Real], t: &mut [Real]) {
     }
 }
 
+/// item 3 (2026-09-16): `chol_fwd_unit` + `chol_back_t` for W unit
+/// right-hand sides at once, RHS-MINOR. The caller seeds `t` with +0.0
+/// everywhere except `t[m_r·W + r] = sign_r`, with every pivot
+/// `m_r >= m0`. The forward pass runs rows i ≥ m0 and chains k ≥ m0 for
+/// ALL lanes, which is bitwise `chol_fwd_unit` per lane:
+///  * i < m0: never touched, the seed's +0.0 == the `fill(0.0)`;
+///  * m0 ≤ i < m_r: seed +0.0, every term is l·(+0.0) = ±0.0 (inductively
+///    x[k] = +0.0 for k < i), `+0.0 − (±0.0) = +0.0`, and +0.0 / (positive
+///    finite pivot, §22) = +0.0 — the fill's bytes;
+///  * i = m_r: `sign − (±0.0)…` is exactly `sign`, so `sign / l_mm`;
+///  * i > m_r: seed +0.0, the k in m0..m_r terms are ±0.0 and leave it
+///    +0.0, then k = m_r..i is `chol_fwd_unit`'s own chain in order.
+/// Lanes are independent accumulators (the `chol_solve_t` argument), so
+/// the SIMD lane-vectorization is legal under strict IEEE.
+pub fn chol_solve_unit_t<const W: usize>(n: usize, l: &[Real], m0: usize, t: &mut [Real]) {
+    debug_assert_eq!(t.len(), W * n);
+    for i in m0..n {
+        let lrow = &l[i * n..i * n + i];
+        let mut s = [0.0 as Real; W];
+        s.copy_from_slice(&t[i * W..i * W + W]);
+        for k in m0..i {
+            let lk = lrow[k];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lk * xr[r];
+            }
+        }
+        let dg = l[i * n + i];
+        let row = &mut t[i * W..i * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+    chol_back_t::<W>(n, l, t);
+}
+
 /// `chol_solve_x4` at width 2 — the remainder rung of the batch ladder.
 pub fn chol_solve_x2(n: usize, l: &[Real], x: &mut [Real]) {
     debug_assert_eq!(x.len(), 2 * n);
