@@ -193,6 +193,19 @@ def parse_args():
                         "--mirror or non-mirror run of the same catalog)")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
+    p.add_argument("--sim", choices=["rust", "cuda"], default="rust",
+                   help="rust (default, the reference): the threaded Rust "
+                        "CPU sim at --num-envs with the policy batched on "
+                        "the GPU. cuda (2026-09-16): every level in ONE "
+                        "wave on CudaBeatVecEnv with the combo walk in the "
+                        "kernel; same JSON schema, same forward kernels "
+                        "(2048-row chunks, graphed); results carry "
+                        "sim='cuda' and never merge into a rust file")
+    p.add_argument("--sim-dtype", choices=["f32", "f64"], default="f32",
+                   help="--sim cuda only: kernel precision. f32 = the "
+                        "trainer's regime (fast; parity vs the f64 Rust "
+                        "sim is statistical), f64 = exact-parity regime "
+                        "(slow on consumer GPUs)")
     return p.parse_args()
 
 
@@ -440,6 +453,159 @@ def finish_slot(slot, info, combo):
     }
 
 
+def run_cuda(args, policy, device, tasks, data, levels, out_path,
+             durations, dur_path):
+    """--sim cuda (2026-09-16): every level of `tasks` plays ONCE in a
+    single CudaBeatVecEnv wave (auto_reset=False, combo_walk=True — the
+    kernel runs the ScoreSaber multiplier walk at the event sites and
+    freezes a finished level, VecBeatSim semantics). The policy forward
+    is the same graphed fp32 argmax the rust path uses, run in 2048-row
+    chunks (the rust path's exact batch shape, tail zero-padded) so the
+    cuBLAS kernels see identical shapes. Results go through finish_slot,
+    so the JSON entries are schema-identical to the rust path's."""
+    from beat_arena_env.cuda_env import CudaBeatVecEnv
+    from beat_arena_env.ranked_pool import _tuple_note
+    if device.type != "cuda":
+        sys.exit("--sim cuda needs a CUDA device")
+    ver = parser_version()
+    t_load = time.perf_counter()
+    charts, walls, slots, n_skip = [], [], [], 0
+    max_last = 0.0
+    for entry in tasks:
+        try:
+            pl = load_or_parse(entry, args.map_cache, args.chart_cache, ver)
+            durations[dur_key(entry)] = round(pl["duration_s"], 1)
+            skip = (None if pl["tuples"] else "no notes parsed")
+            if skip is None and args.max_song_s > 0 \
+                    and pl["last_hit_s"] > args.max_song_s:
+                skip = f"{pl['last_hit_s']:.0f}s > --max-song-s"
+        except Exception as e:
+            pl, skip = None, f"{type(e).__name__}: {e}"
+        if skip is not None:
+            n_skip += 1
+            levels[entry["leaderboard_id"]] = {
+                "leaderboard_id": entry["leaderboard_id"],
+                "song_hash": entry["hash"], "song": entry["song"],
+                "difficulty": entry["difficulty"],
+                "stars": entry["stars"], "skipped": skip}
+            continue
+        tup = mirror_tuples(pl["tuples"]) if args.mirror else pl["tuples"]
+        wl = pl.get("walls", [])
+        walls.append(mirror_walls(wl) if args.mirror else wl)
+        charts.append([_tuple_note(t) for t in tup])
+        slots.append({"entry": entry, "max_score": pl["max_score"],
+                      "duration_s": pl["duration_s"]})
+        max_last = max(max_last, pl["last_hit_s"])
+    n_lv = len(charts)
+    print(f"[cuda-bench] {n_lv} levels loaded ({n_skip} skipped) in "
+          f"{time.perf_counter() - t_load:.1f}s; longest last hit "
+          f"{max_last:.0f}s", flush=True)
+    if n_lv == 0:
+        save_results(out_path, data, levels)
+        return
+    dtype = torch.float64 if args.sim_dtype == "f64" else torch.float32
+    # the rust bench reads BEAT_Z_CLIP_HI (v28 lookahead clamp); mirror it
+    z_clip = float(os.environ.get("BEAT_Z_CLIP_HI", "12.0"))
+    max_steps = int(max_last * 30) + 300     # the kernel ends at last+tail
+    env = CudaBeatVecEnv(n_lv, charts=charts, walls=walls,
+                         max_steps=max_steps, gears=policy.n_gears,
+                         wide_acc=False, device=device, dtype=dtype,
+                         auto_reset=False, want_contacts=False,
+                         foot_contact=True, z_clip_hi=z_clip,
+                         combo_walk=True, seed=0)
+    ts = parse_tau_scale(args.tau_scale)
+    if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
+        env.set_tau_scale(ts)
+    CH = 2048                                # the rust path's batch shape
+    fwd = (None if args.no_graphs else _GraphedArgmax(policy, CH, device))
+    buf = torch.zeros((CH, OBS_DIM), device=device)
+    data["forward"] = "eager" if fwd is None else "graphed"
+    data["sim_dtype"] = args.sim_dtype
+    data["forward_chunk"] = CH
+    obs = env.reset()
+    acts = torch.zeros((n_lv, N_JOINTS), dtype=torch.int64, device=device)
+    t0 = time.perf_counter()
+    tick = 0
+    n_active = n_lv
+    while n_active > 0:
+        for lo in range(0, n_lv, CH):
+            hi = min(lo + CH, n_lv)
+            buf[:hi - lo].copy_(obs[lo:hi])
+            if hi - lo < CH:
+                buf[hi - lo:].zero_()
+            if fwd is not None:
+                fwd._copy_static(fwd.s_obs, buf)
+                a = fwd._run()
+            else:
+                with torch.no_grad():
+                    logits, _ = policy.forward_stacked(buf)
+                a = logits.argmax(-1)
+            acts[lo:hi].copy_(a[:hi - lo])
+        obs, _, done, _ = env.step(acts)
+        tick += 1
+        if tick % 300 == 0:
+            n_active = int((~done).sum().item())
+            if not args.quiet:
+                el = time.perf_counter() - t0
+                print(f"[cuda-bench] tick {tick}  active {n_active}/{n_lv}  "
+                      f"{el:.0f}s  {tick * n_lv / el / 1e3:.0f}k env-steps/s",
+                      flush=True)
+        if tick >= max_steps:
+            break
+    wall = time.perf_counter() - t0
+    good, bad, miss, n_sc, _score, bombs = [t.cpu().numpy()
+                                            for t in env.counters()]
+    pre, acc, post = [t.cpu().numpy() for t in env.components()]
+    cw_score, cw_maxc, cw_breaks = [t.cpu().numpy() for t in env.combo()]
+    fl_rad = env.flail_rad.sum(1).cpu().numpy()
+    fl_ticks = env.flail_ticks.cpu().numpy()
+    done = env._done.cpu().numpy()
+    for i, slot in enumerate(slots):
+        if not done[i]:
+            levels[slot["entry"]["leaderboard_id"]] = {
+                "leaderboard_id": slot["entry"]["leaderboard_id"],
+                "song_hash": slot["entry"]["hash"],
+                "song": slot["entry"]["song"],
+                "difficulty": slot["entry"]["difficulty"],
+                "stars": slot["entry"]["stars"],
+                "skipped": f"not finished in {max_steps} ticks"}
+            continue
+        result = finish_slot(slot, {
+            "good_cuts": int(good[i]), "bad_cuts": int(bad[i]),
+            "misses": int(miss[i]), "n_notes": int(n_sc[i]),
+            "bombs_hit": int(bombs[i]),
+            "score_pre": float(pre[i]), "score_acc": float(acc[i]),
+            "score_post": float(post[i]), "flail_rad": float(fl_rad[i]),
+            "flail_ticks": int(fl_ticks[i])},
+            (float(cw_score[i]), int(cw_maxc[i]), int(cw_breaks[i])))
+        levels[result["leaderboard_id"]] = result
+        if not args.quiet:
+            print(f"[{i + 1}/{n_lv}] {result['stars']:.2f}* "
+                  f"{result['song']!r} [{result['difficulty']}] "
+                  f"acc {100 * result['accuracy']:.2f}% pp {result['pp']:.1f}"
+                  f"{'  FC' if result['full_combo'] else ''}", flush=True)
+    data["pd_floor_hits"] = data.get("pd_floor_hits", 0) + env.pop_pd_hits()
+    data["envelope_hits"] = (data.get("envelope_hits", 0)
+                             + env.pop_envelope_hits())
+    data["cuda_bench"] = {"levels": n_lv, "ticks": tick, "wall_s": round(wall, 1),
+                          "env_steps_per_s": round(tick * n_lv / wall),
+                          "max_steps": max_steps}
+    save_results(out_path, data, levels)
+    if args.chart_cache:
+        os.makedirs(args.chart_cache, exist_ok=True)
+        tmp = dur_path + f".tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(durations, f)
+        os.replace(tmp, dur_path)
+    print(f"\ndone (cuda, {args.sim_dtype}): {n_lv} played ({n_skip} skipped), "
+          f"{data['n_evaluated']} levels on file | total weighted PP "
+          f"{data['total_weighted_pp']} | unweighted PP "
+          f"{data['total_unweighted_pp']} | pd-floor hits "
+          f"{data['pd_floor_hits']} | envelope hits {data['envelope_hits']} "
+          f"| {tick} ticks in {wall:.0f}s ({tick * n_lv / wall / 1e3:.0f}k "
+          f"env-steps/s) -> {out_path}", flush=True)
+
+
 def main():
     args = parse_args()
     if hasattr(sys.stdout, "reconfigure"):   # song titles are arbitrary
@@ -523,6 +689,37 @@ def main():
     # small lookahead (2026-07-27): the warm producer is ~70x faster than
     # consumer demand, so 2*N slots just parked ~290 MB of live note
     # tuples (~1.1M containers) for every gen2 GC pass to walk
+    full_force = args.force and args.stars is None and args.limit == 0
+    # Scoring-rule provenance (2026-07-29): the cut-plane accuracy fix
+    # changed every level's score, so old-rule (swept-surface acc, v1)
+    # results must NOT merge with new-rule (infinite-cut-plane, v2) ones.
+    # Files that predate the stamp but hold results are v1 by definition.
+    prev_rules = data.get("scoring_version")
+    if prev_rules is None and any("skipped" not in e
+                                  for e in levels.values()):
+        prev_rules = 1
+    if (prev_rules is not None and prev_rules != SCORING_VERSION
+            and not full_force):
+        sys.exit(f"error: {out_path} holds scoring-version {prev_rules} "
+                 f"results but the sim now scores version "
+                 f"{SCORING_VERSION} (v2: 2026-07-29 cut-plane accuracy "
+                 f"fix; v3: 2026-07-30 real note speeds) — results "
+                 f"cannot merge across scoring rules. Use a fresh --out, "
+                 f"or full-range --force to re-evaluate everything under "
+                 f"the current rules.")
+    data["scoring_version"] = SCORING_VERSION
+    # --sim provenance (2026-09-16): rust and cuda results never merge
+    prev_sim = data.get("sim", "rust")
+    if prev_sim != args.sim and any("skipped" not in e
+                                     for e in levels.values()):
+        sys.exit(f"error: {out_path} holds sim={prev_sim!r} results but "
+                 f"this run is --sim {args.sim}; use a different --out")
+    data["sim"] = args.sim
+    if args.sim == "cuda":
+        run_cuda(args, policy, device, tasks, data, levels, out_path,
+                 durations, dur_path)
+        return
+
     q = queue.Queue(maxsize=min(2 * args.num_envs, 128))
     stop = threading.Event()
     threading.Thread(target=producer,
@@ -582,24 +779,6 @@ def main():
               f"{fwd_path!r})", flush=True)
     else:
         data["forward"] = fwd_path
-    # Scoring-rule provenance (2026-07-29): the cut-plane accuracy fix
-    # changed every level's score, so old-rule (swept-surface acc, v1)
-    # results must NOT merge with new-rule (infinite-cut-plane, v2) ones.
-    # Files that predate the stamp but hold results are v1 by definition.
-    prev_rules = data.get("scoring_version")
-    if prev_rules is None and any("skipped" not in e
-                                  for e in levels.values()):
-        prev_rules = 1
-    if (prev_rules is not None and prev_rules != SCORING_VERSION
-            and not full_force):
-        sys.exit(f"error: {out_path} holds scoring-version {prev_rules} "
-                 f"results but the sim now scores version "
-                 f"{SCORING_VERSION} (v2: 2026-07-29 cut-plane accuracy "
-                 f"fix; v3: 2026-07-30 real note speeds) — results "
-                 f"cannot merge across scoring rules. Use a fresh --out, "
-                 f"or full-range --force to re-evaluate everything under "
-                 f"the current rules.")
-    data["scoring_version"] = SCORING_VERSION
     # (persistent pinned obs/act buffers live in each _Group: step_into
     # writes obs rows in place, the async D2H lands in pinned act memory,
     # and the group's event is the sync that makes both safe to touch)

@@ -493,7 +493,8 @@ class CudaBeatVecEnv:
                  limit_arms=False,
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
-                 z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0):
+                 z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
+                 combo_walk=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -662,6 +663,21 @@ class CudaBeatVecEnv:
         self._tau_jit = z(N, TAU_FEAT)
         self.ep_rec = z(N, 22)
         self.ep_flag = z(N, dt=torch.uint8)
+        # bench combo walk (2026-09-16): the ScoreSaber multiplied-score
+        # walk (lib.rs ComboWalk) run IN the kernel at the event sites,
+        # plus the "finished level stays finished" freeze — the CUDA
+        # bench's counters. Off (training): the tensors are untouched
+        # and the note-multiplier plane is a 1x1 dummy.
+        self.combo_walk = bool(combo_walk)
+        self.cw_mult = z(N, dt=torch.int32)
+        self.cw_prog = z(N, dt=torch.int32)
+        self.cw_combo = z(N, dt=torch.int32)
+        self.cw_maxc = z(N, dt=torch.int32)
+        self.cw_breaks = z(N, dt=torch.int32)
+        self.cw_score = z(N)
+        self.cw_note_mult = (z(N, C, dt=torch.uint8) if self.combo_walk
+                             else z(1, 1, dt=torch.uint8))
+        self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -806,6 +822,8 @@ class CudaBeatVecEnv:
             self.tau_stat,
             self.prev_idx, self.prev_valid,
             self.tau_scale, self._tau_jit, self.ep_rec, self.ep_flag,
+            self.cw_mult, self.cw_prog, self.cw_combo, self.cw_maxc,
+            self.cw_breaks, self.cw_score, self.cw_note_mult, self.tr_msum,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -840,7 +858,7 @@ class CudaBeatVecEnv:
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
                        self.z_clip_hi, self.self_contact_coef,
-                       self.tau_rand)
+                       self.tau_rand, int(self.combo_walk))
 
     # -- env v46: torque-limit scales ---------------------------------------
     def set_tau_scale(self, s16):
@@ -878,6 +896,8 @@ class CudaBeatVecEnv:
                              generator=self._gen)
 
     def reset(self):
+        if self.combo_walk:   # the freeze keys on done: clear stale flags
+            self._done.zero_()
         self._launch(self._zero_act, self._cand(), 1)
         self._episode += 1
         return self._obs
@@ -966,6 +986,13 @@ class CudaBeatVecEnv:
 
     def components(self):
         return (self.score_pre, self.score_acc, self.score_post)
+
+    def combo(self):
+        """Bench combo walk per env: (multiplied score (N,), highest
+        combo (N,), breaks (N,)) — requires combo_walk=True at
+        construction (VecBeatSim.combo(i) semantics, vectorized)."""
+        assert self.combo_walk, "combo_walk=False at construction"
+        return self.cw_score, self.cw_maxc, self.cw_breaks
 
     def contacts(self):
         """(imp (N,55) tick-summed lambda, point (N,55,3) last substep).
