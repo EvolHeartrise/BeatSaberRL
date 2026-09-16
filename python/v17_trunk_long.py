@@ -45,7 +45,7 @@ TRAIN_TIMEOUT = 50_000   # from-scratch: 24k upds ~10.2h + pool build
 # take it to 3e-6.
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--foot-contact", "--gears", "5", "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "999999", "--mirror-augment",   # FULL doubled pool
           "--gamma", "0.965", "--gae-lambda", "0.98",
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",

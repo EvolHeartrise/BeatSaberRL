@@ -74,7 +74,7 @@ def train_arm(name, n, t):
     cmd = [PY, "train_batch.py",
            "--num-envs", str(n), "--horizon", str(t),
            "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", "--seg-len", "25",
+           "--ranked-maps", 
            "--chart-pool", "24576",
            "--gears", "5",
            "--lr", f"{h['lr']:.6g}",

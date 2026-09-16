@@ -33,7 +33,7 @@ COOLDOWN = 400
 # v17_trunk_long.py COMMON verbatim + the trunk lr
 COMMON = ["--num-envs", "16384", "--horizon", "8",
           "--foot-contact", "--gears", "5", "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
           "--ent-coef", "0.03", "--ent-tau", "1000", "--ent-final", "1e-3",

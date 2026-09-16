@@ -65,7 +65,7 @@ def main():
         return
     cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
            "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", "--seg-len", "25",
+           "--ranked-maps", 
            "--chart-pool", "24576",
            "--wide-acc",  # the default, explicit for the record
            "--lr", "0.00296092",

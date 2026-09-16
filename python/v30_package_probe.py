@@ -50,7 +50,7 @@ Z_CLIP_HI = "40"
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--minibatches", "16", "--mb-accum", "2",
           "--foot-contact", "--gears", "5", "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
           "--z-clip-hi", Z_CLIP_HI,

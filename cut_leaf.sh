@@ -97,7 +97,7 @@ cd $REPO/python
 mkdir -p "$LEAF_DIR"
 python train_batch.py \
   --num-envs 16384 --horizon 8 --foot-contact --gears 5 --seed 0 \
-  --ranked-maps --seg-len 25 --chart-pool 24576 \
+  --ranked-maps --chart-pool 24576 \
   --gamma 0.965 --gae-lambda 0.98 --ent-coef 0.03 \
   --resume "$TRUNK_DIR/$CKPT_NAME" \
   --cooldown-updates $COOLDOWN --ent-final $ENT_FINAL \

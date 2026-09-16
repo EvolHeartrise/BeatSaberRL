@@ -48,7 +48,7 @@ COOLDOWN = 200                 # cd400 retimed for the doubled batch
 COMMON = ["--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
           "--minibatches", "16", "--mb-accum", "2",
           "--foot-contact", "--gears", "5", "--seed", "0",
-          "--ranked-maps", "--seg-len", "25",
+          "--ranked-maps", 
           "--chart-pool", "999999", "--mirror-augment",
           "--gamma", "0.965", "--gae-lambda", "0.98",
           "--energy-coef", "7.5e-6",  # env v43: was --iso-coef 5e-4 (retired 2026-09-14)

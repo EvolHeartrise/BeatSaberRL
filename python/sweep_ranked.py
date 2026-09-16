@@ -53,7 +53,7 @@ from copy import deepcopy
 from protein_sweep import Protein
 
 PY = sys.executable
-SEG_LEN = 25.0
+# SEG_LEN retired 2026-09-16: whole-level episodes are the only pool mode
 SEG_POOL = 24576   # seeded segment subsample per leg (~0.6 GB VRAM;
 #                    identical across legs -> the pool npz caches once)
 SPACE = {
@@ -100,7 +100,7 @@ def run_leg(idx, h, run_dir):
     shutil.rmtree(run_dir, ignore_errors=True)  # leg = always fresh model
     cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
            "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", "--seg-len", f"{SEG_LEN:g}",
+           "--ranked-maps", 
            "--chart-pool", str(SEG_POOL),
            "--lr", f"{h['lr']:.6g}",
            "--ent-coef", f"{h['ent_coef']:.6g}",

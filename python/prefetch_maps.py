@@ -4,8 +4,8 @@
 
 Fills all four cache layers front-to-back: ranked catalog (fetched once
 if missing), extracted chart .dats from BeatSaver, parser-versioned
-chart_cache pickles, and — unless --skip-pool / --limit — the 25 s
-ranked-segment pool npz that --ranked-maps training loads. Everything
+chart_cache pickles, and — unless --skip-pool / --limit — the whole-level
+ranked pool npz that --ranked-maps training loads. Everything
 downstream (train legs, bench, pods) then runs with zero network
 fetches.
 
@@ -72,8 +72,6 @@ def main():
                         "(implies --skip-pool; never prunes the catalog)")
     p.add_argument("--skip-pool", action="store_true",
                    help="stop after dats + chart_cache; no pool npz")
-    p.add_argument("--seg-len", type=float, default=25.0,
-                   help="segment length for the pool build (train default)")
     args = p.parse_args()
 
     from beat_arena_env import scoresaber
@@ -132,7 +130,7 @@ def main():
 
     if not args.skip_pool:
         from beat_arena_env.ranked_pool import load_ranked_pool
-        load_ranked_pool(seg_len=args.seg_len, device="cpu")
+        load_ranked_pool(device="cpu")
         print("[prefetch] pool npz built; cache complete", flush=True)
 
 
