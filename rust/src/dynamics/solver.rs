@@ -113,7 +113,8 @@ use super::algo::{
     chol_solve_t, chol_solve_unit, chol_solve_x2, chol_solve_x4,
 };
 use super::collide::{
-    ground_phase, narrow_phase, Contact, GroundContact, NUM_GROUND_CORNERS, NUM_PAIRS, SLOP,
+    ground_phase, narrow_phase, Contact, GroundContact, GROUND_FRAMES, NUM_GROUND_CORNERS,
+    NUM_PAIRS, SLOP,
 };
 use super::fk::{cross3, dot3, rot_log, sub3};
 use super::model::{Model, F_L_FOOT, F_R_FOOT};
@@ -289,6 +290,51 @@ macro_rules! weld_support_dot2 {
     }};
 }
 
+// ── bench-opt item 2 (2026-09-16): GROUND-ROW SUPPORT — R9's argument
+//    carried over to the contact-mode ground block.
+//
+// A ground row is assembled exactly like a weld linear row: `jr.fill(0.0)`
+// then ONE `point_jacobian_acc` on the corner's own foot frame (the ground
+// is static — no second chain). `ground_phase` only ever emits corners on
+// `GROUND_FRAMES` = [F_L_FOOT, F_R_FOOT], foot_l corners FIRST, so the
+// block is a left-foot prefix (support {0..6} ∪ {23..29}) followed by a
+// right-foot suffix (support {0..6} ∪ {29..35}); every other column holds
+// the memset's +0.0. Consumers in the shipping build: the per-substep
+// effective mass `Σ jr·mr` and the PGS residual `Σ jr·v` (3 rows per
+// active corner × PGS_ITERS). Both are single scalar dots seeded +0.0, so
+// R9's BITWISE proof applies verbatim: skipped terms are (+0.0)·x = ±0.0,
+// the accumulator can never be −0.0, `y + (±0.0) == y`, and the kept
+// terms keep ascending-i order. (Finite trajectories, work-order §10.)
+// The column segment is a compile-time constant of each loop (the
+// dead-store rule 2 above): the prefix/suffix split is found once per
+// solve, not selected per row. Pinned by `ground_support_dot_bitwise`.
+// MEASURED on the pod (EPYC 7573X, f32 native build, replay trace
+// f32_256x2000 = 256 bench envs × 2,000 leaf-policy ticks, ABBA ×2):
+// step_into **−15.1…−16.2%** at 14 threads (10.40–10.54 → 8.81–8.85 s)
+// and **−16.8…−17.3%** at 1 thread (33.30 → 27.54–27.70 s over 500
+// ticks), replay BITWISE IDENTICAL at every tick. The ground dots are
+// strict-FP scalar reductions (not vectorizable), so 35 → 12 terms is
+// a straight 3× on the hottest scalar chain of contact mode.
+const _: () = {
+    assert!(GROUND_FRAMES[0] == F_L_FOOT && GROUND_FRAMES[1] == F_R_FOOT);
+};
+
+/// `Σᵢ jr[i]·x[i]` over the ground-row support {0..W_BASE_HI} ∪ {LO..HI},
+/// ascending i, accumulator seeded +0.0 — bitwise the 35-wide dot for a
+/// ground row of the foot whose chain columns are LO..HI (see above).
+#[inline(always)]
+fn ground_support_dot<const LO: usize, const HI: usize>(jr: &[Real], x: &[Real]) -> Real {
+    let (jr, x) = (&jr[..HI], &x[..HI]);
+    let mut s = 0.0;
+    for i in 0..W_BASE_HI {
+        s += jr[i] * x[i];
+    }
+    for i in LO..HI {
+        s += jr[i] * x[i];
+    }
+    s
+}
+
 /// `dst[i] <op>= Σ_w  minvjt_w[i] · d[w]` over ALL TWELVE weld rows in
 /// ONE pass over `dst` (R15). `$mj` is the head of `minvjt` (the 12 weld
 /// rows, row-major, `nv` apart), `$d` a `[f64; N_WELD_ROWS]`, `$op` the
@@ -442,6 +488,9 @@ pub struct ConstraintSet {
     /// Active sole corners of the last solve, corner order (contact
     /// spec §2). Three rows each.
     pub ground_contacts: Vec<GroundContact>,
+    /// Item 2: number of LEFT-foot corners at the head of
+    /// `ground_contacts` (the rest are right-foot), found once per solve.
+    ground_nleft: usize,
     /// Assembled row count of the last solve (welds + ground + contacts
     /// + limit rows).
     pub nrows: usize,
@@ -569,6 +618,7 @@ impl ConstraintSet {
             h: super::step::H_SUB,
             contacts: Vec::with_capacity(NUM_PAIRS),
             ground_contacts: Vec::with_capacity(NUM_GROUND_CORNERS),
+            ground_nleft: 0,
             nrows: 0,
             lambda: vec![0.0; MAX_ROWS],
             bias: vec![0.0; MAX_ROWS],
@@ -913,16 +963,28 @@ impl ConstraintSet {
     /// contract, which parity and the K13 warp-divergence rule both
     /// require.
     fn pgs_ground_sweep(&mut self, nweld: usize, v: &mut [Real]) {
+        // item 2: left-foot prefix then right-foot suffix — the same
+        // corners in the same order, each loop with its foot's
+        // compile-time support segment
+        let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
+        self.pgs_ground_sweep_foot::<W_L_LO, W_L_HI>(nweld, 0, nl, v);
+        self.pgs_ground_sweep_foot::<W_R_LO, W_R_HI>(nweld, nl, n, v);
+    }
+
+    /// `pgs_ground_sweep` over active corners `g0..g1`, all on the foot
+    /// whose chain columns are `LO..HI` (item 2 support dots).
+    #[inline(always)]
+    fn pgs_ground_sweep_foot<const LO: usize, const HI: usize>(
+        &mut self,
+        nweld: usize,
+        g0: usize,
+        g1: usize,
+        v: &mut [Real],
+    ) {
         let nv = self.nv;
-        for gi in 0..self.ground_contacts.len() {
+        for gi in g0..g1 {
             let nrow = nweld + gi * GROUND_ROWS_PER_CORNER;
-            let mut jv = 0.0;
-            {
-                let jr = &self.j[nrow * nv..(nrow + 1) * nv];
-                for i in 0..nv {
-                    jv += jr[i] * v[i];
-                }
-            }
+            let jv = ground_support_dot::<LO, HI>(&self.j[nrow * nv..(nrow + 1) * nv], v);
             Self::pgs_row_update(
                 nrow,
                 nv,
@@ -939,13 +1001,7 @@ impl ConstraintSet {
             let bound = MU * self.lambda[nrow];
             for t in 1..GROUND_ROWS_PER_CORNER {
                 let row = nrow + t;
-                let mut jv = 0.0;
-                {
-                    let jr = &self.j[row * nv..(row + 1) * nv];
-                    for i in 0..nv {
-                        jv += jr[i] * v[i];
-                    }
-                }
+                let jv = ground_support_dot::<LO, HI>(&self.j[row * nv..(row + 1) * nv], v);
                 Self::pgs_row_update_box(
                     row,
                     nv,
@@ -959,6 +1015,37 @@ impl ConstraintSet {
                 );
             }
         }
+    }
+
+    /// TEST HOOK (item 2): for every assembled GROUND row of the last
+    /// solve, (dense 35-wide dot, support dot) against `src`, plus a flag
+    /// that every column outside the row's support is the +0.0 bit
+    /// pattern.
+    #[cfg(test)]
+    pub fn ground_dot_ref_vs_support(&self, src: &[Real]) -> Vec<(Real, Real, bool)> {
+        let nv = self.nv;
+        let nweld = self.weld_rows();
+        (0..self.ground_rows())
+            .map(|g| {
+                let row = nweld + g;
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mut dense = 0.0;
+                for i in 0..nv {
+                    dense += jr[i] * src[i];
+                }
+                let left = g / GROUND_ROWS_PER_CORNER < self.ground_nleft;
+                let (lo, hi) = if left { (W_L_LO, W_L_HI) } else { (W_R_LO, W_R_HI) };
+                let sup = if left {
+                    ground_support_dot::<W_L_LO, W_L_HI>(jr, src)
+                } else {
+                    ground_support_dot::<W_R_LO, W_R_HI>(jr, src)
+                };
+                let zeros = (0..nv)
+                    .filter(|&i| !(i < W_BASE_HI || (lo..hi).contains(&i)))
+                    .all(|i| jr[i].to_bits() == (0.0 as Real).to_bits());
+                (dense, sup, zeros)
+            })
+            .collect()
     }
 
     /// §3 steps 7–9 against the FK + Cholesky factor already in `ws`
@@ -1023,8 +1110,18 @@ impl ConstraintSet {
         // the §2 pair-id row order is untouched.
         if self.ground {
             ground_phase(ws, &mut self.ground_contacts);
+            // item 2: the ground support segments pin the humanoid layout
+            // (as R9's do for the welds) and a left-foot-prefix order
+            assert_eq!(nv, W_R_HI, "the item-2 ground-support segments pin nv = 35");
+            self.ground_nleft = self
+                .ground_contacts
+                .partition_point(|g| g.frame == F_L_FOOT);
+            debug_assert!(self.ground_contacts[self.ground_nleft..]
+                .iter()
+                .all(|g| g.frame == F_R_FOOT));
         } else {
             self.ground_contacts.clear();
+            self.ground_nleft = 0;
         }
         if self.contacts_enabled {
             narrow_phase(ws, &mut self.contacts);
@@ -1270,8 +1367,28 @@ impl ConstraintSet {
                 row += 1;
             }
         }
+        // item 2: GROUND rows take the support dot (bitwise, see the
+        // item-2 note by `ground_support_dot`), left-foot prefix first
+        {
+            let nlrow = nweld + self.ground_nleft * GROUND_ROWS_PER_CORNER;
+            for row in nweld..nlrow {
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mr = &self.minvjt[row * nv..(row + 1) * nv];
+                let d = ground_support_dot::<W_L_LO, W_L_HI>(jr, mr);
+                debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
+                self.diag[row] = d;
+            }
+            for row in nlrow..nweld + nground {
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mr = &self.minvjt[row * nv..(row + 1) * nv];
+                let d = ground_support_dot::<W_R_LO, W_R_HI>(jr, mr);
+                debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
+                self.diag[row] = d;
+            }
+        }
         for row in 0..ndense {
-            if DIAG_ALL_ROWS || row >= nweld {
+            let ground_row = row >= nweld && row < nweld + nground;
+            if (DIAG_ALL_ROWS || row >= nweld) && !ground_row {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mr = &self.minvjt[row * nv..(row + 1) * nv];
                 let mut d = 0.0;
