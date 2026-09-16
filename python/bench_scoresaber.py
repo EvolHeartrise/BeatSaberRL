@@ -174,6 +174,13 @@ def parse_args():
                         "flag is accepted so older drivers keep running. "
                         "(Weld-era checkpoints predate env v11 and are "
                         "archival.)")
+    p.add_argument("--groups", type=int, default=1,
+                   help="--sim rust: split --num-envs into this many equal "
+                        "groups that alternate — each group's GPU forward "
+                        "runs while the CPU steps the next group's sim "
+                        "(2026-09-16). Forward batch width = num_envs/groups, "
+                        "which is score-relevant: results never merge "
+                        "across a different width")
     p.add_argument("--num-envs", type=int, default=2048,
                    help="maps evaluated in parallel (policy is batched); "
                         "on the fused path the effective width is capped "
@@ -848,7 +855,10 @@ def main():
     # retired 2026-08-13 with the 138k arch; the graphed torch forward
     # is the only CUDA path now — batch width is score-relevant on it,
     # so N stays exactly --num-envs)
-    sizes = [N]
+    if args.groups < 1 or N % args.groups:
+        sys.exit(f"--num-envs {N} must split evenly into --groups "
+                 f"{args.groups}")
+    sizes = [N // args.groups] * args.groups
     if args.sim_dtype == "f32":
         if beat_arena_rs32 is None:
             sys.exit("--sim-dtype f32 needs the beat_arena_rs32 module: "
@@ -886,6 +896,16 @@ def main():
               f"{fwd_path!r})", flush=True)
     else:
         data["forward"] = fwd_path
+    # forward batch width (2026-09-16, --groups): score-relevant on the
+    # graphed path, so a file never mixes widths (unstamped files: unknown)
+    width = sizes[0]
+    prev_w = data.get("forward_width")
+    if (prev_w is not None and prev_w != width and not full_force
+            and any("skipped" not in e for e in levels.values())):
+        sys.exit(f"error: {out_path} holds forward-width {prev_w} results "
+                 f"but this run uses {width} (--num-envs/--groups); use a "
+                 f"fresh --out")
+    data["forward_width"] = width
     # (persistent pinned obs/act buffers live in each _Group: step_into
     # writes obs rows in place, the async D2H lands in pinned act memory,
     # and the group's event is the sync that makes both safe to touch)
