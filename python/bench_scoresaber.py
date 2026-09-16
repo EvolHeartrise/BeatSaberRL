@@ -193,6 +193,10 @@ def parse_args():
                         "--mirror or non-mirror run of the same catalog)")
     p.add_argument("--no-graphs", action="store_true",
                    help="disable CUDA-graph capture of the argmax forward")
+    p.add_argument("--cuda-slots", type=int, default=4096,
+                   help="--sim cuda: parallel slots (each plays a queue "
+                        "of levels, longest-first; 0 = one slot per "
+                        "level). 4096 measured fastest 2026-09-16")
     p.add_argument("--sim", choices=["rust", "cuda"], default="rust",
                    help="rust (default, the reference): the threaded Rust "
                         "CPU sim at --num-envs with the policy batched on "
@@ -453,6 +457,25 @@ def finish_slot(slot, info, combo):
     }
 
 
+def plan_slots(expected_ticks, n_slots):
+    """Longest-processing-time assignment of levels to bench slots: sort
+    levels by expected ticks descending and give each to the slot with
+    the smallest load so far. Returns (queues: list of level-index lists
+    per slot, makespan ticks, ideal ticks = sum/n_slots). Deterministic;
+    every level exactly once. Pinned by tests/test_bench_cuda_refill.py."""
+    n_slots = max(1, min(int(n_slots), len(expected_ticks)))
+    order = sorted(range(len(expected_ticks)),
+                   key=lambda i: (-expected_ticks[i], i))
+    load = [0.0] * n_slots
+    queues = [[] for _ in range(n_slots)]
+    for i in order:
+        k = min(range(n_slots), key=lambda j: (load[j], j))
+        queues[k].append(i)
+        load[k] += expected_ticks[i]
+    total = float(sum(expected_ticks))
+    return queues, max(load), total / n_slots
+
+
 def run_cuda(args, policy, device, tasks, data, levels, out_path,
              durations, dur_path):
     """--sim cuda (2026-09-16): every level of `tasks` plays ONCE in a
@@ -494,7 +517,8 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
         walls.append(mirror_walls(wl) if args.mirror else wl)
         charts.append([_tuple_note(t) for t in tup])
         slots.append({"entry": entry, "max_score": pl["max_score"],
-                      "duration_s": pl["duration_s"]})
+                      "duration_s": pl["duration_s"],
+                      "last_hit_s": pl["last_hit_s"]})
         max_last = max(max_last, pl["last_hit_s"])
     n_lv = len(charts)
     print(f"[cuda-bench] {n_lv} levels loaded ({n_skip} skipped) in "
@@ -506,16 +530,30 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     dtype = torch.float64 if args.sim_dtype == "f64" else torch.float32
     # the rust bench reads BEAT_Z_CLIP_HI (v28 lookahead clamp); mirror it
     z_clip = float(os.environ.get("BEAT_Z_CLIP_HI", "12.0"))
-    max_steps = int(max_last * 30) + 300     # the kernel ends at last+tail
-    env = CudaBeatVecEnv(n_lv, charts=charts, walls=walls,
+    # slot refill (2026-09-16): N slots each play a QUEUE of levels
+    # (longest-first LPT assignment); a finished slot resets onto its next
+    # level in-kernel the same tick, so the wave's tick count is ~the
+    # total work / N + the last level's tail instead of the longest
+    # level's length. Levels in `slots` are indexed by position.
+    exp_ticks = [int(sl["last_hit_s"] * 30) + 60 for sl in slots]
+    n_slots = args.cuda_slots if args.cuda_slots > 0 else n_lv
+    queues, makespan, ideal = plan_slots(exp_ticks, n_slots)
+    n_slots = len(queues)
+    max_steps = int(max_last * 30) + 300     # per-EPISODE limit in-kernel
+    env = CudaBeatVecEnv(n_slots, charts=charts, walls=walls,
                          max_steps=max_steps, gears=policy.n_gears,
                          wide_acc=False, device=device, dtype=dtype,
                          auto_reset=False, want_contacts=False,
                          foot_contact=True, z_clip_hi=z_clip,
-                         combo_walk=True, seed=0)
+                         combo_walk=True, bench_refill=True, seed=0)
     ts = parse_tau_scale(args.tau_scale)
     if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
         env.set_tau_scale(ts)
+    # `charts=` builds the pool in list order, so pool chart k == level k
+    current = [q.pop(0) for q in queues]          # level playing per slot
+    cand_host = np.array([(q[0] if q else -1) for q in queues],
+                         dtype=np.int64)
+    env.set_next_chart(torch.as_tensor(cand_host, device=device))
     CH = 2048                                # the rust path's batch shape
     fwd = (None if args.no_graphs else _GraphedArgmax(policy, CH, device))
     buf = torch.zeros((CH, OBS_DIM), device=device)
@@ -523,14 +561,23 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     data["sim_dtype"] = args.sim_dtype
     data["forward_chunk"] = CH
     obs = env.reset()
-    acts = torch.zeros((n_lv, N_JOINTS), dtype=torch.int64, device=device)
+    acts = torch.zeros((n_slots, N_JOINTS), dtype=torch.int64, device=device)
+    n_sc_pool = env.pool["n_scoreable"].cpu().numpy()
+    active = np.ones(n_slots, dtype=bool)         # slot has a live level
+    active_idx = torch.arange(n_slots, device=device)
+    n_done_levels = 0
     t0 = time.perf_counter()
     tick = 0
-    n_active = n_lv
-    while n_active > 0:
-        for lo in range(0, n_lv, CH):
-            hi = min(lo + CH, n_lv)
-            buf[:hi - lo].copy_(obs[lo:hi])
+    tick_guard = int(3 * makespan) + max_steps
+    while n_done_levels < n_lv and tick < tick_guard:
+        # forward on the active slots only, in fixed 2048-wide chunks
+        # (zero-padded) so the per-sample numerics keep the pinned shape
+        n_act = int(active_idx.numel())
+        obs_a = obs.index_select(0, active_idx)
+        out = torch.empty((n_act, N_JOINTS), dtype=torch.int64, device=device)
+        for lo in range(0, n_act, CH):
+            hi = min(lo + CH, n_act)
+            buf[:hi - lo].copy_(obs_a[lo:hi])
             if hi - lo < CH:
                 buf[hi - lo:].zero_()
             if fwd is not None:
@@ -540,56 +587,76 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                 with torch.no_grad():
                     logits, _ = policy.forward_stacked(buf)
                 a = logits.argmax(-1)
-            acts[lo:hi].copy_(a[:hi - lo])
-        obs, _, done, _ = env.step(acts)
+            out[lo:hi].copy_(a[:hi - lo])
+        acts.zero_()
+        acts.index_copy_(0, active_idx, out)
+        obs, _, _done, _ = env.step(acts)
         tick += 1
-        if tick % 300 == 0:
-            n_active = int((~done).sum().item())
-            if not args.quiet:
-                el = time.perf_counter() - t0
-                print(f"[cuda-bench] tick {tick}  active {n_active}/{n_lv}  "
-                      f"{el:.0f}s  {tick * n_lv / el / 1e3:.0f}k env-steps/s",
-                      flush=True)
-        if tick >= max_steps:
-            break
+        ids, rows = env.pop_bench_rows()
+        if len(ids):
+            for e, r in zip(ids.tolist(), rows):
+                lv = current[e]
+                slot = slots[lv]
+                ci = int(r[13])
+                result = finish_slot(slot, {
+                    "good_cuts": int(r[0]), "bad_cuts": int(r[1]),
+                    "misses": int(r[2]), "n_notes": int(n_sc_pool[ci]),
+                    "bombs_hit": int(r[4]),
+                    "score_pre": float(r[5]), "score_acc": float(r[6]),
+                    "score_post": float(r[7]), "flail_rad": float(r[8]),
+                    "flail_ticks": int(r[9])},
+                    (float(r[10]), int(r[11]), int(r[12])))
+                result["cuda_slot"] = int(e)
+                levels[result["leaderboard_id"]] = result
+                n_done_levels += 1
+                if not args.quiet:
+                    print(f"[{n_done_levels}/{n_lv}] {result['stars']:.2f}* "
+                          f"{result['song']!r} [{result['difficulty']}] "
+                          f"acc {100 * result['accuracy']:.2f}% pp "
+                          f"{result['pp']:.1f}"
+                          f"{'  FC' if result['full_combo'] else ''}",
+                          flush=True)
+                # the kernel already reset slot e onto cand_host[e]; advance
+                if cand_host[e] >= 0:
+                    current[e] = int(cand_host[e])
+                    q = queues[e]
+                    q.pop(0)
+                    cand_host[e] = q[0] if q else -1
+                else:
+                    current[e] = -1
+                    active[e] = False
+            env.set_next_chart(torch.as_tensor(cand_host, device=device))
+            active_idx = torch.as_tensor(np.flatnonzero(active),
+                                         device=device)
+        if tick % 300 == 0 and not args.quiet:
+            el = time.perf_counter() - t0
+            print(f"[cuda-bench] tick {tick}  levels done {n_done_levels}/"
+                  f"{n_lv}  active slots {int(active.sum())}/{n_slots}  "
+                  f"{el:.0f}s", flush=True)
     wall = time.perf_counter() - t0
-    good, bad, miss, n_sc, _score, bombs = [t.cpu().numpy()
-                                            for t in env.counters()]
-    pre, acc, post = [t.cpu().numpy() for t in env.components()]
-    cw_score, cw_maxc, cw_breaks = [t.cpu().numpy() for t in env.combo()]
-    fl_rad = env.flail_rad.sum(1).cpu().numpy()
-    fl_ticks = env.flail_ticks.cpu().numpy()
-    done = env._done.cpu().numpy()
-    for i, slot in enumerate(slots):
-        if not done[i]:
-            levels[slot["entry"]["leaderboard_id"]] = {
-                "leaderboard_id": slot["entry"]["leaderboard_id"],
-                "song_hash": slot["entry"]["hash"],
+    for lv, slot in enumerate(slots):
+        lid = slot["entry"]["leaderboard_id"]
+        if lid not in levels:
+            levels[lid] = {
+                "leaderboard_id": lid, "song_hash": slot["entry"]["hash"],
                 "song": slot["entry"]["song"],
                 "difficulty": slot["entry"]["difficulty"],
                 "stars": slot["entry"]["stars"],
-                "skipped": f"not finished in {max_steps} ticks"}
-            continue
-        result = finish_slot(slot, {
-            "good_cuts": int(good[i]), "bad_cuts": int(bad[i]),
-            "misses": int(miss[i]), "n_notes": int(n_sc[i]),
-            "bombs_hit": int(bombs[i]),
-            "score_pre": float(pre[i]), "score_acc": float(acc[i]),
-            "score_post": float(post[i]), "flail_rad": float(fl_rad[i]),
-            "flail_ticks": int(fl_ticks[i])},
-            (float(cw_score[i]), int(cw_maxc[i]), int(cw_breaks[i])))
-        levels[result["leaderboard_id"]] = result
-        if not args.quiet:
-            print(f"[{i + 1}/{n_lv}] {result['stars']:.2f}* "
-                  f"{result['song']!r} [{result['difficulty']}] "
-                  f"acc {100 * result['accuracy']:.2f}% pp {result['pp']:.1f}"
-                  f"{'  FC' if result['full_combo'] else ''}", flush=True)
+                "skipped": f"not finished by tick {tick} (guard {tick_guard})"}
     data["pd_floor_hits"] = data.get("pd_floor_hits", 0) + env.pop_pd_hits()
     data["envelope_hits"] = (data.get("envelope_hits", 0)
                              + env.pop_envelope_hits())
-    data["cuda_bench"] = {"levels": n_lv, "ticks": tick, "wall_s": round(wall, 1),
-                          "env_steps_per_s": round(tick * n_lv / wall),
-                          "max_steps": max_steps}
+    useful = sum(exp_ticks)
+    data["cuda_bench"] = {
+        "levels": n_lv, "slots": n_slots, "ticks": tick,
+        "wall_s": round(wall, 1),
+        "useful_env_steps_per_s": round(useful / wall),
+        "ideal_ticks": round(ideal), "planned_makespan_ticks": round(makespan),
+        "scheduler": "LPT longest-first, level = position in the task list",
+        "max_steps": max_steps,
+        # the reproducibility record: slot k's level positions in play order
+        "assignment": [[current_lv for current_lv in q]
+                       for q in plan_slots(exp_ticks, n_slots)[0]]}
     save_results(out_path, data, levels)
     if args.chart_cache:
         os.makedirs(args.chart_cache, exist_ok=True)
@@ -602,8 +669,9 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
           f"{data['total_weighted_pp']} | unweighted PP "
           f"{data['total_unweighted_pp']} | pd-floor hits "
           f"{data['pd_floor_hits']} | envelope hits {data['envelope_hits']} "
-          f"| {tick} ticks in {wall:.0f}s ({tick * n_lv / wall / 1e3:.0f}k "
-          f"env-steps/s) -> {out_path}", flush=True)
+          f"| {n_slots} slots, {tick} ticks (ideal {ideal:.0f}) in {wall:.0f}s "
+          f"({useful / wall / 1e3:.0f}k useful env-steps/s) -> {out_path}",
+          flush=True)
 
 
 def main():
