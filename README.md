@@ -363,6 +363,31 @@ D2H, and a JIT trust-the-cache startup. All bitwise-exact (the fused
 per-sample kernel is batch-size-invariant, verified over the full
 catalog): **~128 maps/s warm, full catalog ~48s** on the GTX 1080 box
 (first run parses + warms the cache under `maps/chart_cache/`, ~380 MB).
+
+**CUDA-sim bench (`--sim cuda`, 2026-09-16; the Rust path stays the
+reference and the default):** every level in range plays ONCE in a single
+`CudaBeatVecEnv` wave (`auto_reset=False`, walls loaded from the parsed
+payload, `BEAT_Z_CLIP_HI` honoured like the Rust path), with the
+ScoreSaber multiplier walk run IN the kernel at the event sites (the
+`combo_walk=True` construction: `lib.rs ComboWalk` transcribed — pinned
+cut-time multipliers, follow-through points committed at the sum of a
+tracker's pinned multipliers, breaks on slow/angle/wrong-hand/miss/bomb
+hit/wall ENTRY) and a "finished level stays finished" freeze
+(VecBeatSim's latch). The policy forward is the same graphed fp32
+argmax the Rust path uses, in 2048-row chunks (tail zero-padded) so the
+cuBLAS kernels see the Rust path's exact batch shape. Same
+`finish_slot` → identical JSON entries; the file carries `sim`,
+`sim_dtype`, `forward_chunk` and a `cuda_bench` timing block, and a
+`--sim cuda` file never merges with a rust one. `--sim-dtype f64` is the
+exact-parity regime of the parity gate (slow on consumer GPUs); `f32`
+(default) is the trainer's regime, where Rust-vs-CUDA agreement is
+statistical (knife-edge argmax flips over long free-running episodes).
+Validate a candidate with `python bench_compare.py cuda.json rust.json`.
+VALIDATION (pod igc6hvsqagfnrf, RTX 5090, checkpoint
+runs/v47_taurand_cd300/leaf_from_upd01068.pt vs bench/v47_taurand_cd300.json
+= 2,529,022.22 upp on the Rust path): __VALIDATION__. Rule: the Rust
+bench remains the reference for every comparison until the user promotes
+the CUDA one; the two are not interchangeable in a comparison table.
 Those figures are the KINEMATIC (v7) era and no longer apply: on the
 v10 dynamic body a full 6,097-difficulty bench measures **~18 min
 (~343 levels/min) on a 5090** (2026-08-31). The 7-10 min/checkpoint

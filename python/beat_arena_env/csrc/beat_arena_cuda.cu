@@ -4552,6 +4552,20 @@ struct Sim {
   T tau_rand;
   T* __restrict__ ep_rec;
   uint8_t* __restrict__ ep_flag;
+  // bench combo walk (2026-09-16, CUDA bench): the ScoreSaber multiplied-
+  // score walk of lib.rs ComboWalk, applied AT the event sites in the
+  // same order Rust pushes its events (post -> note loop -> walls ->
+  // post). combo_walk=false leaves every field untouched (training).
+  bool combo_walk;
+  int* __restrict__ cw_mult;          // (N) current multiplier 1/2/4/8
+  int* __restrict__ cw_prog;          // (N) progress toward the next tier
+  int* __restrict__ cw_combo;         // (N) current combo
+  int* __restrict__ cw_maxc;          // (N) highest combo
+  int* __restrict__ cw_breaks;        // (N) combo breaks
+  T* __restrict__ cw_score;           // (N) multiplied score
+  uint8_t* __restrict__ cw_note_mult; // (N, C) pinned cut-time multiplier
+  int* __restrict__ tr_msum;          // (N, 2, N_TRACKERS) sum of the pinned
+                                      // multipliers of a tracker's notes
   // R12 warp-coherence permutation: thread gid serves env env_order[gid]
   // (identity unless the host sorts it — see cuda_env.step). A bijection
   // on the thread->env assignment only; all P.*[e] addressing unchanged.
@@ -4804,6 +4818,42 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
     {0.525, 1.7850000000000001, 2.1, 0.315},
 };
 template <typename T>
+// bench combo walk (lib.rs ComboWalk::consume, applied at the event
+// sites): break = slow / angle / wrong-hand / miss / bomb hit / wall
+// ENTRY; cut = promote-before-commit, pin the multiplier, combo up,
+// score += pts x mult; follow-through points commit at the pinned
+// multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
+// on the event bus before multiplying — mirrored with the (float) cast.
+template <typename T>
+__device__ __forceinline__ void cw_break(const Sim<T>& P, int e) {
+  if (!P.combo_walk) return;
+  P.cw_combo[e] = 0;
+  P.cw_breaks[e] += 1;
+  P.cw_mult[e] = max(1, P.cw_mult[e] / 2);
+  P.cw_prog[e] = 0;
+}
+
+template <typename T>
+__device__ __forceinline__ int cw_cut(const Sim<T>& P, int e, int i, T pts) {
+  if (!P.combo_walk) return 0;
+  int m = P.cw_mult[e];
+  const int need = (m == 1) ? 2 : (m == 2) ? 4 : (m == 4) ? 8 : 0;
+  if (need) {
+    P.cw_prog[e] += 1;
+    if (P.cw_prog[e] >= need) {
+      m *= 2;
+      P.cw_mult[e] = m;
+      P.cw_prog[e] = 0;
+    }
+  }
+  P.cw_note_mult[(size_t)e * P.C + i] = (uint8_t)m;
+  P.cw_combo[e] += 1;
+  if (P.cw_combo[e] > P.cw_maxc[e]) P.cw_maxc[e] = P.cw_combo[e];
+  P.cw_score[e] += T((float)pts) * T(m);
+  return m;
+}
+
+template <typename T>
 __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
                           int64_t chart) {
   d.p[0] = T(BASE_POS0[0]);
@@ -4914,6 +4964,15 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.score_acc[e] = T(0);
   P.score_post[e] = T(0);
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
+  if (P.combo_walk) {  // bench combo walk: fresh walk per level
+    P.cw_mult[e] = 1;
+    P.cw_prog[e] = 0;
+    P.cw_combo[e] = 0;
+    P.cw_maxc[e] = 0;
+    P.cw_breaks[e] = 0;
+    P.cw_score[e] = T(0);
+    for (int i = 0; i < P.C; i++) P.cw_note_mult[(size_t)e * P.C + i] = 0;
+  }
   for (int s = 0; s < 2; s++) {  // env v45
     P.prev_idx[e * 2 + s] = 0;
     P.prev_valid[e * 2 + s] = 0;
@@ -5536,6 +5595,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
         P.acc_pts[e * 2 + h] += pts * T(cnt);
+        if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
     }
@@ -5570,6 +5630,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // 255-register kernel (measured 2026-09-03: -0.5% steps/s).
   const int64_t nb0 = P.p_note_off[c0];
   int n_new[2] = {0, 0};
+  int msum_new[2] = {0, 0};  // bench combo walk: pinned-multiplier sums
 
   // env v19 flail telemetry: on ticks whose next scoreable note is
   // > FLAIL_LEAD_S out, blade arc from hands with no live
@@ -5614,6 +5675,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       } else {
         P.status[e * C + i] = 3;
         P.miss[e] += 1;
+        cw_break(P, e);
         reward += T(REWARD_MISS);
         // env v45: a miss records on the note's colour
         const int h = P.p_is_right[cb] ? 1 : 0;
@@ -5631,6 +5693,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
             <= T(BOMB_RADIUS)) {
           P.status[e * C + i] = 2;
           P.bombs[e] += 1;
+          cw_break(P, e);
           reward += T(REWARD_BOMB);
           break;
         }
@@ -5711,6 +5774,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.status[e * C + i] = 1;
         P.good[e] += 1;
         T pts, pre_pts = T(0), acc_pts = T(0);
+        bool spawn_tr = false;
         if (is_link) {
           pts = T(CHAIN_LINK_PTS);
         } else {
@@ -5739,6 +5803,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
             P.score_post[e] += T(PTS_POST);
           } else {
             n_new[m] += 1;  // spawn a follow-through tracker
+            spawn_tr = true;
           }
         }
         reward += pts / T(SCORE_MAX);
@@ -5747,10 +5812,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.score_acc[e] += acc_pts;
         P.acc_pts[e * 2 + m] += pts;
         P.acc_cuts[e * 2 + m] += 1;
+        {
+          const int mult = cw_cut(P, e, i, pts);
+          if (spawn_tr) msum_new[m] += mult;
+        }
       } else {
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
         reward += T(REWARD_BAD);
+        cw_break(P, e);
       }
     } else {
       const T bad_h[3] = {T(BAD_HALF), P.p_bad_hy[cb], T(BAD_HALF)};
@@ -5759,6 +5829,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.status[e * C + i] = 2;
         P.bad[e] += 1;
         reward += T(REWARD_BAD);
+        cw_break(P, e);
         // env v45: wrong-hand cut — still recorded on the NOTE'S
         // colour (m), never on the saber that cut it
         P.prev_idx[e * 2 + m] = i;
@@ -5775,6 +5846,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       P.tr_acc[b] = T(0);
       P.tr_age[b] = 0;
       P.tr_cnt[b] = n_new[h];
+      P.tr_msum[b] = msum_new[h];
       P.tr_active[b] = true;
       P.tr_ptr[e * 2 + h] = (ptr + 1) % N_TRACKERS;
     }
@@ -5818,6 +5890,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
           // env v37 (lib.rs mirror): charge and remove THIS wall —
           // one fee per wall object, no lingering in-wall ticks.
           reward += T(WALL_PEN);
+          cw_break(P, e);
           P.wall_passed[e * P.W + wi] = true;
           P.walls_in[e] += 1;  // counts entries in despawn mode
         } else {
@@ -5826,7 +5899,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       }
     }
     if (in_wall) {
-      if (!P.in_wall_prev[e]) reward += T(WALL_PEN);
+      if (!P.in_wall_prev[e]) {
+        reward += T(WALL_PEN);
+        cw_break(P, e);
+      }
       P.walls_in[e] += 1;
     }
     P.in_wall_prev[e] = in_wall;
@@ -5876,6 +5952,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
         P.acc_pts[e * 2 + h] += pts * T(cnt);
+        if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
     }
@@ -5946,6 +6023,13 @@ step_kernel(Sim<T> P) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   if (gid >= P.N) return;
   const int e = P.env_order[gid];
+  // bench combo walk mode: a finished level stays finished (lib.rs
+  // VecBeatSim latches `finished` and early-outs; without this a
+  // fallen body would keep collecting misses after its terminal tick)
+  if (P.mode == 0 && P.combo_walk && P.done[e]) {
+    P.reward[e] = T(0);
+    return;
+  }
   // thread-local scratch (local memory; per-thread interleaved =
   // coalesced across the warp for same-index access)
   Dyn<T> d;
@@ -6010,6 +6094,7 @@ enum {
   TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
   TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,22), flag (N) — 2026-09-16
+  TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
@@ -6029,7 +6114,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
-          double z_clip_hi, double self_contact_coef, double tau_rand) {
+          double z_clip_hi, double self_contact_coef, double tau_rand,
+          int64_t combo_walk) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -6103,7 +6189,16 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.tau_jit = ts[TTAUJIT].data_ptr<scalar_t>();
     P.ep_rec = ts[TEPREC].data_ptr<scalar_t>();
     P.ep_flag = ts[TEPFLAG].data_ptr<uint8_t>();
+    P.cw_mult = ts[TCWMULT].data_ptr<int>();
+    P.cw_prog = ts[TCWPROG].data_ptr<int>();
+    P.cw_combo = ts[TCWCOMBO].data_ptr<int>();
+    P.cw_maxc = ts[TCWMAXC].data_ptr<int>();
+    P.cw_breaks = ts[TCWBREAKS].data_ptr<int>();
+    P.cw_score = ts[TCWSCORE].data_ptr<scalar_t>();
+    P.cw_note_mult = ts[TCWNOTEMULT].data_ptr<uint8_t>();
+    P.tr_msum = ts[TTRMSUM].data_ptr<int>();
     P.tau_rand = (scalar_t)tau_rand;
+    P.combo_walk = combo_walk != 0;
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
