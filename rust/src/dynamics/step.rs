@@ -10,13 +10,14 @@
 //! factor for the J·M⁻¹·Jᵀ effective-mass solves) plus the mutable
 //! velocity to project. Unconstrained callers (P1 tests) pass None.
 
+use crate::Real;
 use super::algo::{chol_factor_floored_inplace, chol_solve, chol_solve_unit, crba, rnea};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
 
 /// SPEC-v10 §3 substep h = 1/240 s (8 per 1/30 control tick).
-pub const H_SUB: f64 = 1.0 / 240.0;
+pub const H_SUB: Real = 1.0 / 240.0;
 pub const N_SUB: usize = 8;
 /// Gauss-Seidel passes of the step-11 clamp solve (see below). env v14
 /// (2026-08-10, phantom-force audit): 8 → 64. The passes early-exit on
@@ -28,33 +29,33 @@ pub const CLAMP_PASSES: usize = 64;
 /// v14 joint-stop Baumgarte factor (the ground rows' β, reused): the
 /// per-substep fraction of a stop violation converted into a recovery
 /// rate by the step-11 impulse target.
-pub const BETA_LIMIT: f64 = 0.2;
+pub const BETA_LIMIT: Real = 0.2;
 /// v14 joint-stop slop (rad past a stop tolerated at rest — the ground
 /// rows' SLOP pattern). Inside the slop the rate target is 0 and a
 /// parked joint fires NO impulses, so steady-state stop-resting leaks
 /// nothing; recovery engages only beyond it. 2 mrad ≈ 0.1°.
-pub const SLOP_LIMIT: f64 = 0.002;
+pub const SLOP_LIMIT: Real = 0.002;
 /// v14 deep-violation position backstop (rad past a stop). Routine
 /// stop traffic never reaches it — one-substep overshoot is bounded by
 /// h·ω_cap ≈ 0.17 rad — so its rare reaction-free clamp is a bounded
 /// safety net of the root-envelope class, not part of the physics.
-pub const LIMIT_TELEPORT_BACKSTOP: f64 = 0.35;
+pub const LIMIT_TELEPORT_BACKSTOP: Real = 0.35;
 /// Step-12 root velocity envelope (P3 — Divergences §19): the welded
 /// humanoid's root reaches the ground through a 6-revolute leg chain
 /// whose rates are capped at 16 rad/s each, so |ω_root| ≤ 96 rad/s and
 /// the linear velocity is bounded by the same rates × the ≤ ~0.5 m
 /// root–foot levers (48 m/s). Beyond = solver artifact (see step 12).
-pub const ROOT_W_MAX: f64 = 96.0;
-pub const ROOT_V_MAX: f64 = 48.0;
+pub const ROOT_W_MAX: Real = 96.0;
+pub const ROOT_V_MAX: Real = 48.0;
 
 /// P2 constraint-stage hook (§3 steps 7–9): (model, workspace, q₂₉,
 /// v*) → projected velocity written in place. q (pre-integration) is
 /// needed for the joint-limit rows folded into the main solver
 /// (SPEC-v10 Divergences §15).
-pub type ConstraintHook<'a> = &'a mut dyn FnMut(&Model, &mut Workspace, &[f64], &mut [f64]);
+pub type ConstraintHook<'a> = &'a mut dyn FnMut(&Model, &mut Workspace, &[Real], &mut [Real]);
 
 /// Zero root wrench — `substep`'s §3 step 4 ("root rows 0").
-pub const ZERO_WRENCH: [f64; 6] = [0.0; 6];
+pub const ZERO_WRENCH: [Real; 6] = [0.0; 6];
 
 /// One substep. `tau_act`: applied actuated torques (nq, §1.4 order;
 /// constant across a control tick — the caller holds them). Joint
@@ -68,8 +69,8 @@ pub const ZERO_WRENCH: [f64; 6] = [0.0; 6];
 pub fn substep(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    h: f64,
+    tau_act: &[Real],
+    h: Real,
     ws: &mut Workspace,
     constraints: Option<ConstraintHook>,
 ) {
@@ -84,9 +85,9 @@ pub fn substep(
 pub fn substep_wrench(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    root_wrench: &[f64; 6],
-    h: f64,
+    tau_act: &[Real],
+    root_wrench: &[Real; 6],
+    h: Real,
     ws: &mut Workspace,
     constraints: Option<ConstraintHook>,
 ) {
@@ -110,10 +111,10 @@ pub fn substep_wrench(
 pub fn substep_opts(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    root_wrench: &[f64; 6],
-    implicit_damp: Option<&[f64]>,
-    h: f64,
+    tau_act: &[Real],
+    root_wrench: &[Real; 6],
+    implicit_damp: Option<&[Real]>,
+    h: Real,
     ws: &mut Workspace,
     constraints: Option<ConstraintHook>,
 ) {

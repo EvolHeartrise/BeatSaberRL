@@ -34,6 +34,7 @@
 //! were confirmed to BITE against deliberately reintroduced readers
 //! before the items landed.
 
+use crate::Real;
 use super::fk::{add3, cross3, dot3, mat_vec, scale3, sub3, Mat3};
 use super::model::Model;
 use super::Workspace;
@@ -52,7 +53,7 @@ use super::Workspace;
 /// nine-word loads cost more than recomputing 6 three-term dots from an
 /// `ws.r[k]` that `rnea` is loading anyway (`e = R·com` two lines up).
 /// Do not retry without a register/cache-economics change.
-fn inertia_world(r: &Mat3, i: [f64; 3]) -> Mat3 {
+fn inertia_world(r: &Mat3, i: [Real; 3]) -> Mat3 {
     let mut out = [[0.0; 3]; 3];
     for a in 0..3 {
         for b in a..3 {
@@ -66,7 +67,7 @@ fn inertia_world(r: &Mat3, i: [f64; 3]) -> Mat3 {
 }
 
 /// Parallel-axis dyad: m·((d·d)I − d dᵀ), added into `i`.
-fn add_shift(i: &mut Mat3, m: f64, d: [f64; 3]) {
+fn add_shift(i: &mut Mat3, m: Real, d: [Real; 3]) {
     let dd = dot3(d, d);
     for a in 0..3 {
         for b in 0..3 {
@@ -284,7 +285,7 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
     if ws.poison_m_upper {
         for r in 0..nv {
             for c in (r + 1)..nv {
-                ws.m[r * nv + c] = f64::NAN;
+                ws.m[r * nv + c] = Real::NAN;
             }
         }
     }
@@ -295,7 +296,7 @@ pub fn crba(model: &Model, ws: &mut Workspace) {
 /// call C(q, v)) at state velocity `v`, INCLUDING gravity
 /// (model.gravity enters as F = m·(a_com − g)). Requires fk_all in ws;
 /// result in ws.c.
-pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
+pub fn rnea(model: &Model, ws: &mut Workspace, v: &[Real], acc: Option<&[Real]>) {
     let nf = model.frames.len();
     let nv = model.nv();
     let voff = model.voff();
@@ -431,12 +432,33 @@ pub fn rnea(model: &Model, ws: &mut Workspace, v: &[f64], acc: Option<&[f64]>) {
 /// value. (The retired torch mirror carried it too until 2026-08-03.)
 pub const PD_FLOOR_F64: f64 = 1e-17;
 
+/// f32 Cholesky pivot floor (SPEC-v10 Divergences §20e) — the CUDA
+/// kernel's `PD_FLOOR_F32`, used by the `f32` feature build.
+pub const PD_FLOOR_F32: f32 = 1e-8;
+
+/// Floor one pivot: returns (floored pivot, counted engagement). f64:
+/// `!(d >= 1e-17)` floors and counts (NaN included). f32 mirrors the
+/// .cu f32 branch exactly — counts only `d <= 0`, clamps through the
+/// NaN-to-floor max at 1e-8.
+#[inline(always)]
+fn floor_pivot(d: Real) -> (Real, bool) {
+    #[cfg(not(feature = "f32"))]
+    {
+        if !(d >= PD_FLOOR_F64) { (PD_FLOOR_F64, true) } else { (d, false) }
+    }
+    #[cfg(feature = "f32")]
+    {
+        let hit = d <= 0.0;
+        (if !(d >= PD_FLOOR_F32) { PD_FLOOR_F32 } else { d }, hit)
+    }
+}
+
 /// `chol_factor` with the §22 pivot floor: a pivot below PD_FLOOR_F64
 /// is clamped to it (simple max — exactly reproducible, no fastmath
 /// ambiguity) and counted. Returns the number of floored pivots (0 =
 /// bitwise-identical to `chol_factor` succeeding). The factor is
 /// always produced; the caller reports the count instead of panicking.
-pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
+pub fn chol_factor_floored(n: usize, m: &[Real], l: &mut [Real]) -> u32 {
     l[..n * n].copy_from_slice(&m[..n * n]);
     chol_factor_floored_inplace(n, &mut l[..n * n])
 }
@@ -455,7 +477,7 @@ pub fn chol_factor_floored(n: usize, m: &[f64], l: &mut [f64]) -> u32 {
 /// exactly the value the separate-input version would have read, in the
 /// same order. The strict UPPER triangle is left holding the input's
 /// upper triangle and is never read (see the note below).
-pub fn chol_factor_floored_inplace(n: usize, a: &mut [f64]) -> u32 {
+pub fn chol_factor_floored_inplace(n: usize, a: &mut [Real]) -> u32 {
     let mut hits = 0u32;
     for j in 0..n {
         let mut d = a[j * n + j];
@@ -471,10 +493,9 @@ pub fn chol_factor_floored_inplace(n: usize, a: &mut [f64]) -> u32 {
         // factor). `!(d >= FLOOR)` is true for NaN and identical to
         // `d < FLOOR` for every non-NaN d — this matches the CUDA
         // tmax/fmax semantics the .cu mirror carries (NaN → floor).
-        if !(d >= PD_FLOOR_F64) {
-            hits += 1;
-            d = PD_FLOOR_F64;
-        }
+        let (fd, hit) = floor_pivot(d);
+        hits += hit as u32;
+        d = fd;
         let dj = d.sqrt();
         a[j * n + j] = dj;
         // NOTE (2026-08-03): the strict upper triangle is NOT zeroed
@@ -550,7 +571,7 @@ pub fn chol_factor_floored_inplace(n: usize, a: &mut [f64]) -> u32 {
 
 /// Dense Cholesky M = L·Lᵀ (lower, no pivoting, fixed order — SPEC-v10
 /// §3 step 5). Returns false if a pivot is not strictly positive.
-pub fn chol_factor(n: usize, m: &[f64], l: &mut [f64]) -> bool {
+pub fn chol_factor(n: usize, m: &[Real], l: &mut [Real]) -> bool {
     for j in 0..n {
         let mut d = m[j * n + j];
         for k in 0..j {
@@ -580,7 +601,7 @@ pub fn chol_factor(n: usize, m: &[f64], l: &mut [f64]) -> bool {
 /// unit-stride forward pass. Pure indexing restructure — no `unsafe`,
 /// no `get_unchecked`, no `mul_add`: identical operands in identical
 /// order, so the result is bitwise the naive form's.
-pub fn chol_solve(n: usize, l: &[f64], x: &mut [f64]) {
+pub fn chol_solve(n: usize, l: &[Real], x: &mut [Real]) {
     for i in 0..n {
         let lrow = &l[i * n..i * n + i]; // row i, columns 0..i
         let mut s = x[i];
@@ -629,7 +650,7 @@ pub fn chol_solve(n: usize, l: &[f64], x: &mut [f64]) {
 /// closing divide is per-lane IEEE (`vdivpd` is correctly rounded per
 /// element — no reciprocal approximation), so a batched divide equals
 /// W scalar divides exactly.
-pub fn chol_solve_x4(n: usize, l: &[f64], x: &mut [f64]) {
+pub fn chol_solve_x4(n: usize, l: &[Real], x: &mut [Real]) {
     debug_assert_eq!(x.len(), 4 * n);
     let (a, rest) = x.split_at_mut(n);
     let (b, rest) = rest.split_at_mut(n);
@@ -695,11 +716,11 @@ pub fn chol_solve_x4(n: usize, l: &[f64], x: &mut [f64]) {
 /// rather than storing `minvjt` this way — the RHS-minor layout would
 /// otherwise ripple into the A_ww assembly, the weld-null projections
 /// and the PGS axpy, all of which want unit-stride rows.
-pub fn chol_solve_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
+pub fn chol_solve_t<const W: usize>(n: usize, l: &[Real], t: &mut [Real]) {
     debug_assert_eq!(t.len(), W * n);
     for i in 0..n {
         let lrow = &l[i * n..i * n + i];
-        let mut s = [0.0f64; W];
+        let mut s = [0.0 as Real; W];
         s.copy_from_slice(&t[i * W..i * W + W]);
         for k in 0..i {
             let lk = lrow[k];
@@ -715,7 +736,7 @@ pub fn chol_solve_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
         }
     }
     for i in (0..n).rev() {
-        let mut s = [0.0f64; W];
+        let mut s = [0.0 as Real; W];
         s.copy_from_slice(&t[i * W..i * W + W]);
         for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
             let lki = lrow[i];
@@ -736,10 +757,10 @@ pub fn chol_solve_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
 /// forward pass ran separately (the limit columns: each has its own
 /// pivot row, so their forward passes stay sparse and row-major, but
 /// the dense back pass they share is worth the transpose).
-pub fn chol_back_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
+pub fn chol_back_t<const W: usize>(n: usize, l: &[Real], t: &mut [Real]) {
     debug_assert_eq!(t.len(), W * n);
     for i in (0..n).rev() {
-        let mut s = [0.0f64; W];
+        let mut s = [0.0 as Real; W];
         s.copy_from_slice(&t[i * W..i * W + W]);
         for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
             let lki = lrow[i];
@@ -757,7 +778,7 @@ pub fn chol_back_t<const W: usize>(n: usize, l: &[f64], t: &mut [f64]) {
 }
 
 /// `chol_solve_x4` at width 2 — the remainder rung of the batch ladder.
-pub fn chol_solve_x2(n: usize, l: &[f64], x: &mut [f64]) {
+pub fn chol_solve_x2(n: usize, l: &[Real], x: &mut [Real]) {
     debug_assert_eq!(x.len(), 2 * n);
     let (a, b) = x.split_at_mut(n);
     for i in 0..n {
@@ -795,7 +816,7 @@ pub fn chol_solve_x2(n: usize, l: &[f64], x: &mut [f64]) {
 /// (same operands, same ascending-k order), split out so a right-hand
 /// side whose FORWARD pass has a closed form (`chol_fwd_unit`) can skip
 /// straight to it.
-pub fn chol_back(n: usize, l: &[f64], x: &mut [f64]) {
+pub fn chol_back(n: usize, l: &[Real], x: &mut [Real]) {
     for i in (0..n).rev() {
         let mut s = x[i];
         {
@@ -809,7 +830,7 @@ pub fn chol_back(n: usize, l: &[f64], x: &mut [f64]) {
 }
 
 /// `chol_back` jammed over 2 — the remainder rung.
-pub fn chol_back_x2(n: usize, l: &[f64], x: &mut [f64]) {
+pub fn chol_back_x2(n: usize, l: &[Real], x: &mut [Real]) {
     debug_assert_eq!(x.len(), 2 * n);
     let (a, b) = x.split_at_mut(n);
     for i in (0..n).rev() {
@@ -860,7 +881,7 @@ pub fn chol_back_x2(n: usize, l: &[f64], x: &mut [f64]) {
 ///    kept as an explicit `+0.0` rather than negating the first
 ///    product — `+0.0 − (+0.0)` is `+0.0` where `−(+0.0)` would be
 ///    `-0.0`.)
-pub fn chol_fwd_unit(n: usize, l: &[f64], m: usize, sign: f64, x: &mut [f64]) {
+pub fn chol_fwd_unit(n: usize, l: &[Real], m: usize, sign: Real, x: &mut [Real]) {
     debug_assert_eq!(x.len(), n);
     debug_assert!(m < n);
     x[..m].fill(0.0);
@@ -882,13 +903,13 @@ pub fn chol_fwd_unit(n: usize, l: &[f64], m: usize, sign: f64, x: &mut [f64]) {
 /// forward pass above then the ordinary dense back substitution
 /// (the back pass has no exploitable structure — by the time it runs
 /// every entry above m is generally non-zero).
-pub fn chol_solve_unit(n: usize, l: &[f64], m: usize, sign: f64, x: &mut [f64]) {
+pub fn chol_solve_unit(n: usize, l: &[Real], m: usize, sign: Real, x: &mut [Real]) {
     chol_fwd_unit(n, l, m, sign, x);
     chol_back(n, l, x);
 }
 
 /// Total (linear, angular-about-world-origin) momentum at the FK in ws.
-pub fn momentum(model: &Model, ws: &mut Workspace, v: &[f64]) -> ([f64; 3], [f64; 3]) {
+pub fn momentum(model: &Model, ws: &mut Workspace, v: &[Real]) -> ([Real; 3], [Real; 3]) {
     let nf = model.frames.len();
     let voff = model.voff();
     let (om0, vo0) = if model.free_base {
@@ -899,7 +920,7 @@ pub fn momentum(model: &Model, ws: &mut Workspace, v: &[f64]) -> ([f64; 3], [f64
     let mut pl = [0.0; 3];
     let mut am = [0.0; 3];
     let mut add_body =
-        |m: f64, com: [f64; 3], inertia: [f64; 3], r: &Mat3, o: [f64; 3], om: [f64; 3], vo: [f64; 3]| {
+        |m: Real, com: [Real; 3], inertia: [Real; 3], r: &Mat3, o: [Real; 3], om: [Real; 3], vo: [Real; 3]| {
             if m > 0.0 {
                 let e = mat_vec(r, com);
                 let c = add3(o, e);
@@ -937,7 +958,7 @@ pub fn momentum(model: &Model, ws: &mut Workspace, v: &[f64]) -> ([f64; 3], [f64
 /// Total energy (kinetic + gravitational potential) at the FK in ws,
 /// including the armature rotor term ½·a_j·q̇_j².
 /// U = −Σ m g⃗·c (zero at the world origin).
-pub fn energy(model: &Model, ws: &mut Workspace, v: &[f64]) -> f64 {
+pub fn energy(model: &Model, ws: &mut Workspace, v: &[Real]) -> Real {
     let nf = model.frames.len();
     let voff = model.voff();
     let g = model.gravity;
@@ -948,7 +969,7 @@ pub fn energy(model: &Model, ws: &mut Workspace, v: &[f64]) -> f64 {
     };
     let mut e_tot = 0.0;
     let mut add_body =
-        |m: f64, com: [f64; 3], inertia: [f64; 3], r: &Mat3, o: [f64; 3], om: [f64; 3], vo: [f64; 3]| {
+        |m: Real, com: [Real; 3], inertia: [Real; 3], r: &Mat3, o: [Real; 3], om: [Real; 3], vo: [Real; 3]| {
             if m > 0.0 {
                 let e = mat_vec(r, com);
                 let c = add3(o, e);

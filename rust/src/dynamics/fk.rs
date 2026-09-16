@@ -7,14 +7,15 @@
 //! fastmath assumptions) — the torch/CUDA mirrors replicate them
 //! literally.
 
+use crate::Real;
 use super::model::Model;
 use super::{State, Workspace};
 
-pub type Mat3 = [[f64; 3]; 3];
+pub type Mat3 = [[Real; 3]; 3];
 
 pub const IDENT3: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-pub fn mat_vec(m: &Mat3, v: [f64; 3]) -> [f64; 3] {
+pub fn mat_vec(m: &Mat3, v: [Real; 3]) -> [Real; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
@@ -32,23 +33,23 @@ pub fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
     out
 }
 
-pub fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub fn add3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-pub fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub fn sub3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-pub fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
+pub fn scale3(a: [Real; 3], s: Real) -> [Real; 3] {
     [a[0] * s, a[1] * s, a[2] * s]
 }
 
-pub fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub fn dot3(a: [Real; 3], b: [Real; 3]) -> Real {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-pub fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub fn cross3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -57,7 +58,7 @@ pub fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 }
 
 /// Rodrigues: R = I + sinθ·[a]x + (1−cosθ)·[a]x² for a UNIT axis.
-pub fn rot_axis(axis: [f64; 3], angle: f64) -> Mat3 {
+pub fn rot_axis(axis: [Real; 3], angle: Real) -> Mat3 {
     let (s, c) = angle.sin_cos();
     let k = 1.0 - c;
     let [x, y, z] = axis;
@@ -69,7 +70,7 @@ pub fn rot_axis(axis: [f64; 3], angle: f64) -> Mat3 {
 }
 
 /// World-from-body rotation of a wxyz (scalar-first) quaternion.
-pub fn quat_to_rot(q: [f64; 4]) -> Mat3 {
+pub fn quat_to_rot(q: [Real; 4]) -> Mat3 {
     let [w, x, y, z] = q;
     [
         [
@@ -102,7 +103,7 @@ pub fn quat_to_rot(q: [f64; 4]) -> Mat3 {
 /// the sign continuity themselves — see convert_scoresaber.py, which
 /// hemisphere-aligns consecutive replay frames because the viewer
 /// lerps between them.
-pub fn rot_to_quat(r: &Mat3) -> [f64; 4] {
+pub fn rot_to_quat(r: &Mat3) -> [Real; 4] {
     let (m00, m11, m22) = (r[0][0], r[1][1], r[2][2]);
     let tr = m00 + m11 + m22;
     if tr > 0.0 {
@@ -145,7 +146,7 @@ pub fn rot_to_quat(r: &Mat3) -> [f64; 4] {
 /// θ < 1e-9 → first-order φ = ½·vee(R − Rᵀ); weld errors are held tiny
 /// by Baumgarte, so the near-π branch never engages (θ/(2 sin θ) is
 /// still finite and correct up to θ < π).
-pub fn rot_log(r: &Mat3) -> [f64; 3] {
+pub fn rot_log(r: &Mat3) -> [Real; 3] {
     let w = [
         r[2][1] - r[1][2],
         r[0][2] - r[2][0],
@@ -162,7 +163,7 @@ pub fn rot_log(r: &Mat3) -> [f64; 3] {
     [w[0] * factor, w[1] * factor, w[2] * factor]
 }
 
-pub fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+pub fn quat_mul(a: [Real; 4], b: [Real; 4]) -> [Real; 4] {
     [
         a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
         a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],

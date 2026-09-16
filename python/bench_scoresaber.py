@@ -58,7 +58,11 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
 from beat_arena_env.mirror import mirror_tuples, mirror_walls
-from beat_arena_rs import VecBeatSim
+import beat_arena_rs
+try:  # f32 build of the same sources (../rust32), the default bench engine
+    import beat_arena_rs32
+except ImportError:
+    beat_arena_rs32 = None
 from cuda_graphs import _Graphed, copy_static
 from policy import load_policy
 
@@ -105,9 +109,9 @@ class _Group:
                  "slots", "free", "n_active", "ev", "issued")
 
     def __init__(self, n, fwd, device, gears=3, foot_contact=False,
-                 tau_scale=None):
+                 tau_scale=None, sim_mod=beat_arena_rs):
         self.n = n
-        self.sim = VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
+        self.sim = sim_mod.VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
                               return_events=False, gears=gears,
                               foot_contact=foot_contact)
         # env v46: fixed body for the whole bench (all 1.0 = the v45 body)
@@ -209,10 +213,12 @@ def parse_args():
                         "(2048-row chunks, graphed); results carry "
                         "sim='cuda' and never merge into a rust file")
     p.add_argument("--sim-dtype", choices=["f32", "f64"], default="f32",
-                   help="--sim cuda only: kernel precision. f32 = the "
-                        "trainer's regime (fast; parity vs the f64 Rust "
-                        "sim is statistical), f64 = exact-parity regime "
-                        "(slow on consumer GPUs)")
+                   help="sim precision, both engines. f32 (default, "
+                        "2026-09-16) = the trainer's regime: --sim rust "
+                        "loads beat_arena_rs32 (the ../rust32 build of the "
+                        "same sources), --sim cuda the f32 kernel. f64 = "
+                        "the exact-parity regime the Rust tests pin "
+                        "(slower). Results never merge across dtypes")
     return p.parse_args()
 
 
@@ -798,6 +804,15 @@ def main():
         sys.exit(f"error: {out_path} holds sim={prev_sim!r} results but "
                  f"this run is --sim {args.sim}; use a different --out")
     data["sim"] = args.sim
+    # --sim-dtype provenance (2026-09-16): rust files written before the
+    # f32 build existed carry no key and are f64; cuda files always had it
+    prev_dt = data.get("sim_dtype", "f64" if prev_sim == "rust" else "f32")
+    if prev_dt != args.sim_dtype and any("skipped" not in e
+                                         for e in levels.values()):
+        sys.exit(f"error: {out_path} holds sim_dtype={prev_dt!r} results "
+                 f"but this run is --sim-dtype {args.sim_dtype}; use a "
+                 f"different --out")
+    data["sim_dtype"] = args.sim_dtype
     if args.sim == "cuda":
         run_cuda(args, policy, device, tasks, data, levels, out_path,
                  durations, dur_path)
@@ -834,13 +849,22 @@ def main():
     # is the only CUDA path now — batch width is score-relevant on it,
     # so N stays exactly --num-envs)
     sizes = [N]
+    if args.sim_dtype == "f32":
+        if beat_arena_rs32 is None:
+            sys.exit("--sim-dtype f32 needs the beat_arena_rs32 module: "
+                     "cd rust32 && maturin develop --release "
+                     "(or pass --sim-dtype f64)")
+        sim_mod = beat_arena_rs32
+    else:
+        sim_mod = beat_arena_rs
     groups = []
     for n_g in sizes:
         fwd_g = (None if args.no_graphs or device.type != "cuda"
                  else _GraphedArgmax(policy, n_g, device))
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
                              foot_contact=args.foot_contact,
-                             tau_scale=parse_tau_scale(args.tau_scale)))
+                             tau_scale=parse_tau_scale(args.tau_scale),
+                             sim_mod=sim_mod))
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): different forward paths
     # differ by ~4e-7 in the logits, enough to flip near-tie argmaxes —
@@ -1062,7 +1086,7 @@ def main():
               f"sync {ph[2]:.1f}s ({ph[2] * ms:.2f}) | "
               f"step_into {ph[3]:.1f}s ({ph[3] * ms:.2f}) | "
               f"finish/save {ph[4]:.1f}s ({ph[4] * ms:.2f})", flush=True)
-    print(f"\ndone: {n_done} played ({n_new_skip} skipped), "
+    print(f"\ndone (rust, {args.sim_dtype}): {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
           f"unweighted PP {data['total_unweighted_pp']} | "

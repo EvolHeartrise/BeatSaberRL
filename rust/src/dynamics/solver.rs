@@ -107,6 +107,7 @@
 //! against the build that would ship it, while R23a/c/e summed to
 //! +3.45% individually but delivered +1.85% together.
 
+use crate::Real;
 use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
     chol_solve_t, chol_solve_unit, chol_solve_x2, chol_solve_x4,
@@ -122,15 +123,15 @@ use super::{State, Workspace};
 /// PGS iteration count (§3 step 8, normative).
 pub const PGS_ITERS: usize = 12;
 /// Baumgarte gains (§3 step 8, normative).
-pub const BETA_WELD: f64 = 0.2;
-pub const BETA_CONTACT: f64 = 0.2;
+pub const BETA_WELD: Real = 0.2;
+pub const BETA_CONTACT: Real = 0.2;
 
 /// Feet weld definition (§3): foot body frames held at their
 /// reference-pose world poses, identity orientation. The anchor is each
 /// foot's world position — NOT the world origin (the oracle's original
 /// world-origin-anchor bug put a 0.66 m lever on the rotation rows).
 pub const WELD_FRAMES: [usize; 2] = [F_L_FOOT, F_R_FOOT];
-pub const WELD_TARGET_P: [[f64; 3]; 2] = [[-0.10, 0.07, -0.65], [0.10, 0.07, -0.65]];
+pub const WELD_TARGET_P: [[Real; 3]; 2] = [[-0.10, 0.07, -0.65], [0.10, 0.07, -0.65]];
 
 pub const N_WELD_ROWS: usize = 12;
 
@@ -153,7 +154,7 @@ pub const N_WELD_ROWS: usize = 12;
 /// iters all creep, while μ = 0.9 sticks at < 1 mm). Raising μ past
 /// the cliff makes friction WEAKER in practice, not stronger. A
 /// coupled cone projection per corner would be needed first.
-pub const MU: f64 = 0.9;
+pub const MU: Real = 0.9;
 
 /// Rows per active corner: 1 normal + 2 friction (contact spec §3).
 pub const GROUND_ROWS_PER_CORNER: usize = 3;
@@ -164,7 +165,7 @@ pub const GROUND_ROWS_PER_CORNER: usize = 3;
 /// the direction — no second body to subtract (contrast the §2
 /// self-collision rows, which contract two chains).
 #[rustfmt::skip]
-const GROUND_DIRS: [[f64; 3]; GROUND_ROWS_PER_CORNER] = [
+const GROUND_DIRS: [[Real; 3]; GROUND_ROWS_PER_CORNER] = [
     /* N  */ [0.0, 1.0, 0.0],
     /* T1 */ [1.0, 0.0, 0.0],
     /* T2 */ [0.0, 0.0, 1.0],
@@ -435,7 +436,7 @@ pub struct ConstraintSet {
     /// exclusive with `welds` — see `new_modes`.
     pub ground: bool,
     /// Substep length h — set by the substep wrappers before solving.
-    pub h: f64,
+    pub h: Real,
     /// Active contacts of the last solve, pair-id order.
     pub contacts: Vec<Contact>,
     /// Active sole corners of the last solve, corner order (contact
@@ -448,16 +449,16 @@ pub struct ConstraintSet {
     /// (when enabled), then 3 rows per active sole corner in corner
     /// order (contact mode), then contacts in pair-id order, then limit
     /// rows in joint order.
-    pub lambda: Vec<f64>,
+    pub lambda: Vec<Real>,
     /// Per-row RHS target velocity b of the last solve.
-    pub bias: Vec<f64>,
+    pub bias: Vec<Real>,
     /// Per-row J·v* BEFORE the solve (introspection: complementarity /
     /// no-sticking checks). INTROSPECTION-ONLY — nothing in the solve
     /// reads it, so both the field and its per-row nv-dot are compiled
     /// out of the shipping extension (2026-08-03 dead-work pass);
     /// `cargo test` and `--features introspect` keep it.
     #[cfg(any(test, feature = "introspect"))]
-    pub jv_pre: Vec<f64>,
+    pub jv_pre: Vec<Real>,
     /// TEST HOOK (R23a): when set, every assembled LIMIT row of `j` is
     /// overwritten with NaN as soon as the assembly loop finishes —
     /// which is exactly the state the SHIPPING build leaves them in
@@ -467,12 +468,12 @@ pub struct ConstraintSet {
     #[cfg(test)]
     pub poison_limit_j: bool,
     nv: usize,
-    j: Vec<f64>,      // MAX_ROWS × nv dense Jacobian rows
-    minvjt: Vec<f64>, // MAX_ROWS × nv  M⁻¹Jᵀ columns
-    diag: Vec<f64>,   // per-row effective mass  J M⁻¹ Jᵀ (diagonal)
+    j: Vec<Real>,      // MAX_ROWS × nv dense Jacobian rows
+    minvjt: Vec<Real>, // MAX_ROWS × nv  M⁻¹Jᵀ columns
+    diag: Vec<Real>,   // per-row effective mass  J M⁻¹ Jᵀ (diagonal)
     // weld-block exact solve (Divergences §15): A_ww = J_w M⁻¹ J_wᵀ
-    aww: Vec<f64>, // 12×12
-    lww: Vec<f64>, // its Cholesky factor
+    aww: Vec<Real>, // 12×12
+    lww: Vec<Real>, // its Cholesky factor
     // block residual / solve scratch (12).
     //
     // R23f REVERTED (2026-08-07, the round's largest measured negative).
@@ -494,19 +495,19 @@ pub struct ConstraintSet {
     // aliasing/addressing regime it disturbs is the whole 12×12 solve.
     // Do not retry without an aliasing argument (e.g. `#[inline]`ing the
     // solve so the array never escapes).
-    rw: Vec<f64>,
+    rw: Vec<Real>,
     // ω-cap pass caches: weld-consistent M⁻¹e_j columns, lazily solved
-    capcol: Vec<f64>,     // nq × nv
-    capmass: Vec<f64>,    // nq: e_jᵀ·capcol_j (composite effective mobility)
+    capcol: Vec<Real>,     // nq × nv
+    capmass: Vec<Real>,    // nq: e_jᵀ·capcol_j (composite effective mobility)
     capcached: Vec<bool>, // nq
     /// (joint, sign) per assembled limit row, assembly order.
-    limset: Vec<(usize, f64)>,
+    limset: Vec<(usize, Real)>,
     /// Row index of joint j's LOWER-stop (sign +1) limit row this
     /// solve, or −1. The ω-cap pass reuses that row's already-solved,
     /// already-projected column instead of redoing the work (R1 1f).
     limpos: Vec<i32>,
     /// nv × 12 RHS-minor scratch for the weld batch (R1 1a).
-    wt: Vec<f64>,
+    wt: Vec<Real>,
     /// TRANSPOSED weld Jacobian, nv rows of 12 (`jwt[i*12 + w]` =
     /// J_w[w][i]), rebuilt once per solve. Every consumer of the weld
     /// rows is a set of 12 INDEPENDENT dots against one shared vector
@@ -514,7 +515,7 @@ pub struct ConstraintSet {
     /// layout those 12 accumulators are 12 SIMD lanes, each keeping
     /// its own ascending-i chain (so the vectorization is legal under
     /// strict IEEE, unlike vectorizing a single dot's reduction).
-    jwt: Vec<f64>,
+    jwt: Vec<Real>,
 }
 
 /// A composite (weld-consistent) direction with mobility below this
@@ -534,7 +535,7 @@ pub struct ConstraintSet {
 /// amplification is ~sqrt(1/1e-4) = 100; joints below it are owned by
 /// the welds and their bounds fall to the step-11 clamp (plain
 /// momentum-consistent impulses, always well-conditioned).
-const COMPOSITE_EPS: f64 = 1e-4;
+const COMPOSITE_EPS: Real = 1e-4;
 
 impl ConstraintSet {
     /// `foot_mode` = 0 (weld, the DEFAULT — contact spec §1): the v10
@@ -598,10 +599,10 @@ impl ConstraintSet {
     /// bitwise `chol_back` applied to each row on its own.
     fn back_t<const W: usize>(
         nv: usize,
-        l: &[f64],
-        minvjt: &mut [f64],
+        l: &[Real],
+        minvjt: &mut [Real],
         row: usize,
-        wt: &mut [f64],
+        wt: &mut [Real],
     ) {
         for r in 0..W {
             let mr = &minvjt[(row + r) * nv..(row + r + 1) * nv];
@@ -629,12 +630,12 @@ impl ConstraintSet {
     fn pgs_row_update(
         row: usize,
         nv: usize,
-        jv: f64,
-        bias: &[f64],
-        diag: &[f64],
-        lambda: &mut [f64],
-        minvjt: &[f64],
-        v: &mut [f64],
+        jv: Real,
+        bias: &[Real],
+        diag: &[Real],
+        lambda: &mut [Real],
+        minvjt: &[Real],
+        v: &mut [Real],
     ) {
         let dl = (bias[row] - jv) / diag[row];
         let newl = (lambda[row] + dl).max(0.0); // λ ≥ 0
@@ -671,13 +672,13 @@ impl ConstraintSet {
     fn pgs_row_update_box(
         row: usize,
         nv: usize,
-        jv: f64,
-        bound: f64,
-        bias: &[f64],
-        diag: &[f64],
-        lambda: &mut [f64],
-        minvjt: &[f64],
-        v: &mut [f64],
+        jv: Real,
+        bound: Real,
+        bias: &[Real],
+        diag: &[Real],
+        lambda: &mut [Real],
+        minvjt: &[Real],
+        v: &mut [Real],
     ) {
         let dl = (bias[row] - jv) / diag[row];
         let newl = (lambda[row] + dl).min(bound).max(-bound); // |λ_t| ≤ MU·λ_n
@@ -697,7 +698,7 @@ impl ConstraintSet {
     /// (test / `introspect` / debug builds) — the shipping build no
     /// longer assembles those rows, so `self.j` holds stale words there.
     /// The only caller is `tests_constraints`.
-    pub fn jv(&self, row: usize, v: &[f64]) -> f64 {
+    pub fn jv(&self, row: usize, v: &[Real]) -> Real {
         let jr = &self.j[row * self.nv..(row + 1) * self.nv];
         let mut s = 0.0;
         for i in 0..self.nv {
@@ -710,14 +711,14 @@ impl ConstraintSet {
     /// rows of `nv` — the object whose support the segmented loops rest
     /// on.
     #[cfg(test)]
-    pub fn weld_j(&self) -> &[f64] {
+    pub fn weld_j(&self) -> &[Real] {
         &self.j[..N_WELD_ROWS * self.nv]
     }
 
     /// TEST HOOK (R9): the transposed weld Jacobian (`jwt[i*12 + w]`),
     /// the layout every segmented consumer reads.
     #[cfg(test)]
-    pub fn weld_jwt(&self) -> &[f64] {
+    pub fn weld_jwt(&self) -> &[Real] {
         &self.jwt[..N_WELD_ROWS * self.nv]
     }
 
@@ -730,7 +731,7 @@ impl ConstraintSet {
 
     /// TEST HOOK (R23c): that block of the LIVE `jwt`, as stored.
     #[cfg(test)]
-    pub fn weld_jwt_dead_block(&self) -> &[f64] {
+    pub fn weld_jwt_dead_block(&self) -> &[Real] {
         &self.jwt[W_BASE_HI * N_WELD_ROWS..W_L_LO * N_WELD_ROWS]
     }
 
@@ -739,10 +740,10 @@ impl ConstraintSet {
     #[cfg(test)]
     pub fn weld_dot_ref_vs_segmented(
         &self,
-        src: &[f64],
-    ) -> ([f64; N_WELD_ROWS], [f64; N_WELD_ROWS]) {
+        src: &[Real],
+    ) -> ([Real; N_WELD_ROWS], [Real; N_WELD_ROWS]) {
         let nv = self.nv;
-        let mut dense = [0.0f64; N_WELD_ROWS];
+        let mut dense = [0.0 as Real; N_WELD_ROWS];
         for i in 0..nv {
             let x = src[i];
             let jr = &self.jwt[i * N_WELD_ROWS..(i + 1) * N_WELD_ROWS];
@@ -750,7 +751,7 @@ impl ConstraintSet {
                 dense[w] += jr[w] * x;
             }
         }
-        let mut seg = [0.0f64; N_WELD_ROWS];
+        let mut seg = [0.0 as Real; N_WELD_ROWS];
         weld_support_dot!(seg, self.jwt, src);
         (dense, seg)
     }
@@ -765,27 +766,27 @@ impl ConstraintSet {
     #[cfg(test)]
     pub fn poison_weld_scratch(&mut self) {
         let n = N_WELD_ROWS * self.nv;
-        self.minvjt[..n].fill(f64::NAN);
-        self.wt[..n].fill(f64::NAN);
+        self.minvjt[..n].fill(Real::NAN);
+        self.wt[..n].fill(Real::NAN);
     }
 
     /// TEST HOOK (R10): the `(joint, sign)` pairs of the limit rows
     /// assembled by the last solve, assembly order.
     #[cfg(test)]
-    pub fn limit_set(&self) -> &[(usize, f64)] {
+    pub fn limit_set(&self) -> &[(usize, Real)] {
         &self.limset
     }
 
     /// TEST HOOK (R10): an assembled Jacobian row of the last solve.
     #[cfg(test)]
-    pub fn row_j(&self, row: usize) -> &[f64] {
+    pub fn row_j(&self, row: usize) -> &[Real] {
         &self.j[row * self.nv..(row + 1) * self.nv]
     }
 
     /// TEST HOOK (R10): an `M⁻¹Jᵀ` column of the last solve (post
     /// weld-null projection for the limit rows).
     #[cfg(test)]
-    pub fn row_minvjt(&self, row: usize) -> &[f64] {
+    pub fn row_minvjt(&self, row: usize) -> &[Real] {
         &self.minvjt[row * self.nv..(row + 1) * self.nv]
     }
 
@@ -794,7 +795,7 @@ impl ConstraintSet {
     /// solve. Returns `(dense, closed)` per limit row — the single
     /// expression all three R10 sites collapse.
     #[cfg(test)]
-    pub fn limit_dot_ref_vs_closed(&self, voff: usize, src: &[f64]) -> Vec<(f64, f64)> {
+    pub fn limit_dot_ref_vs_closed(&self, voff: usize, src: &[Real]) -> Vec<(Real, Real)> {
         let nv = self.nv;
         let ndense = self.weld_rows() + self.ground_rows() + self.contacts.len();
         (0..self.limset.len())
@@ -843,7 +844,7 @@ impl ConstraintSet {
     /// assembled whenever the joint is within reach of a stop, so a
     /// hovering-but-not-resting joint reports λ ≈ 0. Feeds the env v34
     /// limit-rest telemetry/penalty (lib.rs Body::limit_imp).
-    pub fn limit_row_lambdas(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+    pub fn limit_row_lambdas(&self) -> impl Iterator<Item = (usize, Real)> + '_ {
         let base = self.weld_rows() + self.ground_rows() + self.contacts.len();
         self.limset
             .iter()
@@ -853,7 +854,7 @@ impl ConstraintSet {
 
     /// Effective mass (J M⁻¹ Jᵀ diagonal) of an assembled row —
     /// post-solve introspection (tests).
-    pub fn row_diag(&self, row: usize) -> f64 {
+    pub fn row_diag(&self, row: usize) -> Real {
         self.diag[row]
     }
 
@@ -870,7 +871,7 @@ impl ConstraintSet {
         &mut self,
         model: &Model,
         ws: &Workspace,
-        hinv: f64,
+        hinv: Real,
         mut nrows: usize,
     ) -> usize {
         let nv = self.nv;
@@ -911,7 +912,7 @@ impl ConstraintSet {
     /// data-dependent branch inside the sweep: the §2 contact loop's
     /// contract, which parity and the K13 warp-divergence rule both
     /// require.
-    fn pgs_ground_sweep(&mut self, nweld: usize, v: &mut [f64]) {
+    fn pgs_ground_sweep(&mut self, nweld: usize, v: &mut [Real]) {
         let nv = self.nv;
         for gi in 0..self.ground_contacts.len() {
             let nrow = nweld + gi * GROUND_ROWS_PER_CORNER;
@@ -964,7 +965,7 @@ impl ConstraintSet {
     /// (valid at the seam: computed from the pre-integration q this
     /// substep). `q` is the pre-integration actuated position vector
     /// (joint-limit rows). Projects `v` (= v*) in place.
-    pub fn solve(&mut self, model: &Model, ws: &mut Workspace, q: &[f64], v: &mut [f64]) {
+    pub fn solve(&mut self, model: &Model, ws: &mut Workspace, q: &[Real], v: &mut [Real]) {
         let nv = self.nv;
         debug_assert_eq!(nv, model.nv());
         // (Reborrowing `v` to exactly nv here to hoist the PGS bounds
@@ -1118,7 +1119,7 @@ impl ConstraintSet {
             // mode this would NaN the GROUND rows instead of the
             // limit rows it means to poison
             let nd = self.weld_rows() + self.ground_rows() + self.contacts.len();
-            self.j[nd * nv..nrows * nv].fill(f64::NAN);
+            self.j[nd * nv..nrows * nv].fill(Real::NAN);
         }
 
         // R26 (feature "stats"): the two assembled row counts this
@@ -1330,7 +1331,7 @@ impl ConstraintSet {
             // destroyed (see the weld PGS note below: strided loads cost
             // more here than the traversals they save).
             for r in 0..nweld {
-                let mut s = [0.0f64; N_WELD_ROWS];
+                let mut s = [0.0 as Real; N_WELD_ROWS];
                 {
                     // R9: only the weld Jacobian's support is visited —
                     // columns 6..23 are +0.0 in all 12 rows.
@@ -1396,7 +1397,7 @@ impl ConstraintSet {
             let mut lj = 0usize;
             while lj + 2 <= nlim {
                 let (t0, t1) = tail[lj * nv..(lj + 2) * nv].split_at_mut(nv);
-                let mut s = [0.0f64; 2 * N_WELD_ROWS];
+                let mut s = [0.0 as Real; 2 * N_WELD_ROWS];
                 {
                     let (s0, s1) = s.split_at_mut(N_WELD_ROWS);
                     weld_support_dot2!(s0, s1, self.jwt, t0, t1);
@@ -1412,7 +1413,7 @@ impl ConstraintSet {
                     self.diag[row] = if dnew > COMPOSITE_EPS * self.diag[row] {
                         dnew
                     } else {
-                        f64::INFINITY // immobile given welds — row inert
+                        Real::INFINITY // immobile given welds — row inert
                     };
                 }
                 lj += 2;
@@ -1428,11 +1429,11 @@ impl ConstraintSet {
                 // mr[i] takes its 12 decrements in w = 0..11 order —
                 // bit-for-bit the one-row-at-a-time result. (A full w/i
                 // interchange was measured SLOWER, see the weld PGS note.)
-                let mut s = [0.0f64; N_WELD_ROWS];
+                let mut s = [0.0 as Real; N_WELD_ROWS];
                 weld_support_dot!(s, self.jwt, mr); // R9 support only
                 self.rw[..N_WELD_ROWS].copy_from_slice(&s);
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                let mut x = [0.0f64; N_WELD_ROWS];
+                let mut x = [0.0 as Real; N_WELD_ROWS];
                 x.copy_from_slice(&self.rw[..N_WELD_ROWS]);
                 weld_axpy12!(mr, head, x, nv, -=);
                 // R10: rank-1 row again — the projected mobility is the
@@ -1441,7 +1442,7 @@ impl ConstraintSet {
                 self.diag[row] = if dnew > COMPOSITE_EPS * self.diag[row] {
                     dnew
                 } else {
-                    f64::INFINITY // immobile given welds — row inert
+                    Real::INFINITY // immobile given welds — row inert
                 };
             }
         }
@@ -1489,13 +1490,13 @@ impl ConstraintSet {
                 // 12 dots against one shared v, in the TRANSPOSED weld
                 // layout: 12 lanes, each accumulating its own row's
                 // terms over ascending i exactly as the scalar dot did.
-                let mut s = [0.0f64; N_WELD_ROWS];
+                let mut s = [0.0 as Real; N_WELD_ROWS];
                 weld_support_dot!(s, self.jwt, v); // R9 support only
                 for r in 0..nweld {
                     self.rw[r] = self.bias[r] - s[r];
                 }
                 chol_solve(nweld, &self.lww, &mut self.rw);
-                let mut d = [0.0f64; N_WELD_ROWS];
+                let mut d = [0.0 as Real; N_WELD_ROWS];
                 d.copy_from_slice(&self.rw[..N_WELD_ROWS]);
                 for r in 0..N_WELD_ROWS {
                     self.lambda[r] += d[r];
@@ -1625,7 +1626,7 @@ impl ConstraintSet {
                             // summing over i ASCENDING, and each col[i]
                             // taking its 12 decrements in w = 0..11
                             // order — bitwise the per-row form.
-                            let mut s = [0.0f64; N_WELD_ROWS];
+                            let mut s = [0.0 as Real; N_WELD_ROWS];
                             {
                                 let col = &self.capcol[jt * nv..(jt + 1) * nv];
                                 weld_support_dot!(s, self.jwt, col); // R9
@@ -1637,7 +1638,7 @@ impl ConstraintSet {
                             // fields can be borrowed at once
                             let (capcol, minvjt) = (&mut self.capcol, &self.minvjt);
                             let col = &mut capcol[jt * nv..(jt + 1) * nv];
-                            let mut x = [0.0f64; N_WELD_ROWS];
+                            let mut x = [0.0 as Real; N_WELD_ROWS];
                             x.copy_from_slice(&self.rw[..N_WELD_ROWS]);
                             weld_axpy12!(col, minvjt, x, nv, -=);
                         }
@@ -1645,7 +1646,7 @@ impl ConstraintSet {
                         self.capmass[jt] = if dnew > COMPOSITE_EPS * plain {
                             dnew
                         } else {
-                            f64::INFINITY // immobile given welds
+                            Real::INFINITY // immobile given welds
                         };
                         self.capcached[jt] = true;
                     }
@@ -1678,10 +1679,10 @@ fn point_jacobian_acc(
     model: &Model,
     ws: &Workspace,
     frame: usize,
-    p: [f64; 3],
-    n: [f64; 3],
-    sign: f64,
-    row: &mut [f64],
+    p: [Real; 3],
+    n: [Real; 3],
+    sign: Real,
+    row: &mut [Real],
 ) {
     let voff = model.voff();
     let mut k = frame as i32;
@@ -1715,8 +1716,8 @@ fn angular_jacobian_acc(
     ws: &Workspace,
     frame: usize,
     axis_t: usize,
-    sign: f64,
-    row: &mut [f64],
+    sign: Real,
+    row: &mut [Real],
 ) {
     let voff = model.voff();
     let mut k = frame as i32;
@@ -1739,8 +1740,8 @@ fn angular_jacobian_acc(
 pub fn substep_constrained(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    h: f64,
+    tau_act: &[Real],
+    h: Real,
     ws: &mut Workspace,
     cs: &mut ConstraintSet,
 ) {
@@ -1752,15 +1753,15 @@ pub fn substep_constrained(
 pub fn substep_constrained_wrench(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    root_wrench: &[f64; 6],
-    h: f64,
+    tau_act: &[Real],
+    root_wrench: &[Real; 6],
+    h: Real,
     ws: &mut Workspace,
     cs: &mut ConstraintSet,
 ) {
     cs.h = h;
     let mut hook =
-        |m: &Model, w: &mut Workspace, q: &[f64], v: &mut [f64]| cs.solve(m, w, q, v);
+        |m: &Model, w: &mut Workspace, q: &[Real], v: &mut [Real]| cs.solve(m, w, q, v);
     substep_wrench(model, st, tau_act, root_wrench, h, ws, Some(&mut hook));
 }
 
@@ -1770,15 +1771,15 @@ pub fn substep_constrained_wrench(
 pub fn substep_constrained_damped(
     model: &Model,
     st: &mut State,
-    tau_act: &[f64],
-    implicit_damp: &[f64],
-    h: f64,
+    tau_act: &[Real],
+    implicit_damp: &[Real],
+    h: Real,
     ws: &mut Workspace,
     cs: &mut ConstraintSet,
 ) {
     cs.h = h;
     let mut hook =
-        |m: &Model, w: &mut Workspace, q: &[f64], v: &mut [f64]| cs.solve(m, w, q, v);
+        |m: &Model, w: &mut Workspace, q: &[Real], v: &mut [Real]| cs.solve(m, w, q, v);
     super::step::substep_opts(
         model,
         st,
