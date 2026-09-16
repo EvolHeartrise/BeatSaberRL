@@ -238,7 +238,8 @@ def test_cuda_scale_applies_symmetrically_and_prices_energy():
     assert n == 16 and abs(tot / 16 - per_tick) < 1e-3
     assert abs(ar / 16 - 0.25 * TAU_MAX[3] * 0.8 * 2) < 1e-3
     obs = e1._obs.cpu().numpy()
-    np.testing.assert_allclose(obs[:, OFF_TAU:OBS_DIM], (np.array(s) - 1.0) / 0.25,
+    np.testing.assert_allclose(obs[:, OFF_TAU:OBS_DIM],
+                               np.broadcast_to((np.array(s) - 1.0) / 0.25, obs[:, OFF_TAU:OBS_DIM].shape),
                                atol=1e-5)
 
 
