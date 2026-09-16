@@ -492,3 +492,54 @@ fn ground_support_dot_bitwise() {
     println!("item-2 ground support: {checked} v-dots, {left_rows} left / {right_rows} right diag rows bitwise");
     assert!(left_rows > 0 && right_rows > 0, "trajectory must exercise both feet");
 }
+
+/// item 3: the RHS-MINOR batched solves for the dense (ground + pair)
+/// rows and the limit columns are bitwise the per-row reference solves
+/// (`chol_solve` on the assembled row / `chol_solve_unit` on the pivot)
+/// against the substep's live factor, along a random-gear contact run.
+#[test]
+fn batched_row_solves_bitwise() {
+    use super::algo::{chol_solve, chol_solve_unit};
+    let m = &HUMANOID;
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    let mut cs = contact_set(m);
+    let mut rng = super::testutil::Rng(0x5EED_0000_0000_17E3);
+    let mut tau = [0.0; NQ];
+    let (mut dense_rows, mut lim_rows, mut wide_dense, mut wide_lim) = (0usize, 0usize, 0usize, 0usize);
+    for tick in 0..480 {
+        if tick % 8 == 0 {
+            for j in 0..NQ {
+                let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
+                tau[j] = g * m.tau_max[j];
+            }
+        }
+        substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+        let nv = st.v.len();
+        let nlim = cs.limit_rows();
+        let ndense = cs.nrows - nlim;
+        assert_eq!(cs.weld_rows(), 0);
+        wide_dense += (ndense >= 24) as usize;
+        wide_lim += (nlim >= 8) as usize;
+        let mut x = vec![0.0; nv];
+        for row in 0..ndense {
+            x.copy_from_slice(cs.row_j(row));
+            chol_solve(nv, &ws.m, &mut x);
+            for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: dense row {row} word {i}");
+            }
+            dense_rows += 1;
+        }
+        let voff = nv - NQ;
+        for (li, &(jt, sign)) in cs.limit_set().to_vec().iter().enumerate() {
+            chol_solve_unit(nv, &ws.m, voff + jt, sign, &mut x);
+            let row = ndense + li;
+            for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: limit row {row} word {i}");
+            }
+            lim_rows += 1;
+        }
+    }
+    println!("item-3 batched solves: {dense_rows} dense / {lim_rows} limit columns bitwise ({wide_dense} / {wide_lim} substeps wide)");
+    assert!(wide_dense > 0 && wide_lim > 0, "trajectory must exercise both batched paths");
+}

@@ -110,7 +110,7 @@
 use crate::Real;
 use super::algo::{
     chol_back, chol_back_t, chol_back_x2, chol_factor_floored, chol_fwd_unit, chol_solve,
-    chol_solve_t, chol_solve_unit, chol_solve_x2, chol_solve_x4,
+    chol_solve_t, chol_solve_unit, chol_solve_unit_t, chol_solve_x2, chol_solve_x4,
 };
 use super::collide::{
     ground_phase, narrow_phase, Contact, GroundContact, GROUND_FRAMES, NUM_GROUND_CORNERS,
@@ -171,6 +171,27 @@ const GROUND_DIRS: [[Real; 3]; GROUND_ROWS_PER_CORNER] = [
     /* T1 */ [1.0, 0.0, 0.0],
     /* T2 */ [0.0, 0.0, 1.0],
 ];
+
+/// item 3 (2026-09-16): widths of the RHS-MINOR batched solves for the
+/// dense non-weld rows (ground + pair normals) and the limit columns;
+/// 0 = off (the pre-item-3 row-major `chol_solve_x4` / `chol_fwd_unit`
+/// ladders). `wt` is sized for the widest user.
+/// MEASURED on the pod (EPYC 7573X, replay f32_256x2000, 14 threads, vs
+/// the item-2 build, ABBA medians 8.79–8.86 s): dense alone W1 = 8
+/// −12%, 12 −14%, 16 −12% (the 8-row remainder falls to x4), 24 −18%;
+/// 24 then 12 −19.8%, 24 then 8 −19.9%. Limits alone: W = 4 −0.6%, but
+/// 8 +0.7%, 12 +0.9%, 16 +1.3% SLOWER — the shared forward from the
+/// group's first pivot wastes the sparse per-column starts, and the
+/// back pass was already batched at 8. Do not widen LIMIT_T_W without a
+/// new argument. Shipped 24/12/4: −21.0% (8.81 → 6.96–6.99 s).
+const DENSE_T_W1: usize = 24;
+const DENSE_T_W2: usize = 12;
+const LIMIT_T_W: usize = 4;
+const WT_ROWS: usize = {
+    let a = if DENSE_T_W1 > N_WELD_ROWS { DENSE_T_W1 } else { N_WELD_ROWS };
+    let a = if DENSE_T_W2 > a { DENSE_T_W2 } else { a };
+    if LIMIT_T_W > a { LIMIT_T_W } else { a }
+};
 
 /// 24 = all 8 corners active, 3 rows each.
 pub const N_GROUND_ROWS: usize = NUM_GROUND_CORNERS * GROUND_ROWS_PER_CORNER;
@@ -638,7 +659,7 @@ impl ConstraintSet {
             capcached: vec![false; model.nq],
             limset: Vec::with_capacity(model.nq),
             limpos: vec![-1; model.nq],
-            wt: vec![0.0; N_WELD_ROWS * nv],
+            wt: vec![0.0; WT_ROWS * nv],
             jwt: vec![0.0; N_WELD_ROWS * nv],
         }
     }
@@ -661,6 +682,33 @@ impl ConstraintSet {
             }
         }
         chol_back_t::<W>(nv, l, &mut wt[..W * nv]);
+        for r in 0..W {
+            let mr = &mut minvjt[(row + r) * nv..(row + r + 1) * nv];
+            for i in 0..nv {
+                mr[i] = wt[i * W + r];
+            }
+        }
+    }
+
+    /// item 3: full solve of W consecutive rows of `j` into the same
+    /// `minvjt` rows through the RHS-MINOR `chol_solve_t` (transpose in,
+    /// solve, transpose out — exact copies, so bitwise `chol_solve` per
+    /// row).
+    fn solve_t_rows<const W: usize>(
+        nv: usize,
+        l: &[Real],
+        j: &[Real],
+        minvjt: &mut [Real],
+        row: usize,
+        wt: &mut [Real],
+    ) {
+        for r in 0..W {
+            let jr = &j[(row + r) * nv..(row + r + 1) * nv];
+            for i in 0..nv {
+                wt[i * W + r] = jr[i];
+            }
+        }
+        chol_solve_t::<W>(nv, l, &mut wt[..W * nv]);
         for r in 0..W {
             let mr = &mut minvjt[(row + r) * nv..(row + r + 1) * nv];
             for i in 0..nv {
@@ -1261,8 +1309,21 @@ impl ConstraintSet {
         // is 12 or 0 (`weld_rows`), and it is exactly the same
         // `nweld == N_WELD_ROWS` test that selects the path, so this
         // skips precisely the rows that get rewritten.
-        self.minvjt[nweld * nv..ndense * nv]
-            .copy_from_slice(&self.j[nweld * nv..ndense * nv]);
+        // item 3: rows nweld..nweld+nbt take the RHS-MINOR batch below,
+        // which overwrites their `minvjt` rows in full — seed only the rest
+        let nbt1 = if DENSE_T_W1 > 0 {
+            (ndense - nweld) / DENSE_T_W1 * DENSE_T_W1
+        } else {
+            0
+        };
+        let nbt2 = if DENSE_T_W2 > 0 {
+            (ndense - nweld - nbt1) / DENSE_T_W2 * DENSE_T_W2
+        } else {
+            0
+        };
+        let nbt = nbt1 + nbt2;
+        self.minvjt[(nweld + nbt) * nv..ndense * nv]
+            .copy_from_slice(&self.j[(nweld + nbt) * nv..ndense * nv]);
         {
             let mut row = 0usize;
             if nweld == N_WELD_ROWS {
@@ -1312,6 +1373,18 @@ impl ConstraintSet {
                 }
                 row = N_WELD_ROWS;
             }
+            // item 3: dense (ground + pair) rows in RHS-MINOR batches
+            // straight from `j` — DENSE_T_W1 at a time, then one DENSE_T_W2
+            // rung — both copies exact, so bitwise `chol_solve` per row
+            // (the weld batch's argument)
+            while row < nweld + nbt1 {
+                Self::solve_t_rows::<DENSE_T_W1>(nv, &ws.m, &self.j, &mut self.minvjt, row, &mut self.wt);
+                row += DENSE_T_W1;
+            }
+            while row < nweld + nbt1 + nbt2 {
+                Self::solve_t_rows::<DENSE_T_W2>(nv, &ws.m, &self.j, &mut self.minvjt, row, &mut self.wt);
+                row += DENSE_T_W2;
+            }
             while row + 4 <= ndense {
                 chol_solve_x4(nv, &ws.m, &mut self.minvjt[row * nv..(row + 4) * nv]);
                 row += 4;
@@ -1334,7 +1407,34 @@ impl ConstraintSet {
         // pivot row is one divide, and the rows above it start their
         // accumulation at k = m. The BACK pass has no such structure —
         // it is dense — so it is jammed 4 columns at a time instead.
-        for li in 0..self.limset.len() {
+        // item 3: whole groups of LIMIT_T_W limit rows take the batched
+        // unit solve (forward from the group's first pivot — limset is in
+        // joint order, so that is the smallest), the rest the old ladder
+        let nlim = self.limset.len();
+        let nlt = if LIMIT_T_W > 0 { nlim / LIMIT_T_W * LIMIT_T_W } else { 0 };
+        {
+            const W: usize = LIMIT_T_W;
+            let mut li = 0;
+            while li < nlt {
+                let m0 = voff + self.limset[li].0;
+                self.wt[..W * nv].fill(0.0);
+                for r in 0..W {
+                    let (jt, sign) = self.limset[li + r];
+                    debug_assert!(voff + jt >= m0);
+                    self.wt[(voff + jt) * W + r] = sign;
+                }
+                chol_solve_unit_t::<W>(nv, &ws.m, m0, &mut self.wt[..W * nv]);
+                for r in 0..W {
+                    let row = ndense + li + r;
+                    let mr = &mut self.minvjt[row * nv..(row + 1) * nv];
+                    for i in 0..nv {
+                        mr[i] = self.wt[i * W + r];
+                    }
+                }
+                li += W;
+            }
+        }
+        for li in nlt..nlim {
             let (jt, sign) = self.limset[li];
             let row = ndense + li;
             chol_fwd_unit(
@@ -1349,7 +1449,7 @@ impl ConstraintSet {
             // RHS-MINOR ladder, same reasoning as the weld batch: the
             // transposes are exact copies, so the group result is
             // bitwise `chol_back` once per column.
-            let mut row = ndense;
+            let mut row = ndense + nlt;
             while row + 8 <= nrows {
                 Self::back_t::<8>(nv, &ws.m, &mut self.minvjt, row, &mut self.wt);
                 row += 8;
