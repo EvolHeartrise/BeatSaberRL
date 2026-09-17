@@ -15,7 +15,7 @@ set -euo pipefail
 
 REPO=/workspace/claude-teaches/projects/beat-arena
 VENV=/root/venv
-[ -d /workspace ] || { echo "no /workspace — not a RunPod pod?"; exit 1; }
+mkdir -p /workspace   # RunPod mounts it; VastAI has none
 [ -d "$REPO" ] || { echo "$REPO missing — rsync/clone the repo first"; exit 1; }
 
 # 1. PATH for interactive shells (cuda first, then venv)

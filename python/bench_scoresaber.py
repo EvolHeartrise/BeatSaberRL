@@ -61,13 +61,24 @@ from beat_arena_env.mirror import mirror_tuples, mirror_walls
 
 
 def _cgroup_cpu_quota():
-    """Whole CPUs the container may use (cgroup v2 cpu.max), or None."""
+    """Whole CPUs the container may use, or None: cgroup v2 cpu.max
+    (RunPod) or cgroup v1 cpu.cfs_quota_us / cfs_period_us (VastAI)."""
     try:
         with open("/sys/fs/cgroup/cpu.max") as f:
             quota, period = f.read().split()[:2]
         if quota == "max":
             return None
         return max(1, int(round(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota <= 0:
+            return None
+        return max(1, int(round(quota / period)))
     except (OSError, ValueError):
         return None
 
