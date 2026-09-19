@@ -318,6 +318,18 @@ pool (`level_lb`, `level_max_pp`, `level_max_score`; older pool caches get
 a `.meta.npz` sidecar instead of a rebuild). Plays are the sampled policy
 at the drawn body — tracking-grade, not comparable to bench upp.
 
+**Default-body search (`--tau-center` + `tau_fit.py`, 2026-09-19):** the
+τmax randomization draws `center × (1 ± r)` per axis (`--tau-center`, 16
+floats or group syntax; 1.0 = the `TAU_MAX` table; obs lanes stay
+relative to `TAU_MAX`). After a trunk with `--tau-rand` + `--ep-stats`,
+`python tau_fit.py runs/<name> --center <that run's center>` regresses
+per-map-demeaned PP (unfinished = 0), completion and accuracy on the 16
+draws (OLS, HC0 se) and prints the next center: each axis with |t| ≥ 3
+moves by up to ±10% along its slope. Retrain at the new center, refit,
+repeat until the slopes sit inside their error bars; bench the winner at
+the fixed center (`bench_scoresaber.py --tau-scale`) against the old
+one, then fold the settled center into `TAU_MAX`.
+
 `rust32/` (2026-09-16) compiles the SAME `rust/src` with `Real = f32`
 (`--features f32`) and exports it as `beat_arena_rs32`. It mirrors the
 CUDA kernel's f32 instantiation — the regime training runs — including

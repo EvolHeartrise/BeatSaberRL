@@ -46,6 +46,7 @@ import torch
 import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
+from beat_arena_env.constants import parse_tau_scale
 from fp16_linear import bump_weights_version
 from metrics_log import dumps_record, update_record
 from policy import (HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
@@ -675,6 +676,12 @@ def parse_args():
                         "updates. Sampled-policy plays at the drawn body "
                         "— tracking-grade, not the bench. ~0 kernel cost; "
                         "+N*C bytes VRAM (note multiplier plane)")
+    p.add_argument("--tau-center", type=str, default=None,
+                   help="env v47b: center of the --tau-rand draws per axis "
+                        "(16 floats or 'spine=0.9,legs=1.1,...'; 1.0 = the "
+                        "TAU_MAX table). Draw = center * (1 +- r). Also the "
+                        "fixed body when --tau-rand 0. Moved between trunks "
+                        "by tau_fit.py on the previous run's ep_stats")
     p.add_argument("--tau-rand", type=float, default=0.0,
                    help="env v46 (user design 2026-09-16): per-env "
                         "randomized joint torque limits — at every "
@@ -1140,6 +1147,7 @@ def main():
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
+                      tau_center=parse_tau_scale(args.tau_center),
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls

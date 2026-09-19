@@ -981,7 +981,7 @@ constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
 // env v46 (user design 2026-09-16): per-env joint torque-limit scales,
 // one per AXIS (16: spine 3, arm 7 shared L/R, leg 6 shared L/R), as
 // (s - 1) / TAU_RAND_NORM lanes (lib.rs OFF_TAU mirror). Drawn at every
-// reset when tau_rand > 0 from the wrapper-supplied tau_jit U(-1,1)
+// reset when tau_rand > 0 from the wrapper-supplied tau_jit (the full draw)
 // buffer (pose_jit precedent); otherwise whatever the wrapper wrote
 // (set_tau_scale; default 1.0 => lanes 0, torque bit-identical).
 constexpr int TAU_FEAT = 16;
@@ -4996,10 +4996,13 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   // env v46: fresh body for the new map — one scale per axis, both
   // sides share it; only when randomization is on (set_tau_scale's
   // explicit values persist otherwise)
+  // env v47b (2026-09-19, --tau-center): the wrapper pre-computes the
+  // whole draw, center[a] * (1 + tau_rand * U(-1,1)), into tau_jit — the
+  // kernel just installs it (v46 computed 1 + r*u here; same draws up to
+  // the host's separate mul/add rounding vs a possible FMA)
   if (P.tau_rand > T(0))
     for (int a = 0; a < TAU_FEAT; a++)
-      P.tau_scale[e * TAU_FEAT + a] =
-          T(1) + P.tau_rand * P.tau_jit[e * TAU_FEAT + a];
+      P.tau_scale[e * TAU_FEAT + a] = P.tau_jit[e * TAU_FEAT + a];
   // env v17 wall state
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
