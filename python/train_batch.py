@@ -351,6 +351,13 @@ def parse_args():
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
+    p.add_argument("--muon-batched", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="shape-grouped bmm Newton-Schulz (5 chains per "
+                        "step instead of 27; default since 2026-09-19, "
+                        "-2.5%% s/update on a slow-dispatch host, bmm-vs-"
+                        "mm rounding ~3e-8). --no-muon-batched = the "
+                        "per-matrix loop every run before v48 used")
     # env v41 (2026-09-12, user): self-contact penalty. Greedy replays of
     # the v40 policies: 10-13% of ticks carry a body-on-body contact,
     # dominated by hands/forearms hitting the head and torso; summed
@@ -757,6 +764,24 @@ def newton_schulz5(g, steps=5, eps=1e-7):
     return x.T if tall else x
 
 
+def newton_schulz5_batched(G, steps=5, eps=1e-7):
+    """newton_schulz5 over a stack (k, m, n) of same-shaped matrices in
+    one bmm chain (2026-09-19): the eager per-matrix loop is 27 x 5
+    tiny launches per optimizer step, ~30k launches per update, and on a
+    slow-dispatch host that alone is 0.6-0.7 s of the update phase
+    (VastAI Xeon profile). Same arithmetic per matrix; bmm vs mm
+    rounding differs at ~3e-8 (max |update| ~1e-3)."""
+    x = G / (G.flatten(1).norm(dim=1).view(-1, 1, 1) + eps)
+    tall = x.shape[1] > x.shape[2]
+    if tall:
+        x = x.transpose(1, 2)
+    a, b, c = MUON_NS_COEFS
+    for _ in range(steps):
+        s = x @ x.transpose(1, 2)
+        x = a * x + (b * s + c * (s @ s)) @ x
+    return x.transpose(1, 2) if tall else x
+
+
 class Muon:
     """The Muon half of the hybrid optimizer (--optimizer muon): Nesterov
     momentum -> Newton-Schulz orthogonalization -> RMS-matched scale
@@ -766,9 +791,14 @@ class Muon:
     read from p.grad (the flat fp32 buffer's views), after the trainer's
     unscale / overflow-zero / global clip."""
 
-    def __init__(self, param_groups, momentum=0.95):
+    def __init__(self, param_groups, momentum=0.95, batched=True):
         self.param_groups = param_groups
         self.momentum = float(momentum)
+        # batched (default since 2026-09-19): shape-grouped bmm Newton-
+        # Schulz + foreach momentum — 5 NS chains per step instead of 27.
+        # Measured -2.5% s/update on the VastAI Xeon host (ABAB), ~0 on a
+        # fast core (dispatch was already under the GPU floor there).
+        self.batched = bool(batched)
         self.state = {p: torch.zeros_like(p)
                       for g in param_groups for p in g["params"]}
 
@@ -776,7 +806,34 @@ class Muon:
         return [p for g in self.param_groups for p in g["params"]]
 
     @torch.no_grad()
+    def _step_batched(self):
+        from collections import defaultdict
+        mu = self.momentum
+        for g in self.param_groups:
+            lr = float(g["lr"])
+            ps = [p for p in g["params"] if p.grad is not None]
+            if not ps:
+                continue
+            bufs = [self.state[p] for p in ps]
+            gs = [p.grad for p in ps]
+            torch._foreach_mul_(bufs, mu)
+            torch._foreach_add_(bufs, gs)
+            upds = torch._foreach_add(gs, bufs, alpha=mu)      # Nesterov
+            byshape = defaultdict(list)
+            for i, p in enumerate(ps):
+                byshape[tuple(p.shape)].append(i)
+            outs = [None] * len(ps)
+            for shp, idx in byshape.items():
+                o = newton_schulz5_batched(torch.stack([upds[i] for i in idx]))
+                o = o * (-lr * 0.2 * math.sqrt(max(shp)))
+                for k, i in enumerate(idx):
+                    outs[i] = o[k]
+            torch._foreach_add_(ps, outs)
+
+    @torch.no_grad()
     def step(self):
+        if self.batched:
+            return self._step_batched()
         mu = self.momentum
         for g in self.param_groups:
             lr = float(g["lr"])
@@ -1272,7 +1329,7 @@ def main():
             [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
              {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
               "lr_mult": args.critic_lr_mult}],
-            momentum=args.muon_momentum)
+            momentum=args.muon_momentum, batched=args.muon_batched)
         if resume_ckpt is not None:
             if not resume_ckpt.get("muon"):
                 raise SystemExit("--resume into --optimizer muon needs a "
