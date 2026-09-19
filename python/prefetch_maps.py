@@ -42,26 +42,52 @@ CHART_CACHE = os.path.join(MAPS, "chart_cache")
 DOWNLOAD_SLEEP_S = 0.1
 
 
-def _prefetch(catalog, ver, log=print):
-    """One pass of load_or_parse over the catalog; returns failed entries."""
+def _prefetch(catalog, ver, log=print, workers=1):
+    """One pass of load_or_parse over the catalog; returns failed entries.
+    `workers` > 1 (2026-09-19) runs the download+parse in a thread pool:
+    the wall time is BeatSaver latency, not CPU. Entries sharing a song
+    hash (one map, several difficulties) are serialized on a per-hash
+    lock so a map is downloaded once — ensure_map_dats' os.replace of
+    the temp dir onto an existing cache dir would fail otherwise."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
     import bench_scoresaber as bs
     failed = []
     t0 = time.time()
-    for i, entry in enumerate(catalog):
-        was_cached = os.path.isdir(os.path.join(MAP_CACHE, entry["hash"]))
-        try:
-            bs.load_or_parse(entry, MAP_CACHE, CHART_CACHE, ver)
-        except Exception as e:
-            failed.append(entry)
-            log(f"[prefetch] FAIL {entry['hash']} {entry['difficulty']} "
-                f"({entry['song']!r}): {e!r}", flush=True)
-        else:
-            if not was_cached:
-                time.sleep(DOWNLOAD_SLEEP_S)
-        if (i + 1) % 100 == 0:
-            log(f"[prefetch] {i + 1}/{len(catalog)} "
+    locks = {}
+    locks_guard = threading.Lock()
+    done = [0]
+    progress = threading.Lock()
+
+    def one(entry):
+        with locks_guard:
+            lock = locks.setdefault(entry["hash"], threading.Lock())
+        with lock:
+            was_cached = os.path.isdir(os.path.join(MAP_CACHE, entry["hash"]))
+            try:
+                bs.load_or_parse(entry, MAP_CACHE, CHART_CACHE, ver)
+            except Exception as e:
+                with progress:
+                    failed.append(entry)
+                log(f"[prefetch] FAIL {entry['hash']} {entry['difficulty']} "
+                    f"({entry['song']!r}): {e!r}", flush=True)
+            else:
+                if not was_cached:
+                    time.sleep(DOWNLOAD_SLEEP_S)
+        with progress:
+            done[0] += 1
+            n = done[0]
+        if n % 100 == 0:
+            log(f"[prefetch] {n}/{len(catalog)} "
                 f"({time.time() - t0:.0f}s, {len(failed)} failed)",
                 flush=True)
+
+    if workers <= 1:
+        for entry in catalog:
+            one(entry)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(one, catalog))
     return failed
 
 
@@ -72,6 +98,10 @@ def main():
                         "(implies --skip-pool; never prunes the catalog)")
     p.add_argument("--skip-pool", action="store_true",
                    help="stop after dats + chart_cache; no pool npz")
+    p.add_argument("--workers", type=int, default=8,
+                   help="parallel download+parse threads (BeatSaver "
+                        "latency-bound; 8 measured fine, 1 = the old "
+                        "serial loop)")
     args = p.parse_args()
 
     from beat_arena_env import scoresaber
@@ -98,11 +128,11 @@ def main():
           flush=True)
 
     work = catalog[:args.limit] if args.limit > 0 else catalog
-    failed = _prefetch(work, ver)
+    failed = _prefetch(work, ver, workers=args.workers)
     if failed:                      # transient-network second chance
         print(f"[prefetch] retrying {len(failed)} failures once...",
               flush=True)
-        failed = _prefetch(failed, ver)
+        failed = _prefetch(failed, ver, workers=args.workers)
 
     if args.limit > 0:
         print(f"[prefetch] smoke done: {args.limit - len(failed)}"
