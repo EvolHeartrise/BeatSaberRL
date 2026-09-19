@@ -38,6 +38,10 @@ from collections import deque
 from datetime import datetime
 
 import numpy as np
+
+# env v47 --ep-stats row layout (float32; reader: ep_stats.py)
+EP_STATS_COLS = 16   # chart_idx, leaderboard_id, max_pp, max_score, ticks, fell, completed,
+                     # cw_score, acc, pp, max_combo, breaks, good, bad, miss, ep_return
 import torch
 import torch.nn as nn
 
@@ -661,6 +665,16 @@ def parse_args():
                         "the 3-arm-probe winner (2026-08-15: falls/update "
                         "8-10k -> ~35, bench zeros 35 -> 2); the legacy "
                         "remaining-notes charge is REMOVED")
+    p.add_argument("--ep-stats", action="store_true", default=False,
+                   help="env v47 (2026-09-19): run the ScoreSaber combo "
+                        "walk in the training envs and log every "
+                        "episode's outcome (multiplied score, accuracy, "
+                        "PP, max combo, breaks, completed, cuts) to "
+                        "<run-dir>/ep_stats.f32 (EP_STATS_COLS float32 "
+                        "cols; reader: ep_stats.py); [pp] line every 25 "
+                        "updates. Sampled-policy plays at the drawn body "
+                        "— tracking-grade, not the bench. ~0 kernel cost; "
+                        "+N*C bytes VRAM (note multiplier plane)")
     p.add_argument("--tau-rand", type=float, default=0.0,
                    help="env v46 (user design 2026-09-16): per-env "
                         "randomized joint torque limits — at every "
@@ -1125,6 +1139,7 @@ def main():
                       z_clip_hi=args.z_clip_hi,
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
+                      ep_stats=args.ep_stats,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -1614,6 +1629,20 @@ def main():
     tau_draws_path = os.path.join(args.run_dir, "tau_draws.f32")
     tau_n_episodes = 0
     tau_recent = []
+    # env v47 per-episode score/PP log state (--ep-stats)
+    ep_stats_path = os.path.join(args.run_dir, "ep_stats.f32")
+    ep_stats_n, ep_stats_recent = 0, []
+    ep_meta = None
+    if args.ep_stats:
+        if not (tensor_env and hasattr(venv, "pool")
+                and "level_lb" in venv.pool):
+            sys.exit("--ep-stats needs --env cuda with --ranked-maps "
+                     "(the pool carries the per-level max score / max PP)")
+        ep_meta = {k: venv.pool[k].cpu().numpy()
+                   for k in ("level_lb", "level_max_pp", "level_max_score")}
+        print(f"--ep-stats: combo walk in the training envs; per-episode "
+              f"score/acc/PP rows -> {ep_stats_path} "
+              f"({EP_STATS_COLS} float32 cols)", flush=True)
     if args.tau_rand > 0.0:
         print(f"--tau-rand {args.tau_rand}: per-env joint torque limits "
               f"drawn U(1-r, 1+r) per axis at every reset (16 axes, L/R "
@@ -2306,17 +2335,62 @@ def main():
         # <run-dir>/tau_draws.f32 (raw float32 rows, 22 cols; reader:
         # tau_regress.py); a [tau] line every 25 updates with the
         # least-squares slope of fall rate on each group's mean scale
-        if args.tau_rand > 0.0 and hasattr(venv, "pop_episodes"):
+        rows = None
+        if (args.tau_rand > 0.0 or args.ep_stats) and hasattr(venv, "pop_episodes"):
             rows = venv.pop_episodes()
+        if args.tau_rand > 0.0 and rows is not None:
             if rows.shape[0]:
                 with open(tau_draws_path, "ab") as f:
-                    f.write(np.ascontiguousarray(rows, dtype=np.float32)
-                            .tobytes())
+                    f.write(np.ascontiguousarray(rows[:, :22],
+                                                 dtype=np.float32).tobytes())
                 tau_n_episodes += int(rows.shape[0])
-                tau_recent.append(rows)
+                tau_recent.append(rows[:, :22])
                 if len(tau_recent) > 400:
                     tau_recent.pop(0)
             m_ev.update(tau_episodes=tau_n_episodes)
+        if args.ep_stats and rows is not None and rows.shape[0]:
+            # env v47: per-episode score -> accuracy -> PP at the level's
+            # max_pp (API maxPP), the bench's own curve (scoresaber.py)
+            from beat_arena_env.scoresaber import pp_multiplier
+            ci = rows[:, 21].astype(np.int64)
+            max_score = ep_meta["level_max_score"][ci]
+            acc = np.where(max_score > 0, rows[:, 22] / np.maximum(max_score, 1.0), 0.0)
+            acc = np.clip(acc, 0.0, 1.0)
+            completed = rows[:, 25] > 0.5
+            pp = np.array([pp_multiplier(float(x)) for x in acc], dtype=np.float32) \
+                * ep_meta["level_max_pp"][ci]
+            pp = np.where(completed, pp, 0.0)   # an unfinished map scores no PP
+            er = np.column_stack([
+                rows[:, 21], ep_meta["level_lb"][ci].astype(np.float32),
+                ep_meta["level_max_pp"][ci], max_score,
+                rows[:, 16], rows[:, 18], rows[:, 25], rows[:, 22], acc, pp,
+                rows[:, 23], rows[:, 24], rows[:, 19], rows[:, 26], rows[:, 27],
+                rows[:, 17]]).astype(np.float32)
+            with open(ep_stats_path, "ab") as f:
+                f.write(np.ascontiguousarray(er).tobytes())
+            ep_stats_n += int(er.shape[0])
+            ep_stats_recent.append(er)
+            if len(ep_stats_recent) > 400:
+                ep_stats_recent.pop(0)
+            m_ev.update(ep_stats_episodes=ep_stats_n)
+            if update % 25 == 0:
+                R = np.concatenate(ep_stats_recent)
+                R = R[R[:, 4] >= 60]                 # skip lead-only episodes
+                if R.shape[0] >= 50:
+                    done_m = R[:, 6] > 0.5
+                    comp = float(done_m.mean())
+                    if done_m.any():
+                        C = R[done_m]
+                        acc_m, pp_m = float(C[:, 8].mean()), float(C[:, 9].mean())
+                        fc = float((C[:, 11] == 0).mean())
+                        m_ev.update(ep_complete=comp, ep_acc=acc_m, ep_pp=pp_m)
+                        print(f"[pp] {ep_stats_n:,} episodes logged | completed "
+                              f"{100 * comp:.1f}% of the last {R.shape[0]:,} | "
+                              f"completed maps: acc {acc_m:.4f}  pp {pp_m:.1f} "
+                              f"(median {float(np.median(C[:, 9])):.1f}, max "
+                              f"{float(C[:, 9].max()):.1f})  FC {100 * fc:.1f}%  "
+                              f"breaks {float(C[:, 11].mean()):.2f}  "
+                              f"maxcombo {float(C[:, 10].mean()):.0f}", flush=True)
             if update % 25 == 0 and tau_recent:
                 R = np.concatenate(tau_recent)
                 R = R[R[:, 16] >= 60]           # skip lead-only episodes

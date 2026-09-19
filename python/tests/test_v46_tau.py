@@ -290,12 +290,12 @@ def test_cuda_pop_episodes_rows():
     e.reset()
     s = e.tau_scale.cpu().numpy().copy()
     act = torch.zeros((32, N_JOINTS), dtype=torch.int64, device="cuda")
-    rows = np.zeros((0, 22), dtype=np.float32)
+    rows = np.zeros((0, 28), dtype=np.float32)
     for _ in range(45):                          # max_steps 40 -> every env ends once
         e.step(act)
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[0] >= 32
-    assert rows.shape[1] == 22
+    assert rows.shape[1] == 28
     # the recorded body is the one that played (auto-reset redraws after)
     assert np.all(rows[:, :16] >= 0.75) and np.all(rows[:, :16] <= 1.25)
     assert np.all(rows[:, 16] >= 1)              # ep_ticks
@@ -303,4 +303,4 @@ def test_cuda_pop_episodes_rows():
     first = rows[:32]
     # first 32 rows: one per env, bodies match the reset draw
     assert sorted(first[:, 21].tolist()) == sorted(e.chart_idx.cpu().numpy().tolist()) or True
-    assert e.pop_episodes().shape == (0, 22)
+    assert e.pop_episodes().shape == (0, 28)

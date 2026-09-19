@@ -4544,7 +4544,7 @@ struct Sim {
   uint8_t* __restrict__ prev_valid;
   // env v46: per-env axis torque-limit scales (N, 16), the wrapper's
   // U(-1,1) draw buffer (N, 16) consumed at reset when tau_rand > 0,
-  // the half-range, and the per-episode outcome record (N, 22) +
+  // the half-range, and the per-episode outcome record (N, 28) +
   // flag written at `done` for the trainer's tau_draws log:
   // [s0..s15, ep_ticks, ep_return, fell, good_cuts, score_pts, chart]
   T* __restrict__ tau_scale;
@@ -4557,6 +4557,10 @@ struct Sim {
   // same order Rust pushes its events (post -> note loop -> walls ->
   // post). combo_walk=false leaves every field untouched (training).
   bool combo_walk;
+  // env v47 (2026-09-19): training-time per-episode score telemetry —
+  // combo walk on WITHOUT the bench's done-freeze (auto-reset stays),
+  // ep_rec rows written for every episode (cols 22..28 filled)
+  bool ep_stats;
   int* __restrict__ cw_mult;          // (N) current multiplier 1/2/4/8
   int* __restrict__ cw_prog;          // (N) progress toward the next tier
   int* __restrict__ cw_combo;         // (N) current combo
@@ -6001,8 +6005,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     P.ret_buf[pos % P.cap] = ep;
     // env v46 tau_draws record (only while randomizing): the body this
     // episode played and how it went; the wrapper pops + clears flags
-    if (P.tau_rand > T(0)) {
-      T* r = P.ep_rec + (size_t)e * 22;
+    if (P.tau_rand > T(0) || P.ep_stats) {
+      T* r = P.ep_rec + (size_t)e * 28;
       for (int a = 0; a < TAU_FEAT; a++) r[a] = P.tau_scale[e * TAU_FEAT + a];
       r[16] = T(tick_new);
       r[17] = ep;
@@ -6010,6 +6014,16 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       r[19] = T(P.good[e]);
       r[20] = P.score[e];
       r[21] = T(P.chart_idx[e]);
+      // env v47 cols: zero unless the combo walk ran this episode
+      r[22] = P.ep_stats ? P.cw_score[e] : T(0);
+      r[23] = P.ep_stats ? T(P.cw_maxc[e]) : T(0);
+      r[24] = P.ep_stats ? T(P.cw_breaks[e]) : T(0);
+      // completed = the level itself ended (notes drained / tail), not a
+      // fall, tilt, envelope escape or the tick cap
+      r[25] = (P.ep_stats && !(fell || tilted || d.env_bad)
+               && tick_new < P.max_steps) ? T(1) : T(0);
+      r[26] = P.ep_stats ? T(P.bad[e]) : T(0);
+      r[27] = P.ep_stats ? T(P.miss[e]) : T(0);
       P.ep_flag[e] = 1;
     }
   }
@@ -6069,7 +6083,7 @@ step_kernel(Sim<T> P) {
   // bench combo walk mode: a finished level stays finished (lib.rs
   // VecBeatSim latches `finished` and early-outs; without this a
   // fallen body would keep collecting misses after its terminal tick)
-  if (P.mode == 0 && P.combo_walk && P.done[e]) {
+  if (P.mode == 0 && P.combo_walk && !P.ep_stats && P.done[e]) {
     P.reward[e] = T(0);
     return;
   }
@@ -6136,7 +6150,7 @@ enum {
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
   TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
-  TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,22), flag (N) — 2026-09-16
+  TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,28: v47 cols 22..28), flag (N) — 2026-09-16/19
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
   TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
@@ -6159,7 +6173,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
           double z_clip_hi, double self_contact_coef, double tau_rand,
-          int64_t combo_walk, int64_t bench_refill) {
+          int64_t combo_walk, int64_t bench_refill, int64_t ep_stats) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   const auto& q = ts[TQ];
@@ -6246,6 +6260,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;
+    P.ep_stats = ep_stats != 0;
     P.chart_idx = ts[TCIDX].data_ptr<int64_t>();
     P.p_hit = ts[PHIT].data_ptr<scalar_t>();
     P.p_speed = ts[PSPEED].data_ptr<scalar_t>();
