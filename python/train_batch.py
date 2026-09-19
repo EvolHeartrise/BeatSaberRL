@@ -488,6 +488,16 @@ def parse_args():
     p.add_argument("--no-critic-stream", dest="critic_stream",
                    action="store_false",
                    help="inline critic (the pre-2.2 rollout)")
+    p.add_argument("--graph-rollout", action="store_true", default=False,
+                   help="capture the rollout step (policy fwd + sample + "
+                        "env kernel) as ONE CUDA graph and replay it for "
+                        "t = 1..T-1 (t = 0 stays eager: full-batch "
+                        "entropy). RESTORED 2026-09-19 for slow-single-"
+                        "core hosts where python dispatch starves the "
+                        "GPU; measured 0.99x on a fast core (2026-08-31). "
+                        "Changes the sampling RNG stream vs eager. Needs "
+                        "--env cuda, no --critic-stream, no --head-clip; "
+                        "auto-downgrades with a note otherwise")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -1169,6 +1179,26 @@ def main():
     critic_stream_on = (args.critic_stream and device.type == "cuda"
                         and policy.critic_arch != "linear_v0")
     policy.critic_side_stream(critic_stream_on)
+    graph_roll = None
+    if args.graph_rollout:
+        if (not tensor_env or device.type != "cuda" or critic_stream_on
+                or head_clip or args.fp16 == "update"):
+            print("--graph-rollout: needs --env cuda on a CUDA device "
+                  "without --critic-stream/--head-clip/--fp16 update "
+                  "(the captured kernels cannot follow the fp16 mode "
+                  "flip), forcing off", flush=True)
+        else:
+            try:
+                from rollout_graph import GraphedRollout
+                graph_roll = GraphedRollout(policy, venv)
+                print(f"--graph-rollout: rollout step captured as one "
+                      f"CUDA graph ({'fp16' if policy.fp16 else 'fp32'} "
+                      f"rollout; t=0 eager, t=1..T-1 replayed; sampling "
+                      f"RNG stream differs from eager)", flush=True)
+            except Exception as e:
+                graph_roll = None
+                print(f"--graph-rollout: capture failed, eager rollout "
+                      f"[{type(e).__name__}: {e}]", flush=True)
     # 2.3 go/no-go probe (policy._critic_late): the side-stream launch
     # is deferred until after the env kernel is enqueued, so the critic
     # runs (or fails to) BESIDE step_kernel instead of before it
@@ -1567,8 +1597,19 @@ def main():
             res_pre = max(res_pre, res_now)
             torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
+        if graph_roll is not None:
+            graph_roll.refresh()  # in-place fp16 caches after opt.steps
         for t in range(T):
             b_obs[t] = obs
+            if graph_roll is not None and t > 0:
+                a, logp, v, rew, done = graph_roll.step()
+                b_act[t], b_logp[t] = a, logp
+                b_rew[t] = rew.to(b_rew.dtype)
+                b_done[t].copy_(done)
+                b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
+                obs = venv._obs
+                global_step += N
+                continue
             with torch.no_grad():
                 # t == 0 only: pay the entropy reduction (~4 kernels and
                 # one (N,29,3) probs buffer, ONCE per update) to get a
