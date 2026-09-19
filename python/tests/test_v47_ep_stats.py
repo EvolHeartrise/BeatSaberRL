@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from beat_arena_env import ranked_pool as rp
-from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import N_JOINTS
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA env")
@@ -80,39 +79,52 @@ def test_pp_from_rows():
 
 
 def _cuda_env(n, **kw):
+    """Synthetic 8-s charts (no falls: foot_contact=False), like the v46
+    tests — a level ends by its notes draining unless max_steps caps it."""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    notes = [Note(hit_time=2.0 + 0.4 * i, col=2, row=1, x=0.3, y=1.4,
-                  color=1, angle=4.712, speed=4.0) for i in range(8)]
-    return CudaBeatVecEnv(n, charts=[[note_tuple(x) for x in notes]] * 2,
-                          foot_contact=True, gears=5, push_prob=0.0,
+    return CudaBeatVecEnv(n, chart_len_s=8.0, seed=0, device="cuda",
+                          foot_contact=False, gears=5, push_prob=0.0,
                           push_vmax=0.0, start_jitter=0.0, **kw)
 
 
 @cuda
-def test_cuda_ep_stats_rows_and_no_freeze():
+def test_cuda_ep_stats_rows_completed_and_no_freeze():
     from beat_arena_env.cuda_env import EP_REC
-    e = _cuda_env(16, ep_stats=True, max_steps=200)
+    e = _cuda_env(16, ep_stats=True, max_steps=600)
     assert e.combo_walk and e.ep_stats
     e.reset()
     act = torch.zeros((16, N_JOINTS), dtype=torch.int64, device="cuda")
     rows = np.zeros((0, EP_REC), dtype=np.float32)
     dones = 0
-    for t in range(230):
+    for t in range(700):
         _, _, done, _ = e.step(act)
         dones += int(done.sum().item())
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[1] == EP_REC and rows.shape[0] >= 16
-    # auto-reset kept going (no bench freeze): a done env steps on and
-    # can end again; the tick cap at 200 makes every env end at least
-    # once in 230 ticks and every such episode is NOT "completed"
-    assert dones >= 16
-    assert np.all(rows[:, 16] <= 200)
-    capped = rows[rows[:, 16] >= 200]
-    assert capped.shape[0] and np.all(capped[:, 25] == 0.0)
-    # combo-walk fields are finite and consistent
-    assert np.all(rows[:, 23] >= 0) and np.all(rows[:, 24] >= 0)
-    assert np.all(rows[:, 22] >= 0)
-    assert np.all(rows[:, 19] + rows[:, 26] + rows[:, 27] <= 8 + 1e-6)
+    # no bench freeze: every env ended at least once and kept playing
+    # (auto-reset), so more episodes than envs over 700 ticks of ~8-s levels
+    assert dones >= 16 and rows.shape[0] > 16
+    # levels end by their notes draining (< the 600-tick cap): completed
+    assert np.all(rows[:, 16] < 600)
+    assert np.all(rows[:, 25] == 1.0)
+    assert np.all(rows[:, 18] == 0.0)                 # no falls (weld mode)
+    # combo-walk fields: finite, non-negative, cut counts bounded by notes
+    assert np.all(rows[:, 22:25] >= 0)
+    assert np.all(rows[:, 19] + rows[:, 26] + rows[:, 27] >= 0)
+
+
+@cuda
+def test_cuda_ep_stats_tick_cap_is_not_completed():
+    from beat_arena_env.cuda_env import EP_REC
+    e = _cuda_env(8, ep_stats=True, max_steps=100)
+    e.reset()
+    act = torch.zeros((8, N_JOINTS), dtype=torch.int64, device="cuda")
+    rows = np.zeros((0, EP_REC), dtype=np.float32)
+    for _ in range(105):
+        e.step(act)
+        rows = np.concatenate([rows, e.pop_episodes()])
+    assert rows.shape[0] >= 8
+    assert np.all(rows[:, 16] == 100) and np.all(rows[:, 25] == 0.0)
 
 
 @cuda
