@@ -494,7 +494,11 @@ def parse_args():
                         "t = 1..T-1 (t = 0 stays eager: full-batch "
                         "entropy). RESTORED 2026-09-19 for slow-single-"
                         "core hosts where python dispatch starves the "
-                        "GPU; measured 0.99x on a fast core (2026-08-31). "
+                        "GPU; measured 0.99x on a fast core (2026-08-31) "
+                        "and 0.985x on a slow shared Xeon (VastAI, "
+                        "2026-09-19: 8.91 vs 8.78 s/update, ABAB) — the "
+                        "rollout is GPU-execution-bound at both widths, "
+                        "so this has never paid; kept as a knob only. "
                         "Changes the sampling RNG stream vs eager. Needs "
                         "--env cuda, no --critic-stream, no --head-clip; "
                         "auto-downgrades with a note otherwise")
