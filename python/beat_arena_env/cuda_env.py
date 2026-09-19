@@ -495,7 +495,8 @@ class CudaBeatVecEnv:
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
-                 combo_walk=False, bench_refill=False, ep_stats=False):
+                 combo_walk=False, bench_refill=False, ep_stats=False,
+                 tau_center=None):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -662,6 +663,16 @@ class CudaBeatVecEnv:
         assert 0.0 <= self.tau_rand < 1.0, "tau_rand in [0, 1)"
         self.tau_scale = torch.ones((N, TAU_FEAT), device=dv, dtype=dtype)
         self._tau_jit = z(N, TAU_FEAT)
+        # env v47b: the randomization's CENTER per axis (16 floats; 1.0 =
+        # the TAU_MAX table). Draws are center * (1 + tau_rand * U(-1,1));
+        # obs lanes stay (s - 1) / 0.25 relative to TAU_MAX, so the policy
+        # always reads the absolute body. The default-body search
+        # (ep_stats + tau_fit.py) moves this between trunks.
+        tc = [1.0] * TAU_FEAT if tau_center is None else [float(x) for x in tau_center]
+        assert len(tc) == TAU_FEAT and all(x > 0 for x in tc), "tau_center: 16 positive floats"
+        self.tau_center = torch.tensor(tc, device=dv, dtype=dtype).view(1, TAU_FEAT)
+        if self.tau_rand == 0.0 and tau_center is not None:
+            self.tau_scale.copy_(self.tau_center.expand(N, TAU_FEAT))
         # env v47 (2026-09-19, user): --ep-stats — the ScoreSaber combo
         # walk runs in TRAINING envs too and every episode's outcome row
         # carries the multiplied score, max combo, breaks, completed
@@ -866,8 +877,10 @@ class CudaBeatVecEnv:
         if self.start_pose_jitter > 0.0 or self.crouch_start_prob > 0.0:
             self._pose_jit.uniform_(-1.0, 1.0)
         if self.tau_rand > 0.0:
-            # seeded generator: the body draws are reproducible per seed
+            # seeded generator: the body draws are reproducible per seed;
+            # the kernel installs this buffer as-is at reset (env v47b)
             self._tau_jit.uniform_(-1.0, 1.0, generator=self._gen)
+            self._tau_jit.mul_(self.tau_rand).add_(1.0).mul_(self.tau_center)
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps, self.wide_acc,
                        self.auto_reset, self.gears, self.want_contacts,

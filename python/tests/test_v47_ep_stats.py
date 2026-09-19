@@ -140,3 +140,20 @@ def test_cuda_ep_stats_off_leaves_cols_zero():
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[0] >= 8
     assert np.all(rows[:, 22:] == 0.0)
+
+
+@cuda
+def test_cuda_tau_center_shifts_the_draws():
+    from beat_arena_env.constants import TAU_FEAT
+    center = [1.0] * TAU_FEAT
+    center[10] = 0.8        # l_hip_pitch axis centered at 80% of TAU_MAX
+    e = _cuda_env(64, tau_rand=0.25, tau_center=center, max_steps=40)
+    e.reset()
+    s = e.tau_scale.cpu().numpy()
+    assert np.all(s[:, 10] >= 0.8 * 0.75 - 1e-6) and np.all(s[:, 10] <= 0.8 * 1.25 + 1e-6)
+    assert abs(s[:, 10].mean() - 0.8) < 0.05
+    others = np.delete(s, 10, axis=1)
+    assert np.all(others >= 0.75 - 1e-6) and np.all(others <= 1.25 + 1e-6)
+    # fixed body at the center when tau_rand == 0
+    f = _cuda_env(4, tau_rand=0.0, tau_center=center, max_steps=40)
+    assert np.allclose(f.tau_scale.cpu().numpy()[:, 10], 0.8)
