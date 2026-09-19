@@ -25,6 +25,8 @@ factorization).
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -433,6 +435,32 @@ class Block(nn.Module):
         return x, ffn_out, ffn_bias
 
 
+def hl_target(v: torch.Tensor, centers: torch.Tensor, sigma: float) -> torch.Tensor:
+    """HL-Gauss target (Farebrother et al. 2024, "Stop Regressing", eq.
+    for p_i): the mass of N(v, sigma^2) inside each histogram bin,
+    truncated to the support [v_min, v_max] and renormalized by Z so
+    every row sums to 1 (mass outside the support is dropped, as in the
+    paper). The scalar target is first clamped into the support so a
+    far-out return does not make Z underflow. v (B,), centers (K,)
+    equally spaced -> (B, K)."""
+    v = v.float()
+    width = centers[1] - centers[0]
+    edges = torch.cat([centers[:1] - 0.5 * width, centers + 0.5 * width])
+    v = v.clamp(edges[0], edges[-1])
+    z = (edges.unsqueeze(0) - v.unsqueeze(1)) / (sigma * math.sqrt(2.0))
+    cdf = 0.5 * (1.0 + torch.erf(z))                           # (B, K+1)
+    p = cdf[:, 1:] - cdf[:, :-1]
+    return p / p.sum(-1, keepdim=True)
+
+
+def hl_loss(logits: torch.Tensor, v_tgt: torch.Tensor, centers: torch.Tensor,
+            sigma: float) -> torch.Tensor:
+    """Cross-entropy between the critic's bin distribution and the
+    HL-Gauss target; mean over the batch. logits (B, K) fp32."""
+    tgt = hl_target(v_tgt, centers, sigma)
+    return -(tgt * F.log_softmax(logits.float(), dim=-1)).sum(-1).mean()
+
+
 class NotePolicy(nn.Module):
     # v17 scaled defaults (2026-08-13, user-approved 6.2x): embed 128,
     # 4 attention heads (multi-entity reasoning — a saber can attend to
@@ -448,6 +476,8 @@ class NotePolicy(nn.Module):
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
                  critic: str = "adapool_v1", note_geo: bool = False,
+                 value_bins: int = 0, value_vmax: float = 6.0,
+                 value_sigma: float = 0.75,
                  trunk_arch: str = "mlp", trunk_hidden: int | None = None):
         super().__init__()
         assert encoder == "transformer", (
@@ -476,7 +506,24 @@ class NotePolicy(nn.Module):
                      # mlp); "simba" = residual + LayerNorm block, below.
                      "trunk_arch": trunk_arch,
                      "trunk_hidden": (int(trunk_hidden) if trunk_hidden
-                                      else trunk_dim)}
+                                      else trunk_dim),
+                     # HL-Gauss critic head (2026-09-19): 0 = scalar
+                     # regression; K > 0 = K-bin histogram over the
+                     # normalized return in [-vmax, vmax], target width
+                     # sigma (in bin widths), value = expectation
+                     "value_bins": int(value_bins),
+                     "value_vmax": float(value_vmax),
+                     "value_sigma": float(value_sigma)}
+        self.value_bins = int(value_bins)
+        self.value_sigma_bins = float(value_sigma)
+        if self.value_bins:
+            assert critic != "linear_v0", "HL-Gauss head needs the adapool critic"
+            centers = torch.linspace(-float(value_vmax), float(value_vmax),
+                                     self.value_bins)
+            self.register_buffer("value_centers", centers, persistent=False)
+            # sigma in return units: sigma_bins x bin width
+            self.value_sigma = float(value_sigma) * float(centers[1] - centers[0])
+        self._value_logits = None
         self.note_geo = bool(note_geo)
         self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
@@ -535,7 +582,7 @@ class NotePolicy(nn.Module):
             self.critic_v = nn.Linear(embed, embed)
             self.critic_out = nn.Linear(embed, embed)
             self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
-                                    trunk_dim, 1])
+                                    trunk_dim, self.value_bins or 1])
         # T4 escape hatch (PPG §3.6 detach): True stops value-loss
         # gradients at the shared-trunk boundary — the critic trains
         # on detached features. Plain attribute, NOT in state_dict.
@@ -868,6 +915,12 @@ class NotePolicy(nn.Module):
             a = torch.softmax(scores, dim=-1) @ v
         a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
         val = _seq(self.critic_mlp, torch.cat([a, h], dim=-1))
+        if self.value_bins:
+            # HL-Gauss: bins -> expectation; the (B, K) logits are kept
+            # for the update's cross-entropy (grad-enabled calls only)
+            logits = val.float()
+            self._value_logits = logits if torch.is_grad_enabled() else None
+            return torch.softmax(logits, dim=-1) @ self.value_centers
         return val.float().squeeze(-1)
 
     def flatten_fp16(self):
@@ -1023,6 +1076,9 @@ def load_policy(ckpt) -> NotePolicy:
         note_geo=arch.get("note_geo", False),
         # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
         trunk_arch=arch.get("trunk_arch", "mlp"),
-        trunk_hidden=arch.get("trunk_hidden"))
+        trunk_hidden=arch.get("trunk_hidden"),
+        value_bins=arch.get("value_bins", 0),
+        value_vmax=arch.get("value_vmax", 6.0),
+        value_sigma=arch.get("value_sigma", 0.75))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
