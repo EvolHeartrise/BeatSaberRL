@@ -307,6 +307,17 @@ cd rust && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 cd ../rust32 && VIRTUAL_ENV=$VENV $VENV/bin/maturin develop --release
 ```
 
+**`--ep-stats` (env v47, 2026-09-19):** the ScoreSaber combo walk runs
+inside the training envs and every finished episode's outcome (multiplied
+score, accuracy, PP at the level's API maxPP, max combo, breaks,
+completed flag, cut counts) is appended to `<run-dir>/ep_stats.f32`
+(reader: `python ep_stats.py runs/<name> [--tau]`, which also joins
+`tau_draws.f32` row-for-row to regress acc/PP on the τmax draws). A `[pp]`
+line every 25 updates. Kernel cost ~0; the per-level meta comes from the
+pool (`level_lb`, `level_max_pp`, `level_max_score`; older pool caches get
+a `.meta.npz` sidecar instead of a rebuild). Plays are the sampled policy
+at the drawn body — tracking-grade, not comparable to bench upp.
+
 `rust32/` (2026-09-16) compiles the SAME `rust/src` with `Real = f32`
 (`--features f32`) and exports it as `beat_arena_rs32`. It mirrors the
 CUDA kernel's f32 instantiation — the regime training runs — including

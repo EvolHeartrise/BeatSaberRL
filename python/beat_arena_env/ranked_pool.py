@@ -110,6 +110,7 @@ def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
     ver = bs.parser_version()
     catalog = json.load(open(catalog_path, encoding="utf-8"))
     segments, seg_walls, dropped_sparse = [], [], 0
+    meta = []   # env v47: (leaderboard_id, max_pp, max_score) per segment
     for i, entry in enumerate(catalog):
         payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
                                                        "scoresaber"),
@@ -137,10 +138,12 @@ def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
         wreb = _window_walls(wtups, lo, hi, base)
         segments.append([_tuple_note(t) for t in reb])
         seg_walls.append(wreb)
+        meta.append(_entry_meta(entry, payload))
         if mirror:   # augmentation: every level also plays reflected
             segments.append([_tuple_note(t)
                              for t in mirror_tuples(reb)])
             seg_walls.append(mirror_walls(wreb))
+            meta.append(meta[-1])
         if (i + 1) % 1000 == 0:
             log(f"[ranked-pool] {i + 1}/{len(catalog)} levels -> "
                 f"{len(segments)} segments", flush=True)
@@ -149,7 +152,53 @@ def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
     log(f"[ranked-pool] {len(segments)} whole-level segments "
         f"({n_wall_segs} with walls; dropped {dropped_sparse} sparse; "
         f"max {n_max} objects)", flush=True)
-    return segments, seg_walls
+    return segments, seg_walls, meta
+
+
+def _entry_meta(entry, payload):
+    from .scoresaber import PP_PER_STAR
+    # test catalogs carry only hash/difficulty: -1 / 0 / 0 then
+    return (int(entry.get("leaderboard_id", -1)),
+            float(entry.get("max_pp")
+                  or float(entry.get("stars", 0.0)) * PP_PER_STAR),
+            float(payload.get("max_score", 0)))
+
+
+def _level_meta(catalog_path, lead_s=LEAD_S, mirror=False):
+    """The (P, 3) level metadata for a pool built by _build_segments —
+    env v47 per-map score/PP telemetry (--ep-stats). Replays the SAME
+    drop rules (empty, last < lead_s, sparse) over the chart cache
+    without packing any tensors, so a pool cached before the meta
+    existed gets a sidecar instead of a multi-GB rebuild."""
+    import json
+    import sys
+    sys.path.insert(0, _BASE)
+    import bench_scoresaber as bs
+    ver = bs.parser_version()
+    catalog = json.load(open(catalog_path, encoding="utf-8"))
+    meta = []
+    for entry in catalog:
+        payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
+                                                       "scoresaber"),
+                                   os.path.join(_BASE, "maps",
+                                                "chart_cache"), ver)
+        tup = sorted(payload["tuples"], key=lambda t: t[0])
+        if not tup or tup[-1][0] < lead_s:
+            continue
+        win = [t for t in tup if lead_s <= t[0]]
+        if sum(1 for t in win if t[7] != KIND_BOMB) < MIN_SCOREABLE:
+            continue
+        meta.append(_entry_meta(entry, payload))
+        if mirror:
+            meta.append(meta[-1])
+    return meta
+
+
+def _meta_arrays(meta):
+    m = np.asarray(meta, dtype=np.float64).reshape(-1, 3)
+    return {"level_lb": m[:, 0].astype(np.int64),
+            "level_max_pp": m[:, 1].astype(np.float32),
+            "level_max_score": m[:, 2].astype(np.float32)}
 
 
 def pool_max_steps(pool, tick_hz=30, margin_ticks=90):
@@ -186,8 +235,8 @@ def load_ranked_pool(sample=None, seed=0, device="cuda",
     if not os.path.exists(cpath):
         from .cuda_env import (_charts_to_tensors, _walls_to_tensors,
                                cat_pools)
-        segs, seg_walls = _build_segments(catalog, log, lead_s=lead_s,
-                                          mirror=mirror)
+        segs, seg_walls, meta = _build_segments(catalog, log, lead_s=lead_s,
+                                                mirror=mirror)
         # Chunked packing (2026-08-08): one whole-pool _charts_to_tensors
         # call holds ~4.6M Note objects + a dozen (P, C) f64 scratch
         # arrays + the f32 outputs simultaneously (~5.5 GB at 46k
@@ -212,6 +261,8 @@ def load_ranked_pool(sample=None, seed=0, device="cuda",
             parts[0].update(_walls_to_tensors([], "cpu", dtype))
         pool = cat_pools(parts)
         del parts
+        pool.update({k: torch.as_tensor(v)
+                     for k, v in _meta_arrays(meta).items()})
         # tmp + atomic rename: the cache lives on a SHARED network
         # volume and other pods poll for it — a direct savez exposes a
         # partial npz for the whole multi-GB write (the v17 lr-ladder
@@ -225,11 +276,27 @@ def load_ranked_pool(sample=None, seed=0, device="cuda",
             flush=True)
     data = np.load(cpath)
     P = data["n_notes"].shape[0]
+    arrs = {k: data[k] for k in data.files}
+    if "level_lb" not in arrs:
+        # pool cached before env v47: level meta from a sidecar (built
+        # once from the chart cache, seconds; the frozen pool key stays)
+        mpath = cpath[:-len(".npz")] + ".meta.npz"
+        if not os.path.exists(mpath):
+            log("[ranked-pool] building level meta sidecar (env v47)",
+                flush=True)
+            ma = _meta_arrays(_level_meta(catalog, lead_s, mirror))
+            assert ma["level_lb"].shape[0] == P, \
+                f"meta {ma['level_lb'].shape[0]} != pool {P} levels"
+            tmp = mpath[:-len(".npz")] + f".tmp{os.getpid()}.npz"
+            np.savez(tmp, **ma)
+            os.replace(tmp, mpath)
+        md = np.load(mpath)
+        arrs.update({k: md[k] for k in md.files})
     idx = None
     if sample is not None and sample < P:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(P, size=sample, replace=False))
-    arrs = _subset_ragged({k: data[k] for k in data.files}, idx)
+    arrs = _subset_ragged(arrs, idx)
     out = {k: torch.as_tensor(a, device=device) for k, a in arrs.items()}
     nn, nw = arrs["n_notes"], arrs["n_walls"]
     log(f"[ranked-pool] {P if idx is None else len(idx)} levels on "

@@ -36,8 +36,9 @@ def fake_catalog(tmp_path, monkeypatch):
 
 
 def test_one_entry_per_level_no_cap(fake_catalog):
-    segs, walls = rp._build_segments(fake_catalog, lambda *a, **k: None,
-                                     lead_s=0.5)
+    segs, walls, meta = rp._build_segments(fake_catalog, lambda *a, **k: None,
+                                           lead_s=0.5)
+    assert len(meta) == 2
     assert len(segs) == 2                       # 'ccc' dropped as sparse
     assert len(segs[0]) == 3000                 # no object cap
     assert len(segs[1]) == 40
@@ -54,8 +55,9 @@ def test_one_entry_per_level_no_cap(fake_catalog):
 
 
 def test_mirror_doubles_the_pool(fake_catalog):
-    segs, walls = rp._build_segments(fake_catalog, lambda *a, **k: None,
-                                     lead_s=0.5, mirror=True)
+    segs, walls, meta = rp._build_segments(fake_catalog, lambda *a, **k: None,
+                                           lead_s=0.5, mirror=True)
+    assert len(meta) == 4 and meta[0] == meta[1]
     assert len(segs) == 4 and len(walls) == 4
     assert len(segs[0]) == len(segs[1]) == 3000
     # mirrored copy: x negated on every note

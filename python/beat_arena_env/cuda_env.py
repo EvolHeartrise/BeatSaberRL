@@ -77,6 +77,7 @@ NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 # same-tick same-saber trackers share (arc, age) forever, so they
 # aggregate into ONE slot with a note COUNT — exact, not approximate.
 N_TRACKERS = FOLLOW_TIMEOUT + 1
+EP_REC = 28   # env v47 episode record width (cols 22..28 = ep_stats)
 
 # lib.rs Z_MISS_TAIL: the episode tail covers the slowest object's trip
 # from the hit plane to the WORST-CASE live head plane (env v10).
@@ -494,7 +495,7 @@ class CudaBeatVecEnv:
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
-                 combo_walk=False, bench_refill=False):
+                 combo_walk=False, bench_refill=False, ep_stats=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -661,7 +662,16 @@ class CudaBeatVecEnv:
         assert 0.0 <= self.tau_rand < 1.0, "tau_rand in [0, 1)"
         self.tau_scale = torch.ones((N, TAU_FEAT), device=dv, dtype=dtype)
         self._tau_jit = z(N, TAU_FEAT)
-        self.ep_rec = z(N, 22)
+        # env v47 (2026-09-19, user): --ep-stats — the ScoreSaber combo
+        # walk runs in TRAINING envs too and every episode's outcome row
+        # carries the multiplied score, max combo, breaks, completed
+        # (level end reached, no fall), bad cuts, misses (cols 22..28);
+        # the trainer turns them into per-map accuracy / PP. Auto-reset
+        # is unchanged (the bench's done-freeze is gated off).
+        self.ep_stats = bool(ep_stats)
+        if self.ep_stats:
+            combo_walk = True
+        self.ep_rec = z(N, EP_REC)
         self.ep_flag = z(N, dt=torch.uint8)
         # bench combo walk (2026-09-16): the ScoreSaber multiplied-score
         # walk (lib.rs ComboWalk) run IN the kernel at the event sites,
@@ -870,7 +880,7 @@ class CudaBeatVecEnv:
                        self.start_pose_jitter, self.crouch_start_prob,
                        self.z_clip_hi, self.self_contact_coef,
                        self.tau_rand, int(self.combo_walk),
-                       int(self.bench_refill))
+                       int(self.bench_refill), int(self.ep_stats))
 
     # -- env v46: torque-limit scales ---------------------------------------
     def set_tau_scale(self, s16):
@@ -885,15 +895,17 @@ class CudaBeatVecEnv:
         self.tau_scale.copy_(s.reshape(1, TAU_FEAT).expand_as(self.tau_scale))
 
     def pop_episodes(self):
-        """Episodes that ended since the last pop, as an (M, 22) float32
-        numpy array: [s0..s15, ep_ticks, ep_return, fell, good_cuts,
-        score_pts, chart_idx] (the kernel writes a row at `done` while
-        tau_rand > 0; an env ending twice inside one pop keeps the later
+        """Episodes that ended since the last pop, as an (M, EP_REC)
+        float32 numpy array: [s0..s15, ep_ticks, ep_return, fell,
+        good_cuts, score_pts, chart_idx, cw_score, max_combo, breaks,
+        completed, bad_cuts, misses] (the kernel writes a row at `done`
+        while tau_rand > 0 or ep_stats; cols 22.. are zero unless
+        ep_stats; an env ending twice inside one pop keeps the later
         row — logging-grade). Two syncs; call once per update."""
         flags = self.ep_flag.bool()
         n = int(flags.sum().item())
         if n == 0:
-            return np.zeros((0, 22), dtype=np.float32)
+            return np.zeros((0, EP_REC), dtype=np.float32)
         rows = self.ep_rec[flags].float().cpu().numpy()
         self.ep_flag.zero_()
         return rows
