@@ -49,7 +49,7 @@ from beat_arena_env.vec_env import BeatVecEnv
 from beat_arena_env.constants import parse_tau_scale
 from fp16_linear import bump_weights_version
 from metrics_log import dumps_record, update_record
-from policy import (HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
+from policy import (hl_loss, HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
                     load_policy)
 
 A_DIM = len(HEAD_SIZES)  # 29 factored joint heads (env v10)
@@ -676,6 +676,21 @@ def parse_args():
                         "updates. Sampled-policy plays at the drawn body "
                         "— tracking-grade, not the bench. ~0 kernel cost; "
                         "+N*C bytes VRAM (note multiplier plane)")
+    p.add_argument("--value-head", choices=["mse", "hl"], default="mse",
+                   help="critic head: mse = scalar regression on the "
+                        "normalized return (every run through v48); hl = "
+                        "HL-Gauss (Farebrother 2024): --hl-bins histogram "
+                        "over [-hl-vmax, hl-vmax] of the normalized "
+                        "return, cross-entropy to a Gaussian-smoothed "
+                        "target (--hl-sigma in bin widths, paper 0.75; "
+                        "tails truncated + renormalized), value = "
+                        "expectation. 2026-09-19, for noisy long-horizon "
+                        "targets (gamma 0.98 probe: ev 0.983 vs 0.995)")
+    p.add_argument("--hl-bins", type=int, default=101)
+    p.add_argument("--hl-vmax", type=float, default=6.0,
+                   help="HL-Gauss support half-width in NORMALIZED return "
+                        "units (the critic target is ~unit variance)")
+    p.add_argument("--hl-sigma", type=float, default=0.75)
     p.add_argument("--tau-center", type=str, default=None,
                    help="env v47b: center of the --tau-rand draws per axis "
                         "(16 floats or 'spine=0.9,legs=1.1,...'; 1.0 = the "
@@ -896,8 +911,11 @@ def muon_param_names(policy):
         if n.startswith(("note_mlp", "saber_mlp", "body_mlp", "heads.",
                          "value_head")):
             continue
-        if p.shape[0] == 1:               # critic_mlp's final layer
+        if p.shape[0] == 1:               # critic_mlp's final layer (mse)
             continue
+        if (hasattr(policy, "critic_mlp")
+                and n == f"critic_mlp.{len(policy.critic_mlp) - 1}.weight"):
+            continue                      # ... or its K-bin HL-Gauss head
         names.append(n)
     return names
 
@@ -1221,7 +1239,15 @@ def main():
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
                             note_geo=args.note_geo,
                             trunk_arch=args.trunk_arch,
-                            trunk_hidden=args.trunk_hidden)
+                            trunk_hidden=args.trunk_hidden,
+                            value_bins=(args.hl_bins
+                                        if args.value_head == "hl" else 0),
+                            value_vmax=args.hl_vmax,
+                            value_sigma=args.hl_sigma)
+    if args.value_head == "hl":
+        print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
+              f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "
+              f"sigma {args.hl_sigma:g} bins", flush=True)
     policy.critic_detach = args.critic_detach
     if args.critic_detach:
         print("--critic-detach: value-loss gradients stop at the "
@@ -2097,7 +2123,12 @@ def main():
                                if head_clip else pg_loss_fn(ratio, a_mb, clip=CLIP))
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
-                    v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
+                    if policy.value_bins:
+                        v_loss = hl_loss(policy._value_logits, v_tgt,
+                                         policy.value_centers,
+                                         policy.value_sigma)
+                    else:
+                        v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
                     ent_loss = entropy.mean()
                     loss = (pg_loss - ent_now * ent_loss
                             + args.vf_coef * v_loss)
