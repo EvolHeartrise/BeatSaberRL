@@ -2146,6 +2146,16 @@ def main():
                             kl_stop_mb = s // mb_size
                             kl_last.copy_(_kl)
                             cf_last.copy_((_r.abs() > CLIP).to(_r.dtype).mean())
+                            # release this minibatch's forward graph:
+                            # no backward will run, and the live
+                            # activations of a 16k-row forward are
+                            # what the next rollout needs (v52 OOMed
+                            # on the update after the first stop)
+                            del newlogp, entropy, newval, logratio, ratio
+                            del _r, _kl
+                            if head_clip:
+                                del logratio_h, ratio_h
+                            policy._value_logits = None
                             break
                     if fp16_update:
                         # overflow forensics (device-side, read at the
