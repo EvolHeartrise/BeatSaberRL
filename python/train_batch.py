@@ -2059,6 +2059,7 @@ def main():
                       "groups": {nm: [a, b] for nm, a, b in per_gv}}
 
         kl_stop_mb = None   # --target-kl: minibatch index the update stopped at
+        gn_sq = None        # [gnorm] per-module grad norm^2 of the last minibatch
         for ep_i in range(args.epochs):
             if kl_stop_mb is not None:
                 break
@@ -2251,6 +2252,20 @@ def main():
                     clean_steps.mul_(1.0 - grow)
                     inf_count += found_inf
                     found_inf.zero_()
+                if (args.diag_every > 0 and update % args.diag_every == 0
+                        and ep_i == args.epochs - 1
+                        and s + mb_size >= train_n):
+                    # [gnorm] (2026-09-20, v52's 4x gradient norm): the
+                    # ACTUAL minibatch gradient (post-unscale, pre-clip)
+                    # split by top-level module, all params — the
+                    # [diag] line covers the shared params only, so a
+                    # head or critic-head gradient is invisible there.
+                    gn_sq = {}
+                    for n_, p_ in policy.named_parameters():
+                        if p_.grad is not None:
+                            k_ = n_.split(".")[0]
+                            v_ = p_.grad.detach().float().square().sum()
+                            gn_sq[k_] = gn_sq[k_] + v_ if k_ in gn_sq else v_
                 if flat_grad is not None:
                     if flat_guard:
                         # one-time: autograd must have accumulated INTO
@@ -2621,6 +2636,15 @@ def main():
                                  cfh_v if head_clip else None,
                                  kl_stop=kl_stop_mb),
                   flush=True)
+            if gn_sq:
+                gng_v = {k: float(v.sqrt()) for k, v in gn_sq.items()}
+                print(f"[gnorm] upd {update + 1}  total "
+                      f"{sum(v * v for v in gng_v.values()) ** 0.5:.2f}  "
+                      + "  ".join(f"{k} {v:.2f}" for k, v in
+                                  sorted(gng_v.items(), key=lambda kv: -kv[1])),
+                      flush=True)
+                m_diag = dict(m_diag or {})
+                m_diag["gn"] = gng_v
 
         m_ckpt = m_vram = None
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
