@@ -598,6 +598,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                          auto_reset=False, want_contacts=False,
                          foot_contact=True, z_clip_hi=z_clip,
                          z_asinh=float(os.environ.get("BEAT_Z_ASINH", "0")),
+                         z_far=float(os.environ.get("BEAT_Z_FAR", "0")),
                          combo_walk=True, bench_refill=True, seed=0)
     ts = parse_tau_scale(args.tau_scale)
     if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
@@ -759,7 +760,24 @@ def main():
         sys.exit(f"BEAT_Z_ASINH={os.environ['BEAT_Z_ASINH']} disagrees with "
                  f"the checkpoint's --z-asinh {z_asinh}; unset it")
     os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
-    print(f"obs z lane: {'asinh(z / %g m)' % z_asinh if z_asinh > 0 else 'clamp / 8'} (from the checkpoint)", flush=True)
+    # env v49: the far lane knee, and the near-field clamp the checkpoint
+    # trained with (BEAT_Z_CLIP_HI wins only when it agrees; a set-but-
+    # different value is a mismatch, not an override)
+    z_far = float(ckpt.get("arch", {}).get(
+        "z_far", ckpt.get("args", {}).get("z_far", 0.0)))
+    if os.environ.get("BEAT_Z_FAR") not in (None, repr(z_far)):
+        sys.exit(f"BEAT_Z_FAR={os.environ['BEAT_Z_FAR']} disagrees with "
+                 f"the checkpoint's --z-far {z_far}; unset it")
+    os.environ["BEAT_Z_FAR"] = repr(z_far)
+    ck_clip = ckpt.get("args", {}).get("z_clip_hi")
+    if ck_clip is not None:
+        env_clip = os.environ.get("BEAT_Z_CLIP_HI")
+        if env_clip is not None and float(env_clip) != float(ck_clip):
+            sys.exit(f"BEAT_Z_CLIP_HI={env_clip} disagrees with the "
+                     f"checkpoint's --z-clip-hi {ck_clip}; unset it")
+        os.environ["BEAT_Z_CLIP_HI"] = repr(float(ck_clip))
+    print(f"obs z lane: {'asinh(z / %g m)' % z_asinh if z_asinh > 0 else 'clamp %s / 8' % os.environ.get('BEAT_Z_CLIP_HI', '12.0')}"
+          f"{' + far lane knee %g m' % z_far if z_far > 0 else ''} (from the checkpoint)", flush=True)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy = policy.to(device).eval()

@@ -376,6 +376,28 @@ fn z_asinh() -> Real {
             .unwrap_or(0.0)
     })
 }
+// env v49 (2026-09-20): split lanes — BEAT_Z_FAR = F metres turns on
+// lane 13 = 0.5 ln(1 + max(z - F, 0) / F) (zero across the near field)
+// and makes lane 17 (wall back) asinh(max(z, z_lo) / F); lane 2 stays
+// the clamped near-field lane. 0/unset = off. The CUDA twin takes z_far.
+fn z_far() -> Real {
+    static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BEAT_Z_FAR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+/// The far z lane (.cu z_far_lane mirror).
+fn z_far_lane(zu: Real) -> Real {
+    let f = z_far();
+    if f > 0.0 {
+        0.5 * (1.0 + (zu - f).max(0.0) / f).ln()
+    } else {
+        0.0
+    }
+}
 /// The obs z lane for a travelling object (.cu z_lane mirror).
 fn z_lane(zu: Real, z_lo: Real) -> Real {
     let c = z_asinh();
@@ -1636,6 +1658,7 @@ impl Core {
                 obs[base + 1] =
                     ((w.cy - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = z_lane(zfu, z_lo) as f32; // env v48
+                obs[base + 13] = z_far_lane(zfu) as f32; // env v49
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
                 // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
                 obs[base + 14] = 1.0; // is_wall
@@ -1648,7 +1671,11 @@ impl Core {
                 // lane is binary-for-notes / continuous-for-walls
                 // under the shared token encoder; lane 17 held wall
                 // length until the same day.)
-                obs[base + 17] = z_lane(zfu + w.len, z_lo) as f32; // env v48
+                obs[base + 17] = if z_far() > 0.0 {
+                    ((zfu + w.len).max(z_lo) / z_far()).asinh() as f32 // env v49
+                } else {
+                    z_lane(zfu + w.len, z_lo) as f32 // env v48
+                };
             } else {
                 let n = &self.chart[idx];
                 let zu = (n.hit_time - self.time) * n.speed + z_off;
@@ -1657,6 +1684,7 @@ impl Core {
                 obs[base + 1] =
                     ((n.y - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = z_lane(zu, z_lo) as f32; // env v48
+                obs[base + 13] = z_far_lane(zu) as f32; // env v49
                 obs[base + 3] = (-n.speed / Z_SCALE) as f32;
                 if n.kind != KIND_BOMB {
                     obs[base + 4 + n.color as usize] = 1.0;
