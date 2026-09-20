@@ -80,7 +80,7 @@
 
   $effect(() => {
     if (!auto) return;
-    const h = setInterval(refresh, 30000);
+    const h = setInterval(refresh, 10000);
     return () => clearInterval(h);
   });
 </script>
@@ -106,7 +106,7 @@
     {WIN_UNIT[xMode].label}
     <button class:on={!win[xMode]} onclick={() => setWin(0)}>all</button>
   </label>
-  <label class="auto"><input type="checkbox" bind:checked={auto} /> auto-refresh 30 s</label>
+  <label class="auto"><input type="checkbox" bind:checked={auto} /> auto-refresh 10 s</label>
   <button onclick={refresh} disabled={refreshing}>{refreshing ? "…" : "refresh now"}</button>
 </div>
 
