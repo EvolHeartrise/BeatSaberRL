@@ -378,6 +378,13 @@ def parse_args():
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
                         "12.0 = every pre-v28 era; CUDA env only")
+    p.add_argument("--z-asinh", type=float, default=0.0,
+                   help="env v48: obs z lanes (note z / wall front, wall "
+                        "back) = asinh(max(z, -0.65) / C) with C in metres "
+                        "— linear near the cut plane, log far out, no upper "
+                        "clamp (--z-clip-hi is then unused). 0 = legacy "
+                        "clamp / 8. Recorded in the checkpoint (arch + "
+                        "args); the bench/replay tools read it from there")
     p.add_argument("--init-critic-fresh", action="store_true",
                    help="with --init-from and a pre-redesign checkpoint: "
                         "load actor/trunk weights, build a FRESH "
@@ -958,6 +965,10 @@ def main():
     if args.bench:
         args.total_steps = args.num_envs * args.horizon * 4
     resume_ckpt = None
+    init_ckpt = None
+    if args.init_from and not args.resume:
+        init_ckpt = torch.load(args.init_from, map_location="cpu",
+                               weights_only=True)
     if args.resume:
         assert not args.init_from, "--resume and --init-from are exclusive"
         resume_ckpt = torch.load(args.resume, map_location="cpu",
@@ -1130,6 +1141,22 @@ def main():
     if args.z_clip_hi != 12.0 and args.env != "cuda":
         raise SystemExit("--z-clip-hi: the rust backend reads "
                          "BEAT_Z_CLIP_HI instead (CUDA env only here)")
+    if args.z_asinh < 0:
+        raise SystemExit("--z-asinh must be >= 0 (metres; 0 = off)")
+    # env v48: the rust twin reads BEAT_Z_ASINH once per process — set it
+    # before any sim exists so --env rust and the CUDA env agree
+    os.environ["BEAT_Z_ASINH"] = repr(float(args.z_asinh))
+    for _name, _ck in (("--resume", resume_ckpt),
+                       ("--init-from", init_ckpt)):
+        if _ck is None:
+            continue
+        _prev = _ck.get("arch", {}).get(
+            "z_asinh", _ck.get("args", {}).get("z_asinh", 0.0))
+        if float(_prev) != float(args.z_asinh):
+            raise SystemExit(
+                f"{_name}: checkpoint was trained with --z-asinh {_prev} "
+                f"but this run asks for {args.z_asinh}; the obs z lanes "
+                f"would not match (pass the checkpoint's value)")
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
@@ -1161,7 +1188,7 @@ def main():
                       wall_despawn=args.wall_despawn,
                       start_pose_jitter=args.start_pose_jitter,
                       crouch_start_prob=args.crouch_start_prob,
-                      z_clip_hi=args.z_clip_hi,
+                      z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
@@ -1188,7 +1215,7 @@ def main():
             energy_coef=args.energy_coef,
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
-            z_clip_hi=args.z_clip_hi,
+            z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
             self_contact_coef=args.self_contact_coef,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -1244,6 +1271,9 @@ def main():
                                         if args.value_head == "hl" else 0),
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma)
+    # env v48: record the obs z encoding in the arch so the bench / replay
+    # tools and --resume/--init-from can match it (0 = legacy clamp)
+    policy.arch["z_asinh"] = float(args.z_asinh)
     if args.value_head == "hl":
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
               f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "

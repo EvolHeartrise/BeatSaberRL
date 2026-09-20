@@ -362,6 +362,29 @@ fn z_clip_hi() -> Real {
             .unwrap_or(Z_CLIP.1)
     })
 }
+// env v48 (2026-09-20, user): asinh z lane — lanes 2/17 become
+// asinh(max(z, z_lo) / c) with c = BEAT_Z_ASINH metres (linear near the
+// plane, log far out, no upper clamp); unset/0 = the legacy clamp /
+// Z_SCALE. Read once per process like z_clip_hi; the CUDA twin takes it
+// as a step parameter (z_asinh).
+fn z_asinh() -> Real {
+    static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BEAT_Z_ASINH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+/// The obs z lane for a travelling object (.cu z_lane mirror).
+fn z_lane(zu: Real, z_lo: Real) -> Real {
+    let c = z_asinh();
+    if c > 0.0 {
+        (zu.max(z_lo) / c).asinh()
+    } else {
+        zu.clamp(z_lo, z_clip_hi()) / Z_SCALE
+    }
+}
 const ROOT_Y0: Real = 0.94; // reference root height (obs centering)
 const HEAD_Y0: Real = 1.70; // reference head height (obs centering)
 const PLANE_Z0: Real = -0.65; // reference body plane (obs centering)
@@ -1603,7 +1626,6 @@ impl Core {
                 let w = &self.walls[idx];
                 let zfu = (w.start_time - self.time) * w.speed - WALL_FRONT_OFF
                     + z_off;
-                let zf = zfu.clamp(z_lo, z_clip_hi());
                 // env v38 (user): entity x/y are HEAD-RELATIVE —
                 // kills the absolute-coordinate shortcut the near-
                 // constant standing head height taught (posture-
@@ -1613,7 +1635,7 @@ impl Core {
                 obs[base] = ((w.cx - self.body.head[0]) / X_NORM) as f32;
                 obs[base + 1] =
                     ((w.cy - self.body.head[1]) / Y_NORM) as f32;
-                obs[base + 2] = (zf / Z_SCALE) as f32;
+                obs[base + 2] = z_lane(zfu, z_lo) as f32; // env v48
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
                 // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
                 obs[base + 14] = 1.0; // is_wall
@@ -1626,18 +1648,15 @@ impl Core {
                 // lane is binary-for-notes / continuous-for-walls
                 // under the shared token encoder; lane 17 held wall
                 // length until the same day.)
-                obs[base + 17] =
-                    ((zfu + w.len).clamp(z_lo, z_clip_hi()) / Z_SCALE)
-                        as f32;
+                obs[base + 17] = z_lane(zfu + w.len, z_lo) as f32; // env v48
             } else {
                 let n = &self.chart[idx];
-                let z = ((n.hit_time - self.time) * n.speed + z_off)
-                    .clamp(z_lo, z_clip_hi());
+                let zu = (n.hit_time - self.time) * n.speed + z_off;
                 // env v38: head-relative x/y (see wall branch note)
                 obs[base] = ((n.x - self.body.head[0]) / X_NORM) as f32;
                 obs[base + 1] =
                     ((n.y - self.body.head[1]) / Y_NORM) as f32;
-                obs[base + 2] = (z / Z_SCALE) as f32;
+                obs[base + 2] = z_lane(zu, z_lo) as f32; // env v48
                 obs[base + 3] = (-n.speed / Z_SCALE) as f32;
                 if n.kind != KIND_BOMB {
                     obs[base + 4 + n.color as usize] = 1.0;
