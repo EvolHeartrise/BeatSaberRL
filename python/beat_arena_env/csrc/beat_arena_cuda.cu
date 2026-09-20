@@ -1614,6 +1614,15 @@ __device__ __forceinline__ T z_lane(T zu, T z_lo, T z_clip_hi, T z_asinh) {
   if (z_asinh > T(0)) return asinh((zu > z_lo ? zu : z_lo) / z_asinh);
   return tclamp(zu, z_lo, z_clip_hi) / T(Z_SCALE);
 }
+// env v49 (2026-09-20): the FAR z lane (lane 13) — 0.5 ln(1 + max(z - F,
+// 0) / F), zero across the near field so it shares no gradient with lane
+// 2's column; F = z_far metres (0 = lane stays zero). lib.rs z_far_lane.
+template <typename T>
+__device__ __forceinline__ T z_far_lane(T zu, T z_far) {
+  if (z_far <= T(0)) return T(0);
+  const T e = zu - z_far;
+  return T(0.5) * log(T(1) + (e > T(0) ? e : T(0)) / z_far);
+}
 template <typename T>
 __device__ __forceinline__ T tclamp(T x, T lo, T hi) {
   return x < lo ? lo : (x > hi ? hi : x);
@@ -4719,6 +4728,10 @@ struct Sim {
   // Z_SCALE. The speed lane is untouched. Recorded in the checkpoint
   // (arch + args); the rust twin reads BEAT_Z_ASINH.
   T z_asinh;
+  // env v49: split lanes — lane 13 = far log lane with knee z_far (m),
+  // lane 2 stays the (clamped) near-field lane, lane 17 (wall back)
+  // = asinh(max(z, z_lo) / z_far) so long walls keep their length. 0 = off.
+  T z_far;
   // env v20 (2026-08-16): per-tick penalty foot_z_coef * (|lfoot_z -
   // PLANE_Z0| + |rfoot_z - PLANE_Z0|) — linear in each foot's world-z
   // distance from the reference foot z (lib.rs mirror). 0 = off.
@@ -5236,6 +5249,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[0] = (float)((P.p_wall_cx[wb] - P.head[e * 3]) / T(X_NORM));
       nb2[1] = (float)((P.p_wall_cy[wb] - P.head[e * 3 + 1]) / T(Y_NORM));
       nb2[2] = (float)z_lane(zfu, z_lo, P.z_clip_hi, P.z_asinh);  // env v48
+      nb2[13] = (float)z_far_lane(zfu, P.z_far);                      // env v49
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
       // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
       nb2[14] = 1.f;  // is_wall
@@ -5249,8 +5263,9 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       // lane 4 for one commit; moved here 2026-08-22 so no lane is
       // binary-for-notes / continuous-for-walls under the shared
       // token encoder. Lane 17 held wall length until the same day.)
-      nb2[17] = (float)z_lane(zfu + P.p_wall_len[wb], z_lo, P.z_clip_hi,
-                              P.z_asinh);  // env v48
+      nb2[17] = (float)(P.z_far > T(0)                                  // env v49
+          ? asinh(tmax(zfu + P.p_wall_len[wb], z_lo) / P.z_far)
+          : z_lane(zfu + P.p_wall_len[wb], z_lo, P.z_clip_hi, P.z_asinh));  // env v48
     } else {
       const int64_t cb = nb + sel_idx[slot];
       const T zu = (P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off;
@@ -5260,6 +5275,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[1] = (float)((P.p_center[cb * 2 + 1] - P.head[e * 3 + 1])
                        / T(Y_NORM));
       nb2[2] = (float)z_lane(zu, z_lo, P.z_clip_hi, P.z_asinh);  // env v48
+      nb2[13] = (float)z_far_lane(zu, P.z_far);                      // env v49
       nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
       nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
       nb2[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
@@ -6188,7 +6204,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
-          double z_clip_hi, double z_asinh, double self_contact_coef,
+          double z_clip_hi, double z_asinh, double z_far, double self_contact_coef,
           double tau_rand, int64_t combo_walk, int64_t bench_refill,
           int64_t ep_stats) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
@@ -6340,6 +6356,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wall_despawn = (int)wall_despawn;
     P.z_clip_hi = (scalar_t)z_clip_hi;
     P.z_asinh = (scalar_t)z_asinh;
+    P.z_far = (scalar_t)z_far;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();

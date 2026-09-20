@@ -397,6 +397,14 @@ def parse_args():
                         "clamp (--z-clip-hi is then unused). 0 = legacy "
                         "clamp / 8. Recorded in the checkpoint (arch + "
                         "args); the bench/replay tools read it from there")
+    p.add_argument("--z-far", type=float, default=0.0,
+                   help="env v49 (2026-09-20): split z lanes. Lane 13 = "
+                        "0.5 ln(1 + max(z - F, 0) / F) with F metres (zero "
+                        "across the near field, so it shares no gradient "
+                        "with lane 2's column), lane 2 stays the clamped "
+                        "near-field lane (use --z-clip-hi 12 with it), wall "
+                        "back face = asinh(z / F). 0 = off. Recorded in the "
+                        "checkpoint like --z-asinh")
     p.add_argument("--init-critic-fresh", action="store_true",
                    help="with --init-from and a pre-redesign checkpoint: "
                         "load actor/trunk weights, build a FRESH "
@@ -1158,17 +1166,22 @@ def main():
     # env v48: the rust twin reads BEAT_Z_ASINH once per process — set it
     # before any sim exists so --env rust and the CUDA env agree
     os.environ["BEAT_Z_ASINH"] = repr(float(args.z_asinh))
+    if args.z_far < 0:
+        raise SystemExit("--z-far must be >= 0 (metres; 0 = off)")
+    os.environ["BEAT_Z_FAR"] = repr(float(args.z_far))
     for _name, _ck in (("--resume", resume_ckpt),
                        ("--init-from", init_ckpt)):
         if _ck is None:
             continue
-        _prev = _ck.get("arch", {}).get(
-            "z_asinh", _ck.get("args", {}).get("z_asinh", 0.0))
-        if float(_prev) != float(args.z_asinh):
-            raise SystemExit(
-                f"{_name}: checkpoint was trained with --z-asinh {_prev} "
-                f"but this run asks for {args.z_asinh}; the obs z lanes "
-                f"would not match (pass the checkpoint's value)")
+        for _key, _flag, _mine in (("z_asinh", "--z-asinh", args.z_asinh),
+                                   ("z_far", "--z-far", args.z_far)):
+            _prev = _ck.get("arch", {}).get(
+                _key, _ck.get("args", {}).get(_key, 0.0))
+            if float(_prev) != float(_mine):
+                raise SystemExit(
+                    f"{_name}: checkpoint was trained with {_flag} {_prev} "
+                    f"but this run asks for {_mine}; the obs z lanes "
+                    f"would not match (pass the checkpoint's value)")
     if tensor_env and args.ranked_maps:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         from beat_arena_env.ranked_pool import load_ranked_pool
@@ -1201,6 +1214,7 @@ def main():
                       start_pose_jitter=args.start_pose_jitter,
                       crouch_start_prob=args.crouch_start_prob,
                       z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
+                      z_far=args.z_far,
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
@@ -1228,6 +1242,7 @@ def main():
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
+            z_far=args.z_far,
             self_contact_coef=args.self_contact_coef,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -1286,6 +1301,7 @@ def main():
     # env v48: record the obs z encoding in the arch so the bench / replay
     # tools and --resume/--init-from can match it (0 = legacy clamp)
     policy.arch["z_asinh"] = float(args.z_asinh)
+    policy.arch["z_far"] = float(args.z_far)        # env v49
     if args.value_head == "hl":
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
               f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "

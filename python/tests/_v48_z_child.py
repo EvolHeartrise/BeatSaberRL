@@ -17,6 +17,7 @@ import beat_arena_rs
 
 mode, c = sys.argv[1], float(sys.argv[2])
 assert os.environ.get("BEAT_Z_ASINH") == repr(c)
+zfar = float(os.environ.get("BEAT_Z_FAR", "0"))      # env v49 split mode
 SPEED = 20.0
 # same x/y so the nearest-first slot order is the z order: 5, 60, 80 m
 NOTES = [Note(hit_time=z / SPEED, col=2, row=1, x=0.3, y=1.4, color=1,
@@ -36,6 +37,7 @@ obs_r, _, _, _ = sim.step([0] * N_JOINTS)
 obs_r = np.asarray(obs_r)
 out = {"mask": [float(obs_r[OFF_NOTE_MASK + s]) for s in range(4)],
        "z": [lane(obs_r, s, 2) for s in range(4)],
+       "far": [lane(obs_r, s, 13) for s in range(4)],
        "wall_back": lane(obs_r, 3, 17), "is_wall": lane(obs_r, 3, 14)}
 
 if mode == "parity":
@@ -44,7 +46,7 @@ if mode == "parity":
     env = CudaBeatVecEnv(1, charts=[NOTES], walls=[[wall_tuple(w) for w in WALLS]],
                          max_steps=MAX_STEPS, gears=3, wide_acc=False,
                          device="cuda", dtype=torch.float64, auto_reset=False,
-                         foot_contact=False, seed=0, z_asinh=c)
+                         foot_contact=False, seed=0, z_asinh=c, z_far=zfar)
     env.reset()
     sim2 = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS, wide_acc=False,
                                     gears=3, foot_contact=False)
