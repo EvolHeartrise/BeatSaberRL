@@ -1,5 +1,5 @@
 <script>
-  import { store, loadMetrics, runById } from "./data.svelte.js";
+  import { store, loadIndex, loadMetrics, runById } from "./data.svelte.js";
   import { COMPARE_KEYS, DIFF_KEYS, X_MODES, xValues, seriesValues, hasAny,
     label, color, interp, rolling, atSamples, fmt, fmtSamples, parseSampleList } from "./series.js";
   import Chart from "./Chart.svelte";
@@ -85,6 +85,25 @@
 
   $effect(() => {
     for (const r of sel) if (!store.metrics[r.id] && !store.loading[r.id]) loadMetrics(r);
+  });
+
+  // auto-refresh every 15 s: re-read the index and re-fetch the selected runs
+  // that are still being written (finished/crashed runs never change).
+  let refreshing = $state(false);
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      await loadIndex();
+      const live = selected.map((id) => runById(id)).filter((r) => r && r.status !== "finished" && r.status !== "crashed");
+      await Promise.all(live.map((r) => loadMetrics(r, { force: true })));
+    } finally {
+      refreshing = false;
+    }
+  }
+  $effect(() => {
+    const h = setInterval(refresh, 15000);
+    return () => clearInterval(h);
   });
 </script>
 
