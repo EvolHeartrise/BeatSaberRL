@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--slots", type=int, nargs="+", default=[24, 32, 48])
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--out", default=os.path.join(PY, "bench/context_window_analysis.json"))
+    ap.add_argument("--out", default=os.path.join(PY, "analysis/context_window_analysis.json"))
     a = ap.parse_args()
     cat = json.load(open(a.catalog))
     jobs = []

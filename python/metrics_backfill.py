@@ -265,7 +265,11 @@ class Backfill:
             st = _stat(p)
             c = self.cache["bench"].get(key)
             if c is None or c.get("stat") != st or self.force:
-                c = {"stat": st, "summary": self._bench_summary(p, key)}
+                try:
+                    c = {"stat": st, "summary": self._bench_summary(p, key)}
+                except Exception as e:   # a non-bench JSON must not kill the scan
+                    log(f"  ! bench {key}: {e}", verbose=self.verbose)
+                    c = {"stat": st, "summary": None}
                 self.cache["bench"][key] = c
             summ = c["summary"]
             if summ and summ.get("run"):
@@ -299,7 +303,8 @@ class Backfill:
                 "wpp": d.get("total_weighted_pp"),
                 "upp": d.get("total_unweighted_pp"),
                 "n_evaluated": d.get("n_evaluated"),
-                "n_levels": len(d.get("levels") or []),
+                "n_levels": (len(d["levels"])
+                             if isinstance(d.get("levels"), list) else 0),
                 "scoring_version": d.get("scoring_version"),
                 "global_step": d.get("global_step"),
                 "updated": d.get("updated")}
