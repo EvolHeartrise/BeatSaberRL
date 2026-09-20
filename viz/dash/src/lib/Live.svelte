@@ -6,7 +6,6 @@
 
   let { xMode = $bindable("samples"), runId = $bindable(null) } = $props();
 
-  let auto = $state(true);
   let now = $state(Date.now());
   let refreshing = $state(false);
 
@@ -79,8 +78,7 @@
   });
 
   $effect(() => {
-    if (!auto) return;
-    const h = setInterval(refresh, 10000);
+    const h = setInterval(refresh, 15000);  // always on
     return () => clearInterval(h);
   });
 </script>
@@ -106,8 +104,7 @@
     {WIN_UNIT[xMode].label}
     <button class:on={!win[xMode]} onclick={() => setWin(0)}>all</button>
   </label>
-  <label class="auto"><input type="checkbox" bind:checked={auto} /> auto-refresh 10 s</label>
-  <button onclick={refresh} disabled={refreshing}>{refreshing ? "…" : "refresh now"}</button>
+  <span class="auto" title="auto-refreshes every 15 s">{refreshing ? "refreshing…" : "auto 15 s"}</span>
 </div>
 
 {#if run}

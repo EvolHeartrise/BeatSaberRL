@@ -50,7 +50,7 @@ def make_handler(archive):
         def log_message(self, fmt, *args):
             first = str(args[0]) if args else ""
             if "index.json" in first or "metrics" in first:
-                return  # the 10 s poll is noise
+                return  # the 15 s poll is noise
             super().log_message(fmt, *args)
 
     return H
