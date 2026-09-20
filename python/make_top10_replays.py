@@ -50,6 +50,10 @@ _W = {}          # per-process state: {"policy", "dev", "fc", "push"} (set by _w
 def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0),
                  tau_scale=None):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    # env v48: the checkpoint's obs z encoding; the rust sim reads
+    # BEAT_Z_ASINH once per process (this runs before any sim exists)
+    os.environ["BEAT_Z_ASINH"] = repr(float(ckpt.get("arch", {}).get(
+        "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0))))
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev

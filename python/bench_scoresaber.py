@@ -597,6 +597,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                          wide_acc=False, device=device, dtype=dtype,
                          auto_reset=False, want_contacts=False,
                          foot_contact=True, z_clip_hi=z_clip,
+                         z_asinh=float(os.environ.get("BEAT_Z_ASINH", "0")),
                          combo_walk=True, bench_refill=True, seed=0)
     ts = parse_tau_scale(args.tau_scale)
     if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
@@ -749,6 +750,16 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     mhash = model_hash(ckpt["state_dict"])
     policy = load_policy(ckpt)
+    # env v48: the obs z encoding is the CHECKPOINT's (arch, else the
+    # embedded args; pre-v48 checkpoints = 0 = legacy clamp). The rust sim
+    # reads BEAT_Z_ASINH once per process, so set it before any sim exists.
+    z_asinh = float(ckpt.get("arch", {}).get(
+        "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0)))
+    if os.environ.get("BEAT_Z_ASINH") not in (None, repr(z_asinh)):
+        sys.exit(f"BEAT_Z_ASINH={os.environ['BEAT_Z_ASINH']} disagrees with "
+                 f"the checkpoint's --z-asinh {z_asinh}; unset it")
+    os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
+    print(f"obs z lane: {'asinh(z / %g m)' % z_asinh if z_asinh > 0 else 'clamp / 8'} (from the checkpoint)", flush=True)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy = policy.to(device).eval()
