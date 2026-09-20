@@ -23,6 +23,9 @@ CHILD = os.path.join(HERE, "_v48_z_child.py")
 def run_child(mode, c, extra_env=None):
     env = dict(os.environ, BEAT_Z_ASINH=repr(float(c)))
     env.pop("BEAT_Z_CLIP_HI", None)
+    # the child is run by path, so its sys.path holds tests/, not python/
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.dirname(HERE)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
     env.update(extra_env or {})
     r = subprocess.run([sys.executable, CHILD, mode, repr(float(c))],
                        capture_output=True, text=True, env=env,
