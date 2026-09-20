@@ -10,7 +10,7 @@ def _groups(seed):
     shapes = [(192, 192)] * 4 + [(768, 192)] * 2 + [(192, 768)] * 2 + [(384, 384)] + [(384, 576)]
     ps = [torch.randn(*s, generator=g) for s in shapes]
     for p in ps:
-        p.grad = torch.randn_like(p, generator=g) if hash(tuple(p.shape)) % 7 else None
+        p.grad = torch.randn(p.shape, generator=g) if hash(tuple(p.shape)) % 7 else None
     return [{"params": ps[:7], "lr": 1e-3, "lr_mult": 1.0},
             {"params": ps[7:], "lr": 3e-3, "lr_mult": 3.0}]
 
