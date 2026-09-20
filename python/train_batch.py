@@ -2672,6 +2672,18 @@ def main():
                   flush=True)
             m_diag = dict(m_diag or {})
             m_diag["gn"] = gng_v
+            # per-INPUT-LANE norm of the note encoder's first-layer
+            # gradient: which of the 18 token lanes (+14 note-geo lanes)
+            # owns the note_mlp gradient (2026-09-20, v52-v54)
+            _w0 = policy.note_mlp[0].weight
+            if _w0.grad is not None:
+                _col = _w0.grad.detach().float().norm(dim=0).tolist()
+                _top = sorted(enumerate(_col), key=lambda kv: -kv[1])[:8]
+                print(f"[gnorm-lanes] upd {update + 1}  note_mlp[0] "
+                      f"{sum(v * v for v in _col) ** 0.5:.2f}  "
+                      + "  ".join(f"lane{i} {v:.2f}" for i, v in _top),
+                      flush=True)
+                m_diag["gn_lanes"] = [round(v, 4) for v in _col]
 
         m_ckpt = m_vram = None
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
