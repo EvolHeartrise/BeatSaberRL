@@ -120,7 +120,7 @@ def update_record(update, num_updates, global_step, *, t=None,
                   cf_first=None, cf_last=None, gnorm=None, clipc=None,
                   ent_head=None, af_ratio=None, events=None,
                   diag=None, ckpt=None, peak_vram=None, cfh_last=None,
-                  pnorm_actor=None, pnorm_critic=None):
+                  pnorm_actor=None, pnorm_critic=None, kl_stop=None):
     """The trainer's formatter: one per-update dict from host values.
 
     `update` is the 1-based index the `update` line prints. `events`
@@ -162,6 +162,8 @@ def update_record(update, num_updates, global_step, *, t=None,
         rec["entfull"] = _num(total)
     rec["afsd"] = _num(af_ratio)
     rec["clipfrac_head_last"] = _num(cfh_last)   # --head-clip only
+    if kl_stop is not None:
+        rec["kl_stop_mb"] = int(kl_stop)          # --target-kl only
     for k, v in (events or {}).items():
         if k in ("flail", "flail_L", "flail_R", "limitrest",
                  "limitrest_legs", "limitrest_spine", "limitrest_arms",
