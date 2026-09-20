@@ -2636,15 +2636,16 @@ def main():
                                  cfh_v if head_clip else None,
                                  kl_stop=kl_stop_mb),
                   flush=True)
-            if gn_sq:
-                gng_v = {k: float(v.sqrt()) for k, v in gn_sq.items()}
-                print(f"[gnorm] upd {update + 1}  total "
-                      f"{sum(v * v for v in gng_v.values()) ** 0.5:.2f}  "
-                      + "  ".join(f"{k} {v:.2f}" for k, v in
-                                  sorted(gng_v.items(), key=lambda kv: -kv[1])),
-                      flush=True)
-                m_diag = dict(m_diag or {})
-                m_diag["gn"] = gng_v
+        if gn_sq:
+            # (both print branches above lead here)
+            gng_v = {k: float(v.sqrt()) for k, v in gn_sq.items()}
+            print(f"[gnorm] upd {update + 1}  total "
+                  f"{sum(v * v for v in gng_v.values()) ** 0.5:.2f}  "
+                  + "  ".join(f"{k} {v:.2f}" for k, v in
+                              sorted(gng_v.items(), key=lambda kv: -kv[1])),
+                  flush=True)
+            m_diag = dict(m_diag or {})
+            m_diag["gn"] = gng_v
 
         m_ckpt = m_vram = None
         if args.ckpt_every > 0 and (update + 1) % args.ckpt_every == 0:
