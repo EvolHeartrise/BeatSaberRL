@@ -205,7 +205,7 @@ def entropy_report(ent_head):
 
 
 def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
-                   af_ratio=None, cfh=None):
+                   af_ratio=None, cfh=None, kl_stop=None):
     """The `[kl]` diagnostic line (2026-09-02, Tier 0.3 of the 09-02
     static audit). `mb1/mbN` = first/last minibatch of THIS update, so
     the pair brackets the within-update drift over 64 optimizer steps.
@@ -229,7 +229,8 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
             f"  clipfrac {cff:.4f}/{cfl:.4f}{ch}"
             f"  gnorm {gnorm:.3f}  clipc {clipc:.3f}"
             f"  ent/head {gs}  min {lo_v:.3f} (h{lo})"
-            f"  entfull {total:.3f}{af}")
+            f"  entfull {total:.3f}{af}"
+            + ("" if kl_stop is None else f"  STOP@mb{kl_stop}"))
 
 
 def parse_args():
@@ -300,6 +301,17 @@ def parse_args():
     # 09-03 T=64 run). With per-head ratios each head is clipped on its
     # own pi_new/pi_old (pg_loss_heads). Costs a (T, N, 29) fp32
     # per-head log-prob buffer (+243 MB at 32768x64) and its perm copy.
+    p.add_argument("--target-kl", type=float, default=0.0,
+                   help="KL early stop (opt-in; 2026-09-20 after v52's "
+                        "update-561 runaway: last-minibatch KL 0.2 -> 52 "
+                        "in three updates, ratio 144, 2,000 falls). Every "
+                        "--kl-check-every minibatches the k3 approx KL of "
+                        "the current minibatch vs the rollout policy is "
+                        "read (one host sync); past this value the rest of "
+                        "the update is skipped. Healthy updates run 0.2-0.3 "
+                        "at the last minibatch; 0 = off (every run before)")
+    p.add_argument("--kl-check-every", type=int, default=4,
+                   help="minibatch stride of the --target-kl probe")
     p.add_argument("--clip", type=float, default=CLIP,
                    help="joint PPO ratio clip epsilon (the CLIP constant; "
                         "0.3 since 2026-09-15 — the ladder: 0.3 beat 0.2 "
@@ -2046,7 +2058,10 @@ def main():
                       "srank_dim": int(h_d.shape[1]), "psrank": psrank,
                       "groups": {nm: [a, b] for nm, a, b in per_gv}}
 
+        kl_stop_mb = None   # --target-kl: minibatch index the update stopped at
         for ep_i in range(args.epochs):
+            if kl_stop_mb is not None:
+                break
             # device-side shuffle: a host-side index array costs a
             # synchronizing pageable H2D copy per minibatch (~26 ms/update
             # measured on WDDM). Permute each flat tensor ONCE per epoch
@@ -2060,6 +2075,8 @@ def main():
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
             p_logp_h = f_logp_h[perm] if head_clip else None
             for s in range(0, train_n, mb_size):
+                if kl_stop_mb is not None:
+                    break
                 # advantage stats over the FULL minibatch so --mb-accum
                 # K>1 is the same math as K=1 (each micro loss is a
                 # mean over an equal slice; the (1/K)-scaled sum of
@@ -2112,6 +2129,23 @@ def main():
                     else:
                         logratio = newlogp - p_logp[sl]
                     ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
+                    if (args.target_kl > 0 and j == 0 and s > 0
+                            and (s // mb_size) % args.kl_check_every == 0):
+                        # --target-kl probe: k3 approx KL of THIS
+                        # minibatch vs the rollout policy, one host sync.
+                        # Past the target the update ends here: no
+                        # backward has run for this minibatch and grads
+                        # were zeroed above, so nothing partial is
+                        # applied. kl_last/cf_last take the probe's
+                        # values so the [kl] line and metrics show the
+                        # drift that tripped it.
+                        _r = ratio.detach() - 1.0
+                        _kl = (_r - logratio.detach()).mean()
+                        if float(_kl) > args.target_kl:
+                            kl_stop_mb = s // mb_size
+                            kl_last.copy_(_kl)
+                            cf_last.copy_((_r.abs() > CLIP).to(_r.dtype).mean())
+                            break
                     if fp16_update:
                         # overflow forensics (device-side, read at the
                         # print sync): a max|logratio| near ~88 fingers
@@ -2168,6 +2202,8 @@ def main():
                         (loss * fp16_scale).backward()
                     else:
                         loss.backward()
+                if kl_stop_mb is not None:
+                    break
                 if fp16_update:
                     # dynamic loss scale, ZERO host syncs: unscale + flag
                     # non-finites in one kernel over the FLAT grad
@@ -2552,7 +2588,8 @@ def main():
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
                                  af_v if adv_filter_on else None,
-                                 cfh_v if head_clip else None),
+                                 cfh_v if head_clip else None,
+                                 kl_stop=kl_stop_mb),
                   flush=True)
         else:
             # one stacked read = one sync, same as the old ent .item()
@@ -2581,7 +2618,8 @@ def main():
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
                                  af_v if adv_filter_on else None,
-                                 cfh_v if head_clip else None),
+                                 cfh_v if head_clip else None,
+                                 kl_stop=kl_stop_mb),
                   flush=True)
 
         m_ckpt = m_vram = None
@@ -2636,7 +2674,7 @@ def main():
             gnorm=gn_v, clipc=cc_v, ent_head=eh_v,
             af_ratio=af_v if adv_filter_on else None,
             cfh_last=cfh_v if head_clip else None, events=m_ev,
-            pnorm_actor=pna_v, pnorm_critic=pnc_v,
+            pnorm_actor=pna_v, pnorm_critic=pnc_v, kl_stop=kl_stop_mb,
             diag=m_diag, ckpt=m_ckpt, peak_vram=m_vram)
         if args.time_cap > 0 and elapsed > args.time_cap:
             print(f"Reached --time-cap {args.time_cap:.0f}s.", flush=True)
