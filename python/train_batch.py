@@ -390,20 +390,29 @@ def parse_args():
                    help="v28: obs z-lane upper clamp in meters (exact-"
                         "timing lookahead = z_clip_hi / note speed). "
                         "12.0 = every pre-v28 era; CUDA env only")
-    p.add_argument("--z-asinh", type=float, default=0.0,
+    p.add_argument("--z-asinh", type=float, default=None,
                    help="env v48: obs z lanes (note z / wall front, wall "
                         "back) = asinh(max(z, -0.65) / C) with C in metres "
                         "— linear near the cut plane, log far out, no upper "
-                        "clamp (--z-clip-hi is then unused). 0 = legacy "
-                        "clamp / 8. Recorded in the checkpoint (arch + "
-                        "args); the bench/replay tools read it from there")
-    p.add_argument("--note-geo-norm", action="store_true",
-                   help="2026-09-21 (user): note-geo lanes normalised to "
-                        "O(1) — z decoded from the lane's true encoding, "
-                        "per-hand z offset and distance as asinh(m/8), "
-                        "seconds-to-plane / 3. Arch marker 'note_geo_norm'. "
-                        "Fixes the note encoder's second-layer gradient "
-                        "(far tokens' raw-metre hidden activations)")
+                        "clamp (--z-clip-hi is then unused). DEFAULT 8 for "
+                        "a fresh run (the recipe since 2026-09-21, v55: "
+                        "gradient 3-4 vs 5-7 legacy, no KL stops); a "
+                        "--resume/--init-from run inherits the checkpoint's "
+                        "value when the flag is not given. 0 = legacy "
+                        "clamp / 8 (every run before v52). Recorded in the "
+                        "checkpoint (arch + args); the bench/replay tools "
+                        "read it from there")
+    p.add_argument("--note-geo-norm", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="note-geo lanes normalised to O(1) — z decoded from "
+                        "the lane's true encoding, per-hand z offset and "
+                        "distance as asinh(m/8), seconds-to-plane / 3. Arch "
+                        "marker 'note_geo_norm'. DEFAULT ON since "
+                        "2026-09-21 (v55: fixed the note encoder's second-"
+                        "layer gradient — far tokens' raw-metre hidden "
+                        "activations). --no-note-geo-norm = the pre-v55 "
+                        "lanes bit for bit (fresh runs only; a loaded "
+                        "checkpoint carries its own marker)")
     p.add_argument("--z-far", type=float, default=0.0,
                    help="env v49 (2026-09-20): split z lanes. Lane 13 = "
                         "0.5 ln(1 + max(z - F, 0) / F) with F metres (zero "
@@ -1168,6 +1177,18 @@ def main():
     if args.z_clip_hi != 12.0 and args.env != "cuda":
         raise SystemExit("--z-clip-hi: the rust backend reads "
                          "BEAT_Z_CLIP_HI instead (CUDA env only here)")
+    if args.z_asinh is None:
+        # recipe default (2026-09-21): C = 8 m for a fresh run; a resumed
+        # or warm-started run keeps the checkpoint's encoding so pre-v52
+        # checkpoints (legacy clamp, 0) still load without the flag
+        _ck = resume_ckpt if resume_ckpt is not None else init_ckpt
+        if _ck is not None:
+            args.z_asinh = float(_ck.get("arch", {}).get(
+                "z_asinh", _ck.get("args", {}).get("z_asinh", 0.0)))
+            print(f"--z-asinh not given: inherited {args.z_asinh:g} from "
+                  f"the checkpoint", flush=True)
+        else:
+            args.z_asinh = 8.0
     if args.z_asinh < 0:
         raise SystemExit("--z-asinh must be >= 0 (metres; 0 = off)")
     # env v48: the rust twin reads BEAT_Z_ASINH once per process — set it
