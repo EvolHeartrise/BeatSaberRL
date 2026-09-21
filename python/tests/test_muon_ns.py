@@ -22,16 +22,37 @@ def _sv(x):
     return torch.linalg.svdvals(x.double())
 
 
+def _poly(coefs, x):
+    for a, b, c in coefs:
+        x = a * x + b * x ** 3 + c * x ** 5
+    return x
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 def test_spectra(shape):
     g = torch.randn(*shape, generator=torch.Generator().manual_seed(0))
-    sj = _sv(tb.newton_schulz5(g, coefs=tb.MUON_NS_SCHEDULES["jordan"]))
-    st = _sv(tb.newton_schulz5(g, coefs=tb.MUON_NS_SCHEDULES["tuned"]))
-    # a Gaussian matrix's normalised singular values sit well above 1e-2,
-    # so the analytic bands apply: jordan [0.68, 1.13], tuned [0.98, 1.03]
-    assert 0.65 <= sj.min() and sj.max() <= 1.16, (sj.min(), sj.max())
-    assert 0.97 <= st.min() and st.max() <= 1.04, (st.min(), st.max())
-    assert (st.max() - st.min()) < (sj.max() - sj.min()) / 3
+    s_in = _sv(g / g.norm())                 # the NS input spectrum
+    for name, lo, hi in (("jordan", 0.65, 1.16), ("tuned", 0.97, 1.04)):
+        co = tb.MUON_NS_SCHEDULES[name]
+        out = _sv(tb.newton_schulz5(g, coefs=co))
+        # the iteration is a polynomial in G G^T, so it maps each singular
+        # value through the schedule's composed polynomial (fp32 vs
+        # float64 drift is ~1e-4 after five quintic steps)
+        expect = _poly(co, s_in)
+        assert torch.allclose(out.sort().values, expect.sort().values,
+                              atol=2e-3, rtol=1e-3), name
+        # the analytic bands (jordan [0.68, 1.13], tuned [0.98, 1.03]) hold
+        # for input sigma >= 0.01; a square Gaussian matrix also has
+        # singular values near 0 (Marchenko-Pastur) that neither schedule
+        # lifts (both reach ~2e-3), so mask those
+        m = s_in >= 0.01
+        assert m.sum() > 0.5 * len(s_in)
+        assert lo <= expect[m].min() and expect[m].max() <= hi, (
+            name, expect[m].min(), expect[m].max())
+        assert expect.max() <= 1.21          # nothing overshoots, ever
+    sj, st = (_poly(tb.MUON_NS_SCHEDULES[n], s_in) for n in ("jordan", "tuned"))
+    m = s_in >= 0.01
+    assert (st[m].max() - st[m].min()) < (sj[m].max() - sj[m].min()) / 3
 
 
 @pytest.mark.parametrize("shape", SHAPES[:3])
