@@ -368,6 +368,14 @@ def parse_args():
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
+    p.add_argument("--muon-ns", choices=sorted(MUON_NS_SCHEDULES),
+                   default="jordan",
+                   help="Newton-Schulz coefficient schedule: jordan = one "
+                        "quintic x 5, singular values land in [0.68, 1.13] "
+                        "(every Muon run before v56); tuned = the "
+                        "modded-nanogpt 2025-02-14 per-step schedule that "
+                        "PufferLib 5.0 ships (same five matmul triples, "
+                        "[0.98, 1.03], flat past 1). See MUON_NS_SCHEDULES")
     p.add_argument("--muon-batched", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="shape-grouped bmm Newton-Schulz (5 chains per "
@@ -824,26 +832,48 @@ def parse_args():
 
 
 MUON_NS_COEFS = (3.4445, -4.7750, 2.0315)   # Jordan's quintic, 5 steps
+# Newton-Schulz coefficient schedules (--muon-ns), one (a, b, c) per step,
+# p(x) = a x + b x^3 + c x^5 applied to the singular values:
+#   jordan  Keller Jordan's single quintic x 5 — max slope at 0 (3.44),
+#           p(1) = 0.70, so it never converges: after 5 steps the
+#           singular values of a normalised input land in [0.68, 1.13]
+#           (sigma >= 0.01). Every Muon run before v56.
+#   tuned   modded-nanogpt medium-track record 4 (2025-02-14, leloykun /
+#           You Jiacheng), the schedule PufferLib 5.0 ships in
+#           src/algo.cu: steeper start (4.08) and two polishing steps
+#           with p(1) -> 0.94, 0.99, so the same five matmul triples
+#           return singular values in [0.98, 1.03] and stay flat past 1
+#           (1.05 -> 1.03; Jordan's flips it to 0.68). NOT Polar Express
+#           (that is the Sept-2025 set starting 8.16 / -22.5 / 15.9).
+MUON_NS_SCHEDULES = {
+    "jordan": (MUON_NS_COEFS,) * 5,
+    "tuned": ((4.0848, -6.8946, 2.9270),
+              (3.9505, -6.3029, 2.6377),
+              (3.7418, -5.5913, 2.3037),
+              (2.8769, -3.1427, 1.2046),
+              (2.8366, -3.0525, 1.2012)),
+}
 
 
 @torch.no_grad()
-def newton_schulz5(g, steps=5, eps=1e-7):
+def newton_schulz5(g, steps=5, eps=1e-7, coefs=None):
     """Orthogonalize a 2-D gradient: the nearest orthogonal matrix by five
-    quintic Newton-Schulz iterations (singular values land in ~(0.7, 1.3)).
+    quintic Newton-Schulz iterations (singular values land in ~(0.7, 1.3)
+    under the jordan schedule, ~(0.98, 1.03) under tuned). `coefs` = one
+    (a, b, c) per step (MUON_NS_SCHEDULES); None = jordan x steps.
     Tall matrices are transposed so the iteration runs on the small
     Gram matrix. fp32 here — the matrices are <= 512 wide."""
     x = g / (g.norm() + eps)
     tall = x.shape[0] > x.shape[1]
     if tall:
         x = x.T
-    a, b, c = MUON_NS_COEFS
-    for _ in range(steps):
+    for a, b, c in (coefs or (MUON_NS_COEFS,) * steps):
         s = x @ x.T
         x = a * x + (b * s + c * (s @ s)) @ x
     return x.T if tall else x
 
 
-def newton_schulz5_batched(G, steps=5, eps=1e-7):
+def newton_schulz5_batched(G, steps=5, eps=1e-7, coefs=None):
     """newton_schulz5 over a stack (k, m, n) of same-shaped matrices in
     one bmm chain (2026-09-19): the eager per-matrix loop is 27 x 5
     tiny launches per optimizer step, ~30k launches per update, and on a
@@ -854,8 +884,7 @@ def newton_schulz5_batched(G, steps=5, eps=1e-7):
     tall = x.shape[1] > x.shape[2]
     if tall:
         x = x.transpose(1, 2)
-    a, b, c = MUON_NS_COEFS
-    for _ in range(steps):
+    for a, b, c in (coefs or (MUON_NS_COEFS,) * steps):
         s = x @ x.transpose(1, 2)
         x = a * x + (b * s + c * (s @ s)) @ x
     return x.transpose(1, 2) if tall else x
@@ -870,9 +899,13 @@ class Muon:
     read from p.grad (the flat fp32 buffer's views), after the trainer's
     unscale / overflow-zero / global clip."""
 
-    def __init__(self, param_groups, momentum=0.95, batched=True):
+    def __init__(self, param_groups, momentum=0.95, batched=True,
+                 ns="jordan"):
         self.param_groups = param_groups
         self.momentum = float(momentum)
+        # --muon-ns: the Newton-Schulz coefficient schedule (2026-09-21)
+        self.ns = str(ns)
+        self.ns_coefs = MUON_NS_SCHEDULES[self.ns]
         # batched (default since 2026-09-19): shape-grouped bmm Newton-
         # Schulz + foreach momentum — 5 NS chains per step instead of 27.
         # Measured -2.5% s/update on the VastAI Xeon host (ABAB), ~0 on a
@@ -903,7 +936,8 @@ class Muon:
                 byshape[tuple(p.shape)].append(i)
             outs = [None] * len(ps)
             for shp, idx in byshape.items():
-                o = newton_schulz5_batched(torch.stack([upds[i] for i in idx]))
+                o = newton_schulz5_batched(
+                    torch.stack([upds[i] for i in idx]), coefs=self.ns_coefs)
                 o = o * (-lr * 0.2 * math.sqrt(max(shp)))
                 for k, i in enumerate(idx):
                     outs[i] = o[k]
@@ -922,7 +956,7 @@ class Muon:
                 buf = self.state[p]
                 buf.mul_(mu).add_(p.grad)
                 upd = p.grad.add(buf, alpha=mu)          # Nesterov
-                o = newton_schulz5(upd)
+                o = newton_schulz5(upd, coefs=self.ns_coefs)
                 scale = 0.2 * math.sqrt(max(p.shape[0], p.shape[1]))
                 p.add_(o, alpha=-lr * scale)
 
@@ -931,7 +965,7 @@ class Muon:
             p.grad = None
 
     def state_dict(self):
-        return {"momentum": self.momentum,
+        return {"momentum": self.momentum, "ns": self.ns,
                 "bufs": [self.state[p].detach().cpu() for p in self._params()]}
 
     def load_state_dict(self, sd):
@@ -1465,7 +1499,8 @@ def main():
             [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
              {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
               "lr_mult": args.critic_lr_mult}],
-            momentum=args.muon_momentum, batched=args.muon_batched)
+            momentum=args.muon_momentum, batched=args.muon_batched,
+            ns=args.muon_ns)
         if resume_ckpt is not None:
             if not resume_ckpt.get("muon"):
                 raise SystemExit("--resume into --optimizer muon needs a "
@@ -1475,7 +1510,8 @@ def main():
         n_a = sum(p.numel() for g in opt.param_groups for p in g["params"])
         print(f"--optimizer muon: Muon on {len(muon_names)} hidden "
               f"matrices ({n_m:,} params; momentum {args.muon_momentum}, "
-              f"RMS-matched 0.2*sqrt(max(A,B))), Adam on the remaining "
+              f"NS schedule {args.muon_ns}, RMS-matched "
+              f"0.2*sqrt(max(A,B))), Adam on the remaining "
               f"{n_a:,} params", flush=True)
     # every lr-carrying group (Adam's two, plus Muon's two when on): the
     # schedule loop and --weight-decay walk this list
