@@ -221,17 +221,35 @@ _X_NORM, _Y_NORM, _Z_SCALE, _V_NORM = 1.0, 0.75, 8.0, 6.0
 _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
 
 
-def _note_geo(notes: torch.Tensor, sabers: torch.Tensor) -> torch.Tensor:
+def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
+              z_asinh: float = 0.0) -> torch.Tensor:
     """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
-    (B, 24, 14) geometry lanes (fp32; the caller casts with the notes)."""
+    (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
+
+    norm=False (every checkpoint before 2026-09-21): metres and seconds,
+    z decoded as lane 2 x 8 (wrong beyond ~8 m under --z-asinh).
+    norm=True (arch marker 'note_geo_norm', user 2026-09-21): every lane
+    O(1) — z decoded from the lane's true encoding (c sinh(lane) under
+    --z-asinh c, the linear lane otherwise), the per-hand offset's z and
+    the distance compressed as asinh(m / 8) (the lane-2 shape), x/y
+    offsets in half-metres as before, seconds-to-plane / 3. Motivation:
+    [gnorm-lanes] on v52-v54 put the note encoder's excess gradient in
+    its second layer, fed by far tokens' large hidden activations from
+    these raw-metre lanes."""
+    if norm and z_asinh > 0:
+        z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
+    else:
+        z_m = notes[..., 2] * _Z_SCALE
     npos = torch.stack([notes[..., 0] * _X_NORM, notes[..., 1] * _Y_NORM,
-                        notes[..., 2] * _Z_SCALE], -1)          # (B,24,3) m
+                        z_m], -1)                                # (B,24,3) m
     cutd = torch.stack([notes[..., 6], notes[..., 7],
                         torch.zeros_like(notes[..., 6])], -1)   # (B,24,3)
     not_wall = 1.0 - notes[..., 14:15]                          # (B,24,1)
     # seconds to the head plane: z / speed with speed = -lane3 * Z_SCALE
     speed = (-notes[..., 3:4] * _Z_SCALE).clamp_min(1e-3)
-    tpl = (notes[..., 2:3] * _Z_SCALE / speed).clamp(-0.5, 3.0)
+    tpl = (z_m[..., None] / speed).clamp(-0.5, 3.0)
+    if norm:
+        tpl = tpl / 3.0
     feats = []
     for hnd in range(2):
         w = sabers[:, hnd]                                       # (B,32)
@@ -240,6 +258,12 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor) -> torch.Tensor:
                             w[:, _S_WPOS + 2]], -1)              # (B,3) m
         dp = (npos - wpos[:, None]) * 0.5                        # (B,24,3)
         dist = dp.norm(dim=-1, keepdim=True)
+        if norm:
+            # z offset and distance: asinh(m / 8) keeps the near field
+            # linear (2 dp units = 1 m) and bounds far tokens (~3 at
+            # 100 m, ~7 at 2 km) instead of raw half-metres
+            dp = torch.cat([dp[..., :2], torch.asinh(dp[..., 2:3] * 2.0 / 8.0)], -1)
+            dist = torch.asinh(dist * 2.0 / 8.0)
         v = w[:, _S_WVEL:_S_WVEL + 3] * _V_NORM                  # (B,3) m/s
         vhat = v / (v.norm(dim=-1, keepdim=True) + 0.05)
         vdot = (vhat[:, None] * cutd).sum(-1, keepdim=True) * not_wall
@@ -476,6 +500,7 @@ class NotePolicy(nn.Module):
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
                  critic: str = "adapool_v1", note_geo: bool = False,
+                 note_geo_norm: bool = False,
                  value_bins: int = 0, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_arch: str = "mlp", trunk_hidden: int | None = None):
@@ -500,6 +525,7 @@ class NotePolicy(nn.Module):
                      "ffn_mult": ffn_mult, "critic": critic,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True,
                      "note_geo": bool(note_geo),
+                     "note_geo_norm": bool(note_geo_norm),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
                      # layout. "mlp" = the plain Linear-ReLU-Linear every
                      # checkpoint before this date used (absent marker =
@@ -525,6 +551,7 @@ class NotePolicy(nn.Module):
             self.value_sigma = float(value_sigma) * float(centers[1] - centers[0])
         self._value_logits = None
         self.note_geo = bool(note_geo)
+        self.note_geo_norm = bool(note_geo_norm)
         self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
                               embed, embed])
@@ -683,7 +710,9 @@ class NotePolicy(nn.Module):
         if self.note_geo:
             # fp32 geometry from the fp32 obs slices, then one cast+copy
             notes = torch.cat(
-                [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT))],
+                [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT),
+                                  norm=self.note_geo_norm,
+                                  z_asinh=float(self.arch.get("z_asinh", 0.0)))],
                 dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
@@ -1074,6 +1103,7 @@ def load_policy(ckpt) -> NotePolicy:
         critic=arch.get("critic", "linear_v0"),
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
         note_geo=arch.get("note_geo", False),
+        note_geo_norm=arch.get("note_geo_norm", False),   # 2026-09-21
         # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
         trunk_arch=arch.get("trunk_arch", "mlp"),
         trunk_hidden=arch.get("trunk_hidden"),

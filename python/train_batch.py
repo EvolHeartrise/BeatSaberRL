@@ -397,6 +397,13 @@ def parse_args():
                         "clamp (--z-clip-hi is then unused). 0 = legacy "
                         "clamp / 8. Recorded in the checkpoint (arch + "
                         "args); the bench/replay tools read it from there")
+    p.add_argument("--note-geo-norm", action="store_true",
+                   help="2026-09-21 (user): note-geo lanes normalised to "
+                        "O(1) — z decoded from the lane's true encoding, "
+                        "per-hand z offset and distance as asinh(m/8), "
+                        "seconds-to-plane / 3. Arch marker 'note_geo_norm'. "
+                        "Fixes the note encoder's second-layer gradient "
+                        "(far tokens' raw-metre hidden activations)")
     p.add_argument("--z-far", type=float, default=0.0,
                    help="env v49 (2026-09-20): split z lanes. Lane 13 = "
                         "0.5 ln(1 + max(z - F, 0) / F) with F metres (zero "
@@ -1292,6 +1299,7 @@ def main():
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
                             note_geo=args.note_geo,
+                            note_geo_norm=args.note_geo_norm,
                             trunk_arch=args.trunk_arch,
                             trunk_hidden=args.trunk_hidden,
                             value_bins=(args.hl_bins
