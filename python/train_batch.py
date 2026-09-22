@@ -2386,22 +2386,24 @@ def main():
                               f"{float(C[:, 9].max()):.1f})  FC {100 * fc:.1f}%  "
                               f"breaks {float(C[:, 11].mean()):.2f}  "
                               f"maxcombo {float(C[:, 10].mean()):.0f}", flush=True)
-            if update % 25 == 0 and tau_recent:
-                R = np.concatenate(tau_recent)
-                R = R[R[:, 16] >= 60]           # skip lead-only episodes
-                if R.shape[0] >= 200:
-                    from beat_arena_env.constants import TAU_GROUPS
-                    fell = R[:, 18]
-                    parts = []
-                    for g, axes in TAU_GROUPS.items():
-                        x = (R[:, list(axes)].mean(1) - 1.0) / 0.25
-                        xc = x - x.mean()
-                        den = float((xc * xc).sum())
-                        slope = float((xc * (fell - fell.mean())).sum() / den) if den > 0 else 0.0
-                        parts.append(f"{g} {slope:+.4f}")
-                    print(f"[tau] {tau_n_episodes:,} episodes logged | fall rate "
-                          f"{fell.mean():.4f} over the last {R.shape[0]:,} | "
-                          f"d(fall)/d(+25%) " + "  ".join(parts), flush=True)
+        # [tau] fall slope: reads only tau_recent (filled under --tau-rand),
+        # so it is independent of --ep-stats and of this update's pop
+        if update % 25 == 0 and tau_recent:
+            R = np.concatenate(tau_recent)
+            R = R[R[:, 16] >= 60]           # skip lead-only episodes
+            if R.shape[0] >= 200:
+                from beat_arena_env.constants import TAU_GROUPS
+                fell = R[:, 18]
+                parts = []
+                for g, axes in TAU_GROUPS.items():
+                    x = (R[:, list(axes)].mean(1) - 1.0) / 0.25
+                    xc = x - x.mean()
+                    den = float((xc * xc).sum())
+                    slope = float((xc * (fell - fell.mean())).sum() / den) if den > 0 else 0.0
+                    parts.append(f"{g} {slope:+.4f}")
+                print(f"[tau] {tau_n_episodes:,} episodes logged | fall rate "
+                      f"{fell.mean():.4f} over the last {R.shape[0]:,} | "
+                      f"d(fall)/d(+25%) " + "  ".join(parts), flush=True)
         # env v41 self-contact telemetry: mean self-collision impulse
         # per env-tick (N.s) and the share of env-ticks with any
         # body-on-body contact — accumulates at coef 0 too, so the
