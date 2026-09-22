@@ -452,9 +452,11 @@ and the file works fully offline. Controls: space play/pause, ←/→
 tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
 (MediaRecorder → .webm). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
-`python/record_replay.py` records episodes from a checkpoint / the
-scripted bot / random (`--tag` prefixes filenames); logged rewards are
-the raw interpretable ones.
+`python/record_replay.py` records episodes of the scripted bot or
+random actions on procedural charts (`--tag` prefixes filenames);
+logged rewards are the raw interpretable ones. Checkpoint replays come
+from `python/make_top10_replays.py`, which sets up the production
+physics and plays the bench's real maps.
 Every interesting run should be recorded.
 
 ## Scripted reference bot (`beat_arena_env/scripted.py`)
@@ -738,8 +740,7 @@ points = pre + acc (+30 on arc-headed free_post grants; links/posts/
 errors carry zeros), and all three sims track per-episode
 `score_pre/score_acc/score_post` totals (Rust `score_components()` /
 `VecBeatSim.components(i)`; torch/CUDA env tensors; f64-parity-pinned
-across all three; replay cut events carry `pre`/`acc`; eval_ckpt
-prints the per-note decomposition; bench level entries carry the
+across all three; replay cut events carry `pre`/`acc`; bench level entries carry the
 totals) — plus getters
 `sabers()` (per hand `q(6) ++ om(6) ++ wrist(3)`), `blades()` (unit
 blade dirs), `status()` (0 pending / 1 good / 2 bad·bomb-hit / 3 missed
