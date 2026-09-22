@@ -269,7 +269,7 @@ def parse_args():
     p.add_argument("--clip", type=float, default=CLIP,
                    help="joint PPO ratio clip epsilon (the CLIP constant; "
                         "0.3 since 2026-09-15 — the ladder: 0.3 beat 0.2 "
-                        "by +1.7% bench, 0.4 lost −8.9% while training acc "
+                        "by +1.7%% bench, 0.4 lost −8.9%% while training acc "
                         "barely moved; 0.2 was the value from the start). "
                         "Also the clipfrac threshold in the [kl] "
                         "diagnostics")
@@ -510,7 +510,7 @@ def parse_args():
     p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="simba",
                    help="readout-trunk layout (2026-09-15, brainstorm item "
                         "2). simba = DEFAULT since 2026-09-15 (user "
-                        "decision: +0.66 pt trunk, +2.0% bench at matched "
+                        "decision: +0.66 pt trunk, +2.0%% bench at matched "
                         "clip 0.3): Linear projection -> residual block "
                         "x + fc2(relu(fc1(LN x))) -> LN (SimBa 2410.09754). "
                         "mlp = plain Linear-ReLU-Linear, reproduces the "
