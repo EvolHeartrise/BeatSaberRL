@@ -64,7 +64,7 @@ def test_flat_past_one():
 
 
 @pytest.mark.parametrize("shape", SHAPES[:3])
-def test_batched_matches():
+def test_batched_matches(shape):
     gen = torch.Generator().manual_seed(1)
     gs = [torch.randn(*shape, generator=gen) for _ in range(4)]
     bat = tb.newton_schulz5_batched(torch.stack(gs))
