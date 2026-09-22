@@ -45,10 +45,10 @@ class RustBeatEnv(gym.Env):
 
         foot_contact: REQUIRED keyword (no default) — env v11 foot_mode
         (unilateral-contact spec §1). True = unilateral frictional ground
-        contact on the 8 sole corners, with the fall termination at root
-        y < 0.55 m: the ONLY production mode (every ckpt is contact-
-        trained). False = the retired v10 foot welds, kept as a TEST
-        HARNESS only. Required so no caller silently gets weld physics
+        contact on the 8 sole corners, with the fall (root y below
+        FALL_ROOT_Y, rust/src/lib.rs) and chest-tilt terminations: the
+        ONLY production mode (every ckpt is contact-trained). False =
+        the retired v10 foot welds, kept as a TEST HARNESS only. Required so no caller silently gets weld physics
         by forgetting it."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
