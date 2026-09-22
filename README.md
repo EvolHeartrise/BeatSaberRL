@@ -356,9 +356,7 @@ error and capped accuracy at 0.870 = 100/115). **Real maps play at
 their real NJS since 2026-07-30** — the speed_scale rescale (NJS×0.3)
 is removed. Bench results stamp `scoring_version` (2 = cut-plane acc
 at 0.3× speeds, 3 = real speeds) and never merge across rules —
-pre-v3 numbers are a different physics regime. `--wide-acc` (30·clamp(1 − d/0.6), unrounded, training
-only) is opt-in: it loses at 400M but is the strongest takeoff
-accelerator measured for short legs.
+pre-v3 numbers are a different physics regime.
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
 

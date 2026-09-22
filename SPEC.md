@@ -209,18 +209,6 @@ checkpoints/replays retire (hard replace).
     floored early cuts at ~0 — the source of the 0.870 (= 100/115)
     accuracy ceiling. Bench results carry `scoring_version` (2 since
     this fix); versions never merge.
-    **Wide-acc TRAINING mode (2026-07-29, user-directed)**: with
-    `wide_acc=true` (a sim-construction flag, default false) the
-    component becomes `30 · clamp(1 − d / 0.6, 0, 1)`, UNROUNDED —
-    double the range and reward (applies to the same cut-plane `d`).
-    Training-gym only; `train_batch.py` default OFF since the
-    cut-plane fix (a 400M head-to-head lost to real scoring on every
-    bench metric, but wide is the best takeoff accelerator measured —
-    +46% upp at 50M, crossover ~200M; opt in for short legs). The
-    ScoreSaber bench, eval_ckpt, replays, and every other consumer
-    construct sims with the real formula. Implemented identically in
-    lib.rs and the CUDA kernel (f64 parity-gated:
-    `test_parity_exact_f64_wide_acc`).
   - **follow-through** `round(30 · min(post_arc / 60°, 1))` — tracker
     unchanged (break/reversal ends it, `FOLLOW_TIMEOUT = 15`);
     `free_post` (arc head) → flat 30 paid at the cut tick, no tracker.
