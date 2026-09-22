@@ -176,7 +176,7 @@ def test_obs_q_and_qd_track_state():
 
 def test_note_block_and_mask_track_pending():
     from beat_arena_env.chart import ChartConfig, generate_chart
-    env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
+    env = RustBeatEnv(foot_contact=False, seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
@@ -204,7 +204,7 @@ def test_note_block_and_mask_track_pending():
 
 def test_determinism_all_kinds():
     def run():
-        env = RustBeatEnv(colors="both", bomb_prob=0.3, extra_prob=0.3,
+        env = RustBeatEnv(foot_contact=False, colors="both", bomb_prob=0.3, extra_prob=0.3,
                           dot_prob=0.2, chart_len_s=8.0, seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
@@ -293,7 +293,7 @@ def test_reach_gate_moves_with_shoulders():
 
 def test_replay_v10_roundtrip(tmp_path):
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
+    env = RustBeatEnv(foot_contact=False, seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
                       colors="both")
     env.set_record(path)
     env.reset(seed=5)

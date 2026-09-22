@@ -203,7 +203,7 @@ def _bot_run(seed, wanted, limit=3000, need=1):
     have fired; return one _Snap per matching event."""
     from beat_arena_env import RustBeatEnv
     from beat_arena_env.scripted import scripted_action
-    env = RustBeatEnv(seed=seed, gears=5)
+    env = RustBeatEnv(foot_contact=False, seed=seed, gears=5)
     env.reset(seed=seed)
     out = []
     for _ in range(limit):

@@ -294,7 +294,7 @@ def test_greedy_rollout_smoke():
 
     cfg = ChartConfig(chart_len_s=6.0, bomb_prob=0.25)
     notes = generate_chart(cfg, np.random.default_rng(3))
-    env = RustBeatEnv(external_chart=notes, seed=0)
+    env = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
     obs, _ = env.reset()
     # seeded: an unseeded random init made this flake ~2/13 full-suite
     # runs (found during round-5 K17; nothing kernel-related)
@@ -329,7 +329,7 @@ def test_greedy_rollout_smoke():
 
     # coast rollout: zero actions never escape; every scoreable note
     # resolves (all misses), so the counter identity is exact
-    env2 = RustBeatEnv(external_chart=notes, seed=0)
+    env2 = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
     env2.reset()
     done = False
     while not done:
@@ -355,7 +355,7 @@ def test_vectorized_events_match_serial():
 
     serial = []
     for ci, chart in enumerate(charts):
-        env = RustBeatEnv(external_chart=chart, seed=0)
+        env = RustBeatEnv(foot_contact=False, external_chart=chart, seed=0)
         env.reset()
         walk, evs, done, t = scoresaber.ComboTracker(), [], False, 0
         while not done:
