@@ -95,17 +95,17 @@ def test_shapes_and_marker():
 
 def test_load_policy_round_trip_and_legacy_default():
     p3 = _policy(3)
-    ck = {"arch": dict(p3.arch), "model": p3.state_dict()}
+    ck = {"arch": dict(p3.arch), "state_dict": p3.state_dict()}
     q = P.load_policy(ck)
     assert q.body_tokens == 3 and q.n_lead == 5
-    q.load_state_dict(ck["model"])
+    q.load_state_dict(ck["state_dict"])
     obs = _obs(4)
     a, va = p3.forward_stacked(obs); b, vb = q.forward_stacked(obs)
     assert torch.equal(a, b) and torch.equal(va, vb)
     # a checkpoint without the marker (every one before 2026-09-22)
     p1 = _policy(1)
     arch = dict(p1.arch); arch.pop("body_tokens")
-    q1 = P.load_policy({"arch": arch, "model": p1.state_dict()})
+    q1 = P.load_policy({"arch": arch, "state_dict": p1.state_dict()})
     assert q1.body_tokens == 1 and hasattr(q1, "body_mlp")
 
 
