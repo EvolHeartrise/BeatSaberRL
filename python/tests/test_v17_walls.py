@@ -171,7 +171,7 @@ def _sim(chart, walls, max_steps=600):
     """Weld-mode sim (feet welded — never falls, head stays ~reference),
     zero effort so the only reward terms are judgments + wall pen."""
     sim = beat_arena_rs.RawBeatSim(max_steps=max_steps,
-                                   wide_acc=False, gears=5,
+                                   gears=5,
                                    foot_contact=False)
     sim.set_chart([note_tuple(n) for n in chart],
                   [wall_tuple(w) for w in walls])
@@ -364,7 +364,7 @@ def test_wall_despawn_charges_once_and_removes():
     wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
                 length=10.0, speed=4.0)   # long: would linger 2.5 s
     sim = beat_arena_rs.RawBeatSim(max_steps=600,
-                                   wide_acc=False, gears=5,
+                                   gears=5,
                                    foot_contact=False, wall_despawn=True)
     sim.set_chart([note_tuple(n) for n in FAR_NOTE],
                   [wall_tuple(wall)])

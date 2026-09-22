@@ -124,7 +124,7 @@ def test_cuda_matches_reference_on_its_own_angles():
 def test_rust_matches_reference_on_its_own_angles():
     beat_arena_rs = pytest.importorskip("beat_arena_rs")
     from beat_arena_env.chart import Note, note_tuple
-    sim = beat_arena_rs.RawBeatSim(max_steps=100000, wide_acc=False,
+    sim = beat_arena_rs.RawBeatSim(max_steps=100000,
                                    gears=5, foot_contact=False)
     sim.set_chart([note_tuple(Note(hit_time=30.0, col=2, row=1, color=1, angle=0.0, speed=4.0))], [])
     rng = np.random.default_rng(1)

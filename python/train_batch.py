@@ -68,15 +68,6 @@ VF_COEF = 0.5
 VALUE_NORM_BETA = 0.01
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
-# the recipe SHAPE. STALE as of 2026-08-31: no production run has used
-# 1024x128 since the 2026-08-08 shape ladder. The live shapes are
-# 32,768x8 (batch 262,144, the v27-v38 champion recipe) and 32,768x32
-# (batch 1,048,576, the T=32 era), so the warning below now fires on
-# every legitimate run and is pure noise. Changing the constant is a
-# BEHAVIOUR change (it decides who gets warned) and needs a call on
-# whether the guard should carry a set of admissible shapes or be
-# retired; left alone deliberately.
-RECIPE_BATCH = 1024 * 128
 # log-ratio clamp before exp() (2026-08-02, 400M-run postmortem). NOT a
 # science change: dual-clip's selection only lets gradient flow through
 # ratio where ratio < max(1 + CLIP, DUAL_CLIP_C), and the loss VALUE is
@@ -104,27 +95,6 @@ def pg_loss_fn(ratio, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
     dual = torch.min(standard, ceiling)
     loss = torch.where(adv < 0, dual, standard)
     return loss.mean()
-
-
-def pg_loss_heads(ratio_h, adv, clip=CLIP, dual_clip_c=DUAL_CLIP_C):
-    """Per-head (sub-action) dual-clip PPO loss (2026-09-06, --head-clip).
-    `ratio_h` is (B, 29): each head's own pi_new/pi_old for the joint
-    it controls; `adv` (B,) is shared by every head. Each head is
-    clipped and dual-clipped on ITS ratio (Song et al. 2023,
-    arXiv:2301.10919, "sub-action loss"; the IPPO/MAPPO per-agent
-    ratio), so one head moving out of the trust region silences only
-    that head's gradient, not all 29. Reduction is SUM over heads, MEAN
-    over rows: at ratio 1 the gradient w.r.t. every head's log-prob is
-    -adv, exactly the joint-ratio loss's, so lr / ent_coef / vf_coef
-    keep their meaning (pinned by tests/test_head_clip.py)."""
-    a = adv.unsqueeze(-1)
-    pg1 = -a * ratio_h
-    pg2 = -a * torch.clamp(ratio_h, 1 - clip, 1 + clip)
-    standard = torch.max(pg1, pg2)
-    ceiling = -dual_clip_c * a
-    dual = torch.min(standard, ceiling)
-    loss = torch.where(a < 0, dual, standard)
-    return loss.sum(-1).mean()
 
 
 def adv_filter_indices(f_adv, train_n):
@@ -205,7 +175,7 @@ def entropy_report(ent_head):
 
 
 def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
-                   af_ratio=None, cfh=None, kl_stop=None):
+                   af_ratio=None, kl_stop=None):
     """The `[kl]` diagnostic line (2026-09-02, Tier 0.3 of the 09-02
     static audit). `mb1/mbN` = first/last minibatch of THIS update, so
     the pair brackets the within-update drift over 64 optimizer steps.
@@ -216,17 +186,12 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
     minibatch's KEPT rows) and lags `ent` by one update. `af_ratio`
     (1.4, only when filtering) is sd(kept advantages) / sd(all), the
     measured size of the normalization confound C §1.1 predicted at
-    ~1.36 — printed as `afsd`. `cfh` (--head-clip only) is the
-    per-head clipfrac of the last minibatch: the share of (row, head)
-    pairs with |r_h - 1| > CLIP, i.e. the gradient actually silenced
-    under per-head clipping, printed as `cfh` next to the joint
-    clipfrac (which under --head-clip is a pure diagnostic)."""
+    ~1.36 — printed as `afsd`."""
     groups, lo, lo_v, total = entropy_report(ent_head)
     gs = "  ".join(f"{nm} {v:.3f}" for nm, v in groups)
     af = "" if af_ratio is None else f"  afsd {af_ratio:.3f}"
-    ch = "" if cfh is None else f"  cfh {cfh:.4f}"
     return (f"[kl] upd {update:>3}  kl(mb1/mbN) {klf:.2e}/{kll:.2e}"
-            f"  clipfrac {cff:.4f}/{cfl:.4f}{ch}"
+            f"  clipfrac {cff:.4f}/{cfl:.4f}"
             f"  gnorm {gnorm:.3f}  clipc {clipc:.3f}"
             f"  ent/head {gs}  min {lo_v:.3f} (h{lo})"
             f"  entfull {total:.3f}{af}"
@@ -293,14 +258,6 @@ def parse_args():
                    help="fraction of the rollout batch to train on, "
                         "selected by |advantage| rank (1.0 = off). "
                         "Rounded to a whole number of minibatches")
-    # Per-head clipping (2026-09-06, user): the joint 29-head product
-    # ratio makes CLIP=0.2 bind at a ~0.6% per-head change (0.2/29 in
-    # log space; ~1.0% at the 0.3 recipe value since 2026-09-15), and
-    # one head leaving the trust region zeroes the
-    # gradient of all 29 (clipfrac 0.43 on the last minibatch of the
-    # 09-03 T=64 run). With per-head ratios each head is clipped on its
-    # own pi_new/pi_old (pg_loss_heads). Costs a (T, N, 29) fp32
-    # per-head log-prob buffer (+243 MB at 32768x64) and its perm copy.
     p.add_argument("--target-kl", type=float, default=0.0,
                    help="KL early stop (opt-in; 2026-09-20 after v52's "
                         "update-561 runaway: last-minibatch KL 0.2 -> 52 "
@@ -317,21 +274,8 @@ def parse_args():
                         "0.3 since 2026-09-15 — the ladder: 0.3 beat 0.2 "
                         "by +1.7% bench, 0.4 lost −8.9% while training acc "
                         "barely moved; 0.2 was the value from the start). "
-                        "Also the default per-head eps under --head-clip "
-                        "and the clipfrac threshold in the [kl] "
+                        "Also the clipfrac threshold in the [kl] "
                         "diagnostics")
-    p.add_argument("--head-clip", action="store_true",
-                   help="clip each of the 29 action heads on its OWN "
-                        "probability ratio (sub-action PPO loss, "
-                        "arXiv:2301.10919) instead of the joint product "
-                        "ratio; kl/clipfrac on the [kl] line stay the "
-                        "joint diagnostics, `cfh` adds the per-head "
-                        "clipfrac")
-    p.add_argument("--head-clip-eps", type=float, default=None,
-                   help="--head-clip only: per-head clip epsilon "
-                        "(default = the joint CLIP, 0.3). The 09-06 "
-                        "design note: if per-head KL runs away, 0.1-0.15 "
-                        "is the knob")
     # Decoupled weight decay (2026-09-12, AdamW semantics, motivated by
     # the parameter-norm census in research/param-norms-2026-09-11):
     # the 2-D weights random-walk outward with optimizer steps under
@@ -413,18 +357,6 @@ def parse_args():
                         "activations). --no-note-geo-norm = the pre-v55 "
                         "lanes bit for bit (fresh runs only; a loaded "
                         "checkpoint carries its own marker)")
-    p.add_argument("--z-far", type=float, default=0.0,
-                   help="env v49 (2026-09-20): split z lanes. Lane 13 = "
-                        "0.5 ln(1 + max(z - F, 0) / F) with F metres (zero "
-                        "across the near field, so it shares no gradient "
-                        "with lane 2's column), lane 2 stays the clamped "
-                        "near-field lane (use --z-clip-hi 12 with it), wall "
-                        "back face = asinh(z / F). 0 = off. Recorded in the "
-                        "checkpoint like --z-asinh")
-    p.add_argument("--init-critic-fresh", action="store_true",
-                   help="with --init-from and a pre-redesign checkpoint: "
-                        "load actor/trunk weights, build a FRESH "
-                        "adapool_v1 critic (cross-era warm start)")
     p.add_argument("--cooldown-updates", type=int, default=0,
                    help="wsd LEAF mode: with --resume <trunk ckpt>, branch "
                         "off and decay lr 1-sqrt from --lr to --lr-final "
@@ -519,30 +451,6 @@ def parse_args():
                         "overrides BEAT_ENV_ORDER")
     p.add_argument("--no-env-order", dest="env_order", action="store_false",
                    help="disable the R12 permutation (identity ordering)")
-    # 2.2 of the 09-02 static audit (B §2, measured 2026-09-03): run
-    # the adapool critic on a side CUDA stream during the rollout so
-    # its GEMM/LN/SDPA kernels can overlap the env kernel. Same kernels
-    # in the same per-stream order -> bit-identical (pinned by
-    # tests/test_critic_stream.py and the 5-update same-seed run).
-    # MEASURED NULL-TO-NEGATIVE, default OFF: 125.9k vs 126.3k steps/s
-    # (-0.3%, 3 vs 3+2 reps), rollout 24.43 vs 24.40 s (+0.1%, noise),
-    # update 8.82 vs 8.75 s (+0.8% of the phase, 5 reps, not chased).
-    # The nsys timeline is why: the critic (2.1 ms/tick) never overlaps
-    # step_kernel — it finishes 0.15 ms BEFORE the env launch, hidden
-    # only behind the actor's own tail kernels (0.18 ms/tick of real
-    # concurrency), and when made eligible at the same instant as
-    # step_kernel (BEAT_CRITIC_LATE=1) the GPU ran it first, serially,
-    # 0.000 ms overlap in 31/31 ticks. That is the 2.3 NO-GO — see the
-    # audit doc's "2.2 results". Kept as the record of the experiment.
-    p.add_argument("--critic-stream", dest="critic_stream",
-                   action="store_true", default=False,
-                   help="rollout critic on a side CUDA stream (bit-"
-                        "identical; --env cuda). Measured -0.3%% steps/s "
-                        "2026-09-03: the GPU serializes it against the "
-                        "env kernel. Default off")
-    p.add_argument("--no-critic-stream", dest="critic_stream",
-                   action="store_false",
-                   help="inline critic (the pre-2.2 rollout)")
     p.add_argument("--graph-rollout", action="store_true", default=False,
                    help="capture the rollout step (policy fwd + sample + "
                         "env kernel) as ONE CUDA graph and replay it for "
@@ -555,8 +463,8 @@ def parse_args():
                         "rollout is GPU-execution-bound at both widths, "
                         "so this has never paid; kept as a knob only. "
                         "Changes the sampling RNG stream vs eager. Needs "
-                        "--env cuda, no --critic-stream, no --head-clip; "
-                        "auto-downgrades with a note otherwise")
+                        "--env cuda and not --fp16 update; auto-downgrades "
+                        "with a note otherwise")
     p.add_argument("--chart-pool", type=int, default=65536,
                    help="pregenerated chart pool size for --env cuda "
                         "(default 65536 since 2026-07-26, user decision "
@@ -661,11 +569,6 @@ def parse_args():
     # crossover ~200M) — default OFF since the cut-plane accuracy fix
     # (same day: the real formula now has reachable lateral gradient);
     # opt in for short-budget legs. Training gym only either way.
-    p.add_argument("--wide-acc", default=False,
-                   action=argparse.BooleanOptionalAction,
-                   help="train with the wide accuracy reward "
-                        "(30*clamp(1 - d/0.6), unrounded; best for short "
-                        "50-150M legs, loses at 400M)")
     p.add_argument("--gears", type=int, default=3, choices=[3, 5, 7],
                    help="env v8 action-table size per joint head: 3 = "
                         "ternary coast/+full/-full; 5 adds +/-1/4-torque "
@@ -1133,15 +1036,6 @@ def main():
     kl_last = torch.zeros((), device=device)
     cf_first = torch.zeros((), device=device)
     cf_last = torch.zeros((), device=device)
-    # --head-clip: per-head clipfrac of the last minibatch (share of
-    # (row, head) pairs outside 1 +/- CLIP); stays 0 otherwise
-    cfh_last = torch.zeros((), device=device)
-    head_clip = bool(args.head_clip)
-    head_clip_eps = (args.head_clip_eps if args.head_clip_eps is not None
-                     else CLIP)
-    if head_clip:
-        print(f"--head-clip: per-head dual-clip PPO, eps {head_clip_eps} "
-              f"(joint kl/clipfrac stay diagnostic)", flush=True)
     # 1.4 / C §5 item 7: sd(kept adv) / sd(full adv) when filtering,
     # written once per update by adv_filter_stats, read at the sync.
     af_ratio = torch.zeros((), device=device)
@@ -1187,11 +1081,6 @@ def main():
     # alone silently rescales the batch, so say so loudly. A warning,
     # not an error: --bench and the micro-shape tools are legitimately
     # off-recipe (and skip this entirely under --bench).
-    if not args.bench and batch != RECIPE_BATCH:
-        print(f"!!! BATCH {batch:,} = {N} envs x {T} horizon, NOT the "
-              f"recipe {RECIPE_BATCH:,} — tuned hypers and checkpoint "
-              f"cadences assume {RECIPE_BATCH:,} !!!", flush=True)
-
     if args.ranked_maps and args.env != "cuda":
         raise SystemExit("--ranked-maps requires --env cuda")
     if args.z_clip_hi != 12.0 and args.env != "cuda":
@@ -1214,15 +1103,11 @@ def main():
     # env v48: the rust twin reads BEAT_Z_ASINH once per process — set it
     # before any sim exists so --env rust and the CUDA env agree
     os.environ["BEAT_Z_ASINH"] = repr(float(args.z_asinh))
-    if args.z_far < 0:
-        raise SystemExit("--z-far must be >= 0 (metres; 0 = off)")
-    os.environ["BEAT_Z_FAR"] = repr(float(args.z_far))
     for _name, _ck in (("--resume", resume_ckpt),
                        ("--init-from", init_ckpt)):
         if _ck is None:
             continue
-        for _key, _flag, _mine in (("z_asinh", "--z-asinh", args.z_asinh),
-                                   ("z_far", "--z-far", args.z_far)):
+        for _key, _flag, _mine in (("z_asinh", "--z-asinh", args.z_asinh),):
             _prev = _ck.get("arch", {}).get(
                 _key, _ck.get("args", {}).get(_key, 0.0))
             if float(_prev) != float(_mine):
@@ -1246,7 +1131,7 @@ def main():
               f"the pool", flush=True)
         venv = VecCls(N, pool=pool,
                       max_steps=pool_steps,
-                      wide_acc=args.wide_acc, gears=args.gears,
+                      gears=args.gears,
                       foot_contact=args.foot_contact,
                       fall_const=args.fall_pen,
                       push_prob=args.push_prob, push_vmax=args.push_vmax,
@@ -1262,7 +1147,6 @@ def main():
                       start_pose_jitter=args.start_pose_jitter,
                       crouch_start_prob=args.crouch_start_prob,
                       z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
-                      z_far=args.z_far,
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
@@ -1277,7 +1161,6 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            wide_acc=args.wide_acc,
             gears=args.gears, foot_contact=args.foot_contact,
             fall_const=args.fall_pen,
             push_prob=args.push_prob, push_vmax=args.push_vmax,
@@ -1290,7 +1173,6 @@ def main():
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
-            z_far=args.z_far,
             self_contact_coef=args.self_contact_coef,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -1301,7 +1183,6 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            wide_acc=args.wide_acc,
             foot_contact=args.foot_contact, fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,
@@ -1316,23 +1197,6 @@ def main():
     elif args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
         policy = load_policy(ckpt)
-        if args.init_critic_fresh and policy.critic_arch == "linear_v0":
-            fresh = NotePolicy(
-                embed=policy.arch["embed"],
-                trunk_dim=policy.arch["trunk_dim"],
-                n_blocks=policy.arch["n_blocks"],
-                n_heads=policy.arch["n_heads"],
-                n_gears=policy.arch["n_gears"],
-                ffn_mult=policy.arch["ffn_mult"], critic="adapool_v1",
-                note_geo=policy.arch.get("note_geo", False))
-            missing, unexpected = fresh.load_state_dict(
-                policy.state_dict(), strict=False)
-            assert (all(k.startswith("critic_") for k in missing)
-                    and all(k.startswith("value_head") for k in
-                            unexpected)), (missing, unexpected)
-            policy = fresh
-            print("--init-critic-fresh: actor/trunk from the "
-                  "checkpoint, FRESH adapool_v1 critic", flush=True)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",
               flush=True)
     else:
@@ -1350,7 +1214,6 @@ def main():
     # env v48: record the obs z encoding in the arch so the bench / replay
     # tools and --resume/--init-from can match it (0 = legacy clamp)
     policy.arch["z_asinh"] = float(args.z_asinh)
-    policy.arch["z_far"] = float(args.z_far)        # env v49
     if args.value_head == "hl":
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
               f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "
@@ -1388,22 +1251,13 @@ def main():
             policy.flatten_fp16()
             print("--fp16: flat master/replica buffers (1-kernel "
                   "refresh)", flush=True)
-    # 2.2: the side stream exists only when asked for AND the critic is
-    # the adapool one on CUDA (the legacy linear_v0 value rides the
-    # fused head GEMM — nothing to move). The rollout loop passes
-    # critic_async=True and joins after the env launch; every other
-    # forward (bootstrap, diag, update) stays inline.
-    critic_stream_on = (args.critic_stream and device.type == "cuda"
-                        and policy.critic_arch != "linear_v0")
-    policy.critic_side_stream(critic_stream_on)
     graph_roll = None
     if args.graph_rollout:
-        if (not tensor_env or device.type != "cuda" or critic_stream_on
-                or head_clip or args.fp16 == "update"):
+        if (not tensor_env or device.type != "cuda"
+                or args.fp16 == "update"):
             print("--graph-rollout: needs --env cuda on a CUDA device "
-                  "without --critic-stream/--head-clip/--fp16 update "
-                  "(the captured kernels cannot follow the fp16 mode "
-                  "flip), forcing off", flush=True)
+                  "and not --fp16 update (the captured kernels cannot "
+                  "follow the fp16 mode flip), forcing off", flush=True)
         else:
             try:
                 from rollout_graph import GraphedRollout
@@ -1416,15 +1270,6 @@ def main():
                 graph_roll = None
                 print(f"--graph-rollout: capture failed, eager rollout "
                       f"[{type(e).__name__}: {e}]", flush=True)
-    # 2.3 go/no-go probe (policy._critic_late): the side-stream launch
-    # is deferred until after the env kernel is enqueued, so the critic
-    # runs (or fails to) BESIDE step_kernel instead of before it
-    critic_late = critic_stream_on and os.environ.get(
-        "BEAT_CRITIC_LATE", "0") == "1"
-    policy._critic_late = critic_late
-    if critic_late:
-        print("[critic-stream] BEAT_CRITIC_LATE=1: side-stream launch "
-              "deferred until after the env kernel (2.3 probe)", flush=True)
     # (--fused-update was retired 2026-08-13 with the 138k arch: the
     # packed kernels were hard-wired to embed 64 / trunk 128 and the
     # eager fp16 path was the production path throughout v16.)
@@ -1588,9 +1433,6 @@ def main():
     # needs a long index). Bit-identical.
     b_act = torch.zeros((T, N, A_DIM), dtype=torch.uint8, device=device)
     b_logp = torch.zeros((T, N), device=device)
-    # --head-clip: the 29 per-head old log-probs (their sum IS b_logp)
-    b_logp_h = (torch.zeros((T, N, A_DIM), device=device)
-                if head_clip else None)
     b_rew = torch.zeros((T, N), device=device)
     b_done = torch.zeros((T, N), device=device)
     # row T holds the bootstrap value: b_val[1:] IS the shifted value
@@ -1736,12 +1578,8 @@ def main():
             f"(_env_order_on={eo_live})")
     eo = "" if eo_live is None else \
         f", env-order {'on' if eo_live else 'off'}"
-    # 2.2 state on the banner for the same reason env-order is: read
-    # off the policy (the fact), not off args (the request)
-    cs = (f", critic-stream "
-          f"{'on' if policy._critic_stream is not None else 'off'}")
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
-          f"minibatch {mb_size}, device {device}{filt}{eo}{cs} ===",
+          f"minibatch {mb_size}, device {device}{filt}{eo} ===",
           flush=True)
 
     # Structured per-update metrics (2026-09-03, dashboard option B):
@@ -1857,29 +1695,12 @@ def main():
                 # [kl] line's `entfull` label. Entropy consumes no RNG,
                 # so the sampling stream is bit-identical either way
                 # (policy.get_action_and_value docstring, 2026-07-28).
-                # critic_async: with --critic-stream the value is
-                # computed on the side stream and `v` is NOT readable
-                # until policy.critic_join() below (a no-op otherwise)
                 a, logp, _, v = policy.get_action_and_value(
-                    obs, need_entropy=(t == 0), critic_async=True,
-                    head_logp=head_clip)
+                    obs, need_entropy=(t == 0))
             if t == 0:
                 torch.mean(policy._ent_h, dim=0, out=ent_head)
                 policy._ent_h = None
-            if head_clip:
-                b_logp_h[t] = logp
-                logp = logp.sum(-1)
             b_act[t], b_logp[t] = a, logp
-            if v is None:
-                # BEAT_CRITIC_LATE probe only: enqueue the deferred
-                # critic HERE, after sampling and right before the env
-                # launch, so its side-stream event fires at the same
-                # instant step_kernel's own dependencies do and the two
-                # are eligible together (recording the event AFTER the
-                # env launch would make the side stream wait for
-                # step_kernel to finish — event semantics, not a
-                # scheduling fact; that was the first cut of the probe)
-                v = policy.critic_launch_deferred()
             if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
                 b_rew[t] = rew.to(b_rew.dtype)
@@ -1891,14 +1712,9 @@ def main():
                 b_done[t] = torch.as_tensor(
                     done.astype(np.float32), device=device)
                 obs = torch.as_tensor(nobs, dtype=torch.float32, device=device)
-            # 2.2: the b_val[t] write moved from BEFORE the env step to
-            # after it (2026-09-03) so the main stream enqueues the env
-            # kernel without waiting for the critic; the join makes the
-            # main stream wait on the side stream's event (device-side,
-            # no host sync) right before the value is consumed. With the
-            # side stream off this is the same copy, one launch later —
-            # b_val[t] has no other reader until GAE.
-            policy.critic_join()
+            # the b_val[t] write sits after the env step (2026-09-03) so
+            # the main stream enqueues the env kernel first; b_val[t] has
+            # no other reader until GAE.
             b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
             for info in infos:
                 ep_returns.append(info["episode_return"])
@@ -2005,7 +1821,6 @@ def main():
         f_obs = b_obs.reshape(-1, OBS_DIM)
         f_act = b_act.reshape(-1, A_DIM)
         f_logp = b_logp.reshape(-1)
-        f_logp_h = b_logp_h.reshape(-1, A_DIM) if head_clip else None
         f_adv = adv.reshape(-1)
         f_ret = returns.reshape(-1)
 
@@ -2042,19 +1857,13 @@ def main():
             dn = min(2048, batch)
             policy._diag_stash = True
             _, dlogp, _, dval = policy.get_action_and_value(
-                f_obs[:dn], f_act[:dn], need_entropy=False,
-                head_logp=head_clip)
+                f_obs[:dn], f_act[:dn], need_entropy=False)
             policy._diag_stash = False
             da = f_adv[:dn]
             da = (da - da.mean()) / (da.std() + 1e-8)
-            if head_clip:   # the same loss the update uses
-                dratio = (dlogp - f_logp_h[:dn]).clamp(
-                    max=LOG_RATIO_CLAMP).exp()
-                d_pg = pg_loss_heads(dratio, da, clip=head_clip_eps)
-            else:
-                dratio = (dlogp - f_logp[:dn]).clamp(
-                    max=LOG_RATIO_CLAMP).exp()
-                d_pg = pg_loss_fn(dratio, da, clip=CLIP)
+            dratio = (dlogp - f_logp[:dn]).clamp(
+                max=LOG_RATIO_CLAMP).exp()
+            d_pg = pg_loss_fn(dratio, da, clip=CLIP)
             d_v = 0.5 * ((dval - (f_ret[:dn] - ret_mu) / ret_sig)
                          ** 2).mean()
             dscale = fp16_scale if fp16_update else 1.0
@@ -2140,7 +1949,6 @@ def main():
                 perm = keep_idx[perm]
             p_obs, p_act = f_obs[perm], f_act[perm]
             p_logp, p_adv, p_ret = f_logp[perm], f_adv[perm], f_ret[perm]
-            p_logp_h = f_logp_h[perm] if head_clip else None
             for s in range(0, train_n, mb_size):
                 if kl_stop_mb is not None:
                     break
@@ -2182,19 +1990,8 @@ def main():
                 for j in range(args.mb_accum):
                     sl = slice(s + j * micro, s + (j + 1) * micro)
                     _, newlogp, entropy, newval = \
-                        policy.get_action_and_value(p_obs[sl], p_act[sl],
-                                                    head_logp=head_clip)
-                    if head_clip:
-                        # per-head log-ratios drive the loss; their sum
-                        # is the joint log-ratio the kl / clipfrac /
-                        # overflow diagnostics below keep reading, so
-                        # the [kl] line stays comparable across modes
-                        logratio_h = newlogp - p_logp_h[sl]
-                        ratio_h = logratio_h.clamp(
-                            max=LOG_RATIO_CLAMP).exp()
-                        logratio = logratio_h.sum(-1)
-                    else:
-                        logratio = newlogp - p_logp[sl]
+                        policy.get_action_and_value(p_obs[sl], p_act[sl])
+                    logratio = newlogp - p_logp[sl]
                     ratio = logratio.clamp(max=LOG_RATIO_CLAMP).exp()
                     if (args.target_kl > 0 and j == 0 and s > 0
                             and (s // mb_size) % args.kl_check_every == 0):
@@ -2219,8 +2016,6 @@ def main():
                             # on the update after the first stop)
                             del newlogp, entropy, newval, logratio, ratio
                             del _r, _kl
-                            if head_clip:
-                                del logratio_h, ratio_h
                             policy._value_logits = None
                             break
                     if fp16_update:
@@ -2246,12 +2041,6 @@ def main():
                                 cf_t.zero_()
                             kl_t.add_(kl_m, alpha=1.0 / args.mb_accum)
                             cf_t.add_(cf_m, alpha=1.0 / args.mb_accum)
-                        if head_clip and kl_slots[-1][1] is cf_last:
-                            cfh_m = ((ratio_h.detach() - 1.0).abs()
-                                     > head_clip_eps).to(r_m1.dtype).mean()
-                            if j == 0:
-                                cfh_last.zero_()
-                            cfh_last.add_(cfh_m, alpha=1.0 / args.mb_accum)
                     if fp16_update and ep_i == 0 and s == 0 and j == 0:
                         # "same policy" fixed point: |ratio-1| at epoch
                         # 1 measures rollout/update precision
@@ -2259,9 +2048,7 @@ def main():
                         # per-update print sync)
                         ratio_diag = (ratio - 1.0).abs().mean().detach()
                     a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
-                    pg_loss = (pg_loss_heads(ratio_h, a_mb,
-                                             clip=head_clip_eps)
-                               if head_clip else pg_loss_fn(ratio, a_mb, clip=CLIP))
+                    pg_loss = pg_loss_fn(ratio, a_mb, clip=CLIP)
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
                     if policy.value_bins:
@@ -2663,13 +2450,13 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last,
+                     clipc_sum / max(opt_steps, 1), af_ratio,
                      pn_a, pn_c]),
                 ent_head]).tolist()
             (ent_v, ev_v, inf_v, r1_v, lmax_v, scale_v, ret_v,
              klf_v, kll_v, cff_v, cfl_v, gn_v, cc_v, af_v,
-             cfh_v, pna_v, pnc_v) = _d[:17]
-            eh_v = _d[17:]
+             pna_v, pnc_v) = _d[:16]
+            eh_v = _d[16:]
             logr_max.zero_()
             gnorm_sum.zero_()
             clipc_sum.zero_()
@@ -2691,7 +2478,6 @@ def main():
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
                                  af_v if adv_filter_on else None,
-                                 cfh_v if head_clip else None,
                                  kl_stop=kl_stop_mb),
                   flush=True)
         else:
@@ -2702,12 +2488,12 @@ def main():
                      b_rew.sum() / b_rew.shape[1],
                      kl_first, kl_last, cf_first, cf_last,
                      gnorm_sum / max(opt_steps, 1),
-                     clipc_sum / max(opt_steps, 1), af_ratio, cfh_last,
+                     clipc_sum / max(opt_steps, 1), af_ratio,
                      pn_a, pn_c]),
                 ent_head]).tolist()
             (ent_v, ev_v, ret_v, klf_v, kll_v, cff_v, cfl_v,
-             gn_v, cc_v, af_v, cfh_v, pna_v, pnc_v) = _d[:13]
-            eh_v = _d[13:]
+             gn_v, cc_v, af_v, pna_v, pnc_v) = _d[:12]
+            eh_v = _d[12:]
             gnorm_sum.zero_()
             clipc_sum.zero_()
             opt_steps = 0
@@ -2721,7 +2507,6 @@ def main():
             print(format_kl_line(update + 1, klf_v, kll_v, cff_v, cfl_v,
                                  gn_v, cc_v, eh_v,
                                  af_v if adv_filter_on else None,
-                                 cfh_v if head_clip else None,
                                  kl_stop=kl_stop_mb),
                   flush=True)
         if gn_sq:
@@ -2798,7 +2583,7 @@ def main():
             kl_first=klf_v, kl_last=kll_v, cf_first=cff_v, cf_last=cfl_v,
             gnorm=gn_v, clipc=cc_v, ent_head=eh_v,
             af_ratio=af_v if adv_filter_on else None,
-            cfh_last=cfh_v if head_clip else None, events=m_ev,
+            events=m_ev,
             pnorm_actor=pna_v, pnorm_critic=pnc_v, kl_stop=kl_stop_mb,
             diag=m_diag, ckpt=m_ckpt, peak_vram=m_vram)
         if args.time_cap > 0 and elapsed > args.time_cap:

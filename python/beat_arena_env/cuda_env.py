@@ -484,7 +484,7 @@ class CudaBeatVecEnv:
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, seed=0,
                  charts=None, chart_pool=1024, max_steps=None,
-                 pool=None, wide_acc=False, gears=3,
+                 pool=None, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
                  want_contacts=False, foot_contact=False,
                  fall_const=5.0, walls=None,
@@ -496,7 +496,7 @@ class CudaBeatVecEnv:
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
                  combo_walk=False, bench_refill=False, ep_stats=False,
-                 tau_center=None, z_asinh=0.0, z_far=0.0):
+                 tau_center=None, z_asinh=0.0):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -548,8 +548,6 @@ class CudaBeatVecEnv:
         # env v48: asinh z lane knee (m); 0 = legacy clamp / Z_SCALE (the
         # rust twin reads BEAT_Z_ASINH)
         self.z_asinh = float(z_asinh)
-        # env v49: far z lane knee (m); 0 = lane 13 stays zero (rust: BEAT_Z_FAR)
-        self.z_far = float(z_far)
         # env v41 (2026-09-12): price on the tick-summed self-collision
         # impulse (N.s); 0 = off. Telemetry accumulates regardless.
         self.self_contact_coef = float(self_contact_coef)
@@ -572,7 +570,6 @@ class CudaBeatVecEnv:
         self.push_prob = float(push_prob)
         self.push_vmax = float(push_vmax)
         self.start_jitter = float(start_jitter)
-        self.wide_acc = bool(wide_acc)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.gears = int(gears)
         # pool=: prebuilt tensor dict (ranked_pool.py; ragged, or padded
@@ -896,7 +893,7 @@ class CudaBeatVecEnv:
             self._tau_jit.uniform_(-1.0, 1.0, generator=self._gen)
             self._tau_jit.mul_(self.tau_rand).add_(1.0).mul_(self.tau_center)
         self._ext.step(self._tensors, actions, cand, mode,
-                       self.max_steps, self.wide_acc,
+                       self.max_steps,
                        self.auto_reset, self.gears, self.want_contacts,
                        self.foot_contact, self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
@@ -905,7 +902,7 @@ class CudaBeatVecEnv:
                        int(self.limit_arms),
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
-                       self.z_clip_hi, self.z_asinh, self.z_far, self.self_contact_coef,
+                       self.z_clip_hi, self.z_asinh, self.self_contact_coef,
                        self.tau_rand, int(self.combo_walk),
                        int(self.bench_refill), int(self.ep_stats))
 

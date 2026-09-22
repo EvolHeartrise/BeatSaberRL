@@ -32,7 +32,7 @@ KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
 
 
 def _rust(**kw):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, wide_acc=False,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    gears=5, foot_contact=False, **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim
@@ -268,11 +268,11 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     chart = [FAR_NOTE]
     env = CudaBeatVecEnv(1, charts=[chart], max_steps=6900, gears=5,
-                         wide_acc=False, device="cuda", dtype=torch.float64,
+                         device="cuda", dtype=torch.float64,
                          auto_reset=False, want_contacts=True,
                          energy_coef=COEF)
     env.reset(); env.set_tau_scale(s)
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, wide_acc=False, gears=5,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900, gears=5,
                                    foot_contact=False, energy_coef=COEF)
     sim.set_chart([note_tuple(FAR_NOTE)]); sim.set_tau_scale(s)
     rng = np.random.default_rng(1)

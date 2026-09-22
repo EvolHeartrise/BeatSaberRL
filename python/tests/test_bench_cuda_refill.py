@@ -45,7 +45,7 @@ def _play(charts, n_slots, device="cuda"):
     queues, _, _ = plan_slots(ticks, n_slots)
     n = len(queues)
     env = CudaBeatVecEnv(n, charts=charts, max_steps=max_steps, gears=5,
-                         wide_acc=False, device=device,
+                         device=device,
                          dtype=torch.float32, auto_reset=False,
                          want_contacts=False, foot_contact=True,
                          combo_walk=True, bench_refill=True, seed=0)

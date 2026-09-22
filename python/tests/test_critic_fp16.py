@@ -30,9 +30,9 @@ def _obs(n, seed=0):
     return obs.cuda()
 
 
-def _policy(fp16=True, flat=False, critic="adapool_v1"):
+def _policy(fp16=True, flat=False):
     torch.manual_seed(0)
-    p = NotePolicy(n_gears=5, critic=critic).cuda()
+    p = NotePolicy(n_gears=5).cuda()
     p.fp16 = fp16
     if flat:
         p.flatten_fp16()
@@ -203,8 +203,3 @@ def test_packed_kv_matches_unpacked(monkeypatch):
             assert rel < 2e-2, f"{n}: packed vs unpacked rel {rel:.3e}"
 
 
-def test_legacy_linear_v0_critic_still_runs_fp16():
-    p = _policy(critic="linear_v0", flat=True)
-    with torch.no_grad():
-        logits, value = p.forward_stacked(_obs(8))
-    assert value.shape == (8,) and value.dtype is torch.float32

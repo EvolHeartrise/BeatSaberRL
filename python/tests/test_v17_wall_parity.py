@@ -39,7 +39,7 @@ N = len(WALLS)
 def _rust_sims():
     sims = []
     for ws in WALLS:
-        sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS, wide_acc=False,
+        sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS,
                                        gears=3, foot_contact=False)
         sim.set_chart([note_tuple(FAR_NOTE)],
                       [wall_tuple(w) for w in ws])
@@ -63,7 +63,7 @@ def test_wall_lockstep_parity():
     env = CudaBeatVecEnv(N, charts=[[FAR_NOTE]] * N,
                          walls=[[wall_tuple(w) for w in ws]
                                 for ws in WALLS],
-                         max_steps=MAX_STEPS, gears=3, wide_acc=False, device="cuda",
+                         max_steps=MAX_STEPS, gears=3, device="cuda",
                          dtype=torch.float64, auto_reset=False,
                          foot_contact=False, seed=0)
     env.reset()   # charts= test mode assigns env i -> chart i HERE

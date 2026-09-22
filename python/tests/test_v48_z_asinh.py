@@ -59,36 +59,9 @@ def test_asinh_keeps_far_notes_distinct():
     assert math.sinh(o["wall_back"]) * c == pytest.approx(130.0 - 20 / 30, abs=0.5)
 
 
-def test_split_lanes_far_lane_and_clamped_near_lane():
-    # env v49: BEAT_Z_FAR=8 with the legacy clamp at 12 m on lane 2
-    o = run_child("rust", 0.0, {"BEAT_Z_FAR": "8.0", "BEAT_Z_CLIP_HI": "12.0"})
-    assert o["mask"] == [1.0, 1.0, 1.0, 1.0]
-    zt = [5.0 - 20 / 30, 60.0 - 20 / 30, 80.0 - 20 / 30]
-    # lane 2: linear z/8 near, clamped at 12 m
-    assert o["z"][0] == pytest.approx(zt[0] / 8, abs=0.01)
-    assert o["z"][1] == pytest.approx(1.5, abs=1e-6)
-    assert o["z"][2] == pytest.approx(1.5, abs=1e-6)
-    # lane 13: zero inside 8 m, 0.5 ln(1 + (z - 8) / 8) beyond, distinct far values
-    assert o["far"][0] == 0.0
-    for slot, z in ((1, zt[1]), (2, zt[2])):
-        assert o["far"][slot] == pytest.approx(0.5 * math.log(1 + (z - 8) / 8), abs=0.01)
-    assert o["far"][2] > o["far"][1] > 0
-    # wall: front lane 2 clamped, far lane on the front face, back face asinh(z / 8)
-    assert o["z"][3] == pytest.approx(1.5, abs=1e-6)
-    assert math.sinh(o["wall_back"]) * 8 == pytest.approx(130.0 - 20 / 30 - 0.25, abs=0.5)
-
-
-def test_legacy_keeps_far_lane_zero():
-    o = run_child("rust", 0.0)
-    assert o["far"] == [0.0, 0.0, 0.0, 0.0]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("c,zfar", [(0.0, 0.0), (2.0, 0.0), (0.0, 8.0)])
-def test_cuda_rust_parity(c, zfar):
-    extra = {"BEAT_Z_FAR": repr(zfar)}
-    if zfar > 0:
-        extra["BEAT_Z_CLIP_HI"] = "12.0"
-    o = run_child("parity", c, extra)
+@pytest.mark.parametrize("c", [0.0, 2.0, 8.0])
+def test_cuda_rust_parity(c):
+    o = run_child("parity", c)
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
     assert o["parity_worst_abs"] < 1e-4, o
