@@ -1545,9 +1545,11 @@ constexpr double FLAIL_LEAD_S = 1.0;
 // wrist-bend reversal telemetry (2026-09-22, user): per hand, a reversal
 // is counted when the wrist BEND axis (joints 8 / 15) turns back by
 // WREV_HYST from its running extreme — position-based peak detection
-// with hysteresis, so tremor under 20 deg never counts and a
-// flick-and-return counts 2. Every tick, no note gating. Mirrored in
-// lib.rs (same constant, same state machine).
+// with hysteresis, so tremor under 20 deg never counts; the first
+// commitment out of rest is not a reversal, a flick-and-return counts
+// 1 (the turn at the peak), steady oscillation 2 per cycle. Every
+// tick, no note gating. Mirrored in lib.rs (same constant, same state
+// machine).
 constexpr double WREV_HYST = 0.34906585;   // 20 deg
 // env v21 (lib.rs mirrors, exact shared f64 literals): wide stance —
 // hip_roll splays the legs +-8 deg, ankle_roll counter-rolls so the

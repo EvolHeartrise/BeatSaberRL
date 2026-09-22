@@ -61,9 +61,12 @@ def _count(trace):
 def test_reference_semantics():
     deg = math.radians
     assert _count([0.0] * 50) == 0
-    # 30 deg flick and back: 2 reversals (out then back), the first
-    # direction commitment is not a reversal
-    assert _count([0, deg(10), deg(20), deg(30), deg(20), deg(10), 0]) == 2
+    # 30 deg flick and back: ONE reversal (the turn at the peak); the
+    # first commitment out of rest is not a direction change
+    assert _count([0, deg(10), deg(20), deg(30), deg(20), deg(10), 0]) == 1
+    # ... and back out again: the second turn makes 2
+    assert _count([0, deg(10), deg(20), deg(30), deg(20), deg(10), 0,
+                   deg(10), deg(20), deg(30)]) == 2
     # 10 deg wiggle: never crosses the hysteresis -> 0
     assert _count([0, deg(10), 0, deg(10), 0, deg(10), 0]) == 0
     # 25 deg out, 15 back (not enough), then on to 40: no reversal yet;
@@ -73,8 +76,8 @@ def test_reference_semantics():
     # slow drift with tremor: 0
     tr = [i * deg(0.5) + (deg(3) if i % 2 else 0) for i in range(200)]
     assert _count(tr) == 0
-    # a 2 Hz 30 deg oscillation over 10 s at 30 Hz: 4 reversals per
-    # second minus the first commitment
+    # a 2 Hz 30 deg oscillation over 10 s at 30 Hz: one reversal per
+    # half cycle = 4 per second, minus the first commitment
     osc = [deg(15) * math.sin(2 * math.pi * 2.0 * t / 30.0) for t in range(300)]
     assert 38 <= _count(osc) <= 40
 

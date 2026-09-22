@@ -515,7 +515,8 @@ def finish_slot(slot, info, combo):
         "flail_ticks": info.get("flail_ticks", 0),
         # wrist-bend reversals (2026-09-22, user): per hand, counted by
         # the sims' 20 deg-hysteresis peak detector on the bend axis on
-        # every tick; rate = per second of played level time
+        # every tick (one per direction change; a flick-and-return = 1);
+        # rate = per second of played level time
         "wrist_rev_l": int(info.get("wrist_rev_l", 0)),
         "wrist_rev_r": int(info.get("wrist_rev_r", 0)),
         "ticks": int(info.get("ticks", 0)),
