@@ -196,6 +196,50 @@ _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 
+# --- 3-token body (2026-09-22, user order): the ONE 87-lane body token
+# decomposed into [torso, leg_L, leg_R], mirroring the two saber tokens
+# (a shared leg encoder + a 2-lane side one-hot, like saber_mlp + the
+# hand one-hot). Lead tokens become [saber_L, saber_R, torso, leg_L,
+# leg_R] (5) + 24 notes = 29; the torso keeps index 2, so the critic's
+# body-derived query is unchanged. Arch marker "body_tokens" (absent /
+# 1 = the single body token every checkpoint before this date).
+#   torso  root pose/vel (15) + spine q (3) + spine qd (3) + head (3)
+#          + contact bits (2) + spine tau-scale lanes (3)        = 29
+#   leg_s  hip/knee/ankle q (6) + qd (6) + that foot's ground-contact
+#          lanes [heel, toe] (2) + knee + foot position (6) + knee +
+#          foot velocity (6) + the 6 leg tau-scale axes (shared L/R,
+#          routed to BOTH leg tokens like the arm axes to both sabers)
+#                                                                  = 32
+# Lane bookkeeping: q lanes 15..45 = spine 15..17, arm_L 18..25 (8: the
+# wrist roll is cos/sin), arm_R 26..33, leg_L 34..39, leg_R 40..45; qd
+# lanes 46..74 = spine 46..48, arm_L 49..55, arm_R 56..62, leg_L 63..68,
+# leg_R 69..74. body_pts / body_pt_vel order: l_elbow, r_elbow, l_knee,
+# r_knee, l_foot, r_foot (3 each). ground_imp = [L_heel, L_toe, R_heel,
+# R_toe].
+_TAU_SPINE = tuple(range(_TAU, _TAU + 3))
+_TAU_LEG = tuple(range(_TAU + 10, _TAU + 16))
+_TORSO_IDX = (tuple(range(0, 18)) + tuple(range(46, 49))
+              + tuple(range(97, 102)) + _TAU_SPINE)
+_LEG_L_IDX = (tuple(range(34, 40)) + tuple(range(63, 69))
+              + (_GI, _GI + 1)
+              + tuple(range(_BP + 6, _BP + 9)) + tuple(range(_BP + 12, _BP + 15))
+              + tuple(range(_BPV + 6, _BPV + 9)) + tuple(range(_BPV + 12, _BPV + 15))
+              + _TAU_LEG)
+_LEG_R_IDX = (tuple(range(40, 46)) + tuple(range(69, 75))
+              + (_GI + 2, _GI + 3)
+              + tuple(range(_BP + 9, _BP + 12)) + tuple(range(_BP + 15, _BP + 18))
+              + tuple(range(_BPV + 9, _BPV + 12)) + tuple(range(_BPV + 15, _BPV + 18))
+              + _TAU_LEG)
+TORSO_FEAT = 29
+LEG_FEAT = 32
+assert len(_TORSO_IDX) == TORSO_FEAT and len(_LEG_L_IDX) == len(_LEG_R_IDX) == LEG_FEAT
+# the three tokens together see exactly the single body token's lanes
+# (the 6 leg tau axes twice), and overlap only on those axes
+assert set(_TORSO_IDX) | set(_LEG_L_IDX) | set(_LEG_R_IDX) == set(_BODY_IDX)
+assert set(_TORSO_IDX).isdisjoint(_LEG_L_IDX) and set(_TORSO_IDX).isdisjoint(_LEG_R_IDX)
+assert set(_LEG_L_IDX) & set(_LEG_R_IDX) == set(_TAU_LEG)
+_BODY3_IDX = _TORSO_IDX + _LEG_L_IDX + _LEG_R_IDX
+
 # --- hand-relative note geometry (2026-09-14, research/2026-09-14-
 # architecture-brainstorm.md #1; user order) ---------------------------
 # Per (hand, note) pair, computed from lanes the obs ALREADY carries and
@@ -503,8 +547,10 @@ class NotePolicy(nn.Module):
                  note_geo_norm: bool = False,
                  value_bins: int = 0, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
-                 trunk_arch: str = "mlp", trunk_hidden: int | None = None):
+                 trunk_arch: str = "mlp", trunk_hidden: int | None = None,
+                 body_tokens: int = 1):
         super().__init__()
+        assert body_tokens in (1, 3), f"body_tokens must be 1 or 3, got {body_tokens}"
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
@@ -524,6 +570,9 @@ class NotePolicy(nn.Module):
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
                      "ffn_mult": ffn_mult, "critic": critic,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True,
+                     # 2026-09-22: 1 = the single 87-lane body token, 3 =
+                     # [torso, leg_L, leg_R] (see _TORSO_IDX / _LEG_*_IDX)
+                     "body_tokens": int(body_tokens),
                      "note_geo": bool(note_geo),
                      "note_geo_norm": bool(note_geo_norm),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
@@ -558,12 +607,23 @@ class NotePolicy(nn.Module):
         # saber token features: the 25 obs-v10 hand features + [is_left,
         # is_right]; the body token gets its own encoder
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
-        self.body_mlp = _mlp([BODY_FEAT, embed, embed])
+        self.body_tokens = int(body_tokens)
+        # lead tokens: 2 sabers + the body token(s); the notes follow
+        self.n_lead = 2 + self.body_tokens
+        if self.body_tokens == 3:
+            # torso gets its own encoder; the two legs share one (+ the
+            # 2-lane side one-hot), like the sabers. Registered before
+            # the blocks so the trainer's "enc" diag group covers them.
+            self.torso_mlp = _mlp([TORSO_FEAT, embed, embed])
+            self.leg_mlp = _mlp([LEG_FEAT + 2, embed, embed])
+        else:
+            self.body_mlp = _mlp([BODY_FEAT, embed, embed])
         self.blocks = nn.ModuleList(
             Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
-        # readout = [saber_L, saber_R, body] output embeddings
+        # readout = the lead tokens' output embeddings
+        # ([saber_L, saber_R, body] or [saber_L, saber_R, torso, leg_L, leg_R])
         if trunk_arch == "mlp":
-            self.trunk = _mlp([3 * embed, trunk_dim, trunk_dim])
+            self.trunk = _mlp([self.n_lead * embed, trunk_dim, trunk_dim])
         else:
             # SimBa-style readout trunk (2026-09-15, brainstorm item 2;
             # SimBa 2410.09754 / SimBaV2 2502.15280, Creus Castanyer
@@ -578,7 +638,7 @@ class NotePolicy(nn.Module):
             # trunk -> heads -> critic) keep their order; the trainer's
             # diag looks the trunk group up by name prefix.
             H = int(trunk_hidden) if trunk_hidden else trunk_dim
-            self.trunk_proj = nn.Linear(3 * embed, trunk_dim)
+            self.trunk_proj = nn.Linear(self.n_lead * embed, trunk_dim)
             self.trunk_ln1 = FusedLayerNorm(trunk_dim)
             self.trunk_fc1 = nn.Linear(trunk_dim, H)
             self.trunk_fc2 = nn.Linear(H, trunk_dim)
@@ -652,7 +712,8 @@ class NotePolicy(nn.Module):
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
                                        dtype=torch.long), persistent=False)
         self.register_buffer(
-            "_body_idx", torch.tensor(_BODY_IDX, dtype=torch.long),
+            "_body_idx", torch.tensor(_BODY3_IDX if self.body_tokens == 3
+                                      else _BODY_IDX, dtype=torch.long),
             persistent=False)
         # fp16-storage mode (2026-07-25): activations flow fp16 between
         # the obs split and the head output; GEMMs are fp16-in with fp32
@@ -728,18 +789,26 @@ class NotePolicy(nn.Module):
         hand_id = hid[1].expand(B, 2, 2)
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
-        body_tok = _seq(self.body_mlp, body.to(dt)).unsqueeze(1)     # (B, 1, 64)
+        if self.body_tokens == 3:
+            body = body.to(dt)
+            torso_tok = _seq(self.torso_mlp, body[:, :TORSO_FEAT]).unsqueeze(1)
+            leg_feat = torch.cat([body[:, TORSO_FEAT:].reshape(B, 2, LEG_FEAT),
+                                  hand_id], dim=-1)        # side one-hot
+            body_tok = torch.cat([torso_tok, _seq(self.leg_mlp, leg_feat)],
+                                 dim=1)                              # (B, 3, d)
+        else:
+            body_tok = _seq(self.body_mlp, body.to(dt)).unsqueeze(1)  # (B, 1, d)
         tokens = torch.cat([_seq(self.saber_mlp, saber_feat), body_tok, emb],
-                           dim=1)                                    # (B, 19, 64)
+                           dim=1)                        # (B, n_lead + 24, d)
         # additive attention mask is block-invariant: build it once.
-        # The 3 lead lanes (2 sabers + body) are always attendable ->
-        # bias exactly +0.0 = F.pad's zero fill (bit-identical).
+        # The lead lanes (sabers + body token(s)) are always attendable
+        # -> bias exactly +0.0 = F.pad's zero fill (bit-identical).
         # The fused fp16 attention kernel accepts odd T since
         # 2026-08-02 (plain-__half bias load) — the 19-token v10
         # layout runs it again; the even-T fallback era was
         # 2026-07-31..08-02.
         attn_bias = F.pad((note_mask.unsqueeze(1) - 1.0) * MASK_BIAS,
-                          (3, 0))
+                          (self.n_lead, 0))
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
         delta = delta_b = None
@@ -768,7 +837,7 @@ class NotePolicy(nn.Module):
         # there). fp16: the value moves at fp16-rounding level, the
         # class already accepted for the actor; r1 is untouched (the
         # value is not in the ratio). Pinned by tests/test_critic_fp16.
-        tokens = self.blocks[-1](tokens, None, n_queries=3,
+        tokens = self.blocks[-1](tokens, None, n_queries=self.n_lead,
                                  attn_bias=attn_bias, delta=delta,
                                  delta_bias=delta_b,
                                  want_resolved=not legacy)
@@ -913,7 +982,7 @@ class NotePolicy(nn.Module):
         # (custom wgrad) for q/out, packed k/v, SDPA, and critic_mlp's
         # bias_relu / relu_bwd epilogues.
         hv = self.critic_ln(x_res)
-        q = _lin(self.critic_q, hv[:, 2:3])          # body-derived query
+        q = _lin(self.critic_q, hv[:, 2:3])   # body / torso token's query
         if _QKV_PACKED and hv.dtype is torch.float16:
             # A §9 / B §7: k and v share input hv -> ONE GEMM against
             # the [wk wv] cat replicas (a flat group when flattened,
@@ -1109,6 +1178,8 @@ def load_policy(ckpt) -> NotePolicy:
         trunk_hidden=arch.get("trunk_hidden"),
         value_bins=arch.get("value_bins", 0),
         value_vmax=arch.get("value_vmax", 6.0),
-        value_sigma=arch.get("value_sigma", 0.75))
+        value_sigma=arch.get("value_sigma", 0.75),
+        # pre-2026-09-22 checkpoints carry no marker: one body token
+        body_tokens=arch.get("body_tokens", 1))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
