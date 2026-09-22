@@ -618,6 +618,7 @@ is green plus all previous gates stay green. f64 parity = EXACT equality
 **P1 — core math** (`rust` unit tests + `python/tests/test_v10_math.py`):
 - Arm-chain FK vs v9 `fk()` on 10k random in-limit poses (root at
   reference, spine 0): |Δ| ≤ 1e-12 per component (wrist, elbow, blade).
+  (Rust gate retired 2026-09-22 with the v9 `fk()`.)
   Spine/leg FK vs an independent Python mirror: ≤ 1e-12.
 - M(q): exact symmetry (built symmetric), Cholesky succeeds on 10k random
   in-limit states; CRBA columns vs RNEA(q, 0, e_j) ≤ 1e-10.
@@ -893,12 +894,12 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        engine to Python (`test_v10_contacts.py` then wraps them).
 18. **P3 env-integration surface (2026-07-31)** — the hard-replace of
     the v9 body in `rust/src/lib.rs`, decisions made at integration:
-    a. **v9 `fk()` survives as a `#[cfg(test)]` reference
+    a. **v9 `fk()` kept as a `#[cfg(test)]` reference
        implementation** in lib.rs (with its SHOULDER/L_UPPER/L_FORE
        literals) solely for the P1 continuity gate
-       (`tests_fk::v9_fk_continuity` references `crate::fk`); nothing
-       live calls it. (Both removed 2026-09-22 — the v10 FK is the
-       only reference now.) `kinematics.py` remains its Python mirror,
+       (`tests_fk::v9_fk_continuity`); nothing live called it. Both
+       were REMOVED 2026-09-22 — the v10 FK is the only Rust
+       reference now. `kinematics.py` remains its Python mirror,
        banner-marked v9-legacy (its IK feeds the P6 bot rebuild).
     b. **Effort's "post-solve substep velocity"** — RETIRED with the
        work reading 2026-09-13 (was: the END-of-substep velocity after
