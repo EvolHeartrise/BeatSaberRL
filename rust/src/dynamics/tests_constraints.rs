@@ -1,8 +1,7 @@
 //! P2 constraint gates: static stance (full-RNEA hold + muscle-tone
 //! weld force sum), weld drift under load (random full gears; scripted
 //! two-arm swing), non-penetration + unilaterality of the contact rows,
-//! no energy injection, bitwise determinism with contacts, and the
-//! contact-substep wall-time probe.
+//! no energy injection, and bitwise determinism with contacts.
 //!
 //! The muscle-tone scenarios follow the oracle protocol (README): the
 //! stabilizer's near-critical kd is applied IMPLICITLY

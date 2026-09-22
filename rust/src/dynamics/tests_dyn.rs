@@ -1,8 +1,7 @@
 //! P1 dynamics gates: mass-matrix identities (symmetry, PD, CRBA vs
 //! RNEA columns), RNEA gravity sanity against hand-computed torques,
 //! momentum conservation of the free-floating unconstrained body,
-//! bitwise determinism, clamp behavior, and the substep wall-time
-//! probe.
+//! bitwise determinism, and clamp behavior.
 
 use super::algo::{
     chol_factor, chol_factor_floored, chol_solve, crba, momentum, rnea, PD_FLOOR_F64,
