@@ -389,13 +389,6 @@ def parse_args():
                         "jointly with --gamma — gamma*lambda sets the "
                         "policy-gradient credit window, gamma alone the "
                         "value-target horizon)")
-    p.add_argument("--gamma-ramp-updates", type=int, default=0,
-                   help="on --resume, ramp gamma LINEARLY from the "
-                        "checkpoint's recorded gamma to --gamma over this "
-                        "many updates (OpenAI Five §4.5: horizon changes "
-                        "were applied gradually to a trained agent; a step "
-                        "change rescales the value targets faster than the "
-                        "value-norm EMA follows). 0 = step change")
     p.add_argument("--value-norm-beta", type=float, default=VALUE_NORM_BETA,
                    help="value-target normalization EMA rate per UPDATE "
                         "(default 0.01, halflife ~69 updates). It is "
@@ -1499,17 +1492,7 @@ def main():
         print(f"RESUMED {args.resume} at update {start_update}/{num_updates} "
               f"(step {global_step:,}; lr/schedule/Adam state restored; "
               f"env stream fresh)", flush=True)
-        gamma_from = float(resume_ckpt.get("args", {}).get("gamma",
-                                                           args.gamma))
-        if args.gamma_ramp_updates > 0 and gamma_from != args.gamma:
-            print(f"GAMMA RAMP: {gamma_from:.4f} -> {args.gamma:.4f} over "
-                  f"{args.gamma_ramp_updates} updates from update "
-                  f"{start_update} (horizon {1 / (1 - gamma_from):.1f} -> "
-                  f"{1 / (1 - args.gamma):.1f} ticks)", flush=True)
-        else:
-            gamma_from = args.gamma
     else:
-        gamma_from = args.gamma
         num_updates = max(1, args.total_steps // batch)
         start_update = 0
         global_step = 0
@@ -1636,17 +1619,6 @@ def main():
             # if --ent-tau 0) — never a function of num_updates, so
             # extension continues the curve
             ent_now = trunk_ent(update)
-        # discount for THIS update's GAE: the --gamma-ramp-updates linear
-        # path from the resumed checkpoint's gamma, else --gamma
-        if gamma_from != args.gamma and args.gamma_ramp_updates > 0:
-            tau_g = min(1.0, (update - start_update + 1)
-                        / args.gamma_ramp_updates)
-            gamma_now = gamma_from + (args.gamma - gamma_from) * tau_g
-            if tau_g < 1.0 or update - start_update + 1 == \
-                    args.gamma_ramp_updates:
-                print(f"[gamma] {gamma_now:.5f}", flush=True)
-        else:
-            gamma_now = args.gamma
         if args.bench and device.type == "cuda":
             res_now = torch.cuda.memory_allocated()
             res_pre = max(res_pre, res_now)
@@ -1760,8 +1732,8 @@ def main():
             # is commutative, so prod+delta == delta+prod bitwise —
             # 2 launches/step, zero allocations (was 3 + 2 allocs).
             nonterm = 1.0 - b_done
-            deltas = b_rew + gamma_now * b_val[1:] * nonterm - b_val[:T]
-            coef = (gamma_now * args.gae_lambda) * nonterm
+            deltas = b_rew + args.gamma * b_val[1:] * nonterm - b_val[:T]
+            coef = (args.gamma * args.gae_lambda) * nonterm
             adv = b_adv
             torch.mul(coef[T - 1], gae_zero, out=adv[T - 1])
             adv[T - 1].add_(deltas[T - 1])
