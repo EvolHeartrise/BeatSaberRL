@@ -34,7 +34,7 @@ projects/beat-arena/
     beat_arena_env/      # chart gen, constants, gym wrappers, scripted bot
     policy.py            # NotePolicy (transformer)
     train_batch.py       # batched CPU PPO (the only trainer)
-    record_replay.py     # replay recorder (Rust event stream -> JSONL v2)
+    record_replay.py     # scripted/random replay recorder (Rust event stream -> JSONL)
     tests/               # pytest
   rust/                  # beat-arena-rs: THE sim implementation
 ```
@@ -740,8 +740,8 @@ points = pre + acc (+30 on arc-headed free_post grants; links/posts/
 errors carry zeros), and all three sims track per-episode
 `score_pre/score_acc/score_post` totals (Rust `score_components()` /
 `VecBeatSim.components(i)`; torch/CUDA env tensors; f64-parity-pinned
-across all three; replay cut events carry `pre`/`acc`; bench level entries carry the
-totals) — plus getters
+across all three; replay cut events carry `pre`/`acc`; bench level
+entries carry the totals) — plus getters
 `sabers()` (per hand `q(6) ++ om(6) ++ wrist(3)`), `blades()` (unit
 blade dirs), `status()` (0 pending / 1 good / 2 bad·bomb-hit / 3 missed
 / 4 bomb passed), `bombs_hit`, `n_notes` (scoreable, bombs excluded),

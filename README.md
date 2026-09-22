@@ -483,8 +483,10 @@ $VENV/bin/python make_top10_replays.py --ckpt <ckpt.pt> --bench <bench.json> --t
 $VENV/bin/python record_replay.py --scripted   # scripted bot, procedural chart
 ```
 
-`make_top10_replays.py` re-plays a bench's top plays for a checkpoint
-with the production physics (tau body, asinh z) on the real maps.
+`make_top10_replays.py` re-plays a bench's top plays (or `--bottom` /
+`--random N` picks) for a checkpoint with the production physics (tau
+body, asinh z) on the real maps, which must already be under
+`python/maps/scoresaber/` (see `prefetch_maps.py`).
 Then open `viz/replay.html` in a browser and drop a
 `python/replays/*.jsonl` file in. Since 2026-07-21 the viewer is a
 Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
