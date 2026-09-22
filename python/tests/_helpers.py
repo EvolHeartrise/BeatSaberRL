@@ -1,12 +1,17 @@
 """Helpers shared by the test modules (import as `tests._helpers`)."""
 import numpy as np
 import pytest
-import torch
 
 from beat_arena_env.chart import Note
 from beat_arena_env.constants import N_JOINTS
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+try:  # the Rust-only tests import this module too and need no torch
+    import torch
+except ImportError:
+    torch = None
+
+cuda = pytest.mark.skipif(torch is None or not torch.cuda.is_available(),
+                          reason="needs CUDA")
 
 # a note far beyond every horizon: pure body dynamics
 FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
