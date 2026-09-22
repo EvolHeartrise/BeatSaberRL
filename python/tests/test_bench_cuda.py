@@ -67,7 +67,8 @@ def test_finish_slot_schema_and_full_combo():
                       "accuracy", "pp", "good_cuts", "bad_cuts", "misses",
                       "bombs_hit", "highest_combo", "full_combo",
                       "score_pre", "score_acc", "score_post", "flail_rad",
-                      "flail_ticks"}
+                      "flail_ticks", "wrist_rev_l", "wrist_rev_r", "ticks",
+                      "wrist_rev_per_s_l", "wrist_rev_per_s_r"}
     assert r["score"] == 900 and r["accuracy"] == 0.9 and r["full_combo"]
     r2 = bs.finish_slot(slot, dict(info, good_cuts=9, misses=1),
                         (600.0, 6, 1))

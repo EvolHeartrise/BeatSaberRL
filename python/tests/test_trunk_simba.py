@@ -40,17 +40,20 @@ def test_param_deltas_exact():
                       trunk_arch="simba")
     s1536 = NotePolicy(embed=192, trunk_dim=384, n_gears=5, note_geo=True,
                        trunk_arch="simba", trunk_hidden=1536)
-    assert _trunk_params(mlp) == 369_408
-    assert _trunk_params(s384) == 518_784
+    # 5 lead tokens since the 3-token body (2026-09-22): 960 -> 384 -> 384
+    assert _trunk_params(mlp) == 516_864
+    assert _trunk_params(s384) == 666_240
     assert _trunk_params(s384) - _trunk_params(mlp) == 149_376
     assert _trunk_params(s1536) - _trunk_params(mlp) == 1_035_264
     tot = lambda p: sum(x.numel() for x in p.parameters())  # noqa: E731
     # env v46 (2026-09-16) widened the encoders: saber 37 -> 44 lanes
     # (+7 x 192 x 2 tokens... one shared saber_mlp: +1,344) and body
     # 78 -> 87 (+9 x 192 = 1,728): totals +3,072 over the v45 counts
-    # (2,418,578 / 2,567,954)
-    assert tot(mlp) == 2_421_650
-    assert tot(s384) == 2_571_026
+    # (2,418,578 / 2,567,954). The 3-token body (2026-09-22) replaced
+    # body_mlp (53,952) with torso_mlp + leg_mlp (86,592: +32,640) and
+    # widened the trunk input 576 -> 960 (+147,456): +180,096 in total
+    assert tot(mlp) == 2_601_746
+    assert tot(s384) == 2_751_122
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
     assert names == {"trunk_proj.weight", "trunk_proj.bias",
