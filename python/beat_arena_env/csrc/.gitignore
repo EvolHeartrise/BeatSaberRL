@@ -1,6 +1,8 @@
 # torch.utils.cpp_extension JIT build directories (cuda_env.py -> build/,
 # fused_ln.py -> build_ln/, fp16_linear.py -> build_fp16/, ...). Each
 # loader os.makedirs() its own dir, so nothing here needs to be tracked.
-build/
-build_*/
+# Anchored to this directory so a nested source dir named build_* is
+# never hidden.
+/build/
+/build_*/
 *.build.log
