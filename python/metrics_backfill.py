@@ -254,7 +254,11 @@ class Backfill:
     # ------------------------------------------------------------ bench
     def bench_index(self):
         """{run name: [bench summary, ...]} over every bench JSON in the
-        archive campaigns and the repo's python/bench."""
+        archive campaigns (including `repo-bench/bench/`, the benches
+        moved out of git on 2026-09-22) and the repo's python/bench
+        (only the tracked reference benches, plus any new local ones).
+        A bench attaches to its run through its `checkpoint_name` /
+        `checkpoint` field, not through the directory it sits in."""
         paths = glob.glob(os.path.join(self.archive, "*", "bench", "*.json"))
         paths += glob.glob(os.path.join(self.repo_python, "bench", "*.json"))
         by_run = {}
