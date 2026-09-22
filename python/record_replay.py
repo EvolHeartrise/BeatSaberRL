@@ -76,7 +76,7 @@ def main():
         tag = args.tag
 
     rng = np.random.default_rng(args.seed)
-    env = RustBeatEnv(seed=args.seed, **kw)
+    env = RustBeatEnv(seed=args.seed, foot_contact=True, **kw)
     for ep in range(args.episodes):
         seed = args.seed + ep
         path = os.path.join(args.out_dir, f"{tag}_ep{ep:02d}_seed{seed}.jsonl")

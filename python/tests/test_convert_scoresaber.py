@@ -206,7 +206,7 @@ def converted(tmp_path_factory):
     (tmp / "Expert.dat").write_text(json.dumps(v2))
 
     notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
-    env = RustBeatEnv(external_chart=notes, seed=0)
+    env = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
     replay_path = str(tmp / "ep.jsonl")
     env.set_record(replay_path)
     obs, _ = env.reset()

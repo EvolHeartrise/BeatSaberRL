@@ -149,7 +149,7 @@ def test_replay_additive_fields(tmp_path):
     actions (activation = Σ|gear fraction| of the tick's action,
     [total, spine, arms, legs])."""
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(seed=2, chart_len_s=4.0, gears=5)
+    env = RustBeatEnv(foot_contact=False, seed=2, chart_len_s=4.0, gears=5)
     env.set_record(path)
     env.reset(seed=2)
     rng = np.random.default_rng(4)

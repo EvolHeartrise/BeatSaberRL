@@ -185,7 +185,7 @@ def test_replay_header_carries_tau_scale(tmp_path):
     from beat_arena_env.rust_env import RustBeatEnv
     n = Note(hit_time=2.0, col=1, row=1, x=-0.3, y=1.4, color=0,
              angle=4.712, speed=6.0)
-    env = RustBeatEnv(external_chart=[n], seed=0, gears=5)   # short episode
+    env = RustBeatEnv(foot_contact=False, external_chart=[n], seed=0, gears=5)   # short episode
     s = parse_tau_scale("arms=1.2,legs=0.9")
     env.set_tau_scale(s)
     path = tmp_path / "r.jsonl"
