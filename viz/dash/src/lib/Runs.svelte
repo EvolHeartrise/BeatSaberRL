@@ -24,6 +24,7 @@
     { key: "bench.wpp", label: "bench wpp", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(0)) },
     { key: "bench.wrev_l", label: "wrist rev L /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
     { key: "bench.wrev_r", label: "wrist rev R /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
+    { key: "bench.wrev_total", label: "wrist rev total", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
     { key: "ckpts", label: "ckpts", num: true },
     { key: "t_last", label: "last seen", num: true, fmt: (v) => (v ? new Date(v * 1000).toLocaleString() : "—") },
   ];
