@@ -51,6 +51,8 @@ UPDATE_FIELDS = (
     # events
     "falls", "tilts", "lifts", "lifts_L", "lifts_R",
     "flail", "flail_L", "flail_R", "flail_ticks",
+    # [wrev] (2026-09-22): wrist-bend reversals per second per hand
+    "wrev", "wrev_L", "wrev_R",
     "limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms",
     # [activation] (2026-09-13): mean commanded |gear fraction| summed
     # over the 29 joints per env-tick (the retired v23 iso base) + groups
@@ -165,7 +167,8 @@ def update_record(update, num_updates, global_step, *, t=None,
     if kl_stop is not None:
         rec["kl_stop_mb"] = int(kl_stop)          # --target-kl only
     for k, v in (events or {}).items():
-        if k in ("flail", "flail_L", "flail_R", "limitrest",
+        if k in ("flail", "flail_L", "flail_R", "wrev", "wrev_L", "wrev_R",
+                 "limitrest",
                  "limitrest_legs", "limitrest_spine", "limitrest_arms",
                  "activation", "activation_spine", "activation_arms",
                  "activation_legs", "torque", "torque_spine",
@@ -224,6 +227,7 @@ _RE_LIFT = re.compile(
 _RE_FLAIL = re.compile(
     r"^\[flail\] (\S+) rad/idle-tick \((?:L (\S+) / R (\S+); )?(\d+) "
     r"note-free")
+_RE_WREV = re.compile(r"^\[wrev\] L (\S+) /s +R (\S+) /s")
 _RE_LIMITREST = re.compile(
     r"^\[limitrest\] (\S+) N\*m\*s/tick \(legs (\S+) / spine (\S+) / "
     r"arms (\S+)\)")
@@ -449,6 +453,14 @@ def parse_log(text, t_end=None):
                 seg._pending["flail_R"] = _num(m.group(3))
             seg._pending["flail_ticks"] = int(m.group(4))
             seg._count("flail")
+            continue
+        m = _RE_WREV.match(line)
+        if m:
+            wl, wr = _num(m.group(1)), _num(m.group(2))
+            seg._pending["wrev_L"] = wl
+            seg._pending["wrev_R"] = wr
+            seg._pending["wrev"] = 0.5 * (wl + wr)
+            seg._count("wrev")
             continue
         m = _RE_LIMITREST.match(line)
         if m:

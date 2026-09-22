@@ -315,6 +315,12 @@ def save_results(path, data, levels):
     _ft = sum(e.get("flail_ticks", 0) for e in evaluated)
     data["flail_rad_per_tick"] = round(
         sum(e.get("flail_rad", 0.0) for e in evaluated) / _ft, 5) if _ft else 0.0
+    # wrist-bend reversals per second of played time, per hand (2026-09-22)
+    _wt = sum(e.get("ticks", 0) for e in evaluated)
+    data["wrist_rev_per_s_l"] = round(
+        30.0 * sum(e.get("wrist_rev_l", 0) for e in evaluated) / _wt, 4) if _wt else 0.0
+    data["wrist_rev_per_s_r"] = round(
+        30.0 * sum(e.get("wrist_rev_r", 0) for e in evaluated) / _wt, 4) if _wt else 0.0
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -507,6 +513,16 @@ def finish_slot(slot, info, combo):
         # hands on note-free ticks + those ticks' count, this level
         "flail_rad": round(info.get("flail_rad", 0.0), 3),
         "flail_ticks": info.get("flail_ticks", 0),
+        # wrist-bend reversals (2026-09-22, user): per hand, counted by
+        # the sims' 20 deg-hysteresis peak detector on the bend axis on
+        # every tick; rate = per second of played level time
+        "wrist_rev_l": int(info.get("wrist_rev_l", 0)),
+        "wrist_rev_r": int(info.get("wrist_rev_r", 0)),
+        "ticks": int(info.get("ticks", 0)),
+        "wrist_rev_per_s_l": (round(30.0 * info.get("wrist_rev_l", 0) / info["ticks"], 3)
+                              if info.get("ticks") else 0.0),
+        "wrist_rev_per_s_r": (round(30.0 * info.get("wrist_rev_r", 0) / info["ticks"], 3)
+                              if info.get("ticks") else 0.0),
     }
 
 
@@ -676,7 +692,9 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                     "bombs_hit": int(r[4]),
                     "score_pre": float(r[5]), "score_acc": float(r[6]),
                     "score_post": float(r[7]), "flail_rad": float(r[8]),
-                    "flail_ticks": int(r[9])},
+                    "flail_ticks": int(r[9]),
+                    "wrist_rev_l": int(r[14]), "wrist_rev_r": int(r[15]),
+                    "ticks": int(r[16])},
                     (float(r[10]), int(r[11]), int(r[12])))
                 result["cuda_slot"] = int(e)
                 levels[result["leaderboard_id"]] = result
@@ -1014,12 +1032,15 @@ def main():
                         g, b, m, n_scoreable, _, bombs = gr.sim.counters(i)
                         c_pre, c_acc, c_post = gr.sim.components(i)
                         fl_rad, fl_ticks = gr.sim.flail(i)
+                        wr_l, wr_r, wr_ticks = gr.sim.wrist_rev(i)
                         result = finish_slot(s, {
                             "good_cuts": g, "bad_cuts": b, "misses": m,
                             "n_notes": n_scoreable, "bombs_hit": bombs,
                             "score_pre": c_pre, "score_acc": c_acc,
                             "score_post": c_post, "flail_rad": fl_rad,
-                            "flail_ticks": fl_ticks}, combo)
+                            "flail_ticks": fl_ticks,
+                            "wrist_rev_l": wr_l, "wrist_rev_r": wr_r,
+                            "ticks": wr_ticks}, combo)
                         levels[result["leaderboard_id"]] = result
                         n_done += 1
                         n_finished += 1
