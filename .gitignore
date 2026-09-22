@@ -10,3 +10,13 @@ resources
 rust/target/
 rust32/target/
 python/maps/
+# Bench JSONs live in the laptop run archive
+# (~/beat-arena-volume-backup/<campaign>/bench/, repo-era copies in
+# repo-bench/bench/; metrics_backfill.py globs both). Only the current
+# reference benches stay tracked.
+python/bench/*.json
+!python/bench/v58_6blk_body3_cd400_body_default.json
+!python/bench/v58_6blk_body3_cd400_body_leaffit.json
+!python/bench/v56_6blk_g965_nstuned_cd400_body_leaffit.json
+!python/bench/v56_6blk_g965_nstuned_cd400_body_leaffit2.json
+!python/bench/v57_g98ramp_ext_cd400_body_default.json
