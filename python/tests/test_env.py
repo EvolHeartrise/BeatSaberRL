@@ -164,7 +164,7 @@ def test_flat_pose_geometry():
 def test_obs_reset_hands_and_notes():
     # bombs/dots/extras off: this test pins slot/feature offsets against
     # chart[0], which must be a plain arrow note for the color/dir asserts
-    env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
+    env = RustBeatEnv(foot_contact=False, seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
     assert OFF_NOTES == 102 and OFF_NOTE_MASK == 534   # env v19
@@ -245,7 +245,7 @@ def test_obs_kind_flags():
 def test_swing_meter_tracks_rotation():
     """The pre-swing obs feature rises while swinging, resets on reversal.
     Uses the right BEND joint torque (action index 15, env v10)."""
-    env = RustBeatEnv(seed=3)
+    env = RustBeatEnv(foot_contact=False, seed=3)
     env.reset()
     # env v20: script calibrated to the pre-v20 zero-arm pose
     _set_arm(env.sim, 0, [0.0] * 7, [0.0] * 7)
@@ -278,7 +278,7 @@ def test_z_is_time_times_speed():
     live head anchor z_off = head_z - PLANE_Z0, recovered here from the
     same obs vector's head lane)."""
     from beat_arena_env.constants import OFF_HEAD, PLANE_Z0, X_NORM
-    env = RustBeatEnv(seed=9)
+    env = RustBeatEnv(foot_contact=False, seed=9)
     obs, _ = env.reset()
     for _ in range(60):
         obs, _, done, _, _ = env.step(COAST)
@@ -304,7 +304,7 @@ def test_z_is_time_times_speed():
 
 def test_determinism():
     def run():
-        env = RustBeatEnv(colors="both", bomb_prob=0.3, extra_prob=0.3,
+        env = RustBeatEnv(foot_contact=False, colors="both", bomb_prob=0.3, extra_prob=0.3,
                           seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
@@ -960,7 +960,7 @@ def test_scripted_bot_solves_easy():
     from beat_arena_env.scripted import scripted_action
     good, total, score = 0, 0, 0.0
     for seed in range(5):
-        env = RustBeatEnv(seed=seed, gears=5)
+        env = RustBeatEnv(foot_contact=False, seed=seed, gears=5)
         env.reset(seed=seed)
         done = False
         while not done:
