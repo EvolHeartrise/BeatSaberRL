@@ -1,15 +1,14 @@
-"""cuBLASLt fused bias+ReLU epilogue (BEAT_LT_EPILOGUE, 2026-09-03,
-Tier 2.5 of the 09-02 static audit, A §5).
+"""cuBLASLt fused bias+ReLU epilogue (2026-09-03, Tier 2.5 of the 09-02
+static audit, A §5; the BEAT_LT_EPILOGUE bisect hatch was removed
+2026-09-22).
 
-The Linear+ReLU sites can run as ONE `torch._addmm_activation` GEMM
-(cublasLt RELU_BIAS epilogue, bias = fp16 replica) instead of the
-two-pass bias-free mm + in-place `bias_relu_(y, b_fp32)`. These pin:
-the routing gate (every production site qualifies, odd K included;
-misaligned or strided operands stay two-pass), the numerics
-class (fp16 last-rounding: fused vs two-pass within ~1e-3 relative,
-both within the same distance of an fp32 reference — NOT
-bit-identical), that the autograd Function's backward is untouched
-(grads from the fused forward match an fp32 reference as tightly as
+The Linear+ReLU sites run as ONE `torch._addmm_activation` GEMM
+(cublasLt RELU_BIAS epilogue, bias = fp16 replica); operands the gate
+rejects fall back to the two-pass bias-free mm + in-place
+`bias_relu_(y, b_fp32)`. These pin: the routing gate (every production
+site qualifies, odd K included; misaligned or strided operands stay
+two-pass), that the autograd Function's backward matches an fp32
+reference as tightly as
 the two-pass grads do), that the whole policy's logits/value move by
 the same class only, and — on CUDA — that the fused call really is a
 single kernel (no separate bias_relu / relu pass), which is the
@@ -79,39 +78,12 @@ def test_gate_rejects_misaligned_or_strided():
                                   bh)                      # strided x
 
 
-@pytest.mark.parametrize("name,M,K,N",
-                         [s for s in SITES if s[0] in QUALIFY],
-                         ids=[s[0] for s in SITES if s[0] in QUALIFY])
-def test_fused_vs_two_pass_numerics(monkeypatch, name, M, K, N):
-    x, w, b = _site(M, K, N)
-    wh, bh = w.half(), b.half()
-    ref = torch.relu(x.float() @ w.t() + b)
-    monkeypatch.setattr(fl, "_LT_EPILOGUE", False)
-    y_two = fl._relu_forward(x, wh, bh, b)
-    monkeypatch.setattr(fl, "_LT_EPILOGUE", True)
-    y_fused = fl._relu_forward(x, wh, bh, b)
-    assert y_fused.dtype is torch.half and y_fused.shape == (M, N)
-    assert y_fused.is_contiguous()
-    # fp16 last-rounding class: 1 ulp at the output scale is 2^-11
-    # relative; bias enters as fp16 (another 2^-11 of |b|)
-    assert _rel(y_fused, y_two) < 2e-3, _rel(y_fused, y_two)
-    assert _rel(y_two, ref) < 2e-3
-    assert _rel(y_fused, ref) < 2e-3
-    # the fused pass is exact-ish where it should be: ReLU zeros agree
-    # except at |pre-activation| within a rounding of 0
-    disagree = (y_fused == 0) != (y_two == 0)
-    if disagree.any():
-        assert ref[disagree].abs().max().item() < 2e-3
-
-
-@pytest.mark.parametrize("lt", [False, True], ids=["two-pass", "fused"])
-def test_backward_matches_fp32_reference(monkeypatch, lt):
-    """The backward is untouched by the toggle: it masks with the SAVED
-    post-ReLU y, so the reference must use that same mask (an fp32
-    relu'd reference would flip the mask on the ~4e-4 of elements whose
-    pre-activation sits within one fp16 rounding of 0, and at 110k rows
-    those flips alone move db by percent — not a backward bug)."""
-    monkeypatch.setattr(fl, "_LT_EPILOGUE", lt)
+def test_backward_matches_fp32_reference():
+    """The backward masks with the SAVED post-ReLU y, so the reference
+    must use that same mask (an fp32 relu'd reference would flip the
+    mask on the ~4e-4 of elements whose pre-activation sits within one
+    fp16 rounding of 0, and at 110k rows those flips alone move db by
+    percent — not a backward bug)."""
     x, w, b = _site(4096 * 27, 128, 512, seed=1)
     w = torch.nn.Parameter(w)
     b = torch.nn.Parameter(b)
@@ -126,42 +98,14 @@ def test_backward_matches_fp32_reference(monkeypatch, lt):
     assert _rel(b.grad, gm.sum(0)) < 1e-4
 
 
-def test_policy_logits_same_class(monkeypatch):
-    from policy import N_NOTE_SLOTS, NotePolicy, OBS_DIM, OFF_NOTE_MASK
-    g = torch.Generator().manual_seed(0)
-    obs = torch.randn(2048, OBS_DIM, generator=g) * 0.7
-    obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS] = (
-        torch.rand(2048, N_NOTE_SLOTS, generator=g) < 0.6).float()
-    obs = obs.cuda()
-    outs = {}
-    for lt in (False, True):
-        monkeypatch.setattr(fl, "_LT_EPILOGUE", lt)
-        torch.manual_seed(0)
-        p = NotePolicy(n_gears=5).cuda()
-        p.fp16 = True
-        p.flatten_fp16()
-        with torch.no_grad():
-            logits, value = p.forward_stacked(obs)
-        outs[lt] = (logits.float(), value.float())
-        fl.bump_weights_version()
-    assert _rel(outs[True][0], outs[False][0]) < 2e-2
-    assert _rel(outs[True][1], outs[False][1]) < 2e-2
-    assert not torch.equal(outs[True][0], outs[False][0]), \
-        "fused path produced bit-identical logits — is the toggle live?"
-
-
 @pytest.mark.skipif(torch.cuda.get_device_capability() < (8, 0),
                     reason="Lt RELU_BIAS fusion pinned on sm_80+ only")
-def test_fused_is_one_kernel(monkeypatch):
-    """The point of the item: under the toggle the ffn.0 site is ONE
-    GEMM launch — no bias_relu_ pass, no separate relu_ (which is what
-    torch's non-Lt fallback would show as a 2nd/3rd kernel)."""
+def test_fused_is_one_kernel():
+    """The point of the item: the ffn.0 site is ONE GEMM launch — no
+    bias_relu_ pass, no separate relu_ (which is what torch's non-Lt
+    fallback would show as a 2nd/3rd kernel)."""
     x, w, b = _site(8192 * 27, 128, 512)
     wh, bh = w.half(), b.half()
-    monkeypatch.setattr(fl, "_LT_EPILOGUE", False)
-    two = _kernels(lambda: fl._relu_forward(x, wh, bh, b))
-    assert len(two) == 2 and any("bias_relu" in k for k in two), two
-    monkeypatch.setattr(fl, "_LT_EPILOGUE", True)
     fused = _kernels(lambda: fl._relu_forward(x, wh, bh, b))
     # exactly one kernel, and it is the GEMM (cuBLAS names the
     # epilogue-capable cutlass kernel "...gemm_relu_..." — the same
@@ -173,8 +117,8 @@ def test_fused_is_one_kernel(monkeypatch):
     wh, bh = w.half(), b.half()          # casts outside the profile
     enc = _kernels(lambda: fl._relu_forward(x, wh, bh, b))
     assert len(enc) == 1 and "gemm" in enc[0], enc
-    # a gate-rejected operand (misaligned bias view) under the toggle
-    # still takes the two-pass kernels, not torch's 3-pass fallback
+    # a gate-rejected operand (misaligned bias view) takes the two-pass
+    # kernels, not torch's 3-pass fallback
     x, w, b = _site(8192, 128, 512)
     wh = w.half()
     big = torch.zeros(512 + 8, device="cuda", dtype=torch.half)

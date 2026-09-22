@@ -57,19 +57,6 @@ def cuda_flags():
     # way, which is the intended behavior)
     if os.environ.get("BEAT_LINEINFO") == "1":
         flags.append("-lineinfo")
-    # BEAT_MIN_BLOCKS=K: legacy step_kernel occupancy-ladder rung (see
-    # the kernel's BEAT_MIN_BLOCKS comment). Digest membership forces
-    # the rebuild + fresh ptxas census per rung.
-    mb = os.environ.get("BEAT_MIN_BLOCKS")
-    if mb and mb.isdigit() and mb != "1":
-        flags.append(f"-DBEAT_MIN_BLOCKS={int(mb)}")
-    # BEAT_CHOL_RL=1: right-looking chol_factor_n arm (see the function's
-    # K21 header). Default off — it is +2.5% ALONE at N=16k and only pays
-    # paired with BEAT_MIN_BLOCKS=16 at N >= 65,536, where the register
-    # demand it frees (254 -> 168) is what makes that rung buildable.
-    # Digest membership forces the rebuild each way.
-    if os.environ.get("BEAT_CHOL_RL") == "1":
-        flags.append("-DBEAT_CHOL_RL=1")
     return flags
 
 

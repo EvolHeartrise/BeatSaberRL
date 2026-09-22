@@ -38,37 +38,17 @@ from fused_ln import FusedLayerNorm
 # (The round-4 fused single-head attention kernel was DELETED
 # 2026-08-16: it only ever ran at n_heads == 1 and d == 64, both
 # impossible since the 6.2x scale-up — see PERF_AUDIT_2026-08-16.md.)
-# Env toggles (debug/bisect) for the LIVE fp16 epilogue paths:
-#   BEAT_NO_BIAS_RELU=1   -> eager addmm+ReLU in _seq
-#   BEAT_NO_BIAS_FOLD=1   -> ffn.2 keeps its addmm bias epilogue
-#                            instead of folding into the next block's
-#                            fused residual+LN pass
-#   BEAT_LT_EPILOGUE=0/1  -> Linear+ReLU sites: two-pass mm+bias_relu_
-#                            vs ONE cublasLt RELU_BIAS GEMM (default 1
-#                            since 2026-09-03; the A/B: fp16_linear.py)
-import os as _os
-_NO_BIAS_RELU = _os.environ.get("BEAT_NO_BIAS_RELU", "0") == "1"
-_NO_BIAS_FOLD = _os.environ.get("BEAT_NO_BIAS_FOLD", "0") == "1"
-# Perf toggles (audit Tier 1.3-1.5), fp16 stream ONLY — the fp32
-# record path stays bitwise stable under every setting. Defaults are
-# the 2026-08-15 ladder WINNERS (isolated-pod A/B, numerics-gated):
-# sdpa+qkv+heads measured 49.2 -> 40.3 ms/update (-18%), graphed
-# rollout forward -23% at N=16384, production train --bench +5.4-6.9%
-# steps/s — and r1 (rollout/update consistency) is EXACTLY 0 because
-# both phases now run the same SDPA kernels. Numerics class: fp16
-# last-rounding (worst 5.9e-3 rel on grad probes), same accepted class
-# as the delta_bias fold. Escape hatches for bisects:
-#   BEAT_ATTN=legacy    hand-rolled scores/softmax/@v (pre-ladder)
-#   BEAT_ATTN=fold      pre-scaled-q reassociation (measured mid)
-#   BEAT_QKV_PACKED=0   per-projection q/k/v GEMMs
-#   BEAT_PACKED_HEADS=0 30-way head cat per update minibatch
-# (The old "SDPA slower" refutation was sm_61/d64/T19/1-head — it did
-# not transfer to the 4090/4-head/27-token config, as the audit
-# predicted.)
-_ATTN_MODE = _os.environ.get("BEAT_ATTN", "sdpa")
-assert _ATTN_MODE in ("legacy", "fold", "sdpa"), _ATTN_MODE
-_QKV_PACKED = _os.environ.get("BEAT_QKV_PACKED", "1") == "1"
-_PACKED_HEADS = _os.environ.get("BEAT_PACKED_HEADS", "1") == "1"
+# The fp16 stream runs the 2026-08-15 ladder WINNERS unconditionally
+# (isolated-pod A/B, numerics-gated): SDPA attention, packed q/k/v
+# GEMMs, the packed head GEMM, the bias_relu / cublasLt-epilogue
+# Linear+ReLU sites and the ffn.2 bias fold into the next block's fused
+# residual+LN pass. sdpa+qkv+heads measured 49.2 -> 40.3 ms/update
+# (-18%); r1 (rollout/update consistency) is EXACTLY 0 because both
+# phases run the same SDPA kernels. Numerics class: fp16 last-rounding
+# (worst 5.9e-3 rel on grad probes). The env-var bisect hatches that
+# reinstated the pre-ladder kernels were removed 2026-09-22 (last used
+# 2026-09-02); the fp32 record path is the reference and stays bitwise
+# stable regardless.
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -93,7 +73,7 @@ def _seq(seq: nn.Sequential, x: torch.Tensor, fold_tail: bool = False):
     if fold_tail:
         tail = ms[-1]
         if (x.dtype is torch.float16 and isinstance(tail, nn.Linear)
-                and not _NO_BIAS_FOLD and _fl.ext_ok()):
+                and _fl.ext_ok()):
             return (fp16_linear_nobias(_run(ms[:-1], x), tail.weight,
                                        tail.bias),
                     tail.bias)
@@ -110,7 +90,7 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
             # (bias-free mm + in-place relu(y + b_fp32)) — round-4 #2
             if (x.dtype is torch.float16 and i + 1 < len(ms)
                     and isinstance(ms[i + 1], nn.ReLU)
-                    and not _NO_BIAS_RELU and _fl.ext_ok()):
+                    and _fl.ext_ok()):
                 x = fp16_linear_relu(x, m.weight, m.bias)
                 i += 2
                 continue
@@ -423,7 +403,7 @@ class Block(nn.Module):
         else:
             h = self.ln_attn(x)
         qkv = None
-        if _QKV_PACKED and h.dtype is torch.float16:
+        if h.dtype is torch.float16:
             # Tier 1.4: q/k/v share input h -> one GEMM against the cat
             # replicas. The final block's q runs on the SLICED h, so
             # only k/v pack there — their cat is the qkv group's tail
@@ -473,24 +453,16 @@ class Block(nn.Module):
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
             v = v.view(B, T, self.n_heads, self.dh).transpose(1, 2)
-            if _ATTN_MODE == "sdpa" and q.dtype is torch.float16:
+            if q.dtype is torch.float16:
                 # Tier 1.3b: fused attention. The additive key mask is
-                # legal here — no row is ever all-masked (3 lead lanes
+                # legal here — no row is ever all-masked (the lead lanes
                 # are always attendable), so no NaN softmax rows.
                 att = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_bias.unsqueeze(1))
             else:
-                if _ATTN_MODE == "fold" and q.dtype is torch.float16:
-                    # Tier 1.3a: pre-scale q (tiny tensor) instead of
-                    # dividing the (B,H,Tq,T) scores, and add the bias
-                    # in place — one full-scores kernel dropped, one
-                    # alloc dropped. Near-tie numerics (mul-by-
-                    # reciprocal on q vs divide on scores).
-                    scores = (q * self.dh ** -0.5) @ k.transpose(-2, -1)
-                    scores += attn_bias.unsqueeze(1)
-                else:
-                    scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)
-                    scores = scores + attn_bias.unsqueeze(1)     # (B,1,1,T)
+                # fp32 record path / CPU: the reference arithmetic
+                scores = q @ k.transpose(-2, -1) / (self.dh ** 0.5)
+                scores = scores + attn_bias.unsqueeze(1)         # (B,1,1,T)
                 att = torch.softmax(scores, dim=-1) @ v          # (B,H,Tq,dh)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
             att = _lin(self.out_proj, att)
@@ -808,7 +780,7 @@ class NotePolicy(nn.Module):
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
             out = F.linear(h, c[1], c[2]).float()
-        elif fp16 and _PACKED_HEADS:
+        elif fp16:
             # Tier 1.5: the update path reuses the rollout's fused-head
             # cache — no per-head weight/bias cats (or their backward
             # split nodes) per minibatch; grads route to the individual
@@ -848,7 +820,7 @@ class NotePolicy(nn.Module):
         # bias_relu / relu_bwd epilogues.
         hv = self.critic_ln(x_res)
         q = _lin(self.critic_q, hv[:, 2:3])   # body / torso token's query
-        if _QKV_PACKED and hv.dtype is torch.float16:
+        if hv.dtype is torch.float16:
             # A §9 / B §7: k and v share input hv -> ONE GEMM against
             # the [wk wv] cat replicas (a flat group when flattened,
             # else a version-keyed cat cache), one wgrad + one bias
@@ -864,7 +836,7 @@ class NotePolicy(nn.Module):
         q = q.view(B, 1, nh, dh).transpose(1, 2)
         k = k.view(B, T, nh, dh).transpose(1, 2)
         v = v.view(B, T, nh, dh).transpose(1, 2)
-        if _ATTN_MODE == "sdpa" and q.dtype is torch.float16:
+        if q.dtype is torch.float16:
             # Tq = 1 fused attention under the same additive key mask
             # the blocks use (no all-masked rows: the 3 lead lanes are
             # always attendable). Replaces two batched matmuls whose
@@ -895,17 +867,12 @@ class NotePolicy(nn.Module):
         else. Trainer-only; MUST run before CUDA-graph capture."""
         tail = list(self.heads)
         # qkv groups (Tier 1.4): laid out [wq wk wv | bq bk bv] per
-        # block so packed_halves resolves to static views. Grouping is
-        # harmless when the toggle is off (layout-only), but kept
-        # toggle-gated so the flat buffer layout — and therefore any
-        # bit-comparison of flat-order-dependent consumers — is
-        # unchanged in the default configuration.
-        groups = ([[blk.q_proj, blk.k_proj, blk.v_proj]
-                   for blk in self.blocks] if _QKV_PACKED else None)
-        if _QKV_PACKED:
-            # critic k/v pack the same way (Tier 1.1 / A §9); critic_q
-            # runs on the single body row and stays a standalone Linear
-            groups.append([self.critic_k, self.critic_v])
+        # block so packed_halves resolves to static views.
+        groups = [[blk.q_proj, blk.k_proj, blk.v_proj]
+                  for blk in self.blocks]
+        # critic k/v pack the same way (Tier 1.1 / A §9); critic_q runs
+        # on the single torso row and stays a standalone Linear
+        groups.append([self.critic_k, self.critic_v])
         w16, b16 = _fl.flatten_fp16_replicas(self, tail_group=tail,
                                              groups=groups)
         self._head_cache = [None, w16, b16]
