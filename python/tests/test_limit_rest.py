@@ -24,14 +24,10 @@ import pytest
 import torch
 
 import beat_arena_rs
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import N_JOINTS
+from tests._helpers import FAR_NOTE, cuda
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
-
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 COEF = 0.01
 L_KNEE, R_KNEE = 20, 26
 L_HIP_P, R_HIP_P = 17, 23
@@ -190,8 +186,7 @@ def test_cuda_flow_and_pricing_consistency():
         kw.setdefault("foot_contact", True)
         e = CudaBeatVecEnv(1, charts=[[FAR_NOTE]], seed=0,
                            device="cuda", gears=5,
-                           max_steps=6900, push_prob=0.0, push_vmax=0.0,
-                           start_jitter=0.0, auto_reset=False, **kw)
+                           max_steps=6900, auto_reset=False, **kw)
         e.reset()
         return e
 

@@ -25,9 +25,7 @@ from beat_arena_env.cuda_env import (NOTE_OBJ_FIELDS, WALL_OBJ_FIELDS,
                                      _walls_to_padded, _walls_to_tensors,
                                      pad_to_ragged, ragged_to_padded)
 from beat_arena_env.ranked_pool import _subset_ragged
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import cuda
 
 
 def _synthetic(n_charts=41, seed=0, max_notes=13, max_walls=4):

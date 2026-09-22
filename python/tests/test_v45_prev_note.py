@@ -23,14 +23,10 @@ from beat_arena_env.constants import (KIND_BOMB, N_JOINTS, OBS_DIM,
                                       OFF_PREV_L, OFF_PREV_R, PREV_FEAT,
                                       X_NORM, Y_NORM, note_center)
 from beat_arena_env.mirror import mirror_tuples
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import FAR_NOTE, cuda, resync, rust_state
 
 DOWN = 3 * math.pi / 2
 UPLEFT = 3 * math.pi / 4
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 COAST = [0] * N_JOINTS
 
 
@@ -311,7 +307,6 @@ def test_cuda_miss_block_matches_rust():
     env.reset()
     sim = _sim([note_tuple(x) for x in chart])
     zero = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
-    from tests.test_v10_parity_cuda import _rust_state
     for _ in range(130):
         tobs, *_ = env.step(zero)
         robs, *_ = sim.step(COAST)
@@ -327,11 +322,8 @@ def test_cuda_miss_block_matches_rust():
         np.testing.assert_array_equal(c[7:10], r[7:10])
         np.testing.assert_allclose(c[[0, 1, 5, 6]], r[[0, 1, 5, 6]],
                                    atol=1e-4)
-        q, v = _rust_state(sim)
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor([q], dtype=torch.float64),
-                      torch.tensor([v], dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        q, v = rust_state(sim)
+        resync(env, [q], [v])
     assert int(env.prev_valid[0, 1]) == 1 and int(env.prev_idx[0, 1]) == 0
     assert int(env.prev_valid[0, 0]) == 0
     assert sim.prev_note()[1] == (0, True)
@@ -343,8 +335,7 @@ def test_cuda_lockstep_prev_record_parity():
     per-colour record (index, valid) is EXACT wherever per-note status
     is exact; the prev lanes differ on <= 8%% of env-ticks (the base
     gate's knife-edge band)."""
-    from tests.test_v10_parity_cuda import (FULL, _charts, _rust_sims,
-                                            _rust_state)
+    from tests.test_v10_parity_cuda import FULL, _charts, _rust_sims
     charts = _charts(FULL, range(300, 306))
     max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
     env = _cuda_env(charts, max_steps=max_steps)
@@ -365,13 +356,10 @@ def test_cuda_lockstep_prev_record_parity():
                            - tobs[e, OFF_PREV_L:].cpu().numpy())
                 flips += int((d > 1e-3).any())
                 ticks += 1
-            q, v = _rust_state(sim)
+            q, v = rust_state(sim)
             q36s.append(q)
             v35s.append(v)
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                      torch.tensor(v35s, dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        resync(env, q36s, v35s)
         if all(done_r):
             break
     assert all(done_r)

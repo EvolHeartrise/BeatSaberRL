@@ -6,15 +6,11 @@ the token/readout shapes, the arch-marker round trip through load_policy
 and its refusal of pre-v58 single-token checkpoints, side awareness of
 the shared leg encoder, and that the CUDA fp16 fused path agrees with
 the fp32 CPU path (forward + backward). Needs torch."""
-import os
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import policy as P  # noqa: E402
-from beat_arena_env import constants as C  # noqa: E402
+import policy as P
+from beat_arena_env import constants as C
 
 
 def _joint_q_lane(j):

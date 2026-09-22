@@ -29,12 +29,10 @@ import re
 import numpy as np
 
 import beat_arena_rs
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import (BASE_POS0, JOINT_LIMITS, N_JOINTS, NV,
                                       OBS_DIM)
-
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
+from tests._helpers import FAR_NOTE
 
 
 def _gimbal_q36():

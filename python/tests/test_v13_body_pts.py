@@ -3,13 +3,11 @@ on the Rust reference. The CUDA mirror is gated by the
 test_v11_contact_parity.py lockstep tiers (full-obs comparison)."""
 import numpy as np
 
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import (FOOT_Y0, KNEE_Y0, N_JOINTS, OBS_DIM,
                                       OFF_BODY_PTS, Y_CENTER, Y_NORM)
 import beat_arena_rs
-
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
+from tests._helpers import FAR_NOTE
 
 
 def _reset_obs(foot_contact):

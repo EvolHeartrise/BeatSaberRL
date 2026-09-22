@@ -7,11 +7,9 @@ equality against the identity ordering, for (a) a fixed scrambled
 permutation and (b) the live sorted mode (BEAT_ENV_ORDER path), plus
 run-to-run determinism of the sorted arm."""
 import numpy as np
-import pytest
 import torch
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import cuda
 
 N = 64
 TICKS = 90

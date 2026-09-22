@@ -18,8 +18,8 @@ from beat_arena_env.constants import (DT, N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT,
                                       OBS_DIM, OFF_NOTES, OFF_NOTE_MASK,
                                       WALL_FRONT_OFF, WALL_PEN)
 import beat_arena_rs
+from tests._helpers import ZERO_ACT
 
-ZERO_ACT = [0] * N_JOINTS
 PLANE_Z0 = -0.65
 
 

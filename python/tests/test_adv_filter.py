@@ -11,14 +11,9 @@ largest |advantage| kept, near-zero rows drop first, count exact
 even on ties.
 """
 
-import os
-import sys
-
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from train_batch import adv_filter_indices  # noqa: E402
+from train_batch import adv_filter_indices
 
 
 def test_keeps_largest_magnitude_both_signs():
