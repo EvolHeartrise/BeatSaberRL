@@ -123,10 +123,10 @@ def test_ternary_prefix_identical_across_k():
 
 
 def test_env_action_space_and_header():
-    env = RustBeatEnv(gears=5, seed=0)
+    env = RustBeatEnv(foot_contact=False, gears=5, seed=0)
     assert list(env.action_space.nvec) == [5] * N_JOINTS
     with pytest.raises(AssertionError):
-        RustBeatEnv(gears=4)
+        RustBeatEnv(foot_contact=False, gears=4)
 
 
 def test_policy_head_width_roundtrip():
@@ -136,7 +136,7 @@ def test_policy_head_width_roundtrip():
     import torch
     from policy import NotePolicy, load_policy
 
-    env = RustBeatEnv(gears=5, seed=0, chart_len_s=6.0)
+    env = RustBeatEnv(foot_contact=False, gears=5, seed=0, chart_len_s=6.0)
     obs, _ = env.reset()
     for k in (3, 5, 7):
         torch.manual_seed(0)

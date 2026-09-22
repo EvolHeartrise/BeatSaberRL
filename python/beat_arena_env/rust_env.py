@@ -35,18 +35,21 @@ class RustBeatEnv(gym.Env):
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125,
-                 external_chart=None, gears=3, seed=0,
-                 foot_contact=False, fall_const=5.0,
+                 external_chart=None, gears=3, seed=0, *,
+                 foot_contact, fall_const=5.0,
                  external_walls=None):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
         external_walls: list[Wall] riding along (env v17, spec §12) —
         real maps only; the procedural generator emits no walls.
 
-        foot_contact: env v11 foot_mode (unilateral-contact spec §1) —
-        False = the v10 foot welds (DEFAULT, physics unchanged), True =
-        unilateral frictional ground contact on the 8 sole corners, with
-        the fall termination at root y < 0.55 m."""
+        foot_contact: REQUIRED keyword (no default) — env v11 foot_mode
+        (unilateral-contact spec §1). True = unilateral frictional ground
+        contact on the 8 sole corners, with the fall (root y below
+        FALL_ROOT_Y, rust/src/lib.rs) and chest-tilt terminations: the
+        ONLY production mode (every ckpt is contact-trained). False =
+        the retired v10 foot welds, kept as a TEST HARNESS only. Required so no caller silently gets weld physics
+        by forgetting it."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),

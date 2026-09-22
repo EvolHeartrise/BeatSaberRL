@@ -51,7 +51,8 @@ def main():
         policy.eval()
 
     env = RustBeatEnv(external_chart=notes, seed=1,
-                      gears=policy.n_gears if policy is not None else 3)
+                      gears=policy.n_gears if policy is not None else 3,
+                      foot_contact=True)
     if args.replay:
         env.set_record(args.replay)
     rng = np.random.default_rng(0)
