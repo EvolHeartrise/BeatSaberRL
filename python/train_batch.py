@@ -1495,8 +1495,8 @@ def main():
     # env-order state is on the banner because it was invisible for the
     # 12 days it existed (2026-08-21 -> 09-02): nothing printed it and
     # nothing set it, so no log ever said which ordering a run used.
-    # Read off the ENV (the trainer always passes env_order=True to the
-    # CUDA env; the Rust env has no permutation and prints nothing).
+    # Read off the env object (the trainer always passes env_order=True
+    # to the CUDA env; the Rust env has no permutation, prints nothing).
     eo_live = getattr(venv, "_env_order_on", None)
     eo = "" if eo_live is None else \
         f", env-order {'on' if eo_live else 'off'}"
