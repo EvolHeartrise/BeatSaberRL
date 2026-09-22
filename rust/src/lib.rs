@@ -2264,6 +2264,68 @@ impl Core {
     }
 }
 
+/// Shared constructor + per-env telemetry pops, used by both
+/// `RawBeatSim` (one Core) and `VecBeatSim` (folds over its Cores in
+/// index order).
+impl Core {
+    /// `new_core` plus the per-env coefficients both Python
+    /// constructors expose.
+    #[allow(clippy::too_many_arguments)]
+    fn configured(max_steps: u32, gears: u8, foot_contact: bool,
+                  fall_const: Real, foot_z_coef: Real, foot_x_coef: Real,
+                  foot_hinge_r: Real, foot_shape_coef: Real,
+                  energy_coef: Real, limit_coef: Real, limit_arms: bool,
+                  wall_despawn: bool, self_contact_coef: Real) -> Self {
+        let mut core = Core::new_core(max_steps, gears, foot_contact);
+        core.fall_const = fall_const;
+        core.foot_z_coef = foot_z_coef;
+        core.foot_x_coef = foot_x_coef;
+        core.foot_hinge_r = foot_hinge_r;
+        core.foot_shape_coef = foot_shape_coef;
+        core.energy_coef = energy_coef;
+        core.limit_coef = limit_coef;
+        core.limit_arms = limit_arms;
+        core.wall_despawn = wall_despawn;
+        core.self_contact_coef = self_contact_coef;
+        core
+    }
+
+    /// Raw self-contact accumulators (impulse N·s, ticks with contact,
+    /// env-ticks — the counts stored as Real), zeroed.
+    fn pop_self_contact(&mut self) -> [Real; 3] {
+        std::mem::replace(&mut self.sc_stat, [0.0; 3])
+    }
+
+    /// (Σ activation [total, spine, arms, legs], env-ticks), zeroed.
+    fn pop_activation(&mut self) -> ([Real; 4], u64) {
+        let s = std::mem::replace(&mut self.act_sum, [0.0; 4]);
+        (s, std::mem::replace(&mut self.act_ticks, 0))
+    }
+
+    /// (Σ applied |τ| [total, spine, arms, legs], env-ticks), zeroed.
+    fn pop_torque(&mut self) -> ([Real; 4], u64) {
+        let s = std::mem::replace(&mut self.tau_sum, [0.0; 4]);
+        (s, std::mem::replace(&mut self.tau_ticks, 0))
+    }
+
+    fn pop_pd_hits(&mut self) -> u64 {
+        std::mem::replace(&mut self.body.ws.pd_hits, 0)
+    }
+
+    fn pop_envelope_hits(&mut self) -> u64 {
+        std::mem::replace(&mut self.body.ws.env_hits, 0)
+    }
+
+    fn pop_fall_hits(&mut self) -> u64 {
+        std::mem::replace(&mut self.body.fall_hits, 0)
+    }
+
+    #[cfg(feature = "stats")]
+    fn pop_dbg_stats(&mut self) -> DbgStats {
+        std::mem::take(&mut self.body.ws.stats)
+    }
+}
+
 #[pyclass]
 struct RawBeatSim {
     core: Core,
@@ -2287,26 +2349,20 @@ impl RawBeatSim {
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: Real) -> Self {
-        let mut core = Core::new_core(max_steps, gears, foot_contact);
-        core.fall_const = fall_const;
-        core.foot_z_coef = foot_z_coef;
-        core.foot_x_coef = foot_x_coef;
-        core.foot_hinge_r = foot_hinge_r;
-        core.foot_shape_coef = foot_shape_coef;
-        core.energy_coef = energy_coef;
-        core.limit_coef = limit_coef;
-        core.limit_arms = limit_arms;
-        core.wall_despawn = wall_despawn;
-        core.self_contact_coef = self_contact_coef;
-        RawBeatSim { core }
+        RawBeatSim {
+            core: Core::configured(max_steps, gears, foot_contact,
+                                   fall_const, foot_z_coef, foot_x_coef,
+                                   foot_hinge_r, foot_shape_coef,
+                                   energy_coef, limit_coef, limit_arms,
+                                   wall_despawn, self_contact_coef),
+        }
     }
 
     /// env v41 self-contact telemetry since the last pop: (summed
     /// self-collision impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
     fn pop_self_contact(&mut self) -> (Real, u64, u64) {
-        let s = self.core.sc_stat;
-        self.core.sc_stat = [0.0; 3];
+        let s = self.core.pop_self_contact();
         (s[0], s[1] as u64, s[2] as u64)
     }
 
@@ -2519,10 +2575,7 @@ impl RawBeatSim {
     /// Activation telemetry since the last pop: (Σ total, Σ spine,
     /// Σ arms, Σ legs, env-ticks). CUDA `pop_activation` mirror.
     fn pop_activation(&mut self) -> (Real, Real, Real, Real, u64) {
-        let s = self.core.act_sum;
-        let t = self.core.act_ticks;
-        self.core.act_sum = [0.0; 4];
-        self.core.act_ticks = 0;
+        let (s, t) = self.core.pop_activation();
         (s[0], s[1], s[2], s[3], t)
     }
 
@@ -2537,10 +2590,7 @@ impl RawBeatSim {
     /// Torque telemetry since the last pop: (Σ total, Σ spine, Σ arms,
     /// Σ legs, env-ticks) of applied |τ| (N·m). CUDA `pop_torque` mirror.
     fn pop_torque(&mut self) -> (Real, Real, Real, Real, u64) {
-        let s = self.core.tau_sum;
-        let t = self.core.tau_ticks;
-        self.core.tau_sum = [0.0; 4];
-        self.core.tau_ticks = 0;
+        let (s, t) = self.core.pop_torque();
         (s[0], s[1], s[2], s[3], t)
     }
 
@@ -2549,9 +2599,7 @@ impl RawBeatSim {
     /// mirror. Returns the count and zeroes it. ADDITIVE getter; 0 in
     /// every state the strict pre-§22 factorization survived.
     fn pop_pd_hits(&mut self) -> u64 {
-        let h = self.core.body.ws.pd_hits;
-        self.core.body.ws.pd_hits = 0;
-        h
+        self.core.pop_pd_hits()
     }
 
     /// PRE-integration root-velocity-envelope engagements since the last
@@ -2560,9 +2608,7 @@ impl RawBeatSim {
     /// zeroes it. 0 on every healthy trajectory; nonzero means at least
     /// one tick's episode was terminated by the C backstop.
     fn pop_envelope_hits(&mut self) -> u64 {
-        let h = self.core.body.ws.env_hits;
-        self.core.body.ws.env_hits = 0;
-        h
+        self.core.pop_envelope_hits()
     }
 
     /// FALL terminations since the last pop (unilateral-contact spec
@@ -2570,9 +2616,7 @@ impl RawBeatSim {
     /// `pop_envelope_hits`. Returns the count and zeroes it. Always 0 in
     /// weld mode (`foot_contact=False`), where the feet cannot let go.
     fn pop_fall_hits(&mut self) -> u64 {
-        let h = self.core.body.fall_hits;
-        self.core.body.fall_hits = 0;
-        h
+        self.core.pop_fall_hits()
     }
 
     /// TILT terminations since the last pop (2026-08-20): root up-axis
@@ -2613,8 +2657,7 @@ impl RawBeatSim {
         let mut acc = DbgStats::default();
         #[cfg(feature = "stats")]
         {
-            acc.merge(&self.core.body.ws.stats);
-            self.core.body.ws.stats = DbgStats::default();
+            acc.merge(&self.core.pop_dbg_stats());
         }
         dbg_stats_dict(&acc)
     }
@@ -2827,18 +2870,11 @@ impl VecBeatSim {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
-                    let mut c = Core::new_core(max_steps, gears, foot_contact);
-                    c.fall_const = fall_const;
-                    c.foot_z_coef = foot_z_coef;
-                    c.foot_x_coef = foot_x_coef;
-                    c.foot_hinge_r = foot_hinge_r;
-                    c.foot_shape_coef = foot_shape_coef;
-                    c.energy_coef = energy_coef;
-                    c.limit_coef = limit_coef;
-                    c.limit_arms = limit_arms;
-                    c.wall_despawn = wall_despawn;
-                    c.self_contact_coef = self_contact_coef;
-                    c
+                    Core::configured(max_steps, gears, foot_contact,
+                                     fall_const, foot_z_coef, foot_x_coef,
+                                     foot_hinge_r, foot_shape_coef,
+                                     energy_coef, limit_coef, limit_arms,
+                                     wall_despawn, self_contact_coef)
                 })
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
@@ -2981,14 +3017,7 @@ impl VecBeatSim {
     /// counters. ADDITIVE getter (no existing FFI shape changed); 0 in
     /// every state the strict pre-§22 factorization survived.
     fn pop_pd_hits(&mut self) -> u64 {
-        self.sims
-            .iter_mut()
-            .map(|s| {
-                let h = s.body.ws.pd_hits;
-                s.body.ws.pd_hits = 0;
-                h
-            })
-            .sum()
+        self.sims.iter_mut().map(Core::pop_pd_hits).sum()
     }
 
     /// PRE-integration root-velocity-envelope engagements summed over
@@ -2997,14 +3026,7 @@ impl VecBeatSim {
     /// zeroes the per-env counters. ADDITIVE getter; 0 on every healthy
     /// trajectory.
     fn pop_envelope_hits(&mut self) -> u64 {
-        self.sims
-            .iter_mut()
-            .map(|s| {
-                let h = s.body.ws.env_hits;
-                s.body.ws.env_hits = 0;
-                h
-            })
-            .sum()
+        self.sims.iter_mut().map(Core::pop_envelope_hits).sum()
     }
 
     /// Activation telemetry summed over all envs since the last pop:
@@ -3014,12 +3036,11 @@ impl VecBeatSim {
         let mut acc = [0.0 as Real; 4];
         let mut tk = 0u64;
         for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_activation();
             for k in 0..4 {
-                acc[k] += s.act_sum[k];
+                acc[k] += a[k];
             }
-            tk += s.act_ticks;
-            s.act_sum = [0.0; 4];
-            s.act_ticks = 0;
+            tk += t;
         }
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
@@ -3042,12 +3063,11 @@ impl VecBeatSim {
         let mut acc = [0.0 as Real; 4];
         let mut tk = 0u64;
         for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_torque();
             for k in 0..4 {
-                acc[k] += s.tau_sum[k];
+                acc[k] += a[k];
             }
-            tk += s.tau_ticks;
-            s.tau_sum = [0.0; 4];
-            s.tau_ticks = 0;
+            tk += t;
         }
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
@@ -3058,10 +3078,10 @@ impl VecBeatSim {
     fn pop_self_contact(&mut self) -> (Real, u64, u64) {
         let (mut imp, mut ct, mut tk) = (0.0 as Real, 0.0 as Real, 0.0 as Real);
         for s in self.sims.iter_mut() {
-            imp += s.sc_stat[0];
-            ct += s.sc_stat[1];
-            tk += s.sc_stat[2];
-            s.sc_stat = [0.0; 3];
+            let a = s.pop_self_contact();
+            imp += a[0];
+            ct += a[1];
+            tk += a[2];
         }
         (imp, ct as u64, tk as u64)
     }
@@ -3072,14 +3092,7 @@ impl VecBeatSim {
     /// zeroes the per-env counters. ADDITIVE getter; always 0 in weld
     /// mode.
     fn pop_fall_hits(&mut self) -> u64 {
-        self.sims
-            .iter_mut()
-            .map(|s| {
-                let h = s.body.fall_hits;
-                s.body.fall_hits = 0;
-                h
-            })
-            .sum()
+        self.sims.iter_mut().map(Core::pop_fall_hits).sum()
     }
 
     /// R26 instrumentation: the per-substep rate counters aggregated
@@ -3100,8 +3113,7 @@ impl VecBeatSim {
         let mut acc = DbgStats::default();
         #[cfg(feature = "stats")]
         for s in self.sims.iter_mut() {
-            acc.merge(&s.body.ws.stats);
-            s.body.ws.stats = DbgStats::default();
+            acc.merge(&s.pop_dbg_stats());
         }
         dbg_stats_dict(&acc)
     }
