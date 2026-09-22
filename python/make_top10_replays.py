@@ -54,8 +54,6 @@ def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0),
     # BEAT_Z_ASINH once per process (this runs before any sim exists)
     os.environ["BEAT_Z_ASINH"] = repr(float(ckpt.get("arch", {}).get(
         "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0))))
-    os.environ["BEAT_Z_FAR"] = repr(float(ckpt.get("arch", {}).get(
-        "z_far", ckpt.get("args", {}).get("z_far", 0.0))))      # env v49
     _clip = ckpt.get("args", {}).get("z_clip_hi")
     if _clip is not None:
         os.environ["BEAT_Z_CLIP_HI"] = repr(float(_clip))

@@ -60,7 +60,7 @@ def test_lane_bookkeeping():
 def _policy(seed=0, **kw):
     torch.manual_seed(seed)
     return P.NotePolicy(embed=64, trunk_dim=128, n_blocks=2, n_heads=4,
-                        n_gears=5, ffn_mult=4, critic="adapool_v1",
+                        n_gears=5, ffn_mult=4,
                         note_geo=True, note_geo_norm=True, trunk_arch="simba",
                         value_bins=101, **kw)
 

@@ -38,9 +38,9 @@ SWEPT = list(SPACE["train"].keys())          # the 7 GP dimensions
 IGNORE = SWEPT + ["run_dir", "ckpt_every"]   # allowed to differ
 # trainer args added AFTER the reference leg: a run still matches the
 # protocol iff the new key holds the value that reproduces the
-# reference-era behavior (e.g. wide_acc=True is a DIFFERENT objective —
-# refused; wide_acc=False is the old scoring — accepted)
-NEW_KEY_DEFAULTS = {"wide_acc": False}
+# reference-era behavior (none outstanding since the wide-acc reward
+# was removed 2026-09-22)
+NEW_KEY_DEFAULTS = {}
 
 
 def close(a, b):

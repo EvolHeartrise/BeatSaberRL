@@ -35,7 +35,7 @@ COAST = [0] * N_JOINTS
 
 
 def _sim(tuples):
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, wide_acc=False,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    gears=5, foot_contact=False)
     sim.set_chart(tuples)
     return sim
@@ -297,7 +297,7 @@ def test_policy_arch_marker_forward_and_refusal():
 def _cuda_env(charts, max_steps=6900):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(len(charts), charts=charts, max_steps=max_steps,
-                          gears=5, wide_acc=False, device="cuda",
+                          gears=5, device="cuda",
                           dtype=torch.float64, auto_reset=False,
                           want_contacts=True)
 

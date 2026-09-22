@@ -381,28 +381,6 @@ fn z_asinh() -> Real {
             .unwrap_or(0.0)
     })
 }
-// env v49 (2026-09-20): split lanes — BEAT_Z_FAR = F metres turns on
-// lane 13 = 0.5 ln(1 + max(z - F, 0) / F) (zero across the near field)
-// and makes lane 17 (wall back) asinh(max(z, z_lo) / F); lane 2 stays
-// the clamped near-field lane. 0/unset = off. The CUDA twin takes z_far.
-fn z_far() -> Real {
-    static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("BEAT_Z_FAR")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
-    })
-}
-/// The far z lane (.cu z_far_lane mirror).
-fn z_far_lane(zu: Real) -> Real {
-    let f = z_far();
-    if f > 0.0 {
-        0.5 * (1.0 + (zu - f).max(0.0) / f).ln()
-    } else {
-        0.0
-    }
-}
 /// The obs z lane for a travelling object (.cu z_lane mirror).
 fn z_lane(zu: Real, z_lo: Real) -> Real {
     let c = z_asinh();
@@ -1184,7 +1162,6 @@ impl Body {
 struct Core {
     max_steps: u32,
     gear: [Real; 7],   // env v8: action id -> signed torque fraction
-    wide_acc: bool,   // TRAINING-ONLY wide accuracy reward (see cut scoring)
     chart: Vec<Note>,
     tail_s: Real, // episode tail after the last hit_time (covers miss exit)
     min_speed: Real, // slowest object; (hit_time-t)*min_speed > reach_z is a
@@ -1340,12 +1317,10 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32, wide_acc: bool,
-                gears: u8, foot_contact: bool) -> Self {
+    fn new_core(max_steps: u32, gears: u8, foot_contact: bool) -> Self {
         Core {
             max_steps,
             gear: gear_signed(gears),
-            wide_acc,
             chart: Vec::new(),
             tail_s: 0.5,
             min_speed: Real::INFINITY,
@@ -1676,7 +1651,6 @@ impl Core {
                 obs[base + 1] =
                     ((w.cy - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = z_lane(zfu, z_lo) as f32; // env v48
-                obs[base + 13] = z_far_lane(zfu) as f32; // env v49
                 obs[base + 3] = (-w.speed / Z_SCALE) as f32;
                 // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
                 obs[base + 14] = 1.0; // is_wall
@@ -1689,11 +1663,7 @@ impl Core {
                 // lane is binary-for-notes / continuous-for-walls
                 // under the shared token encoder; lane 17 held wall
                 // length until the same day.)
-                obs[base + 17] = if z_far() > 0.0 {
-                    ((zfu + w.len).max(z_lo) / z_far()).asinh() as f32 // env v49
-                } else {
-                    z_lane(zfu + w.len, z_lo) as f32 // env v48
-                };
+                obs[base + 17] = z_lane(zfu + w.len, z_lo) as f32; // env v48
             } else {
                 let n = &self.chart[idx];
                 let zu = (n.hit_time - self.time) * n.speed + z_off;
@@ -1702,7 +1672,6 @@ impl Core {
                 obs[base + 1] =
                     ((n.y - self.body.head[1]) / Y_NORM) as f32;
                 obs[base + 2] = z_lane(zu, z_lo) as f32; // env v48
-                obs[base + 13] = z_far_lane(zu) as f32; // env v49
                 obs[base + 3] = (-n.speed / Z_SCALE) as f32;
                 if n.kind != KIND_BOMB {
                     obs[base + 4 + n.color as usize] = 1.0;
@@ -2176,13 +2145,8 @@ impl Core {
                             round_pts(PTS_PRE
                                 * (self.body.swing_acc[m] / PRE_FULL).min(1.0))
                         };
-                        // wide_acc (TRAINING ONLY): 30·(1−d/0.6), unrounded
-                        let acc = if self.wide_acc {
-                            2.0 * PTS_ACC
-                                * (1.0 - (d_min / (2.0 * ACC_NORM)).clamp(0.0, 1.0))
-                        } else {
-                            round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)))
-                        };
+                        let acc =
+                            round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)));
                         let mut p = pre + acc;
                         if n.kind == KIND_CHAIN_HEAD {
                             // chain heads have no follow-through (max 85)
@@ -2378,21 +2342,18 @@ impl RawBeatSim {
     /// contact-only), true = unilateral frictional ground contact on
     /// the 8 sole corners.
     #[new]
-    #[pyo3(signature = (max_steps=690,
-                        wide_acc=false, gears=3, foot_contact=false,
+    #[pyo3(signature = (max_steps=690, gears=3, foot_contact=false,
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, energy_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
                         wall_despawn=false, self_contact_coef=0.0))]
-    fn new(max_steps: u32, wide_acc: bool,
-           gears: u8, foot_contact: bool, fall_const: Real,
+    fn new(max_steps: u32, gears: u8, foot_contact: bool, fall_const: Real,
            foot_z_coef: Real, foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: Real) -> Self {
-        let mut core = Core::new_core(max_steps, wide_acc,
-                                      gears, foot_contact);
+        let mut core = Core::new_core(max_steps, gears, foot_contact);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
         core.foot_x_coef = foot_x_coef;
@@ -2968,7 +2929,7 @@ impl VecBeatSim {
     /// the 8 sole corners.
     #[new]
     #[pyo3(signature = (n, max_steps=690,
-                        combo_walk=false, return_events=true, wide_acc=false,
+                        combo_walk=false, return_events=true,
                         gears=3, foot_contact=false, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
@@ -2977,7 +2938,7 @@ impl VecBeatSim {
                         self_contact_coef=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
-           return_events: bool, wide_acc: bool, gears: u8,
+           return_events: bool, gears: u8,
            foot_contact: bool, fall_const: Real, foot_z_coef: Real,
            foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
@@ -2986,8 +2947,7 @@ impl VecBeatSim {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
-                    let mut c = Core::new_core(max_steps,
-                                               wide_acc, gears, foot_contact);
+                    let mut c = Core::new_core(max_steps, gears, foot_contact);
                     c.fall_const = fall_const;
                     c.foot_z_coef = foot_z_coef;
                     c.foot_x_coef = foot_x_coef;

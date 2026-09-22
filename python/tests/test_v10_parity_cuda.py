@@ -54,19 +54,19 @@ def _charts(cfg_kw, seeds):
             for s in seeds]
 
 
-def _rust_sims(charts, gears, max_steps, wide_acc=False):
+def _rust_sims(charts, gears, max_steps):
     sims = []
     for ch in charts:
         sim = beat_arena_rs.RawBeatSim(max_steps=max_steps,
-                                       wide_acc=wide_acc, gears=gears)
+                                       gears=gears)
         sim.set_chart([note_tuple(n) for n in ch])
         sims.append(sim)
     return sims
 
 
-def _cenv(charts, gears, max_steps, dtype=torch.float64, wide_acc=False):
+def _cenv(charts, gears, max_steps, dtype=torch.float64):
     return CudaBeatVecEnv(len(charts), charts=charts, max_steps=max_steps,
-                          gears=gears, wide_acc=wide_acc, device="cuda",
+                          gears=gears, device="cuda",
                           dtype=dtype, auto_reset=False,
                           want_contacts=True)
 
@@ -279,16 +279,16 @@ def test_free_running_gentle_horizon():
 
 # --- (c) lockstep-resync full episodes ---------------------------------------
 
-def _lockstep_episode(charts, gears, seed, wide_acc=False):
+def _lockstep_episode(charts, gears, seed):
     """Run CUDA + Rust over full episodes, re-syncing the CUDA dynamics
     state to Rust's after every tick (drift never accumulates; the env
     layer — swing chain, trackers, status, counters — evolves freely on
     each side). Returns per-tick stats."""
     max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
     n = len(charts)
-    env = _cenv(charts, gears, max_steps, wide_acc=wide_acc)
+    env = _cenv(charts, gears, max_steps)
     env.reset()
-    sims = _rust_sims(charts, gears, max_steps, wide_acc=wide_acc)
+    sims = _rust_sims(charts, gears, max_steps)
     rng = np.random.default_rng(seed)
     done_r = [False] * n
     flip_ticks = 0
@@ -348,22 +348,6 @@ def test_lockstep_episode_parity():
             env.status[e, :len(sim.status())].cpu().numpy(),
             err_msg=f"env{e} status")
 
-
-def test_lockstep_wide_acc_parity():
-    """The TRAINING-ONLY wide accuracy reward stays in the same band."""
-    charts = _charts(FULL, [55, 56, 57])
-    env, sims, flips, ticks, rew_diff = _lockstep_episode(
-        charts, 5, 9, wide_acc=True)
-    assert rew_diff <= 0.05
-    for e, sim in enumerate(sims):
-        assert (sim.good_cuts, sim.bad_cuts, sim.misses) == (
-            int(env.good[e]), int(env.bad[e]), int(env.miss[e])), f"env{e}"
-        # wide-acc scores are non-integer: knife-edge d_min flips move
-        # them by fractions of a point, never more than a couple
-        assert abs(sim.score - float(env.score[e])) <= 3.0, f"env{e} score"
-
-
-# --- (d) contact-rich parity: midline press (single-tick resync) -------------
 
 def test_contact_rich_parity_midline_press():
     """Both arms driven across the chest midline — the forearm/fist vs

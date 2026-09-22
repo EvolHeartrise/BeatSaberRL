@@ -32,7 +32,7 @@ KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
 def _rust(**kw):
     # weld mode: the charge is COMMAND-based; contact-mode terminals
     # (reward = -fall_const replaces the tick) could erase a gap
-    sim = beat_arena_rs.RawBeatSim(max_steps=6900, wide_acc=False,
+    sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    gears=5, foot_contact=False, **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim

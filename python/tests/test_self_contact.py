@@ -34,7 +34,7 @@ TICKS = 90
 
 def _sim(**kw):
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   wide_acc=False, gears=5,
+                                   gears=5,
                                    foot_contact=True, **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim

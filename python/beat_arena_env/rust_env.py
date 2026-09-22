@@ -35,7 +35,7 @@ class RustBeatEnv(gym.Env):
                  note_speed_min=2.0, note_speed_max=8.0,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125,
-                 external_chart=None, wide_acc=False, gears=3, seed=0,
+                 external_chart=None, gears=3, seed=0,
                  foot_contact=False, fall_const=5.0,
                  external_walls=None):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
@@ -67,15 +67,10 @@ class RustBeatEnv(gym.Env):
             max_steps = int((self._external[-1].hit_time + 0.5) * 30) + 90
         else:
             max_steps = int(chart_len_s * 30) + 90
-        # wide_acc: TRAINING-ONLY wide accuracy reward (30*clamp(1-d/0.6),
-        # unrounded — double the real range and reward); default False so
-        # bench/eval/replay paths keep real scoring
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
-        self.sim = RawBeatSim(max_steps=max_steps,
-                              wide_acc=wide_acc, gears=gears,
+        self.sim = RawBeatSim(max_steps=max_steps, gears=gears,
                               foot_contact=foot_contact,
                               fall_const=fall_const)
-        self.wide_acc = wide_acc
         self.gears = gears
         self.foot_contact = bool(foot_contact)
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the

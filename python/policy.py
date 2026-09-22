@@ -546,8 +546,7 @@ class NotePolicy(nn.Module):
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
-                 critic: str = "adapool_v1", note_geo: bool = False,
-                 note_geo_norm: bool = False,
+                 note_geo: bool = False, note_geo_norm: bool = False,
                  value_bins: int = 0, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_arch: str = "mlp", trunk_hidden: int | None = None):
@@ -555,21 +554,18 @@ class NotePolicy(nn.Module):
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
-        assert critic in ("linear_v0", "adapool_v1"), critic
         assert trunk_arch in ("mlp", "simba"), trunk_arch
         self.encoder = encoder
         self.embed = embed
         self.n_heads = n_heads
         self.n_gears = n_gears
-        self.critic_arch = critic
         self.head_sizes = (n_gears,) * N_ACTION_HEADS
         # arch record: load_policy REFUSES checkpoints whose markers
         # don't match the current era (obs 426 / ffn_mult present).
-        # "critic" absent = the pre-2026-08-19 Linear(trunk,1) probe.
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
                      "n_blocks": n_blocks, "n_heads": n_heads,
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
-                     "ffn_mult": ffn_mult, "critic": critic,
+                     "ffn_mult": ffn_mult, "critic": "adapool_v1",
                      "n_action_heads": N_ACTION_HEADS, "body_token": True,
                      # 2026-09-22 (user): the body is ALWAYS the three
                      # tokens [torso, leg_L, leg_R] (_TORSO_IDX /
@@ -595,7 +591,6 @@ class NotePolicy(nn.Module):
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         if self.value_bins:
-            assert critic != "linear_v0", "HL-Gauss head needs the adapool critic"
             centers = torch.linspace(-float(value_vmax), float(value_vmax),
                                      self.value_bins)
             self.register_buffer("value_centers", centers, persistent=False)
@@ -646,29 +641,25 @@ class NotePolicy(nn.Module):
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
         # Critic (2026-08-19 redesign, topics/critic-design.md):
-        # linear_v0 = the retired Linear(trunk,1) probe, kept ONLY so
-        # pre-redesign checkpoints (v25/v26 campaigns) stay benchable.
         # adapool_v1 = query-derived attention pooling (Brothers
         # 2506.09215: a state-DERIVED query wins over a free learned
         # CLS token in exactly our low-SNR entity regime) + value MLP:
         # the critic's query is a projection of the body token's
         # embedding entering the final block; it pools READ-ONLY over
-        # all 27 resolved tokens (nothing attends back — the actor
-        # path is bit-identical to linear_v0), then a 3-layer MLP on
+        # all resolved tokens (nothing attends back), then a 3-layer MLP on
         # [pooled, trunk] predicts the NORMALIZED value (the trainer
         # owns the return-normalization stats). Registered AFTER the
         # heads so the critic occupies the tail of parameters() order
         # (the trainer's flat-grad diagnostics slice on that).
-        if critic == "linear_v0":
-            self.value_head = nn.Linear(trunk_dim, 1)
-        else:
-            self.critic_ln = FusedLayerNorm(embed)
-            self.critic_q = nn.Linear(embed, embed)
-            self.critic_k = nn.Linear(embed, embed)
-            self.critic_v = nn.Linear(embed, embed)
-            self.critic_out = nn.Linear(embed, embed)
-            self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
-                                    trunk_dim, self.value_bins or 1])
+        # (the pre-redesign Linear(trunk,1) critic was removed 2026-09-22
+        # — no loadable checkpoint carries it)
+        self.critic_ln = FusedLayerNorm(embed)
+        self.critic_q = nn.Linear(embed, embed)
+        self.critic_k = nn.Linear(embed, embed)
+        self.critic_v = nn.Linear(embed, embed)
+        self.critic_out = nn.Linear(embed, embed)
+        self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
+                                trunk_dim, self.value_bins or 1])
         # T4 escape hatch (PPG §3.6 detach): True stops value-loss
         # gradients at the shared-trunk boundary — the critic trains
         # on detached features. Plain attribute, NOT in state_dict.
@@ -683,29 +674,6 @@ class NotePolicy(nn.Module):
         # (2026-09-02). Written unconditionally when entropy is asked
         # for — it is the same tensor the sum reduces, not extra work.
         self._ent_h = None
-        # 2.2 (2026-09-03, B §2 of the 09-02 static audit): rollout-only
-        # side stream for the adapool critic. The trainer creates it
-        # (critic_side_stream(True)); forward_stacked(critic_async=True)
-        # under no_grad then runs _critic on it, concurrently with the
-        # heads GEMM, sampling and — the point — the env kernel, and
-        # the caller MUST critic_join() before it reads the value.
-        # None = today's inline critic. Plain attrs, NOT in state_dict.
-        # Measured 2026-09-03 (audit doc, "2.2 results"): NULL — the
-        # GPU does not co-schedule the critic's CTAs beside the resident
-        # step_kernel wave; the trainer defaults it off.
-        self._critic_stream = None
-        self._critic_pending = None
-        self._critic_ev = None
-        # 2.3 go/no-go PROBE (BEAT_CRITIC_LATE=1 in the trainer): defer
-        # the side-stream launch until critic_launch_deferred(), which
-        # the trainer calls after sampling, right BEFORE the env launch
-        # — so the critic and step_kernel become eligible at the same
-        # instant and the timeline shows whether the GPU co-schedules
-        # GEMM CTAs beside the env blocks (2.3's mechanism) or
-        # serializes them.
-        # forward_stacked returns value=None in this mode. Not for
-        # production: measured 2026-09-03, see the audit doc.
-        self._critic_late = False
         # token-slice index buffers (device-tracked, not in state_dict)
         self.register_buffer(
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
@@ -746,23 +714,11 @@ class NotePolicy(nn.Module):
         _, h = self.trunk_ln2.forward_add(x, d)
         return h
 
-    def forward_stacked(self, obs: torch.Tensor, critic_async: bool = False):
-        """Trunk + ONE fused (trunk_dim -> 29K + 1) head GEMM: stacked
-        logits (B, 29, K) + value (B,). The 29 per-head Linears + value
-        head stay separate modules (state_dict unchanged); their weights
-        are concatenated per call.
-
-        critic_async=True (rollout only, no_grad, side stream set via
-        critic_side_stream): the adapool critic is enqueued on the side
-        stream as soon as its inputs exist — BEFORE the heads GEMM —
-        and the returned value is NOT safe to read until the caller's
-        critic_join(). Every other call (grad enabled, no side stream,
-        legacy critic, CPU) computes the value inline exactly as before.
-        Same kernels, same batch, same per-stream order, so the value
-        is bit-identical either way (tests/test_critic_stream.py)."""
-        if self._critic_pending is not None:
-            raise RuntimeError("forward_stacked: the previous async "
-                               "critic was never critic_join()ed")
+    def forward_stacked(self, obs: torch.Tensor):
+        """Trunk + ONE fused (trunk_dim -> 29K) head GEMM: stacked
+        logits (B, 29, K) + the adapool critic's value (B,). The 29
+        per-head Linears stay separate modules (state_dict unchanged);
+        their weights are concatenated per call."""
         fp16 = self.fp16 and obs.is_cuda
         sabers, body, notes, note_mask = self._split(obs)
         B = obs.shape[0]
@@ -816,8 +772,7 @@ class NotePolicy(nn.Module):
         for blk in self.blocks[:-1]:
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
                                          delta=delta, delta_bias=delta_b)
-        legacy = self.critic_arch == "linear_v0"
-        # final block: only the 3 readout tokens' outputs are consumed.
+        # final block: only the lead tokens' outputs are consumed.
         # adapool critic: it pools over the RESOLVED token stream
         # entering the final block — the same embeddings that block's
         # k/v see — which the block's fused ln_attn pass writes anyway,
@@ -838,29 +793,14 @@ class NotePolicy(nn.Module):
         # there). fp16: the value moves at fp16-rounding level, the
         # class already accepted for the actor; r1 is untouched (the
         # value is not in the ratio). Pinned by tests/test_critic_fp16.
-        tokens = self.blocks[-1](tokens, None, n_queries=self.n_lead,
-                                 attn_bias=attn_bias, delta=delta,
-                                 delta_bias=delta_b,
-                                 want_resolved=not legacy)
-        x_res = None
-        if not legacy:
-            tokens, x_res = tokens
-        h = self._trunk(tokens.reshape(B, -1))          # saber+body readout
+        tokens, x_res = self.blocks[-1](tokens, None, n_queries=self.n_lead,
+                                        attn_bias=attn_bias, delta=delta,
+                                        delta_bias=delta_b,
+                                        want_resolved=True)
+        h = self._trunk(tokens.reshape(B, -1))          # lead-token readout
         if self._diag_stash:
             self._diag_h = h
-        value = None
-        side = (critic_async and self._critic_stream is not None
-                and not legacy and obs.is_cuda
-                and not torch.is_grad_enabled())
-        if side:
-            # 2.2: the critic's inputs (x_res, h, attn_bias) all exist
-            # here and nothing after this line feeds it, so the side
-            # stream can start now and overlap the heads GEMM, the
-            # sampling tail and the env kernel the caller launches next.
-            # (None under the BEAT_CRITIC_LATE probe: deferred launch.)
-            value = self._critic_async(x_res, h, attn_bias)
-        tail = (list(self.heads) + [self.value_head] if legacy
-                else list(self.heads))
+        tail = list(self.heads)
         if fp16 and not torch.is_grad_enabled():
             # rollout fast path: weights are frozen between opt.steps,
             # so the tail-tensor cat + fp16 cast is cached per weight
@@ -884,85 +824,9 @@ class NotePolicy(nn.Module):
                 # fp32 code
                 out = fp16_linear(h, w, b).float()
             else:
-                out = F.linear(h, w, b)                  # (B, 29K [+1])
-        if legacy:
-            return (out[:, :-1].view(B, N_ACTION_HEADS, self.n_gears),
-                    out[:, -1])
-        if not side:
-            value = self._critic(x_res, h, attn_bias)
+                out = F.linear(h, w, b)                  # (B, 29K)
+        value = self._critic(x_res, h, attn_bias)
         return out.view(B, N_ACTION_HEADS, self.n_gears), value
-
-    # -- 2.2: critic on a side stream (rollout only) ------------------------
-    def critic_side_stream(self, on: bool):
-        """Create (True) or drop (False) the rollout critic's side
-        stream. Trainer-only; a no-op request is harmless. A pending
-        async critic must have been joined first."""
-        assert self._critic_pending is None, "critic_join() first"
-        if on and self._critic_stream is None:
-            self._critic_stream = torch.cuda.Stream()
-            self._critic_ev = (torch.cuda.Event(), torch.cuda.Event())
-        elif not on:
-            self._critic_stream = None
-            self._critic_ev = None
-
-    def _critic_async(self, x_res, h, attn_bias):
-        """Enqueue _critic on the side stream. Stream semantics:
-        (1) the side stream waits on an event recorded on the current
-        stream AFTER x_res / h / attn_bias were produced (and after the
-        top-of-forward replica refresh, which is the first fp16 GEMM's
-        _half_params call on the current stream); (2) the three inputs
-        were allocated on the current stream's pool and are read by the
-        side stream, so the policy HOLDS them on _critic_pending until
-        critic_join() — a Python free before the join would let the
-        caching allocator hand their blocks to the next current-stream
-        kernel (the env step) while the side stream still reads them;
-        (3) the value is allocated on the side stream's pool and read
-        on the current stream after the join — record_stream(current)
-        makes the allocator defer its reuse past that read. No RNG is
-        consumed here, so the sampling stream is untouched."""
-        if self._critic_late:
-            self._critic_pending = (None, x_res, h, attn_bias)
-            return None
-        return self._critic_enqueue(x_res, h, attn_bias)
-
-    def critic_launch_deferred(self):
-        """BEAT_CRITIC_LATE probe: enqueue the deferred critic now (the
-        caller is about to launch the env kernel on the current stream).
-        Returns the value; critic_join() still applies."""
-        pend = self._critic_pending
-        assert pend is not None and pend[0] is None, "nothing deferred"
-        self._critic_pending = None
-        # no_grad is enforced HERE, not left to the caller: the trainer
-        # calls this outside its rollout no_grad block, and a grad-mode
-        # critic would chain every tick's activations onto b_val
-        # through copy_'s CopySlices (measured 2026-09-03: OOM at 20
-        # GiB by tick ~20 of the first rollout).
-        with torch.no_grad():
-            return self._critic_enqueue(*pend[1:])
-
-    def _critic_enqueue(self, x_res, h, attn_bias):
-        assert not torch.is_grad_enabled(), "async critic is no_grad-only"
-        cur = torch.cuda.current_stream(x_res.device)
-        side = self._critic_stream
-        ev_in, ev_out = self._critic_ev
-        ev_in.record(cur)
-        side.wait_event(ev_in)
-        with torch.cuda.stream(side):
-            val = self._critic(x_res, h, attn_bias)
-            val.record_stream(cur)
-        ev_out.record(side)
-        self._critic_pending = (ev_out, x_res, h, attn_bias)
-        return val
-
-    def critic_join(self):
-        """Make the current stream wait for the pending async critic
-        (no host sync) and release its inputs. No-op when nothing is
-        pending, so the trainer calls it unconditionally."""
-        pend = self._critic_pending
-        if pend is None:
-            return
-        torch.cuda.current_stream().wait_event(pend[0])
-        self._critic_pending = None
 
     def _critic(self, x_res: torch.Tensor, h: torch.Tensor,
                 attn_bias: torch.Tensor) -> torch.Tensor:
@@ -1029,8 +893,7 @@ class NotePolicy(nn.Module):
         fused-head cache becomes a pair of static VIEWS — never
         rebuilt, refreshed by the same single flat cast as everything
         else. Trainer-only; MUST run before CUDA-graph capture."""
-        tail = list(self.heads) + (
-            [self.value_head] if self.critic_arch == "linear_v0" else [])
+        tail = list(self.heads)
         # qkv groups (Tier 1.4): laid out [wq wk wv | bq bk bv] per
         # block so packed_halves resolves to static views. Grouping is
         # harmless when the toggle is off (layout-only), but kept
@@ -1039,7 +902,7 @@ class NotePolicy(nn.Module):
         # unchanged in the default configuration.
         groups = ([[blk.q_proj, blk.k_proj, blk.v_proj]
                    for blk in self.blocks] if _QKV_PACKED else None)
-        if _QKV_PACKED and self.critic_arch != "linear_v0":
+        if _QKV_PACKED:
             # critic k/v pack the same way (Tier 1.1 / A §9); critic_q
             # runs on the single body row and stays a standalone Linear
             groups.append([self.critic_k, self.critic_v])
@@ -1059,9 +922,7 @@ class NotePolicy(nn.Module):
         vers = _fl._weights_version
         c = getattr(self, "_head_cache", None)
         if c is None or c[0] != vers:
-            tail = list(self.heads) + (
-                [self.value_head] if self.critic_arch == "linear_v0"
-                else [])
+            tail = list(self.heads)
             w = torch.cat([m.weight for m in tail])
             b = torch.cat([m.bias for m in tail])
             if c is None:
@@ -1092,18 +953,12 @@ class NotePolicy(nn.Module):
         logits, value = self.forward_stacked(obs)
         return list(logits.unbind(1)), value
 
-    def get_action_and_value(self, obs, action=None, need_entropy=True,
-                             critic_async=False, head_logp=False):
+    def get_action_and_value(self, obs, action=None, need_entropy=True):
         """need_entropy=False skips the entropy reduction (~5 kernels)
         for callers that discard it — the rollout and the GAE bootstrap.
         No RNG is consumed by entropy, so the sampling stream is
-        untouched either way (2026-07-28). critic_async: see
-        forward_stacked — the caller must critic_join() before reading
-        the value. head_logp=True (2026-09-06, per-head clipping)
-        returns the (B, 29) PER-HEAD log-probs instead of their sum;
-        `.sum(-1)` of it is bit-identical to the default return (it is
-        the same gather, minus the same reduction)."""
-        logits, value = self.forward_stacked(obs, critic_async=critic_async)
+        untouched either way (2026-07-28)."""
+        logits, value = self.forward_stacked(obs)
         logsm = torch.log_softmax(logits, dim=-1)
         probs = None
         if action is None:
@@ -1122,9 +977,7 @@ class NotePolicy(nn.Module):
             # Tier 1.3); gather needs an int64 index. Exact (integers),
             # (B, 29) — a tiny per-micro-batch cast.
             action = action.long()
-        logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1)
-        if not head_logp:
-            logprob = logprob.sum(-1)
+        logprob = logsm.gather(-1, action.unsqueeze(-1)).squeeze(-1).sum(-1)
         entropy = None
         if need_entropy:
             if probs is None:
@@ -1174,9 +1027,6 @@ def load_policy(ckpt) -> NotePolicy:
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
         n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
-        # pre-2026-08-19 checkpoints carry no critic marker: they are
-        # the Linear(trunk,1) era, still loadable for bench/replay
-        critic=arch.get("critic", "linear_v0"),
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
         note_geo=arch.get("note_geo", False),
         note_geo_norm=arch.get("note_geo_norm", False),   # 2026-09-21

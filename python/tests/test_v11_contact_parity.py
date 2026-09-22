@@ -59,7 +59,7 @@ def _rust_sims(n, gears):
     sims = []
     for _ in range(n):
         sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS,
-                                       wide_acc=False, gears=gears,
+                                       gears=gears,
                                        foot_contact=True)
         sim.set_chart([note_tuple(FAR_NOTE)])
         sims.append(sim)
@@ -69,7 +69,7 @@ def _rust_sims(n, gears):
 def _cenv(n, gears, dtype=torch.float64, auto_reset=False,
           seed=0):
     return CudaBeatVecEnv(n, charts=[[FAR_NOTE]] * n, max_steps=MAX_STEPS,
-                          gears=gears, wide_acc=False, device="cuda",
+                          gears=gears, device="cuda",
                           dtype=dtype, auto_reset=auto_reset,
                           want_contacts=True, foot_contact=True, seed=seed)
 

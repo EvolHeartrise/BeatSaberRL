@@ -118,13 +118,13 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
     gears = 5
     max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
     env = CudaBeatVecEnv(n, charts=charts, max_steps=max_steps + 60,
-                         gears=gears, wide_acc=False, device="cuda",
+                         gears=gears, device="cuda",
                          dtype=torch.float64, auto_reset=False,
                          want_contacts=False, combo_walk=True)
     env.reset()
     sims = []
     for ch in charts:
-        sim = beat_arena_rs.RawBeatSim(max_steps=max_steps, wide_acc=False,
+        sim = beat_arena_rs.RawBeatSim(max_steps=max_steps,
                                        gears=gears)
         sim.set_chart([note_tuple(x) for x in ch])
         sims.append(sim)

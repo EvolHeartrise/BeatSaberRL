@@ -57,7 +57,7 @@ class GraphedRollout:
         with torch.cuda.stream(s), torch.no_grad():
             for _ in range(warmup):  # cuBLAS workspaces, allocator, RNG
                 a, _, _, _ = policy.get_action_and_value(
-                    venv._obs, need_entropy=False, critic_async=False)
+                    venv._obs, need_entropy=False)
                 venv.step(a)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
@@ -68,7 +68,7 @@ class GraphedRollout:
             # it removes ~5 dead kernels from every replay (no RNG in
             # the entropy path, so the sampling stream is unchanged)
             a, logp, _, v = policy.get_action_and_value(
-                venv._obs, need_entropy=False, critic_async=False)
+                venv._obs, need_entropy=False)
             venv.step(a)
         # static outputs: same storages every replay
         self.action, self.logp, self.value = a, logp, v
