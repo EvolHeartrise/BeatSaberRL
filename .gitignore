@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 python/runs/
 python/replays/
+# stray top-level replay dump (v16 leaves, removed 2026-09-22); replays live in python/replays/
+/replays/
 *.pt
 resources
 rust/target/
