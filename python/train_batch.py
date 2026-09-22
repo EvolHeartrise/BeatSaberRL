@@ -2185,7 +2185,7 @@ def main():
         # last micro's action slice — a VIEW of p_act, which would keep
         # that storage alive through the del (measured: +0.23 GiB
         # resident at the next rollout start without it).
-        del p_obs, p_act, p_logp, p_logp_h, p_adv, p_ret, perm, _
+        del p_obs, p_act, p_logp, p_adv, p_ret, perm, _
         if adv_filter_on:
             del keep_idx
         if fp16_update:
