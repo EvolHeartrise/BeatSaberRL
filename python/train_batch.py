@@ -402,6 +402,14 @@ def parse_args():
                         "clamp / 8 (every run before v52). Recorded in the "
                         "checkpoint (arch + args); the bench/replay tools "
                         "read it from there")
+    p.add_argument("--body-tokens", type=int, choices=(1, 3), default=3,
+                   help="2026-09-22 (user): 3 = the body as [torso, leg_L, "
+                        "leg_R] tokens (torso encoder + a shared leg "
+                        "encoder with a side one-hot, like the sabers; 29 "
+                        "tokens, readout over 5 lead tokens); 1 = the "
+                        "single 87-lane body token of every checkpoint "
+                        "before v58. Arch marker 'body_tokens'; a loaded "
+                        "checkpoint keeps its own layout")
     p.add_argument("--note-geo-norm", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="note-geo lanes normalised to O(1) — z decoded from "
@@ -965,14 +973,15 @@ class Muon:
 
 def muon_param_names(policy):
     """Which params Muon owns: hidden 2-D matrices only. Encoder input
-    layers (note/saber/body_mlp), the 29 heads, the critic's final
-    1-row layer, biases and LN gains stay on Adam (Jordan's rule)."""
+    layers (note/saber/body_mlp, or torso/leg_mlp under --body-tokens
+    3), the 29 heads, the critic's final 1-row layer, biases and LN
+    gains stay on Adam (Jordan's rule)."""
     names = []
     for n, p in policy.named_parameters():
         if p.ndim != 2:
             continue
-        if n.startswith(("note_mlp", "saber_mlp", "body_mlp", "heads.",
-                         "value_head")):
+        if n.startswith(("note_mlp", "saber_mlp", "body_mlp", "torso_mlp",
+                         "leg_mlp", "heads.", "value_head")):
             continue
         if p.shape[0] == 1:               # critic_mlp's final layer (mse)
             continue
@@ -1341,6 +1350,7 @@ def main():
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
                             note_geo=args.note_geo,
                             note_geo_norm=args.note_geo_norm,
+                            body_tokens=args.body_tokens,
                             trunk_arch=args.trunk_arch,
                             trunk_hidden=args.trunk_hidden,
                             value_bins=(args.hl_bins
