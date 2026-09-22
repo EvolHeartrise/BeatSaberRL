@@ -195,6 +195,11 @@ const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
 // env v19 flail telemetry: a tick is "note-free" when the next pending
 // chart object is further out than this (s). Telemetry only.
 const FLAIL_LEAD_S: Real = 1.0;
+// wrist-bend reversal telemetry (2026-09-22, user): a reversal is
+// counted when the wrist BEND axis (joints 8 / 15) turns back by
+// WREV_HYST from its running extreme (peak detection with hysteresis,
+// every tick). Mirrors the .cu twin exactly.
+const WREV_HYST: Real = 0.34906585;   // 20 deg
 // env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
 // env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
@@ -1293,6 +1298,12 @@ struct Core {
     // pop-based instead — each matches its consumer.
     flail_rad: Real,
     flail_ticks: u32,
+    // wrist-bend reversal telemetry (2026-09-22): per hand [L, R] count
+    // THIS episode, running extreme angle, detector state (0 fresh, 3
+    // armed, 1 moving +, 2 moving -). Zeroed by reset_state.
+    wrev: [u32; 2],
+    wrev_ext: [Real; 2],
+    wrev_dir: [u8; 2],
     // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
     // latches once the back face clears the head (monotone per wall);
     // first_wall advances over the passed prefix; walls_in counts ticks
@@ -1372,6 +1383,9 @@ impl Core {
             n_scoreable: 0,
             flail_rad: 0.0,
             flail_ticks: 0,
+            wrev: [0, 0],
+            wrev_ext: [0.0, 0.0],
+            wrev_dir: [0, 0],
             walls: Vec::new(),
             wall_passed: Vec::new(),
             first_wall: 0,
@@ -1471,6 +1485,8 @@ impl Core {
         self.n_scoreable = self.chart.iter().filter(|n| n.kind != KIND_BOMB).count() as u32;
         self.flail_rad = 0.0;
         self.flail_ticks = 0;
+        self.wrev = [0, 0];
+        self.wrev_dir = [0, 0];
         self.prev_foot_pot = 0.0;
         self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
@@ -1932,6 +1948,44 @@ impl Core {
                 }
                 self.flail_ticks += 1;
             }
+        }
+
+        // wrist-bend reversal telemetry (2026-09-22): peak detection
+        // with WREV_HYST hysteresis on this tick's integrated bend
+        // angle, per hand. Telemetry only — the .cu twin's state
+        // machine, step for step.
+        for h in 0..2 {
+            let q = self.body.st.q[if h == 0 { 8 } else { 15 }];
+            let mut dir = self.wrev_dir[h];
+            let mut ext = self.wrev_ext[h];
+            if dir == 0 {
+                ext = q;
+                dir = 3;
+            } else if dir == 3 {
+                if q >= ext + WREV_HYST {
+                    dir = 1;
+                    ext = q;
+                } else if q <= ext - WREV_HYST {
+                    dir = 2;
+                    ext = q;
+                }
+            } else if dir == 1 {
+                if q > ext {
+                    ext = q;
+                } else if q <= ext - WREV_HYST {
+                    self.wrev[h] += 1;
+                    dir = 2;
+                    ext = q;
+                }
+            } else if q < ext {
+                ext = q;
+            } else if q >= ext + WREV_HYST {
+                self.wrev[h] += 1;
+                dir = 1;
+                ext = q;
+            }
+            self.wrev_dir[h] = dir;
+            self.wrev_ext[h] = ext;
         }
 
         // both sabers' swept surfaces this tick
@@ -2763,6 +2817,11 @@ impl RawBeatSim {
     fn walls_in(&self) -> u32 {
         self.core.walls_in
     }
+    /// wrist-bend reversal telemetry, THIS episode: (L count, R count,
+    /// ticks played) — 2026-09-22. ADDITIVE getter.
+    fn wrist_rev(&self) -> (u32, u32, u32) {
+        (self.core.wrev[0], self.core.wrev[1], self.core.tick)
+    }
     /// env v17: wall ENTRIES this episode — combo breaks under the
     /// §12b combo rule (edge-triggered; >= 1 tick out re-arms).
     #[getter]
@@ -3059,6 +3118,13 @@ impl VecBeatSim {
     fn flail(&self, i: usize) -> (Real, u32) {
         let s = &self.sims[i];
         (s.flail_rad, s.flail_ticks)
+    }
+
+    /// wrist-bend reversal telemetry for env i, THIS episode: (L count,
+    /// R count, ticks played). Same lifecycle as flail(). ADDITIVE.
+    fn wrist_rev(&self, i: usize) -> (u32, u32, u32) {
+        let s = &self.sims[i];
+        (s.wrev[0], s.wrev[1], s.tick)
     }
 
     /// f64 Cholesky pivot-floor engagements summed over all envs since

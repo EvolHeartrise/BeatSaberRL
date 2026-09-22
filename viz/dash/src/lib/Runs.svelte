@@ -22,6 +22,8 @@
     { key: "final.ent", label: "ent", num: true, fmt: (v) => fmt(v, 3) },
     { key: "bench.upp", label: "bench upp", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
     { key: "bench.wpp", label: "bench wpp", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(0)) },
+    { key: "bench.wrev_l", label: "wrist rev L /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
+    { key: "bench.wrev_r", label: "wrist rev R /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
     { key: "ckpts", label: "ckpts", num: true },
     { key: "t_last", label: "last seen", num: true, fmt: (v) => (v ? new Date(v * 1000).toLocaleString() : "—") },
   ];

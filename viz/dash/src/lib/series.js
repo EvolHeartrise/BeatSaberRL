@@ -103,6 +103,7 @@ export const PANELS = [
   { id: "entgroups", title: "entropy per head group (mean per head)", series: ["ent_spine", "ent_armL", "ent_armR", "ent_legL", "ent_legR"] },
   { id: "lifts", title: "foot lifts per 1M samples", series: ["lifts_per_1m"] },
   { id: "flail", title: "flail (rad / idle tick)", series: ["flail", "flail_L", "flail_R"] },
+  { id: "wrev", title: "wrist-bend reversals per second (per hand · 20° hysteresis, every tick)", series: ["wrev_L", "wrev_R"] },
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
   { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
   { id: "torque", title: "joint torque Σ|τ| (N·m / env-tick · total / spine / arms / legs) — the energy price base (env v43)", series: ["torque", "torque_spine", "torque_arms", "torque_legs"] },
@@ -115,7 +116,7 @@ export const PANELS = [
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
   "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
-  "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "lifts_per_1m",
+  "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "wrev", "lifts_per_1m",
   "activation", "activation_spine", "activation_arms", "activation_legs",
   "torque", "torque_spine", "torque_arms", "torque_legs",
   "contact", "contact_pct",
@@ -133,6 +134,7 @@ export const LABELS = {
   kl_first_pos: "kl mb1", kl_last_pos: "kl mbN", gnorm: "gnorm", clipc: "clipc",
   ent_spine: "spine", ent_armL: "armL", ent_armR: "armR", ent_legL: "legL", ent_legR: "legR",
   flail: "flail", flail_L: "flail L", flail_R: "flail R",
+  wrev: "wrist rev /s", wrev_L: "wrist rev L /s", wrev_R: "wrist rev R /s",
   limitrest: "total", limitrest_legs: "legs", limitrest_spine: "spine", limitrest_arms: "arms",
   activation: "activation", activation_spine: "act. spine", activation_arms: "act. arms", activation_legs: "act. legs",
   torque: "Σ|τ| N·m", torque_spine: "τ spine", torque_arms: "τ arms", torque_legs: "τ legs",

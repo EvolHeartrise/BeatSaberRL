@@ -712,7 +712,7 @@ class CudaBeatVecEnv:
         self.cw_note_mult = (z(N, C, dt=torch.uint8) if self.combo_walk
                              else z(1, 1, dt=torch.uint8))
         self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
-        self.bench_rec = z(N, 14)
+        self.bench_rec = z(N, 17)   # + [wrev_L, wrev_R, ticks] (2026-09-22)
         self.bench_flag = z(N, dt=torch.uint8)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
@@ -758,6 +758,14 @@ class CudaBeatVecEnv:
         # the Rust reference carries the obs change but not this.
         self.flail_rad = z(N, 2)   # per-hand [L, R] since 2026-08-20
         self.flail_ticks = z(N, dt=torch.int32)
+        # wrist-bend reversal telemetry (2026-09-22, user): per env x
+        # hand — count since the last pop (kernel peak detection with a
+        # 20 deg hysteresis on the bend joints; flail lifecycle), the
+        # running extreme angle and the detector state (reset per
+        # episode by the kernel's reset_env). Popped by pop_wrist_rev.
+        self.wrev = z(N, 2, dt=torch.int32)
+        self.wrev_ext = z(N, 2)
+        self.wrev_dir = z(N, 2, dt=torch.int32)
         # env v34 limit-rest telemetry (per env, kernel-accrued):
         # tick-summed joint-limit-row impulses [legs, spine, arms]
         # (arms priced only under limit_arms — env v35)
@@ -846,6 +854,7 @@ class CudaBeatVecEnv:
             self._pd_hits, self._env_hits, self._fall_hits,
             self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
+            self.wrev, self.wrev_ext, self.wrev_dir,
             self.acc_pts, self.acc_cuts,
             self.ground_imp,
             self.chart_idx,
@@ -941,16 +950,17 @@ class CudaBeatVecEnv:
 
     def pop_bench_rows(self):
         """Levels that finished since the last pop: (env ids (M,) int64
-        numpy, rows (M, 14) float64 numpy) with the row layout of the
+        numpy, rows (M, 17) float64 numpy) with the row layout of the
         kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
         post, flail_rad, flail_ticks, cw_score, cw_maxc, cw_breaks,
-        chart_idx]. One row per env — pop every tick (a level lasts >= 60
-        ticks, so no slot can finish twice between pops)."""
+        chart_idx, wrev_L, wrev_R, ticks]. One row per env — pop every
+        tick (a level lasts >= 60 ticks, so no slot can finish twice
+        between pops)."""
         flags = self.bench_flag.bool()
         n = int(flags.sum().item())
         if n == 0:
             return (np.zeros((0,), dtype=np.int64),
-                    np.zeros((0, 14), dtype=np.float64))
+                    np.zeros((0, 17), dtype=np.float64))
         ids = flags.nonzero(as_tuple=False).squeeze(1)
         rows = self.bench_rec[ids].double().cpu().numpy()
         self.bench_flag.zero_()
@@ -1153,6 +1163,16 @@ class CudaBeatVecEnv:
         self.flail_rad.zero_()
         self.flail_ticks.zero_()
         return rad_l, rad_r, ticks
+
+    def pop_wrist_rev(self):
+        """Wrist-bend reversals since the last pop, (L, R) counts summed
+        over envs (2026-09-22; 20 deg hysteresis peak detection in the
+        kernel, every tick). Zeroes the counters. The caller divides by
+        the env-ticks it stepped (num_envs x horizon per update)."""
+        per_hand = self.wrev.sum(dim=0)
+        l, r = int(per_hand[0].item()), int(per_hand[1].item())
+        self.wrev.zero_()
+        return l, r
 
     def pop_limit_rest(self):
         """Limit-rest telemetry since the last pop: (legs lambda-flow

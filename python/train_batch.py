@@ -2483,6 +2483,18 @@ def main():
                       f"rad/idle-tick (L {fl_l / fl_ticks:.4f} / "
                       f"R {fl_r / fl_ticks:.4f}; {fl_ticks} note-free "
                       "env-ticks)", flush=True)
+        # wrist-bend reversal telemetry (2026-09-22, user): reversals of
+        # the bend axis per hand (20 deg hysteresis peak detection in
+        # the kernel, every tick) per second of env time; the update
+        # stepped num_envs x horizon env-ticks at 30 Hz.
+        if hasattr(venv, "pop_wrist_rev"):
+            wr_l, wr_r = venv.pop_wrist_rev()
+            _wt = float(args.num_envs * args.horizon)
+            wr_ls, wr_rs = 30.0 * wr_l / _wt, 30.0 * wr_r / _wt
+            m_ev.update(wrev=0.5 * (wr_ls + wr_rs), wrev_L=wr_ls, wrev_R=wr_rs)
+            print(f"[wrev] L {wr_ls:.3f} /s  R {wr_rs:.3f} /s wrist-bend "
+                  f"reversals per hand (20 deg hysteresis; {int(_wt)} "
+                  "env-ticks)", flush=True)
         # limit-rest telemetry: mean limit-row lambda-flow per
         # env-tick (N*m*s), legs / spine / arms split — sustained flow
         # means the pose is resting on its stops. Arms accumulate

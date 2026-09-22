@@ -302,6 +302,9 @@ class Backfill:
                 "ckpt": os.path.basename(ckpt_name or ckpt) or None,
                 "wpp": d.get("total_weighted_pp"),
                 "upp": d.get("total_unweighted_pp"),
+                # wrist-bend reversals / s per hand (2026-09-22)
+                "wrev_l": d.get("wrist_rev_per_s_l"),
+                "wrev_r": d.get("wrist_rev_per_s_r"),
                 "n_evaluated": d.get("n_evaluated"),
                 "n_levels": (len(d["levels"])
                              if isinstance(d.get("levels"), list) else 0),

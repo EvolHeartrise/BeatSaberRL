@@ -1542,6 +1542,13 @@ constexpr double SWING_BREAK = 0.005;
 // scoreable note is further out than this (s). Telemetry only — no
 // reward or obs effect.
 constexpr double FLAIL_LEAD_S = 1.0;
+// wrist-bend reversal telemetry (2026-09-22, user): per hand, a reversal
+// is counted when the wrist BEND axis (joints 8 / 15) turns back by
+// WREV_HYST from its running extreme — position-based peak detection
+// with hysteresis, so tremor under 20 deg never counts and a
+// flick-and-return counts 2. Every tick, no note gating. Mirrored in
+// lib.rs (same constant, same state machine).
+constexpr double WREV_HYST = 0.34906585;   // 20 deg
 // env v21 (lib.rs mirrors, exact shared f64 literals): wide stance —
 // hip_roll splays the legs +-8 deg, ankle_roll counter-rolls so the
 // soles stay flat. Contact mode only (weld mode's feet are welded at
@@ -4594,7 +4601,7 @@ struct Sim {
   // (cand < 0: queue exhausted — the combo_walk early-out above keeps it
   // idle at ~zero cost). Row: [good, bad, miss, score, bombs, pre, acc,
   // post, flail_rad(2 hands), flail_ticks, cw_score, cw_maxc, cw_breaks,
-  // chart_idx].
+  // chart_idx, wrev_L, wrev_R, ticks].
   bool bench_refill;
   T* __restrict__ bench_rec;
   uint8_t* __restrict__ bench_flag;
@@ -4644,6 +4651,15 @@ struct Sim {
   // and the count of those note-free ticks (the denominator).
   T* __restrict__ flail_rad;
   int* __restrict__ flail_ticks;
+  // wrist-bend reversal telemetry (2026-09-22): per env x hand [L, R] —
+  // count (flail lifecycle: popped by the wrapper's pop_wrist_rev in
+  // training, snapshotted + zeroed per level by the bench refill), the
+  // running extreme angle, and the detector state (0 = fresh episode,
+  // ext invalid; 3 = armed, no direction yet; 1 = moving +; 2 = moving
+  // -). reset_env zeroes the state, never the count.
+  int* __restrict__ wrev;
+  T* __restrict__ wrev_ext;
+  int* __restrict__ wrev_dir;
   // env v34 (2026-08-21) limit-rest telemetry (per env, [legs, spine],
   // popped + zeroed by the wrapper's pop_limit_rest, NOT touched by
   // reset_env): tick-summed joint-limit-row impulses (N.m.s) the
@@ -4866,7 +4882,7 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
 // score += pts x mult; follow-through points commit at the pinned
 // multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
 // on the event bus before multiplying — mirrored with the (float) cast.
-constexpr int BENCH_REC = 14;
+constexpr int BENCH_REC = 17;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
 
 template <typename T>
 __device__ __forceinline__ void cw_break(const Sim<T>& P, int e) {
@@ -5007,6 +5023,8 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.score_pre[e] = T(0);
   P.score_acc[e] = T(0);
   P.score_post[e] = T(0);
+  P.wrev_dir[e * 2] = 0;       // wrist-reversal detector re-arms on the
+  P.wrev_dir[e * 2 + 1] = 0;   // new episode's first tick (count kept)
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
   if (P.combo_walk) {  // bench combo walk: fresh walk per level
     P.cw_mult[e] = 1;
@@ -5709,6 +5727,30 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
   }
 
+  // wrist-bend reversal telemetry (2026-09-22): peak detection with
+  // WREV_HYST hysteresis on this tick's integrated bend angle. Pure
+  // accumulation — no reward/obs/termination effect.
+  for (int h = 0; h < 2; h++) {
+    const int idx = e * 2 + h;
+    const T q = d.q[h ? 15 : 8];
+    int dir = P.wrev_dir[idx];
+    T ext = P.wrev_ext[idx];
+    if (dir == 0) {
+      ext = q; dir = 3;
+    } else if (dir == 3) {
+      if (q >= ext + T(WREV_HYST)) { dir = 1; ext = q; }
+      else if (q <= ext - T(WREV_HYST)) { dir = 2; ext = q; }
+    } else if (dir == 1) {
+      if (q > ext) ext = q;
+      else if (q <= ext - T(WREV_HYST)) { P.wrev[idx] += 1; dir = 2; ext = q; }
+    } else {
+      if (q < ext) ext = q;
+      else if (q >= ext + T(WREV_HYST)) { P.wrev[idx] += 1; dir = 1; ext = q; }
+    }
+    P.wrev_dir[idx] = dir;
+    P.wrev_ext[idx] = ext;
+  }
+
   for (int i = P.first_pending[e]; i < nn; i++) {
     if (P.status[e * C + i] != 0) continue;
     const int64_t cb = nb0 + i;
@@ -6080,10 +6122,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     r[11] = T(P.cw_maxc[e]);
     r[12] = T(P.cw_breaks[e]);
     r[13] = T(P.chart_idx[e]);
+    r[14] = T(P.wrev[e * 2]);        // wrist-bend reversals L / R this
+    r[15] = T(P.wrev[e * 2 + 1]);    // level + the level's ticks
+    r[16] = T(tick_new);
     P.bench_flag[e] = 1;
     P.flail_rad[e * 2] = T(0);
     P.flail_rad[e * 2 + 1] = T(0);
     P.flail_ticks[e] = 0;
+    P.wrev[e * 2] = 0;
+    P.wrev[e * 2 + 1] = 0;
     if (P.cand[e] >= 0) {
       reset_env(d, P, e, P.cand[e]);
       P.done[e] = 0;
@@ -6175,7 +6222,7 @@ enum {
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
-  TFLAILR, TFLAILT,
+  TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals (N,2) x3 — 2026-09-22
   TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
@@ -6266,6 +6313,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_down_prev = ts[TFOOTDOWN].data_ptr<bool>();
     P.flail_rad = ts[TFLAILR].data_ptr<scalar_t>();
     P.flail_ticks = ts[TFLAILT].data_ptr<int>();
+    P.wrev = ts[TWREV].data_ptr<int>();
+    P.wrev_ext = ts[TWREVEXT].data_ptr<scalar_t>();
+    P.wrev_dir = ts[TWREVDIR].data_ptr<int>();
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
     P.acc_cuts = ts[TACCC].data_ptr<int>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
