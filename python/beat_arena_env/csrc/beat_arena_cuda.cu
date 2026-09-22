@@ -1273,6 +1273,17 @@ constexpr int F_L_FOOT = 23, F_R_FOOT = 29;
 // env v13 (contact spec §8): obs body points
 constexpr int F_L_ELBOW = 7, F_R_ELBOW = 14;
 constexpr int F_L_SHANK = 21, F_R_SHANK = 27;
+// The six §8 body points' frames, in obs order. An accessor over a
+// function-local table rather than a file-scope __device__ constexpr
+// array: callers index it inside fully unrolled loops, and a local
+// table folds to immediates exactly like the four per-site copies it
+// replaces, whereas a __device__ constexpr array is GLOBAL memory that
+// nvcc does not reliably constant-fold (see the K17 note at F_COORD).
+__device__ __forceinline__ int body_pt_frame(int i) {
+  const int f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
+                             F_R_SHANK, F_L_FOOT, F_R_FOOT};
+  return f[i];
+}
 
 __device__ constexpr double LIMIT_LO[NQ] = {
     -0.3490658503988659, -0.6981317007977318, -0.5235987755982988,
@@ -1556,8 +1567,6 @@ constexpr double LOOK_DIST = 8.0;
 constexpr double X_NORM = 1.0;
 constexpr double Y_NORM = 0.75;
 constexpr double Z_SCALE = 8.0;
-constexpr double Z_CLIP_LO = -0.65;  // = PLANE_Z0, the HEAD/miss boundary (2026-08-22, user intent "nothing behind the body"; was -3.0, briefly 0.0 — but lane 0 is the cut PLANE 0.65 m in front of the head, and notes stay cuttable / walls interactable down to the head)
-constexpr double Z_CLIP_HI = 12.0;
 constexpr double ROOT_Y0 = 0.94;
 constexpr double HEAD_Y0 = 1.70;
 constexpr double PLANE_Z0 = -0.65;
@@ -1935,22 +1944,10 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
 
 // ---- algo.rs ---------------------------------------------------------------
 // I_world = R diag(i) R^T — upper computed, lower mirrored (bitwise
-// symmetric, algo.rs inertia_world).
-template <typename T>
-__device__ void inertia_world(const T r[3][3], const double idiag[3],
-                              T out[3][3]) {
-  for (int a = 0; a < 3; a++)
-    for (int b = a; b < 3; b++) {
-      T v = r[a][0] * T(idiag[0]) * r[b][0] + r[a][1] * T(idiag[1]) * r[b][1]
-            + r[a][2] * T(idiag[2]) * r[b][2];
-      out[a][b] = v;
-      out[b][a] = v;
-    }
-}
-
-// Same, teed into two destinations from the one register value v (K4e):
-// crba needs a MUTABLE composite seed and a pristine copy for rnea_bias,
-// and both get identical bits with no read-back.
+// symmetric, algo.rs inertia_world), teed into two destinations from
+// the one register value v (K4e): crba needs a MUTABLE composite seed
+// and a pristine copy for rnea_bias, and both get identical bits with
+// no read-back.
 template <typename T>
 __device__ void inertia_world2(const T r[3][3], const double idiag[3],
                                T out[3][3], T keep[3][3]) {
@@ -4559,7 +4556,7 @@ struct Sim {
   T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
   // v28 probe (2026-08-20): obs z-lane upper clamp (m), RUNTIME so one
   // binary serves every era (old ckpts bench at 12; the rust twin
-  // reads BEAT_Z_CLIP_HI). Z_CLIP_HI stays as the default.
+  // reads BEAT_Z_CLIP_HI; its default is 12 m, set host-side).
   T z_clip_hi;
   // env v48 (2026-09-20, user): asinh z lane — lane 2 (note z / wall
   // front) and lane 17 (wall back) become asinh(max(z, z_lo) / z_asinh)
@@ -4732,6 +4729,22 @@ __device__ __forceinline__ int cw_cut(const Sim<T>& P, int e, int i, T pts) {
   return m;
 }
 
+// env v24: seed the body points' finite-diff base at the current FK
+// pose (d.pos), velocities zero — reset and set_state share it (lib.rs
+// Body reset / set_state mirror). Pure copies and zero stores, no
+// floating-point arithmetic, so inlining it cannot change FMA
+// contraction or any bit of the result.
+template <typename T>
+__device__ __forceinline__ void seed_body_pts(Dyn<T>& __restrict__ d,
+                                              const Sim<T>& P, int e) {
+  for (int i = 0; i < N_BODY_PTS; i++)
+    for (int k = 0; k < 3; k++) {
+      const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
+      P.body_pt[idx] = d.pos[body_pt_frame(i)][k];
+      P.body_pt_vel[idx] = T(0);
+    }
+}
+
 template <typename T>
 __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
                           int64_t chart) {
@@ -4805,16 +4818,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   refresh_fk(d, P, e);
   // env v24: seed the finite-diff base with the reset pose's §8
   // points, velocities zero (lib.rs Body reset mirror)
-  {
-    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
-                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
-    for (int i = 0; i < N_BODY_PTS; i++)
-      for (int k = 0; k < 3; k++) {
-        const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
-        P.body_pt[idx] = d.pos[bp_f[i]][k];
-        P.body_pt_vel[idx] = T(0);
-      }
-  }
+  seed_body_pts(d, P, e);
   for (int s = 0; s < 2; s++) {
     for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
     P.swing_acc[e * 2 + s] = T(0);
@@ -5138,15 +5142,14 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   // contact spec §8 (env v13): elbow/knee/foot world positions from
   // d.pos — refresh_fk ran fk_all in every mode before this call
   {
-    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
-                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
     const double bp_y0[N_BODY_PTS] = {Y_CENTER, Y_CENTER, KNEE_Y0,
                                       KNEE_Y0, FOOT_Y0, FOOT_Y0};
     for (int i = 0; i < N_BODY_PTS; i++) {
       const int base = OFF_BODY_PTS + 3 * i;
-      obs[base] = (float)(d.pos[bp_f[i]][0] / T(X_NORM));
-      obs[base + 1] = (float)((d.pos[bp_f[i]][1] - T(bp_y0[i])) / T(Y_NORM));
-      obs[base + 2] = (float)((d.pos[bp_f[i]][2] - T(PLANE_Z0)) / T(X_NORM));
+      const int f = body_pt_frame(i);
+      obs[base] = (float)(d.pos[f][0] / T(X_NORM));
+      obs[base + 1] = (float)((d.pos[f][1] - T(bp_y0[i])) / T(Y_NORM));
+      obs[base + 2] = (float)((d.pos[f][2] - T(PLANE_Z0)) / T(X_NORM));
     }
   }
   // env v24: the same points' world velocities (lib.rs mirror —
@@ -5339,12 +5342,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // last tick's stored positions, then advance the base (lib.rs
   // Body::tick mirror; d.pos holds this tick's refreshed FK)
   {
-    const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
-                                  F_R_SHANK, F_L_FOOT, F_R_FOOT};
     for (int i = 0; i < N_BODY_PTS; i++)
       for (int k = 0; k < 3; k++) {
         const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
-        const T np = d.pos[bp_f[i]][k];
+        const T np = d.pos[body_pt_frame(i)][k];
         P.body_pt_vel[idx] = (np - P.body_pt[idx]) / T(DT);
         P.body_pt[idx] = np;
       }
@@ -5997,16 +5998,7 @@ step_kernel(Sim<T> P) {
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
     // env v24: set_state semantics — re-seed the finite-diff base at
     // the refreshed pose, velocities zero (lib.rs set_state mirror)
-    {
-      const int bp_f[N_BODY_PTS] = {F_L_ELBOW, F_R_ELBOW, F_L_SHANK,
-                                    F_R_SHANK, F_L_FOOT, F_R_FOOT};
-      for (int i = 0; i < N_BODY_PTS; i++)
-        for (int k = 0; k < 3; k++) {
-          const size_t idx = ((size_t)e * N_BODY_PTS + i) * 3 + k;
-          P.body_pt[idx] = d.pos[bp_f[i]][k];
-          P.body_pt_vel[idx] = T(0);
-        }
-    }
+    seed_body_pts(d, P, e);
   } else {
     d.pd_bad = false;
     d.env_bad = false;
