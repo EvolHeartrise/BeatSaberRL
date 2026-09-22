@@ -126,7 +126,7 @@ def test_cpu_trainer_smoke_simba(tmp_path):
     cmd = [sys.executable, os.path.join(HERE, "train_batch.py"),
            "--device", "cpu", "--env", "rust", "--num-envs", "8",
            "--horizon", "8", "--minibatches", "1", "--total-steps", "128",
-           "--gears", "5", "--foot-contact", "--optimizer", "muon",
+           "--gears", "5", "--foot-contact",
            "--trunk-arch", "simba", "--ckpt-every", "0",
            "--run-dir", str(run)]
     r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,

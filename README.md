@@ -95,16 +95,16 @@ $VENV/bin/python train_batch.py --num-envs 1024
 $VENV/bin/python train_batch.py --env rust --num-envs 512
 ```
 
-**Optimizer: hybrid Muon is the default since 2026-09-12** (`--optimizer
-muon`): Newton-Schulz Muon on the 26 hidden matrices, Adam on the encoder
-input layers, the 29 heads, the critic's final layer, biases and LN gains;
+**Optimizer: hybrid Muon since 2026-09-12, the only optimizer since
+2026-09-22** (pure Adam and the per-matrix NS loop removed): Newton-Schulz
+Muon on the hidden matrices, Adam on the encoder input layers, the 29 heads, the critic's final layer, biases and LN gains;
 updates RMS-matched so `--lr 7e-4` (critic ×3) carries over. v40 probes
 (from scratch, 1.12B samples, same pod): 0.9409 vs Adam's 0.9099 training
 acc, +10% return, half the falls, no throughput cost, seed-1 replication
 within 0.3 pts. Muon at 2× lr lost; AdamW-style `--weight-decay` (0.03 a
 wash, 0.1 hurts) and `--head-clip` (ε 0.2 entropy collapse, ε 0.05 too
-tight) both lost. `--resume` of a pre-09-12 checkpoint keeps Adam
-automatically (exact resume); `--optimizer adam` forces the old path.
+tight) both lost. Pre-09-12 (Adam-only) checkpoints can only be
+`--init-from` warm-starts.
 
 Env v43 (2026-09-14, user-directed): **torque energy price**. The v23
 fraction "activation" price (`--iso-coef`, retired) charged every joint the
