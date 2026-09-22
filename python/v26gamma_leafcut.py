@@ -85,7 +85,7 @@ def main():
 
     run([PY, "make_top10_replays.py", "--ckpt", leaf_path,
          "--bench", out, "--tag", f"v26gamma{CUT // 1000}k",
-         "--top", "10", "--workers", "8", "--foot-contact"],
+         "--top", "10", "--workers", "8"],
         "replays.log", 7_200)
     print("[leafcut] replays done", flush=True)
 
