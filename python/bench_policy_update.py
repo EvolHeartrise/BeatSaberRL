@@ -16,8 +16,7 @@ Adam and bump the fp16 weights-version each step (weights drift during
 timing — same work every iteration, and the per-minibatch replica
 refresh is exactly production's).
 
-Perf-ladder toggles (BEAT_ATTN / BEAT_QKV_PACKED / BEAT_PACKED_HEADS /
-BEAT_GEMM_LEGACY / BEAT_NO_WIDE_RELU_BWD) are read at import — run one
+(The perf-ladder env toggles were removed 2026-09-22; run one
 process per configuration.
 """
 

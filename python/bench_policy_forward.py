@@ -20,8 +20,7 @@ are timed: "forward" (logits + value on device) and "argmax" (greedy
 (N, 29) actions on device — what bench_scoresaber consumes). Inputs
 live on device; no host<->device copies are inside the timed region.
 
-Perf-ladder toggles (BEAT_ATTN / BEAT_QKV_PACKED / BEAT_PACKED_HEADS /
-BEAT_GEMM_LEGACY / BEAT_NO_WIDE_RELU_BWD) are read at import — run one
+(The perf-ladder env toggles were removed 2026-09-22; run one
 process per configuration.
 """
 

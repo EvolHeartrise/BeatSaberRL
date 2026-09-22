@@ -5,8 +5,7 @@
 // (GTX 1080 / cu126) — none re-measured on the 4090/861k config; see
 // PERF_AUDIT_2026-08-16.md. (The audit's Tier 1.1/1.2 width-gate
 // misses — ffn 512 / trunk 256 falling to the slow paths — were fixed
-// 2026-08-15; BEAT_GEMM_LEGACY=1 restores the old bias_relu dispatch
-// for A/B.)
+// 2026-08-15.)
 //
 // Why this exists (2026-07-25 gate benchmarks, GTX 1080 / cu126):
 // torch's half matmul dispatch routes the TN large-K shape (K = mb*18 =
@@ -70,16 +69,6 @@ __global__ void bias_relu_kernel_p2(__half2* __restrict__ y,
   y[i] = __float22half2_rn(o);
 }
 
-// BEAT_GEMM_LEGACY=1 pins the pre-2026-08-15 dispatch (generic kernel
-// for d2 128/256) so the measurement ladder can A/B the width fix
-// without a rebuild. Read once — dispatch stays branch-free.
-bool legacy_dispatch() {
-  static const bool v = []() {
-    const char* e = getenv("BEAT_GEMM_LEGACY");
-    return e && e[0] == '1';
-  }();
-  return v;
-}
 
 void bias_relu_(at::Tensor y, at::Tensor b) {
   const c10::cuda::CUDAGuard guard(y.device());
@@ -104,10 +93,10 @@ void bias_relu_(at::Tensor y, at::Tensor b) {
   } else if (n2 <= INT32_MAX && d2 == 32) {
     bias_relu_kernel_p2<32><<<(unsigned)blocks, threads, 0, stream>>>(
         yp, bp, (int)n2);
-  } else if (n2 <= INT32_MAX && d2 == 256 && !legacy_dispatch()) {
+  } else if (n2 <= INT32_MAX && d2 == 256) {
     bias_relu_kernel_p2<256><<<(unsigned)blocks, threads, 0, stream>>>(
         yp, bp, (int)n2);
-  } else if (n2 <= INT32_MAX && d2 == 128 && !legacy_dispatch()) {
+  } else if (n2 <= INT32_MAX && d2 == 128) {
     bias_relu_kernel_p2<128><<<(unsigned)blocks, threads, 0, stream>>>(
         yp, bp, (int)n2);
   } else {

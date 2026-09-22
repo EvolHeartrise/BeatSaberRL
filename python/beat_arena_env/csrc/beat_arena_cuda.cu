@@ -929,20 +929,11 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // (warp-per-env with the factor in shared memory) — out of P5 scope.
 constexpr int THREADS = 32;
 
-// Occupancy-ladder knob (WARP_RESCUE_LEGACY_SIDE.md §1, 2026-08-15):
-// every historical "occupancy is not the lever" verdict — including the
-// paragraph above — was measured GRID-STARVED (<= 8 blocks/SM even
-// requested). BEAT_MIN_BLOCKS pins minBlocksPerMultiprocessor for the
-// legacy kernel exactly as hard as the (THREADS, 1) pin does, so the
-// free-choice instability the paragraph above documents cannot occur on
-// any rung; the register CAP that comes with K > 8 (65,536/32/K) is the
-// experiment. Default 1 == the shipped kernel, bit for bit. The ladder
-// is only meaningful at N >= 32,768 (below that the grid supplies fewer
-// blocks than the pin asks for). Set via jit_cache BEAT_MIN_BLOCKS=K
-// (part of the flag digest => forces the rebuild that re-censuses).
-#ifndef BEAT_MIN_BLOCKS
-#define BEAT_MIN_BLOCKS 1
-#endif
+// (The BEAT_MIN_BLOCKS occupancy-ladder pin and the BEAT_CHOL_RL
+// right-looking Cholesky arm — the 2026-08-15 warp-rescue back-ports,
+// last measured 2026-08-14, design/WARP_RESCUE_LEGACY_SIDE.md — were
+// removed 2026-09-22; the shipped kernel is the (THREADS, 1) pin and
+// the left-looking factor, bit for bit as before.)
 
 // ---- obs layout (SPEC-v10 §5; mirrors constants.py) -------------------------
 constexpr int OFF_ROOT_POS = 0;
@@ -2353,177 +2344,13 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // only inside block j, and the diagonal of column j+1 lives in block
 // j+1).
 //
-// K21 (2026-08-15) — RIGHT-LOOKING ALTERNATIVE, COMPILE-TIME OPTION,
-// DEFAULT OFF (`#if BEAT_CHOL_RL` below; jit_cache BEAT_CHOL_RL=1 appends
-// -DBEAT_CHOL_RL=1 and is part of the flag digest). The one micro
-// back-port that survived the four-way warp rescue analysis
-// (WARP_ENV_SOLVER_CORE.md §4.2, WARP_RESCUE_LEGACY_SIDE.md §4.1) after
-// the warp/sub-warp kernel family itself was refuted; it is
-// warp-independent, so it lands on this LEGACY serial kernel as written.
-//
-// MEASURED VERDICT (RTX 4090, step ms/tick), which is why it is an option
-// and not the body:
-//   * ALONE, at production N = 16,384: 124.8 vs 121.8 = +2.5% SLOWER.
-//     The ~6,545 read-modify-writes into the 42 KB local frame cost more
-//     than the chain cut wins at that occupancy. Bitwise-correct, just
-//     slower — so shipping it by default would be a pure regression.
-//   * ITS REAL VALUE IS AN ENABLER. It cuts register demand 254 -> 168,
-//     which is what lets BEAT_MIN_BLOCKS=16 build at 128 registers with
-//     ZERO spills. At N = 65,536: 350.8 (RL + K=16) vs 386.1 (RL alone,
-//     K=1) vs 365.6 (default left-looking baseline) — -4.1% against the
-//     baseline and -9.2% against its own K=1 arm. The first real
-//     occupancy win in this kernel's history.
-//
-// FLAG CONTRACT: BEAT_CHOL_RL=1 is expected to pay ONLY together with
-// BEAT_MIN_BLOCKS=16 AND N >= 65,536. On its own, at any N, or at K = 1,
-// it is a measured loss; below N = 65,536 the grid cannot supply the
-// blocks the K = 16 pin asks for, so the rung it unlocks is unreachable
-// and only the +2.5% RMW cost remains. Set both or set neither.
-// (K = 12 is a no-op on this arm: demand 168 < the 170 cap it imposes.)
-//
-// WHAT MOVES. Left-looking (the default body) holds each output element's
-// accumulator in a register and sweeps k = 0..j-1 to gather its terms
-// just before writing it. Right-looking turns that inside out: as soon as
-// column j's pivot resolves and its column is scaled, the rank-1 update
-//   A[i][c] -= L[i][j] * L[c][j],   c = j+1..n-1,  i = c..n-1
-// is pushed into the whole trailing submatrix immediately. Every trailing
-// element therefore receives its subtractions ONE j AT A TIME, j
-// ASCENDING — the same terms, in the same order, from the same seed
-// M[i][c] — instead of all at once at the end. Only the interleaving in
-// time changed. The pivot also stops needing the K4b/a pipelining above:
-// column j's diagonal is finished, in place, by the rank-1 update of
-// column j-1, and column j simply LOADS it.
-//
-// WHY (the chain arithmetic, n = NV = 35). Op counts are unchanged:
-// 6,545 FMA (sum_j j*(34-j)), 595 divides (sum_j (34-j)), 35 sqrt. What
-// changes is the DEPENDENT chain:
-//   * left-looking: accumulator s_t is a serial chain of length j, so
-//     the critical path is sum_j j = 595 dependent FMAs, plus 35
-//     (sqrt + divide). The K6 jam bought ILP, NOT chain length.
-//   * right-looking: within a column the rank-1 FMAs target DIFFERENT
-//     elements and are mutually independent, so a column contributes
-//     max/sqrt -> divide -> ONE FMA before the next column's diagonal is
-//     final. 35 columns * ~4 dependent ops = ~140 dependent steps.
-// 595 -> ~140 is 4.3x on the FMA chain (5.7x counting the sqrt/divide
-// tail the old form also pays). That predicted a win by the kernel's
-// best-attested class (`:129-131`) and did not get one at 16k — the
-// counter-traffic it trades for (`:2309-2315` below) is what ate it.
-//
-// THE COST. Serially, right-looking writes the whole trailing submatrix
-// per column: ~6,545 read-modify-writes into the 42 KB local frame, where
-// left-looking accumulates in a register and stores once. It TRADES chain
-// length for local traffic, and at N = 16,384 the trade loses by 2.5%.
-//
-// K6's UNROLL-AND-JAM IS DELIBERATELY ABSENT from this arm, and so is the
-// peeled pivot row. Both exist in the default body for one reason: to
-// manufacture ILP for the left-looking form, whose single accumulator
-// chain has none. The right-looking form has natural ILP by construction
-// — the rank-1 update's subtractions are independent ACROSS ELEMENTS, so
-// the inner loop is already n-c independent FMAs and the scale loop
-// n-1-j independent divides. Jamming it would add live registers and
-// address pressure to buy ILP that is already there, and register demand
-// is the entire point of this arm. Plain nests; no #pragma unroll,
-// because every trip count here is a function of the runtime `n` (35 for
-// d.m, 12 for s.aww) and there is no compile-time count to unroll.
-//
-// PRESERVED EXACTLY across both arms: the `chol_factor_floored` pivot-
-// FLOOR semantics and both thresholds (f64 latches `bad` on
-// dpiv < PD_FLOOR_F64 and clamps there; f32 latches only on dpiv <= 0 and
-// clamps at PD_FLOOR_F32; the tmax form still maps a NaN pivot onto the
-// floor, which chol_fwd_unit*_n's headers depend on); the `bad` monotone
-// latch; the column-major a[C*n+R] contract; fp32/fp64 genericity; and
-// the per-element arithmetic ORDER. The lower triangle + diagonal the
-// right-looking arm leaves is byte-for-byte what the left-looking arm
-// leaves, so every consumer — chol_solve_n / _multi_n / _multi_tn /
-// _fwd_unit*_n / _back*_n, which read (i,k) k<i, (k,i) k>i and the
-// diagonal — is untouched by construction, and the two arms are
-// INTERCHANGEABLE at every call site.
-//
-// BITWISE ARGUMENT, element by element:
-//   * off-diagonal (i, c): left-looking computes
-//       s = M[i][c]; for k = 0..c-1: s -= L[i][k]*L[c][k]; L[i][c] = s/dc.
-//     Right-looking seeds the SAME M[i][c] in place and applies the SAME
-//     terms for k = 0..c-1 in the SAME ascending order (k is now the
-//     outer column loop), then divides the same value by the same dc.
-//   * diagonal (c, c): left-looking accumulates `np` from M[c][c] over
-//     `np -= v0*v0` with v0 = L[c][k], k ascending. Right-looking's
-//     update at i == c is `a[cc+c] -= a[cj+c] * ljc` where both operands
-//     ARE that same L[c][j] — the identical `v*v` term, same ascending
-//     order. The accumulator now lives in memory instead of a register,
-//     which is value-preserving: f32/f64 stores round to the declared
-//     type and there is no extended-precision register on this target.
-//   * OPERAND ORDER inside each multiply is kept as (row element) *
-//     (pivot-row element), matching `:2292-2295`, and each subtraction
-//     is still ONE STATEMENT of the shape `X -= Y*Z`, so it contracts to
-//     the same single FFMA under --fmad=true. No mul/sub was split, no
-//     fma chain was restructured — this is the K10e2 hazard's only
-//     escape and it is closed by keeping the expression shape identical.
-//
-// HARNESS (g++ shim, the stage-2 technique; source kept as
-// b1_harness.cpp): the two arms compiled side by side under g++ -O2 and
-// run on the SAME buffers, comparing the FULL n*n buffer by memcmp plus
-// the `bad` flag. 1,754 cases / 1,409,410 words per arm, 688 of them
-// tripping the pivot floor: 200 well-conditioned random SPD (n=35), 150
-// rank-deficient/near-singular, 100 ill-scaled (1e-8..1e8 row scaling),
-// 100 adversarial non-PD (negative diagonals, +0/-0 diagonals,
-// denormals, zeroed sub-blocks), the degenerate fixed set (all-zero,
-// all-negative-zero, identity, negative identity, alternating-zero
-// diagonal, rank-1 all-ones, NaN/+Inf/-Inf entries), 120 at N_WELD = 12,
-// and 200 at n = 1..8 to cover every remainder tier of the default form's
-// 4-way peel. Buffer slots ABOVE the diagonal are poisoned with sNaN
-// patterns so a stray write is caught too.
-//   -ffp-contract=off                   -> 0 mismatching words, 0 flags
-//   forced fma() at every SUBMUL site   -> 0 mismatching words, 0 flags
-// Those two arms BRACKET nvcc: no contraction anywhere, and full
-// statement-level contraction everywhere. GCC 13's -ffp-contract=on is
-// a no-op alias for `off` (verified: zero vfmadd in the binary), so the
-// explicit-fma arm is what stands in for --fmad=true. Mutation-tested
-// live: replacing the divide with a reciprocal multiply in the new form
-// produced 400,335 mismatching words, and weakening the f32 `bad`
-// predicate produced 9 flag mismatches.
-//   -ffp-contract=fast FAILS (336,619 words, 1 ulp). That is the
-// PRE-EXISTING hazard recorded in WARP_RESCUE_LEGACY_SIDE.md §4.2, not
-// a property of this transform: under `fast` GCC contracts each site by
-// its own scheduling whim and is not even self-consistent WITHIN the
-// default function — it emits vfnmadd231ss for the peeled scalar row and
-// separate vmulss + vsubss for the 4-wide jammed block. The kernel's
-// no-fast-math discipline is what protects the gate.
+// FMA-contraction discipline (the K10e2 hazard, WARP_RESCUE_LEGACY_SIDE
+// §4.2): every subtraction below stays ONE statement of the shape
+// `X -= Y*Z` with operand order (row element) * (pivot-row element), so
+// nvcc contracts each to the same single FFMA under --fmad=true; the
+// kernel's no-fast-math discipline is what protects the parity gate.
 template <typename T>
 __device__ void chol_factor_n(int n, T* a, bool* bad) {
-#if BEAT_CHOL_RL
-  for (int j = 0; j < n; j++) {
-    const int cj = j * n;  // COLUMN-MAJOR (K12): column j is contiguous
-    // The diagonal was finished in place by column j-1's rank-1 update
-    // (or is the untouched M[0][0] at j = 0), so the pivot is a LOAD.
-    T dpiv = a[cj + j];
-    if (sizeof(T) == 8) {
-      if (dpiv < T(PD_FLOOR_F64)) *bad = true;
-      dpiv = tmax(dpiv, T(PD_FLOOR_F64));
-    } else {
-      if (dpiv <= T(0)) *bad = true;
-      dpiv = tmax(dpiv, T(PD_FLOOR_F32));
-    }
-    const T dj = sqrt(dpiv);
-    a[cj + j] = dj;  // read-before-write, and no later column re-reads it
-    // SCALE: L[i][j] = A[i][j] / dj, i > j. The n-1-j divides are
-    // mutually independent — one divide of chain, not n-1-j.
-    for (int i = j + 1; i < n; i++) {
-      const T s = a[cj + i];
-      a[cj + i] = s / dj;
-    }
-    // RANK-1 UPDATE of the trailing submatrix, columns c > j, rows
-    // i >= c (diagonal included). Reads live in column j, writes in
-    // column c > j: DISJOINT address blocks under column-major, so the
-    // in-place aliasing argument is a statement about whole blocks.
-    // Every (i, c) here is independent of every other, which is the
-    // whole ILP story — no jam required.
-    for (int c = j + 1; c < n; c++) {
-      const int cc = c * n;
-      const T ljc = a[cj + c];  // L[c][j], already scaled above
-      for (int i = c; i < n; i++) a[cc + i] -= a[cj + i] * ljc;
-    }
-  }
-#else
   T dpiv = a[0];  // j = 0: the pivot is M[0][0], no terms
   for (int j = 0; j < n; j++) {
     if (sizeof(T) == 8) {
@@ -2605,7 +2432,6 @@ __device__ void chol_factor_n(int n, T* a, bool* bad) {
     }
     dpiv = np;
   }
-#endif
 }
 
 // Triangular solve. l and x are always distinct objects at every call
@@ -6134,7 +5960,7 @@ template <typename T, bool FC>
 // The `, 1` PINS the register budget at 255 — see the THREADS note: it
 // is not an occupancy hint, it is what stops ptxas's free-choice
 // heuristic from flipping to 64 regs + double the spills.
-__global__ void __launch_bounds__(THREADS, BEAT_MIN_BLOCKS)
+__global__ void __launch_bounds__(THREADS, 1)
 step_kernel(Sim<T> P) {
   // R12 (2026-08-21): warp-coherence env permutation. The grid walks
   // env_order — identity by default; under BEAT_ENV_ORDER=1 the host
@@ -6195,9 +6021,9 @@ step_kernel(Sim<T> P) {
 // per-lane execution and its local traffic (plus spills at W>=4) beat
 // the residency arithmetic at every rung, so there is no rung to climb.
 // Full record: design/WARP_ENV_SOLVER_CORE.md, WARP_RESCUE_LEGACY_SIDE.md,
-// WARP_ENV_RECONCILIATION.md; code in git history at b02e7ce. The one
-// back-port that survived is the right-looking Cholesky, kept above as
-// the BEAT_CHOL_RL compile-time option (default OFF).
+// WARP_ENV_RECONCILIATION.md; code in git history at b02e7ce (the
+// right-looking Cholesky back-port lived on as a compile-time option
+// until 2026-09-22).
 
 // tensor-list slots (order is a contract with cuda_env.py _tensors)
 enum {

@@ -41,7 +41,7 @@ ARMS = {
     # N learning gate (2026-08-15): same PPO batch (65,536 x 2 =
     # 131,072) and update count, but the rollout pays 2 env ticks per
     # update instead of 8 — the wall-clock arm. MUST run with
-    # BEAT_CHOL_RL=1 BEAT_MIN_BLOCKS=16 exported (the flag-pair kernel:
+    # (the BEAT_CHOL_RL=1 BEAT_MIN_BLOCKS=16 flag-pair kernel, removed 2026-09-22:
     # 352.8 ms @65k, the +39%/env occupancy win). Judged on leaf-end
     # return vs the w24 baseline (+118.2) AND trunk wall minutes; the
     # learning risk under test is the T=2 GAE bootstrap horizon.
