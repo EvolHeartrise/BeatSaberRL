@@ -931,7 +931,8 @@ constexpr int THREADS = 32;
 
 // (The BEAT_MIN_BLOCKS occupancy-ladder pin and the BEAT_CHOL_RL
 // right-looking Cholesky arm — the 2026-08-15 warp-rescue back-ports,
-// last measured 2026-08-14, design/WARP_RESCUE_LEGACY_SIDE.md — were
+// last measured 2026-08-14 (git 4c235a5,
+// design/WARP_RESCUE_LEGACY_SIDE.md) — were
 // removed 2026-09-22; the shipped kernel is the (THREADS, 1) pin and
 // the left-looking factor, bit for bit as before.)
 
@@ -2344,10 +2345,13 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
 // only inside block j, and the diagonal of column j+1 lives in block
 // j+1).
 //
-// FMA-contraction discipline (the K10e2 hazard, WARP_RESCUE_LEGACY_SIDE
-// §4.2): every subtraction below stays ONE statement of the shape
-// `X -= Y*Z` with operand order (row element) * (pivot-row element), so
-// nvcc contracts each to the same single FFMA under --fmad=true; the
+// FMA-contraction discipline (the K10e2 hazard): every subtraction below
+// stays ONE statement of the shape `X -= Y*Z` with operand order
+// (row element) * (pivot-row element), so nvcc contracts each to the same
+// single FFMA under --fmad=true. The three bitwise solve equivalences
+// (g++ shim checks, since removed; git 4c235a5,
+// design/WARP_RESCUE_LEGACY_SIDE.md §4.2) hold under --fmad=true but
+// BREAK under -ffp-contract=fast, which contracts each site by its own whim — so the
 // kernel's no-fast-math discipline is what protects the parity gate.
 template <typename T>
 __device__ void chol_factor_n(int n, T* a, bool* bad) {
@@ -6020,7 +6024,8 @@ step_kernel(Sim<T> P) {
 // per tick at N=16,384 against the legacy kernel's 121.8. Redundant
 // per-lane execution and its local traffic (plus spills at W>=4) beat
 // the residency arithmetic at every rung, so there is no rung to climb.
-// Full record: design/WARP_ENV_SOLVER_CORE.md, WARP_RESCUE_LEGACY_SIDE.md,
+// Full record (docs deleted 2026-09-22, in git history at 4c235a5):
+// design/WARP_ENV_SOLVER_CORE.md, WARP_RESCUE_LEGACY_SIDE.md,
 // WARP_ENV_RECONCILIATION.md; code in git history at b02e7ce (the
 // right-looking Cholesky back-port lived on as a compile-time option
 // until 2026-09-22).
