@@ -470,17 +470,17 @@ macro_rules! weld_axpy12 {
 //   · the effective mass and the post-projection `dnew` are the R10
 //     closed forms `0.0 + sign·minvjt[row·nv + voff+jt]`;
 //   · the PGS residual is `0.0 + sign·v[voff+jt]`;
-//   · `jv_pre` is `cfg(any(test, feature = "introspect"))`;
+//   · `jv_pre` is `cfg(test)`;
 //   · `row_j` / `limit_dot_ref_vs_closed` are `cfg(test)`;
 //   · `pub fn jv` has exactly one caller, tests_constraints.rs.
 // The `self.minvjt[nweld·nv..ndense·nv] ← self.j` seed and the two
 // `for row in 0..ndense` loops stop at ndense by construction, so no
 // dense-row consumer can reach a limit row. `LIMIT_J_ROWS` keeps the
-// assembly for `cargo test`, `--features introspect` and debug builds —
-// the same idiom (and the same three cfgs) as `DIAG_ALL_ROWS` below.
+// assembly for `cargo test` and debug builds — the same idiom (and the
+// same cfgs) as `DIAG_ALL_ROWS` below.
 // Worth `nlim × (nv + 1)` stores per substep, i.e. ~270 under the
 // random-gear micro and ~565 under bench traffic (R26: nlim mean 15.73).
-const LIMIT_J_ROWS: bool = cfg!(any(test, feature = "introspect", debug_assertions));
+const LIMIT_J_ROWS: bool = cfg!(any(test, debug_assertions));
 
 // MEASURED +5.4% at N = 256 (20,123 → 21,215 env-steps/s, pooled median
 // of six interleaved A/B pairs) and −9.8% of bench wall (440.5 → 397.4 s
@@ -526,8 +526,8 @@ pub struct ConstraintSet {
     /// no-sticking checks). INTROSPECTION-ONLY — nothing in the solve
     /// reads it, so both the field and its per-row nv-dot are compiled
     /// out of the shipping extension (2026-08-03 dead-work pass);
-    /// `cargo test` and `--features introspect` keep it.
-    #[cfg(any(test, feature = "introspect"))]
+    /// `cargo test` keeps it.
+    #[cfg(test)]
     pub jv_pre: Vec<Real>,
     /// TEST HOOK (R23a): when set, every assembled LIMIT row of `j` is
     /// overwritten with NaN as soon as the assembly loop finishes —
@@ -643,7 +643,7 @@ impl ConstraintSet {
             nrows: 0,
             lambda: vec![0.0; MAX_ROWS],
             bias: vec![0.0; MAX_ROWS],
-            #[cfg(any(test, feature = "introspect"))]
+            #[cfg(test)]
             jv_pre: vec![0.0; MAX_ROWS],
             #[cfg(test)]
             poison_limit_j: false,
@@ -793,7 +793,7 @@ impl ConstraintSet {
     /// J·v of an assembled row (post-solve introspection).
     ///
     /// R23a: valid for a LIMIT row only when `LIMIT_J_ROWS` holds
-    /// (test / `introspect` / debug builds) — the shipping build no
+    /// (test / debug builds) — the shipping build no
     /// longer assembles those rows, so `self.j` holds stale words there.
     /// The only caller is `tests_constraints`.
     pub fn jv(&self, row: usize, v: &[Real]) -> Real {
@@ -1289,7 +1289,7 @@ impl ConstraintSet {
         // so release drops the branch and the 12 nv-dots with it.
         let nweld = self.weld_rows();
         const DIAG_ALL_ROWS: bool =
-            cfg!(any(test, feature = "introspect", debug_assertions));
+            cfg!(any(test, debug_assertions));
         // BATCHED multi-RHS solve (2026-08-03, R1): every row's RHS is
         // the same shared factor's, so instead of `nrows` serial dense
         // chol_solves the rows go 4 at a time through `chol_solve_x4`,
@@ -1499,7 +1499,7 @@ impl ConstraintSet {
                 self.diag[row] = d;
             }
             // pre-solve J·v* (introspection only — compiled out below)
-            #[cfg(any(test, feature = "introspect"))]
+            #[cfg(test)]
             {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mut s = 0.0;
@@ -1521,7 +1521,7 @@ impl ConstraintSet {
             self.diag[row] = d;
             // pre-solve J·v* stays dense: introspection-only, so it is
             // already compiled out of the shipping build.
-            #[cfg(any(test, feature = "introspect"))]
+            #[cfg(test)]
             {
                 let jr = &self.j[row * nv..(row + 1) * nv];
                 let mut s = 0.0;
