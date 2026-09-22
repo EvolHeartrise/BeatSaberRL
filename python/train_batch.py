@@ -561,14 +561,6 @@ def parse_args():
     # "activation" price (--iso-coef) was retired 2026-09-14 for the env
     # v43 torque energy price; the live movement prices are --energy-coef
     # (Σ|τ|) and --limit-coef/--limit-arms (limit rest).)
-    # wide-acc training reward (2026-07-29, user-directed): acc_train =
-    # 30*clamp(1 - d/0.6), unrounded — effectively DOUBLING the acc
-    # component's range and reward vs the real round(15*(1 - d/0.3)).
-    # Head-to-head at 400M it LOST to real scoring on every bench metric
-    # but was the best takeoff accelerator measured (+46% upp at 50M,
-    # crossover ~200M) — default OFF since the cut-plane accuracy fix
-    # (same day: the real formula now has reachable lateral gradient);
-    # opt in for short-budget legs. Training gym only either way.
     p.add_argument("--gears", type=int, default=3, choices=[3, 5, 7],
                    help="env v8 action-table size per joint head: 3 = "
                         "ternary coast/+full/-full; 5 adds +/-1/4-torque "
