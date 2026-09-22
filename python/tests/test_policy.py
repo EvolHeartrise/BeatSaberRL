@@ -1,5 +1,5 @@
 """Policy + vec-env tests (transformer-only since 2026-07-20; env v10
-shapes since P4: obs 340, 19 tokens incl. the body token, 29 gear heads)."""
+shapes since P4: obs 340, lead tokens + notes, 29 gear heads)."""
 
 import numpy as np
 import pytest

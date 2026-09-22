@@ -196,13 +196,16 @@ _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
 assert len(_SABER_L_IDX) == len(_SABER_R_IDX) == SABER_FEAT
 assert len(_BODY_IDX) == BODY_FEAT
 
-# --- 3-token body (2026-09-22, user order): the ONE 87-lane body token
-# decomposed into [torso, leg_L, leg_R], mirroring the two saber tokens
+# --- 3-token body (2026-09-22, user order; the ONLY layout since the
+# same day — the single body token was removed): the 87 body lanes
+# (_BODY_IDX, kept as the coverage reference) as [torso, leg_L, leg_R],
+# mirroring the two saber tokens
 # (a shared leg encoder + a 2-lane side one-hot, like saber_mlp + the
 # hand one-hot). Lead tokens become [saber_L, saber_R, torso, leg_L,
-# leg_R] (5) + 24 notes = 29; the torso keeps index 2, so the critic's
-# body-derived query is unchanged. Arch marker "body_tokens" (absent /
-# 1 = the single body token every checkpoint before this date).
+# leg_R] (5) + 24 notes = 29; the torso sits at index 2, where the
+# single body token used to be, so the critic's body-derived query
+# reads the torso. Arch marker "body_tokens" = 3; load_policy refuses
+# checkpoints without it.
 #   torso  root pose/vel (15) + spine q (3) + spine qd (3) + head (3)
 #          + contact bits (2) + spine tau-scale lanes (3)        = 29
 #   leg_s  hip/knee/ankle q (6) + qd (6) + that foot's ground-contact
@@ -547,10 +550,8 @@ class NotePolicy(nn.Module):
                  note_geo_norm: bool = False,
                  value_bins: int = 0, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
-                 trunk_arch: str = "mlp", trunk_hidden: int | None = None,
-                 body_tokens: int = 1):
+                 trunk_arch: str = "mlp", trunk_hidden: int | None = None):
         super().__init__()
-        assert body_tokens in (1, 3), f"body_tokens must be 1 or 3, got {body_tokens}"
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
@@ -570,9 +571,11 @@ class NotePolicy(nn.Module):
                      "n_gears": n_gears, "obs_dim": OBS_DIM,
                      "ffn_mult": ffn_mult, "critic": critic,
                      "n_action_heads": N_ACTION_HEADS, "body_token": True,
-                     # 2026-09-22: 1 = the single 87-lane body token, 3 =
-                     # [torso, leg_L, leg_R] (see _TORSO_IDX / _LEG_*_IDX)
-                     "body_tokens": int(body_tokens),
+                     # 2026-09-22 (user): the body is ALWAYS the three
+                     # tokens [torso, leg_L, leg_R] (_TORSO_IDX /
+                     # _LEG_*_IDX); the single 87-lane body token of every
+                     # checkpoint before v58 is gone (no back-compat)
+                     "body_tokens": 3,
                      "note_geo": bool(note_geo),
                      "note_geo_norm": bool(note_geo_norm),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
@@ -607,21 +610,17 @@ class NotePolicy(nn.Module):
         # saber token features: the 25 obs-v10 hand features + [is_left,
         # is_right]; the body token gets its own encoder
         self.saber_mlp = _mlp([SABER_FEAT + 2, embed, embed])
-        self.body_tokens = int(body_tokens)
-        # lead tokens: 2 sabers + the body token(s); the notes follow
-        self.n_lead = 2 + self.body_tokens
-        if self.body_tokens == 3:
-            # torso gets its own encoder; the two legs share one (+ the
-            # 2-lane side one-hot), like the sabers. Registered before
-            # the blocks so the trainer's "enc" diag group covers them.
-            self.torso_mlp = _mlp([TORSO_FEAT, embed, embed])
-            self.leg_mlp = _mlp([LEG_FEAT + 2, embed, embed])
-        else:
-            self.body_mlp = _mlp([BODY_FEAT, embed, embed])
+        self.body_tokens = 3
+        # lead tokens [saber_L, saber_R, torso, leg_L, leg_R]; the notes follow
+        self.n_lead = 5
+        # torso gets its own encoder; the two legs share one (+ the 2-lane
+        # side one-hot), like the sabers. Registered before the blocks so
+        # the trainer's "enc" diag group covers them.
+        self.torso_mlp = _mlp([TORSO_FEAT, embed, embed])
+        self.leg_mlp = _mlp([LEG_FEAT + 2, embed, embed])
         self.blocks = nn.ModuleList(
             Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
-        # readout = the lead tokens' output embeddings
-        # ([saber_L, saber_R, body] or [saber_L, saber_R, torso, leg_L, leg_R])
+        # readout = the 5 lead tokens' output embeddings
         if trunk_arch == "mlp":
             self.trunk = _mlp([self.n_lead * embed, trunk_dim, trunk_dim])
         else:
@@ -712,8 +711,7 @@ class NotePolicy(nn.Module):
             "_saber_idx", torch.tensor(_SABER_L_IDX + _SABER_R_IDX,
                                        dtype=torch.long), persistent=False)
         self.register_buffer(
-            "_body_idx", torch.tensor(_BODY3_IDX if self.body_tokens == 3
-                                      else _BODY_IDX, dtype=torch.long),
+            "_body_idx", torch.tensor(_BODY3_IDX, dtype=torch.long),
             persistent=False)
         # fp16-storage mode (2026-07-25): activations flow fp16 between
         # the obs split and the head output; GEMMs are fp16-in with fp32
@@ -789,23 +787,20 @@ class NotePolicy(nn.Module):
         hand_id = hid[1].expand(B, 2, 2)
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
-        if self.body_tokens == 3:
-            # column slices of the (B, 93) body block are non-contiguous
-            # views; the fp16 wgrad kernel needs contiguous inputs, so
-            # each token's features are materialised (B x 29 / B x 64
-            # fp16 copies — negligible)
-            body = body.to(dt)
-            torso_tok = _seq(self.torso_mlp,
-                             body[:, :TORSO_FEAT].contiguous()).unsqueeze(1)
-            leg_feat = torch.cat([body[:, TORSO_FEAT:].contiguous()
-                                  .view(B, 2, LEG_FEAT),
-                                  hand_id], dim=-1)        # side one-hot
-            body_tok = torch.cat([torso_tok, _seq(self.leg_mlp, leg_feat)],
-                                 dim=1)                              # (B, 3, d)
-        else:
-            body_tok = _seq(self.body_mlp, body.to(dt)).unsqueeze(1)  # (B, 1, d)
+        # column slices of the (B, 93) body block are non-contiguous
+        # views; the fp16 wgrad kernel needs contiguous inputs, so each
+        # token's features are materialised (B x 29 / B x 64 fp16 copies
+        # — negligible)
+        body = body.to(dt)
+        torso_tok = _seq(self.torso_mlp,
+                         body[:, :TORSO_FEAT].contiguous()).unsqueeze(1)
+        leg_feat = torch.cat([body[:, TORSO_FEAT:].contiguous()
+                              .view(B, 2, LEG_FEAT),
+                              hand_id], dim=-1)            # side one-hot
+        body_tok = torch.cat([torso_tok, _seq(self.leg_mlp, leg_feat)],
+                             dim=1)                                  # (B, 3, d)
         tokens = torch.cat([_seq(self.saber_mlp, saber_feat), body_tok, emb],
-                           dim=1)                        # (B, n_lead + 24, d)
+                           dim=1)                                    # (B, 29, d)
         # additive attention mask is block-invariant: build it once.
         # The lead lanes (sabers + body token(s)) are always attendable
         # -> bias exactly +0.0 = F.pad's zero fill (bit-identical).
@@ -1158,6 +1153,12 @@ def load_policy(ckpt) -> NotePolicy:
     (v9 and earlier: obs 290 / 14 heads, no body token) is REFUSED —
     the v10 body retired every earlier checkpoint (house pattern)."""
     arch = ckpt.get("arch", {})
+    if arch.get("body_tokens", 1) != 3:
+        raise SystemExit(
+            "checkpoint has the single body token (pre-v58, 2026-09-22); "
+            "the body is now always [torso, leg_L, leg_R] and the old "
+            "layout was removed (user: no back-compat). Check out a "
+            "commit before 2026-09-22 to bench or replay it.")
     if (arch.get("obs_dim") != OBS_DIM
             or arch.get("n_action_heads") != N_ACTION_HEADS
             or "ffn_mult" not in arch
@@ -1184,8 +1185,6 @@ def load_policy(ckpt) -> NotePolicy:
         trunk_hidden=arch.get("trunk_hidden"),
         value_bins=arch.get("value_bins", 0),
         value_vmax=arch.get("value_vmax", 6.0),
-        value_sigma=arch.get("value_sigma", 0.75),
-        # pre-2026-09-22 checkpoints carry no marker: one body token
-        body_tokens=arch.get("body_tokens", 1))
+        value_sigma=arch.get("value_sigma", 0.75))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
