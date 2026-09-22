@@ -3,8 +3,8 @@
 Reference model: **v40_w192_cd300** (embed 192 / trunk 384, Muon, cd300 leaf off the
 1,068-update trunk; bench 2,353,043 upp / 16,419.9 wpp / mean level accuracy 0.9690,
 6,097 ranked levels, 6,476,219 scoreable notes). Cross-checked against v40_muon_cd300,
-v40_t64b_cd150, v40_muon_cd200 and v41_sc005_cd200. Scripts and the per-level feature
-table live in `research/2026-09-14-pp-loss-analysis/` (see §8). No project code was
+v40_t64b_cd150, v40_muon_cd200 and v41_sc005_cd200. The per-level feature
+table lives in `research/2026-09-14-pp-loss-analysis/` (scripts: see §8). No project code was
 modified.
 
 Standing constraints honoured throughout: no change to WHEN or HOW MUCH reward is
@@ -450,7 +450,7 @@ Revisit if a cd600 leaf and the long trunk both stall the acc component at ~12.
 - `bench_decomp.py <bench.json> [--ref ...]` — §1, §2, §2c/2d, mapper table,
   paired comparisons.
 - `replay_cuts.py '<replays>*.jsonl'` — §3a–3d.
-- `replay_geometry.py` — the attempted §3e reconstruction (kept for the record;
+- `replay_geometry.py` — the attempted §3e reconstruction (not reportable;
   see limitation).
 - `train_vs_bench_weight.py <bench.json>` — §5.
 - `acc_component_value.py <bench.json>` — §4.
