@@ -315,12 +315,17 @@ def save_results(path, data, levels):
     _ft = sum(e.get("flail_ticks", 0) for e in evaluated)
     data["flail_rad_per_tick"] = round(
         sum(e.get("flail_rad", 0.0) for e in evaluated) / _ft, 5) if _ft else 0.0
-    # wrist-bend reversals per second of played time, per hand (2026-09-22)
+    # wrist-bend reversals (2026-09-22): catalog-wide totals per hand and
+    # combined, plus the rate per second of played time per hand
     _wt = sum(e.get("ticks", 0) for e in evaluated)
-    data["wrist_rev_per_s_l"] = round(
-        30.0 * sum(e.get("wrist_rev_l", 0) for e in evaluated) / _wt, 4) if _wt else 0.0
-    data["wrist_rev_per_s_r"] = round(
-        30.0 * sum(e.get("wrist_rev_r", 0) for e in evaluated) / _wt, 4) if _wt else 0.0
+    _wl = sum(int(e.get("wrist_rev_l", 0)) for e in evaluated)
+    _wr = sum(int(e.get("wrist_rev_r", 0)) for e in evaluated)
+    data["wrist_rev_total_l"] = _wl
+    data["wrist_rev_total_r"] = _wr
+    data["wrist_rev_total"] = _wl + _wr
+    data["wrist_rev_ticks"] = _wt
+    data["wrist_rev_per_s_l"] = round(30.0 * _wl / _wt, 4) if _wt else 0.0
+    data["wrist_rev_per_s_r"] = round(30.0 * _wr / _wt, 4) if _wt else 0.0
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -753,7 +758,10 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
     print(f"\ndone (cuda, {args.sim_dtype}): {n_lv} played ({n_skip} skipped), "
           f"{data['n_evaluated']} levels on file | total weighted PP "
           f"{data['total_weighted_pp']} | unweighted PP "
-          f"{data['total_unweighted_pp']} | pd-floor hits "
+          f"{data['total_unweighted_pp']} | wrist reversals "
+          f"{data['wrist_rev_total']} (L {data['wrist_rev_total_l']} / R "
+          f"{data['wrist_rev_total_r']}; {data['wrist_rev_per_s_l']} / "
+          f"{data['wrist_rev_per_s_r']} per s) | pd-floor hits "
           f"{data['pd_floor_hits']} | envelope hits {data['envelope_hits']} "
           f"| {n_slots} slots, {tick} ticks (ideal {ideal:.0f}) in {wall:.0f}s "
           f"({useful / wall / 1e3:.0f}k useful env-steps/s) -> {out_path}",
@@ -1198,6 +1206,9 @@ def main():
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
           f"unweighted PP {data['total_unweighted_pp']} | "
+          f"wrist reversals {data['wrist_rev_total']} (L "
+          f"{data['wrist_rev_total_l']} / R {data['wrist_rev_total_r']}; "
+          f"{data['wrist_rev_per_s_l']} / {data['wrist_rev_per_s_r']} per s) | "
           f"pd-floor hits {pd_hits} (file total) "
           f"| envelope hits {env_hits} (file total) "
           f"-> {out_path}", flush=True)
