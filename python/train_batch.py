@@ -233,9 +233,6 @@ def parse_args():
                    help="critic param-group lr multiplier (T1, "
                         "ProtoMotions ships 5x; 1.0 disables). Inactive "
                         "when resuming a legacy single-group optimizer")
-    p.add_argument("--critic-detach", action="store_true",
-                   help="T4: stop value-loss gradients at the shared "
-                        "trunk boundary (PPG-style detach)")
     p.add_argument("--diag-every", type=int, default=50,
                    help="every N updates run the critic/trunk "
                         "diagnostics minibatch (grad cosine, dormant "
@@ -272,7 +269,7 @@ def parse_args():
     p.add_argument("--clip", type=float, default=CLIP,
                    help="joint PPO ratio clip epsilon (the CLIP constant; "
                         "0.3 since 2026-09-15 — the ladder: 0.3 beat 0.2 "
-                        "by +1.7% bench, 0.4 lost −8.9% while training acc "
+                        "by +1.7%% bench, 0.4 lost −8.9%% while training acc "
                         "barely moved; 0.2 was the value from the start). "
                         "Also the clipfrac threshold in the [kl] "
                         "diagnostics")
@@ -513,7 +510,7 @@ def parse_args():
     p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="simba",
                    help="readout-trunk layout (2026-09-15, brainstorm item "
                         "2). simba = DEFAULT since 2026-09-15 (user "
-                        "decision: +0.66 pt trunk, +2.0% bench at matched "
+                        "decision: +0.66 pt trunk, +2.0%% bench at matched "
                         "clip 0.3): Linear projection -> residual block "
                         "x + fc2(relu(fc1(LN x))) -> LN (SimBa 2410.09754). "
                         "mlp = plain Linear-ReLU-Linear, reproduces the "
@@ -1210,10 +1207,6 @@ def main():
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
               f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "
               f"sigma {args.hl_sigma:g} bins", flush=True)
-    policy.critic_detach = args.critic_detach
-    if args.critic_detach:
-        print("--critic-detach: value-loss gradients stop at the "
-              "shared-trunk boundary (T4)", flush=True)
     if policy.n_gears != args.gears:
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "

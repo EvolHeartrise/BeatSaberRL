@@ -632,10 +632,6 @@ class NotePolicy(nn.Module):
         self.critic_out = nn.Linear(embed, embed)
         self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
                                 trunk_dim, self.value_bins or 1])
-        # T4 escape hatch (PPG §3.6 detach): True stops value-loss
-        # gradients at the shared-trunk boundary — the critic trains
-        # on detached features. Plain attribute, NOT in state_dict.
-        self.critic_detach = False
         # trainer diagnostics: _diag_stash=True makes the next forward
         # keep its trunk output on self._diag_h (forward hooks can't
         # see it — the fp16 paths bypass module __call__). Plain
@@ -810,8 +806,6 @@ class NotePolicy(nn.Module):
         construction: nothing here feeds back into the actor path.
         Output is the NORMALIZED value prediction (fp32) — the trainer
         owns the return-normalization stats."""
-        if self.critic_detach:
-            x_res, h = x_res.detach(), h.detach()
         B, T, d = x_res.shape
         # On the fp16 stream x_res is fp16 (Tier 1.1, see
         # forward_stacked), so from here every stage takes the same
