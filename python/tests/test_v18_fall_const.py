@@ -14,17 +14,11 @@ body slumps; the wall tests lean on the same physics), which gives a
 deterministic fall without crafting actions.
 """
 
-import os
-import sys
-
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import beat_arena_rs  # noqa: E402
-from beat_arena_env.chart import Note, note_tuple  # noqa: E402
-
-ZERO_ACT = [0] * 29
+import beat_arena_rs
+from beat_arena_env.chart import Note, note_tuple
+from tests._helpers import ZERO_ACT
 
 SPARSE = [Note(hit_time=100.0, col=2, row=1, x=2.5, y=1.4, color=0,
                angle=4.712, speed=4.0)]

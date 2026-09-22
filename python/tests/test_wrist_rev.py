@@ -6,15 +6,12 @@ against that reference run on the kernel's own integrated angles
 (including episode resets), (3) the Rust sim likewise, (4) the widened
 bench row. Needs torch; the sim parts need CUDA / beat_arena_rs."""
 import math
-import os
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from beat_arena_env.constants import N_JOINTS  # noqa: E402
+from beat_arena_env.constants import N_JOINTS
 
 HYST = 0.34906585
 L_BEND, R_BEND = 8, 15

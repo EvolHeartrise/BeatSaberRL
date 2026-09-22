@@ -35,18 +35,16 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CudaBeatVecEnv needs CUDA", allow_module_level=True)
 
-from beat_arena_env.chart import ChartConfig, Note, generate_chart, note_tuple
+from beat_arena_env.chart import ChartConfig, generate_chart, note_tuple
 from beat_arena_env.constants import (
     JOINT_LIMITS, N_JOINTS, NV, OBS_DIM, OMEGA_CAP,
 )
 from beat_arena_env.cuda_env import CudaBeatVecEnv, _load_ext
 import beat_arena_rs
+from tests._helpers import FAR_NOTE, resync, rust_state
 
 FULL = dict(colors="both", chart_len_s=6.0, bomb_prob=0.25, extra_prob=0.3,
             dot_prob=0.15)
-# a note far beyond every horizon: pure body dynamics
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 
 
 def _charts(cfg_kw, seeds):
@@ -69,10 +67,6 @@ def _cenv(charts, gears, max_steps, dtype=torch.float64):
                           gears=gears, device="cuda",
                           dtype=dtype, auto_reset=False,
                           want_contacts=True)
-
-
-def _rust_state(sim):
-    return list(sim.qpos()), list(np.concatenate([sim.twist(), sim.omega()]))
 
 
 def _tame_states(n, seed):
@@ -308,13 +302,10 @@ def _lockstep_episode(charts, gears, seed):
                 env_ticks += 1
                 max_rew_diff = max(max_rew_diff, abs(rew_r - float(trew[e])))
                 done_r[e] = d_r
-            q, v = _rust_state(sim)
+            q, v = rust_state(sim)
             q36s.append(q)
             v35s.append(v)
-        wv = env.wrist_vel.clone()  # set_state zeroes it (Rust semantics);
-        env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                      torch.tensor(v35s, dtype=torch.float64))
-        env.wrist_vel.copy_(wv)     # carry the true finite-diff velocity
+        resync(env, q36s, v35s)
         if all(done_r):
             break
     assert all(done_r), "episodes did not finish inside max_steps"
@@ -420,13 +411,10 @@ def test_contact_rich_parity_midline_press():
                 saw_contact = True
             if np.asarray(obs_r)[98:100].any():
                 saw_bits = True
-            q, v = _rust_state(sim)
+            q, v = rust_state(sim)
             q36s.append(q)
             v35s.append(v)
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                      torch.tensor(v35s, dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        resync(env, q36s, v35s)
     assert saw_contact, "press scenario produced no contact impulses"
     assert saw_bits, "press scenario never set the obs contact bits"
 
@@ -460,14 +448,11 @@ def test_activation_parity_and_coast_zero():
             act_r = sim.last_activation()
             act_c = env.act_stat[e].tolist()
             assert act_c[4] == t + 1, f"t{t} env{e} activation ticks"
-            q, v = _rust_state(sim)
+            q, v = rust_state(sim)
             q36s.append(q)
             v35s.append(v)
         assert float(env.act_stat[0, 0]) == 0.0, f"t{t}: coast not free"
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                      torch.tensor(v35s, dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        resync(env, q36s, v35s)
     # 5 ticks of the same command: accumulator = 5 x last tick's value
     act_r = sims[1].last_activation()
     for k in range(4):

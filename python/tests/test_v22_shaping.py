@@ -10,21 +10,16 @@ pot computed from the SAME §8 body_pts obs lanes the kernel reads;
 a plain reset.
 """
 
-import pytest
 import torch
 
 from beat_arena_env.constants import FOOT_X0, OFF_BODY_PTS, PLANE_Z0, X_NORM
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
-
-KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
+from tests._helpers import cuda
 
 
 def _env(**kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(64, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=True, **KW, **kw)
+                          foot_contact=True, **kw)
 
 
 def _feet(obs):

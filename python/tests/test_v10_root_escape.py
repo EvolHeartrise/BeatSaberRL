@@ -35,13 +35,11 @@ import pytest
 import torch
 
 import beat_arena_rs
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import H_SUB, N_JOINTS, N_SUB, NV, ROOT_V_MAX
-
-# a note far beyond every horizon: the tick is pure body dynamics, so
+# FAR_NOTE is beyond every horizon: the tick is pure body dynamics, so
 # `done` can only come from the C backstop
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
+from tests._helpers import FAR_NOTE
 
 ESC_Q36 = [
     -0.18843580782413483, 0.8035035133361816, -1.077133059501648,
