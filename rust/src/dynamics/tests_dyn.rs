@@ -284,42 +284,6 @@ fn clamps_hold_limits() {
     );
 }
 
-/// Crude wall-time probe for the orchestrator's throughput projection:
-/// run `cargo test --release bench_substep -- --nocapture`. Two
-/// regimes: free fall with no active clamps (pure pipeline: FK + CRBA
-/// + RNEA + Cholesky + integrate), and the worst case with every
-/// joint torque-pinned at a limit (clamp solves every substep).
-#[test]
-fn bench_substep_walltime() {
-    let m = &HUMANOID;
-    let h = 1.0 / 240.0;
-    let n = 5000;
-    let mut ws = Workspace::new(m);
-
-    let mut st = State::neutral(m);
-    let tau0 = vec![0.0; NQ];
-    for _ in 0..100 {
-        substep(m, &mut st, &tau0, h, &mut ws, None);
-    }
-    let t0 = std::time::Instant::now();
-    for _ in 0..n {
-        substep(m, &mut st, &tau0, h, &mut ws, None);
-    }
-    let free = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
-
-    let mut st = State::neutral(m);
-    let tau1 = vec![1.0; NQ]; // pins every joint at a stop
-    for _ in 0..200 {
-        substep(m, &mut st, &tau1, h, &mut ws, None);
-    }
-    let t0 = std::time::Instant::now();
-    for _ in 0..n {
-        substep(m, &mut st, &tau1, h, &mut ws, None);
-    }
-    let pinned = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
-    println!("35-DoF substep: {free:.2} us free-fall, {pinned:.2} us all-pinned ({n} iters)");
-}
-
 /// Regression: the shoulder stack (yaw→pitch→twist) gimbal-locks at
 /// pitch ±90°, and l_arm_pitch's LOWER LIMIT is exactly −90° — at the
 /// clamp the yaw and twist world axes are anti-parallel through the

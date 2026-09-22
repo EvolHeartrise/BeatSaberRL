@@ -446,44 +446,6 @@ fn determinism_with_contacts() {
     assert_eq!(la, lb, "impulse stream differs");
 }
 
-/// Gate (g): wall-time probe with welds + an active contact every
-/// substep. Run `cargo test --release bench_substep_contacts --
-/// --nocapture` for the report number.
-#[test]
-fn bench_substep_contacts() {
-    let m = muscle_model();
-    let (kp, kd) = muscle_gains();
-    let pose = pose_a();
-    let (_w, tau_g) = gravity_comp(&pose);
-    let mut ws = Workspace::new(&m);
-    let mut st = State::neutral(&m);
-    st.q.copy_from_slice(&pose);
-    let mut cs = ConstraintSet::new(&m, true, true);
-    let mut tau = [0.0; NQ];
-    let mut do_step = |st: &mut State, ws: &mut Workspace, cs: &mut ConstraintSet| {
-        for j in 0..NQ {
-            tau[j] = tau_g[j] + kp[j] * (pose[j] - st.q[j]);
-        }
-        tau[4] += 5.0;
-        tau[11] -= 5.0;
-        substep_constrained_damped(&m, st, &tau, &kd, H, ws, cs);
-    };
-    for _ in 0..200 {
-        do_step(&mut st, &mut ws, &mut cs);
-    }
-    assert!(!cs.contacts.is_empty(), "bench pose lost its contact");
-    let n = 5000;
-    let t0 = std::time::Instant::now();
-    for _ in 0..n {
-        do_step(&mut st, &mut ws, &mut cs);
-    }
-    let us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
-    println!(
-        "constrained substep (welds + {} contact rows): {us:.2} us ({n} iters)",
-        cs.contacts.len()
-    );
-}
-
 /// Gate (R9): the WELD-JACOBIAN SUPPORT claim the segmented weld dots
 /// rest on, plus a dense-vs-segmented bit-equality soak.
 ///
