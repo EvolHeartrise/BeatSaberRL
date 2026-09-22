@@ -118,7 +118,7 @@ def main():
     # protocol as the 19k-champion measurement set (v25c19k)
     run([PY, "make_top10_replays.py", "--ckpt", leaf_path,
          "--bench", out, "--tag", "v26gamma3k",
-         "--top", "10", "--workers", "8", "--foot-contact"],
+         "--top", "10", "--workers", "8"],
         "replays.log", 7_200)
     print("[gamma-probe] replays done", flush=True)
 

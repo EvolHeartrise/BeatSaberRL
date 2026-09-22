@@ -44,11 +44,10 @@ def slug(s, n=24):
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:n].lower() or "song"
 
 
-_W = {}          # per-process state: {"policy", "dev", "fc", "push"} (set by _worker_init)
+_W = {}          # per-process state: {"policy", "dev", "push", "tau"} (set by _worker_init)
 
 
-def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0),
-                 tau_scale=None):
+def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     # env v48: the checkpoint's obs z encoding; the rust sim reads
     # BEAT_Z_ASINH once per process (this runs before any sim exists)
@@ -60,7 +59,6 @@ def _worker_init(ckpt_path, device, foot_contact=False, push=(0.0, 0.0, 0),
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
-    _W["fc"] = foot_contact
     _W["push"] = push
     _W["tau"] = tau_scale   # env v46 fixed body (None = all 1.0)
 
@@ -93,7 +91,9 @@ def _make_one(job):
     base = (f"replays/{tag}_{label}{rank:02d}_"
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
-                      foot_contact=_W["fc"],
+                      # contact physics is the only mode: every production
+                      # ckpt is contact-trained and the bench forces it
+                      foot_contact=True,
                       external_walls=meta["walls"])
     if _W.get("tau") is not None:
         env.set_tau_scale(_W["tau"])
@@ -186,10 +186,6 @@ def main():
                         "body TAU_BODY_DEFAULT, 'nominal' = all 1.0; see "
                         "bench_scoresaber --tau-scale). Default: the saved "
                         "body (since 2026-09-22)")
-    p.add_argument("--foot-contact", action="store_true",
-                   help="env v11 contact physics — MUST match how the "
-                        "checkpoint was trained (a v12+/contact ckpt "
-                        "replayed under welds is a different game)")
     p.add_argument("--push-prob", type=float, default=0.0,
                    help="replay the env v18 perturbation: per-tick "
                         "probability of a horizontal root-velocity kick "
@@ -239,7 +235,6 @@ def main():
                                  mp_context=ctx,
                                  initializer=_worker_init,
                                  initargs=(args.ckpt, device,
-                                           args.foot_contact,
                                            (args.push_prob, args.push_vmax,
                                             args.push_seed),
                                            parse_tau_scale(args.tau_scale)
@@ -250,7 +245,7 @@ def main():
                 print(line, flush=True)
                 made.append(base)
     else:
-        _worker_init(args.ckpt, device, args.foot_contact,
+        _worker_init(args.ckpt, device,
                      (args.push_prob, args.push_vmax, args.push_seed),
                      parse_tau_scale(args.tau_scale) if args.tau_scale
                      else None)

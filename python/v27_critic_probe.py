@@ -131,7 +131,7 @@ def main():
     # top-10 pp replays: elbow-at-contact protocol continuity
     run([PY, "make_top10_replays.py", "--ckpt", leaf_path,
          "--bench", out, "--tag", "v27crit3k",
-         "--top", "10", "--workers", "8", "--foot-contact"],
+         "--top", "10", "--workers", "8"],
         "replays.log", 7_200)
     print("[v27-probe] replays done", flush=True)
 
