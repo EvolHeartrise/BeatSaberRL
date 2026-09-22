@@ -4,8 +4,8 @@ is INVARIANCE — per-env results are bitwise-identical under ANY
 bijection, because the permutation only reassigns threads to envs and
 every P.*[e] address is unchanged. Gate: full state + obs/reward/done
 equality against the identity ordering, for (a) a fixed scrambled
-permutation and (b) the live sorted mode (BEAT_ENV_ORDER path), plus
-run-to-run determinism of the sorted arm."""
+permutation and (b) the live sorted mode (CudaBeatVecEnv(env_order=True),
+what the trainer runs), plus run-to-run determinism of the sorted arm."""
 import numpy as np
 import torch
 
@@ -30,12 +30,11 @@ _STATE = ("p", "quat", "q", "v", "score", "status", "first_pending",
           "tick", "ep_return", "swing_acc", "flail_rad", "acc_pts")
 
 
-def _run(env, order=None, sort=False):
+def _run(env, order=None):
     torch.manual_seed(0)
     env.reset()
     if order is not None:
         env.env_order.copy_(order)
-    env._env_order_on = sort
     rng = np.random.default_rng(7)
     outs = []
     for _ in range(TICKS):
@@ -67,8 +66,12 @@ def test_any_permutation_is_bitwise_identity():
 
 @cuda
 def test_sorted_mode_is_bitwise_identity_and_deterministic():
-    ref = _run(_env())
-    s1 = _run(_env(), sort=True)
-    s2 = _run(_env(), sort=True)
+    ref_env = _env()
+    assert ref_env._env_order_on is False     # constructor default: off
+    ref = _run(ref_env)
+    e1 = _env(env_order=True)
+    assert e1._env_order_on is True
+    s1 = _run(e1)
+    s2 = _run(_env(env_order=True))
     _assert_same(ref, s1, "sorted")
     _assert_same(s1, s2, "sorted-rerun")

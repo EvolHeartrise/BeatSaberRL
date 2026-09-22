@@ -5968,7 +5968,7 @@ template <typename T, bool FC>
 __global__ void __launch_bounds__(THREADS, 1)
 step_kernel(Sim<T> P) {
   // R12 (2026-08-21): warp-coherence env permutation. The grid walks
-  // env_order — identity by default; under BEAT_ENV_ORDER=1 the host
+  // env_order — identity by default; under env_order=True the host
   // sorts it by (chart, first_pending) each tick so warp-mates share
   // note windows (audit 3.3: identical-envs header ran 3.5x production
   // traffic). Per-env work and every P.*[e] address are unchanged —
