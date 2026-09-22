@@ -233,9 +233,6 @@ def parse_args():
                    help="critic param-group lr multiplier (T1, "
                         "ProtoMotions ships 5x; 1.0 disables). Inactive "
                         "when resuming a legacy single-group optimizer")
-    p.add_argument("--critic-detach", action="store_true",
-                   help="T4: stop value-loss gradients at the shared "
-                        "trunk boundary (PPG-style detach)")
     p.add_argument("--diag-every", type=int, default=50,
                    help="every N updates run the critic/trunk "
                         "diagnostics minibatch (grad cosine, dormant "
@@ -1210,10 +1207,6 @@ def main():
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
               f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "
               f"sigma {args.hl_sigma:g} bins", flush=True)
-    policy.critic_detach = args.critic_detach
-    if args.critic_detach:
-        print("--critic-detach: value-loss gradients stop at the "
-              "shared-trunk boundary (T4)", flush=True)
     if policy.n_gears != args.gears:
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "
