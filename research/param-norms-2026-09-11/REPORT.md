@@ -2,6 +2,8 @@
 
 Measured on the laptop (CPU torch 2.13) from `~/beat-arena-volume-backup`,
 108 checkpoints across 9 runs. `param_norms.py` reproduces `param_norms.csv`.
+(`param_norms.py` was removed 2026-09-22; recover with
+`git show 4c235a5:projects/beat-arena/research/param-norms-2026-09-11/param_norms.py`.)
 All norms are L2 over fp32 master weights. "actor" = enc + blocks + trunk +
 heads; "critic" = the adapool critic (231k params). `ln` = mean LayerNorm
 gain over the 7 LN layers. `qk` = max over blocks of ‖W_q‖₂·‖W_k‖₂ (a bound
