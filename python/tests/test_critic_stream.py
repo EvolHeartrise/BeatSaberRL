@@ -95,8 +95,8 @@ def test_critic_actually_runs_on_the_side_stream_and_holds_inputs():
         _, v = p.forward_stacked(_obs(64), critic_async=True)
         assert p._critic_pending is not None
         ev, x_res, h, ab = p._critic_pending
-        assert x_res.shape == (64, 3 + N_NOTE_SLOTS, p.embed)
-        assert h.shape == (64, 256) and ab.shape == (64, 1, 3 + N_NOTE_SLOTS)
+        assert x_res.shape == (64, p.n_lead + N_NOTE_SLOTS, p.embed)
+        assert h.shape == (64, 256) and ab.shape == (64, 1, p.n_lead + N_NOTE_SLOTS)
         p.critic_join()
     assert p._critic_pending is None
     assert len(seen) == 1 and seen[0] == p._critic_stream
@@ -161,7 +161,7 @@ def test_main_stream_churn_between_forward_and_join_cannot_corrupt():
             # churn: several tensors the size of x_res / h / attn_bias,
             # written on the main stream, freed immediately
             for _ in range(6):
-                junk = torch.empty(4096, 27, 128, device="cuda",
+                junk = torch.empty(4096, 29, 128, device="cuda",
                                    dtype=torch.float16)
                 junk.fill_(float(it))
                 junk2 = torch.empty(4096, 256, device="cuda",

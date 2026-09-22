@@ -84,7 +84,7 @@ def test_critic_inputs_are_fp16_on_fp16_stream(flat, grad):
     (x_res, h, ab), = spy.calls
     assert x_res.dtype is torch.float16, x_res.dtype
     assert h.dtype is torch.float16 and ab.dtype is torch.float16
-    assert x_res.shape == (64, 3 + N_NOTE_SLOTS, p.embed)
+    assert x_res.shape == (64, p.n_lead + N_NOTE_SLOTS, p.embed)
     assert x_res.is_contiguous()
     (hv,) = spy.ln_out
     assert hv.dtype is torch.float16, "critic_ln output promoted"
