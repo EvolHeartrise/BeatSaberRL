@@ -155,8 +155,8 @@ const fn revb(
 
 // §1.3 joint semantics as stacked revolutes, chain order. Child body
 // orientation = parent × Rot(axis_1, q_1) × Rot(axis_2, q_2) × ... —
-// intrinsic composition, leftmost applied first. Verified against v9
-// fk() by the continuity gate (tests_fk.rs):
+// intrinsic composition, leftmost applied first (reproduces the
+// retired v9 arm chains):
 //   shoulder  M   = R_y(yaw)·R_x(−pitch)·R_z(twist)  — axes (0,1,0),
 //             (−1,0,0), (0,0,1); upper arm along local +z (0.35)
 //   elbow     M_f = M·R_x(−e)                        — axis (−1,0,0);
