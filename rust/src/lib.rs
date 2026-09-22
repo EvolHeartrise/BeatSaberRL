@@ -3435,7 +3435,7 @@ mod env_tests {
         acts[3] = 2;
 
         // empty chart = the bench's idle slot: done on the FIRST tick
-        let mut core = Core::new_core(100_000_000, false, 5, false);
+        let mut core = Core::new_core(100_000_000, 5, false);
         core.set_chart_notes(Vec::new());
         assert!(!core.finished, "install must clear the latch");
         let (_r0, d0) = core.step_inner(&acts);
@@ -3481,7 +3481,7 @@ mod env_tests {
             .map(|i| (1.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
-        let mut core = Core::new_core(690, false, 5, false);
+        let mut core = Core::new_core(690, 5, false);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         let mut first_done = None;
@@ -3517,7 +3517,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, false, 3, false);
+        let mut core = Core::new_core(690, 3, false);
         core.set_chart_notes(chart);
         core.body.st.p = ESC_P;
         core.body.st.quat = ESC_QUAT;
@@ -3562,7 +3562,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, false, 5, false);
+        let mut core = Core::new_core(690, 5, false);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[10] = 1;
@@ -3601,7 +3601,7 @@ mod env_tests {
             .collect();
         chart.push((9.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_BOMB,
                     false, false));
-        let mut core = Core::new_core(690, false, 5, true);
+        let mut core = Core::new_core(690, 5, true);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[17] = 1; // l_hip_pitch, full +
@@ -3650,7 +3650,7 @@ mod env_tests {
     fn ground_reaction_carries_weight_in_contact_mode() {
         let chart: Vec<ChartTuple> = vec![(8.0, 0.0, 1.0, 0, 0.0, 6.0,
                                            false, KIND_NOTE, false, false)];
-        let mut core = Core::new_core(690, false, 5, true);
+        let mut core = Core::new_core(690, 5, true);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         // ticks 1-3: the first tick still carries the reset's settling
@@ -3692,7 +3692,7 @@ mod env_tests {
                  KIND_NOTE, false, false)
             })
             .collect();
-        let mut core = Core::new_core(690, false, 5, false);
+        let mut core = Core::new_core(690, 5, false);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[17] = 1;
