@@ -44,7 +44,7 @@ use rayon::prelude::*;
 pub mod dynamics;
 
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
-use dynamics::fk::quat_to_rot;
+use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
 use dynamics::model::{
     Model, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
     F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHANK, F_R_SHOULDER,
@@ -440,72 +440,6 @@ struct Note {
     free_post: bool, // arc head: full 30 follow-through granted
 }
 
-// --- v9 reference arm FK (TEST-ONLY since P3) --------------------------------
-// The v10 continuity gate (dynamics/tests_fk.rs `v9_fk_continuity`)
-// pins the dynamics tree against the retired v9 arm chains; the v9
-// `fk()` survives as a #[cfg(test)] reference implementation for that
-// gate (SPEC-v10 Divergences §18). Nothing in the live env calls it.
-#[cfg(test)]
-const SHOULDER: [[Real; 3]; 2] = [[-0.2, 1.47, -0.65], [0.2, 1.47, -0.65]];
-#[cfg(test)]
-const L_UPPER: Real = 0.35;
-#[cfg(test)]
-const L_FORE: Real = 0.30;
-
-/// v9 forward kinematics: (elbow, wrist, blade unit dir, (cos, sin) of
-/// roll) from q = [pitch, yaw, twist, elbow, roll, bend, dev].
-/// Arm frame M = R_y(yaw)·R_x(−pitch)·R_z(twist); forearm =
-/// M·(0, sin e, cos e); blade = Rz(roll)·Ry(dev)·Rx(−bend)·e_z in the
-/// forearm frame M_f = M·R_x(−elbow).
-#[cfg(test)]
-pub fn fk(hand: usize, q: &[Real; 7]) -> ([Real; 3], [Real; 3], [Real; 3], (Real, Real)) {
-    let (sp, cp) = q[0].sin_cos();
-    let (sy, cy) = q[1].sin_cos();
-    let (st, ct) = q[2].sin_cos();
-    let (se, ce) = q[3].sin_cos();
-    let m = [
-        [cy * ct - sy * sp * st, -cy * st - sy * sp * ct, sy * cp],
-        [cp * st, cp * ct, sp],
-        [-sy * ct - cy * sp * st, sy * st - cy * sp * ct, cy * cp],
-    ];
-    let sh = SHOULDER[hand];
-    let e = [
-        sh[0] + L_UPPER * m[0][2],
-        sh[1] + L_UPPER * m[1][2],
-        sh[2] + L_UPPER * m[2][2],
-    ];
-    let f = [
-        m[0][1] * se + m[0][2] * ce,
-        m[1][1] * se + m[1][2] * ce,
-        m[2][1] * se + m[2][2] * ce,
-    ];
-    let w = [e[0] + L_FORE * f[0], e[1] + L_FORE * f[1], e[2] + L_FORE * f[2]];
-    let (sr, cr) = q[4].sin_cos();
-    let (sb, cb) = q[5].sin_cos();
-    let (sv, cv) = q[6].sin_cos();
-    let d = [cr * sv * cb - sr * sb, sr * sv * cb + cr * sb, cv * cb];
-    let b = [
-        m[0][0] * d[0] + (m[0][1] * ce - m[0][2] * se) * d[1] + f[0] * d[2],
-        m[1][0] * d[0] + (m[1][1] * ce - m[1][2] * se) * d[1] + f[1] * d[2],
-        m[2][0] * d[0] + (m[2][1] * ce - m[2][2] * se) * d[1] + f[2] * d[2],
-    ];
-    (e, w, b, (cr, sr))
-}
-
-fn sub(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn dot3(a: [Real; 3], b: [Real; 3]) -> Real {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
 /// Triangle vs axis-aligned box (Akenine-Möller SAT). Verts are given
 /// RELATIVE to the box center; h = half extents.
 fn tri_box_overlap(v: [[Real; 3]; 3], h: [Real; 3]) -> bool {
@@ -517,7 +451,7 @@ fn tri_box_overlap(v: [[Real; 3]; 3], h: [Real; 3]) -> bool {
             return false;
         }
     }
-    let e = [sub(v[1], v[0]), sub(v[2], v[1]), sub(v[0], v[2])];
+    let e = [sub3(v[1], v[0]), sub3(v[2], v[1]), sub3(v[0], v[2])];
     // 9 cross-axis tests: a = u_k x e_j (u_k = box axes)
     for j in 0..3 {
         let ax = [
@@ -545,19 +479,19 @@ fn tri_box_overlap(v: [[Real; 3]; 3], h: [Real; 3]) -> bool {
 /// Real-Time Collision Detection §5.1.5). Handles degenerate triangles
 /// via the edge/vertex regions.
 fn tri_point_dist(a: [Real; 3], b: [Real; 3], c: [Real; 3], p: [Real; 3]) -> Real {
-    let ab = sub(b, a);
-    let ac = sub(c, a);
-    let ap = sub(p, a);
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(p, a);
     let d1 = dot3(ab, ap);
     let d2 = dot3(ac, ap);
     let dist = |q: [Real; 3]| {
-        let d = sub(p, q);
+        let d = sub3(p, q);
         dot3(d, d).sqrt()
     };
     if d1 <= 0.0 && d2 <= 0.0 {
         return dist(a);
     }
-    let bp = sub(p, b);
+    let bp = sub3(p, b);
     let d3 = dot3(ab, bp);
     let d4 = dot3(ac, bp);
     if d3 >= 0.0 && d4 <= d3 {
@@ -569,7 +503,7 @@ fn tri_point_dist(a: [Real; 3], b: [Real; 3], c: [Real; 3], p: [Real; 3]) -> Rea
         let v = if denom.abs() < 1e-15 { 0.0 } else { d1 / denom };
         return dist([a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]]);
     }
-    let cp = sub(p, c);
+    let cp = sub3(p, c);
     let d5 = dot3(ab, cp);
     let d6 = dot3(ac, cp);
     if d6 >= 0.0 && d5 <= d6 {
@@ -602,9 +536,9 @@ fn tri_point_dist(a: [Real; 3], b: [Real; 3], c: [Real; 3], p: [Real; 3]) -> Rea
 }
 
 fn seg_point_dist3(a: [Real; 3], b: [Real; 3], c: [Real; 3]) -> Real {
-    let ab = sub(b, a);
+    let ab = sub3(b, a);
     let denom = dot3(ab, ab);
-    let ac = sub(c, a);
+    let ac = sub3(c, a);
     let t = if denom < 1e-12 {
         0.0
     } else {
@@ -669,7 +603,7 @@ fn note_frame(
 ) -> [[Real; 3]; 3] {
     let up = [-sin_r, cos_r, 0.0];
     let hp = [head[0], head[1] + LOOK_VERT * (p[1] - head[1]), head[2]];
-    let d = sub(p, hp);
+    let d = sub3(p, hp);
     let dn = dot3(d, d).sqrt().max(1e-9);
     let g = [
         lam * d[0] / dn,
@@ -687,7 +621,7 @@ fn note_frame(
 
 /// p relative to `center`, expressed in the note frame.
 fn to_frame(p: [Real; 3], center: [Real; 3], f: &[[Real; 3]; 3]) -> [Real; 3] {
-    let q = sub(p, center);
+    let q = sub3(p, center);
     [dot3(q, f[0]), dot3(q, f[1]), dot3(q, f[2])]
 }
 
@@ -2435,60 +2369,6 @@ impl RawBeatSim {
         out
     }
 
-    /// World center of mass from the §1.2 mass model (introspection —
-    /// balance forensics). Σ mᵢ (pᵢ + Rᵢ·comᵢ) / M over the base +
-    /// every mass-carrying frame, current FK.
-    fn com(&self) -> [Real; 3] {
-        let b = &self.core.body;
-        let mut acc = [0.0 as Real; 3];
-        let mut mass = MODEL.base_mass;
-        let r0 = dynamics::fk::quat_to_rot(b.st.quat);
-        for k in 0..3 {
-            // base com is in the root frame
-            acc[k] = MODEL.base_mass
-                * (b.st.p[k]
-                    + r0[k][0] * MODEL.base_com[0]
-                    + r0[k][1] * MODEL.base_com[1]
-                    + r0[k][2] * MODEL.base_com[2]);
-        }
-        for (f, fr) in MODEL.frames.iter().enumerate() {
-            if fr.mass == 0.0 {
-                continue;
-            }
-            mass += fr.mass;
-            let (p, r) = (&b.ws.p[f], &b.ws.r[f]);
-            for k in 0..3 {
-                acc[k] += fr.mass
-                    * (p[k]
-                        + r[k][0] * fr.com[0]
-                        + r[k][1] * fr.com[1]
-                        + r[k][2] * fr.com[2]);
-            }
-        }
-        [acc[0] / mass, acc[1] / mass, acc[2] / mass]
-    }
-
-    /// World positions of the 8 sole corners (contact spec §2 normative
-    /// order), current FK. Introspection — support-polygon forensics.
-    fn sole_corners(&self) -> Vec<[Real; 3]> {
-        use dynamics::collide::{CORNERS_PER_FOOT, GROUND_CORNERS, GROUND_FRAMES};
-        let b = &self.core.body;
-        let mut out = Vec::with_capacity(8);
-        for f in 0..GROUND_FRAMES.len() {
-            let frame = GROUND_FRAMES[f];
-            let (p, r) = (&b.ws.p[frame], &b.ws.r[frame]);
-            for k in 0..CORNERS_PER_FOOT {
-                let c = &GROUND_CORNERS[k];
-                out.push([
-                    p[0] + r[0][0] * c[0] + r[0][1] * c[1] + r[0][2] * c[2],
-                    p[1] + r[1][0] * c[0] + r[1][1] * c[1] + r[1][2] * c[2],
-                    p[2] + r[2][0] * c[0] + r[2][1] * c[1] + r[2][2] * c[2],
-                ]);
-            }
-        }
-        out
-    }
-
     /// Replay v10 `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
     fn twist(&self) -> [Real; 6] {
         let v = &self.core.body.st.v;
@@ -3047,11 +2927,6 @@ impl VecBeatSim {
         )
     }
 
-    /// Single env's current obs (340,) — used for cheap post-reset reads.
-    fn obs_one<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyArray1<f32>> {
-        PyArray1::from_slice_bound(py, &self.sims[i].build_obs())
-    }
-
     /// Single env's current obs written into row i of a caller-owned
     /// (N, 340) f32 array (the `step_into` buffer).
     fn obs_one_into<'py>(
@@ -3132,22 +3007,6 @@ impl VecBeatSim {
             .sum()
     }
 
-    /// env v34 limit-rest telemetry summed over all envs since the last
-    /// pop: (legs λ-flow N·m·s, spine λ-flow, env-ticks). CUDA
-    /// `pop_limit_rest` mirror.
-    fn pop_limit_rest(&mut self) -> (Real, Real, Real, u64) {
-        let (mut lg, mut sp, mut ar, mut tk) = (0.0 as Real, 0.0 as Real, 0.0 as Real, 0u64);
-        for s in self.sims.iter_mut() {
-            lg += s.limit_rest_sum[0];
-            sp += s.limit_rest_sum[1];
-            ar += s.limit_rest_sum[2];
-            tk += s.limit_rest_ticks;
-            s.limit_rest_sum = [0.0; 3];
-            s.limit_rest_ticks = 0;
-        }
-        (lg, sp, ar, tk)
-    }
-
     /// Activation telemetry summed over all envs since the last pop:
     /// (Σ total, Σ spine, Σ arms, Σ legs, env-ticks). CUDA
     /// `pop_activation` mirror.
@@ -3221,55 +3080,6 @@ impl VecBeatSim {
                 h
             })
             .sum()
-    }
-
-    /// TILT terminations summed over all envs since the last pop
-    /// (2026-08-20) — the CUDA backend's `pop_tilt_hits` mirror.
-    /// ADDITIVE getter; always 0 in weld mode.
-    fn pop_tilt_hits(&mut self) -> u64 {
-        self.sims
-            .iter_mut()
-            .map(|s| {
-                let h = s.body.tilt_hits;
-                s.body.tilt_hits = 0;
-                h
-            })
-            .sum()
-    }
-
-    /// Foot-lift events summed over all envs since the last pop
-    /// (2026-08-20), (left, right) — the CUDA backend's
-    /// `pop_foot_lifts` mirror. ADDITIVE getter; (0, 0) in weld mode.
-    fn pop_foot_lifts(&mut self) -> (u64, u64) {
-        let (mut l, mut r) = (0u64, 0u64);
-        for s in self.sims.iter_mut() {
-            let h = s.body.foot_lift_hits;
-            s.body.foot_lift_hits = [0, 0];
-            l += h[0];
-            r += h[1];
-        }
-        (l, r)
-    }
-
-    /// Fall terminations in env i's current episode (contact spec §4).
-    fn falls(&self, i: usize) -> u32 {
-        self.sims[i].falls
-    }
-
-    /// Tilt terminations in env i's current episode (2026-08-20).
-    fn tilts(&self, i: usize) -> u32 {
-        self.sims[i].tilts
-    }
-
-    /// env v17: head-in-wall ticks in env i's current episode (each
-    /// charged WALL_PEN). ADDITIVE getter (spec §12b).
-    fn walls_in(&self, i: usize) -> u32 {
-        self.sims[i].walls_in
-    }
-
-    /// env v17: wall entries (combo breaks) in env i's episode.
-    fn wall_enters(&self, i: usize) -> u32 {
-        self.sims[i].wall_enters
     }
 
     /// R26 instrumentation: the per-substep rate counters aggregated

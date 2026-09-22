@@ -897,7 +897,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        implementation** in lib.rs (with its SHOULDER/L_UPPER/L_FORE
        literals) solely for the P1 continuity gate
        (`tests_fk::v9_fk_continuity` references `crate::fk`); nothing
-       live calls it. `kinematics.py` remains its Python mirror,
+       live calls it. (Both removed 2026-09-22 — the v10 FK is the
+       only reference now.) `kinematics.py` remains its Python mirror,
        banner-marked v9-legacy (its IK feeds the P6 bot rebuild).
     b. **Effort's "post-solve substep velocity"** — RETIRED with the
        work reading 2026-09-13 (was: the END-of-substep velocity after
