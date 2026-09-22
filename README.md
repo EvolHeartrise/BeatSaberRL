@@ -479,11 +479,15 @@ See `viz/dash/README.md` for the field vocabulary and index schema.
 ## Watching replays
 
 ```bash
-$VENV/bin/python record_replay.py --ckpt runs/pure_tf_batch_4m/final.pt --episodes 3
-$VENV/bin/python record_replay.py --scripted
+$VENV/bin/python make_top10_replays.py --ckpt <ckpt.pt> --bench <bench.json> --tag <tag>
+$VENV/bin/python record_replay.py --scripted   # scripted bot, procedural chart
 ```
 
-then open `viz/replay.html` in a browser and drop a
+`make_top10_replays.py` re-plays a bench's top plays (or `--bottom` /
+`--random N` picks) for a checkpoint with the production physics (tau
+body, asinh z) on the real maps, which must already be under
+`python/maps/scoresaber/` (see `prefetch_maps.py`).
+Then open `viz/replay.html` in a browser and drop a
 `python/replays/*.jsonl` file in. Since 2026-07-21 the viewer is a
 Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
 wheel = zoom, right-drag = pan), compiled to that single static file —
@@ -715,8 +719,7 @@ plan latch).
   policy reaches 75-80% vs scripted 81%.
 - **v3 milestone: real BeatSaver maps parse (v2+v3 schemas, dot notes,
   precision angles) and sight-read** — e.g. 81% on Spectre [Easy] with
-  zero training on real charts. Try:
-  `python sightread.py --map maps/<map>.zip --difficulty Easy --ckpt <ckpt> --replay out.jsonl`
+  zero training on real charts.
 - GPU training (2026-07-21, Windows box): `--device cuda` on a GTX 1080
   (torch cu126 wheels — the last line with Pascal kernels) sustains
   ~24.7k steps/s vs 8.5k CPU; rollout is now the bottleneck (77%).
