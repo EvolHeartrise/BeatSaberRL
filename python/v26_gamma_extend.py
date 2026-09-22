@@ -98,7 +98,7 @@ def main():
 
     run([PY, "make_top10_replays.py", "--ckpt", leaf_path,
          "--bench", out, "--tag", "v26gamma6k",
-         "--top", "10", "--workers", "8", "--foot-contact"],
+         "--top", "10", "--workers", "8"],
         LEAF_DIR, "replays.log", 7_200)
     print("[gamma-ext] replays done", flush=True)
 
