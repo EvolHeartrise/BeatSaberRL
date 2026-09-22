@@ -104,13 +104,16 @@ def test_cuda_matches_reference_on_its_own_angles():
         a = np.full((N, N_JOINTS), 2, dtype=np.int64)
         a[:, [L_BEND, R_BEND]] = rng.integers(0, 5, (N, 2))
         _obs, _r, done, _ev = env.step(torch.as_tensor(a, device="cuda"))
-        if bool(done.any()):
-            break
         q = env.q[:, [L_BEND, R_BEND]].cpu().numpy()   # this tick's angles
+        d = done.cpu().numpy()
         for i in range(N):
+            if d[i]:            # pose already reset: detector input unseen
+                continue
             for h in range(2):
                 refs[i][h].feed(float(q[i, h]))
         steps += 1
+        if d.any():             # the kernel counted this tick for the
+            break               # live envs; stop before the frozen state
     assert steps >= 100, steps
     l, r = env.pop_wrist_rev()
     exp_l = sum(refs[i][0].count for i in range(N))
