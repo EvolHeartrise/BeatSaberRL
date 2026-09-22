@@ -87,8 +87,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("run_dir")
     p.add_argument("--last", type=int, default=0, help="only the last N episodes")
-    p.add_argument("--center", type=str, default=None,
-                   help="the run's --tau-center (16 floats or group syntax); default all 1.0")
+    p.add_argument("--center", type=str, default="default",
+                   help="the run's --tau-center (16 floats, group syntax, 'default' = "
+                        "the saved body TAU_BODY_DEFAULT, 'nominal' = all 1.0); default "
+                        "= the saved body (a fresh trunk trains around it)")
     p.add_argument("--r", type=float, default=0.25, help="the run's --tau-rand")
     p.add_argument("--cap", type=float, default=0.10, help="max center move per axis per round")
     p.add_argument("--tmin", type=float, default=3.0, help="|t| needed to move an axis")
