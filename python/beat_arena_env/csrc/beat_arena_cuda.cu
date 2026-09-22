@@ -4656,9 +4656,10 @@ struct Sim {
   // wrist-bend reversal telemetry (2026-09-22): per env x hand [L, R] —
   // count (flail lifecycle: popped by the wrapper's pop_wrist_rev in
   // training, snapshotted + zeroed per level by the bench refill), the
-  // running extreme angle, and the detector state (0 = fresh episode,
-  // ext invalid; 3 = armed, no direction yet; 1 = moving +; 2 = moving
-  // -). reset_env zeroes the state, never the count.
+  // running extremes [lo, hi] (N, 2, 2), and the detector state (0 =
+  // fresh episode, extremes invalid; 3 = armed, no direction yet; 1 =
+  // moving +; 2 = moving -). reset_env zeroes the state, never the
+  // count.
   int* __restrict__ wrev;
   T* __restrict__ wrev_ext;
   int* __restrict__ wrev_dir;
@@ -5736,21 +5737,27 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     const int idx = e * 2 + h;
     const T q = d.q[h ? 15 : 8];
     int dir = P.wrev_dir[idx];
-    T ext = P.wrev_ext[idx];
+    T lo = P.wrev_ext[idx * 2], hi = P.wrev_ext[idx * 2 + 1];
     if (dir == 0) {
-      ext = q; dir = 3;
+      lo = hi = q; dir = 3;
     } else if (dir == 3) {
-      if (q >= ext + T(WREV_HYST)) { dir = 1; ext = q; }
-      else if (q <= ext - T(WREV_HYST)) { dir = 2; ext = q; }
+      // undirected: track both extremes; a WREV_HYST rise from the low
+      // (or fall from the high) commits the first direction — not a
+      // reversal
+      if (q < lo) lo = q;
+      if (q > hi) hi = q;
+      if (q >= lo + T(WREV_HYST)) { dir = 1; hi = q; }
+      else if (q <= hi - T(WREV_HYST)) { dir = 2; lo = q; }
     } else if (dir == 1) {
-      if (q > ext) ext = q;
-      else if (q <= ext - T(WREV_HYST)) { P.wrev[idx] += 1; dir = 2; ext = q; }
+      if (q > hi) hi = q;
+      else if (q <= hi - T(WREV_HYST)) { P.wrev[idx] += 1; dir = 2; lo = q; }
     } else {
-      if (q < ext) ext = q;
-      else if (q >= ext + T(WREV_HYST)) { P.wrev[idx] += 1; dir = 1; ext = q; }
+      if (q < lo) lo = q;
+      else if (q >= lo + T(WREV_HYST)) { P.wrev[idx] += 1; dir = 1; hi = q; }
     }
     P.wrev_dir[idx] = dir;
-    P.wrev_ext[idx] = ext;
+    P.wrev_ext[idx * 2] = lo;
+    P.wrev_ext[idx * 2 + 1] = hi;
   }
 
   for (int i = P.first_pending[e]; i < nn; i++) {
@@ -6224,7 +6231,7 @@ enum {
   TTICK, TSTATUS, TFIRSTP, TEPRET,
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
-  TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals (N,2) x3 — 2026-09-22
+  TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals: count (N,2), extremes (N,2,2), state (N,2) — 2026-09-22
   TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)

@@ -761,10 +761,10 @@ class CudaBeatVecEnv:
         # wrist-bend reversal telemetry (2026-09-22, user): per env x
         # hand — count since the last pop (kernel peak detection with a
         # 20 deg hysteresis on the bend joints; flail lifecycle), the
-        # running extreme angle and the detector state (reset per
+        # running extremes and the detector state (reset per
         # episode by the kernel's reset_env). Popped by pop_wrist_rev.
         self.wrev = z(N, 2, dt=torch.int32)
-        self.wrev_ext = z(N, 2)
+        self.wrev_ext = z(N, 2, 2)          # running [lo, hi] per hand
         self.wrev_dir = z(N, 2, dt=torch.int32)
         # env v34 limit-rest telemetry (per env, kernel-accrued):
         # tick-summed joint-limit-row impulses [legs, spine, arms]
