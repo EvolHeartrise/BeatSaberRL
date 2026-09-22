@@ -164,6 +164,16 @@ def main():
                    help="take the WORST N by the sort key instead of "
                         "the best (2026-07-29: bottom-acc failure-mode "
                         "review)")
+    p.add_argument("--stars", type=float, nargs=2, metavar=("LO", "HI"),
+                   default=None,
+                   help="only levels with LO <= stars < HI (2026-09-22: "
+                        "star-band review sets)")
+    p.add_argument("--random", type=int, default=0, metavar="N",
+                   help="pick N levels uniformly at random from the "
+                        "(star-filtered) bench instead of the top/bottom "
+                        "of the sort key; label 'rand'; seeded by --seed")
+    p.add_argument("--seed", type=int, default=0,
+                   help="--random selection seed")
     p.add_argument("--label", default=None,
                    help="override the filename label (default: derived "
                         "from --sort/--bottom, e.g. toppp/botacc). Used "
@@ -200,13 +210,24 @@ def main():
     args = p.parse_args()
 
     bench = json.load(open(args.bench, encoding="utf-8"))
-    sgn = 1.0 if args.bottom else -1.0
-    top = sorted((e for e in bench["levels"] if "skipped" not in e),
-                 key=lambda e: sgn * e[args.sort])[:args.top]
+    pool = [e for e in bench["levels"] if "skipped" not in e]
+    if args.stars is not None:
+        lo, hi = args.stars
+        pool = [e for e in pool if lo <= float(e.get("stars", 0)) < hi]
+        if not pool:
+            sys.exit(f"error: no bench levels with {lo} <= stars < {hi}")
+    if args.random:
+        import random
+        top = random.Random(args.seed).sample(pool, min(args.random, len(pool)))
+        top.sort(key=lambda e: -e["pp"])          # rank order = pp within the pick
+    else:
+        sgn = 1.0 if args.bottom else -1.0
+        top = sorted(pool, key=lambda e: sgn * e[args.sort])[:args.top]
     # label carries the sort key too (2026-07-30, user request): the pp
     # and accuracy "top" sets used to collide on topNN names
-    label = args.label or ("bot" if args.bottom else "top") + (
-        "acc" if args.sort == "accuracy" else "pp")
+    label = args.label or ("rand" if args.random else
+                           ("bot" if args.bottom else "top") + (
+                               "acc" if args.sort == "accuracy" else "pp"))
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     # replays/ is gitignored and absent on fresh checkouts (third
     # "output dir assumed to exist" bug of the 2026-08-08 migration)
