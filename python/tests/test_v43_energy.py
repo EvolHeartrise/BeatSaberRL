@@ -17,16 +17,11 @@ import pytest
 import torch
 
 import beat_arena_rs
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import N_JOINTS, TAU_MAX
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import FAR_NOTE, cuda
 
 COEF = 1e-4
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
-KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
 
 
 def _rust(**kw):
@@ -83,7 +78,7 @@ def test_rust_coast_is_free_and_wrist_vs_spine_ratio():
 def _cuda_pair():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     kw = dict(chart_len_s=8.0, seed=0, device="cuda", foot_contact=False,
-              gears=5, **KW)
+              gears=5)
     env0 = CudaBeatVecEnv(64, **kw)
     env1 = CudaBeatVecEnv(64, energy_coef=COEF, **kw)
     env0.reset()

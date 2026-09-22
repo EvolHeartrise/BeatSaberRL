@@ -8,25 +8,21 @@ per-tick delta of the position lane, denormalized, /DT). Zero at
 reset and after a set_state refresh.
 """
 
-import pytest
 import torch
 
 from beat_arena_env.constants import (OBS_DIM, OFF_BODY_PTS,
                                       OFF_BODY_PT_VEL, V_NORM, X_NORM,
                                       Y_NORM)
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import cuda
 
 DT = 1.0 / 30.0
-KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
 
 
 def _env():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(64, chart_len_s=8.0, seed=0, device="cuda",
                           dtype=torch.float64, foot_contact=True,
-                          gears=5, **KW)
+                          gears=5)
 
 
 def _vel_lanes(obs):

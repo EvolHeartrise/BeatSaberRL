@@ -2,16 +2,12 @@
 color/bomb handling, wall reflection, and pool-augmentation plumbing."""
 
 import math
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from beat_arena_env.chart import note_tuple  # noqa: E402
-from beat_arena_env.constants import KIND_BOMB, KIND_NOTE  # noqa: E402
-from beat_arena_env.mirror import (  # noqa: E402
+from beat_arena_env.chart import note_tuple
+from beat_arena_env.constants import KIND_BOMB, KIND_NOTE
+from beat_arena_env.mirror import (
     mirror_angle, mirror_note_tuple, mirror_tuples, mirror_wall_tuple)
 
 UP, DOWN = math.pi / 2, 3 * math.pi / 2

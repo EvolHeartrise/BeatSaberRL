@@ -14,14 +14,11 @@ on every mode).
 
 import math
 
-import pytest
 import torch
 
 from beat_arena_env.constants import (OBS_DIM, OFF_HAND_L, OFF_HAND_R,
                                       POST_FULL)
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import cuda
 
 LANE_L = OFF_HAND_L + 10   # 85
 LANE_R = OFF_HAND_R + 10   # 96

@@ -15,13 +15,12 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CudaBeatVecEnv needs CUDA", allow_module_level=True)
 
-from beat_arena_env.chart import Note, Wall, note_tuple, wall_tuple
+from beat_arena_env.chart import Wall, note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM
 from beat_arena_env.cuda_env import CudaBeatVecEnv
 import beat_arena_rs
+from tests._helpers import FAR_NOTE, resync_from_sims
 
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 MAX_STEPS = 6900
 
 # four regimes: full crossing, dodged side wall, hanging crouch wall,
@@ -47,17 +46,6 @@ def _rust_sims():
     return sims
 
 
-def _resync(env, sims):
-    q36s, v35s = [], []
-    for sim in sims:
-        q36s.append(list(sim.qpos()))
-        v35s.append(list(np.concatenate([sim.twist(), sim.omega()])))
-    wv = env.wrist_vel.clone()
-    env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                  torch.tensor(v35s, dtype=torch.float64))
-    env.wrist_vel.copy_(wv)
-
-
 def test_wall_lockstep_parity():
     sims = _rust_sims()
     env = CudaBeatVecEnv(N, charts=[[FAR_NOTE]] * N,
@@ -74,7 +62,7 @@ def test_wall_lockstep_parity():
     # ever tripping the root-escape backstop (random gears do, ~t 60)
     for tick in range(80):                      # spans every crossing
         acts = np.zeros((N, N_JOINTS), dtype=np.int64)
-        _resync(env, sims)
+        resync_from_sims(env, sims)
         r_rust, ev_codes = [], []
         for i, sim in enumerate(sims):
             _obs, r, done, ev = sim.step([int(a) for a in acts[i]])

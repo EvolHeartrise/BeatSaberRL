@@ -21,14 +21,10 @@ from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import (
     N_JOINTS, OBS_DIM, OFF_TAU, TAU_AXIS_JOINTS, TAU_AXIS_OF_JOINT, TAU_FEAT,
     TAU_GROUPS, TAU_MAX, TAU_RAND_NORM, expand_tau_scale, parse_tau_scale)
+from tests._helpers import FAR_NOTE, cuda, resync, rust_state
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="CUDA env")
 COEF = 7.5e-6
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 COAST = [0] * N_JOINTS
-KW = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
 
 
 def _rust(**kw):
@@ -206,7 +202,7 @@ def _cuda_env(n=8, tau_rand=0.0, seed=0, **kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(n, chart_len_s=8.0, seed=seed, device="cuda",
                           foot_contact=False, gears=5, tau_rand=tau_rand,
-                          **KW, **kw)
+                          **kw)
 
 
 @cuda
@@ -255,7 +251,6 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
     """tau_rand 0 with default scales vs explicit all-1.0: identical
     rewards/obs; and the tau lanes agree with Rust for a random body
     (lockstep, per-tick state resync like the base parity gate)."""
-    from tests.test_v10_parity_cuda import _rust_state
     e0 = _cuda_env(4); e1 = _cuda_env(4); e0.reset(); e1.reset()
     e1.set_tau_scale([1.0] * 16)
     for _ in range(20):
@@ -282,11 +277,8 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
         robs, rrew, *_ = sim.step(a)
         np.testing.assert_allclose(tobs[0, OFF_TAU:OBS_DIM].cpu().numpy(),
                                    np.asarray(robs)[OFF_TAU:OBS_DIM], atol=1e-6)
-        q, v = _rust_state(sim)
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor([q], dtype=torch.float64),
-                      torch.tensor([v], dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        q, v = rust_state(sim)
+        resync(env, [q], [v])
     tot_c = env.pop_torque()[0]; tot_r = sim.pop_torque()[0]
     assert abs(tot_c - tot_r) < 1e-6 * max(1.0, tot_r)
 

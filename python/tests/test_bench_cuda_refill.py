@@ -3,13 +3,11 @@ kernel-side refill (CUDA twins): every level plays exactly once, the
 result of a level does not depend on which slot or wave played it, and
 two runs are bit-identical."""
 import numpy as np
-import pytest
 import torch
 
 from beat_arena_env.chart import ChartConfig, generate_chart
 from beat_arena_env.constants import N_JOINTS
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+from tests._helpers import cuda
 
 
 def test_plan_slots_every_level_once_and_lpt_bound():

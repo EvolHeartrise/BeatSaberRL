@@ -41,6 +41,7 @@ out = {"mask": [float(obs_r[OFF_NOTE_MASK + s]) for s in range(4)],
 if mode == "parity":
     import torch
     from beat_arena_env.cuda_env import CudaBeatVecEnv
+    from tests._helpers import resync, rust_state
     env = CudaBeatVecEnv(1, charts=[NOTES], walls=[[wall_tuple(w) for w in WALLS]],
                          max_steps=MAX_STEPS, gears=3,
                          device="cuda", dtype=torch.float64, auto_reset=False,
@@ -52,12 +53,8 @@ if mode == "parity":
     worst = 0.0
     for tick in range(30):
         # lockstep-resync (v10 protocol): CUDA re-takes rust's state
-        q36 = list(sim2.qpos())
-        v35 = list(np.concatenate([sim2.twist(), sim2.omega()]))
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor([q36], dtype=torch.float64),
-                      torch.tensor([v35], dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        q36, v35 = rust_state(sim2)
+        resync(env, [q36], [v35])
         o_r, _, _, _ = sim2.step([0] * N_JOINTS)
         o_c, _, _, _ = env.step(torch.zeros((1, N_JOINTS), dtype=torch.int64,
                                             device="cuda"))

@@ -6,12 +6,11 @@ tiers (note lanes are part of the full obs; judgment feeds reward)."""
 import numpy as np
 
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import (DT, N_JOINTS, NOTE_FEAT, OFF_HEAD,
+from beat_arena_env.constants import (DT, NOTE_FEAT, OFF_HEAD,
                                       OFF_NOTES, PLANE_Z0, X_NORM, Z_CLIP,
                                       Z_SCALE)
 import beat_arena_rs
-
-ZERO_ACT = [0] * N_JOINTS
+from tests._helpers import ZERO_ACT
 
 
 def _sim(chart, **kw):

@@ -15,18 +15,13 @@ alter the physics, so the reward gap must equal c * (popped impulse)
 exactly in f64 (Rust) / to float tolerance (CUDA).
 """
 import numpy as np
-import pytest
 import torch
 
 import beat_arena_rs
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import N_JOINTS
+from tests._helpers import FAR_NOTE, cuda
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
-
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 COEF = 0.05
 NV = 35
 TICKS = 90

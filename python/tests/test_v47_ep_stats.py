@@ -11,8 +11,7 @@ import torch
 
 from beat_arena_env import ranked_pool as rp
 from beat_arena_env.constants import N_JOINTS
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA env")
+from tests._helpers import cuda
 
 
 def _payload(n, dt=0.5, first=2.0, max_score=0):
@@ -83,8 +82,7 @@ def _cuda_env(n, **kw):
     tests — a level ends by its notes draining unless max_steps caps it."""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(n, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=False, gears=5, push_prob=0.0,
-                          push_vmax=0.0, start_jitter=0.0, **kw)
+                          foot_contact=False, gears=5, **kw)
 
 
 @cuda

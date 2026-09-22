@@ -15,15 +15,12 @@ body_pts obs lanes report.
 import math
 
 import numpy as np
-import pytest
 import torch
 
 from beat_arena_env.constants import (FOOT_X0, JOINT_LIMITS, OFF_BODY_PTS,
                                       PLANE_Z0, X_NORM, q_start)
 from beat_arena_env.kinematics import F_L_FOOT, F_R_FOOT, fk_body
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(),
-                          reason="needs CUDA")
+from tests._helpers import cuda
 
 GROUND_CORNERS = ((-0.045, -0.070, -0.075), (-0.045, -0.070, 0.175),
                   (0.045, -0.070, -0.075), (0.045, -0.070, 0.175))
@@ -112,9 +109,8 @@ def test_pose_jitter_distribution_limits_and_ground():
 
 @cuda
 def test_foot_z_penalty_matches_obs_feet():
-    kw = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
-    env0 = _env(foot_z_coef=0.0, **kw)
-    env1 = _env(foot_z_coef=0.02, **kw)
+    env0 = _env(foot_z_coef=0.0)
+    env1 = _env(foot_z_coef=0.02)
     env0.reset()
     env1.reset()
     # shift both roots 0.3 m toward the notes; identical physics, so
@@ -140,9 +136,8 @@ def test_foot_z_penalty_matches_obs_feet():
 
 @cuda
 def test_foot_x_penalty_matches_obs_feet():
-    kw = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
-    env0 = _env(foot_x_coef=0.0, **kw)
-    env1 = _env(foot_x_coef=0.02, **kw)
+    env0 = _env(foot_x_coef=0.0)
+    env1 = _env(foot_x_coef=0.02)
     env0.reset()
     env1.reset()
     # shift both roots 0.3 m to the right; identical physics, so the
@@ -167,9 +162,8 @@ def test_foot_x_penalty_zero_at_reset():
     """At the plain v21 reset the feet sit AT their +-FOOT_X0 targets,
     so the x penalty is ~0 — pins the target constants to the actual
     reset geometry."""
-    kw = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
-    env0 = _env(foot_x_coef=0.0, **kw)
-    env1 = _env(foot_x_coef=0.02, **kw)
+    env0 = _env(foot_x_coef=0.0)
+    env1 = _env(foot_x_coef=0.02)
     env0.reset()
     env1.reset()
     _, r0, _, _ = env0.step(env0._zero_act)
@@ -179,9 +173,8 @@ def test_foot_x_penalty_zero_at_reset():
 
 @cuda
 def test_foot_z_penalty_zero_at_reference():
-    kw = dict(push_prob=0.0, push_vmax=0.0, start_jitter=0.0)
-    env0 = _env(foot_z_coef=0.0, **kw)
-    env1 = _env(foot_z_coef=0.02, **kw)
+    env0 = _env(foot_z_coef=0.0)
+    env1 = _env(foot_z_coef=0.02)
     env0.reset()
     env1.reset()
     _, r0, _, _ = env0.step(env0._zero_act)

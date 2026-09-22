@@ -35,11 +35,12 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CudaBeatVecEnv needs CUDA", allow_module_level=True)
 
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import (JOINT_LIMITS, N_JOINTS, NV,
                                       OFF_GROUND_IMP, OMEGA_CAP)
 from beat_arena_env.cuda_env import CudaBeatVecEnv
 import beat_arena_rs
+from tests._helpers import FAR_NOTE, resync_from_sims
 
 # SPEC-v10 §1.4 joint order is spine(3) + arm_l(7) + arm_r(7) + leg_l(6)
 # + leg_r(6): joints 0..16 are the upper body, 17..28 the legs (17 and 23
@@ -49,9 +50,6 @@ J_L_HIP_PITCH, J_R_HIP_PITCH = 17, 23
 # lib.rs FALL_ROOT_Y / beat_arena_cuda.cu FALL_ROOT_Y (contact spec §4;
 # 0.55 -> ... -> 0.35 -> 0.3 2026-08-20, crouch headroom)
 FALL_ROOT_Y = 0.25
-# a note far beyond every horizon: pure body dynamics, no judgment
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
 MAX_STEPS = 6900
 
 
@@ -72,25 +70,6 @@ def _cenv(n, gears, dtype=torch.float64, auto_reset=False,
                           gears=gears, device="cuda",
                           dtype=dtype, auto_reset=auto_reset,
                           want_contacts=True, foot_contact=True, seed=seed)
-
-
-def _rust_state(sim):
-    return list(sim.qpos()), list(np.concatenate([sim.twist(), sim.omega()]))
-
-
-def _resync(env, sims):
-    """Push Rust's dynamics state into the CUDA env (the v10 lockstep
-    protocol: set_state zeroes the finite-diff wrist velocity, which is
-    env-layer state Rust keeps, so it is carried across by hand)."""
-    q36s, v35s = [], []
-    for sim in sims:
-        q, v = _rust_state(sim)
-        q36s.append(q)
-        v35s.append(v)
-    wv = env.wrist_vel.clone()
-    env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                  torch.tensor(v35s, dtype=torch.float64))
-    env.wrist_vel.copy_(wv)
 
 
 def _stance_states(n, seed):
@@ -267,7 +246,7 @@ def test_contact_lockstep_horizon_parity():
                 assert rew_d < 0.1 and q_d < 0.5, \
                     f"t{t} env{e} beyond sanity: rew {rew_d} qpos {q_d}"
             done_r[e] = d_r
-        _resync(env, sims)
+        resync_from_sims(env, sims)
         if all(done_r):
             break
     print(f"contact lockstep: {ticks} env-ticks, {flips} knife-edge flips; "
@@ -318,7 +297,7 @@ def test_fall_envelope_parity():
             fall_tick = t
             break
         assert not sims[0].fell and sims[0].tilts == 0
-        _resync(env, sims)
+        resync_from_sims(env, sims)
     assert fall_tick is not None, "1 s of full hip flexion did not tilt"
     print(f"tilt parity: both engines terminated at tick {fall_tick}, "
           f"root y {float(env.p[0, 1]):.4f}")
@@ -471,7 +450,7 @@ def test_ground_imp_lanes_settled_parity():
     sims = _rust_sims(n, 5)
     # env v20: the 10-tick settle band is calibrated to the zero-arm
     # stance (hanging arms swing and delay settling); pin the legacy
-    # pose in Rust, then _resync copies it into the CUDA env
+    # pose in Rust, then resync_from_sims copies it into the CUDA env
     for sim in sims:
         q = list(sim.qpos())
         for _j in (3, 6, 8, 10, 13, 15):
@@ -479,7 +458,7 @@ def test_ground_imp_lanes_settled_parity():
         sim.set_joints(q, [0.0] * 35)
     env = _cenv(n, 5)
     env.reset()
-    _resync(env, sims)
+    resync_from_sims(env, sims)
     zero_t = torch.zeros((n, N_JOINTS), dtype=torch.int64)
     zero_r = [0] * N_JOINTS
     tobs = None
