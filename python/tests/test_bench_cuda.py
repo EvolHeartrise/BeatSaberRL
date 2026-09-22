@@ -3,19 +3,13 @@
 sim's event stream under per-tick state resync, the finished-level
 freeze, the bench result schema, and bench_compare."""
 import json
-import os
-import sys
 
 import numpy as np
-import pytest
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from beat_arena_env.chart import ChartConfig, generate_chart, note_tuple
 from beat_arena_env.constants import N_JOINTS
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+from tests._helpers import cuda, resync, rust_state
 
 
 class RefWalk:
@@ -110,7 +104,6 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
     finished level must freeze."""
     import beat_arena_rs
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    from tests.test_v10_parity_cuda import _rust_state
     cfg = dict(colors="both", chart_len_s=5.0, bomb_prob=0.25,
                extra_prob=0.3, dot_prob=0.15)
     charts = [generate_chart(ChartConfig(**cfg), np.random.default_rng(s))
@@ -156,13 +149,10 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
                 assert (float(cw_s[e]), int(cw_c[e]), int(cw_b[e]),
                         int(env.good[e]), int(env.miss[e])) == frozen[e], (t, e)
                 assert bool(tdone[e])
-            q, v = _rust_state(sim)
+            q, v = rust_state(sim)
             q36s.append(q)
             v35s.append(v)
-        wv = env.wrist_vel.clone()
-        env.set_state(torch.tensor(q36s, dtype=torch.float64),
-                      torch.tensor(v35s, dtype=torch.float64))
-        env.wrist_vel.copy_(wv)
+        resync(env, q36s, v35s)
         if all(done_r) and t > max(0, max_steps - 1):
             break
     assert all(done_r)

@@ -5,15 +5,11 @@ tiers compare full 344-lane obs and rewards, and a targeted settled-lane
 test runs there as well)."""
 import numpy as np
 
-from beat_arena_env.chart import Note, note_tuple
+from beat_arena_env.chart import note_tuple
 from beat_arena_env.constants import (ALIVE_BONUS, GROUND_IMP_NORM,
-                                      N_JOINTS, OBS_DIM, OFF_GROUND_IMP)
+                                      OBS_DIM, OFF_GROUND_IMP)
 import beat_arena_rs
-
-# a note far beyond every horizon: pure body dynamics, no judgment
-FAR_NOTE = Note(hit_time=200.0, col=2, row=1, x=0.3, y=1.4, color=1,
-                angle=4.712, speed=4.0)
-ZERO_ACT = [0] * N_JOINTS  # gear 0 = zero torque on every joint
+from tests._helpers import FAR_NOTE, ZERO_ACT
 
 
 def _sim(foot_contact):
