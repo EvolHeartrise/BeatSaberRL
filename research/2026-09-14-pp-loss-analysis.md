@@ -439,6 +439,9 @@ Revisit if a cd600 leaf and the long trunk both stall the acc component at ~12.
 
 `projects/beat-arena/research/2026-09-14-pp-loss-analysis/`:
 
+> The `.py` scripts below were removed on 2026-09-22 (`level_features.json` is kept); recover with
+> `git show 4c235a5:projects/beat-arena/research/2026-09-14-pp-loss-analysis/<script>.py`.
+
 - `level_features.py` — builds `level_features.json` from `python/maps/chart_cache`
   (NJS, NPS, peak density, kinds, walls, row/column/crossover/double fractions,
   per-kind maxima). 16 s.
