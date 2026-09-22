@@ -172,10 +172,12 @@ def main():
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
-    p.add_argument("--tau-scale", type=str, default=None,
+    p.add_argument("--tau-scale", type=str, default="default",
                    help="env v46: fixed per-axis torque-limit scales (16 "
-                        "floats or group shorthand, see bench_scoresaber "
-                        "--tau-scale); default = the v45 body")
+                        "floats, group shorthand, 'default' = the saved "
+                        "body TAU_BODY_DEFAULT, 'nominal' = all 1.0; see "
+                        "bench_scoresaber --tau-scale). Default: the saved "
+                        "body (since 2026-09-22)")
     p.add_argument("--foot-contact", action="store_true",
                    help="env v11 contact physics — MUST match how the "
                         "checkpoint was trained (a v12+/contact ckpt "

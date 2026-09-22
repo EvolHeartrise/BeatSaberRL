@@ -192,15 +192,18 @@ def parse_args():
     # (--pipeline was retired 2026-08-13 with the fused per-sample
     # forward: the two-group split needed its batch invariance; cuBLAS
     # forwards are width-sensitive, so the bench runs one group now)
-    p.add_argument("--tau-scale", type=str, default=None,
+    p.add_argument("--tau-scale", type=str, default="default",
                    help="env v46: fixed per-axis torque-limit scales for "
                         "the whole bench — 16 comma-separated floats "
                         "(axis order: spine pitch/yaw/roll, arm pitch/"
                         "yaw/twist/elbow/wrist roll/bend/dev, hip pitch/"
-                        "yaw/roll, knee, ankle pitch/roll) or group "
+                        "yaw/roll, knee, ankle pitch/roll), group "
                         "shorthand spine=1.25,arms=1,wrists=0.8,legs=1,"
-                        "knees=1.1 (unspecified = 1.0). Default: the "
-                        "v45 body (all 1.0)")
+                        "knees=1.1 (unspecified = 1.0), 'default' (the "
+                        "saved body TAU_BODY_DEFAULT — the default since "
+                        "2026-09-22) or 'nominal' (all 1.0, the TAU_MAX "
+                        "table = every bench before 2026-09-20). The "
+                        "scales are stamped in the bench JSON")
     p.add_argument("--foot-contact", action="store_true", default=True,
                    help="DEPRECATED NO-OP (2026-08-16): contact mode is "
                         "the only physics the bench runs — every "

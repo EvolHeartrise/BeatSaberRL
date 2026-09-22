@@ -734,12 +734,15 @@ def parse_args():
                    help="HL-Gauss support half-width in NORMALIZED return "
                         "units (the critic target is ~unit variance)")
     p.add_argument("--hl-sigma", type=float, default=0.75)
-    p.add_argument("--tau-center", type=str, default=None,
+    p.add_argument("--tau-center", type=str, default="default",
                    help="env v47b: center of the --tau-rand draws per axis "
-                        "(16 floats or 'spine=0.9,legs=1.1,...'; 1.0 = the "
-                        "TAU_MAX table). Draw = center * (1 +- r). Also the "
-                        "fixed body when --tau-rand 0. Moved between trunks "
-                        "by tau_fit.py on the previous run's ep_stats")
+                        "(16 floats or 'spine=0.9,legs=1.1,...'). DEFAULT "
+                        "= the saved body TAU_BODY_DEFAULT (constants.py; "
+                        "the v56 leaf fit since 2026-09-22); 'nominal' = "
+                        "all 1.0 = the TAU_MAX table (every run through "
+                        "v50). Draw = center * (1 +- r). Also the fixed "
+                        "body when --tau-rand 0. Moved between trunks by "
+                        "tau_fit.py on the previous leaf's ep_stats")
     p.add_argument("--tau-rand", type=float, default=0.0,
                    help="env v46 (user design 2026-09-16): per-env "
                         "randomized joint torque limits — at every "

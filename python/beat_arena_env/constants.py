@@ -308,12 +308,36 @@ TAU_GROUPS = {"spine": (0, 1, 2), "arms": (3, 4, 5, 6),
               "wrists": (7, 8, 9), "legs": (10, 11, 12, 14, 15),
               "knees": (13,)}
 
+# The saved DEFAULT BODY (per-axis torque-limit scales on TAU_MAX, axis
+# order TAU_AXIS_NAMES): the training center for a fresh trunk and the
+# fixed body the bench / replay / census tools run unless told otherwise
+# ('--tau-center' / '--tau-scale' default "default"; "nominal" = all
+# 1.0 = the raw TAU_MAX table). Moved between trunks by tau_fit.py on
+# the previous leaf's ep_stats (user, 2026-09-22 "save it as the new
+# default"). History: all 1.0 through v50; v51 leaf-fit (2026-09-20)
+# 0.9012,1,0.9513,1,0.9424,0.9563,1.1,1.1603,1.0567,1,0.9055,1.0453,
+# 1.0608,1,1.0668,1.1428; v56 leaf-fit (2026-09-22, current) — arms
+# -10%, wrist roll 1.19, wrist dev 1.02, knee 1.03, spine yaw/roll -2%;
+# bench 2,946,594 upp vs 2,895,798 at the v51 body (+1.75%).
+TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
+                    1.1000, 1.1889, 1.0567, 1.0220, 0.9055, 1.0453,
+                    1.0608, 1.0269, 1.0668, 1.1428)
+TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
+assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)
+
 
 def parse_tau_scale(spec):
-    """'--tau-scale' text -> list of 16 floats. Either 16 comma-separated
-    floats in axis order, or group shorthand 'spine=1.25,wrists=0.8'
-    (groups: TAU_GROUPS; unspecified axes = 1.0). None/'' -> all 1.0."""
+    """'--tau-scale' / '--tau-center' text -> list of 16 floats. Either
+    16 comma-separated floats in axis order, group shorthand
+    'spine=1.25,wrists=0.8' (groups: TAU_GROUPS; unspecified axes =
+    1.0), the keyword "default" (TAU_BODY_DEFAULT, the saved body) or
+    "nominal" (all 1.0, the raw TAU_MAX table). None/'' -> all 1.0."""
     if spec is None or str(spec).strip() == "":
+        return [1.0] * TAU_FEAT
+    key = str(spec).strip().lower()
+    if key == "default":
+        return list(TAU_BODY_DEFAULT)
+    if key in ("nominal", "ones", "1"):
         return [1.0] * TAU_FEAT
     parts = [t.strip() for t in str(spec).split(",") if t.strip()]
     if all("=" not in t for t in parts):

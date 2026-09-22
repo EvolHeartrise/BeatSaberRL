@@ -73,6 +73,13 @@ def test_parse_tau_scale_both_syntaxes():
     with pytest.raises(ValueError):
         parse_tau_scale("elbows=2")
     assert set(a for g in TAU_GROUPS.values() for a in g) == set(range(16))
+    # keywords (2026-09-22): the saved default body and the raw table
+    from beat_arena_env.constants import TAU_BODY_DEFAULT, TAU_BODY_DEFAULT_SPEC
+    assert parse_tau_scale("default") == list(TAU_BODY_DEFAULT)
+    assert parse_tau_scale(" Default ") == list(TAU_BODY_DEFAULT)
+    assert parse_tau_scale("nominal") == [1.0] * 16
+    assert parse_tau_scale(TAU_BODY_DEFAULT_SPEC) == pytest.approx(list(TAU_BODY_DEFAULT))
+    assert len(TAU_BODY_DEFAULT) == 16 and all(x > 0 for x in TAU_BODY_DEFAULT)
 
 
 # --- Rust: explicit scales -----------------------------------------------------
