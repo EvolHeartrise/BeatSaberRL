@@ -135,3 +135,17 @@ def test_cuda_fp16_matches_cpu_fp32():
     g.fp16 = False
     out32, v32 = g.forward_stacked(obs.cuda())
     assert torch.allclose(out32.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_fp16_backward_runs():
+    # the fp16 wgrad kernel needs contiguous inputs: the first v58 launch
+    # died here on a non-contiguous torso column slice (2026-09-22)
+    g = _policy(3).cuda(); g.fp16 = True
+    obs = _obs(64).cuda()
+    logits, value = g.forward_stacked(obs)
+    (logits.float().sum() + value.float().sum()).backward()
+    for name in ("torso_mlp", "leg_mlp", "saber_mlp", "note_mlp", "trunk_proj"):
+        w = getattr(g, name)
+        w = w[0].weight if isinstance(w, torch.nn.Sequential) else w.weight
+        assert w.grad is not None and torch.isfinite(w.grad).all(), name

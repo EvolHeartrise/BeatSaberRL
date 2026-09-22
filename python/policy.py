@@ -790,9 +790,15 @@ class NotePolicy(nn.Module):
         saber_feat = torch.cat(
             [sabers.reshape(B, 2, SABER_FEAT).to(dt), hand_id], dim=-1)
         if self.body_tokens == 3:
+            # column slices of the (B, 93) body block are non-contiguous
+            # views; the fp16 wgrad kernel needs contiguous inputs, so
+            # each token's features are materialised (B x 29 / B x 64
+            # fp16 copies — negligible)
             body = body.to(dt)
-            torso_tok = _seq(self.torso_mlp, body[:, :TORSO_FEAT]).unsqueeze(1)
-            leg_feat = torch.cat([body[:, TORSO_FEAT:].reshape(B, 2, LEG_FEAT),
+            torso_tok = _seq(self.torso_mlp,
+                             body[:, :TORSO_FEAT].contiguous()).unsqueeze(1)
+            leg_feat = torch.cat([body[:, TORSO_FEAT:].contiguous()
+                                  .view(B, 2, LEG_FEAT),
                                   hand_id], dim=-1)        # side one-hot
             body_tok = torch.cat([torso_tok, _seq(self.leg_mlp, leg_feat)],
                                  dim=1)                              # (B, 3, d)
