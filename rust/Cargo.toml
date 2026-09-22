@@ -8,12 +8,6 @@ name = "beat_arena_rs"
 crate-type = ["cdylib"]
 
 [features]
-# Keeps the solver's introspection-only fields (ConstraintSet::jv_pre)
-# and the weld-row effective-mass diagonal in a non-test build. Off by
-# default: nothing in the solve reads them, and they cost a 35-wide dot
-# per constraint row per substep. `cargo test` enables them implicitly.
-introspect = []
-
 # R26 instrumentation: per-substep rate counters (limit rows, contacts,
 # ω-cap chol_solve_unit calls, step-11 clamp chol_solve_unit calls) that
 # parameterize R21/R22/R27. Off by default and the SHIPPING BUILD MUST

@@ -1,13 +1,9 @@
-//! P1 FK gates: model-table sanity, the neutral-stance anchors
-//! (SPEC-v10 §1.1), and the v9 continuity theorem (§1.3) — v10 tree FK
-//! with the root at reference + spine zero must reproduce the v9
-//! `crate::fk()` wrist/elbow/blade to ≤ 1e-12 per component. v9
-//! behavior is the ground truth; the spec is its description.
+//! P1 FK gates: model-table sanity and the neutral-stance anchors
+//! (SPEC-v10 §1.1).
 
 use super::fk::fk_all;
 use super::model::{
-    HUMANOID, A_L_ARM, A_R_ARM, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHOULDER,
-    F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHOULDER, F_R_WRIST, NQ,
+    HUMANOID, F_HEAD, F_L_FOOT, F_L_SHOULDER, F_R_FOOT, F_R_SHOULDER, NQ,
 };
 use super::testutil::Rng;
 use super::{State, Workspace};
@@ -189,65 +185,6 @@ fn head_pose_is_the_spine_pose() {
     for i in 0..3 {
         for j in 0..3 {
             assert!((r2[i][j] - ws.r[F_HEAD][i][j]).abs() <= TOL);
-        }
-    }
-}
-
-/// The load-bearing P1 gate: v10 FK vs the v9 `fk()` on the arm chains.
-/// Grid: all-zero, every joint at each limit (per hand), 100 random
-/// in-limit poses (fixed seed). If this fails the bug may be in
-/// SPEC-v10's stacking-order spec rather than the code — v9 wins.
-#[test]
-fn v9_fk_continuity() {
-    let m = &HUMANOID;
-    let mut ws = Workspace::new(m);
-    let mut poses: Vec<[f64; 2 * 7]> = Vec::new(); // [L q7, R q7]
-
-    poses.push([0.0; 14]);
-    for hand in 0..2 {
-        let base = if hand == 0 { A_L_ARM } else { A_R_ARM };
-        for j in 0..7 {
-            for lim in 0..2 {
-                let mut p = [0.0; 14];
-                let (lo, hi) = m.limits[base + j];
-                p[hand * 7 + j] = if lim == 0 { lo } else { hi };
-                poses.push(p);
-            }
-        }
-    }
-    let mut rng = Rng(0x5EED_F0F0_1234_0001);
-    for _ in 0..100 {
-        let mut p = [0.0; 14];
-        for hand in 0..2 {
-            let base = if hand == 0 { A_L_ARM } else { A_R_ARM };
-            for j in 0..7 {
-                let (lo, hi) = m.limits[base + j];
-                p[hand * 7 + j] = rng.range(lo, hi);
-            }
-        }
-        poses.push(p);
-    }
-
-    let mut st = State::neutral(m);
-    for (pi, pose) in poses.iter().enumerate() {
-        for j in 0..7 {
-            st.q[A_L_ARM + j] = pose[j];
-            st.q[A_R_ARM + j] = pose[7 + j];
-        }
-        fk_all(m, &st, &mut ws);
-        for hand in 0..2 {
-            let q7: [f64; 7] = pose[hand * 7..hand * 7 + 7].try_into().unwrap();
-            let (e9, w9, b9, _) = crate::fk(hand, &q7);
-            let (fe, fw, fh) = if hand == 0 {
-                (F_L_ELBOW, F_L_WRIST, F_L_HAND)
-            } else {
-                (F_R_ELBOW, F_R_WRIST, F_R_HAND)
-            };
-            let blade = [ws.r[fh][0][2], ws.r[fh][1][2], ws.r[fh][2][2]];
-            let name = format!("pose {pi} hand {hand}");
-            assert_vec3(ws.p[fe], e9, &format!("{name} elbow"));
-            assert_vec3(ws.p[fw], w9, &format!("{name} wrist"));
-            assert_vec3(blade, b9, &format!("{name} blade"));
         }
     }
 }

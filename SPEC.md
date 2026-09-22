@@ -768,7 +768,7 @@ the sim side (128 envs ≈ 0.28 ms/vector-step).
 ## Batched rollouts (`VecBeatSim` + `python/train_batch.py`)
 
 `beat_arena_rs.VecBeatSim`: N sim cores stepped in ONE FFI call per
-vector step (obs returned flat, reshaped Python-side; `obs_one(i)` for
+vector step (obs returned flat, reshaped Python-side; `obs_one_into(i, buf)` for
 cheap post-reset rows). `beat_arena_env/vec_env.py: BeatVecEnv` adds
 auto-reset with Python-side chart gen and per-episode info dicts.
 `train_batch.py` = same PPO math as train_smoke, one policy forward per

@@ -96,13 +96,13 @@ fn mat_add(a: &mut Mat3, b: &Mat3) {
 /// reader is likewise lower-only. The harness implicit-damping pass
 /// touches diagonal entries alone.
 ///
-/// `MIRROR_M_UPPER` keeps the mirrors for `cargo test` /
-/// `--features introspect` / debug builds, so tests_dyn's BITWISE
+/// `MIRROR_M_UPPER` keeps the mirrors for `cargo test` / debug
+/// builds, so tests_dyn's BITWISE
 /// M-symmetry test still has both triangles to compare. Same cfg set
 /// (and same reasoning) as solver.rs's `DIAG_ALL_ROWS` / `LIMIT_J_ROWS`.
 /// Worth ~300 stores per substep: 117 ancestor entries, 174 free-base
 /// coupling entries, 9 in the root skew block.
-const MIRROR_M_UPPER: bool = cfg!(any(test, feature = "introspect", debug_assertions));
+const MIRROR_M_UPPER: bool = cfg!(any(test, debug_assertions));
 
 /// CRBA: fills ws.m (nv×nv, row-major) from the FK in ws. Composite
 /// rigid bodies accumulated leaf→root; column j of M = the generalized
