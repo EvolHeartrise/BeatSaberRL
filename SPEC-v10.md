@@ -1198,9 +1198,7 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
     g. **Regression**: `dynamics::tests_soak::{root_step_bounded_on_the
        _escape_state, adversarial_states_stay_finite_and_bounded,
        healthy_motion_never_engages_the_envelope,
-       soak_state_engages_the_envelope_and_stays_bounded}`,
-       `env_tests::{escaped_env_terminates_with_zero_reward,
-       healthy_env_never_escapes}` (Rust), and
+       soak_state_engages_the_envelope_and_stays_bounded}` (Rust), and
        `tests/test_v10_root_escape.py` (Rust FFI + CUDA f64/f32 tiers
        on the escape fixture: `done`, zeroed reward, engagement count
        and the ‖Δp‖ ≤ N_SUB·h·ROOT_V_MAX bound all pinned exactly, the
