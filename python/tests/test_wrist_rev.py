@@ -21,34 +21,36 @@ L_BEND, R_BEND = 8, 15
 
 
 class Ref:
-    """The kernel's detector: 0 fresh, 3 armed, 1 moving +, 2 moving -."""
+    """The kernel's detector: 0 fresh, 3 armed (tracks lo and hi), 1
+    moving + (tracks hi), 2 moving - (tracks lo)."""
 
     def __init__(self):
-        self.dir, self.ext, self.count = 0, 0.0, 0
+        self.dir, self.lo, self.hi, self.count = 0, 0.0, 0.0, 0
 
     def reset(self):
         self.dir = 0
 
     def feed(self, q):
-        d, e = self.dir, self.ext
+        d, lo, hi = self.dir, self.lo, self.hi
         if d == 0:
-            e, d = q, 3
+            lo = hi = q; d = 3
         elif d == 3:
-            if q >= e + HYST:
-                d, e = 1, q
-            elif q <= e - HYST:
-                d, e = 2, q
+            lo = min(lo, q); hi = max(hi, q)
+            if q >= lo + HYST:
+                d, hi = 1, q
+            elif q <= hi - HYST:
+                d, lo = 2, q
         elif d == 1:
-            if q > e:
-                e = q
-            elif q <= e - HYST:
-                self.count += 1; d, e = 2, q
+            if q > hi:
+                hi = q
+            elif q <= hi - HYST:
+                self.count += 1; d, lo = 2, q
         else:
-            if q < e:
-                e = q
-            elif q >= e + HYST:
-                self.count += 1; d, e = 1, q
-        self.dir, self.ext = d, e
+            if q < lo:
+                lo = q
+            elif q >= lo + HYST:
+                self.count += 1; d, hi = 1, q
+        self.dir, self.lo, self.hi = d, lo, hi
 
 
 def _count(trace):
@@ -85,31 +87,36 @@ def test_reference_semantics():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_matches_reference_on_its_own_angles():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    N, T = 8, 240
+    N, T = 8, 200
+    # no auto-reset: on a terminating tick the kernel resets the pose
+    # before the wrapper exposes it, so the detector's input for that
+    # tick is unobservable; here only the wrists are actuated (neutral
+    # gear 2 elsewhere) so the slumping body never terminates
     env = CudaBeatVecEnv(N, chart_len_s=6.0, seed=3, device="cuda",
-                         dtype=torch.float64, gears=5)
+                         dtype=torch.float64, gears=5, auto_reset=False)
     env.reset()
     refs = [[Ref(), Ref()] for _ in range(N)]
     rng = np.random.default_rng(0)
-    # bench-row width
     ids, rows = env.pop_bench_rows()
-    assert rows.shape == (0, 17)
+    assert rows.shape == (0, 17)                      # widened bench row
+    steps = 0
     for t in range(T):
-        acts = torch.as_tensor(rng.integers(0, 5, (N, N_JOINTS)), device="cuda")
-        _obs, _r, done, _ev = env.step(acts)
+        a = np.full((N, N_JOINTS), 2, dtype=np.int64)
+        a[:, [L_BEND, R_BEND]] = rng.integers(0, 5, (N, 2))
+        _obs, _r, done, _ev = env.step(torch.as_tensor(a, device="cuda"))
+        if bool(done.any()):
+            break
         q = env.q[:, [L_BEND, R_BEND]].cpu().numpy()   # this tick's angles
-        d = done.cpu().numpy()
         for i in range(N):
             for h in range(2):
                 refs[i][h].feed(float(q[i, h]))
-            if d[i]:                       # auto-reset: the kernel's
-                for h in range(2):         # reset_env re-arms the state
-                    refs[i][h].reset()
+        steps += 1
+    assert steps >= 100, steps
     l, r = env.pop_wrist_rev()
     exp_l = sum(refs[i][0].count for i in range(N))
     exp_r = sum(refs[i][1].count for i in range(N))
     assert (l, r) == (exp_l, exp_r), ((l, r), (exp_l, exp_r))
-    assert l + r > 0                       # random gears do flap the wrists
+    assert l + r > 0                       # random wrist gears do flap
     assert env.pop_wrist_rev() == (0, 0)   # popped + zeroed
 
 
@@ -123,7 +130,9 @@ def test_rust_matches_reference_on_its_own_angles():
     refs = [Ref(), Ref()]
     n = 0
     for t in range(240):
-        _obs, _r, done, _ev = sim.step([int(a) for a in rng.integers(0, 5, N_JOINTS)])
+        a = [2] * N_JOINTS                  # neutral gear except the wrists
+        a[L_BEND], a[R_BEND] = (int(x) for x in rng.integers(0, 5, 2))
+        _obs, _r, done, _ev = sim.step(a)
         qp = sim.qpos()
         refs[0].feed(float(qp[7 + L_BEND])); refs[1].feed(float(qp[7 + R_BEND]))
         n += 1

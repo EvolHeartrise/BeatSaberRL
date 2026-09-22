@@ -1299,10 +1299,11 @@ struct Core {
     flail_rad: Real,
     flail_ticks: u32,
     // wrist-bend reversal telemetry (2026-09-22): per hand [L, R] count
-    // THIS episode, running extreme angle, detector state (0 fresh, 3
+    // THIS episode, running extremes [lo, hi], detector state (0 fresh, 3
     // armed, 1 moving +, 2 moving -). Zeroed by reset_state.
     wrev: [u32; 2],
-    wrev_ext: [Real; 2],
+    wrev_lo: [Real; 2],
+    wrev_hi: [Real; 2],
     wrev_dir: [u8; 2],
     // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
     // latches once the back face clears the head (monotone per wall);
@@ -1384,7 +1385,8 @@ impl Core {
             flail_rad: 0.0,
             flail_ticks: 0,
             wrev: [0, 0],
-            wrev_ext: [0.0, 0.0],
+            wrev_lo: [0.0, 0.0],
+            wrev_hi: [0.0, 0.0],
             wrev_dir: [0, 0],
             walls: Vec::new(),
             wall_passed: Vec::new(),
@@ -1957,35 +1959,46 @@ impl Core {
         for h in 0..2 {
             let q = self.body.st.q[if h == 0 { 8 } else { 15 }];
             let mut dir = self.wrev_dir[h];
-            let mut ext = self.wrev_ext[h];
+            let (mut lo, mut hi) = (self.wrev_lo[h], self.wrev_hi[h]);
             if dir == 0 {
-                ext = q;
+                lo = q;
+                hi = q;
                 dir = 3;
             } else if dir == 3 {
-                if q >= ext + WREV_HYST {
+                // undirected: track both extremes; a WREV_HYST rise from
+                // the low (or fall from the high) commits the first
+                // direction — not a reversal
+                if q < lo {
+                    lo = q;
+                }
+                if q > hi {
+                    hi = q;
+                }
+                if q >= lo + WREV_HYST {
                     dir = 1;
-                    ext = q;
-                } else if q <= ext - WREV_HYST {
+                    hi = q;
+                } else if q <= hi - WREV_HYST {
                     dir = 2;
-                    ext = q;
+                    lo = q;
                 }
             } else if dir == 1 {
-                if q > ext {
-                    ext = q;
-                } else if q <= ext - WREV_HYST {
+                if q > hi {
+                    hi = q;
+                } else if q <= hi - WREV_HYST {
                     self.wrev[h] += 1;
                     dir = 2;
-                    ext = q;
+                    lo = q;
                 }
-            } else if q < ext {
-                ext = q;
-            } else if q >= ext + WREV_HYST {
+            } else if q < lo {
+                lo = q;
+            } else if q >= lo + WREV_HYST {
                 self.wrev[h] += 1;
                 dir = 1;
-                ext = q;
+                hi = q;
             }
             self.wrev_dir[h] = dir;
-            self.wrev_ext[h] = ext;
+            self.wrev_lo[h] = lo;
+            self.wrev_hi[h] = hi;
         }
 
         // both sabers' swept surfaces this tick
