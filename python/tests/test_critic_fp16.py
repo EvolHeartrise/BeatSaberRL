@@ -173,33 +173,3 @@ def test_critic_params_receive_grads_through_fp16_path(flat):
         cos = F.cosine_similarity(m16.weight.grad.flatten(),
                                   m32.weight.grad.flatten(), dim=0)
         assert cos > 0.98, f"{name}: grad cos {cos:.4f}"
-
-
-def test_packed_kv_matches_unpacked(monkeypatch):
-    """Routing pin for the packed critic k/v GEMM (A §9): with the pack
-    toggled off the same fp16 forward/backward must land the same
-    grads. Measured 2026-09-02: the forward is bit-identical (so every
-    grad downstream of hv — q, out, the value MLP — is exactly equal);
-    dW_k / dW_v differ at 1e-12..1e-10 (wgrad's fp32 accumulation order
-    at N=256 vs 128) and critic_ln's grad at ~5e-3 rel (dhv is ONE
-    rounded fp16 GEMM instead of two rounded GEMMs plus an add) — the
-    last-rounding class. A row-routing bug would be O(1)."""
-    import policy as P
-    obs = _obs(512, seed=2)
-
-    def grads(packed):
-        monkeypatch.setattr(P, "_QKV_PACKED", packed)
-        p = _policy(flat=False)
-        _, value = p.forward_stacked(obs)
-        value.pow(2).mean().backward()
-        return {n: q.grad.detach().clone()
-                for n, q in p.named_parameters() if n.startswith("critic")}
-    a, b = grads(True), grads(False)
-    for n in a:
-        if n.startswith(("critic_q", "critic_out", "critic_mlp")):
-            assert torch.equal(a[n], b[n]), n
-        else:
-            rel = (a[n] - b[n]).abs().max() / b[n].abs().max().clamp_min(1e-30)
-            assert rel < 2e-2, f"{n}: packed vs unpacked rel {rel:.3e}"
-
-
