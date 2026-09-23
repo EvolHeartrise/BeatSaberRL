@@ -1,29 +1,25 @@
 """Child process for test_v48_z_asinh.py — BEAT_Z_ASINH is read ONCE per
 process by the rust sim, so every configuration runs in its own process.
+(The CUDA-vs-rust parity case needs only the default C, so it runs
+in-process in the test module.)
 
-argv: <mode> <c>   mode = rust | parity; c = "default" leaves
-BEAT_Z_ASINH unset (both engines then use their 8 m default).
+argv: <c>   c = "default" leaves BEAT_Z_ASINH unset (the 8 m default).
 Prints one JSON line."""
 import json
-import math
 import os
 import sys
 
 import numpy as np
 
 from beat_arena_env.chart import Note, Wall, note_tuple, wall_tuple
-from beat_arena_env.constants import (N_JOINTS, NOTE_FEAT, OBS_DIM, OFF_NOTES,
+from beat_arena_env.constants import (N_JOINTS, NOTE_FEAT, OFF_NOTES,
                                       OFF_NOTE_MASK)
 import beat_arena_rs
 
-mode = sys.argv[1]
-if sys.argv[2] == "default":
+if sys.argv[1] == "default":
     assert "BEAT_Z_ASINH" not in os.environ
-    env_kw = {}
 else:
-    c = float(sys.argv[2])
-    assert os.environ.get("BEAT_Z_ASINH") == repr(c)
-    env_kw = {"z_asinh": c}
+    assert os.environ.get("BEAT_Z_ASINH") == repr(float(sys.argv[1]))
 SPEED = 20.0
 # same x/y so the nearest-first slot order is the z order: 5, 60, 80 m
 NOTES = [Note(hit_time=z / SPEED, col=2, row=1, x=0.3, y=1.4, color=1,
@@ -45,31 +41,4 @@ out = {"mask": [float(obs_r[OFF_NOTE_MASK + s]) for s in range(4)],
        "z": [lane(obs_r, s, 2) for s in range(4)],
        "wall_back": lane(obs_r, 3, 17), "is_wall": lane(obs_r, 3, 14)}
 
-if mode == "parity":
-    import torch
-    from beat_arena_env.cuda_env import CudaBeatVecEnv
-    from tests._helpers import resync, rust_state
-    env = CudaBeatVecEnv(1, charts=[NOTES], walls=[[wall_tuple(w) for w in WALLS]],
-                         max_steps=MAX_STEPS, gears=3,
-                         device="cuda", dtype=torch.float64, auto_reset=False,
-                         foot_contact=False, seed=0, **env_kw)
-    env.reset()
-    sim2 = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS,
-                                    gears=3, foot_contact=False)
-    sim2.set_chart([note_tuple(n) for n in NOTES], [wall_tuple(w) for w in WALLS])
-    worst = 0.0
-    for tick in range(30):
-        # lockstep-resync (v10 protocol): CUDA re-takes rust's state
-        q36, v35 = rust_state(sim2)
-        resync(env, [q36], [v35])
-        o_r, _, _, _ = sim2.step([0] * N_JOINTS)
-        o_c, _, _, _ = env.step(torch.zeros((1, N_JOINTS), dtype=torch.int64,
-                                            device="cuda"))
-        o_r = np.asarray(o_r)
-        o_c = o_c.cpu().numpy().reshape(OBS_DIM)
-        worst = max(worst, float(np.abs(o_c[OFF_NOTES:OFF_NOTE_MASK]
-                                        - o_r[OFF_NOTES:OFF_NOTE_MASK]).max()))
-        assert (o_c[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]
-                == o_r[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]).all(), tick
-    out["parity_worst_abs"] = worst
 print(json.dumps(out))
