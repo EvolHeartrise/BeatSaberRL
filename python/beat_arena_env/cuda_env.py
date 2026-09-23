@@ -496,7 +496,7 @@ class CudaBeatVecEnv:
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
                  combo_walk=False, bench_refill=False, ep_stats=False,
-                 tau_center=None, z_asinh=0.0):
+                 tau_center=None, z_asinh=0.0, env_order=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -816,14 +816,14 @@ class CudaBeatVecEnv:
         # once-per-entry WALL_PEN (2026-08-20; kernel-reset per episode)
         self.in_wall_prev = z(N, dt=torch.bool)
         # R12 warp-coherence permutation: thread gid serves env
-        # env_order[gid]. Identity unless BEAT_ENV_ORDER=1, which sorts
-        # by (chart, first_pending) each tick so warp-mates share note
-        # windows. A bijection on thread->env assignment only — per-env
-        # results are bitwise-identical under ANY permutation
-        # (tests/test_env_order_bitwise.py).
+        # env_order[gid]. Identity unless env_order=True (the trainer
+        # passes it), which sorts by (chart, first_pending) each tick so
+        # warp-mates share note windows. A bijection on thread->env
+        # assignment only — per-env results are bitwise-identical under
+        # ANY permutation (tests/test_env_order_bitwise.py).
         self.env_order = torch.arange(N, dtype=torch.int32,
                                       device=self.device)
-        self._env_order_on = os.environ.get("BEAT_ENV_ORDER", "0") == "1"
+        self._env_order_on = bool(env_order)
         self._gbits = torch.tensor([1, 2, 4, 8], device=self.device)
         # episode-return ring buffer (device-side)
         self._cap = 4096
