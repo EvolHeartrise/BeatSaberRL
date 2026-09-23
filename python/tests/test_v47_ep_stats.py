@@ -77,33 +77,36 @@ def test_pp_from_rows():
         assert pp == pytest.approx(want, rel=1e-9)
 
 
-def _cuda_env(n, **kw):
+def _cuda_env(n, chart_len_s=8.0, **kw):
     """Synthetic 8-s charts (no falls: foot_contact=False), like the v46
     tests — a level ends by its notes draining unless max_steps caps it."""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    return CudaBeatVecEnv(n, chart_len_s=8.0, seed=0, device="cuda",
+    return CudaBeatVecEnv(n, chart_len_s=chart_len_s, seed=0, device="cuda",
                           foot_contact=False, gears=5, **kw)
 
 
 @cuda
 def test_cuda_ep_stats_rows_completed_and_no_freeze():
     from beat_arena_env.cuda_env import EP_REC
-    e = _cuda_env(16, ep_stats=True, max_steps=600)
+    # 3-s levels: last note <= ~3 s + tail <= 0.5 + 1.5 / 2 m/s, so every
+    # level drains in < ~130 ticks, well under the 250-tick cap
+    e = _cuda_env(16, chart_len_s=3.0, chart_pool=64, ep_stats=True,
+                  max_steps=250)
     assert e.combo_walk and e.ep_stats
     e.reset()
     act = torch.zeros((16, N_JOINTS), dtype=torch.int64, device="cuda")
     rows = np.zeros((0, EP_REC), dtype=np.float32)
     dones = 0
-    for t in range(700):
+    for t in range(300):
         _, _, done, _ = e.step(act)
         dones += int(done.sum().item())
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[1] == EP_REC and rows.shape[0] >= 16
     # no bench freeze: every env ended at least once and kept playing
-    # (auto-reset), so more episodes than envs over 700 ticks of ~8-s levels
+    # (auto-reset), so more episodes than envs over 300 ticks of ~3-s levels
     assert dones >= 16 and rows.shape[0] > 16
-    # levels end by their notes draining (< the 600-tick cap): completed
-    assert np.all(rows[:, 16] < 600)
+    # levels end by their notes draining (< the 250-tick cap): completed
+    assert np.all(rows[:, 16] < 250)
     assert np.all(rows[:, 25] == 1.0)
     assert np.all(rows[:, 18] == 0.0)                 # no falls (weld mode)
     # combo-walk fields: finite, non-negative, cut counts bounded by notes

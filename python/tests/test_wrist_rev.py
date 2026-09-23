@@ -84,7 +84,11 @@ def test_reference_semantics():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_matches_reference_on_its_own_angles():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    N, T = 8, 200
+    # 32 envs x 60 ticks (was 8 x 200): the cost is the per-tick host
+    # sync, so extra envs buy back reversal coverage almost for free.
+    # f64 stays: the Python reference compares q against lo/hi +- HYST
+    # in f64, so an f32 kernel could round a boundary tick differently.
+    N, T = 32, 60
     # no auto-reset: on a terminating tick the kernel resets the pose
     # before the wrapper exposes it, so the detector's input for that
     # tick is unobservable; here only the wrists are actuated (neutral
@@ -109,12 +113,12 @@ def test_cuda_matches_reference_on_its_own_angles():
         steps += 1
         if d.any():             # stop before the frozen ticks
             break
-    assert steps >= 100, steps
+    assert steps >= 50, steps
     l, r = env.pop_wrist_rev()
     exp_l = sum(refs[i][0].count for i in range(N))
     exp_r = sum(refs[i][1].count for i in range(N))
     assert (l, r) == (exp_l, exp_r), ((l, r), (exp_l, exp_r))
-    assert l + r > 0                       # random wrist gears do flap
+    assert l + r > 0     # random wrist gears do flap: detector exercised
     assert env.pop_wrist_rev() == (0, 0)   # popped + zeroed
 
 

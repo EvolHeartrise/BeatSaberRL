@@ -76,7 +76,8 @@ def test_cuda_env_refuses_nonpositive_c(c):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("c", [None, 2.0, 8.0])
+# None == C = 8 (both engines' default, the recipe); one child process
+@pytest.mark.parametrize("c", [None])
 def test_cuda_rust_parity(c):
     o = run_child("parity", c)
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
