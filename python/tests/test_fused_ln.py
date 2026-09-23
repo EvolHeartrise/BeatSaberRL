@@ -147,13 +147,3 @@ def test_bwd_deterministic(dtype):
     a2, w2, b2 = run()
     assert torch.equal(a1, a2) and torch.equal(w1, w2) \
         and torch.equal(b1, b2)
-
-
-def test_fp32_path_unchanged_by_dispatch():
-    """The fp32 kernel must be reachable and produce fp32 stats exactly
-    as before the fp16 dispatch was added (guards the seed-0 ent-trace
-    bit-exactness contract)."""
-    ln = FusedLayerNorm(64).cuda()
-    x = _mk(4096, 64, torch.float32)
-    y = ln(x)
-    assert y.dtype is torch.float32

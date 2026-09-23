@@ -6,12 +6,6 @@ math:
 - ``fk_body(q36)``: full-tree FK over the SPEC-v10 §1 frame table
   (mirror of rust/src/dynamics/model.rs + fk.rs) — 30 frames plus the
   free base; wrists = hand-frame origins, blades = hand-frame +z.
-- ``gravity_comp(q36)``: the 29 gravity-compensation torques
-  RNEA(q, 0, 0) restricted to gravity — implemented directly from the
-  frame/mass tables (τ_j = Σ_{i∈subtree(j)} m_i·g·∂y_i/∂q_j; exact for
-  zero velocity/acceleration, validated against a finite-difference
-  gradient of the potential). Chosen over an FFI RNEA getter: pure
-  Python from the same normative tables, no new surface on the sim.
 
 The v9 arm-chain FK below remains the continuity reference
 (SPEC-v10 §1.3 carries the arm stacking orders verbatim): at the
@@ -39,7 +33,9 @@ straight wrist).
 
 Used by the scenario tests, gen_crouch_table.py and the viewer mirror.
 (The closed-form arm IK — ik_arm / wrist_for_blade — was removed
-2026-09-22 with the scripted reference bot, its only user.)
+2026-09-22 with the scripted reference bot, its only user; so were the
+bot's gravity/stance feedforward helpers — gravity_comp, stance_comp,
+potential_energy, com_of.)
 """
 
 from __future__ import annotations
@@ -88,8 +84,6 @@ def fk(hand, q):
 # (pelvis).
 # =============================================================================
 
-G = 9.81
-BASE_MASS = 8.40
 ROOT_POS0 = (0.0, 0.94, -0.65)
 
 _AX = (1.0, 0.0, 0.0)
@@ -99,7 +93,7 @@ _AZ = (0.0, 0.0, 1.0)
 _Z3 = (0.0, 0.0, 0.0)
 
 # (parent, anchor, axis, coord, mass, com) per frame — model.rs verbatim
-# (inertia diagonals omitted: FK + gravity need mass/COM only).
+# (inertia diagonals omitted; mass/COM kept for table parity with model.rs).
 FRAMES = (
     # spine: pelvis -> chest, anchor at the waist
     (-1, (0.0, 0.10, 0.0), _AX, 0, 0.0, _Z3),          # 0 spine_pitch
@@ -175,11 +169,6 @@ def _mat_mul(a, b):
         for i in range(3))
 
 
-def _mat_vec(m, v):
-    return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]
-                 for i in range(3))
-
-
 def fk_body(q36):
     """Full-tree FK from the replay-v10 position vector q36 = [root
     pos(3), root quat wxyz(4), 29 joint angles §1.4 order].
@@ -207,148 +196,3 @@ def blade_of(rots, hand):
     """Unit blade direction (hand-frame +z column) for hand 0/1."""
     r = rots[F_L_HAND if hand == 0 else F_R_HAND]
     return (r[0][2], r[1][2], r[2][2])
-
-
-def potential_energy(q36):
-    """Σ m_i · g · y_com,i over all bodies (validation aid for
-    gravity_comp: G = ∂V/∂q)."""
-    rots, pos = fk_body(q36)
-    v = BASE_MASS * G * q36[1]  # pelvis COM at the frame origin
-    for k, (_p, _a, _ax, _c, mass, com) in enumerate(FRAMES):
-        if mass == 0.0:
-            continue
-        cy = pos[k][1] + sum(rots[k][1][i] * com[i] for i in range(3))
-        v += mass * G * cy
-    return v
-
-
-def gravity_comp(q36, fk=None):
-    """The 29 gravity-compensation torques at pose q36 (= RNEA(q, 0, 0)
-    actuated rows restricted to gravity; armature adds nothing at zero
-    acceleration). τ_j = Σ_{i ∈ subtree(j)} m_i·g·(a_j × (c_i − p_j))_y
-    with a_j the joint's WORLD axis, p_j its origin, c_i the body's
-    world COM. Pass fk=(rots, pos) to reuse an existing fk_body call."""
-    rots, pos = fk if fk is not None else fk_body(q36)
-    n = len(FRAMES)
-    # world COM moments m·c and masses, accumulated leaf-to-root
-    sub_m = [0.0] * n
-    sub_mc = [[0.0, 0.0, 0.0] for _ in range(n)]
-    for k in range(n):
-        _pnt, _a, _ax, _c, mass, com = FRAMES[k]
-        if mass != 0.0:
-            c = _mat_vec(rots[k], com)
-            sub_m[k] += mass
-            for i in range(3):
-                sub_mc[k][i] += mass * (pos[k][i] + c[i])
-    for k in range(n - 1, -1, -1):
-        parent = FRAMES[k][0]
-        if parent >= 0:
-            sub_m[parent] += sub_m[k]
-            for i in range(3):
-                sub_mc[parent][i] += sub_mc[k][i]
-    tau = [0.0] * 29
-    for k in range(n):
-        parent, _anchor, axis, coord, _m, _com = FRAMES[k]
-        if coord < 0 or sub_m[k] == 0.0:
-            continue
-        # world joint axis: PARENT rotation × local axis (the joint
-        # rotates the child about the pre-rotation axis)
-        rl = _quat_to_rot(q36[3:7]) if parent < 0 else rots[parent]
-        a = _mat_vec(rl, axis)
-        p = pos[k]
-        # moment arm of the subtree weight about the axis:
-        # ∂y_com/∂q = (a × (c − p))_y summed with masses
-        mx = sub_mc[k][0] - sub_m[k] * p[0]
-        mz = sub_mc[k][2] - sub_m[k] * p[2]
-        # (a × d)_y = a_z·d_x − a_x·d_z, mass-weighted
-        tau[coord] = G * (a[2] * mx - a[0] * mz)
-    return tau
-
-
-# ancestor joint chains of the two welded feet: (frame idx, coord)
-_LEG_CHAIN_L = tuple((k, FRAMES[k][3]) for k in (18, 19, 20, 21, 22, 23))
-_LEG_CHAIN_R = tuple((k, FRAMES[k][3]) for k in (24, 25, 26, 27, 28, 29))
-
-
-def stance_comp(q36, fk=None):
-    """Gravity compensation for the WELDED stance (written as the retired P6 bot's feedforward).
-
-    ``gravity_comp`` is the free-tree answer: each actuated row holds
-    its DISTAL subtree. That is right for the arms/spine but blind to
-    the trunk's weight, which maps to the unactuated ROOT wrench rows
-    and reaches the ground only through the foot welds — the leg
-    torques required to keep the pelvis from folding are set by the
-    CONSTRAINED statics, not the subtree rule (measured failure: the
-    subtree-comp'd bot hip-hinges forward in ~1.5 s).
-
-    Static balance with weld forces λ (12 rows, solver layout §3):
-        actuated:  τ = G_act − (J_wᵀ λ)_act
-        root (6):  (J_wᵀ λ)_root = G_root
-    The root equations fix 6 of λ's 12 DoF; the least-norm λ
-    (Aᵀ(AAᵀ)⁻¹ G_root) picks the symmetric weight split. Arm rows of
-    J_w are zero, so arm torques reduce to gravity_comp exactly."""
-    import numpy as np
-    rots, pos = fk if fk is not None else fk_body(q36)
-    g_act = gravity_comp(q36, fk=(rots, pos))
-    p_root = np.asarray(q36[0:3], dtype=float)
-    r0 = _quat_to_rot(q36[3:7])
-
-    # generalized gravity on the root rows (world linear + world
-    # angular coords, the solver's twist layout): G = ∂V/∂q
-    masses = [(k, FRAMES[k][4], FRAMES[k][5]) for k in range(len(FRAMES))
-              if FRAMES[k][4] != 0.0]
-    m_tot = BASE_MASS
-    g_rot = np.zeros(3)
-    # base COM sits at the root origin: d = 0, no moment from it
-    for k, mass, com in masses:
-        c = np.asarray(pos[k]) + np.asarray(_mat_vec(rots[k], com))
-        d = c - p_root
-        m_tot += mass
-        g_rot += mass * G * np.array([-d[2], 0.0, d[0]])
-    g_root = np.concatenate(([0.0, m_tot * G, 0.0], g_rot))
-
-    # weld Jacobian columns for the root (A, 6x12 = rows-as-columns)
-    # and for the 12 leg joints. Row layout: foot_l lin xyz, ang xyz,
-    # foot_r lin, ang (solver.rs).
-    A = np.zeros((6, 12))          # (root coord, weld row)
-    J_act = np.zeros((12, 29))     # (weld row, actuated joint)
-    for w, (foot, chain) in enumerate(((F_L_FOOT, _LEG_CHAIN_L),
-                                       (F_R_FOOT, _LEG_CHAIN_R))):
-        pf = np.asarray(pos[foot])
-        rel = pf - p_root
-        for t in range(3):
-            row = 6 * w + t
-            A[t, row] = 1.0                       # v_root linear
-            # ω_root columns: (e_k × rel)_t
-            for k in range(3):
-                e = np.zeros(3)
-                e[k] = 1.0
-                A[3 + k, row] = np.cross(e, rel)[t]
-        for t in range(3):
-            A[3 + t, 6 * w + 3 + t] = 1.0         # angular rows: ω_root
-        for fr, coord in chain:
-            parent = FRAMES[fr][0]
-            rl = r0 if parent < 0 else rots[parent]
-            a = np.asarray(_mat_vec(rl, FRAMES[fr][2]))
-            pj = np.asarray(pos[fr])
-            lin = np.cross(a, pf - pj)
-            for t in range(3):
-                J_act[6 * w + t, coord] = lin[t]
-                J_act[6 * w + 3 + t, coord] = a[t]
-
-    lam = A.T @ np.linalg.solve(A @ A.T, g_root)
-    return np.asarray(g_act) - J_act.T @ lam
-
-
-def com_of(q36, fk=None):
-    """Whole-body center of mass (world) at pose q36."""
-    import numpy as np
-    rots, pos = fk if fk is not None else fk_body(q36)
-    m = BASE_MASS
-    s = np.asarray(q36[0:3], dtype=float) * BASE_MASS
-    for k, (_p, _a, _ax, _c, mass, com) in enumerate(FRAMES):
-        if mass != 0.0:
-            c = np.asarray(pos[k]) + np.asarray(_mat_vec(rots[k], com))
-            m += mass
-            s = s + mass * c
-    return s / m

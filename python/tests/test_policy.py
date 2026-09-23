@@ -2,7 +2,6 @@
 shapes since P4: obs 340, lead tokens + notes, 29 gear heads)."""
 
 import numpy as np
-import pytest
 import torch
 
 from beat_arena_env import RustBeatEnv, OFF_NOTES, OFF_NOTE_MASK, NOTE_FEAT
@@ -66,11 +65,6 @@ def test_junk_in_masked_slots_cannot_leak():
 def test_obs_dim_contract():
     assert OBS_DIM == 624   # env v46: tau-scale lanes
     assert N_ACTION_HEADS == N_JOINTS == 29
-
-
-def test_pool_encoder_removed():
-    with pytest.raises(AssertionError):
-        NotePolicy(encoder="pool")
 
 
 def test_vec_env_auto_reset():

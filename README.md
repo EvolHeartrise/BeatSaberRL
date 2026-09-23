@@ -684,8 +684,7 @@ import + our z mirror) into `viz/app/src/lib/models.data.js` by
 `test/models.test.js` pins the reference sizes. The transform ledger is
 in `research/vendor/scoresaber-watch/SOURCE.md` ("Models"). GPL-3.0
 applies to the embedded meshes: `replay.html` is internal tooling; keep
-any redistribution GPL-compatible. `test/closeup-probe.mjs` screenshots
-the built viewer at chosen ticks for eyeballing.
+any redistribution GPL-compatible.
 
 Historical reference points (the env v10 P6 scripted bot —
 gravity-compensated PD-over-IK on the dynamic body, REMOVED 2026-09-22
