@@ -6231,33 +6231,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
   });
 }
 
-// Transcendental-agreement probe (Divergences §21 measurement): apply
-// the named f64 op elementwise on the device so the parity suite can
-// compare bitwise against the CRT libm (numpy/Rust). op: 0 sin, 1 cos,
-// 2 acos, 3 sqrt, 4 recip.
-__global__ void transcend_kernel(const double* x, double* y, int n, int op) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  const double v = x[i];
-  y[i] = op == 0 ? sin(v)
-         : op == 1 ? cos(v)
-         : op == 2 ? acos(v)
-         : op == 3 ? sqrt(v)
-                   : 1.0 / v;
-}
-
-void transcend(at::Tensor x, at::Tensor y, int64_t op) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kDouble
-              && x.is_contiguous());
-  TORCH_CHECK(y.is_cuda() && y.scalar_type() == at::kDouble
-              && y.is_contiguous() && y.numel() == x.numel());
-  const int n = (int)x.numel();
-  transcend_kernel<<<(unsigned)((n + 255) / 256), 256, 0,
-                     at::cuda::getCurrentCUDAStream()>>>(
-      x.data_ptr<double>(), y.data_ptr<double>(), n, (int)op);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -6267,7 +6240,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "tensors mutated in place, obs/reward/done written into their "
         "output slots. foot_contact selects env v11 foot_mode = 1 "
         "(unilateral ground contact) instead of the v10 foot welds");
-  m.def("transcend", &transcend,
-        "f64 transcendental probe: y = op(x) on the device (0 sin, "
-        "1 cos, 2 acos, 3 sqrt, 4 recip)");
 }

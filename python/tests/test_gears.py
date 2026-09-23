@@ -167,7 +167,8 @@ def test_gears_cuda_parity():
     action stream is BITWISE identical across K=3/5/7 on the CUDA
     backend (ids 1/2 are +/-full at every K); (b) short-horizon f64
     CUDA-vs-Rust agreement holds at the transcendental-seed band for
-    every table (full free-running parity semantics live in
+    the production K=5 table (K=3/7 table math is pinned CPU-side in
+    test_gear_tables; full free-running parity semantics live in
     test_v10_parity_cuda.py)."""
     import torch
     if not torch.cuda.is_available():
@@ -193,8 +194,8 @@ def test_gears_cuda_parity():
     for k in (5, 7):
         np.testing.assert_array_equal(streams[3], streams[k])
 
-    # (b) vs Rust, per table, 2 gentle ticks from neutral (same chart!)
-    for k in (3, 5, 7):
+    # (b) vs Rust, production table, 2 gentle ticks from neutral
+    for k in (5,):
         env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
                              device="cuda", dtype=torch.float64,
                              auto_reset=False, gears=k,

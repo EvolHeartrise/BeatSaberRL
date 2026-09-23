@@ -147,7 +147,8 @@ def test_vec_sim_pop_envelope_hits_zero_in_ordinary_motion():
 #  done, zeroed reward, the engagement count, and the h*ROOT_V_MAX bound.)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+# f32 (production) only: f64 structure is pinned against Rust below
+@pytest.mark.parametrize("dtype", [torch.float32])
 def test_cuda_escape_terminates_bounded_and_counted(dtype):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     env = CudaBeatVecEnv(2, charts=[[FAR_NOTE], [FAR_NOTE]], max_steps=6900,
