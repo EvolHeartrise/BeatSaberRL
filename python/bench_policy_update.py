@@ -31,7 +31,7 @@ import torch.nn as nn
 
 from fp16_linear import bump_weights_version
 from policy import (N_ACTION_HEADS, N_NOTE_SLOTS, NotePolicy, OBS_DIM,
-                    OFF_NOTE_MASK, load_policy)
+                    OFF_NOTE_MASK, hl_loss, load_policy)
 from train_batch import MAX_GRAD_NORM, VF_COEF, pg_loss_fn
 
 ENT_COEF = 0.03
@@ -64,11 +64,13 @@ def eager_update(policy, opt, obs, act, logp, adv, ret, accum=1):
     micro = obs.shape[0] // accum
     for j in range(accum):
         sl = slice(j * micro, (j + 1) * micro)
-        _, newlogp, entropy, newval = policy.get_action_and_value(
+        _, newlogp, entropy, _ = policy.get_action_and_value(
             obs[sl], act[sl])
         ratio = (newlogp - logp[sl]).exp()
         pg_loss = pg_loss_fn(ratio, a_mb_full[sl])
-        v_loss = 0.5 * ((newval - ret[sl]) ** 2).mean()
+        # HL-Gauss cross-entropy, the only critic loss since 2026-09-22
+        v_loss = hl_loss(policy._value_logits, ret[sl],
+                         policy.value_centers, policy.value_sigma)
         loss = pg_loss - ENT_COEF * entropy.mean() + VF_COEF * v_loss
         if accum > 1:
             loss = loss / accum
@@ -81,12 +83,8 @@ def eager_update(policy, opt, obs, act, logp, adv, ret, accum=1):
 def fresh_policy(src, device):
     """One policy per bench row: flatten_fp16 moves p.data pointers
     exactly once per module, so a shared module can't be reflattened."""
-    a = src.arch
-    p = NotePolicy(embed=a["embed"], trunk_dim=a["trunk_dim"],
-                   n_blocks=a["n_blocks"], n_heads=a["n_heads"],
-                   n_gears=a["n_gears"], ffn_mult=a["ffn_mult"]).to(device)
-    p.load_state_dict(src.state_dict())
-    return p
+    return load_policy({"arch": dict(src.arch),
+                        "state_dict": src.state_dict()}).to(device)
 
 
 def bench(fn, iters, reps, warmup=5):

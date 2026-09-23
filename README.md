@@ -89,11 +89,22 @@ cd python
 VENV=../../kiting-arena/python/.venv
 
 $VENV/bin/python -m pytest tests/
-# the trainer — v10 (P5): cuda env is the default GPU backend;
-# rust env = the CPU path AND the parity reference
-$VENV/bin/python train_batch.py --num-envs 1024
-$VENV/bin/python train_batch.py --env rust --num-envs 512
+# the trainer: its defaults ARE the production recipe (the v58 trunk,
+# since 2026-09-22), so a bare launch is a v58-recipe trunk on the cuda env
+$VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
+# leaf: branch a cooldown off a numbered trunk checkpoint
+$VENV/bin/python train_batch.py --resume runs/NAME/trunk_updNNNNN.pt \
+    --cooldown-updates 400 --run-dir runs/NAME_leaf
+# rust env = the CPU path AND the parity reference: small shapes, and
+# the recipe's ranked pool (and --ep-stats on it) is CUDA-only
+$VENV/bin/python train_batch.py --env rust --no-ranked-maps --no-ep-stats \
+    --num-envs 512 --horizon 32 --minibatches 4 --run-dir runs/cpu_try
 ```
+
+Recipe switches are `--flag/--no-flag` pairs (`--no-ranked-maps`,
+`--no-mirror-augment`, `--no-ep-stats`, `--no-limit-arms`,
+`--no-wall-despawn`); the critic is HL-Gauss (101 bins), the only head
+since 2026-09-22 (the scalar MSE head and `--value-head` were removed).
 
 **Optimizer: hybrid Muon since 2026-09-12, the only optimizer since
 2026-09-22** (pure Adam and the per-matrix NS loop removed): Newton-Schulz
