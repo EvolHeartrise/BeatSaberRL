@@ -1,7 +1,8 @@
 """Child process for test_v48_z_asinh.py — BEAT_Z_ASINH is read ONCE per
 process by the rust sim, so every configuration runs in its own process.
 
-argv: <mode> <c>   mode = rust | parity
+argv: <mode> <c>   mode = rust | parity; c = "default" leaves
+BEAT_Z_ASINH unset (both engines then use their 8 m default).
 Prints one JSON line."""
 import json
 import math
@@ -15,8 +16,14 @@ from beat_arena_env.constants import (N_JOINTS, NOTE_FEAT, OBS_DIM, OFF_NOTES,
                                       OFF_NOTE_MASK)
 import beat_arena_rs
 
-mode, c = sys.argv[1], float(sys.argv[2])
-assert os.environ.get("BEAT_Z_ASINH") == repr(c)
+mode = sys.argv[1]
+if sys.argv[2] == "default":
+    assert "BEAT_Z_ASINH" not in os.environ
+    env_kw = {}
+else:
+    c = float(sys.argv[2])
+    assert os.environ.get("BEAT_Z_ASINH") == repr(c)
+    env_kw = {"z_asinh": c}
 SPEED = 20.0
 # same x/y so the nearest-first slot order is the z order: 5, 60, 80 m
 NOTES = [Note(hit_time=z / SPEED, col=2, row=1, x=0.3, y=1.4, color=1,
@@ -45,7 +52,7 @@ if mode == "parity":
     env = CudaBeatVecEnv(1, charts=[NOTES], walls=[[wall_tuple(w) for w in WALLS]],
                          max_steps=MAX_STEPS, gears=3,
                          device="cuda", dtype=torch.float64, auto_reset=False,
-                         foot_contact=False, seed=0, z_asinh=c)
+                         foot_contact=False, seed=0, **env_kw)
     env.reset()
     sim2 = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS,
                                     gears=3, foot_contact=False)

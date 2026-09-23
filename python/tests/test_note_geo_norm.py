@@ -1,6 +1,7 @@
 """note-geo normalisation (2026-09-21, user): with norm=True every geometry
 lane is O(1) for notes at any distance, the z decode uses the lane's true
-asinh encoding, and norm=False reproduces the pre-2026-09-21 lanes exactly."""
+asinh encoding, and norm=False reproduces the pre-2026-09-21 lanes exactly
+(z decoded as lane x 8, whatever the lane's encoding)."""
 import math
 
 import torch
@@ -14,7 +15,7 @@ def _notes(zs, c):
     for i, z in enumerate(zs):
         notes[0, i, 0] = 0.3          # x / X_NORM
         notes[0, i, 1] = 0.2          # (y - center) / Y_NORM
-        notes[0, i, 2] = math.asinh(z / c) if c > 0 else min(z, 40.0) / _Z_SCALE
+        notes[0, i, 2] = math.asinh(z / c)
         notes[0, i, 3] = -20.0 / _Z_SCALE   # speed 20 m/s
         notes[0, i, 6] = 0.0; notes[0, i, 7] = -1.0
     sabers = torch.zeros(B, 2, SABER_FEAT)
@@ -41,12 +42,14 @@ def test_norm_lanes_are_order_one_at_any_distance():
 
 def test_norm_false_matches_legacy_lanes():
     zs = [0.0, 2.0, 12.0, 40.0]
-    notes, sabers = _notes(zs, c=0.0)
+    notes, sabers = _notes(zs, c=8.0)
     g_old = _note_geo(notes, sabers)
     g_ref = _note_geo(notes, sabers, norm=False, z_asinh=8.0)
     assert torch.equal(g_old, g_ref)
-    # legacy lanes are raw half-metres: 40 m note -> dp_z ~ 20
-    assert abs(g_old[0, 3, 2].item() - (40.0 + 0.65) * 0.5) < 1e-4
+    # legacy lanes are raw half-metres of lane x 8: 40 m note -> the
+    # decoded z is 8 asinh(40 / 8), dp_z = (that + 0.65) / 2
+    assert abs(g_old[0, 3, 2].item()
+               - (8.0 * math.asinh(40.0 / 8.0) + 0.65) * 0.5) < 1e-4
 
 
 def test_norm_true_decodes_true_z():

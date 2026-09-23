@@ -3,9 +3,10 @@
 Lane 2 (note z / wall front face) and lane 17 (wall back face) become
 asinh(max(z, z_lo) / C) with C = --z-asinh metres (BEAT_Z_ASINH for the
 rust sim): linear near the cut plane, log far out, NO upper clamp — so
-tokens beyond the old --z-clip-hi stay distinguishable. C = 0 is the
-legacy clamp(z_lo, z_clip_hi) / 8 bit for bit. Each configuration runs in
-a child process because the rust sim reads the variable once per process.
+far tokens stay distinguishable. It is the only z encoding (the legacy
+clamp / 8 path was removed 2026-09-22); both engines default to C = 8 m
+and refuse C <= 0. Each configuration runs in a child process because
+the rust sim reads the variable once per process.
 """
 import json
 import math
@@ -20,28 +21,35 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHILD = os.path.join(HERE, "_v48_z_child.py")
 
 
-def run_child(mode, c, extra_env=None):
-    env = dict(os.environ, BEAT_Z_ASINH=repr(float(c)))
-    env.pop("BEAT_Z_CLIP_HI", None)
+def run_child(mode, c, extra_env=None, check=True):
+    """c = None leaves BEAT_Z_ASINH unset (engine defaults)."""
+    env = dict(os.environ)
+    env.pop("BEAT_Z_ASINH", None)
+    if c is not None:
+        env["BEAT_Z_ASINH"] = repr(float(c))
     # the child is run by path, so its sys.path holds tests/, not python/
     env["PYTHONPATH"] = os.pathsep.join(
         [os.path.dirname(HERE)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
     env.update(extra_env or {})
-    r = subprocess.run([sys.executable, CHILD, mode, repr(float(c))],
+    r = subprocess.run([sys.executable, CHILD, mode,
+                        "default" if c is None else repr(float(c))],
                        capture_output=True, text=True, env=env,
                        cwd=os.path.dirname(HERE))
+    if not check:
+        return r
     assert r.returncode == 0, r.stderr[-2000:]
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
-def test_legacy_saturates_far_notes():
-    o = run_child("rust", 0.0)
-    assert o["mask"] == [1.0, 1.0, 1.0, 1.0]
-    # 60 m and 80 m both clamp to 12 m -> the same lane value 1.5
-    assert o["z"][1] == pytest.approx(1.5, abs=1e-6)
-    assert o["z"][2] == pytest.approx(1.5, abs=1e-6)
-    assert o["wall_back"] == pytest.approx(1.5, abs=1e-6)
-    assert 0 < o["z"][0] < 1.5
+def test_rust_default_is_8m():
+    assert run_child("rust", None) == run_child("rust", 8.0)
+
+
+@pytest.mark.parametrize("c", [0.0, -1.0])
+def test_rust_refuses_nonpositive_c(c):
+    r = run_child("rust", c, check=False)
+    assert r.returncode != 0
+    assert "BEAT_Z_ASINH must be > 0" in r.stderr
 
 
 def test_asinh_keeps_far_notes_distinct():
@@ -60,7 +68,7 @@ def test_asinh_keeps_far_notes_distinct():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("c", [0.0, 2.0, 8.0])
+@pytest.mark.parametrize("c", [None, 2.0, 8.0])
 def test_cuda_rust_parity(c):
     o = run_child("parity", c)
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
