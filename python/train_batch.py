@@ -1099,10 +1099,8 @@ def main():
                             trunk_hidden=args.trunk_hidden,
                             value_bins=args.hl_bins,
                             value_vmax=args.hl_vmax,
-                            value_sigma=args.hl_sigma)
-    # env v48: record the obs z encoding in the arch so the bench / replay
-    # tools and --resume/--init-from can match it
-    policy.arch["z_asinh"] = float(args.z_asinh)
+                            value_sigma=args.hl_sigma,
+                            z_asinh=args.z_asinh)
     print(f"HL-Gauss critic: {policy.value_bins} bins over "
           f"[-{policy.arch['value_vmax']:g}, {policy.arch['value_vmax']:g}] "
           f"(normalized return), sigma {policy.value_sigma_bins:g} bins",
