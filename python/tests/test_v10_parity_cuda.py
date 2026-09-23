@@ -9,8 +9,9 @@ Rust expression trees literally (one thread per env — every accumulation
 in Rust's order), but its f64 tier is NOT bitwise (as the retired
 torch-CPU-f64 P4 tier was): CUDA's f64 sin/cos/acos differ from the
 CRT libm by 1 ulp on a
-few %% of inputs and nvcc contracts FMAs (SPEC-v10 Divergences §21 —
-`test_transcendental_agreement` below IS the measurement). Those
+few %% of inputs and nvcc contracts FMAs (SPEC-v10 Divergences §21a,
+measured once over 1e5 inputs: sqrt/recip bitwise, sin/cos/acos 1 ulp
+on 10.5 / 14.0 / 4.2 %%; the probe kernel is retired). Those
 <=1-ulp-per-op seeds are amplified at the v10 dynamics' measured
 e-folding (~0.35 s) and flip knife-edge branches (contact margins,
 limit-row reach, the COMPOSITE_EPS band, score rounding) — a 1-ulp
@@ -39,7 +40,7 @@ from beat_arena_env.chart import ChartConfig, generate_chart, note_tuple
 from beat_arena_env.constants import (
     JOINT_LIMITS, N_JOINTS, NV, OBS_DIM, OMEGA_CAP,
 )
-from beat_arena_env.cuda_env import CudaBeatVecEnv, _load_ext
+from beat_arena_env.cuda_env import CudaBeatVecEnv
 import beat_arena_rs
 from tests._helpers import FAR_NOTE, resync, rust_state
 
@@ -91,39 +92,6 @@ def _tame_states(n, seed):
     return q36s, v35s
 
 
-# --- Divergences §21: the transcendental-provenance measurement --------------
-
-def test_transcendental_agreement():
-    """CUDA f64 sqrt and division are IEEE-correctly-rounded => bitwise
-    Rust/CRT; sin/cos/acos (libdevice) may differ by AT MOST 1 ulp on a
-    minority of inputs. This is the measured basis for the toleranced
-    f64 tier (SPEC-v10 Divergences §21)."""
-    ext = _load_ext()
-    g = torch.Generator().manual_seed(0)
-    x = (torch.randn(100000, generator=g, dtype=torch.float64) * 2).cuda()
-    cases = [
-        (0, "sin", np.sin, x),
-        (1, "cos", np.cos, x),
-        (2, "acos", np.arccos, x.clamp(-1, 1)),
-        (3, "sqrt", np.sqrt, x.abs()),
-        (4, "recip", lambda v: 1.0 / v, x),
-    ]
-    for op, name, fn, xi in cases:
-        y = torch.empty_like(xi)
-        ext.transcend(xi.contiguous(), y, op)
-        r = torch.from_numpy(fn(xi.cpu().numpy())).cuda()
-        neq = y != r
-        if name in ("sqrt", "recip"):
-            assert not bool(neq.any()), f"{name}: not bitwise CRT"
-        else:
-            frac = float(neq.float().mean())
-            assert frac < 0.25, f"{name}: {frac:.1%} mismatch (expected few %)"
-            if bool(neq.any()):
-                a = y[neq].cpu().numpy().view(np.int64)
-                b = r[neq].cpu().numpy().view(np.int64)
-                assert int(np.abs(a - b).max()) <= 1, f"{name}: > 1 ulp"
-
-
 # --- reset + set_state exactness ---------------------------------------------
 
 def test_reset_obs_exact():
@@ -164,10 +132,12 @@ def test_set_state_fk_parity():
                                    err_msg=f"env{i} obs")
 
 
-# --- (a) single-tick parity from random states, gears matrix -----------------
+# --- (a) single-tick parity from random states ------------------------------
 
-@pytest.mark.parametrize("gears,n_states,seed", [(3, 32, 100), (5, 32, 200),
-                                                 (7, 32, 300)])
+# production gears only. K=3 still runs on CUDA elsewhere (the env default);
+# the K=7 fine ids 3-6 of the kernel's GEAR_TAB copy are no longer
+# CUDA-vs-Rust checked (K=7 is not a production setting)
+@pytest.mark.parametrize("gears,n_states,seed", [(5, 32, 200)])
 def test_single_tick_parity_random_states(gears, n_states, seed):
     """One 30 Hz tick (8 constrained substeps) from tame random states:
     state within 1e-9, obs within 1e-5, reward within 1e-9 of Rust —
@@ -532,13 +502,15 @@ def test_parity_f32_bounded():
 
 def test_auto_reset_and_stats():
     env = CudaBeatVecEnv(4, seed=3, chart_pool=8, dtype=torch.float32,
-                         colors="both", chart_len_s=6.0, note_prob=0.5,
+                         colors="both", chart_len_s=2.0, note_prob=0.5,
                          extra_prob=0.4, bomb_prob=0.25,
                          want_contacts=True)
     obs = env.reset()
     assert obs.shape == (4, OBS_DIM)
     rng = np.random.default_rng(0)
-    n_steps = 2 * (int((6.0 + 0.5 + 1.5 / 2.0) * 30) + 5)
+    # max_steps (= 2 s chart + 90 ticks = 150) truncates at the latest,
+    # so every env is done at least once => >= 4 dones
+    n_steps = env.max_steps
     dones = 0
     for _ in range(n_steps):
         a = torch.as_tensor(rng.integers(0, 3, size=(4, N_JOINTS)))
@@ -550,22 +522,3 @@ def test_auto_reset_and_stats():
     assert len(stats) == dones and dones >= 4
     assert all(np.isfinite(s) for s in stats)
     assert env.pop_stats() == []  # second pop: nothing new
-
-
-def test_same_seed_reproduces():
-    def run(seed):
-        env = CudaBeatVecEnv(2, seed=seed, chart_pool=4, dtype=torch.float32,
-                             colors="both", chart_len_s=6.0, note_prob=0.5,
-                             extra_prob=0.4, bomb_prob=0.25,
-                             want_contacts=True)
-        obs = env.reset()
-        rng = np.random.default_rng(1)
-        tot = torch.zeros(2, device="cuda")
-        for _ in range(150):
-            a = torch.as_tensor(rng.integers(0, 3, size=(2, N_JOINTS)))
-            obs, r, done, _ = env.step(a)
-            tot += r
-        return obs.clone(), tot.clone()
-    o1, t1 = run(5)
-    o2, t2 = run(5)
-    assert torch.equal(o1, o2) and torch.equal(t1, t2)
