@@ -2,11 +2,11 @@
 
 Covers the v10 additions under the bot: the full-body FK mirror
 (kinematics.fk_body vs the sim's own FK through `sabers()`), the
-gravity-compensation torques (vs a finite-difference gradient of the
-potential), the constrained-stance feedforward, the P6 additive
+frame-table masses, the P6 additive
 introspection (`weld_impulses`) and the additive replay fields
-("feet", "activation"). The bot itself and its solvability gate were
-removed 2026-09-22; these support-layer checks stay.
+("feet", "activation"). The bot itself, its solvability gate and its
+gravity/stance feedforward helpers were removed 2026-09-22; these
+support-layer checks stay.
 """
 
 import json
@@ -20,8 +20,7 @@ from beat_arena_env.constants import (
     DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0, gear_table,
 )
 from beat_arena_env.kinematics import (
-    F_HEAD, F_L_WRIST, F_R_WRIST, FRAMES, blade_of, com_of, fk_body,
-    gravity_comp, potential_energy, stance_comp,
+    F_HEAD, F_L_WRIST, F_R_WRIST, FRAMES, blade_of, fk_body,
 )
 
 from beat_arena_rs import RawBeatSim
@@ -87,46 +86,6 @@ def test_frame_table_masses():
     assert total == pytest.approx(75.02, abs=1e-9)
 
 
-# --- gravity compensation -----------------------------------------------------
-
-def test_gravity_comp_is_potential_gradient():
-    """τ_grav = ∂V/∂q (finite difference, random poses + tipped root)."""
-    rng = np.random.default_rng(3)
-    for _ in range(5):
-        joints = np.array([rng.uniform(lo, hi) for lo, hi in JOINT_LIMITS])
-        quat = rng.normal(size=4)
-        quat /= np.linalg.norm(quat)
-        q = _q36(joints, quat=quat)
-        tau = gravity_comp(q)
-        eps = 1e-6
-        for j in range(N_JOINTS):
-            qp, qm = q.copy(), q.copy()
-            qp[7 + j] += eps
-            qm[7 + j] -= eps
-            fd = (potential_energy(qp) - potential_energy(qm)) / (2 * eps)
-            assert tau[j] == pytest.approx(fd, abs=5e-6), f"joint {j}"
-
-
-def test_gravity_comp_hand_case():
-    """r_arm_pitch at neutral: the arm extends horizontally along +z —
-    holding it costs g·Σ mᵢ·zᵢ = 9.81·(2·0.175 + 1.2·0.5 + 0.61·0.71)
-    exactly (SPEC-v10 §1.2 masses/anchors)."""
-    tau = gravity_comp(_q36())
-    want = 9.81 * (2.0 * 0.175 + 1.2 * 0.5 + 0.61 * 0.71)
-    assert tau[10] == pytest.approx(want, abs=1e-9)
-    assert tau[3] == pytest.approx(want, abs=1e-9)  # left mirrors
-
-
-def test_stance_comp_arm_rows_and_symmetry():
-    """The weld statics leave arm rows = plain gravity comp (arm
-    columns of the weld Jacobian are zero) and split the load L/R
-    symmetrically at symmetric poses."""
-    q = _q36()
-    ts, tg = stance_comp(q), gravity_comp(q)
-    assert np.allclose(ts[3:17], np.asarray(tg)[3:17], atol=1e-9)
-    assert np.allclose(ts[17:23], ts[23:29], atol=1e-9)
-
-
 # --- P6 additive introspection + replay fields --------------------------------
 
 def test_weld_impulses_carry_body_weight():
@@ -175,13 +134,3 @@ def test_replay_additive_fields(tmp_path):
     assert max(t["feet"][0][1] + t["feet"][1][1] for t in ticks) > 0.5
     assert max(t["activation"][0] for t in ticks) > 0.0
 
-
-# --- the COM helper -----------------------------------------------------------
-
-def test_com_of_reference():
-    """Reference-pose COM: on the midline, ~1.0 m up, slightly forward
-    of the body plane (the horizontal arms)."""
-    c = com_of(_q36())
-    assert abs(c[0]) < 1e-12
-    assert 0.9 < c[1] < 1.1
-    assert -0.65 < c[2] < -0.55
