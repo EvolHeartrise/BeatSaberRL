@@ -78,16 +78,20 @@ def test_cuda_env_refuses_nonpositive_c(c):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.skipif(os.environ.get("BEAT_Z_ASINH") not in (None, "8.0"),
-                    reason="parity is pinned at the default C = 8")
+@pytest.mark.skipif(float(os.environ.get("BEAT_Z_ASINH", "8")) != 8.0,
+                    reason="the in-process rust sim must run at C = 8")
 def test_cuda_rust_parity():
-    """Both engines at their default C (= 8 m, the recipe): the z lanes
-    agree under lockstep resync. Same chart as _v48_z_child.py."""
+    """Both engines at their default C (= 8 m, the recipe): every
+    entity lane agrees under lockstep resync. Plus a C = 2 CUDA env on
+    the same resynced state: its z lanes (2, 17) must be the rust C = 8
+    lanes re-encoded to C = 2 and every other lane identical — pins that
+    the kernel honours z_asinh (the rust side of C != 8 is pinned by the
+    child-process tests above). Same chart as _v48_z_child.py."""
     import numpy as np
     import beat_arena_rs
     from beat_arena_env.chart import Note, Wall, note_tuple, wall_tuple
-    from beat_arena_env.constants import (N_JOINTS, OBS_DIM, OFF_NOTES,
-                                          OFF_NOTE_MASK)
+    from beat_arena_env.constants import (N_JOINTS, NOTE_FEAT, OBS_DIM,
+                                          OFF_NOTES, OFF_NOTE_MASK)
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     from tests._helpers import resync, rust_state
     speed, max_steps = 20.0, 600
@@ -95,28 +99,45 @@ def test_cuda_rust_parity():
                   angle=4.712, speed=speed) for z in (5.0, 60.0, 80.0)]
     walls = [wall_tuple(Wall(100.0 / speed, 0.0, 0.0, 20.0, 40.0, 30.0,
                              speed))]
-    env = CudaBeatVecEnv(1, charts=[notes], walls=[walls],
-                         max_steps=max_steps, gears=3, device="cuda",
-                         dtype=torch.float64, auto_reset=False,
-                         foot_contact=False, seed=0)
+    kw = dict(charts=[notes], walls=[walls], max_steps=max_steps, gears=3,
+              device="cuda", dtype=torch.float64, auto_reset=False,
+              foot_contact=False, seed=0)
+    env = CudaBeatVecEnv(1, **kw)
+    env2 = CudaBeatVecEnv(1, z_asinh=2.0, **kw)
     assert env.z_asinh == 8.0
     env.reset()
+    env2.reset()
     sim = beat_arena_rs.RawBeatSim(max_steps=max_steps, gears=3,
                                    foot_contact=False)
     sim.set_chart([note_tuple(n) for n in notes], walls)
-    worst = 0.0
+    ent = slice(OFF_NOTES, OFF_NOTE_MASK)
+    zl = np.zeros((OFF_NOTE_MASK - OFF_NOTES) // NOTE_FEAT * NOTE_FEAT,
+                  dtype=bool).reshape(-1, NOTE_FEAT)
+    zl[:, [2, 17]] = True
+    zl = zl.reshape(-1)                     # z lanes of the entity block
+    act = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
+    worst = worst2 = 0.0
     for tick in range(30):
         # lockstep-resync (v10 protocol): CUDA re-takes rust's state
         q36, v35 = rust_state(sim)
         resync(env, [q36], [v35])
+        resync(env2, [q36], [v35])
         o_r, _, _, _ = sim.step([0] * N_JOINTS)
-        o_c, _, _, _ = env.step(torch.zeros((1, N_JOINTS), dtype=torch.int64,
-                                            device="cuda"))
+        o_c, _, _, _ = env.step(act)
+        o_2, _, _, _ = env2.step(act)
         o_r = np.asarray(o_r)
         o_c = o_c.cpu().numpy().reshape(OBS_DIM)
-        worst = max(worst, float(np.abs(o_c[OFF_NOTES:OFF_NOTE_MASK]
-                                        - o_r[OFF_NOTES:OFF_NOTE_MASK]).max()))
-        assert (o_c[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]
-                == o_r[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]).all(), tick
+        o_2 = o_2.cpu().numpy().reshape(OBS_DIM)
+        worst = max(worst, float(np.abs(o_c[ent] - o_r[ent]).max()))
+        # rust C = 8 lanes re-encoded to C = 2 (asinh(z / C), z from sinh)
+        r64 = o_r[ent].astype(np.float64)
+        want2 = np.where(zl, np.arcsinh(np.sinh(r64) * 8.0 / 2.0), r64)
+        worst2 = max(worst2, float(np.abs(o_2[ent] - want2).max()))
+        for o in (o_c, o_2):
+            assert (o[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]
+                    == o_r[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]).all(), tick
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
     assert worst < 1e-4, worst
+    assert worst2 < 1e-4, worst2
+    # and C really moved the far z lanes (40+ m out: asinh(z/8) vs z/2)
+    assert float(np.abs(o_2[ent][zl] - o_c[ent][zl]).max()) > 0.5
