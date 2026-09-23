@@ -354,7 +354,8 @@ hatch, and it now covers the critic too); `critic_mlp` takes the
 `bias_relu` / `relu_bwd` epilogues. The fp32 record path is
 bit-identical (the fused `ln_fwd_add`'s `x` IS `a + b` in fp32, which
 is what the old recompute produced there — pinned by
-`tests/test_critic_fp16.py::test_fp32_path_matches_old_recompute_bitwise`).
+`tests/test_critic_fp16.py::test_fp32_path_matches_old_recompute_bitwise`,
+removed 2026-09-22 as a historical pin).
 
 *Measured:* `bench_policy_forward --ns 32768`: 26.1 → **18.4 ms
 (−29%)**; `bench_policy_update 16384/accum 2`: 39.95 → **32.2 ms
