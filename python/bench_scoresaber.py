@@ -56,7 +56,9 @@ import torch
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
-from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
+from beat_arena_env.constants import (N_JOINTS, OBS_DIM, add_env_body_args,
+                                      env_body, env_body_cli,
+                                      env_body_of_ckpt, parse_tau_scale)
 from beat_arena_env.mirror import mirror_tuples, mirror_walls
 
 
@@ -143,11 +145,14 @@ class _Group:
                  "slots", "free", "n_active", "ev", "issued")
 
     def __init__(self, n, fwd, device, gears=3, foot_contact=False,
-                 tau_scale=None, sim_mod=beat_arena_rs):
+                 tau_scale=None, sim_mod=beat_arena_rs, env_body=None):
         self.n = n
         self.sim = sim_mod.VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
                               return_events=False, gears=gears,
                               foot_contact=foot_contact)
+        # run-only body options: the checkpoint's (None = default body)
+        if env_body is not None:
+            self.sim.set_body(**env_body)
         # env v46: fixed body for the whole bench (all 1.0 = the v45 body)
         if tau_scale is not None:
             self.sim.set_tau_scale([float(x) for x in tau_scale])
@@ -204,6 +209,7 @@ def parse_args():
                         "2026-09-22) or 'nominal' (all 1.0, the TAU_MAX "
                         "table = every bench before 2026-09-20). The "
                         "scales are stamped in the bench JSON")
+    add_env_body_args(p)
     p.add_argument("--foot-contact", action="store_true", default=True,
                    help="DEPRECATED NO-OP (2026-08-16): contact mode is "
                         "the only physics the bench runs — every "
@@ -623,6 +629,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                          # main() sets it from the checkpoint; unset = the
                          # rust sim's default (8 m)
                          z_asinh=float(os.environ.get("BEAT_Z_ASINH", "8.0")),
+                         env_body=args.env_body,
                          combo_walk=True, bench_refill=True, seed=0)
     ts = parse_tau_scale(args.tau_scale)
     if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
@@ -795,6 +802,14 @@ def main():
     os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
     print(f"obs z lane: asinh(z / {z_asinh:g} m) (from the checkpoint)",
           flush=True)
+    # run-only body options (2026-09-22): the checkpoint's env body (absent
+    # = the default body); CLI flags may only restate it
+    try:
+        args.env_body = env_body_of_ckpt(ckpt, env_body_cli(args))
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if args.env_body != env_body():
+        print(f"env body: {args.env_body} (from the checkpoint)", flush=True)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy = policy.to(device).eval()
@@ -811,6 +826,7 @@ def main():
         "global_step": ckpt.get("global_step"),
         "foot_contact": args.foot_contact,   # physics-regime provenance
         "tau_scale": parse_tau_scale(args.tau_scale),  # env v46 body
+        "env_body": args.env_body,           # run-only body options
         "mirror": args.mirror,               # charts left-right reflected
     }
     if bool(data.get("mirror")) != args.mirror:
@@ -954,7 +970,11 @@ def main():
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
                              foot_contact=args.foot_contact,
                              tau_scale=parse_tau_scale(args.tau_scale),
-                             sim_mod=sim_mod))
+                             sim_mod=sim_mod, env_body=args.env_body))
+    if args.env_body != env_body():
+        # read back from the sim's MODEL: proves the body round-tripped
+        print(f"[body] rust sim runs: {groups[0].sim.body_info()}",
+              flush=True)
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): different forward paths
     # differ by ~4e-7 in the logits, enough to flip near-tie argmaxes —

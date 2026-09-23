@@ -69,6 +69,7 @@ from .constants import (TAU_FEAT,
     BAD_HALF, BAD_HALF_Y_LINK, FOLLOW_TIMEOUT, GOOD_HALF_Y,
     GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BOMB, KIND_CHAIN_HEAD,
     KIND_CHAIN_LINK, N_JOINTS, NV, OBS_DIM, note_center,
+    env_body as _env_body, env_body_derived,
 )
 
 NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
@@ -496,7 +497,8 @@ class CudaBeatVecEnv:
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  self_contact_coef=0.0, tau_rand=0.0,
                  combo_walk=False, bench_refill=False, ep_stats=False,
-                 tau_center=None, z_asinh=8.0, env_order=False):
+                 tau_center=None, z_asinh=8.0, env_order=False,
+                 env_body=None):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -571,6 +573,11 @@ class CudaBeatVecEnv:
         self.start_jitter = float(start_jitter)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.gears = int(gears)
+        # run-only body options (2026-09-22; constants.ENV_BODY_DEFAULT,
+        # None = the default body, bit-for-bit): baked per instance, so
+        # launch-constant and CUDA-graph safe
+        self.env_body = _env_body(env_body, self.gears)
+        self._body_args = env_body_derived(self.env_body)
         # pool=: prebuilt tensor dict (ranked_pool.py; ragged, or padded
         # (P, C) from an older builder — converted here) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is
@@ -904,7 +911,8 @@ class CudaBeatVecEnv:
                        self.start_pose_jitter, self.crouch_start_prob,
                        self.z_asinh, self.self_contact_coef,
                        self.tau_rand, int(self.combo_walk),
-                       int(self.bench_refill), int(self.ep_stats))
+                       int(self.bench_refill), int(self.ep_stats),
+                       *self._body_args)
 
     # -- env v46: torque-limit scales ---------------------------------------
     def set_tau_scale(self, s16):

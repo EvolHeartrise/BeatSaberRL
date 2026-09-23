@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import OBS_DIM
+from .constants import OBS_DIM, env_body as _env_body
 
 from beat_arena_rs import VecBeatSim
 
@@ -30,7 +30,8 @@ class BeatVecEnv:
                  bomb_prob=0.125,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, energy_coef=0.0, self_contact_coef=0.0,
-                 gears=3, seed=0, foot_contact=False, fall_const=5.0):
+                 gears=3, seed=0, foot_contact=False, fall_const=5.0,
+                 env_body=None):
         """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
         False = the v10 foot welds (TEST-HARNESS ONLY since 2026-08-16
         — production is contact-only and train/bench force it), True =
@@ -57,6 +58,10 @@ class BeatVecEnv:
                               foot_shape_coef=foot_shape_coef,
                               energy_coef=energy_coef,
                               self_contact_coef=self_contact_coef)
+        # run-only body options (constants.ENV_BODY_DEFAULT; None = the
+        # default body, bit-for-bit)
+        self.env_body = _env_body(env_body, gears)
+        self.sim.set_body(**self.env_body)
         self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)

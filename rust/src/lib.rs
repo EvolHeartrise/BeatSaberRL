@@ -48,7 +48,8 @@ use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
 use dynamics::model::{
     Model, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
     F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHANK, F_R_SHOULDER,
-    F_R_WRIST, HUMANOID, NQ, NV,
+    F_R_WRIST, HUMANOID, NQ, NV, A_L_WRIST_BEND, A_R_WRIST_BEND, BodyCfg,
+    humanoid_with,
 };
 use dynamics::solver::{substep_constrained, ConstraintSet};
 use dynamics::step::{H_SUB, N_SUB};
@@ -130,6 +131,10 @@ const HANDLE_LEN: Real = 0.16;
 const GEAR_SIGNED: [Real; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
                                0.125, -0.125];
 const GEAR_SIGNED_5: [Real; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
+// run-only --wrist-bend-half-gear (2026-09-22): the two wrist-BEND
+// joints' table under gears 5 — ids 3/4 are +-1/2 instead of +-1/4
+// (every other joint keeps GEAR_SIGNED_5). CUDA GEAR_TAB row 3 mirror.
+const GEAR_BEND_HALF_5: [Real; 7] = [0.0, 1.0, -1.0, 0.5, -0.5, 0.0, 0.0];
 
 fn gear_signed(gears: u8) -> [Real; 7] {
     match gears {
@@ -650,6 +655,11 @@ type WallTuple = (Real, Real, Real, Real, Real, Real, Real);
 /// The v10 physical body: dynamics state + solver buffers + the derived
 /// per-tick caches the judgment/obs layers consume. One per env.
 struct Body {
+    // run-only body options (2026-09-22): the Model the dynamics run
+    // (humanoid_with(cfg); &HUMANOID for the default body) and the
+    // wrist-bend half-gear switch. Persist across resets (set_body).
+    model: &'static Model,
+    cfg: BodyCfg,
     st: State,
     ws: Workspace,
     cs: ConstraintSet,
@@ -751,6 +761,8 @@ struct Body {
     foot_grf: [[Real; 3]; 2],
 }
 
+// The DEFAULT body's model — only for the joint-limit tables (which no
+// body option touches); everything option-dependent reads Body::model.
 const MODEL: &Model = &HUMANOID;
 
 impl Body {
@@ -760,6 +772,8 @@ impl Body {
         // contact spec §1: contact mode DROPS the 12 weld rows
         let cs = ConstraintSet::new_modes(MODEL, !foot_contact, true, foot_contact);
         let mut b = Body {
+            model: MODEL,
+            cfg: BodyCfg::DEFAULT,
             st,
             ws,
             cs,
@@ -808,8 +822,16 @@ impl Body {
         }
     }
 
+    /// Run-only body options (2026-09-22): install `cfg`'s model and
+    /// gear switch. Persists across resets; the state is untouched (the
+    /// neutral pose/FK do not depend on masses, caps or torques).
+    fn set_body(&mut self, cfg: BodyCfg) {
+        self.model = humanoid_with(&cfg);
+        self.cfg = cfg;
+    }
+
     fn reset(&mut self) {
-        self.st = State::neutral(MODEL);
+        self.st = State::neutral(self.model);
         // env v20 (user, 2026-08-16): episode-start ARM pose — the
         // real-player ready stance (arms hang, forearms cocked, wrists
         // tilted forward) instead of the zombie arms-forward zero pose.
@@ -875,7 +897,7 @@ impl Body {
     /// blade = hand-frame +z column (SPEC-v10 §1.3), live head +
     /// shoulder anchors for the reach/miss gates.
     fn refresh_fk(&mut self) {
-        dynamics::fk::fk_all(MODEL, &self.st, &mut self.ws);
+        dynamics::fk::fk_all(self.model, &self.st, &mut self.ws);
         for (s, (fw, fh)) in [(F_L_WRIST, F_L_HAND), (F_R_WRIST, F_R_HAND)]
             .into_iter()
             .enumerate()
@@ -896,19 +918,22 @@ impl Body {
         let mut grp = [0.0 as Real; 3];
         let mut tau_abs = 0.0;
         let mut tgrp = [0.0 as Real; 3];
+        let model = self.model;
+        let half_bend = self.cfg.wrist_bend_half_gear;
         for j in 0..NQ {
             let a = actions[j] as usize;
-            let frac = if a < 7 { gear[a] } else { 0.0 };
+            let bend_half = half_bend && (j == A_L_WRIST_BEND || j == A_R_WRIST_BEND);
+            let frac = if a >= 7 { 0.0 } else if bend_half { GEAR_BEND_HALF_5[a] } else { gear[a] };
             // env v46: τ_max scaled per env (s = 1.0 is exact: bit-
             // identical to v45); same expression tree as the kernel
-            self.tau[j] = frac * MODEL.tau_max[j] * self.tau_scale[j];
+            self.tau[j] = frac * model.tau_max[j] * self.tau_scale[j];
             let f = frac.abs();
             act += f;
             let g = if j < 3 { 0 } else if j < 17 { 1 } else { 2 };
             grp[g] += f;
             // env v43 energy base: |τ_j| = |frac·τ_max·s| (abs commutes
             // with the product exactly; same expression tree as the kernel)
-            let t = (frac * MODEL.tau_max[j] * self.tau_scale[j]).abs();
+            let t = (frac * model.tau_max[j] * self.tau_scale[j]).abs();
             tau_abs += t;
             tgrp[g] += t;
         }
@@ -939,7 +964,7 @@ impl Body {
         let mut fell = false;
         let mut tilted = false;
         for _ in 0..N_SUB {
-            substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
+            substep_constrained(self.model, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
 
             // contact aggregation: obs bits see every ACTIVE row this
@@ -1442,7 +1467,7 @@ impl Core {
         }
         debug_assert_eq!(lane, OFF_QD);
         for j in 0..NQ {
-            obs[OFF_QD + j] = (st.v[6 + j] / MODEL.omega_cap[j]) as f32;
+            obs[OFF_QD + j] = (st.v[6 + j] / self.body.model.omega_cap[j]) as f32;
         }
         // hand derived blocks (v9 semantics on the v10 FK)
         for (s, base) in [(0usize, OFF_HAND_L), (1usize, OFF_HAND_R)] {
@@ -2309,6 +2334,47 @@ impl Core {
     fn pop_dbg_stats(&mut self) -> DbgStats {
         std::mem::take(&mut self.body.ws.stats)
     }
+
+    /// Run-only body options (2026-09-22): validated install; the half
+    /// gear rewrites gears-5 ids 3/4, so any other table refuses it.
+    fn set_body(&mut self, cfg: BodyCfg) -> Result<(), String> {
+        cfg.validate()?;
+        if cfg.wrist_bend_half_gear && self.gear != GEAR_SIGNED_5 {
+            return Err("wrist_bend_half_gear needs gears=5".to_string());
+        }
+        self.body.set_body(cfg);
+        Ok(())
+    }
+
+    /// The body this sim RUNS, read back from its model (not the
+    /// requested options): proves a config round-tripped.
+    fn body_info(&self) -> HashMap<String, f64> {
+        let m = self.body.model;
+        let c = &self.body.cfg;
+        let (fl, fr) = (&m.frames[F_L_HAND], &m.frames[F_R_HAND]);
+        let (jl, jr) = (A_L_WRIST_BEND, A_R_WRIST_BEND);
+        assert!(fl.mass == fr.mass && fl.inertia == fr.inertia
+                && m.tau_max[jl] == m.tau_max[jr]
+                && m.omega_cap[jl] == m.omega_cap[jr], "asymmetric body");
+        let bend_gear = if c.wrist_bend_half_gear { GEAR_BEND_HALF_5[3] } else { self.gear[3] };
+        [("hand_mass", fl.mass as f64),
+         ("hand_inertia", fl.inertia[0] as f64),
+         ("wrist_bend_tau_max", m.tau_max[jl] as f64),
+         ("wrist_bend_cap", m.omega_cap[jl] as f64),
+         ("wrist_bend_gear3", bend_gear as f64),
+         ("wrist_roll_cap", m.omega_cap[7] as f64),
+         ("wrist_dev_cap", m.omega_cap[9] as f64),
+         ("wrist_roll_tau_max", m.tau_max[7] as f64),
+         ("gear3", self.gear[3] as f64)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+}
+
+fn body_cfg(hand_mass: f64, wrist_bend_tau_mult: f64, wrist_bend_cap: f64,
+            wrist_bend_half_gear: bool) -> BodyCfg {
+    BodyCfg { hand_mass, wrist_bend_tau_mult, wrist_bend_cap, wrist_bend_half_gear }
 }
 
 #[pyclass]
@@ -2546,6 +2612,24 @@ impl RawBeatSim {
     /// env v46: the current 16 axis scales (replay header field).
     fn tau_scale(&self) -> Vec<Real> {
         self.core.body.tau_axis.to_vec()
+    }
+
+    /// Run-only body options (2026-09-22; defaults = the v58 body, bit-
+    /// for-bit): hand mass (kg, both hands; inertia scales with it),
+    /// wrist-bend nominal tau_max multiplier, wrist-bend omega cap
+    /// (rad/s; also the qd obs normalizer), wrist-bend half gear
+    /// (gears 5 only). Persists across resets; call before stepping.
+    fn set_body(&mut self, hand_mass: f64, wrist_bend_tau_mult: f64,
+                wrist_bend_cap: f64, wrist_bend_half_gear: bool) -> PyResult<()> {
+        self.core
+            .set_body(body_cfg(hand_mass, wrist_bend_tau_mult, wrist_bend_cap,
+                               wrist_bend_half_gear))
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// The running body read back from the model (see Core::body_info).
+    fn body_info(&self) -> HashMap<String, f64> {
+        self.core.body_info()
     }
 
     /// Last tick's joint activation — commanded Σ|gear fraction| as
@@ -3030,6 +3114,22 @@ impl VecBeatSim {
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
 
+    /// Run-only body options on EVERY env (RawBeatSim.set_body mirror).
+    fn set_body(&mut self, hand_mass: f64, wrist_bend_tau_mult: f64,
+                wrist_bend_cap: f64, wrist_bend_half_gear: bool) -> PyResult<()> {
+        let cfg = body_cfg(hand_mass, wrist_bend_tau_mult, wrist_bend_cap,
+                           wrist_bend_half_gear);
+        for c in self.sims.iter_mut() {
+            c.set_body(cfg).map_err(pyo3::exceptions::PyValueError::new_err)?;
+        }
+        Ok(())
+    }
+
+    /// Env 0's running body (all envs share one; see Core::body_info).
+    fn body_info(&self) -> HashMap<String, f64> {
+        self.sims[0].body_info()
+    }
+
     /// env v46: set the 16 per-axis torque-limit scales on EVERY env
     /// (bench / eval at a fixed body). RawBeatSim.set_tau_scale mirror.
     fn set_tau_scale(&mut self, s: Vec<Real>) {
@@ -3183,6 +3283,58 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod env_tests {
     use super::*;
+
+    /// Run-only body options (2026-09-22): the default config runs the
+    /// very HUMANOID tables; a modified one reports exactly the requested
+    /// hand mass / inertia (0.000264 x M / 0.35), bend tau_max (1.06 x
+    /// mult), bend cap and bend half gear — on the bend joints ONLY —
+    /// and the half gear applies 0.5 x tau_max on 8/15 alone.
+    #[test]
+    fn body_options_model_and_gears() {
+        let mut core = Core::configured(690, 5, true, 5.0, 0.0, 0.0, 0.0,
+                                        0.0, 0.0, 0.0, false, false, 0.0);
+        assert!(std::ptr::eq(core.body.model, &HUMANOID));
+        core.set_body(BodyCfg::DEFAULT).unwrap();
+        assert!(std::ptr::eq(core.body.model, &HUMANOID));
+        let cfg = BodyCfg { hand_mass: 0.5, wrist_bend_tau_mult: 1.3,
+                            wrist_bend_cap: 65.0, wrist_bend_half_gear: true };
+        core.set_body(cfg).unwrap();
+        let m = core.body.model;
+        assert!(std::ptr::eq(m, humanoid_with(&cfg)), "cached per config");
+        for f in [F_L_HAND, F_R_HAND] {
+            assert_eq!(m.frames[f].mass, 0.5 as Real);
+            assert_eq!(m.frames[f].inertia, [(0.000264f64 * (0.5 / 0.35)) as Real; 3]);
+            assert_eq!(m.frames[f].com, HUMANOID.frames[f].com);
+        }
+        for j in 0..NQ {
+            let bend = j == 8 || j == 15;
+            assert_eq!(m.tau_max[j], if bend { (1.06f64 * 1.3) as Real } else { HUMANOID.tau_max[j] });
+            assert_eq!(m.omega_cap[j], if bend { 65.0 } else { HUMANOID.omega_cap[j] });
+        }
+        for k in 0..HUMANOID.frames.len() {
+            if k != F_L_HAND && k != F_R_HAND {
+                assert_eq!(m.frames[k].mass, HUMANOID.frames[k].mass);
+                assert_eq!(m.frames[k].inertia, HUMANOID.frames[k].inertia);
+            }
+        }
+        let info = core.body_info();
+        assert_eq!(info["wrist_bend_gear3"], 0.5);
+        assert_eq!(info["gear3"], 0.25);
+        // gear id 3 (+1/4 table entry) on every joint: bend joints get
+        // +1/2 x their tau_max, all others +1/4
+        let gear = gear_signed(5);
+        core.body.tick(&[3u8; NQ], &gear);
+        for j in 0..NQ {
+            let f = if j == 8 || j == 15 { 0.5 } else { 0.25 };
+            assert_eq!(core.body.tau[j], f * m.tau_max[j] * core.body.tau_scale[j]);
+        }
+        // the half gear rewrites the gears-5 table: refused elsewhere
+        let mut c3 = Core::configured(690, 3, true, 5.0, 0.0, 0.0, 0.0,
+                                      0.0, 0.0, 0.0, false, false, 0.0);
+        assert!(c3.set_body(cfg).is_err());
+        assert!(c3.set_body(BodyCfg { wrist_bend_half_gear: false, ..cfg }).is_ok());
+        assert!(c3.set_body(BodyCfg { hand_mass: 0.0, ..BodyCfg::DEFAULT }).is_err());
+    }
 
     /// Activation telemetry wiring: Body::tick's act_frac is the
     /// commanded Σ|gear fraction| (the v23 fraction base, telemetry) and the
