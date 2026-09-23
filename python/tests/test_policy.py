@@ -140,9 +140,11 @@ def test_note_geo_normalizers_pinned():
 def test_note_geo_lanes_geometry():
     """A hand-crafted obs: left wrist at (0.2, -0.3, -0.5) head-relative
     x/y and world z, moving +x at 3 m/s with the blade along +y; note slot
-    0 at head-relative (0.5, 0.15), world z 4.0, speed 16 m/s, cut
-    direction (cos, sin) = (1, 0). The 14 lanes must be the metre-space
-    offset/2, |dp|/2, z/speed, and the two direction dots."""
+    0 at head-relative (0.5, 0.15), world z 4.0 (lane asinh(4 / 8)),
+    speed 16 m/s, cut direction (cos, sin) = (1, 0). The 14 lanes must be
+    the x/y offset in half-metres, the z offset and |dp| as asinh(m / 8),
+    z/speed / 3, and the two direction dots."""
+    import math
     import policy as P
     from beat_arena_env import constants as C
     obs = torch.zeros(1, OBS_DIM)
@@ -151,19 +153,22 @@ def test_note_geo_lanes_geometry():
     obs[0, hl + 3:hl + 6] = torch.tensor([3.0 / C.V_NORM, 0.0, 0.0])
     obs[0, hl + 6:hl + 9] = torch.tensor([0.0, 1.0, 0.0])
     n0 = OFF_NOTES
-    obs[0, n0:n0 + 4] = torch.tensor([0.5, 0.15 / 0.75, 4.0 / C.Z_SCALE,
+    obs[0, n0:n0 + 4] = torch.tensor([0.5, 0.15 / 0.75,
+                                      math.asinh(4.0 / 8.0),
                                       -16.0 / C.Z_SCALE])
     obs[0, n0 + 6], obs[0, n0 + 7] = 1.0, 0.0
     obs[0, OFF_NOTE_MASK] = 1.0
     pol = NotePolicy(note_geo=True)
     sabers, body, notes, mask = pol._split(obs)
-    geo = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT))
+    geo = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0)
     assert geo.shape == (1, N_NOTE_SLOTS, P.NOTE_GEO_FEAT)
     g = geo[0, 0]
-    dp = torch.tensor([0.5 - 0.2, 0.15 - (-0.3), 4.0 - (-0.5)]) * 0.5
-    assert torch.allclose(g[0:3], dp, atol=1e-5)
-    assert abs(g[3] - dp.norm()) < 1e-5
-    assert abs(g[4] - 4.0 / 16.0) < 1e-5              # seconds to plane
+    dm = torch.tensor([0.5 - 0.2, 0.15 - (-0.3), 4.0 - (-0.5)])   # metres
+    want = torch.tensor([dm[0] * 0.5, dm[1] * 0.5,
+                         math.asinh(dm[2].item() / 8.0)])
+    assert torch.allclose(g[0:3], want, atol=1e-5)
+    assert abs(g[3] - math.asinh(dm.norm().item() / 8.0)) < 1e-5
+    assert abs(g[4] - 4.0 / 16.0 / 3.0) < 1e-5        # seconds to plane / 3
     assert abs(g[5] - 3.0 / (3.0 + 0.05)) < 1e-5      # vhat.cutd, +x vs (1,0)
     assert abs(g[6]) < 1e-6                            # blade +y . (1,0) = 0
     # right hand sits at the origin with zero velocity: its dots are ~0
@@ -171,8 +176,8 @@ def test_note_geo_lanes_geometry():
     # wall rows have no cut direction: dots masked to 0
     obs[0, n0 + 14] = 1.0
     sabers, body, notes, mask = pol._split(obs)
-    g2 = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT))[0, 0]
-    assert g2[5] == 0 and g2[6] == 0 and torch.allclose(g2[0:3], dp, atol=1e-5)
+    g2 = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0)[0, 0]
+    assert g2[5] == 0 and g2[6] == 0 and torch.allclose(g2[0:3], want, atol=1e-5)
 
 
 def test_note_geo_forward_and_arch_marker():

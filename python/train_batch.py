@@ -317,17 +317,6 @@ def parse_args():
                         "inherits the checkpoint's value when the flag is "
                         "not given. Recorded in the checkpoint (arch + "
                         "args); the bench/replay tools read it from there")
-    p.add_argument("--note-geo-norm", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="note-geo lanes normalised to O(1) — z decoded from "
-                        "the lane's true encoding, per-hand z offset and "
-                        "distance as asinh(m/8), seconds-to-plane / 3. Arch "
-                        "marker 'note_geo_norm'. DEFAULT ON since "
-                        "2026-09-21 (v55: fixed the note encoder's second-"
-                        "layer gradient — far tokens' raw-metre hidden "
-                        "activations). --no-note-geo-norm = the pre-v55 "
-                        "lanes bit for bit (fresh runs only; a loaded "
-                        "checkpoint carries its own marker)")
     p.add_argument("--cooldown-updates", type=int, default=0,
                    help="wsd LEAF mode: with --resume <trunk ckpt>, branch "
                         "off and decay lr 1-sqrt from --lr to --lr-final "
@@ -1094,7 +1083,6 @@ def main():
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
                             note_geo=args.note_geo,
-                            note_geo_norm=args.note_geo_norm,
                             trunk_arch=args.trunk_arch,
                             trunk_hidden=args.trunk_hidden,
                             value_bins=args.hl_bins,
