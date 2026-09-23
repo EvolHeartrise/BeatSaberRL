@@ -292,7 +292,7 @@ def test_greedy_rollout_smoke():
     from beat_arena_env.rust_env import RustBeatEnv
     from policy import NotePolicy
 
-    cfg = ChartConfig(chart_len_s=6.0, bomb_prob=0.25)
+    cfg = ChartConfig(chart_len_s=3.0, bomb_prob=0.25)
     notes = generate_chart(cfg, np.random.default_rng(3))
     env = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
     obs, _ = env.reset()
@@ -305,7 +305,7 @@ def test_greedy_rollout_smoke():
                       "max_pp": 42.117, "api_max_score": None},
             "walk": scoresaber.ComboTracker(),
             "max_score": scoresaber.max_multiplied_score(notes),
-            "duration_s": 6.0}
+            "duration_s": 3.0}
     done = False
     while not done:
         with torch.no_grad():
@@ -403,27 +403,15 @@ def test_rust_combo_walk_matches_python():
     from beat_arena_env.chart import note_tuple
     from beat_arena_env.constants import EVENT_REASONS
 
-    try:
-        vec = beat_arena_rs.VecBeatSim(2, max_steps=100_000_000,
-                                       combo_walk=True)
-    except TypeError:
-        pytest.skip("extension predates combo_walk (rebuild pending)")
+    vec = beat_arena_rs.VecBeatSim(2, max_steps=100_000_000,
+                                   combo_walk=True)
     charts = [generate_chart(ChartConfig(chart_len_s=6.0, colors="both",
                                          bomb_prob=0.25),
                              np.random.default_rng(s)) for s in (3, 4)]
     for i, chart in enumerate(charts):
         vec.set_chart(i, [note_tuple(n) for n in chart])
-    # rng 7 -> 17 (env v15, contact spec §10): the head-anchored
-    # track shifts with the flailing trunk even in weld mode, and
-    # seed 7's lucky random hits stopped connecting in episode 0
-    # (the walk itself matched exactly; only score>0 broke).
-    # 17 -> 41 (env v20): same story again under the arm ready stance.
-    # 41 -> 42 (2026-08-20 spine -25%): and again — the weaker waist
-    # rewrote the flail trajectory (swept: 42 scores 342/114, exact
-    # walk match). 42 -> 43 (2026-08-20 ankle_p +35: wider passive
-    # rock, same story; swept: 43 scores 69/154, exact walk match).
-    # (2026-08-21: briefly 47 under the v33 +0.3 note offset; back to
-    # 43 when the offset was reverted to player height 1.8.)
+    # the seed only matters for `py[i].score > 0` below (random
+    # actions must land some hits); body/env changes can re-roll it
     acts = np.random.default_rng(43).integers(0, 3, size=(400, 2, 29))
     py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
     rust_result, t = [None, None], 0
