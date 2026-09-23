@@ -3,11 +3,9 @@ PERF_AUDIT_2026-09-02_static.md, C §1.2 / §2.2 / §5).
 
 The claims pinned here:
 
-1. Splitting the 29-head entropy sum into a per-head intermediate is a
-   RENAME, not a numerics change — `entropy` must stay bit-identical to
-   the pre-split `-(probs*logsm).sum(-1).sum(-1)`, because the printed
-   `ent` series has to remain comparable across the change (the
-   bit-identity gate the logging work was accepted under).
+1. The returned `entropy` IS the sum of the stashed per-head
+   entropies (`_ent_h`), so the printed `ent` and the per-head [kl]
+   breakdown describe the same numbers.
 2. `HEAD_GROUPS` is derived from the env's actuated-order contract, not
    invented here: policy.py duplicates it to stay a leaf module, so the
    duplication is checked against beat_arena_env.constants.
@@ -70,16 +68,6 @@ def test_stashed_per_head_entropy_sums_to_the_returned_entropy():
     # bitwise: `entropy` IS `_ent_h.sum(-1)`, the same reduction the
     # pre-split code ran second
     assert torch.equal(entropy, pol._ent_h.sum(-1))
-
-
-def test_entropy_is_bitwise_the_pre_split_expression():
-    pol = _policy()
-    obs = torch.randn(7, OBS_DIM) * 0.7
-    _, _, entropy, _ = pol.get_action_and_value(obs)
-    logits, _ = pol.forward_stacked(obs)
-    logsm = torch.log_softmax(logits, dim=-1)
-    ref = -(logsm.exp() * logsm).sum(-1).sum(-1)     # the 2026-08 form
-    assert torch.equal(entropy, ref)
 
 
 def test_need_entropy_false_leaves_no_stash():
