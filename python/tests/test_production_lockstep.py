@@ -177,7 +177,8 @@ def _cuda_pops(env):
 def test_production_lockstep_parity():
     a = _recipe()
     # the kwargs below mirror the ranked-pool (production) branch
-    assert a.ranked_maps and a.foot_contact and a.ep_stats
+    assert (a.ranked_maps and a.foot_contact and a.ep_stats
+            and a.wall_despawn)
     assert a.z_asinh is None and Z_ASINH_C == 8.0, \
         "recipe z encoding is asinh C = 8 m (unset BEAT_Z_ASINH)"
     tau = parse_tau_scale(a.tau_center)
@@ -280,9 +281,17 @@ def test_production_lockstep_parity():
             assert sc_c[e].tolist() == [sim.score,
                                         *sim.score_components()], \
                 f"{tag} score decomposition"
-            codes = {c for _i, c, *_ in ev}
-            assert (7 in codes) == (sim.walls_in > walls_in_prev[e]), \
-                f"{tag} head-in-wall event vs walls_in"
+            # wall contract under the recipe's wall_despawn (env v37,
+            # lib.rs / .cu wall block): each charged wall emits ONE
+            # entry event 8, adds 1 to walls_in (entries, not in-wall
+            # ticks) and despawns — no event-7 stream. walls_in itself
+            # is compared CUDA vs Rust above; the combo break the 8
+            # carries is checked through the combo walk at done.
+            codes = [c for _i, c, *_ in ev]
+            assert 7 not in codes, f"{tag} event 7 under wall_despawn"
+            assert codes.count(8) == sim.walls_in - walls_in_prev[e], \
+                f"{tag} wall entry events vs walls_in"
+            assert sim.wall_enters == sim.walls_in, f"{tag} wall_enters"
             walls_in_prev[e] = sim.walls_in
             combo[e].consume([(int(i), EVENT_REASONS[c], p)
                               for i, c, p, *_ in ev])
