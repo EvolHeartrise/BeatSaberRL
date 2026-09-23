@@ -286,9 +286,9 @@ network with neither a LayerNorm nor a skip (the blocks are pre-LN
 residual, the critic pool has its own LN). SimBa replaced it with a Linear 576→384 projection, one
 residual block `x + fc2(relu(fc1(LN1 x)))`, and a final LN2 (modules
 `trunk_proj`, `trunk_ln1`, `trunk_fc1`, `trunk_fc2`, `trunk_ln2`;
-`--trunk-hidden` sets the block width, default = trunk dim). Params:
-+149,376 at 192/384 with hidden 384 (trunk 518,784 vs 369,408; total
-2,567,954), +1,035,264 with hidden 1536. Why: SimBa (2410.09754) and
+`--trunk-hidden` sets the block width, default = trunk dim). Params
+(today's 960-lane input, 192/384, hidden 384): trunk 666,240, total
+2,789,622; hidden 1536 adds 885,888. Why: SimBa (2410.09754) and
 SimBaV2 (2502.15280) show plain MLPs lose monotone width scaling in RL
 while LN + residual blocks keep it; Creus Castanyer et al. (2506.15544)
 report the same for shared-trunk PPO on IsaacGym humanoids; Kumar et al.

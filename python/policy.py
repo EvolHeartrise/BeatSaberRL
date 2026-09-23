@@ -4,7 +4,8 @@ Current production shape (v18, 2026-08-16): the 24-slot shared entity
 window (notes + walls, distance-sorted), two saber tokens and one body
 token form a 27-token sequence run through 3 full pre-LN transformer
 blocks (LayerNorm -> 4-head self-attention -> residual; LayerNorm ->
-4x FFN -> residual) at embed 128, then a 256-wide trunk MLP and 29
+4x FFN -> residual) at embed 128, then a 256-wide trunk (a plain MLP
+then; the SimBa residual + LN trunk since 2026-09-15) and 29
 factored action heads (~863k actor params, the 2026-08-13
 user-approved 6.2x scale-up) plus the adapool_v1 critic (2026-08-19,
 topics/critic-design.md): a body-token-derived attention-pool query
