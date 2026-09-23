@@ -632,7 +632,9 @@ def parse_args():
     p.add_argument("--wall-despawn", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="env v37: walls despawn on the charged hit "
-                        "(bomb-like; training-only credit aid)")
+                        "(bomb-like; training-only credit aid). DEFAULT "
+                        "ON (trunk recipe); leaves that must match the "
+                        "bench pass --no-wall-despawn")
     p.add_argument("--energy-coef", type=float, default=7.5e-6,
                    help="env v43 (2026-09-14, user): per-tick ENERGY cost "
                         "in reward per N*m*tick — energy_coef * sum over "
