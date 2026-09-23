@@ -12,8 +12,8 @@ width — production runs N = 1024..8192).
 
 Parity is pinned by tests/test_v10_parity_cuda.py: the f64 tier is
 HORIZON-BOUNDED tight-tolerance (CUDA f64 sin/cos/acos differ from the
-CRT libm by 1 ulp on a few %% of inputs and nvcc contracts FMAs — both
-measured there; SPEC-v10 Divergences §21), f32 is the bounded
+CRT libm by 1 ulp on a few %% of inputs and nvcc contracts FMAs —
+SPEC-v10 Divergences §21), f32 is the bounded
 well-formedness tier. Both dtypes carry a Cholesky pivot-floor safety
 net with engagements counted (`pop_pd_hits`): f32 floors at 1e-8
 (§20e), f64 at 1e-17 (§22 — the same floor Rust/torch f64 now carry).

@@ -44,8 +44,8 @@
 // N=1024 5,496 -> 7,283 steps/s, env micro-bench 6,212 -> 8,264
 // env-steps/s. The "~2x" estimate of the prize was the honest half.
 //
-// f64 parity tier (SPEC-v10 Divergences §21, measured in
-// tests/test_v10_parity_cuda.py): CUDA f64 sqrt and division are
+// f64 parity tier (SPEC-v10 Divergences §21, measured by a since-
+// retired probe; numbers in §21a): CUDA f64 sqrt and division are
 // IEEE-correctly-rounded and match Rust's CRT bitwise; CUDA f64
 // sin/cos/acos (libdevice) differ from the CRT libm by 1 ulp on a few
 // %% of inputs, and nvcc's default FMA contraction re-rounds
