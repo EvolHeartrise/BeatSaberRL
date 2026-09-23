@@ -302,7 +302,7 @@ def parse_args():
                         "([contact] line, metrics) accumulates always")
     p.add_argument("--z-asinh", type=float, default=None,
                    help="env v48: obs z lanes (note z / wall front, wall "
-                        "back) = asinh(max(z, -0.65) / C) with C in metres "
+                        "back) = asinh(max(z, head z) / C) with C in metres "
                         "— linear near the cut plane, log far out, no upper "
                         "clamp. The only z encoding (the legacy clamp / 8 "
                         "path was removed 2026-09-22); C must be > 0. "

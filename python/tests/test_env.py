@@ -309,6 +309,9 @@ def test_z_is_time_times_speed():
             cands = [env.chart[i].hit_time - env.sim.time for i in pending
                      if abs(obs[base] - (nc(env.chart[i])[0] - obs[OFF_HEAD]))
                      < 1e-5
+                     and abs(obs[base + 1] * 0.75 + obs[OFF_HEAD + 1] * 0.75
+                             + 1.70
+                             - nc(env.chart[i])[1]) < 1e-5
                      and abs(vz_obs + env.chart[i].speed) < 1e-4]
             assert cands, (slot, t_obs)
             assert min(abs(t_obs - t) for t in cands) < 1e-4, (slot, t_obs,
