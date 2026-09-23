@@ -46,7 +46,8 @@ import torch
 import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
-from beat_arena_env.constants import parse_tau_scale
+from beat_arena_env.constants import (ENV_BODY_DEFAULT, env_body,
+                                      env_body_of_ckpt, parse_tau_scale)
 from fp16_linear import bump_weights_version
 from metrics_log import dumps_record, update_record
 from policy import (hl_loss, HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
@@ -497,6 +498,28 @@ def parse_args():
                         "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
                         "under the doubled alpha/omega body). Resuming a "
                         "geared checkpoint needs the matching --gears")
+    # run-only body options (2026-09-22, user). Default None = inherit
+    # the --resume / --init-from checkpoint's env_body (absent = the
+    # default body), else the default body — bit-for-bit the tables.
+    # Recorded as ckpt["env_body"]; bench / replays configure from it.
+    p.add_argument("--hand-mass", type=float, default=None,
+                   help="mass (kg) of BOTH hands; inertia scales with it "
+                        "(0.000264 x M / 0.35 per axis), COM unchanged. "
+                        "Default 0.35")
+    p.add_argument("--wrist-bend-tau-mult", type=float, default=None,
+                   help="x the NOMINAL tau_max (1.06 N.m) of the two "
+                        "wrist-BEND joints only; the per-env tau scales "
+                        "(--tau-center, --tau-rand) still apply on top. "
+                        "Default 1.0")
+    p.add_argument("--wrist-bend-cap", type=float, default=None,
+                   help="omega cap (rad/s) of the two wrist-BEND joints "
+                        "only (solver clamp + their qd obs normalizer); "
+                        "wrist roll/dev keep 50. Default 50")
+    p.add_argument("--wrist-bend-half-gear", default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help="the two wrist-BEND joints' +/-1/4 gears (ids 3/4) "
+                        "become +/-1/2; every other joint keeps +/-1/4. "
+                        "Needs --gears 5. Default off")
     p.add_argument("--foot-contact", default=True,
                    action=argparse.BooleanOptionalAction,
                    help="DEPRECATED NO-OP (2026-08-16, user decision): "
@@ -936,6 +959,25 @@ def main():
     # argmax — cuda_graphs.py, bench_scoresaber --no-graphs — which is
     # untouched, and bench JSONs still stamp forward=graphed/eager.)
 
+    # run-only body options: unset flags inherit the checkpoint's body
+    # (resume, else init), else the default body; a flag that changes a
+    # checkpoint's body is allowed (a deliberate body switch) but loud
+    _body_ck = resume_ckpt if resume_ckpt is not None else init_ckpt
+    _body_base = (env_body_of_ckpt(_body_ck) if _body_ck is not None
+                  else env_body())
+    _body_cli = {k: getattr(args, k) for k in ENV_BODY_DEFAULT
+                 if getattr(args, k) is not None}
+    try:
+        body_cfg = env_body({**_body_base, **_body_cli}, gears=args.gears)
+    except ValueError as exc:
+        raise SystemExit(f"body options: {exc}")
+    for _k, _v in body_cfg.items():
+        setattr(args, _k, _v)   # resolved values -> args.json / ckpt args
+    if body_cfg != env_body():
+        print(f"[body] NON-DEFAULT env body: {body_cfg}", flush=True)
+    if _body_ck is not None and body_cfg != _body_base:
+        print(f"!!! [body] this run's env body {body_cfg} differs from the "
+              f"checkpoint's {_body_base}", flush=True)
     # Config provenance (2026-07-26, after the gen3 postmortem: a
     # missing --colors flag survived a 5B run and a 4-arm bisect because
     # nothing recorded what any run was launched with). Written AFTER
@@ -1023,7 +1065,7 @@ def main():
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
                       tau_center=parse_tau_scale(args.tau_center),
-                      env_order=True,
+                      env_order=True, env_body=body_cfg,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -1047,6 +1089,7 @@ def main():
             crouch_start_prob=args.crouch_start_prob,
             z_asinh=args.z_asinh,
             self_contact_coef=args.self_contact_coef, env_order=True,
+            env_body=body_cfg,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -1063,6 +1106,7 @@ def main():
             foot_shape_coef=args.foot_shape_coef,
             energy_coef=args.energy_coef,
             self_contact_coef=args.self_contact_coef,
+            env_body=body_cfg,
             seed=args.seed)
 
     if resume_ckpt is not None:
@@ -2374,6 +2418,7 @@ def main():
                         "optimizer": cpu_opt_state(opt),
                         "muon": muon.state_dict(),
                         "args": args_snapshot,
+                        "env_body": body_cfg,
                         "wsd_role": ("leaf" if leaf_from is not None
                                      else "trunk"),
                         "branched_from_update": leaf_from,
@@ -2431,6 +2476,7 @@ def main():
                 "optimizer": cpu_opt_state(opt),
                         "muon": muon.state_dict(),
                 "args": args_snapshot,
+                "env_body": body_cfg,
                 "wsd_role": ("leaf" if leaf_from is not None
                              else "trunk"),
                 "branched_from_update": leaf_from,

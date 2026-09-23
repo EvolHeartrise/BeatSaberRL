@@ -52,6 +52,10 @@ pd floor) tick by tick. At each env's done tick: the ep_stats row
 fed Rust's events, completed, bad, misses, body) and the per-env
 telemetry (activation, torque, limit rest, self contact, wrist
 reversals).
+
+A third arm (2026-09-22) reruns the production lockstep with the four
+run-only body options off their defaults on both engines (heavier
+hands, stronger + faster wrist bends, bend half gear).
 """
 import sys
 
@@ -69,7 +73,8 @@ from beat_arena_env.constants import (EVENT_REASONS, KIND_BOMB, N_JOINTS,
                                       OBS_DIM, OFF_CONTACT, OFF_GROUND_IMP,
                                       OFF_NOTE_MASK, OFF_NOTES, OFF_PREV_L,
                                       OFF_PREV_R, OFF_TAU, PREV_FEAT,
-                                      TAU_BODY_DEFAULT, parse_tau_scale)
+                                      TAU_AXIS_OF_JOINT, TAU_BODY_DEFAULT,
+                                      TAU_MAX, gear_table, parse_tau_scale)
 from beat_arena_env.cuda_env import CudaBeatVecEnv
 from beat_arena_env.scoresaber import ComboTracker
 from tests._helpers import Z_ASINH_C, resync, rust_state
@@ -128,7 +133,7 @@ def _charts(chart_s, seeds):
     return [generate_chart(cfg, np.random.default_rng(s)) for s in seeds]
 
 
-def _build(a, charts, walls, max_steps, tau):
+def _build(a, charts, walls, max_steps, tau, body=None):
     N = len(charts)
     wt = [[wall_tuple(w) for w in ws] for ws in walls]
     # the ranked-pool VecCls(...) call in train_batch.py, kwarg for
@@ -144,7 +149,7 @@ def _build(a, charts, walls, max_steps, tau):
         start_pose_jitter=0.0, crouch_start_prob=0.0,
         z_asinh=Z_ASINH_C, self_contact_coef=a.self_contact_coef,
         tau_rand=0.0, ep_stats=a.ep_stats, tau_center=tau,
-        env_order=True, seed=a.seed, device="cuda",
+        env_order=True, env_body=body, seed=a.seed, device="cuda",
         dtype=torch.float64, auto_reset=False)
     sims = []
     for ch, ws in zip(charts, wt):
@@ -157,6 +162,8 @@ def _build(a, charts, walls, max_steps, tau):
             wall_despawn=a.wall_despawn,
             self_contact_coef=a.self_contact_coef)
         sim.set_tau_scale(list(tau))   # persists across set_chart resets
+        if body is not None:
+            sim.set_body(**body)       # persists likewise
         sim.set_chart([note_tuple(n) for n in ch], ws)
         sims.append(sim)
     return env, sims
@@ -208,9 +215,82 @@ def test_persistent_wall_lockstep_parity():
     assert sims[2].walls_in > 0
 
 
-def _lockstep(a, N, HELD, chart_s, seeds, walls):
+# run-only body options (2026-09-22): every option off its default
+MOD_BODY = {"hand_mass": 0.5, "wrist_bend_tau_mult": 1.3,
+            "wrist_bend_cap": 65.0, "wrist_bend_half_gear": True}
+BEND_J = (8, 15)
+SWING_TICKS = 5
+
+
+def test_modified_body_lockstep_parity():
+    """The production lockstep with all four run-only body options
+    set (hand 0.50 kg, bend tau x1.3, bend cap 65, bend half gear) on
+    both engines. Tick 0 plays gear id 3 on every joint: the applied
+    torque is 1/2 x tau_max on the two bend joints (tau_max 1.06 x 1.3)
+    and 1/4 elsewhere. The held envs then swing both wrist bends with
+    sustained alternating full gears, so the bend speed must pass the
+    default 50 rad/s cap and stay under the 65 one."""
+    a = _recipe()
+    assert a.gears == 5
+    tau = parse_tau_scale(a.tau_center)
+    gear = gear_table(5)
+    peak = [0.0]
+
+    def expected_torque(bend_frac, bend_tau):
+        grp = [0.0, 0.0, 0.0]
+        for j in range(N_JOINTS):
+            bend = j in BEND_J
+            t = abs((bend_frac if bend else gear[3])
+                    * (bend_tau if bend else TAU_MAX[j])
+                    * tau[TAU_AXIS_OF_JOINT[j]])
+            grp[0 if j < 3 else (1 if j < 17 else 2)] += t
+        return [sum(grp)] + grp
+
+    def act_hook(t, acts):
+        if t == 0:
+            acts[:] = 3
+        else:
+            for e in PRODUCTION[1]:
+                acts[e, list(BEND_J)] = 1 if (t // SWING_TICKS) % 2 else 2
+
+    def tick_hook(t, env, sims, done):
+        if t == 0:
+            want = expected_torque(0.5, 1.06 * 1.3)
+            for e, sim in enumerate(sims):
+                np.testing.assert_allclose(sim.last_torque(), want,
+                                           rtol=1e-12, atol=0)
+                np.testing.assert_allclose(env.tau_stat[e, :4].tolist(),
+                                           want, rtol=1e-12, atol=0)
+            # the default half/quarter gear would differ visibly
+            assert abs(expected_torque(0.25, 1.06 * 1.3)[2] - want[2]) > 0.5
+        for e, sim in enumerate(sims):
+            if not done[e]:
+                _q, v = rust_state(sim)
+                peak[0] = max(peak[0], *(abs(v[6 + j]) for j in BEND_J))
+                assert all(abs(v[6 + j]) <= 65.0 + 1e-9 for j in BEND_J), \
+                    f"t{t} env{e} bend over the 65 cap"
+
+    probe = beat_arena_rs.RawBeatSim(gears=5, foot_contact=True)
+    probe.set_body(**MOD_BODY)
+    info = probe.body_info()      # read back from the sim's model
+    assert (info["hand_mass"], info["hand_inertia"],
+            info["wrist_bend_tau_max"], info["wrist_bend_cap"],
+            info["wrist_bend_gear3"], info["gear3"]) == \
+        (0.5, 0.000264 * (0.5 / 0.35), 1.06 * 1.3, 65.0, 0.5, 0.25)
+    ends, sims = _lockstep(a, *PRODUCTION, body=MOD_BODY,
+                           act_hook=act_hook, tick_hook=tick_hook)
+    print(f"modified body: peak wrist-bend speed {peak[0]:.2f} rad/s")
+    assert 50.0 < peak[0] <= 65.0 + 1e-9, peak[0]
+    assert "completed" in [r for r, _ in ends.values()], ends
+
+
+def _lockstep(a, N, HELD, chart_s, seeds, walls, body=None,
+              act_hook=None, tick_hook=None):
     """Run the lockstep over whole episodes; returns (ends, sims) where
-    ends[e] = (termination reason, ticks)."""
+    ends[e] = (termination reason, ticks). body: run-only env-body
+    options for BOTH engines (None = default body); act_hook(t, acts)
+    may rewrite the tick's actions (ended envs are zeroed after it);
+    tick_hook(t, env, sims, done) runs after each tick's checks."""
     # the kwargs mirror the ranked-pool (production) branch
     assert a.ranked_maps and a.foot_contact and a.ep_stats
     assert a.z_asinh is None and Z_ASINH_C == 8.0, \
@@ -222,7 +302,7 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
     assert {(False, 0), (False, 1), (True, 0)} <= kinds, kinds
     max_steps = max(int((max(n.hit_time for n in ch) + 0.5) * 30) + 90
                     for ch in charts)
-    env, sims = _build(a, charts, walls, max_steps, tau)
+    env, sims = _build(a, charts, walls, max_steps, tau, body)
     env.reset()
     assert env.chart_idx.cpu().tolist() == list(range(N))
     np.testing.assert_array_equal(env.tau_scale.cpu().numpy(),
@@ -249,6 +329,8 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
         acts = rng.integers(0, a.gears, size=(N, N_JOINTS))
         for e in HELD:
             acts[e, POSTURE_J] = 0
+        if act_hook is not None:
+            act_hook(t, acts)
         for e in range(N):
             if done[e]:
                 acts[e] = 0
@@ -357,6 +439,8 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
         np.testing.assert_array_equal(
             pops_c, pops_r,
             err_msg=f"t{t} [fall, tilt, lift L, lift R, envelope, pd]")
+        if tick_hook is not None:
+            tick_hook(t, env, sims, done)
         if all(done):
             break
         # resync: live envs re-take Rust's state; ended envs park at the
