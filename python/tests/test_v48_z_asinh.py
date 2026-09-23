@@ -68,6 +68,14 @@ def test_asinh_keeps_far_notes_distinct():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("c", [0.0, -1.0])
+def test_cuda_env_refuses_nonpositive_c(c):
+    from beat_arena_env.cuda_env import CudaBeatVecEnv
+    with pytest.raises(ValueError, match="z_asinh must be > 0"):
+        CudaBeatVecEnv(1, device="cuda", z_asinh=c)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("c", [None, 2.0, 8.0])
 def test_cuda_rust_parity(c):
     o = run_child("parity", c)
