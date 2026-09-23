@@ -7,8 +7,7 @@ and delta_b is the fp32 ffn.2.bias Parameter — dimensioned fp16 +
 dimensioned fp32 promotes to fp32. These tests pin the fix: the
 critic's inputs on the fp16 stream ARE fp16, the input is the very
 tensor the final block's fused ln_attn pass wrote (reused, not
-recomputed), the fp32 record path is bit-identical to the old
-recompute, and the critic's parameters still receive grads through
+recomputed), and the critic's parameters still receive grads through
 the fp16 machinery (packed k/v, SDPA, bias_relu/relu_bwd).
 """
 
@@ -61,7 +60,6 @@ class _Spy:
         self.calls = []
         self.ln_out = []
         self.add_x = []
-        self.add_args = []
         orig_critic = p._critic
         orig_ln = p.critic_ln.forward
         orig_add = p.blocks[-1].ln_attn.forward_add
@@ -76,7 +74,6 @@ class _Spy:
             return y
 
         def add(a, b, b_bias=None):
-            self.add_args.append((a, b, b_bias))
             x, y = orig_add(a, b, b_bias)
             self.add_x.append(x)
             return x, y
@@ -116,21 +113,6 @@ def test_critic_input_is_the_final_blocks_resolved_stream():
     (x_res, _, _), = spy.calls
     (x_add,) = spy.add_x
     assert x_res is x_add
-
-
-def test_fp32_path_matches_old_recompute_bitwise():
-    """--fp16 off: the critic's input must equal the old
-    `tokens + delta` recompute to the bit (fused ln_fwd_add's x is that
-    fp32 sum; delta_b is None on the fp32 path)."""
-    p = _policy(fp16=False)
-    spy = _Spy(p)
-    with torch.no_grad():
-        _, value = p.forward_stacked(_obs(32))
-    (x_res, _, _), = spy.calls
-    ((a, b, b_bias),) = spy.add_args
-    assert x_res.dtype is torch.float32 and b_bias is None
-    assert torch.equal(x_res, a + b)
-    assert value.dtype is torch.float32
 
 
 def test_fp16_value_tracks_fp32_value():

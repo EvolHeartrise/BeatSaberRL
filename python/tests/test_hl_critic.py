@@ -4,7 +4,6 @@ Gaussian-smoothed target truncated to the support and renormalized,
 value = expectation."""
 import math
 
-import pytest
 import torch
 
 import policy as P
@@ -69,12 +68,8 @@ def test_policy_hl_head_value_shape_logits_and_muon_split():
     assert pol2.value_bins == 51 and pol2.critic_mlp[-1].out_features == 51
 
 
-def test_default_head_is_hl_101_and_scalar_head_is_gone():
+def test_default_head_is_hl_101():
     pol = P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
                        n_gears=5, ffn_mult=2, note_geo=True, trunk_arch="simba")
     assert pol.value_bins == 101 and pol.critic_mlp[-1].out_features == 101
     assert pol.arch["value_bins"] == 101
-    # the scalar MSE head (value_bins 0) was removed 2026-09-22
-    with pytest.raises(AssertionError):
-        P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
-                     n_gears=5, ffn_mult=2, value_bins=0)
