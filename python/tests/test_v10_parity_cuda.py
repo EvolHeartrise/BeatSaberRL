@@ -21,9 +21,9 @@ ANY non-bitwise mirror. The f64 tier is therefore:
 
  - single-tick / short-horizon free-running parity at tight tolerance,
  - LOCKSTEP-RESYNC full episodes (the CUDA env re-takes Rust's exact
-   state each tick, so drift never accumulates): counters, score
-   decomposition, per-note status, done timing EXACT over whole
-   episodes; per-tick rewards within the score-rounding flip band,
+   state each tick, so drift never accumulates) — in the production
+   (contact) configuration since 2026-09-22:
+   tests/test_production_lockstep.py,
  - an f32 well-formedness + statistical tier.
 
 The whole module is skipped without CUDA (the kernel has no CPU path).
@@ -239,75 +239,6 @@ def test_free_running_gentle_horizon():
             tight[e] = False
             assert rew_d < 0.1, f"t{t} env{e} flipped beyond sanity"
     assert sum(tight) >= 4, f"only {sum(tight)}/8 envs stayed tight"
-
-
-# --- (c) lockstep-resync full episodes ---------------------------------------
-
-def _lockstep_episode(charts, gears, seed):
-    """Run CUDA + Rust over full episodes, re-syncing the CUDA dynamics
-    state to Rust's after every tick (drift never accumulates; the env
-    layer — swing chain, trackers, status, counters — evolves freely on
-    each side). Returns per-tick stats."""
-    max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
-    n = len(charts)
-    env = _cenv(charts, gears, max_steps)
-    env.reset()
-    sims = _rust_sims(charts, gears, max_steps)
-    rng = np.random.default_rng(seed)
-    done_r = [False] * n
-    flip_ticks = 0
-    env_ticks = 0
-    max_rew_diff = 0.0
-    for t in range(max_steps):
-        acts = rng.integers(0, gears, size=(n, N_JOINTS))
-        tobs, trew, tdone, _ = env.step(torch.as_tensor(acts))
-        q36s, v35s = [], []
-        for e, sim in enumerate(sims):
-            if not done_r[e]:
-                obs_r, rew_r, d_r, _ev = sim.step([int(x) for x in acts[e]])
-                assert d_r == bool(tdone[e]), f"t{t} env{e} done"
-                d = np.abs(np.asarray(obs_r) - tobs[e].cpu().numpy())
-                if (d > 1e-3).any():
-                    flip_ticks += 1  # knife-edge branch flip this tick
-                env_ticks += 1
-                max_rew_diff = max(max_rew_diff, abs(rew_r - float(trew[e])))
-                done_r[e] = d_r
-            q, v = rust_state(sim)
-            q36s.append(q)
-            v35s.append(v)
-        resync(env, q36s, v35s)
-        if all(done_r):
-            break
-    assert all(done_r), "episodes did not finish inside max_steps"
-    return env, sims, flip_ticks, env_ticks, max_rew_diff
-
-
-def test_lockstep_episode_parity():
-    charts = _charts(FULL, range(200, 208))
-    env, sims, flips, ticks, rew_diff = _lockstep_episode(charts, 5, 11)
-    # per-tick rewards: identical up to integer score-rounding flips at
-    # razor-thin pre/acc boundaries (<= 2 pts = 2/115)
-    assert rew_diff <= 0.05, f"reward diff {rew_diff}"
-    # knife-edge obs flips are rare. Band 5% -> 8% (2026-08-18): the
-    # fist-only hand + cap-50 wrist is twitchier, so more ticks sit at
-    # discrete-threshold knife edges where f32-vs-f64 flips (measured
-    # 5.8% at the change)
-    assert flips <= 0.08 * ticks, f"{flips}/{ticks} flip ticks"
-    # counters / score decomposition / per-note status: EXACT
-    for e, sim in enumerate(sims):
-        cnt = ((sim.good_cuts, sim.bad_cuts, sim.misses, sim.bombs_hit),
-               (int(env.good[e]), int(env.bad[e]), int(env.miss[e]),
-                int(env.bombs[e])))
-        assert cnt[0] == cnt[1], f"env{e} counters {cnt}"
-        assert sim.score == float(env.score[e]), f"env{e} score"
-        pre, acc, post = sim.score_components()
-        assert (pre, acc, post) == (float(env.score_pre[e]),
-                                    float(env.score_acc[e]),
-                                    float(env.score_post[e])), f"env{e}"
-        np.testing.assert_array_equal(
-            np.array(sim.status(), dtype=np.uint8),
-            env.status[e, :len(sim.status())].cpu().numpy(),
-            err_msg=f"env{e} status")
 
 
 def test_contact_rich_parity_midline_press():
