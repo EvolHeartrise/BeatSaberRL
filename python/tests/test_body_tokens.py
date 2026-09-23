@@ -57,7 +57,7 @@ def _policy(seed=0, **kw):
     torch.manual_seed(seed)
     return P.NotePolicy(embed=64, trunk_dim=128, n_blocks=2, n_heads=4,
                         n_gears=5, ffn_mult=4,
-                        note_geo=True, trunk_arch="simba",
+                        note_geo=True,
                         value_bins=101, **kw)
 
 
