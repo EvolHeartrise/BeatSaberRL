@@ -722,6 +722,7 @@ test_v10_bot.py`): JS full-body FK vs sim-logged `sabers` wrist ≤ 1e-6;
 replay v10 parse + version rejection; per-joint τ/ω gauges + foot
 reaction-force display render (screenshot smoke); gravity-compensated
 PD-over-IK bot ≥ 50 % good cuts on the default chart (v9 solvability bar).
+(The bot and its gate were removed 2026-09-22.)
 
 ## 8. Decisions record (locked 2026-07-31)
 
@@ -900,7 +901,8 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        (`tests_fk::v9_fk_continuity`); nothing live called it. Both
        were REMOVED 2026-09-22 — the v10 FK is the only Rust
        reference now. `kinematics.py` remains its Python mirror,
-       banner-marked v9-legacy (its IK feeds the P6 bot rebuild).
+       banner-marked v9-legacy (its IK, which fed the P6 bot, was
+       removed with the bot 2026-09-22).
     b. **Effort's "post-solve substep velocity"** — RETIRED with the
        work reading 2026-09-13 (was: the END-of-substep velocity after
        the step-11 clamps and step-12 envelope, pinned bitwise in

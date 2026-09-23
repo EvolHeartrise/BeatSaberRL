@@ -5,8 +5,8 @@ Covers the v10 additions under the bot: the full-body FK mirror
 gravity-compensation torques (vs a finite-difference gradient of the
 potential), the constrained-stance feedforward, the P6 additive
 introspection (`weld_impulses`) and the additive replay fields
-("feet", "activation"). The bot's solvability gate itself lives in
-test_env.py::test_scripted_bot_solves_easy (the v9 slot).
+("feet", "activation"). The bot itself and its solvability gate were
+removed 2026-09-22; these support-layer checks stay.
 """
 
 import json

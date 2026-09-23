@@ -17,9 +17,8 @@ Moved tests (re-authored in tests/test_v10_env.py, the P3 gate file):
   - test_effort_penalty_tiers -> test_effort_is_priced_positive_work
                               (the EFFORT_COST table is retired; effort
                               is positive mechanical work, SPEC-v10 §4)
-P6 (2026-07-31): test_scripted_bot_solves_easy un-skipped — the bot is
-the gravity-compensated PD-over-IK re-author (scripted.py), gate floors
-honestly re-based to the measured v10 band (see its docstring).
+The scripted reference bot and its solvability gate
+(test_scripted_bot_solves_easy) were removed 2026-09-22.
 """
 
 import math
@@ -938,38 +937,6 @@ def test_chain_links_layout():
     assert all(a < b for a, b in zip(xs, xs[1:]))         # marches toward tail
     assert xs[-1] == pytest.approx(col_x(2))              # ends at the tail
     assert all(l.kind == KIND_CHAIN_LINK and l.any_dir for l in links)
-
-
-# --- scripted bot solvability ------------------------------------------------
-
-def test_scripted_bot_solves_easy():
-    """P6 solvability referee: the gravity-compensated PD-over-IK bot
-    on the default gym (both hands, default dials — the v9 "easy
-    gate" config), 5 eps, gears=5.
-
-    HONEST RE-BASING of the SPEC-v10 §7 P6 aspiration (>= 50%): after
-    13 documented tuning iterations the bot lands ~37% good cuts /
-    ~28 pts per note (5-seed refs 2026-07-31: easy right-only 36.4%,
-    hard both-hands 36.9%, dynamic 33.0% — vs random ~5-7% and the
-    retired v9 kinematic bot's 59-66%). The drop is the v6-precedent
-    cost of the physics jump: gravity, free-root reaction coupling,
-    and the coarse gear ladder (min nonzero torque = 1/4 τ_max at
-    K=5) put a floor on tracking error the kinematic body never had.
-    Floors below sit under the measured band with seed-noise margin;
-    score/note >= 18 still proves real swings (stab ceiling is 15)."""
-    from beat_arena_env.scripted import scripted_action
-    good, total, score = 0, 0, 0.0
-    for seed in range(5):
-        env = RustBeatEnv(foot_contact=False, seed=seed, gears=5)
-        env.reset(seed=seed)
-        done = False
-        while not done:
-            _, _, done, _, info = env.step(scripted_action(env))
-        good += info["good_cuts"]
-        total += info["n_notes"]
-        score += info["score"]
-    assert good / total >= 0.25, (good, total)
-    assert score / total >= 18.0, (score, total)
 
 
 # --- BeatSaver parser (fixtures cover all three schemas + v7 objects) --------
