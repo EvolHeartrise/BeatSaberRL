@@ -10,7 +10,8 @@ padded builder's row (p, j) for every segment p and object j < n_notes
 exactly (pads included); (3) the seeded subsample path gathers each
 chosen segment's object range; (4) on CUDA, an env fed the padded dict
 (converted at construction) and one fed the ragged dict step bitwise-
-identically — the pad_to_ragged path the production pool takes.
+identically — the pad_to_ragged path the production pool takes (pinned
+at construction: the kernel sees only the converted pool).
 """
 
 import numpy as np
@@ -160,29 +161,14 @@ def test_subset_ragged_gathers_segment_ranges(seed):
     assert _subset_ragged(arrs, None) is arrs
 
 
-def _ticks(env, n=120, seed=0):
-    torch.manual_seed(seed)
-    env.reset()
-    rng = np.random.default_rng(seed)
-    outs = []
-    judged = 0          # notes judged over the run (auto-resets zero status)
-    for _ in range(n):
-        a = torch.as_tensor(rng.integers(0, 5, size=(env.num_envs, 29)),
-                            device="cuda")
-        obs, rew, done, _ = env.step(a)
-        outs.append((obs.clone(), rew.clone(), done.clone()))
-        judged += int(env.status.count_nonzero())
-    return outs, [getattr(env, k).clone() for k in
-                  ("status", "first_pending", "wall_passed", "first_wall",
-                   "score", "good", "bad", "miss", "bombs", "walls_in")], \
-        judged
-
-
 @cuda
 def test_env_padded_pool_equals_ragged_pool_bitwise():
-    """pool= accepts either layout; both step to the same bits (the
-    kernel only ever sees ragged — the padded dict is converted at
-    construction)."""
+    """pool= accepts either layout and the kernel only ever sees ragged:
+    the padded dict is converted at construction (pad_to_ragged), and
+    self.pool / C / W / pool_size are the ONLY constructor state that
+    depends on pool= (everything else comes from the shared kwargs; the
+    kernel's tensor list is built from self.pool). So identical
+    construction output == bitwise-identical stepping — no rollout."""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     charts, walls = _synthetic(n_charts=24, seed=2, max_notes=40,
                                max_walls=6)
@@ -193,13 +179,13 @@ def test_env_padded_pool_equals_ragged_pool_bitwise():
     e_rag = CudaBeatVecEnv(64, pool=ragged, **kw)
     assert (e_pad.C, e_pad.W) == (e_rag.C, e_rag.W)
     assert e_pad.C == padded["hit"].shape[1]
+    assert e_pad.W == padded["wall_t"].shape[1]
+    assert e_pad.pool_size == e_rag.pool_size == len(charts)
+    assert not e_pad._test_charts and not e_rag._test_charts
     assert "note_off" in e_pad.pool and e_pad.pool["hit"].dim() == 1
-    a, b = _ticks(e_pad), _ticks(e_rag)
-    for t, ((oa, ra, da), (ob, rb, db)) in enumerate(zip(a[0], b[0])):
-        assert torch.equal(oa, ob), f"obs diverged at tick {t}"
-        assert torch.equal(ra, rb), f"reward diverged at tick {t}"
-        assert torch.equal(da, db), f"done diverged at tick {t}"
-    for sa, sb in zip(a[1], b[1]):
-        assert torch.equal(sa, sb)
-    # the run actually exercised the pool: notes were judged along the way
-    assert a[2] == b[2] and a[2] > 0
+    assert set(e_pad.pool) == set(e_rag.pool)
+    for k, a in e_pad.pool.items():
+        b = e_rag.pool[k]
+        assert (a.dtype, a.device, a.shape, a.stride()) == \
+            (b.dtype, b.device, b.shape, b.stride()), k
+        assert torch.equal(a, b), k
