@@ -819,7 +819,8 @@ class CudaBeatVecEnv:
         # passes it), which sorts by (chart, first_pending) each tick so
         # warp-mates share note windows. A bijection on thread->env
         # assignment only — per-env results are bitwise-identical under
-        # ANY permutation (tests/test_env_order_bitwise.py).
+        # ANY permutation (the sorted mode is pinned against identity in
+        # tests/test_env_order_bitwise.py).
         self.env_order = torch.arange(N, dtype=torch.int32,
                                       device=self.device)
         self._env_order_on = bool(env_order)

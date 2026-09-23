@@ -5,8 +5,9 @@ permutation, because it only reassigns threads to envs and every P.*[e]
 address is unchanged. Gate: full state + obs/reward/done equality of the
 live sorted mode (CudaBeatVecEnv(env_order=True), what the trainer runs)
 against the identity ordering, with the sort shown to have actually
-permuted the envs. Run-to-run determinism of the contact kernel is
-pinned by test_v11_contact_parity.py::test_contact_determinism_bitwise."""
+permuted the envs. Sorted-mode run-to-run determinism follows: sorted
+== identity bitwise, and the identity order's determinism is pinned by
+test_v11_contact_parity.py::test_contact_determinism_bitwise."""
 import numpy as np
 import torch
 
