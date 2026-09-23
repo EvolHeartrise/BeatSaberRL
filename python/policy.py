@@ -249,7 +249,7 @@ _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
 
 
 def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
-              z_asinh: float = 8.0) -> torch.Tensor:
+              z_asinh: float | None = None) -> torch.Tensor:
     """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
     (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
 
@@ -264,6 +264,8 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
     its second layer, fed by far tokens' large hidden activations from
     these raw-metre lanes."""
     if norm:
+        assert z_asinh is not None and z_asinh > 0, (
+            f"note_geo_norm needs the obs z encoding C > 0, got {z_asinh}")
         z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
     else:
         z_m = notes[..., 2] * _Z_SCALE
@@ -974,7 +976,9 @@ def load_policy(ckpt) -> NotePolicy:
     """Rebuild a NotePolicy from a checkpoint dict. v10 checkpoints
     carry obs_dim/n_action_heads/body_token arch markers; anything else
     (v9 and earlier: obs 290 / 14 heads, no body token) is REFUSED —
-    the v10 body retired every earlier checkpoint (house pattern)."""
+    the v10 body retired every earlier checkpoint (house pattern).
+    Also refused: an arch without z_asinh > 0 (the obs z encoding the
+    note_geo_norm lanes decode with; never defaulted)."""
     arch = ckpt.get("arch", {})
     if arch.get("body_tokens", 1) != 3:
         raise SystemExit(
