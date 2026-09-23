@@ -167,9 +167,10 @@ def test_gears_cuda_parity():
     action stream is BITWISE identical across K=3/5/7 on the CUDA
     backend (ids 1/2 are +/-full at every K); (b) short-horizon f64
     CUDA-vs-Rust agreement holds at the transcendental-seed band for
-    the production K=5 table (K=3/7 table math is pinned CPU-side in
-    test_gear_tables; full free-running parity semantics live in
-    test_v10_parity_cuda.py)."""
+    the production K=5 table (the Python/Rust K=3/7 tables are pinned
+    CPU-side in test_gear_tables; the kernel's own GEAR_TAB K=7 fine
+    ids are not CUDA-checked; full free-running parity semantics live
+    in test_v10_parity_cuda.py)."""
     import torch
     if not torch.cuda.is_available():
         pytest.skip("CUDA env needs CUDA")

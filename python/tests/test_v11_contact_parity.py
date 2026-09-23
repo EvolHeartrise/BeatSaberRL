@@ -147,7 +147,9 @@ def _rust_one_ulp_flips(q36s, v35s, acts, gears):
 
 # --- (i) f64: single tick from random stance states ---------------------------
 
-# production gears only: K=3/7 table math is pinned CPU-side in test_gears
+# production gears only. K=3 still runs on CUDA elsewhere (the env default);
+# the K=7 fine ids 3-6 of the kernel's GEAR_TAB copy are no longer
+# CUDA-vs-Rust checked (K=7 is not a production setting)
 @pytest.mark.parametrize("gears,n_states,seed", [(5, 32, 800)])
 def test_contact_single_tick_parity(gears, n_states, seed):
     """One 30 Hz tick (8 constrained substeps with the ground block) from
