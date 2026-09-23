@@ -44,6 +44,7 @@ def main():
     a = ap.parse_args()
     counts = np.zeros((29, 5), dtype=np.int64)
     tau_scale = None
+    body = None
     tele = np.zeros(4)
     n_ticks = 0
     per_file = []
@@ -55,6 +56,11 @@ def main():
             if tau_scale is None:
                 tau_scale = ts
             assert list(ts) == list(tau_scale), (f, ts)
+            # run-only body options (record_rev 6; absent = default)
+            b = _c.env_body(hdr.get("env_body"))
+            if body is None:
+                body = b
+            assert b == body, (f, b)
             for line in fh:
                 r = json.loads(line)
                 acts.append(r["action"])
@@ -65,8 +71,15 @@ def main():
         n_ticks += len(acts)
         per_file.append({"file": os.path.basename(f), "ticks": int(len(acts))})
     share = counts / max(n_ticks, 1)
-    lim = TAU_MAX * np.asarray([tau_scale[TAU_AXIS_OF_JOINT[j]] for j in range(29)])
-    mean_tau = (share * np.abs(GEAR)[None, :]).sum(axis=1) * lim
+    # the body's per-joint tau_max and gear table (wrist bends may differ)
+    tmax = TAU_MAX.copy()
+    gear = np.tile(np.abs(GEAR), (29, 1))
+    for j in _c.WRIST_BEND_JOINTS:
+        tmax[j] *= body["wrist_bend_tau_mult"]
+        if body["wrist_bend_half_gear"]:
+            gear[j, 3:5] = 0.5
+    lim = tmax * np.asarray([tau_scale[TAU_AXIS_OF_JOINT[j]] for j in range(29)])
+    mean_tau = (share * gear).sum(axis=1) * lim
     dead = int((share < 0.01).sum())
     groups = {}
     for g, js in GROUPS.items():
@@ -78,9 +91,9 @@ def main():
                      "mean_tau_sum": float(mean_tau[js].sum())}
     tele /= max(n_ticks, 1)
     out = {"label": a.label, "ticks": n_ticks, "files": per_file,
-           "tau_scale": tau_scale, "dead_cells": dead,
+           "tau_scale": tau_scale, "env_body": body, "dead_cells": dead,
            "joints": [{"name": JOINTS[j], "share": share[j].tolist(),
-                       "tau_max": float(TAU_MAX[j]), "tau_lim": float(lim[j]),
+                       "tau_max": float(tmax[j]), "tau_lim": float(lim[j]),
                        "mean_tau": float(mean_tau[j])} for j in range(29)],
            "groups": groups,
            "gear_total_tau": float(mean_tau.sum()),

@@ -123,7 +123,9 @@ class RustBeatEnv(gym.Env):
             # never as an error. 5 = header "tau_scale" (env v46, the 16
             # per-axis torque-limit scales this episode played with;
             # 2026-09-16) — a HEADER field, per-tick record unchanged.
-            "record_rev": 5,
+            # 6 = header "env_body" (the run-only body options,
+            # 2026-09-22; absent = constants.ENV_BODY_DEFAULT).
+            "record_rev": 6,
             "tau_scale": [round(v, 6) for v in self.tau_scale],
             # run-only body options (2026-09-22), ADDITIVE header field:
             # absent = the default body (constants.ENV_BODY_DEFAULT)
@@ -178,7 +180,9 @@ class RustBeatEnv(gym.Env):
         # them as optional): "feet" = per-foot [L, R] tick-summed weld
         # impulses [jx, jy, jz, jax, jay, jaz] (N·s; ground reaction —
         # vertical force ≈ jy/DT). τ per joint is NOT logged: it is
-        # exactly gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
+        # derivable from "action", the header "tau_scale" and (rev 6)
+        # "env_body" — gear x TAU_MAX x scale, with the wrist-bend
+        # joints' tau_max / half gear taken from env_body.
         # record_rev 3 (2026-09-13): the P6 "effort" (positive work, J)
         # field is GONE; "activation" = this tick's commanded |gear
         # fraction| summed [total, spine, arms, legs] (the retired v23

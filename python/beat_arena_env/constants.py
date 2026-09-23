@@ -17,6 +17,7 @@ layout. World geometry, judgment, scoring, chart generation are
 UNCHANGED from env v7-v9.
 """
 
+import argparse
 import math
 
 DT = 1.0 / 30.0
@@ -342,6 +343,9 @@ WRIST_BEND_JOINTS = (8, 15)
 ENV_BODY_DEFAULT = {"hand_mass": 0.35, "wrist_bend_tau_mult": 1.0,
                     "wrist_bend_cap": 50.0, "wrist_bend_half_gear": False}
 _HAND_INERTIA_NOM = 0.000264   # per axis at hand_mass 0.35
+# step.rs's one-substep stop-overshoot bound is H_SUB x cap; the 0.35 rad
+# teleport backstop must stay out of reach, so cap < 0.35 x 240 = 84
+WRIST_BEND_CAP_MAX = 84.0
 assert TAU_MAX[8] == TAU_MAX[15] == 1.06
 assert OMEGA_CAP[8] == OMEGA_CAP[15] == ENV_BODY_DEFAULT["wrist_bend_cap"]
 
@@ -360,6 +364,11 @@ def env_body(body=None, gears=None):
         out[k] = float(out[k])
         if not (math.isfinite(out[k]) and out[k] > 0):
             raise ValueError(f"env_body {k} must be finite and > 0, got {out[k]}")
+    if not out["wrist_bend_cap"] < WRIST_BEND_CAP_MAX:
+        raise ValueError(f"env_body wrist_bend_cap must be < "
+                         f"{WRIST_BEND_CAP_MAX:g} rad/s (the H_SUB x cap stop "
+                         f"overshoot would reach the 0.35 rad teleport "
+                         f"backstop), got {out['wrist_bend_cap']}")
     out["wrist_bend_half_gear"] = bool(out["wrist_bend_half_gear"])
     if gears is not None and out["wrist_bend_half_gear"] and gears != 5:
         raise ValueError(f"wrist_bend_half_gear needs gears=5, got {gears}")
@@ -401,7 +410,7 @@ def add_env_body_args(p):
                             "checkpoint (ckpt['env_body']); if given it must "
                             "agree with it")
     p.add_argument("--wrist-bend-half-gear", default=None,
-                   action=__import__("argparse").BooleanOptionalAction,
+                   action=argparse.BooleanOptionalAction,
                    help="run-only body option — read from the checkpoint; "
                         "if given it must agree with it")
 

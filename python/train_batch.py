@@ -501,6 +501,7 @@ def parse_args():
     # run-only body options (2026-09-22, user). Default None = inherit
     # the --resume / --init-from checkpoint's env_body (absent = the
     # default body), else the default body — bit-for-bit the tables.
+    # --resume refuses a different body; --init-from allows it.
     # Recorded as ckpt["env_body"]; bench / replays configure from it.
     p.add_argument("--hand-mass", type=float, default=None,
                    help="mass (kg) of BOTH hands; inertia scales with it "
@@ -514,7 +515,9 @@ def parse_args():
     p.add_argument("--wrist-bend-cap", type=float, default=None,
                    help="omega cap (rad/s) of the two wrist-BEND joints "
                         "only (solver clamp + their qd obs normalizer); "
-                        "wrist roll/dev keep 50. Default 50")
+                        "wrist roll/dev keep 50. Must be < 84. Default 50. "
+                        "All four body flags: unset = inherit the "
+                        "--resume/--init-from checkpoint's body")
     p.add_argument("--wrist-bend-half-gear", default=None,
                    action=argparse.BooleanOptionalAction,
                    help="the two wrist-BEND joints' +/-1/4 gears (ids 3/4) "
@@ -960,8 +963,9 @@ def main():
     # untouched, and bench JSONs still stamp forward=graphed/eager.)
 
     # run-only body options: unset flags inherit the checkpoint's body
-    # (resume, else init), else the default body; a flag that changes a
-    # checkpoint's body is allowed (a deliberate body switch) but loud
+    # (resume, else init), else the default body. An exact --resume may
+    # not switch the body (the z_asinh precedent); --init-from may (a
+    # deliberate warm start onto a new body), loudly
     _body_ck = resume_ckpt if resume_ckpt is not None else init_ckpt
     _body_base = (env_body_of_ckpt(_body_ck) if _body_ck is not None
                   else env_body())
@@ -975,6 +979,11 @@ def main():
         setattr(args, _k, _v)   # resolved values -> args.json / ckpt args
     if body_cfg != env_body():
         print(f"[body] NON-DEFAULT env body: {body_cfg}", flush=True)
+    if resume_ckpt is not None and body_cfg != _body_base:
+        raise SystemExit(
+            f"--resume: checkpoint was trained on env body {_body_base} but "
+            f"this run asks for {body_cfg}; drop the body flags to inherit "
+            f"it (a body switch is an --init-from warm start)")
     if _body_ck is not None and body_cfg != _body_base:
         print(f"!!! [body] this run's env body {body_cfg} differs from the "
               f"checkpoint's {_body_base}", flush=True)
