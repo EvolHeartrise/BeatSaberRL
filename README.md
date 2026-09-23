@@ -92,9 +92,13 @@ $VENV/bin/python -m pytest tests/
 # the trainer: its defaults ARE the production recipe (the v58 trunk,
 # since 2026-09-22), so a bare launch is a v58-recipe trunk on the cuda env
 $VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
-# leaf: branch a cooldown off a numbered trunk checkpoint
+# leaf: branch a cooldown off a numbered trunk checkpoint. A resume
+# takes only lr/ent/schedule/z/arch from the checkpoint; every other
+# knob is CLI, so a leaf states where it departs from the trunk recipe
+# (walls stay solid as in the bench; --ent-final is the leaf's target)
 $VENV/bin/python train_batch.py --resume runs/NAME/trunk_updNNNNN.pt \
-    --cooldown-updates 400 --run-dir runs/NAME_leaf
+    --cooldown-updates 400 --no-wall-despawn --ent-final 3e-6 \
+    --run-dir runs/NAME_leaf
 # rust env = the CPU path AND the parity reference: small shapes, and
 # the recipe's ranked pool (and --ep-stats on it) is CUDA-only
 $VENV/bin/python train_batch.py --env rust --no-ranked-maps --no-ep-stats \
@@ -103,8 +107,11 @@ $VENV/bin/python train_batch.py --env rust --no-ranked-maps --no-ep-stats \
 
 Recipe switches are `--flag/--no-flag` pairs (`--no-ranked-maps`,
 `--no-mirror-augment`, `--no-ep-stats`, `--no-limit-arms`,
-`--no-wall-despawn`); the critic is HL-Gauss (101 bins), the only head
-since 2026-09-22 (the scalar MSE head and `--value-head` were removed).
+`--no-wall-despawn`). With `--no-ranked-maps --env cuda` pass
+`--chart-pool 65536` (the default 999999 is the ranked level subsample;
+on the procedural generator it would build ~1M charts). The critic is
+HL-Gauss (101 bins), the only head since 2026-09-22 (the scalar MSE
+head and `--value-head` were removed).
 
 **Optimizer: hybrid Muon since 2026-09-12, the only optimizer since
 2026-09-22** (pure Adam and the per-matrix NS loop removed): Newton-Schulz
