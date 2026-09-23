@@ -186,12 +186,13 @@ def test_note_block_and_mask_track_pending():
     # x/z signature and pin the lane contents there.
     n = env.chart[0]
     from beat_arena_env.constants import note_center as nc
-    z = min(n.hit_time * n.speed, 12.0)
+    from tests._helpers import z_lane
+    z = n.hit_time * n.speed
     hit_slots = [s for s in range(N_NOTE_SLOTS)
                  if obs[OFF_NOTE_MASK + s] == 1.0
                  and abs(obs[OFF_NOTES + s * NOTE_FEAT]
                          - (nc(n)[0] - obs[OFF_HEAD])) < 1e-6
-                 and abs(obs[OFF_NOTES + s * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
+                 and abs(obs[OFF_NOTES + s * NOTE_FEAT + 2] - z_lane(z)) < 1e-6]
     assert hit_slots, "soonest note missing from the entity window"
     base = OFF_NOTES + hit_slots[0] * NOTE_FEAT
     assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22

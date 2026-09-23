@@ -603,8 +603,6 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
         save_results(out_path, data, levels)
         return
     dtype = torch.float64 if args.sim_dtype == "f64" else torch.float32
-    # the rust bench reads BEAT_Z_CLIP_HI (v28 lookahead clamp); mirror it
-    z_clip = float(os.environ.get("BEAT_Z_CLIP_HI", "12.0"))
     # slot refill (2026-09-16): N slots each play a QUEUE of levels
     # (longest-first LPT assignment); a finished slot resets onto its next
     # level in-kernel the same tick, so the wave's tick count is ~the
@@ -621,8 +619,10 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                          max_steps=max_steps, gears=policy.n_gears,
                          device=device, dtype=dtype,
                          auto_reset=False, want_contacts=False,
-                         foot_contact=True, z_clip_hi=z_clip,
-                         z_asinh=float(os.environ.get("BEAT_Z_ASINH", "0")),
+                         foot_contact=True,
+                         # main() sets it from the checkpoint; unset = the
+                         # rust sim's default (8 m)
+                         z_asinh=float(os.environ.get("BEAT_Z_ASINH", "8.0")),
                          combo_walk=True, bench_refill=True, seed=0)
     ts = parse_tau_scale(args.tau_scale)
     if ts is not None and any(abs(x - 1.0) > 1e-12 for x in ts):
@@ -780,27 +780,21 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
     mhash = model_hash(ckpt["state_dict"])
     policy = load_policy(ckpt)
-    # env v48: the obs z encoding is the CHECKPOINT's (arch, else the
-    # embedded args; pre-v48 checkpoints = 0 = legacy clamp). The rust sim
-    # reads BEAT_Z_ASINH once per process, so set it before any sim exists.
+    # env v48: the obs z encoding is the CHECKPOINT's asinh knee C (arch,
+    # else the embedded args). The rust sim reads BEAT_Z_ASINH once per
+    # process, so set it before any sim exists.
     z_asinh = float(ckpt.get("arch", {}).get(
         "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0)))
+    if not z_asinh > 0:
+        sys.exit(f"checkpoint has z_asinh {z_asinh:g}: it predates the asinh "
+                 f"z encoding (legacy clamp, removed 2026-09-22) and cannot "
+                 f"be benched")
     if os.environ.get("BEAT_Z_ASINH") not in (None, repr(z_asinh)):
         sys.exit(f"BEAT_Z_ASINH={os.environ['BEAT_Z_ASINH']} disagrees with "
                  f"the checkpoint's --z-asinh {z_asinh}; unset it")
     os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
-    # the near-field clamp the checkpoint trained with (BEAT_Z_CLIP_HI
-    # wins only when it agrees; a set-but-different value is a mismatch,
-    # not an override)
-    ck_clip = ckpt.get("args", {}).get("z_clip_hi")
-    if ck_clip is not None:
-        env_clip = os.environ.get("BEAT_Z_CLIP_HI")
-        if env_clip is not None and float(env_clip) != float(ck_clip):
-            sys.exit(f"BEAT_Z_CLIP_HI={env_clip} disagrees with the "
-                     f"checkpoint's --z-clip-hi {ck_clip}; unset it")
-        os.environ["BEAT_Z_CLIP_HI"] = repr(float(ck_clip))
-    print(f"obs z lane: {'asinh(z / %g m)' % z_asinh if z_asinh > 0 else 'clamp %s / 8' % os.environ.get('BEAT_Z_CLIP_HI', '12.0')}"
-          " (from the checkpoint)", flush=True)
+    print(f"obs z lane: asinh(z / {z_asinh:g} m) (from the checkpoint)",
+          flush=True)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy = policy.to(device).eval()
