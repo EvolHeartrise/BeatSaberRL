@@ -400,7 +400,7 @@ catalog): **~128 maps/s warm, full catalog ~48s** on the GTX 1080 box
 **CUDA-sim bench (`--sim cuda`, 2026-09-16; the Rust path stays the
 reference and the default):** every level in range plays ONCE in a single
 `CudaBeatVecEnv` wave (`auto_reset=False`, walls loaded from the parsed
-payload, `BEAT_Z_CLIP_HI` honoured like the Rust path), with the
+payload, the checkpoint's `z_asinh` z encoding like the Rust path), with the
 ScoreSaber multiplier walk run IN the kernel at the event sites (the
 `combo_walk=True` construction: `lib.rs ComboWalk` transcribed — pinned
 cut-time multipliers, follow-through points committed at the sum of a

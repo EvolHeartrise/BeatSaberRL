@@ -1616,13 +1616,11 @@ template <typename T>
 __device__ __forceinline__ T tmin(T a, T b) { return a < b ? a : b; }
 template <typename T>
 __device__ __forceinline__ T tmax(T a, T b) { return a > b ? a : b; }
+// env v48: the obs z lane for a travelling object (lib.rs z_lane mirror);
+// z_asinh > 0 always (host-validated)
 template <typename T>
-__device__ __forceinline__ T tclamp(T x, T lo, T hi);
-// env v48: the obs z lane for a travelling object (lib.rs z_lane mirror)
-template <typename T>
-__device__ __forceinline__ T z_lane(T zu, T z_lo, T z_clip_hi, T z_asinh) {
-  if (z_asinh > T(0)) return asinh((zu > z_lo ? zu : z_lo) / z_asinh);
-  return tclamp(zu, z_lo, z_clip_hi) / T(Z_SCALE);
+__device__ __forceinline__ T z_lane(T zu, T z_lo, T z_asinh) {
+  return asinh((zu > z_lo ? zu : z_lo) / z_asinh);
 }
 template <typename T>
 __device__ __forceinline__ T tclamp(T x, T lo, T hi) {
@@ -4554,16 +4552,12 @@ struct Sim {
   bool* __restrict__ done;
   int N, C, max_steps, cap, mode;  // mode: 0 step, 1 reset-all, 2 refresh
   T fall_const;   // v18 (sole mode): flat -fall_const fall reward (lib.rs mirror)
-  // v28 probe (2026-08-20): obs z-lane upper clamp (m), RUNTIME so one
-  // binary serves every era (old ckpts bench at 12; the rust twin
-  // reads BEAT_Z_CLIP_HI; its default is 12 m, set host-side).
-  T z_clip_hi;
   // env v48 (2026-09-20, user): asinh z lane — lane 2 (note z / wall
   // front) and lane 17 (wall back) become asinh(max(z, z_lo) / z_asinh)
   // (metres; linear near the plane, log far out, NO upper clamp, so far
-  // tokens stay distinguishable). 0 = legacy clamp(z_lo, z_clip_hi) /
-  // Z_SCALE. The speed lane is untouched. Recorded in the checkpoint
-  // (arch + args); the rust twin reads BEAT_Z_ASINH.
+  // tokens stay distinguishable). Always > 0 (the only z encoding
+  // since 2026-09-22). The speed lane is untouched. Recorded in the
+  // checkpoint (arch + args); the rust twin reads BEAT_Z_ASINH.
   T z_asinh;
   // env v20 (2026-08-16): per-tick penalty foot_z_coef * (|lfoot_z -
   // PLANE_Z0| + |rfoot_z - PLANE_Z0|) — linear in each foot's world-z
@@ -5089,22 +5083,20 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       // already head-anchored via z_off.
       nb2[0] = (float)((P.p_wall_cx[wb] - P.head[e * 3]) / T(X_NORM));
       nb2[1] = (float)((P.p_wall_cy[wb] - P.head[e * 3 + 1]) / T(Y_NORM));
-      nb2[2] = (float)z_lane(zfu, z_lo, P.z_clip_hi, P.z_asinh);  // env v48
+      nb2[2] = (float)z_lane(zfu, z_lo, P.z_asinh);  // env v48
       nb2[3] = (float)(-P.p_wall_speed[wb] / T(Z_SCALE));
       // lanes 4..13 (color/dir/kind/free/ex-valid) stay zero
       nb2[14] = 1.f;  // is_wall
       nb2[15] = (float)(P.p_wall_w[wb] / T(X_NORM));
       nb2[16] = (float)(P.p_wall_h[wb] / T(Y_NORM));
-      // env v36: lane 17 = BACK-face z (wall end), clamped like lane
-      // 2 to [live head z, hi] — exact for any wall length while the
-      // front face saturates inside long walls. An observable wall's
-      // back face is ahead of the head, so the floor clips nothing
-      // live — it only bounds the lane on the removal tick. (Lived in
+      // env v36: lane 17 = BACK-face z (wall end), encoded like lane
+      // 2 (floored at the live head z) — exact for any wall length. An
+      // observable wall's back face is ahead of the head, so the floor
+      // clips nothing live — it only bounds the lane on the removal tick. (Lived in
       // lane 4 for one commit; moved here 2026-08-22 so no lane is
       // binary-for-notes / continuous-for-walls under the shared
       // token encoder. Lane 17 held wall length until the same day.)
-      nb2[17] = (float)z_lane(zfu + P.p_wall_len[wb], z_lo, P.z_clip_hi,
-                              P.z_asinh);                            // env v48
+      nb2[17] = (float)z_lane(zfu + P.p_wall_len[wb], z_lo, P.z_asinh);  // env v48
     } else {
       const int64_t cb = nb + sel_idx[slot];
       const T zu = (P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off;
@@ -5113,7 +5105,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       nb2[0] = (float)((P.p_center[cb * 2] - P.head[e * 3]) / T(X_NORM));
       nb2[1] = (float)((P.p_center[cb * 2 + 1] - P.head[e * 3 + 1])
                        / T(Y_NORM));
-      nb2[2] = (float)z_lane(zu, z_lo, P.z_clip_hi, P.z_asinh);  // env v48
+      nb2[2] = (float)z_lane(zu, z_lo, P.z_asinh);  // env v48
       nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
       nb2[4] = (!bomb && !P.p_is_right[cb]) ? 1.f : 0.f;
       nb2[5] = (!bomb && P.p_is_right[cb]) ? 1.f : 0.f;
@@ -6060,11 +6052,12 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t limit_arms,
           int64_t wall_despawn,
           double start_pose_jitter, double crouch_prob,
-          double z_clip_hi, double z_asinh, double self_contact_coef,
+          double z_asinh, double self_contact_coef,
           double tau_rand, int64_t combo_walk, int64_t bench_refill,
           int64_t ep_stats) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
+  TORCH_CHECK(z_asinh > 0.0, "z_asinh must be > 0 (asinh z lane, metres)");
   const auto& q = ts[TQ];
   TORCH_CHECK(q.is_cuda(), "state must live on CUDA");
   TORCH_CHECK(actions.scalar_type() == at::kLong && actions.is_contiguous());
@@ -6213,7 +6206,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.limit_arms = (int)limit_arms;
     P.self_contact_coef = (scalar_t)self_contact_coef;
     P.wall_despawn = (int)wall_despawn;
-    P.z_clip_hi = (scalar_t)z_clip_hi;
     P.z_asinh = (scalar_t)z_asinh;
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();

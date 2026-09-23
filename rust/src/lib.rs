@@ -353,42 +353,28 @@ const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 102);
 const X_NORM: Real = 1.0;
 const Y_NORM: Real = 0.75;
 const Z_SCALE: Real = 8.0;
-const Z_CLIP: (Real, Real) = (-0.65, 12.0); // lo = PLANE_Z0 = the head/miss boundary (2026-08-22; was -3.0, briefly 0.0 — see .cu note)
-// v28 probe (2026-08-20): the obs z-lane upper clamp is runtime-
-// overridable via BEAT_Z_CLIP_HI (meters; default Z_CLIP.1 = the
-// pre-v28 era) so one binary serves every checkpoint era — the CUDA
-// twin takes it as a step parameter instead. Read once per process.
-fn z_clip_hi() -> Real {
-    static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("BEAT_Z_CLIP_HI")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(Z_CLIP.1)
-    })
-}
-// env v48 (2026-09-20, user): asinh z lane — lanes 2/17 become
+// env v48 (2026-09-20, user): asinh z lane — lanes 2/17 are
 // asinh(max(z, z_lo) / c) with c = BEAT_Z_ASINH metres (linear near the
-// plane, log far out, no upper clamp); unset/0 = the legacy clamp /
-// Z_SCALE. Read once per process like z_clip_hi; the CUDA twin takes it
-// as a step parameter (z_asinh).
+// plane, log far out, no upper clamp); the only z encoding since
+// 2026-09-22 (the legacy clamp / Z_SCALE path is gone). Unset = 8 m (the
+// recipe value); a value <= 0 or unparsable panics. Read once per
+// process; the CUDA twin takes it as a step parameter (z_asinh).
 fn z_asinh() -> Real {
     static V: std::sync::OnceLock<Real> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("BEAT_Z_ASINH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
+        let c: Real = match std::env::var("BEAT_Z_ASINH") {
+            Ok(s) => s
+                .parse()
+                .unwrap_or_else(|_| panic!("BEAT_Z_ASINH={s:?} is not a number")),
+            Err(_) => 8.0,
+        };
+        assert!(c > 0.0, "BEAT_Z_ASINH must be > 0 (metres), got {c}");
+        c
     })
 }
 /// The obs z lane for a travelling object (.cu z_lane mirror).
 fn z_lane(zu: Real, z_lo: Real) -> Real {
-    let c = z_asinh();
-    if c > 0.0 {
-        (zu.max(z_lo) / c).asinh()
-    } else {
-        zu.clamp(z_lo, z_clip_hi()) / Z_SCALE
-    }
+    (zu.max(z_lo) / z_asinh()).asinh()
 }
 const ROOT_Y0: Real = 0.94; // reference root height (obs centering)
 const HEAD_Y0: Real = 1.70; // reference head height (obs centering)
@@ -1590,10 +1576,9 @@ impl Core {
                 obs[base + 14] = 1.0; // is_wall
                 obs[base + 15] = (2.0 * w.half_w / X_NORM) as f32;
                 obs[base + 16] = (2.0 * w.half_h / Y_NORM) as f32;
-                // env v36: lane 17 = BACK-face z (wall end), clamped
-                // like lane 2 to [live head z, hi] — exact for any
-                // wall length while the front face saturates inside
-                // long walls. (Moved from lane 4 2026-08-22 so no
+                // env v36: lane 17 = BACK-face z (wall end), encoded
+                // like lane 2 (floored at the live head z) — exact for
+                // any wall length. (Moved from lane 4 2026-08-22 so no
                 // lane is binary-for-notes / continuous-for-walls
                 // under the shared token encoder; lane 17 held wall
                 // length until the same day.)

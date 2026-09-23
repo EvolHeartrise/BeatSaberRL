@@ -494,9 +494,9 @@ class CudaBeatVecEnv:
                  limit_arms=False,
                  wall_despawn=False,
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
-                 z_clip_hi=12.0, self_contact_coef=0.0, tau_rand=0.0,
+                 self_contact_coef=0.0, tau_rand=0.0,
                  combo_walk=False, bench_refill=False, ep_stats=False,
-                 tau_center=None, z_asinh=0.0, env_order=False):
+                 tau_center=None, z_asinh=8.0, env_order=False):
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -542,12 +542,11 @@ class CudaBeatVecEnv:
         # env v37: bomb-like wall despawn on charge (training-only aid;
         # bench/replays leave it off for faithful persistent walls)
         self.wall_despawn = bool(wall_despawn)
-        # v28: obs z-lane upper clamp (m), runtime per-run (arg wins;
-        # the rust twin reads BEAT_Z_CLIP_HI instead)
-        self.z_clip_hi = float(z_clip_hi)
-        # env v48: asinh z lane knee (m); 0 = legacy clamp / Z_SCALE (the
-        # rust twin reads BEAT_Z_ASINH)
+        # env v48: asinh z lane knee C (m), the only z encoding; default
+        # 8 = the recipe (the rust twin reads BEAT_Z_ASINH, unset = 8)
         self.z_asinh = float(z_asinh)
+        if not self.z_asinh > 0:
+            raise ValueError(f"z_asinh must be > 0 (metres), got {z_asinh}")
         # env v41 (2026-09-12): price on the tick-summed self-collision
         # impulse (N.s); 0 = off. Telemetry accumulates regardless.
         self.self_contact_coef = float(self_contact_coef)
@@ -902,7 +901,7 @@ class CudaBeatVecEnv:
                        int(self.limit_arms),
                        int(self.wall_despawn),
                        self.start_pose_jitter, self.crouch_start_prob,
-                       self.z_clip_hi, self.z_asinh, self.self_contact_coef,
+                       self.z_asinh, self.self_contact_coef,
                        self.tau_rand, int(self.combo_walk),
                        int(self.bench_refill), int(self.ep_stats))
 

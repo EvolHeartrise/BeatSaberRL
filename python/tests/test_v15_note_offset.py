@@ -3,14 +3,11 @@ on the Rust reference. Walking toward the notes must shift them away by
 exactly the walked amount — approach distance and miss timing are
 invariant to head z. The CUDA mirror is gated by the lockstep parity
 tiers (note lanes are part of the full obs; judgment feeds reward)."""
-import numpy as np
-
 from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import (DT, NOTE_FEAT, OFF_HEAD,
-                                      OFF_NOTES, PLANE_Z0, X_NORM, Z_CLIP,
-                                      Z_SCALE)
+                                      OFF_NOTES, PLANE_Z0, X_NORM)
 import beat_arena_rs
-from tests._helpers import ZERO_ACT
+from tests._helpers import ZERO_ACT, z_lane_m
 
 
 def _sim(chart, **kw):
@@ -40,9 +37,11 @@ def test_note_obs_z_carries_live_head_offset():
         z_off = head_z - PLANE_Z0
         max_off = max(max_off, abs(z_off))
         base = (note.hit_time - t) * note.speed
-        want = np.clip(base + z_off, *Z_CLIP)
-        got = float(obs[OFF_NOTES + 2]) * Z_SCALE
-        # f32 lanes; Z_SCALE=8 keeps the quantum ~1e-6·8
+        # env v48 asinh lane (BEAT_Z_ASINH unset -> C = 8 m); the note
+        # is far ahead of the head, so the head-z floor never binds
+        want = max(base + z_off, head_z)
+        got = z_lane_m(obs[OFF_NOTES + 2])
+        # f32 lane ~1.8: quantum ~1.2e-7 x cosh(1.8) x 8 ~ 3e-6 m
         assert abs(got - want) < 1e-4, (k, got, want)
     # the invariant must have been tested away from the trivial pose
     assert max_off > 2e-3, max_off
