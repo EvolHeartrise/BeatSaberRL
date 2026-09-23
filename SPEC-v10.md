@@ -702,7 +702,8 @@ module are deleted; see the live contract below.
 **PARITY CONTRACT (live, from 2026-08-03).** The **Rust crate is THE
 reference sim** — every rule change lands in `rust/src/` first. The
 **CUDA backend is the one gated mirror** (`--env cuda`, the training
-backend), gated by `python/tests/test_v10_parity_cuda.py` per P5. There
+backend), gated by `python/tests/test_v10_parity_cuda.py` per P5
+(whole-episode lockstep: `python/tests/test_production_lockstep.py`). There
 is no bitwise cross-implementation tier any more: the CUDA f64 branch
 is horizon-bounded tight-tolerance by construction (Divergences §21 —
 libdevice is 1 ulp off the CRT libm and nvcc contracts FMAs), so the
