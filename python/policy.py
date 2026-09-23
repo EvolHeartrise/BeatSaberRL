@@ -1014,8 +1014,7 @@ def load_policy(ckpt) -> NotePolicy:
         n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
         note_geo=arch.get("note_geo", False),
-        # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
-        trunk_arch=arch.get("trunk_arch", "mlp"),
+        trunk_arch=arch["trunk_arch"],
         trunk_hidden=arch.get("trunk_hidden"),
         value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
