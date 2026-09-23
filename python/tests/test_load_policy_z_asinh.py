@@ -1,5 +1,5 @@
 """load_policy carries the obs z encoding (2026-09-22 eval bug): the
-note_geo_norm lanes decode each note's distance as C sinh(lane) with C =
+note-geo lanes decode each note's distance as C sinh(lane) with C =
 the policy's z_asinh. load_policy used to rebuild the policy without it,
 so every v55+ bench / replay decoded far notes linearly (lane x 8) while
 training used C sinh(lane). A policy built the way train_batch.py builds
@@ -16,11 +16,11 @@ from beat_arena_env import constants as C
 
 def _trainer_policy(z_asinh, seed=0):
     # train_batch.py's fresh-run construction (recipe markers: note_geo
-    # + note_geo_norm + simba + HL critic), small widths for speed
+    # + simba + HL critic), small widths for speed
     torch.manual_seed(seed)
     return P.NotePolicy(embed=64, trunk_dim=128, n_blocks=2, n_heads=4,
                         n_gears=5, ffn_mult=4, note_geo=True,
-                        note_geo_norm=True, trunk_arch="simba",
+                        trunk_arch="simba",
                         value_bins=101, value_vmax=6.0, value_sigma=0.75,
                         z_asinh=z_asinh)
 
