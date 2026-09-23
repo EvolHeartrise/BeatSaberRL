@@ -191,12 +191,13 @@ def test_obs_reset_hands_and_notes():
     # find it by its x/z signature, then pin the lane semantics there
     n = env.chart[0]
     from beat_arena_env.constants import note_center as nc
-    z = min(n.hit_time * n.speed, 12.0)
+    from tests._helpers import z_lane
+    z = n.hit_time * n.speed
     hits = [s2 for s2 in range(N_NOTE_SLOTS)
             if obs[OFF_NOTE_MASK + s2] == 1.0
             and abs(obs[OFF_NOTES + s2 * NOTE_FEAT]
                     - (nc(n)[0] - obs[OFF_HEAD])) < 1e-6
-            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT + 2] - z / 8.0) < 1e-6]
+            and abs(obs[OFF_NOTES + s2 * NOTE_FEAT + 2] - z_lane(z)) < 1e-6]
     assert hits, "soonest note missing from the entity window"
     base = OFF_NOTES + hits[0] * NOTE_FEAT
     assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
@@ -277,26 +278,46 @@ def test_z_is_time_times_speed():
     live head anchor z_off = head_z - PLANE_Z0, recovered here from the
     same obs vector's head lane)."""
     from beat_arena_env.constants import OFF_HEAD, PLANE_Z0, X_NORM
+    from beat_arena_env.constants import note_center as nc
+    from tests._helpers import z_lane_m
     env = RustBeatEnv(foot_contact=False, seed=9)
     obs, _ = env.reset()
+    checked = 0
     for _ in range(60):
         obs, _, done, _, _ = env.step(COAST)
         if done:
             break
         z_off = float(obs[OFF_HEAD + 2]) * X_NORM  # head_z - PLANE_Z0
         status = env.sim.status()
-        pending = [i for i, s in enumerate(status) if s == 0][:N_NOTE_SLOTS]
-        for slot, i in enumerate(pending):
-            z_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 2] * 8.0
-            vz_obs = obs[OFF_NOTES + slot * NOTE_FEAT + 3] * 8.0
-            t_until = env.chart[i].hit_time - env.sim.time
-            # clip floor = LIVE head z since 2026-08-22; in nominal
-            # terms the boundary is exactly t*speed > PLANE_Z0 (z_off
+        pending = [i for i, s in enumerate(status) if s == 0]
+        # env v17: slots are DISTANCE-sorted, not chart-ordered, so each
+        # slot is matched to its note by the x-lane signature + speed
+        # (the chart-order pairing only held while the 12 m clamp hid
+        # the far, reorderable notes)
+        for slot in range(N_NOTE_SLOTS):
+            if obs[OFF_NOTE_MASK + slot] != 1.0:
+                continue
+            base = OFF_NOTES + slot * NOTE_FEAT
+            z_obs = z_lane_m(obs[base + 2])
+            vz_obs = obs[base + 3] * 8.0
+            # floor = LIVE head z since 2026-08-22; in nominal terms
+            # the boundary is exactly t*speed > PLANE_Z0 (z_off
             # cancels), and it coincides with miss/pass resolution
-            if (t_until * env.chart[i].speed > -0.65
-                    and t_until * env.chart[i].speed + z_off < 12.0):
-                assert (z_obs - z_off) / -vz_obs == pytest.approx(
-                    t_until, abs=1e-4)
+            if z_obs - z_off <= PLANE_Z0 + 1e-4:
+                continue
+            t_obs = (z_obs - z_off) / -vz_obs
+            cands = [env.chart[i].hit_time - env.sim.time for i in pending
+                     if abs(obs[base] - (nc(env.chart[i])[0] - obs[OFF_HEAD]))
+                     < 1e-5
+                     and abs(obs[base + 1] * 0.75 + obs[OFF_HEAD + 1] * 0.75
+                             + 1.70
+                             - nc(env.chart[i])[1]) < 1e-5
+                     and abs(vz_obs + env.chart[i].speed) < 1e-4]
+            assert cands, (slot, t_obs)
+            assert min(abs(t_obs - t) for t in cands) < 1e-4, (slot, t_obs,
+                                                                cands)
+            checked += 1
+    assert checked > 0, checked
 
 
 # --- determinism -------------------------------------------------------------

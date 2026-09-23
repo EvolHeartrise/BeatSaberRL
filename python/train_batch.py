@@ -300,22 +300,17 @@ def parse_args():
                         "only, blades collide with nothing; 0 = off "
                         "(every run before 2026-09-12). Telemetry "
                         "([contact] line, metrics) accumulates always")
-    p.add_argument("--z-clip-hi", type=float, default=12.0,
-                   help="v28: obs z-lane upper clamp in meters (exact-"
-                        "timing lookahead = z_clip_hi / note speed). "
-                        "12.0 = every pre-v28 era; CUDA env only")
     p.add_argument("--z-asinh", type=float, default=None,
                    help="env v48: obs z lanes (note z / wall front, wall "
-                        "back) = asinh(max(z, -0.65) / C) with C in metres "
+                        "back) = asinh(max(z, head z) / C) with C in metres "
                         "— linear near the cut plane, log far out, no upper "
-                        "clamp (--z-clip-hi is then unused). DEFAULT 8 for "
-                        "a fresh run (the recipe since 2026-09-21, v55: "
-                        "gradient 3-4 vs 5-7 legacy, no KL stops); a "
-                        "--resume/--init-from run inherits the checkpoint's "
-                        "value when the flag is not given. 0 = legacy "
-                        "clamp / 8 (every run before v52). Recorded in the "
-                        "checkpoint (arch + args); the bench/replay tools "
-                        "read it from there")
+                        "clamp. The only z encoding (the legacy clamp / 8 "
+                        "path was removed 2026-09-22); C must be > 0. "
+                        "DEFAULT 8 for a fresh run (the recipe since "
+                        "2026-09-21, v55); a --resume/--init-from run "
+                        "inherits the checkpoint's value when the flag is "
+                        "not given. Recorded in the checkpoint (arch + "
+                        "args); the bench/replay tools read it from there")
     p.add_argument("--note-geo-norm", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="note-geo lanes normalised to O(1) — z decoded from "
@@ -968,13 +963,9 @@ def main():
     # off-recipe (and skip this entirely under --bench).
     if args.ranked_maps and args.env != "cuda":
         raise SystemExit("--ranked-maps requires --env cuda")
-    if args.z_clip_hi != 12.0 and args.env != "cuda":
-        raise SystemExit("--z-clip-hi: the rust backend reads "
-                         "BEAT_Z_CLIP_HI instead (CUDA env only here)")
     if args.z_asinh is None:
         # recipe default (2026-09-21): C = 8 m for a fresh run; a resumed
-        # or warm-started run keeps the checkpoint's encoding so pre-v52
-        # checkpoints (legacy clamp, 0) still load without the flag
+        # or warm-started run keeps the checkpoint's encoding
         _ck = resume_ckpt if resume_ckpt is not None else init_ckpt
         if _ck is not None:
             args.z_asinh = float(_ck.get("arch", {}).get(
@@ -983,8 +974,10 @@ def main():
                   f"the checkpoint", flush=True)
         else:
             args.z_asinh = 8.0
-    if args.z_asinh < 0:
-        raise SystemExit("--z-asinh must be >= 0 (metres; 0 = off)")
+    if not args.z_asinh > 0:
+        raise SystemExit(
+            f"--z-asinh must be > 0 (metres), got {args.z_asinh:g}: the "
+            f"legacy clamp z encoding (0, pre-v52 checkpoints) was removed")
     # env v48: the rust twin reads BEAT_Z_ASINH once per process — set it
     # before any sim exists so --env rust and the CUDA env agree
     os.environ["BEAT_Z_ASINH"] = repr(float(args.z_asinh))
@@ -1031,7 +1024,7 @@ def main():
                       wall_despawn=args.wall_despawn,
                       start_pose_jitter=args.start_pose_jitter,
                       crouch_start_prob=args.crouch_start_prob,
-                      z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
+                      z_asinh=args.z_asinh,
                       self_contact_coef=args.self_contact_coef,
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
@@ -1058,7 +1051,7 @@ def main():
             energy_coef=args.energy_coef,
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
-            z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
+            z_asinh=args.z_asinh,
             self_contact_coef=args.self_contact_coef, env_order=True,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
@@ -1098,7 +1091,7 @@ def main():
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma)
     # env v48: record the obs z encoding in the arch so the bench / replay
-    # tools and --resume/--init-from can match it (0 = legacy clamp)
+    # tools and --resume/--init-from can match it
     policy.arch["z_asinh"] = float(args.z_asinh)
     if args.value_head == "hl":
         print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "

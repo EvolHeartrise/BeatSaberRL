@@ -49,13 +49,16 @@ _W = {}          # per-process state: {"policy", "dev", "push", "tau"} (set by _
 
 def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    # env v48: the checkpoint's obs z encoding; the rust sim reads
-    # BEAT_Z_ASINH once per process (this runs before any sim exists)
-    os.environ["BEAT_Z_ASINH"] = repr(float(ckpt.get("arch", {}).get(
-        "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0))))
-    _clip = ckpt.get("args", {}).get("z_clip_hi")
-    if _clip is not None:
-        os.environ["BEAT_Z_CLIP_HI"] = repr(float(_clip))
+    # env v48: the checkpoint's obs z encoding (asinh knee C); the rust
+    # sim reads BEAT_Z_ASINH once per process (this runs before any sim
+    # exists)
+    z_asinh = float(ckpt.get("arch", {}).get(
+        "z_asinh", ckpt.get("args", {}).get("z_asinh", 0.0)))
+    if not z_asinh > 0:
+        raise SystemExit(f"{ckpt_path}: z_asinh {z_asinh:g} — the checkpoint "
+                         f"predates the asinh z encoding (legacy clamp, "
+                         f"removed 2026-09-22)")
+    os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
