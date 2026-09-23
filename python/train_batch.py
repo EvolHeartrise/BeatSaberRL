@@ -54,7 +54,7 @@ from policy import (hl_loss, HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
 
 A_DIM = len(HEAD_SIZES)  # 29 factored joint heads (env v10)
 
-GAMMA = 0.99
+GAMMA = 0.965  # the recipe since v53 (2026-09-21)
 GAE_LAMBDA = 0.95
 CLIP = 0.3  # 0.3 since 2026-09-15 (user decision after the clip ladder)
 DUAL_CLIP_C = 3.0
@@ -66,7 +66,7 @@ VF_COEF = 0.5
 # (v26 gamma 0.99 inflated v_loss ~10x into the shared trunk).
 # halflife ~69 updates at 0.01.
 VALUE_NORM_BETA = 0.01
-LR = 3e-4
+LR = 5.7e-4  # 7e-4 * sqrt(128/192), the wide-arch recipe
 MAX_GRAD_NORM = 0.5
 # log-ratio clamp before exp() (2026-08-02, 400M-run postmortem). NOT a
 # science change: dual-clip's selection only lets gradient flow through
@@ -184,15 +184,20 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--num-envs", type=int, default=128)
-    p.add_argument("--horizon", type=int, default=128)
-    # e1/mb8 DEFAULT since 2026-07-26 (user decision after the paired
+    # DEFAULTS = THE PRODUCTION RECIPE (2026-09-22, user): a bare
+    # `train_batch.py --run-dir X` launches the v58 trunk recipe
+    # (runs/v58_6blk_body3/args.json). Recipe switches are
+    # BooleanOptionalAction (--no-ranked-maps, --no-mirror-augment, ...);
+    # CPU / --env rust / test runs pass small shapes and --no-ranked-maps.
+    p.add_argument("--num-envs", type=int, default=32768)
+    p.add_argument("--horizon", type=int, default=32)
+    # e1/mb8 was the default from 2026-07-26 (user decision after the paired
     # 50M gate): same 8 gradient steps/update as the old e2/mb4 at HALF
     # the update compute — measured +110.9 wpp (dAcc t=+12.88,
     # score_acc +32.5%) AND 1.61x wall (249.5k steps/s). The 07-21
     # "single-pass fails" study conflated sample reuse with
     # gradient-step density; density was what mattered.
-    p.add_argument("--minibatches", type=int, default=8)
+    p.add_argument("--minibatches", type=int, default=64)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--time-cap", type=float, default=0.0)
@@ -205,7 +210,7 @@ def parse_args():
     # pre-WSD checkpoints remain usable as --init-from warm-starts.
     p.add_argument("--lr-final", type=float, default=1e-4,
                    help="the leaf cooldown's lr floor")
-    p.add_argument("--warmup-updates", type=int, default=0,
+    p.add_argument("--warmup-updates", type=int, default=34,
                    help="linear lr warmup length in updates (0 = auto, "
                         "1.5%% of the run's updates); stored in the "
                         "checkpoint schedule so resumes agree")
@@ -234,19 +239,20 @@ def parse_args():
     # with the fraction — that is where the wall-clock saving comes
     # from. Ranking is by MAGNITUDE (two-sided; see
     # adv_filter_indices for why the signed variant was cut).
-    p.add_argument("--adv-filter", type=float, default=1.0,
+    p.add_argument("--adv-filter", type=float, default=0.5,
                    help="fraction of the rollout batch to train on, "
                         "selected by |advantage| rank (1.0 = off). "
                         "Rounded to a whole number of minibatches")
-    p.add_argument("--target-kl", type=float, default=0.0,
-                   help="KL early stop (opt-in; 2026-09-20 after v52's "
+    p.add_argument("--target-kl", type=float, default=1.0,
+                   help="KL early stop (2026-09-20 after v52's "
                         "update-561 runaway: last-minibatch KL 0.2 -> 52 "
                         "in three updates, ratio 144, 2,000 falls). Every "
                         "--kl-check-every minibatches the k3 approx KL of "
                         "the current minibatch vs the rollout policy is "
                         "read (one host sync); past this value the rest of "
                         "the update is skipped. Healthy updates run 0.2-0.3 "
-                        "at the last minibatch; 0 = off (every run before)")
+                        "at the last minibatch. DEFAULT 1.0 (the recipe "
+                        "guard since v55); 0 = off")
     p.add_argument("--kl-check-every", type=int, default=4,
                    help="minibatch stride of the --target-kl probe")
     p.add_argument("--clip", type=float, default=CLIP,
@@ -330,12 +336,12 @@ def parse_args():
                         "leaf_fromNNNNN_*.pt; leaves are terminal "
                         "deliverables — continue training from the TRUNK "
                         "checkpoint, never from a leaf")
-    p.add_argument("--ent-coef", type=float, default=0.01)
-    p.add_argument("--ent-final", type=float, default=None,
+    p.add_argument("--ent-coef", type=float, default=0.03)
+    p.add_argument("--ent-final", type=float, default=1e-3,
                    help="leaf: the cooldown's entropy target; trunk with "
                         "--ent-tau: the anneal FLOOR. Ignored (with a "
                         "notice) on a constant-ent trunk")
-    p.add_argument("--ent-tau", type=int, default=0,
+    p.add_argument("--ent-tau", type=int, default=125,
                    help="trunk: exponential entropy-anneal time constant "
                         "in UPDATES — ent(u) = --ent-final + (--ent-coef - "
                         "--ent-final) * exp(-u/tau), a pure function of the "
@@ -348,8 +354,9 @@ def parse_args():
                         "cosine 174.6 upp) — the ent bonus is part of the "
                         "objective, unlike lr")
     p.add_argument("--gamma", type=float, default=GAMMA,
-                   help="discount (default 0.99 ~ 3.3 s effective horizon "
-                        "at 30 Hz; swept 2026-07-27 — user hypothesis: "
+                   help="discount (default 0.965, the recipe since v53; "
+                        "0.99 ~ 3.3 s effective horizon at 30 Hz was the "
+                        "old default; swept 2026-07-27 — user hypothesis: "
                         "Beat Saber decisions live ~1 s ahead, gamma "
                         "~0.967)")
     p.add_argument("--gae-lambda", type=float, default=GAE_LAMBDA,
@@ -402,9 +409,12 @@ def parse_args():
                         "Changes the sampling RNG stream vs eager. Needs "
                         "--env cuda and not --fp16 update; auto-downgrades "
                         "with a note otherwise")
-    p.add_argument("--chart-pool", type=int, default=65536,
-                   help="pregenerated chart pool size for --env cuda "
-                        "(default 65536 since 2026-07-26, user decision "
+    p.add_argument("--chart-pool", type=int, default=999999,
+                   help="level subsample size with --ranked-maps "
+                        "(default 999999 = the whole pool); pregenerated "
+                        "chart pool size with --no-ranked-maps --env cuda, "
+                        "where 65536 was the default (2026-07-26, user "
+                        "decision "
                         "after two paired 50M gates: 1024->8192 +91.3 "
                         "wpp (t=+8.31), 8192->65536 +80.9 wpp (t=+12.55, "
                         "score_acc +21%%, bad_cuts -31%%, FCs +38%%) — "
@@ -444,7 +454,7 @@ def parse_args():
     # Checkpoints carry their own arch, so 128/256 ckpts still load.
     p.add_argument("--embed", type=int, default=192)
     p.add_argument("--trunk-dim", type=int, default=384)
-    p.add_argument("--n-blocks", type=int, default=3)
+    p.add_argument("--n-blocks", type=int, default=6)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
     p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="simba",
@@ -498,7 +508,7 @@ def parse_args():
     # "activation" price (--iso-coef) was retired 2026-09-14 for the env
     # v43 torque energy price; the live movement prices are --energy-coef
     # (Σ|τ|) and --limit-coef/--limit-arms (limit rest).)
-    p.add_argument("--gears", type=int, default=3, choices=[3, 5, 7],
+    p.add_argument("--gears", type=int, default=5, choices=[3, 5, 7],
                    help="env v8 action-table size per joint head: 3 = "
                         "ternary coast/+full/-full; 5 adds +/-1/4-torque "
                         "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
@@ -515,7 +525,8 @@ def parse_args():
                         "PHYSICS-REGIME BREAK — "
                         "checkpoints and bench numbers do not carry "
                         "across the weld/contact boundary")
-    p.add_argument("--ranked-maps", action="store_true",
+    p.add_argument("--ranked-maps", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="train on WHOLE LEVELS of the real ranked ScoreSaber "
                         "catalog (beat_arena_env/ranked_pool.py; bench "
                         "parsing protocol, real NJS speeds since "
@@ -524,13 +535,14 @@ def parse_args():
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
-    p.add_argument("--lead-s", type=float, default=1.5,
+    p.add_argument("--lead-s", type=float, default=0.5,
                    help="ranked-maps front gap (s) — notes before it are "
                         "dropped, walls clipped to it; the earliest "
                         "first note of an episode (env v16, contact spec "
                         "§11: shorter keeps note data in the mix when "
                         "falls spike, damping survival-drift)")
-    p.add_argument("--mirror-augment", action="store_true",
+    p.add_argument("--mirror-augment", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="double the ranked-maps pool with left-right "
                         "mirrored copies of every level (handedness-"
                         "bias regularizer, 2026-08-14; --chart-pool "
@@ -541,7 +553,8 @@ def parse_args():
                         "the 3-arm-probe winner (2026-08-15: falls/update "
                         "8-10k -> ~35, bench zeros 35 -> 2); the legacy "
                         "remaining-notes charge is REMOVED")
-    p.add_argument("--ep-stats", action="store_true", default=False,
+    p.add_argument("--ep-stats", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="env v47 (2026-09-19): run the ScoreSaber combo "
                         "walk in the training envs and log every "
                         "episode's outcome (multiplied score, accuracy, "
@@ -551,16 +564,12 @@ def parse_args():
                         "updates. Sampled-policy plays at the drawn body "
                         "— tracking-grade, not the bench. ~0 kernel cost; "
                         "+N*C bytes VRAM (note multiplier plane)")
-    p.add_argument("--value-head", choices=["mse", "hl"], default="mse",
-                   help="critic head: mse = scalar regression on the "
-                        "normalized return (every run through v48); hl = "
-                        "HL-Gauss (Farebrother 2024): --hl-bins histogram "
-                        "over [-hl-vmax, hl-vmax] of the normalized "
-                        "return, cross-entropy to a Gaussian-smoothed "
-                        "target (--hl-sigma in bin widths, paper 0.75; "
-                        "tails truncated + renormalized), value = "
-                        "expectation. 2026-09-19, for noisy long-horizon "
-                        "targets (gamma 0.98 probe: ev 0.983 vs 0.995)")
+    # critic head: HL-Gauss (Farebrother 2024), the ONLY head since
+    # 2026-09-22 (the scalar MSE head of every run through v48 and its
+    # --value-head flag were removed): --hl-bins histogram over
+    # [-hl-vmax, hl-vmax] of the normalized return, cross-entropy to a
+    # Gaussian-smoothed target (--hl-sigma in bin widths, paper 0.75;
+    # tails truncated + renormalized), value = expectation
     p.add_argument("--hl-bins", type=int, default=101)
     p.add_argument("--hl-vmax", type=float, default=6.0,
                    help="HL-Gauss support half-width in NORMALIZED return "
@@ -575,7 +584,7 @@ def parse_args():
                         "v50). Draw = center * (1 +- r). Also the fixed "
                         "body when --tau-rand 0. Moved between trunks by "
                         "tau_fit.py on the previous leaf's ep_stats")
-    p.add_argument("--tau-rand", type=float, default=0.0,
+    p.add_argument("--tau-rand", type=float, default=0.25,
                    help="env v46 (user design 2026-09-16): per-env "
                         "randomized joint torque limits — at every "
                         "episode reset each of the 16 axes (spine 3, arm "
@@ -598,30 +607,34 @@ def parse_args():
                         "envs: |dv| ~ U(0, s), direction uniform "
                         "(RSI-flavored start variety; 0.2 -> 0.15 "
                         "2026-08-20)")
-    p.add_argument("--foot-hinge-r", type=float, default=0.0,
+    p.add_argument("--foot-hinge-r", type=float, default=0.12,
                    help="env v22: free radius (m) for BOTH foot penalties "
                         "— deviation inside it costs nothing (target "
                         "AREAS), rent applies to the excess. 0 = the v21 "
                         "pure-linear behavior")
-    p.add_argument("--foot-shape-coef", type=float, default=0.0,
+    p.add_argument("--foot-shape-coef", type=float, default=0.05,
                    help="env v22: potential-based delta shaping on the "
                         "total hinged foot deviation — reward/punish each "
                         "tick's CHANGE in deviation (round trips net "
                         "zero; sharpens credit assignment; provably "
                         "optimum-preserving). 0 = off")
-    p.add_argument("--limit-coef", type=float, default=0.0,
+    p.add_argument("--limit-coef", type=float, default=5e-3,
                    help="env v34: per-tick price on the joint-limit-row "
                         "impulse (N*m*s) the POSTURAL stops carry (spine "
                         "+ legs; arms exempt) — resting a pose on its "
                         "stops pays its gravity moment, an active hold "
                         "does not. 0 = off (bitwise pre-v34 rewards)")
-    p.add_argument("--limit-arms", action="store_true",
+    p.add_argument("--limit-arms", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="env v35: widen --limit-coef's scope to the 14 "
                         "arm joints as well (all-body pricing; default "
                         "postural-only keeps whip stop-slams free)")
-    p.add_argument("--wall-despawn", action="store_true",
+    p.add_argument("--wall-despawn", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="env v37: walls despawn on the charged hit "
-                        "(bomb-like; training-only credit aid)")
+                        "(bomb-like; training-only credit aid). DEFAULT "
+                        "ON (trunk recipe); leaves that must match the "
+                        "bench pass --no-wall-despawn")
     p.add_argument("--energy-coef", type=float, default=7.5e-6,
                    help="env v43 (2026-09-14, user): per-tick ENERGY cost "
                         "in reward per N*m*tick — energy_coef * sum over "
@@ -636,20 +649,20 @@ def parse_args():
                         "the bill matches the old 5e-4 fraction price at "
                         "the 2026-09-14 leaves' ~400 N*m/tick (~0.003 "
                         "reward/tick). 0 = off")
-    p.add_argument("--foot-x-coef", type=float, default=0.0,
+    p.add_argument("--foot-x-coef", type=float, default=0.01,
                    help="env v21: per-tick penalty coefficient on each "
                         "foot's |world_x - its_stance_x| (per-side "
                         "targets +-FOOT_X0; targets lateral wander). "
                         "0 = off")
-    p.add_argument("--foot-z-coef", type=float, default=0.0,
+    p.add_argument("--foot-z-coef", type=float, default=0.01,
                    help="env v20: per-tick penalty coefficient on each "
                         "foot's |world_z - reference_z| (linear; targets "
                         "the toward/away-from-notes shimmy). 0 = off")
-    p.add_argument("--crouch-start-prob", type=float, default=0.0,
+    p.add_argument("--crouch-start-prob", type=float, default=0.25,
                    help="env v38: fraction of resets that spawn in a "
                         "physics-validated crouch (continuous depth, "
                         "knee 0.3-1.5 rad; posture-diversity fix)")
-    p.add_argument("--start-pose-jitter", type=float, default=0.0,
+    p.add_argument("--start-pose-jitter", type=float, default=0.15,
                    help="env v20 (CUDA training only): episode-start leg/"
                         "foot joint jitter scale in radians — 12 leg "
                         "joints sampled U(-s, s) (knees |U|), clamped to "
@@ -765,19 +778,17 @@ class Muon:
 def muon_param_names(policy):
     """Which params Muon owns: hidden 2-D matrices only. Encoder input
     layers (note/saber/torso/leg_mlp), the 29 heads, the critic's final
-    1-row layer, biases and LN gains stay on Adam (Jordan's rule)."""
+    K-bin HL-Gauss layer, biases and LN gains stay on Adam (Jordan's
+    rule)."""
     names = []
     for n, p in policy.named_parameters():
         if p.ndim != 2:
             continue
         if n.startswith(("note_mlp", "saber_mlp", "torso_mlp", "leg_mlp",
-                         "heads.", "value_head")):
+                         "heads.")):
             continue
-        if p.shape[0] == 1:               # critic_mlp's final layer (mse)
-            continue
-        if (hasattr(policy, "critic_mlp")
-                and n == f"critic_mlp.{len(policy.critic_mlp) - 1}.weight"):
-            continue                      # ... or its K-bin HL-Gauss head
+        if n == f"critic_mlp.{len(policy.critic_mlp) - 1}.weight":
+            continue                      # the K-bin HL-Gauss output layer
         names.append(n)
     return names
 
@@ -1086,17 +1097,16 @@ def main():
                             note_geo_norm=args.note_geo_norm,
                             trunk_arch=args.trunk_arch,
                             trunk_hidden=args.trunk_hidden,
-                            value_bins=(args.hl_bins
-                                        if args.value_head == "hl" else 0),
+                            value_bins=args.hl_bins,
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma)
     # env v48: record the obs z encoding in the arch so the bench / replay
     # tools and --resume/--init-from can match it
     policy.arch["z_asinh"] = float(args.z_asinh)
-    if args.value_head == "hl":
-        print(f"--value-head hl: HL-Gauss critic, {args.hl_bins} bins over "
-              f"[-{args.hl_vmax:g}, {args.hl_vmax:g}] (normalized return), "
-              f"sigma {args.hl_sigma:g} bins", flush=True)
+    print(f"HL-Gauss critic: {policy.value_bins} bins over "
+          f"[-{policy.arch['value_vmax']:g}, {policy.arch['value_vmax']:g}] "
+          f"(normalized return), sigma {policy.value_sigma_bins:g} bins",
+          flush=True)
     if policy.n_gears != args.gears:
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "
@@ -1153,17 +1163,17 @@ def main():
     # the 2026-07-25 profile). Same per-element math, not guaranteed
     # bitwise vs foreach.
     fused_adam = device.type == "cuda"
-    # T1 critic lr split: the critic params (adapool modules, or the
-    # legacy value_head) form their own group with an lr multiplier the
+    # T1 critic lr split: the critic params (the adapool critic_*
+    # modules) form their own group with an lr multiplier the
     # schedule loop re-applies every update via the "lr_mult" key
     # (extra param_group keys survive state_dict round trips).
     # hybrid Muon: the hidden matrices leave the Adam groups
     muon_names = set(muon_param_names(policy))
     crit_p = [p for n, p in policy.named_parameters()
-              if n.startswith(("critic_", "value_head"))
+              if n.startswith("critic_")
               and n not in muon_names]
     main_p = [p for n, p in policy.named_parameters()
-              if not n.startswith(("critic_", "value_head"))
+              if not n.startswith("critic_")
               and n not in muon_names]
     opt = torch.optim.Adam(
         [{"params": main_p, "lr": args.lr, "lr_mult": 1.0},
@@ -1193,10 +1203,10 @@ def main():
 
     m_main = [p for n, p in policy.named_parameters()
               if n in muon_names
-              and not n.startswith(("critic_", "value_head"))]
+              and not n.startswith("critic_")]
     m_crit = [p for n, p in policy.named_parameters()
               if n in muon_names
-              and n.startswith(("critic_", "value_head"))]
+              and n.startswith("critic_")]
     muon = Muon(
         [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
          {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
@@ -1233,9 +1243,9 @@ def main():
     # parameter norms for the per-update line/metrics (actor vs critic),
     # read at the print sync like everything else
     _pn_actor_params = [p_ for n_, p_ in policy.named_parameters()
-                        if not n_.startswith(("critic_", "value_head"))]
+                        if not n_.startswith("critic_")]
     _pn_critic_params = [p_ for n_, p_ in policy.named_parameters()
-                         if n_.startswith(("critic_", "value_head"))]
+                         if n_.startswith("critic_")]
 
     @torch.no_grad()
     def param_norms():
@@ -1892,12 +1902,9 @@ def main():
                     pg_loss = pg_loss_fn(ratio, a_mb, clip=CLIP)
                     # T1: the critic learns the NORMALIZED target
                     v_tgt = (p_ret[sl] - ret_mu) / ret_sig
-                    if policy.value_bins:
-                        v_loss = hl_loss(policy._value_logits, v_tgt,
-                                         policy.value_centers,
-                                         policy.value_sigma)
-                    else:
-                        v_loss = 0.5 * ((newval - v_tgt) ** 2).mean()
+                    v_loss = hl_loss(policy._value_logits, v_tgt,
+                                     policy.value_centers,
+                                     policy.value_sigma)
                     ent_loss = entropy.mean()
                     loss = (pg_loss - ent_now * ent_loss
                             + args.vf_coef * v_loss)
