@@ -249,21 +249,21 @@ _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
 
 
 def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
-              z_asinh: float = 0.0) -> torch.Tensor:
+              z_asinh: float = 8.0) -> torch.Tensor:
     """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
     (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
 
     norm=False (every checkpoint before 2026-09-21): metres and seconds,
     z decoded as lane 2 x 8 (wrong beyond ~8 m under --z-asinh).
     norm=True (arch marker 'note_geo_norm', user 2026-09-21): every lane
-    O(1) — z decoded from the lane's true encoding (c sinh(lane) under
-    --z-asinh c, the linear lane otherwise), the per-hand offset's z and
+    O(1) — z decoded from the lane's true encoding c sinh(lane) (c =
+    z_asinh, the policy's recorded --z-asinh), the per-hand offset's z and
     the distance compressed as asinh(m / 8) (the lane-2 shape), x/y
     offsets in half-metres as before, seconds-to-plane / 3. Motivation:
     [gnorm-lanes] on v52-v54 put the note encoder's excess gradient in
     its second layer, fed by far tokens' large hidden activations from
     these raw-metre lanes."""
-    if norm and z_asinh > 0:
+    if norm:
         z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
     else:
         z_m = notes[..., 2] * _Z_SCALE
@@ -521,8 +521,15 @@ class NotePolicy(nn.Module):
                  note_geo: bool = False, note_geo_norm: bool = False,
                  value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
-                 trunk_arch: str = "mlp", trunk_hidden: int | None = None):
+                 trunk_arch: str = "mlp", trunk_hidden: int | None = None,
+                 z_asinh: float = 8.0):
         super().__init__()
+        # obs z lane encoding asinh(z / C), C = z_asinh metres (env v48;
+        # the only encoding since 2026-09-22). note_geo_norm decodes the
+        # note distance with it, so it is part of the forward and lives
+        # in the arch record. Default = the env/trainer default C = 8.
+        if not float(z_asinh) > 0:
+            raise ValueError(f"z_asinh must be > 0 (metres), got {z_asinh}")
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
@@ -549,6 +556,7 @@ class NotePolicy(nn.Module):
                      "body_tokens": 3,
                      "note_geo": bool(note_geo),
                      "note_geo_norm": bool(note_geo_norm),
+                     "z_asinh": float(z_asinh),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
                      # layout. "mlp" = the plain Linear-ReLU-Linear every
                      # checkpoint before this date used (absent marker =
@@ -574,6 +582,7 @@ class NotePolicy(nn.Module):
         self._value_logits = None
         self.note_geo = bool(note_geo)
         self.note_geo_norm = bool(note_geo_norm)
+        self.z_asinh = float(z_asinh)
         self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
                               embed, embed])
@@ -698,7 +707,7 @@ class NotePolicy(nn.Module):
             notes = torch.cat(
                 [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT),
                                   norm=self.note_geo_norm,
-                                  z_asinh=float(self.arch.get("z_asinh", 0.0)))],
+                                  z_asinh=self.z_asinh)],
                 dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
@@ -984,6 +993,15 @@ def load_policy(ckpt) -> NotePolicy:
             "torque-limit scale lanes (obs 608 -> 624; v45 was 608, "
             "the same-day v44 block 626); every earlier checkpoint "
             "plays a different obs — retrain, no conversion.")
+    # the obs z encoding feeds the note_geo_norm distance decode: it must
+    # come from the checkpoint (before 2026-09-22 it was dropped here and
+    # every v55+ bench/replay decoded far notes linearly — train/eval skew)
+    z_asinh = arch.get("z_asinh")
+    if z_asinh is None or not float(z_asinh) > 0:
+        raise SystemExit(
+            f"checkpoint arch has z_asinh {z_asinh!r}: every loadable "
+            "checkpoint records its obs z encoding (> 0 m, env v48); "
+            "refusing to guess the note-distance decode")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
@@ -996,6 +1014,7 @@ def load_policy(ckpt) -> NotePolicy:
         trunk_hidden=arch.get("trunk_hidden"),
         value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
-        value_sigma=arch.get("value_sigma", 0.75))
+        value_sigma=arch.get("value_sigma", 0.75),
+        z_asinh=float(z_asinh))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
