@@ -216,7 +216,7 @@ def test_free_running_gentle_horizon():
     Rust's own 1-ulp self-divergence behaves identically; measured
     first flips at t1/t1/t2 for 3 of 8 envs at this seed). Gate: >= 4/8
     envs stay tight through 3 ticks; a flipped env stays sane. Episode-
-    scale coverage lives in the lockstep tier below."""
+    scale coverage lives in tests/test_production_lockstep.py."""
     n = 8
     charts = [[FAR_NOTE]] * n
     env = _cenv(charts, 5, 6900)

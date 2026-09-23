@@ -74,29 +74,29 @@ from beat_arena_env.cuda_env import CudaBeatVecEnv
 from beat_arena_env.scoresaber import ComboTracker
 from tests._helpers import Z_ASINH_C, resync, rust_state
 
-N = 8
-HELD = range(0, 6)
 HOLD_EVERY = 3
-CHART_S = 4.0
-CHART_SEEDS = range(500, 508)
 ACT_SEED = 58
 # joints the hold pins (spine 0..2, legs 17..28); the arms (3..16) play
 POSTURE_J = [0, 1, 2] + list(range(17, 29))
 
 # walls per env, (start_time, cx, cy, width, height, length, speed):
 # 0 crossing, 1 dodged side wall, 2 hanging crouch wall, 3 two
-# overlapping crossings, 4/5 later crossings, 6/7 (free) crossing
+# overlapping crossings, 4/5 later crossings, 6/7 (free) early
+# crossings (charged before those bodies go down)
 _CROSS = lambda t: Wall(t, 0.0, 0.0, 20.0, 40.0, 2.0, 4.0)
 WALLS = [
     [_CROSS(1.5)],
     [Wall(1.2, 2.5, 1.5, 0.6, 3.0, 2.0, 4.0)],
     [Wall(1.4, 0.0, 2.1, 2.4, 1.8, 4.0, 4.0)],
     [_CROSS(1.6), Wall(1.8, 0.0, 0.0, 20.0, 40.0, 1.0, 4.0)],
-    [_CROSS(2.2)],
-    [_CROSS(2.8)],
-    [_CROSS(0.6)],
-    [_CROSS(0.8)],
+    [_CROSS(2.0)],
+    [_CROSS(2.4)],
+    [_CROSS(0.2)],
+    [_CROSS(0.3)],
 ]
+# (n_envs, held envs, chart seconds, chart seeds, walls) per arm
+PRODUCTION = (8, range(0, 6), 3.0, range(500, 508), WALLS)
+PERSISTENT = (4, range(0, 4), 2.2, range(600, 604), WALLS[:4])
 
 # obs lane groups for the flip census
 _GROUPS = {
@@ -122,15 +122,15 @@ def _recipe():
         sys.argv = old
 
 
-def _charts():
-    cfg = ChartConfig(chart_len_s=CHART_S, colors="both", bomb_prob=0.25,
+def _charts(chart_s, seeds):
+    cfg = ChartConfig(chart_len_s=chart_s, colors="both", bomb_prob=0.25,
                       extra_prob=0.3, dot_prob=0.15)
-    return [generate_chart(cfg, np.random.default_rng(s))
-            for s in CHART_SEEDS]
+    return [generate_chart(cfg, np.random.default_rng(s)) for s in seeds]
 
 
-def _build(a, charts, max_steps, tau):
-    wt = [[wall_tuple(w) for w in ws] for ws in WALLS]
+def _build(a, charts, walls, max_steps, tau):
+    N = len(charts)
+    wt = [[wall_tuple(w) for w in ws] for ws in walls]
     # the ranked-pool VecCls(...) call in train_batch.py, kwarg for
     # kwarg; zeroed = training-only randomness the Rust twin lacks
     env = CudaBeatVecEnv(
@@ -175,20 +175,54 @@ def _cuda_pops(env):
 
 
 def test_production_lockstep_parity():
+    """The trainer's configuration, recipe wall_despawn ON."""
     a = _recipe()
-    # the kwargs below mirror the ranked-pool (production) branch
-    assert (a.ranked_maps and a.foot_contact and a.ep_stats
-            and a.wall_despawn)
+    assert a.wall_despawn
+    ends, sims = _lockstep(a, *PRODUCTION)
+    # coverage: whole charts played AND the fall/tilt path fired
+    reasons = [r for r, _ in ends.values()]
+    assert "completed" in reasons, ends
+    assert "fall" in reasons or "tilt" in reasons, ends
+    assert sims[0].walls_in > 0 and sims[3].walls_in > 0
+    assert sims[6].walls_in > 0, "free env went down before its wall"
+
+
+def test_persistent_wall_lockstep_parity():
+    """Same lockstep with wall_despawn OFF — the bench / replay wall
+    mode (bench_scoresaber runs the CUDA env at the default False):
+    persistent walls, the per-tick event-7 stream, walls_in counting
+    in-wall ticks once per tick however many walls overlap the head,
+    and the entry edge (event 8) as the combo break. The v17 wall
+    gate's regimes (crossing, dodged, crouch, overlapping) in contact
+    mode."""
+    a = _recipe()
+    a.wall_despawn = False
+    ends, sims = _lockstep(a, *PERSISTENT)
+    assert all(r == "completed" for r, _ in ends.values()), ends
+    # a crossing wall is 0.5 s deep: many in-wall ticks per entry
+    assert sims[0].walls_in > 5 * sims[0].wall_enters >= 5
+    # overlap de-duplication: the second wall lies inside the first's
+    # span, so one entry edge and at most one in-wall count per tick
+    # (the per-tick check); the crouch wall charges the standing head
+    assert sims[0].wall_enters == 1 and sims[3].wall_enters == 1
+    assert sims[2].walls_in > 0
+
+
+def _lockstep(a, N, HELD, chart_s, seeds, walls):
+    """Run the lockstep over whole episodes; returns (ends, sims) where
+    ends[e] = (termination reason, ticks)."""
+    # the kwargs mirror the ranked-pool (production) branch
+    assert a.ranked_maps and a.foot_contact and a.ep_stats
     assert a.z_asinh is None and Z_ASINH_C == 8.0, \
         "recipe z encoding is asinh C = 8 m (unset BEAT_Z_ASINH)"
     tau = parse_tau_scale(a.tau_center)
     assert tuple(tau) == TAU_BODY_DEFAULT
-    charts = _charts()
+    charts = _charts(chart_s, seeds)
     kinds = {(n.kind == KIND_BOMB, n.color) for ch in charts for n in ch}
     assert {(False, 0), (False, 1), (True, 0)} <= kinds, kinds
     max_steps = max(int((max(n.hit_time for n in ch) + 0.5) * 30) + 90
                     for ch in charts)
-    env, sims = _build(a, charts, max_steps, tau)
+    env, sims = _build(a, charts, walls, max_steps, tau)
     env.reset()
     assert env.chart_idx.cpu().tolist() == list(range(N))
     np.testing.assert_array_equal(env.tau_scale.cpu().numpy(),
@@ -205,7 +239,7 @@ def test_production_lockstep_parity():
     combo = [ComboTracker() for _ in range(N)]
     ret_r = np.zeros(N)
     ret_c = np.zeros(N)
-    walls_in_prev = [0] * N
+    walls_in_prev = [[0] * N, [0] * N]   # walls_in, wall_enters
     ends = {}
     flips = macro = ticks = 0
     grp_flips = dict.fromkeys(_GROUPS, 0)
@@ -255,6 +289,16 @@ def test_production_lockstep_parity():
             np.testing.assert_array_equal(obs_c[e, _PREV_VALID],
                                           obs_r[_PREV_VALID],
                                           err_msg=f"{tag} prev_valid")
+            # identical end state => the env-layer lanes (note / wall
+            # tokens, prev-note blocks) are functions of it and the
+            # chart; hold them at the v17 wall gate's 1e-4 even when a
+            # velocity lane flipped
+            if q_d < 1e-9:
+                for g in ("notes", "prev"):
+                    lo, hi = _GROUPS[g]
+                    assert od[lo:hi].max() < 1e-4, \
+                        f"{tag} {g} lanes {od[lo:hi].max():.3e} off " \
+                        f"with the state in the seed band"
             if rew_d < 1e-9 and od.max() < 1e-5 and q_d < 1e-9:
                 worst["rew"] = max(worst["rew"], rew_d)
                 worst["obs"] = max(worst["obs"], float(od.max()))
@@ -265,7 +309,10 @@ def test_production_lockstep_parity():
                 max_flip_rew = max(max_flip_rew, rew_d)
                 for g, (lo, hi) in _GROUPS.items():
                     grp_flips[g] += int(od[lo:hi].max() >= 1e-5)
-                assert rew_d < 0.1 and q_d < 0.5, \
+                # reward: the weld tier's 0.05 (score-rounding flips
+                # <= 2/115 plus shaping; measured 1.3e-3); state: the
+                # contact tier's knife-edge sanity bound
+                assert rew_d < 0.05 and q_d < 0.5, \
                     f"{tag} beyond the knife-edge band: rew {rew_d} q {q_d}"
             # env layer: EXACT every tick
             st_r = np.array(sim.status(), dtype=np.uint8)
@@ -281,18 +328,25 @@ def test_production_lockstep_parity():
             assert sc_c[e].tolist() == [sim.score,
                                         *sim.score_components()], \
                 f"{tag} score decomposition"
-            # wall contract under the recipe's wall_despawn (env v37,
-            # lib.rs / .cu wall block): each charged wall emits ONE
-            # entry event 8, adds 1 to walls_in (entries, not in-wall
-            # ticks) and despawns — no event-7 stream. walls_in itself
-            # is compared CUDA vs Rust above; the combo break the 8
+            # wall event contract (lib.rs / .cu wall block). walls_in is
+            # compared CUDA vs Rust above; the combo break event 8
             # carries is checked through the combo walk at done.
             codes = [c for _i, c, *_ in ev]
-            assert 7 not in codes, f"{tag} event 7 under wall_despawn"
-            assert codes.count(8) == sim.walls_in - walls_in_prev[e], \
-                f"{tag} wall entry events vs walls_in"
-            assert sim.wall_enters == sim.walls_in, f"{tag} wall_enters"
-            walls_in_prev[e] = sim.walls_in
+            d_in = sim.walls_in - walls_in_prev[0][e]
+            d_ent = sim.wall_enters - walls_in_prev[1][e]
+            if a.wall_despawn:
+                # env v37: each charged wall emits ONE entry event 8,
+                # adds 1 to walls_in (entries) and despawns; no 7s
+                assert 7 not in codes, f"{tag} event 7 under despawn"
+                assert codes.count(8) == d_in == d_ent, \
+                    f"{tag} wall entry events vs walls_in"
+            else:
+                # persistent: one 7 per in-wall tick (overlaps charge
+                # once), one 8 on the entry edge
+                assert codes.count(7) == d_in <= 1, f"{tag} event 7"
+                assert codes.count(8) == d_ent <= d_in, f"{tag} event 8"
+            walls_in_prev[0][e] = sim.walls_in
+            walls_in_prev[1][e] = sim.wall_enters
             combo[e].consume([(int(i), EVENT_REASONS[c], p)
                               for i, c, p, *_ in ev])
             if d_r:
@@ -334,8 +388,7 @@ def test_production_lockstep_parity():
             env.wrist_vel[zero_wv] = 0.0
     assert all(done), "episodes did not finish inside max_steps"
 
-    reasons = {e: r for e, (r, _) in ends.items()}
-    print(f"production lockstep: {ticks} env-ticks, {flips} tight-band "
+    print(f"lockstep (wall_despawn={a.wall_despawn}): {ticks} env-ticks, {flips} tight-band "
           f"flips ({macro} > 1e-3), per group {grp_flips}, max flip "
           f"reward diff {max_flip_rew:.3e}; tight max diffs rew "
           f"{worst['rew']:.3e} obs {worst['obs']:.3e} q {worst['q']:.3e}; "
@@ -344,13 +397,10 @@ def test_production_lockstep_parity():
     # and the weld tiers' macroscopic-flip ceiling (8 %)
     assert flips <= 0.2 * ticks, f"{flips}/{ticks} flip env-ticks"
     assert macro <= 0.08 * ticks, f"{macro}/{ticks} flips beyond 1e-3"
-    # coverage: whole charts played AND the fall/tilt path fired; notes
-    # resolved on both colours; walls charged, the dodged one not
-    assert any(r == "completed" for r in reasons.values()), reasons
-    assert any(r in ("fall", "tilt") for r in reasons.values()), reasons
+    # coverage: notes resolved; the dodged side wall never charged
     assert sum(s.good_cuts + s.bad_cuts + s.misses for s in sims) > 0
-    assert sims[0].walls_in > 0 and sims[3].walls_in > 0
-    assert sims[1].walls_in == 0
+    assert sims[1].walls_in == 0 and sims[1].wall_enters == 0
+    return ends, sims
 
 
 def _check_episode_end(env, sim, e, walk, ret_r, ret_c, tau, max_steps):
@@ -379,6 +429,7 @@ def _check_episode_end(env, sim, e, walk, ret_r, ret_c, tau, max_steps):
     assert abs(ret_c - ret_r) < 0.5, f"{tag} return {ret_c} vs {ret_r}"
     assert bool(rec[18]) == fell_r, f"{tag} fell/tilted"
     assert int(rec[19]) == sim.good_cuts and rec[20] == sim.score, tag
+    assert int(rec[21]) == e, f"{tag} chart index"
     assert (rec[22], int(rec[23]), int(rec[24])) == \
         (walk.score, walk.max_combo, walk.breaks), \
         f"{tag} combo walk cuda {rec[22:25]} rust " \
