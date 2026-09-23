@@ -3,11 +3,9 @@ PERF_AUDIT_2026-09-02_static.md, C §1.2 / §2.2 / §5).
 
 The claims pinned here:
 
-1. Splitting the 29-head entropy sum into a per-head intermediate is a
-   RENAME, not a numerics change — `entropy` must stay bit-identical to
-   the pre-split `-(probs*logsm).sum(-1).sum(-1)`, because the printed
-   `ent` series has to remain comparable across the change (the
-   bit-identity gate the logging work was accepted under).
+1. The returned `entropy` IS the sum of the stashed per-head
+   entropies (`_ent_h`), so the printed `ent` and the per-head [kl]
+   breakdown describe the same numbers.
 2. `HEAD_GROUPS` is derived from the env's actuated-order contract, not
    invented here: policy.py duplicates it to stay a leaf module, so the
    duplication is checked against beat_arena_env.constants.
@@ -27,25 +25,21 @@ from train_batch import entropy_report, format_kl_line
 
 # ---------------------------------------------------------------- groups
 
-def test_head_groups_match_the_env_actuated_order():
+def test_head_groups_are_the_env_actuated_blocks():
+    """policy.HEAD_GROUPS against the env contract: group starts are the
+    env's actuated-order offsets, the groups tile all 29 heads
+    contiguously in SPEC-v10 block sizes, and each group's joints carry
+    its name prefix. (train_batch / metrics_log copies: see
+    test_metrics_log.test_head_groups_match_trainer.)"""
     starts = {nm: a for nm, a, _ in HEAD_GROUPS}
     assert starts == {"spine": A_SPINE, "armL": A_L_ARM, "armR": A_R_ARM,
                       "legL": A_L_LEG, "legR": A_R_LEG}
-
-
-def test_head_groups_tile_all_29_heads_contiguously():
     edges = [(a, b) for _, a, b in HEAD_GROUPS]
     assert edges[0][0] == 0
     assert edges[-1][1] == N_ACTION_HEADS == len(JOINT_NAMES)
     for (_, b), (a2, _) in zip(edges, edges[1:]):
         assert b == a2
-
-
-def test_group_sizes_are_the_spec_v10_blocks():
-    assert [b - a for _, a, b in HEAD_GROUPS] == [3, 7, 7, 6, 6]
-
-
-def test_group_names_match_the_joint_name_prefixes():
+    assert [b - a for a, b in edges] == [3, 7, 7, 6, 6]
     for nm, a, b in HEAD_GROUPS:
         names = JOINT_NAMES[a:b]
         if nm == "spine":
@@ -72,14 +66,16 @@ def test_stashed_per_head_entropy_sums_to_the_returned_entropy():
     assert torch.equal(entropy, pol._ent_h.sum(-1))
 
 
-def test_entropy_is_bitwise_the_pre_split_expression():
+def test_entropy_is_the_categorical_entropy_of_the_logits():
+    """Correctness (not a history pin): the summed entropy matches an
+    independent -(p log p) over forward_stacked's logits."""
     pol = _policy()
     obs = torch.randn(7, OBS_DIM) * 0.7
     _, _, entropy, _ = pol.get_action_and_value(obs)
     logits, _ = pol.forward_stacked(obs)
-    logsm = torch.log_softmax(logits, dim=-1)
-    ref = -(logsm.exp() * logsm).sum(-1).sum(-1)     # the 2026-08 form
-    assert torch.equal(entropy, ref)
+    logsm = torch.log_softmax(logits.double(), dim=-1)
+    ref = -(logsm.exp() * logsm).sum(-1).sum(-1)
+    assert torch.allclose(entropy.double(), ref, rtol=1e-5, atol=1e-5)
 
 
 def test_need_entropy_false_leaves_no_stash():

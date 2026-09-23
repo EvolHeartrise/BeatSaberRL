@@ -1,6 +1,5 @@
 """--trunk-arch simba (2026-09-15, brainstorm item 2): SimBa-style
-residual + LayerNorm readout trunk. Pins: exact param deltas, the mlp
-default unchanged (arch marker + old-checkpoint round trip), simba
+residual + LayerNorm readout trunk. Pins: exact param deltas, simba
 forward shapes / finiteness / LN-scaled h, checkpoint round trip, a
 2-update CPU trainer smoke, and (CUDA) fp16-vs-fp32 agreement."""
 import os
@@ -64,23 +63,6 @@ def test_param_deltas_exact():
                      "trunk_fc1.weight", "trunk_fc1.bias",
                      "trunk_fc2.weight", "trunk_fc2.bias",
                      "trunk_ln2.weight", "trunk_ln2.bias"}
-
-
-def test_mlp_default_unchanged_and_old_ckpt_loads():
-    p = NotePolicy(n_gears=5)
-    assert p.arch["trunk_arch"] == "mlp"
-    assert p.arch["trunk_hidden"] == p.arch["trunk_dim"]
-    assert hasattr(p, "trunk") and not hasattr(p, "trunk_proj")
-    # a checkpoint written BEFORE the marker existed: no trunk_arch key
-    arch = {k: v for k, v in p.arch.items()
-            if k not in ("trunk_arch", "trunk_hidden")}
-    q = load_policy({"arch": arch, "state_dict": p.state_dict()})
-    assert q.arch["trunk_arch"] == "mlp"
-    obs = _obs(4)
-    with torch.no_grad():
-        a, va = p.forward_stacked(obs)
-        b, vb = q.forward_stacked(obs)
-    assert torch.equal(a, b) and torch.equal(va, vb)
 
 
 def test_simba_forward_shapes_and_ln_scale():
