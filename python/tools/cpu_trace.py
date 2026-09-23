@@ -93,14 +93,15 @@ def import_sim(dtype, module_dir, threads):
     return mod
 
 
-def set_z_asinh(c):
+def set_z_asinh(c, source):
     """BEAT_Z_ASINH for the rust sim (read once per process, at its first
-    step) from the checkpoint / trace; a disagreeing preset is refused."""
+    obs write) from the checkpoint / trace; a disagreeing preset is
+    refused."""
     if os.environ.get("BEAT_Z_ASINH") not in (None, repr(c)):
         sys.exit(f"BEAT_Z_ASINH={os.environ['BEAT_Z_ASINH']} disagrees with "
-                 f"the checkpoint's --z-asinh {c}; unset it")
+                 f"the {source}'s z_asinh {c}; unset it")
     os.environ["BEAT_Z_ASINH"] = repr(c)
-    print(f"obs z lane: asinh(z / {c:g} m) (from the checkpoint)", flush=True)
+    print(f"obs z lane: asinh(z / {c:g} m) (from the {source})", flush=True)
 
 
 def so_sha(mod):
@@ -212,7 +213,7 @@ def record(args):
     if not z_asinh > 0:
         sys.exit(f"checkpoint has z_asinh {z_asinh:g}: it predates the asinh "
                  f"z encoding (legacy clamp, removed 2026-09-22)")
-    set_z_asinh(z_asinh)
+    set_z_asinh(z_asinh, "checkpoint")
     policy = load_policy(ckpt).eval()
     levels, payloads, ver = pick_levels(args.envs, args.ticks, args.seed)
     n, T = args.envs, args.ticks
@@ -281,7 +282,10 @@ def replay(args):
     # the sim must encode z as the recording did; traces recorded before
     # z_asinh was stored ran the rust default (8 m, BEAT_Z_ASINH unset)
     if "z_asinh" in meta:
-        set_z_asinh(float(meta["z_asinh"]))
+        set_z_asinh(float(meta["z_asinh"]), "trace")
+    else:
+        print(f"trace has no z_asinh (recorded with the rust default 8 m); "
+              f"BEAT_Z_ASINH={os.environ.get('BEAT_Z_ASINH')}", flush=True)
     mod = import_sim(dtype, args.module_dir, args.threads)
     sys.path.insert(0, PYDIR)
     from beat_arena_env.constants import OBS_DIM
