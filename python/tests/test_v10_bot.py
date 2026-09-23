@@ -133,4 +133,3 @@ def test_replay_additive_fields(tmp_path):
     # some tick carries weight through the welds and commands torque
     assert max(t["feet"][0][1] + t["feet"][1][1] for t in ticks) > 0.5
     assert max(t["activation"][0] for t in ticks) > 0.0
-

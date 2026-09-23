@@ -66,6 +66,18 @@ def test_stashed_per_head_entropy_sums_to_the_returned_entropy():
     assert torch.equal(entropy, pol._ent_h.sum(-1))
 
 
+def test_entropy_is_the_categorical_entropy_of_the_logits():
+    """Correctness (not a history pin): the summed entropy matches an
+    independent -(p log p) over forward_stacked's logits."""
+    pol = _policy()
+    obs = torch.randn(7, OBS_DIM) * 0.7
+    _, _, entropy, _ = pol.get_action_and_value(obs)
+    logits, _ = pol.forward_stacked(obs)
+    logsm = torch.log_softmax(logits.double(), dim=-1)
+    ref = -(logsm.exp() * logsm).sum(-1).sum(-1)
+    assert torch.allclose(entropy.double(), ref, rtol=1e-5, atol=1e-5)
+
+
 def test_need_entropy_false_leaves_no_stash():
     pol = _policy()
     obs = torch.randn(4, OBS_DIM) * 0.7
