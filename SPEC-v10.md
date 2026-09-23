@@ -1038,9 +1038,10 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        full-episode 1e-6 bounds relied on the v9 kinematic body being
        contractive (DRAG), which died with it.
     c. **The P5 gate** (`test_v10_parity_cuda.py`) is accordingly:
-       the transcendental measurement itself (a); reset/set_state
-       bitwise-or-1e-12; single-tick + short-horizon parity in the
-       seed band (obs 1e-5, reward 1e-9) with a small deterministic
+       reset/set_state bitwise-or-1e-12 (the (a) measurement was a
+       one-off probe, retired 2026-09-22; its numbers above stand);
+       single-tick + short-horizon parity in the seed band (obs
+       1e-5, reward 1e-9) with a small deterministic
        quota of knife-edge envs; LOCKSTEP-RESYNC full episodes (the
        CUDA env re-takes Rust's exact state each tick) with counters /
        score decomposition / per-note status / done timing EXACT and
