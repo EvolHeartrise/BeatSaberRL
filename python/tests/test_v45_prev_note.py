@@ -19,9 +19,12 @@ import torch
 
 import beat_arena_rs
 from beat_arena_env.chart import Note, note_tuple
-from beat_arena_env.constants import (KIND_BOMB, N_JOINTS, OBS_DIM,
-                                      OFF_PREV_L, OFF_PREV_R, PREV_FEAT,
-                                      X_NORM, Y_NORM, note_center)
+from beat_arena_env.constants import (A_L_ARM, A_R_ARM, DT, EVENT_REASONS,
+                                      KIND_BOMB, N_JOINTS, OBS_DIM,
+                                      OFF_PREV_L, OFF_PREV_R,
+                                      PLAYER_HEIGHT_OFFSET, PREV_FEAT, ROW_Y,
+                                      X_NORM, Y_NORM, joint_limits,
+                                      note_center)
 from beat_arena_env.mirror import mirror_tuples
 from tests._helpers import FAR_NOTE, cuda, resync, rust_state
 
@@ -176,14 +179,22 @@ def test_mirror_augment_reflects_the_block():
     assert la[4] == rb[4] == 1.0
 
 
-# --- cuts (scripted bot) -----------------------------------------------------
+# --- cuts (deterministic blade placements) ----------------------------------
+#
+# Bot-free event generator: the test_env.py cut-scenario pose family —
+# one arm set to the v9 "aligned wrist frame" FLAT pose (blade in a
+# z = const plane, roll velocity sweeping it vertically) against a note
+# on the plane, then one coast tick. Same inputs => same events.
+
+_DELTA = 0.7
+
 
 class _Snap:
-    """State captured on the tick an event fired (the env moves on)."""
-    def __init__(self, obs, e, env):
-        self.obs, self.e, self.chart = obs, e, env.chart
-        self.prev = env.sim.prev_note()
-        self.head = env.sim.head_pose()
+    """State captured on the tick an event fired."""
+    def __init__(self, obs, e, chart, sim):
+        self.obs, self.e, self.chart = obs, e, chart
+        self.prev = sim.prev_note()
+        self.head = sim.head_pose()
 
     def expect(self, note):
         x, y = note_center(note)
@@ -194,27 +205,68 @@ class _Snap:
                          math.sin(note.angle) if show_dir else 0.0, 1.0])
 
 
-def _bot_run(seed, wanted, limit=3000, need=1):
-    """Run the scripted bot until `need` events with a reason in `wanted`
-    have fired; return one _Snap per matching event."""
-    from beat_arena_env import RustBeatEnv
-    from beat_arena_env.scripted import scripted_action
-    env = RustBeatEnv(foot_contact=False, seed=seed, gears=5)
-    env.reset(seed=seed)
-    out = []
-    for _ in range(limit):
-        obs, _r, done, _t, info = env.step(scripted_action(env))
-        for e in info["events"]:
-            if e[1] in wanted:
-                out.append(_Snap(obs, e, env))
-        if len(out) >= need or done:
-            break
-    return out
+def _set_arm(sim, hand, q7, om7):
+    """Overwrite one arm's 7-joint state (test_env.py::_set_arm)."""
+    q = np.asarray(sim.qpos())
+    v = np.concatenate([sim.twist(), sim.omega()])
+    base = A_L_ARM if hand == 0 else A_R_ARM
+    q[7 + base:7 + base + 7] = q7
+    v[6 + base:6 + base + 7] = om7
+    sim.set_joints(list(q), list(v))
+
+
+def _park(sim, hand):
+    """Arm down and outward: blade far below/outside the grid."""
+    _set_arm(sim, hand, [-1.2, -1.5 if hand == 0 else 1.5, 0, 0, 0, 0, 0],
+             [0.0] * 7)
+
+
+def _set_flat(sim, hand, azimuth, om_roll=0.0):
+    """test_env.py::_set_flat: FLAT pose, blade along `azimuth`."""
+    lo, hi = joint_limits(hand)[4]
+    roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
+    bend = np.pi / 2
+    if not (lo <= roll <= hi):
+        roll = (azimuth + np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
+        bend = -np.pi / 2
+    _set_arm(sim, hand, [-np.pi / 2 + _DELTA, 0.0, 0.0, np.pi / 2, roll,
+                         bend, 0.0],
+             [0.0, 0.0, 0.0, 0.0, om_roll, 0.0, 0.0])
+
+
+# reason -> (note fields, setup(sim)); geometry = test_env.py's
+# test_good_swing_cut_scores_integer_points / test_slow_graze_is_bad /
+# test_wrong_direction_swing_is_bad / test_wrong_hand_only_triggers_small_box
+_SCENARIOS = {
+    "ok": (dict(hit_time=DT, col=3, color=1),
+           lambda sim: _set_flat(sim, 1, 0.0, om_roll=-15.0)),
+    "slow": (dict(hit_time=DT, col=3, color=1),
+             lambda sim: _set_flat(sim, 1, 0.0, om_roll=-0.5)),
+    "angle": (dict(hit_time=DT, col=3, color=1),
+              lambda sim: _set_flat(sim, 1, 0.0, om_roll=15.0)),
+    "wrong_hand": (dict(hit_time=0.0, col=1, color=0, x=0.0),
+                   lambda sim: (_park(sim, 0), _set_flat(sim, 1, np.pi))),
+}
+
+
+def _cut_run(reason):
+    """Play the fixed scenario for `reason` for one tick; return one
+    _Snap per event with that reason (the target note is chart idx 0)."""
+    fields, setup = _SCENARIOS[reason]
+    # row 1 at the pre-v33 height, as test_env.py pins it
+    note = Note(row=1, angle=DOWN, speed=4.0,
+                y=ROW_Y[1] - PLAYER_HEIGHT_OFFSET, **fields)
+    chart = [note, FAR_NOTE]
+    sim = _sim([note_tuple(n) for n in chart])
+    setup(sim)
+    obs, _r, _d, ev = sim.step(COAST)
+    return [_Snap(obs, (i, EVENT_REASONS[c], p), chart, sim)
+            for i, c, p, *_ in ev if EVENT_REASONS[c] == reason]
 
 
 def test_good_cut_records_on_the_note_colour():
-    hits = _bot_run(0, ("ok",))
-    assert hits, "bot produced no good cut"
+    hits = _cut_run("ok")
+    assert hits, "fixture produced no good cut"
     s = hits[-1]
     note = s.chart[s.e[0]]
     hand = note.color
@@ -225,45 +277,40 @@ def test_good_cut_records_on_the_note_colour():
 
 
 def test_bad_and_wrong_hand_cuts_record_on_the_note_colour():
-    """Every bad cut the bot produces — slow, angle AND wrong-hand —
-    lands on the block of the NOTE'S colour, never on the other saber's."""
+    """Every bad cut — slow, angle AND wrong-hand — lands on the block
+    of the NOTE'S colour, never on the other saber's."""
     seen = {}
-    for seed in (3, 5, 7, 11):
-        for s in _bot_run(seed, ("slow", "angle", "wrong_hand"), need=6):
+    for reason in ("slow", "angle", "wrong_hand"):
+        for s in _cut_run(reason):
             note = s.chart[s.e[0]]
             hand = note.color
             idx, valid = s.prev[hand]
             # later chart indices resolved on the same tick win, so the
             # record is this note or a later note of the SAME colour
-            assert valid and idx >= s.e[0], (seed, s.e, idx)
-            assert s.chart[idx].color == hand, (seed, s.e, idx)
+            assert valid and idx >= s.e[0], (reason, s.e, idx)
+            assert s.chart[idx].color == hand, (reason, s.e, idx)
             np.testing.assert_allclose(_blocks(s.obs)[hand],
                                        s.expect(s.chart[idx]), atol=1e-6)
             seen[s.e[1]] = seen.get(s.e[1], 0) + 1
-    assert seen, "bot produced no bad cut"
+    assert set(seen) == {"slow", "angle", "wrong_hand"}, seen
 
 
 def test_wrong_hand_cut_records_on_the_note_colour_not_the_cutter():
     """A note swept by the OTHER saber's bad box records on the block of
-    the note's colour; the cutting saber's block never takes it. Hunts
-    the scripted bot for wrong_hand events over a few seeds."""
+    the note's colour; the cutting saber's block never takes it."""
     found = 0
-    for seed in range(0, 40):
-        for s in _bot_run(seed, ("wrong_hand",), limit=1500, need=1):
-            note = s.chart[s.e[0]]
-            c = note.color
-            idx, valid = s.prev[c]
-            assert valid and idx >= s.e[0] and s.chart[idx].color == c
-            oidx, ovalid = s.prev[1 - c]
-            assert not ovalid or oidx != s.e[0], \
-                "the cutting saber's block must not take the note"
-            np.testing.assert_allclose(_blocks(s.obs)[c],
-                                       s.expect(s.chart[idx]), atol=1e-6)
-            found += 1
-        if found:
-            break
-    if not found:
-        pytest.skip("scripted bot produced no wrong_hand cut in 40 seeds")
+    for s in _cut_run("wrong_hand"):
+        note = s.chart[s.e[0]]
+        c = note.color
+        idx, valid = s.prev[c]
+        assert valid and idx >= s.e[0] and s.chart[idx].color == c
+        oidx, ovalid = s.prev[1 - c]
+        assert not ovalid or oidx != s.e[0], \
+            "the cutting saber's block must not take the note"
+        np.testing.assert_allclose(_blocks(s.obs)[c],
+                                   s.expect(s.chart[idx]), atol=1e-6)
+        found += 1
+    assert found, "fixture produced no wrong_hand cut"
 
 
 # --- policy ------------------------------------------------------------------
