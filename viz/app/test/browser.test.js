@@ -31,7 +31,7 @@ function findBrowser() {
 const EDGE = findBrowser();
 const dist = resolve("dist/index.html");
 const replay = resolve(process.argv[2] ??
-  "../../python/replays/v10_scripted_ep00_seed0.jsonl");
+  "test/fixtures/v10_scripted_ep00_seed0.jsonl");
 // env v15: a recording whose header carries "track_anchor": "head", so the
 // built bundle is exercised on the head-anchored track as well as on the
 // legacy fixed one above (skipped if the probe recording is not present).
