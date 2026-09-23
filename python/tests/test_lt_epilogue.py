@@ -28,7 +28,6 @@ if fl._load() is None:
 
 # (name, M, K, N) — the production ReLU sites at micro-batch 8192
 SITES = [("ffn.0", 8192 * 27, 128, 512),
-         ("trunk.0", 8192, 384, 256),
          ("critic_mlp.0", 8192, 384, 256),
          ("note_mlp.0", 8192 * 16, 18, 128),
          ("saber_mlp.0", 8192 * 2, 34, 128),
