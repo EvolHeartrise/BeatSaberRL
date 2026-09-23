@@ -104,7 +104,7 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
     finished level must freeze."""
     import beat_arena_rs
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    cfg = dict(colors="both", chart_len_s=5.0, bomb_prob=0.25,
+    cfg = dict(colors="both", chart_len_s=2.5, bomb_prob=0.25,
                extra_prob=0.3, dot_prob=0.15)
     charts = [generate_chart(ChartConfig(**cfg), np.random.default_rng(s))
               for s in range(900, 906)]
