@@ -5,8 +5,10 @@ asinh(max(z, z_lo) / C) with C = --z-asinh metres (BEAT_Z_ASINH for the
 rust sim): linear near the cut plane, log far out, NO upper clamp — so
 far tokens stay distinguishable. It is the only z encoding (the legacy
 clamp / 8 path was removed 2026-09-22); both engines default to C = 8 m
-and refuse C <= 0. Each configuration runs in a child process because
-the rust sim reads the variable once per process.
+and refuse C <= 0. Each rust configuration runs in a child process
+because the rust sim reads the variable once per process; the CUDA-vs-
+rust parity case uses the default C = 8 and runs in-process (a CUDA
+child OOMed on reset behind the parent's cached allocations).
 """
 import json
 import math
@@ -21,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHILD = os.path.join(HERE, "_v48_z_child.py")
 
 
-def run_child(mode, c, extra_env=None, check=True):
+def run_child(c, extra_env=None, check=True):
     """c = None leaves BEAT_Z_ASINH unset (engine defaults)."""
     env = dict(os.environ)
     env.pop("BEAT_Z_ASINH", None)
@@ -31,7 +33,7 @@ def run_child(mode, c, extra_env=None, check=True):
     env["PYTHONPATH"] = os.pathsep.join(
         [os.path.dirname(HERE)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
     env.update(extra_env or {})
-    r = subprocess.run([sys.executable, CHILD, mode,
+    r = subprocess.run([sys.executable, CHILD,
                         "default" if c is None else repr(float(c))],
                        capture_output=True, text=True, env=env,
                        cwd=os.path.dirname(HERE))
@@ -42,19 +44,19 @@ def run_child(mode, c, extra_env=None, check=True):
 
 
 def test_rust_default_is_8m():
-    assert run_child("rust", None) == run_child("rust", 8.0)
+    assert run_child(None) == run_child(8.0)
 
 
 @pytest.mark.parametrize("c", [0.0, -1.0])
 def test_rust_refuses_nonpositive_c(c):
-    r = run_child("rust", c, check=False)
+    r = run_child(c, check=False)
     assert r.returncode != 0
     assert "BEAT_Z_ASINH must be > 0" in r.stderr
 
 
 def test_asinh_keeps_far_notes_distinct():
     c = 2.0
-    o = run_child("rust", c)
+    o = run_child(c)
     assert o["mask"] == [1.0, 1.0, 1.0, 1.0]
     assert o["is_wall"] == 1.0
     # one tick in: z ~ z0 - speed/30 (+ a ~0 head offset); recover metres
@@ -76,8 +78,66 @@ def test_cuda_env_refuses_nonpositive_c(c):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("c", [None, 2.0, 8.0])
-def test_cuda_rust_parity(c):
-    o = run_child("parity", c)
+@pytest.mark.skipif(float(os.environ.get("BEAT_Z_ASINH", "8")) != 8.0,
+                    reason="the in-process rust sim must run at C = 8")
+def test_cuda_rust_parity():
+    """Both engines at their default C (= 8 m, the recipe): every
+    entity lane agrees under lockstep resync. Plus a C = 2 CUDA env on
+    the same resynced state: its z lanes (2, 17) must be the rust C = 8
+    lanes re-encoded to C = 2 and every other lane identical — pins that
+    the kernel honours z_asinh (the rust side of C != 8 is pinned by the
+    child-process tests above). Same chart as _v48_z_child.py."""
+    import numpy as np
+    import beat_arena_rs
+    from beat_arena_env.chart import Note, Wall, note_tuple, wall_tuple
+    from beat_arena_env.constants import (N_JOINTS, NOTE_FEAT, OBS_DIM,
+                                          OFF_NOTES, OFF_NOTE_MASK)
+    from beat_arena_env.cuda_env import CudaBeatVecEnv
+    from tests._helpers import resync, rust_state
+    speed, max_steps = 20.0, 600
+    notes = [Note(hit_time=z / speed, col=2, row=1, x=0.3, y=1.4, color=1,
+                  angle=4.712, speed=speed) for z in (5.0, 60.0, 80.0)]
+    walls = [wall_tuple(Wall(100.0 / speed, 0.0, 0.0, 20.0, 40.0, 30.0,
+                             speed))]
+    kw = dict(charts=[notes], walls=[walls], max_steps=max_steps, gears=3,
+              device="cuda", dtype=torch.float64, auto_reset=False,
+              foot_contact=False, seed=0)
+    env = CudaBeatVecEnv(1, **kw)
+    env2 = CudaBeatVecEnv(1, z_asinh=2.0, **kw)
+    assert env.z_asinh == 8.0
+    env.reset()
+    env2.reset()
+    sim = beat_arena_rs.RawBeatSim(max_steps=max_steps, gears=3,
+                                   foot_contact=False)
+    sim.set_chart([note_tuple(n) for n in notes], walls)
+    ent = slice(OFF_NOTES, OFF_NOTE_MASK)
+    zl = np.zeros((OFF_NOTE_MASK - OFF_NOTES) // NOTE_FEAT * NOTE_FEAT,
+                  dtype=bool).reshape(-1, NOTE_FEAT)
+    zl[:, [2, 17]] = True
+    zl = zl.reshape(-1)                     # z lanes of the entity block
+    act = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
+    worst = worst2 = 0.0
+    for tick in range(30):
+        # lockstep-resync (v10 protocol): CUDA re-takes rust's state
+        q36, v35 = rust_state(sim)
+        resync(env, [q36], [v35])
+        resync(env2, [q36], [v35])
+        o_r, _, _, _ = sim.step([0] * N_JOINTS)
+        o_c, _, _, _ = env.step(act)
+        o_2, _, _, _ = env2.step(act)
+        o_r = np.asarray(o_r)
+        o_c = o_c.cpu().numpy().reshape(OBS_DIM)
+        o_2 = o_2.cpu().numpy().reshape(OBS_DIM)
+        worst = max(worst, float(np.abs(o_c[ent] - o_r[ent]).max()))
+        # rust C = 8 lanes re-encoded to C = 2 (asinh(z / C), z from sinh)
+        r64 = o_r[ent].astype(np.float64)
+        want2 = np.where(zl, np.arcsinh(np.sinh(r64) * 8.0 / 2.0), r64)
+        worst2 = max(worst2, float(np.abs(o_2[ent] - want2).max()))
+        for o in (o_c, o_2):
+            assert (o[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]
+                    == o_r[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]).all(), tick
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
-    assert o["parity_worst_abs"] < 1e-4, o
+    assert worst < 1e-4, worst
+    assert worst2 < 1e-4, worst2
+    # and C really moved the far z lanes (40+ m out: asinh(z/8) vs z/2)
+    assert float(np.abs(o_2[ent][zl] - o_c[ent][zl]).max()) > 0.5
