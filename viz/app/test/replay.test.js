@@ -17,7 +17,7 @@ import {
 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ??
-  "../../python/replays/v10_scripted_ep00_seed0.jsonl";
+  "test/fixtures/v10_scripted_ep00_seed0.jsonl";
 const rep = parseReplay(readFileSync(path, "utf8"));
 console.log(`loaded: ${rep.chart.length} objects, ${rep.ticks.length} ticks, ` +
             `${rep.posts.length} post events, ${rep.arcs.length} arc pairs`);
