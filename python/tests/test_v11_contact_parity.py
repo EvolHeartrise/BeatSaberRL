@@ -147,8 +147,8 @@ def _rust_one_ulp_flips(q36s, v35s, acts, gears):
 
 # --- (i) f64: single tick from random stance states ---------------------------
 
-@pytest.mark.parametrize("gears,n_states,seed",
-                         [(3, 32, 700), (5, 32, 800), (7, 32, 900)])
+# production gears only: K=3/7 table math is pinned CPU-side in test_gears
+@pytest.mark.parametrize("gears,n_states,seed", [(5, 32, 800)])
 def test_contact_single_tick_parity(gears, n_states, seed):
     """One 30 Hz tick (8 constrained substeps with the ground block) from
     random stance states: state within 1e-9, obs within 1e-5, reward
