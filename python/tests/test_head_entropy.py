@@ -25,25 +25,21 @@ from train_batch import entropy_report, format_kl_line
 
 # ---------------------------------------------------------------- groups
 
-def test_head_groups_match_the_env_actuated_order():
+def test_head_groups_are_the_env_actuated_blocks():
+    """policy.HEAD_GROUPS against the env contract: group starts are the
+    env's actuated-order offsets, the groups tile all 29 heads
+    contiguously in SPEC-v10 block sizes, and each group's joints carry
+    its name prefix. (train_batch / metrics_log copies: see
+    test_metrics_log.test_head_groups_match_trainer.)"""
     starts = {nm: a for nm, a, _ in HEAD_GROUPS}
     assert starts == {"spine": A_SPINE, "armL": A_L_ARM, "armR": A_R_ARM,
                       "legL": A_L_LEG, "legR": A_R_LEG}
-
-
-def test_head_groups_tile_all_29_heads_contiguously():
     edges = [(a, b) for _, a, b in HEAD_GROUPS]
     assert edges[0][0] == 0
     assert edges[-1][1] == N_ACTION_HEADS == len(JOINT_NAMES)
     for (_, b), (a2, _) in zip(edges, edges[1:]):
         assert b == a2
-
-
-def test_group_sizes_are_the_spec_v10_blocks():
-    assert [b - a for _, a, b in HEAD_GROUPS] == [3, 7, 7, 6, 6]
-
-
-def test_group_names_match_the_joint_name_prefixes():
+    assert [b - a for a, b in edges] == [3, 7, 7, 6, 6]
     for nm, a, b in HEAD_GROUPS:
         names = JOINT_NAMES[a:b]
         if nm == "spine":
