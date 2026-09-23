@@ -228,12 +228,12 @@ _BODY3_IDX = _TORSO_IDX + _LEG_L_IDX + _LEG_R_IDX
 # Per (hand, note) pair, computed from lanes the obs ALREADY carries and
 # appended to the 18 note lanes before note_mlp, so the wrist->note
 # relation is an input instead of something attention has to assemble:
-#   dp (3)   wrist->note offset in METRES / 2  (x, y are both head-relative
-#            in the obs since env v38 — same frame, same normalizers; z
-#            is world z on both sides)
-#   |dp| (1) / 2
+#   dp (3)   wrist->note offset: x, y in METRES / 2 (both head-relative
+#            in the obs since env v38 — same frame, same normalizers), z
+#            (world z on both sides) as asinh(m / 8)
+#   |dp| (1) asinh(m / 8)
 #   t_plane (1)  note z / speed = seconds until the note reaches the head
-#            plane, clipped to [-0.5, 3], / 1.0
+#            plane, clipped to [-0.5, 3], / 3
 #   v.d (1)  unit wrist-velocity . required cut direction (cos_a, sin_a, 0)
 #   b.d (1)  blade direction . required cut direction
 # = 7 per hand -> 14 lanes; the dot lanes are masked to 0 on wall rows
@@ -248,27 +248,22 @@ _X_NORM, _Y_NORM, _Z_SCALE, _V_NORM = 1.0, 0.75, 8.0, 6.0
 _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
 
 
-def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
-              z_asinh: float | None = None) -> torch.Tensor:
+def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
+              z_asinh: float) -> torch.Tensor:
     """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
     (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
 
-    norm=False (every checkpoint before 2026-09-21): metres and seconds,
-    z decoded as lane 2 x 8 (wrong beyond ~8 m under --z-asinh).
-    norm=True (arch marker 'note_geo_norm', user 2026-09-21): every lane
-    O(1) — z decoded from the lane's true encoding c sinh(lane) (c =
+    Every lane O(1) (user 2026-09-21, v55; the only layout since
+    2026-09-22 — the raw-metre lanes of earlier checkpoints were
+    removed): z decoded from the lane's true encoding c sinh(lane) (c =
     z_asinh, the policy's recorded --z-asinh), the per-hand offset's z and
     the distance compressed as asinh(m / 8) (the lane-2 shape), x/y
-    offsets in half-metres as before, seconds-to-plane / 3. Motivation:
+    offsets in half-metres, seconds-to-plane / 3. Motivation:
     [gnorm-lanes] on v52-v54 put the note encoder's excess gradient in
     its second layer, fed by far tokens' large hidden activations from
-    these raw-metre lanes."""
-    if norm:
-        assert z_asinh is not None and z_asinh > 0, (
-            f"note_geo_norm needs the obs z encoding C > 0, got {z_asinh}")
-        z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
-    else:
-        z_m = notes[..., 2] * _Z_SCALE
+    raw-metre lanes."""
+    assert z_asinh > 0, f"the obs z encoding C must be > 0, got {z_asinh}"
+    z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
     npos = torch.stack([notes[..., 0] * _X_NORM, notes[..., 1] * _Y_NORM,
                         z_m], -1)                                # (B,24,3) m
     cutd = torch.stack([notes[..., 6], notes[..., 7],
@@ -277,8 +272,7 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
     # seconds to the head plane: z / speed with speed = -lane3 * Z_SCALE
     speed = (-notes[..., 3:4] * _Z_SCALE).clamp_min(1e-3)
     tpl = (z_m[..., None] / speed).clamp(-0.5, 3.0)
-    if norm:
-        tpl = tpl / 3.0
+    tpl = tpl / 3.0
     feats = []
     for hnd in range(2):
         w = sabers[:, hnd]                                       # (B,32)
@@ -287,12 +281,11 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor, norm: bool = False,
                             w[:, _S_WPOS + 2]], -1)              # (B,3) m
         dp = (npos - wpos[:, None]) * 0.5                        # (B,24,3)
         dist = dp.norm(dim=-1, keepdim=True)
-        if norm:
-            # z offset and distance: asinh(m / 8) keeps the near field
-            # linear (2 dp units = 1 m) and bounds far tokens (~3 at
-            # 100 m, ~7 at 2 km) instead of raw half-metres
-            dp = torch.cat([dp[..., :2], torch.asinh(dp[..., 2:3] * 2.0 / 8.0)], -1)
-            dist = torch.asinh(dist * 2.0 / 8.0)
+        # z offset and distance: asinh(m / 8) keeps the near field
+        # linear (2 dp units = 1 m) and bounds far tokens (~3 at
+        # 100 m, ~7 at 2 km) instead of raw half-metres
+        dp = torch.cat([dp[..., :2], torch.asinh(dp[..., 2:3] * 2.0 / 8.0)], -1)
+        dist = torch.asinh(dist * 2.0 / 8.0)
         v = w[:, _S_WVEL:_S_WVEL + 3] * _V_NORM                  # (B,3) m/s
         vhat = v / (v.norm(dim=-1, keepdim=True) + 0.05)
         vdot = (vhat[:, None] * cutd).sum(-1, keepdim=True) * not_wall
@@ -520,15 +513,15 @@ class NotePolicy(nn.Module):
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
-                 note_geo: bool = False, note_geo_norm: bool = False,
+                 note_geo: bool = False,
                  value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_arch: str = "mlp", trunk_hidden: int | None = None,
                  z_asinh: float = 8.0):
         super().__init__()
         # obs z lane encoding asinh(z / C), C = z_asinh metres (env v48;
-        # the only encoding since 2026-09-22). note_geo_norm decodes the
-        # note distance with it, so it is part of the forward and lives
+        # the only encoding since 2026-09-22). The note-geo lanes decode
+        # the note distance with it, so it is part of the forward and lives
         # in the arch record. Default = the env/trainer default C = 8.
         if not float(z_asinh) > 0:
             raise ValueError(f"z_asinh must be > 0 (metres), got {z_asinh}")
@@ -557,7 +550,11 @@ class NotePolicy(nn.Module):
                      # checkpoint before v58 is gone (no back-compat)
                      "body_tokens": 3,
                      "note_geo": bool(note_geo),
-                     "note_geo_norm": bool(note_geo_norm),
+                     # 2026-09-21 (v55): note-geo lanes normalised to
+                     # O(1); the only layout since 2026-09-22, still
+                     # stamped because load_policy refuses a note_geo
+                     # checkpoint without it (raw-metre lanes)
+                     "note_geo_norm": True,
                      "z_asinh": float(z_asinh),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
                      # layout. "mlp" = the plain Linear-ReLU-Linear every
@@ -583,7 +580,6 @@ class NotePolicy(nn.Module):
         self.value_sigma = float(value_sigma) * float(centers[1] - centers[0])
         self._value_logits = None
         self.note_geo = bool(note_geo)
-        self.note_geo_norm = bool(note_geo_norm)
         self.z_asinh = float(z_asinh)
         self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
@@ -708,8 +704,7 @@ class NotePolicy(nn.Module):
             # fp32 geometry from the fp32 obs slices, then one cast+copy
             notes = torch.cat(
                 [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT),
-                                  norm=self.note_geo_norm,
-                                  z_asinh=self.z_asinh)],
+                                  self.z_asinh)],
                 dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
@@ -978,7 +973,8 @@ def load_policy(ckpt) -> NotePolicy:
     (v9 and earlier: obs 290 / 14 heads, no body token) is REFUSED —
     the v10 body retired every earlier checkpoint (house pattern).
     Also refused: an arch without z_asinh > 0 (the obs z encoding the
-    note_geo_norm lanes decode with; never defaulted)."""
+    note-geo lanes decode with; never defaulted), and a note_geo arch
+    without the note_geo_norm marker (the raw-metre lanes, removed)."""
     arch = ckpt.get("arch", {})
     if arch.get("body_tokens", 1) != 3:
         raise SystemExit(
@@ -997,7 +993,7 @@ def load_policy(ckpt) -> NotePolicy:
             "torque-limit scale lanes (obs 608 -> 624; v45 was 608, "
             "the same-day v44 block 626); every earlier checkpoint "
             "plays a different obs — retrain, no conversion.")
-    # the obs z encoding feeds the note_geo_norm distance decode: it must
+    # the obs z encoding feeds the note-geo distance decode: it must
     # come from the checkpoint (before 2026-09-22 it was dropped here and
     # every v55+ bench/replay decoded far notes linearly — train/eval skew)
     z_asinh = arch.get("z_asinh")
@@ -1006,13 +1002,18 @@ def load_policy(ckpt) -> NotePolicy:
             f"checkpoint arch has z_asinh {z_asinh!r}: every loadable "
             "checkpoint records its obs z encoding (> 0 m, env v48); "
             "refusing to guess the note-distance decode")
+    if arch.get("note_geo", False) and not arch.get("note_geo_norm", False):
+        raise SystemExit(
+            "checkpoint has the raw-metre note-geo lanes (no note_geo_norm "
+            "marker, pre-v55); the normalised lanes are the only layout "
+            "since 2026-09-22 (user: no back-compat). Check out a commit "
+            "before 2026-09-22 to bench or replay it.")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
         n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
         note_geo=arch.get("note_geo", False),
-        note_geo_norm=arch.get("note_geo_norm", False),   # 2026-09-21
         # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
         trunk_arch=arch.get("trunk_arch", "mlp"),
         trunk_hidden=arch.get("trunk_hidden"),
