@@ -231,8 +231,7 @@ def parse_args():
                         "this is a real relative weight now")
     p.add_argument("--critic-lr-mult", type=float, default=3.0,
                    help="critic param-group lr multiplier (T1, "
-                        "ProtoMotions ships 5x; 1.0 disables). Inactive "
-                        "when resuming a legacy single-group optimizer")
+                        "ProtoMotions ships 5x; 1.0 disables)")
     p.add_argument("--diag-every", type=int, default=50,
                    help="every N updates run the critic/trunk "
                         "diagnostics minibatch (grad cosine, dormant "
@@ -289,7 +288,10 @@ def parse_args():
                         "2026-09-12). Time constant 1/(lr*wd) optimizer "
                         "steps: 0.1 at lr 7e-4 = 14k steps")
     # Hybrid Muon (2026-09-12 probe; sessions/2026-09-10-pufferlib-5-
-    # evaluation.md "Muon deep dive"): Muon (Jordan 2024) on the HIDDEN
+    # evaluation.md "Muon deep dive"), the ONLY optimizer since 2026-09-22
+    # (pure Adam, every run before 2026-09-12, removed; so is the
+    # per-matrix NS loop every run before v48 used — the shape-batched
+    # bmm step is the only step): Muon (Jordan 2024) on the HIDDEN
     # 2-D matrices — attention q/k/v/out, FFN, trunk, critic attention +
     # hidden MLP layers — and the existing Adam on everything else (the
     # three encoder input layers, the 29 heads, the critic's final 1-row
@@ -297,25 +299,12 @@ def parse_args():
     # (0.2*sqrt(max(A,B)) scale, Moonshot arXiv 2502.16982) so --lr and
     # --critic-lr-mult keep their meaning. --weight-decay applies to the
     # Muon groups too. Checkpoints carry the Muon momentum under "muon";
-    # --resume into --optimizer muon needs such a checkpoint.
-    # DEFAULT muon since 2026-09-12 (user decision after the v40 probes:
-    # 0.9409 vs Adam 0.9099 training acc at matched 1.12B samples, seed 1
-    # tracking seed 0). Every run before that date was Adam. Left None so
-    # a --resume of an Adam-era checkpoint can fall back to adam.
-    p.add_argument("--optimizer", choices=["adam", "muon"], default=None,
-                   help="muon (default, the recipe since 2026-09-12) = "
-                        "hybrid Muon on hidden matrices + Adam elsewhere; "
-                        "adam = every run before that date")
+    # --resume needs such a checkpoint (Adam-era ones are --init-from
+    # only). User decision after the v40 probes: 0.9409 vs Adam 0.9099
+    # training acc at matched 1.12B samples, seed 1 tracking seed 0.
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
-    p.add_argument("--muon-batched", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="shape-grouped bmm Newton-Schulz (5 chains per "
-                        "step instead of 27; default since 2026-09-19, "
-                        "-2.5%% s/update on a slow-dispatch host, bmm-vs-"
-                        "mm rounding ~3e-8). --no-muon-batched = the "
-                        "per-matrix loop every run before v48 used")
     # env v41 (2026-09-12, user): self-contact penalty. Greedy replays of
     # the v40 policies: 10-13% of ticks carry a body-on-body contact,
     # dominated by hands/forearms hitting the head and torso; summed
@@ -732,30 +721,17 @@ MUON_NS_COEFS = ((4.0848, -6.8946, 2.9270),
                  (2.8366, -3.0525, 1.2012))
 
 
-@torch.no_grad()
-def newton_schulz5(g, eps=1e-7):
-    """Orthogonalize a 2-D gradient: the nearest orthogonal matrix by the
-    five quintic Newton-Schulz steps of MUON_NS_COEFS (singular values
-    land in ~(0.98, 1.03)). Tall matrices are transposed so the iteration
-    runs on the small Gram matrix. fp32 here — the matrices are <= 512
-    wide."""
-    x = g / (g.norm() + eps)
-    tall = x.shape[0] > x.shape[1]
-    if tall:
-        x = x.T
-    for a, b, c in MUON_NS_COEFS:
-        s = x @ x.T
-        x = a * x + (b * s + c * (s @ s)) @ x
-    return x.T if tall else x
-
-
 def newton_schulz5_batched(G, eps=1e-7):
-    """newton_schulz5 over a stack (k, m, n) of same-shaped matrices in
-    one bmm chain (2026-09-19): the eager per-matrix loop is 27 x 5
-    tiny launches per optimizer step, ~30k launches per update, and on a
-    slow-dispatch host that alone is 0.6-0.7 s of the update phase
-    (VastAI Xeon profile). Same arithmetic per matrix; bmm vs mm
-    rounding differs at ~3e-8 (max |update| ~1e-3)."""
+    """Orthogonalize a stack (k, m, n) of same-shaped 2-D updates in one
+    bmm chain: each matrix -> the nearest orthogonal matrix by the five
+    quintic Newton-Schulz steps of MUON_NS_COEFS (singular values land
+    in ~(0.98, 1.03)). Tall matrices are transposed so the iteration
+    runs on the small Gram matrix; fp32 (the matrices are <= 768 wide).
+    Batched since 2026-09-19 (the only path since 2026-09-22): the old
+    per-matrix loop was 5 launch triples per matrix per optimizer step
+    (~30k launches per update at the 2026-09-19 arch) — 0.6-0.7 s of the
+    update phase on a slow-dispatch host;
+    bmm vs mm rounding differs at ~3e-8 (max |update| ~1e-3)."""
     x = G / (G.flatten(1).norm(dim=1).view(-1, 1, 1) + eps)
     tall = x.shape[1] > x.shape[2]
     if tall:
@@ -767,22 +743,19 @@ def newton_schulz5_batched(G, eps=1e-7):
 
 
 class Muon:
-    """The Muon half of the hybrid optimizer (--optimizer muon): Nesterov
+    """The Muon half of the hybrid optimizer: Nesterov
     momentum -> Newton-Schulz orthogonalization -> RMS-matched scale
     0.2*sqrt(max(A, B)) -> SGD step. `param_groups` mirrors
     torch.optim's list-of-dicts (params, lr, lr_mult) so the schedule
     loop and --weight-decay treat it like the Adam groups. Gradients are
     read from p.grad (the flat fp32 buffer's views), after the trainer's
-    unscale / overflow-zero / global clip."""
+    unscale / overflow-zero / global clip. The step is shape-grouped:
+    foreach momentum + one bmm Newton-Schulz chain per distinct matrix
+    shape instead of one per matrix."""
 
-    def __init__(self, param_groups, momentum=0.95, batched=True):
+    def __init__(self, param_groups, momentum=0.95):
         self.param_groups = param_groups
         self.momentum = float(momentum)
-        # batched (default since 2026-09-19): shape-grouped bmm Newton-
-        # Schulz + foreach momentum — 5 NS chains per step instead of 27.
-        # Measured -2.5% s/update on the VastAI Xeon host (ABAB), ~0 on a
-        # fast core (dispatch was already under the GPU floor there).
-        self.batched = bool(batched)
         self.state = {p: torch.zeros_like(p)
                       for g in param_groups for p in g["params"]}
 
@@ -790,7 +763,7 @@ class Muon:
         return [p for g in self.param_groups for p in g["params"]]
 
     @torch.no_grad()
-    def _step_batched(self):
+    def step(self):
         from collections import defaultdict
         mu = self.momentum
         for g in self.param_groups:
@@ -813,23 +786,6 @@ class Muon:
                 for k, i in enumerate(idx):
                     outs[i] = o[k]
             torch._foreach_add_(ps, outs)
-
-    @torch.no_grad()
-    def step(self):
-        if self.batched:
-            return self._step_batched()
-        mu = self.momentum
-        for g in self.param_groups:
-            lr = float(g["lr"])
-            for p in g["params"]:
-                if p.grad is None:
-                    continue
-                buf = self.state[p]
-                buf.mul_(mu).add_(p.grad)
-                upd = p.grad.add(buf, alpha=mu)          # Nesterov
-                o = newton_schulz5(upd)
-                scale = 0.2 * math.sqrt(max(p.shape[0], p.shape[1]))
-                p.add_(o, alpha=-lr * scale)
 
     def zero_grad(self):
         for p in self._params():
@@ -934,17 +890,6 @@ def main():
         args.ent_tau = sched.get("ent_tau", 0)
         if args.run_dir is None:      # continue in the checkpoint's run dir
             args.run_dir = os.path.dirname(os.path.abspath(args.resume))
-    if args.optimizer is None:
-        # resolved BEFORE args_snapshot so args.json records the truth:
-        # resuming an Adam-era checkpoint (no "muon" state) keeps Adam so
-        # the resume stays exact; everything else is muon by default
-        if resume_ckpt is not None and not resume_ckpt.get("muon"):
-            args.optimizer = "adam"
-            print("--optimizer: resuming an Adam-era checkpoint -> adam "
-                  "(to switch, warm-start with --init-from --optimizer "
-                  "muon)", flush=True)
-        else:
-            args.optimizer = "muon"
     if args.run_dir is None:
         args.run_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -1260,9 +1205,8 @@ def main():
     # legacy value_head) form their own group with an lr multiplier the
     # schedule loop re-applies every update via the "lr_mult" key
     # (extra param_group keys survive state_dict round trips).
-    # --optimizer muon: the hidden matrices leave the Adam groups
-    muon_names = (set(muon_param_names(policy))
-                  if args.optimizer == "muon" else set())
+    # hybrid Muon: the hidden matrices leave the Adam groups
+    muon_names = set(muon_param_names(policy))
     crit_p = [p for n, p in policy.named_parameters()
               if n.startswith(("critic_", "value_head"))
               and n not in muon_names]
@@ -1274,12 +1218,11 @@ def main():
          {"params": crit_p, "lr": args.lr * args.critic_lr_mult,
           "lr_mult": args.critic_lr_mult}],
         lr=args.lr, fused=fused_adam)
-    if resume_ckpt is not None and len(
-            resume_ckpt["optimizer"]["param_groups"]) != 2:
-        print("resume: legacy single-group optimizer state — "
-              "--critic-lr-mult inactive on this run", flush=True)
-        opt = torch.optim.Adam(policy.parameters(), lr=args.lr,
-                               fused=fused_adam)
+    if resume_ckpt is not None and not resume_ckpt.get("muon"):
+        # checked before the Adam load: an Adam-era checkpoint's Adam
+        # groups also hold the hidden matrices and would fail there
+        raise SystemExit("--resume needs a checkpoint saved by a muon "
+                         "run (Adam-era ones: --init-from)")
     if resume_ckpt is not None:
         try:
             # stamp the fused flag into the SAVED groups before loading:
@@ -1296,34 +1239,29 @@ def main():
                 f"--resume optimizer state does not match this policy "
                 f"arch (pre-scale checkpoints were retired). [{e}]")
 
-    muon = None
-    if args.optimizer == "muon":
-        m_main = [p for n, p in policy.named_parameters()
-                  if n in muon_names
-                  and not n.startswith(("critic_", "value_head"))]
-        m_crit = [p for n, p in policy.named_parameters()
-                  if n in muon_names
-                  and n.startswith(("critic_", "value_head"))]
-        muon = Muon(
-            [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
-             {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
-              "lr_mult": args.critic_lr_mult}],
-            momentum=args.muon_momentum, batched=args.muon_batched)
-        if resume_ckpt is not None:
-            if not resume_ckpt.get("muon"):
-                raise SystemExit("--resume into --optimizer muon needs a "
-                                 "checkpoint saved by a muon run")
-            muon.load_state_dict(resume_ckpt["muon"])
-        n_m = sum(p.numel() for p in m_main + m_crit)
-        n_a = sum(p.numel() for g in opt.param_groups for p in g["params"])
-        print(f"--optimizer muon: Muon on {len(muon_names)} hidden "
-              f"matrices ({n_m:,} params; momentum {args.muon_momentum}, "
-              f"5-step tuned NS schedule, RMS-matched "
-              f"0.2*sqrt(max(A,B))), Adam on the remaining "
-              f"{n_a:,} params", flush=True)
-    # every lr-carrying group (Adam's two, plus Muon's two when on): the
+    m_main = [p for n, p in policy.named_parameters()
+              if n in muon_names
+              and not n.startswith(("critic_", "value_head"))]
+    m_crit = [p for n, p in policy.named_parameters()
+              if n in muon_names
+              and n.startswith(("critic_", "value_head"))]
+    muon = Muon(
+        [{"params": m_main, "lr": args.lr, "lr_mult": 1.0},
+         {"params": m_crit, "lr": args.lr * args.critic_lr_mult,
+          "lr_mult": args.critic_lr_mult}],
+        momentum=args.muon_momentum)
+    if resume_ckpt is not None:
+        muon.load_state_dict(resume_ckpt["muon"])
+    n_m = sum(p.numel() for p in m_main + m_crit)
+    n_a = sum(p.numel() for g in opt.param_groups for p in g["params"])
+    print(f"optimizer: Muon on {len(muon_names)} hidden "
+          f"matrices ({n_m:,} params; momentum {args.muon_momentum}, "
+          f"5-step tuned NS schedule, RMS-matched "
+          f"0.2*sqrt(max(A,B))), Adam on the remaining "
+          f"{n_a:,} params", flush=True)
+    # every lr-carrying group (Adam's two, plus Muon's two): the
     # schedule loop and --weight-decay walk this list
-    all_groups = list(opt.param_groups) + (muon.param_groups if muon else [])
+    all_groups = list(opt.param_groups) + muon.param_groups
 
     # --weight-decay: per optimizer group, the ndim >= 2 params it will
     # decay at that group's live lr (see the flag's comment)
@@ -1941,8 +1879,7 @@ def main():
                     flat_grad.zero_()
                 else:
                     opt.zero_grad(set_to_none=True)
-                    if muon is not None:
-                        muon.zero_grad()
+                    muon.zero_grad()
                 micro = mb_size // args.mb_accum
                 for j in range(args.mb_accum):
                     sl = slice(s + j * micro, s + (j + 1) * micro)
@@ -2129,8 +2066,7 @@ def main():
                         for g_, ps_ in wd_groups:
                             torch._foreach_mul_(ps_, 1.0 - g_["lr"] * wd)
                 opt.step()
-                if muon is not None:
-                    muon.step()
+                muon.step()
                 bump_weights_version()  # invalidate fp16 replica caches
         # Tier 1.2 (2026-09-02 audit A §3): the permuted copies (p_obs
         # 1.25 GB + p_act at production shape) are dead once the epoch
@@ -2504,7 +2440,7 @@ def main():
                         "value_norm": {"mu": float(ret_mu),
                                        "var": float(ret_var)},
                         "optimizer": cpu_opt_state(opt),
-                        "muon": muon.state_dict() if muon else None,
+                        "muon": muon.state_dict(),
                         "args": args_snapshot,
                         "wsd_role": ("leaf" if leaf_from is not None
                                      else "trunk"),
@@ -2561,7 +2497,7 @@ def main():
                 "value_norm": {"mu": float(ret_mu),
                                "var": float(ret_var)},
                 "optimizer": cpu_opt_state(opt),
-                        "muon": muon.state_dict() if muon else None,
+                        "muon": muon.state_dict(),
                 "args": args_snapshot,
                 "wsd_role": ("leaf" if leaf_from is not None
                              else "trunk"),
