@@ -51,9 +51,12 @@ def test_param_deltas_exact():
     # 78 -> 87 (+9 x 192 = 1,728): totals +3,072 over the v45 counts
     # (2,418,578 / 2,567,954). The 3-token body (2026-09-22) replaced
     # body_mlp (53,952) with torso_mlp + leg_mlp (86,592: +32,640) and
-    # widened the trunk input 576 -> 960 (+147,456): +180,096 in total
-    assert tot(mlp) == 2_601_746
-    assert tot(s384) == 2_751_122
+    # widened the trunk input 576 -> 960 (+147,456): +180,096 in total.
+    # The ctor's critic head is HL-Gauss 101 bins since the scalar head
+    # was removed (2026-09-22): final layer 384 -> 101 instead of -> 1,
+    # +38,500 over the scalar-head counts (2,601,746 / 2,751,122)
+    assert tot(mlp) == 2_640_246
+    assert tot(s384) == 2_789_622
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
     assert names == {"trunk_proj.weight", "trunk_proj.bias",
@@ -126,7 +129,8 @@ def test_cpu_trainer_smoke_simba(tmp_path):
     cmd = [sys.executable, os.path.join(HERE, "train_batch.py"),
            "--device", "cpu", "--env", "rust", "--num-envs", "8",
            "--horizon", "8", "--minibatches", "1", "--total-steps", "128",
-           "--gears", "5", "--foot-contact",
+           "--gears", "5", "--foot-contact", "--n-blocks", "3",
+           "--no-ranked-maps", "--no-mirror-augment", "--no-ep-stats",
            "--trunk-arch", "simba", "--ckpt-every", "0",
            "--run-dir", str(run)]
     r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
