@@ -72,7 +72,7 @@ from beat_arena_env.chart import (ChartConfig, Wall, generate_chart,
 from beat_arena_env.constants import (EVENT_REASONS, KIND_BOMB, N_JOINTS,
                                       OBS_DIM, OFF_CONTACT, OFF_GROUND_IMP,
                                       OFF_NOTE_MASK, OFF_NOTES, OFF_PREV_L,
-                                      OFF_PREV_R, OFF_TAU, PREV_FEAT,
+                                      OFF_PREV_R, OFF_QD, OFF_TAU, PREV_FEAT,
                                       TAU_AXIS_OF_JOINT, TAU_BODY_DEFAULT,
                                       TAU_MAX, gear_table, parse_tau_scale)
 from beat_arena_env.cuda_env import CudaBeatVecEnv
@@ -263,6 +263,14 @@ def test_modified_body_lockstep_parity():
                                            want, rtol=1e-12, atol=0)
             # the default half/quarter gear would differ visibly
             assert abs(expected_torque(0.25, 1.06 * 1.3)[2] - want[2]) > 0.5
+        # CUDA's qd obs lanes of the bend joints use the 65 cap: exactly
+        # (float)(v / 65) of its own post-tick state
+        v_c = env.v.cpu().numpy()
+        obs_c = env._obs.cpu().numpy()
+        for j in BEND_J:
+            np.testing.assert_array_equal(
+                obs_c[:, OFF_QD + j], (v_c[:, 6 + j] / 65.0).astype(np.float32),
+                err_msg=f"t{t} bend qd lane {j}")
         for e, sim in enumerate(sims):
             if not done[e]:
                 _q, v = rust_state(sim)

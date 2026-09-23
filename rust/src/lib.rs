@@ -3334,6 +3334,7 @@ mod env_tests {
         assert!(c3.set_body(cfg).is_err());
         assert!(c3.set_body(BodyCfg { wrist_bend_half_gear: false, ..cfg }).is_ok());
         assert!(c3.set_body(BodyCfg { hand_mass: 0.0, ..BodyCfg::DEFAULT }).is_err());
+        assert!(c3.set_body(BodyCfg { wrist_bend_cap: 84.0, ..BodyCfg::DEFAULT }).is_err());
     }
 
     /// Activation telemetry wiring: Body::tick's act_frac is the

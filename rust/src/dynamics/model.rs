@@ -322,6 +322,9 @@ pub const A_R_WRIST_BEND: usize = 15;
 
 pub const HAND_MASS_DEFAULT: f64 = 0.35;
 pub const WRIST_BEND_CAP_DEFAULT: f64 = 50.0;
+/// step.rs bounds a stop overshoot by H_SUB x cap; the 0.35 rad
+/// LIMIT_TELEPORT_BACKSTOP must stay out of reach: cap < 0.35 x 240.
+pub const WRIST_BEND_CAP_MAX: f64 = 84.0;
 const HAND_INERTIA_NOM: f64 = 0.000264; // per axis at HAND_MASS_DEFAULT
 const WRIST_BEND_TAU_NOM: f64 = 1.06; // nominal bend tau_max (N·m)
 
@@ -363,6 +366,11 @@ impl BodyCfg {
             if !(x.is_finite() && x > 0.0) {
                 return Err(format!("{name} must be finite and > 0, got {x}"));
             }
+        }
+        if !(self.wrist_bend_cap < WRIST_BEND_CAP_MAX) {
+            return Err(format!("wrist_bend_cap must be < {WRIST_BEND_CAP_MAX} rad/s \
+                                (stop overshoot vs the teleport backstop), got {}",
+                               self.wrist_bend_cap));
         }
         Ok(())
     }

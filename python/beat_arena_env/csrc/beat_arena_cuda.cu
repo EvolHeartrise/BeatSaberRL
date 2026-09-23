@@ -1231,6 +1231,12 @@ __device__ constexpr double F_AXIS[NF][3] = {
     {0, 0, 1}, {0, 1, 0}, {-1, 0, 0},
     {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1},
     {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}};
+// NOTE (2026-09-22): the two HAND rows of F_MASS / F_INERTIA and the
+// wrist-BEND entries (8, 15) of TAU_MAX / OMEGA_CAP below are NOT read
+// for values any more — the run-only body options feed them per launch
+// (Sim hand_m / hand_i / bend_tau / bend_cap, from constants.py
+// env_body_derived; only the hand F_MASS > 0 predicate is still read).
+// Edit the default body in constants.ENV_BODY_DEFAULT + model.rs.
 // hand 0.61 -> 0.35 (user 2026-08-18): fist only, no controller mass
 // — real players exploit controller motion prediction and never truly
 // swing the composite mass; inertia rescaled with it (model.rs mirror)
@@ -6107,8 +6113,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   TORCH_CHECK(z_asinh > 0.0, "z_asinh must be > 0 (asinh z lane, metres)");
-  TORCH_CHECK(hand_m > 0.0 && hand_i > 0.0 && bend_tau > 0.0 && bend_cap > 0.0,
-              "body options must be > 0");
+  TORCH_CHECK(hand_m > 0.0 && hand_i > 0.0 && bend_tau > 0.0 && bend_cap > 0.0
+                  && bend_cap < 84.0,
+              "body options must be > 0 (wrist-bend cap < 84 rad/s)");
   TORCH_CHECK(!bend_half || gears == 5, "wrist_bend_half_gear needs gears=5");
   const auto& q = ts[TQ];
   TORCH_CHECK(q.is_cuda(), "state must live on CUDA");
