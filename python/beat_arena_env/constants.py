@@ -450,7 +450,7 @@ def note_center(n):
 # v9-LEGACY SECTION (retired with the kinematic body at P3, 2026-07-31).
 # Kept ONLY for kinematics.fk (the v9 arm-chain FK mirror: SHOULDER,
 # L_UPPER, L_FORE) and joint_limits (v9 per-hand limit table, read by
-# the test_env pose fixtures). Nothing in the live sim reads them.
+# the test_env / test_v45 pose fixtures). Nothing in the live sim reads them.
 # DO NOT use in new code.
 # =============================================================================
 SHOULDER = SHOULDER0

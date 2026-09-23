@@ -229,6 +229,7 @@ def _set_flat(sim, hand, azimuth, om_roll=0.0):
     if not (lo <= roll <= hi):
         roll = (azimuth + np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
         bend = -np.pi / 2
+        assert lo <= roll <= hi, f"azimuth {azimuth} unreachable for hand {hand}"
     _set_arm(sim, hand, [-np.pi / 2 + _DELTA, 0.0, 0.0, np.pi / 2, roll,
                          bend, 0.0],
              [0.0, 0.0, 0.0, 0.0, om_roll, 0.0, 0.0])

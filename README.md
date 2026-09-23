@@ -675,7 +675,8 @@ with `record_replay.py`; 5 eps each, gears 5, seeds 0-4, 2026-07-31):
 easy (right-only, default dials) **36.4%** good cuts / 25.7 pts per
 note; hard (both hands, default dials) **36.9% / 28.3**, ~4 bombs
 hit/ep; dynamic (both hands, note_prob 0.35) **33.0% / 24.2**. Random
-actions land 5-7% / ~5 on the same gyms.
+actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
+59.1/66.2% are not comparable — different physics.)
 
 ## Status
 
