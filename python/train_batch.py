@@ -136,22 +136,6 @@ def adv_filter_stats(f_adv, keep_idx):
     return mu, sd, ratio
 
 
-def resolve_env_order(flag, environ):
-    """R12 env-order resolution (2026-09-02, Tier 0.1). `flag` is
-    args.env_order: True/False if --env-order/--no-env-order was given,
-    None if neither was. Precedence: explicit flag > a BEAT_ENV_ORDER
-    already in the shell > ON.
-
-    The shell variable is kept in the chain (rather than the flag simply
-    defaulting True) so the standalone env-var contract other tools and
-    the 2026-08-21 A/B harness use still works, and so a pod that
-    exports BEAT_ENV_ORDER=0 to quarantine the permutation is not
-    silently overridden by the new default."""
-    if flag is None:
-        return environ.get("BEAT_ENV_ORDER", "1") == "1"
-    return bool(flag)
-
-
 def entropy_report(ent_head):
     """Per-limb-group entropy, the weakest head, and the 29-head sum.
 
@@ -409,27 +393,6 @@ def parse_args():
                         "parity reference). Default: cuda on a CUDA "
                         "device, else rust. (The P4 torch mirror, "
                         "--env torch, was removed 2026-08-03.)")
-    # R12 warp-coherence env permutation (cuda_env.py:608, the
-    # dynamics-key argsort). Promoted from a bare BEAT_ENV_ORDER env
-    # var to a real flag 2026-09-02 (Tier 0.1 of the 09-02 static
-    # audit): it was default OFF and no launcher ever set it, so the
-    # +5.4% measured on the previous pod (2026-08-21, 123,081 vs
-    # 116,804 steps/s) was never actually collected by a campaign.
-    # Per-env results are bitwise-identical under ANY thread->env
-    # bijection (tests/test_env_order_bitwise.py), so this is a pure
-    # throughput knob. Default ON. Resolution order: explicit flag >
-    # a pre-existing BEAT_ENV_ORDER in the shell > ON. The trainer
-    # re-exports the resolved value into os.environ BEFORE the env is
-    # constructed, so cuda_env's reader is untouched and the env var
-    # keeps working standalone (the bitwise test drives
-    # _env_order_on directly and is unaffected either way).
-    p.add_argument("--env-order", dest="env_order", action="store_true",
-                   default=None,
-                   help="R12 warp-coherence env permutation (--env cuda; "
-                        "bitwise identical per env). Default ON; "
-                        "overrides BEAT_ENV_ORDER")
-    p.add_argument("--no-env-order", dest="env_order", action="store_false",
-                   help="disable the R12 permutation (identity ordering)")
     p.add_argument("--graph-rollout", action="store_true", default=False,
                    help="capture the rollout step (policy fwd + sample + "
                         "env kernel) as ONE CUDA graph and replay it for "
@@ -924,11 +887,6 @@ def main():
         print("--fp16: CPU device, forcing off", flush=True)
         args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
-    # R12 env-order resolution, BEFORE any env is constructed (cuda_env
-    # snapshots os.environ in __init__). Explicit flag wins; otherwise
-    # a BEAT_ENV_ORDER already in the shell wins; otherwise ON.
-    args.env_order = resolve_env_order(args.env_order, os.environ)
-    os.environ["BEAT_ENV_ORDER"] = "1" if args.env_order else "0"
     # device-side loss-scaling state: NO host syncs in the minibatch
     # loop (an overflow zeroes the grads device-side; the audit rides
     # the existing once-per-update print sync). The scale itself is a
@@ -1078,6 +1036,7 @@ def main():
                       tau_rand=args.tau_rand,
                       ep_stats=args.ep_stats,
                       tau_center=parse_tau_scale(args.tau_center),
+                      env_order=True,
                       seed=args.seed, device=device)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
@@ -1100,7 +1059,7 @@ def main():
             start_pose_jitter=args.start_pose_jitter,
             crouch_start_prob=args.crouch_start_prob,
             z_clip_hi=args.z_clip_hi, z_asinh=args.z_asinh,
-            self_contact_coef=args.self_contact_coef,
+            self_contact_coef=args.self_contact_coef, env_order=True,
             seed=args.seed, chart_pool=args.chart_pool, device=device)
     else:
         venv = BeatVecEnv(
@@ -1474,14 +1433,9 @@ def main():
     # env-order state is on the banner because it was invisible for the
     # 12 days it existed (2026-08-21 -> 09-02): nothing printed it and
     # nothing set it, so no log ever said which ordering a run used.
-    # Read off the ENV, not off args — a banner that reports the request
-    # rather than the fact is how this knob stayed dark in the first
-    # place; the assert catches a future env that stops reading the var.
+    # Read off the env object (the trainer always passes env_order=True
+    # to the CUDA env; the Rust env has no permutation, prints nothing).
     eo_live = getattr(venv, "_env_order_on", None)
-    if eo_live is not None:
-        assert eo_live == bool(args.env_order), (
-            f"--env-order {args.env_order} did not reach the env "
-            f"(_env_order_on={eo_live})")
     eo = "" if eo_live is None else \
         f", env-order {'on' if eo_live else 'off'}"
     print(f"=== batched PPO: {N} envs x {T} horizon = {batch} steps/update, "
