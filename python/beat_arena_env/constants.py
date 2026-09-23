@@ -448,44 +448,26 @@ def note_center(n):
 
 # =============================================================================
 # v9-LEGACY SECTION (retired with the kinematic body at P3, 2026-07-31).
-# Kept ONLY because kinematics.py (v9 arm FK/IK mirror — P6 rebuilds the
-# bot on the dynamic body) and scripted.py (v9 bot, broken against the
-# v10 sim API, P6 re-authors) still import these names. Nothing in the
-# live sim reads them. DO NOT use in new code.
+# Kept ONLY for kinematics.fk (the v9 arm-chain FK mirror: SHOULDER,
+# L_UPPER, L_FORE) and joint_limits (v9 per-hand limit table, read by
+# the test_env pose fixtures). Nothing in the live sim reads them.
+# DO NOT use in new code.
 # =============================================================================
-DRAG = 0.02           # v9 per-tick velocity decay (now physical damping b)
-EFFORT_COST = (2e-4, 2e-4, 2e-4, 1.3e-4, 0.7e-4, 0.7e-4, 0.7e-4)  # v7.9 table
 SHOULDER = SHOULDER0
 L_UPPER = 0.35        # m
 L_FORE = 0.30         # m
-HEAD = HEAD0
-N_HAND_JOINTS = 7     # v9 per-hand joint count (pitch..dev)
-ALPHA_ARM, OMEGA_ARM = 160.0, 16.0
-# scripted-harness wrist model — tracks the TRUE engine values so
-# scripted swings land as designed (a too-slow model overshoots):
-# alpha = tau_max / (armature + I_hand + m_hand*d^2)
-#       = 1.06 / (0.0000266 + 0.000264 + 0.35*0.06^2) ~ 684 rad/s^2
-# (2026-08-18 fist-only hand); omega = the wrist cap (50).
-ALPHA_WRIST, OMEGA_WRIST = 684.0, 50.0
-JOINT_ALPHA = (ALPHA_ARM,) * 4 + (ALPHA_WRIST,) * 3
-JOINT_OMEGA = (OMEGA_ARM,) * 4 + (OMEGA_WRIST,) * 3
-PITCH_LIM = math.radians(90.0)
 PITCH_LO = math.radians(-90.0)
 PITCH_HI = math.radians(65.0)
 YAW_LO = (math.radians(-100.0), math.radians(-45.0))    # (left, right)
 YAW_HI = (math.radians(45.0), math.radians(100.0))
-TWIST_LIM = math.radians(90.0)
 TWIST_LO = (math.radians(-90.0), math.radians(-70.0))   # (left, right)
 TWIST_HI = (math.radians(70.0), math.radians(90.0))
 ELBOW_HI = math.radians(150.0)
 ROLL_LO = (0.0, math.radians(-180.0))                   # (left, right)
 ROLL_HI = (math.radians(180.0), 0.0)
 BEND_LIM = math.radians(95.0)
-DEV_LIM = math.radians(30.0)
 DEV_LO = (math.radians(-30.0), math.radians(-15.0))     # (left, right)
 DEV_HI = (math.radians(15.0), math.radians(30.0))
-REACH_Z = 1.75        # v9 constant gate (now live: REACH_PAST_SHOULDER)
-Z_MISS = 0.65         # v9 constant miss boundary (now live: head_z(t))
 
 
 def joint_limits(hand):

@@ -31,10 +31,10 @@ projects/beat-arena/
   SPEC.md
   README.md
   python/
-    beat_arena_env/      # chart gen, constants, gym wrappers, scripted bot
+    beat_arena_env/      # chart gen, constants, gym wrappers, FK mirror
     policy.py            # NotePolicy (transformer)
     train_batch.py       # batched CPU PPO (the only trainer)
-    record_replay.py     # scripted/random replay recorder (Rust event stream -> JSONL)
+    make_top10_replays.py # checkpoint replay recorder (Rust event stream -> JSONL)
     tests/               # pytest
   rust/                  # beat-arena-rs: THE sim implementation
 ```
@@ -121,7 +121,7 @@ checkpoints/replays retire (hard replace).
   each (env v9; `MultiDiscrete([K]×14)`, left hand first, joint order as
   above, no masks). Gear table (`constants.gear_table`): id 0 = coast,
   1/2 = `±α` at EVERY K (the ternary era is the K=3 prefix — old action
-  streams and the scripted bot stay valid); finer ± pairs append:
+  streams stay valid); finer ± pairs append:
   K=5 adds `±α/4`, K=7 adds `±α/3` and `±α/8`. Effort cost scales by
   |fraction|. Checkpoints stamp `n_gears` in `arch`; env and policy
   tables must match (trainer enforces).
@@ -452,57 +452,22 @@ and the file works fully offline. Controls: space play/pause, ←/→
 tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
 (MediaRecorder → .webm). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
-`python/record_replay.py` records episodes of the scripted bot or
-random actions on procedural charts (`--tag` prefixes filenames);
-logged rewards are the raw interpretable ones. Checkpoint replays come
-from `python/make_top10_replays.py`, which sets up the production
-physics and plays the bench's real maps.
+Replays come from `python/make_top10_replays.py`, which sets up the
+production physics and plays a checkpoint on the bench's real maps
+(the procedural-chart `record_replay.py` scripted/random recorder was
+removed 2026-09-22 with the scripted bot).
 Every interesting run should be recorded.
 
-## Scripted reference bot (`beat_arena_env/scripted.py`)
+## Scripted reference bot (removed 2026-09-22)
 
-Per hand, against its color's earliest pending scoreable object (bombs
-are never targets; chain links are targeted with their TANGENT as the
-swing direction, so one whip sweeps consecutive links). Env v7 changes:
-the wrist plants at `PLANT_Z = −0.25` (shoulders sit 0.65 m behind the
-plane — an on-plane wrist would be at full stretch), and the whip is
-timed to pass through the contact angle `EARLY_S = 0.10` s BEFORE
-`hit_time` — the elongated good box reaches the blade zone early, and a
-plane-timed swing gets caught mid-wind-up (`angle`/`slow`); cutting
-early inside the deep box is exactly what real players do. Otherwise
-the v6 plan survives (plant, cock up to `SWING_ARC = 130°`, whip
-through; the leftover rotation is the follow-through):
-
-1. **Plant**: the wrist goal slides along the ray
-   `center − s·(cosθ_c, sinθ_c, 0)` + `(0, 0, PLANT_Z)` (both
-   perpendicular candidates, s ∈ [0.3, 0.95], ideal s = 0.75) to the
-   most reachable point; `kinematics.ik_arm(hand, goal, swivel="back")`
-   solves closed-form two-link IK with the elbow pushed toward −z,
-   which keeps the FOREARM pointing at the notes — roll-swings then
-   sweep near the hit plane.
-2. **Re-aim**: the contact blade orientation is `θ_aim` = wrist→note
-   from the pose the arm will actually reach (exact when the plant is
-   reachable, best-effort otherwise — the 60° cut tolerance absorbs the
-   residual). `kinematics.wrist_for_blade` inverts the forearm-frame
-   blade formula; BOTH wrist representations (`(ψ, φ)` ≡ `(ψ±π, −φ)`)
-   and both sweep senses are ranked: direction error ≤ 55° (hard cap),
-   then wind-up room ≥ arc and follow-through room ≥ 45° inside the
-   roll range (v5.2's room ranking, in roll space).
-3. **Steering**: every joint is an independent force-free integrator,
-   so each is bang-banged toward its target (desired ω = gain·error).
-   The whip is FULL roll accel in the swing sense, timed by the wrist's
-   `α/Ω` physics so the blade sweeps THROUGH `θ_aim` at contact.
-
-Stateless per tick; solvability proof and eyeball baseline, not
-optimal. Must land ≥ 50% good cuts on the default (right-only) chart
-(tested; **generator v2 dropped it from 82.9% to ~60%** — parity-flow
-angles, extras, and the 2-8 m/s speed walk tax its flat-blade whip),
-with mean score well above the 15-point stab ceiling. Its flat-blade
-technique caps accuracy (~5 of 15 — the blade plane sits ~0.2 m behind
-the note center; forward-TILTED blades sweeping through the box depth
-are the real-BS high-accuracy technique, open to the learned policy).
-The realistic body costs it dearly on harder configs (see README
-reference numbers) — by design ("that's the game").
+The v7-v10 scripted reference bot (`beat_arena_env/scripted.py`: plant
+the wrist by closed-form two-link IK, re-aim the blade, whip through
+the note; the P6 re-author added gravity-compensated PD over that IK
+on the dynamic body) was the solvability proof and eyeball baseline
+before learned policies surpassed it. It was deleted together with
+the arm IK only it used (`kinematics.ik_arm` / `wrist_for_blade`),
+its solvability test and the `record_replay.py` recorder; last
+measured numbers are in the README ("Historical reference points").
 
 ## Policy (`python/policy.py`)
 
@@ -797,7 +762,7 @@ Further gains need a GPU or a cheaper policy, not more envs.
 ## Tests (`python/tests/`, pytest)
 
 1. Obs layout: length 290, offsets, arm-state block, kind/arc flags,
-   mask semantics; the Python FK/IK mirror (`kinematics.py`) pinned
+   mask semantics; the Python FK mirror (`kinematics.py`) pinned
    against the sim's getters on random poses.
 2. Determinism: same seed + fixed action stream (all object kinds in
    the chart) ⇒ identical rewards and events across two runs.
@@ -834,8 +799,8 @@ Further gains need a GPU or a cheaper policy, not more envs.
    positions marching along the curve).
 5. Policy junk-leak: garbage in masked note slots changes no
    logprob/entropy/value (key-masking).
-6. Scripted bot ≥ 50% good cuts on the default chart (solvability;
-   ~60% measured on generator v2).
+6. (Retired 2026-09-22: the scripted-bot solvability gate, removed
+   with the bot.)
 7. ScoreSaber bench (offline, network monkeypatched): PP-curve anchors
    (0.95→1, 1.0→5.367…, interpolation, monotonicity), 0.965-weighted
    totals, the multiplier walk vs ScoreSaber's 115·(8n−63) formula,

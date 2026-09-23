@@ -60,7 +60,7 @@ the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
 root twist + ω29 + contact events; since P6 additive per-tick "feet"
 weld impulses; record_rev 3 "activation"). Gravity is real and nothing holds the body
 up — posture is the policy's problem now. ALL v9 checkpoints,
-replays, and records are retired. The viewer and scripted bot are v10
+replays, and records are retired. The viewer is v10
 (P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` — the whole
 8-substep dynamics tick as ONE launch, one thread per env, f64 branch
 horizon-bounded tight-tolerance vs Rust) is the default training
@@ -480,7 +480,6 @@ See `viz/dash/README.md` for the field vocabulary and index schema.
 
 ```bash
 $VENV/bin/python make_top10_replays.py --ckpt <ckpt.pt> --bench <bench.json> --tag <tag>
-$VENV/bin/python record_replay.py --scripted   # scripted bot, procedural chart
 ```
 
 `make_top10_replays.py` re-plays a bench's top plays (or `--bottom` /
@@ -670,19 +669,13 @@ applies to the embedded meshes: `replay.html` is internal tooling; keep
 any redistribution GPL-compatible. `test/closeup-probe.mjs` screenshots
 the built viewer at chosen ticks for eyeballing.
 
-Reference points (env v10 P6 scripted bot — gravity-compensated
-PD-over-IK on the dynamic body; 5 eps each, gears 5, seeds 0-4,
-2026-07-31): easy (right-only, default dials) **36.4%** good cuts /
-25.7 pts per note; hard (both hands, default dials) **36.9% / 28.3**,
-~4 bombs hit/ep; dynamic (both hands, note_prob 0.35) **33.0% /
-24.2**. Random actions land 5-7% / ~5 on the same gyms. The retired
-v9 kinematic bot's 59.1/66.2% are NOT comparable — the physics jump
-(gravity, free-root reaction coupling, ≥¼-τ_max gear quanta) costs
-the scripted referee roughly half its rate, the v6-precedent drop;
-13 tuning iterations are documented in `beat_arena_env/scripted.py`
-(measured apparent inertias, constrained-stance feedforward,
-COM-over-ankles balance, pelvis righting, chest-frame IK, endgame
-plan latch).
+Historical reference points (the env v10 P6 scripted bot —
+gravity-compensated PD-over-IK on the dynamic body, REMOVED 2026-09-22
+with `record_replay.py`; 5 eps each, gears 5, seeds 0-4, 2026-07-31):
+easy (right-only, default dials) **36.4%** good cuts / 25.7 pts per
+note; hard (both hands, default dials) **36.9% / 28.3**, ~4 bombs
+hit/ep; dynamic (both hands, note_prob 0.35) **33.0% / 24.2**. Random
+actions land 5-7% / ~5 on the same gyms.
 
 ## Status
 
