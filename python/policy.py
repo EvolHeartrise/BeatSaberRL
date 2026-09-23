@@ -519,7 +519,7 @@ class NotePolicy(nn.Module):
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
                  note_geo: bool = False, note_geo_norm: bool = False,
-                 value_bins: int = 0, value_vmax: float = 6.0,
+                 value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_arch: str = "mlp", trunk_hidden: int | None = None):
         super().__init__()
@@ -527,6 +527,9 @@ class NotePolicy(nn.Module):
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
         assert trunk_arch in ("mlp", "simba"), trunk_arch
+        assert value_bins > 1, (
+            f"value_bins must be > 1 (HL-Gauss is the only critic head; "
+            f"the scalar MSE head was removed 2026-09-22), got {value_bins}")
         self.encoder = encoder
         self.embed = embed
         self.n_heads = n_heads
@@ -553,21 +556,21 @@ class NotePolicy(nn.Module):
                      "trunk_arch": trunk_arch,
                      "trunk_hidden": (int(trunk_hidden) if trunk_hidden
                                       else trunk_dim),
-                     # HL-Gauss critic head (2026-09-19): 0 = scalar
-                     # regression; K > 0 = K-bin histogram over the
-                     # normalized return in [-vmax, vmax], target width
-                     # sigma (in bin widths), value = expectation
+                     # HL-Gauss critic head (2026-09-19; the only head
+                     # since 2026-09-22, the scalar MSE head is gone):
+                     # K-bin histogram over the normalized return in
+                     # [-vmax, vmax], target width sigma (in bin
+                     # widths), value = expectation
                      "value_bins": int(value_bins),
                      "value_vmax": float(value_vmax),
                      "value_sigma": float(value_sigma)}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
-        if self.value_bins:
-            centers = torch.linspace(-float(value_vmax), float(value_vmax),
-                                     self.value_bins)
-            self.register_buffer("value_centers", centers, persistent=False)
-            # sigma in return units: sigma_bins x bin width
-            self.value_sigma = float(value_sigma) * float(centers[1] - centers[0])
+        centers = torch.linspace(-float(value_vmax), float(value_vmax),
+                                 self.value_bins)
+        self.register_buffer("value_centers", centers, persistent=False)
+        # sigma in return units: sigma_bins x bin width
+        self.value_sigma = float(value_sigma) * float(centers[1] - centers[0])
         self._value_logits = None
         self.note_geo = bool(note_geo)
         self.note_geo_norm = bool(note_geo_norm)
@@ -631,7 +634,7 @@ class NotePolicy(nn.Module):
         self.critic_v = nn.Linear(embed, embed)
         self.critic_out = nn.Linear(embed, embed)
         self.critic_mlp = _mlp([embed + trunk_dim, trunk_dim,
-                                trunk_dim, self.value_bins or 1])
+                                trunk_dim, self.value_bins])
         # trainer diagnostics: _diag_stash=True makes the next forward
         # keep its trunk output on self._diag_h (forward hooks can't
         # see it — the fp16 paths bypass module __call__). Plain
@@ -843,14 +846,11 @@ class NotePolicy(nn.Module):
             scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
             a = torch.softmax(scores, dim=-1) @ v
         a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
-        val = _seq(self.critic_mlp, torch.cat([a, h], dim=-1))
-        if self.value_bins:
-            # HL-Gauss: bins -> expectation; the (B, K) logits are kept
-            # for the update's cross-entropy (grad-enabled calls only)
-            logits = val.float()
-            self._value_logits = logits if torch.is_grad_enabled() else None
-            return torch.softmax(logits, dim=-1) @ self.value_centers
-        return val.float().squeeze(-1)
+        logits = _seq(self.critic_mlp, torch.cat([a, h], dim=-1)).float()
+        # HL-Gauss: bins -> expectation; the (B, K) logits are kept for
+        # the update's cross-entropy (grad-enabled calls only)
+        self._value_logits = logits if torch.is_grad_enabled() else None
+        return torch.softmax(logits, dim=-1) @ self.value_centers
 
     def flatten_fp16(self):
         """Repack all Linear masters into one flat fp32 buffer with a
@@ -994,7 +994,7 @@ def load_policy(ckpt) -> NotePolicy:
         # pre-2026-09-15 checkpoints carry no trunk marker: plain mlp
         trunk_arch=arch.get("trunk_arch", "mlp"),
         trunk_hidden=arch.get("trunk_hidden"),
-        value_bins=arch.get("value_bins", 0),
+        value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
         value_sigma=arch.get("value_sigma", 0.75))
     policy.load_state_dict(ckpt["state_dict"])

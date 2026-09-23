@@ -1,8 +1,10 @@
-"""HL-Gauss critic head (Farebrother et al. 2024; --value-head hl,
-2026-09-19): histogram over the normalized return, Gaussian-smoothed
-target truncated to the support and renormalized, value = expectation."""
+"""HL-Gauss critic head (Farebrother et al. 2024; 2026-09-19, the only
+critic head since 2026-09-22): histogram over the normalized return,
+Gaussian-smoothed target truncated to the support and renormalized,
+value = expectation."""
 import math
 
+import pytest
 import torch
 
 import policy as P
@@ -67,8 +69,12 @@ def test_policy_hl_head_value_shape_logits_and_muon_split():
     assert pol2.value_bins == 51 and pol2.critic_mlp[-1].out_features == 51
 
 
-def test_mse_head_unchanged():
+def test_default_head_is_hl_101_and_scalar_head_is_gone():
     pol = P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
                        n_gears=5, ffn_mult=2, note_geo=True, trunk_arch="simba")
-    assert pol.value_bins == 0 and pol.critic_mlp[-1].out_features == 1
-    assert pol.arch["value_bins"] == 0
+    assert pol.value_bins == 101 and pol.critic_mlp[-1].out_features == 101
+    assert pol.arch["value_bins"] == 101
+    # the scalar MSE head (value_bins 0) was removed 2026-09-22
+    with pytest.raises(AssertionError):
+        P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
+                     n_gears=5, ffn_mult=2, value_bins=0)
