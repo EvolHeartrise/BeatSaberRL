@@ -19,7 +19,7 @@ import torch.nn.functional as F
 if not torch.cuda.is_available():
     pytest.skip("fp16 critic path needs CUDA", allow_module_level=True)
 
-from policy import N_NOTE_SLOTS, NotePolicy, OBS_DIM, OFF_NOTE_MASK
+from policy import N_NOTE_SLOTS, NotePolicy, OBS_DIM, OFF_NOTE_MASK, hl_loss
 
 
 def _obs(n, seed=0):
@@ -28,6 +28,19 @@ def _obs(n, seed=0):
     obs[:, OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS] = (
         torch.rand(n, N_NOTE_SLOTS, generator=g) < 0.6).float()
     return obs.cuda()
+
+
+def _value_loss(p, n, seed=7):
+    """The trainer's critic loss: HL-Gauss cross-entropy of the head's
+    bin logits against non-trivial normalized-return targets. (Until the
+    scalar head was removed, 2026-09-22, this test used value**2; on the
+    HL head at init that loss is ~0 by symmetry — v = softmax . centers
+    ~ 0, so dL/dv = 2v/B — and the score-path grads it produces, already
+    ~1e-5 under the scalar head, fall below the fp16 range with no loss
+    scale: critic_ln.weight came back exactly 0.)"""
+    g = torch.Generator().manual_seed(seed)
+    tgt = (torch.randn(n, generator=g) * 1.5).cuda()
+    return hl_loss(p._value_logits, tgt, p.value_centers, p.value_sigma)
 
 
 def _policy(fp16=True, flat=False):
@@ -139,8 +152,8 @@ def test_fp16_value_tracks_fp32_value():
 def test_critic_params_receive_grads_through_fp16_path(flat):
     p = _policy(flat=flat)
     obs = _obs(256, seed=1)
-    _, value = p.forward_stacked(obs)
-    value.float().pow(2).mean().backward()
+    p.forward_stacked(obs)
+    _value_loss(p, 256).backward()
     crit = ["critic_ln", "critic_q", "critic_k", "critic_v",
             "critic_out", "critic_mlp"]
     for name, prm in p.named_parameters():
@@ -164,8 +177,8 @@ def test_critic_params_receive_grads_through_fp16_path(flat):
     # to 0.85-0.97 with q/k scaled x8). The run-level gate for those is
     # the 5-update ev/acc comparison in the audit's Tier 1 results.
     p32 = _policy(fp16=False)
-    _, v32 = p32.forward_stacked(obs)
-    v32.pow(2).mean().backward()
+    p32.forward_stacked(obs)
+    _value_loss(p32, 256).backward()
     for name in ("critic_v", "critic_out", "critic_mlp.0", "critic_mlp.2",
                  "critic_mlp.4"):
         m16 = dict(p.named_modules())[name]
