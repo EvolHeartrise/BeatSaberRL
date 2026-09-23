@@ -202,10 +202,10 @@ if it passes 1e-2 or `clipfrac` on the first minibatch leaves 0, move the
 head GEMM to fp32.
 
 **Recipe since 2026-09-16 (user decisions 09-15/09-16): `--clip 0.3`,
-`--trunk-arch simba`, and whole-level episodes (the only ranked-pool
+the SimBa trunk, and whole-level episodes (the only ranked-pool
 mode since 2026-09-16).** The full recipe is Muon + wide arch 192/384 +
 env v45 (v42 hilt grip, `--note-geo`, v43 torque energy price, v45
-per-hand previous-note block) + `--clip 0.3` + `--trunk-arch simba` +
+per-hand previous-note block) + `--clip 0.3` + the SimBa trunk +
 `--ranked-maps` whole-level episodes; the pod BASE string needs no
 clip/trunk/segment flags (there is no segment flag any more). Reference
 numbers are `v46_whole` (pod igc6hvsqagfnrf, 2026-09-16): trunk final-50
@@ -277,12 +277,13 @@ accuracy, return) with bootstrap CIs. The CUDA env draws from its seeded
 generator (reproducible per seed); the Rust sim has no per-episode RNG
 and takes scales explicitly. Probe pending.
 
-**`--trunk-arch simba` (2026-09-15, research/2026-09-14-architecture-brainstorm.md
-#2; DEFAULT since 2026-09-15, `--trunk-arch mlp` reproduces the older layout):** the readout trunk that turns the three
-lead tokens (576 lanes) into the 384-lane feature `h` is a plain
-Linear-ReLU-Linear — the one stage in the network with neither a
-LayerNorm nor a skip (the blocks are pre-LN residual, the critic pool has
-its own LN). `simba` replaces it with a Linear 576→384 projection, one
+**SimBa readout trunk (2026-09-15, research/2026-09-14-architecture-brainstorm.md
+#2; the only trunk since 2026-09-22 — the plain MLP trunk and
+`--trunk-arch` were removed):** the readout trunk that turns the lead
+tokens (576 lanes then; 960 since the 3-token body) into the 384-lane
+feature `h` used to be a plain Linear-ReLU-Linear — the one stage in the
+network with neither a LayerNorm nor a skip (the blocks are pre-LN
+residual, the critic pool has its own LN). SimBa replaced it with a Linear 576→384 projection, one
 residual block `x + fc2(relu(fc1(LN1 x)))`, and a final LN2 (modules
 `trunk_proj`, `trunk_ln1`, `trunk_fc1`, `trunk_fc2`, `trunk_ln2`;
 `--trunk-hidden` sets the block width, default = trunk dim). Params:
@@ -296,8 +297,8 @@ layers — and `h` is where the `[diag]` srank (≈60% of width under Muon,
 decayed 165→50 over a 4.7B Adam trunk) is measured. Watch items: LN2 fixes
 the feature scale the heads see, so `ent` and `clipfrac` may move in the
 first ~50 updates; srank is now measured AFTER LN2. Checkpoints carry the
-marker (`arch["trunk_arch"]`, absent = mlp), so every earlier checkpoint
-loads unchanged; a simba run is a fresh construction (no trunk warm-start).
+marker `arch["trunk_arch"] = "simba"`; `load_policy` refuses any other
+(or a missing) marker.
 Note: the fused LN kernel is eligible only up to 256 lanes, so at trunk 384
 both trunk LNs run the stock fp32-stats fallback (bit-defined, slightly
 slower — a few small kernels per forward).

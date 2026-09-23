@@ -1,7 +1,8 @@
-"""--trunk-arch simba (2026-09-15, brainstorm item 2): SimBa-style
-residual + LayerNorm readout trunk. Pins: exact param deltas, simba
-forward shapes / finiteness / LN-scaled h, checkpoint round trip, a
-2-update CPU trainer smoke, and (CUDA) fp16-vs-fp32 agreement."""
+"""SimBa-style residual + LayerNorm readout trunk (2026-09-15,
+brainstorm item 2; the only trunk since 2026-09-22, the plain MLP trunk
+was removed). Pins: exact param counts, forward shapes / finiteness /
+LN-scaled h, checkpoint round trip (and refusal of a non-simba trunk),
+a 2-update CPU trainer smoke, and (CUDA) fp16-vs-fp32 agreement."""
 import os
 import subprocess
 import sys
@@ -33,17 +34,14 @@ def _trunk_params(p):
                if n.startswith("trunk"))
 
 
-def test_param_deltas_exact():
-    mlp = NotePolicy(embed=192, trunk_dim=384, n_gears=5, note_geo=True)
-    s384 = NotePolicy(embed=192, trunk_dim=384, n_gears=5, note_geo=True,
-                      trunk_arch="simba")
+def test_param_counts_exact():
+    s384 = NotePolicy(embed=192, trunk_dim=384, n_gears=5, note_geo=True)
     s1536 = NotePolicy(embed=192, trunk_dim=384, n_gears=5, note_geo=True,
-                       trunk_arch="simba", trunk_hidden=1536)
-    # 5 lead tokens since the 3-token body (2026-09-22): 960 -> 384 -> 384
-    assert _trunk_params(mlp) == 516_864
+                       trunk_hidden=1536)
+    # 5 lead tokens since the 3-token body (2026-09-22): proj 960 -> 384,
+    # block 384 -> H -> 384, two LNs
     assert _trunk_params(s384) == 666_240
-    assert _trunk_params(s384) - _trunk_params(mlp) == 149_376
-    assert _trunk_params(s1536) - _trunk_params(mlp) == 1_035_264
+    assert _trunk_params(s1536) - _trunk_params(s384) == 885_888
     tot = lambda p: sum(x.numel() for x in p.parameters())  # noqa: E731
     # env v46 (2026-09-16) widened the encoders: saber 37 -> 44 lanes
     # (+7 x 192 x 2 tokens... one shared saber_mlp: +1,344) and body
@@ -53,8 +51,7 @@ def test_param_deltas_exact():
     # widened the trunk input 576 -> 960 (+147,456): +180,096 in total.
     # The ctor's critic head is HL-Gauss 101 bins since the scalar head
     # was removed (2026-09-22): final layer 384 -> 101 instead of -> 1,
-    # +38,500 over the scalar-head counts (2,601,746 / 2,751,122)
-    assert tot(mlp) == 2_640_246
+    # +38,500 over the scalar-head count (2,751,122)
     assert tot(s384) == 2_789_622
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
@@ -67,7 +64,7 @@ def test_param_deltas_exact():
 
 def test_simba_forward_shapes_and_ln_scale():
     torch.manual_seed(0)
-    p = NotePolicy(n_gears=5, trunk_arch="simba")
+    p = NotePolicy(n_gears=5)
     obs = _obs(16)
     p._diag_stash = True
     with torch.no_grad():
@@ -92,7 +89,7 @@ def test_simba_forward_shapes_and_ln_scale():
 
 def test_simba_checkpoint_round_trip():
     torch.manual_seed(1)
-    p = NotePolicy(n_gears=5, trunk_arch="simba", trunk_hidden=512)
+    p = NotePolicy(n_gears=5, trunk_hidden=512)
     ckpt = {"arch": dict(p.arch), "state_dict": p.state_dict()}
     q = load_policy(ckpt)
     assert q.arch["trunk_arch"] == "simba" and q.arch["trunk_hidden"] == 512
@@ -102,18 +99,27 @@ def test_simba_checkpoint_round_trip():
         a, va = p.forward_stacked(obs)
         b, vb = q.forward_stacked(obs)
     assert torch.equal(a, b) and torch.equal(va, vb)
+    # a checkpoint with any other trunk (the removed plain MLP) is refused
+    for bad in ("mlp", None):
+        arch = dict(p.arch)
+        if bad is None:
+            del arch["trunk_arch"]
+        else:
+            arch["trunk_arch"] = bad
+        with pytest.raises(SystemExit, match="SimBa trunk is the only"):
+            load_policy({"arch": arch, "state_dict": p.state_dict()})
 
 
 def test_cpu_trainer_smoke_simba(tmp_path):
-    """2 updates, 8 envs x T=8 on the Rust env, --trunk-arch simba: runs
-    clean, reports the simba trunk and puts its matrices under Muon."""
+    """2 updates, 8 envs x T=8 on the Rust env: runs clean, reports the
+    simba trunk and puts its matrices under Muon."""
     run = tmp_path / "simba_smoke"
     cmd = [sys.executable, os.path.join(HERE, "train_batch.py"),
            "--device", "cpu", "--env", "rust", "--num-envs", "8",
            "--horizon", "8", "--minibatches", "1", "--total-steps", "128",
            "--gears", "5", "--foot-contact", "--n-blocks", "3",
            "--no-ranked-maps", "--no-mirror-augment", "--no-ep-stats",
-           "--trunk-arch", "simba", "--ckpt-every", "0",
+           "--ckpt-every", "0",
            "--run-dir", str(run)]
     r = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
                        timeout=900)
@@ -124,16 +130,15 @@ def test_cpu_trainer_smoke_simba(tmp_path):
     assert "update   2/2" in out or "update 2/2" in out.replace("  ", " "), out[-2000:]
     m = [ln for ln in out.splitlines() if "Muon on" in ln]
     assert m, out[-2000:]
-    # mlp: 18 block + 2 trunk + 6 critic = 26 hidden matrices; simba's 3
-    # trunk matrices (proj, fc1, fc2) replace the mlp's 2 -> 27
+    # 18 block + 3 trunk (proj, fc1, fc2) + 6 critic = 27 hidden matrices
     assert "Muon on 27 hidden" in m[0], m[0]
 
 
 @cuda
 def test_simba_fp16_matches_fp32_cuda():
     torch.manual_seed(0)
-    p32 = NotePolicy(n_gears=5, trunk_arch="simba").cuda()
-    p16 = NotePolicy(n_gears=5, trunk_arch="simba").cuda()
+    p32 = NotePolicy(n_gears=5).cuda()
+    p16 = NotePolicy(n_gears=5).cuda()
     p16.load_state_dict(p32.state_dict())
     p16.fp16 = True
     obs = _obs(256, seed=1).cuda()

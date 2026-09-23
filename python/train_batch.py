@@ -446,19 +446,13 @@ def parse_args():
     p.add_argument("--n-blocks", type=int, default=6)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
-    p.add_argument("--trunk-arch", choices=["mlp", "simba"], default="simba",
-                   help="readout-trunk layout (2026-09-15, brainstorm item "
-                        "2). simba = DEFAULT since 2026-09-15 (user "
-                        "decision: +0.66 pt trunk, +2.0%% bench at matched "
-                        "clip 0.3): Linear projection -> residual block "
-                        "x + fc2(relu(fc1(LN x))) -> LN (SimBa 2410.09754). "
-                        "mlp = plain Linear-ReLU-Linear, reproduces the "
-                        "pre-09-15 layout. Fresh construction only; "
-                        "resumes take the arch from the checkpoint.")
+    # readout trunk: always SimBa (Linear projection -> residual block
+    # x + fc2(relu(fc1(LN x))) -> LN, SimBa 2410.09754; the plain MLP
+    # trunk and --trunk-arch were removed 2026-09-22)
     p.add_argument("--trunk-hidden", type=int, default=None,
-                   help="--trunk-arch simba: hidden width of the residual "
-                        "block (default = --trunk-dim; +149,376 params at "
-                        "192/384; 1536 = the ffn x4 rung, +1,035,264)")
+                   help="hidden width of the SimBa trunk's residual "
+                        "block (default = --trunk-dim; 1536 = the ffn x4 "
+                        "rung, +885,888 params at 192/384)")
     p.add_argument("--note-geo", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="DEFAULT ON since 2026-09-14 (user decision: part of "
@@ -1083,7 +1077,6 @@ def main():
                             n_blocks=args.n_blocks, n_heads=args.n_heads,
                             n_gears=args.gears, ffn_mult=args.ffn_mult,
                             note_geo=args.note_geo,
-                            trunk_arch=args.trunk_arch,
                             trunk_hidden=args.trunk_hidden,
                             value_bins=args.hl_bins,
                             value_vmax=args.hl_vmax,
@@ -1101,7 +1094,7 @@ def main():
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     n_trunk = sum(p_.numel() for n_, p_ in policy.named_parameters()
                   if n_.startswith("trunk"))
-    print(f"readout trunk: {policy.arch.get('trunk_arch', 'mlp')} "
+    print(f"readout trunk: {policy.arch['trunk_arch']} "
           f"(hidden {policy.arch.get('trunk_hidden')}) — {n_trunk:,} params",
           flush=True)
     policy = policy.to(device)
@@ -1264,8 +1257,7 @@ def main():
         # region is everything before the first head. Per-group
         # boundaries feed the [diag] per-layer grad norms.
         shared_end = name_off.get("heads.0.weight", off)
-        # the trunk group's first param by NAME PREFIX (mlp: trunk.0.weight;
-        # simba: trunk_proj.weight, 2026-09-15) so both layouts slice right
+        # the trunk group's first param by NAME PREFIX (trunk_proj.weight)
         trunk_start = min((o_ for n_, o_ in name_off.items()
                            if n_.startswith("trunk")), default=shared_end)
         diag_groups = [("enc", 0, name_off.get("blocks.0.ln_attn.weight",

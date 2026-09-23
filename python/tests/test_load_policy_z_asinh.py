@@ -20,7 +20,6 @@ def _trainer_policy(z_asinh, seed=0):
     torch.manual_seed(seed)
     return P.NotePolicy(embed=64, trunk_dim=128, n_blocks=2, n_heads=4,
                         n_gears=5, ffn_mult=4, note_geo=True,
-                        trunk_arch="simba",
                         value_bins=101, value_vmax=6.0, value_sigma=0.75,
                         z_asinh=z_asinh)
 

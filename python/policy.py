@@ -507,16 +507,16 @@ class NotePolicy(nn.Module):
     # and its fused update kernels were retired with it (no conversion,
     # house pattern); training runs the eager fp16 path.
     # Recipe since 2026-09-15: the TRAINER defaults are embed 192 /
-    # trunk 384 and trunk_arch "simba" (train_batch.py); the ctor keeps
-    # the historical defaults (128/256, "mlp") so checkpoint loading and
-    # tests that construct explicitly are unaffected.
+    # trunk 384 (train_batch.py); the ctor keeps the historical 128/256
+    # widths. The readout trunk is always SimBa (the plain MLP trunk
+    # was removed 2026-09-22).
     def __init__(self, embed: int = 128, trunk_dim: int = 256,
                  encoder: str = "transformer", n_blocks: int = 3,
                  n_heads: int = 4, n_gears: int = 3, ffn_mult: int = 4,
                  note_geo: bool = False,
                  value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
-                 trunk_arch: str = "mlp", trunk_hidden: int | None = None,
+                 trunk_hidden: int | None = None,
                  z_asinh: float = 8.0):
         super().__init__()
         # obs z lane encoding asinh(z / C), C = z_asinh metres (env v48;
@@ -528,7 +528,6 @@ class NotePolicy(nn.Module):
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
-        assert trunk_arch in ("mlp", "simba"), trunk_arch
         assert value_bins > 1, (
             f"value_bins must be > 1 (HL-Gauss is the only critic head; "
             f"the scalar MSE head was removed 2026-09-22), got {value_bins}")
@@ -557,10 +556,11 @@ class NotePolicy(nn.Module):
                      "note_geo_norm": True,
                      "z_asinh": float(z_asinh),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
-                     # layout. "mlp" = the plain Linear-ReLU-Linear every
-                     # checkpoint before this date used (absent marker =
-                     # mlp); "simba" = residual + LayerNorm block, below.
-                     "trunk_arch": trunk_arch,
+                     # layout. "simba" = residual + LayerNorm block,
+                     # below — the only layout since 2026-09-22 (the
+                     # plain MLP trunk is gone); still stamped because
+                     # load_policy refuses anything else.
+                     "trunk_arch": "simba",
                      "trunk_hidden": (int(trunk_hidden) if trunk_hidden
                                       else trunk_dim),
                      # HL-Gauss critic head (2026-09-19; the only head
@@ -581,7 +581,6 @@ class NotePolicy(nn.Module):
         self._value_logits = None
         self.note_geo = bool(note_geo)
         self.z_asinh = float(z_asinh)
-        self.trunk_arch = trunk_arch
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
                               embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
@@ -598,27 +597,23 @@ class NotePolicy(nn.Module):
         self.blocks = nn.ModuleList(
             Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
         # readout = the 5 lead tokens' output embeddings
-        if trunk_arch == "mlp":
-            self.trunk = _mlp([self.n_lead * embed, trunk_dim, trunk_dim])
-        else:
-            # SimBa-style readout trunk (2026-09-15, brainstorm item 2;
-            # SimBa 2410.09754 / SimBaV2 2502.15280, Creus Castanyer
-            # 2506.15544, Kumar 2010.14498): the plain trunk was the
-            # ONE stage with neither normalization nor a skip, and it
-            # produces the feature h whose effective rank the [diag]
-            # line tracks. Layout: projection -> one residual block
-            # x + fc2(relu(fc1(LN1 x))) -> LN2 -> h. H = trunk_hidden
-            # (default trunk_dim: +149,376 params at 192/384; 1536 =
-            # +1,035,264). Registered in the same parameters() slot as
-            # `trunk` so the flat-grad diag groups (encoder -> blocks ->
-            # trunk -> heads -> critic) keep their order; the trainer's
-            # diag looks the trunk group up by name prefix.
-            H = int(trunk_hidden) if trunk_hidden else trunk_dim
-            self.trunk_proj = nn.Linear(self.n_lead * embed, trunk_dim)
-            self.trunk_ln1 = FusedLayerNorm(trunk_dim)
-            self.trunk_fc1 = nn.Linear(trunk_dim, H)
-            self.trunk_fc2 = nn.Linear(H, trunk_dim)
-            self.trunk_ln2 = FusedLayerNorm(trunk_dim)
+        # SimBa-style readout trunk (2026-09-15, brainstorm item 2;
+        # SimBa 2410.09754 / SimBaV2 2502.15280, Creus Castanyer
+        # 2506.15544, Kumar 2010.14498): the old plain trunk was the
+        # ONE stage with neither normalization nor a skip, and it
+        # produces the feature h whose effective rank the [diag]
+        # line tracks. Layout: projection -> one residual block
+        # x + fc2(relu(fc1(LN1 x))) -> LN2 -> h. H = trunk_hidden
+        # (default trunk_dim). Registered between the blocks and the
+        # heads so the flat-grad diag groups (encoder -> blocks ->
+        # trunk -> heads -> critic) keep their order; the trainer's
+        # diag looks the trunk group up by name prefix.
+        H = int(trunk_hidden) if trunk_hidden else trunk_dim
+        self.trunk_proj = nn.Linear(self.n_lead * embed, trunk_dim)
+        self.trunk_ln1 = FusedLayerNorm(trunk_dim)
+        self.trunk_fc1 = nn.Linear(trunk_dim, H)
+        self.trunk_fc2 = nn.Linear(H, trunk_dim)
+        self.trunk_ln2 = FusedLayerNorm(trunk_dim)
         # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
@@ -675,17 +670,14 @@ class NotePolicy(nn.Module):
         return sabers, body, notes, note_mask
 
     def _trunk(self, x: torch.Tensor) -> torch.Tensor:
-        """Readout trunk: (B, 3*embed) -> (B, trunk_dim) feature h.
-        mlp: the plain Linear-ReLU-Linear (unchanged bits). simba:
-        proj -> LN1 -> fc1 -> ReLU -> fc2 -> residual add + LN2, with
+        """SimBa readout trunk: (B, n_lead*embed) -> (B, trunk_dim)
+        feature h. proj -> LN1 -> fc1 -> ReLU -> fc2 -> residual add + LN2, with
         the add+LN2 taken through FusedLayerNorm.forward_add (one fused
         pass on the CUDA path when the kernel is eligible — its row
         width must be <= 256, so at trunk_dim 384 both LNs run the
         stock fp32-stats fallback; the residual sum is then a plain
         add). Same helpers as the blocks, so the fp16 stream (fp16
         activations, fp32 LN stats/affine) is honoured end to end."""
-        if self.trunk_arch == "mlp":
-            return _seq(self.trunk, x)
         x = _lin(self.trunk_proj, x)
         d = _lin(self.trunk_fc2, F.relu(_lin(self.trunk_fc1,
                                               self.trunk_ln1(x))))
@@ -1008,13 +1000,18 @@ def load_policy(ckpt) -> NotePolicy:
             "marker, pre-v55); the normalised lanes are the only layout "
             "since 2026-09-22 (user: no back-compat). Check out a commit "
             "before 2026-09-22 to bench or replay it.")
+    if arch.get("trunk_arch") != "simba":
+        raise SystemExit(
+            f"checkpoint has readout trunk {arch.get('trunk_arch')!r}; the "
+            "SimBa trunk is the only layout since 2026-09-22 (the plain "
+            "MLP trunk was removed, no back-compat). Check out a commit "
+            "before 2026-09-22 to bench or replay it.")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
         n_gears=arch["n_gears"], ffn_mult=arch["ffn_mult"],
         # pre-2026-09-14 checkpoints carry no note_geo marker: 18 lanes
         note_geo=arch.get("note_geo", False),
-        trunk_arch=arch["trunk_arch"],
         trunk_hidden=arch.get("trunk_hidden"),
         value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
