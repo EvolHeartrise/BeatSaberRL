@@ -5,8 +5,8 @@ Parser geometry is pinned against hand-computed ScoreSaber-watch
 conversions (WallManager.cs); the sim tests pin the head-in-wall
 penalty window (front face reaches the head 0.4/speed after the wall's
 nominal time) and the nearest-first window admission incl. the
-behind-the-head exclusion. The CUDA mirror is gated separately by the
-§5 lockstep tiers."""
+behind-the-head exclusion. The CUDA mirror is gated separately by
+tests/test_production_lockstep.py (despawn and persistent walls)."""
 import json
 import math
 
