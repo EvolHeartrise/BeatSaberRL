@@ -64,13 +64,12 @@ def dump(args):
     probes = {"g_q0": blk.q_proj.weight, "g_k0": blk.k_proj.weight,
               "g_v0": blk.v_proj.weight, "g_ffn0": blk.ffn[0].weight,
               "g_ffn2": blk.ffn[2].weight,
-              "g_trunk": policy.trunk[0].weight,
+              "g_trunk": policy.trunk_proj.weight,
               "g_head0": policy.heads[0].weight,
               "g_head28": policy.heads[28].weight,
               # bias grads ride relu_bwd's fixed-order partials at the
               # NEW widths (512/256) — probe them explicitly
               "g_ffn0_b": blk.ffn[0].bias,
-              "g_trunk_b": policy.trunk[0].bias,
               "g_q0_b": blk.q_proj.bias}
     # adapool critic (the dump crashed on `value_head` for every
     # post-2026-08-19 policy until 2026-09-02): packed k/v routing,

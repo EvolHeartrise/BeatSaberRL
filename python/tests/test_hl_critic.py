@@ -50,7 +50,7 @@ def test_loss_gradient_moves_expectation_toward_target():
 def test_policy_hl_head_value_shape_logits_and_muon_split():
     pol = P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
                        n_gears=5, ffn_mult=2, note_geo=True,
-                       trunk_arch="simba", value_bins=51, value_vmax=6.0)
+                       value_bins=51, value_vmax=6.0)
     obs = torch.randn(4, P.OBS_DIM)
     with torch.no_grad():
         _, _, _, v = pol.get_action_and_value(obs)
@@ -70,6 +70,6 @@ def test_policy_hl_head_value_shape_logits_and_muon_split():
 
 def test_default_head_is_hl_101():
     pol = P.NotePolicy(embed=32, trunk_dim=48, n_blocks=1, n_heads=2,
-                       n_gears=5, ffn_mult=2, note_geo=True, trunk_arch="simba")
+                       n_gears=5, ffn_mult=2, note_geo=True)
     assert pol.value_bins == 101 and pol.critic_mlp[-1].out_features == 101
     assert pol.arch["value_bins"] == 101
