@@ -1,5 +1,5 @@
 {
- "checkpoint": "/workspace/claude-teaches/projects/beat-arena/python/runs/v57_g98ramp_ext_cd400/leaf_from_upd02636.pt",
+ "checkpoint": "/workspace/BeatSaberRL/python/runs/v57_g98ramp_ext_cd400/leaf_from_upd02636.pt",
  "checkpoint_name": "v57_g98ramp_ext_cd400/leaf_from_upd02636.pt",
  "model_hash": "sha256:18d846f5cac1b49e712aa10490a4b2dc2bed31f6e09ca1b78f5996e25d82268e",
  "arch": {

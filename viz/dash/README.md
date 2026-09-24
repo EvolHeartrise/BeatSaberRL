@@ -19,7 +19,7 @@ Local, no-backend dashboard over the laptop run archive
 ## Run
 
 ```bash
-cd projects/beat-arena
+cd ~/git\ projects/BeatSaberRL
 
 # one-off backfill (first pass ~35 s over 133 runs / 310k updates)
 python3 python/metrics_backfill.py

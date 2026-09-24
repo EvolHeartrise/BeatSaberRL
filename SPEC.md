@@ -8,9 +8,8 @@ Toy RL environment modeled on Beat Saber: timed note blocks approach a cut
 plane; the agent controls two sabers (left/red, right/blue) and must swing
 through each note fast enough, in the note's required direction, with the
 matching hand, inside a timing window. Built to learn **temporal/sequence
-transformers** (vs kiting-arena's set encoder) and per-tick motion control
-under a schedule. Pure Python/NumPy sim, Gymnasium API, PufferLib hookup,
-same PPO harness style as `../kiting-arena`.
+transformers** and per-tick motion control under a schedule. Pure
+Python/NumPy sim, Gymnasium API, PufferLib hookup, PPO harness.
 
 Milestones: v0 (easy one-hand charts, pool baseline + transformer both train)
 → v1 (two hands, direction variety, flow patterns) → v2 (difficulty
@@ -22,12 +21,12 @@ graded swing scoring; v5.3 = notes are rotated boxes)
 → **v7 (real Beat Saber geometry & judgment: real lanes/rows/hitboxes,
 swept-surface collision, integer 115, bombs/chains/arcs — current)**.
 v7's constants are sourced from the ArcViewer + BeatLeader code
-inventory: `../research/2026-07-22-bs-mechanics-inventory.md`.
+inventory: `research/2026-07-22-bs-mechanics-inventory.md`.
 
 ## Layout
 
 ```
-projects/beat-arena/
+BeatSaberRL/
   SPEC.md
   README.md
   python/
@@ -48,8 +47,8 @@ lib.rs and are gated by the scenario tests in `tests/test_env.py`
 (which drive the Rust sim directly via its `set_joints` hook and event
 stream).
 
-Uses kiting-arena's venv: `../kiting-arena/python/.venv` (torch-cpu,
-gymnasium, pufferlib 3.0, pytest). No new dependencies in v0. No GPU;
+Uses the repo venv `python/.venv` (torch-cpu,
+gymnasium, pytest; see README Quick start). No new dependencies in v0. No GPU;
 paths contain a space — quote everything.
 
 ## Sim rules (`rust/src/lib.rs`) — env v7: real geometry & judgment

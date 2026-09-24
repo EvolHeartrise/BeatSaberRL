@@ -15,7 +15,7 @@ ranked by expected value per pod-hour at the standard probe shape.
 - The width step 128/256 → 192/384 (1.09M → 2.41M) under Muon at matched
   1.12B samples: +0.45 pt trunk acc, +3.4% bench upp, gain GROWING with star
   rating (+0.2 pt at 4–6★, +0.9 at 12–14★), falls halved, +15% wall.
-  [sessions/2026-09-12-five-credit-horizon.md]
+  [2026-09-12 five-credit-horizon probes]
 - Trunk-feature effective rank (99% energy) ≈ 60% of width at BOTH widths
   (158/256, 232/384 at upd 451); Muon holds it, Adam collapsed 165 → 50 over
   4.7B. Dormant fraction 0.0 everywhere. The rank is measured on the OUTPUT
@@ -178,8 +178,8 @@ exploration lives), acc +0–0.3 through fewer terminations and cleaner
 advantage estimates on hard maps. Unsupported by literature (no paper
 prunes a factored discrete action space from a usage census); the closest
 is the general finding that entropy regularization over irrelevant actions
-hurts (e.g. per-head clip literature in `sessions/2026-09-12-per-head-
-clip-literature.md`). Risk: knees actually use −1.0 ~17% of the time
+hurts (e.g. the 2026-09-12 per-head clip
+literature review). Risk: knees actually use −1.0 ~17% of the time
 (hard squats/wall ducks); keep knees at K=5 or map knee to {0, 2, 4}. Test:
 standard probe; readouts falls/M, per-group entropy, leaf falls (0.8/M for
 w192_cd300), duck hit rate on the 8 forced-duck maps.
@@ -218,7 +218,7 @@ hand↔note precision features; leg/spine heads want balance features; the
 γ-noisy fall advantages and the dense cut advantages both flow into the
 same 384 dims. Split the readout: arm_L sub-trunk on [saber_L, body] (384
 → 256), arm_R on [saber_R, body] (weights optionally SHARED with arm_L via
-the mirror map — see `sessions/2026-09-07-symmetry-methods.md`; the
+the mirror map — see the 2026-09-07 symmetry-methods study; the
 residual L/R asymmetry there was ~0.2 pp so sharing is a small
 regularizer, not a win), lower-body sub-trunk on [body, saber_L, saber_R]
 (576 → 384). Literature: Body Transformer (https://arxiv.org/abs/2408.06316)

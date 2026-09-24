@@ -238,7 +238,7 @@ d. Physics untouched — this is a scoring/obs change; v14 checkpoints
 
 Motivated by the 8h-trunk survival-drift postmortem (leaf value
 peaked at upd ~8k then decayed while balance kept improving; user
-suspects #1 and #4 pre-registered in sessions/2026-08-10-wsd).
+suspects #1 and #4 pre-registered on 2026-08-10).
 
 a. **Discounted fall pricing.** The v11.1 lump sum is return-
    equivalent to standing-and-missing, but NOT under discounting: it

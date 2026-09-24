@@ -264,7 +264,7 @@ A real line (update 5, unfiltered, 5-update run from a fresh init):
 Same pod (`194.14.47.19`, RTX 5090, torch 2.8.0.dev+cu128), same
 session, same production argv as Tier 0 (`--num-envs 32768 --horizon 32
 --minibatches 64 --mb-accum 2`, `--env-order` now default ON). The
-baseline was RE-MEASURED at `cb339ca` in this session, not taken from
+baseline was RE-MEASURED at `279a57b` in this session, not taken from
 the Tier 0 table (which it reproduces: 115.3k steps/s, 13.78 GiB,
 identical 5-update prints). Every item shipped alone, measured, then
 committed, in the order 1.2 → 1.3 → 1.5 → 1.1 so the one
@@ -280,11 +280,11 @@ skipped by brief. Instruments per item: full gate (`pytest tests/`),
 
 | state | commit | steps/s (2 reps) | rollout s / 4 upd | update s / 4 upd | peak GiB (rollout / update) | BPF ms @32768 | BPU ms 16384/accum 2 | gate |
 |---|---|---|---|---|---|---|---|---|
-| baseline `cb339ca` | — | 115,331 / 115,199 | 25.48 / 25.54 | 10.83 / 10.81 | 13.78 | 26.09 / 26.21 | 40.00 / 39.96 | 268 |
-| + 1.2 `del` perm copies | `decd53a` | 115,231 / 115,265 | 25.52 / 25.48 | 10.82 / 10.84 | **13.01** (12.60 / 13.01) | 26.09 / 26.22 | 39.96 / 39.96 | 268 |
-| + 1.3 `b_act` uint8 | `54f0bc9` | 115,121 / 115,210 | 25.52 / 25.50 | 10.85 / 10.84 | **12.61** (12.17 / 12.61) | 26.10 / 26.23 | 39.98 / 39.99 | 268 |
-| + 1.5 `relu_bwd` `at::empty` | `9436ba3` | 115,186 / 115,435 | 25.53 / 25.43 | 10.81 / 10.84 | 12.61 (12.17 / 12.61) | 26.08 / 26.22 | 39.96 / 39.94 | 268 |
-| + 1.1 fp16 critic | `f4f6011` | **125,992 / 125,999** | **24.42 / 24.42** | **8.80 / 8.80** | 12.60 (12.17 / 12.60) | **18.42 / 18.50** | **32.22 / 32.17** | 279 |
+| baseline `279a57b` | — | 115,331 / 115,199 | 25.48 / 25.54 | 10.83 / 10.81 | 13.78 | 26.09 / 26.21 | 40.00 / 39.96 | 268 |
+| + 1.2 `del` perm copies | `94e978e` | 115,231 / 115,265 | 25.52 / 25.48 | 10.82 / 10.84 | **13.01** (12.60 / 13.01) | 26.09 / 26.22 | 39.96 / 39.96 | 268 |
+| + 1.3 `b_act` uint8 | `394573e` | 115,121 / 115,210 | 25.52 / 25.50 | 10.85 / 10.84 | **12.61** (12.17 / 12.61) | 26.10 / 26.23 | 39.98 / 39.99 | 268 |
+| + 1.5 `relu_bwd` `at::empty` | `4b3943a` | 115,186 / 115,435 | 25.53 / 25.43 | 10.81 / 10.84 | 12.61 (12.17 / 12.61) | 26.08 / 26.22 | 39.96 / 39.94 | 268 |
+| + 1.1 fp16 critic | `2d1afd9` | **125,992 / 125,999** | **24.42 / 24.42** | **8.80 / 8.80** | 12.60 (12.17 / 12.60) | **18.42 / 18.50** | **32.22 / 32.17** | 279 |
 
 Net over the four items: **+9.3% steps/s** (115.3k → 126.0k), update
 phase **−18.7%** (10.82 → 8.80 s), rollout **−4.2%** (25.5 → 24.4 s),
@@ -469,7 +469,7 @@ x_res = (x_res + delta if delta_b is None
 - `torch.cat([a, h])` (L547) promotes `h` (fp16 trunk readout) to fp32 → `critic_mlp` runs the stock fp32 path too (`_run` L106 only takes the `bias_relu` epilogue for fp16).
 - `(q*scale) @ k.transpose(-2,-1)` and `softmax @ v` (L543–545): 4-D `matmul` with batch dims (B, 4) whose strides (3456, 32) are not collapsible → `reshape` **copies k and v** (113 MB fp32 each, forward and again in backward). The actor blocks avoid this because SDPA accepts the strided 4-D layout directly.
 
-The comments say "the critic pays it once, one (B,27,d) add" (L475–478) and `val.float()` (L548) expects an fp16 value — this is almost certainly unintended. The critic-design topic never declares an fp32 critic; `git log -S x_res` shows it landed with the adapool commit (8d36d47) untouched since.
+The comments say "the critic pays it once, one (B,27,d) add" (L475–478) and `val.float()` (L548) expects an fp16 value — this is almost certainly unintended. The critic-design topic never declares an fp32 critic; `git log -S x_res` shows it landed with the adapool commit (1f1c2a0) untouched since.
 
 **Estimated cost (per micro-batch, B=8192):** forward ≈ 1.2 GB traffic (two adds 340 MB, LN 226 MB, k/v GEMMs 450 MB, two bmm copies 450 MB), backward ≈ 2.5 GB (k/v dX+dW+db ≈ 1.1 GB, grad accumulation of dhv from q/k/v incl. a full-size zero-fill from the `hv[:, 2:3]` slice backward ≈ 450 MB, fp32 ln_bwd 340 MB, the add-backward cast + reductions ≈ 400 MB). At B=16384 (the bench shape) ≈ 7.4 GB → ~5 ms at ~1.5 TB/s effective, + ~1 ms of full-fp32 GEMM compute, + inefficient m=1 batched GEMMs. **≈ 6–7 ms of the measured 39.7 ms/minibatch (~15%).** On the fp16 stream ≈ 2–2.5 ms.
 
@@ -739,14 +739,14 @@ Dual-clip with the log-ratio clamp; value normalization T1; no value clipping; `
 
 ### Tier 1 results — 1.4 + probe re-run (2026-09-02/03)
 
-Same pod (`194.14.47.19`, RTX 5090), code at `97af37c` (= `f4f6011`
+Same pod (`194.14.47.19`, RTX 5090), code at `32e3730` (= `2d1afd9`
 + 1.4). Two things: item 1.4 shipped and measured, then the 2026-08-31
 top-|A| 50% probe was re-run under the fixed normalization against a
 matched control on this pod and this code, so the four arms in the
 table are two different pods/codes but the two NEW arms differ only
 in `--adv-filter 0.5`.
 
-#### 1.4 — full-batch advantage stats under the filter (`97af37c`)
+#### 1.4 — full-batch advantage stats under the filter (`32e3730`)
 
 When `adv_filter_on`, `a_mu`/`a_sd` are computed ONCE per update over
 the full flat `f_adv` (`adv_filter_stats`) and used in every minibatch;
@@ -1340,10 +1340,10 @@ gate from now on.
 ### 2.6 T=64 probes (2026-09-03)
 
 Two from-scratch T=64 arms on the re-bootstrapped pod (`194.14.47.19`,
-port 22705, RTX 5090, code = `0fdf055` + `a12c491`), compared at
+port 22705, RTX 5090, code = `d5ac644` + `7c9da3b`), compared at
 matched SAMPLES against the two T=32 runs of the 1.4 re-run
 (`ctrl_trunk`, `af50n_trunk`, previous container of the same pod,
-code `97af37c` — pre-2.7/2.2/2.5, so their VRAM is not comparable and
+code `32e3730` — pre-2.7/2.2/2.5, so their VRAM is not comparable and
 their steps/s only roughly). Verdict first: **T=64 at matched samples
 LOSES to the T=32 filtered run at every point (−0.012 to −0.023 acc,
 3–5× the ±0.004 floor, one seed), and γ=0.98 loses further (−0.03 vs
@@ -1354,7 +1354,7 @@ design; the design confounds T with the number of policy iterations
 
 #### Recipe and ops
 
-`--value-norm-beta` flag added (`a12c491`, default 0.01 = the old
+`--value-norm-beta` flag added (`7c9da3b`, default 0.01 = the old
 module constant, bit-identical, 2 pins; pod gate **336** = 321 + 13
 `test_metrics_log` + 2). Base argv = `af50n_trunk`'s verbatim
 (v38 T=32 recipe, `--adv-filter 0.5`, seed 0) re-shaped to T=64:
@@ -1374,7 +1374,7 @@ logs are on the pod and in `~/beat-arena-volume-backup/beat-arena-t64/`
 (`trunk_final.pt` md5 verified both sides; 5-min rsync loop stopped
 after the final pull). No leaf cut, no bench. Pre-flight: a 5-update
 T=64 smoke (13.8 s/upd, peak 7.00 GiB, banner `warmup 17`, `tau=62`).
-Side confirmation for `0fdf055`: `metrics.jsonl` appeared next to
+Side confirmation for `d5ac644`: `metrics.jsonl` appeared next to
 `args.json` in both run dirs.
 
 #### Matched-sample table

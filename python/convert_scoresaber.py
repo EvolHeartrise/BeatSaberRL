@@ -7,7 +7,7 @@ The output loads in ScoreSaber's web viewer (watch.scoresaber.com — an
 ArcViewer derivative; open/drag the .dat onto the page and it fetches
 the map from BeatSaver by the hash embedded in the metadata). Format
 reverse-engineered from the viewer's own decoder in the ScoreSaber/watch
-repo (mirrored at projects/beat-arena/research/vendor/scoresaber-watch):
+repo (mirrored at research/vendor/scoresaber-watch):
 
   "ScoreSaber Replay 👌🤠\\r\\n" magic (28 bytes) + LZMA-alone body.
   Body = 9-int pointer table (metadata, poses, heights, notes, scores,

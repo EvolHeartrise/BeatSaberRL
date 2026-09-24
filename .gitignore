@@ -20,3 +20,12 @@ python/bench/*.json
 !python/bench/v56_6blk_g965_nstuned_cd400_body_leaffit.json
 !python/bench/v56_6blk_g965_nstuned_cd400_body_leaffit2.json
 !python/bench/v57_g98ramp_ext_cd400_body_default.json
+
+# Logs, venv, build and sweep artifacts
+*.log
+.venv/
+target/
+python/pool_cache/
+python/sweeps/
+.runpod_api_key
+.claude/worktrees/

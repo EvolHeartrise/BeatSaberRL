@@ -1,5 +1,5 @@
 {
- "checkpoint": "/workspace/claude-teaches/projects/beat-arena/python/runs/v56_6blk_g965_nstuned_cd400/leaf_from_upd02136.pt",
+ "checkpoint": "/workspace/BeatSaberRL/python/runs/v56_6blk_g965_nstuned_cd400/leaf_from_upd02136.pt",
  "checkpoint_name": "v56_6blk_g965_nstuned_cd400/leaf_from_upd02136.pt",
  "model_hash": "sha256:ece16e8bd6bbc28290fc26a6ea0529e14bc1a52db2efe258086284e739cf1fe9",
  "arch": {

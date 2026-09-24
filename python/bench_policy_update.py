@@ -3,7 +3,7 @@ on the eager path, plus a peak-memory probe.
 
     python bench_policy_update.py [--mbs 16384] [--ckpt runs/...]
 
-(Restored 2026-08-15 from bd07669^ as the perf-ladder A/B instrument;
+(Restored 2026-08-15 from 68fbc13^ as the perf-ladder A/B instrument;
 the fused-trainer column died with the 138k arch, and the eager body
 below mirrors train_batch.py's minibatch loop minus the loss-scale /
 flat-grad machinery — a few fixed elementwise kernels that are

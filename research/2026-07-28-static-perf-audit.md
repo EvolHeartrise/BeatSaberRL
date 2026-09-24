@@ -59,7 +59,7 @@ and gate the interval save.
 ### 1.4 Resumability — up to ~37 min per interruption
 Driver never passes `--ckpt-every`; `run_leg` rmtree's the dir. `train_batch.py:255-268`
 already implements exact resume. Pass `--ckpt-every` ≈5 min and prefer resume when `args.json`
-matches exactly (preserves the fresh-model-per-leg invariant; cf. commit 7f2a735 / run 003).
+matches exactly (preserves the fresh-model-per-leg invariant; cf. commit d4a1808 / run 003).
 
 Verified non-problems: JIT cache is armed for all six extensions (3.4 s median inter-leg gap);
 GP proposal cost negligible; parsed-chart cache hits 100%; checkpoint I/O negligible.

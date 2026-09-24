@@ -278,7 +278,7 @@ pub fn substep_opts(
     //     (st.v[vj] = 0) summed to a measured +250-335 N of phantom
     //     support — 27-46% of body weight, sustained for 12 s — plus
     //     15.6 m of free-fall deviation over 4 s in a mid-air repro
-    //     (three-agent audit, sessions/2026-08-08 session log). Bounds
+    //     (three-agent audit, 2026-08-08). Bounds
     //     are now enforced only by momentum-consistent impulses; a
     //     residual bound violation after CLAMP_PASSES leaks POSITION
     //     error into the next substep's clamp (physically a slightly
