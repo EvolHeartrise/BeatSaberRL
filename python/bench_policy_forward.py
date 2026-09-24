@@ -2,7 +2,7 @@
 
     python bench_policy_forward.py [--ns 2048 16384] [--ckpt runs/...]
 
-(Restored 2026-08-15 from bd07669^ as the perf-ladder A/B instrument;
+(Restored 2026-08-15 from 68fbc13^ as the perf-ladder A/B instrument;
 the fused-kernel column died with the 138k arch — the fused stack only
 ever ran at n_heads == 1 / d == 64, see PERF_AUDIT_2026-08-16.md.)
 

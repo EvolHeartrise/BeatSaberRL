@@ -8,11 +8,11 @@ harness only makes the oracle itself trustworthy.
 
 ## Setup / running
 
-Uses kiting-arena's venv (house convention) with `mujoco` (3.11.0,
-CPU) installed into it:
+Uses the repo venv (`python/.venv`, README Quick start) with `mujoco`
+(3.11.0, CPU) installed into it:
 
 ```
-PY=../../../kiting-arena/python/.venv/Scripts/python.exe   # from this dir
+PY=../.venv/bin/python   # from this dir
 $PY -m pip install mujoco     # once
 $PY check_fk.py               # gate 1 - MANDATORY FIRST
 $PY check_static.py           # gate 2

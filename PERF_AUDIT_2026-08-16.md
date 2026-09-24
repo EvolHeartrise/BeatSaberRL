@@ -49,7 +49,7 @@ vs 87.0k (noise)). The header's 3.5x identical-envs figure is another
 sm_61 verdict that did not transfer: sm_89 cost is dominated by the
 42 KB/thread local frame, whose traffic is order-invariant. DO NOT
 RETRY without counters showing divergence stalls. (Mechanism lives in
-git history at 1c548d1 if a future arch changes the calculus.)
+git history at 3bc31cb if a future arch changes the calculus.)
 
 Tier 2.1 graphed update: **REFUTED by the census** — update-phase CPU
 enqueue is 30 ms/iter vs 48 ms/iter GPU execution (63%), the queue
@@ -110,7 +110,7 @@ What WOULD move the env kernel, quantified:
   (41,872 B/thread local frame => ~5.4 MB/SM vs 128 KB L1) vs
   latency-bound (4 warps/SM against a reg ceiling of 8). This selects
   Tier 3.1/3.2 (layout) vs 3.3 (divergence).
-- 0.4 Restore bench_policy_forward/update.py from bd07669^ (deleted
+- 0.4 Restore bench_policy_forward/update.py from 68fbc13^ (deleted
   with the fused stack; they're the A/B harness for Tier 1–2).
 
 ## Tier 1 — scale-up regressions (bit-identical or near-tie)
@@ -189,7 +189,7 @@ claimed. But the binding terms were never the algebra: the S1/S2
 campaign measured marshalling-on-the-serial-path + L1-carveout +
 envs/SM collapse (W=32: 634 ms/tick; sub-warp ladder W=2/4/8:
 169/251/338 vs legacy 121.8@16k — loses at every rung; stop rule fired,
-family deleted at 5d30814). Nothing in the sm_89->sm_120 move changes
+family deleted at 0144024). Nothing in the sm_89->sm_120 move changes
 that arithmetic (same 1536 threads/SM ceiling, same local-frame L1
 economics). NOT re-attempted beyond the micro-bench; BEAT_CHOL_RL+K16
 remains the only surviving rung and still requires N>=65,536.

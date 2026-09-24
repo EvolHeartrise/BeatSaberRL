@@ -26,8 +26,8 @@ distribution — cross-check any winner on procedural charts / old
 gens before claiming generalization.
 
 **s3 (2026-07-29): fresh sweep under the CUT-PLANE accuracy rules**
-(scoring v2 — the user-caught fix that unlocked the acc component;
-sessions/2026-07-29-cut-plane-accuracy-fix.md). The fix changed both
+(scoring v2 — the user-caught 2026-07-29 fix that unlocked the acc
+component). The fix changed both
 the bench scale and the training reward, so s2's observations are a
 different objective: sweeps/s2_ranked_upp is FROZEN (103 v1-scored
 observations, never extend), the default --dir now points at

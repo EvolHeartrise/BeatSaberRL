@@ -2,7 +2,7 @@
 
 Scope: the PPO recipe inside PufferLib 5.0, read from source, compared
 against our trainer. The C/CUDA runtime was evaluated and declined on
-2026-09-10 (`sessions/2026-09-10-pufferlib-5-evaluation.md`); this note is
+2026-09-10; this note is
 only about what the *learner* does differently and whether any of it should
 be probed here. Fixed constraints honoured: no reward-timing changes, no
 posture/effort costs, T=32 floor (T=64 allowed), target = accuracy on real
@@ -163,8 +163,8 @@ was removed in 5.0), entropy anneal (ours is exp-to-floor + leaf target).
   Engstrom et al. 2020, *Implementation Matters in Deep RL*, arXiv
   2005.12729; Andrychowicz et al. 2020, *What Matters in On-Policy RL*,
   arXiv 2006.05990 (value clipping, advantage recompute, λ/γ sensitivity).
-- Ours: `sessions/2026-09-10-pufferlib-5-evaluation.md` (runtime verdict,
-  profile 70/9/21, Muon deep dive), `sessions/2026-09-12-v40-probes.md`
-  (Muon, wd, per-head clip, self-contact), `sessions/2026-09-12-five-
-  credit-horizon.md` (γ/λ 2×2, T=64, width, filter ladder, dead gears,
+- Ours: the 2026-09-10 PufferLib 5 evaluation (runtime verdict,
+  profile 70/9/21, Muon deep dive), the 2026-09-12 v40 probes
+  (Muon, wd, per-head clip, self-contact), the 2026-09-12 five-credit-
+  horizon probes (γ/λ 2×2, T=64, width, filter ladder, dead gears,
   2-GPU hardware Q&A), `python/train_batch.py` at HEAD `8b2c59c`.

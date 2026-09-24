@@ -8,7 +8,7 @@ blocks (LayerNorm -> 4-head self-attention -> residual; LayerNorm ->
 then; the SimBa residual + LN trunk since 2026-09-15) and 29
 factored action heads (~863k actor params, the 2026-08-13
 user-approved 6.2x scale-up) plus the adapool_v1 critic (2026-08-19,
-topics/critic-design.md): a body-token-derived attention-pool query
+2026-08-19 critic redesign): a body-token-derived attention-pool query
 over the resolved token stream + a 3-layer value MLP, ~231k critic
 params, ~1.09M total. The critic reads; it is never read.
 
@@ -618,7 +618,7 @@ class NotePolicy(nn.Module):
         # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
-        # Critic (2026-08-19 redesign, topics/critic-design.md):
+        # Critic (2026-08-19 redesign):
         # adapool_v1 = query-derived attention pooling (Brothers
         # 2506.09215: a state-DERIVED query wins over a free learned
         # CLS token in exactly our low-SNR entity regime) + value MLP:
@@ -755,7 +755,7 @@ class NotePolicy(nn.Module):
         # the four critic Linears (stock F.linear, non-tensor-core fp32
         # SGEMM), two hidden reshape copies in the pooling matmuls and
         # critic_mlp — silently ran in fp32 through stock torch since
-        # the adapool commit (8d36d47). Now: 2 fewer (B,27,d) kernels,
+        # the adapool commit (1f1c2a0). Now: 2 fewer (B,27,d) kernels,
         # the critic input is bit-consistent with the block's own k/v
         # input, and _critic rides the fp16 machinery. fp32 record path
         # (--fp16 off / CPU): bit-identical — the fused ln_fwd_add's x

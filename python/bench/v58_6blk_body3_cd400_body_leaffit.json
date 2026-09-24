@@ -1,5 +1,5 @@
 {
- "checkpoint": "/workspace/claude-teaches/projects/beat-arena/python/runs/v58_6blk_body3_cd400/leaf_from_upd02136.pt",
+ "checkpoint": "/workspace/BeatSaberRL/python/runs/v58_6blk_body3_cd400/leaf_from_upd02136.pt",
  "checkpoint_name": "v58_6blk_body3_cd400/leaf_from_upd02136.pt",
  "model_hash": "sha256:027434f460fa096756a8661c36b79bde186f4a6626161e071f52029b4787ea7a",
  "arch": {

@@ -82,11 +82,21 @@ geometry — their bench numbers are not comparable; retrain.
 
 ## Quick start
 
-Uses kiting-arena's venv (`../kiting-arena/python/.venv`), no extra deps.
+Uses its own venv at `python/.venv` (gitignored). One-time setup
+(the laptop is torch-cpu; pods use the image's CUDA torch — see
+`setup_pod.sh`):
 
 ```bash
 cd python
-VENV=../../kiting-arena/python/.venv
+python3 -m venv .venv
+.venv/bin/pip install torch numpy gymnasium pytest maturin ninja scipy
+(cd ../rust && VIRTUAL_ENV=$PWD/../python/.venv ../python/.venv/bin/maturin develop --release)
+(cd ../rust32 && VIRTUAL_ENV=$PWD/../python/.venv ../python/.venv/bin/maturin develop --release)
+```
+
+```bash
+cd python
+VENV=.venv
 
 $VENV/bin/python -m pytest tests/
 # the trainer: its defaults ARE the production recipe (the v58 trunk,

@@ -60,7 +60,7 @@ CLIP = 0.3  # 0.3 since 2026-09-15 (user decision after the clip ladder)
 DUAL_CLIP_C = 3.0
 VF_COEF = 0.5
 # value-target normalization EMA rate, per update (2026-08-19 critic
-# redesign, topics/critic-design.md T1): the critic predicts
+# redesign, T1): the critic predicts
 # NORMALIZED values v_hat; V = v_hat*sig+mu everywhere GAE reads it.
 # Fixes the silent VF_COEF re-weighting under return-scale shifts
 # (v26 gamma 0.99 inflated v_loss ~10x into the shared trunk).
@@ -214,7 +214,7 @@ def parse_args():
                    help="linear lr warmup length in updates (0 = auto, "
                         "1.5%% of the run's updates); stored in the "
                         "checkpoint schedule so resumes agree")
-    # 2026-08-19 critic redesign (topics/critic-design.md T0-T4)
+    # 2026-08-19 critic redesign (T0-T4)
     p.add_argument("--vf-coef", type=float, default=VF_COEF,
                    help="value-loss weight; targets are normalized, so "
                         "this is a real relative weight now")
@@ -277,8 +277,8 @@ def parse_args():
                         "weights; 0 = plain Adam (every run before "
                         "2026-09-12). Time constant 1/(lr*wd) optimizer "
                         "steps: 0.1 at lr 7e-4 = 14k steps")
-    # Hybrid Muon (2026-09-12 probe; sessions/2026-09-10-pufferlib-5-
-    # evaluation.md "Muon deep dive"), the ONLY optimizer since 2026-09-22
+    # Hybrid Muon (2026-09-12 probe; the 2026-09-10 PufferLib 5
+    # evaluation's "Muon deep dive"), the ONLY optimizer since 2026-09-22
     # (pure Adam, every run before 2026-09-12, removed; so is the
     # per-matrix NS loop every run before v48 used — the shape-batched
     # bmm step is the only step): Muon (Jordan 2024) on the HIDDEN
@@ -1674,7 +1674,7 @@ def main():
         m_diag = None
         if (args.diag_every > 0 and flat_grad is not None
                 and update % args.diag_every == 0):
-            # T0 diagnostics (2026-08-19, topics/critic-design.md): a
+            # T0 diagnostics (2026-08-19 critic redesign): a
             # 2048-row grad-enabled forward + TWO extra backwards,
             # separating the policy-loss and value-loss gradients over
             # the SHARED params (flat buffer [0, shared_end)) — their

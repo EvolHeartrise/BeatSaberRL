@@ -13,7 +13,7 @@
 set -u
 POD=$1
 S=${SHIP_DIR:-/tmp/ba_ship}   # holds ba_code.tgz + catalog*.gz + failures.json.gz (see ship step in README)
-LOCAL_MAPS="/home/evolheartrise/git projects/claude-teaches/projects/beat-arena/python/maps"
+LOCAL_MAPS="/home/evolheartrise/git projects/BeatSaberRL/python/maps"
 KEY=$(cat ~/.runpod_api_key)
 CTL=$HOME/.ssh/cm_$POD
 ts() { date -u +%T; }
@@ -66,15 +66,15 @@ sshm 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; df -h / /w
 echo "[$(ts)] 1/6 rsync + ship bundle"
 sshm 'which rsync >/dev/null || { apt-get update -q >/dev/null 2>&1; apt-get install -y -q rsync >/dev/null 2>&1; }; which rsync'
 rsync -rlt --no-owner --no-group -e "ssh $MUX" $S/ship/ $R:/root/ || { echo SHIP-FAILED; exit 1; }
-rsync -rlt --no-owner --no-group -e "ssh $MUX" "/home/evolheartrise/git projects/claude-teaches/projects/beat-arena/pod_up.sh" $R:/root/pod_up.sh
+rsync -rlt --no-owner --no-group -e "ssh $MUX" "/home/evolheartrise/git projects/BeatSaberRL/pod_up.sh" $R:/root/pod_up.sh
 sshm 'ls -la /root/ba_code.tgz /root/catalog.json.gz /root/pod_up.sh' || exit 1
 
 echo "[$(ts)] 2/6 launch pod_up.sh --skip-prefetch (background on pod)"
 sshm 'nohup setsid bash /root/pod_up.sh --skip-prefetch > /root/pod_up.out 2>&1 < /dev/null & echo launched'
 
 echo "[$(ts)] 3/6 wait for repo layout, then upload caches"
-for i in $(seq 1 60); do sshm 'test -d /workspace/claude-teaches/projects/beat-arena/python' 2>/dev/null && break; sleep 5; done
-M=/workspace/claude-teaches/projects/beat-arena/python/maps
+for i in $(seq 1 60); do sshm 'test -d /workspace/BeatSaberRL/python' 2>/dev/null && break; sleep 5; done
+M=/workspace/BeatSaberRL/python/maps
 sshm "mkdir -p $M"
 t1=$(date +%s); rsync -a --no-owner --no-group -e "ssh $MUX" "$LOCAL_MAPS/chart_cache" $R:$M/ && echo "[$(ts)] chart_cache uploaded in $(( $(date +%s) - t1 ))s"
 t1=$(date +%s); rsync -a --no-owner --no-group -e "ssh $MUX" "$LOCAL_MAPS/scoresaber" $R:$M/ && echo "[$(ts)] raw maps uploaded in $(( $(date +%s) - t1 ))s"
@@ -88,8 +88,8 @@ echo "[$(ts)] key-loss forensics: $(sshm 'grep -c REAPPENDED /workspace/sshwatch
 ssh $BASE $R 'echo FRESH-AUTH-OK' 2>&1 | tail -1
 
 echo "[$(ts)] 5/6 full gate with maps present"
-sshm 'export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:$PATH VIRTUAL_ENV=/root/venv; cd /workspace/claude-teaches/projects/beat-arena/python && python -m pytest tests/ -q 2>&1 | tail -2'
+sshm 'export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:$PATH VIRTUAL_ENV=/root/venv; cd /workspace/BeatSaberRL/python && python -m pytest tests/ -q 2>&1 | tail -2'
 
 echo "[$(ts)] 6/6 production-shape smoke (builds the ranked pool npz, 5 updates)"
-sshm 'export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:$PATH VIRTUAL_ENV=/root/venv PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; cd /workspace/claude-teaches/projects/beat-arena/python && python train_batch.py --num-envs 32768 --horizon 32 --minibatches 64 --mb-accum 2 --foot-contact --gears 5 --seed 0 --ranked-maps --chart-pool 999999 --mirror-augment --gamma 0.965 --gae-lambda 0.98 --energy-coef 7.5e-6 --ent-coef 0.03 --ent-tau 125 --ent-final 1e-3 --lead-s 0.5 --lr 7e-4 --start-pose-jitter 0.15 --foot-z-coef 0.01 --foot-x-coef 0.01 --foot-hinge-r 0.12 --foot-shape-coef 0.05 --limit-coef 5e-3 --limit-arms --wall-despawn --crouch-start-prob 0.25 --total-steps 5242880 --run-dir runs/v39_smoke 2>&1 | grep -E "ranked-pool|batched PPO|update +5/5|THROUGHPUT|Error|Traceback"; ls pool_cache/'
+sshm 'export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:$PATH VIRTUAL_ENV=/root/venv PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; cd /workspace/BeatSaberRL/python && python train_batch.py --num-envs 32768 --horizon 32 --minibatches 64 --mb-accum 2 --foot-contact --gears 5 --seed 0 --ranked-maps --chart-pool 999999 --mirror-augment --gamma 0.965 --gae-lambda 0.98 --energy-coef 7.5e-6 --ent-coef 0.03 --ent-tau 125 --ent-final 1e-3 --lead-s 0.5 --lr 7e-4 --start-pose-jitter 0.15 --foot-z-coef 0.01 --foot-x-coef 0.01 --foot-hinge-r 0.12 --foot-shape-coef 0.05 --limit-coef 5e-3 --limit-arms --wall-despawn --crouch-start-prob 0.25 --total-steps 5242880 --run-dir runs/v39_smoke 2>&1 | grep -E "ranked-pool|batched PPO|update +5/5|THROUGHPUT|Error|Traceback"; ls pool_cache/'
 echo "[$(ts)] BOOTSTRAP-DONE  (master socket kept at $CTL)"

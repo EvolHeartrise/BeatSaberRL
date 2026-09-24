@@ -10,10 +10,10 @@
 #
 # Idempotent: safe to re-run on a warm pod (skips what exists).
 #
-#   bash /workspace/claude-teaches/projects/beat-arena/setup_pod.sh
+#   bash /workspace/BeatSaberRL/setup_pod.sh
 set -euo pipefail
 
-REPO=/workspace/claude-teaches/projects/beat-arena
+REPO=/workspace/BeatSaberRL
 VENV=/root/venv
 mkdir -p /workspace   # RunPod mounts it; VastAI has none
 [ -d "$REPO" ] || { echo "$REPO missing — rsync/clone the repo first"; exit 1; }
