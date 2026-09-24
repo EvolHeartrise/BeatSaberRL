@@ -21,7 +21,7 @@ import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
 from .constants import (TAU_FEAT, HANDLE_LEN, 
-    EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
+    EVENT_REASONS, N_JOINTS, OBS_DIM, note_center, env_body as _env_body,
 )
 
 from beat_arena_rs import RawBeatSim
@@ -37,7 +37,7 @@ class RustBeatEnv(gym.Env):
                  bomb_prob=0.125,
                  external_chart=None, gears=3, seed=0, *,
                  foot_contact, fall_const=5.0,
-                 external_walls=None):
+                 external_walls=None, env_body=None):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
         external_walls: list[Wall] riding along (env v17, spec §12) —
@@ -75,6 +75,10 @@ class RustBeatEnv(gym.Env):
                               foot_contact=foot_contact,
                               fall_const=fall_const)
         self.gears = gears
+        # run-only body options (constants.ENV_BODY_DEFAULT; None = the
+        # default body, bit-for-bit); recorded in the replay header
+        self.env_body = _env_body(env_body, gears)
+        self.sim.set_body(**self.env_body)
         self.foot_contact = bool(foot_contact)
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the
         # v45 body); recorded in the replay header (record_rev 5)
@@ -119,8 +123,13 @@ class RustBeatEnv(gym.Env):
             # never as an error. 5 = header "tau_scale" (env v46, the 16
             # per-axis torque-limit scales this episode played with;
             # 2026-09-16) — a HEADER field, per-tick record unchanged.
-            "record_rev": 5,
+            # 6 = header "env_body" (the run-only body options,
+            # 2026-09-22; absent = constants.ENV_BODY_DEFAULT).
+            "record_rev": 6,
             "tau_scale": [round(v, 6) for v in self.tau_scale],
+            # run-only body options (2026-09-22), ADDITIVE header field:
+            # absent = the default body (constants.ENV_BODY_DEFAULT)
+            "env_body": self.env_body,
             # env v15 (contact spec §10), ADDITIVE: the note track is
             # head-anchored — viewers must add head_z - PLANE_Z0 to
             # every note's world z. Absent on pre-v15 recordings
@@ -171,7 +180,9 @@ class RustBeatEnv(gym.Env):
         # them as optional): "feet" = per-foot [L, R] tick-summed weld
         # impulses [jx, jy, jz, jax, jay, jaz] (N·s; ground reaction —
         # vertical force ≈ jy/DT). τ per joint is NOT logged: it is
-        # exactly gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
+        # derivable from "action", the header "tau_scale" and (rev 6)
+        # "env_body" — gear x TAU_MAX x scale, with the wrist-bend
+        # joints' tau_max / half gear taken from env_body.
         # record_rev 3 (2026-09-13): the P6 "effort" (positive work, J)
         # field is GONE; "activation" = this tick's commanded |gear
         # fraction| summed [total, spine, arms, legs] (the retired v23

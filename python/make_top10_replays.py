@@ -31,7 +31,8 @@ import torch
 
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
-from beat_arena_env.constants import parse_tau_scale
+from beat_arena_env.constants import (add_env_body_args, env_body_cli,
+                                      env_body_of_ckpt, parse_tau_scale)
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
 from policy import load_policy
@@ -59,6 +60,8 @@ def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None):
                          f"predates the asinh z encoding (legacy clamp, "
                          f"removed 2026-09-22)")
     os.environ["BEAT_Z_ASINH"] = repr(z_asinh)
+    # run-only body options: the checkpoint's (absent = default body)
+    _W["body"] = env_body_of_ckpt(ckpt)
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
@@ -97,7 +100,8 @@ def _make_one(job):
                       # contact physics is the only mode: every production
                       # ckpt is contact-trained and the bench forces it
                       foot_contact=True,
-                      external_walls=meta["walls"])
+                      external_walls=meta["walls"],
+                      env_body=_W["body"])
     if _W.get("tau") is not None:
         env.set_tau_scale(_W["tau"])
     env.set_record(base + ".jsonl")
@@ -189,6 +193,7 @@ def main():
                         "body TAU_BODY_DEFAULT, 'nominal' = all 1.0; see "
                         "bench_scoresaber --tau-scale). Default: the saved "
                         "body (since 2026-09-22)")
+    add_env_body_args(p)
     p.add_argument("--push-prob", type=float, default=0.0,
                    help="replay the env v18 perturbation: per-tick "
                         "probability of a horizontal root-velocity kick "
@@ -207,6 +212,17 @@ def main():
     args = p.parse_args()
 
     bench = json.load(open(args.bench, encoding="utf-8"))
+    # run-only body options come from the checkpoint; CLI flags may only
+    # restate them, and the bench must have run the same body
+    try:
+        body = env_body_of_ckpt(
+            torch.load(args.ckpt, map_location="cpu", weights_only=True),
+            env_body_cli(args))
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if bench.get("env_body", body) != body:
+        sys.exit(f"error: the bench ran env body {bench['env_body']} but the "
+                 f"checkpoint's is {body}")
     pool = [e for e in bench["levels"] if "skipped" not in e]
     if args.stars is not None:
         lo, hi = args.stars

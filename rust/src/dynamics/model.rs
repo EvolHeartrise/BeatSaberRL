@@ -305,3 +305,114 @@ pub const HUMANOID: Model = Model {
     armature: &HUMANOID_ARMATURE,
     gravity: [0.0, -G, 0.0],
 };
+
+// ---- run-only body options (2026-09-22, user) --------------------------
+// Four per-sim options, all defaulting to the tables above: the default
+// config IS `HUMANOID` (the very same &'static, bit-for-bit); any other
+// config is a patched copy built once per distinct config and leaked
+// (cached, so a 2,048-env VecBeatSim builds one). CUDA mirror:
+// beat_arena_cuda.cu Sim::hand_m / hand_i / bend_tau / bend_cap /
+// bend_half, fed from constants.env_body_derived — the SAME f64 formulas
+// as `hand_inertia` / `wrist_bend_tau` below; each engine rounds the f64
+// result to its Real once.
+
+/// Actuated indices of the two wrist-BEND joints (§1.4 order).
+pub const A_L_WRIST_BEND: usize = 8;
+pub const A_R_WRIST_BEND: usize = 15;
+
+pub const HAND_MASS_DEFAULT: f64 = 0.35;
+pub const WRIST_BEND_CAP_DEFAULT: f64 = 50.0;
+/// step.rs bounds a stop overshoot by H_SUB x cap; the 0.35 rad
+/// LIMIT_TELEPORT_BACKSTOP must stay out of reach: cap < 0.35 x 240.
+pub const WRIST_BEND_CAP_MAX: f64 = 84.0;
+const HAND_INERTIA_NOM: f64 = 0.000264; // per axis at HAND_MASS_DEFAULT
+const WRIST_BEND_TAU_NOM: f64 = 1.06; // nominal bend tau_max (N·m)
+
+/// The four run-only body options. `wrist_bend_half_gear` is not a
+/// Model field (it picks the bend joints' gear table, lib.rs
+/// Body::tick) but rides here so one struct names the whole body.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BodyCfg {
+    pub hand_mass: f64,             // kg, BOTH hands; COM unchanged
+    pub wrist_bend_tau_mult: f64,   // x nominal tau_max of joints 8/15
+    pub wrist_bend_cap: f64,        // omega cap (rad/s) of joints 8/15
+    pub wrist_bend_half_gear: bool, // gears-5 ids 3/4: +-1/4 -> +-1/2 on 8/15
+}
+
+impl BodyCfg {
+    pub const DEFAULT: BodyCfg = BodyCfg {
+        hand_mass: HAND_MASS_DEFAULT,
+        wrist_bend_tau_mult: 1.0,
+        wrist_bend_cap: WRIST_BEND_CAP_DEFAULT,
+        wrist_bend_half_gear: false,
+    };
+
+    /// Per-axis hand inertia, scaled with the mass (the 0.61 -> 0.35
+    /// rescale's rule). Written I_nom * (M / M_nom) so the default is
+    /// EXACTLY I_nom (x / x == 1.0 in IEEE).
+    pub fn hand_inertia(&self) -> f64 {
+        HAND_INERTIA_NOM * (self.hand_mass / HAND_MASS_DEFAULT)
+    }
+
+    /// Nominal wrist-bend tau_max (the per-env tau scales apply on top).
+    pub fn wrist_bend_tau(&self) -> f64 {
+        WRIST_BEND_TAU_NOM * self.wrist_bend_tau_mult
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, x) in [("hand_mass", self.hand_mass),
+                          ("wrist_bend_tau_mult", self.wrist_bend_tau_mult),
+                          ("wrist_bend_cap", self.wrist_bend_cap)] {
+            if !(x.is_finite() && x > 0.0) {
+                return Err(format!("{name} must be finite and > 0, got {x}"));
+            }
+        }
+        if !(self.wrist_bend_cap < WRIST_BEND_CAP_MAX) {
+            return Err(format!("wrist_bend_cap must be < {WRIST_BEND_CAP_MAX} rad/s \
+                                (stop overshoot vs the teleport backstop), got {}",
+                               self.wrist_bend_cap));
+        }
+        Ok(())
+    }
+
+    fn model_key(&self) -> [u64; 3] {
+        [self.hand_mass.to_bits(), self.wrist_bend_tau_mult.to_bits(),
+         self.wrist_bend_cap.to_bits()]
+    }
+}
+
+/// The humanoid under `cfg`'s Model-side options (hand mass/inertia,
+/// bend tau_max, bend omega cap). A Model-default config returns
+/// `&HUMANOID` itself; any other a cached, leaked patched copy.
+pub fn humanoid_with(cfg: &BodyCfg) -> &'static Model {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<([u64; 3], &'static Model)>> = Mutex::new(Vec::new());
+    let key = cfg.model_key();
+    if key == BodyCfg::DEFAULT.model_key() {
+        return &HUMANOID;
+    }
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, m)) = cache.iter().find(|(k, _)| *k == key) {
+        return m;
+    }
+    let mut frames = HUMANOID_FRAMES;
+    let (mh, ih) = (cfg.hand_mass as Real, cfg.hand_inertia() as Real);
+    for f in [F_L_HAND, F_R_HAND] {
+        frames[f].mass = mh;
+        frames[f].inertia = [ih, ih, ih];
+    }
+    let mut tau = HUMANOID_TAU_MAX;
+    let mut cap = HUMANOID_OMEGA_CAP;
+    for j in [A_L_WRIST_BEND, A_R_WRIST_BEND] {
+        tau[j] = cfg.wrist_bend_tau() as Real;
+        cap[j] = cfg.wrist_bend_cap as Real;
+    }
+    let m: &'static Model = Box::leak(Box::new(Model {
+        frames: Box::leak(Box::new(frames)),
+        tau_max: Box::leak(Box::new(tau)),
+        omega_cap: Box::leak(Box::new(cap)),
+        ..HUMANOID
+    }));
+    cache.push((key, m));
+    m
+}

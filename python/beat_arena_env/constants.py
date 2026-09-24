@@ -17,6 +17,7 @@ layout. World geometry, judgment, scoring, chart generation are
 UNCHANGED from env v7-v9.
 """
 
+import argparse
 import math
 
 DT = 1.0 / 30.0
@@ -324,6 +325,99 @@ TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
                     1.0608, 1.0269, 1.0668, 1.1428)
 TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
 assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)
+
+
+# --- run-only body options (2026-09-22, user) --------------------------------
+# Four per-run options on top of the tables above; the defaults ARE the
+# tables (bit-for-bit, both engines). Mirrors: rust dynamics/model.rs
+# BodyCfg (+ humanoid_with) and the .cu Sim hand_m / hand_i / bend_tau /
+# bend_cap / bend_half. The trainer records them as ckpt["env_body"];
+# bench / replay tooling read them back (env_body_of_ckpt).
+#   hand_mass             kg, BOTH hands (inertia scales with it; COM same)
+#   wrist_bend_tau_mult   x nominal tau_max of the two wrist-BEND joints
+#                         (8, 15) — the per-env tau scales apply on top
+#   wrist_bend_cap        omega cap (rad/s) of joints 8/15 — solver clamp,
+#                         limit-row reach and the qd obs normalizer
+#   wrist_bend_half_gear  gears-5 ids 3/4 on joints 8/15: +-1/4 -> +-1/2
+WRIST_BEND_JOINTS = (8, 15)
+ENV_BODY_DEFAULT = {"hand_mass": 0.35, "wrist_bend_tau_mult": 1.0,
+                    "wrist_bend_cap": 50.0, "wrist_bend_half_gear": False}
+_HAND_INERTIA_NOM = 0.000264   # per axis at hand_mass 0.35
+# step.rs's one-substep stop-overshoot bound is H_SUB x cap; the 0.35 rad
+# teleport backstop must stay out of reach, so cap < 0.35 x 240 = 84
+WRIST_BEND_CAP_MAX = 84.0
+assert TAU_MAX[8] == TAU_MAX[15] == 1.06
+assert OMEGA_CAP[8] == OMEGA_CAP[15] == ENV_BODY_DEFAULT["wrist_bend_cap"]
+
+
+def env_body(body=None, gears=None):
+    """Validated full env-body dict: ENV_BODY_DEFAULT overlaid with
+    `body` (a partial dict, or None). `gears` (when given) checks the
+    half gear's gears-5 requirement."""
+    body = dict(body or {})
+    unknown = set(body) - set(ENV_BODY_DEFAULT)
+    if unknown:
+        raise ValueError(f"unknown env_body keys {sorted(unknown)}")
+    out = dict(ENV_BODY_DEFAULT)
+    out.update(body)
+    for k in ("hand_mass", "wrist_bend_tau_mult", "wrist_bend_cap"):
+        out[k] = float(out[k])
+        if not (math.isfinite(out[k]) and out[k] > 0):
+            raise ValueError(f"env_body {k} must be finite and > 0, got {out[k]}")
+    if not out["wrist_bend_cap"] < WRIST_BEND_CAP_MAX:
+        raise ValueError(f"env_body wrist_bend_cap must be < "
+                         f"{WRIST_BEND_CAP_MAX:g} rad/s (the H_SUB x cap stop "
+                         f"overshoot would reach the 0.35 rad teleport "
+                         f"backstop), got {out['wrist_bend_cap']}")
+    out["wrist_bend_half_gear"] = bool(out["wrist_bend_half_gear"])
+    if gears is not None and out["wrist_bend_half_gear"] and gears != 5:
+        raise ValueError(f"wrist_bend_half_gear needs gears=5, got {gears}")
+    return out
+
+
+def env_body_derived(body):
+    """(hand_mass, hand_inertia, wrist_bend_tau_max, wrist_bend_cap,
+    half_gear) — the per-sim constants the CUDA kernel takes, in f64 by
+    the SAME formulas as model.rs BodyCfg (I_nom * (M / M_nom) keeps the
+    default exactly I_nom)."""
+    b = env_body(body)
+    m = b["hand_mass"]
+    return (m, _HAND_INERTIA_NOM * (m / ENV_BODY_DEFAULT["hand_mass"]),
+            TAU_MAX[8] * b["wrist_bend_tau_mult"], b["wrist_bend_cap"],
+            b["wrist_bend_half_gear"])
+
+
+def env_body_of_ckpt(ckpt, override=None):
+    """A checkpoint's env body (ckpt["env_body"]; absent = the defaults,
+    i.e. every checkpoint older than the options). `override`: optional
+    {key: value or None} from a tool's CLI — a given value must AGREE
+    with the checkpoint (ValueError otherwise); the body is the ckpt's."""
+    body = env_body(ckpt.get("env_body"))
+    for k, v in (override or {}).items():
+        if v is not None and env_body({k: v})[k] != body[k]:
+            raise ValueError(f"--{k.replace('_', '-')} {v} disagrees with the "
+                             f"checkpoint's env body ({k} = {body[k]}); the "
+                             f"body comes from the checkpoint — drop the flag")
+    return body
+
+
+def add_env_body_args(p):
+    """The four body flags for tools that take the body FROM a checkpoint
+    (bench, replays): optional, and only allowed to restate it."""
+    for k in ("hand_mass", "wrist_bend_tau_mult", "wrist_bend_cap"):
+        p.add_argument("--" + k.replace("_", "-"), type=float, default=None,
+                       help="run-only body option — read from the "
+                            "checkpoint (ckpt['env_body']); if given it must "
+                            "agree with it")
+    p.add_argument("--wrist-bend-half-gear", default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help="run-only body option — read from the checkpoint; "
+                        "if given it must agree with it")
+
+
+def env_body_cli(args):
+    """The body flags of an add_env_body_args parser, as a dict."""
+    return {k: getattr(args, k) for k in ENV_BODY_DEFAULT}
 
 
 def parse_tau_scale(spec):

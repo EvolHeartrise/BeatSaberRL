@@ -1231,6 +1231,12 @@ __device__ constexpr double F_AXIS[NF][3] = {
     {0, 0, 1}, {0, 1, 0}, {-1, 0, 0},
     {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1},
     {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}};
+// NOTE (2026-09-22): the two HAND rows of F_MASS / F_INERTIA and the
+// wrist-BEND entries (8, 15) of TAU_MAX / OMEGA_CAP below are NOT read
+// for values any more — the run-only body options feed them per launch
+// (Sim hand_m / hand_i / bend_tau / bend_cap, from constants.py
+// env_body_derived; only the hand F_MASS > 0 predicate is still read).
+// Edit the default body in constants.ENV_BODY_DEFAULT + model.rs.
 // hand 0.61 -> 0.35 (user 2026-08-18): fist only, no controller mass
 // — real players exploit controller motion prediction and never truly
 // swing the composite mass; inertia rescaled with it (model.rs mirror)
@@ -1598,11 +1604,14 @@ constexpr double TILT_TAN2_ROLL = 0.7040881910418472;  // tan^2(40 deg)
 // the pop counter makes that visible if it ever matters.
 constexpr double FOOT_LIFT_PEN = -0.1;
 
-// env v8 gears (lib.rs gear_signed)
-__device__ constexpr double GEAR_TAB[3][7] = {
+// env v8 gears (lib.rs gear_signed). Row 3: the two wrist-BEND joints'
+// K=5 table under the run-only --wrist-bend-half-gear (lib.rs
+// GEAR_BEND_HALF_5; host-refused for K != 5).
+__device__ constexpr double GEAR_TAB[4][7] = {
     {0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0},                     // K=3
     {0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0},                  // K=5
-    {0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0, 0.125, -0.125}};  // K=7
+    {0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0, 0.125, -0.125},   // K=7
+    {0.0, 1.0, -1.0, 0.5, -0.5, 0.0, 0.0}};                   // K=5 bend-half
 __device__ __forceinline__ const double* gear_row(int gears) {
   return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
 }
@@ -1643,6 +1652,33 @@ __device__ __forceinline__ void sub3v(const T a[3], const T b[3], T o[3]) {
   o[0] = a[0] - b[0];
   o[1] = a[1] - b[1];
   o[2] = a[2] - b[2];
+}
+
+// ---- run-only body options (2026-09-22, model.rs BodyCfg mirror) ----------
+// Hand mass/inertia (both hands), wrist-BEND nominal tau_max / omega cap /
+// half gear are per-launch Sim fields, NOT tables: every consumer of the
+// hand rows of F_MASS / F_INERTIA (crba seeds, rnea_bias) and of the bend
+// rows of TAU_MAX / OMEGA_CAP (torque + energy, limit-row reach, the
+// PGS and step-12 cap clamps, the qd obs normalizer) reads them through
+// the accessors below. The defaults are the table values exactly, and
+// each accessor only swaps WHICH value feeds an unchanged expression
+// tree, so the default body is bitwise the table body.
+template <typename T>
+struct Sim;
+constexpr int A_L_WRIST_BEND = 8, A_R_WRIST_BEND = 15;
+__device__ __forceinline__ bool is_bend(int j) {
+  return j == A_L_WRIST_BEND || j == A_R_WRIST_BEND;
+}
+__device__ __forceinline__ bool is_hand_frame(int k) {
+  return k == F_L_HAND || k == F_R_HAND;
+}
+template <typename T>
+__device__ __forceinline__ T frame_mass(const Sim<T>& P, int k) {
+  return is_hand_frame(k) ? P.hand_m : T(F_MASS[k]);
+}
+template <typename T>
+__device__ __forceinline__ T omega_cap(const Sim<T>& P, int j) {
+  return is_bend(j) ? P.bend_cap : T(OMEGA_CAP[j]);
 }
 
 // ---- dynamics scratch (thread-local) ----------------------------------------
@@ -1946,8 +1982,8 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
 // the one register value v (K4e): crba needs a MUTABLE composite seed
 // and a pristine copy for rnea_bias, and both get identical bits with
 // no read-back.
-template <typename T>
-__device__ void inertia_world2(const T r[3][3], const double idiag[3],
+template <typename T, typename U>
+__device__ void inertia_world2(const T r[3][3], const U idiag[3],
                                T out[3][3], T keep[3][3]) {
   for (int a = 0; a < 3; a++)
     for (int b = a; b < 3; b++) {
@@ -1985,19 +2021,24 @@ __device__ void add_shift(T i[3][3], T m, const T d[3]) {
 // written is unchanged (still exactly row >= col), and M's symmetry
 // means the values were never orientation-dependent in the first place.
 template <typename T>
-__device__ void crba(Dyn<T>& __restrict__ d) {
+__device__ void crba(Dyn<T>& __restrict__ d, const Sim<T>& P) {
   for (int i = 0; i < NV; i++)
     for (int j = 0; j <= i; j++) d.m[j * NV + i] = T(0);
-  // composite seeds
+  // composite seeds (hand rows: the run-only hand mass / inertia; the
+  // F_MASS > 0 predicate holds for them either way — hand_m > 0)
   for (int k = 0; k < NF; k++) {
-    const T mk = T(F_MASS[k]);
+    const T mk = frame_mass(P, k);
     d.cm[k] = mk;
     if (F_MASS[k] > 0.0) {
       for (int i = 0; i < 3; i++)
         d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * T(F_COM[k][0])
                                     + d.r[k][i][1] * T(F_COM[k][1])
                                     + d.r[k][i][2] * T(F_COM[k][2]));
-      inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
+      const bool hand = is_hand_frame(k);
+      const T idiag[3] = {hand ? P.hand_i : T(F_INERTIA[k][0]),
+                          hand ? P.hand_i : T(F_INERTIA[k][1]),
+                          hand ? P.hand_i : T(F_INERTIA[k][2])};
+      inertia_world2(d.r[k], idiag, d.ci[k], d.iw[k]);
     } else {
       for (int i = 0; i < 3; i++) d.cc[k][i] = d.pos[k][i];
       for (int i = 0; i < 3; i++)
@@ -2125,7 +2166,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
 
 // RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
 template <typename T>
-__device__ void rnea_bias(Dyn<T>& __restrict__ d) {
+__device__ void rnea_bias(Dyn<T>& __restrict__ d, const Sim<T>& P) {
   const T g[3] = {T(0), T(-GRAV), T(0)};
   T om0[3] = {d.v[3], d.v[4], d.v[5]};
   // forward pass (acc = 0 everywhere; al0/ao0 = 0)
@@ -2179,7 +2220,8 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       for (int i = 0; i < 3; i++) ac[i] = (aok[i] + alxe[i]) + omxomxe[i];
       const T(&iw)[3][3] = d.iw[k];  // K4e
       T fbk[3];
-      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * T(F_MASS[k]);
+      const T mk = frame_mass(P, k);
+      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * mk;
       T iwal[3], iwom[3];
       for (int i = 0; i < 3; i++) {
         iwal[i] = iw[i][0] * alk[0] + iw[i][1] * alk[1] + iw[i][2] * alk[2];
@@ -3383,7 +3425,7 @@ __device__ void ensure_pcol_multi(Solver<T, FC>& __restrict__ s,
 template <typename T, bool FC>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
                                  Solver<T, FC>& __restrict__ s, const T* qpre,
-                                 T* __restrict__ v) {
+                                 T* __restrict__ v, const Sim<T>& P) {
   const T hinv = T(1) / T(H_SUB);
 
   // -- assembly: weld rows 0-11 (foot_mode = 0 only) --------------------------
@@ -3612,7 +3654,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   for (int j = 0; j < NQ; j++) {
     const T gl = qpre[j] - T(LIMIT_LO[j]);
     const T gh = T(LIMIT_HI[j]) - qpre[j];
-    const T reach = T(H_SUB) * T(OMEGA_CAP[j]);
+    const T reach = T(H_SUB) * omega_cap(P, j);
     T sign, gap;
     if (gl <= gh) {
       sign = T(1);
@@ -4010,7 +4052,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // (d) omega-cap pass, joint order: weld-consistent impulses
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = omega_cap(P, j);
       const T target = tclamp(v[vj], -cap, cap);
       if (target != v[vj]) {
         ensure_pcol(d, s, j);
@@ -4031,11 +4073,11 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 // ---- step.rs substep (constrained) ------------------------------------------
 template <typename T, bool FC>
 __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
-                        const T* __restrict__ tau) {
+                        const T* __restrict__ tau, const Sim<T>& P) {
   // 1-3. FK, CRBA, RNEA bias
   fk_all(d);
-  crba(d);
-  rnea_bias(d);
+  crba(d, P);
+  rnea_bias(d, P);
   // 4. rhs = tau - b*qd - C (root rows 0 - C)
   for (int i = 0; i < VOFF; i++) d.rhs[i] = T(0) - d.c[i];
   for (int j = 0; j < NQ; j++)
@@ -4054,7 +4096,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     s.pcomp[j] = false;
   }
   // 7-9. constraint stage
-  constraint_solve(d, s, d.q, v);
+  constraint_solve(d, s, d.q, v, P);
   for (int i = 0; i < NV; i++) d.v[i] = v[i];
   // 12-PRE. root velocity envelope, FIRST application (SPEC-v10 §3
   //     step 12 as amended 2026-08-03 — Divergences §23). Identical
@@ -4137,7 +4179,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     bool changed = false;
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = omega_cap(P, j);
       // v14: at a stop the target is a Baumgarte recovery toward the
       // bound with a SLOP_LIMIT dead-band (mirrors step.rs) — the
       // impulse restores position reciprocally; a parked joint inside
@@ -4620,6 +4662,13 @@ struct Sim {
   // pose; the sole-corner root drop makes any pose ground-exact.
   T crouch_prob;
   int gears;
+  // run-only body options (2026-09-22; see frame_mass / omega_cap):
+  // hand mass (kg) + per-axis inertia, wrist-bend omega cap in T; the
+  // bend nominal tau_max in double (the energy sum is double); the
+  // bend half-gear switch (K=5 only, host-checked)
+  T hand_m, hand_i, bend_cap;
+  double bend_tau;
+  bool bend_half;
   bool auto_reset;
   // contact_imp/contact_pt are pure introspection (parity harness /
   // CudaBeatVecEnv.contacts()); nothing in the kernel reads them back.
@@ -4966,7 +5015,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     }
   }
   for (int j = 0; j < NQ; j++)
-    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / T(OMEGA_CAP[j]));
+    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / omega_cap(P, j));
   // hand derived blocks
   const int bases[2] = {OFF_HAND_L, OFF_HAND_R};
   for (int s = 0; s < 2; s++) {
@@ -5200,6 +5249,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // act_grp splits the same terms [spine, arms, legs] for telemetry
   T tau[NQ];
   const double* gr = gear_row(P.gears);
+  // run-only --wrist-bend-half-gear: the bend joints' own K=5 row
+  const double* grb = P.bend_half ? GEAR_TAB[3] : gr;
   double act = 0.0;
   double act_grp[3] = {0.0, 0.0, 0.0};
   // env v43 energy base: Σ|frac·τ_max| in double, joint order, matching
@@ -5208,15 +5259,18 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   double tau_grp[3] = {0.0, 0.0, 0.0};
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
-    const double frac = a < 7 ? gr[a] : 0.0;
+    const bool bend = is_bend(j);
+    const double frac = a < 7 ? (bend ? grb[a] : gr[a]) : 0.0;
+    // run-only --wrist-bend-tau-mult: the bend joints' nominal tau_max
+    const double tmax_j = bend ? P.bend_tau : TAU_MAX[j];
     // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
     const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
-    tau[j] = T(frac) * T(TAU_MAX[j]) * T(ts);
+    tau[j] = T(frac) * T(tmax_j) * T(ts);
     const double f = fabs(frac);
     act += f;
     const int g = j < 3 ? 0 : (j < 17 ? 1 : 2);
     act_grp[g] += f;
-    const double t = fabs(frac * TAU_MAX[j] * ts);
+    const double t = fabs(frac * tmax_j * ts);
     tau_abs += t;
     tau_grp[g] += t;
   }
@@ -5245,7 +5299,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // env v41: this tick's self-collision row impulse (all pairs)
   T sc_imp = T(0);
   for (int sub = 0; sub < N_SUB; sub++) {
-    substep(d, s, tau);
+    substep(d, s, tau, P);
     for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
     if constexpr (FC)
       for (int gi = 0; gi < s.ng; gi++)
@@ -6054,10 +6108,15 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           double start_pose_jitter, double crouch_prob,
           double z_asinh, double self_contact_coef,
           double tau_rand, int64_t combo_walk, int64_t bench_refill,
-          int64_t ep_stats) {
+          int64_t ep_stats, double hand_m, double hand_i, double bend_tau,
+          double bend_cap, bool bend_half) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   TORCH_CHECK(z_asinh > 0.0, "z_asinh must be > 0 (asinh z lane, metres)");
+  TORCH_CHECK(hand_m > 0.0 && hand_i > 0.0 && bend_tau > 0.0 && bend_cap > 0.0
+                  && bend_cap < 84.0,
+              "body options must be > 0 (wrist-bend cap < 84 rad/s)");
+  TORCH_CHECK(!bend_half || gears == 5, "wrist_bend_half_gear needs gears=5");
   const auto& q = ts[TQ];
   TORCH_CHECK(q.is_cuda(), "state must live on CUDA");
   TORCH_CHECK(actions.scalar_type() == at::kLong && actions.is_contiguous());
@@ -6215,6 +6274,11 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.crouch_prob = (scalar_t)crouch_prob;
     P.gears = (int)gears;
+    P.hand_m = (scalar_t)hand_m;
+    P.hand_i = (scalar_t)hand_i;
+    P.bend_cap = (scalar_t)bend_cap;
+    P.bend_tau = bend_tau;
+    P.bend_half = bend_half;
     P.auto_reset = auto_reset;
     P.want_contacts = want_contacts;
     const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
