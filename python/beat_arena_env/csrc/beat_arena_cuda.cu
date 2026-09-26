@@ -1541,6 +1541,21 @@ constexpr double PTS_ACC = 15.0;
 constexpr double SCORE_MAX = 115.0;
 constexpr double CHAIN_LINK_PTS = 20.0;
 constexpr double SWING_BREAK = 0.005;
+// Flux game mode (lib.rs flux.rs verbatim; SPEC.md §Flux): no sabers —
+// each hand is its palm centre PALM_OFF along the hand axis; circles
+// (colour, disc radius CIRCLE_R) score on the matching palm's touch,
+// bars (colourless, 2*BAR_HALF_W wide) on the swept Flux segment
+// between the palms. Hitbox depth slab = the good box's convention.
+constexpr double PALM_OFF = 0.06;
+constexpr double CIRCLE_R = 0.175;
+constexpr double CIRCLE_PTS = 50.0;
+constexpr double CIRCLE_ACC_PTS = 10.0;
+constexpr double BAR_PTS = 100.0;
+constexpr double BAR_ACC_PTS = 15.0;
+constexpr double BAR_HALF_W = 0.025;
+constexpr double FLUX_SLAB_LO = GOOD_Z_SHIFT - GOOD_HALF_Z;  // -0.75
+constexpr double FLUX_SLAB_HI = GOOD_Z_SHIFT + GOOD_HALF_Z;  // +0.25
+constexpr double FLUX_REACH_PAST_SHOULDER = 0.65 + PALM_OFF - FLUX_SLAB_LO;
 // env v19 flail telemetry: a tick is "note-free" when the next
 // scoreable note is further out than this (s). Telemetry only — no
 // reward or obs effect.
@@ -4346,6 +4361,62 @@ __device__ T sweep_dist(const T w0[3], const T t0[3], const T t1[3],
   return tmin(tri_point_dist(w0, t0, t1, p), tri_point_dist(w0, t1, w1, p));
 }
 
+// ---- Flux geometry (flux.rs circle_touch / bar_sweet_dist verbatim) ----
+// Palm path a_w -> b_w vs the circle centred at c: clip to the depth
+// slab, closest in-plane approach. Returns the distance when it is
+// within CIRCLE_R, else -1 (Rust: Option<Real>).
+template <typename T>
+__device__ T flux_circle_touch(const T a_w[3], const T b_w[3], const T c[3]) {
+  const T a[3] = {a_w[0] - c[0], a_w[1] - c[1], a_w[2] - c[2]};
+  const T b[3] = {b_w[0] - c[0], b_w[1] - c[1], b_w[2] - c[2]};
+  const T dz = b[2] - a[2];
+  T t0 = T(0), t1 = T(1);
+  if (fabs(dz) < T(1e-12)) {
+    if (a[2] < T(FLUX_SLAB_LO) || a[2] > T(FLUX_SLAB_HI)) return T(-1);
+  } else {
+    const T ta = (T(FLUX_SLAB_LO) - a[2]) / dz;
+    const T tb = (T(FLUX_SLAB_HI) - a[2]) / dz;
+    t0 = tmax(t0, tmin(ta, tb));
+    t1 = tmin(t1, tmax(ta, tb));
+    if (t0 > t1) return T(-1);
+  }
+  const T ex = b[0] - a[0];
+  const T ey = b[1] - a[1];
+  const T ee = ex * ex + ey * ey;
+  const T t = ee < T(1e-12) ? t0
+                            : tclamp(-(a[0] * ex + a[1] * ey) / ee, t0, t1);
+  const T qx = a[0] + t * ex;
+  const T qy = a[1] + t * ey;
+  const T d = sqrt(qx * qx + qy * qy);
+  return d <= T(CIRCLE_R) ? d : T(-1);
+}
+
+// Distance along the bar axis u from where the CURRENT Flux line (palms
+// l, r projected onto the bar plane) crosses the axis c + s*u (clamped
+// onto the bar) to the sweet spot at sweet*len/2; a parallel or
+// collapsed Flux takes its projected span's point nearest the sweet spot.
+template <typename T>
+__device__ T flux_bar_sweet_dist(T nx, T ny, T len, T sweet, T ux, T uy,
+                                 const T l[3], const T r[3]) {
+  const T half = T(0.5) * len;
+  const T s_sweet = sweet * half;
+  const T fx = r[0] - l[0];
+  const T fy = r[1] - l[1];
+  const T lx = l[0] - nx;
+  const T ly = l[1] - ny;
+  const T cr = ux * fy - uy * fx;
+  const T ff = fx * fx + fy * fy;
+  T sv;
+  if (ff > T(1e-12) && cr * cr > T(1e-12) * ff) {
+    sv = (lx * fy - ly * fx) / cr;
+  } else {
+    const T sa = lx * ux + ly * uy;
+    const T sb = (r[0] - nx) * ux + (r[1] - ny) * uy;
+    sv = tclamp(s_sweet, tmin(sa, sb), tmax(sa, sb));
+  }
+  return fabs(tclamp(sv, -half, half) - s_sweet);
+}
+
 // ---- kernel parameters ------------------------------------------------------
 // Every pointer below is __restrict__: the 58 slots are 58 DISTINCT
 // torch tensors, each its own allocation (cuda_env.py CudaBeatVecEnv
@@ -4367,6 +4438,10 @@ struct Sim {
   // env v24: §8 body-point positions of the last tick (finite-diff
   // base) and the resulting world velocities (lib.rs body_pt_vel)
   T *__restrict__ body_pt, *__restrict__ body_pt_vel;
+  // Flux: palm-centre finite-difference velocity (E, 2, 3) — lib.rs
+  // Core::palm_vel; zeroed by reset_env and the mode-2 refresh,
+  // written only by the Flux judgment (stays 0 in the standard game)
+  T* __restrict__ palm_vel;
   // swing chain
   T *__restrict__ swing_acc, *__restrict__ axis;
   bool* __restrict__ axis_valid;
@@ -4521,6 +4596,10 @@ struct Sim {
       *__restrict__ p_is_head, *__restrict__ p_is_link,
       *__restrict__ p_show_dir, *__restrict__ p_free_pre,
       *__restrict__ p_free_post;
+  // Flux bars (0 on every other object): length (m) and sweet-spot
+  // offset in [-1, 1]; a Flux object is a BAR iff p_len > 0 (flux
+  // charts assert len > 0 on bars, circles carry 0 — lib.rs flux.rs)
+  const T *__restrict__ p_len, *__restrict__ p_sweet;
   const int64_t* __restrict__ p_n_notes;
   const T *__restrict__ p_last_hit, *__restrict__ p_tail,
       *__restrict__ p_min_speed;
@@ -4815,6 +4894,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   seed_body_pts(d, P, e);
   for (int s = 0; s < 2; s++) {
     for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
+    for (int k = 0; k < 3; k++) P.palm_vel[(e * 2 + s) * 3 + k] = T(0);
     P.swing_acc[e * 2 + s] = T(0);
     P.axis_valid[e * 2 + s] = false;
     P.tr_ptr[e * 2 + s] = 0;
@@ -4927,7 +5007,10 @@ static_assert(OFF_ROOT_ROT == 3 && OFF_ROOT_VLIN == 9 && OFF_ROOT_VANG == 12
                   && OFF_NOTES == OFF_CONTACT + 2,
               "K10e: obs lanes 0..OFF_NOTES-1 must be a gapless "
               "unconditionally-written prefix");
-template <typename T>
+// FX = Flux game mode (compile-time, host-selected per instance like
+// FC): the hand blocks carry the palms and the entity window the Flux
+// lane meanings (lib.rs write_flux_hands / write_flux_entities).
+template <typename T, bool FX>
 __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   float* __restrict__ obs = P.obs + (size_t)e * OBS_DIM;
   for (int i = OFF_NOTES; i < OBS_DIM; i++) obs[i] = 0.f;
@@ -4969,6 +5052,27 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
     obs[OFF_QD + j] = (float)(d.v[VOFF + j] / T(OMEGA_CAP[j]));
   // hand derived blocks
   const int bases[2] = {OFF_HAND_L, OFF_HAND_R};
+  if constexpr (FX) {
+    // Flux: palm x/y head-relative, palm z world, palm velocity
+    // /V_NORM, hand axis; lanes 9..10 zero — they sit in the
+    // unconditionally-written prefix (K10e note 3), so write the zeros
+    for (int s = 0; s < 2; s++) {
+      const int base = bases[s];
+      const int wb = (e * 2 + s) * 3;
+      T pm[3];
+      for (int k = 0; k < 3; k++)
+        pm[k] = P.wrist[wb + k] + T(PALM_OFF) * P.blade[wb + k];
+      obs[base] = (float)((pm[0] - P.head[e * 3]) / T(X_NORM));
+      obs[base + 1] = (float)((pm[1] - P.head[e * 3 + 1]) / T(Y_NORM));
+      obs[base + 2] = (float)pm[2];
+      for (int k = 0; k < 3; k++) {
+        obs[base + 3 + k] = (float)(P.palm_vel[wb + k] / T(V_NORM));
+        obs[base + 6 + k] = (float)P.blade[wb + k];
+      }
+      obs[base + 9] = 0.f;
+      obs[base + 10] = 0.f;
+    }
+  } else
   for (int s = 0; s < 2; s++) {
     const int base = bases[s];
     const int wb = (e * 2 + s) * 3;
@@ -5097,6 +5201,36 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       // binary-for-notes / continuous-for-walls under the shared
       // token encoder. Lane 17 held wall length until the same day.)
       nb2[17] = (float)z_lane(zfu + P.p_wall_len[wb], z_lo, P.z_asinh);  // env v48
+    } else if constexpr (FX) {
+      // Flux entity lanes (lib.rs write_flux_entities; Flux pools carry
+      // no walls, so the selection above is exactly Rust's notes-only
+      // scan): 0-3 as standard, 4/5 circle colour, 8 is_circle; bars
+      // 6/7 axis u, 9 is_bar, 10 length, 11 sweet offset, 12/13 the
+      // sweet spot head-relative; 14-17 zero
+      const int64_t cb = nb + sel_idx[slot];
+      const T zu = (P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off;
+      const T nx = P.p_center[cb * 2], ny = P.p_center[cb * 2 + 1];
+      nb2[0] = (float)((nx - P.head[e * 3]) / T(X_NORM));
+      nb2[1] = (float)((ny - P.head[e * 3 + 1]) / T(Y_NORM));
+      nb2[2] = (float)z_lane(zu, z_lo, P.z_asinh);
+      nb2[3] = (float)(-P.p_speed[cb] / T(Z_SCALE));
+      const T blen = P.p_len[cb];
+      if (!(blen > T(0))) {  // circle
+        nb2[P.p_is_right[cb] ? 5 : 4] = 1.f;
+        nb2[8] = 1.f;
+      } else {               // bar: p_rot = (cos θ, sin θ)
+        const T ux = -P.p_rot[cb * 2 + 1], uy = P.p_rot[cb * 2];
+        const T sw = P.p_sweet[cb];
+        const T s_sweet = sw * T(0.5) * blen;
+        nb2[6] = (float)ux;
+        nb2[7] = (float)uy;
+        nb2[9] = 1.f;
+        nb2[10] = (float)blen;
+        nb2[11] = (float)sw;
+        nb2[12] = (float)((nx + s_sweet * ux - P.head[e * 3]) / T(X_NORM));
+        nb2[13] = (float)((ny + s_sweet * uy - P.head[e * 3 + 1])
+                          / T(Y_NORM));
+      }
     } else {
       const int64_t cb = nb + sel_idx[slot];
       const T zu = (P.p_hit[cb] - time_o) * P.p_speed[cb] + z_off;
@@ -5181,7 +5315,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
 // entirely per-thread.
-template <typename T, bool FC>
+template <typename T, bool FC, bool FX>
 __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
                          const Sim<T>& P, int e) {
   const int C = P.C;
@@ -5409,9 +5543,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     }
   }
 
-  // swing chain update
-  T deltas[2];
-  bool continued[2];
+  // swing chain update — Flux has no sabers: no swing chain, no
+  // trackers, deltas stay 0 (lib.rs `if !self.flux`; the flail
+  // telemetry below then accrues nothing, exactly as Rust)
+  T deltas[2] = {T(0), T(0)};
+  bool continued[2] = {false, false};
+  if constexpr (!FX) {
   for (int h = 0; h < 2; h++) {
     const T dp = tclamp(dot3(prev_d[h], new_d[h]), T(-1), T(1));
     const T delta = acos(dp);
@@ -5475,6 +5612,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       }
     }
   }
+  }  // !FX
 
   const T time_new = T(P.tick[e] + 1) * T(DT);
 
@@ -5566,6 +5704,105 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     P.wrev_ext[idx * 2 + 1] = hi;
   }
 
+  if constexpr (FX) {
+    // ---- Flux judgment (lib.rs Core::flux_judge verbatim) ----------
+    T p0[2][3], p1[2][3];
+    for (int h = 0; h < 2; h++)
+      for (int k = 0; k < 3; k++) {
+        p0[h][k] = prev_w[h][k] + T(PALM_OFF) * prev_d[h][k];
+        p1[h][k] = new_w[h][k] + T(PALM_OFF) * new_d[h][k];
+      }
+    for (int h = 0; h < 2; h++)
+      for (int k = 0; k < 3; k++)
+        P.palm_vel[(e * 2 + h) * 3 + k] = (p1[h][k] - p0[h][k]) / T(DT);
+    const T freach = tmax(P.shoulder_z[e * 2], P.shoulder_z[e * 2 + 1])
+                     + T(FLUX_REACH_PAST_SHOULDER);
+    for (int i = P.first_pending[e]; i < nn; i++) {
+      if (P.status[e * C + i] != 0) continue;
+      const int64_t cb = nb0 + i;
+      if (!P.p_valid[cb]) continue;
+      if ((P.p_hit[cb] - time_new) * min_speed + z_off > freach) break;
+      const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb] + z_off;
+      const T blen = P.p_len[cb];
+      const bool is_bar = blen > T(0);
+      if (z < head_z) {
+        P.status[e * C + i] = 3;
+        P.miss[e] += 1;
+        cw_break(P, e);
+        reward += T(REWARD_MISS);
+        if (!is_bar) {  // circles record on their colour; bars never
+          const int h = P.p_is_right[cb] ? 1 : 0;
+          P.prev_idx[e * 2 + h] = i;
+          P.prev_valid[e * 2 + h] = 1;
+        }
+        continue;
+      }
+      if (z > freach) continue;
+      const T center[3] = {P.p_center[cb * 2], P.p_center[cb * 2 + 1], z};
+      if (!is_bar) {
+        const int m = P.p_is_right[cb] ? 1 : 0;
+        const T dm = flux_circle_touch(p0[m], p1[m], center);
+        if (dm >= T(0)) {
+          const T acc = round_pts(
+              T(CIRCLE_ACC_PTS)
+              * (T(1) - tclamp(dm / T(ACC_NORM), T(0), T(1))));
+          const T pts = T(CIRCLE_PTS) + acc;
+          P.status[e * C + i] = 1;
+          P.good[e] += 1;
+          reward += pts / T(SCORE_MAX);
+          P.score[e] += pts;
+          P.score_pre[e] += T(CIRCLE_PTS);
+          P.score_acc[e] += acc;
+          P.acc_pts[e * 2 + m] += pts;
+          P.acc_cuts[e * 2 + m] += 1;
+          cw_cut(P, e, i, pts);
+          P.prev_idx[e * 2 + m] = i;
+          P.prev_valid[e * 2 + m] = 1;
+        } else if (flux_circle_touch(p0[1 - m], p1[1 - m], center)
+                   >= T(0)) {
+          P.status[e * C + i] = 2;
+          P.bad[e] += 1;
+          reward += T(REWARD_BAD);
+          cw_break(P, e);
+          P.prev_idx[e * 2 + m] = i;
+          P.prev_valid[e * 2 + m] = 1;
+        }
+      } else {
+        // bar: lam = 0 z-roll frame, p_rot = (cos θ, sin θ), local y' = u
+        T frame[3][3];
+        note_frame(center, P.p_rot[cb * 2], P.p_rot[cb * 2 + 1], T(0),
+                   head_pos, frame);
+        const T bc[3] = {center[0], center[1], center[2] + T(GOOD_Z_SHIFT)};
+        const T bh[3] = {T(BAR_HALF_W), T(0.5) * blen, T(GOOD_HALF_Z)};
+        // swept Flux quad (L0 -> R0) to (L1 -> R1): triangles
+        // (L0, R0, R1) and (L0, R1, L1) — sweep_hits_box's (w0, t0, t1)
+        // + (w0, t1, w1) split with w0 = L0, t0 = R0, t1 = R1, w1 = L1
+        if (sweep_hits_box(p0[0], p0[1], p1[1], p1[0], bc, bh, frame)) {
+          const T ux = -P.p_rot[cb * 2 + 1], uy = P.p_rot[cb * 2];
+          const T dm = flux_bar_sweet_dist(center[0], center[1], blen,
+                                           P.p_sweet[cb], ux, uy, p1[0],
+                                           p1[1]);
+          const T acc = round_pts(
+              T(BAR_ACC_PTS)
+              * (T(1) - tclamp(dm / T(ACC_NORM), T(0), T(1))));
+          const T pts = T(BAR_PTS) + acc;
+          P.status[e * C + i] = 1;
+          P.good[e] += 1;
+          reward += pts / T(SCORE_MAX);
+          P.score[e] += pts;
+          P.score_pre[e] += T(BAR_PTS);
+          P.score_acc[e] += acc;
+          // training-acc telemetry (CUDA-only): a bar is both hands' —
+          // credited to each hand's flow (no Rust twin)
+          for (int h = 0; h < 2; h++) {
+            P.acc_pts[e * 2 + h] += pts;
+            P.acc_cuts[e * 2 + h] += 1;
+          }
+          cw_cut(P, e, i, pts);
+        }
+      }
+    }
+  } else {
   for (int i = P.first_pending[e]; i < nn; i++) {
     if (P.status[e * C + i] != 0) continue;
     const int64_t cb = nb0 + i;
@@ -5736,6 +5973,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       }
     }
   }
+  }  // FX / standard judgment
 
   // spawn aggregated trackers (same-tick spawns share (arc, age))
   for (int h = 0; h < 2; h++) {
@@ -5953,7 +6191,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
 // unchanged; TRUE swaps the 12 weld rows for the ground block and arms
 // the fall envelope. Two instantiations per dtype, selected once on the
 // host — the flag is baked per env instance, so it is launch-constant.
-template <typename T, bool FC>
+// FX = Flux game mode (lib.rs Core::flux, fixed per instance): a
+// second compile-time switch, so every Flux branch is discarded from
+// the standard FX = false kernels. Their arithmetic is unchanged; the
+// only additions there are the palm_vel zero stores in reset_env and
+// the mode-2 refresh (shared device functions, not FX-templated), so
+// the register/spill census may move slightly — re-check on the pod.
+template <typename T, bool FC, bool FX>
 // The `, 1` PINS the register budget at 255 — see the THREADS note: it
 // is not an occupancy hint, it is what stops ptxas's free-choice
 // heuristic from flipping to 64 regs + double the spills.
@@ -5988,6 +6232,7 @@ step_kernel(Sim<T> P) {
     load_state(d, P, e);
     refresh_fk(d, P, e);
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
+    for (int k = 0; k < 6; k++) P.palm_vel[e * 6 + k] = T(0);  // Flux
     // env v24: set_state semantics — re-seed the finite-diff base at
     // the refreshed pose, velocities zero (lib.rs set_state mirror)
     seed_body_pts(d, P, e);
@@ -5995,9 +6240,9 @@ step_kernel(Sim<T> P) {
     d.pd_bad = false;
     d.env_bad = false;
     d.env_n = 0;
-    step_env(d, s, P, e);
+    step_env<T, FC, FX>(d, s, P, e);
   }
-  write_obs(d, P, e);
+  write_obs<T, FX>(d, P, e);
 }
 
 // TOMBSTONE (2026-08-15) — the warp / sub-warp-per-env kernel family
@@ -6033,8 +6278,10 @@ enum {
   TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,28: v47 cols 22..28), flag (N) — 2026-09-16/19
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
   TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
+  TPALMV,   // Flux palm velocity (N, 2, 3)
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
+  PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)
   PNNOTES, PLASTHIT, PTAIL, PMINSP, PNOFF,
   // env v17 wall pool (ragged) + per-env wall state
   PWALLT, PWALLCX, PWALLCY, PWALLW, PWALLH, PWALLLEN, PWALLSP,
@@ -6054,7 +6301,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           double start_pose_jitter, double crouch_prob,
           double z_asinh, double self_contact_coef,
           double tau_rand, int64_t combo_walk, int64_t bench_refill,
-          int64_t ep_stats) {
+          int64_t ep_stats, bool flux) {
   TORCH_CHECK((int)ts.size() == T_COUNT, "expected ", (int)T_COUNT,
               " state tensors, got ", ts.size());
   TORCH_CHECK(z_asinh > 0.0, "z_asinh must be > 0 (asinh z lane, metres)");
@@ -6142,6 +6389,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.tr_msum = ts[TTRMSUM].data_ptr<int>();
     P.bench_rec = ts[TBENCHREC].data_ptr<scalar_t>();
     P.bench_flag = ts[TBENCHFLAG].data_ptr<uint8_t>();
+    P.palm_vel = ts[TPALMV].data_ptr<scalar_t>();
     P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;
@@ -6163,6 +6411,8 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.p_show_dir = ts[PSHOW].data_ptr<bool>();
     P.p_free_pre = ts[PFPRE].data_ptr<bool>();
     P.p_free_post = ts[PFPOST].data_ptr<bool>();
+    P.p_len = ts[PLEN].data_ptr<scalar_t>();
+    P.p_sweet = ts[PSWEET].data_ptr<scalar_t>();
     P.p_n_notes = ts[PNNOTES].data_ptr<int64_t>();
     P.p_last_hit = ts[PLASTHIT].data_ptr<scalar_t>();
     P.p_tail = ts[PTAIL].data_ptr<scalar_t>();
@@ -6221,12 +6471,21 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     // env v11 foot_mode: a COMPILE-TIME switch (see GROUND_CORNERS), so
     // the choice is made here, once per launch, and the weld kernel is
     // the v10 one to the byte.
-    if (foot_contact)
-      step_kernel<scalar_t, true><<<blocks, THREADS, 0,
-                                    at::cuda::getCurrentCUDAStream()>>>(P);
-    else
-      step_kernel<scalar_t, false><<<blocks, THREADS, 0,
-                                     at::cuda::getCurrentCUDAStream()>>>(P);
+    // Flux (FX) is a second compile-time switch (4 instantiations per
+    // dtype, ~2x compile time); the standard game's arithmetic is
+    // untouched.
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (flux) {
+      if (foot_contact)
+        step_kernel<scalar_t, true, true><<<blocks, THREADS, 0, stream>>>(P);
+      else
+        step_kernel<scalar_t, false, true><<<blocks, THREADS, 0, stream>>>(P);
+    } else {
+      if (foot_contact)
+        step_kernel<scalar_t, true, false><<<blocks, THREADS, 0, stream>>>(P);
+      else
+        step_kernel<scalar_t, false, false><<<blocks, THREADS, 0, stream>>>(P);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
 }
@@ -6239,5 +6498,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "refresh after a state write (mode 2) for every env; state "
         "tensors mutated in place, obs/reward/done written into their "
         "output slots. foot_contact selects env v11 foot_mode = 1 "
-        "(unilateral ground contact) instead of the v10 foot welds");
+        "(unilateral ground contact) instead of the v10 foot welds; "
+        "flux selects the Flux game mode (circles + bars, palms)");
 }
