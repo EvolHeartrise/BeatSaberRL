@@ -36,10 +36,13 @@ class RustFluxEnv(gym.Env):
                  note_speed_min=10.0, note_speed_max=18.0,
                  circle_prob=0.3, bar_prob=0.15,
                  external_chart=None, gears=3, seed=0, *,
-                 foot_contact, fall_const=5.0, energy_coef=0.0):
+                 foot_contact, fall_const=5.0, energy_coef=0.0,
+                 sim_dtype="f64"):
         """external_chart: a fixed list[FluxObj] played on every reset.
         foot_contact: REQUIRED keyword, as RustBeatEnv (True = the
-        production unilateral ground contact)."""
+        production unilateral ground contact). sim_dtype: "f64" (the
+        reference build every test pins) or "f32" (beat_arena_rs32, the
+        CUDA training kernel's regime — the bench/replay default)."""
         self.cfg = _flux_cfg(chart_len_s, cols, rows, note_speed_min,
                              note_speed_max, circle_prob, bar_prob)
         self._base_seed = seed
@@ -53,7 +56,12 @@ class RustFluxEnv(gym.Env):
         else:
             max_steps = int(chart_len_s * 30) + 90
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
-        self.sim = RawBeatSim(max_steps=max_steps, gears=gears,
+        assert sim_dtype in ("f64", "f32"), sim_dtype
+        if sim_dtype == "f32":
+            from beat_arena_rs32 import RawBeatSim as Sim
+        else:
+            Sim = RawBeatSim
+        self.sim = Sim(max_steps=max_steps, gears=gears,
                               foot_contact=foot_contact,
                               fall_const=fall_const,
                               energy_coef=energy_coef, flux=True)
@@ -168,7 +176,8 @@ class RustFluxEnv(gym.Env):
             info.update(score_base=base, score_acc=acc,
                         good=self.sim.good_cuts, bad=self.sim.bad_cuts,
                         misses=self.sim.misses, n_objects=self.sim.n_notes,
-                        score=self.sim.score, falls=self.sim.falls)
+                        score=self.sim.score, falls=self.sim.falls,
+                        tilts=self.sim.tilts)
         return obs, float(reward), bool(done), False, info
 
 

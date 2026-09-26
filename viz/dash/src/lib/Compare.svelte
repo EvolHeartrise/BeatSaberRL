@@ -14,7 +14,8 @@
   const runs = $derived(store.index?.runs ?? []);
   const shown = $derived.by(() => {
     const f = filter.trim().toLowerCase();
-    return runs.filter((r) => !f || r.id.toLowerCase().includes(f));
+    return runs.filter((r) => !f || r.id.toLowerCase().includes(f)
+      || (r.game ?? "standard") === f);
   });
   const sel = $derived(selected.map((id) => runById(id)).filter(Boolean));
   const loaded = $derived(sel.filter((r) => store.metrics[r.id]?.recs?.length));
@@ -115,7 +116,7 @@
         <label class:sel={selected.includes(r.id)}>
           <input type="checkbox" checked={selected.includes(r.id)} onchange={() => toggle(r.id)} />
           <span class="dot" style:background={selected.includes(r.id) ? color(selected.indexOf(r.id)) : "transparent"}></span>
-          <span class="name">{r.id}</span>
+          <span class="name">{r.id}{#if r.game === "flux"} <b class="flux">FLUX</b>{/if}</span>
           <span class="meta">{fmtSamples(r.samples)}</span>
         </label>
       {/each}
@@ -196,6 +197,7 @@
 </div>
 
 <style>
+  .flux { color: #8b5cf6; font-size: 10px; }
   .layout { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
   aside { border-right: 1px solid var(--border); padding-right: 10px; }
   aside > input { width: 100%; box-sizing: border-box; }
