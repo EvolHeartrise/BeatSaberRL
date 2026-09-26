@@ -3,8 +3,8 @@
 The body plays a deterministic square-wave arm pattern in the weld
 harness (it never falls). A first pass records the palm path; the chart
 is then built ON that path — circles at a palm, bars across the Flux
-with random sweet spots, a wrong-hand circle and a few deliberate
-misses — and a second pass records the episode. Objects never touch the
+with random sweet spots (every other one turned 75 deg off square, a
+bad "angle" cut), a wrong-hand circle and a few deliberate misses — and a second pass records the episode. Objects never touch the
 body, so the second pass follows the same trajectory and the placed
 objects really are touched.
 
@@ -87,7 +87,11 @@ def main():
             fx, fy = r[0] - l[0], r[1] - l[1]
             n = math.hypot(fx, fy) or 1.0
             ux, uy = -fy / n, fx / n
-            rot = math.atan2(-ux, uy) + float(rng.uniform(-0.5, 0.5))
+            # every other bar is turned 75 deg off square: the Flux
+            # crosses it too obliquely (> 60 deg) -> bad cut "angle"
+            off = math.radians(75.0) if (j // 7) % 2 else float(
+                rng.uniform(-0.5, 0.5))
+            rot = math.atan2(-ux, uy) + off
             length = float(rng.uniform(0.4, 0.9))
             sweet = float(rng.uniform(-1.0, 1.0))
             f = float(rng.uniform(0.3, 0.7))
