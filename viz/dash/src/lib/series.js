@@ -113,6 +113,21 @@ export const PANELS = [
   { id: "vram", title: "peak VRAM at checkpoints (GiB)", series: ["peak_vram"] },
 ];
 
+// Game mode of a run (index.json `game`, SPEC.md §Flux; absent = standard).
+export const gameOf = (run) => run?.game ?? "standard";
+
+// Panels for a run's game mode. Flux (no sabers): the trainer's acc is
+// points per touch / 115 — a perfect circle reads 60/115 = 0.52, a
+// perfect bar 1.0, and a bar counts for both hands (both palms make the
+// Flux line) — so the panel says so; flail (saber arc on idle ticks) is
+// structurally zero and dropped.
+export function panelsFor(game) {
+  if (game !== "flux") return PANELS;
+  return PANELS.filter((p) => p.id !== "flail").map((p) => p.id === "acc"
+    ? { ...p, title: "FLUX points per touch / 115 (perfect circle 0.52, perfect bar 1.0; bars count for both hands)" }
+    : p);
+}
+
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
   "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
