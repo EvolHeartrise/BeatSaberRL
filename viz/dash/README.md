@@ -77,10 +77,26 @@ second (`?archive=/some/prefix/` overrides). Development:
   copies are links; repo-only copies are named), replay dir + the 3D
   viewer (`/replay.html`, drop a replay file in), run dir listing.
 
+## Flux runs (SPEC.md §Flux)
+
+Runs trained with `train_batch.py --game flux` carry `game: "flux"` in
+index.json (read from args.json / the banner config; absent =
+standard). The Live view badges them FLUX and relabels the accuracy
+panel: the trainer's acc is points per touch / 115, so a perfect circle
+reads 60/115 = 0.52 and a perfect bar 1.0 (bars count for both hands —
+both palms make the Flux line); the saber-only flail panel is dropped.
+The Runs table has a `game` column, and typing `flux` in either filter
+box selects the Flux runs. Pod runs reach the archive the usual way —
+an rsync loop pulling `runs/flux_*` (logs, metrics.jsonl, args.json)
+into `~/beat-arena-volume-backup/beat-arena-flux/runs/`; replays from
+`python/make_flux_replays.py` go in that campaign's `replays/` and are
+linked by their `<tag>_bot…` names.
+
 ## index.json (per run)
 
 `id` (`<campaign>/<run>`), `campaign`, `run`, `run_dir`, `logs`,
-`metrics`, `metrics_source` (backfill | trainer), `args` (args.json
+`metrics`, `metrics_source` (backfill | trainer), `game` (standard |
+flux), `args` (args.json
 when present, else the banner argv + `config:` dict), `invocations`,
 `role` (trunk | leaf), `leaf_from`, `resume_from`, `num_envs`,
 `horizon`, `batch`, `device`, `n_params`, `seed`, `status` (finished |

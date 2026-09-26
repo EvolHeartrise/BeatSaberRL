@@ -80,6 +80,20 @@ carry `config.handle_len` so the viewer places the saber correctly for
 both eras). Every pre-v42 checkpoint plays a different game on this
 geometry — their bench numbers are not comparable; retrain.
 
+**Flux game mode (2026-09-26, user-specified — SPEC.md §Flux):** a
+second Beat Saber mode alongside the standard game, on the same body,
+physics, track and reward terms. No sabers: the hands are palm-centre
+points and the "Flux" is the segment between them. Circles (coloured,
+35 cm discs) score 50 + up to 10 accuracy when touched by the matching
+palm (the other palm = a bad hit); bars (colourless, thin, rotated,
+with a sweet-spot offset) score 100 + up to 15 accuracy when the swept
+Flux crosses them. Charts come from a procedural generator
+(`flux_chart.py`) that places objects along two imaginary palm paths.
+`train_batch.py --game flux` trains its own policy from scratch
+(arch marker `game="flux"`; never cross-loaded with standard
+checkpoints). The standard game is bit-identical with Flux compiled
+in.
+
 ## Quick start
 
 Uses its own venv at `python/.venv` (gitignored). One-time setup

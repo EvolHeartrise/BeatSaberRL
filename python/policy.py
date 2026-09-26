@@ -250,7 +250,7 @@ _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
 
 
 def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
-              z_asinh: float) -> torch.Tensor:
+              z_asinh: float, flux: bool = False) -> torch.Tensor:
     """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
     (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
 
@@ -262,10 +262,21 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
     offsets in half-metres, seconds-to-plane / 3. Motivation:
     [gnorm-lanes] on v52-v54 put the note encoder's excess gradient in
     its second layer, fed by far tokens' large hidden activations from
-    raw-metre lanes."""
+    raw-metre lanes.
+
+    Flux (SPEC.md §Flux obs): the hand block holds the PALM, lanes 6/7
+    are a bar's axis (so vdot/bdot read palm-velocity / hand-axis · bar
+    axis), and a bar's target point is its SWEET SPOT (lanes 12/13)
+    rather than its centre — the per-hand offsets aim the palms at
+    circles and at the point the Flux must cross."""
     assert z_asinh > 0, f"the obs z encoding C must be > 0, got {z_asinh}"
     z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
-    npos = torch.stack([notes[..., 0] * _X_NORM, notes[..., 1] * _Y_NORM,
+    tx, ty = notes[..., 0], notes[..., 1]
+    if flux:
+        is_bar = notes[..., 9] > 0.5
+        tx = torch.where(is_bar, notes[..., 12], tx)
+        ty = torch.where(is_bar, notes[..., 13], ty)
+    npos = torch.stack([tx * _X_NORM, ty * _Y_NORM,
                         z_m], -1)                                # (B,24,3) m
     cutd = torch.stack([notes[..., 6], notes[..., 7],
                         torch.zeros_like(notes[..., 6])], -1)   # (B,24,3)
@@ -518,8 +529,12 @@ class NotePolicy(nn.Module):
                  value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_hidden: int | None = None,
-                 z_asinh: float = 8.0):
+                 z_asinh: float = 8.0, game: str = "standard"):
         super().__init__()
+        # game mode the policy plays (SPEC.md §Flux): same network,
+        # different obs lane meanings — never cross-loaded
+        if game not in ("standard", "flux"):
+            raise ValueError(f"game must be 'standard' or 'flux', got {game!r}")
         # obs z lane encoding asinh(z / C), C = z_asinh metres (env v48;
         # the only encoding since 2026-09-22). The note-geo lanes decode
         # the note distance with it, so it is part of the forward and lives
@@ -571,7 +586,8 @@ class NotePolicy(nn.Module):
                      # widths), value = expectation
                      "value_bins": int(value_bins),
                      "value_vmax": float(value_vmax),
-                     "value_sigma": float(value_sigma)}
+                     "value_sigma": float(value_sigma),
+                     "game": game}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -582,6 +598,7 @@ class NotePolicy(nn.Module):
         self._value_logits = None
         self.note_geo = bool(note_geo)
         self.z_asinh = float(z_asinh)
+        self.game = game
         self.note_mlp = _mlp([NOTE_FEAT + (NOTE_GEO_FEAT if note_geo else 0),
                               embed, embed])
         # saber token features: the 25 obs-v10 hand features + [is_left,
@@ -697,7 +714,7 @@ class NotePolicy(nn.Module):
             # fp32 geometry from the fp32 obs slices, then one cast+copy
             notes = torch.cat(
                 [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT),
-                                  self.z_asinh)],
+                                  self.z_asinh, self.game == "flux")],
                 dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
@@ -960,15 +977,22 @@ class NotePolicy(nn.Module):
         return action, logprob, entropy, value
 
 
-def load_policy(ckpt) -> NotePolicy:
+def load_policy(ckpt, game: str = "standard") -> NotePolicy:
     """Rebuild a NotePolicy from a checkpoint dict. v10 checkpoints
     carry obs_dim/n_action_heads/body_token arch markers; anything else
     (v9 and earlier: obs 290 / 14 heads, no body token) is REFUSED —
     the v10 body retired every earlier checkpoint (house pattern).
     Also refused: an arch without z_asinh > 0 (the obs z encoding the
     note-geo lanes decode with; never defaulted), and a note_geo arch
-    without the note_geo_norm marker (the raw-metre lanes, removed)."""
+    without the note_geo_norm marker (the raw-metre lanes, removed),
+    and a checkpoint of the other GAME MODE (arch "game"; absent =
+    "standard") — the caller names the mode it will play."""
     arch = ckpt.get("arch", {})
+    if arch.get("game", "standard") != game:
+        raise SystemExit(
+            f"checkpoint plays game {arch.get('game', 'standard')!r} but "
+            f"this tool plays {game!r}; the two modes share the network "
+            "shape but not the obs lane meanings (SPEC.md §Flux)")
     if arch.get("body_tokens", 1) != 3:
         raise SystemExit(
             "checkpoint has the single body token (pre-v58, 2026-09-22); "
@@ -1017,6 +1041,6 @@ def load_policy(ckpt) -> NotePolicy:
         value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
         value_sigma=arch.get("value_sigma", 0.75),
-        z_asinh=float(z_asinh))
+        z_asinh=float(z_asinh), game=game)
     policy.load_state_dict(ckpt["state_dict"])
     return policy
