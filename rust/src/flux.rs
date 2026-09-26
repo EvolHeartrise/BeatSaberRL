@@ -22,7 +22,10 @@
 //!   saber-sweep triangulation) touching its box scores BAR_PTS +
 //!   round(15·(1 − clamp(d/0.3, 0, 1))), d = the distance along u from
 //!   where this tick's Flux LINE crosses the bar axis (clamped onto the
-//!   bar) to the sweet spot at `sweet·len/2`.
+//!   bar) to the sweet spot at `sweet·len/2`. The crossing must be
+//!   near-square: this tick's Flux line may deviate at most 60 deg from
+//!   the bar's perpendicular (2D, undirected), else the touch is a bad
+//!   cut (event 2 "angle") — the note swing tolerance's twin.
 //!
 //! Events reuse the standard codes (0 good, 3 wrong hand, 4 miss) so
 //! ComboWalk runs unchanged; a good event's `pre` slot carries the base
@@ -122,6 +125,23 @@ fn bar_sweet_dist(n: &Note, u: [Real; 2], l: [Real; 3], r: [Real; 3]) -> Real {
         s_sweet.clamp(sa.min(sb), sa.max(sb))
     };
     (s.clamp(-half, half) - s_sweet).abs()
+}
+
+/// Bar crossing-angle check (user rule 2026-09-26, the note swing
+/// tolerance's twin): this tick's Flux LINE, projected onto the bar's xy
+/// plane, may deviate at most 60 deg from the bar's perpendicular
+/// n = (cos θ, sin θ) (a line is undirected, so the deviation is 0-90
+/// deg): |f̂ · n| >= COS_TOL, squared to stay sqrt-free. A collapsed
+/// Flux (palms coincident in xy) has no direction and fails.
+fn bar_angle_ok(n: &Note, l: [Real; 3], r: [Real; 3]) -> bool {
+    let fx = r[0] - l[0];
+    let fy = r[1] - l[1];
+    let ff = fx * fx + fy * fy;
+    if ff <= 1e-12 {
+        return false;
+    }
+    let dn = fx * n.cos_a + fy * n.sin_a;
+    dn * dn >= COS_TOL * COS_TOL * ff
 }
 
 impl Core {
@@ -248,6 +268,15 @@ impl Core {
                 let box_c = [center[0], center[1], center[2] + GOOD_Z_SHIFT];
                 let h = [BAR_HALF_W, 0.5 * n.len, GOOD_HALF_Z];
                 if sweep_hits_box(&tris, box_c, h, &frame) {
+                    if !bar_angle_ok(n, p1[0], p1[1]) {
+                        // crossed, but more than 60 deg off square: a bad
+                        // cut (event 2 "angle", like an off-direction note)
+                        self.status[i] = 2;
+                        self.bad_cuts += 1;
+                        *reward += REWARD_BAD;
+                        self.events_buf.push((i as u32, 2, 0.0, 0.0, 0.0));
+                        continue;
+                    }
                     let u = [-n.sin_a, n.cos_a];
                     let d = bar_sweet_dist(n, u, p1[0], p1[1]);
                     let acc = round_pts(
@@ -429,6 +458,35 @@ mod tests {
         // collapsed Flux (palms together) at y = 1.3
         let d = bar_sweet_dist(&n, u, [0.0, 1.3, 0.0], [0.0, 1.3, 0.0]);
         assert!((d - 0.4).abs() < 1e-9, "{d}");
+    }
+
+    #[test]
+    fn bar_angle_allows_60_deg_off_square_and_no_more() {
+        let n = bar(0.0, 1.4, 0.0, 0.6, 0.0); // vertical: square = horizontal
+        let flux = |deg: f64, len: f64| {
+            let (s, c) = (deg.to_radians() as Real).sin_cos();
+            let h = 0.5 * len as Real;
+            ([-h * c, 1.4 - h * s, 0.0], [h * c, 1.4 + h * s, 0.0])
+        };
+        for (deg, ok) in [(0.0, true), (30.0, true), (59.0, true),
+                          (61.0, false), (90.0, false), (115.0, false),
+                          (125.0, true), (150.0, true), (180.0, true),
+                          (-59.0, true),
+                          (-61.0, false)] {
+            let (l, r) = flux(deg, 0.6);
+            assert_eq!(bar_angle_ok(&n, l, r), ok, "{deg} deg");
+            // undirected: swapping the palms changes nothing
+            assert_eq!(bar_angle_ok(&n, r, l), ok, "{deg} deg swapped");
+        }
+        // rotated bar: square follows the bar
+        let rot = bar(0.0, 1.4, 1.0, 0.6, 0.0); // normal at 1 rad
+        let (l, r) = flux(57.29577951308232 + 55.0, 0.6);
+        assert!(bar_angle_ok(&rot, l, r));
+        let (l, r) = flux(57.29577951308232 + 65.0, 0.6);
+        assert!(!bar_angle_ok(&rot, l, r));
+        // collapsed Flux has no direction
+        let p = [0.1, 1.4, 0.0];
+        assert!(!bar_angle_ok(&n, p, [0.1, 1.4, 0.3]));
     }
 
     #[test]

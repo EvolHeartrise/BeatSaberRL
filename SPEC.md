@@ -313,7 +313,12 @@ rollouts on both builds and both foot modes).
   the **sweet spot** at `sweet · length/2` (sweet ∈ [−1, 1]: 0 = the
   middle, +1 = the `+u` end, "top" at rot 0). A Flux parallel to the
   bar (or collapsed to a point) uses the point of its projected span
-  nearest the sweet spot. No orientation requirement.
+  nearest the sweet spot. **Crossing angle** (user rule, the note
+  swing tolerance's twin): this tick's Flux line, projected onto the
+  bar's xy plane, may deviate at most 60° from the bar's perpendicular
+  `(cos rot, sin rot)` — undirected, so 0–90°: `(f · n)² ≥ 0.25 |f|²`.
+  A crossing beyond that is a **bad cut** (event 2 "angle", −0.5,
+  combo break); a collapsed Flux (palms coincident in xy) fails too.
 - **Misses**: an untouched circle or bar passing the head plane is a
   miss (event 4, −0.5), exactly like a note.
 - **Reward / score**: good = `pts / 115` (circle max 60/115, bar
@@ -347,7 +352,9 @@ rollouts on both builds and both foot modes).
   right) and objects are placed ON that trajectory: each hand spawns a
   circle at its palm with P = `circle_prob` (0.3) per tick; a bar
   (P = `bar_prob`, 0.15) gets its sweet spot on the palm-to-palm
-  segment (fraction U(0.2, 0.8)), rot U(0, 2π), length U(0.3, 1.2) m,
+  segment (fraction U(0.2, 0.8)), rotated within ±`bar_dev_max` (45°)
+  of square to the palm-to-palm line (so it is clearable under the 60°
+  rule) and flipped end-for-end with P = ½, length U(0.3, 1.2) m,
   sweet U(−1, 1), centre = sweet point − sweet·length/2·u.
 - **Envs / trainer**: `flux_env.RustFluxEnv` (gym, JSONL recording with
   header `"game": "flux"`, the Flux chart, and per-tick `"palms"`),

@@ -16,7 +16,10 @@ contains:
   position with P = circle_prob per tick (colour = that hand).
 - **Bars**: with P = bar_prob per tick, a bar whose SWEET SPOT lies on
   the segment between the two palms (at fraction U(0.2, 0.8) from left
-  to right), rotation θ ~ U(0, 2π), length U(bar_len_min, bar_len_max),
+  to right), rotated so the palm-to-palm line crosses it within
+  ±bar_dev_max (45°) of square — the sim rejects crossings more than
+  60° off square — then flipped end-for-end with P = 1/2 (so the sweet
+  spot lands on either side), length U(bar_len_min, bar_len_max),
   sweet offset U(−1, 1); its centre follows as
   sweet_point − sweet·(len/2)·u, u = (−sin θ, cos θ).
 
@@ -66,6 +69,7 @@ class FluxConfig:
     min_sep: float = 0.3          # left palm stays >= this left of right (m)
     bar_len_min: float = 0.3      # bar length range (m)
     bar_len_max: float = 1.2
+    bar_dev_max: float = math.radians(45.0)  # off-square range (< 60°)
 
     def __post_init__(self):
         assert self.note_speed_max >= self.note_speed_min > 0
@@ -73,6 +77,7 @@ class FluxConfig:
             assert 0.0 <= p <= 1.0
         assert self.bar_len_max >= self.bar_len_min > 0
         assert self.hand_speed > 0 and self.min_sep >= 0
+        assert 0.0 <= self.bar_dev_max < math.radians(60.0)
 
 
 def flux_tuple(o: FluxObj):
@@ -155,7 +160,13 @@ def generate_flux_chart(cfg: FluxConfig, rng: np.random.Generator) -> list[FluxO
             f = float(rng.uniform(0.2, 0.8))
             px = palms[LEFT][0] + f * (palms[RIGHT][0] - palms[LEFT][0])
             py = palms[LEFT][1] + f * (palms[RIGHT][1] - palms[LEFT][1])
-            rot = float(rng.uniform(0.0, 2.0 * math.pi))
+            # square = the bar's normal (cos θ, sin θ) along the palm line
+            square = math.atan2(palms[RIGHT][1] - palms[LEFT][1],
+                                palms[RIGHT][0] - palms[LEFT][0])
+            rot = float((square
+                         + rng.uniform(-cfg.bar_dev_max, cfg.bar_dev_max)
+                         + (math.pi if rng.random() < 0.5 else 0.0))
+                        % (2.0 * math.pi))
             length = float(rng.uniform(cfg.bar_len_min, cfg.bar_len_max))
             sweet = float(rng.uniform(-1.0, 1.0))
             ux, uy = bar_axis(rot)

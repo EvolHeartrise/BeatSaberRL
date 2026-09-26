@@ -4417,6 +4417,21 @@ __device__ T flux_bar_sweet_dist(T nx, T ny, T len, T sweet, T ux, T uy,
   return fabs(tclamp(sv, -half, half) - s_sweet);
 }
 
+// Bar crossing-angle check (flux.rs bar_angle_ok verbatim): the CURRENT
+// Flux line may deviate at most 60 deg from the bar's perpendicular
+// n = (cos θ, sin θ) = p_rot (2D, undirected): (f·n)^2 >= COS_TOL^2 |f|^2.
+// A collapsed Flux (|f|^2 <= 1e-12) fails.
+template <typename T>
+__device__ bool flux_bar_angle_ok(T cos_r, T sin_r, const T l[3],
+                                  const T r[3]) {
+  const T fx = r[0] - l[0];
+  const T fy = r[1] - l[1];
+  const T ff = fx * fx + fy * fy;
+  if (ff <= T(1e-12)) return false;
+  const T dn = fx * cos_r + fy * sin_r;
+  return dn * dn >= T(COS_TOL) * T(COS_TOL) * ff;
+}
+
 // ---- kernel parameters ------------------------------------------------------
 // Every pointer below is __restrict__: the 58 slots are 58 DISTINCT
 // torch tensors, each its own allocation (cuda_env.py CudaBeatVecEnv
@@ -5778,6 +5793,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
         // (L0, R0, R1) and (L0, R1, L1) — sweep_hits_box's (w0, t0, t1)
         // + (w0, t1, w1) split with w0 = L0, t0 = R0, t1 = R1, w1 = L1
         if (sweep_hits_box(p0[0], p0[1], p1[1], p1[0], bc, bh, frame)) {
+          if (!flux_bar_angle_ok(P.p_rot[cb * 2], P.p_rot[cb * 2 + 1],
+                                 p1[0], p1[1])) {
+            // crossed > 60 deg off square: bad cut (event 2 "angle")
+            P.status[e * C + i] = 2;
+            P.bad[e] += 1;
+            reward += T(REWARD_BAD);
+            cw_break(P, e);
+            continue;
+          }
           const T ux = -P.p_rot[cb * 2 + 1], uy = P.p_rot[cb * 2];
           const T dm = flux_bar_sweet_dist(center[0], center[1], blen,
                                            P.p_sweet[cb], ux, uy, p1[0],

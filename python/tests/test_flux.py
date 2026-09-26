@@ -144,15 +144,17 @@ def test_untouched_circle_is_missed_at_the_head_plane():
     assert sim.misses == 1 and total == pytest.approx(-0.5)
 
 
-def _bar_across_palms(sim, palms, length, sweet, dy=0.0):
-    """A bar perpendicular to the palm-to-palm line, centred on its
-    midpoint (shifted dy along the bar axis)."""
+def _bar_across_palms(sim, palms, length, sweet, dy=0.0, dev_deg=0.0):
+    """A bar perpendicular to the palm-to-palm line (turned dev_deg off
+    square), centred on its midpoint (shifted dy along the bar axis)."""
     (lx, ly, lz), (rx, ry, rz) = palms
     fx, fy = rx - lx, ry - ly
     n = math.hypot(fx, fy)
     ux, uy = -fy / n, fx / n                    # perpendicular axis
     rot = math.atan2(-ux, uy)                   # u = (-sin, cos)
     assert bar_axis(rot) == pytest.approx((ux, uy))
+    rot += math.radians(dev_deg)
+    ux, uy = bar_axis(rot)
     mx, my = 0.5 * (lx + rx), 0.5 * (ly + ry)
     return FluxObj(hit_time=_arrive_now(sim, 0.5 * (lz + rz)),
                    x=mx + dy * ux, y=my + dy * uy, kind=KIND_BAR,
@@ -177,6 +179,45 @@ def test_bar_sweet_offset_moves_the_full_accuracy_point(sweet, acc):
     events, _ = _run(sim, [b])
     goods = [e for e in events if e[1] == 0]
     assert [g[2:] for g in goods] == [(100.0 + acc, 100.0, acc)]
+
+
+@pytest.mark.parametrize("dev, ok", [(50.0, True), (-50.0, True),
+                                     (70.0, False), (-70.0, False),
+                                     (180.0 - 50.0, True)])
+def test_bar_crossed_more_than_60_deg_off_square_is_a_bad_cut(dev, ok):
+    sim, palms = _reset_palms()
+    b = _bar_across_palms(sim, palms, length=0.4, sweet=0.0, dev_deg=dev)
+    events, total = _run(sim, [b])
+    if ok:
+        assert [e[1] for e in events] == [0]
+        assert events[0][3] == 100.0
+    else:
+        assert [e[1] for e in events] == [2]           # "angle"
+        assert sim.bad_cuts == 1 and sim.good_cuts == 0
+        assert total == pytest.approx(-0.5)
+
+
+def test_generator_bars_are_clearable_along_the_palm_path():
+    # every generated bar sits within bar_dev_max (< the sim's 60 deg) of
+    # square to the imaginary palm line; same-tick circles sit exactly on
+    # those palms, so their joining line is that palm line
+    cfg = FluxConfig(circle_prob=1.0, bar_prob=1.0)
+    ch = generate_flux_chart(cfg, np.random.default_rng(9))
+    by_t = {}
+    for o in ch:
+        by_t.setdefault(o.hit_time, []).append(o)
+    checked = 0
+    for objs in by_t.values():
+        circ = {o.color: o for o in objs if o.kind == KIND_CIRCLE}
+        bars = [o for o in objs if o.kind == KIND_BAR]
+        if len(circ) < 2 or not bars:
+            continue
+        fx, fy = circ[1].x - circ[0].x, circ[1].y - circ[0].y
+        for b in bars:
+            dev = abs(fx * math.cos(b.rot) + fy * math.sin(b.rot)) / math.hypot(fx, fy)
+            assert dev >= math.cos(cfg.bar_dev_max) - 1e-9
+            checked += 1
+    assert checked > 10
 
 
 def test_bar_the_flux_does_not_reach_is_missed():

@@ -95,12 +95,13 @@ def _arrive_now(sim, palm_z, lead=0.2, t_tick=1):
     return t_tick * DT + (palm_z + lead - z_off) / SPEED
 
 
-def _bar_across(sim, palms, length, sweet, dy=0.0, t_tick=1):
+def _bar_across(sim, palms, length, sweet, dy=0.0, t_tick=1, dev_deg=0.0):
     (lx, ly, lz), (rx, ry, rz) = palms
     fx, fy = rx - lx, ry - ly
     n = math.hypot(fx, fy)
     ux, uy = -fy / n, fx / n
-    rot = math.atan2(-ux, uy)
+    rot = math.atan2(-ux, uy) + math.radians(dev_deg)   # off square
+    ux, uy = -math.sin(rot), math.cos(rot)
     mx, my = 0.5 * (lx + rx), 0.5 * (ly + ry)
     return FluxObj(hit_time=_arrive_now(sim, 0.5 * (lz + rz), t_tick=t_tick),
                    x=mx + dy * ux, y=my + dy * uy, kind=KIND_BAR,
@@ -126,8 +127,11 @@ def _scripted_charts():
         [_bar_across(sim, palms, 0.4, -1.0)],             # 105
         [_bar_across(sim, palms, 0.4, 0.5)],              # 110
         [_bar_across(sim, palms, 0.4, 0.0, dy=0.5)],      # miss
+        [_bar_across(sim, palms, 0.4, 0.0, dev_deg=50.0)],  # 115 (in tol)
+        [_bar_across(sim, palms, 0.4, 0.0, dev_deg=70.0)],  # angle: bad
     ]
-    expect = [60.0, 55.0, 0.0, 0.0, 115.0, 105.0, 105.0, 110.0, 0.0]
+    expect = [60.0, 55.0, 0.0, 0.0, 115.0, 105.0, 105.0, 110.0, 0.0,
+              115.0, 0.0]
     return charts, expect
 
 
@@ -183,6 +187,7 @@ def test_flux_scripted_points_match_rust():
             [s.good_cuts, s.bad_cuts, s.misses], f"env{e} counters"
     assert [s.bad_cuts for s in sims][2] == 1       # wrong hand
     assert sims[3].misses == 1 and sims[8].misses == 1
+    assert sims[10].bad_cuts == 1 and sims[10].misses == 0   # > 60 deg
 
 
 # -- lockstep whole episodes ----------------------------------------------------
