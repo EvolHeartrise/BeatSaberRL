@@ -356,6 +356,15 @@ rollouts on both builds and both foot modes).
   `--circle-prob`, `--bar-prob`, per-mode speed defaults).
   Tests: `tests/test_flux.py`, `rust/src/flux.rs` unit tests,
   `tests/test_flux_parity_cuda.py`.
+- **Viewer** (`viz/app`, header `"game": "flux"`): palms (hand-coloured
+  orbs at wrist + PALM_OFF along the hand axis, from the body FK) and
+  the Flux beam replace the sabers; circles draw as coloured discs with
+  a rim, bars as thin strips rolled by `rot` with a gold sweet-spot
+  notch; 'h' shows the circle cylinders / bar boxes; touches burst and
+  fade (no cut plane to slice), bad touches and misses leave an outline
+  + mark. Fixture: `python/tools/make_flux_fixture.py` →
+  `viz/app/test/fixtures/flux_scripted.jsonl`; tests
+  `test/flux.test.js` (npm test) and `test/flux-browser.mjs`.
 
 ## Chart generation (`beat_arena_env/chart.py`) — generator v2
 

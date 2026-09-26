@@ -13,8 +13,9 @@
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, reachZ,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
     frameQuatScene, headQuats, noteFrame, poseQ36, qAt, quatNlerp,
-    rotQuatScene, smoothQuats, viewerTrackOffset,
+    rotQuatScene, smoothQuats, viewerTrackOffset, isFlux,
   } from "./replay.js";
+  import Flux from "./Flux.svelte";
   import Body from "./Body.svelte";
   import { RAMP } from "./toon.js";
   import Notes from "./Notes.svelte";
@@ -307,8 +308,13 @@
 {#if fkAll}
   <!-- the articulated v10 body + blades -->
   <Body fk={fkAll} showHead={!pb.firstPerson} />
-  <Saber s={0} fk={fkAll} />
-  <Saber s={1} fk={fkAll} />
+  {#if isFlux(pb.rep)}
+    <!-- Flux game mode: palms + the Flux beam instead of sabers -->
+    <Flux fk={fkAll} />
+  {:else}
+    <Saber s={0} fk={fkAll} />
+    <Saber s={1} fk={fkAll} />
+  {/if}
 {/if}
 
 <!-- self-collision contact markers: flash a sphere at the contact
