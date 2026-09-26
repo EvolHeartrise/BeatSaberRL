@@ -15,6 +15,7 @@
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, landedPost,
     noteCenter,
     noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
+    BAR_W, CIRCLE_R, FLUX_DEPTH, KIND_CIRCLE, isFluxKind,
   } from "./replay.js";
   // the REAL object models + colours, as ScoreSaber's replay viewer draws
   // them (the canonical visual reference — see models.js)
@@ -66,6 +67,25 @@
   const arcGeo = new THREE.CylinderGeometry(0.035, 0.035, 1, 8, 1, true);
   const flashGeo = new THREE.SphereGeometry(1, 20, 14);
   const WALL_COL = WALL_COLOR; // Wall.mat (1, 0.184, 0.184) @ alpha 0.5
+
+  // ---- Flux objects (SPEC.md §Flux) ---------------------------------------
+  // circle: a flat disc facing the player (hitbox radius = the disc) with
+  // a bright rim; bar: a thin strip, unit plane scaled (BAR_W, len) and
+  // rolled by its rot, with a gold sweet-spot notch. Hitboxes ('h'): the
+  // circle's 1 m deep cylinder / the bar's box, both shifted 0.25 m
+  // toward the player like the note good box.
+  const circleGeo = new THREE.CircleGeometry(CIRCLE_R, 40);
+  const circleRimGeo = new THREE.RingGeometry(CIRCLE_R * 0.8, CIRCLE_R, 40);
+  const circleEdgeGeo = new THREE.EdgesGeometry(
+    new THREE.RingGeometry(CIRCLE_R * 0.999, CIRCLE_R, 40), 1);
+  const unitPlaneGeo = new THREE.PlaneGeometry(1, 1);
+  const unitPlaneEdges = new THREE.EdgesGeometry(unitPlaneGeo);
+  const sweetGeo = new THREE.PlaneGeometry(BAR_W * 3, 0.025);
+  const circleHbGeo = new THREE.EdgesGeometry(
+    new THREE.CylinderGeometry(CIRCLE_R, CIRCLE_R, FLUX_DEPTH, 24, 1, true)
+      .rotateX(Math.PI / 2));
+  const unitBoxEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+  const BAR_COL = "#f2ecff", SWEET_COL = "#ffd166";
 
   // real hitboxes ('h' overlay): good box shifted toward the player; the
   // small box is all the wrong-color saber can trigger. Env v7.4 rolls
@@ -276,8 +296,39 @@
        they approach (lam blends toward full head-facing at the plane);
        heads/links keep the pure z-roll via lam = 0 -->
   {@const lam = noteLam(n, z)}
-  {@const vq = frameQuatScene(noteFrame([cx, cy, z], noteRot(n), lam))}
-  {#if n.kind === KIND_BOMB}
+  {@const vq = isFluxKind(n) ? null
+    : frameQuatScene(noteFrame([cx, cy, z], noteRot(n), lam))}
+  {#if n.kind === KIND_CIRCLE}
+    <!-- Flux circle: coloured disc + bright rim, flat to the player -->
+    {@const k = NK[n.color]}
+    <T.Group position={[cx, cy, -z]}>
+      <T.Mesh geometry={circleGeo}>
+        <T.MeshBasicMaterial color={k.base} transparent
+          opacity={0.55 * alpha} side={THREE.DoubleSide} depthWrite={false} />
+      </T.Mesh>
+      <T.Mesh geometry={circleRimGeo} position={[0, 0, 0.002]}>
+        <T.MeshBasicMaterial color={k.arrowBase} transparent opacity={alpha}
+          side={THREE.DoubleSide} />
+      </T.Mesh>
+    </T.Group>
+  {:else if isFluxKind(n)}
+    <!-- Flux bar: thin strip rolled by rot (u = local +y), sweet notch -->
+    <T.Group position={[cx, cy, -z]} rotation={[0, 0, n.rot]}>
+      <T.Mesh geometry={unitPlaneGeo} scale={[BAR_W * 3, n.len, 1]}>
+        <T.MeshBasicMaterial color={BAR_COL} transparent
+          opacity={0.18 * alpha} side={THREE.DoubleSide} depthWrite={false} />
+      </T.Mesh>
+      <T.Mesh geometry={unitPlaneGeo} scale={[BAR_W, n.len, 1]}>
+        <T.MeshBasicMaterial color={BAR_COL} transparent opacity={alpha}
+          side={THREE.DoubleSide} />
+      </T.Mesh>
+      <T.Mesh geometry={sweetGeo}
+        position={[0, n.sweet * 0.5 * n.len, 0.002]}>
+        <T.MeshBasicMaterial color={SWEET_COL} transparent opacity={alpha}
+          side={THREE.DoubleSide} />
+      </T.Mesh>
+    </T.Group>
+  {:else if n.kind === KIND_BOMB}
     <!-- bomb: the spiked Bomb.obj at the viewer's scale (~0.65 m over
          the spikes), Bomb.mat dark gray, glossy; rides the note frame
          like the notes do (its own rotation is a plain z-roll) -->
@@ -346,7 +397,18 @@
     <TextSprite text="free post" color="#9ece6a" size={0.07} bold={false}
       position={[cx, cy + HALF + 0.1, -z]} opacity={alpha * 0.85} />
   {/if}
-  {#if pb.hitboxes}
+  {#if pb.hitboxes && n.kind === KIND_CIRCLE}
+    <T.LineSegments geometry={circleHbGeo}
+      position={[cx, cy, -(z + HB.goodZShift)]}>
+      <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+    </T.LineSegments>
+  {:else if pb.hitboxes && isFluxKind(n)}
+    <T.Group position={[cx, cy, -(z + HB.goodZShift)]} rotation={[0, 0, n.rot]}>
+      <T.LineSegments geometry={unitBoxEdges} scale={[BAR_W, n.len, FLUX_DEPTH]}>
+        <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
+      </T.LineSegments>
+    </T.Group>
+  {:else if pb.hitboxes}
     {@const hb = hitboxFor(n)}
     <!-- hitboxes live on the same v7.6 frame (with the hitbox roll —
          links roll by their tangent), centered on the NOTE CENTER; the
@@ -370,7 +432,40 @@
      while later head motion moves the live track. 0 on pre-v15 replays. -->
 {#each after as { n, i, o, age, alpha, zOff: oz } (n)}
   {@const [cx, cy] = noteCenter(n)}
-  {#if o.kind === "bomb"}
+  {#if isFluxKind(n)}
+    <!-- Flux: a touched circle/bar bursts outward and fades (no cut plane
+         to slice by); a bad touch or a miss leaves its outline + mark -->
+    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS) + oz}
+    {@const good = o.kind === "good"}
+    {@const col = good ? "#ffffff" : o.kind === "bad" ? BAD_COL : MISS_COL}
+    {#if n.kind === KIND_CIRCLE}
+      <T.LineSegments geometry={circleEdgeGeo} position={[cx, cy, -zEv]}
+        scale={good ? 1 + age * 3 : 1}>
+        <T.LineBasicMaterial color={good ? NOTE_COLORS[n.color] : col}
+          transparent opacity={alpha} />
+      </T.LineSegments>
+    {:else}
+      <T.Group position={[cx, cy, -zEv]} rotation={[0, 0, n.rot]}>
+        <T.LineSegments geometry={unitPlaneEdges}
+          scale={[good ? BAR_W * (1 + age * 12) : BAR_W, n.len, 1]}>
+          <T.LineBasicMaterial color={col} transparent opacity={alpha} />
+        </T.LineSegments>
+      </T.Group>
+    {/if}
+    {@const ind = indicator(cx, cy, i, age, !good, oz)}
+    {#if good}
+      <TextSprite text={o.points.toFixed(0)} color={IND_COL} size={IND_SIZE}
+        position={ind.pos} opacity={ind.alpha} />
+    {:else}
+      <TextSprite text={o.kind === "miss" ? "MISS" : "X"} color={IND_BAD_COL}
+        size={IND_SIZE * 1.5} position={ind.pos} opacity={ind.alpha} />
+      {#if o.kind === "bad"}
+        <TextSprite text={o.reason.replace("_", " ")} color={col} size={0.1}
+          bold={false} opacity={ind.alpha * 0.85}
+          position={[ind.pos[0], ind.pos[1] - IND_SIZE * 1.15, ind.pos[2]]} />
+      {/if}
+    {/if}
+  {:else if o.kind === "bomb"}
     <!-- bomb hit: red flash at the bomb, X mark on the indicator (the
          reference viewer shows the X for bombs and bad cuts alike) -->
     {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
