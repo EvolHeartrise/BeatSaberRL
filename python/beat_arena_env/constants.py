@@ -216,6 +216,30 @@ KIND_BOMB = 1
 KIND_CHAIN_HEAD = 2
 KIND_CHAIN_LINK = 3
 
+# --- Flux mode (rust/src/flux.rs; SPEC.md §Flux) ------------------------------
+# A second game mode on the same body/track: no sabers, the hands are
+# palm-centre points, the Flux is the segment between them. Two object
+# kinds, never mixed into a standard chart.
+KIND_CIRCLE = 4
+KIND_BAR = 5
+PALM_OFF = 0.06          # palm centre along the hand axis from the wrist (m)
+CIRCLE_R = 0.175         # circle hitbox radius (m) — the ~35 cm disc
+CIRCLE_PTS = 50          # touch points
+CIRCLE_ACC_PTS = 10      # + round(10·(1 − clamp(d/ACC_NORM, 0, 1)))
+BAR_PTS = 100            # Flux-line contact points
+BAR_ACC_PTS = 15         # + round(15·(1 − clamp(d/ACC_NORM, 0, 1)))
+BAR_WIDTH = 0.05         # bar full width (m)
+# Flux entity-token lanes (the standard 18-lane slot, Flux meanings):
+# 0-3 as standard (x, y head-relative; z lane; -speed), 4/5 circle
+# colour, 6/7 bar axis u, 8 is_circle, 9 is_bar, 10 bar length (m),
+# 11 sweet offset, 12/13 sweet-spot head-relative x/y, 14-17 zero.
+FLUX_LANE_IS_CIRCLE = 8
+FLUX_LANE_IS_BAR = 9
+FLUX_LANE_BAR_LEN = 10
+FLUX_LANE_SWEET = 11
+FLUX_LANE_SWEET_X = 12
+FLUX_LANE_SWEET_Y = 13
+
 # --- obs layout v17 (spec §12; offsets DERIVED from the block table) ---------
 # env v17: the slots are a SHARED entity window (notes + walls),
 # nearest-first by 3D head distance; per-token = the v9 note lanes then

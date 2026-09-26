@@ -475,9 +475,23 @@ def parse_args():
     p.add_argument("--cols", type=int, nargs="+", default=[0, 1, 2, 3])
     p.add_argument("--rows", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--chart-len", type=float, default=20.0)
-    p.add_argument("--note-speed-min", type=float, default=2.0,
-                   help="speed random-walk clamp (m/s)")
-    p.add_argument("--note-speed-max", type=float, default=8.0)
+    p.add_argument("--note-speed-min", type=float, default=None,
+                   help="speed random-walk clamp (m/s); default 2 "
+                        "(standard) / 10 (flux, real-NJS range)")
+    p.add_argument("--note-speed-max", type=float, default=None,
+                   help="default 8 (standard) / 18 (flux)")
+    p.add_argument("--game", choices=["standard", "flux"],
+                   default="standard",
+                   help="game mode (SPEC.md §Flux). flux = circles + bars "
+                        "on the palms/Flux line, no sabers: procedural "
+                        "charts only (flux_chart.py), so --ranked-maps "
+                        "and --ep-stats switch off; the policy is stamped "
+                        "arch game='flux' and never loads into the "
+                        "standard tools (or vice versa)")
+    p.add_argument("--circle-prob", type=float, default=0.3,
+                   help="flux: P(circle) per hand path per generation tick")
+    p.add_argument("--bar-prob", type=float, default=0.15,
+                   help="flux: P(bar) per generation tick")
     p.add_argument("--note-prob", type=float, default=0.25,
                    help="P(note) per hand path per ~0.15 s generation tick")
     p.add_argument("--extra-prob", type=float, default=0.125,
@@ -811,6 +825,23 @@ def main():
               "contact mode is the only training mode (weld = test "
               "harness only)", flush=True)
         args.foot_contact = True
+    # game mode (SPEC.md §Flux): per-mode generator speed defaults; Flux
+    # has no real maps, so the ranked pool and its ep-stats walk are off
+    _speeds = (10.0, 18.0) if args.game == "flux" else (2.0, 8.0)
+    if args.note_speed_min is None:
+        args.note_speed_min = _speeds[0]
+    if args.note_speed_max is None:
+        args.note_speed_max = _speeds[1]
+    if args.game == "flux":
+        for _flag in ("ranked_maps", "ep_stats"):
+            if getattr(args, _flag):
+                print(f"[flux] --{_flag.replace('_', '-')} does not apply "
+                      f"to the flux game (procedural charts only): off",
+                      flush=True)
+                setattr(args, _flag, False)
+        if args.chart_pool == 999999:
+            # the ranked-pool default; the procedural pool's size
+            args.chart_pool = 65536
     if args.bench:
         args.total_steps = args.num_envs * args.horizon * 4
     resume_ckpt = None
@@ -1025,6 +1056,49 @@ def main():
                       tau_center=parse_tau_scale(args.tau_center),
                       env_order=True,
                       seed=args.seed, device=device)
+    elif tensor_env and args.game == "flux":
+        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
+        venv = VecCls(
+            N, game="flux", cols=tuple(args.cols),
+            rows=tuple(args.rows), chart_len_s=args.chart_len,
+            note_speed_min=args.note_speed_min,
+            note_speed_max=args.note_speed_max,
+            circle_prob=args.circle_prob, bar_prob=args.bar_prob,
+            gears=args.gears, foot_contact=args.foot_contact,
+            fall_const=args.fall_pen,
+            push_prob=args.push_prob, push_vmax=args.push_vmax,
+            start_jitter=args.start_jitter,
+            foot_z_coef=args.foot_z_coef,
+            foot_x_coef=args.foot_x_coef,
+            foot_hinge_r=args.foot_hinge_r,
+            foot_shape_coef=args.foot_shape_coef,
+            energy_coef=args.energy_coef,
+            limit_coef=args.limit_coef,
+            limit_arms=args.limit_arms,
+            start_pose_jitter=args.start_pose_jitter,
+            crouch_start_prob=args.crouch_start_prob,
+            z_asinh=args.z_asinh,
+            self_contact_coef=args.self_contact_coef,
+            tau_rand=args.tau_rand,
+            tau_center=parse_tau_scale(args.tau_center),
+            env_order=True,
+            seed=args.seed, chart_pool=args.chart_pool, device=device)
+    elif args.game == "flux":
+        from beat_arena_env.flux_env import FluxVecEnv
+        venv = FluxVecEnv(
+            N, gears=args.gears, cols=tuple(args.cols),
+            rows=tuple(args.rows), chart_len_s=args.chart_len,
+            note_speed_min=args.note_speed_min,
+            note_speed_max=args.note_speed_max,
+            circle_prob=args.circle_prob, bar_prob=args.bar_prob,
+            foot_contact=args.foot_contact, fall_const=args.fall_pen,
+            foot_z_coef=args.foot_z_coef,
+            foot_x_coef=args.foot_x_coef,
+            foot_hinge_r=args.foot_hinge_r,
+            foot_shape_coef=args.foot_shape_coef,
+            energy_coef=args.energy_coef,
+            self_contact_coef=args.self_contact_coef,
+            seed=args.seed)
     elif tensor_env:
         from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
         venv = VecCls(
@@ -1066,10 +1140,10 @@ def main():
             seed=args.seed)
 
     if resume_ckpt is not None:
-        policy = load_policy(resume_ckpt)
+        policy = load_policy(resume_ckpt, game=args.game)
     elif args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
-        policy = load_policy(ckpt)
+        policy = load_policy(ckpt, game=args.game)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",
               flush=True)
     else:
@@ -1081,7 +1155,7 @@ def main():
                             value_bins=args.hl_bins,
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma,
-                            z_asinh=args.z_asinh)
+                            z_asinh=args.z_asinh, game=args.game)
     print(f"HL-Gauss critic: {policy.value_bins} bins over "
           f"[-{policy.arch['value_vmax']:g}, {policy.arch['value_vmax']:g}] "
           f"(normalized return), sigma {policy.value_sigma_bins:g} bins",
