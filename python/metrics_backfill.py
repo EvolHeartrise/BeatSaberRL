@@ -375,6 +375,10 @@ class Backfill:
                     or first_seg.get("config"), "source": "log"}
         else:
             args["source"] = "args.json"
+        # game mode (SPEC.md §Flux): args.json / the banner config carry
+        # it since the Flux mode landed; absent = the standard game
+        game = (args.get("game")
+                or (args.get("resolved") or {}).get("game") or "standard")
         # wall: sum of each invocation's final elapsed
         wall = sum((sr.get("elapsed") or 0.0) for sr in seg_runs)
         log_mtimes = [_stat(os.path.join(self.archive, l))[1]
@@ -413,6 +417,7 @@ class Backfill:
             "metrics": self.rel(metrics_path),
             "metrics_source": source,
             "args": args,
+            "game": game,
             "invocations": len(seg_runs),
             "role": last_seg.get("role") or first_seg.get("role"),
             "leaf_from": last_seg.get("leaf_from"),

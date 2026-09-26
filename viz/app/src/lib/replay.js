@@ -70,6 +70,36 @@ export const ARC_WINDOW = 2.5; // s: max head->tail gap for an arc pair
 // object kinds (chart entry `kind`)
 export const KIND_NOTE = 0, KIND_BOMB = 1, KIND_CHAIN_HEAD = 2,
   KIND_CHAIN_LINK = 3;
+
+// ---- Flux game mode (SPEC.md §Flux; header "game": "flux") ---------------
+// No sabers: each hand is its PALM (wrist + PALM_OFF along the hand
+// axis) and the Flux is the segment between the palms. Circles are
+// coloured discs facing the player; bars are thin rotated strips with a
+// sweet spot. Chart entries: {t, x, y, kind, color, rot, speed, len,
+// sweet}. Both hitboxes use the note good box's depth convention (1 m
+// deep, shifted 0.25 m toward the player).
+export const KIND_CIRCLE = 4, KIND_BAR = 5;
+export const PALM_OFF = 0.06;
+export const CIRCLE_R = 0.175;
+export const BAR_W = 0.05;
+export const FLUX_DEPTH = 1.0;
+export const isFlux = (rep) => rep?.game === "flux";
+export const isFluxKind = (n) => n.kind === KIND_CIRCLE || n.kind === KIND_BAR;
+/** Bar axis u = (-sin rot, cos rot): rot 0 points up, CCW from the
+ * player's view. */
+export const barAxis = (rot) => [-Math.sin(rot), Math.cos(rot)];
+/** World (x, y) of a bar's sweet spot (sweet * len / 2 along u). */
+export function sweetPoint(n) {
+  const [ux, uy] = barAxis(n.rot);
+  const s = n.sweet * 0.5 * n.len;
+  return [n.x + s * ux, n.y + s * uy];
+}
+/** Palm point [x, y, z] from a 6-field saber [wrist(3), hand axis(3)]. */
+export const palmOf = (sab) => [
+  sab[0] + PALM_OFF * sab[3],
+  sab[1] + PALM_OFF * sab[4],
+  sab[2] + PALM_OFF * sab[5],
+];
 // Visual sizes follow ScoreSaber's replay viewer models (src/lib/models.js
 // is the authority): bomb axis extent 0.324, spikes to r 0.345 (collision radius stays
 // 0.18), chain link 0.5 x 0.087 x 0.5 slab, chain head = the note minus
@@ -479,8 +509,9 @@ export const SABER_COLORS = ["#e06c75", "#61afef"]; // left/red, right/blue
 export const SABER_DARK = ["#7c3b41", "#33586f"];
 export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
 
-// per-kind max points (real BS: 115 note, 85 chain head, 20 link, bombs 0)
-export const KIND_MAX = [115, 0, 85, 20];
+// per-kind max points (real BS: 115 note, 85 chain head, 20 link, bombs 0;
+// Flux: 60 circle, 115 bar)
+export const KIND_MAX = [115, 0, 85, 20, 60, 115];
 
 export function parseReplay(text) {
   const lines = text.split("\n").filter((l) => l.trim());
@@ -524,6 +555,9 @@ export function parseReplay(text) {
   for (const p of posts) (postsByNote[p.note] ??= []).push(p);
 
   return {
+    // ADDITIVE header field: "flux" for the Flux game mode (SPEC.md
+    // §Flux); absent = the standard game
+    game: head.header.game ?? "standard",
     config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
@@ -633,6 +667,13 @@ export function maxScore(chart) {
 
 export function configSummary(rep) {
   const c = rep.config;
+  if (isFlux(rep)) {
+    const nc = rep.chart.filter((n) => n.kind === KIND_CIRCLE).length;
+    const spd = c.note_speed_min != null
+      ? `${c.note_speed_min}-${c.note_speed_max} m/s` : null;
+    return `FLUX: ${nc} circles, ${rep.chart.length - nc} bars, ` +
+      `${rep.ticks.length} ticks` + (spd ? ` (${spd})` : "");
+  }
   const spd = c.note_speed_min != null
     ? `${c.note_speed_min}-${c.note_speed_max} m/s`
     : (c.note_speed != null ? `${c.note_speed} m/s` : null);

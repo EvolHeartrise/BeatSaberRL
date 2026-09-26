@@ -42,6 +42,8 @@ use rayon::prelude::*;
 
 // env v10 dynamics core — SPEC-v10.md §1–3 (P1 math, P2 constraints).
 pub mod dynamics;
+// Flux game mode (circles + bars, no sabers) — SPEC.md §Flux.
+mod flux;
 
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
@@ -232,6 +234,9 @@ const KIND_NOTE: u8 = 0;
 const KIND_BOMB: u8 = 1;
 const KIND_CHAIN_HEAD: u8 = 2;
 const KIND_CHAIN_LINK: u8 = 3;
+// Flux mode objects (flux.rs; never appear in a standard chart)
+const KIND_CIRCLE: u8 = 4;
+const KIND_BAR: u8 = 5;
 
 // env v17 (contact spec §12): walls. The head CENTER is the collision
 // point (no sweep). WALL_PEN is charged ONCE, on the tick the head
@@ -424,6 +429,10 @@ struct Note {
     kind: u8,       // KIND_NOTE / _BOMB / _CHAIN_HEAD / _CHAIN_LINK
     free_pre: bool, // arc tail: full 70 pre-swing granted
     free_post: bool, // arc head: full 30 follow-through granted
+    // Flux bars only (0 elsewhere): length (m) and sweet-spot offset
+    // in [-1, 1] along the bar axis (sin_a/cos_a carry its rotation)
+    len: Real,
+    sweet: Real,
 }
 
 /// Triangle vs axis-aligned box (Akenine-Möller SAT). Verts are given
@@ -633,6 +642,27 @@ fn sweep_hits_box(
 fn sweep_dist(tris: &[[[Real; 3]; 3]; 2], p: [Real; 3]) -> Real {
     tri_point_dist(tris[0][0], tris[0][1], tris[0][2], p)
         .min(tri_point_dist(tris[1][0], tris[1][1], tris[1][2], p))
+}
+
+/// Entity-window selection: insert `cand` = (dist², is_wall, index)
+/// into the ascending buffer; ties keep the FIRST-inserted entry
+/// (strict-< displacement), a full buffer drops anything not closer
+/// than its worst entry. Shared by the standard and Flux obs writers.
+fn slot_insert(
+    sel: &mut [(Real, bool, usize); N_NOTE_SLOTS],
+    n_sel: &mut usize,
+    cand: (Real, bool, usize),
+) {
+    if *n_sel == N_NOTE_SLOTS && cand.0 >= sel[N_NOTE_SLOTS - 1].0 {
+        return;
+    }
+    let mut i = (*n_sel).min(N_NOTE_SLOTS - 1);
+    while i > 0 && cand.0 < sel[i - 1].0 {
+        sel[i] = sel[i - 1];
+        i -= 1;
+    }
+    sel[i] = cand;
+    *n_sel = (*n_sel + 1).min(N_NOTE_SLOTS);
 }
 
 /// A good cut's pending follow-through meter.
@@ -1234,6 +1264,12 @@ struct Core {
     score_post: Real,
     // reusable event buffer: cleared and refilled in place each tick.
     events_buf: Vec<(u32, u8, f32, f32, f32)>,
+    // Flux mode (flux.rs): fixed at construction — the chart holds
+    // circles/bars, the hands are palms (no sabers), and the obs hand /
+    // entity blocks switch to the Flux lane meanings.
+    flux: bool,
+    // Flux: palm-centre finite-difference velocity across the last tick
+    palm_vel: [[Real; 3]; 2],
 }
 
 impl Core {
@@ -1295,6 +1331,8 @@ impl Core {
             score_acc: 0.0,
             score_post: 0.0,
             events_buf: Vec::new(),
+            flux: false,
+            palm_vel: [[0.0; 3]; 2],
         }
     }
 
@@ -1334,8 +1372,16 @@ impl Core {
                 kind,
                 free_pre: fpre,
                 free_post: fpost,
+                len: 0.0,
+                sweet: 0.0,
             })
             .collect();
+        self.finish_chart_install();
+    }
+
+    /// Shared tail of every chart install (standard and Flux): order
+    /// check, slowest-object tail, state reset.
+    fn finish_chart_install(&mut self) {
         // the scan cursors assume hit_time order (chart.py/beatsaver.py
         // both sort); an unsorted chart would silently change behavior
         assert!(
@@ -1390,6 +1436,7 @@ impl Core {
         self.score_pre = 0.0;
         self.score_acc = 0.0;
         self.score_post = 0.0;
+        self.palm_vel = [[0.0; 3]; 2];
     }
 
     /// Obs written into a caller-owned OBS_DIM slice — SPEC-v10 §5
@@ -1444,7 +1491,10 @@ impl Core {
         for j in 0..NQ {
             obs[OFF_QD + j] = (st.v[6 + j] / MODEL.omega_cap[j]) as f32;
         }
-        // hand derived blocks (v9 semantics on the v10 FK)
+        // hand derived blocks (v9 semantics on the v10 FK; Flux: palms)
+        if self.flux {
+            self.write_flux_hands(obs);
+        } else {
         for (s, base) in [(0usize, OFF_HAND_L), (1usize, OFF_HAND_R)] {
             let b = &self.body;
             // env v38: wrist x/y join the entities' head-relative
@@ -1474,6 +1524,7 @@ impl Core {
             }
             obs[base + 10] = rem.min(2.0) as f32;
         }
+        }
         // head position (FK, centered on the reference pose)
         obs[OFF_HEAD] = (self.body.head[0] / X_NORM) as f32;
         obs[OFF_HEAD + 1] = ((self.body.head[1] - HEAD_Y0) / Y_NORM) as f32;
@@ -1487,6 +1538,9 @@ impl Core {
         // slots (notes: past the §10b miss boundary; walls: back face
         // past the head). Head-anchoring makes every dz head-z-
         // invariant, so the sort cannot be gamed by walking (v15).
+        if self.flux {
+            self.write_flux_entities(obs);
+        } else {
         let z_off = self.body.head[2] - PLANE_Z0;
         // 2026-08-22: z-lane low clamp = LIVE head z (exact existence
         // boundary; see the .cu mirror's note)
@@ -1498,22 +1552,6 @@ impl Core {
         // same comparison order (§5 parity).
         let mut sel = [(Real::INFINITY, false, 0usize); N_NOTE_SLOTS];
         let mut n_sel = 0usize;
-        fn insert(
-            sel: &mut [(Real, bool, usize); N_NOTE_SLOTS],
-            n_sel: &mut usize,
-            cand: (Real, bool, usize),
-        ) {
-            if *n_sel == N_NOTE_SLOTS && cand.0 >= sel[N_NOTE_SLOTS - 1].0 {
-                return;
-            }
-            let mut i = (*n_sel).min(N_NOTE_SLOTS - 1);
-            while i > 0 && cand.0 < sel[i - 1].0 {
-                sel[i] = sel[i - 1];
-                i -= 1;
-            }
-            sel[i] = cand;
-            *n_sel = (*n_sel + 1).min(N_NOTE_SLOTS);
-        }
         for i in self.first_pending..self.chart.len() {
             if self.status[i] != 0 {
                 continue;
@@ -1535,7 +1573,7 @@ impl Core {
             }
             let dx = n.x - head[0];
             let dy = n.y - head[1];
-            insert(&mut sel, &mut n_sel, (dx * dx + dy * dy + dz * dz, false, i));
+            slot_insert(&mut sel, &mut n_sel, (dx * dx + dy * dy + dz * dz, false, i));
         }
         for wi in self.first_wall..self.walls.len() {
             if self.wall_passed[wi] {
@@ -1552,7 +1590,7 @@ impl Core {
             let sx = ((head[0] - w.cx).abs() - w.half_w).max(0.0);
             let sy = ((head[1] - w.cy).abs() - w.half_h).max(0.0);
             let sz = dzf.max(-(dzf + w.len)).max(0.0);
-            insert(&mut sel, &mut n_sel, (sx * sx + sy * sy + sz * sz, true, wi));
+            slot_insert(&mut sel, &mut n_sel, (sx * sx + sy * sy + sz * sz, true, wi));
         }
         for slot in 0..n_sel {
             let (_, is_wall, idx) = sel[slot];
@@ -1612,6 +1650,7 @@ impl Core {
                 // see. The mask block stays.
             }
             obs[OFF_NOTE_MASK + slot] = 1.0;
+        }
         }
 
         // contact spec §7: per-foot ground-contact lanes
@@ -1762,7 +1801,9 @@ impl Core {
             }
         }
 
-        // swing chain update (feeds pre-swing + follow-through scores)
+        // swing chain update (feeds pre-swing + follow-through scores);
+        // Flux has no sabers, so no swing chain and no trackers
+        if !self.flux {
         for s in 0..2 {
             let d_old = prev_dir[s];
             let d_new = self.body.blade[s];
@@ -1812,6 +1853,7 @@ impl Core {
                 !resolve
             });
             self.trackers[s] = trs;
+        }
         }
 
         self.time = (self.tick + 1) as Real * DT;
@@ -1889,6 +1931,9 @@ impl Core {
             self.wrev_hi[h] = hi;
         }
 
+        if self.flux {
+            self.flux_judge(&mut reward, &prev_pos, &prev_dir);
+        } else {
         // both sabers' swept surfaces this tick
         let tris = [
             sweep_tris(prev_pos[0], prev_dir[0], self.body.wrist[0], self.body.blade[0]),
@@ -2113,9 +2158,11 @@ impl Core {
                 }
             }
         }
+        }
 
         self.tick += 1;
         // advance the low-water cursor past the newly resolved prefix
+        let head = self.body.head; // (bound inside the cut branch above too)
         // ── env v17 walls (spec §12b): head center vs AABB ────────────
         // Head-anchored like notes: dz_front = (t0 − t)·speed + 0.4 is
         // the front face's z relative to the HEAD ((−PLANE_Z0) − 0.25 =
@@ -2328,19 +2375,45 @@ impl RawBeatSim {
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, energy_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
-                        wall_despawn=false, self_contact_coef=0.0))]
+                        wall_despawn=false, self_contact_coef=0.0,
+                        flux=false))]
+    #[allow(clippy::too_many_arguments)]
     fn new(max_steps: u32, gears: u8, foot_contact: bool, fall_const: Real,
            foot_z_coef: Real, foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: Real) -> Self {
-        RawBeatSim {
-            core: Core::configured(max_steps, gears, foot_contact,
-                                   fall_const, foot_z_coef, foot_x_coef,
-                                   foot_hinge_r, foot_shape_coef,
-                                   energy_coef, limit_coef, limit_arms,
-                                   wall_despawn, self_contact_coef),
-        }
+           self_contact_coef: Real, flux: bool) -> Self {
+        let mut core = Core::configured(max_steps, gears, foot_contact,
+                                        fall_const, foot_z_coef, foot_x_coef,
+                                        foot_hinge_r, foot_shape_coef,
+                                        energy_coef, limit_coef, limit_arms,
+                                        wall_despawn, self_contact_coef);
+        core.flux = flux;
+        RawBeatSim { core }
+    }
+
+    /// Flux mode: the sim was built with `flux=True`.
+    #[getter]
+    fn flux(&self) -> bool {
+        self.core.flux
+    }
+
+    /// Flux chart (flux sims only): list of (hit_time, x, y, kind,
+    /// color, rot_rad, speed, length, sweet) sorted by hit_time — kind 4
+    /// circle / 5 bar (flux.rs). Resets state, returns the reset obs.
+    fn set_flux_chart<'py>(
+        &mut self,
+        py: Python<'py>,
+        chart: Vec<flux::FluxTuple>,
+    ) -> Bound<'py, PyArray1<f32>> {
+        self.core.set_flux_chart(chart);
+        PyArray1::from_slice_bound(py, &self.core.build_obs())
+    }
+
+    /// Flux: the two palm-centre points [L, R] (wrist + PALM_OFF along
+    /// the hand axis) — the circle contact points and Flux-line ends.
+    fn palms(&self) -> [[Real; 3]; 2] {
+        [0, 1].map(|s| flux::palm(self.core.body.wrist[s], self.core.body.blade[s]))
     }
 
     /// env v41 self-contact telemetry since the last pop: (summed
@@ -2364,6 +2437,7 @@ impl RawBeatSim {
         chart: Vec<ChartTuple>,
         walls: Vec<WallTuple>,
     ) -> Bound<'py, PyArray1<f32>> {
+        assert!(!self.core.flux, "flux sim: use set_flux_chart");
         self.core.set_walls(walls);
         self.core.set_chart_notes(chart);
         PyArray1::from_slice_bound(py, &self.core.build_obs())
@@ -2531,6 +2605,7 @@ impl RawBeatSim {
         body.refresh_fk();
         body.wrist_vel = [[0.0; 3]; 2];
         body.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
+        self.core.palm_vel = [[0.0; 3]; 2];
     }
 
     /// env v46: set the 16 per-axis torque-limit scales (spine 3, arm 7,
@@ -2843,7 +2918,7 @@ impl VecBeatSim {
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         energy_coef=0.0, limit_coef=0.0,
                         limit_arms=false, wall_despawn=false,
-                        self_contact_coef=0.0))]
+                        self_contact_coef=0.0, flux=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, gears: u8,
@@ -2851,15 +2926,17 @@ impl VecBeatSim {
            foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: Real) -> Self {
+           self_contact_coef: Real, flux: bool) -> Self {
         VecBeatSim {
             sims: (0..n)
                 .map(|_| {
-                    Core::configured(max_steps, gears, foot_contact,
-                                     fall_const, foot_z_coef, foot_x_coef,
-                                     foot_hinge_r, foot_shape_coef,
-                                     energy_coef, limit_coef, limit_arms,
-                                     wall_despawn, self_contact_coef)
+                    let mut core = Core::configured(
+                        max_steps, gears, foot_contact, fall_const,
+                        foot_z_coef, foot_x_coef, foot_hinge_r,
+                        foot_shape_coef, energy_coef, limit_coef,
+                        limit_arms, wall_despawn, self_contact_coef);
+                    core.flux = flux;
+                    core
                 })
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
@@ -2869,9 +2946,20 @@ impl VecBeatSim {
 
     #[pyo3(signature = (i, chart, walls = Vec::new()))]
     fn set_chart(&mut self, i: usize, chart: Vec<ChartTuple>, walls: Vec<WallTuple>) {
+        assert!(!self.sims[i].flux, "flux sim: use set_flux_chart");
         let n_objects = chart.len();
         self.sims[i].set_walls(walls);
         self.sims[i].set_chart_notes(chart);
+        if let Some(walks) = &mut self.walks {
+            walks[i] = ComboWalk::new(n_objects);
+        }
+    }
+
+    /// Flux chart for env i (flux sims only) — tuple layout as
+    /// `RawBeatSim.set_flux_chart`.
+    fn set_flux_chart(&mut self, i: usize, chart: Vec<flux::FluxTuple>) {
+        let n_objects = chart.len();
+        self.sims[i].set_flux_chart(chart);
         if let Some(walks) = &mut self.walks {
             walks[i] = ComboWalk::new(n_objects);
         }

@@ -67,9 +67,11 @@ import torch
 from .chart import ChartConfig, generate_chart
 from .constants import (TAU_FEAT, 
     BAD_HALF, BAD_HALF_Y_LINK, FOLLOW_TIMEOUT, GOOD_HALF_Y,
-    GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BOMB, KIND_CHAIN_HEAD,
-    KIND_CHAIN_LINK, N_JOINTS, NV, OBS_DIM, note_center,
+    GOOD_HALF_Y_DOT, GOOD_HALF_Y_LINK, KIND_BAR, KIND_BOMB,
+    KIND_CHAIN_HEAD, KIND_CHAIN_LINK, KIND_CIRCLE, N_JOINTS, NV, OBS_DIM,
+    PALM_OFF, note_center,
 )
+from .flux_chart import FluxConfig, flux_tuple, generate_flux_chart
 
 NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 
@@ -249,6 +251,85 @@ def _charts_to_padded(charts, device, dtype, pad_to=None):
     }
 
 
+def _flux_to_padded(charts, device, dtype):
+    """Pack a list[list[FluxObj | flux_tuple]] (Flux game mode, SPEC.md
+    §Flux) into the standard per-field (P, C) pool dict plus `len` /
+    `sweet`. Validation and per-object values mirror lib.rs flux.rs
+    set_flux_chart: circles carry colour, len/sweet 0; bars carry
+    colour 0 and their rotation in `rot` as (cos θ, sin θ) — the pair
+    the kernel feeds note_frame (lam = 0) and derives the axis
+    u = (-sin θ, cos θ) from. Every object is any_dir, never shows a
+    direction, and is neither bomb, chain head nor link; a Flux object
+    is a BAR iff len > 0. sin/cos come from numpy (the CRT libm — what
+    Rust's set_flux_chart computes)."""
+    P = len(charts)
+    tups = [[o if isinstance(o, tuple) else flux_tuple(o) for o in ch]
+            for ch in charts]
+    for ch in tups:
+        assert all(a[0] <= b[0] for a, b in zip(ch, ch[1:])), \
+            "flux chart must be sorted by hit_time"
+        for (_t, _x, _y, kind, color, _rot, speed, length, sweet) in ch:
+            assert kind in (KIND_CIRCLE, KIND_BAR), \
+                "flux chart kinds are 4 (circle) / 5 (bar)"
+            assert color in (0, 1), "colour must be 0 (left) or 1 (right)"
+            assert speed > 0.0, "speed must be positive"
+            if kind == KIND_BAR:
+                assert length > 0.0, "bar length must be positive"
+                assert -1.0 <= sweet <= 1.0, \
+                    "sweet-spot offset must be in [-1, 1]"
+    C = max(1, max((len(ch) for ch in tups), default=1))
+    lens = np.fromiter((len(ch) for ch in tups), np.int64, P)
+    n_tot = int(lens.sum())
+    idx = (np.repeat(np.arange(P, dtype=np.int64) * C
+                     - (np.cumsum(lens) - lens), lens)
+           + np.arange(n_tot, dtype=np.int64))
+    rec = (np.array(list(itertools.chain.from_iterable(tups)), np.float64)
+           .reshape(n_tot, 9) if n_tot else np.zeros((0, 9), np.float64))
+
+    def fill(vals, dt=np.float64, pad=0.0):
+        a = np.full(P * C, pad, dtype=dt)
+        a[idx] = vals
+        return a.reshape(P, C)
+
+    kind = fill(rec[:, 3].astype(np.int64), np.int64, 0)
+    valid = fill(np.ones(n_tot, bool), bool, False)
+    is_bar = valid & (kind == KIND_BAR)
+    hit = fill(rec[:, 0]); x = fill(rec[:, 1]); y = fill(rec[:, 2])
+    color = np.where(is_bar, 0, fill(rec[:, 4].astype(np.int64),
+                                     np.int64, 0))
+    rot = fill(rec[:, 5])
+    speed = fill(rec[:, 6], pad=1.0)
+    length = np.where(is_bar, fill(rec[:, 7]), 0.0)
+    sweet = np.where(is_bar, fill(rec[:, 8]), 0.0)
+    sin_a = np.where(is_bar, np.sin(rot), 0.0)
+    cos_a = np.where(is_bar, np.cos(rot), 1.0)
+    no = np.zeros((P, C), bool)
+    min_speed = np.where(valid, speed, np.inf).min(1)
+    finite = np.isfinite(min_speed)
+    min_speed = np.where(finite, min_speed, 1.0)
+    tail = np.where(finite, 0.5 + Z_MISS_TAIL / min_speed, 0.5)
+    t = lambda a, dt=dtype: torch.as_tensor(a, device=device, dtype=dt)
+    return {
+        "hit": t(hit), "speed": t(speed),
+        "center": torch.stack([t(x), t(y)], -1),
+        "dvec": torch.stack([t(cos_a), t(sin_a)], -1),
+        "rot": torch.stack([t(cos_a), t(sin_a)], -1),
+        "is_right": t(color, torch.bool),
+        "any_dir": t(valid, torch.bool), "valid": t(valid, torch.bool),
+        "is_bomb": t(no, torch.bool), "is_head": t(no, torch.bool),
+        "is_link": t(no, torch.bool), "show_dir": t(no, torch.bool),
+        "free_pre": t(no, torch.bool), "free_post": t(no, torch.bool),
+        "good_hy": t(np.full((P, C), GOOD_HALF_Y_DOT)),
+        "bad_hy": t(np.full((P, C), BAD_HALF)),
+        "len": t(length), "sweet": t(sweet),
+        "n_notes": t(valid.sum(1), torch.long),
+        "n_scoreable": t(valid.sum(1), torch.long),
+        "last_hit": t(np.where(valid.any(1), (hit * valid).max(1), 0.0)),
+        "tail": t(tail),
+        "min_speed": t(min_speed),
+    }
+
+
 def _walls_to_padded(walls, device, dtype, pad_to=None):
     """Pad a list[list[wall_tuple]] into per-field (P, W) tensors (env
     v17, spec §12). wall_tuple order: (t0, cx, cy, width, height,
@@ -297,6 +378,10 @@ def _walls_to_padded(walls, device, dtype, pad_to=None):
 NOTE_OBJ_FIELDS = ("hit", "speed", "center", "dvec", "rot", "is_right",
                    "any_dir", "valid", "is_bomb", "is_head", "is_link",
                    "show_dir", "free_pre", "free_post", "good_hy", "bad_hy")
+# Flux-only per-object fields (bar length / sweet offset): present in
+# Flux pools only — the layout helpers below skip absent keys, so
+# standard pools and their caches are unchanged (the env fills zeros)
+FLUX_OBJ_FIELDS = ("len", "sweet")
 WALL_OBJ_FIELDS = ("wall_t", "wall_cx", "wall_cy", "wall_w", "wall_h",
                    "wall_len", "wall_speed", "wall_valid")
 
@@ -322,7 +407,8 @@ def pad_to_ragged(pool):
     """Padded (P, C) / (P, W) pool dict -> ragged, IN PLACE (returns the
     dict). The valid mask selects each segment's objects in (p, j) order,
     which is exactly CSR order; pads are dropped. Idempotent."""
-    _flatten_block(pool, NOTE_OBJ_FIELDS, "valid", "note_off", "n_notes")
+    _flatten_block(pool, NOTE_OBJ_FIELDS + FLUX_OBJ_FIELDS, "valid",
+                   "note_off", "n_notes")
     _flatten_block(pool, WALL_OBJ_FIELDS, "wall_valid", "wall_off",
                    "n_walls")
     return pool
@@ -358,8 +444,11 @@ def ragged_to_padded(pool):
     pad_to_ragged reproduces the padded builders' output exactly."""
     dt = pool["hit"].dtype
     dev = pool["hit"].device
-    _unflatten_block(pool, NOTE_OBJ_FIELDS, "note_off", "n_notes",
-                     _charts_to_padded([[]], dev, dt))
+    empty = _charts_to_padded([[]], dev, dt)
+    for k in ("len", "sweet"):          # Flux-only fields pad with 0
+        empty[k] = torch.zeros((1, 1), device=dev, dtype=dt)
+    _unflatten_block(pool, NOTE_OBJ_FIELDS + FLUX_OBJ_FIELDS, "note_off",
+                     "n_notes", empty)
     _unflatten_block(pool, WALL_OBJ_FIELDS, "wall_off", "n_walls",
                      _walls_to_padded([[]], dev, dt))
     return pool
@@ -396,6 +485,30 @@ def _walls_to_tensors(walls, device, dtype):
     return pad_to_ragged(_walls_to_padded(walls, device, dtype))
 
 
+def _flux_to_tensors(charts, device, dtype):
+    """list[list[FluxObj | flux_tuple]] -> ragged Flux pool dict."""
+    return pad_to_ragged(_flux_to_padded(charts, device, dtype))
+
+
+def _flux_generator_version():
+    """_generator_version's twin for the Flux generator (flux_chart.py):
+    the config, the generator (closures ride along), the object record,
+    the shared lattice tunables it imports and the grid geometry."""
+    import inspect
+
+    from . import chart
+    from . import constants as K
+    from . import flux_chart as F
+    h = hashlib.sha256()
+    for sym in (F.FluxConfig, F.generate_flux_chart, F._rect, F.bar_axis,
+                F.FluxObj, F.flux_tuple, K.col_x):
+        h.update(inspect.getsource(sym).encode())
+    h.update(repr((chart.TICK_DT, chart.TICK_JITTER, chart.SPEED_DEV,
+                   F.LEFT, F.RIGHT, K.ROW_Y, K.CELL_X, K.KIND_CIRCLE,
+                   K.KIND_BAR)).encode())
+    return h.hexdigest()[:16]
+
+
 def _generator_version():
     """Hash of the code the CACHED POOL CONTENT actually depends on —
     the bench's parser_version() pattern (bench_scoresaber.py). Hashing
@@ -426,7 +539,7 @@ def _generator_version():
     return h.hexdigest()[:16]
 
 
-def _pool_cache_path(cfg, seed, pool_size, dtype):
+def _pool_cache_path(cfg, seed, pool_size, dtype, game="standard"):
     """Cache file for a procedural chart pool. Keyed on the FULL chart
     config (it determines content) + seed + pool size + dtype +
     _generator_version() + a pool LAYOUT version.
@@ -439,13 +552,21 @@ def _pool_cache_path(cfg, seed, pool_size, dtype):
     Layout v12 (2026-09-03, audit 2.7): ragged (CSR) pool — the npz
     holds flat per-object arrays + note_off / wall_off; v11 caches were
     (P, C)-padded and are not reused."""
-    blob = repr(("v12", _generator_version(), repr(cfg), seed, pool_size,
-                 str(dtype))).encode()
+    if game == "flux":
+        # Flux pools key on the Flux generator + a game tag and live
+        # under their own file prefix — never aliased with standard
+        blob = repr(("v12-flux", _flux_generator_version(), repr(cfg),
+                     seed, pool_size, str(dtype))).encode()
+        prefix = "pool_flux"
+    else:
+        blob = repr(("v12", _generator_version(), repr(cfg), seed,
+                     pool_size, str(dtype))).encode()
+        prefix = "pool"
     key = hashlib.sha1(blob).hexdigest()[:16]
     cdir = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "pool_cache")
     os.makedirs(cdir, exist_ok=True)
-    return os.path.join(cdir, f"pool_{pool_size}_{key}.npz")
+    return os.path.join(cdir, f"{prefix}_{pool_size}_{key}.npz")
 
 
 def _load_pool_cache(path, device):
@@ -480,7 +601,7 @@ class CudaBeatVecEnv:
 
     def __init__(self, num_envs, colors="both", chart_len_s=20.0,
                  cols=(0, 1, 2, 3), rows=(0, 1, 2),
-                 note_speed_min=2.0, note_speed_max=8.0,
+                 note_speed_min=None, note_speed_max=None,
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125, seed=0,
                  charts=None, chart_pool=1024, max_steps=None,
@@ -496,7 +617,33 @@ class CudaBeatVecEnv:
                  start_pose_jitter=0.0, crouch_start_prob=0.0,
                  self_contact_coef=0.0, tau_rand=0.0,
                  combo_walk=False, bench_refill=False, ep_stats=False,
-                 tau_center=None, z_asinh=8.0, env_order=False):
+                 tau_center=None, z_asinh=8.0, env_order=False,
+                 game="standard", circle_prob=0.3, bar_prob=0.15,
+                 flux_charts=None):
+        # game (SPEC.md §Flux): "standard" (the default; every existing
+        # caller) or "flux" — circles + bars, palms instead of sabers.
+        # A compile-time kernel switch like foot_contact, baked here.
+        # Flux draws procedural charts from flux_chart.generate_flux_chart
+        # (circle_prob / bar_prob + the shared chart kwargs), or plays
+        # flux_charts= (list[list[FluxObj | flux_tuple]], the charts=
+        # test-mode twin); ranked pools, charts= and walls are standard-
+        # only. note_speed_min/max None = the mode's default (standard
+        # 2 / 8 m/s, Flux 10 / 18 — FluxConfig's real-NJS range).
+        assert game in ("standard", "flux"), game
+        self.game = game
+        self.flux = game == "flux"
+        if self.flux:
+            assert pool is None and charts is None and walls is None, \
+                "flux: use flux_charts= (no ranked pool / charts= / walls)"
+            _fd = FluxConfig()
+            note_speed_min = (_fd.note_speed_min if note_speed_min is None
+                              else note_speed_min)
+            note_speed_max = (_fd.note_speed_max if note_speed_max is None
+                              else note_speed_max)
+        else:
+            assert flux_charts is None, "flux_charts= needs game='flux'"
+            note_speed_min = 2.0 if note_speed_min is None else note_speed_min
+            note_speed_max = 8.0 if note_speed_max is None else note_speed_max
         # walls (env v17, charts= test mode only): list[list[wall_tuple]]
         # aligned with `charts` — chart i plays with walls[i]. Ranked
         # pools carry their wall tensors themselves.
@@ -575,8 +722,32 @@ class CudaBeatVecEnv:
         # (P, C) from an older builder — converted here) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is
         # the deterministic-sequential test mode)
-        self._test_charts = charts is not None and pool is None
-        if pool is not None:
+        self._test_charts = ((charts is not None or flux_charts is not None)
+                             and pool is None)
+        if self.flux and flux_charts is not None:
+            self.pool = _flux_to_tensors(flux_charts, self.device, dtype)
+        elif self.flux:
+            fcfg = FluxConfig(
+                chart_len_s=chart_len_s, cols=tuple(cols), rows=tuple(rows),
+                note_speed_min=note_speed_min,
+                note_speed_max=note_speed_max,
+                circle_prob=circle_prob, bar_prob=bar_prob)
+            cpath = _pool_cache_path(fcfg, seed, chart_pool, dtype,
+                                     game="flux")
+            self.pool = _load_pool_cache(cpath, self.device)
+            if self.pool is None:
+                rng = np.random.default_rng(seed)
+                fch = [generate_flux_chart(fcfg, rng)
+                       for _ in range(chart_pool)]
+                self.pool = _flux_to_tensors(fch, self.device, dtype)
+                np.savez(cpath, **{k: v.cpu().numpy()
+                                   for k, v in self.pool.items()})
+                print(f"[pool-cache] generated {chart_pool} flux charts -> "
+                      f"{os.path.basename(cpath)}", flush=True)
+            else:
+                print(f"[pool-cache] hit: {os.path.basename(cpath)}",
+                      flush=True)
+        elif pool is not None:
             self.pool = pad_to_ragged(_fix_pool_tail(
                 {k: v.to(self.device, dtype if v.is_floating_point() else
                          v.dtype) for k, v in pool.items()}))
@@ -620,6 +791,11 @@ class CudaBeatVecEnv:
             self.pool.update(_walls_to_tensors(
                 [[] for _ in range(self.pool_size)], self.device, dtype))
         self.W = _max_count(self.pool["n_walls"])
+        # Flux bar fields: standard pools (procedural, ranked, caches)
+        # never carry them — zeros, which the standard kernel never reads
+        for _k in ("len", "sweet"):
+            if _k not in self.pool:
+                self.pool[_k] = torch.zeros_like(self.pool["hit"])
         if max_steps is None:
             max_steps = int(chart_len_s * 30) + 90
         self.max_steps = int(max_steps)
@@ -710,6 +886,9 @@ class CudaBeatVecEnv:
         self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
         self.bench_rec = z(N, 17)   # + [wrev_L, wrev_R, ticks] (2026-09-22)
         self.bench_flag = z(N, dt=torch.uint8)
+        # Flux: palm-centre finite-difference velocity (kernel-written in
+        # Flux mode only; zeroed at reset / set_state)
+        self.palm_vel = z(N, 2, 3)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -867,11 +1046,13 @@ class CudaBeatVecEnv:
             self.cw_mult, self.cw_prog, self.cw_combo, self.cw_maxc,
             self.cw_breaks, self.cw_score, self.cw_note_mult, self.tr_msum,
             self.bench_rec, self.bench_flag,
+            self.palm_vel,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
             p["is_head"], p["is_link"], p["show_dir"], p["free_pre"],
             p["free_post"],
+            p["len"], p["sweet"],
             p["n_notes"], p["last_hit"], p["tail"], p["min_speed"],
             p["note_off"],
             p["wall_t"], p["wall_cx"], p["wall_cy"], p["wall_w"],
@@ -904,7 +1085,8 @@ class CudaBeatVecEnv:
                        self.start_pose_jitter, self.crouch_start_prob,
                        self.z_asinh, self.self_contact_coef,
                        self.tau_rand, int(self.combo_walk),
-                       int(self.bench_refill), int(self.ep_stats))
+                       int(self.bench_refill), int(self.ep_stats),
+                       self.flux)
 
     # -- env v46: torque-limit scales ---------------------------------------
     def set_tau_scale(self, s16):
@@ -1064,6 +1246,11 @@ class CudaBeatVecEnv:
 
     def sabers(self):
         return torch.cat([self.wrist, self.blade], -1)  # (N, 2, 6)
+
+    def palms(self):
+        """Flux palm-centre points (N, 2, 3): wrist + PALM_OFF along the
+        hand axis (RawBeatSim.palms mirror)."""
+        return self.wrist + PALM_OFF * self.blade
 
     def counters(self):
         return (self.good, self.bad, self.miss,

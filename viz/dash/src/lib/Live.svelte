@@ -1,7 +1,7 @@
 <script>
   import { store, loadIndex, loadMetrics, mostRecentRun, runById } from "./data.svelte.js";
-  import { PANELS, X_MODES, xValues, seriesValues, hasAny, label, color, fmt,
-    fmtDuration, fmtSamples } from "./series.js";
+  import { X_MODES, xValues, seriesValues, hasAny, label, color, fmt,
+    fmtDuration, fmtSamples, gameOf, panelsFor } from "./series.js";
   import Chart from "./Chart.svelte";
 
   let { xMode = $bindable("samples"), runId = $bindable(null) } = $props();
@@ -46,7 +46,7 @@
 
   const panels = $derived.by(() => {
     if (!recs || !recs.length) return [];
-    return PANELS.map((p) => {
+    return panelsFor(gameOf(run)).map((p) => {
       const keys = p.series.filter((k) => hasAny(recs, k));
       return {
         ...p,
@@ -88,7 +88,7 @@
     <select value={run?.id ?? ""} onchange={(e) => { runId = e.target.value || null; }}>
       <option value="">most recent ({mostRecentRun()?.id ?? "—"})</option>
       {#each runs as r (r.id)}
-        <option value={r.id}>{r.id} · {fmtSamples(r.samples)} · {r.status}</option>
+        <option value={r.id}>{r.id}{gameOf(r) === "flux" ? " · FLUX" : ""} · {fmtSamples(r.samples)} · {r.status}</option>
       {/each}
     </select>
   </label>
@@ -110,11 +110,12 @@
 {#if run}
   <div class="status">
     <b>{run.id}</b>
+    {#if gameOf(run) === "flux"}<span class="game">FLUX</span>{/if}
     {#if last}
       · last update <b>{last.upd.toLocaleString()}</b>{#if last.n_upd} / {last.n_upd.toLocaleString()}{/if}
       · {fmtSamples(last.steps)} samples
       · <b>{ago == null ? "—" : fmtDuration(ago)} ago</b>
-      · acc {fmt(last.acc)} · return {fmt(last.return, 3)} · ent {fmt(last.ent, 3)} · ev {fmt(last.ev, 3)}
+      · {gameOf(run) === "flux" ? "pts/touch÷115" : "acc"} {fmt(last.acc)} · return {fmt(last.return, 3)} · ent {fmt(last.ent, 3)} · ev {fmt(last.ev, 3)}
       · {fmt(last.sps / 1000, 3)}k steps/s
     {:else if store.loading[run.id]}
       · loading metrics…
@@ -140,6 +141,7 @@
   .bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 8px 0; }
   .status { font-size: 13px; color: var(--muted); margin: 4px 0 10px; }
   .status b { color: var(--fg); }
+  .game { background: #8b5cf6; color: #fff; border-radius: 4px; padding: 0 5px; margin-left: 4px; font-size: 11px; font-weight: 700; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 10px; }
   .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
   .xmode button.on, .win button.on { background: var(--accent); color: #fff; }

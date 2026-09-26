@@ -1,6 +1,6 @@
 <script>
   import { store, archiveUrl } from "./data.svelte.js";
-  import { fmt, fmtDuration, fmtSamples } from "./series.js";
+  import { fmt, fmtDuration, fmtSamples, gameOf } from "./series.js";
 
   let { onpick = () => {}, selected = [] } = $props();
 
@@ -11,6 +11,7 @@
   const COLS = [
     { key: "campaign", label: "campaign" },
     { key: "run", label: "run" },
+    { key: "game", label: "game" },
     { key: "status", label: "status" },
     { key: "samples", label: "samples", num: true, fmt: fmtSamples },
     { key: "updates", label: "updates", num: true, fmt: (v) => v?.toLocaleString() },
@@ -31,6 +32,7 @@
 
   function get(r, key) {
     if (key === "ckpts") return r.checkpoints?.length ?? 0;
+    if (key === "game") return gameOf(r);
     if (key.startsWith("final.")) return r.final?.[key.slice(6)] ?? null;
     if (key.startsWith("bench.")) {
       const b = bestBench(r);
@@ -48,7 +50,8 @@
 
   const rows = $derived.by(() => {
     const f = filter.trim().toLowerCase();
-    const rs = (store.index?.runs ?? []).filter((r) => !f || r.id.toLowerCase().includes(f));
+    const rs = (store.index?.runs ?? []).filter((r) => !f || r.id.toLowerCase().includes(f)
+      || gameOf(r) === f);
     const col = COLS.find((c) => c.key === sortKey);
     return rs.slice().sort((a, b) => {
       const va = get(a, sortKey), vb = get(b, sortKey);
@@ -73,7 +76,7 @@
 </script>
 
 <div class="bar">
-  <input placeholder="filter…" bind:value={filter} />
+  <input placeholder="filter… (run id, or 'flux')" bind:value={filter} />
   <span class="muted">{rows.length} runs · click a row to add it to Compare · generated {store.index ? new Date(store.index.generated * 1000).toLocaleString() : "—"}</span>
 </div>
 <div class="tablewrap">

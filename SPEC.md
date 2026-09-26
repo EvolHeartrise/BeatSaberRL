@@ -259,6 +259,120 @@ checkpoints/replays retire (hard replace).
 - **RNG**: `numpy.random.Generator(PCG64(seed))`; all randomness (chart
   gen) flows from it. Same seed + same action sequence ⇒ identical episode.
 
+## Flux game mode (`rust/src/flux.rs`) — 2026-09-26
+
+A SECOND game mode, alongside (never replacing) the standard game
+above. User-specified rules; everything not listed here is the
+standard env verbatim: the v10 body and physics, 30 Hz ticks, the 29
+gear heads, the head-anchored track (`z = (hit_time − t)·speed +
+z_off`), the energy / limit / self-contact / foot terms, the fall and
+tilt terminations, the episode end and tail rules, and the combo /
+multiplier rules (event codes are the standard ones, so ComboWalk and
+the bench walk run unchanged). The standard game is bit-identical with
+Flux compiled in (pinned by a before/after fingerprint of seeded
+rollouts on both builds and both foot modes).
+
+- **Mode selection**: `RawBeatSim(..., flux=True)` / `VecBeatSim(...,
+  flux=True)`, fixed per sim. A Flux sim takes `set_flux_chart(chart)`
+  (`set_chart` refuses) and vice versa. Walls, bombs, chains and arcs
+  do not exist in Flux.
+- **Hands**: no sabers. Each hand is its **palm centre**, a point
+  `PALM_OFF = 0.06` m along the hand axis (the blade direction of the
+  standard game) from the wrist — the model's fist-collider centre.
+  The **Flux** is the finite segment between the two palms, always
+  live. No swing chain, no follow-through trackers.
+- **Chart tuple**: `(hit_time, x, y, kind, color, rot_rad, speed,
+  length, sweet)`, sorted by hit_time; kind 4 = circle, 5 = bar.
+  Positions are world metres in the standard grid frame (object
+  centre at the hit plane).
+- **Circle** (`KIND_CIRCLE`, colour 0 left / 1 right): a flat disc
+  facing the player, hitbox radius `CIRCLE_R = 0.175` (the ~35 cm
+  visual disc), with the standard good box's depth convention: 1.0 m
+  deep, shifted 0.25 m toward the player (`z ∈ [z − 0.75, z + 0.25]`).
+  No look-at tilt. Contact = the palm's path over the tick (last
+  tick's palm → this tick's) clipped to the slab passes within
+  `CIRCLE_R` of the centre in-plane. **Matching palm → good**:
+  `50 + round(10 · (1 − clamp(d / 0.3, 0, 1)))`, `d` = that in-plane
+  closest approach (the standard accuracy formula at 10 points; note
+  the hitbox radius caps `d` at 0.175, so the accuracy floor is 4).
+  **Other palm → bad hit** (event 3 wrong_hand, −0.5); the matching
+  palm wins a same-tick double touch. No speed or direction
+  requirement.
+- **Bar** (`KIND_BAR`, colourless): a thin rectangle in the plane
+  facing the player, width `BAR_WIDTH = 0.05`, length `length` m,
+  rotated `rot` about z: axis `u = (−sin rot, cos rot)` — 0 = vertical,
+  CCW from the player's view (the note-angle convention). Hitbox: the
+  box `[0.025, length/2, 0.5]` half-extents in that z-roll frame,
+  centred 0.25 m toward the player (the circle slab). Contact = the
+  **swept Flux** — the quad from last tick's segment to this tick's,
+  triangulated `(L0, R0, R1), (L0, R1, L1)` exactly like the saber
+  sweep — overlaps the box (Akenine-Möller SAT). Score:
+  `100 + round(15 · (1 − clamp(d / 0.3, 0, 1)))` with `d` = the
+  distance along `u` from where THIS tick's Flux LINE (infinite, in
+  the bar's xy plane) crosses the bar axis — clamped onto the bar — to
+  the **sweet spot** at `sweet · length/2` (sweet ∈ [−1, 1]: 0 = the
+  middle, +1 = the `+u` end, "top" at rot 0). A Flux parallel to the
+  bar (or collapsed to a point) uses the point of its projected span
+  nearest the sweet spot. **Crossing angle** (user rule, the note
+  swing tolerance's twin): this tick's Flux line, projected onto the
+  bar's xy plane, may deviate at most 60° from the bar's perpendicular
+  `(cos rot, sin rot)` — undirected, so 0–90°: `(f · n)² ≥ 0.25 |f|²`.
+  A crossing beyond that is a **bad cut** (event 2 "angle", −0.5,
+  combo break); a collapsed Flux (palms coincident in xy) fails too.
+- **Misses**: an untouched circle or bar passing the head plane is a
+  miss (event 4, −0.5), exactly like a note.
+- **Reward / score**: good = `pts / 115` (circle max 60/115, bar
+  115/115); bad and miss −0.5. `score_components()` returns (base
+  contact points, accuracy points, 0); a good event's `pre` slot
+  carries the base (50/100) and `acc` the accuracy points.
+- **Reach gate**: `max(shoulder_z) + 0.65 + PALM_OFF + 0.75` (the
+  slab's near face) replaces the saber reach.
+- **Obs** (same OBS_DIM and offsets as standard; Flux lane meanings,
+  `constants.FLUX_LANE_*`): hand blocks = palm x/y head-relative, palm
+  z world, palm velocity /V_NORM, hand axis (3), lanes 9–10 zero.
+  Entity slots (nearest-first by head distance, no walls): 0–3 as
+  standard (x, y head-relative; z lane; −speed/Z_SCALE), 4/5 circle
+  colour one-hot, 6/7 bar axis u, 8 is_circle, 9 is_bar, 10 bar length
+  (m), 11 sweet offset, 12/13 sweet-spot head-relative x/y, 14–17
+  zero. Previous-note blocks record the last resolved CIRCLE of that
+  colour (x/y, valid; direction lanes zero); bars never record.
+- **Policy**: the same NotePolicy network, trained from scratch, with
+  arch marker `game = "flux"`; `load_policy(ckpt, game=...)` refuses a
+  checkpoint of the other mode (absent marker = standard), so the
+  standard bench/replay tools never load a Flux policy. Under
+  `--note-geo` a bar's target point is its sweet spot (lanes 12/13)
+  instead of its centre.
+- **Generator f1** (`beat_arena_env/flux_chart.py`; no official Flux
+  map data exists yet): generator v2's clock (jittered lattice,
+  interval × note_speed_max / walk speed, one shared speed walk,
+  default 10–18 m/s) plus HAND FLOW — two imaginary palms walk the
+  play rectangle (default = the grid span, x ∈ [−0.9, 0.9], y ∈ the
+  row heights; one step per tick uniform in a disc of radius
+  `hand_speed · dt`, 2.5 m/s; left kept ≥ `min_sep` 0.3 m left of
+  right) and objects are placed ON that trajectory: each hand spawns a
+  circle at its palm with P = `circle_prob` (0.3) per tick; a bar
+  (P = `bar_prob`, 0.15) gets its sweet spot on the palm-to-palm
+  segment (fraction U(0.2, 0.8)), rotated within ±`bar_dev_max` (45°)
+  of square to the palm-to-palm line (so it is clearable under the 60°
+  rule) and flipped end-for-end with P = ½, length U(0.3, 1.2) m,
+  sweet U(−1, 1), centre = sweet point − sweet·length/2·u.
+- **Envs / trainer**: `flux_env.RustFluxEnv` (gym, JSONL recording with
+  header `"game": "flux"`, the Flux chart, and per-tick `"palms"`),
+  `flux_env.FluxVecEnv` (batched Rust), `CudaBeatVecEnv(game="flux")`;
+  `train_batch.py --game flux` (ranked maps and ep-stats switch off;
+  `--circle-prob`, `--bar-prob`, per-mode speed defaults).
+  Tests: `tests/test_flux.py`, `rust/src/flux.rs` unit tests,
+  `tests/test_flux_parity_cuda.py`.
+- **Viewer** (`viz/app`, header `"game": "flux"`): palms (hand-coloured
+  orbs at wrist + PALM_OFF along the hand axis, from the body FK) and
+  the Flux beam replace the sabers; circles draw as coloured discs with
+  a rim, bars as thin strips rolled by `rot` with a gold sweet-spot
+  notch; 'h' shows the circle cylinders / bar boxes; touches burst and
+  fade (no cut plane to slice), bad touches and misses leave an outline
+  + mark. Fixture: `python/tools/make_flux_fixture.py` →
+  `viz/app/test/fixtures/flux_scripted.jsonl`; tests
+  `test/flux.test.js` (npm test) and `test/flux-browser.mjs`.
+
 ## Chart generation (`beat_arena_env/chart.py`) — generator v2
 
 **Generator v2 (2026-07-24, user-designed, hard replace):** the old
