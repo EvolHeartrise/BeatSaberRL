@@ -38,7 +38,8 @@ def test_fp32_matches_torch(rows, d):
     torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("rows,d", [(33, 64), (4096, 64), (4096, 128)])
+@pytest.mark.parametrize("rows,d", [(33, 64), (4096, 64), (4096, 128),
+                                    (4096, 192), (4096, 384)])
 def test_fp16_fwd_vs_fp64(rows, d):
     ln = FusedLayerNorm(d).cuda()
     torch.nn.init.normal_(ln.weight)
@@ -102,7 +103,32 @@ def test_fwd_add_b_bias_grad_is_the_channel_sum():
     assert torch.equal(bias.grad, a.grad.sum(0, dtype=torch.float32))
 
 
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [192, 384])
+def test_fwd_add_b_bias_grad_fused_in_ln_bwd(d):
+    """At d 192/384 the channel sum is fused into ln_bwd's dx store loop
+    (2026-09-26): same rounded summands as the torch sum, different
+    order -> near-tie; dx itself is unchanged by asking for it."""
+    ln = FusedLayerNorm(d).cuda()
+    torch.nn.init.normal_(ln.weight)
+    rows = 8192 * 3 + 5
+    g = _mk(rows, d, torch.float16, seed=3)
+
+    def run(with_bias):
+        a = _mk(rows, d, torch.float16, seed=1).requires_grad_(True)
+        b = _mk(rows, d, torch.float16, seed=2)
+        bias = torch.zeros(d, device="cuda", requires_grad=with_bias)
+        _, y = ln.forward_add(a, b, bias)
+        y.backward(g)
+        return a.grad, bias.grad
+
+    ga, gb = run(True)
+    ga0, _ = run(False)
+    assert torch.equal(ga, ga0)
+    ref = ga.sum(0, dtype=torch.float32)
+    torch.testing.assert_close(gb, ref, atol=1e-3, rtol=1e-5)
+
+
+@pytest.mark.parametrize("d", [64, 128, 192, 384])
 def test_fp16_bwd_vs_fp64(d):
     rows = 4096
     ln = FusedLayerNorm(d).cuda()
@@ -147,3 +173,14 @@ def test_bwd_deterministic(dtype):
     a2, w2, b2 = run()
     assert torch.equal(a1, a2) and torch.equal(w1, w2) \
         and torch.equal(b1, b2)
+
+
+def test_width_gate_fp16_to_384_fp32_to_256():
+    """2026-09-26: fp16 rows up to 384 (the SimBa trunk LNs at
+    trunk_dim 384) take the fused kernel; fp32 stays <= 256 so the
+    record path's stock-LN bits above 256 are untouched."""
+    ln = FusedLayerNorm(384).cuda()
+    assert ln._eligible(_mk(8, 384, torch.float16))
+    assert not ln._eligible(_mk(8, 384, torch.float32))
+    assert not FusedLayerNorm(512).cuda()._eligible(
+        _mk(8, 512, torch.float16))

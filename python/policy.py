@@ -456,6 +456,16 @@ class Block(nn.Module):
             scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
                                    alpha=self.d ** -0.5)      # (B, Tq, T)
             att = torch.softmax(scores, dim=-1) @ v
+        elif qkv is not None:
+            # non-final fp16 block: fused attention straight off the
+            # packed projection; the backward writes dq|dk|dv as ONE
+            # packed gradient (no split-backward cat copy, 2026-09-26) —
+            # bitwise identical to the F.sdpa call below
+            # (fp16_linear.packed_sdpa)
+            att = _fl.packed_sdpa(qkv, attn_bias.unsqueeze(1),
+                                  self.n_heads)
+            att = att.transpose(1, 2).reshape(B, Tq, self.d)
+            att = _lin(self.out_proj, att)
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
@@ -691,14 +701,25 @@ class NotePolicy(nn.Module):
         """SimBa readout trunk: (B, n_lead*embed) -> (B, trunk_dim)
         feature h. proj -> LN1 -> fc1 -> ReLU -> fc2 -> residual add + LN2, with
         the add+LN2 taken through FusedLayerNorm.forward_add (one fused
-        pass on the CUDA path when the kernel is eligible — its row
-        width must be <= 256, so at trunk_dim 384 both LNs run the
-        stock fp32-stats fallback; the residual sum is then a plain
-        add). Same helpers as the blocks, so the fp16 stream (fp16
+        pass on the CUDA path; since 2026-09-26 the fp16 kernels take
+        rows up to 384 wide, so at trunk_dim 384 both LNs run the fused
+        kernel on the fp16 stream — the fp32 record path keeps the stock
+        fallback above 256). Same helpers as the blocks, so the fp16 stream (fp16
         activations, fp32 LN stats/affine) is honoured end to end."""
         x = _lin(self.trunk_proj, x)
-        d = _lin(self.trunk_fc2, F.relu(_lin(self.trunk_fc1,
-                                              self.trunk_ln1(x))))
+        # fc1 + ReLU: on the fp16 stream fp16_linear_relu (cublasLt
+        # RELU_BIAS epilogue forward, fused relu_bwd backward —
+        # 2026-09-26; it was F.relu(_lin(...)), i.e. a separate ReLU
+        # pass + threshold_backward + a gm.sum(0) bias grad; fp16
+        # last-rounding class, like every other Linear+ReLU site).
+        # fp32 / no extension: _lin then F.relu, bitwise as before.
+        u = self.trunk_ln1(x)
+        if u.dtype is torch.float16 and _fl.ext_ok():
+            r = fp16_linear_relu(u, self.trunk_fc1.weight,
+                                 self.trunk_fc1.bias)
+        else:
+            r = F.relu(_lin(self.trunk_fc1, u))
+        d = _lin(self.trunk_fc2, r)
         _, h = self.trunk_ln2.forward_add(x, d)
         return h
 

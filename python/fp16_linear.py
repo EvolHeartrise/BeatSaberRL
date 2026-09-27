@@ -29,7 +29,9 @@ _ext_failed = False
 # relu_bwd widths (the 138k-era 64/128 plus 256/512 since the audit's
 # Tier 1.2, 2026-08-15): db comes from the kernel's fixed-order partials
 # at these widths and from a torch gm.sum(0) elsewhere.
-_RELU_BWD_DIMS = (64, 128, 256, 512)
+# 192/384/768 added 2026-09-26 (the 192/384/768 recipe's encoder,
+# SimBa-trunk/critic and ffn-hidden widths, 384-thread blocks).
+_RELU_BWD_DIMS = (64, 128, 256, 512, 192, 384, 768)
 
 # cuBLASLt fused bias+ReLU epilogue for the Linear+ReLU sites (09-02
 # static audit A §5 / Tier 2.5, measured 2026-09-03). The forward runs
@@ -108,7 +110,8 @@ def _load():
             bdir = os.path.join(src, "build_fp16")
             os.makedirs(bdir, exist_ok=True)
             srcs = [os.path.join(src, "fp16_gemm.cu")]
-            cublas = "cublas.lib" if os.name == "nt" else "-lcublas"
+            cublas = ["cublas.lib", "cublasLt.lib"] if os.name == "nt" \
+                else ["-lcublas", "-lcublasLt"]
 
             def _full():
                 from beat_arena_env.cuda_env import _toolchain_env
@@ -118,10 +121,10 @@ def _load():
                 return load(name="fp16_gemm", sources=srcs,
                             build_directory=bdir,
                             extra_cuda_cflags=cuda_flags(),
-                            extra_ldflags=[cublas], verbose=True)
+                            extra_ldflags=cublas, verbose=True)
 
             _ext = fast_load("fp16_gemm", srcs, bdir,
-                             cuda_flags() + [cublas], _full)
+                             cuda_flags() + cublas, _full)
         except Exception as e:
             _ext_failed = True
             print(f"[fp16-gemm] unavailable, torch fallback: {e}",
@@ -339,6 +342,37 @@ def packed_halves(ms):
     return c[1], c[2]
 
 
+# Row count from which a Linear's (dW, db) pair runs as ONE cuBLASLt
+# GEMM with the BGRADB epilogue (csrc/fp16_gemm.cu wgrad_bgrad) instead
+# of GemmEx wgrad + a separate torch column sum over dy (2026-09-26).
+# Measured on the RTX 5090 at the token-level sites (R = B x 24..29
+# rows): 436 -> 247 us (192x192), 907 -> 692 (qkv 576x192), 592 -> 427
+# (critic k|v); at R = 16384 (trunk/critic/heads) it is a wash or much
+# worse (the 145-row head GEMM: 99 -> 869 us), hence the gate. Numerics:
+# dW near-tie (fp32 accumulation order, <= 4e-5 rel to max), db near-tie
+# and closer to an fp64 reference than the torch sum.
+_LT_BGRAD_MIN_ROWS = 65536
+
+
+def _wgrad_db(g2, x2, need_w, need_b):
+    """(dW, db) fp32 for dy = g2 (R, M), x = x2 (R, K); each None when
+    not needed."""
+    ext = _load()
+    if (need_w and need_b and ext is not None
+            and g2.shape[0] >= _LT_BGRAD_MIN_ROWS
+            and hasattr(ext, "wgrad_bgrad")):
+        r = ext.wgrad_bgrad(g2, x2)
+        if r:
+            return r[0], r[1]
+    dw = db = None
+    if need_w:
+        dw = (ext.wgrad(g2, x2) if ext is not None             # fp32 out
+              else g2.float().t() @ x2.float())
+    if need_b:
+        db = g2.sum(0, dtype=torch.float32)
+    return dw, db
+
+
 class _Fp16PackedLinear(torch.autograd.Function):
     """One addmm over a group's concatenated fp16 replicas; the backward
     computes the CONCATENATED dW/db (one wgrad + one sum instead of one
@@ -368,16 +402,14 @@ class _Fp16PackedLinear(torch.autograd.Function):
         n = len(splits)
         dws = [None] * n
         dbs = [None] * n
-        if any(ctx.needs_input_grad[4:4 + n]):
-            ext = _load()
-            dwcat = (ext.wgrad(g2, x2) if ext is not None
-                     else g2.float().t() @ x2.float())
+        dwcat, dbcat = _wgrad_db(g2, x2, any(ctx.needs_input_grad[4:4 + n]),
+                                 any(ctx.needs_input_grad[4 + n:]))
+        if dwcat is not None:
             o = 0
             for i, r in enumerate(splits):
                 dws[i] = dwcat[o:o + r]
                 o += r
-        if any(ctx.needs_input_grad[4 + n:]):
-            dbcat = g2.sum(0, dtype=torch.float32)
+        if dbcat is not None:
             o = 0
             for i, r in enumerate(splits):
                 dbs[i] = dbcat[o:o + r]
@@ -424,14 +456,8 @@ class _Fp16Linear(torch.autograd.Function):
         dx = dw = db = None
         if ctx.needs_input_grad[0]:
             dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
-        if ctx.needs_input_grad[1]:
-            ext = _load()
-            if ext is not None:
-                dw = ext.wgrad(g2, x2)                    # fp32 out
-            else:
-                dw = g2.float().t() @ x2.float()
-        if ctx.needs_input_grad[2]:
-            db = g2.sum(0, dtype=torch.float32)
+        dw, db = _wgrad_db(g2, x2, ctx.needs_input_grad[1],
+                           ctx.needs_input_grad[2])
         return dx, dw, db
 
 
@@ -542,3 +568,107 @@ def fp16_linear(x, w, b):
         x2 = x.reshape(-1, x.shape[-1])
         return torch.addmm(bh, x2, wh.t()).view(*x.shape[:-1], w.shape[0])
     return _Fp16Linear.apply(x, w, b)
+
+
+# --- packed-gradient fused attention (2026-09-26) -------------------------
+# The non-final blocks' q/k/v come out of ONE packed GEMM (qkv = x @
+# [wq wk wv]^T, split into three views). Under F.scaled_dot_product_
+# attention the mem-efficient backward writes dq, dk, dv into three
+# separate buffers and autograd routes them through split's backward —
+# a torch.cat that copies the whole (B*T, 3d) fp16 gradient per block
+# (~5 ms per production minibatch across the 5 blocks). The aten
+# kernel can write them straight into ONE (B, T, 3, H, dh) chunk — i.e.
+# exactly qkv's [dq | dk | dv] row layout — via _efficient_attention_
+# backward(shared_storage_dqdkdv=True); the SDPA-level backward just
+# never asks for it. This Function runs the same forward op F.sdpa
+# dispatches to and the same backward kernel with that flag, and hands
+# the chunk back as qkv's gradient (a data_ptr/stride check proves it is
+# the chunk; anything else falls back to the cat). Same kernels, same
+# arithmetic: bitwise identical to the F.sdpa path (tests/
+# test_packed_sdpa.py). Only the 3-way self-attention case qualifies
+# (the flag needs Tq == T), so the final block's / the critic's packed
+# k|v keep F.sdpa.
+
+
+def _sdpa_bias(attn_bias, B, H, Tq, T):
+    """Mirror aten's preprocess_mask for the mem-efficient backend:
+    re-pad a mask whose non-last strides are not multiples of 8 (then
+    slice back), and expand to (B, H, Tq, T). Values are untouched."""
+    m = attn_bias
+    if not (m.stride(-1) == 1
+            and all(m.stride(i) % 8 == 0 for i in range(m.dim() - 1))):
+        n = m.shape[-1]
+        m = F.pad(m, (0, 8 - n % 8))[..., :n]
+    return m.expand(B, H, Tq, T)
+
+
+def _qkv_views(qkv, H):
+    """(B, H, T, dh) q/k/v views of the packed (B, T, 3d) projection,
+    laid out exactly as the block's split + view + transpose."""
+    B, T, W = qkv.shape
+    d = W // 3
+    return tuple(t.view(B, T, H, d // H).transpose(1, 2)
+                 for t in qkv.split(d, dim=-1))
+
+
+def _as_packed(gs, src):
+    """The (B, T, 3d) packed gradient whose [.., i*d:(i+1)*d] slices ARE
+    the (B, T, H, dh) grads gs[i] (the backward's chunk), or None."""
+    g0 = gs[0]
+    B, T, H, dh = g0.shape
+    d = H * dh
+    W = d * len(gs)
+    if tuple(src.shape) != (B, T, W):
+        return None
+    esz = g0.element_size()
+    for i, g in enumerate(gs):
+        if (g.stride() != (T * W, W, dh, 1)
+                or g.data_ptr() != g0.data_ptr() + i * d * esz):
+            return None
+    return g0.as_strided((B, T, W), (T * W, W, 1))
+
+
+class _PackedSdpa(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv, attn_bias, n_heads):
+        q, k, v = _qkv_views(qkv, n_heads)
+        B, H, T, _ = q.shape
+        bias = _sdpa_bias(attn_bias, B, H, T, T)
+        out, lse, seed, off = \
+            torch.ops.aten._scaled_dot_product_efficient_attention(
+                q, k, v, bias, True, 0.0, False)
+        ctx.save_for_backward(qkv, bias, out, lse, seed, off)
+        ctx.n_heads = n_heads
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        qkv, bias, out, lse, seed, off = ctx.saved_tensors
+        q, k, v = _qkv_views(qkv, ctx.n_heads)
+        T = q.shape[2]
+        t = lambda x: x.transpose(1, 2)
+        # exactly the SDPA-level backward's call (attention_backward.cu,
+        # _scaled_dot_product_efficient_attention_backward_cuda), plus
+        # the shared-storage flag
+        gq, gk, gv, _ = torch.ops.aten._efficient_attention_backward(
+            t(gout), t(q), t(k), t(v), bias, t(out), None, None, T, T,
+            lse, 0.0, seed, off, 0, False, shared_storage_dqdkdv=True)
+        g = _as_packed([gq, gk, gv], qkv)
+        if g is None:
+            B, _, H, dh = gq.shape
+            g = torch.cat([x.reshape(B, T, H * dh) for x in (gq, gk, gv)],
+                          dim=-1)
+        return g, None, None
+
+
+def packed_sdpa(qkv, attn_bias, n_heads):
+    """Fused self-attention over a packed (B, T, 3d) q|k|v projection ->
+    (B, H, T, dh): the same tensor F.scaled_dot_product_attention(q, k,
+    v, attn_mask=attn_bias) returns for qkv's split/view/transpose
+    views, with the gradient delivered as ONE packed (B, T, 3d) tensor.
+    attn_bias: (B, 1, 1, T) additive mask, no grad. fp16 CUDA only;
+    grad-free calls take F.sdpa itself (same forward kernel)."""
+    if not torch.is_grad_enabled():
+        q, k, v = _qkv_views(qkv, n_heads)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+    return _PackedSdpa.apply(qkv, attn_bias, n_heads)
