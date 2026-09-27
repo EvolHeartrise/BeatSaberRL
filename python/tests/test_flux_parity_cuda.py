@@ -355,11 +355,13 @@ def test_flux_parity_f32_bounded():
     rng = np.random.default_rng(4)
     r_rew = np.zeros(4)
     c_rew = np.zeros(4)
-    # each side's return summed up to ITS done (the bodies fall under
-    # random gears on ground contact, and a finished auto_reset=False
-    # CUDA env keeps re-reporting its terminal reward — see the standard
-    # f32 tier); the lane ceiling compares live ticks only
+    # the bodies fall under random gears on ground contact and each
+    # engine ends its episode on its own tick; both then LATCH (reward 0,
+    # done held, obs frozen — lib.rs B4 / the kernel's finished-episode
+    # early-out), so returns sum over all ticks and the lane ceiling
+    # compares live ticks only
     c_done = [False] * 4
+    frozen = {}
     r_done = [False] * 4
     for t in range(60):
         acts = rng.integers(0, GEARS, size=(4, N_JOINTS))
@@ -371,11 +373,18 @@ def test_flux_parity_f32_bounded():
             if not (c_done[e] or r_done[e]):
                 d = np.abs(tobs[e].cpu().numpy() - np.asarray(o_r))
                 assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
-            if not r_done[e]:
-                r_rew[e] += r_r
-            if not c_done[e]:
-                c_rew[e] += float(trew[e])
+            if r_done[e]:
+                assert d_r and r_r == 0.0, f"t{t} env{e} Rust latch"
+            if c_done[e]:
+                assert bool(tdone[e]) and float(trew[e]) == 0.0, \
+                    f"t{t} env{e} CUDA finished-episode latch"
+                assert torch.equal(tobs[e], frozen[e]), \
+                    f"t{t} env{e} CUDA obs moved after done"
+            r_rew[e] += r_r
+            c_rew[e] += float(trew[e])
             r_done[e] |= d_r
+            if bool(tdone[e]) and not c_done[e]:
+                frozen[e] = tobs[e].clone()
             c_done[e] |= bool(tdone[e])
     np.testing.assert_allclose(c_rew, r_rew, atol=3.0)
     for e, s in enumerate(sims):

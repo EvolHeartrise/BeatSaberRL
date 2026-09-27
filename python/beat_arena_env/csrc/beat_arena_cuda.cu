@@ -5512,10 +5512,19 @@ step_kernel(Sim<T> P) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   if (gid >= P.N) return;
   const int e = P.env_order[gid];
-  // bench combo walk mode: a finished level stays finished (lib.rs
-  // VecBeatSim latches `finished` and early-outs; without this a
-  // fallen body would keep collecting misses after its terminal tick)
-  if (P.mode == 0 && P.combo_walk && !P.ep_stats && P.done[e]) {
+  // A finished episode stays finished — MIRROR of lib.rs's B4
+  // `finished` latch (step_inner early-out): reward exactly 0, done
+  // stays true, no physics, no event scan, no telemetry, obs row and
+  // tick frozen. Applies whenever nothing re-arms the slot in-kernel:
+  // auto_reset=False (a latched done is only cleared by reset(), the
+  // chart-install funnel), and the bench combo walk (without it a fallen
+  // body would keep collecting misses after its terminal tick). Under
+  // auto_reset a done flag means the slot was ALREADY reset on its
+  // terminal tick, so it must step. Before 2026-09-27 the auto_reset=
+  // False case kept stepping the finished body and re-reported its
+  // terminal reward (fall_const again) every tick.
+  if (P.mode == 0 && P.done[e]
+      && (!P.auto_reset || (P.combo_walk && !P.ep_stats))) {
     P.reward[e] = T(0);
     return;
   }

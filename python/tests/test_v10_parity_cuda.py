@@ -410,10 +410,11 @@ def test_parity_f32_bounded():
     t_rews = np.zeros(4)
     # 2026-09-27 (weld harness removed): random gears now tip each body
     # over (ground contact) and each engine ends its episode on its own
-    # tick; a finished auto_reset=False CUDA env keeps re-reporting its
-    # terminal reward, so each side's return is summed up to ITS done and
-    # the lane ceiling compares live ticks only
+    # tick; both then LATCH (reward 0, done held, obs frozen — lib.rs B4 /
+    # the kernel's finished-episode early-out), so returns sum over all
+    # ticks and the lane ceiling compares live ticks only
     t_done = [False] * 4
+    frozen = {}
     r_done = [False] * 4
     for t in range(40):
         acts = rng.integers(0, 5, size=(4, N_JOINTS))
@@ -441,11 +442,18 @@ def test_parity_f32_bounded():
             if not (t_done[e] or r_done[e]):
                 d = np.abs(tobs[e].cpu().numpy() - np.asarray(obs_r))
                 assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
-            if not r_done[e]:
-                r_rews[e] += rew_r
-            if not t_done[e]:
-                t_rews[e] += float(trew[e])
+            if r_done[e]:
+                assert d_r and rew_r == 0.0, f"t{t} env{e} Rust latch"
+            if t_done[e]:
+                assert bool(tdone[e]) and float(trew[e]) == 0.0, \
+                    f"t{t} env{e} CUDA finished-episode latch"
+                assert torch.equal(tobs[e], frozen[e]), \
+                    f"t{t} env{e} CUDA obs moved after done"
+            r_rews[e] += rew_r
+            t_rews[e] += float(trew[e])
             r_done[e] |= d_r
+            if bool(tdone[e]) and not t_done[e]:
+                frozen[e] = tobs[e].clone()
             t_done[e] |= bool(tdone[e])
     np.testing.assert_allclose(t_rews, r_rews, atol=3.0)
     for e, sim in enumerate(sims):
