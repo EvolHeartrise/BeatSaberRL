@@ -1208,3 +1208,28 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        and the ‖Δp‖ ≤ N_SUB·h·ROOT_V_MAX bound all pinned exactly, the
        state to the single-tick f64 band. The retired torch mirror
        additionally pinned the escape tick BITWISE until 2026-08-03).
+24. **Ground rows solved through each foot's 6-D spatial Jacobian
+    (2026-09-26, audit #9) — a REFORMULATION, not a physics change.**
+    In contact mode (`foot_mode` = 1) a sole-corner row is
+    `e_a·(v_o + ω × r) = [e_a; r × e_a]·(J_f v)` with `r = p_corner −
+    p_foot` and `J_f` the foot's six spatial rows (3 linear at the foot
+    origin + 3 world angular — the weld rows of that foot). Both engines
+    now solve `G_f = M⁻¹J_fᵀ` once per contacting foot (≤ 12 columns,
+    was up to 24 corner columns; CUDA solves both feet in one 12-RHS
+    batch whenever any corner is down), form `Φ_f = J_f G_f`, per row
+    `u = Φ_f c`, `diag = c·u`, and run the ground PGS per foot on
+    `V = J_f v`: each active corner's rows in the §3 order with residual
+    `c·V`, the unchanged per-row clamps (λ_n ≥ 0, then the box against
+    this sweep's λ_n), `Λ += c·Δλ`, `V += u·Δλ` on a non-zero step, and
+    `v += G_f Λ` once at the end of the foot. In exact arithmetic every
+    row sees the residual and `v` leaves the foot with the value of the
+    per-row form, so the constraint set, row order, Gauss-Seidel
+    semantics, clamps, Baumgarte terms and iteration count are
+    unchanged; only rounding moves. Gate:
+    `tests_ground::ground_6d_matches_rowwise_per_substep` runs the old
+    per-row solve (`ground_rowwise_ref` test hook) against the new one on
+    the same FK/factor/v* every contact substep (worst |Δv|/max(|v|,1)
+    5.5e-13 f64); trajectories diverge afterwards only by chaotic
+    amplification of that rounding (the step-11 clamps are
+    discontinuous), exactly as a 1-ulp input nudge of the old build does.
+    Weld mode is untouched. CUDA: flux bench −18.6 % ms/tick.

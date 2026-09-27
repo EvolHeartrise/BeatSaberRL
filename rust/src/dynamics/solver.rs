@@ -172,6 +172,43 @@ const GROUND_DIRS: [[Real; 3]; GROUND_ROWS_PER_CORNER] = [
     /* T2 */ [0.0, 0.0, 1.0],
 ];
 
+// ── audit #9 (2026-09-26): GROUND ROWS FROM EACH FOOT'S 6-D SPATIAL
+//    JACOBIAN. A corner row is `point_jacobian_acc(foot, p_c, e_a)`,
+//    i.e. the world velocity of the corner point projected on e_a:
+//        j·v = e_a·(v_o + ω × r) = e_a·v_o + (r × e_a)·ω,  r = p_c − p_f,
+//    an EXACT linear combination c = [e_a; r × e_a] of the foot's six
+//    spatial rows J_f (3 linear rows at the foot origin p_f, then 3 world
+//    angular rows — the weld rows of that foot, verbatim). So instead of
+//    M⁻¹Jᵀ for up to 24 corner rows the solve takes M⁻¹J_fᵀ once per
+//    CONTACTING foot (6 columns each, ≤ 12), and every row quantity comes
+//    from the 6-D foot objects:
+//      · Φ_f = J_f M⁻¹ J_fᵀ (6×6; entry (r, c ≥ r) = J_f[c]·G_f[r], the
+//        A_ww contraction, mirrored to the other triangle);
+//      · u = Φ_f c (row's 6-D mobility image), diag = c·u;
+//      · PGS per foot per sweep: V = J_f v (6 support dots), then each
+//        active corner's rows in the §3 order with residual c·V, the
+//        SAME per-row clamps (λ_n ≥ 0 then the box against this sweep's
+//        λ_n), and on a non-zero Δλ: Λ += c·Δλ, V += u·Δλ; finally
+//        v += G_f Λ (6 axpys) before the next foot / the pair rows.
+//    Exact arithmetic: J_f(v + G_f Λ) = V + Φ_f Λ, so every row sees the
+//    residual the per-row form produced, and v leaves the foot block with
+//    the per-row form's value — ROW-BY-ROW GAUSS-SEIDEL, ORDER, CLAMPS
+//    AND ITERATION COUNT ARE UNCHANGED; only rounding moves (SPEC-v10
+//    Divergences §24). The CUDA kernel mirrors this term for term.
+/// Per ground row t (normal ŷ, friction x̂, friction ẑ): its linear axis
+/// a and the two angular indices b1 < b2 where r × e_a is non-zero —
+///   r × e_1 = (−r2, 0,  r0)   r × e_0 = (0,  r2, −r1)
+///   r × e_2 = ( r1, −r0, 0)
+/// (the coefficient values are set in `assemble_ground_rows`).
+const GROUND_SPATIAL: [(usize, usize, usize); GROUND_ROWS_PER_CORNER] =
+    [(1, 0, 2), (0, 1, 2), (2, 0, 1)];
+/// Spatial rows per foot (3 linear + 3 angular).
+const FOOT_ROWS: usize = 6;
+/// audit #9: the dense per-corner ground rows have no reader left in the
+/// shipping build (every consumer is 6-D) — assembled for `cargo test` /
+/// debug introspection only (the `LIMIT_J_ROWS` idiom).
+const GROUND_J_ROWS: bool = cfg!(any(test, debug_assertions));
+
 /// item 3 (2026-09-16): widths of the RHS-MINOR batched solves for the
 /// dense non-weld rows (ground + pair normals) and the limit columns;
 /// 0 = off (the pre-item-3 row-major `chol_solve_x4` / `chol_fwd_unit`
@@ -537,6 +574,13 @@ pub struct ConstraintSet {
     /// shipping build has no reader for them.
     #[cfg(test)]
     pub poison_limit_j: bool,
+    /// TEST HOOK (audit #9): run the ground block in the PRE-audit-#9
+    /// per-row form — M⁻¹jᵀ solved for every dense corner row, diag
+    /// = j·M⁻¹jᵀ, and the PGS residual / impulse through those nv-wide
+    /// rows — so a test can hold the 6-D form against the formulation
+    /// it replaced, substep by substep.
+    #[cfg(test)]
+    pub ground_rowwise_ref: bool,
     nv: usize,
     j: Vec<Real>,      // MAX_ROWS × nv dense Jacobian rows
     minvjt: Vec<Real>, // MAX_ROWS × nv  M⁻¹Jᵀ columns
@@ -586,6 +630,18 @@ pub struct ConstraintSet {
     /// its own ascending-i chain (so the vectorization is legal under
     /// strict IEEE, unlike vectorizing a single dot's reduction).
     jwt: Vec<Real>,
+    /// audit #9: foot f's six spatial Jacobian rows (3 linear at the
+    /// foot origin, 3 world angular), dense nv-wide, at rows 6f..6f+6.
+    /// Assembled only for a foot with an active corner.
+    gfoot_j: Vec<Real>,
+    /// audit #9: `M⁻¹ J_fᵀ`, row-major like `minvjt` (same slots).
+    gfoot_minv: Vec<Real>,
+    /// audit #9, per ground row g (corner-packed, 3 per active corner):
+    /// the two non-zero angular coefficients of c = [e_a; r × e_a]
+    /// (at angular indices `GROUND_SPATIAL[t].1/.2`) ...
+    gcoef: [[Real; 2]; N_GROUND_ROWS],
+    /// ... and u = Φ_f c, the row's image in foot-velocity space.
+    gu: [[Real; FOOT_ROWS]; N_GROUND_ROWS],
 }
 
 /// A composite (weld-consistent) direction with mobility below this
@@ -647,6 +703,8 @@ impl ConstraintSet {
             jv_pre: vec![0.0; MAX_ROWS],
             #[cfg(test)]
             poison_limit_j: false,
+            #[cfg(test)]
+            ground_rowwise_ref: false,
             nv,
             j: vec![0.0; MAX_ROWS * nv],
             minvjt: vec![0.0; MAX_ROWS * nv],
@@ -661,6 +719,10 @@ impl ConstraintSet {
             limpos: vec![-1; model.nq],
             wt: vec![0.0; WT_ROWS * nv],
             jwt: vec![0.0; N_WELD_ROWS * nv],
+            gfoot_j: vec![0.0; 2 * FOOT_ROWS * nv],
+            gfoot_minv: vec![0.0; 2 * FOOT_ROWS * nv],
+            gcoef: [[0.0; 2]; N_GROUND_ROWS],
+            gu: [[0.0; FOOT_ROWS]; N_GROUND_ROWS],
         }
     }
 
@@ -737,49 +799,6 @@ impl ConstraintSet {
     ) {
         let dl = (bias[row] - jv) / diag[row];
         let newl = (lambda[row] + dl).max(0.0); // λ ≥ 0
-        let d = newl - lambda[row];
-        lambda[row] = newl;
-        if d != 0.0 {
-            let mr = &minvjt[row * nv..(row + 1) * nv];
-            for i in 0..nv {
-                v[i] += mr[i] * d;
-            }
-        }
-    }
-
-    /// MIRROR: one projected-Gauss-Seidel row update with a SYMMETRIC
-    /// BOX projection |λ| ≤ `bound` instead of the unilateral λ ≥ 0 —
-    /// the ground friction rows (contact spec §3). `bound` is
-    /// `MU · λ_n` of the SAME corner, read after that corner's normal
-    /// row has already been updated THIS sweep (Gauss-Seidel coupling),
-    /// so it is re-imposed on every one of the PGS_ITERS iterations.
-    ///
-    /// Everything except the projection is `pgs_row_update` verbatim,
-    /// including the `d != 0.0` propagation guard, so the two rows
-    /// classes share one impulse-propagation shape.
-    ///
-    /// `.min(bound).max(-bound)` mirrors the unilateral row's
-    /// `.max(0.0)` idiom: Rust's `f64::min`/`max` return the OTHER
-    /// operand when one side is NaN, so an artifact λ collapses onto the
-    /// bound exactly as the λ ≥ 0 row collapses to 0. At `bound == 0.0`
-    /// a negative candidate lands on `−0.0` (the negation of +0.0), and
-    /// `d != 0.0` is then false for a λ that was already zero — no
-    /// impulse, deterministic.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn pgs_row_update_box(
-        row: usize,
-        nv: usize,
-        jv: Real,
-        bound: Real,
-        bias: &[Real],
-        diag: &[Real],
-        lambda: &mut [Real],
-        minvjt: &[Real],
-        v: &mut [Real],
-    ) {
-        let dl = (bias[row] - jv) / diag[row];
-        let newl = (lambda[row] + dl).min(bound).max(-bound); // |λ_t| ≤ MU·λ_n
         let d = newl - lambda[row];
         lambda[row] = newl;
         if d != 0.0 {
@@ -965,6 +984,13 @@ impl ConstraintSet {
     /// The rows land where the weld rows used to (the caller passes
     /// `nrows` = 0 in contact mode), i.e. BEFORE the self-collision
     /// normals — so the §2 pair-id row order downstream is untouched.
+    ///
+    /// audit #9: what is assembled per row is its 6-D foot coefficient
+    /// (`gcoef`, see `GROUND_SPATIAL`) plus its RHS; the Jacobian object
+    /// is each CONTACTING foot's six spatial rows (`gfoot_j` — the weld
+    /// rows of that foot, same `point_jacobian_acc` / `angular_jacobian_acc`
+    /// calls). The dense corner rows are introspection-only
+    /// (`GROUND_J_ROWS`).
     fn assemble_ground_rows(
         &mut self,
         model: &Model,
@@ -973,15 +999,47 @@ impl ConstraintSet {
         mut nrows: usize,
     ) -> usize {
         let nv = self.nv;
-        for gi in 0..self.ground_contacts.len() {
-            let gc = self.ground_contacts[gi];
-            for t in 0..GROUND_ROWS_PER_CORNER {
-                let row = nrows + t;
-                let jr = &mut self.j[row * nv..(row + 1) * nv];
-                jr.fill(0.0);
-                // static ground: only the corner's own chain contributes
-                point_jacobian_acc(model, ws, gc.frame, gc.point, GROUND_DIRS[t], 1.0, jr);
+        let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
+        for f in 0..2 {
+            let active = if f == 0 { nl > 0 } else { n > nl };
+            if !active {
+                continue;
             }
+            let frame = GROUND_FRAMES[f];
+            let pf = ws.p[frame];
+            for t in 0..3 {
+                let r = FOOT_ROWS * f + t;
+                let jr = &mut self.gfoot_j[r * nv..(r + 1) * nv];
+                jr.fill(0.0);
+                let mut e = [0.0; 3];
+                e[t] = 1.0;
+                point_jacobian_acc(model, ws, frame, pf, e, 1.0, jr);
+            }
+            for t in 0..3 {
+                let r = FOOT_ROWS * f + 3 + t;
+                let jr = &mut self.gfoot_j[r * nv..(r + 1) * nv];
+                jr.fill(0.0);
+                angular_jacobian_acc(model, ws, frame, t, 1.0, jr);
+            }
+        }
+        for gi in 0..n {
+            let gc = self.ground_contacts[gi];
+            if GROUND_J_ROWS {
+                for t in 0..GROUND_ROWS_PER_CORNER {
+                    let row = nrows + t;
+                    let jr = &mut self.j[row * nv..(row + 1) * nv];
+                    jr.fill(0.0);
+                    // static ground: only the corner's own chain contributes
+                    point_jacobian_acc(model, ws, gc.frame, gc.point, GROUND_DIRS[t], 1.0, jr);
+                }
+            }
+            // lever from the foot origin; the angular coefficients of
+            // c = [e_a; r × e_a] in `GROUND_SPATIAL` order
+            let r = sub3(gc.point, ws.p[gc.frame]);
+            let g = gi * GROUND_ROWS_PER_CORNER;
+            self.gcoef[g] = [-r[2], r[0]]; // normal ŷ: ω_x, ω_z
+            self.gcoef[g + 1] = [r[2], -r[1]]; // friction x̂: ω_y, ω_z
+            self.gcoef[g + 2] = [r[1], -r[0]]; // friction ẑ: ω_x, ω_y
             // NORMAL row rhs: the §3-step-8 contact pipeline verbatim —
             // speculative approach limit while the gap is open, Baumgarte
             // push-out beyond SLOP once penetrating (contact spec §3:
@@ -1000,6 +1058,73 @@ impl ConstraintSet {
         nrows
     }
 
+    /// audit #9: M⁻¹J_fᵀ for every contacting foot (one RHS-MINOR batch:
+    /// 12 columns with both feet down, 6 with one — the columns are
+    /// independent and the batch is bitwise the per-column solve, item 3's
+    /// argument), then per foot Φ_f and every active row's u / diag.
+    fn prep_ground_rows(&mut self, ws: &Workspace, nweld: usize) {
+        let nv = self.nv;
+        let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
+        let (a0, a1) = (nl > 0, n > nl);
+        if a0 && a1 {
+            Self::solve_t_rows::<{ 2 * FOOT_ROWS }>(
+                nv, &ws.m, &self.gfoot_j, &mut self.gfoot_minv, 0, &mut self.wt,
+            );
+        } else if a0 || a1 {
+            let r0 = if a0 { 0 } else { FOOT_ROWS };
+            Self::solve_t_rows::<FOOT_ROWS>(
+                nv, &ws.m, &self.gfoot_j, &mut self.gfoot_minv, r0, &mut self.wt,
+            );
+        }
+        if a0 {
+            self.prep_ground_foot::<W_L_LO, W_L_HI>(0, nweld, 0, nl);
+        }
+        if a1 {
+            self.prep_ground_foot::<W_R_LO, W_R_HI>(1, nweld, nl, n);
+        }
+    }
+
+    /// `prep_ground_rows` for foot `f` (chain columns LO..HI), whose
+    /// active corners are `g0..g1`.
+    ///   Φ[r][c] = Φ[c][r] = Σᵢ J_f[c][i]·G_f[r][i]  (c ≥ r; support dot,
+    ///                                               ascending i)
+    ///   u[i]    = (Φ[i][a] + c1·Φ[i][3+b1]) + c2·Φ[i][3+b2]
+    ///   diag    = (u[a] + c1·u[3+b1]) + c2·u[3+b2]
+    #[inline(always)]
+    fn prep_ground_foot<const LO: usize, const HI: usize>(
+        &mut self,
+        f: usize,
+        nweld: usize,
+        g0: usize,
+        g1: usize,
+    ) {
+        let nv = self.nv;
+        let mut phi = [[0.0 as Real; FOOT_ROWS]; FOOT_ROWS];
+        for r in 0..FOOT_ROWS {
+            let rr = FOOT_ROWS * f + r;
+            let mr = &self.gfoot_minv[rr * nv..(rr + 1) * nv];
+            for c in r..FOOT_ROWS {
+                let cc = FOOT_ROWS * f + c;
+                let jr = &self.gfoot_j[cc * nv..(cc + 1) * nv];
+                let s = ground_support_dot::<LO, HI>(jr, mr);
+                phi[r][c] = s;
+                phi[c][r] = s;
+            }
+        }
+        for g in g0 * GROUND_ROWS_PER_CORNER..g1 * GROUND_ROWS_PER_CORNER {
+            let (a, b1, b2) = GROUND_SPATIAL[g % GROUND_ROWS_PER_CORNER];
+            let [c1, c2] = self.gcoef[g];
+            let mut u = [0.0 as Real; FOOT_ROWS];
+            for i in 0..FOOT_ROWS {
+                u[i] = phi[i][a] + c1 * phi[i][3 + b1] + c2 * phi[i][3 + b2];
+            }
+            let d = u[a] + c1 * u[3 + b1] + c2 * u[3 + b2];
+            debug_assert!(d > 0.0, "ground row {g} has zero effective mass");
+            self.gu[g] = u;
+            self.diag[nweld + g] = d;
+        }
+    }
+
     /// MIRROR: one PGS sweep over the ground block, corner order. Per
     /// corner: the unilateral normal row first (λ_n ≥ 0, the §2 contact
     /// path verbatim), then its two friction rows box-clamped against
@@ -1015,75 +1140,181 @@ impl ConstraintSet {
         // corners in the same order, each loop with its foot's
         // compile-time support segment
         let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
-        self.pgs_ground_sweep_foot::<W_L_LO, W_L_HI>(nweld, 0, nl, v);
-        self.pgs_ground_sweep_foot::<W_R_LO, W_R_HI>(nweld, nl, n, v);
+        if nl > 0 {
+            self.pgs_ground_sweep_foot::<W_L_LO, W_L_HI>(0, nweld, 0, nl, v);
+        }
+        if n > nl {
+            self.pgs_ground_sweep_foot::<W_R_LO, W_R_HI>(1, nweld, nl, n, v);
+        }
     }
 
-    /// `pgs_ground_sweep` over active corners `g0..g1`, all on the foot
-    /// whose chain columns are `LO..HI` (item 2 support dots).
+    /// `pgs_ground_sweep` over active corners `g0..g1` (≥ 1), all on foot
+    /// `f` whose chain columns are `LO..HI` — audit #9's 6-D form of the
+    /// per-row sweep (see `GROUND_SPATIAL`): V = J_f v once, each row's
+    /// residual c·V and its `pgs_row_update(_box)` λ step verbatim, the
+    /// impulse carried as Λ += c·Δλ / V += u·Δλ, then v += G_f Λ once.
     #[inline(always)]
     fn pgs_ground_sweep_foot<const LO: usize, const HI: usize>(
         &mut self,
+        f: usize,
         nweld: usize,
         g0: usize,
         g1: usize,
         v: &mut [Real],
     ) {
         let nv = self.nv;
+        let mut vf = [0.0 as Real; FOOT_ROWS];
+        for a in 0..FOOT_ROWS {
+            let r = FOOT_ROWS * f + a;
+            vf[a] = ground_support_dot::<LO, HI>(&self.gfoot_j[r * nv..(r + 1) * nv], v);
+        }
+        let mut lf = [0.0 as Real; FOOT_ROWS];
+        let mut any = false;
         for gi in g0..g1 {
             let nrow = nweld + gi * GROUND_ROWS_PER_CORNER;
-            let jv = ground_support_dot::<LO, HI>(&self.j[nrow * nv..(nrow + 1) * nv], v);
-            Self::pgs_row_update(
-                nrow,
-                nv,
-                jv,
-                &self.bias,
-                &self.diag,
-                &mut self.lambda,
-                &self.minvjt,
-                v,
-            );
-            // the friction cone is read AFTER the normal update, so a
-            // corner that just lost its normal impulse loses its
-            // friction in the same sweep
-            let bound = MU * self.lambda[nrow];
-            for t in 1..GROUND_ROWS_PER_CORNER {
+            let mut bound = 0.0;
+            for t in 0..GROUND_ROWS_PER_CORNER {
                 let row = nrow + t;
-                let jv = ground_support_dot::<LO, HI>(&self.j[row * nv..(row + 1) * nv], v);
-                Self::pgs_row_update_box(
-                    row,
-                    nv,
-                    jv,
-                    bound,
-                    &self.bias,
-                    &self.diag,
-                    &mut self.lambda,
-                    &self.minvjt,
-                    v,
-                );
+                let g = gi * GROUND_ROWS_PER_CORNER + t;
+                let (a, b1, b2) = GROUND_SPATIAL[t];
+                let [c1, c2] = self.gcoef[g];
+                let jv = vf[a] + c1 * vf[3 + b1] + c2 * vf[3 + b2];
+                let dl = (self.bias[row] - jv) / self.diag[row];
+                let lam = self.lambda[row];
+                // the friction rows' SYMMETRIC BOX |λ_t| ≤ MU·λ_n (contact
+                // spec §3; the former `pgs_row_update_box`, verbatim):
+                // `.min(bound).max(-bound)` mirrors the normal row's
+                // `.max(0.0)` idiom — f64::min/max return the OTHER
+                // operand on NaN, so an artifact λ collapses onto the
+                // bound; at bound == 0.0 a negative candidate lands on
+                // −0.0 and `d != 0.0` is false for a λ already at zero.
+                let newl = if t == 0 {
+                    (lam + dl).max(0.0) // λ_n ≥ 0
+                } else {
+                    (lam + dl).min(bound).max(-bound) // |λ_t| ≤ MU·λ_n
+                };
+                let d = newl - lam;
+                self.lambda[row] = newl;
+                if d != 0.0 {
+                    lf[a] += d;
+                    lf[3 + b1] += c1 * d;
+                    lf[3 + b2] += c2 * d;
+                    let u = &self.gu[g];
+                    for i in 0..FOOT_ROWS {
+                        vf[i] += u[i] * d;
+                    }
+                    any = true;
+                }
+                if t == 0 {
+                    // the friction cone is read AFTER the normal update,
+                    // so a corner that just lost its normal impulse loses
+                    // its friction in the same sweep
+                    bound = MU * self.lambda[row];
+                }
+            }
+        }
+        if any {
+            let r0 = FOOT_ROWS * f;
+            let gm = &self.gfoot_minv[r0 * nv..(r0 + FOOT_ROWS) * nv];
+            let (m0, t) = gm.split_at(nv);
+            let (m1, t) = t.split_at(nv);
+            let (m2, t) = t.split_at(nv);
+            let (m3, t) = t.split_at(nv);
+            let (m4, m5) = t.split_at(nv);
+            for i in 0..nv {
+                let mut x = v[i];
+                x += m0[i] * lf[0];
+                x += m1[i] * lf[1];
+                x += m2[i] * lf[2];
+                x += m3[i] * lf[3];
+                x += m4[i] * lf[4];
+                x += m5[i] * lf[5];
+                v[i] = x;
             }
         }
     }
 
-    /// TEST HOOK (item 2): for every assembled GROUND row of the last
-    /// solve, (dense 35-wide dot, support dot) against `src`, plus a flag
-    /// that every column outside the row's support is the +0.0 bit
-    /// pattern.
+    /// TEST HOOK (audit #9): the PRE-audit per-row ground sweep, verbatim
+    /// in semantics (dense dot residual, per-row clamp, nv-wide impulse
+    /// propagation through the row's own M⁻¹jᵀ) — the reference the 6-D
+    /// sweep is held against (`ground_rowwise_ref`).
+    #[cfg(test)]
+    fn pgs_ground_sweep_rowwise(&mut self, nweld: usize, v: &mut [Real]) {
+        let nv = self.nv;
+        for gi in 0..self.ground_contacts.len() {
+            let nrow = nweld + gi * GROUND_ROWS_PER_CORNER;
+            let mut bound = 0.0;
+            for t in 0..GROUND_ROWS_PER_CORNER {
+                let row = nrow + t;
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mut jv = 0.0;
+                for i in 0..nv {
+                    jv += jr[i] * v[i];
+                }
+                let dl = (self.bias[row] - jv) / self.diag[row];
+                let lam = self.lambda[row];
+                let newl = if t == 0 {
+                    (lam + dl).max(0.0)
+                } else {
+                    (lam + dl).min(bound).max(-bound)
+                };
+                let d = newl - lam;
+                self.lambda[row] = newl;
+                if d != 0.0 {
+                    let mr = &self.minvjt[row * nv..(row + 1) * nv];
+                    for i in 0..nv {
+                        v[i] += mr[i] * d;
+                    }
+                }
+                if t == 0 {
+                    bound = MU * self.lambda[row];
+                }
+            }
+        }
+    }
+
+    /// TEST HOOK (audit #9): foot f's six spatial rows and their M⁻¹J_fᵀ
+    /// columns of the last solve (valid when the foot had a contact).
+    #[cfg(test)]
+    pub fn foot_rows(&self, f: usize) -> (&[Real], &[Real]) {
+        let (a, b) = (FOOT_ROWS * f * self.nv, FOOT_ROWS * (f + 1) * self.nv);
+        (&self.gfoot_j[a..b], &self.gfoot_minv[a..b])
+    }
+
+    /// TEST HOOK (audit #9): ground row g's 6-D coefficient c (full
+    /// 6-vector) and u = Φ_f c of the last solve.
+    #[cfg(test)]
+    pub fn ground_row_6d(&self, g: usize) -> ([Real; FOOT_ROWS], [Real; FOOT_ROWS]) {
+        let (a, b1, b2) = GROUND_SPATIAL[g % GROUND_ROWS_PER_CORNER];
+        let mut c = [0.0 as Real; FOOT_ROWS];
+        c[a] = 1.0;
+        c[3 + b1] = self.gcoef[g][0];
+        c[3 + b2] = self.gcoef[g][1];
+        (c, self.gu[g])
+    }
+
+    /// TEST HOOK (item 2 / audit #9): every foot spatial row of the last
+    /// solve's CONTACTING feet: (dense 35-wide dot, support dot) against
+    /// `src`, plus a flag that every column outside the row's support is
+    /// the +0.0 bit pattern.
     #[cfg(test)]
     pub fn ground_dot_ref_vs_support(&self, src: &[Real]) -> Vec<(Real, Real, bool)> {
         let nv = self.nv;
-        let nweld = self.weld_rows();
-        (0..self.ground_rows())
-            .map(|g| {
-                let row = nweld + g;
-                let jr = &self.j[row * nv..(row + 1) * nv];
+        let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
+        let mut out = Vec::new();
+        for f in 0..2 {
+            if !(if f == 0 { nl > 0 } else { n > nl }) {
+                continue;
+            }
+            for a in 0..FOOT_ROWS {
+                let r = FOOT_ROWS * f + a;
+                let jr = &self.gfoot_j[r * nv..(r + 1) * nv];
                 let mut dense = 0.0;
                 for i in 0..nv {
                     dense += jr[i] * src[i];
                 }
-                let left = g / GROUND_ROWS_PER_CORNER < self.ground_nleft;
-                let (lo, hi) = if left { (W_L_LO, W_L_HI) } else { (W_R_LO, W_R_HI) };
-                let sup = if left {
+                let (lo, hi) = if f == 0 { (W_L_LO, W_L_HI) } else { (W_R_LO, W_R_HI) };
+                let sup = if f == 0 {
                     ground_support_dot::<W_L_LO, W_L_HI>(jr, src)
                 } else {
                     ground_support_dot::<W_R_LO, W_R_HI>(jr, src)
@@ -1091,9 +1322,10 @@ impl ConstraintSet {
                 let zeros = (0..nv)
                     .filter(|&i| !(i < W_BASE_HI || (lo..hi).contains(&i)))
                     .all(|i| jr[i].to_bits() == (0.0 as Real).to_bits());
-                (dense, sup, zeros)
-            })
-            .collect()
+                out.push((dense, sup, zeros));
+            }
+        }
+        out
     }
 
     /// §3 steps 7–9 against the FK + Cholesky factor already in `ws`
@@ -1302,7 +1534,11 @@ impl ConstraintSet {
         // whose M⁻¹Jᵀ column goes through the batched Cholesky ladder:
         // welds, then the ground block, then the self-collision normals.
         // (The limit rows below are rank-1 and take the closed forms.)
+        // audit #9: the ground rows are NOT solved per row any more —
+        // `prep_ground_rows` solves each contacting foot's six spatial
+        // columns instead — so the batched ladder starts at `pbase`.
         let ndense = nweld + nground + self.contacts.len();
+        let pbase = nweld + nground;
         // R13: the weld block (rows 0..nweld) takes the RHS-MINOR path
         // below, which OVERWRITES those `minvjt` rows in full from `wt`
         // — seeding them from `j` here was a dead 12×35 store. `nweld`
@@ -1312,20 +1548,19 @@ impl ConstraintSet {
         // item 3: rows nweld..nweld+nbt take the RHS-MINOR batch below,
         // which overwrites their `minvjt` rows in full — seed only the rest
         let nbt1 = if DENSE_T_W1 > 0 {
-            (ndense - nweld) / DENSE_T_W1 * DENSE_T_W1
+            (ndense - pbase) / DENSE_T_W1 * DENSE_T_W1
         } else {
             0
         };
         let nbt2 = if DENSE_T_W2 > 0 {
-            (ndense - nweld - nbt1) / DENSE_T_W2 * DENSE_T_W2
+            (ndense - pbase - nbt1) / DENSE_T_W2 * DENSE_T_W2
         } else {
             0
         };
         let nbt = nbt1 + nbt2;
-        self.minvjt[(nweld + nbt) * nv..ndense * nv]
-            .copy_from_slice(&self.j[(nweld + nbt) * nv..ndense * nv]);
+        self.minvjt[(pbase + nbt) * nv..ndense * nv]
+            .copy_from_slice(&self.j[(pbase + nbt) * nv..ndense * nv]);
         {
-            let mut row = 0usize;
             if nweld == N_WELD_ROWS {
                 // the 12 weld rows go through the RHS-MINOR form
                 // (transpose in, solve, transpose out — both copies
@@ -1371,17 +1606,21 @@ impl ConstraintSet {
                         mr[i] = self.wt[i * N_WELD_ROWS + r];
                     }
                 }
-                row = N_WELD_ROWS;
             }
-            // item 3: dense (ground + pair) rows in RHS-MINOR batches
+            // audit #9: the ground block's foot columns, Φ_f, u and diag
+            if nground > 0 {
+                self.prep_ground_rows(ws, nweld);
+            }
+            let mut row = pbase;
+            // item 3: dense pair rows in RHS-MINOR batches
             // straight from `j` — DENSE_T_W1 at a time, then one DENSE_T_W2
             // rung — both copies exact, so bitwise `chol_solve` per row
             // (the weld batch's argument)
-            while row < nweld + nbt1 {
+            while row < pbase + nbt1 {
                 Self::solve_t_rows::<DENSE_T_W1>(nv, &ws.m, &self.j, &mut self.minvjt, row, &mut self.wt);
                 row += DENSE_T_W1;
             }
-            while row < nweld + nbt1 + nbt2 {
+            while row < pbase + nbt1 + nbt2 {
                 Self::solve_t_rows::<DENSE_T_W2>(nv, &ws.m, &self.j, &mut self.minvjt, row, &mut self.wt);
                 row += DENSE_T_W2;
             }
@@ -1467,25 +1706,6 @@ impl ConstraintSet {
                 row += 1;
             }
         }
-        // item 2: GROUND rows take the support dot (bitwise, see the
-        // item-2 note by `ground_support_dot`), left-foot prefix first
-        {
-            let nlrow = nweld + self.ground_nleft * GROUND_ROWS_PER_CORNER;
-            for row in nweld..nlrow {
-                let jr = &self.j[row * nv..(row + 1) * nv];
-                let mr = &self.minvjt[row * nv..(row + 1) * nv];
-                let d = ground_support_dot::<W_L_LO, W_L_HI>(jr, mr);
-                debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
-                self.diag[row] = d;
-            }
-            for row in nlrow..nweld + nground {
-                let jr = &self.j[row * nv..(row + 1) * nv];
-                let mr = &self.minvjt[row * nv..(row + 1) * nv];
-                let d = ground_support_dot::<W_R_LO, W_R_HI>(jr, mr);
-                debug_assert!(d > 0.0, "constraint row {row} has zero effective mass");
-                self.diag[row] = d;
-            }
-        }
         for row in 0..ndense {
             let ground_row = row >= nweld && row < nweld + nground;
             if (DIAG_ALL_ROWS || row >= nweld) && !ground_row {
@@ -1507,6 +1727,23 @@ impl ConstraintSet {
                     s += jr[i] * v[i];
                 }
                 self.jv_pre[row] = s;
+            }
+        }
+        // audit #9 TEST HOOK: the pre-audit per-row ground quantities
+        #[cfg(test)]
+        if self.ground_rowwise_ref {
+            for row in nweld..nweld + nground {
+                let (j, m) = (&self.j, &mut self.minvjt);
+                let mr = &mut m[row * nv..(row + 1) * nv];
+                mr.copy_from_slice(&j[row * nv..(row + 1) * nv]);
+                chol_solve(nv, &ws.m, mr);
+                let jr = &self.j[row * nv..(row + 1) * nv];
+                let mr = &self.minvjt[row * nv..(row + 1) * nv];
+                let mut d = 0.0;
+                for i in 0..nv {
+                    d += jr[i] * mr[i];
+                }
+                self.diag[row] = d;
             }
         }
         // R10: a limit row is rank-1, so its effective mass is one load
@@ -1726,7 +1963,16 @@ impl ConstraintSet {
             // around it — it is simply another projected-GS block, run
             // where the weld block would be. Empty (and free) in weld
             // mode: `ground_contacts` is cleared at step 7.
-            self.pgs_ground_sweep(nweld, v);
+            #[cfg(test)]
+            let rowwise = self.ground_rowwise_ref;
+            #[cfg(not(test))]
+            let rowwise = false;
+            if rowwise {
+                #[cfg(test)]
+                self.pgs_ground_sweep_rowwise(nweld, v);
+            } else {
+                self.pgs_ground_sweep(nweld, v);
+            }
             // (b)+(c) contacts (pair-id order) then joint-limit rows
             // (joint order): projected GS, λ ≥ 0.
             // R10: the one loop is SPLIT at `ndense` — same rows, same
