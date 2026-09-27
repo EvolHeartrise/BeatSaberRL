@@ -372,9 +372,160 @@ std::vector<at::Tensor> wgrad_bgrad(at::Tensor dy, at::Tensor x) {
   return {c, db};
 }
 
+// ---- ReLU bitmask epilogues: RELU_AUX_BIAS forward, DRELU dgrad ---------
+// A Linear+ReLU whose consumer is another Linear (block FFN, note/saber/
+// torso/leg encoders, SimBa trunk fc1, critic MLP) runs its forward as ONE
+// cuBLASLt GEMM that also writes the ReLU bitmask (1 bit per element), and
+// the consumer's dgrad GEMM (g @ W_next) applies that mask in its epilogue
+// -- replacing the standalone relu_bwd pass (a full read of g and y plus a
+// write of gm, ~7.5 ms of a production minibatch at the ffn hidden width).
+// The ReLU layer's bias grad then comes from its own wgrad GEMM (BGRADB
+// epilogue at >= 64k rows, see wgrad_bgrad), so no pass re-reads gm there.
+// (DRELU_BGRAD would reduce db in the dgrad epilogue too, but cuBLASLt
+// offers it here only with a bias of the output type -- an fp16 db, which
+// overflows at the production loss scale over ~475k rows -- and no algo
+// for an fp32 one; probed 2026-09-27 on the RTX 5090, cu128.)
+// Layouts (col-major, m = H output features, n = R rows): the aux mask is
+// (H, R) with ld = H rounded up to 128 bits (cuBLASLt requirement), i.e.
+// R * ld/8 bytes. Algo = the heuristic's first pick per shape
+// (deterministic, like lt_plan).
+struct LtEpiPlan {
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+  cublasLtMatmulAlgo_t algo;
+  size_t ws = 0;
+  bool ok = false;
+};
+
+inline int64_t relu_mask_ld(int64_t H) { return (H + 127) / 128 * 128; }
+
+// kind 0: forward  C(H,R) = W(H,K) x^T + b, relu, aux mask   (A=W op T)
+// kind 1: dgrad    C(H,R) = W(M,H)^T g^T, drelu(mask)        (A=W op N)
+LtEpiPlan& lt_epi_plan(int kind, int64_t R, int64_t H, int64_t K) {
+  static std::map<std::tuple<int, int64_t, int64_t, int64_t>, LtEpiPlan>
+      plans;
+  auto key = std::make_tuple(kind, R, H, K);
+  auto it = plans.find(key);
+  if (it != plans.end()) return it->second;
+  LtEpiPlan p;
+  auto chk = [](cublasStatus_t s) { return s == CUBLAS_STATUS_SUCCESS; };
+  bool ok = chk(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F,
+                                         CUDA_R_32F));
+  const cublasOperation_t tn = CUBLAS_OP_N, tt = CUBLAS_OP_T;
+  const cublasLtEpilogue_t epi = kind == 0 ? CUBLASLT_EPILOGUE_RELU_AUX_BIAS
+                                           : CUBLASLT_EPILOGUE_DRELU;
+  const int64_t ld = relu_mask_ld(H);
+  const bool ta = kind == 0;
+  ok = ok && chk(cublasLtMatmulDescSetAttribute(
+      p.op, CUBLASLT_MATMUL_DESC_TRANSA, ta ? &tt : &tn,
+      sizeof(tn)));
+  ok = ok && chk(cublasLtMatmulDescSetAttribute(
+      p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tn, sizeof(tn)));
+  ok = ok && chk(cublasLtMatmulDescSetAttribute(
+      p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+  ok = ok && chk(cublasLtMatmulDescSetAttribute(
+      p.op, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD, &ld, sizeof(ld)));
+  if (ta) {
+    // A = W row-major (H,K) = col-major (K,H), op T; B = x (K,R), op N
+    ok = ok && chk(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_16F, K, H, K));
+    ok = ok && chk(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_16F, K, R, K));
+  } else {
+    // A = W row-major (K=M_next,H) = col-major (H,K), op N; B = g (K,R)
+    ok = ok && chk(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_16F, H, K, H));
+    ok = ok && chk(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_16F, K, R, K));
+  }
+  ok = ok && chk(cublasLtMatrixLayoutCreate(&p.lc, CUDA_R_16F, H, R, H));
+  if (ok) {
+    cublasLtMatmulPreference_t pref = nullptr;
+    ok = chk(cublasLtMatmulPreferenceCreate(&pref));
+    size_t wsmax = kLtWorkspace;
+    ok = ok && chk(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsmax,
+        sizeof(wsmax)));
+    cublasLtMatmulHeuristicResult_t res{};
+    int n = 0;
+    ok = ok && chk(cublasLtMatmulAlgoGetHeuristic(
+        at::cuda::getCurrentCUDABlasLtHandle(), p.op, p.la, p.lb, p.lc,
+        p.lc, pref, 1, &res, &n)) && n > 0;
+    if (ok) {
+      p.algo = res.algo;
+      p.ws = res.workspaceSize;
+    }
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+  }
+  p.ok = ok;
+  return plans.emplace(key, p).first->second;
+}
+
+void lt_epi_run(LtEpiPlan& p, const void* a, const void* b, void* c,
+                void* bias, void* aux, const at::Tensor& like) {
+  if (bias)
+    TORCH_CUDABLAS_CHECK(cublasLtMatmulDescSetAttribute(
+        p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+  TORCH_CUDABLAS_CHECK(cublasLtMatmulDescSetAttribute(
+      p.op, CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER, &aux, sizeof(aux)));
+  at::Tensor ws;
+  if (p.ws) ws = at::empty({(int64_t)p.ws}, like.options().dtype(at::kByte));
+  const float alpha = 1.f, beta = 0.f;
+  TORCH_CUDABLAS_CHECK(cublasLtMatmul(
+      at::cuda::getCurrentCUDABlasLtHandle(), p.op, &alpha, a, p.la, b,
+      p.lb, &beta, c, p.lc, c, p.lc, &p.algo,
+      p.ws ? ws.data_ptr() : nullptr, p.ws,
+      at::cuda::getCurrentCUDAStream()));
+}
+
+// y = relu(x @ w^T + b) (R,H) fp16 and its bitmask (R, ld/8) uint8;
+// x (R,K), w (H,K), b (H) fp16 (the replicas). {} if no Lt algo.
+std::vector<at::Tensor> linear_relu_aux(at::Tensor x, at::Tensor w,
+                                        at::Tensor b) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf
+              && x.is_contiguous() && x.dim() == 2, "x: (R,K) fp16");
+  TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous()
+              && w.dim() == 2 && w.size(1) == x.size(1), "w: (H,K) fp16");
+  TORCH_CHECK(b.scalar_type() == at::kHalf && b.is_contiguous()
+              && b.numel() == w.size(0), "b: (H) fp16");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const int64_t R = x.size(0), K = x.size(1), H = w.size(0);
+  LtEpiPlan& p = lt_epi_plan(0, R, H, K);
+  if (!p.ok) return {};
+  auto y = at::empty({R, H}, x.options());
+  auto mask = at::empty({R, relu_mask_ld(H) / 8}, x.options().dtype(at::kByte));
+  if (R == 0) return {y, mask};
+  lt_epi_run(p, w.data_ptr(), x.data_ptr(), y.data_ptr(), b.data_ptr(),
+             mask.data_ptr(), x);
+  return {y, mask};
+}
+
+// gm = (g @ w) * mask (R,H) fp16; g (R,M), w (M,H) fp16, mask from
+// linear_relu_aux. Undefined tensor (None) if no Lt algo.
+at::Tensor dgrad_drelu(at::Tensor g, at::Tensor w, at::Tensor mask) {
+  TORCH_CHECK(g.is_cuda() && g.scalar_type() == at::kHalf
+              && g.is_contiguous() && g.dim() == 2, "g: (R,M) fp16");
+  TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous()
+              && w.dim() == 2 && w.size(0) == g.size(1), "w: (M,H) fp16");
+  const int64_t R = g.size(0), K = g.size(1), H = w.size(1);
+  TORCH_CHECK(mask.scalar_type() == at::kByte && mask.is_contiguous()
+              && mask.size(0) == R && mask.size(1) == relu_mask_ld(H) / 8,
+              "mask: (R, ld/8) uint8 from linear_relu_aux");
+  const c10::cuda::CUDAGuard guard(g.device());
+  LtEpiPlan& p = lt_epi_plan(1, R, H, K);
+  if (!p.ok) return at::Tensor();
+  auto gm = at::empty({R, H}, g.options());
+  if (R == 0) return gm;
+  lt_epi_run(p, w.data_ptr(), g.data_ptr(), gm.data_ptr(), nullptr,
+             mask.data_ptr(), g);
+  return gm;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("linear_relu_aux", &linear_relu_aux,
+        "(y, mask): y = relu(x @ w^T + b) fp16 + its ReLU bitmask, one "
+        "cublasLt GEMM (RELU_AUX_BIAS); [] if unsupported");
+  m.def("dgrad_drelu", &dgrad_drelu,
+        "gm = (g @ w) * mask fp16, one cublasLt GEMM (DRELU epilogue); "
+        "None if unsupported");
   m.def("wgrad_bgrad", &wgrad_bgrad,
         "(dW = dY^T X, db = sum_rows dY), fp16 in / fp32 out, one "
         "cublasLt GEMM with the BGRADB epilogue; [] if unsupported");
