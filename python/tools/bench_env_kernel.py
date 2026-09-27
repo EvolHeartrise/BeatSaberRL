@@ -14,11 +14,11 @@ foot terms):
              (--ckpt), so the body actually stands and moves: both feet
              loaded, i.e. the ground block's real workload.
   standard — procedural standard charts with a fixed random action
-             stream (bodies fall and auto-reset: weld/limit/contact
-             coverage, not a realistic posture mix).
-The identity tiers run every workload in f32 and f64 plus a weld-mode
-f32 run, compare obs / reward / done / qpos / twist of every tick with
-array_equal. Everything is seeded; any bit difference is a kernel
+             stream (bodies fall and auto-reset: limit/contact coverage,
+             not a realistic posture mix).
+The identity tiers run every workload in f32 and f64 (the weld-mode tier
+went with the weld harness, 2026-09-27), compare obs / reward / done /
+qpos / twist of every tick with array_equal. Everything is seeded; any bit difference is a kernel
 change. Timing uses CUDA events around env.step only (the policy
 forward is excluded) after a warmup.
 """
@@ -34,7 +34,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from beat_arena_env.cuda_env import CudaBeatVecEnv  # noqa: E402
 
-RECIPE = dict(gears=5, foot_contact=True, fall_const=5.0,
+RECIPE = dict(gears=5, fall_const=5.0,
               push_prob=0.00333, push_vmax=0.15, start_jitter=0.15,
               start_pose_jitter=0.15, crouch_start_prob=0.25,
               foot_z_coef=0.01, foot_x_coef=0.01, foot_hinge_r=0.12,
@@ -43,12 +43,8 @@ RECIPE = dict(gears=5, foot_contact=True, fall_const=5.0,
 DEFAULT_CKPT = "runs/flux_v1_cd300/leaf_from_upd00457.pt"
 
 
-def make_env(workload, n, dtype, foot_contact=True, pool=2048):
+def make_env(workload, n, dtype, pool=2048):
     kw = dict(RECIPE)
-    kw["foot_contact"] = foot_contact
-    if not foot_contact:   # weld harness: the contact-only knobs off
-        for k in ("start_pose_jitter", "crouch_start_prob"):
-            kw[k] = 0.0
     if workload == "flux":
         kw["game"] = "flux"
     return CudaBeatVecEnv(n, chart_pool=pool, seed=0, device="cuda",
@@ -71,11 +67,11 @@ def actions_for(policy, obs, gen, n):
     return logits.argmax(-1)
 
 
-def rollout(workload, n, ticks, dtype, ckpt, foot_contact=True,
+def rollout(workload, n, ticks, dtype, ckpt,
             record=False, timing=False, warmup=0):
     torch.manual_seed(0)                       # pushes use the global RNG
     gen = torch.Generator(device="cuda").manual_seed(1)
-    env = make_env(workload, n, dtype, foot_contact)
+    env = make_env(workload, n, dtype)
     policy = load_policy_for(workload, ckpt)
     obs = env.reset()
     rec = {k: [] for k in ("obs", "rew", "done", "qpos", "twist")}
@@ -101,19 +97,18 @@ def rollout(workload, n, ticks, dtype, ckpt, foot_contact=True,
     return rec, ms
 
 
-TIERS = [  # (tag, workload, dtype, foot_contact, n, ticks)
-    ("flux_f32", "flux", torch.float32, True, 2048, 240),
-    ("flux_f64", "flux", torch.float64, True, 512, 120),
-    ("std_f32", "standard", torch.float32, True, 2048, 240),
-    ("std_f64", "standard", torch.float64, True, 512, 120),
-    ("std_weld_f32", "standard", torch.float32, False, 1024, 120),
+TIERS = [  # (tag, workload, dtype, n, ticks)
+    ("flux_f32", "flux", torch.float32, 2048, 240),
+    ("flux_f64", "flux", torch.float64, 512, 120),
+    ("std_f32", "standard", torch.float32, 2048, 240),
+    ("std_f64", "standard", torch.float64, 512, 120),
 ]
 
 
 def cmd_record(a):
     out = {}
-    for tag, wl, dt, fc, n, ticks in TIERS:
-        rec, _ = rollout(wl, n, ticks, dt, a.ckpt, fc, record=True)
+    for tag, wl, dt, n, ticks in TIERS:
+        rec, _ = rollout(wl, n, ticks, dt, a.ckpt, record=True)
         for k, v in rec.items():
             out[f"{tag}/{k}"] = np.stack(v)
         print(f"recorded {tag}: {n} envs x {ticks} ticks", flush=True)
@@ -124,8 +119,8 @@ def cmd_record(a):
 def cmd_compare(a):
     ref = np.load(a.ref)
     bad = 0
-    for tag, wl, dt, fc, n, ticks in TIERS:
-        rec, _ = rollout(wl, n, ticks, dt, a.ckpt, fc, record=True)
+    for tag, wl, dt, n, ticks in TIERS:
+        rec, _ = rollout(wl, n, ticks, dt, a.ckpt, record=True)
         for k, v in rec.items():
             got, want = np.stack(v), ref[f"{tag}/{k}"]
             if got.shape != want.shape or not np.array_equal(
