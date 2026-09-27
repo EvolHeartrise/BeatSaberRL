@@ -91,10 +91,16 @@ class _LnAddFn(torch.autograd.Function):
         # guard for safety — an undefined gx just skips the fused add.
         if gx is not None and not gx.is_contiguous():
             gx = gx.contiguous()
-        dx, dw, db = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd, gx)
+        want = ctx.needs_input_grad[5]
+        r = _ext.ln_bwd(x, gy.contiguous(), weight, mean, rstd, gx, want)
+        dx, dw, db = r[:3]
         dbb = None
-        if ctx.needs_input_grad[5]:
-            dbb = dx.reshape(-1, dx.shape[-1]).sum(0, dtype=torch.float32)
+        if want:
+            # fused in the kernel's dx store loop at d 192/384 (fp16,
+            # 2026-09-26 — near-tie with the torch sum: same rounded
+            # summands, different order); elsewhere a torch sum
+            dbb = (r[3] if len(r) > 3 else
+                   dx.reshape(-1, dx.shape[-1]).sum(0, dtype=torch.float32))
         # NOTE (load-bearing): dx is returned for BOTH a and b as the
         # SAME tensor object — valid because autograd only reads these
         # edges; a .clone() would cost a full-size copy for nothing.
@@ -110,7 +116,11 @@ class FusedLayerNorm(nn.LayerNorm):
         return (x.is_cuda and x.dtype in (torch.float32, torch.float16)
                 and x.is_contiguous()
                 and len(self.normalized_shape) == 1
-                and self.normalized_shape[0] <= 256
+                # fp16 rows up to 384 (the SimBa trunk LNs, 2026-09-26);
+                # fp32 stays <= 256 so the record path's stock-LN bits
+                # above that width are untouched
+                and self.normalized_shape[0] <= (
+                    384 if x.dtype is torch.float16 else 256)
                 and self.elementwise_affine and _load() is not None)
 
     def forward(self, x):
