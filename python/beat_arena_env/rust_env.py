@@ -37,7 +37,7 @@ class RustBeatEnv(gym.Env):
                  bomb_prob=0.125,
                  external_chart=None, gears=3, seed=0, *,
                  foot_contact, fall_const=5.0,
-                 external_walls=None):
+                 external_walls=None, sim_dtype="f64"):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
         external_walls: list[Wall] riding along (env v17, spec §12) —
@@ -71,9 +71,15 @@ class RustBeatEnv(gym.Env):
         else:
             max_steps = int(chart_len_s * 30) + 90
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
-        self.sim = RawBeatSim(max_steps=max_steps, gears=gears,
-                              foot_contact=foot_contact,
-                              fall_const=fall_const)
+        # sim_dtype (2026-09-26): "f64" = the reference build every test
+        # pins; "f32" = beat_arena_rs32, the bench's (and training's) regime
+        assert sim_dtype in ("f64", "f32"), sim_dtype
+        if sim_dtype == "f32":
+            from beat_arena_rs32 import RawBeatSim as Sim
+        else:
+            Sim = RawBeatSim
+        self.sim = Sim(max_steps=max_steps, gears=gears,
+                       foot_contact=foot_contact, fall_const=fall_const)
         self.gears = gears
         self.foot_contact = bool(foot_contact)
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the

@@ -66,3 +66,26 @@ def test_load_policy_refuses_raw_metre_note_geo():
     q = NotePolicy(embed=64, trunk_dim=128, n_blocks=1, n_gears=5)
     arch = dict(q.arch); arch.pop("note_geo_norm")
     load_policy({"arch": arch, "state_dict": q.state_dict()})
+
+
+def test_fp16_stream_rollout_and_update_forwards_agree_bitwise():
+    """--fp16 all: the rollout forwards fp32 obs, the update forwards the
+    half b_obs copy of the SAME obs. Every consumer rounds to fp16 at use,
+    so the two logit sets must be bit-identical — the note-geo lanes
+    included (2026-09-26 fix: they used to be computed from fp32 lanes in
+    the rollout and from fp16 lanes in fp16 arithmetic in the update)."""
+    import pytest
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA (the fp16 stream is CUDA-only)")
+    from policy import NotePolicy, OBS_DIM
+    torch.manual_seed(0)
+    p = NotePolicy(embed=64, trunk_dim=128, n_blocks=2, n_heads=4,
+                   note_geo=True).cuda().eval()
+    p.fp16 = True
+    obs = torch.randn(256, OBS_DIM, device="cuda") * 0.7
+    with torch.no_grad():
+        l32, v32 = p.forward_stacked(obs)
+        l16, v16 = p.forward_stacked(obs.half())
+    assert torch.equal(l32, l16), (l32 - l16).abs().max()
+    assert torch.equal(v32, v16), (v32 - v16).abs().max()
