@@ -4,7 +4,9 @@
         --tag gen2_429m [--top 10] [--workers 10]
 
 For each top play: greedy re-rollout with the bench protocol (cached
-map, real NJS speeds, seed 0) recording JSONL v7, verify the outcome
+map, real NJS speeds, seed 0) in the bench's own regime — its sim dtype
+(f32 by default), its forward batch width via the bench's graphed
+argmax, and its recorded body (tau_scale) — recording JSONL, verify the outcome
 counters and multiplied score against the bench entry, then convert to
 a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
 (Was a 598M one-off; parameterized 2026-07-24.)
@@ -31,7 +33,7 @@ import torch
 
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
-from beat_arena_env.constants import parse_tau_scale
+from beat_arena_env.constants import OBS_DIM, parse_tau_scale
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
 from policy import load_policy
@@ -47,7 +49,8 @@ def slug(s, n=24):
 _W = {}          # per-process state: {"policy", "dev", "push", "tau"} (set by _worker_init)
 
 
-def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None):
+def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None,
+                 sim_dtype="f32", width=1024):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     # env v48: the checkpoint's obs z encoding (asinh knee C); the rust
     # sim reads BEAT_Z_ASINH once per process (this runs before any sim
@@ -62,6 +65,24 @@ def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None):
     dev = torch.device(device)
     _W["policy"] = load_policy(ckpt).to(dev).eval()
     _W["dev"] = dev
+    # the bench's own regime (2026-09-26): its sim dtype and its forward —
+    # the graphed fp32 argmax over a fixed (width, OBS_DIM) batch. GEMM
+    # kernel choice depends on the batch width, so a batch-1 eager forward
+    # differs from the bench by ~1e-7 in the logits and flips near-tie
+    # argmaxes ("near-tie drift"); the play's obs rides in row 0 of a
+    # zero-padded batch of the bench's width instead.
+    _W["sim_dtype"] = sim_dtype
+    _W["buf"] = torch.zeros(width, OBS_DIM,
+                            pin_memory=dev.type == "cuda")
+    if dev.type == "cuda":
+        from bench_scoresaber import _GraphedArgmax
+        _W["fwd"] = _GraphedArgmax(_W["policy"], width, dev)
+    else:
+        def _eager(buf):
+            with torch.no_grad():
+                logits, _ = _W["policy"].forward_stacked(buf.to(dev))
+            return logits.argmax(-1)
+        _W["fwd"] = _eager
     _W["push"] = push
     _W["tau"] = tau_scale   # env v46 fixed body (None = all 1.0)
 
@@ -94,6 +115,7 @@ def _make_one(job):
     base = (f"replays/{tag}_{label}{rank:02d}_"
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
+                      sim_dtype=_W["sim_dtype"],
                       # contact physics is the only mode: every production
                       # ckpt is contact-trained and the bench forces it
                       foot_contact=True,
@@ -112,12 +134,10 @@ def _make_one(job):
             _kick(env, rng, push_vmax)
             n_push += 1
         tick += 1
-        with torch.no_grad():
-            logits, _ = policy(
-                torch.as_tensor(obs, dtype=torch.float32,
-                                device=dev).unsqueeze(0))
-        obs, _, done, _, info = env.step(
-            [int(l.argmax()) for l in logits])
+        buf = _W["buf"]
+        buf[0].copy_(torch.as_tensor(obs, dtype=torch.float32))
+        acts = _W["fwd"](buf)[0].cpu().tolist()
+        obs, _, done, _, info = env.step([int(x) for x in acts])
         walk.consume(info["events"])
     exact = (round(walk.score) == entry["score"]
              and walk.max_combo == entry["highest_combo"]
@@ -183,12 +203,18 @@ def main():
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
-    p.add_argument("--tau-scale", type=str, default="default",
+    p.add_argument("--tau-scale", type=str, default=None,
                    help="env v46: fixed per-axis torque-limit scales (16 "
                         "floats, group shorthand, 'default' = the saved "
                         "body TAU_BODY_DEFAULT, 'nominal' = all 1.0; see "
-                        "bench_scoresaber --tau-scale). Default: the saved "
-                        "body (since 2026-09-22)")
+                        "bench_scoresaber --tau-scale). Default: the body "
+                        "the bench JSON records (tau_scale), else 'default'")
+    p.add_argument("--sim-dtype", choices=["f32", "f64"], default=None,
+                   help="Rust sim build. Default: the bench JSON's "
+                        "sim_dtype (else f32, the bench default)")
+    p.add_argument("--forward-width", type=int, default=None,
+                   help="policy forward batch width. Default: the bench "
+                        "JSON's forward_width (else 1024)")
     p.add_argument("--push-prob", type=float, default=0.0,
                    help="replay the env v18 perturbation: per-tick "
                         "probability of a horizontal root-velocity kick "
@@ -207,6 +233,14 @@ def main():
     args = p.parse_args()
 
     bench = json.load(open(args.bench, encoding="utf-8"))
+    # reproduce the bench's regime unless told otherwise (2026-09-26)
+    sim_dtype = args.sim_dtype or bench.get("sim_dtype", "f32")
+    width = args.forward_width or int(bench.get("forward_width", 1024))
+    if args.tau_scale is None:
+        ts = bench.get("tau_scale")
+        args.tau_scale = (",".join(f"{v:g}" for v in ts) if ts else "default")
+    print(f"regime: sim {sim_dtype}, forward width {width}, tau_scale "
+          f"{args.tau_scale}", flush=True)
     pool = [e for e in bench["levels"] if "skipped" not in e]
     if args.stars is not None:
         lo, hi = args.stars
@@ -241,7 +275,8 @@ def main():
                                            (args.push_prob, args.push_vmax,
                                             args.push_seed),
                                            parse_tau_scale(args.tau_scale)
-                                           if args.tau_scale else None)) as ex:
+                                           if args.tau_scale else None,
+                                           sim_dtype, width)) as ex:
             for base, line, warn in ex.map(_make_one, jobs):
                 if warn:
                     print(warn, flush=True)
@@ -251,7 +286,7 @@ def main():
         _worker_init(args.ckpt, device,
                      (args.push_prob, args.push_vmax, args.push_seed),
                      parse_tau_scale(args.tau_scale) if args.tau_scale
-                     else None)
+                     else None, sim_dtype, width)
         for job in jobs:
             base, line, warn = _make_one(job)
             if warn:
