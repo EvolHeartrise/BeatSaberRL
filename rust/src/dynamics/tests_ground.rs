@@ -439,22 +439,16 @@ fn v14_settled_cop_matches_com_projection() {
     assert!(gap < 0.04, "CoP-CoM gap {:.1} mm: moment balance broken", gap * 1e3);
 }
 
-/// bench-opt item 2 (2026-09-16): the ground rows' support dots are
-/// BITWISE the dense 35-wide dots, on LIVE rows of a random-gear
-/// contact-mode trajectory (corners come and go, both feet, falls) —
-/// against the post-solve v AND each row's own M⁻¹Jᵀ column (the two
-/// shipping consumers: PGS residual and effective mass) — and every
-/// column outside a row's support is the +0.0 bit pattern.
-#[test]
-fn ground_support_dot_bitwise() {
+/// Random-gear contact-mode drive shared by the audit-#9 gates: corners
+/// come and go, both feet, falls.
+fn random_gear_contact_run(seed: u64, ticks: usize, mut each: impl FnMut(usize, &State, &Workspace, &ConstraintSet)) {
     let m = &HUMANOID;
     let mut ws = Workspace::new(m);
     let mut st = State::neutral(m);
     let mut cs = contact_set(m);
-    let mut rng = super::testutil::Rng(0x5EED_0000_0000_17E2);
+    let mut rng = super::testutil::Rng(seed);
     let mut tau = [0.0; NQ];
-    let (mut checked, mut left_rows, mut right_rows) = (0usize, 0usize, 0usize);
-    for tick in 0..480 {
+    for tick in 0..ticks {
         if tick % 8 == 0 {
             for j in 0..NQ {
                 let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
@@ -462,84 +456,243 @@ fn ground_support_dot_bitwise() {
             }
         }
         substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+        each(tick, &st, &ws, &cs);
+    }
+}
+
+/// bench-opt item 2 (2026-09-16), re-pointed by audit #9: the support
+/// dots of the contacting feet's SPATIAL rows are BITWISE the dense
+/// 35-wide dots, on LIVE rows of a random-gear contact-mode trajectory —
+/// against the post-solve v, a signed-zero-rich probe, AND the feet's own
+/// M⁻¹J_fᵀ columns (the three shipping consumers: V = J_f v, Φ_f) — and
+/// every column outside a row's support is the +0.0 bit pattern.
+#[test]
+fn ground_support_dot_bitwise() {
+    let (mut checked, mut left_feet, mut right_feet) = (0usize, 0usize, 0usize);
+    random_gear_contact_run(0x5EED_0000_0000_17E2, 480, |tick, st, _ws, cs| {
         let nv = st.v.len();
         let mut probe = vec![0.0; nv];
         for i in 0..nv {
             // a signed-zero-rich finite vector: exact zeros on odd columns
             probe[i] = if i % 2 == 1 { -0.0 } else { st.v[i] };
         }
-        let lefts: Vec<bool> = cs.ground_contacts.iter().map(|g| g.frame == GROUND_FRAMES[0]).collect();
-        for src in [&st.v[..], &probe[..]] {
-            for (g, (dense, sup, zeros)) in cs.ground_dot_ref_vs_support(src).into_iter().enumerate() {
-                assert!(zeros, "substep {tick}: ground row {g} has a non-+0.0 word off its support");
-                assert_eq!(dense.to_bits(), sup.to_bits(), "substep {tick}: ground row {g} dot vs v");
+        let mut srcs: Vec<Vec<f64>> = vec![st.v.to_vec(), probe];
+        let nl = cs.ground_contacts.iter().filter(|g| g.frame == GROUND_FRAMES[0]).count();
+        let feet: Vec<usize> = (0..2)
+            .filter(|&f| if f == 0 { nl > 0 } else { cs.ground_contacts.len() > nl })
+            .collect();
+        for &f in &feet {
+            let (_, minv) = cs.foot_rows(f);
+            for r in 0..6 {
+                srcs.push(minv[r * nv..(r + 1) * nv].to_vec());
+            }
+            if f == 0 {
+                left_feet += 1;
+            } else {
+                right_feet += 1;
+            }
+        }
+        for src in &srcs {
+            let rows = cs.ground_dot_ref_vs_support(src);
+            assert_eq!(rows.len(), 6 * feet.len());
+            for (g, (dense, sup, zeros)) in rows.into_iter().enumerate() {
+                assert!(zeros, "substep {tick}: foot row {g} has a non-+0.0 word off its support");
+                assert_eq!(dense.to_bits(), sup.to_bits(), "substep {tick}: foot row {g} dot");
                 checked += 1;
             }
         }
-        for g in 0..cs.ground_rows() {
-            let row = cs.ground_row(0) + g;
-            let mr = cs.row_minvjt(row).to_vec();
-            let (dense, sup, _) = cs.ground_dot_ref_vs_support(&mr)[g];
-            assert_eq!(dense.to_bits(), sup.to_bits(), "substep {tick}: ground row {g} diag dot");
-            assert_eq!(sup.to_bits(), cs.row_diag(row).to_bits(), "substep {tick}: live diag");
-            if lefts[g / GROUND_ROWS_PER_CORNER] {
-                left_rows += 1;
-            } else {
-                right_rows += 1;
-            }
-        }
-    }
-    println!("item-2 ground support: {checked} v-dots, {left_rows} left / {right_rows} right diag rows bitwise");
-    assert!(left_rows > 0 && right_rows > 0, "trajectory must exercise both feet");
+    });
+    println!("ground support: {checked} foot-row dots bitwise ({left_feet} left / {right_feet} right foot-substeps)");
+    assert!(left_feet > 0 && right_feet > 0, "trajectory must exercise both feet");
 }
 
-/// item 3: the RHS-MINOR batched solves for the dense (ground + pair)
-/// rows and the limit columns are bitwise the per-row reference solves
-/// (`chol_solve` on the assembled row / `chol_solve_unit` on the pivot)
-/// against the substep's live factor, along a random-gear contact run.
+/// audit #9: the 6-D foot formulation reproduces the per-row quantities
+/// of the dense corner rows it replaced, on live rows of a random-gear
+/// contact trajectory: the row IS c·J_f (to rounding), its effective mass
+/// c·Φ_f·c equals j·M⁻¹jᵀ, u = Φ_f c equals J_f·M⁻¹jᵀ, and the residual
+/// c·(J_f v) equals j·v — each to ~1e-12 relative. (Exact arithmetic
+/// makes all four identities; only rounding separates them.)
 #[test]
-fn batched_row_solves_bitwise() {
-    use super::algo::{chol_solve, chol_solve_unit};
-    let m = &HUMANOID;
-    let mut ws = Workspace::new(m);
-    let mut st = State::neutral(m);
-    let mut cs = contact_set(m);
-    let mut rng = super::testutil::Rng(0x5EED_0000_0000_17E3);
-    let mut tau = [0.0; NQ];
-    let (mut dense_rows, mut lim_rows, mut wide_dense, mut wide_lim) = (0usize, 0usize, 0usize, 0usize);
-    for tick in 0..480 {
-        if tick % 8 == 0 {
-            for j in 0..NQ {
-                let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
-                tau[j] = g * m.tau_max[j];
+fn ground_rows_6d_match_dense_corner_rows() {
+    use super::algo::tc_solve_v;
+    let (mut rows_checked, mut worst) = (0usize, 0.0f64);
+    let mut esc = vec![0.0f64; HUMANOID.nv()];
+    let rel = |a: f64, b: f64, scale: f64| (a - b).abs() / scale.max(1e-300);
+    random_gear_contact_run(0x5EED_0000_0000_17E4, 480, |tick, st, ws, cs| {
+        let nv = st.v.len();
+        for (gi, gc) in cs.ground_contacts.iter().enumerate() {
+            let f = if gc.frame == GROUND_FRAMES[0] { 0 } else { 1 };
+            let (jf, _) = cs.foot_rows(f);
+            for t in 0..GROUND_ROWS_PER_CORNER {
+                let g = gi * GROUND_ROWS_PER_CORNER + t;
+                let row = cs.ground_row(gi) + t;
+                let (c, u) = cs.ground_row_6d(g);
+                // (1) row == c · J_f, column by column
+                let j = cs.row_j(row);
+                let jscale = j.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+                for i in 0..nv {
+                    let mut cj = 0.0;
+                    for a in 0..6 {
+                        cj += c[a] * jf[a * nv + i];
+                    }
+                    let e = rel(cj, j[i], jscale);
+                    worst = worst.max(e);
+                    assert!(e < 1e-12, "substep {tick} row {row} col {i}: c·J_f {cj} vs j {}", j[i]);
+                }
+                // (2) diag and (3) u against the dense M⁻¹jᵀ
+                let mut mj = j.to_vec();
+                tc_solve_v(&ws.tc, &ws.l, &mut mj, &mut esc);
+                let dd: f64 = (0..nv).map(|i| j[i] * mj[i]).sum();
+                let e = rel(cs.row_diag(row), dd, dd);
+                worst = worst.max(e);
+                assert!(e < 1e-12, "substep {tick} row {row}: diag {} vs dense {dd}", cs.row_diag(row));
+                let mut ud = [0.0f64; 6];
+                for a in 0..6 {
+                    ud[a] = (0..nv).map(|i| jf[a * nv + i] * mj[i]).sum();
+                }
+                let uscale = ud.iter().fold(0.0f64, |a, x| a.max(x.abs()));
+                for a in 0..6 {
+                    let e = rel(u[a], ud[a], uscale);
+                    worst = worst.max(e);
+                    assert!(e < 1e-11, "substep {tick} row {row}: u[{a}] {} vs {}", u[a], ud[a]);
+                }
+                // (4) residual on the post-solve v
+                let jv: f64 = (0..nv).map(|i| j[i] * st.v[i]).sum();
+                let mut vf = [0.0f64; 6];
+                for a in 0..6 {
+                    vf[a] = (0..nv).map(|i| jf[a * nv + i] * st.v[i]).sum();
+                }
+                let cv: f64 = (0..6).map(|a| c[a] * vf[a]).sum();
+                let vscale = (0..nv).map(|i| (j[i] * st.v[i]).abs()).sum::<f64>();
+                let e = rel(cv, jv, vscale);
+                worst = worst.max(e);
+                assert!(e < 1e-12, "substep {tick} row {row}: c·V {cv} vs j·v {jv}");
+                rows_checked += 1;
             }
         }
-        substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
+    });
+    println!("audit #9: {rows_checked} ground rows, worst relative deviation {worst:.3e}");
+    assert!(rows_checked > 1000, "trajectory must carry ground rows");
+}
+
+/// item 3: the RHS-MINOR batched solves for the dense pair rows, the
+/// contacting feet's spatial columns (audit #9) and the limit columns
+/// are bitwise the per-row reference solves (`tc_solve_v` on the
+/// assembled row / `tc_solve_unit_v` on the pivot) against the substep's
+/// live factor, along a random-gear contact run. audit #10: this also
+/// pins the RESTRICTED forward passes (the feet's upward-closure mask,
+/// the limit columns' ancestor chains) bitwise against the full ones.
+#[test]
+fn batched_row_solves_bitwise() {
+    use super::algo::{tc_solve_unit_v, tc_solve_v};
+    let mut esc = vec![0.0f64; HUMANOID.nv()];
+    let (mut dense_rows, mut foot_cols, mut lim_rows, mut wide_lim, mut two_feet) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    random_gear_contact_run(0x5EED_0000_0000_17E3, 480, |tick, st, ws, cs| {
         let nv = st.v.len();
         let nlim = cs.limit_rows();
         let ndense = cs.nrows - nlim;
         assert_eq!(cs.weld_rows(), 0);
-        wide_dense += (ndense >= 24) as usize;
         wide_lim += (nlim >= 8) as usize;
         let mut x = vec![0.0; nv];
-        for row in 0..ndense {
+        for row in cs.ground_rows()..ndense {
             x.copy_from_slice(cs.row_j(row));
-            chol_solve(nv, &ws.m, &mut x);
+            tc_solve_v(&ws.tc, &ws.l, &mut x, &mut esc);
             for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: dense row {row} word {i}");
             }
             dense_rows += 1;
         }
+        let nl = cs.ground_contacts.iter().filter(|g| g.frame == GROUND_FRAMES[0]).count();
+        let feet: Vec<usize> = (0..2)
+            .filter(|&f| if f == 0 { nl > 0 } else { cs.ground_contacts.len() > nl })
+            .collect();
+        two_feet += (feet.len() == 2) as usize;
+        for &f in &feet {
+            let (jf, minv) = cs.foot_rows(f);
+            for r in 0..6 {
+                x.copy_from_slice(&jf[r * nv..(r + 1) * nv]);
+                tc_solve_v(&ws.tc, &ws.l, &mut x, &mut esc);
+                for (i, (a, b)) in x.iter().zip(&minv[r * nv..(r + 1) * nv]).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: foot {f} column {r} word {i}");
+                }
+                foot_cols += 1;
+            }
+        }
         let voff = nv - NQ;
         for (li, &(jt, sign)) in cs.limit_set().to_vec().iter().enumerate() {
-            chol_solve_unit(nv, &ws.m, voff + jt, sign, &mut x);
+            tc_solve_unit_v(&ws.tc, &ws.l, voff + jt, sign, &mut x, &mut esc);
             let row = ndense + li;
             for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: limit row {row} word {i}");
             }
             lim_rows += 1;
         }
+    });
+    println!("item-3 batched solves: {dense_rows} dense / {foot_cols} foot / {lim_rows} limit columns bitwise ({two_feet} two-foot / {wide_lim} wide-limit substeps)");
+    assert!(two_feet > 0 && wide_lim > 0 && foot_cols > 0, "trajectory must exercise the batched paths");
+}
+
+/// audit #9 EQUIVALENCE GATE: the 6-D foot formulation against the
+/// per-row formulation it replaced (`ground_rowwise_ref`, the pre-audit
+/// solve), held on the SOLVER OUTPUT itself: at every substep of
+/// random-gear and gentle contact trajectories both solves run on the
+/// same FK / factor / v* (the step-7..9 hook), and the projected
+/// velocities are compared before step 10/11 (whose position/rate clamps
+/// are discontinuous — a rounding-level difference that lands a joint on
+/// the other side of a stop turns into an O(|q̇|) jump, and does so for a
+/// 1-ulp nudge of the OLD solve's input just as often). The two are the
+/// same algorithm in exact arithmetic (same rows, order, clamps,
+/// iterations), so the outputs agree to rounding: checked to 1e-9
+/// (|Δv| / max(|v|, 1)), observed worst printed.
+#[test]
+fn ground_6d_matches_rowwise_per_substep() {
+    use super::step::substep_wrench;
+    let m = &HUMANOID;
+    let mut worst = 0.0f64;
+    let mut checked = 0usize;
+    for (seed, amp) in [(0x5EED_0000_0000_17E5u64, 1.0), (0x5EED_0000_0000_17E6, 0.25)] {
+        let mut ws = Workspace::new(m);
+        let mut st = State::neutral(m);
+        let mut cs = contact_set(m);
+        let mut cs_ref = contact_set(m);
+        cs_ref.ground_rowwise_ref = true;
+        let mut rng = super::testutil::Rng(seed);
+        let mut tau = [0.0; NQ];
+        for tick in 0..480 {
+            if tick % 8 == 0 {
+                for j in 0..NQ {
+                    let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
+                    tau[j] = amp * g * m.tau_max[j];
+                }
+            }
+            let mut e = -1.0f64;
+            {
+                let (cs, cs_ref, e) = (&mut cs, &mut cs_ref, &mut e);
+                let mut hook = |mm: &super::model::Model, w: &mut Workspace, q: &[f64], v: &mut [f64]| {
+                    cs.h = H;
+                    cs_ref.h = H;
+                    let mut vr = v.to_vec();
+                    cs_ref.solve(mm, w, q, &mut vr);
+                    cs.solve(mm, w, q, v);
+                    if cs.ground_rows() > 0 {
+                        assert_eq!(cs.nrows, cs_ref.nrows);
+                        let mut d = 0.0f64;
+                        for (a, b) in v.iter().zip(&vr) {
+                            d = d.max((a - b).abs() / a.abs().max(1.0));
+                        }
+                        *e = d;
+                    }
+                };
+                substep_wrench(m, &mut st, &tau, &super::step::ZERO_WRENCH, H, &mut ws, Some(&mut hook));
+            }
+            if e < 0.0 {
+                continue;
+            }
+            assert!(e < 1e-9, "seed {seed:x} substep {tick}: 6-D vs per-row |dv| {e:.3e}");
+            worst = worst.max(e);
+            checked += 1;
+        }
     }
-    println!("item-3 batched solves: {dense_rows} dense / {lim_rows} limit columns bitwise ({wide_dense} / {wide_lim} substeps wide)");
-    assert!(wide_dense > 0 && wide_lim > 0, "trajectory must exercise both batched paths");
+    println!("audit #9 per-substep solver equivalence: {checked} contact substeps, worst |dv|/max(|v|,1) = {worst:.3e}");
+    assert!(checked > 500);
 }
