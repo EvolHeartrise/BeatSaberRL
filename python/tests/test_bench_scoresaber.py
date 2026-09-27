@@ -294,7 +294,7 @@ def test_greedy_rollout_smoke():
 
     cfg = ChartConfig(chart_len_s=3.0, bomb_prob=0.25)
     notes = generate_chart(cfg, np.random.default_rng(3))
-    env = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
+    env = RustBeatEnv(external_chart=notes, seed=0)
     obs, _ = env.reset()
     # seeded: an unseeded random init made this flake ~2/13 full-suite
     # runs (found during round-5 K17; nothing kernel-related)
@@ -328,8 +328,13 @@ def test_greedy_rollout_smoke():
     assert isinstance(r["full_combo"], bool)
 
     # coast rollout: zero actions never escape; every scoreable note
-    # resolves (all misses), so the counter identity is exact
-    env2 = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
+    # resolves (all misses), so the counter identity is exact. The notes
+    # are pulled forward to 0.2-0.4 s so they all pass the head plane
+    # before the unactuated body tips over (~0.7 s on ground contact)
+    import dataclasses
+    early = [dataclasses.replace(n, hit_time=0.2 + 0.1 * k)
+             for k, n in enumerate(notes[:3])]
+    env2 = RustBeatEnv(external_chart=early, seed=0)
     env2.reset()
     done = False
     while not done:
@@ -355,7 +360,7 @@ def test_vectorized_events_match_serial():
 
     serial = []
     for ci, chart in enumerate(charts):
-        env = RustBeatEnv(foot_contact=False, external_chart=chart, seed=0)
+        env = RustBeatEnv(external_chart=chart, seed=0)
         env.reset()
         walk, evs, done, t = scoresaber.ComboTracker(), [], False, 0
         while not done:
@@ -398,7 +403,14 @@ def test_vectorized_events_match_serial():
 def test_rust_combo_walk_matches_python():
     """The Rust-side combo walk (VecBeatSim combo_walk=True, 2026-07-25)
     reproduces the Python ComboTracker exactly over the same episodes:
-    multiplied score, max combo, and break count."""
+    multiplied score, max combo, and break count.
+
+    2026-09-27 (weld harness removed): a randomly driven body on ground
+    contact falls within ~1 s, so each env plays REPEATED short episodes
+    (the chart re-installed on done, as the bench refills a slot) with
+    its first notes at 0.3 s, until it has played at least one episode
+    that scored (random full gears land a good cut in ~1 in 3 of them on
+    these two charts); every episode's walk is compared."""
     import beat_arena_rs
     from beat_arena_env.chart import note_tuple
     from beat_arena_env.constants import EVENT_REASONS
@@ -406,29 +418,32 @@ def test_rust_combo_walk_matches_python():
     vec = beat_arena_rs.VecBeatSim(2, max_steps=100_000_000,
                                    combo_walk=True)
     charts = [generate_chart(ChartConfig(chart_len_s=6.0, colors="both",
-                                         bomb_prob=0.25),
-                             np.random.default_rng(s)) for s in (3, 4)]
-    for i, chart in enumerate(charts):
-        vec.set_chart(i, [note_tuple(n) for n in chart])
-    # the seed only matters for `py[i].score > 0` below (random
-    # actions must land some hits); body/env changes can re-roll it
-    acts = np.random.default_rng(43).integers(0, 3, size=(400, 2, 29))
-    py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
-    rust_result, t = [None, None], 0
-    while not all(r is not None for r in rust_result):
-        _, _, dones, events = vec.step(
-            np.ascontiguousarray(acts[t], dtype=np.int64))
-        for i, note, code, pts, _pre, _acc in events:
-            if rust_result[i] is None:
-                py[i].consume([(note, EVENT_REASONS[code], pts)])
-        for i in range(2):
-            if bool(dones[i]) and rust_result[i] is None:
-                rust_result[i] = vec.combo(i)   # before set_chart resets
-                vec.set_chart(i, [])
-        t += 1
+                                         bomb_prob=0.25, first_note_s=0.3),
+                             np.random.default_rng(s)) for s in (3, 5)]
+    tuples = [[note_tuple(n) for n in chart] for chart in charts]
     for i in range(2):
-        score, max_combo, breaks = rust_result[i]
-        assert score == pytest.approx(py[i].score, abs=1e-9)
-        assert max_combo == py[i].max_combo
-        assert breaks == py[i].breaks
-        assert py[i].score > 0                  # episodes actually scored
+        vec.set_chart(i, tuples[i])
+    rng = np.random.default_rng(43)
+    py = [scoresaber.ComboTracker(), scoresaber.ComboTracker()]
+    scored, episodes, compared = [False, False], [0, 0], 0
+    for _t in range(20_000):
+        if all(scored):
+            break
+        acts = rng.integers(0, 3, size=(2, 29))
+        _, _, dones, events = vec.step(np.ascontiguousarray(acts,
+                                                            dtype=np.int64))
+        for i, note, code, pts, _pre, _acc in events:
+            py[i].consume([(note, EVENT_REASONS[code], pts)])
+        for i in range(2):
+            if bool(dones[i]):
+                score, max_combo, breaks = vec.combo(i)  # before reinstall
+                assert score == pytest.approx(py[i].score, abs=1e-9)
+                assert max_combo == py[i].max_combo
+                assert breaks == py[i].breaks
+                scored[i] |= py[i].score > 0
+                episodes[i] += 1
+                compared += 1
+                py[i] = scoresaber.ComboTracker()
+                vec.set_chart(i, tuples[i])
+    assert all(scored), f"no scoring episode in {episodes} episodes"
+    assert compared >= 2

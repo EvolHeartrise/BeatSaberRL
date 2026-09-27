@@ -34,18 +34,12 @@ The extension is built on first use via torch.utils.cpp_extension.load
 jit_cache.cuda_flags()). Windows toolchain quirks
 (CUDA_HOME, cl.exe, ninja discovery) are handled in _toolchain_env().
 
-Env v11 (unilateral-contact spec, 2026-08-08) adds `foot_contact=`:
-foot_mode 1 swaps the two 6-DOF foot welds for unilateral frictional
-ground contact on the 8 sole-box corners and arms the fall termination
-(root y < 0.45, counted by `pop_fall_hits()`). It selects a COMPILE-TIME
-kernel instantiation, so the default weld mode is the v10 kernel
-unchanged; test_v11_contact_parity.py is the contact-mode gate.
-
-WELD MODE IS TEST-HARNESS ONLY since 2026-08-16 (user decision): the
-production surfaces (train_batch, bench_scoresaber) force contact mode
-unconditionally. foot_contact=False survives solely so the
-scripted-mechanics suite has a stable platform (an unactuated contact
-body tips in ~0.7 s, which would end every multi-second swing script).
+Env v11 (unilateral-contact spec, 2026-08-08): the feet stand on
+unilateral frictional ground contact at the 8 sole-box corners, with the
+fall termination (root y < FALL_ROOT_Y, counted by `pop_fall_hits()`).
+The v10 welded-feet mode (`foot_contact=False`) was a test harness from
+2026-08-16 and was REMOVED on 2026-09-27 (issue #2): the argument is gone
+and passing it is a TypeError.
 
 Limits vs BeatVecEnv: no per-step info dicts, no event stream, CUDA only.
 """
@@ -607,7 +601,7 @@ class CudaBeatVecEnv:
                  charts=None, chart_pool=1024, max_steps=None,
                  pool=None, gears=3,
                  device="cuda", dtype=torch.float32, auto_reset=True,
-                 want_contacts=False, foot_contact=False,
+                 want_contacts=False,
                  fall_const=5.0, walls=None,
                  push_prob=0.0, push_vmax=0.0, start_jitter=0.0,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
@@ -622,7 +616,7 @@ class CudaBeatVecEnv:
                  flux_charts=None):
         # game (SPEC.md §Flux): "standard" (the default; every existing
         # caller) or "flux" — circles + bars, palms instead of sabers.
-        # A compile-time kernel switch like foot_contact, baked here.
+        # A compile-time kernel switch, baked here.
         # Flux draws procedural charts from flux_chart.generate_flux_chart
         # (circle_prob / bar_prob + the shared chart kwargs), or plays
         # flux_charts= (list[list[FluxObj | flux_tuple]], the charts=
@@ -660,13 +654,6 @@ class CudaBeatVecEnv:
         # the parity harnesses pass True. Baked here, never mutated =>
         # constant per instance => safe under CUDA-graph capture.
         self.want_contacts = bool(want_contacts)
-        # env v11 foot_mode (unilateral-contact spec §1): False = weld
-        # (v10, the DEFAULT — every existing trajectory unchanged), True =
-        # unilateral frictional ground contact on the 8 sole corners plus
-        # the fall termination. Baked here, never mutated: the kernel
-        # selects a COMPILE-TIME instantiation on it, so it is constant
-        # per instance and safe under CUDA-graph capture.
-        self.foot_contact = bool(foot_contact)
         # env v18 (2026-08-15, sole mode): flat -fall_const terminal
         # reward on a fall (kills the sparse-state fall-indifference
         # exploit; the legacy remaining-notes charge is REMOVED).
@@ -698,12 +685,8 @@ class CudaBeatVecEnv:
         # impulse (N.s); 0 = off. Telemetry accumulates regardless.
         self.self_contact_coef = float(self_contact_coef)
         self.start_pose_jitter = float(start_pose_jitter)
-        assert start_pose_jitter == 0.0 or foot_contact, \
-            "start_pose_jitter fights the v10 foot welds; contact mode only"
         # env v38 crouch-rich starts (training-only; see kernel table)
         self.crouch_start_prob = float(crouch_start_prob)
-        assert crouch_start_prob == 0.0 or foot_contact, \
-            "crouch starts need contact mode (welded feet fight the pose)"
 
         # env v18 perturbation training (push-recovery lit): with
         # probability push_prob per (env, tick) add a horizontal root
@@ -910,7 +893,7 @@ class CudaBeatVecEnv:
         self._env_hits = z(1, dt=torch.int32)
         self._env_popped = 0
         # env v11 FALL terminations (unilateral-contact spec §4), counted
-        # per (env, tick); always 0 in weld mode
+        # per (env, tick)
         self._fall_hits = z(1, dt=torch.int32)
         self._fall_popped = 0
         # TILT terminations (2026-08-20): chest up-axis > 40 deg
@@ -982,7 +965,7 @@ class CudaBeatVecEnv:
         self._foot_pot = z(N)
         # env v12 (contact spec §7): tick-summed ground normal impulses
         # per (env, [L_heel, L_toe, R_heel, R_toe]); feeds the four
-        # OFF_GROUND_IMP obs lanes. Stays 0 in weld mode.
+        # OFF_GROUND_IMP obs lanes.
         self.ground_imp = z(N, 4)
         self.chart_idx = z(N, dt=torch.int64)
         # env v17 wall state (spec §12b): passed latches, passed-prefix
@@ -1076,7 +1059,7 @@ class CudaBeatVecEnv:
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps,
                        self.auto_reset, self.gears, self.want_contacts,
-                       self.foot_contact, self.fall_const,
+                       self.fall_const,
                        self.foot_z_coef, self.foot_x_coef,
                        self.foot_hinge_r, self.foot_shape_coef,
                        self.energy_coef, self.limit_coef,
@@ -1304,8 +1287,7 @@ class CudaBeatVecEnv:
         §4) — the Rust backend's pop_fall_hits mirror, same shape as
         pop_envelope_hits. Counted per (env, tick): each one terminated an
         env's episode with a zeroed reward because its root dropped below
-        FALL_ROOT_Y = 0.3 m. Always 0 with foot_contact=False, where the
-        feet cannot let go. One sync."""
+        FALL_ROOT_Y. One sync."""
         total = int(self._fall_hits.item())
         new = total - self._fall_popped
         self._fall_popped = total
@@ -1317,7 +1299,7 @@ class CudaBeatVecEnv:
         forward, 20 deg backward, or 40 deg to the
         side at end of tick (per-TICK check, not per substep) —
         episode ends priced at the flat fall_const, exactly like a
-        fall. Always 0 with foot_contact=False. One sync."""
+        fall. One sync."""
         total = int(self._tilt_hits.item())
         new = total - self._tilt_popped
         self._tilt_popped = total
@@ -1328,8 +1310,7 @@ class CudaBeatVecEnv:
         tick-summed ground normal impulse hit zero after a grounded
         tick — each charged the flat FOOT_LIFT_PEN (-0.1). Returns
         (left, right) counts since the last pop (per-foot split, user
-        2026-08-20). Always (0, 0) with foot_contact=False. One
-        sync."""
+        2026-08-20). One sync."""
         tl, tr = (int(x) for x in self._lift_hits.tolist())
         new = (tl - self._lift_popped[0], tr - self._lift_popped[1])
         self._lift_popped = [tl, tr]

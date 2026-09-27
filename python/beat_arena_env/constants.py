@@ -7,7 +7,8 @@ the written contract.
 
 Env v10 (P3, 2026-07-31): the v9 kinematic body is RETIRED — the body
 is the SPEC-v10 full humanoid (floating pelvis + 29 actuated revolute
-DoF, foot welds, self-collision) integrated at 8 × 1/240 s per 30 Hz
+DoF, self-collision; env v11 unilateral ground contact on the soles)
+integrated at 8 × 1/240 s per 30 Hz
 control tick. Actions are 29 gear heads (tau_j = gear_fraction ×
 TAU_MAX[j]); per-tick positive mechanical work is TELEMETRY only — the
 v10 work price (EFFORT_COEF) and the v7.9 EFFORT_COST table are both
@@ -124,9 +125,9 @@ TAU_MAX = (
 OMEGA_CAP = (16.0,) * 7 + (50.0,) * 3 + (16.0,) * 4 + (50.0,) * 3 + (16.0,) * 12
 
 # §19b root-velocity envelope (dynamics/step.rs ROOT_W_MAX / ROOT_V_MAX,
-# mirrored in the .cu): a kinematic consequence of the foot welds + the
-# ω caps, applied both BEFORE the step-10 integration (counted, §23) and
-# after step 11. Bounds ‖Δp‖ ≤ H_SUB·ROOT_V_MAX per substep.
+# mirrored in the .cu): a kinematic consequence of the grounded leg chain
+# + the ω caps (derived on the v10 welded-feet body), applied both
+# BEFORE the step-10 integration (counted, §23) and after step 11. Bounds ‖Δp‖ ≤ H_SUB·ROOT_V_MAX per substep.
 ROOT_W_MAX = 96.0
 ROOT_V_MAX = 48.0
 
@@ -147,8 +148,7 @@ Q_START_ARM = ((3, -1.3962634015954636), (6, 1.7453292519943295),
                (13, 1.7453292519943295), (15, 1.2217304763960306))
 # env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
 # +-8 deg, ankle_roll counter-rolls so the soles stay flat (verified:
-# fk_body foot up-vector exactly (0,1,0)). CONTACT MODE ONLY (weld
-# mode's feet are welded at the v10 reference). Exact f64 radians,
+# fk_body foot up-vector exactly (0,1,0)). Exact f64 radians,
 # mirrored verbatim in lib.rs Q_START_LEG and the .cu.
 Q_START_LEG = ((19, -0.13962634015954636), (22, 0.13962634015954636),
                (25, 0.13962634015954636), (28, -0.13962634015954636))
@@ -158,15 +158,14 @@ Q_START_LEG = ((19, -0.13962634015954636), (22, 0.13962634015954636),
 FOOT_X0 = 0.22108059783525694
 
 
-def q_start(foot_contact=False):
+def q_start():
     """The 29-joint episode-start pose vector: env v20 arm ready
-    stance, plus (contact mode only) the env v21 wide leg stance."""
+    stance plus the env v21 wide leg stance."""
     q = [0.0] * N_JOINTS
     for j, v in Q_START_ARM:
         q[j] = v
-    if foot_contact:
-        for j, v in Q_START_LEG:
-            q[j] = v
+    for j, v in Q_START_LEG:
+        q[j] = v
     return q
 
 
@@ -276,7 +275,7 @@ _OBS_BLOCKS = (
     ("note_mask", N_NOTE_SLOTS),
     # env v12 (unilateral-contact spec §7): per-foot ground-contact
     # lanes [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse
-    # / GROUND_IMP_NORM; all-zero in weld mode
+    # / GROUND_IMP_NORM
     ("ground_imp", 4),
     # env v13 (contact spec §8): world positions of [l_elbow, r_elbow,
     # l_knee, r_knee, l_foot, r_foot], head-style normalization

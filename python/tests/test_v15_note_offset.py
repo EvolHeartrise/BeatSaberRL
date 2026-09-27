@@ -13,7 +13,7 @@ from tests._helpers import ZERO_ACT, z_lane_m
 def _sim(chart, **kw):
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    gears=5,
-                                   foot_contact=True, **kw)
+                                   **kw)
     sim.set_chart([note_tuple(n) for n in chart])
     return sim
 

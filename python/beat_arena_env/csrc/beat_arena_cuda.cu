@@ -1,21 +1,22 @@
 // Beat Arena env v10 sim step as ONE CUDA kernel launch (P5).
 //
 // Full SPEC-v10 pipeline per env: 8 x substep (FK -> CRBA -> RNEA ->
-// tree-sparse Cholesky (audit #10, TreeTabs) -> constraint solve [12 x weld-block / contacts /
-// limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
+// tree-sparse Cholesky (audit #10, TreeTabs) -> constraint solve [12 x
+// ground block / contacts / limit rows / omega-cap pass, COMPOSITE_EPS
 // 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
 // + gear->tau, activation + torque telemetry, blade sweep/cut judgment, scoring,
 // obs write (OBS_DIM below) — a semantics-exact transcription of rust/src/lib.rs +
 // rust/src/dynamics/{model,fk,algo,collide,solver,step}.rs. The Rust
 // crate remains THE reference implementation.
 //
-// ENV v11 (2026-08-08, "Unilateral foot contact" spec), foot_mode = 1:
-// the 12 weld rows are DROPPED and the 8 sole-box corners get unilateral
-// frictional GROUND rows against the plane y = 0 (1 normal + 2
-// box-clamped friction per ACTIVE corner), plus a fall termination at
-// root y < FALL_ROOT_Y. It is a COMPILE-TIME mode — step_kernel<T, FC>,
-// selected on the host — so foot_mode = 0 is the v10 kernel unchanged;
-// see the rationale block at GROUND_CORNERS.
+// ENV v11 (2026-08-08, "Unilateral foot contact" spec): the 8 sole-box
+// corners get unilateral frictional GROUND rows against the plane
+// y = 0 (1 normal + 2 box-clamped friction per ACTIVE corner), plus a
+// fall termination at root y < FALL_ROOT_Y. This is the ONLY foot mode:
+// the v10 welded-feet mode (12 bilateral foot-weld rows, the former
+// FC = false instantiation) was deleted on 2026-09-27 (issue #2). The
+// K-series perf notes below predate that and mention the weld block
+// (s.mw / s.aww / A_ww, ensure_pcol's projection) as provenance only.
 //
 // Parallelization (P5 decision, profiled — see the session note):
 // ONE THREAD PER ENV. The whole substep is a serial transcription of
@@ -39,8 +40,8 @@
 // gated at max diff 0.0 across f32 and f64, free-running and
 // max_steps=60, want_contacts). It also needs no cross-thread
 // parallelism — the batches run inside the one thread, as ILP. A1
-// landed them (weld block, contacts, limit-row unit columns, plus the
-// weld dot/axpy interchanges) for +33% end to end: train --bench
+// landed them (the since-deleted weld block, contacts, limit-row unit
+// columns, plus the weld dot/axpy interchanges) for +33% end to end: train --bench
 // N=1024 5,496 -> 7,283 steps/s, env micro-bench 6,212 -> 8,264
 // env-steps/s. The "~2x" estimate of the prize was the honest half.
 //
@@ -85,7 +86,6 @@ constexpr int VOFF = 6;
 constexpr int NF = 30;
 constexpr int NUM_COLLIDERS = 12;
 constexpr int NUM_PAIRS = 55;
-constexpr int N_WELD = 12;
 constexpr int N_TRACKERS = 16;  // FOLLOW_TIMEOUT + 1 (aggregated ring)
 constexpr int N_NOTE_SLOTS = 24;  // env v18: 16 -> 24 (eviction study)
 // env v17 (contact spec §12): shared entity window — notes AND walls
@@ -230,100 +230,11 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // different transform — a loop interchange over independent right-hand
 // sides — and remains legal in both directions, as today.
 //
-// K7 (2026-08-07) — BATCH ensure_pcol OVER THE LIMIT-ROW GROUP, the same
-// RHS-batching transform applied to the last serial per-column pass in
-// the constraint stage. The limit rows' projected columns were computed
-// one joint at a time, each re-reading all of s.jw (144 loads), its own
-// 12x12 solve, and all of s.mw (420 loads). Batched 4-wide those reads
-// are shared, so a group of four costs one traversal instead of four:
-// 24,224 -> 25,370 env-steps/s at N=4096, +4.73% (5 interleaved rounds,
-// non-overlapping ranges). Width ladder and the two rejected widths are
-// tabulated at the call site.
-//
-// SPILL-CLIFF STATUS AFTER K7 — the headroom is GONE. f32 goes 249 ->
-// 255 registers, still 0 spill stores / 0 spill loads, frame 43,024 ->
-// 43,216 B (the +192 is exactly the rw[4][12] batch). So K7 spent all
-// six registers K6 bought and the kernel is now pinned AT the 255 cap:
-// the NEXT item that adds a live value falls off the cliff, and the
-// "check the build log before reading a micro-bench number" rule is now
-// the first thing K8/K9/K11 must do, not the last.
-// f64 crossed its OWN cliff on the same edit, in the opposite direction
-// from what its history predicted: step_kernel<double> went 90,992 B /
-// 12,308 / 10,300 spills to 85,536 B / ZERO spills at the same 255
-// registers, and its SASS shrank 56,130 -> 38,302 instructions (LDL
-// 12,493 -> 6,624, STL 4,744 -> 2,972). Nothing about the f64 arithmetic
-// got smaller; ptxas simply found a schedule that fits once the
-// per-column pcol pass stopped being four separate live regions. So the
-// K6 header's "the f64 kernel cannot fit either way" is now FALSE — f64
-// is on the cliff edge too, and K8/K9/K11 must gate BOTH dtypes' spill
-// counters, not just f32's.
-//
-// K8+K9 (2026-08-07) — REFINE the K5 weld support and stop materialising
-// the weld Jacobian twice. Three pieces, each probed against the build
-// below it, 5 interleaved A/B rounds at N=4096 apiece:
-//   K8   support 12 cols -> 9 (linear rows) / 7 (angular)
-//                                 25,363.7 -> 25,690.3   +1.29%   KEPT
-//   K9a+b one ancestor walk per foot, single-write stores
-//                                 25,706.3 -> 25,719.4   +0.10%   KEPT
-//   K9c  build J_w straight into s.mw; compact 84-value support store
-//                                 25,706.3 -> 25,821.3   +0.45%   KEPT
-//   PACKAGE                       25,359.7 -> 25,828.1   +1.85%
-// (all four medians of 5; every pair had non-overlapping ranges.)
-// The derivation is at WELD_FRAMES: K5 took the six root columns
-// wholesale, but a linear row's column 3+t is a STRUCTURAL +0.0 (the
-// t-th component of cross(rel0, e_t)) and an angular row touches only
-// 3+t of them; each row also has exactly one entry that is exactly 1.0,
-// contracted as a bare add (1.0*x == x unconditionally). nnz 144 -> 96,
-// of which 12 need no multiply. K9c then drops s.jw entirely: the rows
-// are built in s.mw (which the 12-RHS solve overwrote in place anyway),
-// the 420-load/420-store seed copy is gone, and the raw Jacobian
-// survives as s.jwc[12][6] + s.jwr[6][2] = 84 numbers instead of 420.
-// f32 frame 43,216 -> 41,872 B, still 255 registers and ZERO spills.
-// MEASURED AND REJECTED (recorded at the site): dropping the forced
-// `#pragma unroll` on the A_ww r/c nest costs -0.12% on f32
-// (25,838.9 -> 25,809.0) even though it clears f64's 8-byte spill and
-// shrinks the SASS — the unrolled nest folds WJ_ONE/WJ_ANG/WJ_R2 to
-// immediates, and f32 is the production dtype.
-// SPILL STATUS: f32 41,872 B / 0 / 0 / 255 regs; f64 82,912 B / 8 B
-// spill stores / 8 B spill loads / 255 regs. f64 picked up that 8-byte
-// spill at the K8 step and never lost it; it is one 64-bit value and
-// f64 still measures ~1% off f32's shape, so it was not traded for the
-// f32 point above. f32 has NO headroom: still pinned at 255.
-// SASS f32 33,407 -> 38,070 instrs (LDL 6,595 -> 6,548, STL 2,882 ->
-// 3,042); f64 38,302 -> 43,290 (LDL 6,624 -> 6,570, STL 2,972 ->
-// 2,901). Static size GREW while the kernel got faster — the pragmas
-// above trade code for immediates; static counts are not dynamic
-// traffic (the same caveat K7 recorded).
-//
-// K11 (2026-08-07) — RHS-MINOR s.mw, and the death of the LDL-width
-// theory. The task was posed as a SASS census: count vector vs scalar
-// local loads in the mw consumers and transpose [N_WELD][NV] ->
-// [NV][N_WELD] only if the scalar loads could be fused. The census
-// (nvcc -lineinfo + nvdisasm -c -g, per-source-line attribution) said
-// they were 100% scalar, so the transpose was built — and it is worth
-// +7.06%, 25,769.5 -> 27,588.8 env-steps/s at N=4096 (6 interleaved A/B
-// rounds, medians, ranges 25,750.7-25,778.3 vs 27,559.6-27,615.0, i.e.
-// non-overlapping by 30x the spread). But NOT ONE LOAD WAS FUSED: f32
-// LDL 6,548 -> 6,548, STL 3,042 -> 3,042, f64 6,570 / 2,901 likewise
-// unchanged; total instructions 38,070 -> 38,088 and 43,290 -> 43,308.
-// The whole gain is ADDRESS ARITHMETIC AND SCHEDULING — 12 consecutive
-// words off one base with immediate offsets, instead of 12 independent
-// runtime-stride addresses live at once — and that is the general
-// lesson for this kernel: it is register- and issue-bound, so a layout
-// change should be judged by how many ADDRESSES its inner loop must
-// keep live, not by LDL width. The corollary is that the SASS LDL
-// census, which K6/K7/K8 all leaned on, is a WEAK instrument here: it
-// was flat across the single largest win of the round.
-// Why ptxas would not fuse: on sm_61 it vectorizes local accesses only
-// in pure copy patterns (the one site in this kernel is
-// `x[b][w] = rw[b][w]`, 18 LDL.128 and zero scalars). Feed the same 12
-// consecutive words into FFMAs and it emits 12 scalar LDL regardless of
-// layout or alignment — __align__(16) on mw was measured at +0.07% =
-// noise and cost 16 B of f64 frame (rejected, recorded at the member).
-// SPILL STATUS UNCHANGED, both dtypes: f32 41,872 B / 0 / 0 / 255 regs,
-// f64 82,912 B / 8 / 8 / 255 regs — byte for byte what K8+K9 left.
-// s.c_minv and the ensure_pcol batches stay row-major on
-// chol_solve_multi_n; only s.mw uses the _tn twin.
+// K7 / K8+K9 / K11 (2026-08-07) — weld-block items (batched
+// weld-null projection, refined weld-Jacobian support, RHS-minor s.mw):
+// their code went with weld mode on 2026-09-27; the K8 support layout
+// survives in the ground block (GroundRows) and K11's lesson in the
+// K18(i) note below. Full notes: git history before issue #2.
 //
 // K12 (2026-08-07) — COLUMN-MAJOR CHOLESKY FACTORS, the same
 // live-address transform applied to the OTHER operand. Both matrices
@@ -547,8 +458,8 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // and it measured +0.02%, i.e. nothing. 96 chase steps per tick against
 // crba's 960: the site was never worth the code. It is REVERTED rather
 // than kept-as-neutral because it adds a forced unroll and a
-// compile-time coupling for no measured return; the derivation stands
-// at ANC_WELD_D if anyone wants it back.
+// compile-time coupling for no measured return (the weld walk itself
+// was deleted with weld mode on 2026-09-27).
 //
 // K19 (2026-08-07) — SPLIT write_obs INTO ITS OWN KERNEL: BUILT, FULLY
 // GATED, AND REJECTED at -0.28% / -0.33%. DO NOT RE-TRY IT. The round-5
@@ -714,93 +625,11 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // items that REDUCE divergence (rather than adding a ladder) now have a
 // measured ceiling to aim at.
 //
-// K15 (2026-08-07) — FOLD THE STEP-6 SOLVE INTO THE WELD MULTI-SOLVE AS
-// A 13th RHS: BUILT, FULLY GATED, AND REVERTED at −0.06% on f32 (noise)
-// even though it is +0.90% on f64 and PASSED EVERY OTHER GATE, including
-// the spill gate the round had it flagged as most likely to fail. DO NOT
-// RE-TRY IT IN THIS FORM. This is the round's cleanest example of the
-// A1/1f -> K10e1 -> K19 family: a pure traffic-and-pass removal on a
-// serial-latency-bound kernel buys nothing on the dtype that matters.
-// WHAT WAS BUILT, exactly as the audit specified. s.mw widened to
-// [NV][13] (RHS-minor, K11 layout — lane 12 is one more immediate offset
-// off the same base); step 4's rhs assembly left AT ITS INLINE SITE in
-// substep() with only its destination changed (d.rhs[i] -> s.mw[i][12]),
-// which is legal because the weld assembly writes only lanes 0..11 and
-// nothing between the seed and the solve touches lane 12; the standalone
-// `chol_solve_n(NV, d.m, d.rhs)` DELETED; chol_solve_multi_tn<12> ->
-// <13>; and `v[i] = d.v[i] + H_SUB * s.mw[i][12]` moved into
-// constraint_solve immediately after the widened solve (v is first read
-// ~160 lines later, at the PGS weld dot, so the move is safe). d.rhs
-// removed from Dyn. Net −1,140 dynamic local loads per substep and one
-// fewer serially-scheduled solve pass.
-// PTXAS — BYTE-IDENTICAL TO THE INCUMBENT IN BOTH DTYPES, which is the
-// first surprise: f32 41,872 B / 0 / 0 / 255 regs, f64 82,912 B / 8 / 8
-// / 255. The audit ranked this the HIGHEST spill risk of the round on
-// the grounds that the forward block's accumulators go 36 -> 39 live
-// (s0/s1/s2 gain a lane each) at zero margin. They do, and ptxas
-// absorbed all three at the same 255-register allocation. The frame did
-// not move either, because mw's +140 B (f32) is exactly d.rhs's −140 B.
-// So the 255-register pin is NOT a hard ceiling on live values — it is
-// where the allocator parks; the K13 note that "the allocator found a
-// 254-register allocation for a different edit" now has a companion in
-// the other direction. Stop treating the cliff as one added value away.
-// BITWISE, and the argument is worth keeping. Max diff EXACTLY 0.0 on
-// f32 AND f64, all 10 dumped arrays byte-equal, over five configs:
-// free-running with want_contacts, max_steps=60, the 128-env random-gear
-// traffic, and K13's stopjam / altstop limit-heavy configs. The solve
-// lane 12 rides is chol_solve_multi_tn (forward row-blocked R=3) where
-// it used to be chol_solve_n (R=4) — DIFFERENT blocking, same values,
-// because the K6 forward argument makes every R produce each row's terms
-// as k = 0..i−1 ascending from the same seed x[i]; the divides and the
-// back half are identical. The K10e2 hazard did not fire: `s −= l*x` is
-// one mul+add with exactly one contraction available and no freedom, and
-// the two expression trees that DID move (the rhs assembly's destination,
-// the v* axpy's enclosing function) were relocated whole, which K19
-// already showed is safe. pytest 172 green.
-// A/B, N=4096, fresh process per arm, TWO order-balanced batches:
-//   batch 1 (incumbent first)  incumbent 28,517.4 (28,497.8 - 28,532.6)
-//                              K15       28,495.4 (28,478.9 - 28,510.9)
-//                              −0.077%, 5/5 paired losses
-//   batch 2 (K15 first)        K15       28,497.8 (28,493.0 - 28,512.0)
-//                              incumbent 28,499.5 (28,487.0 - 28,532.5)
-//                              −0.006%, 2/5 paired wins
-//   pooled (10 pairs)          incumbent 28,514.1  K15 28,496.4
-//                              −0.062%, 8/10 paired losses, ranges
-//                              overlapping over most of their extent
-// i.e. NOISE-to-marginal-negative, and reverted on the round's standing
-// rule that a non-positive f32 verdict is a revert.
-// THE f64 SPLIT IS THE FINDING, and it is new. The SAME .pyd is
-// +0.90% on f64 — 16,869.3 (16,868.9 - 16,939.0) -> 17,021.7 (17,017.1
-// - 17,042.5), 3/3 paired wins, non-overlapping — while f32 is flat.
-// Both dtypes lost the identical pass and the identical ~1,140 loads;
-// the difference is that an f64 load moves twice the bytes against the
-// same 45/91 KB local working set, so on f64 the removed traffic was NOT
-// already hidden behind the serial chains and on f32 it was. That is the
-// A1/1f rule with a MEASURED BOUNDARY on it for the first time: "traffic
-// cuts do not pay here" is a statement about f32's arithmetic-to-traffic
-// ratio, not about the transform. f32 is the production dtype, so the
-// verdict follows f32 (the K8 no-unroll precedent) — but an item that
-// looks traffic-shaped should now be measured on BOTH dtypes before it is
-// called dead, and if the f64 tier ever becomes load-bearing this edit is
-// worth exactly +0.9%.
-// K15B, THE PADDED-STRIDE VARIANT, MEASURED AND REJECTED HARDER at
-// −0.46%. Hypothesis after the flat f32 result: the gain was eaten by
-// address arithmetic, because the mw row stride went 12 (two shifts) to
-// 13 (three, or an XMAD chain) at every one of the four hot mw
-// consumers — K17's power-of-two [NF][16] finding says that is a real
-// tax. So mw was padded to [NV][16] with chol_solve_multi_tn
-// generalized to <W, T, STRIDE> (the K18(i) generalization, re-derived)
-// and W = 13 riding a 16-word row, making every mw address a single
-// shift — CHEAPER than the incumbent's 12. It measured 28,525.9
-// (28,477.7 - 28,549.8) -> 28,395.7 (28,386.3 - 28,428.5), −0.457%,
-// 5/5 paired losses, non-overlapping in the wrong direction, at f32
-// 42,288 B / 0 / 0 / 255 regs (frame +416 B, still no spills). So the
-// stride hypothesis is FALSIFIED: 105 dead words per thread of frame
-// cost more than the address arithmetic saved, and the 12 -> 13 stride
-// was never the tax. The transferable half: on this kernel a
-// power-of-two stride is worth its padding only when the padding is
-// SMALL relative to the frame (K17's tables live in global memory and
-// cost the frame nothing, which is why that one paid).
+// K15 / K15B (2026-08-07) — folding the step-6 solve into the weld
+// multi-solve as a 13th RHS: REVERTED at -0.06% f32 (+0.90% f64). The
+// weld multi-solve no longer exists (weld mode deleted 2026-09-27); the
+// transferable finding is that traffic cuts can pay on f64 while being
+// flat on f32 — measure both dtypes before calling one dead.
 //
 // K20 + K16 (2026-08-07) — THE HOUSEKEEPING BUNDLE, and the round's
 // biggest surprise-to-effort ratio. Two of the three K20 items landed
@@ -810,44 +639,10 @@ constexpr double WALL_FRONT_OFF = 0.25; // viewer front-face offset (m)
 // (29,524.2 - 29,535.3), +2.08%, 5/5 paired wins, non-overlapping by
 // ~25x the within-arm spread.
 //
-// K20-1 ensure_pcol COPY -> RE-READ ELIMINATION: +1.96%, and the audit
-// priced it at 0.2%. ensure_pcol used to COPY the plain column into the
-// projected one (col[i] = s.ecol[j][i], fused into the dot pass plus a
-// copy-only range over VOFF..WJ_L0) and then the projection loop re-read
-// col[i] as its seed. The projection now reads s.ecol[j][i] DIRECTLY and
-// writes col[i] only as its OUTPUT, so the copy disappears entirely —
-// both in the scalar body and in K7's ensure_pcol_multi<B>.
-// BITWISE by inspection and gated at max diff EXACTLY 0.0 on f32 AND f64
-// across all five configs (free-running want_contacts, max_steps=60,
-// 128-env random-gear, stopjam, altstop), all 10 arrays byte-equal:
-// col[i] was set to EXACTLY s.ecol[j][i] over the whole 0..NV-1 range
-// (the four segments tile it, by the WJ_R0 + 6 == NV static_assert), so
-// seeding from the source is the same bytes; nothing between the two
-// passes touches either buffer, and s.ecol / s.pcol are distinct members.
-//   A/B N=4096 f32, fresh process per arm, TWO order-balanced batches:
-//     batch 1 (incumbent first) 28,512.5 (28,507.5-28,550.5) ->
-//                               29,084.0 (29,056.8-29,091.1)  +2.00%
-//     batch 2 (K20-1 first)     28,504.2 (28,497.2-28,543.4) ->
-//                               29,071.0 (29,034.3-29,110.3)  +1.99%
-//     pooled (10 pairs)         28,517.3 -> 29,075.7  +1.96%, 10/10
-//     paired WINS, ranges non-overlapping by ~15x the spread.
-//   f64 16,941.2 -> 17,165.5, +1.32%, 3/3.
-//   ptxas BYTE-IDENTICAL both dtypes: f32 41,872 B / 0 / 0 / 255 regs,
-//   f64 82,912 B / 8 / 8 / 255. pytest 172 green.
-// WHY IT IS 10x THE ESTIMATE, and this is the transferable half. The
-// audit costed it as traffic (35 stores + 35 loads per column), and this
-// file's standing rule — A1/1f -> K10e1 -> K19 -> K15 — says pure
-// traffic cuts do not pay on f32. They still don't: what this removes is
-// a STORE -> LOAD FORWARDING DEPENDENCY. The projection's seed for row i
-// was a local store issued a few instructions earlier in the same
-// function, so every one of the 35 rows had to wait for the copy's store
-// to land before its own FFMA chain could start; reading s.ecol instead
-// makes all 35 seeds independent loads that ptxas can hoist ahead of the
-// chain. The SASS census agrees on the traffic and understates the win,
-// as usual here (f32 LDL 6,584 -> 6,447, STL 3,048 -> 2,768, instrs
-// 38,334 -> 37,932). RULE: a removed load that was feeding on a value
-// this thread just STORED is not a traffic cut, it is a chain cut —
-// price it like A4/K6, not like K19.
+// K20-1 ensure_pcol COPY -> RE-READ ELIMINATION: +1.96% (weld-null
+// projection, deleted with weld mode 2026-09-27). RULE it left: a
+// removed load that was feeding on a value this thread just STORED is
+// not a traffic cut, it is a chain cut — price it like A4/K6, not K19.
 //
 // K20-2 rnea_bias DEAD ZERO FILL: +0.13% f32 / +0.11% f64, KEPT at the
 // edge of noise. `for (i < NV) d.c[i] = 0` ran immediately before a
@@ -953,8 +748,7 @@ constexpr int OFF_NOTES = 102;
 constexpr int OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT;  // 534
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse /
-// GROUND_IMP_NORM. All-zero in weld mode, so lanes 0..340 are the v10
-// obs verbatim.
+// GROUND_IMP_NORM.
 constexpr int OFF_GROUND_IMP = OFF_NOTE_MASK + N_NOTE_SLOTS;         // 558
 constexpr int N_GROUND_IMP_LANES = 4;
 // env v13 (contact spec §8): [l_elbow, r_elbow, l_knee, r_knee,
@@ -1009,7 +803,10 @@ constexpr double BETA_LIMIT = 0.2;
 constexpr double SLOP_LIMIT = 0.002;
 constexpr double LIMIT_TELEPORT_BACKSTOP = 0.35;
 constexpr int PGS_ITERS = 12;
-constexpr double BETA_WELD = 0.2;
+// Baumgarte gain of the joint-limit ROWS in the constraint solve
+// (solver.rs; named BETA_WELD until the 2026-09-27 weld removal — same
+// constant, the value the weld rows shared).
+constexpr double BETA_LIMIT_ROW = 0.2;
 constexpr double BETA_CONTACT = 0.2;
 constexpr double COMPOSITE_EPS = 1e-4;
 constexpr double ROOT_W_MAX = 96.0;
@@ -1366,77 +1163,34 @@ __device__ __forceinline__ bool is_arm_r(int id) {
   return id == 3 || id == 5 || id == 7;
 }
 
-// feet weld (solver.rs)
-__device__ constexpr int WELD_FRAMES[2] = {F_L_FOOT, F_R_FOOT};
-// K5 — STRUCTURAL SPARSITY of the 12 weld Jacobian rows. A weld row is
-// built by point_jacobian_acc / angular_jacobian_acc, which touch
-// row[VOFF + F_COORD[k]] for k on the frame's ancestor chain plus
-// row[0..5]; every other column is left at the +0.0 of the row's zero
-// fill. Walking F_PARENT from F_L_FOOT = 23 gives frames
-// 23,22,21,20,19,18 -> F_COORD 22,21,20,19,18,17 -> v-columns 23..28,
-// and from F_R_FOOT = 29 frames 29,28,27,26,25,24 -> v-columns 29..34.
-// So rows 0..5 have support {0..5} u {23..28} and rows 6..11 have
-// {0..5} u {29..34}: 12 of NV = 35 columns.
+// FOOT SPATIAL-ROW SUPPORT (the former K5/K8 weld-row derivation, now
+// serving the ground block — GroundRows / foot_row_dot). A foot's six
+// spatial rows (3 linear at the foot origin, 3 world angular) are built
+// by one ancestor walk touching row[VOFF + F_COORD[k]] for k on the
+// foot's chain plus root columns: walking F_PARENT from F_L_FOOT = 23
+// gives v-columns 23..28, from F_R_FOOT = 29 v-columns 29..34.
+//   ANGULAR row t: the chain plus ONE root column 3 + t holding exactly
+//   +0.0 + 1.0 = 1.0.
+//   LINEAR row t (n = e_t): the chain, row[t] = 1.0, and the two root
+//   columns {3,4,5} \ {3+t} (cross(rel0, e_t)); column 3+t is a
+//   structural +-0.0 absorbed by the zero fill's +0.0 (Divergences 20c).
+// Every consumer keeps each accumulator's ASCENDING-i term order; the
+// dropped products are (+-0.0)*x into +0.0-seeded accumulators, so the
+// -0.0 channel is unreachable, and the exactly-1.0 entries are
+// contracted as a bare add (1.0*x == x unconditionally).
 constexpr int WJ_L0 = 23;
 constexpr int WJ_R0 = 29;
-static_assert(WJ_R0 == WJ_L0 + 6 && WJ_R0 + 6 == NV && N_WELD == 12,
-              "K5: weld support layout is {0..5} u {L0..L0+5} / {R0..NV}");
-//
-// K8 (2026-08-07) — the SAME derivation carried into the six root
-// columns, which K5 took wholesale. Row r of the weld block is
-// r = 6*widx + m; t = m % 3 and the row is ANGULAR iff m >= 3.
-//
-//   ANGULAR row (angular_jacobian_acc, sign = +1): the ancestor walk
-//   writes only row[VOFF + F_COORD[k]], then `row[3 + axis_t] += sign`
-//   -- ONE root column, holding exactly +0.0 + 1.0 = 1.0. Columns 0..2
-//   and the other two of 3..5 are never touched.
-//        support = {3 + t} u chain6  ->  7 columns, one of them 1.0.
-//
-//   LINEAR row (point_jacobian_acc with n = e_t, sign = +1): the walk
-//   writes row[VOFF + F_COORD[k]] += dot3(e_t, w) = w[t]; then
-//   `row[tt] += n[tt]` gives row[t] = +0.0 + 1.0 = 1.0 and leaves the
-//   other two of 0..2 at +0.0; then rxn = cross(rel0, e_t) is added
-//   into row[3..5]. cross(a, e_t)[t] is structurally a[j]*0 - a[k]*0,
-//   i.e. +-0.0, and row[3+t] = +0.0 + (+-0.0) = +0.0 EXACTLY (the zero
-//   fill's +0.0 absorbs the sign -- Divergences 20c). The other two
-//   components are +-a[.] and generally nonzero.
-//        support = {t} u ({3,4,5} \ {3+t}) u chain6  ->  9 columns,
-//        one of them 1.0.
-//
-// nnz 6*9 + 6*7 = 96 vs K5's 144. Per-column contributor counts (used
-// by the two i-outer dots): i in 0..2 -> the 2 linear rows with t == i;
-// i in 3..5 -> the 2 angular rows with 3+t == i plus the 4 linear rows
-// with t != i-3; chainL -> rows 0..5; chainR -> rows 6..11. That is
-// 3*2 + 3*6 + 6*6 + 6*6 = 96, which checks.
-//
-// Every consumer keeps each accumulator's ASCENDING-i term order; the
-// dropped products are (+-0.0)*x and the accumulators are +0.0-seeded,
-// so the -0.0 channel is unreachable (K5's argument verbatim). The
-// entries proven to be exactly 1.0 are contracted as a bare add:
-// 1.0*x == x unconditionally, so that drop is exact even for +-0.0.
-constexpr bool WJ_ANG(int r) { return (r % 6) >= 3; }
-constexpr int WJ_T(int r) { return r % 3; }
-constexpr int WJ_CH0(int r) { return WJ_L0 + 6 * (r / 6); }
-// the ONE column of row r whose entry is exactly 1.0
-constexpr int WJ_ONE(int r) { return WJ_ANG(r) ? 3 + WJ_T(r) : WJ_T(r); }
+static_assert(WJ_R0 == WJ_L0 + 6 && WJ_R0 + 6 == NV,
+              "foot support layout is {0..5} u {L0..L0+5} / {R0..NV}");
 // a LINEAR row t's two other root columns, {3,4,5} \ {3+t}, ASCENDING
 __device__ constexpr int WJ_R2[3][2] = {{4, 5}, {3, 5}, {3, 4}};
-// K9c compact-storage indices: linear rows 0,1,2,6,7,8 -> jwr slots
-// 0..5; column 3+u of linear row t -> which of that row's two slots.
-constexpr int WJ_LIN(int r) { return r < N_WELD / 2 ? r : r - 3; }
-constexpr int WJ_RIDX(int t, int u) { return u > t ? u - 1 : u; }
-static_assert(WJ_LIN(0) == 0 && WJ_LIN(2) == 2 && WJ_LIN(6) == 3
-                  && WJ_LIN(8) == 5,
-              "K9c: linear rows 0,1,2,6,7,8 map onto jwr slots 0..5");
-static_assert(WJ_R2[0][WJ_RIDX(0, 1)] == 4 && WJ_R2[0][WJ_RIDX(0, 2)] == 5
-                  && WJ_R2[1][WJ_RIDX(1, 0)] == 3
-                  && WJ_R2[1][WJ_RIDX(1, 2)] == 5
-                  && WJ_R2[2][WJ_RIDX(2, 0)] == 3
-                  && WJ_R2[2][WJ_RIDX(2, 1)] == 4,
-              "K9c: WJ_RIDX(t,u) is the slot holding column 3+u");
+static_assert(WJ_R2[0][0] == 4 && WJ_R2[0][1] == 5 && WJ_R2[1][0] == 3
+                  && WJ_R2[1][1] == 5 && WJ_R2[2][0] == 3
+                  && WJ_R2[2][1] == 4,
+              "linear-row root extras are {3,4,5}\\{3+t}, ascending");
 // re-derivation of the ancestor chains straight off F_PARENT/F_COORD:
 // the bit mask of v-columns the walk touches must be exactly the
-// 6-column segment [WJ_CH0, WJ_CH0+6). Equality pins count, contiguity,
+// 6-column segment [WJ_L0 / WJ_R0, +6). Equality pins count, contiguity,
 // distinctness AND disjointness from the root columns 0..5 at once.
 constexpr unsigned long long wj_chain_mask(int f) {
   unsigned long long m = 0;
@@ -1446,26 +1200,8 @@ constexpr unsigned long long wj_chain_mask(int f) {
 }
 static_assert(wj_chain_mask(F_L_FOOT) == (0x3full << WJ_L0)
                   && wj_chain_mask(F_R_FOOT) == (0x3full << WJ_R0),
-              "K8: weld ancestor chains are exactly v-columns 23..28 "
+              "foot ancestor chains are exactly v-columns 23..28 "
               "and 29..34 -- 6 distinct columns each, none in 0..5");
-// K17, REVERTED ROW: the weld assembly's chase folds to immediates if
-// its walk is unrolled at a compile-time length, and this is that
-// length — kept as a compile-time claim (it costs nothing) because the
-// item measured +0.02% and the derivation is the only expensive part.
-// See the K17 header block before re-trying it.
-constexpr int ANC_WELD_D = 6;
-static_assert(ANC_N[F_L_FOOT] == ANC_WELD_D && ANC_N[F_R_FOOT] == ANC_WELD_D,
-              "K17: each foot's coord-bearing chain is exactly 6 frames");
-static_assert(WJ_ONE(0) == 0 && WJ_ONE(2) == 2 && WJ_ONE(3) == 3
-                  && WJ_ONE(5) == 5 && WJ_ONE(6) == 0 && WJ_ONE(11) == 5
-                  && WJ_CH0(5) == WJ_L0 && WJ_CH0(6) == WJ_R0,
-              "K8: row -> (one-column, chain) map");
-static_assert(WJ_R2[0][0] == 4 && WJ_R2[0][1] == 5 && WJ_R2[1][0] == 3
-                  && WJ_R2[1][1] == 5 && WJ_R2[2][0] == 3
-                  && WJ_R2[2][1] == 4,
-              "K8: linear-row root extras are {3,4,5}\\{3+t}, ascending");
-__device__ constexpr double WELD_TARGET_P[2][3] = {
-    {-0.10, 0.07, -0.65}, {0.10, 0.07, -0.65}};
 
 // ---- audit #10 (2026-09-26): TREE ELIMINATION LAYOUT of the mass matrix ----
 // algo.rs `TreeChol::tree`, mirrored as compile-time tables (read the
@@ -1634,24 +1370,12 @@ static_assert(tc_all_subtrees_massive(),
               "if every coord frame's composite mass is > 0");
 
 // ---- env v11 GROUND CONTACT (unilateral-contact spec §2/§3) -----------------
-// The contact-mode replacement for the 12 weld rows: the 8 sole-box
-// corners against the static plane y = 0 — one unilateral normal row
-// plus two BOX-clamped friction rows per ACTIVE corner, assembled where
-// the weld rows used to sit (so the §2 pair-id row order downstream is
-// untouched). MIRROR sources: collide.rs `ground_phase`, solver.rs
-// `assemble_ground_rows` / `prep_ground_rows` / `pgs_ground_sweep_foot`.
-//
-// WHY A TEMPLATE PARAMETER AND NOT A RUNTIME FLAG. `foot_mode` is baked
-// per CudaBeatVecEnv instance and constant across launches, so it is
-// warp-uniform AND launch-uniform: nothing is gained by branching on it
-// at runtime and two things are lost. (1) The K13 rule — a data-dependent
-// selector makes the warp pay the union of the arms; a compile-time one
-// cannot. (2) The weld build must stay the v10 kernel EXACTLY: with
-// `if constexpr` the ground block is discarded before ptxas sees it, the
-// ground scratch collapses to a stub row (see Solver), and the f32/f64
-// weld census stays byte-identical to the pre-v11 baseline — which is
-// checkable, and was checked. The cost is 4 step_kernel instantiations
-// instead of 2 (~2x compile time, still ~2.5 min on the pod).
+// The 8 sole-box corners against the static plane y = 0 — one
+// unilateral normal row plus two BOX-clamped friction rows per ACTIVE
+// corner, assembled BEFORE the self-collision rows (so the §2 pair-id
+// row order downstream is untouched). MIRROR sources: collide.rs
+// `ground_phase`, solver.rs `assemble_ground_rows` / `prep_ground_rows`
+// / `pgs_ground_sweep_foot`.
 constexpr int CORNERS_PER_FOOT = 4;
 constexpr int NUM_GROUND_CORNERS = 2 * CORNERS_PER_FOOT;  // foot_l, foot_r
 constexpr int GROUND_ROWS_PER_CORNER = 3;                 // N, T1, T2
@@ -1676,7 +1400,8 @@ __device__ constexpr double GROUND_CORNERS[CORNERS_PER_FOOT][3] = {
 __device__ constexpr double GROUND_DIRS[GROUND_ROWS_PER_CORNER][3] = {
     {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 1.0}};
 // G1: the world axis of each row direction (GROUND_DIRS[t] = e_axis), so
-// row t is a weld-LINEAR-shaped row with WJ_ONE = axis (see GroundRows)
+// row t is a foot LINEAR-shaped row whose 1.0 entry sits at column axis
+// (see GroundRows)
 __device__ constexpr int GROUND_AXIS[GROUND_ROWS_PER_CORNER] = {1, 0, 2};
 static_assert(GROUND_DIRS[0][GROUND_AXIS[0]] == 1.0
                   && GROUND_DIRS[1][GROUND_AXIS[1]] == 1.0
@@ -1690,7 +1415,7 @@ static_assert(GROUND_DIRS[0][GROUND_AXIS[0]] == 1.0
 // Divergences §24). A corner row is e_a . (v_o + w x r) = e_a . v_o +
 // (r x e_a) . w with r = p_corner - p_foot, i.e. the combination
 // c = [e_a; r x e_a] of the foot's six spatial rows J_f (3 linear rows at
-// the foot origin + 3 world angular rows = that foot's weld rows). Per
+// the foot origin + 3 world angular rows). Per
 // row t: its linear axis a and the two angular slots b1 < b2 where
 // r x e_a is non-zero:
 //   r x e_1 = (-r2, 0, r0)   r x e_0 = (0, r2, -r1)   r x e_2 = (r1, -r0, 0)
@@ -1714,7 +1439,7 @@ constexpr double Y_CENTER = 1.40;
 constexpr double REWARD_BAD = -0.5;
 constexpr double REWARD_MISS = -0.5;
 constexpr double REWARD_BOMB = -1.5;
-// env v12 (contact spec §7): per-tick survival bonus, contact mode only
+// env v12 (contact spec §7): per-tick survival bonus
 // — see lib.rs ALIVE_BONUS for the sizing rationale. Overridden by the
 // fall/escape terminal pricing.
 constexpr double ALIVE_BONUS = 0.002;
@@ -1766,8 +1491,7 @@ constexpr double FLAIL_LEAD_S = 1.0;
 constexpr double WREV_HYST = 0.34906585;   // 20 deg
 // env v21 (lib.rs mirrors, exact shared f64 literals): wide stance —
 // hip_roll splays the legs +-8 deg, ankle_roll counter-rolls so the
-// soles stay flat. Contact mode only (weld mode's feet are welded at
-// the v10 reference). FOOT_X0 = the stance's per-side foot x (fk of
+// soles stay flat. FOOT_X0 = the stance's per-side foot x (fk of
 // the start pose; the root ground-drop does not move x).
 constexpr double Q_START_HIP_ROLL = 0.13962634015954636;   // 8 deg
 constexpr double FOOT_X0 = 0.22108059783525694;
@@ -1782,14 +1506,14 @@ constexpr double HEAD_Y0 = 1.70;
 constexpr double PLANE_Z0 = -0.65;
 constexpr double ROOT_VLIN_NORM = 6.0;
 constexpr double ROOT_VANG_NORM = 16.0;
-// env v11 FALL termination (unilateral-contact spec §4), CONTACT MODE
-// ONLY — lib.rs FALL_ROOT_Y. Root below this at the END of a tick
+// env v11 FALL termination (unilateral-contact spec §4) — lib.rs
+// FALL_ROOT_Y. Root below this at the END of a tick
 // (per-TICK since 2026-08-20, user: consistent with the tilt check;
 // the per-substep dip test is retired) ends the episode with a ZEROED
 // reward, reported exactly like the root-escape envelope (SPEC-v10
 // §20e "reported, never hidden").
 constexpr double FALL_ROOT_Y = 0.25;  // 2026-08-21: 0.5 -> 0.25 (user; follows the player-height revert to 1.8 — full crouch headroom restored)
-// TILT termination (user 2026-08-20), CONTACT MODE ONLY — lib.rs
+// TILT termination (user 2026-08-20) — lib.rs
 // mirror: CHEST up-axis tilted more than 40 deg FORWARD, 20 deg
 // BACKWARD (asymmetric sagittal, user 2026-08-20 — the tight back
 // bound targets the v30 backbend exploit; forward stays duck-sized)
@@ -1801,7 +1525,7 @@ constexpr double FALL_ROOT_Y = 0.25;  // 2026-08-21: 0.5 -> 0.25 (user; follows 
 constexpr double TILT_TAN2_FWD = 0.7040881910418472;   // tan^2(40 deg)
 constexpr double TILT_TAN2_BACK = 0.1324743314317942;  // tan^2(20 deg) — 2026-08-21: briefly 10 deg, reverted to 20 same day (user)
 constexpr double TILT_TAN2_ROLL = 0.7040881910418472;  // tan^2(40 deg)
-// FOOT-LIFT penalty (user 2026-08-20), CONTACT MODE ONLY — lib.rs
+// FOOT-LIFT penalty (user 2026-08-20) — lib.rs
 // mirror: flat charge on the TICK a foot leaves the ground (edge:
 // that foot's tick-summed ground normal impulse hits zero after a
 // grounded tick), per foot. Grazing contact can flicker the edge;
@@ -1894,104 +1618,31 @@ struct Dyn {
   int env_n;
 };
 
-// FC = env v11 `foot_mode` (unilateral-contact spec §1): false = weld
-// (v10, the DEFAULT), true = unilateral frictional ground contact. It is
-// a TEMPLATE parameter, not a field — see the rationale at
-// GROUND_CORNERS.
+// GROUND-BLOCK scratch (unilateral-contact spec §3): 3 rows per ACTIVE
+// sole corner, corners in the §2 normative order. Same field shape as
+// the self-collision contact rows — bias / diag / lambda — because the
+// normal row's PGS update IS the contact path's and the friction rows
+// differ from it only in the projection. A base of Solver (as it has
+// been since v11), so the frame layout is unchanged.
 //
-// The two modes are MUTUALLY EXCLUSIVE (contact mode DROPS the 12 weld
-// rows), and each block's scratch is therefore an EMPTY BASE in the
-// other instantiation rather than a stub array. That is not tidiness:
-// this kernel's whole history says frame size buys spills, and the
-// measurement here says it twice. Carrying the other mode's arrays as
-// [1]-row stubs cost the weld build 304 B (f32) / 608 B (f64) of frame
-// it never touches, and carrying the weld arrays into the CONTACT build
-// cost f64 1,382/1,736 B of SPILL that vanished when they went away.
-// Empty bases with EBO cost exactly zero, and every reader of either
-// block sits under an `if constexpr` on FC, so the names are not even
-// looked up in the instantiation that lacks them.
-//
-// WELD-MODE scratch (foot_mode = 0). `pcol` belongs here too: with no
-// weld block there is no null space to project into, so contact mode
-// reads `ecol` wherever weld mode reads `pcol` (solver.rs skips the
-// entire `if nweld > 0` block, leaving the plain M^-1 e_j column and
-// its plain mobility). `pdiag` stays in Solver — it is written in BOTH
-// modes, holding that plain mobility in contact mode.
-template <typename T, bool FC>
-struct WeldRows {
-  // weld rows. K9c: the dense J_w is built STRAIGHT INTO mw (which the
-  // 12-RHS solve then overwrites in place with M^-1 J_w^T), so the old
-  // full jw[12][35] copy source is gone -- 1,680 B of f32 frame and a
-  // 420-load/420-store seed pass. All four consumers contract a weld
-  // row against its K8 support only, so the raw Jacobian survives as
-  // 84 numbers: jwc[r][e] is chain column WJ_CH0(r)+e, jwr[WJ_LIN(r)][.]
-  // the two extra root columns WJ_R2[t][.] of a linear row. The 12
-  // exactly-1.0 entries are not stored at all (WJ_ONE(r) is implicit).
-  // K11 — mw is stored RHS-MINOR, [NV][N_WELD], not [N_WELD][NV], worth
-  // +7.06% (25,769 -> 27,589 env-steps/s at N=4096, 6 interleaved A/B
-  // rounds, non-overlapping ranges). All four consumers sweep the 12
-  // weld rows in the INNER loop at a fixed column i — the 12-RHS solve
-  // (chol_solve_multi_tn), both ensure_pcol projections, the PGS weld
-  // update — so RHS-minor makes each of those sweeps 12 CONSECUTIVE
-  // per-thread words off ONE base register with immediate offsets;
-  // row-major made them stride-NV, i.e. 12 independent addresses.
-  //
-  // WHY, and what it is NOT: the K11 premise was that contiguity would
-  // let ptxas fuse the sweep into 3 LDL.128. IT DOES NOT. The SASS
-  // census before and after is IDENTICAL to the instruction — f32 LDL
-  // 6,548 -> 6,548 and STL 3,042 -> 3,042 (f64 6,570 / 2,901 likewise
-  // unchanged), total instructions 38,070 -> 38,088 — and EVERY mw
-  // sweep is still 12 scalar LDL (PGS weld update 420 -> 420, A_ww
-  // chain 180 -> 180, batched projection 48 -> 48, 12-RHS solve 12 per
-  // (i, k) either way). ptxas on sm_61 only vectorizes local accesses
-  // in pure copy patterns: the one place it fires in this kernel is
-  // `x[b][w] = rw[b][w]` (18 LDL.128, zero scalars) where the loaded
-  // value feeds a store and nothing else. Feed the same 12 words into
-  // FFMAs and it emits 12 scalar LDL no matter how they are laid out.
-  // So the +7% is ADDRESSING AND SCHEDULING, not load width, and
-  // forcing alignment buys nothing: __align__(16) on this member (which
-  // would make all 35 rows 16-byte aligned) was MEASURED at +0.07% =
-  // NOISE (27,609.5 vs 27,589.7 medians, 3 interleaved rounds,
-  // overlapping ranges) and cost 16 B of f64 frame — REVERTED, do not
-  // re-add it. Local memory is per-thread interleaved, so stride never
-  // affected transactions either. LESSON: on this kernel, judge a
-  // layout change by how many ADDRESS registers the inner loop needs
-  // live, not by LDL width.
-  T mw[NV][N_WELD];
-  T jwc[N_WELD][6], jwr[N_WELD / 2][2], bias_w[N_WELD];
-  T aww[N_WELD * N_WELD], rw[N_WELD];  // aww: A_ww, then in-place L
-  T pcol[NQ][NV];  // weld-null-space-projected M^-1 e_j (limit + cap)
-};
-template <typename T>
-struct WeldRows<T, true> {};  // contact mode: the weld block is dropped
-
-// CONTACT-MODE scratch (foot_mode = 1, unilateral-contact spec §3): 3
-// rows per ACTIVE sole corner, corners in the §2 normative order. Same
-// field shape as the self-collision contact rows — dense J, its
-// M^-1 J^T column, bias / diag / lambda — because the normal row's PGS
-// update IS the contact path's and the friction rows differ from it only
-// in the projection.
-//
-// G1 (2026-09-26) — FIXED SLOTS + SUPPORT-ONLY STORAGE, the weld block's
-// K5/K8/K9/K11 layout carried over. Row slot 3*c + t belongs to corner
-// c = 4*foot + k (spec §2 order) whatever the active set is; bit c of
-// g_act says whether the corner is in contact. Row t of a corner is
-// point_jacobian_acc with n = e_{GROUND_AXIS[t]}, i.e. EXACTLY a weld
-// LINEAR row (K8 derivation, verbatim): one entry of 1.0 at column
-// GROUND_AXIS[t], two root values at WJ_R2[axis], six chain values at
-// WJ_L0 / WJ_R0 + 0..5; every other column is the zero fill's +0.0.
+// G1 (2026-09-26) — FIXED SLOTS + SUPPORT-ONLY STORAGE. Row slot 3*c + t
+// belongs to corner c = 4*foot + k (spec §2 order) whatever the active
+// set is; bit c of g_act says whether the corner is in contact. Row t of
+// a corner is point_jacobian_acc with n = e_{GROUND_AXIS[t]}, i.e. a foot
+// LINEAR row (the support derivation at WJ_L0): one entry of 1.0 at
+// column GROUND_AXIS[t], two root values at WJ_R2[axis], six chain values
+// at WJ_L0 / WJ_R0 + 0..5; every other column is the zero fill's +0.0.
 //
 // audit #9 (2026-09-26) — the Jacobian object is no longer the corner
 // rows but each foot's SIX SPATIAL ROWS (GROUND_SPATIAL above), stored
-// exactly like the weld block's K8/K9c support (they ARE the weld rows of
-// that foot): g_fjc[f][m] the six chain values of spatial row m,
+// support-only: g_fjc[f][m] the six chain values of spatial row m,
 // g_fjr[f][t] linear row t's two root values at WJ_R2[t] (the 1.0 entries
 // implicit). g_minv is M^-1 J_f^T for BOTH feet RHS-MINOR ([NV][12], foot
-// f at columns 6f..6f+5): ONE chol_solve_multi_tn<12> per substep with
-// any corner down (was one <12> per contacting foot). Per corner row:
-// g_coef its two angular coefficients of c, g_u = Phi_f c (its image in
-// foot-velocity space, Phi_f = J_f M^-1 J_f^T), g_diag = c . g_u.
-template <typename T, bool FC>
+// f at columns 6f..6f+5): ONE tree_solve_feet_tn per substep with any
+// corner down. Per corner row: g_coef its two angular coefficients of c,
+// g_u = Phi_f c (its image in foot-velocity space, Phi_f = J_f M^-1
+// J_f^T), g_diag = c . g_u.
+template <typename T>
 struct GroundRows {
   uint32_t g_act;  // bit c: corner c in contact this substep (0..7)
   T g_fjc[2][FOOT_ROWS][6], g_fjr[2][3][2];
@@ -2000,10 +1651,7 @@ struct GroundRows {
   T g_bias[N_GROUND_ROWS], g_diag[N_GROUND_ROWS], g_lam[N_GROUND_ROWS];
 };
 template <typename T>
-struct GroundRows<T, false> {};  // weld mode: no ground rows exist
-
-template <typename T, bool FC>
-struct Solver : WeldRows<T, FC>, GroundRows<T, FC> {
+struct Solver : GroundRows<T> {
   // contacts (compacted, pair-id order)
   int nc;
   int c_pair[NUM_PAIRS];
@@ -2018,14 +1666,13 @@ struct Solver : WeldRows<T, FC>, GroundRows<T, FC> {
   int nl;
   int l_j[NQ];
   T l_sign[NQ], l_bias[NQ], l_lam[NQ], l_diag[NQ];
-  // shared per-joint columns: ecol = M^-1 e_j (plain; step-8 lazy cap +
-  // step-11 clamps), pcol = weld-null-space-projected ecol (limit rows
-  // + cap pass), pdiag = composite mobility (INF = immobile given the
-  // welds). Bitwise identical to Rust's separately-computed
+  // shared per-joint columns: ecol = M^-1 e_j (limit rows, step-8 lazy
+  // cap, step-11 clamps), pdiag = its mobility e_j^T M^-1 e_j with the
+  // COMPOSITE_EPS verdict (INF = degenerate, row/cap inert); pcomp
+  // caches pdiag. Bitwise identical to Rust's separately-computed
   // minvjt/capcol/solcache columns (linear solves commute with the +-1
   // row sign exactly; recomputation of the same expression tree is
   // deterministic).
-  // (`pcol` lives in WeldRows — see the note there.)
   T ecol[NQ][NV], pdiag[NQ];
   bool ecomp[NQ], pcomp[NQ];
   bool hit[NQ];
@@ -2075,7 +1722,6 @@ __device__ constexpr auto COL_B_F = f32_tab(COL_B);
 __device__ constexpr auto COL_R_F = f32_tab(COL_R);
 __device__ constexpr auto GROUND_CORNERS_F = f32_tab(GROUND_CORNERS);
 __device__ constexpr auto GROUND_DIRS_F = f32_tab(GROUND_DIRS);
-__device__ constexpr auto WELD_TARGET_P_F = f32_tab(WELD_TARGET_P);
 // T(COL_R[a] + COL_R[b]) per pair: the double sum folded at compile time
 // (an IEEE double add either way), then converted like any table
 struct PairRSum { double v[NUM_PAIRS]; };
@@ -2121,20 +1767,6 @@ __device__ void quat_to_rot(const T q[4], T r[3][3]) {
 }
 
 template <typename T>
-__device__ void rot_log(const T r[3][3], T out[3]) {
-  T w0 = r[2][1] - r[1][2];
-  T w1 = r[0][2] - r[2][0];
-  T w2 = r[1][0] - r[0][1];
-  T tr = r[0][0] + r[1][1] + r[2][2];
-  T cth = tclamp((tr - T(1)) * T(0.5), T(-1), T(1));
-  T theta = acos(cth);
-  T factor = theta < T(1e-9) ? T(0.5) : theta / (T(2) * sin(theta));
-  out[0] = w0 * factor;
-  out[1] = w1 * factor;
-  out[2] = w2 * factor;
-}
-
-template <typename T>
 __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
   o[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
   o[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
@@ -2147,7 +1779,7 @@ __device__ void quat_mul(const T a[4], const T b[4], T o[4]) {
 // step_kernel, and no other pointer into either escapes — so every
 // `Dyn<T>& __restrict__ d` / `Solver<T>& __restrict__ s` parameter below
 // is legal and true. It matters because the kernel is local-memory-
-// traffic bound: without it, a store to any Solver field (s.jw, s.rw,
+// traffic bound: without it, a store to any Solver field (s.g_lam,
 // s.c_lam …) makes the compiler re-load the Dyn fields it was holding
 // — above all d.m, which holds the Cholesky factor read by every solve.
 // Read-only aliases are still permitted under restrict (only MODIFIED
@@ -2554,348 +2186,12 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   d.c[5] = n0[2];
 }
 
-// Dense Cholesky (lower, no pivoting; algo.rs chol_factor_floored). audit #10:
-// since the mass matrix moved to the TREE factor (tree_factor below) the
-// dense factor/solves serve ONLY the 12x12 weld block A_ww (s.aww, weld
-// mode); the notes below that talk about d.m / NV describe the pre-#10
-// mass-matrix use, whose loop shapes the tree routines inherit.
-// Pivot-floor guards (the tree factor carries the same): f64
-// floors pivots at PD_FLOOR_F64 = 1e-17 (Divergences §22 — same
-// constant and max clamp as Rust; Rust counts into ws.pd_hits
-// instead of panicking now), f32 floors at 1e-8 and latches bad only
-// for d <= 0 (Divergences §20e).
-//
-// COLUMN-MAJOR STORAGE (K12, 2026-08-07). Element (row R, col C) of both
-// M and L lives at a[C*n + R] — the transpose of the address map every
-// earlier note here used. NOTHING else changed: same reads, same writes,
-// same order, same expression trees, at the same inline sites. It is a
-// pure bijective remap of addresses, so it is BITWISE by construction
-// (both dtypes gated at max diff 0.0); the producers (crba, the A_ww
-// assembly) just swap their two index terms, which is value-preserving
-// because M and A_ww are symmetric and only one triangle is ever stored.
-// WHY: every hot loop in this file walks a COLUMN of the factor while
-// varying the row. Row-major made that R separate runtime addresses at
-// stride n (5 live in chol_factor_n's inner loop, 8 in chol_fwd_unit4_n);
-// column-major collapses them to ONE base (k*n) with immediate offsets
-// +0..+3 — exactly the live-address transform that won K11 its +7.06%,
-// and the back substitutions' l[k*n+i] sweep becomes contiguous too.
-// This is the one direction that strictly REMOVES live address registers,
-// which matters at the 255-register pin (see the SPILL-CLIFF notes).
-// The triangle actually occupied is therefore a[C*n+R] with R >= C, i.e.
-// the UPPER triangle of the buffer read as a row-major array — the
-// K4c "lower triangle + diagonal only" invariant is unchanged in matrix
-// terms, only its address form moved.
-//
-// IN PLACE, one buffer (2026-08-03; supersedes the 2026-08-02 note that
-// deliberately withheld __restrict__ here pending exactly this change).
-// `a` enters as M and leaves as its lower Cholesky factor L. Legal by
-// inspection of the recurrence, and bitwise identical to the old
-// two-buffer form because it issues the SAME reads, the SAME writes, in
-// the SAME order — only the destination address changes:
-//   * column j reads a[j*n+j] (the M diagonal) as its FIRST statement
-//     and writes a[j*n+j] = dj only after the k-loop — read-before-
-//     write, and no later column ever re-reads a diagonal;
-//   * the row loop reads a[j*n+i] (element (i, j)) as the first statement
-//     of iteration i and writes exactly that one element as its last —
-//     read once, immediately before its own overwrite;
-//   * every other read is a[k*n+i] / a[k*n+j] with k < j, i.e. columns
-//     already converted to L by earlier j, and no write at column j
-//     touches a column < j. Under column-major those columns are the
-//     DISJOINT address blocks [k*n, (k+1)*n), which makes the in-place
-//     aliasing argument a statement about whole blocks rather than
-//     strides: column j writes only inside block j.
-// Callers: d.m (written only by crba) and s.aww (rewritten before each
-// factor) — neither is read as M after its factor, so nothing needs the
-// original matrix. Both are supplied LOWER TRIANGLE + DIAGONAL ONLY
-// since K4c; this function reads and writes nothing above the diagonal.
-// Frees Dyn::l (NV*NV) and Solver::lww (N_WELD*N_WELD) from the frame.
-//
-// The dead upper-triangle zeroing that used to run here (element (j, i),
-// i > j — 595 stores per NV=35 factor + 66 per weld factor, per
-// substep) is GONE: the only readers of a factor are this function
-// (elements (i, k), (j, k) with k < j <= i) and chol_solve_n ((i, k)
-// k<i; (k, i) k>i; (i, i)) — strictly lower triangle plus diagonal.
-// Nothing reads above it, so it needs no value.
-// `a` and `bad` are distinct objects (the matrix buffer vs d.pd_bad),
-// so __restrict__ on both is true and lets the L row stay in registers
-// across the (rare) pivot-floor latch.
-//
-// PIVOT CHAIN SOFTWARE-PIPELINED (2026-08-03, K4b/a). The column-j pivot
-// used to be its own serial reduction over k < j, run back to back with
-// the row loop that immediately follows it. Column j+1's pivot,
-//   dpiv_{j+1} = M[j+1][j+1] - sum_{k<=j} L[j+1][k]^2,
-// depends only on values that are FINAL by the time column j's row loop
-// touches row j+1: L[j+1][k] for k < j was written by earlier columns,
-// and L[j+1][j] is the very first value that loop produces. So it is
-// accumulated INSIDE column j's first row block — the same terms, the
-// same ascending k, one extra scalar carried in a register, zero extra
-// storage and zero extra loads (element (j+1, k) is already being loaded
-// there as s0's operand) — and column j+1 then starts with its pivot in
-// hand. Bitwise: identical expression, identical order, identical
-// inputs; a[(j+1)*n+(j+1)] is the untouched M diagonal (column j writes
-// only inside block j, and the diagonal of column j+1 lives in block
-// j+1).
-//
-// FMA-contraction discipline (the K10e2 hazard): every subtraction below
-// stays ONE statement of the shape `X -= Y*Z` with operand order
-// (row element) * (pivot-row element), so nvcc contracts each to the same
-// single FFMA under --fmad=true. The three bitwise solve equivalences
-// (g++ shim checks, since removed; git 91eac64,
-// design/WARP_RESCUE_LEGACY_SIDE.md §4.2) hold under --fmad=true but
-// BREAK under -ffp-contract=fast, which contracts each site by its own whim — so the
-// kernel's no-fast-math discipline is what protects the parity gate.
-template <typename T>
-__device__ void chol_factor_n(int n, T* a, bool* bad) {
-  T dpiv = a[0];  // j = 0: the pivot is M[0][0], no terms
-  for (int j = 0; j < n; j++) {
-    if (sizeof(T) == 8) {
-      if (dpiv < T(PD_FLOOR_F64)) *bad = true;
-      dpiv = tmax(dpiv, T(PD_FLOOR_F64));
-    } else {
-      if (dpiv <= T(0)) *bad = true;
-      dpiv = tmax(dpiv, T(PD_FLOOR_F32));
-    }
-    const T dj = sqrt(dpiv);
-    a[j * n + j] = dj;
-    // Row loop, UNROLLED AND JAMMED BY 4: the pivot row a[j*n+k] (k<j)
-    // used to be re-read once per i; jammed it is read once per FOUR i,
-    // and the four s_t carry independent dependency chains instead of
-    // one. Bitwise: each s_t accumulates over k in the same ascending
-    // order, over the same values, as its scalar counterpart — no
-    // reassociation, only interleaving. Deferring the four stores to
-    // the end of the block is safe under the in-place aliasing too: the
-    // inner loop only ever reads columns k < j, and the four deferred
-    // stores are all in column j.
-    const int cj = j * n;  // COLUMN-MAJOR (K12): column j is contiguous
-    int i = j + 1;
-    // Row j+1 is peeled (as the head of a 4-block when there is room,
-    // scalar otherwise) so the next pivot rides along on its loads.
-    T np = i < n ? a[i * n + i] : T(0);
-    if (i + 3 < n) {
-      T s0 = a[cj + i], s1 = a[cj + i + 1];
-      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T ljk = a[ck + j];
-        const T v0 = a[ck + i];
-        s0 -= v0 * ljk;
-        s1 -= a[ck + i + 1] * ljk;
-        s2 -= a[ck + i + 2] * ljk;
-        s3 -= a[ck + i + 3] * ljk;
-        np -= v0 * v0;
-      }
-      const T l0 = s0 / dj;
-      a[cj + i] = l0;
-      a[cj + i + 1] = s1 / dj;
-      a[cj + i + 2] = s2 / dj;
-      a[cj + i + 3] = s3 / dj;
-      np -= l0 * l0;
-      i += 4;
-    } else if (i < n) {
-      T s = a[cj + i];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T v0 = a[ck + i];
-        s -= v0 * a[ck + j];
-        np -= v0 * v0;
-      }
-      const T l0 = s / dj;
-      a[cj + i] = l0;
-      np -= l0 * l0;
-      i += 1;
-    }
-    for (; i + 3 < n; i += 4) {
-      T s0 = a[cj + i], s1 = a[cj + i + 1];
-      T s2 = a[cj + i + 2], s3 = a[cj + i + 3];
-      for (int k = 0; k < j; k++) {
-        const int ck = k * n;
-        const T ljk = a[ck + j];
-        s0 -= a[ck + i] * ljk;
-        s1 -= a[ck + i + 1] * ljk;
-        s2 -= a[ck + i + 2] * ljk;
-        s3 -= a[ck + i + 3] * ljk;
-      }
-      a[cj + i] = s0 / dj;
-      a[cj + i + 1] = s1 / dj;
-      a[cj + i + 2] = s2 / dj;
-      a[cj + i + 3] = s3 / dj;
-    }
-    for (; i < n; i++) {
-      T s = a[cj + i];
-      for (int k = 0; k < j; k++) s -= a[k * n + i] * a[k * n + j];
-      a[cj + i] = s / dj;
-    }
-    dpiv = np;
-  }
-}
-
-// Triangular solve. l and x are always distinct objects at every call
-// site (d.m, holding the in-place factor, vs {d.rhs, s.mw,
-// s.c_minv[ci], s.ecol[j]}; s.aww vs s.rw), and x is the only thing
-// written — so restrict here is the
-// difference between keeping l's row in registers across the x[i]
-// store and re-loading it every iteration.
-template <typename T>
-//
-// The FORWARD half is ROW-BLOCKED BY 4 (K6). Unblocked it is ONE
-// dependent chain for the whole triangle: row i's dot is a chain of
-// length i and row i+1 cannot start until x[i] is stored. Blocked, the
-// four rows of a block share the k < i0 sweep as FOUR INDEPENDENT
-// accumulators (and share the x[k] load: 4 + 1 loads per k for 4 FMAs
-// instead of 8), and only the short triangular tail k in [i0, i) — at
-// most three terms, taken from the values just stored — stays serial.
-// BITWISE (forward only): k = 0..i0-1 ascending is the exact PREFIX of
-// every blocked row's required order, and the tail k = i0..i-1 follows
-// it ascending, so each accumulator meets the same terms in the same
-// sequence from the same seed x[i].
-__device__ void chol_solve_n(int n, const T* __restrict__ l,
-                             T* __restrict__ x) {
-  int i = 0;
-  for (; i + 3 < n; i += 4) {
-    T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
-    for (int k = 0; k < i; k++) {
-      const int ck = k * n;
-      const T xk = x[k];
-      s0 -= l[ck + i] * xk;
-      s1 -= l[ck + i + 1] * xk;
-      s2 -= l[ck + i + 2] * xk;
-      s3 -= l[ck + i + 3] * xk;
-    }
-    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n, c3 = c2 + n;
-    const T v0 = s0 / l[c0 + i];
-    x[i] = v0;
-    s1 -= l[c0 + i + 1] * v0;
-    const T v1 = s1 / l[c1 + i + 1];
-    x[i + 1] = v1;
-    s2 -= l[c0 + i + 2] * v0;
-    s2 -= l[c1 + i + 2] * v1;
-    const T v2 = s2 / l[c2 + i + 2];
-    x[i + 2] = v2;
-    s3 -= l[c0 + i + 3] * v0;
-    s3 -= l[c1 + i + 3] * v1;
-    s3 -= l[c2 + i + 3] * v2;
-    x[i + 3] = s3 / l[c3 + i + 3];
-  }
-  for (; i < n; i++) {
-    T s = x[i];
-    for (int k = 0; k < i; k++) s -= l[k * n + i] * x[k];
-    x[i] = s / l[i * n + i];
-  }
-  // BACK half: NOT row-blockable (K6 prohibition, file header).
-  for (int i = n - 1; i >= 0; i--) {
-    const int ci = i * n;
-    T s = x[i];
-    for (int k = i + 1; k < n; k++) s -= l[ci + k] * x[k];
-    x[i] = s / l[ci + i];
-  }
-}
-
-// BATCHED multi-RHS solve: W independent right-hand sides, laid out as
-// W consecutive rows of stride `n` (s.c_minv and the ensure_pcol
-// batches are exactly that; s.mw is RHS-minor and uses the _tn twin),
-// sharing ONE factor. This is a pure LOOP INTERCHANGE of W calls to
-// chol_solve_n: the (i, k) iteration space is walked in the same
-// ascending order, and each RHS w keeps its OWN accumulator visiting the
-// same terms in the same sequence from the same seed x[w*n+i], so every
-// value is BITWISE what the W separate calls produced. Nothing is
-// reassociated; only the w loop is hoisted inside.
-//
-// Why it pays on this kernel (serial-latency bound, measured): the
-// scalar solve's inner k-loop is ONE dependent FMA chain of length i,
-// and the W calls run those chains back to back. Interleaved, the W
-// chains are mutually independent, so the chain latency is amortized
-// W-fold; the factor element (i, k) is also loaded once per (i, k)
-// instead of once per (i, k, w). The accumulators are a fixed-size local
-// array indexed only by fully unrolled compile-time w, so they live in
-// registers (W f32 = W*4 B).
-//
-// The FORWARD half is additionally ROW-BLOCKED BY 3 (K6): rows i0..i0+2
-// share the k < i0 sweep, so the W values x[w*n+k] are loaded ONCE for
-// 3*W FMAs instead of once per (row, w) — per k the block costs 3 + W
-// loads for 3*W FMAs where the unblocked triple cost 3*(1 + W), i.e.
-// 15/36 vs 39/36 at W = 12. The terms k in [i0, i) that a later row of
-// the block needs and the earlier ones do not are applied after those
-// rows' divides, from the registers just stored.
-// R = 4 was measured too and was NOISE over R = 3 (+0.03%, overlapping
-// ranges, f64 spills 12,308/10,300 -> 12,380/10,564) — REVERTED, the
-// x-load saving is already down to a sixth by R = 3.
-// BITWISE (forward only, see the back half's note): row i0's terms are
-// k = 0..i0-1 ascending, unchanged; a later row's are k = 0..i0-1
-// ascending (the SHARED PREFIX of its required order) followed by the
-// tail k = i0.. in ascending order, i.e. exactly its scalar sequence.
-// Every accumulator starts from the same seed x[w*n+i] and meets the
-// same terms in the same order; the x[i0] values it multiplies are the
-// same values the stores just wrote.
-template <int W, typename T>
-__device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
-                                   T* __restrict__ x) {
-  int i = 0;
-  for (; i + 2 < n; i += 3) {
-    T s0[W], s1[W], s2[W];
-#pragma unroll
-    for (int w = 0; w < W; w++) {
-      s0[w] = x[w * n + i];
-      s1[w] = x[w * n + i + 1];
-      s2[w] = x[w * n + i + 2];
-    }
-    for (int k = 0; k < i; k++) {
-      const int ck = k * n;
-      const T l0 = l[ck + i], l1 = l[ck + i + 1], l2 = l[ck + i + 2];
-#pragma unroll
-      for (int w = 0; w < W; w++) {
-        const T xk = x[w * n + k];
-        s0[w] -= l0 * xk;
-        s1[w] -= l1 * xk;
-        s2[w] -= l2 * xk;
-      }
-    }
-    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n;
-    const T d0 = l[c0 + i], l1i = l[c0 + i + 1], d1 = l[c1 + i + 1];
-    const T l2i = l[c0 + i + 2], l2j = l[c1 + i + 2], d2 = l[c2 + i + 2];
-#pragma unroll
-    for (int w = 0; w < W; w++) {
-      const T v0 = s0[w] / d0;
-      x[w * n + i] = v0;
-      s1[w] -= l1i * v0;
-      const T v1 = s1[w] / d1;
-      x[w * n + i + 1] = v1;
-      s2[w] -= l2i * v0;
-      s2[w] -= l2j * v1;
-      x[w * n + i + 2] = s2[w] / d2;
-    }
-  }
-  for (; i < n; i++) {  // up to two rows left over (NV = 35)
-    T s[W];
-#pragma unroll
-    for (int w = 0; w < W; w++) s[w] = x[w * n + i];
-    for (int k = 0; k < i; k++) {
-      const T lik = l[k * n + i];
-#pragma unroll
-      for (int w = 0; w < W; w++) s[w] -= lik * x[w * n + k];
-    }
-    const T dg = l[i * n + i];
-#pragma unroll
-    for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
-  }
-  // BACK half: row-blocking here is FORBIDDEN, see the K6 prohibition in
-  // the file header (the shared high-k region is each row's TAIL, not a
-  // prefix, and the near-diagonal terms are not available yet). The W
-  // right-hand sides stay batched — that is a different transform.
-  for (int i = n - 1; i >= 0; i--) {
-    const int ci = i * n;
-    T s[W];
-#pragma unroll
-    for (int w = 0; w < W; w++) s[w] = x[w * n + i];
-    for (int k = i + 1; k < n; k++) {
-      const T lki = l[ci + k];
-#pragma unroll
-      for (int w = 0; w < W; w++) s[w] -= lki * x[w * n + k];
-    }
-    const T dg = l[ci + i];
-#pragma unroll
-    for (int w = 0; w < W; w++) x[w * n + i] = s[w] / dg;
-  }
-}
+// (The dense Cholesky chol_factor_n / chol_solve_n / chol_solve_multi_n
+// — after audit #10 they served only the 12x12 weld block A_ww — were
+// deleted with weld mode on 2026-09-27. Their loop-shape notes (K4b
+// pivot pipelining, K6 forward row blocking and the back-pass
+// PROHIBITION, K12 column-major storage, the K10e2 FMA discipline) are
+// inherited by the tree routines below; see git history for the text.)
 
 // ---- audit #10: TREE-SPARSE FACTOR AND SOLVES (algo.rs tc_*) -----------------
 // The mass matrix's factor and every M^-1 solve now run in the fill-free
@@ -3117,8 +2413,7 @@ __device__ __forceinline__ void tree_solve_multi_n(const T* __restrict__ l,
   tree_back_w<W, NV, 1>(l, x);
 }
 
-// The 12 FOOT columns, RHS-minor x[v*12 + m] (s.mw in weld mode, s.g_minv
-// in contact mode — same layout, same support): column m < 6 is a left-foot
+// The 12 FOOT columns, RHS-minor x[v*12 + m] (s.g_minv): column m < 6 is a left-foot
 // row (support: base + v 23..28 = e 6..11), m >= 6 a right-foot row (base +
 // v 29..34 = e 0..5). The forward pass visits only that support's upward
 // closure — each leg's rows on its own six lanes, then the base rows with
@@ -3132,7 +2427,7 @@ template <typename T>
 __device__ __forceinline__ void tree_fwd_leg_tn(const T* __restrict__ l,
                                                 T* __restrict__ x, int e0,
                                                 int m0) {
-  constexpr int W = N_WELD;
+  constexpr int W = 2 * FOOT_ROWS;
 #pragma unroll
   for (int e = e0; e < e0 + 6; e++) {
     const int de = TREE.d[e], ve = TREE.e2v[e] * W + m0;
@@ -3153,8 +2448,8 @@ __device__ __forceinline__ void tree_fwd_leg_tn(const T* __restrict__ l,
 }
 template <typename T>
 __device__ void tree_solve_feet_tn(const T* __restrict__ l, T* __restrict__ x) {
-  constexpr int W = N_WELD;
-  static_assert(N_WELD == 2 * 6, "two feet x six spatial rows");
+  constexpr int W = 2 * FOOT_ROWS;
+  static_assert(W == 2 * 6, "two feet x six spatial rows");
   tree_fwd_leg_tn(l, x, 6, 0);  // left leg rows, left-foot lanes 0..5
   tree_fwd_leg_tn(l, x, 0, 6);  // right leg rows, right-foot lanes 6..11
 #pragma unroll
@@ -3384,17 +2679,17 @@ __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
   for (int t = 0; t < 3; t++) row[3 + t] += sign * rxn[t];
 }
 
-// (angular_jacobian_acc lived here; K9a folded its body — one ancestor
-// walk writing row[VOFF + F_COORD[k]] += sign*axw[k][t] plus
-// row[3+t] += sign — into the shared weld walk in constraint_solve,
-// which was its only caller. point_jacobian_acc survives for contacts.)
+// (angular_jacobian_acc lived here; its body — one ancestor walk
+// writing row[VOFF + F_COORD[k]] += sign*axw[k][t] plus row[3+t] +=
+// sign — is folded into the foot-row walk of the ground block in
+// constraint_solve. point_jacobian_acc survives for contacts.)
 
 // RHS seed: the full-length zero fill is load-bearing for
 // chol_fwd_unit_n / chol_back_n — see chol_solve_unit_n's header (the
 // skipped forward rows keep these +0.0 for the dense back substitution
 // to read).
-template <typename T, bool FC>
-__device__ __forceinline__ void ecol_seed(Solver<T, FC>& __restrict__ s,
+template <typename T>
+__device__ __forceinline__ void ecol_seed(Solver<T>& __restrict__ s,
                                           int j) {
   T* col = s.ecol[j];
   for (int i = 0; i < NV; i++) col[i] = T(0);
@@ -3404,262 +2699,36 @@ __device__ __forceinline__ void ecol_seed(Solver<T, FC>& __restrict__ s,
 // Lazily compute the plain M^-1 e_j column (shared by step-8 cap/limit
 // rows and the step-11 clamps — same expression tree as Rust's three
 // separate caches).
-template <typename T, bool FC>
+template <typename T>
 __device__ void ensure_ecol(Dyn<T>& __restrict__ d,
-                            Solver<T, FC>& __restrict__ s, int j) {
+                            Solver<T>& __restrict__ s, int j) {
   if (s.ecomp[j]) return;
   ecol_seed(s, j);
   tree_solve_unit_n(d.m, s.ecol[j], VOFF + j);
   s.ecomp[j] = true;
 }
 
-// Lazily compute the weld-null-space-projected column + composite
-// mobility (solver.rs capcol path; also the limit-row direction).
-template <typename T, bool FC>
-__device__ void ensure_pcol(Dyn<T>& __restrict__ d,
-                            Solver<T, FC>& __restrict__ s, int j) {
+// Lazily compute joint j's plain column and its mobility verdict
+// (solver.rs capcol path; also the limit-row diagonal). The direction
+// is the plain column s.ecol[j] and the mobility is `plain`; the
+// COMPOSITE_EPS verdict is kept verbatim rather than assumed: Rust
+// still evaluates `dnew > COMPOSITE_EPS * plain` with dnew == plain,
+// which is true for every positive mobility and false for a degenerate
+// one (0, NaN, +inf).
+template <typename T>
+__device__ void ensure_pdiag(Dyn<T>& __restrict__ d,
+                             Solver<T>& __restrict__ s, int j) {
   if (s.pcomp[j]) return;
   ensure_ecol(d, s, j);
   const T plain = s.ecol[j][VOFF + j];
-  if constexpr (FC) {
-    // env v11 CONTACT mode: there is no weld block, so solver.rs's
-    // `if nweld > 0` projection never runs — the projected column IS the
-    // plain column (read through s.ecol; see the Solver note) and the
-    // composite mobility IS `plain`. The COMPOSITE_EPS verdict is kept
-    // verbatim rather than assumed: Rust still evaluates
-    // `dnew > COMPOSITE_EPS * plain` with dnew == plain, which is true
-    // for every positive mobility and false for a degenerate one.
-    s.pdiag[j] = plain > T(COMPOSITE_EPS) * plain
-                     ? plain
-                     : std::numeric_limits<T>::infinity();
-    s.pcomp[j] = true;
-  } else {
-    T* col = s.pcol[j];
-    // K20-1: the 12 dots, in one pass over i. There used to be a COPY
-    // half fused into this pass (col[i] = s.ecol[j][i] over all NV,
-    // including a copy-only range) whose only consumer was the projection
-    // loop below, which re-read col[i] as its seed. The projection now
-    // reads s.ecol[j][i] directly and writes col[i] as its OUTPUT only:
-    // 35 stores and 35 dependent re-loads per column disappear, and the
-    // store->load forwarding edge between the two passes is cut.
-    // BITWISE: col[i] was set EXACTLY = s.ecol[j][i] (a plain copy, whole
-    // range covered — 0..5, VOFF..WJ_L0, WJ_L0..+6, WJ_R0..+6 = 0..NV-1
-    // by the WJ_R0 + 6 == NV static_assert), so seeding from the source
-    // is the same bytes. Each sum[w] still accumulates over i in
-    // ascending order over the same terms.
-    {
-      // The dot half is segmented onto the K8 weld support: each sum[w]
-      // still visits its own terms in ascending i, only the structural
-      // +-0.0 products are gone and the exactly-1.0 entries became bare
-      // adds.
-      T sum[N_WELD];
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) sum[w] = T(0);
-#pragma unroll
-      for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
-        const T ci = s.ecol[j][t];
-        sum[t] += ci;
-        sum[6 + t] += ci;
-      }
-#pragma unroll
-      for (int u = 0; u < 3; u++) {  // i = 3,4,5
-        const T ci = s.ecol[j][3 + u];
-        sum[3 + u] += ci;  // angular rows 3+u, 9+u (1.0)
-        sum[9 + u] += ci;
-#pragma unroll
-        for (int t = 0; t < 3; t++)
-          if (t != u) {
-            sum[t] += s.jwr[t][WJ_RIDX(t, u)] * ci;
-            sum[6 + t] += s.jwr[3 + t][WJ_RIDX(t, u)] * ci;
-          }
-      }
-      // (rows VOFF..WJ_L0 are structurally outside the weld support and,
-      // since K20-1, need no copy either — nothing to do here)
-#pragma unroll
-      for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
-        const T ci = s.ecol[j][WJ_L0 + e];
-#pragma unroll
-        for (int w = 0; w < N_WELD / 2; w++) sum[w] += s.jwc[w][e] * ci;
-      }
-#pragma unroll
-      for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
-        const T ci = s.ecol[j][WJ_R0 + e];
-#pragma unroll
-        for (int w = N_WELD / 2; w < N_WELD; w++) sum[w] += s.jwc[w][e] * ci;
-      }
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) s.rw[w] = sum[w];
-    }
-    chol_solve_n(N_WELD, s.aww, s.rw);
-    {
-      // Same order-preservation argument as the PGS weld update: all 12
-      // multipliers are known before the loop (chol_solve_n has finished
-      // with s.rw), and each col[i] still sees w = 0..11 applied in that
-      // exact sequence — only its 12 memory round trips are gone.
-      T x[N_WELD];
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) x[w] = s.rw[w];
-      for (int i = 0; i < NV; i++) {
-        T ci = s.ecol[j][i];  // K20-1: seed from the source, not the copy
-#pragma unroll
-        for (int w = 0; w < N_WELD; w++) ci -= s.mw[i][w] * x[w];
-        col[i] = ci;
-      }
-    }
-    const T dnew = col[VOFF + j];
-    s.pdiag[j] = dnew > T(COMPOSITE_EPS) * plain
-                     ? dnew
-                     : std::numeric_limits<T>::infinity();
-    s.pcomp[j] = true;
-  }
-}
-
-// K7: BATCHED ensure_pcol. B columns of the limit-row group are computed
-// together so they share the three big reads:
-//   (a) the dot pass reads each support value ONCE for all
-//       B columns;
-//   (b) the 12x12 weld solve becomes chol_solve_multi_n<B> — the proven
-//       multi-RHS loop interchange, bitwise per right-hand side;
-//   (c) the projection pass reads s.mw[i][w] ONCE for all B columns.
-// BITWISE: the columns are mutually independent (distinct ecol/pcol
-// rows), every sum[b][w] still runs over the same terms in ascending i
-// from the same +0.0 seed, and every col[b][i] still applies w = 0..11
-// in that exact sequence — only the b loop is hoisted inside, which
-// reassociates nothing. NO row blocking is involved anywhere here, so
-// K6's back-substitution prohibition does not apply.
-//
-// PRECONDITIONS at the one call site (constraint_solve's limit
-// projection), all three guaranteed by the substep that calls in:
-//   - s.ecomp[j] is already true for every j in the group — the batched
-//     unit-solve block computes the WHOLE s.l_j group a few lines above
-//     — so ensure_ecol would be a no-op here; it is left out rather than
-//     drag B copies of chol_solve_unit_n into this instantiation.
-//   - s.pcomp[j] is false for every j (substep clears it right before
-//     constraint_solve and this is the substep's first ensure_pcol), so
-//     the lazy-cache early-out cannot fire.
-//   - s.l_j is strictly ascending with distinct joints, so the B
-//     ecol/pcol row pairs never alias.
-// pdiag / pcomp are written exactly as the scalar path writes them.
-template <int B, typename T, bool FC>
-__device__ void ensure_pcol_multi(Solver<T, FC>& __restrict__ s,
-                                  const int* js) {
-  static_assert(!FC, "the batched weld-null projection is weld mode only");
-  int j[B];
-  T plain[B];
-#pragma unroll
-  for (int b = 0; b < B; b++) {
-    j[b] = js[b];
-    plain[b] = s.ecol[j[b]][VOFF + j[b]];
-  }
-  T rw[B][N_WELD];
-  {
-    // Same segmentation onto the K8 weld support as the scalar body: the
-    // copy half stays full-length, the dot half visits only the support.
-    T sum[B][N_WELD];
-#pragma unroll
-    for (int b = 0; b < B; b++) {
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) sum[b][w] = T(0);
-    }
-#pragma unroll
-    for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
-      T ci[B];
-#pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][t];
-#pragma unroll
-      for (int b = 0; b < B; b++) {
-        sum[b][t] += ci[b];
-        sum[b][6 + t] += ci[b];
-      }
-    }
-#pragma unroll
-    for (int u = 0; u < 3; u++) {  // i = 3,4,5
-      T ci[B];
-#pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][3 + u];
-#pragma unroll
-      for (int b = 0; b < B; b++) {  // angular rows 3+u, 9+u (1.0)
-        sum[b][3 + u] += ci[b];
-        sum[b][9 + u] += ci[b];
-      }
-#pragma unroll
-      for (int t = 0; t < 3; t++)
-        if (t != u) {
-          const T jl = s.jwr[t][WJ_RIDX(t, u)];
-          const T jr = s.jwr[3 + t][WJ_RIDX(t, u)];
-#pragma unroll
-          for (int b = 0; b < B; b++) {
-            sum[b][t] += jl * ci[b];
-            sum[b][6 + t] += jr * ci[b];
-          }
-        }
-    }
-    // (K20-1: the copy-only range VOFF..WJ_L0 is gone with the rest of
-    // the copy half — the projection below seeds from s.ecol directly)
-#pragma unroll
-    for (int e = 0; e < 6; e++) {  // left-foot chain: rows 0..5
-      T ci[B];
-#pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][WJ_L0 + e];
-#pragma unroll
-      for (int w = 0; w < N_WELD / 2; w++) {
-        const T jwi = s.jwc[w][e];
-#pragma unroll
-        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
-      }
-    }
-#pragma unroll
-    for (int e = 0; e < 6; e++) {  // right-foot chain: rows 6..11
-      T ci[B];
-#pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][WJ_R0 + e];
-#pragma unroll
-      for (int w = N_WELD / 2; w < N_WELD; w++) {
-        const T jwi = s.jwc[w][e];
-#pragma unroll
-        for (int b = 0; b < B; b++) sum[b][w] += jwi * ci[b];
-      }
-    }
-#pragma unroll
-    for (int b = 0; b < B; b++) {
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) rw[b][w] = sum[b][w];
-    }
-  }
-  chol_solve_multi_n<B>(N_WELD, s.aww, &rw[0][0]);
-  {
-    T x[B][N_WELD];
-#pragma unroll
-    for (int b = 0; b < B; b++) {
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) x[b][w] = rw[b][w];
-    }
-    for (int i = 0; i < NV; i++) {
-      T ci[B];
-#pragma unroll
-      for (int b = 0; b < B; b++) ci[b] = s.ecol[j[b]][i];  // K20-1
-#pragma unroll
-      for (int w = 0; w < N_WELD; w++) {
-        const T mwi = s.mw[i][w];
-#pragma unroll
-        for (int b = 0; b < B; b++) ci[b] -= mwi * x[b][w];
-      }
-#pragma unroll
-      for (int b = 0; b < B; b++) s.pcol[j[b]][i] = ci[b];
-    }
-  }
-#pragma unroll
-  for (int b = 0; b < B; b++) {
-    const T dnew = s.pcol[j[b]][VOFF + j[b]];
-    s.pdiag[j[b]] = dnew > T(COMPOSITE_EPS) * plain[b]
-                        ? dnew
-                        : std::numeric_limits<T>::infinity();
-    s.pcomp[j[b]] = true;
-  }
+  s.pdiag[j] = plain > T(COMPOSITE_EPS) * plain
+                   ? plain
+                   : std::numeric_limits<T>::infinity();
+  s.pcomp[j] = true;
 }
 
 // audit #9 — support dot of foot spatial row m (0..2 linear, 3..5
-// angular; the weld rows' K8 shapes) against a dense NV-vector read
+// angular; the support shapes at WJ_L0) against a dense NV-vector read
 // through g(i): the exactly-1.0 column m as a bare add, a linear row's two
 // root values at WJ_R2[m], then the six chain columns ch0..ch0+5 —
 // ascending column order, which is solver.rs `ground_support_dot` over
@@ -3680,99 +2749,13 @@ __device__ __forceinline__ T foot_row_dot(int m, int ch0, const T jr[3][2],
 }
 
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
-template <typename T, bool FC>
+template <typename T>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
-                                 Solver<T, FC>& __restrict__ s, const T* qpre,
+                                 Solver<T>& __restrict__ s, const T* qpre,
                                  T* __restrict__ v) {
   const T hinv = T(1) / T(H_SUB);
 
-  // -- assembly: weld rows 0-11 (foot_mode = 0 only) --------------------------
-  // K9a — ONE ancestor walk per foot emits all six rows. The three
-  // point_jacobian_acc calls differed only in n = e_t, so each of them
-  // re-derived the SAME rel = pf - pos[k] and w = axw[k] x rel and then
-  // dotted it with a basis vector; dot3(e_t, w) is w[t] (1.0*w[t] is
-  // exact, and the two +-0.0 terms are absorbed by the row's +0.0 zero
-  // fill -- Divergences 20c). The three angular_jacobian_acc calls
-  // walked the same chain again for axw[k][t]. Likewise rel0 = pf - d.p
-  // and rxn = cross(rel0, e_t) are shared, in closed form:
-  //   cross(a, e_0) = (  0, a[2], -a[1])
-  //   cross(a, e_1) = (-a[2],  0,  a[0])
-  //   cross(a, e_2) = ( a[1], -a[0],  0)
-  // whose t-th component is exactly K8's structural +-0.0 (it lands in
-  // column 3+t, which is OUTSIDE the refined support).
-  // K9b — every entry below is a SINGLE `T(0) + value` store into a
-  // column the walk touches at most once (F_COORD injective on the
-  // chain, root columns disjoint from it -- see wj_chain_mask's
-  // static_assert). `T(0) + x` is NOT the identity when x is -0.0, and
-  // that is the point: it reproduces the zero fill's +0.0 absorption
-  // bit for bit, so the stores are what `fill(+0.0); row[col] += x`
-  // wrote. `T(0) - x` does the same for the negated components.
-  // K9c — the rows are built DIRECTLY IN s.mw (same zero fill, same
-  // values, same single writes: s.mw was a verbatim copy of s.jw, so
-  // writing one instead of both is the identity on every element), and
-  // the 84 support values are teed off into s.jwc / s.jwr as they are
-  // stored -- no reload, and the exactly-1.0 entries are not stored.
-  if constexpr (!FC)
-  for (int widx = 0; widx < 2; widx++) {
-    const int frame = WELD_FRAMES[widx];
-    const T* pf = d.pos[frame];
-    const int r0 = 6 * widx;
-    // K11 layout: same 6 * NV stores of +0.0, i-outer so the six of them
-    // at a fixed column are consecutive words.
-    for (int i = 0; i < NV; i++)
-#pragma unroll
-      for (int m = 0; m < 6; m++) s.mw[i][r0 + m] = T(0);
-    for (int k = frame; k >= 0; k = F_PARENT[k]) {
-      if (F_COORD[k] < 0) continue;
-      const int col = VOFF + F_COORD[k];
-      const int e = col - (WJ_L0 + 6 * widx);
-      T rel[3], w[3];
-      sub3v(pf, d.pos[k], rel);
-      cross3(d.axw[k], rel, w);
-#pragma unroll
-      for (int t = 0; t < 3; t++) {
-        const T lv = T(0) + w[t];
-        s.mw[col][r0 + t] = lv;
-        s.jwc[r0 + t][e] = lv;
-        const T av = T(0) + d.axw[k][t];
-        s.mw[col][r0 + 3 + t] = av;
-        s.jwc[r0 + 3 + t][e] = av;
-      }
-    }
-    T rel0[3];
-    sub3v(pf, d.p, rel0);
-    const T v04 = T(0) + rel0[2], v05 = T(0) - rel0[1];
-    const T v13 = T(0) - rel0[2], v15 = T(0) + rel0[0];
-    const T v23 = T(0) + rel0[1], v24 = T(0) - rel0[0];
-    s.mw[0][r0 + 0] = T(1);
-    s.mw[4][r0 + 0] = v04;
-    s.mw[5][r0 + 0] = v05;
-    s.mw[1][r0 + 1] = T(1);
-    s.mw[3][r0 + 1] = v13;
-    s.mw[5][r0 + 1] = v15;
-    s.mw[2][r0 + 2] = T(1);
-    s.mw[3][r0 + 2] = v23;
-    s.mw[4][r0 + 2] = v24;
-    s.jwr[3 * widx + 0][0] = v04;  // cols WJ_R2[0] = {4, 5}
-    s.jwr[3 * widx + 0][1] = v05;
-    s.jwr[3 * widx + 1][0] = v13;  // cols WJ_R2[1] = {3, 5}
-    s.jwr[3 * widx + 1][1] = v15;
-    s.jwr[3 * widx + 2][0] = v23;  // cols WJ_R2[2] = {3, 4}
-    s.jwr[3 * widx + 2][1] = v24;
-#pragma unroll
-    for (int t = 0; t < 3; t++) {
-      s.mw[3 + t][r0 + 3 + t] = T(1);
-      s.bias_w[r0 + t] =
-          -(T(BETA_WELD) * hinv) * (pf[t] - CT(WELD_TARGET_P, [widx][t]));
-    }
-    T phi[3];
-    rot_log(d.r[frame], phi);
-#pragma unroll
-    for (int t = 0; t < 3; t++)
-      s.bias_w[r0 + 3 + t] = -(T(BETA_WELD) * hinv) * phi[t];
-  }
-
-  // -- env v11 GROUND BLOCK, where the weld rows used to be -------------------
+  // -- env v11 GROUND BLOCK (rows ahead of the pair rows) ---------------------
   // MIRROR of collide.rs `ground_phase` + solver.rs `assemble_ground_rows`.
   // The corner order is the spec §2 normative one (foot_l then foot_r,
   // GROUND_CORNERS order within a foot), the row order the §3 one (normal,
@@ -3784,11 +2767,17 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // audit #9: with any corner down, BOTH feet's six spatial rows are
   // built (Rust builds only the contacting feet; the extra foot's columns
   // are independent RHS of the same solve — A1 — so no active value
-  // moves) straight into g_minv as the RHS-minor seed, by the weld
-  // block's K9a/K9b/K9c walk verbatim: ONE ancestor walk per foot, every
-  // column a single `T(0) + x` store, the support teed off into g_fjc /
-  // g_fjr. Every corner slot also gets its coefficient pair g_coef.
-  if constexpr (FC) {
+  // moves) straight into g_minv as the RHS-minor seed: ONE ancestor walk
+  // per foot emits all six rows (rel = pf - pos[k] and w = axw[k] x rel
+  // shared; dot3(e_t, w) is w[t] exactly), every column a single
+  // `T(0) + x` store — `T(0) + x` is NOT the identity when x is -0.0,
+  // and that is the point: it reproduces the zero fill's +0.0
+  // absorption bit for bit (F_COORD is injective on the chain and the
+  // root columns are disjoint from it — wj_chain_mask), so the stores
+  // are what `fill(+0.0); row[col] += x` wrote. The root columns use
+  // cross(rel0, e_t) in closed form; the support is teed off into g_fjc
+  // / g_fjr. Every corner slot also gets its coefficient pair g_coef.
+  {
     s.g_act = 0;
     T pt[NUM_GROUND_CORNERS][3];
 #pragma unroll
@@ -3986,20 +2975,13 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       s.l_j[li] = j;
       s.l_sign[li] = sign;
       s.l_bias[li] =
-          gap >= T(0) ? -gap * hinv : (T(BETA_WELD) * hinv) * -gap;
+          gap >= T(0) ? -gap * hinv : (T(BETA_LIMIT_ROW) * hinv) * -gap;
       s.nl = li + 1;
     }
   }
 
-  // -- effective masses (row order: welds, contacts, limits) ------------------
-  // 12 independent solves against ONE factor: batched (see
-  // chol_solve_multi_n — a loop interchange, bitwise). K11: s.mw is
-  // T[NV][N_WELD], so the RHS-MINOR entry point takes it (same solve,
-  // one address map; see chol_solve_multi_tn).
-  // K9c: the assembly above already wrote J_w here, so the 420-element
-  // seed copy that used to stand at this point is gone.
-  if constexpr (!FC) tree_solve_feet_tn(d.m, &s.mw[0][0]);
-  // Ground rows (contact mode), audit #9: ONE chol_solve_multi_tn<12>
+  // -- effective masses (row order: ground, contacts, limits) -----------------
+  // Ground rows, audit #9: ONE tree_solve_feet_tn (12 RHS-minor columns)
   // over both feet's spatial rows (the RHS-minor seed the assembly
   // wrote), then per foot
   //   Phi[r][c] = Phi[c][r] = J_f[c] . G_f[:, r]   (c >= r, foot_row_dot)
@@ -4010,7 +2992,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // of the solve is a pure loop interchange with each RHS keeping its own
   // ascending accumulator chains (A1), so each G_f column is bit-for-bit
   // what Rust's per-foot batch produces.
-  if constexpr (FC) {
+  {
     if (s.g_act != 0) {
       tree_solve_feet_tn(d.m, &s.g_minv[0][0]);
       const T(*x)[2 * FOOT_ROWS] = s.g_minv;
@@ -4055,8 +3037,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // which says the common nc is small. Rows are mutually
   // independent (c_minv[ci] depends only on c_J[ci] and the factor,
   // c_diag[ci] only on those two), so grouping the copies / solves /
-  // diagonals changes no value; the solve itself is the same bitwise
-  // interchange as the weld batch.
+  // diagonals changes no value; the solve itself is a bitwise
+  // multi-RHS loop interchange (A1).
   {
     int ci = 0;
     for (; ci + 3 < s.nc; ci += 4) {
@@ -4100,9 +3082,6 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // per-column (each has its own m = VOFF + j); the dense back halves
   // run 4 / 2 at a time. s.l_j is strictly ascending and its entries are
   // distinct joints, so the batched pointers never alias.
-  // LOAD-BEARING for K7: this block must keep covering the WHOLE s.l_j
-  // group — ensure_pcol_multi below takes s.ecomp[j] as a precondition.
-  //
   // Width: s.nl measures mean 7.8, range 3-14 (f32 trace, 256 envs), so
   // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
   // steps/s) for ~30 more lines — dropped. See the block-size note in
@@ -4147,170 +3126,32 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     for (; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
   }
 
-  // -- weld block A_ww = J_w M^-1 J_w^T, factored once ------------------------
-  // entry (r, c>=r) = sum_i J_row_c[i] * minvjt_row_r[i]. A_ww is
-  // symmetric, and its only consumers are chol_factor_n (in place) and
-  // chol_solve_n, both of which read row >= col only (see crba's K4c
-  // note), so ONLY the (row c, col r) entry (lower, c >= r) is stored —
-  // the (r, c) mirror was dead. c == r writes the diagonal once. K12:
-  // that entry now lives at aww[r*N_WELD + c] (column-major); same
-  // value, transposed address, and A_ww's symmetry makes the choice of
-  // which triangle to fill immaterial to the values.
-  // Only row c's support contributes (s.mw is dense, but it would be
-  // multiplied by row c's structural zeros). K8 narrows that
-  // from K5's 12 columns to 9 (linear c) / 7 (angular c) and contracts
-  // the one exactly-1.0 entry as a bare add. Ascending column order is
-  // preserved: WJ_ONE(c) < WJ_R2[.] < chain for both row classes.
-  // The two `#pragma unroll` below are LOAD-BEARING, not decoration:
-  // they make c a compile-time constant so WJ_ONE / WJ_ANG / WJ_CH0 /
-  // WJ_R2 fold to immediates instead of arithmetic plus a cmem load.
-  // MEASURED without them (K8, 5 interleaved rounds, N=4096): 25,838.9
-  // -> 25,809.0 = -0.12% on f32, and that is despite the un-unrolled
-  // build being SMALLER (SASS f32 38,070 -> ~33k) and clearing f64's
-  // 8-byte spill. Rejected — f32 is the production dtype.
-  if constexpr (!FC) {
-#pragma unroll
-  for (int r = 0; r < N_WELD; r++)
-#pragma unroll
-    for (int c = r; c < N_WELD; c++) {
-      T sum = T(0);
-      sum += s.mw[WJ_ONE(c)][r];  // the row's entry there is exactly 1.0
-      if (!WJ_ANG(c)) {
-        sum += s.jwr[WJ_LIN(c)][0] * s.mw[WJ_R2[WJ_T(c)][0]][r];
-        sum += s.jwr[WJ_LIN(c)][1] * s.mw[WJ_R2[WJ_T(c)][1]][r];
-      }
-      const int lo = WJ_CH0(c);
-#pragma unroll
-      for (int e = 0; e < 6; e++) sum += s.jwc[c][e] * s.mw[lo + e][r];
-      s.aww[r * N_WELD + c] = sum;
-    }
-  chol_factor_n(N_WELD, s.aww, &d.pd_bad);  // in place: aww -> L_ww
-  }
-
-  // -- limit rows: project into the weld null space ---------------------------
-  // BATCHED (K7) on the same 4 / 2 / 1 ladder as the unit solves above:
-  // the whole group is uncomputed and its columns are independent, so B
-  // of them share the jw read, the 12x12 solve and the mw read. See
-  // ensure_pcol_multi's header for the preconditions this relies on
-  // (they are exactly what the ecol block above establishes).
-  // WIDTH probed (5 / 3 / 3 interleaved rounds vs this build, N = 4096):
-  //   4 / 2 / 1 (this)          24,224 -> 25,370  +4.73%   KEPT
-  //   2 / 1 only                24,240 -> 24,603  +1.50%   rejected
-  //   8 / 4 / 2 / 1             25,366 -> 25,192  -0.69%   REVERTED
-  // (the two rejected rows were measured against the 4-wide arm in its
-  // own pairs, hence the slightly different A-arm readings)
-  // Same saturation the ecol ladder found: four independent chains is
-  // where the gain tops out. The 8-tier fits (f32 still 0 spills, 255
-  // regs, frame 43,472) but nl means 7.8, so it fires on about half the
-  // substeps and pays a doubled live-x[8][12] projection loop for it.
-  //
-  // CONTACT MODE takes the scalar arm only: with no weld block the
-  // projection is the identity (solver.rs's `if nweld > 0` block does not
-  // run), so ensure_pcol just records the plain mobility and there is
-  // nothing to batch.
-  {
-    int li = 0;
-    if constexpr (!FC) {
-      for (; li + 3 < s.nl; li += 4) ensure_pcol_multi<4>(s, &s.l_j[li]);
-      if (li + 1 < s.nl) {
-        ensure_pcol_multi<2>(s, &s.l_j[li]);
-        li += 2;
-      }
-    }
-    for (; li < s.nl; li++) ensure_pcol(d, s, s.l_j[li]);
-  }
+  // -- limit rows: mobility verdict of each plain column ----------------------
+  for (int li = 0; li < s.nl; li++) ensure_pdiag(d, s, s.l_j[li]);
   for (int li = 0; li < s.nl; li++) {
     s.l_diag[li] = s.pdiag[s.l_j[li]];
     s.l_lam[li] = T(0);
   }
   for (int ci = 0; ci < s.nc; ci++) s.c_lam[ci] = T(0);
-  if constexpr (FC)
-    for (int gi = 0; gi < N_GROUND_ROWS; gi++) s.g_lam[gi] = T(0);
+  for (int gi = 0; gi < N_GROUND_ROWS; gi++) s.g_lam[gi] = T(0);
 
   // -- step 8: exactly 12 iterations, fixed order -----------------------------
-  // G2/G5 (contact mode): the whole PGS loop runs on vr, a register copy
-  // of the local-memory `v` (see the G2 note at the ground block), taken
-  // here and written back after the last iteration. Weld mode keeps `v`.
+  // G2/G5: the whole PGS loop runs on vr, a register copy of the
+  // local-memory `v` (see the G2 note at the ground block), taken here and
+  // written back after the last iteration.
   T vr[NV];
-  if constexpr (FC) {
+  {
 #pragma unroll
     for (int i = 0; i < NV; i++) vr[i] = v[i];
   }
   for (int iter = 0; iter < PGS_ITERS; iter++) {
-    // (a) weld block: exact solve of the current residual.
-    // Both halves are LOOP INTERCHANGES of the 12 x NV nests (bitwise —
-    // see the argument below); v[i] is touched once per i instead of 12
-    // times, and the 12 dots / the 12 terms of each v[i] become
-    // independent work instead of 12 back-to-back serial passes.
-    if constexpr (!FC) {
-    {
-      // 12 dots against the SAME v: each jv[r] accumulates over i in the
-      // identical ascending order over identical terms (v is read-only
-      // here), so every jv[r] is bitwise the scalar loop's.
-      // segmented onto the K8 weld support via the per-i contributing-row
-      // table (same ascending i per jv[r]; 96 terms, 12 of them 1.0)
-      T jv[N_WELD];
-#pragma unroll
-      for (int r = 0; r < N_WELD; r++) jv[r] = T(0);
-#pragma unroll
-      for (int t = 0; t < 3; t++) {  // i = 0,1,2: linear rows t, 6+t (1.0)
-        const T vi = v[t];
-        jv[t] += vi;
-        jv[6 + t] += vi;
-      }
-#pragma unroll
-      for (int u = 0; u < 3; u++) {  // i = 3,4,5
-        const T vi = v[3 + u];
-        jv[3 + u] += vi;  // angular rows 3+u, 9+u (1.0)
-        jv[9 + u] += vi;
-#pragma unroll
-        for (int t = 0; t < 3; t++)
-          if (t != u) {  // linear rows with t != u carry rxn[u]
-            jv[t] += s.jwr[t][WJ_RIDX(t, u)] * vi;
-            jv[6 + t] += s.jwr[3 + t][WJ_RIDX(t, u)] * vi;
-          }
-      }
-#pragma unroll
-      for (int e = 0; e < 6; e++) {
-        const T vi = v[WJ_L0 + e];
-#pragma unroll
-        for (int r = 0; r < N_WELD / 2; r++) jv[r] += s.jwc[r][e] * vi;
-      }
-#pragma unroll
-      for (int e = 0; e < 6; e++) {
-        const T vi = v[WJ_R0 + e];
-#pragma unroll
-        for (int r = N_WELD / 2; r < N_WELD; r++) jv[r] += s.jwc[r][e] * vi;
-      }
-#pragma unroll
-      for (int r = 0; r < N_WELD; r++) s.rw[r] = s.bias_w[r] - jv[r];
-    }
-    chol_solve_n(N_WELD, s.aww, s.rw);
-    {
-      // All 12 dl are known before the update (chol_solve_n has already
-      // finished writing s.rw and nothing below writes it), so the r
-      // loop can move inside. ORDER-PRESERVING per element: the r-outer
-      // form applied r = 0..11 to v[i] in that sequence, and so does
-      // this one — the only thing removed is v[i]'s 12 round trips
-      // through memory, which are the identity on the value.
-      T dl[N_WELD];
-#pragma unroll
-      for (int r = 0; r < N_WELD; r++) dl[r] = s.rw[r];
-      for (int i = 0; i < NV; i++) {
-        T vi = v[i];
-#pragma unroll
-        for (int r = 0; r < N_WELD; r++) vi += s.mw[i][r] * dl[r];
-        v[i] = vi;
-      }
-    }
-    }
     // (a2) env v11 GROUND BLOCK (contact spec §3), corner order: the
     // unilateral normal row first (the §2 contact path verbatim), then
     // its two friction rows BOX-clamped against the lambda_n THIS sweep
     // just produced — Gauss-Seidel coupling, re-clamped on every one of
     // the PGS_ITERS iterations. MIRROR of solver.rs `pgs_ground_sweep` /
-    // `pgs_ground_sweep_foot`. It runs where the weld block would, with the
-    // same fixed iteration count and no early exit.
+    // `pgs_ground_sweep_foot`. It runs first in the sweep, with the same
+    // fixed iteration count and no early exit.
     // G1: fixed slots walked in ascending corner order, inactive corners
     // skipped (= Rust's packed order).
     // audit #9 (solver.rs `pgs_ground_sweep_foot`, term for term): per
@@ -4327,9 +3168,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // compile-time) — and writes it back once. A copy is the identity
     // on every value; the arithmetic is unchanged operation for
     // operation.
-    // G4: the register copy also carries the (b) contact sweep below
-    // (contact mode only).
-    if constexpr (FC) {
+    // G4: the register copy also carries the (b) contact sweep below.
+    {
       const T(*x)[2 * FOOT_ROWS] = s.g_minv;
 #pragma unroll
       for (int f = 0; f < 2; f++) {
@@ -4394,9 +3234,13 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
           }
         }
       }
-      // (b) contacts, contact mode — G4: the weld-mode loop below,
-      // operation for operation, on vr (see there for why the dot stays
-      // dense).
+      // (b) contacts, pair-id order: projected GS, lambda >= 0 — G4: on
+      // vr. This dot is DENSE ON PURPOSE. c_J[ci] has 12-23 structurally
+      // nonzero columns of 35 and K14 narrowed it to a two-segment cover
+      // of the pair's compile-time support: -1.42% / -0.90% / -0.29% in
+      // three forms, all reverted. The bound would be runtime, which
+      // costs this loop its full unrolling — see the K14 block in the
+      // header before touching it.
       for (int ci = 0; ci < s.nc; ci++) {
         T jv = T(0);
 #pragma unroll
@@ -4410,25 +3254,6 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
           for (int i = 0; i < NV; i++) vr[i] += s.c_minv[ci][i] * dd;
       }
     }
-    // (b) contacts, pair-id order: projected GS, lambda >= 0
-    // This dot is DENSE ON PURPOSE. c_J[ci] has 12-23 structurally
-    // nonzero columns of 35 and K14 narrowed it to a two-segment cover
-    // of the pair's compile-time support: -1.42% / -0.90% / -0.29% in
-    // three forms, all reverted. The bound would be runtime, which
-    // costs this loop its full unrolling — see the K14 block in the
-    // header before touching it.
-    // (contact mode runs this sweep on vr inside the G2 block above)
-    if constexpr (!FC)
-    for (int ci = 0; ci < s.nc; ci++) {
-      T jv = T(0);
-      for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * v[i];
-      const T dl = (s.c_bias[ci] - jv) / s.c_diag[ci];
-      const T newl = tmax(s.c_lam[ci] + dl, T(0));
-      const T dd = newl - s.c_lam[ci];
-      s.c_lam[ci] = newl;
-      if (dd != T(0))
-        for (int i = 0; i < NV; i++) v[i] += s.c_minv[ci][i] * dd;
-    }
     // (c) limit rows, joint order (J = sign * e_j: exact-zero terms
     // dropped — Divergences §20c sign-of-zero class)
     // These axpys are DELIBERATELY NOT FUSED across the limit-row group.
@@ -4439,11 +3264,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // pays the UNION of the ladder's widths. The same .pyd is +2.26% on
     // warp-uniform traffic. Read the K13 block in the header before
     // touching this loop.
-    // G5: contact mode runs the same rows on vr. The runtime-indexed read
-    // v[VOFF + j] becomes a select chain over compile-time slots (a copy
-    // of the one selected value — exact), and the axpy has compile-time
-    // i. Operation for operation the weld-mode arm below.
-    if constexpr (FC)
+    // G5: the rows run on vr. The runtime-indexed read v[VOFF + j]
+    // becomes a select chain over compile-time slots (a copy of the one
+    // selected value — exact), and the axpy has compile-time i.
     for (int li = 0; li < s.nl; li++) {
       const int j = s.l_j[li];
       T vj = vr[VOFF];
@@ -4461,34 +3284,15 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
         for (int i = 0; i < NV; i++) vr[i] += s.ecol[j][i] * sd;
       }
     }
-    if constexpr (!FC)
-    for (int li = 0; li < s.nl; li++) {
-      const int j = s.l_j[li];
-      const T jv = s.l_sign[li] * v[VOFF + j];
-      const T dl = (s.l_bias[li] - jv) / s.l_diag[li];
-      const T newl = tmax(s.l_lam[li] + dl, T(0));
-      const T dd = newl - s.l_lam[li];
-      s.l_lam[li] = newl;
-      if (dd != T(0)) {
-        const T sd = s.l_sign[li] * dd;
-        // contact mode reads the PLAIN column (no weld null space to
-        // project into — see ensure_pcol); the weld arm is left textually
-        // untouched so its codegen cannot move.
-        if constexpr (FC) {
-          for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * sd;
-        } else {
-          for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * sd;
-        }
-      }
-    }
-    // (d) omega-cap pass, joint order: weld-consistent impulses
-    // G5 (contact mode): scan the 29 joints on vr with the loop's own
-    // test, compile-time j. Until the first joint whose test fires the
-    // original loop changes nothing, so if none fires the pass is done;
-    // otherwise vr goes back to `v`, the original loop runs from that
-    // joint on (bodies included, unchanged), and vr is reloaded.
+    // (d) omega-cap pass, joint order: momentum-consistent impulses
+    // along the plain M^-1 e_j columns.
+    // G5: scan the 29 joints on vr with the loop's own test, compile-time
+    // j. Until the first joint whose test fires the original loop changes
+    // nothing, so if none fires the pass is done; otherwise vr goes back
+    // to `v`, the original loop runs from that joint on (bodies included,
+    // unchanged), and vr is reloaded.
     int j0 = 0;
-    if constexpr (FC) {
+    {
       j0 = NQ;
 #pragma unroll
       for (int j = NQ - 1; j >= 0; j--) {
@@ -4506,34 +3310,32 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const T cap = CT(OMEGA_CAP, [j]);
       const T target = tclamp(v[vj], -cap, cap);
       if (target != v[vj]) {
-        ensure_pcol(d, s, j);
+        ensure_pdiag(d, s, j);
         if (!isinf(s.pdiag[j])) {
           const T lam = (target - v[vj]) / s.pdiag[j];
-          if constexpr (FC) {
+          {
             for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * lam;
-          } else {
-            for (int i = 0; i < NV; i++) v[i] += s.pcol[j][i] * lam;
           }
           v[vj] = target;  // exact — the cap is a hard bound
         }
       }
     }
-    if constexpr (FC) {
+    {
       if (j0 < NQ) {
 #pragma unroll
         for (int i = 0; i < NV; i++) vr[i] = v[i];
       }
     }
   }
-  if constexpr (FC) {
+  {
 #pragma unroll
     for (int i = 0; i < NV; i++) v[i] = vr[i];
   }
 }
 
 // ---- step.rs substep (constrained) ------------------------------------------
-template <typename T, bool FC>
-__device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
+template <typename T>
+__device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                         const T* __restrict__ tau) {
   // 1-3. FK, CRBA, RNEA bias
   fk_all(d);
@@ -4566,7 +3368,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   //     this function; run HERE it is the one that bounds what the
   //     integrator consumes: ‖Δp‖ ≤ h·ROOT_V_MAX and |Δθ| ≤ h·ROOT_W_MAX
   //     per substep, UNCONDITIONALLY, and hence the next substep's
-  //     Baumgarte weld bias. Never engages on a healthy trajectory (a
+  //     Baumgarte contact / limit bias. Never engages on a healthy trajectory (a
   //     converged v10 policy: 0 engagements in 204,800 env-ticks), so it
   //     is bitwise transparent there. Engagements are counted and the env
   //     layer terminates the episode on them (C backstop).
@@ -5031,8 +3833,6 @@ struct Sim {
   // env v11 FALL terminations (unilateral-contact spec §4), counted per
   // (env, TICK) exactly as lib.rs `fall_hits` is — the root-escape
   // envelope's twin, popped by the wrapper and reported by the trainer.
-  // Written in contact mode only; stays 0 in weld mode, where the feet
-  // cannot let go.
   int* __restrict__ fall_hits;
   // (env, TICK) tilt terminations — lib.rs tilt_hits mirror
   int* __restrict__ tilt_hits;
@@ -5082,9 +3882,8 @@ struct Sim {
   int* __restrict__ acc_cuts;
   // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
   // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
-  // Body::ground_imp mirror. Written by the step tick in contact mode,
-  // zeroed by reset_env, read back by write_obs in EVERY mode (weld
-  // mode never writes, so the reset zeros stand — lanes stay 0).
+  // Body::ground_imp mirror. Written by the step tick, zeroed by
+  // reset_env, read back by write_obs.
   T* __restrict__ ground_imp;
   int64_t* __restrict__ chart_idx;
   // chart pool, read-only. RAGGED (CSR) since 2026-09-03 (audit 2.7):
@@ -5184,10 +3983,6 @@ struct Sim {
   // env v22: previous tick's total hinged foot deviation, per env
   // (zeroed by reset_env — resets start on-target).
   T* __restrict__ foot_pot;
-  // env v21: reset_env needs the runtime mode flag (the kernel's
-  // FOOT_CONTACT template parameter is not visible there) to gate the
-  // wide stance + ground fit.
-  bool foot_contact;
   // env v20 start-pose jitter (TRAINING-ONLY, no lib.rs mirror — the
   // push/start_jitter precedent): per-env U(-1,1) draws for the 12 leg
   // joints, refilled by the wrapper every launch; consumed by reset_env
@@ -5342,14 +4137,14 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   d.q[13] = T(1.7453292519943295);   // r_elbow
   d.q[15] = T(1.2217304763960306);   // r_wrist_bend
   for (int i = 0; i < NV; i++) d.v[i] = T(0);
-  // env v21 (contact mode only): wide stance, then OPTIONAL v20
+  // env v21: wide stance, then OPTIONAL v20
   // start-pose jitter CENTERED on the stance (12 leg joints, §1.4
   // indices 17..28; one-way knees take |draw|), clamped to the joint
   // ranges. ALWAYS finish with the exact no-clip fix: FK the pose,
   // transform the 8 sole corners (contact spec §2 GROUND_CORNERS),
   // and drop/lift the root so the lowest corner sits exactly on the
   // ground plane (y = 0) — the stance alone lifts the ankles ~8.5 mm.
-  if (P.foot_contact) {
+  {
     d.q[19] = T(-Q_START_HIP_ROLL);  // l_hip_roll
     d.q[22] = T(Q_START_HIP_ROLL);   // l_ankle_roll (counter)
     d.q[25] = T(Q_START_HIP_ROLL);   // r_hip_roll
@@ -5511,8 +4306,7 @@ static_assert(OFF_ROOT_ROT == 3 && OFF_ROOT_VLIN == 9 && OFF_ROOT_VANG == 12
                   && OFF_NOTES == OFF_CONTACT + 2,
               "K10e: obs lanes 0..OFF_NOTES-1 must be a gapless "
               "unconditionally-written prefix");
-// FX = Flux game mode (compile-time, host-selected per instance like
-// FC): the hand blocks carry the palms and the entity window the Flux
+// FX = Flux game mode (compile-time, host-selected per instance): the hand blocks carry the palms and the entity window the Flux
 // lane meanings (lib.rs write_flux_hands / write_flux_entities).
 template <typename T, bool FX>
 __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
@@ -5763,7 +4557,7 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   }
 
   // contact spec §7: per-foot ground-contact lanes [L_heel, L_toe,
-  // R_heel, R_toe]; the buffer is all-zero under welds
+  // R_heel, R_toe]
   for (int k = 0; k < N_GROUND_IMP_LANES; k++)
     obs[OFF_GROUND_IMP + k] = (float)(
         P.ground_imp[(size_t)e * N_GROUND_IMP_LANES + k] /
@@ -5819,8 +4613,8 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
 // entirely per-thread.
-template <typename T, bool FC, bool FX>
-__device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
+template <typename T, bool FX>
+__device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                          const Sim<T>& P, int e) {
   const int C = P.C;
   const int64_t c0 = P.chart_idx[e];
@@ -5871,12 +4665,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // env v11 FALL (contact spec §4): per-TICK on the end-of-tick root
   // height since 2026-08-20 (user — consistent with the tilt check; a
   // mid-tick dip that recovers within the tick no longer terminates).
-  // Structurally false (and folded away) in weld mode.
   bool fell = false;
   bool tilted = false;
   // contact spec §7: tick-summed ground normal impulses per obs bucket
-  // [L_heel, L_toe, R_heel, R_toe] (lib.rs Body::ground_imp). Dead code
-  // in weld mode — no reader, so it folds away.
+  // [L_heel, L_toe, R_heel, R_toe] (lib.rs Body::ground_imp).
   T gimp[4] = {T(0), T(0), T(0), T(0)};
   // env v34 limit-rest: this tick's limit-row impulse buckets
   T lrest_legs = T(0), lrest_spine = T(0), lrest_arms = T(0);
@@ -5885,11 +4677,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
     for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
-    if constexpr (FC)
-      for (int c = 0; c < NUM_GROUND_CORNERS; c++)  // G1 fixed slots
-        if ((s.g_act >> c) & 1u)  // ascending = the packed order
-          gimp[(c / CORNERS_PER_FOOT) * 2 + (c & 1)] +=
-              s.g_lam[c * GROUND_ROWS_PER_CORNER];
+    for (int c = 0; c < NUM_GROUND_CORNERS; c++)  // G1 fixed slots
+      if ((s.g_act >> c) & 1u)  // ascending = the packed order
+        gimp[(c / CORNERS_PER_FOOT) * 2 + (c & 1)] +=
+            s.g_lam[c * GROUND_ROWS_PER_CORNER];
     // env v34: joint-limit-row lambda this substep, postural scope
     // ([legs, spine]; arms skipped). l_lam is already >= 0 (PGS
     // unilateral clamp) — tmax is belt-and-suspenders (lib.rs mirror).
@@ -5918,7 +4709,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   if (d.pd_bad) atomicAdd(P.pd_hits, 1);
   if (d.env_n) atomicAdd(P.env_hits, d.env_n);
   // FALL check at end of tick; one count per fallen tick (lib.rs mirror)
-  if constexpr (FC) {
+  {
     if (d.p[1] < T(FALL_ROOT_Y)) fell = true;
     if (fell) atomicAdd(P.fall_hits, 1);
   }
@@ -5930,7 +4721,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // -20 deg limit for a sustained ~70 deg backbend). Chest up-axis =
   // R_root * Rx(spine_pitch) * Ry(spine_yaw) * Rz(spine_roll) * yhat;
   // the spine-local up v is composed first, then quat-rotated.
-  if constexpr (FC) {
+  {
     const T cp = cos(d.q[0]), sp = sin(d.q[0]);
     const T cy = cos(d.q[1]), sy = sin(d.q[1]);
     const T cr = cos(d.q[2]), sr = sin(d.q[2]);
@@ -5954,9 +4745,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
       tilted = true;
     if (tilted) atomicAdd(P.tilt_hits, 1);
   }
-  if constexpr (FC)
-    for (int k = 0; k < N_GROUND_IMP_LANES; k++)
-      P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
+  for (int k = 0; k < N_GROUND_IMP_LANES; k++)
+    P.ground_imp[e * N_GROUND_IMP_LANES + k] = gimp[k];
   P.contact_arm[e * 2] = arm_l;
   P.contact_arm[e * 2 + 1] = arm_r;
   store_state(d, P, e);
@@ -6013,8 +4803,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // FOOT-LIFT penalty (2026-08-20): flat FOOT_LIFT_PEN the tick a
   // foot leaves the ground — edge on the tick-summed ground normal
   // impulse (gimp buckets [L_heel, L_toe, R_heel, R_toe]), per foot.
-  // lib.rs mirror; folds away in weld mode (feet cannot lift).
-  if constexpr (FC) {
+  // lib.rs mirror.
+  {
     for (int f = 0; f < 2; f++) {
       const bool fdown = gimp[f * 2] + gimp[f * 2 + 1] > T(0);
       if (!fdown && P.foot_down_prev[e * 2 + f]) {
@@ -6612,7 +5402,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // contact spec §7 survival gradient — MIRROR of lib.rs: the alive
   // bonus lands BEFORE the terminal overrides, so a fall/escape tick
   // never collects it.
-  if constexpr (FC) reward += T(ALIVE_BONUS);
+  reward += T(ALIVE_BONUS);
   if (d.env_bad) reward = T(0);
   // v11.1 fall pricing (contact spec §4, 2026-08-09) — MIRROR of
   // lib.rs's fell block: REWARD_MISS x pending scoreable notes, full
@@ -6622,14 +5412,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   // (slots 0..nn are exactly the valid ones by pool construction) —
   // it mirrors the note loop's own i<nn convention so the two scans
   // can never diverge if that invariant ever changes.
-  if constexpr (FC) {
+  {
     if (fell || tilted) {
       // env v18 (sole mode) — MIRROR of lib.rs: flat terminal reward;
       // tilt terminations (2026-08-20) priced identically
       reward = -P.fall_const;
     }
-  } else {
-    if (fell) reward = T(0);  // fell/tilted constant-false here; folded
   }
   const T ep = P.ep_return[e] + reward;
   P.ep_return[e] = ep;
@@ -6701,17 +5489,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   }
 }
 
-// FC = env v11 foot_mode (see GROUND_CORNERS): FALSE is the v10 kernel,
-// unchanged; TRUE swaps the 12 weld rows for the ground block and arms
-// the fall envelope. Two instantiations per dtype, selected once on the
-// host — the flag is baked per env instance, so it is launch-constant.
 // FX = Flux game mode (lib.rs Core::flux, fixed per instance): a
-// second compile-time switch, so every Flux branch is discarded from
-// the standard FX = false kernels. Their arithmetic is unchanged; the
+// compile-time switch, so every Flux branch is discarded from the
+// standard FX = false kernels (two instantiations per dtype, selected
+// once on the host; the former foot-mode switch FC went with weld mode
+// on 2026-09-27). Their arithmetic is unchanged; the
 // only additions there are the palm_vel zero stores in reset_env and
 // the mode-2 refresh (shared device functions, not FX-templated), so
 // the register/spill census may move slightly — re-check on the pod.
-template <typename T, bool FC, bool FX>
+template <typename T, bool FX>
 // The `, 1` PINS the register budget at 255 — see the THREADS note: it
 // is not an occupancy hint, it is what stops ptxas's free-choice
 // heuristic from flipping to 64 regs + double the spills.
@@ -6736,7 +5522,7 @@ step_kernel(Sim<T> P) {
   // thread-local scratch (local memory; per-thread interleaved =
   // coalesced across the warp for same-index access)
   Dyn<T> d;
-  Solver<T, FC> s;
+  Solver<T> s;
   if (P.mode == 1) {
     reset_env(d, P, e, P.cand[e]);
   } else if (P.mode == 2) {
@@ -6754,7 +5540,7 @@ step_kernel(Sim<T> P) {
     d.pd_bad = false;
     d.env_bad = false;
     d.env_n = 0;
-    step_env<T, FC, FX>(d, s, P, e);
+    step_env<T, FX>(d, s, P, e);
   }
   write_obs<T, FX>(d, P, e);
 }
@@ -6808,7 +5594,7 @@ enum {
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps,
           bool auto_reset, int64_t gears,
-          bool want_contacts, bool foot_contact, double fall_const,
+          bool want_contacts, double fall_const,
           double foot_z_coef, double foot_x_coef, double foot_hinge_r,
           double foot_shape_coef, double energy_coef, double limit_coef,
           int64_t limit_arms,
@@ -6975,7 +5761,6 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.foot_pot = ts[TFOOTPOT].data_ptr<scalar_t>();
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
-    P.foot_contact = foot_contact;
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.crouch_prob = (scalar_t)crouch_prob;
@@ -6983,26 +5768,16 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.auto_reset = auto_reset;
     P.want_contacts = want_contacts;
     const unsigned blocks = (unsigned)((N + THREADS - 1) / THREADS);
-    // env v11 foot_mode: a COMPILE-TIME switch (see GROUND_CORNERS), so
-    // the choice is made here, once per launch, and the weld kernel is
-    // the v10 one to the byte.
-    // Flux (FX) is a second compile-time switch (4 instantiations per
-    // dtype, ~2x compile time); the standard game's arithmetic is
-    // untouched. (Audit #5a, 2026-09-26: forcing the max-L1 carveout via
+    // Flux (FX) is a compile-time switch (2 instantiations per dtype;
+    // the foot-mode switch and its weld instantiations were deleted
+    // 2026-09-27); the standard game's arithmetic is untouched. (Audit #5a, 2026-09-26: forcing the max-L1 carveout via
     // cudaFuncSetAttribute measured null on the RTX 5090 — the driver
     // already picks it for this 0 B-shared kernel — so it is not set.)
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (flux) {
-      if (foot_contact)
-        step_kernel<scalar_t, true, true><<<blocks, THREADS, 0, stream>>>(P);
-      else
-        step_kernel<scalar_t, false, true><<<blocks, THREADS, 0, stream>>>(P);
-    } else {
-      if (foot_contact)
-        step_kernel<scalar_t, true, false><<<blocks, THREADS, 0, stream>>>(P);
-      else
-        step_kernel<scalar_t, false, false><<<blocks, THREADS, 0, stream>>>(P);
-    }
+    if (flux)
+      step_kernel<scalar_t, true><<<blocks, THREADS, 0, stream>>>(P);
+    else
+      step_kernel<scalar_t, false><<<blocks, THREADS, 0, stream>>>(P);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
 }
@@ -7014,7 +5789,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "One v10 sim step (mode 0), reset-all (mode 1) or FK-cache "
         "refresh after a state write (mode 2) for every env; state "
         "tensors mutated in place, obs/reward/done written into their "
-        "output slots. foot_contact selects env v11 foot_mode = 1 "
-        "(unilateral ground contact) instead of the v10 foot welds; "
-        "flux selects the Flux game mode (circles + bars, palms)");
+        "output slots. Feet are always in env v11 unilateral ground "
+        "contact; flux selects the Flux game mode (circles + bars, "
+        "palms)");
 }

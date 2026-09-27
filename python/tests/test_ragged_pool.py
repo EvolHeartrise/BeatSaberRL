@@ -173,7 +173,7 @@ def test_env_padded_pool_equals_ragged_pool_bitwise():
     charts, walls = _synthetic(n_charts=24, seed=2, max_notes=40,
                                max_walls=6)
     padded, ragged = _build(charts, walls)
-    kw = dict(max_steps=25 * 30 + 90, foot_contact=True, gears=5, seed=0,
+    kw = dict(max_steps=25 * 30 + 90, gears=5, seed=0,
               device="cuda", wall_despawn=True, dtype=torch.float32)
     e_pad = CudaBeatVecEnv(64, pool=padded, **kw)
     e_rag = CudaBeatVecEnv(64, pool=ragged, **kw)

@@ -30,11 +30,10 @@ class BeatVecEnv:
                  bomb_prob=0.125,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, energy_coef=0.0, self_contact_coef=0.0,
-                 gears=3, seed=0, foot_contact=False, fall_const=5.0):
-        """foot_contact: env v11 foot_mode (unilateral-contact spec §1);
-        False = the v10 foot welds (TEST-HARNESS ONLY since 2026-08-16
-        — production is contact-only and train/bench force it), True =
-        unilateral ground contact + the fall termination."""
+                 gears=3, seed=0, fall_const=5.0):
+        """Unilateral ground contact + the fall termination is the only
+        foot mode (the v10 weld harness and its `foot_contact=` argument
+        were removed 2026-09-27)."""
         self.num_envs = num_envs
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
@@ -49,7 +48,6 @@ class BeatVecEnv:
         # materializing it into Python tuples every step
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90, return_events=False,
                               gears=gears,
-                              foot_contact=foot_contact,
                               fall_const=fall_const,
                               foot_z_coef=foot_z_coef,
                               foot_x_coef=foot_x_coef,
@@ -57,7 +55,6 @@ class BeatVecEnv:
                               foot_shape_coef=foot_shape_coef,
                               energy_coef=energy_coef,
                               self_contact_coef=self_contact_coef)
-        self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
         self._obs = np.zeros((num_envs, OBS_DIM), dtype=np.float32)
@@ -65,8 +62,7 @@ class BeatVecEnv:
     def pop_fall_hits(self):
         """FALL terminations summed over all envs since the last pop
         (unilateral-contact spec §4) — the VecBeatSim getter, exposed so
-        the trainer's [fall] line works on this backend too. Always 0
-        without foot_contact=True."""
+        the trainer's [fall] line works on this backend too."""
         return self.sim.pop_fall_hits()
 
     def pop_flail(self):

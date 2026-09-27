@@ -2,7 +2,10 @@
 //! (python/oracle/gen_reference.py) replayed through the Rust engine
 //! with the SAME per-substep pattern torque + muscle-tone stabilizer
 //! law (τ_total = tau29 + kp·(0 − q) − kd·q̇; kd REPLACES the spec
-//! damping b_j), welds + contacts live. MuJoCo's Newton solver and
+//! damping b_j), on the FREE-FLOATING body: self-collision rows and
+//! joint limits live, no ground and no foot constraint (the refdata
+//! were regenerated so 2026-09-27, when the v10 foot welds they used to
+//! run under were removed — issue #2). MuJoCo's Newton solver and
 //! implicit-damping Euler are NOT our PGS-12 / explicit damping, so the
 //! comparison uses tolerance BANDS, never parity: max |Δq| ≤ 0.05 rad
 //! on the 4 smooth scenarios, ≤ 0.15 rad on random_all29.
@@ -96,7 +99,7 @@ fn band(name: &str) -> (f64, f64) {
     let m = muscle_model(); // kd is the TOTAL damping — spec b_j off
     let mut ws = Workspace::new(&m);
     let mut st = State::neutral(&m);
-    let mut cs = ConstraintSet::new(&m, true, true);
+    let mut cs = ConstraintSet::new(&m, true, false); // floating
     // row 0 must be the shared neutral state
     assert!((qpos[0][0]).abs() < 1e-12 && (qpos[0][1] - 0.94).abs() < 1e-12);
     for j in 0..NQ {

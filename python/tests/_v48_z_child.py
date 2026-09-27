@@ -32,8 +32,7 @@ def lane(obs, slot, k):
     return float(obs[OFF_NOTES + slot * NOTE_FEAT + k])
 
 
-sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS, gears=3,
-                               foot_contact=False)
+sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS, gears=3)
 sim.set_chart([note_tuple(n) for n in NOTES], [wall_tuple(w) for w in WALLS])
 obs_r, _, _, _ = sim.step([0] * N_JOINTS)
 obs_r = np.asarray(obs_r)

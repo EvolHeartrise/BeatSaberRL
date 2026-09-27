@@ -18,7 +18,7 @@ from beat_arena_env.constants import (DT, N_JOINTS, N_NOTE_SLOTS, NOTE_FEAT,
                                       OBS_DIM, OFF_NOTES, OFF_NOTE_MASK,
                                       WALL_FRONT_OFF, WALL_PEN)
 import beat_arena_rs
-from tests._helpers import ZERO_ACT, z_lane, z_lane_m
+from tests._helpers import ALIVE, ZERO_ACT, z_lane, z_lane_m
 
 PLANE_Z0 = -0.65
 
@@ -168,14 +168,27 @@ def test_v4_y_clamp_is_wider(tmp_path):
 # --- sim: head-in-wall penalty (spec §12b) -----------------------------------
 
 def _sim(chart, walls, max_steps=600):
-    """Weld-mode sim (feet welded — never falls, head stays ~reference),
-    zero effort so the only reward terms are judgments + wall pen."""
+    """Zero-effort sim: the only reward terms are the per-tick alive
+    bonus, judgments and the wall pen.
+
+    2026-09-27 (weld harness removed): the coasting body now stands on
+    ground contact and tips over after ~0.7 s (it used to be welded and
+    never fell), so every wall below arrives within the first ~0.3 s at
+    8 m/s and each scenario ends by tick ~25; rewards are compared NET of
+    the alive bonus, and `_step` asserts the body is still standing."""
     sim = beat_arena_rs.RawBeatSim(max_steps=max_steps,
-                                   gears=5,
-                                   foot_contact=False)
+                                   gears=5)
     sim.set_chart([note_tuple(n) for n in chart],
                   [wall_tuple(w) for w in walls])
     return sim
+
+
+def _step(sim):
+    """One coast tick; returns (obs, reward net of the alive bonus,
+    events) and asserts the episode is still running."""
+    obs, r, done, ev = sim.step(ZERO_ACT)
+    assert not done, "the body fell inside the scenario window"
+    return obs, r - ALIVE, ev
 
 
 # a far-future far-off note keeps the episode alive without scoring
@@ -185,20 +198,18 @@ FAR_NOTE = [Note(hit_time=100.0, col=2, row=1, x=2.5, y=1.4, color=0,
 
 def test_head_in_wall_penalty_window():
     # Wall spanning far beyond the grid: front crosses the plane at
-    # t=1, at speed 4 it reaches the head 0.4/4 = 0.1 s later, and the
-    # back face (len 2.05 m — off the tick grid so the exit boundary
+    # t=0.2, at speed 8 it reaches the head 0.4/8 = 0.05 s later, and
+    # the back face (len 1.05 m — off the tick grid so the exit boundary
     # is not a knife-edge fp equality under the v36 sweep) passes
-    # 2.05/4 s after that. The box is
-    # made HUGE in x/y because the unactuated weld-mode body SLUMPS —
-    # by ~1.5 s the head is near the floor — so the test isolates the
-    # z window (the x/y test has its own dodged-wall case).
-    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                length=2.05, speed=4.0)
+    # 1.05/8 s after that. The box is made HUGE in x/y because the
+    # unactuated body sways, so the test isolates the z window (the x/y
+    # test has its own dodged-wall case).
+    wall = Wall(start_time=0.2, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=1.05, speed=8.0)
     sim = _sim(FAR_NOTE, [wall])
     ticks_in, reward_in = 0, 0.0
-    for k in range(1, 121):
-        _obs, r, done, ev = sim.step(ZERO_ACT)
-        assert not done
+    for k in range(1, 18):
+        _obs, r, ev = _step(sim)
         codes = [e[1] for e in ev]
         t = k * DT
         dzf = (wall.start_time - t) * wall.speed - PLANE_Z0 - WALL_FRONT_OFF
@@ -227,12 +238,12 @@ def test_thin_fast_wall_cannot_phase_through():
     7.5 ms) fits entirely between two 33 ms ticks was invisible to the
     old end-of-tick point test; the interval sweep must charge it
     exactly once."""
-    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
+    wall = Wall(start_time=0.3, cx=0.0, cy=0.0, width=20.0, height=40.0,
                 length=0.06, speed=8.0)
     sim = _sim(FAR_NOTE, [wall])
     total, enters = 0.0, 0
-    for _k in range(90):
-        _obs, r, _done, _ev = sim.step(ZERO_ACT)
+    for _k in range(18):
+        _obs, r, _ev = _step(sim)
         total += r
     assert sim.wall_enters == 1, "thin wall phased through the sweep"
     assert sim.walls_in == 1                     # one swept tick
@@ -242,12 +253,12 @@ def test_thin_fast_wall_cannot_phase_through():
 def test_dodged_wall_charges_nothing():
     # same wall but off to the side: z-span crosses, x never contains
     # the head
-    wall = Wall(start_time=1.0, cx=2.5, cy=1.5, width=0.6, height=3.0,
-                length=2.0, speed=4.0)
+    wall = Wall(start_time=0.2, cx=2.5, cy=1.5, width=0.6, height=3.0,
+                length=1.0, speed=8.0)
     sim = _sim(FAR_NOTE, [wall])
     total = 0.0
-    for _ in range(120):
-        _obs, r, _d, ev = sim.step(ZERO_ACT)
+    for _ in range(18):
+        _obs, r, ev = _step(sim)
         total += r
         assert all(e[1] != 7 for e in ev)
     assert sim.walls_in == 0
@@ -255,14 +266,14 @@ def test_dodged_wall_charges_nothing():
 
 
 def test_overlapping_walls_charge_once_per_entry():
-    walls = [Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                  length=2.0, speed=4.0),
-             Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                  length=2.0, speed=4.0)]
+    walls = [Wall(start_time=0.2, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                  length=1.0, speed=8.0),
+             Wall(start_time=0.2, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                  length=1.0, speed=8.0)]
     sim = _sim(FAR_NOTE, walls)
     total = 0.0
-    for _ in range(120):
-        _obs, r, _d, _ev = sim.step(ZERO_ACT)
+    for _ in range(18):
+        _obs, r, _ev = _step(sim)
         total += r
         assert r >= WALL_PEN - 1e-12      # never double-charged in a tick
     assert sim.walls_in > 0
@@ -317,15 +328,15 @@ def test_long_wall_back_face_lane_stays_exact_inside():
     """Straddling a LONG wall, lane 2's front face saturates at
     the live head z (since 2026-08-22) while lane 17 keeps
     reporting the true remaining-wall distance."""
-    wall = Wall(start_time=0.5, cx=0.0, cy=1.5, width=2.4, height=3.0,
+    wall = Wall(start_time=0.05, cx=0.0, cy=1.5, width=2.4, height=3.0,
                 length=10.0, speed=8.0)
     sim = _sim(FAR_NOTE, [wall])
     deep_tick = None
-    for t in range(300):
-        sim.step([0] * N_JOINTS)
-        # front face z at end-of-tick time (z_off ~ 0 for the welded
-        # coasting body within f32 noise)
-        zf = (0.5 - sim.time) * 8.0 - 0.25
+    for t in range(20):
+        _step(sim)
+        # front face z at end-of-tick time (z_off ~ 0 for the coasting
+        # body within f32 noise this early)
+        zf = (0.05 - sim.time) * 8.0 - 0.25
         if zf < -3.5:
             deep_tick = t
             break
@@ -337,15 +348,15 @@ def test_long_wall_back_face_lane_stays_exact_inside():
     head_z = obs[OFF_HEAD + 2] * 1.0 + (-0.65)   # z_off lane + PLANE_Z0
     assert tok0[2] == pytest.approx(z_lane(head_z), abs=1e-4), \
         "front-face lane should be saturated at the LIVE head z"
-    zf = (0.5 - sim.time) * 8.0 - 0.25
+    zf = (0.05 - sim.time) * 8.0 - 0.25
     want_back = zf + 10.0
     # absolute: nominal remaining +- the head-z drift the z_off anchor
-    # adds (welded body sways; bound it at 0.6 m)
+    # adds (the coasting body sways; bound it at 0.6 m)
     assert z_lane_m(tok0[17]) == pytest.approx(want_back, abs=0.6), \
         f"back-face lane {z_lane_m(tok0[17])} m != true remaining {want_back}"
     # exact tracking: across one tick the lane must advance by the
     # wall's speed*DT (z_off drift per tick is < 0.02 m)
-    sim.step([0] * N_JOINTS)
+    _step(sim)
     obs2 = sim.obs()
     (tok0b, m0b) = _slots(obs2)[0]
     assert m0b == 1.0 and tok0b[14] == 1.0
@@ -361,17 +372,17 @@ def test_wall_despawn_charges_once_and_removes():
     the entry tick, despawns (obs + penalty loops both skip it via the
     passed latch), and produces NO in-wall tick events afterward."""
     import beat_arena_rs
-    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                length=10.0, speed=4.0)   # long: would linger 2.5 s
+    wall = Wall(start_time=0.2, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=10.0, speed=8.0)   # long: would linger 1.25 s
     sim = beat_arena_rs.RawBeatSim(max_steps=600,
                                    gears=5,
-                                   foot_contact=False, wall_despawn=True)
+                                   wall_despawn=True)
     sim.set_chart([note_tuple(n) for n in FAR_NOTE],
                   [wall_tuple(wall)])
     total, enter_ticks, in_ticks = 0.0, 0, 0
     seen_after = False
-    for k in range(1, 181):
-        obs, r, _d, ev = sim.step(ZERO_ACT)
+    for k in range(1, 20):
+        obs, r, ev = _step(sim)
         codes = [e[1] for e in ev]
         total += r
         if 8 in codes:
@@ -392,12 +403,12 @@ def test_wall_despawn_charges_once_and_removes():
 def test_wall_despawn_default_off_keeps_persistence():
     """Default (bench) semantics unchanged: the wall persists after
     entry and keeps emitting in-wall ticks."""
-    wall = Wall(start_time=1.0, cx=0.0, cy=0.0, width=20.0, height=40.0,
-                length=10.0, speed=4.0)
+    wall = Wall(start_time=0.2, cx=0.0, cy=0.0, width=20.0, height=40.0,
+                length=10.0, speed=8.0)
     sim = _sim(FAR_NOTE, [wall])
     enters, in_ticks = 0, 0
-    for _k in range(1, 181):
-        _obs, _r, _d, ev = sim.step(ZERO_ACT)
+    for _k in range(1, 20):
+        _obs, _r, ev = _step(sim)
         codes = [e[1] for e in ev]
         enters += codes.count(8)
         in_ticks += codes.count(7)
@@ -467,23 +478,24 @@ def test_wall_at_head_outranks_everything():
 def test_wall_enter_is_edge_triggered():
     # two crossings separated by >= 1 tick out -> exactly two entries;
     # overlapping walls forming one continuous span -> exactly one
-    big = dict(cx=0.0, cy=0.0, width=20.0, height=40.0, speed=4.0)
-    two = [Wall(start_time=1.0, length=0.8, **big),
-           Wall(start_time=1.5, length=0.8, **big)]
+    # (compressed to 8 m/s inside the standing window — see _sim)
+    big = dict(cx=0.0, cy=0.0, width=20.0, height=40.0, speed=8.0)
+    two = [Wall(start_time=0.2, length=0.4, **big),
+           Wall(start_time=0.35, length=0.4, **big)]
     sim = _sim(FAR_NOTE, two)
     enters = 0
-    for _ in range(90):
-        _o, _r, _d, ev = sim.step(ZERO_ACT)
+    for _ in range(20):
+        _o, _r, ev = _step(sim)
         enters += sum(1 for e in ev if e[1] == 8)
     assert enters == 2 == sim.wall_enters
     assert sim.walls_in > 2          # the drain ran for the whole spans
 
-    overlap = [Wall(start_time=1.0, length=2.0, **big),
-               Wall(start_time=1.2, length=1.0, **big)]
+    overlap = [Wall(start_time=0.2, length=1.6, **big),
+               Wall(start_time=0.3, length=0.8, **big)]
     sim = _sim(FAR_NOTE, overlap)
     enters = 0
-    for _ in range(90):
-        _o, _r, _d, ev = sim.step(ZERO_ACT)
+    for _ in range(20):
+        _o, _r, ev = _step(sim)
         enters += sum(1 for e in ev if e[1] == 8)
     assert enters == 1 == sim.wall_enters
 

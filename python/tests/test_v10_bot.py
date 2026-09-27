@@ -3,7 +3,8 @@
 Covers the v10 additions under the bot: the full-body FK mirror
 (kinematics.fk_body vs the sim's own FK through `sabers()`), the
 frame-table masses, the P6 additive
-introspection (`weld_impulses`) and the additive replay fields
+introspection (`ground_reaction`, the contact-mode twin of the retired
+`weld_impulses`) and the additive replay fields
 ("feet", "activation"). The bot itself, its solvability gate and its
 gravity/stance feedforward helpers were removed 2026-09-22; these
 support-layer checks stay.
@@ -74,7 +75,7 @@ def test_fk_body_reference_pose():
     assert np.allclose(pos[F_L_WRIST], (-0.2, 1.47, 0.0), atol=1e-12)
     assert np.allclose(pos[F_R_WRIST], (0.2, 1.47, 0.0), atol=1e-12)
     assert np.allclose(blade_of(rots, 0), (0, 0, 1), atol=1e-12)
-    # feet at their weld anchors
+    # feet at their reference anchors (the v10 weld anchors)
     from beat_arena_env.kinematics import F_L_FOOT, F_R_FOOT
     assert np.allclose(pos[F_L_FOOT], (-0.10, 0.07, -0.65), atol=1e-12)
     assert np.allclose(pos[F_R_FOOT], (0.10, 0.07, -0.65), atol=1e-12)
@@ -88,18 +89,18 @@ def test_frame_table_masses():
 
 # --- P6 additive introspection + replay fields --------------------------------
 
-def test_weld_impulses_carry_body_weight():
-    """Vertical weld reaction ≈ body weight once the coasting body's
-    initial transient settles — checked on the FIRST tick (the body is
-    still near rest): total jy/DT within 25% of m·g, and the getter's
-    shape/order matches the solver's row layout."""
+def test_ground_reaction_carries_body_weight():
+    """Vertical ground reaction ≈ body weight on the FIRST tick (the
+    coasting body is still near rest): total jy/DT within 25% of m·g,
+    upward on both feet, and the getter's shape is per foot [L, R] x
+    [jx, jy, jz]. (Replaced the v10 `weld_impulses` twin, 2026-09-27.)"""
     sim = _sim()
     sim.step([0] * N_JOINTS)
-    w = sim.weld_impulses()
-    assert len(w) == 2 and all(len(f) == 6 for f in w)
-    fy = (w[0][1] + w[1][1]) / DT
-    assert fy == pytest.approx(75.02 * 9.81, rel=0.25)
-    assert w[0][1] > 0 and w[1][1] > 0  # upward on both feet
+    g = sim.ground_reaction()
+    assert len(g) == 2 and all(len(f) == 3 for f in g)
+    fy = (g[0][1] + g[1][1]) / DT
+    assert fy == pytest.approx(74.50 * 9.81, rel=0.25)
+    assert g[0][1] > 0 and g[1][1] > 0  # upward on both feet
 
 
 def test_replay_additive_fields(tmp_path):
@@ -108,7 +109,7 @@ def test_replay_additive_fields(tmp_path):
     actions (activation = Σ|gear fraction| of the tick's action,
     [total, spine, arms, legs])."""
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(foot_contact=False, seed=2, chart_len_s=4.0, gears=5)
+    env = RustBeatEnv(seed=2, chart_len_s=4.0, gears=5)
     env.set_record(path)
     env.reset(seed=2)
     rng = np.random.default_rng(4)
@@ -130,6 +131,6 @@ def test_replay_additive_fields(tmp_path):
         assert a[2] == pytest.approx(sum(gear[x] for x in act[3:17]), abs=1e-3)
         assert a[3] == pytest.approx(sum(gear[x] for x in act[17:]), abs=1e-3)
         assert "effort" not in t
-    # some tick carries weight through the welds and commands torque
+    # some tick carries weight through the feet and commands torque
     assert max(t["feet"][0][1] + t["feet"][1][1] for t in ticks) > 0.5
     assert max(t["activation"][0] for t in ticks) > 0.0

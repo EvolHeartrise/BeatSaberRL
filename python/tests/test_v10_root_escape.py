@@ -23,11 +23,20 @@ Engagements of the PRE-integration application are counted
 a ZEROED reward — an escaped trajectory is bounded but not physical, and
 feeding its observations/rewards to the policy is the actual harm.
 
-Fixture: escape #7 of the 2026-08-03 corpus (CUDA f32 env, N=4096 seed 1
+Original fixture (retired 2026-09-27): escape #7 of the 2026-08-03 corpus (CUDA f32 env, N=4096 seed 1
 gears 3, env 48 @ tick 17) — the state at the START of a control tick
 during which the root moved 642.7 m without an auto-reset. It looks
 ordinary: |v_root| 0.15 m/s, |ω_root| 6.4 rad/s, |q̇|max at the wrist cap.
 Pre-fix the Rust f64 tier moved it 31.1 m in the FIRST substep alone.
+
+2026-09-27 (weld harness removed, issue #2): the divergence was the
+OBLIQUE projector above — the weld-null-space projection — which left with
+the welds; on ground contact the captured state steps benignly, so it was
+retired. The fixture now INJECTS the runaway: the upright reference stance
+with an over-envelope root velocity (|v| = 62 m/s > ROOT_V_MAX) pointing up
+and away from the floor, which the unilateral ground rows cannot absorb.
+Everything downstream — engagement, count, termination, zeroed reward,
+the per-tick bound, Rust<->CUDA agreement — is pinned as before.
 """
 
 import numpy as np
@@ -36,37 +45,18 @@ import torch
 
 import beat_arena_rs
 from beat_arena_env.chart import note_tuple
-from beat_arena_env.constants import H_SUB, N_JOINTS, N_SUB, NV, ROOT_V_MAX
+from beat_arena_env.constants import (H_SUB, N_JOINTS, N_SUB, NV, ROOT_V_MAX,
+                                      q_start)
 # FAR_NOTE is beyond every horizon: the tick is pure body dynamics, so
 # `done` can only come from the C backstop
 from tests._helpers import FAR_NOTE
 
-ESC_Q36 = [
-    -0.18843580782413483, 0.8035035133361816, -1.077133059501648,
-    0.8241789937019348, 0.5093252062797546, 0.09989655017852783,
-    -0.2265780121088028, 0.7853981852531433, -0.6981030106544495,
-    -0.47437214851379395, 0.9689304828643799, -0.1498527228832245,
-    0.566002607345581, 0.8901060819625854, 0.07968739420175552,
-    1.0873289108276367, 0.2617993950843811, 0.14637738466262817,
-    1.3688384294509888, 0.45331719517707825, 0.8741688132286072,
-    -0.5112427473068237, -0.5565317869186401, 0.33905500173568726,
-    1.5271868705749512, -0.5984416604042053, 0.294033020734787,
-    0.005854796152561903, -0.4577142298221588, -0.22766704857349396,
-    1.6427476406097412, -0.6469371318817139, 0.26761528849601746, 0.0,
-    -0.5667280554771423, -0.2737051248550415,
-]
-ESC_V35 = [
-    0.012548212893307209, 0.0441480427980423, -0.1442444622516632,
-    -5.172290325164795, -1.5389772653579712, 3.447293281555176, 0.0,
-    -10.52071762084961, -4.945155620574951, -10.435583114624023,
-    14.81192398071289, 6.78498649597168, 15.845629692077637, -40.0,
-    25.100996017456055, 0.0, -16.0, 10.470308303833008, -15.397571563720703,
-    4.1626200675964355, -5.062375545501709, -18.275327682495117,
-    39.9994010925293, -14.463310241699219, 5.370003700256348,
-    5.604532241821289, -15.959772109985352, -8.515240669250488,
-    -0.1936049610376358, -6.113821506500244, 3.4726436138153076,
-    0.6403346657752991, 0.0, 0.18586382269859314, 0.2472548931837082,
-]
+# the runaway (see the module doc): the reference stance, upright (a
+# tilted body would also trip the chest-tilt envelope, whose flat
+# -fall_const price overrides the escape's zeroed reward), with an
+# over-envelope root velocity pointing up and away from the floor
+ESC_Q36 = [0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start()
+ESC_V35 = [30.0, 45.0, -30.0] + [0.0] * (NV - 3)
 ESC_ACT = [0, 2, 0, 1, 1, 0, 2, 1, 2, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1,
            1, 2, 0, 1, 1, 0, 0]
 
@@ -101,8 +91,7 @@ def test_rust_escape_terminates_bounded_and_counted():
     p1 = np.array(sim.qpos()[:3])
     dp = float(np.linalg.norm(p1 - p0))
     assert dp <= TICK_DP_BOUND + 1e-9, (
-        f"tick |dp| = {dp} m — the pre-fix teleport (31.1 m in substep 0 "
-        f"alone, 642.7 m over the tick in the capturing f32 env) survived")
+        f"tick |dp| = {dp} m — above the per-tick envelope bound")
     assert np.isfinite(obs).all(), "escaped obs must stay finite"
     assert np.isfinite(np.array(sim.twist())).all()
     assert np.isfinite(np.array(sim.omega())).all()

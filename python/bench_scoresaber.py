@@ -142,12 +142,11 @@ class _Group:
     __slots__ = ("n", "sim", "fwd", "obs_t", "obs_buf", "act_t", "act_np",
                  "slots", "free", "n_active", "ev", "issued")
 
-    def __init__(self, n, fwd, device, gears=3, foot_contact=False,
+    def __init__(self, n, fwd, device, gears=3,
                  tau_scale=None, sim_mod=beat_arena_rs):
         self.n = n
         self.sim = sim_mod.VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
-                              return_events=False, gears=gears,
-                              foot_contact=foot_contact)
+                              return_events=False, gears=gears)
         # env v46: fixed body for the whole bench (all 1.0 = the v45 body)
         if tau_scale is not None:
             self.sim.set_tau_scale([float(x) for x in tau_scale])
@@ -205,12 +204,11 @@ def parse_args():
                         "table = every bench before 2026-09-20). The "
                         "scales are stamped in the bench JSON")
     p.add_argument("--foot-contact", action="store_true", default=True,
-                   help="DEPRECATED NO-OP (2026-08-16): contact mode is "
-                        "the only physics the bench runs — every "
-                        "production checkpoint is contact-trained. The "
-                        "flag is accepted so older drivers keep running. "
-                        "(Weld-era checkpoints predate env v11 and are "
-                        "archival.)")
+                   help="DEPRECATED NO-OP: contact mode is the only "
+                        "physics (the v10 weld harness was removed from "
+                        "the engines 2026-09-27). The flag is accepted so "
+                        "older drivers keep running. (Weld-era "
+                        "checkpoints predate env v11 and are archival.)")
     p.add_argument("--groups", type=int, default=2,
                    help="--sim rust: split --num-envs into this many equal "
                         "groups that alternate — each group's GPU forward "
@@ -619,7 +617,6 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                          max_steps=max_steps, gears=policy.n_gears,
                          device=device, dtype=dtype,
                          auto_reset=False, want_contacts=False,
-                         foot_contact=True,
                          # main() sets it from the checkpoint; unset = the
                          # rust sim's default (8 m)
                          z_asinh=float(os.environ.get("BEAT_Z_ASINH", "8.0")),
@@ -809,7 +806,7 @@ def main():
         "checkpoint": args.ckpt, "checkpoint_name": ckpt_name,
         "model_hash": mhash, "arch": ckpt.get("arch"),
         "global_step": ckpt.get("global_step"),
-        "foot_contact": args.foot_contact,   # physics-regime provenance
+        "foot_contact": True,   # physics-regime provenance (the only mode)
         "tau_scale": parse_tau_scale(args.tau_scale),  # env v46 body
         "mirror": args.mirror,               # charts left-right reflected
     }
@@ -952,7 +949,6 @@ def main():
         fwd_g = (None if args.no_graphs or device.type != "cuda"
                  else _GraphedArgmax(policy, n_g, device))
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
-                             foot_contact=args.foot_contact,
                              tau_scale=parse_tau_scale(args.tau_scale),
                              sim_mod=sim_mod))
     fwd = groups[0].fwd                  # for the provenance stamp below

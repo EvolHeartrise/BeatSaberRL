@@ -21,9 +21,9 @@ mirror):
   (iv)  CUDA contact-mode determinism: same seed twice, bitwise-equal
         state.
 
-Weld mode (foot_mode = 0, the default) is NOT retested here — it is the
-v10 physics unchanged, and test_v10_parity_cuda.py is its gate. That
-module passing unmodified IS the §5 (f) weld-regression assertion.
+Contact mode is the only foot mode since the v10 weld harness was
+removed (2026-09-27, issue #2); test_v10_parity_cuda.py's tiers run in it
+too, and the §5 (f) weld-regression half retired with the welds.
 
 The whole module is skipped without CUDA (the kernel has no CPU path).
 """
@@ -57,8 +57,7 @@ def _rust_sims(n, gears):
     sims = []
     for _ in range(n):
         sim = beat_arena_rs.RawBeatSim(max_steps=MAX_STEPS,
-                                       gears=gears,
-                                       foot_contact=True)
+                                       gears=gears)
         sim.set_chart([note_tuple(FAR_NOTE)])
         sims.append(sim)
     return sims
@@ -69,7 +68,7 @@ def _cenv(n, gears, dtype=torch.float64, auto_reset=False,
     return CudaBeatVecEnv(n, charts=[[FAR_NOTE]] * n, max_steps=MAX_STEPS,
                           gears=gears, device="cuda",
                           dtype=dtype, auto_reset=auto_reset,
-                          want_contacts=True, foot_contact=True, seed=seed)
+                          want_contacts=True, seed=seed)
 
 
 def _stance_states(n, seed):
@@ -313,30 +312,6 @@ def test_fall_envelope_parity():
     assert float(env.p[0, 1]) > FALL_ROOT_Y
 
 
-def test_weld_mode_never_falls():
-    """The other half of §5 (d)/(f), and the assertion is sharper than it
-    looks. With foot_contact=False the same hard lean drives the welded
-    root WELL below FALL_ROOT_Y — v10 has no ground, so the body folds
-    through the floor about its pinned ankles — and the env must not
-    notice: no termination, no counted fall. That is the flag proving
-    itself dead in weld mode on a trajectory that would trip it in
-    contact mode, not merely on one that never gets near the threshold."""
-    env = CudaBeatVecEnv(4, charts=[[FAR_NOTE]] * 4, max_steps=MAX_STEPS,
-                         gears=5, device="cuda", dtype=torch.float64,
-                         auto_reset=False, want_contacts=True)
-    env.reset()
-    acts = np.zeros((4, N_JOINTS), dtype=np.int64)
-    acts[:, J_L_HIP_PITCH] = 1
-    acts[:, J_R_HIP_PITCH] = 1
-    crossed = False
-    for _ in range(40):
-        _o, _r, done, _ = env.step(torch.as_tensor(acts))
-        assert not bool(done.any()), "weld mode terminated under a hard lean"
-        crossed |= bool((env.p[:, 1] < FALL_ROOT_Y).any())
-    assert crossed, "the weld control never reached the fall threshold"
-    assert env.pop_fall_hits() == 0
-
-
 # --- (ii) f32 well-formedness -------------------------------------------------
 
 def test_contact_f32_well_formed():
@@ -417,7 +392,7 @@ def test_contact_determinism_bitwise():
         env = CudaBeatVecEnv(4, seed=seed, chart_pool=8, dtype=torch.float32,
                              colors="both", chart_len_s=6.0, note_prob=0.5,
                              extra_prob=0.4, bomb_prob=0.25,
-                             want_contacts=True, foot_contact=True)
+                             want_contacts=True)
         obs = env.reset()
         rng = np.random.default_rng(11)
         tot = torch.zeros(4, device="cuda")
