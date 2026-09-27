@@ -2749,6 +2749,32 @@ __device__ void ensure_pdiag(Dyn<T>& __restrict__ d,
   s.pcomp[j] = true;
 }
 
+// OUT-OF-LINE lazy column builds for the register-resident cap pass and
+// step-11 clamps (#6c): those loops are unrolled over the 29 joints, and
+// an inlined tree solve per joint would be 29 copies of it. The ecomp /
+// pcomp early-out stays inline at the call site, so the call (and the
+// register save / restore around it) is paid only on a genuine miss — a
+// few per substep against dozens of firings. Measured alternatives
+// (trained standard, sampled, N=32768): dropping to the old
+// local-memory loop at the first miss, 32.0 ms/tick vs 29.9 here; a
+// "restart" form (leave the unrolled sweep at the miss, build inline
+// once, resume at that joint) wins without the #6e column prediction
+// (25.7) but loses with it (23.8 vs 23.5), and in step 11 either way.
+// ptxas: this costs f32 +60 B / +124 B of spill stores (standard /
+// Flux), f64 about +1.2 KB — static counts; the timings above are net.
+template <typename T>
+__device__ __noinline__ void ensure_ecol_ool(Dyn<T>& __restrict__ d,
+                                             Solver<T>& __restrict__ s,
+                                             int j) {
+  ensure_ecol(d, s, j);
+}
+template <typename T>
+__device__ __noinline__ void ensure_pdiag_ool(Dyn<T>& __restrict__ d,
+                                              Solver<T>& __restrict__ s,
+                                              int j) {
+  ensure_pdiag(d, s, j);
+}
+
 // audit #9 — support dot of foot spatial row m (0..2 linear, 3..5
 // angular; the support shapes at WJ_L0) against a dense NV-vector read
 // through g(i): the exactly-1.0 column m as a bare add, a linear row's two
@@ -3324,45 +3350,29 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
     // (d) omega-cap pass, joint order: momentum-consistent impulses
     // along the plain M^-1 e_j columns.
-    // G5: scan the 29 joints on vr with the loop's own test, compile-time
-    // j. Until the first joint whose test fires the original loop changes
-    // nothing, so if none fires the pass is done; otherwise vr goes back
-    // to `v`, the original loop runs from that joint on (bodies included,
-    // unchanged), and vr is reloaded.
-    int j0 = 0;
-    {
-      j0 = NQ;
+    // #6c (perf/kernel-limits; was G5's scan + local-memory fallback
+    // loop): the pass runs on vr, unrolled over the 29 joints — per
+    // joint the same test, impulse and hard write, in the same ascending
+    // order, so every value is unchanged (the old scan only skipped the
+    // joints before the first firing one, which change nothing). v never
+    // takes the round trip through local memory, every vr index is
+    // compile-time, and a column miss builds out of line. Trained
+    // standard traffic caps ~21 times per env-substep (warp worst lane
+    // ~54), in every one of the 12 iterations.
 #pragma unroll
-      for (int j = NQ - 1; j >= 0; j--) {
-        const T cap = CT(OMEGA_CAP, [j]);
-        const T target = tclamp(vr[VOFF + j], -cap, cap);
-        if (target != vr[VOFF + j]) j0 = j;
-      }
-      if (j0 < NQ) {
-#pragma unroll
-        for (int i = 0; i < NV; i++) v[i] = vr[i];
-      }
-    }
-    for (int j = j0; j < NQ; j++) {
+    for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = CT(OMEGA_CAP, [j]);
-      const T target = tclamp(v[vj], -cap, cap);
-      if (target != v[vj]) {
-        ensure_pdiag(d, s, j);
+      const T target = tclamp(vr[vj], -cap, cap);
+      if (target != vr[vj]) {
+        if (!s.pcomp[j]) ensure_pdiag_ool(d, s, j);
         if (!isinf(s.pdiag[j])) {
-          const T lam = (target - v[vj]) / s.pdiag[j];
-          {
-            const T* const col = ecol_of(s, j);
-            for (int i = 0; i < NV; i++) v[i] += col[i] * lam;
-          }
-          v[vj] = target;  // exact — the cap is a hard bound
-        }
-      }
-    }
-    {
-      if (j0 < NQ) {
+          const T lam = (target - vr[vj]) / s.pdiag[j];
+          const T* const col = ecol_of(s, j);
 #pragma unroll
-        for (int i = 0; i < NV; i++) vr[i] = v[i];
+          for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+          vr[vj] = target;  // exact — the cap is a hard bound
+        }
       }
     }
   }
@@ -3478,8 +3488,21 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       if (over > T(LIMIT_TELEPORT_BACKSTOP)) d.q[j] = tclamp(d.q[j], lo, hi);
     }
   }
+  // #6c (perf/kernel-limits): the passes run on a register copy of d.v,
+  // unrolled over the 29 joints — the same targets, impulses and hard
+  // writes in the same order (a copy is the identity), with compile-time
+  // indices and no store -> load chain through local d.v per firing; a
+  // column miss builds out of line. On trained standard traffic the
+  // warp's worst lane runs ~57 of the 64 passes (~27 firings per
+  // env-substep, worst lane ~210), so this loop was the kernel's
+  // dominant cost: 69.5 -> 29.9 ms/tick together with the cap pass
+  // above (RTX 5090, N=32768, sampled actions).
+  T vr[NV];
+#pragma unroll
+  for (int i = 0; i < NV; i++) vr[i] = d.v[i];
   for (int pass = 0; pass < CLAMP_PASSES; pass++) {
     bool changed = false;
+#pragma unroll
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = CT(OMEGA_CAP, [j]);
@@ -3497,19 +3520,22 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                      : tclamp(T(BETA_LIMIT) * (over < T(0) ? -rec : rec) / T(H_SUB),
                               -cap, cap);
       } else {
-        target = tclamp(d.v[vj], -cap, cap);
+        target = tclamp(vr[vj], -cap, cap);
       }
-      if (target != d.v[vj]) {
-        ensure_ecol(d, s, j);
-        const T* col = ecol_of(s, j);
-        const T lam = (target - d.v[vj]) / col[vj];
-        for (int i = 0; i < NV; i++) d.v[i] += col[i] * lam;
-        d.v[vj] = target;  // exact — the clamp is a hard bound
+      if (target != vr[vj]) {
+        if (!s.ecomp[j]) ensure_ecol_ool(d, s, j);
+        const T* const col = ecol_of(s, j);
+        const T lam = (target - vr[vj]) / col[vj];
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+        vr[vj] = target;  // exact — the clamp is a hard bound
         changed = true;
       }
     }
     if (!changed) break;
   }
+#pragma unroll
+  for (int i = 0; i < NV; i++) d.v[i] = vr[i];
   // (env v14: no direct-write guarantee pass — mirror of step.rs.)
   // 12. root velocity envelope guarantee, SECOND application
   //     (Divergences §19b; the first is the 12-PRE block above, §23).
