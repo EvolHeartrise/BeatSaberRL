@@ -45,8 +45,10 @@ Env v10 (2026-07-31, P3 — SPEC-v10.md): the kinematic upper body is
 RETIRED. The body is a full **dynamic humanoid** — floating pelvis +
 29 actuated revolute DoF (spine 3, arms 2×7 with the v9 arm chains
 verbatim, legs 2×6), de Leva masses on the v9 anchor geometry, feet
-welded to the floor, 12-collider self-contact — integrated by a
-hand-rolled f64 engine (CRBA/RNEA/Cholesky + weld-block/PGS solver,
+welded to the floor (env v11 replaced the welds with unilateral ground
+contact; the weld test harness was removed 2026-09-27), 12-collider
+self-contact — integrated by a hand-rolled f64 engine (CRBA/RNEA/
+Cholesky + PGS constraint solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
 are **29 gear heads** (τ = gear_fraction × τ_max); movement is priced by
 `--energy-coef` (env v43: the applied Σ|τ| per tick; the v23 `--iso-coef` fraction price is retired);
@@ -58,7 +60,8 @@ activation itself is the energy telemetry (replay `activation`
 the dashboard panel); the reach/miss gates and note look-at follow
 the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
 root twist + ω29 + contact events; since P6 additive per-tick "feet"
-weld impulses; record_rev 3 "activation"). Gravity is real and nothing holds the body
+impulses — the ground reaction since the 2026-08-17 replay fix;
+record_rev 3 "activation"). Gravity is real and nothing holds the body
 up — posture is the policy's problem now. ALL v9 checkpoints,
 replays, and records are retired. The viewer is v10
 (P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` — the whole
@@ -563,7 +566,7 @@ follow-through a few ticks later) but the indicator shows ONE number per
 note out of the full 115: it spawns with the cut's points and counts up
 when the follow-through lands (`landedPost`). Env v10 (P6): the viewer draws the REAL
 articulated skeleton (full-body FK from the replayed q36 — capsules at
-the SPEC-v10 collider dims, feet on their weld anchors), flashes
+the SPEC-v10 collider dims, feet at their reference anchors), flashes
 yellow contact markers sized by impulse at self-collision events, and
 the `g` gauges are per-joint dials for all 29 joints (grouped spine /
 arms / legs: limit arcs, ω, near-limit orange, applied-τ bars derived
