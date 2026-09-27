@@ -685,7 +685,7 @@ MUON_NS_COEFS = ((4.0848, -6.8946, 2.9270),
                  (2.8366, -3.0525, 1.2012))
 
 
-def newton_schulz5_batched(G, eps=1e-7):
+def newton_schulz5_batched(G, eps=1e-7, scale=None):
     """Orthogonalize a stack (k, m, n) of same-shaped 2-D updates in one
     bmm chain: each matrix -> the nearest orthogonal matrix by the five
     quintic Newton-Schulz steps of MUON_NS_COEFS (singular values land
@@ -695,14 +695,29 @@ def newton_schulz5_batched(G, eps=1e-7):
     per-matrix loop was 5 launch triples per matrix per optimizer step
     (~30k launches per update at the 2026-09-19 arch) — 0.6-0.7 s of the
     update phase on a slow-dispatch host;
-    bmm vs mm rounding differs at ~3e-8 (max |update| ~1e-3)."""
-    x = G / (G.flatten(1).norm(dim=1).view(-1, 1, 1) + eps)
+    bmm vs mm rounding differs at ~3e-8 (max |update| ~1e-3).
+    Each step is 3 kernels since 2026-09-27 (#7b): s = x x^T, then
+    B = b s + c s s and x = a x + B x as two baddbmm (the scalar
+    multiplies and adds ride the GEMM epilogue; fp32 throughout, no
+    TF32). `scale` (optional, a list of (start, stop, factor) row runs
+    of the stack covering all of it) folds the caller's per-matrix step
+    scale into the LAST step's epilogue: x_out = factor * (a x + B x)."""
+    x = G / (torch.linalg.vector_norm(G, dim=(1, 2), keepdim=True) + eps)
     tall = x.shape[1] > x.shape[2]
     if tall:
         x = x.transpose(1, 2)
-    for a, b, c in MUON_NS_COEFS:
-        s = x @ x.transpose(1, 2)
-        x = a * x + (b * s + c * (s @ s)) @ x
+    last = len(MUON_NS_COEFS) - 1
+    for j, (a, b, c) in enumerate(MUON_NS_COEFS):
+        s = torch.bmm(x, x.transpose(1, 2))
+        s2 = torch.baddbmm(s, s, s, beta=b, alpha=c)
+        if j == last and scale is not None:
+            out = torch.empty_like(x)
+            for lo, hi, f in scale:
+                torch.baddbmm(x[lo:hi], s2[lo:hi], x[lo:hi], beta=a * f,
+                              alpha=f, out=out[lo:hi])
+            x = out
+        else:
+            x = torch.baddbmm(x, s2, x, beta=a)
     return x.transpose(1, 2) if tall else x
 
 
@@ -728,28 +743,59 @@ class Muon:
 
     @torch.no_grad()
     def step(self):
+        # Consolidated 2026-09-27 (#7b): ONE Newton-Schulz chain per
+        # matrix shape across BOTH lr groups (lr only scales NS's
+        # output), with tall matrices transposed into their wide
+        # orientation so ffn.0 (768x192) and ffn.2 (192x768) share one
+        # stack — 5 chains at the production arch instead of 8 — and
+        # the per-matrix step scale folded into the last NS step's
+        # epilogue. fp32 throughout (no TF32/bf16: that changes
+        # learning). Same math as the per-group loop; fp32 rounding
+        # differs at the ~1e-7 relative level (bmm batch composition,
+        # fused epilogue adds).
         from collections import defaultdict
         mu = self.momentum
+        ps, scl = [], []
         for g in self.param_groups:
             lr = float(g["lr"])
-            ps = [p for p in g["params"] if p.grad is not None]
-            if not ps:
-                continue
-            bufs = [self.state[p] for p in ps]
-            gs = [p.grad for p in ps]
-            torch._foreach_mul_(bufs, mu)
-            torch._foreach_add_(bufs, gs)
-            upds = torch._foreach_add(gs, bufs, alpha=mu)      # Nesterov
-            byshape = defaultdict(list)
-            for i, p in enumerate(ps):
-                byshape[tuple(p.shape)].append(i)
-            outs = [None] * len(ps)
-            for shp, idx in byshape.items():
-                o = newton_schulz5_batched(torch.stack([upds[i] for i in idx]))
-                o = o * (-lr * 0.2 * math.sqrt(max(shp)))
-                for k, i in enumerate(idx):
-                    outs[i] = o[k]
-            torch._foreach_add_(ps, outs)
+            for p in g["params"]:
+                if p.grad is not None:
+                    ps.append(p)
+                    scl.append(-lr * 0.2 * math.sqrt(max(p.shape)))
+        if not ps:
+            return
+        bufs = [self.state[p] for p in ps]
+        gs = [p.grad for p in ps]
+        torch._foreach_mul_(bufs, mu)
+        torch._foreach_add_(bufs, gs)
+        upds = torch._foreach_add(gs, bufs, alpha=mu)          # Nesterov
+        byshape = defaultdict(list)
+        for i, p in enumerate(ps):
+            m, n = p.shape
+            byshape[(min(m, n), max(m, n))].append(i)
+        outs = [None] * len(ps)
+        for shp, idx in byshape.items():
+            # order: wide first then tall (one contiguous un-transpose
+            # copy), each sorted by scale so equal-scale runs are
+            # contiguous slices for the fused last step
+            idx = sorted(idx, key=lambda i: (ps[i].shape[0] > ps[i].shape[1],
+                                             scl[i]))
+            tall = [ps[i].shape[0] > ps[i].shape[1] for i in idx]
+            X = torch.stack([upds[i].t() if t else upds[i]
+                             for i, t in zip(idx, tall)])
+            runs = []
+            for k, i in enumerate(idx):
+                if runs and runs[-1][2] == scl[i]:
+                    runs[-1][1] = k + 1
+                else:
+                    runs.append([k, k + 1, scl[i]])
+            o = newton_schulz5_batched(X, scale=runs)
+            nt = sum(tall)
+            if nt:
+                ot = o[len(idx) - nt:].transpose(1, 2).contiguous()
+            for k, i in enumerate(idx):
+                outs[i] = ot[k - (len(idx) - nt)] if tall[k] else o[k]
+        torch._foreach_add_(ps, outs)
 
     def zero_grad(self):
         for p in self._params():
