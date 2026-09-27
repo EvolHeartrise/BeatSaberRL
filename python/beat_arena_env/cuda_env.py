@@ -1138,7 +1138,8 @@ class CudaBeatVecEnv:
                              generator=self._gen)
 
     def reset(self):
-        if self.combo_walk:   # the freeze keys on done: clear stale flags
+        if self.combo_walk or not self.auto_reset:
+            # the finished-episode latch keys on done: clear stale flags
             self._done.zero_()
         if self.bench_refill:
             assert self._bench_cand is not None, "set_next_chart() first"
@@ -1171,9 +1172,11 @@ class CudaBeatVecEnv:
         actions = actions.to(self.device).long().reshape(
             self.num_envs, N_JOINTS).contiguous()
         if self.push_prob > 0.0:
-            self._kick(torch.rand(self.num_envs, device=self.device,
-                                  dtype=self.dtype) < self.push_prob,
-                       self.push_vmax)
+            kick = torch.rand(self.num_envs, device=self.device,
+                              dtype=self.dtype) < self.push_prob
+            if not self.auto_reset:   # a finished (latched) slot is frozen
+                kick &= ~self._done
+            self._kick(kick, self.push_vmax)
         if self.bench_refill:
             cand = self._bench_cand
         else:
