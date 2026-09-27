@@ -1662,7 +1662,8 @@ struct Solver : GroundRows<T> {
   T c_J[NUM_PAIRS][NV], c_minv[NUM_PAIRS][NV];
   T c_bias[NUM_PAIRS], c_diag[NUM_PAIRS], c_lam[NUM_PAIRS];
   T c_pt[NUM_PAIRS][3];
-  // limit rows (joint order)
+  // limit rows (joint order); l_j[nl..] carries the #6e predicted
+  // column list transiently (read by nothing past the column block)
   int nl;
   int l_j[NQ];
   T l_sign[NQ], l_bias[NQ], l_lam[NQ], l_diag[NQ];
@@ -1690,6 +1691,9 @@ struct Solver : GroundRows<T> {
   T ecol[NQ][NV], pdiag[NQ];
   int nslot;
   uint8_t eslot[NQ];
+  // #6e column prediction: emask = joints whose column this substep
+  // built, eprev = the previous substep's emask (0 at the tick's start)
+  uint32_t emask, eprev;
   bool ecomp[NQ], pcomp[NQ];
   bool hit[NQ];
 };
@@ -2724,6 +2728,7 @@ __device__ void ensure_ecol(Dyn<T>& __restrict__ d,
                             Solver<T>& __restrict__ s, int j) {
   if (s.ecomp[j]) return;
   s.eslot[j] = uint8_t(s.nslot++);
+  s.emask |= 1u << j;
   T* const col = ecol_of(s, j);
   ecol_seed(col, j);
   tree_solve_unit_n(d.m, col, VOFF + j);
@@ -3137,9 +3142,36 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // #6a: row li's column goes to SLOT li (see the Solver note), so the
   // seed stores and every back-pass access are warp-uniform words; the
   // scalar tail's ensure_ecol hands out the same slot li (nslot == li).
+  //
+  // #6e COLUMN PREDICTION (perf/kernel-limits). The cap pass and step 11
+  // build their columns lazily, one at a time — each a serial 35-row
+  // back substitution through local memory, run once per distinct
+  // (joint, sweep position) any lane of the warp misses at. Columns
+  // likely to be needed join this batched block instead, appended to
+  // the limit group in s.l_j[nl..nx-1] (ascending; slots nl..nx-1, so
+  // the limit rows keep slots 0..nl-1): every joint whose column the
+  // previous substep built (eprev — caps and clamps persist across
+  // substeps) and every joint already within 10% of its speed cap in
+  // the unconstrained v*. A column is a pure function of this substep's
+  // factor, so building it early, or building one that is never used,
+  // changes no value — only when and where it is computed. The alpha
+  // was swept: 0.9 / 0.95 best, 0.8 / 0.7 progressively worse; eprev
+  // alone recovers little, the v* test alone about two thirds.
   {
+    uint32_t lmask = 0;
+    for (int li = 0; li < s.nl; li++) lmask |= 1u << s.l_j[li];
+    uint32_t want = s.eprev;
+#pragma unroll
+    for (int j = 0; j < NQ; j++)
+      if (fabs(v[VOFF + j]) >= T(0.9) * CT(OMEGA_CAP, [j])) want |= 1u << j;
+    want &= ~lmask;
+    int nx = s.nl;
+    while (want) {
+      s.l_j[nx++] = __ffs(want) - 1;
+      want &= want - 1;
+    }
     int li = 0;
-    for (; li + 3 < s.nl; li += 4) {
+    for (; li + 3 < nx; li += 4) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       const int j2 = s.l_j[li + 2], j3 = s.l_j[li + 3];
       s.eslot[j0] = uint8_t(li);
@@ -3168,7 +3200,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       s.ecomp[j2] = true;
       s.ecomp[j3] = true;
     }
-    if (li + 1 < s.nl) {
+    if (li + 1 < nx) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       s.eslot[j0] = uint8_t(li);
       s.eslot[j1] = uint8_t(li + 1);
@@ -3187,7 +3219,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       li += 2;
     }
     s.nslot = li;
-    for (; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
+    s.emask = 0;
+    for (int k = 0; k < li; k++) s.emask |= 1u << s.l_j[k];
+    for (; li < nx; li++) ensure_ecol(d, s, s.l_j[li]);  // sets its bit
   }
 
   // -- limit rows: mobility verdict of each plain column ----------------------
@@ -3537,6 +3571,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 #pragma unroll
   for (int i = 0; i < NV; i++) d.v[i] = vr[i];
   // (env v14: no direct-write guarantee pass — mirror of step.rs.)
+  s.eprev = s.emask;  // #6e: this substep's columns predict the next's
   // 12. root velocity envelope guarantee, SECOND application
   //     (Divergences §19b; the first is the 12-PRE block above, §23).
   //     Bounds the STORED velocity — step 11's joint impulses have
@@ -5597,6 +5632,7 @@ step_kernel(Sim<T> P) {
   // coalesced across the warp for same-index access)
   Dyn<T> d;
   Solver<T> s;
+  s.eprev = 0;  // #6e: no column history at the tick's first substep
   if (P.mode == 1) {
     reset_env(d, P, e, P.cand[e]);
   } else if (P.mode == 2) {
