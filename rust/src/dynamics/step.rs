@@ -6,12 +6,12 @@
 //! the `constraints` hook between the unconstrained-velocity solve and
 //! position integration — solver.rs `ConstraintSet::solve` is the P2
 //! implementation (use `solver::substep_constrained` for the full v10
-//! substep). The hook receives the Workspace (ws.m holds the Cholesky
+//! substep). The hook receives the Workspace (ws.l holds the Cholesky
 //! factor for the J·M⁻¹·Jᵀ effective-mass solves) plus the mutable
 //! velocity to project. Unconstrained callers (P1 tests) pass None.
 
 use crate::Real;
-use super::algo::{chol_factor_floored_inplace, chol_solve, chol_solve_unit, crba, rnea};
+use super::algo::{crba, rnea, tc_factor, tc_solve_unit_v, tc_solve_v};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
@@ -150,20 +150,20 @@ pub fn substep_opts(
         }
     }
 
-    // 5. dense Cholesky (lower, no pivoting), pivots floored at
-    //    PD_FLOOR_F64 with engagements counted (Divergences §22 — the
-    //    f64 analogue of the CUDA f32 §20e net; 0 hits = bitwise the
-    //    old strict factorization)
-    //    Factored IN PLACE (2026-08-03, R1 item 1e): from here to the
-    //    end of the substep `ws.m` holds L, not M (LAPACK `potrf`
-    //    convention). Nothing reads the mass matrix after this point —
-    //    CRBA and the harness damping above are its only other
-    //    touchers — and dropping the second nv×nv buffer keeps the
-    //    factor stage's working set in L1 alongside `j`/`minvjt`.
-    ws.pd_hits += chol_factor_floored_inplace(nv, &mut ws.m[..nv * nv]) as u64;
+    // 5. Cholesky (lower, no pivoting), pivots floored at PD_FLOOR_F64
+    //    with engagements counted (Divergences §22 — the f64 analogue of
+    //    the CUDA f32 §20e net). audit #10 (Divergences §25): factored in
+    //    the fill-free LEAVES-FIRST elimination order of the kinematic
+    //    tree (algo.rs `TreeChol`), from `ws.m` (M, v-order) into `ws.l`
+    //    (L, e-order profile) — the same M and the same no-pivot
+    //    Cholesky, only a different data-independent elimination order,
+    //    so L carries exactly the tree's ancestor sparsity (factor ~1.7k
+    //    MACs, was ~7.1k; a dense solve ~612, was ~1,225). `ws.m` keeps
+    //    M from here to the end of the substep; nothing reads it.
+    ws.pd_hits += tc_factor(&ws.tc, &ws.m, &mut ws.l) as u64;
 
     // 6. unconstrained velocity v* = v + h·M⁻¹(τ − C)
-    chol_solve(nv, &ws.m, &mut ws.rhs);
+    tc_solve_v(&ws.tc, &ws.l, &mut ws.rhs, &mut ws.esc);
     for i in 0..nv {
         ws.vstar[i] = st.v[i] + h * ws.rhs[i];
     }
@@ -336,9 +336,10 @@ pub fn substep_opts(
             };
             if target != st.v[vj] {
                 if !ws.cached[j] {
-                    // unit RHS +e_vj — sparse forward + dense back,
-                    // bitwise the fill/store/chol_solve it replaces
-                    // (see `chol_fwd_unit`'s argument in algo.rs)
+                    // unit RHS +e_vj — audit #10: the forward pass runs
+                    // only e_vj's ancestor chain (≤ 16 rows, bitwise the
+                    // full forward — `tc_fwd_unit_lane`), then the dense
+                    // back pass
                     //
                     // R23d REVERTED (2026-08-07): solving STRAIGHT into
                     // `ws.solcache[j*nv..(j+1)*nv]` and deleting `ws.sol`
@@ -358,7 +359,7 @@ pub fn substep_opts(
                     // R15 order-dependence rule earned its keep here —
                     // measured alone this item was indistinguishable
                     // from zero.
-                    chol_solve_unit(nv, &ws.m, vj, 1.0, &mut ws.sol[..nv]);
+                    tc_solve_unit_v(&ws.tc, &ws.l, vj, 1.0, &mut ws.sol[..nv], &mut ws.esc);
                     // R26: counted INSIDE the cache-miss branch — a
                     // cached re-entry is not a solve.
                     #[cfg(feature = "stats")]

@@ -944,6 +944,461 @@ pub fn chol_solve_unit(n: usize, l: &[Real], m: usize, sign: Real, x: &mut [Real
     chol_back(n, l, x);
 }
 
+// ── audit #10 (2026-09-26): TREE-SPARSE, FILL-FREE FACTORIZATION OF M ──
+//
+// The generalized coordinates are root-first (6 floating-base DoF, then
+// the 29 joints), so the dense `chol_factor` above eliminates the six
+// root columns FIRST and every L row fills completely: 7.1k MACs per
+// factor, 1,225 per dense solve, and a unit right-hand side loses its
+// sparsity after the pivot. The kinematic tree admits a fill-free
+// factorization (Featherstone's branch-induced sparsity, RBDA ch. 6):
+// eliminate LEAVES FIRST, the floating base LAST, and L has exactly the
+// tree's ancestor structure — nothing else is ever touched.
+//
+// ELIMINATION ORDER ("e-order"). A DFS PRE-order of the coordinate tree
+// — the base as a chain v5 → v4 → … → v0 (v5 the root, the joint roots
+// hanging off v0; the 6×6 base block is dense either way), then the
+// joints in frame (= stacking) order with head-style coord-less frames
+// transparent — REVERSED: e = n − 1 − preorder. Reversed pre-order is a
+// POST-order, so every node's subtree is the CONTIGUOUS range
+// `desc(e) = [lo[e], e)` just below it, and
+//   · row e of L is structurally non-zero exactly on [lo[e], e]
+//     (a PROFILE / skyline matrix with no padding zeros);
+//   · column e is non-zero exactly on e and its ANCESTORS anc(e), which
+//     all have larger e (the chain up to the root, ≤ 15 entries).
+// For the humanoid (NV = 35): e 0..28 are the joints in reversed frame
+// order (r leg 0..5, l leg 6..11, r arm 12..18, l arm 19..25, spine
+// 26..28) and e 29..34 the base v0..v5. The PERMUTATION is explicit
+// (`e2v`/`v2e`) because stacking order ≠ actuated order in the
+// shoulder (yaw → pitch → twist stacked, pitch, yaw, twist actuated)
+// and wrist (roll → dev → bend vs roll, bend, dev) clusters. Every
+// right-hand side and solution stays in v-order at the call sites; the
+// permutation is applied where a solve copies its RHS in (the RHS-minor
+// transposes the batched solves already did) and out.
+//
+// CANONICAL ARITHMETIC — every implementation (this file's f64 and
+// f32 builds and both .cu dtype branches) evaluates exactly these
+// expression chains, each sum in ASCENDING index order:
+//   factor, column j = 0..n−1 (pivot first):
+//     d_j    = M_jj − Σ_{k∈[lo_j, j)} L_jk·L_jk ;  floor ;  L_jj = √d_j
+//     L_aj   = (M_aj − Σ_{k∈[lo_j, j)} L_ak·L_jk) / L_jj   for a ∈ anc(j)
+//   forward  y_e = (b_e − Σ_{k∈[lo_e, e)} L_ek·y_k) / L_ee,  e ascending
+//   back     x_e = (y_e − Σ_{a∈anc(e)}  L_ae·x_a) / L_ee,  e descending
+// which is, term for term, the DENSE `chol_factor`/`chol_solve` of the
+// PERMUTED matrix P·M·Pᵀ with its structural zeros skipped: a skipped
+// L entry is an exact +0.0 (two tree-unrelated coordinates share no
+// descendant, so every product in its dense chain has a +0.0 factor
+// and its seed is CRBA's +0.0 fill), and dropping (+0.0)·x terms from a
+// +0.0-seeded or non-zero accumulator is exact (the chol_fwd_unit
+// argument). `tree_factor_matches_dense_permuted` pins that BITWISE.
+// So this is the same M, the same linear systems, the same no-pivot
+// Cholesky, in a different (data-independent) elimination order; only
+// rounding moves (SPEC-v10 Divergences §25).
+//
+// PIVOT FLOOR (§22 f64 1e-17 counted on `!(d >= floor)`, §20e f32 1e-8
+// counted on `d <= 0`): `floor_pivot` is applied to the new pivots d_j
+// verbatim, at the same point of the recurrence (before column j's
+// entries are divided). What a pivot IS moves with the order: pivot j
+// is the Schur complement of M on coordinate j given every coordinate
+// eliminated before it — root-first that was "given the base and the
+// lower-index joints", leaves-first it is "given j's own subtree". For
+// the humanoid every joint pivot is still ≥ its armature (the Schur
+// complement of M_rigid + diag(armature) on any coordinate set is ≥
+// the armature) and the base pivots are ≥ the pelvis' own spatial
+// inertia (the articulated-body inertia at the root), so a healthy M
+// never engages the floor in either order — the floor stays a pure
+// NaN/degenerate-matrix guard. On a genuinely singular M the engagement
+// can land on a DIFFERENT coordinate (and, since a rank-deficient
+// pivot is rounding noise, its count can differ by rounding) — that is
+// the only semantic change, and it is confined to states the floor
+// already reports as non-physical.
+//
+// A `TreeChol::dense(n)` layout (identity permutation, full profile,
+// anc(e) = e+1..n) makes every tc_* routine below evaluate the OLD
+// dense root-first arithmetic bit for bit — the tests swap it into the
+// Workspace to hold the new order against the old one substep by
+// substep (`tree_matches_dense_per_substep`).
+
+/// Elimination layout of the mass-matrix factor (audit #10, see above).
+/// The factor itself lives in `Workspace::l` as an e-order n×n
+/// row-major array of which only the profile (row e, columns
+/// lo[e]..=e) is ever written or read.
+#[derive(Clone)]
+pub struct TreeChol {
+    pub n: usize,
+    /// e-order position → v index, and back
+    pub e2v: Vec<usize>,
+    pub v2e: Vec<usize>,
+    /// row e of L spans columns lo[e]..=e (desc(e) = [lo[e], e))
+    pub lo: Vec<usize>,
+    /// anc(e) = anc[anc_off[e]..anc_off[e+1]], ascending e (parent first)
+    pub anc_off: Vec<usize>,
+    pub anc: Vec<usize>,
+    /// v-order `m` index of the LOWER-triangle cell holding M(anc, e),
+    /// aligned with `anc`; `diag_mcell[e]` the one of M(e, e)
+    pub anc_mcell: Vec<usize>,
+    pub diag_mcell: Vec<usize>,
+    /// bit k set iff k ∈ {e} ∪ anc(e) — the rows a right-hand side
+    /// supported on v2e-image e can make non-zero in the forward pass
+    pub chain: Vec<u64>,
+}
+
+impl TreeChol {
+    /// Assemble from a parent map in e-order (`par[e] > e`, or `usize::MAX`
+    /// for a root) plus the permutation.
+    fn from_parents(n: usize, e2v: Vec<usize>, par: Vec<usize>) -> TreeChol {
+        assert!(n <= 64, "TreeChol chain masks are u64");
+        let mut v2e = vec![0; n];
+        for e in 0..n {
+            v2e[e2v[e]] = e;
+        }
+        let mut anc_off = Vec::with_capacity(n + 1);
+        let mut anc = Vec::new();
+        let mut chain = vec![0u64; n];
+        for e in 0..n {
+            anc_off.push(anc.len());
+            chain[e] = 1u64 << e;
+            let mut a = par[e];
+            while a != usize::MAX {
+                assert!(a > e, "e-order must put every child before its parent");
+                anc.push(a);
+                chain[e] |= 1u64 << a;
+                a = par[a];
+            }
+        }
+        anc_off.push(anc.len());
+        // post-order check + lo: desc(e) must be exactly the contiguous
+        // range [lo, e) — the profile structure every loop relies on
+        let mut lo = vec![0; n];
+        for e in 0..n {
+            let nd = (0..e).filter(|&k| chain[k] >> e & 1 == 1).count();
+            lo[e] = e - nd;
+            for k in lo[e]..e {
+                assert!(chain[k] >> e & 1 == 1, "e-order is not a post-order at ({e},{k})");
+            }
+        }
+        let cell = |a: usize, b: usize| {
+            let (r, c) = (e2v[a].max(e2v[b]), e2v[a].min(e2v[b]));
+            r * n + c
+        };
+        let anc_mcell = (0..n)
+            .flat_map(|e| anc[anc_off[e]..anc_off[e + 1]].iter().map(move |&a| (a, e)))
+            .map(|(a, e)| cell(a, e))
+            .collect();
+        let diag_mcell = (0..n).map(|e| cell(e, e)).collect();
+        TreeChol { n, e2v, v2e, lo, anc_off, anc, anc_mcell, diag_mcell, chain }
+    }
+
+    /// The fill-free leaves-first layout of `model`'s coordinate tree.
+    pub fn tree(model: &Model) -> TreeChol {
+        let n = model.nv();
+        let voff = model.voff();
+        let nf = model.frames.len();
+        // coord-bearing frame → its v index; nearest coord-bearing
+        // ancestor of every frame (usize::MAX = the base / world)
+        let vof = |k: usize| voff + model.frames[k].coord as usize;
+        let mut up = vec![usize::MAX; nf];
+        for k in 0..nf {
+            let p = model.frames[k].parent;
+            if p >= 0 {
+                let p = p as usize;
+                assert!(p < k, "frames must be topologically ordered");
+                up[k] = if model.frames[p].coord >= 0 { p } else { up[p] };
+            }
+        }
+        // DFS pre-order: base chain v5 → … → v0 first, then the joint
+        // forest, children in frame order
+        let mut pre: Vec<usize> = Vec::with_capacity(n); // v indices
+        let mut vpar = vec![usize::MAX; n]; // coordinate-tree parent (v)
+        if model.free_base {
+            for t in (0..voff).rev() {
+                pre.push(t);
+                if t + 1 < voff {
+                    vpar[t] = t + 1;
+                }
+            }
+        }
+        let jroot = if model.free_base { 0 } else { usize::MAX };
+        fn dfs(
+            k: usize,
+            model: &Model,
+            up: &[usize],
+            vof: &dyn Fn(usize) -> usize,
+            pre: &mut Vec<usize>,
+        ) {
+            pre.push(vof(k));
+            for c in 0..model.frames.len() {
+                if model.frames[c].coord >= 0 && up[c] == k {
+                    dfs(c, model, up, vof, pre);
+                }
+            }
+        }
+        for k in 0..nf {
+            if model.frames[k].coord >= 0 {
+                vpar[vof(k)] = if up[k] == usize::MAX { jroot } else { vof(up[k]) };
+                if up[k] == usize::MAX {
+                    dfs(k, model, &up, &vof, &mut pre);
+                }
+            }
+        }
+        assert_eq!(pre.len(), n, "every coordinate visited once");
+        let e2v: Vec<usize> = pre.iter().rev().copied().collect();
+        let mut v2e = vec![0; n];
+        for e in 0..n {
+            v2e[e2v[e]] = e;
+        }
+        let par = (0..n)
+            .map(|e| {
+                let p = vpar[e2v[e]];
+                if p == usize::MAX { usize::MAX } else { v2e[p] }
+            })
+            .collect();
+        TreeChol::from_parents(n, e2v, par)
+    }
+
+    /// The OLD dense root-first layout: identity permutation, every row
+    /// full (lo = 0), anc(e) = e+1..n. The tc_* routines on this layout
+    /// ARE the pre-audit-#10 dense arithmetic (test reference).
+    pub fn dense(n: usize) -> TreeChol {
+        let par = (0..n).map(|e| if e + 1 < n { e + 1 } else { usize::MAX }).collect();
+        TreeChol::from_parents(n, (0..n).collect(), par)
+    }
+
+    /// Upward closure (in e-order) of a right-hand side whose v-order
+    /// support is `supp`: the rows the forward pass can make non-zero.
+    pub fn closure(&self, supp: impl IntoIterator<Item = usize>) -> u64 {
+        supp.into_iter().fold(0u64, |m, v| m | self.chain[self.v2e[v]])
+    }
+
+    /// Structural non-zeros of L (diagonal included).
+    pub fn nnz(&self) -> usize {
+        (0..self.n).map(|e| e - self.lo[e] + 1).sum()
+    }
+}
+
+/// audit #10 factor: M (v-order, dense row-major — only the LOWER
+/// triangle is read) → L in `l` (e-order, row-major, profile only),
+/// with the §22/§20e pivot floor on the new pivots. Returns the floor
+/// engagement count. Column-oriented like `chol_factor_floored_inplace`
+/// (pivot, then the column's entries — here only the rows anc(j),
+/// UNROLL-AND-JAMMED by 4 over them): every entry is the canonical
+/// ascending-k chain of the header, bitwise independent of the jam.
+pub fn tc_factor(tc: &TreeChol, m: &[Real], l: &mut [Real]) -> u32 {
+    let n = tc.n;
+    let mut hits = 0u32;
+    for j in 0..n {
+        let lo = tc.lo[j];
+        let mut d = m[tc.diag_mcell[j]];
+        {
+            let lj = &l[j * n + lo..j * n + j];
+            for k in 0..j - lo {
+                d -= lj[k] * lj[k];
+            }
+        }
+        let (fd, hit) = floor_pivot(d);
+        hits += hit as u32;
+        let dj = fd.sqrt();
+        l[j * n + j] = dj;
+        let (head, tail) = l.split_at_mut((j + 1) * n);
+        let lj = &head[j * n + lo..j * n + j];
+        let (a0, a1) = (tc.anc_off[j], tc.anc_off[j + 1]);
+        let mut q = a0;
+        while q + 4 <= a1 {
+            let r = [
+                (tc.anc[q] - j - 1) * n,
+                (tc.anc[q + 1] - j - 1) * n,
+                (tc.anc[q + 2] - j - 1) * n,
+                (tc.anc[q + 3] - j - 1) * n,
+            ];
+            let (mut s0, mut s1, mut s2, mut s3) = (
+                m[tc.anc_mcell[q]],
+                m[tc.anc_mcell[q + 1]],
+                m[tc.anc_mcell[q + 2]],
+                m[tc.anc_mcell[q + 3]],
+            );
+            {
+                let t = &*tail;
+                let (p0, p1) = (&t[r[0] + lo..r[0] + j], &t[r[1] + lo..r[1] + j]);
+                let (p2, p3) = (&t[r[2] + lo..r[2] + j], &t[r[3] + lo..r[3] + j]);
+                for k in 0..j - lo {
+                    let ljk = lj[k];
+                    s0 -= p0[k] * ljk;
+                    s1 -= p1[k] * ljk;
+                    s2 -= p2[k] * ljk;
+                    s3 -= p3[k] * ljk;
+                }
+            }
+            tail[r[0] + j] = s0 / dj;
+            tail[r[1] + j] = s1 / dj;
+            tail[r[2] + j] = s2 / dj;
+            tail[r[3] + j] = s3 / dj;
+            q += 4;
+        }
+        while q < a1 {
+            let r = (tc.anc[q] - j - 1) * n;
+            let mut s = m[tc.anc_mcell[q]];
+            {
+                let p = &tail[r + lo..r + j];
+                for k in 0..j - lo {
+                    s -= p[k] * lj[k];
+                }
+            }
+            tail[r + j] = s / dj;
+            q += 1;
+        }
+    }
+    hits
+}
+
+/// audit #10 forward pass on W right-hand sides held RHS-MINOR in
+/// e-order (`t[e*W + r]`), the canonical profile chain per row. Lanes
+/// are independent accumulators (the `chol_solve_t` argument).
+pub fn tc_fwd_t<const W: usize>(tc: &TreeChol, l: &[Real], t: &mut [Real]) {
+    let n = tc.n;
+    debug_assert_eq!(t.len(), W * n);
+    for e in 0..n {
+        let lo = tc.lo[e];
+        let lrow = &l[e * n..e * n + e];
+        let mut s = [0.0 as Real; W];
+        s.copy_from_slice(&t[e * W..e * W + W]);
+        for k in lo..e {
+            let lk = lrow[k];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lk * xr[r];
+            }
+        }
+        let dg = l[e * n + e];
+        let row = &mut t[e * W..e * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+}
+
+/// `tc_fwd_t` restricted to the rows of `mask` (an UPWARD-CLOSED set,
+/// `TreeChol::closure` of the right-hand sides' support), each row
+/// summing only its terms k ∈ mask. BITWISE the full forward when every
+/// lane's RHS is +0.0 off `mask`: a row outside an upward-closed set
+/// has no mask row below it in its subtree, so it stays at its +0.0
+/// seed (the chol_fwd_unit induction), and the dropped k ∉ mask terms
+/// are (+0.0)·L products against a +0.0-seeded or non-zero accumulator.
+pub fn tc_fwd_mask_t<const W: usize>(tc: &TreeChol, l: &[Real], mask: u64, t: &mut [Real]) {
+    let n = tc.n;
+    debug_assert_eq!(t.len(), W * n);
+    let mut rows = mask;
+    while rows != 0 {
+        let e = rows.trailing_zeros() as usize;
+        rows &= rows - 1;
+        let lrow = &l[e * n..e * n + e];
+        let mut s = [0.0 as Real; W];
+        s.copy_from_slice(&t[e * W..e * W + W]);
+        // mask ∩ [lo[e], e)
+        let mut ks = mask & ((1u64 << e) - 1) & !((1u64 << tc.lo[e]) - 1);
+        while ks != 0 {
+            let k = ks.trailing_zeros() as usize;
+            ks &= ks - 1;
+            let lk = lrow[k];
+            let xr = &t[k * W..k * W + W];
+            for r in 0..W {
+                s[r] -= lk * xr[r];
+            }
+        }
+        let dg = l[e * n + e];
+        let row = &mut t[e * W..e * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+}
+
+/// audit #10 back pass on W RHS-MINOR e-order right-hand sides: each
+/// column's ancestor chain, ascending (the canonical order).
+pub fn tc_back_t<const W: usize>(tc: &TreeChol, l: &[Real], t: &mut [Real]) {
+    let n = tc.n;
+    debug_assert_eq!(t.len(), W * n);
+    for e in (0..n).rev() {
+        let mut s = [0.0 as Real; W];
+        s.copy_from_slice(&t[e * W..e * W + W]);
+        for &a in &tc.anc[tc.anc_off[e]..tc.anc_off[e + 1]] {
+            let lae = l[a * n + e];
+            let xr = &t[a * W..a * W + W];
+            for r in 0..W {
+                s[r] -= lae * xr[r];
+            }
+        }
+        let dg = l[e * n + e];
+        let row = &mut t[e * W..e * W + W];
+        for r in 0..W {
+            row[r] = s[r] / dg;
+        }
+    }
+}
+
+/// Forward pass of the UNIT right-hand side `sign·e_(e0)` into lane `r`
+/// of an RHS-MINOR e-order buffer whose lane r is +0.0 everywhere on
+/// entry: only e0's chain {e0} ∪ anc(e0) can become non-zero, and each
+/// chain row sums exactly the chain rows below it (its only non-zero
+/// terms, in ascending order) — bitwise the full forward by the
+/// `tc_fwd_mask_t` argument, and on the dense layout bitwise
+/// `chol_fwd_unit` (whose chain is m..n).
+pub fn tc_fwd_unit_lane<const W: usize>(
+    tc: &TreeChol,
+    l: &[Real],
+    e0: usize,
+    sign: Real,
+    r: usize,
+    t: &mut [Real],
+) {
+    let n = tc.n;
+    t[e0 * W + r] = sign / l[e0 * n + e0];
+    let (a0, a1) = (tc.anc_off[e0], tc.anc_off[e0 + 1]);
+    for q in a0..a1 {
+        let a = tc.anc[q];
+        let lrow = &l[a * n..a * n + a];
+        // +0.0 seed, first term k = e0 — `chol_fwd_unit`'s own chain
+        let mut s = 0.0;
+        s -= lrow[e0] * t[e0 * W + r];
+        for &k in &tc.anc[a0..q] {
+            s -= lrow[k] * t[k * W + r];
+        }
+        t[a * W + r] = s / l[a * n + a];
+    }
+}
+
+/// Dense-RHS solve of a v-order vector: permute into the e-order
+/// scratch `esc`, forward + back, permute back.
+pub fn tc_solve_v(tc: &TreeChol, l: &[Real], x: &mut [Real], esc: &mut [Real]) {
+    let n = tc.n;
+    for e in 0..n {
+        esc[e] = x[tc.e2v[e]];
+    }
+    tc_fwd_t::<1>(tc, l, &mut esc[..n]);
+    tc_back_t::<1>(tc, l, &mut esc[..n]);
+    for e in 0..n {
+        x[tc.e2v[e]] = esc[e];
+    }
+}
+
+/// Unit-RHS solve `M⁻¹·(sign·e_vm)` into the v-order `x` (chain forward
+/// + dense back), through the e-order scratch `esc`.
+pub fn tc_solve_unit_v(
+    tc: &TreeChol,
+    l: &[Real],
+    vm: usize,
+    sign: Real,
+    x: &mut [Real],
+    esc: &mut [Real],
+) {
+    let n = tc.n;
+    esc[..n].fill(0.0);
+    tc_fwd_unit_lane::<1>(tc, l, tc.v2e[vm], sign, 0, &mut esc[..n]);
+    tc_back_t::<1>(tc, l, &mut esc[..n]);
+    for e in 0..n {
+        x[tc.e2v[e]] = esc[e];
+    }
+}
+
 /// Total (linear, angular-about-world-origin) momentum at the FK in ws.
 pub fn momentum(model: &Model, ws: &mut Workspace, v: &[Real]) -> ([Real; 3], [Real; 3]) {
     let nf = model.frames.len();

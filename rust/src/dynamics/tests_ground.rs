@@ -514,8 +514,9 @@ fn ground_support_dot_bitwise() {
 /// makes all four identities; only rounding separates them.)
 #[test]
 fn ground_rows_6d_match_dense_corner_rows() {
-    use super::algo::chol_solve;
+    use super::algo::tc_solve_v;
     let (mut rows_checked, mut worst) = (0usize, 0.0f64);
+    let mut esc = vec![0.0f64; HUMANOID.nv()];
     let rel = |a: f64, b: f64, scale: f64| (a - b).abs() / scale.max(1e-300);
     random_gear_contact_run(0x5EED_0000_0000_17E4, 480, |tick, st, ws, cs| {
         let nv = st.v.len();
@@ -540,7 +541,7 @@ fn ground_rows_6d_match_dense_corner_rows() {
                 }
                 // (2) diag and (3) u against the dense M⁻¹jᵀ
                 let mut mj = j.to_vec();
-                chol_solve(nv, &ws.m, &mut mj);
+                tc_solve_v(&ws.tc, &ws.l, &mut mj, &mut esc);
                 let dd: f64 = (0..nv).map(|i| j[i] * mj[i]).sum();
                 let e = rel(cs.row_diag(row), dd, dd);
                 worst = worst.max(e);
@@ -576,12 +577,15 @@ fn ground_rows_6d_match_dense_corner_rows() {
 
 /// item 3: the RHS-MINOR batched solves for the dense pair rows, the
 /// contacting feet's spatial columns (audit #9) and the limit columns
-/// are bitwise the per-row reference solves (`chol_solve` on the
-/// assembled row / `chol_solve_unit` on the pivot) against the substep's
-/// live factor, along a random-gear contact run.
+/// are bitwise the per-row reference solves (`tc_solve_v` on the
+/// assembled row / `tc_solve_unit_v` on the pivot) against the substep's
+/// live factor, along a random-gear contact run. audit #10: this also
+/// pins the RESTRICTED forward passes (the feet's upward-closure mask,
+/// the limit columns' ancestor chains) bitwise against the full ones.
 #[test]
 fn batched_row_solves_bitwise() {
-    use super::algo::{chol_solve, chol_solve_unit};
+    use super::algo::{tc_solve_unit_v, tc_solve_v};
+    let mut esc = vec![0.0f64; HUMANOID.nv()];
     let (mut dense_rows, mut foot_cols, mut lim_rows, mut wide_lim, mut two_feet) = (0usize, 0usize, 0usize, 0usize, 0usize);
     random_gear_contact_run(0x5EED_0000_0000_17E3, 480, |tick, st, ws, cs| {
         let nv = st.v.len();
@@ -592,7 +596,7 @@ fn batched_row_solves_bitwise() {
         let mut x = vec![0.0; nv];
         for row in cs.ground_rows()..ndense {
             x.copy_from_slice(cs.row_j(row));
-            chol_solve(nv, &ws.m, &mut x);
+            tc_solve_v(&ws.tc, &ws.l, &mut x, &mut esc);
             for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: dense row {row} word {i}");
             }
@@ -607,7 +611,7 @@ fn batched_row_solves_bitwise() {
             let (jf, minv) = cs.foot_rows(f);
             for r in 0..6 {
                 x.copy_from_slice(&jf[r * nv..(r + 1) * nv]);
-                chol_solve(nv, &ws.m, &mut x);
+                tc_solve_v(&ws.tc, &ws.l, &mut x, &mut esc);
                 for (i, (a, b)) in x.iter().zip(&minv[r * nv..(r + 1) * nv]).enumerate() {
                     assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: foot {f} column {r} word {i}");
                 }
@@ -616,7 +620,7 @@ fn batched_row_solves_bitwise() {
         }
         let voff = nv - NQ;
         for (li, &(jt, sign)) in cs.limit_set().to_vec().iter().enumerate() {
-            chol_solve_unit(nv, &ws.m, voff + jt, sign, &mut x);
+            tc_solve_unit_v(&ws.tc, &ws.l, voff + jt, sign, &mut x, &mut esc);
             let row = ndense + li;
             for (i, (a, b)) in x.iter().zip(cs.row_minvjt(row)).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "substep {tick}: limit row {row} word {i}");

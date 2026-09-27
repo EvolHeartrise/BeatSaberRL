@@ -1467,6 +1467,167 @@ static_assert(WJ_R2[0][0] == 4 && WJ_R2[0][1] == 5 && WJ_R2[1][0] == 3
 __device__ constexpr double WELD_TARGET_P[2][3] = {
     {-0.10, 0.07, -0.65}, {0.10, 0.07, -0.65}};
 
+// ---- audit #10 (2026-09-26): TREE ELIMINATION LAYOUT of the mass matrix ----
+// algo.rs `TreeChol::tree`, mirrored as compile-time tables (read the
+// algo.rs header for the whole argument). The dense factor eliminated the
+// root-first coordinates in index order, so every L row filled; eliminating
+// LEAVES FIRST, the floating base LAST, gives a fill-free factor with
+// exactly the tree's ancestor sparsity. The order ("e-order") is the
+// REVERSED DFS pre-order of the coordinate tree — the frames are already
+// in DFS pre-order, so the joints are simply the coord frames in reversed
+// frame order (e 0..28: r leg, l leg, r arm, l arm, spine) and the base
+// chain v5 -> ... -> v0 reversed puts v0..v5 at e 29..34. Reversed
+// pre-order is a POST-order: desc(e) is the contiguous range [lo[e], e),
+// so row e of L is non-zero exactly on [lo[e], e] and column e exactly on
+// {e} u anc(e), anc ascending (the chain to the root, <= 15 entries).
+//
+// STORAGE (d.m, TC_NNZ = 341 words, was NV*NV = 1,225): COLUMN-MAJOR
+// PROFILE — column e at cb[e] .. cb[e] + d[e]: slot 0 the diagonal, slot t
+// the entry of its t-th ancestor. crba writes M straight into these
+// slots (each joint's CRBA column IS its chain: diagonal, the coord-bearing
+// ancestors nearest first, then the six base rows), the factor overwrites
+// them in place, and every solve reads them. Two addressing facts carry
+// all the loops:
+//   * column k's ancestors are [..., e, anc(e)] for any e in anc(k), so
+//     L(e, k) sits at slot d[k] - d[e] of column k: kb[k] - d[e] with
+//     kb[k] = cb[k] + d[k] (forward rows, factor inner products);
+//   * vslot[s] / eslot[s] name the v / e index of the row slot s holds
+//     (back pass, unit chains).
+// Right-hand sides and solutions stay in v-order; the loops translate
+// through e2v (warp-uniform tables — the loop indices never depend on
+// data except in the per-column unit chains, which read the __device__
+// copy).
+constexpr int TC_NNZ = 341;
+constexpr int TC_BASE_E = NQ;  // e of base coordinate v0 (v_t at NQ + t)
+struct TreeTabs {
+  int e2v[NV], v2e[NV], par[NV], lo[NV], d[NV], cb[NV], kb[NV];
+  int fcb[NF];  // column base of coord frame f (-1: welded frame)
+  // per profile slot: the v / e index of the row it holds, and the
+  // column base of that row's own column (the unit chains' L(a, k))
+  int vslot[TC_NNZ], eslot[TC_NNZ], cbslot[TC_NNZ];
+};
+constexpr int tc_up(int f) {  // nearest coord-bearing strict ancestor
+  for (int k = F_PARENT[f]; k >= 0; k = F_PARENT[k])
+    if (F_COORD[k] >= 0) return k;
+  return -1;
+}
+constexpr TreeTabs tree_tabs() {
+  TreeTabs t{};
+  int ef[NF] = {};
+  int r = 0;
+  for (int f = 0; f < NF; f++) {
+    ef[f] = -1;
+    if (F_COORD[f] >= 0) {
+      ef[f] = NQ - 1 - r;  // reversed pre-order rank
+      t.e2v[ef[f]] = VOFF + F_COORD[f];
+      r++;
+    }
+  }
+  for (int f = 0; f < NF; f++)
+    if (F_COORD[f] >= 0) {
+      const int u = tc_up(f);
+      t.par[ef[f]] = u < 0 ? TC_BASE_E : ef[u];
+    }
+  for (int b = 0; b < VOFF; b++) {
+    t.e2v[TC_BASE_E + b] = b;
+    t.par[TC_BASE_E + b] = b + 1 < VOFF ? TC_BASE_E + b + 1 : -1;
+  }
+  for (int e = 0; e < NV; e++) t.v2e[t.e2v[e]] = e;
+  int c = 0;
+  for (int e = 0; e < NV; e++) {
+    int n = 0;
+    for (int a = t.par[e]; a >= 0; a = t.par[a]) n++;
+    t.d[e] = n;
+    int nd = 0;
+    for (int k = 0; k < e; k++)
+      for (int a = t.par[k]; a >= 0; a = t.par[a])
+        if (a == e) nd++;
+    t.lo[e] = e - nd;
+    t.cb[e] = c;
+    t.kb[e] = c + n;
+    t.vslot[c] = t.e2v[e];
+    t.eslot[c] = e;
+    int s = 1;
+    for (int a = t.par[e]; a >= 0; a = t.par[a], s++) {
+      t.vslot[c + s] = t.e2v[a];
+      t.eslot[c + s] = a;
+    }
+    c += n + 1;
+  }
+  for (int f = 0; f < NF; f++)
+    t.fcb[f] = F_COORD[f] >= 0 ? t.cb[t.v2e[VOFF + F_COORD[f]]] : -1;
+  for (int q = 0; q < TC_NNZ; q++) t.cbslot[q] = t.cb[t.eslot[q]];
+  return t;
+}
+__device__ constexpr TreeTabs TREE = tree_tabs();
+// the warp-uniform loops read this copy (constant bank: one broadcast
+// per warp-uniform index); the per-column unit chains read TREE
+__constant__ TreeTabs TREE_C = tree_tabs();
+constexpr bool tree_tabs_ok() {
+  const TreeTabs t = tree_tabs();
+  int nnz = 0;
+  for (int e = 0; e < NV; e++) {
+    if (t.v2e[t.e2v[e]] != e) return false;
+    if (t.par[e] >= 0 && t.par[e] <= e) return false;  // children first
+    // post-order: every k in [lo, e) has e on its ancestor chain
+    for (int k = t.lo[e]; k < e; k++) {
+      bool anc = false;
+      for (int a = t.par[k]; a >= 0; a = t.par[a]) anc = anc || a == e;
+      if (!anc) return false;
+    }
+    nnz += t.d[e] + 1;
+  }
+  if (nnz != TC_NNZ) return false;
+  // crba's slot map: a coord frame's column is [itself, its ANC.f row
+  // a = 1.. (coord-bearing ancestors, nearest first), base v0..v5]
+  for (int f = 0; f < NF; f++) {
+    if (F_COORD[f] < 0) continue;
+    const int cb = t.fcb[f];
+    if (t.vslot[cb] != VOFF + F_COORD[f]) return false;
+    for (int a = 1; a < ANC_N[f]; a++)
+      if (t.vslot[cb + a] != ANC_C[f][a]) return false;
+    for (int b = 0; b < VOFF; b++)
+      if (t.vslot[cb + ANC_N[f] + b] != b) return false;
+    if (t.d[t.v2e[VOFF + F_COORD[f]]] != ANC_N[f] - 1 + VOFF) return false;
+  }
+  // the feet's forward closure (tree_fwd_feet_tn): r leg = e 0..5 with
+  // the right foot at e 0, l leg = e 6..11 with the left foot at e 6,
+  // both legs' profiles closed (lo = 0 / 6), the base at e 29..34
+  if (t.v2e[VOFF + F_COORD[F_R_FOOT]] != 0 || t.v2e[VOFF + F_COORD[F_L_FOOT]] != 6)
+    return false;
+  for (int e = 0; e < 12; e++)
+    if (t.lo[e] != (e < 6 ? 0 : 6) || t.v2e[t.e2v[e]] != e) return false;
+  for (int e = 0; e < 6; e++)
+    if (t.e2v[e] < WJ_R0 || t.e2v[6 + e] < WJ_L0 || t.e2v[6 + e] >= WJ_R0)
+      return false;
+  for (int b = 0; b < VOFF; b++)
+    if (t.lo[TC_BASE_E + b] != 0) return false;
+  return true;
+}
+static_assert(tree_tabs_ok(),
+              "audit #10: the tree layout must be a post-order with the "
+              "algo.rs TreeChol::tree permutation, 341 profile slots, and "
+              "crba's column-slot map");
+// crba writes every profile slot exactly once (no zero fill): a joint
+// column's slots are written iff the frame's composite mass is > 0, which
+// holds whenever the frame's subtree carries mass
+constexpr bool tc_all_subtrees_massive() {
+  for (int f = 0; f < NF; f++) {
+    if (F_COORD[f] < 0) continue;
+    double m = 0;
+    for (int k = f; k < NF; k++) {
+      bool in = k == f;
+      for (int a = F_PARENT[k]; a >= 0 && !in; a = F_PARENT[a]) in = a == f;
+      if (in) m += F_MASS[k];
+    }
+    if (!(m > 0)) return false;
+  }
+  return true;
+}
+static_assert(tc_all_subtrees_massive(),
+              "audit #10: crba's slot writes cover the whole profile only "
+              "if every coord frame's composite mass is > 0");
+
 // ---- env v11 GROUND CONTACT (unilateral-contact spec §2/§3) -----------------
 // The contact-mode replacement for the 12 weld rows: the 8 sole-box
 // corners against the static plane y = 0 — one unilateral normal row
@@ -1697,8 +1858,10 @@ struct Dyn {
   // FK
   T r[NF][3][3], pos[NF][3], axw[NF][3];
   T r0[3][3];
-  // dense — m holds M from crba, then its IN-PLACE Cholesky factor L
-  T m[NV * NV], c[NV], rhs[NV];
+  // audit #10: m holds M from crba, then its IN-PLACE Cholesky factor L,
+  // in the TREE PROFILE layout (TreeTabs: column-major, 341 slots — the
+  // dense form was NV*NV = 1,225)
+  T m[TC_NNZ], c[NV], rhs[NV];
   // CRBA composites
   T cm[NF], cc[NF][3], ci[NF][3][3];
   T bm, bc[3], bi[3][3];
@@ -2091,26 +2254,27 @@ __device__ void add_shift(T i[3][3], T m, const T d[3]) {
       i[a][b] += m * ((a == b ? dd : T(0)) - d[a] * d[b]);
 }
 
-// LOWER TRIANGLE + DIAGONAL ONLY (2026-08-03, K4c). Every consumer of
-// d.m — chol_factor_n (in place), chol_solve_n / chol_solve_multi_n{,_tn}
-// ((i,k) k<i; (k,i) k>i; (i,i)), chol_fwd_unit{,2,4}_n ((i,k) m<=k<i;
-// diag) and chol_back{,2,4}_n ((k,i) k>i; diag) — touches row >= col
-// ONLY. Nothing in the kernel ever reads d.m above the diagonal, so this
-// function no longer writes there: the NV*NV zero fill is narrowed to
-// the 630 lower+diagonal entries (595 stores saved — and ~286 of the
-// kept ones are genuinely load-bearing, entries no producer below
-// touches), the symmetric ancestor pair writes one element, and the
-// root-block mirror stores are gone. ~970 dead stores per substep.
-//
-// COLUMN-MAJOR ADDRESSES (K12, 2026-08-07): element (row R, col C) is at
-// d.m[C*NV + R] — see chol_factor_n's header for why. Every store below
-// is the SAME value at the transposed address; the set of entries
-// written is unchanged (still exactly row >= col), and M's symmetry
-// means the values were never orientation-dependent in the first place.
+// audit #10 (2026-09-26): crba writes M STRAIGHT INTO THE TREE PROFILE
+// (d.m[TC_NNZ], column-major, see TreeTabs): each joint's column is its
+// chain — d.m[fcb[k]] the diagonal, d.m[fcb[k] + a] its a-th coord-bearing
+// ancestor (the ANC.f row, nearest first — exactly the column's slot
+// order, tree_tabs_ok() pins it), d.m[fcb[k] + ANC_N[k] + t] the six base
+// rows — and the 6x6 base block fills columns TC_BASE_E.. (compile-time
+// slots). Every stored VALUE is the one the dense form stored; only the
+// address moved. That retires three things at once:
+//   * the zero fill (K4c had narrowed it to the 630 lower+diagonal
+//     entries): every profile slot is written exactly once below
+//     (tc_all_subtrees_massive() pins the one precondition), and nothing
+//     outside the profile exists any more;
+//   * the runtime min/max select on the ancestor pair (coord order is not
+//     frame order in the shoulder/wrist stacks): the slot is simply
+//     fcb[k] + a;
+//   * 884 words of frame (1,225 -> 341).
+// The dense-era history (K4c lower-triangle-only, K12 column-major) is in
+// git; both of its invariants survive in profile form (only the lower
+// triangle exists; columns are contiguous).
 template <typename T>
 __device__ void crba(Dyn<T>& __restrict__ d) {
-  for (int i = 0; i < NV; i++)
-    for (int j = 0; j <= i; j++) d.m[j * NV + i] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
     const T mk = CT(F_MASS, [k]);
@@ -2144,7 +2308,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
     const T m = d.cm[k];
     T cvec[3] = {d.cc[k][0], d.cc[k][1], d.cc[k][2]};
     if (coord >= 0 && m > T(0)) {
-      const int j = VOFF + coord;
+      const int cbk = TREE_C.fcb[k];  // this coordinate's profile column
       const T* a = d.axw[k];
       T rel[3], hl[3], ha[3];
       sub3v(cvec, d.pos[k], rel);
@@ -2157,7 +2321,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       T relxhl[3];
       cross3(rel, hl, relxhl);
       T tot[3] = {ha[0] + relxhl[0], ha[1] + relxhl[1], ha[2] + relxhl[2]};
-      d.m[j * NV + j] = dot3(a, tot);
+      d.m[cbk] = dot3(a, tot);
       // K17 — the same coord-bearing ancestors, in the same order, read
       // out of ANC.f / ANC.c instead of chased through F_PARENT. Entry 0
       // is k itself (F_COORD[k] >= 0 holds here), so the strict
@@ -2166,16 +2330,13 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       const int na = ANC_N[k];
       for (int a = 1; a < na; a++) {
         const int anc = ANC.f[k][a];
-        const int ia = ANC.c[k][a];
         T rel2[3];
         sub3v(cvec, d.pos[anc], rel2);
         T r2xhl[3];
         cross3(rel2, hl, r2xhl);
         T tot2[3] = {ha[0] + r2xhl[0], ha[1] + r2xhl[1], ha[2] + r2xhl[2]};
-        const T val = dot3(d.axw[anc], tot2);
-        // symmetric pair -> lower entry only (F_COORD is not monotonic
-        // in the frame index, so the order of ia vs j is a runtime fact)
-        d.m[(ia > j ? j : ia) * NV + (ia > j ? ia : j)] = val;
+        // audit #10: slot a of the column IS ancestor a (tree_tabs_ok)
+        d.m[cbk + a] = dot3(d.axw[anc], tot2);
       }
       // root rows
       T relr[3];
@@ -2183,11 +2344,10 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
       T rrxhl[3];
       cross3(relr, hl, rrxhl);
       T lr[3] = {ha[0] + rrxhl[0], ha[1] + rrxhl[1], ha[2] + rrxhl[2]};
-      // j >= VOFF > 3 + t, so only the [j][*] halves are in the lower
-      // triangle; the [t][j] / [3+t][j] mirrors were dead.
+      // the base rows close the column: v0..v5 at slots na .. na + 5
       for (int t = 0; t < 3; t++) {
-        d.m[t * NV + j] = hl[t];
-        d.m[(3 + t) * NV + j] = lr[t];
+        d.m[cbk + na + t] = hl[t];
+        d.m[cbk + na + 3 + t] = lr[t];
       }
     }
     // merge composite k into parent (or base)
@@ -2223,10 +2383,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
 
   // armature diagonal (Divergences §12)
   for (int k = 0; k < NF; k++)
-    if (F_COORD[k] >= 0) {
-      const int j = VOFF + F_COORD[k];
-      d.m[j * NV + j] += CT(ARMATURE, [F_COORD[k]]);
-    }
+    if (F_COORD[k] >= 0) d.m[TREE_C.fcb[k]] += CT(ARMATURE, [F_COORD[k]]);
 
   // root 6x6 from the total composite
   T dd[3];
@@ -2235,18 +2392,22 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   for (int i = 0; i < 3; i++)
     for (int j = 0; j < 3; j++) rr[i][j] = d.bi[i][j];
   add_shift(rr, d.bm, dd);
+  // base block: element (row R, col C), R >= C, lives at slot R - C of
+  // base column C (e = TC_BASE_E + C) — compile-time addresses
+  constexpr int bcb[VOFF] = {TREE.cb[TC_BASE_E], TREE.cb[TC_BASE_E + 1],
+                             TREE.cb[TC_BASE_E + 2], TREE.cb[TC_BASE_E + 3],
+                             TREE.cb[TC_BASE_E + 4], TREE.cb[TC_BASE_E + 5]};
   for (int i = 0; i < 3; i++)
     for (int j = 0; j <= i; j++) {
-      d.m[j * NV + i] = i == j ? d.bm : T(0);
-      d.m[(3 + j) * NV + (3 + i)] = rr[i][j];
+      d.m[bcb[j] + (i - j)] = i == j ? d.bm : T(0);
+      d.m[bcb[3 + j] + (i - j)] = rr[i][j];
     }
   const T sk[3][3] = {{T(0), -dd[2], dd[1]},
                       {dd[2], T(0), -dd[0]},
                       {-dd[1], dd[0], T(0)}};
-  // (3+i, j) is strictly lower for every i, j in 0..2; the (j, 3+i)
-  // mirror was dead.
+  // (3+i, j) is strictly lower for every i, j in 0..2
   for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++) d.m[j * NV + (3 + i)] = d.bm * sk[i][j];
+    for (int j = 0; j < 3; j++) d.m[bcb[j] + (3 + i - j)] = d.bm * sk[i][j];
 }
 
 // RNEA(q, v, 0) -> bias C (gravity included), result in d.c.
@@ -2388,8 +2549,12 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   d.c[5] = n0[2];
 }
 
-// Dense Cholesky (lower, no pivoting; algo.rs chol_factor_floored)
-// with the same pivot-floor guards: f64
+// Dense Cholesky (lower, no pivoting; algo.rs chol_factor_floored). audit #10:
+// since the mass matrix moved to the TREE factor (tree_factor below) the
+// dense factor/solves serve ONLY the 12x12 weld block A_ww (s.aww, weld
+// mode); the notes below that talk about d.m / NV describe the pre-#10
+// mass-matrix use, whose loop shapes the tree routines inherit.
+// Pivot-floor guards (the tree factor carries the same): f64
 // floors pivots at PD_FLOOR_F64 = 1e-17 (Divergences §22 — same
 // constant and max clamp as Rust; Rust counts into ws.pd_hits
 // instead of panicking now), f32 floors at 1e-8 and latches bad only
@@ -2727,431 +2892,363 @@ __device__ void chol_solve_multi_n(int n, const T* __restrict__ l,
   }
 }
 
-// K11 — the SAME batched solve on a RHS-MINOR right-hand side: x[k*W+w]
-// instead of x[w*n+k]. Only s.mw is stored this way (see Solver::mw);
-// s.c_minv and the ensure_pcol batches keep the row-major entry point
-// above, so both survive.
+// ---- audit #10: TREE-SPARSE FACTOR AND SOLVES (algo.rs tc_*) -----------------
+// The mass matrix's factor and every M^-1 solve now run in the fill-free
+// tree elimination order (TreeTabs above; algo.rs header for the argument
+// and SPEC-v10 Divergences §25). CANONICAL ARITHMETIC, identical to the
+// Rust tc_* routines term for term (each sum in ascending index order, e
+// the elimination position):
+//   factor, column j (pivot first):
+//     d_j  = M_jj - sum_{k in [lo_j, j)} L_jk * L_jk ; floor ; L_jj = sqrt
+//     L_aj = (M_aj - sum_{k in [lo_j, j)} L_ak * L_jk) / L_jj, a in anc(j)
+//   forward  y_e = (b_e - sum_{k in [lo_e, e)} L_ek * y_k) / L_ee, e up
+//   back     x_e = (y_e - sum_{a in anc(e)} L_ae * x_a) / L_ee, e down
+// = the dense Cholesky of P M P^T with its structural zeros (exact +0.0)
+// skipped. What each kernel loop below adds on top is the usual set of
+// bitwise-neutral transforms: RHS batching (a loop interchange, A1), row
+// blocking of FORWARD rows that share a k-prefix (K6 — the base rows, all
+// of which span every joint), and dropping terms whose y_k is a structural
+// +0.0 (the chol_fwd_unit induction: the unit chains and the feet batch).
+// The back pass is never row-blocked (K6 ABSOLUTE PROHIBITION, unchanged:
+// the shared region is each row's TAIL).
 //
-// TRIVIALLY BITWISE: this is chol_solve_multi_n with one address map
-// applied to x and nothing else. Same i order, same k order, same w
-// order, same seeds, same divisors, same accumulator chains — every
-// floating-point operation is the identical operation on the identical
-// operands, only fetched from a different offset.
+// Loop indices are warp-uniform (they depend only on the tables), so the
+// tables come from the constant bank (TREE_C); only the unit chains index
+// by a per-lane joint and read the __device__ copy (TREE).
 //
-// Why it is worth a second entry point: the W-loop is the innermost
-// loop of all three halves, so RHS-minor makes its W accesses W
-// CONSECUTIVE per-thread words reachable as immediate offsets from ONE
-// base (`bk = k * W`, W a compile-time constant), where the row-major
-// form needed W separate addresses at runtime stride n. The load COUNT
-// is unchanged — ptxas emits 12 scalar LDL either way, see Solver::mw
-// for why the LDL.128 hypothesis was falsified — but the back half
-// alone runs n(n-1)/2 = 595 (i, k) pairs at W = 12, and cutting each
-// one's address arithmetic to a single IADD is most of K11's +7.06%.
-template <int W, typename T>
-__device__ void chol_solve_multi_tn(int n, const T* __restrict__ l,
-                                    T* __restrict__ x) {
-  int i = 0;
-  for (; i + 2 < n; i += 3) {  // ROW-BLOCKED BY 3, as above (K6)
-    const int b0 = i * W, b1 = b0 + W, b2 = b1 + W;
-    T s0[W], s1[W], s2[W];
+// FMA-contraction discipline (K10e2): every update stays ONE `X -= Y*Z`
+// statement, contracted to one FFMA exactly like the dense solves were.
+
+// Factor helper: the k-loop of column j feeding the pivot (PIV) and R
+// consecutive ancestor rows t0..t0+R-1. Column k in [lo, j) holds L_jk at
+// slot kb[k] - d[j] and L_{anc_t(j), k} at the next slots (its chain runs
+// on through j's), so every k costs ONE table read and loads off ONE base
+// with immediate offsets — K12's single-base column form.
+template <int R, bool PIV, typename T>
+__device__ __forceinline__ void tf_rows(const T* __restrict__ a, int lo, int j,
+                                        int dcol, int cj, int t0, T& dpiv,
+                                        T (&s)[4]) {
 #pragma unroll
-    for (int w = 0; w < W; w++) {
-      s0[w] = x[b0 + w];
-      s1[w] = x[b1 + w];
-      s2[w] = x[b2 + w];
+  for (int r = 0; r < R; r++) s[r] = a[cj + 1 + t0 + r];
+  for (int k = lo; k < j; k++) {
+    const int base = TREE_C.kb[k] - dcol;
+    const T ljk = a[base];
+    if (PIV) dpiv -= ljk * ljk;
+#pragma unroll
+    for (int r = 0; r < R; r++) s[r] -= a[base + 1 + t0 + r] * ljk;
+  }
+}
+
+template <int R, typename T>
+__device__ __forceinline__ void tf_store(T* __restrict__ a, int cj, int t0,
+                                         T dj, const T (&s)[4]) {
+#pragma unroll
+  for (int r = 0; r < R; r++) a[cj + 1 + t0 + r] = s[r] / dj;
+}
+
+// The tree factor, IN PLACE on the profile d.m (crba wrote M there), with
+// the §22 / §20e pivot floor verbatim on the new pivots (algo.rs header:
+// what a pivot IS moves with the order; a healthy M never floors in
+// either). Column j's ancestor rows go in blocks of 4 / 2 / 1 — d[j] is
+// warp-uniform, so the ladder cannot diverge (K13's condition) — with the
+// pivot riding the first block's k-loop (it needs the same L_jk loads).
+// IN PLACE is legal for the dense form's reason: column j reads only
+// columns k < j (final) and its own seeds, and writes only column j.
+template <typename T>
+__device__ void tree_factor(T* __restrict__ a, bool* __restrict__ bad) {
+  for (int j = 0; j < NV; j++) {
+    const int lo = TREE_C.lo[j], dn = TREE_C.d[j], cj = TREE_C.cb[j];
+    T dpiv = a[cj];
+    T s[4];
+    const int w = dn >= 4 ? 4 : dn >= 2 ? 2 : dn;
+    if (w == 4)
+      tf_rows<4, true>(a, lo, j, dn, cj, 0, dpiv, s);
+    else if (w == 2)
+      tf_rows<2, true>(a, lo, j, dn, cj, 0, dpiv, s);
+    else if (w == 1)
+      tf_rows<1, true>(a, lo, j, dn, cj, 0, dpiv, s);
+    else
+      tf_rows<0, true>(a, lo, j, dn, cj, 0, dpiv, s);
+    if (sizeof(T) == 8) {
+      if (dpiv < T(PD_FLOOR_F64)) *bad = true;
+      dpiv = tmax(dpiv, T(PD_FLOOR_F64));
+    } else {
+      if (dpiv <= T(0)) *bad = true;
+      dpiv = tmax(dpiv, T(PD_FLOOR_F32));
     }
-    for (int k = 0; k < i; k++) {
-      const int ck = k * n;
-      const T l0 = l[ck + i], l1 = l[ck + i + 1], l2 = l[ck + i + 2];
-      const int bk = k * W;
+    const T dj = sqrt(dpiv);
+    a[cj] = dj;
+    if (w == 4)
+      tf_store<4>(a, cj, 0, dj, s);
+    else if (w == 2)
+      tf_store<2>(a, cj, 0, dj, s);
+    else if (w == 1)
+      tf_store<1>(a, cj, 0, dj, s);
+    int t = w;
+    for (; t + 4 <= dn; t += 4) {
+      tf_rows<4, false>(a, lo, j, dn, cj, t, dpiv, s);
+      tf_store<4>(a, cj, t, dj, s);
+    }
+    if (t + 2 <= dn) {
+      tf_rows<2, false>(a, lo, j, dn, cj, t, dpiv, s);
+      tf_store<2>(a, cj, t, dj, s);
+      t += 2;
+    }
+    if (t < dn) {
+      tf_rows<1, false>(a, lo, j, dn, cj, t, dpiv, s);
+      tf_store<1>(a, cj, t, dj, s);
+    }
+  }
+}
+
+// FORWARD pass on W right-hand sides in v-order at x[w*SW + v*SV]
+// (row-major batches: SW = NV, SV = 1; RHS-minor: SW = 1, SV = W).
+// Joint rows are short profile sums (|desc| <= 16); the six base rows each
+// span EVERY joint (lo = 0, tree_tabs_ok), so they run as row blocks of
+// RB sharing the k in [0, NQ) prefix (K6), then the base-internal
+// triangle in ascending k — each row's canonical order.
+template <int W, int SW, int SV, int RB, typename T>
+__device__ void tree_fwd_w(const T* __restrict__ l, T* __restrict__ x) {
+  static_assert(VOFF % RB == 0, "base row blocks tile the base");
+  for (int e = 0; e < TC_BASE_E; e++) {
+    const int de = TREE_C.d[e], ve = TREE_C.e2v[e] * SV;
+    T s[W];
 #pragma unroll
-      for (int w = 0; w < W; w++) {
-        const T xk = x[bk + w];
-        s0[w] -= l0 * xk;
-        s1[w] -= l1 * xk;
-        s2[w] -= l2 * xk;
+    for (int w = 0; w < W; w++) s[w] = x[w * SW + ve];
+    for (int k = TREE_C.lo[e]; k < e; k++) {
+      const T lk = l[TREE_C.kb[k] - de];
+      const int vk = TREE_C.e2v[k] * SV;
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lk * x[w * SW + vk];
+    }
+    const T dg = l[TREE_C.cb[e]];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[w * SW + ve] = s[w] / dg;
+  }
+#pragma unroll
+  for (int b0 = 0; b0 < VOFF; b0 += RB) {
+    // rows e = TC_BASE_E + b0 + r hold v = b0 + r; d[e] = VOFF - 1 - b
+    T s[RB][W];
+#pragma unroll
+    for (int r = 0; r < RB; r++)
+#pragma unroll
+      for (int w = 0; w < W; w++) s[r][w] = x[w * SW + (b0 + r) * SV];
+    for (int k = 0; k < TC_BASE_E; k++) {  // shared prefix: every joint
+      const int kb = TREE_C.kb[k], vk = TREE_C.e2v[k] * SV;
+#pragma unroll
+      for (int r = 0; r < RB; r++) {
+        const T lk = l[kb - (VOFF - 1 - (b0 + r))];
+#pragma unroll
+        for (int w = 0; w < W; w++) s[r][w] -= lk * x[w * SW + vk];
       }
     }
-    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n;
-    const T d0 = l[c0 + i], l1i = l[c0 + i + 1], d1 = l[c1 + i + 1];
-    const T l2i = l[c0 + i + 2], l2j = l[c1 + i + 2], d2 = l[c2 + i + 2];
 #pragma unroll
-    for (int w = 0; w < W; w++) {
-      const T v0 = s0[w] / d0;
-      x[b0 + w] = v0;
-      s1[w] -= l1i * v0;
-      const T v1 = s1[w] / d1;
-      x[b1 + w] = v1;
-      s2[w] -= l2i * v0;
-      s2[w] -= l2j * v1;
-      x[b2 + w] = s2[w] / d2;
+    for (int bk = 0; bk < b0; bk++) {  // earlier base rows, shared
+      const int cbk = TREE.cb[TC_BASE_E + bk];
+#pragma unroll
+      for (int r = 0; r < RB; r++) {
+        const T lk = l[cbk + (b0 + r - bk)];
+#pragma unroll
+        for (int w = 0; w < W; w++) s[r][w] -= lk * x[w * SW + bk * SV];
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < RB; r++) {  // the block's own triangle
+#pragma unroll
+      for (int rr = 0; rr < r; rr++) {
+        const T lk = l[TREE.cb[TC_BASE_E + b0 + rr] + (r - rr)];
+#pragma unroll
+        for (int w = 0; w < W; w++)
+          s[r][w] -= lk * x[w * SW + (b0 + rr) * SV];
+      }
+      const T dg = l[TREE.cb[TC_BASE_E + b0 + r]];
+#pragma unroll
+      for (int w = 0; w < W; w++) x[w * SW + (b0 + r) * SV] = s[r][w] / dg;
     }
   }
-  for (; i < n; i++) {  // up to two rows left over (NV = 35)
-    const int bi = i * W;
+}
+
+// BACK pass on the same layouts: e descending, each column's chain
+// ascending (slots 1..d[e] of column e, row v = vslot). Not row-blocked.
+template <int W, int SW, int SV, typename T>
+__device__ void tree_back_w(const T* __restrict__ l, T* __restrict__ x) {
+  for (int e = NV - 1; e >= 0; e--) {
+    const int c = TREE_C.cb[e], de = TREE_C.d[e], ve = TREE_C.e2v[e] * SV;
     T s[W];
 #pragma unroll
-    for (int w = 0; w < W; w++) s[w] = x[bi + w];
-    for (int k = 0; k < i; k++) {
-      const T lik = l[k * n + i];
-      const int bk = k * W;
+    for (int w = 0; w < W; w++) s[w] = x[w * SW + ve];
+    for (int t = 1; t <= de; t++) {
+      const T la = l[c + t];
+      const int va = TREE_C.vslot[c + t] * SV;
 #pragma unroll
-      for (int w = 0; w < W; w++) s[w] -= lik * x[bk + w];
+      for (int w = 0; w < W; w++) s[w] -= la * x[w * SW + va];
     }
-    const T dg = l[i * n + i];
+    const T dg = l[c];
 #pragma unroll
-    for (int w = 0; w < W; w++) x[bi + w] = s[w] / dg;
+    for (int w = 0; w < W; w++) x[w * SW + ve] = s[w] / dg;
   }
-  // BACK half: not row-blocked (K6 prohibition, file header).
-  for (int i = n - 1; i >= 0; i--) {
-    const int bi = i * W;
-    const int ci = i * n;
+}
+
+// Dense-RHS solves: one vector (the step-6 rhs, a lone contact column)
+// and W row-major columns (the contact batches).
+template <typename T>
+__device__ __forceinline__ void tree_solve_n(const T* __restrict__ l,
+                                             T* __restrict__ x) {
+  tree_fwd_w<1, 0, 1, 3>(l, x);
+  tree_back_w<1, 0, 1>(l, x);
+}
+template <int W, typename T>
+__device__ __forceinline__ void tree_solve_multi_n(const T* __restrict__ l,
+                                                   T* __restrict__ x) {
+  tree_fwd_w<W, NV, 1, (W >= 4 ? 2 : 3)>(l, x);
+  tree_back_w<W, NV, 1>(l, x);
+}
+
+// The 12 FOOT columns, RHS-minor x[v*12 + m] (s.mw in weld mode, s.g_minv
+// in contact mode — same layout, same support): column m < 6 is a left-foot
+// row (support: base + v 23..28 = e 6..11), m >= 6 a right-foot row (base +
+// v 29..34 = e 0..5). The forward pass visits only that support's upward
+// closure — each leg's rows on its own six lanes, then the base rows with
+// each lane group's own leg prefix — so every dropped term multiplies a
+// structural +0.0 (the other leg's rows and the arms/spine rows of a foot
+// column stay at their +0.0 seed: nothing below them in the tree is
+// non-zero). algo.rs `tc_fwd_mask_t` computes the same rows with the
+// union mask; the extra terms it keeps are (+-0.0)-products, exact no-ops.
+// Every index here is a compile-time constant.
+template <typename T>
+__device__ __forceinline__ void tree_fwd_leg_tn(const T* __restrict__ l,
+                                                T* __restrict__ x, int e0,
+                                                int m0) {
+  constexpr int W = N_WELD;
+#pragma unroll
+  for (int e = e0; e < e0 + 6; e++) {
+    const int de = TREE.d[e], ve = TREE.e2v[e] * W + m0;
+    T s[6];
+#pragma unroll
+    for (int w = 0; w < 6; w++) s[w] = x[ve + w];
+#pragma unroll
+    for (int k = e0; k < e; k++) {  // lo[e] = e0 on a leg (tree_tabs_ok)
+      const T lk = l[TREE.kb[k] - de];
+      const int vk = TREE.e2v[k] * W + m0;
+#pragma unroll
+      for (int w = 0; w < 6; w++) s[w] -= lk * x[vk + w];
+    }
+    const T dg = l[TREE.cb[e]];
+#pragma unroll
+    for (int w = 0; w < 6; w++) x[ve + w] = s[w] / dg;
+  }
+}
+template <typename T>
+__device__ void tree_solve_feet_tn(const T* __restrict__ l, T* __restrict__ x) {
+  constexpr int W = N_WELD;
+  static_assert(N_WELD == 2 * 6, "two feet x six spatial rows");
+  tree_fwd_leg_tn(l, x, 6, 0);  // left leg rows, left-foot lanes 0..5
+  tree_fwd_leg_tn(l, x, 0, 6);  // right leg rows, right-foot lanes 6..11
+#pragma unroll
+  for (int b = 0; b < VOFF; b++) {
+    const int e = TC_BASE_E + b, de = VOFF - 1 - b;
     T s[W];
 #pragma unroll
-    for (int w = 0; w < W; w++) s[w] = x[bi + w];
-    for (int k = i + 1; k < n; k++) {
-      const T lki = l[ci + k];
-      const int bk = k * W;
+    for (int w = 0; w < W; w++) s[w] = x[b * W + w];
 #pragma unroll
-      for (int w = 0; w < W; w++) s[w] -= lki * x[bk + w];
-    }
-    const T dg = l[ci + i];
+    for (int k = 0; k < 6; k++) {  // right leg (e 0..5): lanes 6..11
+      const T lk = l[TREE.kb[k] - de];
+      const int vk = TREE.e2v[k] * W;
 #pragma unroll
-    for (int w = 0; w < W; w++) x[bi + w] = s[w] / dg;
+      for (int w = 6; w < W; w++) s[w] -= lk * x[vk + w];
+    }
+#pragma unroll
+    for (int k = 6; k < 12; k++) {  // left leg (e 6..11): lanes 0..5
+      const T lk = l[TREE.kb[k] - de];
+      const int vk = TREE.e2v[k] * W;
+#pragma unroll
+      for (int w = 0; w < 6; w++) s[w] -= lk * x[vk + w];
+    }
+#pragma unroll
+    for (int bk = 0; bk < b; bk++) {  // earlier base rows, all lanes
+      const T lk = l[TREE.cb[TC_BASE_E + bk] + (b - bk)];
+#pragma unroll
+      for (int w = 0; w < W; w++) s[w] -= lk * x[bk * W + w];
+    }
+    const T dg = l[TREE.cb[e]];
+#pragma unroll
+    for (int w = 0; w < W; w++) x[b * W + w] = s[w] / dg;
+  }
+  tree_back_w<W, 1, W>(l, x);
+}
+
+// UNIT-RHS forward pass for M^-1 e_vm (x: +0.0 everywhere, as ecol_seed
+// leaves it): only vm's elimination chain {e0} u anc(e0) — at most 16
+// rows (a wrist: 7 arm + 3 spine + 6 base) — can become non-zero, and
+// each chain row sums exactly the chain rows below it, ascending (algo.rs
+// tc_fwd_unit_lane, term for term: the +0.0 seed, the e0 term, then the
+// ancestors). L(a, k) for the chain's r-th and s-th members sits at slot
+// s - r of column k, whose base is cbslot[] of the chain slot — every
+// table read is independent (no F_PARENT-style chase, K17). The joint is
+// per LANE here, so the reads go to the __device__ copy.
+template <typename T>
+__device__ void tree_fwd_unit_n(const T* __restrict__ l, T* __restrict__ x,
+                                int vm) {
+  const int e0 = TREE.v2e[vm];
+  const int c0 = TREE.cb[e0], len = TREE.d[e0];
+  const T y0 = T(1) / l[c0];
+  x[vm] = y0;
+  for (int s = 1; s <= len; s++) {
+    T acc = T(0);
+    acc -= l[c0 + s] * y0;
+    for (int r = 1; r < s; r++)
+      acc -= l[TREE.cbslot[c0 + r] + (s - r)] * x[TREE.vslot[c0 + r]];
+    x[TREE.vslot[c0 + s]] = acc / l[TREE.cbslot[c0 + s]];
   }
 }
 
-// Same solve, specialized for a UNIT right-hand side e_m (x enters as
-// all +0.0 except x[m] = 1). BITWISE identical to chol_solve_n on that
-// input, not an approximation — the forward substitution provably
-// reproduces the incoming +0.0 for every row i < m, and every k < m
-// term of every later row is an exact no-op:
-//   * the factor diagonal is always strictly positive and finite
-//     (chol_factor_n floors the pivot at PD_FLOOR_* through tmax, whose
-//     `a > b ? a : b` form also maps a NaN pivot onto the floor), so
-//     +0.0 / L[i][i] = +0.0 — the value already in the buffer;
-//   * by induction on i < m: s starts at x[i] = +0.0 and every term
-//     L[i][k] * x[k] has x[k] = +0.0 (k < i < m, established by the
-//     induction), so the product is +-0.0 and s stays exactly +0.0
-//     (+0.0 - +0.0 = +0.0 and +0.0 - -0.0 = +0.0 under RN; FMA
-//     contraction does not change either);
-//   * at i == m the same k < m terms leave s = x[m] = 1 untouched, so
-//     the k-loop may start at k = m (zero iterations here) and the
-//     divide is the identical 1 / L[m][m];
-//   * at i > m s starts at +0.0, the k < m terms leave it at +0.0, and
-//     the surviving k >= m terms then run in the SAME ascending order
-//     over the SAME values from the SAME accumulator start.
-// The BACK substitution stays dense: it reads x[k] for k > i, which for
-// k < m are the skipped rows — they must still hold the +0.0 the
-// forward pass would have written, so the caller's full-length zero
-// fill CANNOT shrink. (Rows > m need it too: it is their `s` seed.)
+// BACK pass for 4 / 2 columns that are not contiguous (s.ecol rows of
+// non-consecutive joints): the tree_back_w loop over explicit pointers —
+// the RHS-batching interchange, bitwise per column.
 template <typename T>
-__device__ void chol_fwd_unit_n(int n, const T* __restrict__ l,
-                                T* __restrict__ x, int m) {
-  // ROW-BLOCKED BY 4 (K6), same forward-only proof as chol_solve_n's.
-  int i = m;
-  for (; i + 3 < n; i += 4) {
-    T s0 = x[i], s1 = x[i + 1], s2 = x[i + 2], s3 = x[i + 3];
-    for (int k = m; k < i; k++) {
-      const int ck = k * n;
-      const T xk = x[k];
-      s0 -= l[ck + i] * xk;
-      s1 -= l[ck + i + 1] * xk;
-      s2 -= l[ck + i + 2] * xk;
-      s3 -= l[ck + i + 3] * xk;
+__device__ void tree_back4_n(const T* __restrict__ l, T* __restrict__ x0,
+                             T* __restrict__ x1, T* __restrict__ x2,
+                             T* __restrict__ x3) {
+  for (int e = NV - 1; e >= 0; e--) {
+    const int c = TREE_C.cb[e], de = TREE_C.d[e], ve = TREE_C.e2v[e];
+    T s0 = x0[ve], s1 = x1[ve], s2 = x2[ve], s3 = x3[ve];
+    for (int t = 1; t <= de; t++) {
+      const T la = l[c + t];
+      const int va = TREE_C.vslot[c + t];
+      s0 -= la * x0[va];
+      s1 -= la * x1[va];
+      s2 -= la * x2[va];
+      s3 -= la * x3[va];
     }
-    const int c0 = i * n, c1 = c0 + n, c2 = c1 + n, c3 = c2 + n;
-    const T v0 = s0 / l[c0 + i];
-    x[i] = v0;
-    s1 -= l[c0 + i + 1] * v0;
-    const T v1 = s1 / l[c1 + i + 1];
-    x[i + 1] = v1;
-    s2 -= l[c0 + i + 2] * v0;
-    s2 -= l[c1 + i + 2] * v1;
-    const T v2 = s2 / l[c2 + i + 2];
-    x[i + 2] = v2;
-    s3 -= l[c0 + i + 3] * v0;
-    s3 -= l[c1 + i + 3] * v1;
-    s3 -= l[c2 + i + 3] * v2;
-    x[i + 3] = s3 / l[c3 + i + 3];
-  }
-  for (; i < n; i++) {
-    T s = x[i];
-    for (int k = m; k < i; k++) s -= l[k * n + i] * x[k];
-    x[i] = s / l[i * n + i];
+    const T dg = l[c];
+    x0[ve] = s0 / dg;
+    x1[ve] = s1 / dg;
+    x2[ve] = s2 / dg;
+    x3[ve] = s3 / dg;
   }
 }
-
-// BATCHED unit forward substitution, W columns sharing one factor, run
-// DENSE from the group's smallest m0 = min(m_t) (K4a). Every column
-// keeps its own accumulator over the same ascending k, so this is the
-// same loop interchange as chol_solve_multi_n on the rows i >= m_t; the
-// rows and terms it ADDS for a column with m_t > m0 are exact no-ops by
-// chol_fwd_unit_n's own proof, quoted here for the batched shape:
-//   * rows m0 <= i < m_t: x_t[i] enters as the seeded +0.0 and every
-//     term L[i][k] * x_t[k] has k < i < m_t, so x_t[k] is +0.0 by
-//     induction — s stays exactly +0.0 (+0.0 - (+-0.0) = +0.0 under RN)
-//     and the store is +0.0 / diag = +0.0, the value already there
-//     (the diagonal is strictly positive and finite: chol_factor_n's
-//     tmax floor maps even a NaN pivot onto PD_FLOOR_*);
-//   * row i == m_t: s enters as 1 and the k < m_t terms subtract +-0.0
-//     from it, leaving 1 — then the surviving k >= m_t terms and the
-//     divide are the scalar pass's, bit for bit;
-//   * rows i > m_t: s enters +0.0, the k < m_t terms leave it +0.0, and
-//     the k >= m_t terms then run in the SAME ascending order over the
-//     SAME values from the SAME accumulator start.
-// So the batch is bitwise the W separate chol_fwd_unit_n calls, and it
-// replaces W back-to-back serial chains with W independent ones.
 template <typename T>
-__device__ void chol_fwd_unit4_n(int n, const T* __restrict__ l,
-                                 T* __restrict__ x0, T* __restrict__ x1,
-                                 T* __restrict__ x2, T* __restrict__ x3,
-                                 int m0) {
-  // ROW-BLOCKED BY 4 as well (K6): the four x_t[k] are loaded once for
-  // 16 FMAs. Same forward-only proof — the four rows share the ascending
-  // PREFIX k in [m0, i0), and each row's remaining terms k in [i0, i)
-  // follow it ascending, taken from the values the earlier rows of the
-  // block just stored.
-  int i = m0;
-  for (; i + 3 < n; i += 4) {
-    T a0 = x0[i], a1 = x1[i], a2 = x2[i], a3 = x3[i];
-    T b0 = x0[i + 1], b1 = x1[i + 1], b2 = x2[i + 1], b3 = x3[i + 1];
-    T c0 = x0[i + 2], c1 = x1[i + 2], c2 = x2[i + 2], c3 = x3[i + 2];
-    T e0 = x0[i + 3], e1 = x1[i + 3], e2 = x2[i + 3], e3 = x3[i + 3];
-    for (int k = m0; k < i; k++) {
-      const int ck = k * n;
-      const T la = l[ck + i], lb = l[ck + i + 1];
-      const T lc = l[ck + i + 2], le = l[ck + i + 3];
-      const T y0 = x0[k], y1 = x1[k], y2 = x2[k], y3 = x3[k];
-      a0 -= la * y0;
-      a1 -= la * y1;
-      a2 -= la * y2;
-      a3 -= la * y3;
-      b0 -= lb * y0;
-      b1 -= lb * y1;
-      b2 -= lb * y2;
-      b3 -= lb * y3;
-      c0 -= lc * y0;
-      c1 -= lc * y1;
-      c2 -= lc * y2;
-      c3 -= lc * y3;
-      e0 -= le * y0;
-      e1 -= le * y1;
-      e2 -= le * y2;
-      e3 -= le * y3;
+__device__ void tree_back2_n(const T* __restrict__ l, T* __restrict__ x0,
+                             T* __restrict__ x1) {
+  for (int e = NV - 1; e >= 0; e--) {
+    const int c = TREE_C.cb[e], de = TREE_C.d[e], ve = TREE_C.e2v[e];
+    T s0 = x0[ve], s1 = x1[ve];
+    for (int t = 1; t <= de; t++) {
+      const T la = l[c + t];
+      const int va = TREE_C.vslot[c + t];
+      s0 -= la * x0[va];
+      s1 -= la * x1[va];
     }
-    const int c0b = i * n, c1b = c0b + n, c2b = c1b + n, c3b = c2b + n;
-    const T d0 = l[c0b + i];
-    const T v0 = a0 / d0, v1 = a1 / d0, v2 = a2 / d0, v3 = a3 / d0;
-    x0[i] = v0;
-    x1[i] = v1;
-    x2[i] = v2;
-    x3[i] = v3;
-    const T p1 = l[c0b + i + 1];
-    b0 -= p1 * v0;
-    b1 -= p1 * v1;
-    b2 -= p1 * v2;
-    b3 -= p1 * v3;
-    const T d1 = l[c1b + i + 1];
-    const T w0 = b0 / d1, w1 = b1 / d1, w2 = b2 / d1, w3 = b3 / d1;
-    x0[i + 1] = w0;
-    x1[i + 1] = w1;
-    x2[i + 1] = w2;
-    x3[i + 1] = w3;
-    const T p2 = l[c0b + i + 2], q2 = l[c1b + i + 2];
-    c0 -= p2 * v0;
-    c1 -= p2 * v1;
-    c2 -= p2 * v2;
-    c3 -= p2 * v3;
-    c0 -= q2 * w0;
-    c1 -= q2 * w1;
-    c2 -= q2 * w2;
-    c3 -= q2 * w3;
-    const T d2 = l[c2b + i + 2];
-    const T z0 = c0 / d2, z1 = c1 / d2, z2 = c2 / d2, z3 = c3 / d2;
-    x0[i + 2] = z0;
-    x1[i + 2] = z1;
-    x2[i + 2] = z2;
-    x3[i + 2] = z3;
-    const T p3 = l[c0b + i + 3], q3 = l[c1b + i + 3], u3 = l[c2b + i + 3];
-    e0 -= p3 * v0;
-    e1 -= p3 * v1;
-    e2 -= p3 * v2;
-    e3 -= p3 * v3;
-    e0 -= q3 * w0;
-    e1 -= q3 * w1;
-    e2 -= q3 * w2;
-    e3 -= q3 * w3;
-    e0 -= u3 * z0;
-    e1 -= u3 * z1;
-    e2 -= u3 * z2;
-    e3 -= u3 * z3;
-    const T d3 = l[c3b + i + 3];
-    x0[i + 3] = e0 / d3;
-    x1[i + 3] = e1 / d3;
-    x2[i + 3] = e2 / d3;
-    x3[i + 3] = e3 / d3;
-  }
-  for (; i < n; i++) {  // up to three rows left over
-    T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
-    for (int k = m0; k < i; k++) {
-      const T lik = l[k * n + i];
-      s0 -= lik * x0[k];
-      s1 -= lik * x1[k];
-      s2 -= lik * x2[k];
-      s3 -= lik * x3[k];
-    }
-    const T dg = l[i * n + i];
-    x0[i] = s0 / dg;
-    x1[i] = s1 / dg;
-    x2[i] = s2 / dg;
-    x3[i] = s3 / dg;
+    const T dg = l[c];
+    x0[ve] = s0 / dg;
+    x1[ve] = s1 / dg;
   }
 }
-
 template <typename T>
-__device__ void chol_fwd_unit2_n(int n, const T* __restrict__ l,
-                                 T* __restrict__ x0, T* __restrict__ x1,
-                                 int m0) {
-  // ROW-BLOCKED BY 4 (K6), same forward-only proof.
-  int i = m0;
-  for (; i + 3 < n; i += 4) {
-    T a0 = x0[i], a1 = x1[i];
-    T b0 = x0[i + 1], b1 = x1[i + 1];
-    T c0 = x0[i + 2], c1 = x1[i + 2];
-    T e0 = x0[i + 3], e1 = x1[i + 3];
-    for (int k = m0; k < i; k++) {
-      const int ck = k * n;
-      const T la = l[ck + i], lb = l[ck + i + 1];
-      const T lc = l[ck + i + 2], le = l[ck + i + 3];
-      const T y0 = x0[k], y1 = x1[k];
-      a0 -= la * y0;
-      a1 -= la * y1;
-      b0 -= lb * y0;
-      b1 -= lb * y1;
-      c0 -= lc * y0;
-      c1 -= lc * y1;
-      e0 -= le * y0;
-      e1 -= le * y1;
-    }
-    const int c0b = i * n, c1b = c0b + n, c2b = c1b + n, c3b = c2b + n;
-    const T d0 = l[c0b + i];
-    const T v00 = a0 / d0, v01 = a1 / d0;
-    x0[i] = v00;
-    x1[i] = v01;
-    const T p1 = l[c0b + i + 1];
-    b0 -= p1 * v00;
-    b1 -= p1 * v01;
-    const T d1 = l[c1b + i + 1];
-    const T v10 = b0 / d1, v11 = b1 / d1;
-    x0[i + 1] = v10;
-    x1[i + 1] = v11;
-    const T p2 = l[c0b + i + 2], q2 = l[c1b + i + 2];
-    c0 -= p2 * v00;
-    c1 -= p2 * v01;
-    c0 -= q2 * v10;
-    c1 -= q2 * v11;
-    const T d2 = l[c2b + i + 2];
-    const T v20 = c0 / d2, v21 = c1 / d2;
-    x0[i + 2] = v20;
-    x1[i + 2] = v21;
-    const T p3 = l[c0b + i + 3], q3 = l[c1b + i + 3], u3 = l[c2b + i + 3];
-    e0 -= p3 * v00;
-    e1 -= p3 * v01;
-    e0 -= q3 * v10;
-    e1 -= q3 * v11;
-    e0 -= u3 * v20;
-    e1 -= u3 * v21;
-    const T d3 = l[c3b + i + 3];
-    x0[i + 3] = e0 / d3;
-    x1[i + 3] = e1 / d3;
-  }
-  for (; i < n; i++) {
-    T s0 = x0[i], s1 = x1[i];
-    for (int k = m0; k < i; k++) {
-      const T lik = l[k * n + i];
-      s0 -= lik * x0[k];
-      s1 -= lik * x1[k];
-    }
-    const T dg = l[i * n + i];
-    x0[i] = s0 / dg;
-    x1[i] = s1 / dg;
-  }
-}
-
-// The back substitutions (this one and chol_back{2,4}_n below) are the
-// one shape in the kernel that must stay row-serial: see the K6
-// ABSOLUTE PROHIBITION in the file header. Do not row-block them, at any
-// R — batching more right-hand sides in is the legal direction.
-template <typename T>
-__device__ void chol_back_n(int n, const T* __restrict__ l,
-                            T* __restrict__ x) {
-  for (int i = n - 1; i >= 0; i--) {
-    const int ci = i * n;
-    T s = x[i];
-    for (int k = i + 1; k < n; k++) s -= l[ci + k] * x[k];
-    x[i] = s / l[ci + i];
-  }
-}
-
-template <typename T>
-__device__ void chol_solve_unit_n(int n, const T* __restrict__ l,
-                                  T* __restrict__ x, int m) {
-  chol_fwd_unit_n(n, l, x, m);
-  chol_back_n(n, l, x);
-}
-
-// BACK substitution for 4 / 2 independent columns at once. The back pass
-// is DENSE and m-independent — identical code for every right-hand side —
-// so batching it needs no per-column bookkeeping at all: it is the same
-// loop interchange as chol_solve_multi_n (each column keeps its own
-// accumulator over the same k in the same descending-i order, so every
-// value is bitwise the scalar pass's), just over columns that are not
-// contiguous in memory (s.ecol rows for non-consecutive joints), hence
-// explicit pointers rather than a stride. Accumulators are named scalars
-// so they cannot land in local memory.
-//
-// The forward half is batched too since K4a (chol_fwd_unit{2,4}_n): it
-// runs dense from the group's smallest m, which does re-add some of the
-// rows A4 removed, but they are exact arithmetic no-ops and the four
-// chains it buys pay for them — measured, see the session note.
-template <typename T>
-__device__ void chol_back4_n(int n, const T* __restrict__ l,
-                             T* __restrict__ x0, T* __restrict__ x1,
-                             T* __restrict__ x2, T* __restrict__ x3) {
-  for (int i = n - 1; i >= 0; i--) {
-    const int ci = i * n;
-    T s0 = x0[i], s1 = x1[i], s2 = x2[i], s3 = x3[i];
-    for (int k = i + 1; k < n; k++) {
-      const T lki = l[ci + k];
-      s0 -= lki * x0[k];
-      s1 -= lki * x1[k];
-      s2 -= lki * x2[k];
-      s3 -= lki * x3[k];
-    }
-    const T dg = l[ci + i];
-    x0[i] = s0 / dg;
-    x1[i] = s1 / dg;
-    x2[i] = s2 / dg;
-    x3[i] = s3 / dg;
-  }
-}
-
-template <typename T>
-__device__ void chol_back2_n(int n, const T* __restrict__ l,
-                             T* __restrict__ x0, T* __restrict__ x1) {
-  for (int i = n - 1; i >= 0; i--) {
-    const int ci = i * n;
-    T s0 = x0[i], s1 = x1[i];
-    for (int k = i + 1; k < n; k++) {
-      const T lki = l[ci + k];
-      s0 -= lki * x0[k];
-      s1 -= lki * x1[k];
-    }
-    const T dg = l[ci + i];
-    x0[i] = s0 / dg;
-    x1[i] = s1 / dg;
-  }
+__device__ __forceinline__ void tree_solve_unit_n(const T* __restrict__ l,
+                                                  T* __restrict__ x, int vm) {
+  tree_fwd_unit_n(l, x, vm);
+  tree_back_w<1, 0, 1>(l, x);
 }
 
 // ---- collide.rs seg_seg_closest (fixed branch order) ------------------------
@@ -3256,7 +3353,7 @@ __device__ void ensure_ecol(Dyn<T>& __restrict__ d,
                             Solver<T, FC>& __restrict__ s, int j) {
   if (s.ecomp[j]) return;
   ecol_seed(s, j);
-  chol_solve_unit_n(NV, d.m, s.ecol[j], VOFF + j);
+  tree_solve_unit_n(d.m, s.ecol[j], VOFF + j);
   s.ecomp[j] = true;
 }
 
@@ -3845,7 +3942,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // one address map; see chol_solve_multi_tn).
   // K9c: the assembly above already wrote J_w here, so the 420-element
   // seed copy that used to stand at this point is gone.
-  if constexpr (!FC) chol_solve_multi_tn<N_WELD>(NV, d.m, &s.mw[0][0]);
+  if constexpr (!FC) tree_solve_feet_tn(d.m, &s.mw[0][0]);
   // Ground rows (contact mode), audit #9: ONE chol_solve_multi_tn<12>
   // over both feet's spatial rows (the RHS-minor seed the assembly
   // wrote), then per foot
@@ -3859,7 +3956,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // what Rust's per-foot batch produces.
   if constexpr (FC) {
     if (s.g_act != 0) {
-      chol_solve_multi_tn<2 * FOOT_ROWS>(NV, d.m, &s.g_minv[0][0]);
+      tree_solve_feet_tn(d.m, &s.g_minv[0][0]);
       const T(*x)[2 * FOOT_ROWS] = s.g_minv;
 #pragma unroll
       for (int f = 0; f < 2; f++) {
@@ -3909,7 +4006,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     for (; ci + 3 < s.nc; ci += 4) {
       for (int t = 0; t < 4; t++)
         for (int i = 0; i < NV; i++) s.c_minv[ci + t][i] = s.c_J[ci + t][i];
-      chol_solve_multi_n<4>(NV, d.m, &s.c_minv[ci][0]);
+      tree_solve_multi_n<4>(d.m, &s.c_minv[ci][0]);
       for (int t = 0; t < 4; t++) {
         T diag = T(0);
         for (int i = 0; i < NV; i++)
@@ -3920,7 +4017,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     if (ci + 1 < s.nc) {
       for (int t = 0; t < 2; t++)
         for (int i = 0; i < NV; i++) s.c_minv[ci + t][i] = s.c_J[ci + t][i];
-      chol_solve_multi_n<2>(NV, d.m, &s.c_minv[ci][0]);
+      tree_solve_multi_n<2>(d.m, &s.c_minv[ci][0]);
       for (int t = 0; t < 2; t++) {
         T diag = T(0);
         for (int i = 0; i < NV; i++)
@@ -3931,7 +4028,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
     for (; ci < s.nc; ci++) {
       for (int i = 0; i < NV; i++) s.c_minv[ci][i] = s.c_J[ci][i];
-      chol_solve_n(NV, d.m, s.c_minv[ci]);
+      tree_solve_n(d.m, s.c_minv[ci]);
       T diag = T(0);
       for (int i = 0; i < NV; i++) diag += s.c_J[ci][i] * s.c_minv[ci][i];
       s.c_diag[ci] = diag;
@@ -3963,10 +4060,13 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       ecol_seed(s, j1);
       ecol_seed(s, j2);
       ecol_seed(s, j3);
-      // s.l_j ascending => VOFF + j0 is the group's smallest m (K4a)
-      chol_fwd_unit4_n(NV, d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2],
-                       s.ecol[j3], VOFF + j0);
-      chol_back4_n(NV, d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
+      // audit #10: each column's forward pass is its own ancestor
+      // chain (tree_fwd_unit_n); the dense back pass is batched
+      tree_fwd_unit_n(d.m, s.ecol[j0], VOFF + j0);
+      tree_fwd_unit_n(d.m, s.ecol[j1], VOFF + j1);
+      tree_fwd_unit_n(d.m, s.ecol[j2], VOFF + j2);
+      tree_fwd_unit_n(d.m, s.ecol[j3], VOFF + j3);
+      tree_back4_n(d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       s.ecomp[j2] = true;
@@ -3976,8 +4076,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       ecol_seed(s, j0);
       ecol_seed(s, j1);
-      chol_fwd_unit2_n(NV, d.m, s.ecol[j0], s.ecol[j1], VOFF + j0);
-      chol_back2_n(NV, d.m, s.ecol[j0], s.ecol[j1]);
+      tree_fwd_unit_n(d.m, s.ecol[j0], VOFF + j0);
+      tree_fwd_unit_n(d.m, s.ecol[j1], VOFF + j1);
+      tree_back2_n(d.m, s.ecol[j0], s.ecol[j1]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       li += 2;
@@ -4383,10 +4484,11 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     d.rhs[VOFF + j] =
         tau[j] - CT(DAMPING, [j]) * d.v[VOFF + j] - d.c[VOFF + j];
   // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
-  // substep (crba rewrites all NV*NV of it next substep)
-  chol_factor_n(NV, d.m, &d.pd_bad);
+  // substep (crba rewrites the whole profile next substep). audit #10: in
+  // the fill-free tree order (tree_factor; SPEC-v10 Divergences §25).
+  tree_factor(d.m, &d.pd_bad);
   // 6. v* = v + h M^-1 (tau - C)
-  chol_solve_n(NV, d.m, d.rhs);
+  tree_solve_n(d.m, d.rhs);
   T v[NV];
   for (int i = 0; i < NV; i++) v[i] = d.v[i] + T(H_SUB) * d.rhs[i];
   // shared per-joint column caches reset per substep (this factor)
