@@ -55,7 +55,12 @@ from fused_ln import FusedLayerNorm
 # 8-aligned input (block FFNs, note encoder, SimBa trunk, critic MLP)
 # runs its ReLUs in cuBLASLt epilogues (fp16_linear.fp16_relu_chain:
 # RELU_AUX_BIAS forward, DRELU on the next Linear's dgrad) — no
-# standalone relu_bwd pass.
+# standalone relu_bwd pass. And at the production attention shape
+# (29 keys, d 192, 4 heads) every attention site — the blocks' packed
+# self-attention, the final block's lead queries, the critic's pool —
+# runs the fused T = 29 kernel (fp16_linear.attn29_*, csrc/
+# small_attn.cu) in BOTH phases instead of SDPA; SDPA remains for any
+# other shape.
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -493,6 +498,12 @@ class Block(nn.Module):
             scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
                                    alpha=self.d ** -0.5)      # (B, Tq, T)
             att = torch.softmax(scores, dim=-1) @ v
+        elif qkv is not None and _fl.attn29_ok(T, self.d, self.n_heads):
+            # non-final fp16 block: the T = 29 fused attention kernel
+            # (fp16_linear.attn29_packed, 2026-09-27) straight off the
+            # packed projection -> (B, T, d) in the out-projection's
+            # layout; gradient = ONE packed (B, T, 3d) tensor
+            att = _lin(self.out_proj, _fl.attn29_packed(qkv, attn_bias))
         elif qkv is not None:
             # non-final fp16 block: fused attention straight off the
             # packed projection; the backward writes dq|dk|dv as ONE
@@ -503,6 +514,11 @@ class Block(nn.Module):
                                   self.n_heads)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
             att = _lin(self.out_proj, att)
+        elif (q.dtype is torch.float16 and n_queries
+                and _fl.attn29_ok(T, self.d, self.n_heads)):
+            # final fp16 block: the lead-token queries over the packed
+            # k|v (same T = 29 kernel as every other attention site)
+            att = _lin(self.out_proj, _fl.attn29_qkv(q, kv, attn_bias))
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
@@ -922,22 +938,28 @@ class NotePolicy(nn.Module):
             k = _lin(self.critic_k, hv)
             v = _lin(self.critic_v, hv)
         nh, dh = self.n_heads, d // self.n_heads
-        q = q.view(B, 1, nh, dh).transpose(1, 2)
-        k = k.view(B, T, nh, dh).transpose(1, 2)
-        v = v.view(B, T, nh, dh).transpose(1, 2)
-        if q.dtype is torch.float16:
-            # Tq = 1 fused attention under the same additive key mask
-            # the blocks use (no all-masked rows: the 3 lead lanes are
-            # always attendable). Replaces two batched matmuls whose
-            # non-collapsible (B, nh) batch strides forced hidden
-            # reshape COPIES of k and v, forward and backward.
-            a = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias.unsqueeze(1))   # (B,nh,1,dh)
+        if hv.dtype is torch.float16 and _fl.attn29_ok(T, d, nh):
+            # Tq = 1 on the T = 29 fused attention kernel (2026-09-27,
+            # fp16_linear.attn29_qkv): (B, 1, d), heads concatenated
+            a = _fl.attn29_qkv(q, kv, attn_bias).view(B, d)
         else:
-            scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
-            scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
-            a = torch.softmax(scores, dim=-1) @ v
-        a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
+            q = q.view(B, 1, nh, dh).transpose(1, 2)
+            k = k.view(B, T, nh, dh).transpose(1, 2)
+            v = v.view(B, T, nh, dh).transpose(1, 2)
+            if q.dtype is torch.float16:
+                # Tq = 1 fused attention under the same additive key mask
+                # the blocks use (no all-masked rows: the 3 lead lanes
+                # are always attendable). Replaces two batched matmuls
+                # whose non-collapsible (B, nh) batch strides forced
+                # hidden reshape COPIES of k and v, forward and backward.
+                a = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias.unsqueeze(1))  # (B,nh,1,dh)
+            else:
+                scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
+                scores = scores + attn_bias.unsqueeze(1)    # (B, nh, 1, T)
+                a = torch.softmax(scores, dim=-1) @ v
+            a = a.transpose(1, 2).reshape(B, d)
+        a = _lin(self.critic_out, a)
         logits = _seq(self.critic_mlp, torch.cat([a, h], dim=-1)).float()
         # HL-Gauss: bins -> expectation; the (B, K) logits are kept for
         # the update's cross-entropy (grad-enabled calls only)

@@ -519,7 +519,18 @@ at::Tensor dgrad_drelu(at::Tensor g, at::Tensor w, at::Tensor mask) {
 
 }  // namespace
 
+// small_attn.cu (T = 29 fused attention, 2026-09-27)
+at::Tensor attn29_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
+                      at::Tensor bias);
+void attn29_bwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor bias,
+                at::Tensor dout, at::Tensor dq, at::Tensor dk, at::Tensor dv);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("attn29_fwd", &attn29_fwd,
+        "fused 4-head x 48 attention over 29 keys (TQ = 29/5/1 queries), "
+        "additive fp16 key bias -> contiguous (B, TQ, 192) fp16");
+  m.def("attn29_bwd", &attn29_bwd,
+        "attn29 backward: writes dq/dk/dv into the given strided views");
   m.def("linear_relu_aux", &linear_relu_aux,
         "(y, mask): y = relu(x @ w^T + b) fp16 + its ReLU bitmask, one "
         "cublasLt GEMM (RELU_AUX_BIAS); [] if unsupported");
