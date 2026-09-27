@@ -44,6 +44,8 @@ mod tests_oracle;
 mod tests_pendulum;
 #[cfg(test)]
 pub(crate) mod tests_soak;
+#[cfg(test)]
+mod tests_tree;
 
 use model::Model;
 
@@ -150,8 +152,18 @@ pub struct Workspace {
     pub p: Vec<[Real; 3]>,   // world origin per frame
     pub axw: Vec<[Real; 3]>, // world revolute axis per frame
     // dense matrices (row-major nv×nv)
-    pub m: Vec<Real>, // mass matrix
-    pub l: Vec<Real>, // Cholesky factor (lower)
+    pub m: Vec<Real>, // mass matrix (v-order; CRBA output, lower triangle read)
+    /// Cholesky factor of M in the audit-#10 ELIMINATION order (e-order,
+    /// row-major nv×nv, only the profile of `tc` written/read) — step 5
+    /// factors `m` into it; `m` keeps M for the rest of the substep.
+    pub l: Vec<Real>,
+    /// audit #10: the elimination layout `l` is factored in (the
+    /// fill-free leaves-first tree order; tests may swap in
+    /// `TreeChol::dense` to reproduce the old root-first arithmetic).
+    pub tc: algo::TreeChol,
+    /// e-order scratch for the single-vector solves (`tc_solve_v`,
+    /// `tc_solve_unit_v`) — the dedicated-scratch rule of solver.rs R23.
+    pub esc: Vec<Real>,
     // vectors (nv)
     pub c: Vec<Real>,     // RNEA output / bias forces
     pub rhs: Vec<Real>,   // tau − c, then the accel after the solve
@@ -225,6 +237,8 @@ impl Workspace {
             axw: vec![[0.0; 3]; nf],
             m: vec![0.0; nv * nv],
             l: vec![0.0; nv * nv],
+            tc: algo::TreeChol::tree(model),
+            esc: vec![0.0; nv],
             c: vec![0.0; nv],
             rhs: vec![0.0; nv],
             vstar: vec![0.0; nv],
