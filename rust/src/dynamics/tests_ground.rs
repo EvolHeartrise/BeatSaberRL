@@ -6,9 +6,10 @@
 //!
 //! §5 (a) settle, (b) no-pull + weight support, (c) static friction
 //! (40 N holds / 1000 N slides; hold arm 100 -> 40 N at the
-//! 2026-08-20 torque softening), (e) bitwise determinism, (f) weld
-//! regression. §5 (d) fall termination is an ENV-layer gate and lives in
-//! lib.rs `env_tests` beside its root-escape twin.
+//! 2026-08-20 torque softening), (e) bitwise determinism. (§5 (f), the
+//! weld-mode regression, retired with the weld harness on 2026-09-27.)
+//! §5 (d) fall termination is an ENV-layer gate and lives in lib.rs
+//! `env_tests` beside its root-escape twin.
 
 use super::collide::{
     ground_phase, GroundContact, CORNERS_PER_FOOT, GROUND_CORNERS, GROUND_FRAMES, MARGIN,
@@ -25,8 +26,8 @@ const BODY_MASS: f64 = 74.50;
 const WEIGHT: f64 = BODY_MASS * super::model::G;
 
 fn contact_set(m: &super::model::Model) -> ConstraintSet {
-    // contact spec §1: foot_mode = 1 drops the 12 weld rows
-    ConstraintSet::new_modes(m, false, true, true)
+    // self-collision rows + the ground block (contact spec §1/§3)
+    ConstraintSet::new(m, true, true)
 }
 
 /// Reference-pose sanity for the §2 geometry: all 8 sole corners sit at
@@ -64,13 +65,12 @@ fn ground_corners_touch_at_reference() {
 /// AMBIGUITY RESOLVED (recorded, not silently deviated from): the spec
 /// says "zero gears", and a gear is an ACTION (§1.4 torque fraction) —
 /// but the raw v10 body has no postural controller at all, and with the
-/// feet unwelded it is a free inverted pendulum on frictionless-hinge
+/// feet on the ground it is a free inverted pendulum on frictionless-hinge
 /// ankles: the reference-pose COM sits ~38 mm forward of the ankle axis,
-/// so 0 N·m of ankle torque topples it in well under a second. That is
-/// true of the WELDED body too — "the raw unstabilized body simply falls
-/// over" is the oracle README's own note, and every existing stance gate
-/// (`stance_weld_force_sum`, `weld_under_two_arm_swing`) therefore runs
-/// the oracle muscle-tone protocol. This gate does the same: zero GEAR
+/// so 0 N·m of ankle torque topples it in well under a second — "the raw
+/// unstabilized body simply falls over" is the oracle README's own note,
+/// and the v10 stance gates on the (since removed) welded body therefore
+/// ran the oracle muscle-tone protocol. This gate does the same: zero GEAR
 /// torque, muscle-tone stance holding the joints at neutral. What it
 /// tests is the ground block — that the contacts carry the body, do not
 /// sink and do not let the feet slide — which is what §5 (a) is for.
@@ -336,56 +336,6 @@ fn contact_mode_determinism_bitwise() {
     println!("contact determinism: {} words bit-identical across two runs", ba.len());
 }
 
-/// Gate §5 (f) WELD REGRESSION, direct form: `foot_mode` = 0 assembles
-/// ZERO ground rows and produces a trajectory bit-identical to the
-/// pre-v11 constructor's. (The full evidence is the rest of the suite
-/// passing unchanged; this pins the switch itself.)
-#[test]
-fn weld_mode_is_untouched_by_the_ground_block() {
-    let m = &HUMANOID;
-    let run = |ground_ctor: bool| {
-        let mut ws = Workspace::new(m);
-        let mut st = State::neutral(m);
-        let mut cs = if ground_ctor {
-            ConstraintSet::new_modes(m, true, true, false)
-        } else {
-            ConstraintSet::new(m, true, true)
-        };
-        let mut rng = super::testutil::Rng(0x5EED_0000_0000_0B22);
-        let mut tau = [0.0; NQ];
-        let mut bits: Vec<u64> = Vec::new();
-        for tick in 0..120 {
-            if tick % 8 == 0 {
-                for j in 0..NQ {
-                    let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
-                    tau[j] = g * m.tau_max[j];
-                }
-            }
-            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
-            assert_eq!(cs.ground_rows(), 0, "weld mode assembled a ground row");
-            assert!(cs.ground_contacts.is_empty());
-            for j in 0..NQ {
-                bits.push(st.q[j].to_bits());
-            }
-            for r in 0..cs.nrows {
-                bits.push(cs.lambda[r].to_bits());
-            }
-        }
-        bits
-    };
-    assert_eq!(run(false), run(true), "the foot_mode switch moved weld physics");
-}
-
-/// The mode flag is a SWITCH (contact spec §1): welds and ground rows
-/// are never both live — the weld-null projection would not cover the
-/// ground impulses.
-#[test]
-#[should_panic(expected = "exclusive")]
-fn welds_and_ground_are_mutually_exclusive() {
-    let _ = ConstraintSet::new_modes(&HUMANOID, true, true, true);
-}
-
-
 /// v14 GATE — CoP consistency (2026-08-10 audit finding #2: no gate
 /// ever checked MOMENT balance, so a phantom moment subsidy was
 /// invisible to the force-only §5 (b) gate). In the settled muscle-tone
@@ -591,7 +541,6 @@ fn batched_row_solves_bitwise() {
         let nv = st.v.len();
         let nlim = cs.limit_rows();
         let ndense = cs.nrows - nlim;
-        assert_eq!(cs.weld_rows(), 0);
         wide_lim += (nlim >= 8) as usize;
         let mut x = vec![0.0; nv];
         for row in cs.ground_rows()..ndense {

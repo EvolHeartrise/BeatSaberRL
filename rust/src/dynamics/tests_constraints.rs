@@ -1,7 +1,13 @@
-//! P2 constraint gates: static stance (full-RNEA hold + muscle-tone
-//! weld force sum), weld drift under load (random full gears; scripted
-//! two-arm swing), non-penetration + unilaterality of the contact rows,
-//! no energy injection, and bitwise determinism with contacts.
+//! P2 constraint gates: static stance (full-RNEA hold on the free-
+//! floating body), ground integrity under random full gears and under a
+//! scripted two-arm swing, non-penetration + unilaterality of the
+//! contact rows, no energy injection, bitwise determinism with contacts,
+//! and the solver's structural bitwise claims (R10 / R13 / R23).
+//!
+//! The v10 versions of the stance / drift / swing gates ran on the
+//! welded-feet harness (removed 2026-09-27, issue #2); the ground-block
+//! gates that replace their weight-support half live in tests_ground.rs
+//! (`no_pull_and_weight_is_carried`, `settle_stands_for_five_seconds`).
 //!
 //! The muscle-tone scenarios follow the oracle protocol (README): the
 //! stabilizer's near-critical kd is applied IMPLICITLY
@@ -10,11 +16,10 @@
 //! (spec damping b, ω caps) never needs this.
 
 use super::algo::energy;
-use super::fk::{fk_all, rot_log};
+use super::fk::fk_all;
 use super::model::{HUMANOID, NQ};
 use super::solver::{
     substep_constrained, substep_constrained_damped, substep_constrained_wrench, ConstraintSet,
-    WELD_FRAMES, WELD_TARGET_P,
 };
 use super::testutil::{gravity_comp, muscle_gains, muscle_model, Rng};
 use super::{State, Workspace};
@@ -22,120 +27,61 @@ use super::{State, Workspace};
 const H: f64 = 1.0 / 240.0;
 const DEG: f64 = std::f64::consts::PI / 180.0;
 
-/// Max (position, orientation) weld violation over both feet at the
-/// CURRENT state (fresh FK into ws).
-fn weld_violation(m: &super::model::Model, st: &State, ws: &mut Workspace) -> (f64, f64) {
-    fk_all(m, st, ws);
-    let mut wp = 0.0f64;
-    let mut wr = 0.0f64;
-    for (widx, &frame) in WELD_FRAMES.iter().enumerate() {
-        let p = ws.p[frame];
-        let t = WELD_TARGET_P[widx];
-        let dp = [(p[0] - t[0]), (p[1] - t[1]), (p[2] - t[2])];
-        wp = wp.max((dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]).sqrt());
-        let phi = rot_log(&ws.r[frame]);
-        wr = wr.max((phi[0] * phi[0] + phi[1] * phi[1] + phi[2] * phi[2]).sqrt());
-    }
-    (wp, wr)
+/// The env's constraint set: self-collision rows + the ground block.
+fn contact_set(m: &super::model::Model) -> ConstraintSet {
+    ConstraintSet::new(m, true, true)
 }
 
-/// Gate (a1), stance protocol (oracle check_static b2): welds on,
+/// Gate (a), stance protocol (oracle check_static b2) on the FREE-
+/// FLOATING body (no ground; the v10 gate held the welded body):
 /// constant full 35-DoF RNEA(q_ref, 0, 0) compensation INCLUDING the
-/// root wrench (joint-rows-only is not an equilibrium of the welded
-/// closed chain), 2 s at h = 1/240. The compensation cancels gravity
-/// bitwise, so drift is rounding noise on a knife-edge equilibrium —
-/// the equilibrium is UNSTABLE (constant-torque inverted-pendulum
-/// modes; measured e-fold ~0.35 s from 1e-17 seeds), which is why the
-/// horizon is the protocol's 2 s and not SPEC §7 P2's 10 s (Divergences
-/// §17). Task gate < 5e-2 rad; measured ~1e-13.
+/// root wrench, 2 s at h = 1/240. The compensation cancels gravity
+/// bitwise, so drift is rounding noise on a knife-edge equilibrium
+/// (constant-torque modes are unstable — measured e-fold ~0.35 s from
+/// 1e-17 seeds on the welded body), which is why the horizon is the
+/// protocol's 2 s and not SPEC §7 P2's 10 s (Divergences §17). Pins the
+/// RNEA / CRBA / constraint-stage consistency: joints AND root stay put.
 #[test]
 fn static_stance_full_rnea_hold() {
     let m = &HUMANOID;
     let mut ws = Workspace::new(m);
     let mut st = State::neutral(m);
+    let p0 = st.p;
     let (wrench, tau) = gravity_comp(&[0.0; NQ]);
-    let mut cs = ConstraintSet::new(m, true, true);
+    let mut cs = ConstraintSet::new(m, true, false);
     let mut max_drift = 0.0f64;
-    let mut max_wp = 0.0f64;
-    let mut max_wr = 0.0f64;
+    let mut max_root = 0.0f64;
     for _ in 0..480 {
         substep_constrained_wrench(m, &mut st, &tau, &wrench, H, &mut ws, &mut cs);
         for j in 0..NQ {
             max_drift = max_drift.max(st.q[j].abs());
         }
-        let (wp, wr) = weld_violation(m, &st, &mut ws);
-        max_wp = max_wp.max(wp);
-        max_wr = max_wr.max(wr);
-    }
-    println!(
-        "static stance 2 s: max joint drift {max_drift:e} rad, weld violation {max_wp:e} m / {max_wr:e} rad"
-    );
-    assert!(max_drift <= 1e-6, "joint drift {max_drift:e}");
-    assert!(max_wp <= 1e-8, "weld position violation {max_wp:e}");
-    assert!(max_wr <= 1e-8, "weld orientation violation {max_wr:e}");
-}
-
-/// Gate (a2), oracle protocol check_static (c): muscle-tone spring
-/// stance (kp = τ_max/0.2 to neutral, near-critical kd implicit),
-/// settle 4 s, then the vertical weld constraint forces must sum to
-/// body weight 735.95 N within 5 % over the next second.
-#[test]
-fn stance_weld_force_sum() {
-    let m = muscle_model();
-    let (kp, kd) = muscle_gains();
-    let mut ws = Workspace::new(&m);
-    let mut st = State::neutral(&m);
-    let mut cs = ConstraintSet::new(&m, true, true);
-    let mut tau = [0.0; NQ];
-    let mut run = |st: &mut State, ws: &mut Workspace, cs: &mut ConstraintSet, n: usize| -> f64 {
-        let mut fy_sum = 0.0;
-        for _ in 0..n {
-            for j in 0..NQ {
-                tau[j] = kp[j] * (0.0 - st.q[j]);
-            }
-            substep_constrained_damped(&m, st, &tau, &kd, H, ws, cs);
-            // weld linear-y rows: 1 (foot_l) and 7 (foot_r); force = λ/h
-            fy_sum += (cs.lambda[1] + cs.lambda[7]) / H;
+        for k in 0..3 {
+            max_root = max_root.max((st.p[k] - p0[k]).abs());
         }
-        fy_sum / n as f64
-    };
-    run(&mut st, &mut ws, &mut cs, 960); // 4 s settle
-    let fy = run(&mut st, &mut ws, &mut cs, 240); // 1 s measure
-    let droop = st.q.iter().fold(0.0f64, |a, q| a.max(q.abs()));
-    let weight = 74.50 * 9.81;
-    println!(
-        "muscle-tone stance: mean vertical weld force {fy:.2} N (weight {weight:.2}), max droop {droop:.4} rad"
-    );
-    assert!(
-        (fy - weight).abs() <= 0.05 * weight,
-        "vertical weld force {fy:.2} vs weight {weight:.2}"
-    );
+    }
+    println!("static stance 2 s (floating): max joint drift {max_drift:e} rad, root drift {max_root:e} m");
+    assert!(max_drift <= 1e-6, "joint drift {max_drift:e}");
+    assert!(max_root <= 1e-6, "root drift {max_root:e}");
 }
 
-/// Gate (b): 10 s of per-tick random FULL-gear torques on all 29
-/// (fixed seed), welds + contacts live, raw production body (spec
-/// damping, ω caps active — this doubles as the integrability stress
-/// test). Feet must stay put at every substep, no NaN, root sane.
-///
-/// Gate re-reading (Divergences §17): the original < 2 mm bound is
-/// below the velocity-level + Baumgarte(β = 0.2) formulation's
-/// intrinsic floor for THIS input — with leg joints riding their
-/// 16 rad/s caps the per-substep linearization error is O(h²·q̇²·L)
-/// ≈ 1.5 mm, and the steady-state violation is that divided by β.
-/// Measured 7.5 mm max (β sensitivity check: 2.5 mm at β = 1 —
-/// confirming the floor scales as predicted); gate set at 10 mm /
-/// 0.05 rad. The physically sane load regime is 100× under the spec's
-/// own 1e-4 gate (see weld_under_two_arm_swing).
+/// Gate (b): 10 s of per-tick random FULL-gear torques on all 29 (fixed
+/// seed) on the env constraint set (ground + self-collision), raw
+/// production body (spec damping, ω caps — this doubles as the
+/// integrability stress test). The body falls and thrashes on the
+/// floor; every substep must stay finite and the sole corners must not
+/// sink: the ground block's Baumgarte push-out bounds the penetration.
+/// (The v10 twin gated weld drift on the welded body.)
 #[test]
-fn weld_drift_random_full_gears() {
+fn ground_integrity_random_full_gears() {
     let m = &HUMANOID;
     let mut ws = Workspace::new(m);
     let mut st = State::neutral(m);
-    let mut cs = ConstraintSet::new(m, true, true);
+    let mut cs = contact_set(m);
     let mut rng = Rng(0x5EED_0000_0000_0020);
     let mut tau = [0.0; NQ];
-    let mut max_wp = 0.0f64;
-    let mut max_wr = 0.0f64;
+    let mut max_pen = 0.0f64;
+    let mut ground_substeps = 0usize;
     for _tick in 0..300 {
         for t in tau.iter_mut() {
             let g = [0.0, 1.0, -1.0, 0.25, -0.25][rng.next_u64() as usize % 5];
@@ -146,53 +92,45 @@ fn weld_drift_random_full_gears() {
         }
         for _ in 0..8 {
             substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
-            let (wp, wr) = weld_violation(m, &st, &mut ws);
-            max_wp = max_wp.max(wp);
-            max_wr = max_wr.max(wr);
-            // tolerance recalibrated 1e-2 -> 1.5e-2 at the 2026-08-17
-            // human-realism leg caps (hip_pitch 350 / hip_roll 180): the
-            // random-gear trajectory shifted and peaks at 1.04e-2
-            assert!(wp < 1.5e-2, "weld position violation {wp:e} m");
-            // orientation gate recalibrated 5e-2 -> 1.2e-1 at the
-            // 2026-08-20 torque pass (knee 150, legs -25%, shoulder
-            // pitch/yaw 85.38): trajectory shifted again, peaks at
-            // 8.11e-2 rad (wp 8.28e-3, root 0.96 m — bounded, finite;
-            // same Baumgarte-floor phenomenon, same ~1.5x margin)
-            assert!(wr < 1.2e-1, "weld orientation violation {wr:e} rad");
+            for c in cs.ground_contacts.iter() {
+                max_pen = max_pen.max(-c.gap);
+            }
+            ground_substeps += !cs.ground_contacts.is_empty() as usize;
             assert!(st.q.iter().all(|x| x.is_finite()));
             assert!(st.v.iter().all(|x| x.is_finite()));
+            assert!(st.p.iter().all(|x| x.is_finite()));
         }
     }
-    let dp = [
-        st.p[0] - m.base_pos0[0],
-        st.p[1] - m.base_pos0[1],
-        st.p[2] - m.base_pos0[2],
-    ];
-    let root_move = (dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]).sqrt();
     println!(
-        "random full gears 10 s: max weld violation {max_wp:e} m / {max_wr:e} rad, root moved {root_move:.3} m"
+        "random full gears 10 s (contact): max sole penetration {max_pen:.4e} m over \
+         {ground_substeps} grounded substeps, root y {:.3}, pd_hits {}",
+        st.p[1], ws.pd_hits
     );
-    // sanity: the pelvis hangs on the welded feet through ≤ 0.87 m of
-    // leg, so it can reach at most ~1.8 m from its start (deep crouch +
-    // lean is legitimate under full-gear thrash)
-    assert!(root_move < 1.8, "root wandered {root_move} m despite welds");
+    assert!(ground_substeps > 1000, "the feet barely touched the ground ({ground_substeps})");
+    assert!(max_pen < PEN_RANDOM_GEARS, "sole penetration {max_pen:e} m");
 }
+/// measured 3.47e-2 m (2026-09-27)
+const PEN_RANDOM_GEARS: f64 = 5e-2;
 
-/// SPEC-v10 §7 P2 "weld under load": scripted two-arm swinging on the
-/// muscle-tone stance (the raw unstabilized body simply falls over —
-/// oracle README), 10 s: weld pose violation ≤ 1e-4 m / 1e-4 rad
-/// (Baumgarte holds).
+/// SPEC-v10 §7 P2 "stance under load", contact mode: scripted two-arm
+/// swinging on the muscle-tone stance (the raw unstabilized body simply
+/// falls over — oracle README), 10 s. The body must keep standing on
+/// all eight corners and the soles must not creep: foot-frame
+/// horizontal drift stays under the static-friction gate's hold bound.
+/// (The v10 twin gated weld pose violation ≤ 1e-4 on the welded body.)
 #[test]
-fn weld_under_two_arm_swing() {
+fn stance_under_two_arm_swing() {
     let m = muscle_model();
     let (kp, kd) = muscle_gains();
     let mut ws = Workspace::new(&m);
     let mut st = State::neutral(&m);
-    let mut cs = ConstraintSet::new(&m, true, true);
+    let mut cs = contact_set(&m);
+    fk_all(&m, &st, &mut ws);
+    let feet0 = [ws.p[super::model::F_L_FOOT], ws.p[super::model::F_R_FOOT]];
     let mut tau = [0.0; NQ];
     let two_pi = 2.0 * std::f64::consts::PI;
-    let mut max_wp = 0.0f64;
-    let mut max_wr = 0.0f64;
+    let mut min_active = usize::MAX;
+    let mut max_slip = 0.0f64;
     for k in 0..2400usize {
         let t = k as f64 * H;
         for j in 0..NQ {
@@ -205,14 +143,24 @@ fn weld_under_two_arm_swing() {
             tau[a0 + 5] += 1.0 * (two_pi * 3.0 * t + ph).sin(); // bend
         }
         substep_constrained_damped(&m, &mut st, &tau, &kd, H, &mut ws, &mut cs);
-        let (wp, wr) = weld_violation(&m, &st, &mut ws);
-        max_wp = max_wp.max(wp);
-        max_wr = max_wr.max(wr);
+        min_active = min_active.min(cs.ground_contacts.len());
+        fk_all(&m, &st, &mut ws);
+        for (f, fr) in [super::model::F_L_FOOT, super::model::F_R_FOOT].into_iter().enumerate() {
+            let p = ws.p[fr];
+            let d = ((p[0] - feet0[f][0]).powi(2) + (p[2] - feet0[f][2]).powi(2)).sqrt();
+            max_slip = max_slip.max(d);
+        }
+        assert!(st.v.iter().all(|x| x.is_finite()));
     }
-    println!("two-arm swing 10 s: max weld violation {max_wp:e} m / {max_wr:e} rad");
-    assert!(max_wp <= 1e-4, "weld position violation {max_wp:e}");
-    assert!(max_wr <= 1e-4, "weld orientation violation {max_wr:e}");
+    println!(
+        "two-arm swing 10 s (contact): min active corners {min_active}, max foot slip {max_slip:e} m, root y {:.4}",
+        st.p[1]
+    );
+    assert_eq!(min_active, super::collide::NUM_GROUND_CORNERS, "a corner left the ground");
+    assert!(max_slip <= SLIP_SWING, "foot slip {max_slip:e} m");
 }
+/// measured 4.48e-3 m (2026-09-27)
+const SLIP_SWING: f64 = 1e-2;
 
 // ── contact-press scenarios (oracle check_contacts protocol) ─────────
 
@@ -271,9 +219,9 @@ fn run_press(
             tau[j] += e;
         }
         substep_constrained_damped(&m, st, &tau, &kd, H, ws, cs);
-        let nweld = cs.weld_rows();
+        let nground = cs.ground_rows();
         for (i, c) in cs.contacts.iter().enumerate() {
-            let row = nweld + i;
+            let row = nground + i;
             let lam = cs.lambda[row];
             stats.max_pen = stats.max_pen.max(-c.gap);
             stats.pair_impulse[c.pair] += lam;
@@ -348,6 +296,13 @@ fn contact_press_non_penetration() {
 /// substep; the implicit kd only dissipates) plus the Baumgarte bound;
 /// windowed drift ≤ 1 J over any 1 s window (SPEC-v10 §7 P2). Reports
 /// the measured bounds.
+///
+/// Runs on the FREE-FLOATING body (self-collision rows, no ground): the
+/// gate is about the pair rows, and the v10 version's welds were exact
+/// bilateral rows that did no work. On the env constraint set the
+/// ground block's box-clamped friction sweep is not exactly dissipative
+/// per substep at 12 iterations (measured 9e-6 J over one substep of
+/// this press, 2026-09-27) — ground energy is gated by tests_ground.rs.
 #[test]
 fn energy_no_injection_contact_press() {
     let m = muscle_model();
@@ -357,7 +312,7 @@ fn energy_no_injection_contact_press() {
     let mut ws = Workspace::new(&m);
     let mut st = State::neutral(&m);
     st.q.copy_from_slice(&pose);
-    let mut cs = ConstraintSet::new(&m, true, true);
+    let mut cs = ConstraintSet::new(&m, true, false);
     let mut tau = [0.0; NQ];
     let n = 480usize;
     let mut excess = vec![0.0f64; n]; // ΔE − W per substep
@@ -445,127 +400,6 @@ fn determinism_with_contacts() {
     assert_eq!(la, lb, "impulse stream differs");
 }
 
-/// Gate (R9): the WELD-JACOBIAN SUPPORT claim the segmented weld dots
-/// rest on, plus a dense-vs-segmented bit-equality soak.
-///
-/// Two things are pinned:
-///  1. STRUCTURE — every weld row is `fill(0.0)` + writes on the
-///     free-base columns and the welded foot's ancestor chain, so the
-///     columns outside `{0..6} ∪ chain` hold the memset's +0.0 EXACTLY
-///     (sign bit clear, not merely `== 0.0`). Both the CHEAP tier's
-///     claim (columns 6..23 dead in all 12 rows) and the FULL tier's
-///     (23..29 dead in rows 6..12, 29..35 dead in rows 0..6) are
-///     asserted, so the record survives whichever tier ships.
-///  2. ARITHMETIC — the shipped segmented dot reproduces the dense one
-///     bit for bit on the live `jwt` of every solve, over probe vectors
-///     including the state itself, ±1 unit columns (the −0.0 channel's
-///     only way in) and random dense vectors.
-#[test]
-fn r9_weld_support_and_segmented_dot_bitwise() {
-    let m = &HUMANOID;
-    let nv = m.nv();
-    let voff = m.voff();
-    // ancestor chains of the two welded foot frames, as v-columns
-    let chain = |frame: usize| -> Vec<usize> {
-        let mut out = vec![];
-        let mut k = frame as i32;
-        while k >= 0 {
-            let fr = &m.frames[k as usize];
-            if fr.coord >= 0 {
-                out.push(voff + fr.coord as usize);
-            }
-            k = fr.parent;
-        }
-        out.sort_unstable();
-        out
-    };
-    let cl = chain(WELD_FRAMES[0]);
-    let cr = chain(WELD_FRAMES[1]);
-    assert_eq!(cl, (23..29).collect::<Vec<_>>(), "left-foot chain columns");
-    assert_eq!(cr, (29..35).collect::<Vec<_>>(), "right-foot chain columns");
-
-    let mut rng = Rng(0x0000_0009_5EED_0090);
-    let mut solves = 0usize;
-    let mut probes = 0usize;
-    for state_i in 0..24 {
-        let mut st = super::testutil::random_state(m, &mut rng, true);
-        let mut ws = Workspace::new(m);
-        let mut cs = ConstraintSet::new(m, true, true);
-        let mut tau = [0.0f64; NQ];
-        for k in 0..40 {
-            if k % 8 == 0 {
-                for j in 0..NQ {
-                    let s = match rng.next_u64() % 3 {
-                        0 => 0.0,
-                        1 => 1.0,
-                        _ => -1.0,
-                    };
-                    tau[j] = s * m.tau_max[j];
-                }
-            }
-            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
-            if !st.v.iter().all(|x| x.is_finite()) {
-                break; // the support claim is a finite-trajectory one
-            }
-            solves += 1;
-            // (1) structure: dead columns are EXACTLY +0.0
-            let j = cs.weld_j();
-            let jwt = cs.weld_jwt();
-            for r in 0..12 {
-                let live: &[usize] = if r < 6 { &cl } else { &cr };
-                for i in 0..nv {
-                    let x = j[r * nv + i];
-                    assert_eq!(
-                        jwt[i * 12 + r].to_bits(),
-                        x.to_bits(),
-                        "jwt transpose mismatch at row {r} col {i}"
-                    );
-                    if i < 6 || live.contains(&i) {
-                        continue;
-                    }
-                    assert_eq!(
-                        x.to_bits(),
-                        0.0f64.to_bits(),
-                        "state {state_i} substep {k}: weld row {r} column \
-                         {i} is {x} — outside the R9 support"
-                    );
-                }
-            }
-            // (2) arithmetic: segmented == dense, bit for bit
-            let mut probe_vecs: Vec<Vec<f64>> = vec![st.v.to_vec()];
-            for c in [0usize, 5, 6, 22, 23, 29, 34] {
-                let mut e = vec![0.0f64; nv];
-                e[c] = if c % 2 == 0 { 1.0 } else { -1.0 };
-                probe_vecs.push(e);
-            }
-            let mut dense_rand = vec![0.0f64; nv];
-            for x in dense_rand.iter_mut() {
-                *x = rng.range(-1e3, 1e3);
-            }
-            probe_vecs.push(dense_rand);
-            for pv in probe_vecs.iter() {
-                let (dense, seg) = cs.weld_dot_ref_vs_segmented(pv);
-                for w in 0..12 {
-                    assert_eq!(
-                        dense[w].to_bits(),
-                        seg[w].to_bits(),
-                        "state {state_i} substep {k} lane {w}: segmented \
-                         {} != dense {}",
-                        seg[w],
-                        dense[w]
-                    );
-                }
-                probes += 1;
-            }
-        }
-    }
-    println!(
-        "R9 support gate: {solves} solves, {probes} dense-vs-segmented \
-         12-lane dots, all bit-identical"
-    );
-    assert!(solves > 500, "corpus too small ({solves} solves)");
-}
-
 /// Gate (R10): the RANK-1 LIMIT-ROW claim the three closed forms rest
 /// on, plus a dense-vs-closed bit-equality soak — and a direct pin on
 /// the `0.0 +` zero-sign guard.
@@ -614,7 +448,7 @@ fn r10_limit_rows_are_rank1_and_closed_form_is_bitwise() {
                 break; // the closed forms are a finite-trajectory claim
             }
             solves += 1;
-            let ndense = cs.weld_rows() + cs.contacts.len();
+            let ndense = cs.ground_rows() + cs.contacts.len();
             let limset: Vec<(usize, f64)> = cs.limit_set().to_vec();
             assert_eq!(limset.len(), cs.limit_rows(), "limit row bookkeeping");
             // (1) structure: rank-1, +0.0 everywhere but the pivot
@@ -687,22 +521,19 @@ fn r10_limit_rows_are_rank1_and_closed_form_is_bitwise() {
     );
 }
 
-/// Gate (R13): the weld block's `minvjt` rows and the `wt` staging
-/// buffer are WRITE-BEFORE-READ within a solve — the property that
-/// makes R13's two deleted passes dead work.
+/// Gate (R13): the solve's staging scratch — every `minvjt` row and
+/// the `wt` RHS-minor buffer — is WRITE-BEFORE-READ within a solve.
 ///
-/// Before R13, `minvjt` rows 0..12 were seeded from `j` and then fully
-/// overwritten by the RHS-MINOR transpose-back, and `wt` was a separate
-/// `copy_from_slice` of `jwt` that the fused transpose now writes
-/// directly. Both deletions are safe only if nothing in a solve ever
-/// reads a word of those regions that the solve did not itself write.
-/// This runs the same random-gear trajectory twice — once clean, once
-/// with both regions poisoned to NaN before EVERY substep — and demands
-/// bit-identical state and impulse streams. A surviving NaN would
-/// contaminate the weld impulses immediately and the whole state within
-/// a substep, so the gate is sharp.
+/// R13 (2026-08-07) deleted a `j → minvjt` seed copy and a separate
+/// `wt` copy pass as dead work on the (since removed) weld block; the
+/// batched ground / pair / limit solves that remain rely on the same
+/// property. This runs the same random-gear trajectory twice — once
+/// clean, once with both regions poisoned to NaN before EVERY substep —
+/// and demands bit-identical state and impulse streams. A surviving NaN
+/// would contaminate the impulses immediately and the whole state
+/// within a substep, so the gate is sharp.
 #[test]
-fn r13_weld_scratch_is_write_before_read() {
+fn r13_solve_scratch_is_write_before_read() {
     let m = &HUMANOID;
     let mut rng = Rng(0x0000_000D_5EED_0130);
     // one fixed torque schedule, replayed by both runs
@@ -732,7 +563,7 @@ fn r13_weld_scratch_is_write_before_read() {
             for k in 0..40 {
                 let tau = &sched[state_i * 5 + k / 8];
                 if poison {
-                    cs.poison_weld_scratch();
+                    cs.poison_solve_scratch();
                 }
                 substep_constrained(m, &mut st, tau, H, &mut ws, &mut cs);
                 if !st.v.iter().all(|x| x.is_finite()) {
@@ -753,13 +584,12 @@ fn r13_weld_scratch_is_write_before_read() {
     assert!(clean.len() > 50_000, "corpus too small ({})", clean.len());
     assert_eq!(
         clean, poisoned,
-        "poisoning minvjt's weld rows / wt changed the trajectory — the \
-         weld block does NOT write them all before reading, so R13's \
-         deleted seed copy was load-bearing"
+        "poisoning minvjt / wt changed the trajectory — a solve reads \
+         a scratch word it did not write first"
     );
     println!(
         "R13 write-before-read gate: {} recorded words, identical with the \
-         weld scratch poisoned to NaN before every substep",
+         solve scratch poisoned to NaN before every substep",
         clean.len()
     );
 }
@@ -777,14 +607,13 @@ fn r13_weld_scratch_is_write_before_read() {
 // performance findings rather than open correctness questions.
 //
 // The gates are built exactly the way R13's
-// `poison_weld_scratch` verified its two — fill the region the shipping
+// poison gate verified its two — fill the region the shipping
 // build stops writing with NaN in a TEST build (where the stores are
 // still compiled in, so the poison genuinely replaces live data) and
 // require the trajectory back BIT FOR BIT. Any surviving reader turns
 // the run into NaN on the first substep, so the gate is sharp rather
-// than statistical. The fifth (c, `jwt`'s dead column block) is not a
-// poison case at all: those words are asserted to be the exact `+0.0`
-// BYTES, which is why skipping their stores needs no cfg gate.
+// than statistical. The fifth (c, a dead column block of the weld
+// Jacobian) left with the weld harness on 2026-09-27.
 //
 // The recorded corpus is q/v/p plus every row impulse, plus `energy`
 // and `momentum` at each tick — the two functions that still own the
@@ -901,61 +730,5 @@ fn r23_dead_regions_have_no_reader() {
         "R23 dead-region gate: {} recorded words, identical under all \
          five NaN poisonings",
         clean.len()
-    );
-}
-
-#[test]
-fn r23c_jwt_dead_columns_are_exactly_plus_zero() {
-    // R23c rests on a BYTE claim, not a value claim: `jwt`'s columns
-    // W_BASE_HI..W_L_LO are +0.0 in every one of the 12 weld rows for
-    // every solve (R9's support argument), and `jwt` is written nowhere
-    // else, so the words the transpose loop stops storing keep the
-    // `vec![0.0; ..]` bytes they were constructed with. Checked here on
-    // LIVE solves, together with the dense weld rows they mirror.
-    let m = &HUMANOID;
-    let (lo, hi) = ConstraintSet::WELD_DEAD_COLS;
-    let nv = m.nv();
-    let mut rng = Rng(0x0000_0023_5EED_23C0);
-    let mut checks = 0usize;
-    for _ in 0..12 {
-        let mut st = super::testutil::random_state(m, &mut rng, true);
-        let mut ws = Workspace::new(m);
-        let mut cs = ConstraintSet::new(m, true, true);
-        for _ in 0..20 {
-            let mut tau = [0.0f64; NQ];
-            for j in 0..NQ {
-                tau[j] = rng.range(-1.0, 1.0) * m.tau_max[j];
-            }
-            substep_constrained(m, &mut st, &tau, H, &mut ws, &mut cs);
-            if !st.v.iter().all(|x| x.is_finite()) {
-                break;
-            }
-            for (i, x) in cs.weld_jwt_dead_block().iter().enumerate() {
-                assert_eq!(
-                    x.to_bits(),
-                    0u64,
-                    "jwt dead block word {i} is {x:?}, not the +0.0 BYTES \
-                     R23c skips its store on"
-                );
-            }
-            let j = cs.weld_j();
-            for r in 0..12 {
-                for c in lo..hi {
-                    assert_eq!(
-                        j[r * nv + c].to_bits(),
-                        0u64,
-                        "weld row {r} column {c} is not +0.0 — R9's \
-                         support argument (and R23c with it) is broken"
-                    );
-                }
-            }
-            checks += 1;
-        }
-    }
-    assert!(checks > 100, "too few live solves checked ({checks})");
-    println!(
-        "R23c: {checks} solves × 12 rows × {} dead columns all exactly \
-         +0.0 bytes",
-        hi - lo
     );
 }

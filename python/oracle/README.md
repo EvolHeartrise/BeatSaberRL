@@ -78,9 +78,16 @@ Expected: `max |ref - mujoco| ≈ 1.3e-15` (gate ≤ 1e-8). Also asserts the
 
 ## gen_reference.py — refdata/*.json
 
-5 scenarios × 1 s × 240 substeps at h = 1/240, welds on, per-substep
-qpos(36)/qvel(35) at full JSON precision, plus the applied pattern
-torque `tau29` per substep (actuated §1.4 order):
+5 scenarios × 1 s × 240 substeps at h = 1/240 on the FREE-FLOATING
+body (the MJCF's foot welds deactivated at load, `eq_active0 = 0`; the
+floor never collides — every geom is contype 0 — so the body falls
+freely), per-substep qpos(36)/qvel(35) at full JSON precision, plus the
+applied pattern torque `tau29` per substep (actuated §1.4 order).
+Regenerated 2026-09-27 when the engines dropped the v10 foot welds
+(issue #2): `tests_oracle.rs` replays them with
+`ConstraintSet::new(m, contacts = true, ground = false)`. (The welds stay
+in the MJCF for the check_static.py statics gates, which are
+MuJoCo-internal.)
 
 | file | scenario |
 |---|---|

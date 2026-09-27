@@ -40,8 +40,10 @@ pub const SLOP_LIMIT: Real = 0.002;
 /// h·ω_cap ≈ 0.17 rad — so its rare reaction-free clamp is a bounded
 /// safety net of the root-envelope class, not part of the physics.
 pub const LIMIT_TELEPORT_BACKSTOP: Real = 0.35;
-/// Step-12 root velocity envelope (P3 — Divergences §19): the welded
-/// humanoid's root reaches the ground through a 6-revolute leg chain
+/// Step-12 root velocity envelope (P3 — Divergences §19; derived on the
+/// v10 welded-feet body, and it still bounds a standing body — a falling
+/// one terminates on the env's FALL_ROOT_Y): the humanoid's root
+/// reaches the ground through a 6-revolute leg chain
 /// whose rates are capped at 16 rad/s each, so |ω_root| ≤ 96 rad/s and
 /// the linear velocity is bounded by the same rates × the ≤ ~0.5 m
 /// root–foot levers (48 m/s). Beyond = solver artifact (see step 12).
@@ -170,8 +172,8 @@ pub fn substep_opts(
 
     // ── constraint stage (§3 steps 7–9) via the hook ───────────────
     // 7. collision detection (55-pair table, margin 0.01)
-    // 8. PGS, 12 iterations, fixed row order (welds — or, in env v11
-    //    contact mode, the ground block — then contacts, then limits)
+    // 8. PGS, 12 iterations, fixed row order (the ground block, then
+    //    contacts, then limits, then the ω-cap pass)
     // 9. v ← v* + M⁻¹Jᵀλ
     // Implemented by solver::ConstraintSet::solve (P2); None = the
     // unconstrained pipeline.
