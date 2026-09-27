@@ -556,6 +556,151 @@ def ext_ok():
     return _load() is not None
 
 
+# --- Linear-ReLU-...-Linear chains with the ReLU in GEMM epilogues --------
+# (2026-09-27, #7a.) Every fp16 ReLU on this network sits BETWEEN two
+# Linears (block FFN ffn.0 -> ffn.2, the four encoder MLPs, SimBa trunk
+# fc1 -> fc2, the critic MLP). A chain runs each Linear+ReLU forward as
+# ONE cuBLASLt GEMM with the RELU_AUX_BIAS epilogue (output + a 1-bit
+# ReLU mask), and in the backward the NEXT Linear's dgrad GEMM (g @ W)
+# takes the DRELU epilogue: it applies the mask as it stores. The
+# standalone relu_bwd pass (read g + y, write gm: ~7.5 ms of a production
+# minibatch at the 768-wide ffn hidden) disappears; the ReLU layer's db
+# comes from its own wgrad GEMM (_wgrad_db: BGRADB epilogue at >= 64k
+# rows, else a torch column sum over the small gm). The post-ReLU y is
+# still saved, for the next Linear's wgrad.
+# Rollout and update run the SAME forward GEMM (the grad-free path also
+# calls linear_relu_aux and drops the mask), so rollout/update logp
+# agreement (r1) keeps its footing. Numerics vs the _Fp16LinearReLU path:
+# forward near-tie (Lt kernel choice; the fp16 bias replica rides the
+# epilogue in both), gm near-tie (the dgrad GEMM's kernel), db fp32 from
+# the BGRADB epilogue / torch sum instead of relu_bwd's partials.
+
+
+def _chain_forward(x2, ms, tail_bias, ext):
+    """Forward over the chain; returns (out, inputs, masks) or None when
+    an Lt plan is unavailable (caller falls back)."""
+    h = x2
+    ins, masks = [], []
+    n = len(ms)
+    for i, m in enumerate(ms):
+        wh, bh = _half_params(m.weight, m.bias)
+        ins.append(h)
+        if i < n - 1:
+            r = ext.linear_relu_aux(h, wh, bh)
+            if not r:
+                return None
+            h, mk = r
+            masks.append(mk)
+        elif tail_bias:
+            h = torch.addmm(bh, h, wh.t())
+        else:
+            h = torch.mm(h, wh.t())
+    return h, ins, masks
+
+
+class _Fp16ReluChain(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, ms, tail_bias, *params):
+        x2 = x.reshape(-1, x.shape[-1])
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
+        out, ins, masks = _chain_forward(x2, ms, tail_bias, _load())
+        ctx.save_for_backward(*ins, *masks)
+        ctx.ms = ms
+        ctx.tail_bias = tail_bias
+        ctx.lead = x.shape[:-1]
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    @staticmethod
+    def backward(ctx, gy):
+        ms = ctx.ms
+        n = len(ms)
+        saved = ctx.saved_tensors
+        ins, masks = saved[:n], saved[n:]
+        ext = _load()
+        g = gy.reshape(-1, gy.shape[-1])
+        if not g.is_contiguous():
+            g = g.contiguous()
+        nig = ctx.needs_input_grad
+        dws = [None] * n
+        dbs = [None] * n
+        dx = None
+        for i in range(n - 1, -1, -1):
+            # (dW, db) of layer i from its own wgrad GEMM (BGRADB epilogue
+            # at >= 64k rows), g already ReLU-masked by the dgrad below
+            dws[i], dbs[i] = _wgrad_db(
+                g, ins[i], nig[3 + i],
+                nig[3 + n + i] and (i < n - 1 or ctx.tail_bias))
+            wh = _half_params(ms[i].weight, ms[i].bias)[0]
+            if i > 0:
+                g = ext.dgrad_drelu(g, wh, masks[i - 1])
+            elif nig[0]:
+                dx = (g @ wh).view(*ctx.lead, wh.shape[1])
+        return (dx, None, None, *dws, *dbs)
+
+
+def fp16_relu_chain(x, ms, tail_bias=True):
+    """Linear(ms[0]) -> ReLU -> ... -> Linear(ms[-1]) on the fp16 stream
+    with every ReLU in a GEMM epilogue (forward RELU_AUX_BIAS, backward
+    DRELU). tail_bias=False runs the last Linear bias-free (the
+    fold_tail contract: its bias is consumed downstream). Returns None
+    when the extension lacks the Lt epilogues for these shapes (caller
+    falls back to the per-Linear path)."""
+    ext = _load()
+    if ext is None or not hasattr(ext, "linear_relu_aux"):
+        return None
+    if ms[0].in_features % 8:
+        # odd-K encoder inputs (saber 46 / torso 29 / leg 34): cuBLASLt
+        # has no fused RELU_AUX_BIAS kernel there (it appends a separate
+        # epilogue kernel), so they keep the fused RELU_BIAS forward +
+        # relu_bwd (their backward is tiny; the forward runs every tick)
+        return None
+    if not torch.is_grad_enabled():
+        x2 = x.reshape(-1, x.shape[-1])
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
+        r = _chain_forward(x2, ms, tail_bias, ext)
+        if r is None:
+            return None
+        return r[0].view(*x.shape[:-1], r[0].shape[-1])
+    # probe the plans once per shape set before committing to autograd
+    x2 = x.reshape(-1, x.shape[-1])
+    key = (x2.shape[0],) + tuple(tuple(m.weight.shape) for m in ms)
+    ok = _chain_ok.get(key)
+    if ok is None:
+        ok = _probe_chain(x2.shape[0], ms, ext)
+        _chain_ok[key] = ok
+    if not ok:
+        return None
+    ws = [m.weight for m in ms]
+    bs = [m.bias for m in ms]
+    return _Fp16ReluChain.apply(x, tuple(ms), bool(tail_bias), *ws, *bs)
+
+
+_chain_ok = {}
+
+
+def _probe_chain(R, ms, ext):
+    """True when every Lt plan of the chain exists at R rows (tiny
+    zero-size calls would not exercise the heuristic, so run R-row
+    dummies once)."""
+    dev = ms[0].weight.device
+    for i, m in enumerate(ms[:-1]):
+        H, K = m.weight.shape
+        x = torch.zeros(R, K, device=dev, dtype=torch.float16)
+        w = torch.zeros(H, K, device=dev, dtype=torch.float16)
+        b = torch.zeros(H, device=dev, dtype=torch.float16)
+        r = ext.linear_relu_aux(x, w, b)
+        if not r:
+            return False
+        M = ms[i + 1].weight.shape[0]
+        g = torch.zeros(R, M, device=dev, dtype=torch.float16)
+        w2 = torch.zeros(M, H, device=dev, dtype=torch.float16)
+        if ext.dgrad_drelu(g, w2, r[1]) is None:
+            return False
+    return True
+
+
 def fp16_linear(x, w, b):
     """Linear on an fp16 stream against fp32 master weights."""
     if not torch.is_grad_enabled():
@@ -672,3 +817,4 @@ def packed_sdpa(qkv, attn_bias, n_heads):
         q, k, v = _qkv_views(qkv, n_heads)
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
     return _PackedSdpa.apply(qkv, attn_bias, n_heads)
+
