@@ -482,8 +482,8 @@ fn substep_survives_pd_loss_and_counts() {
 
 /// Long-horizon health under the actuation the trainer will actually
 /// emit: seeded random FULL gears on every joint, re-drawn each 30 Hz
-/// tick, 10 s free-floating (no welds — the P1 worst case; from P2 on
-/// the foot welds ground net moments). The state must stay finite and
+/// tick, 10 s free-floating (no constraints at all — the P1 worst case;
+/// the env's ground contact grounds net moments). The state must stay finite and
 /// the §22 pivot floor must never engage (pd_hits stays 0 — the
 /// armature keeps every pivot 12 decades above the floor here).
 ///
@@ -492,8 +492,8 @@ fn substep_survives_pd_loss_and_counts() {
 /// net free moment of O(1000 N·m) on the whole body, which spins the
 /// root past the explicit-Coriolis stability bound h·omega ~ 1 (~240
 /// rad/s at h = 1/240) — a fixed-step explicit integrator cannot
-/// follow it (MuJoCo included), and the welded v10 env can never
-/// produce it.
+/// follow it (MuJoCo included), and a grounded env body cannot sustain
+/// it (it falls and the episode terminates).
 #[test]
 fn pd_under_random_full_gears() {
     let m = &HUMANOID;
@@ -537,7 +537,7 @@ fn v14_momentum_conserved_with_joints_parked_on_stops() {
     let mut ws = Workspace::new(m);
     let mut st = State::neutral(m);
     st.p[1] = 500.0; // airborne: the y=0 plane is unreachable
-    let mut cs = super::solver::ConstraintSet::new_modes(m, false, true, true);
+    let mut cs = super::solver::ConstraintSet::new(m, true, true);
     let h = 1.0 / 240.0;
     let g = super::model::G;
     let mut tau = [0.0; NQ];

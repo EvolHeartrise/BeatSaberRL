@@ -2,9 +2,16 @@
 tolerance-band comparisons (SPEC-v10 P2b: different constraint solvers -
 bands, not parity).
 
-5 seeded scenarios, each 1 s at h = 1/240 (240 substeps), welds active,
-per-substep qpos (36) / qvel (35) at full precision to
-refdata/<name>.json:
+5 seeded scenarios, each 1 s at h = 1/240 (240 substeps), on the
+FREE-FLOATING body: the MJCF's two foot welds are deactivated at load
+(`eq_active0 = 0`) and the floor plane never collides (every geom is
+contype 0), so the body falls freely under gravity with only the joint
+limits, the 55 self-collision pairs and the stabilizer acting. This is the
+engine's `ConstraintSet::new(m, contacts, ground = false)` regime - the
+v10 foot-weld mode these references used to exercise was removed from the
+engines 2026-09-27 (issue #2), and MuJoCo's soft ground contact is too
+far from our PGS ground block for tolerance bands. Per-substep qpos (36) /
+qvel (35) at full precision to refdata/<name>.json:
 
   1 neutral_hold       stabilized stance, no pattern torque
   2 const_l_arm_pitch  constant +60 N*m on l_arm_pitch
@@ -69,6 +76,9 @@ def build_stabilized():
     """Model with muscle-tone joint springs + near-critical damping.
     Returns (model, names29, dofs29, taumax29, kp29, kd29)."""
     model = mujoco.MjModel.from_xml_path(MJCF)
+    # free-floating references: the MJCF welds stay in the file for the
+    # check_static.py statics gates, but are OFF here (see module doc)
+    model.eq_active0[:] = 0
     d0 = mujoco.MjData(model)
     mujoco.mj_forward(model, d0)
     M = np.zeros((model.nv, model.nv))

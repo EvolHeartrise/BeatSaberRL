@@ -30,7 +30,7 @@
 //!     non-overlapping).
 //! Both are gated by `tests_constraints::r23_dead_regions_have_no_reader`,
 //! which NaN-poisons each region and requires the trajectory back bit
-//! for bit (the R13 `poison_weld_scratch` idiom); all four poisonings
+//! for bit (the R13 `poison_solve_scratch` idiom); all four poisonings
 //! were confirmed to BITE against deliberately reintroduced readers
 //! before the items landed.
 
@@ -517,7 +517,7 @@ pub fn chol_factor_floored_inplace(n: usize, a: &mut [Real]) -> u32 {
         // rung above this one (ladder 8 → 4 → 1, bitwise-clean) measured
         // **−1.00%** end to end (22,273 → 22,050 env-steps/s at N = 256,
         // 4 interleaved ABBA pairs, every pair negative). Unlike the
-        // `weld_axpy12!` jams next door this k-chain is a DEPENDENT
+        // (since removed) 12-wide weld axpy jams this k-chain is a DEPENDENT
         // scalar recurrence — it cannot vectorize, so the 8 accumulators
         // and 8 row pointers are 8 real live registers competing with
         // the address arithmetic, and at n = 35 the halved `lj[k]` load
@@ -630,8 +630,8 @@ pub fn chol_solve(n: usize, l: &[Real], x: &mut [Real]) {
 
 /// Batched in-place solve of W right-hand sides sharing ONE factor.
 /// `x` holds the W RHS ROW-MAJOR — W consecutive rows of `n` doubles,
-/// exactly the `minvjt` layout, so nothing ripples into the A_ww
-/// assembly / weld-null projection / PGS axpy consumers.
+/// exactly the `minvjt` layout, so nothing ripples into the PGS axpy
+/// consumers.
 ///
 /// SHAPE (2026-08-03, R1): UNROLL-AND-JAM over the RHS index with the
 /// solve index i kept OUTER. Every factor load (`lrow[k]` forward,
@@ -639,7 +639,7 @@ pub fn chol_solve(n: usize, l: &[Real], x: &mut [Real]) {
 /// stream stays UNIT-STRIDE — the form the small-items pass established
 /// as the winner on this CPU. The opposite arrangement (RHS outer, i
 /// inner, or an RHS-minor `x[i*W + r]` transpose) was rejected for the
-/// same reason the weld-PGS interchange was reverted: at nv = 35 the
+/// same reason the (v10) weld-PGS interchange was reverted: at nv = 35 the
 /// whole working set is L1-resident, so there is no streaming win to
 /// buy and strided inner loads only cost the unit-stride AVX2
 /// vectorization.
@@ -714,8 +714,7 @@ pub fn chol_solve_x4(n: usize, l: &[Real], x: &mut [Real]) {
 ///
 /// The caller transposes in and out (an exact copy, bitwise neutral)
 /// rather than storing `minvjt` this way — the RHS-minor layout would
-/// otherwise ripple into the A_ww assembly, the weld-null projections
-/// and the PGS axpy, all of which want unit-stride rows.
+/// otherwise ripple into the PGS axpy, which wants unit-stride rows.
 pub fn chol_solve_t<const W: usize>(n: usize, l: &[Real], t: &mut [Real]) {
     debug_assert_eq!(t.len(), W * n);
     for i in 0..n {
@@ -811,41 +810,6 @@ pub fn chol_solve_unit_t<const W: usize>(n: usize, l: &[Real], m0: usize, t: &mu
         }
     }
     chol_back_t::<W>(n, l, t);
-}
-
-/// `chol_solve_x4` at width 2 — the remainder rung of the batch ladder.
-pub fn chol_solve_x2(n: usize, l: &[Real], x: &mut [Real]) {
-    debug_assert_eq!(x.len(), 2 * n);
-    let (a, b) = x.split_at_mut(n);
-    for i in 0..n {
-        let lrow = &l[i * n..i * n + i];
-        let (mut s0, mut s1) = (a[i], b[i]);
-        {
-            let (ar, br) = (&a[..i], &b[..i]);
-            for k in 0..i {
-                let lk = lrow[k];
-                s0 -= lk * ar[k];
-                s1 -= lk * br[k];
-            }
-        }
-        let dg = l[i * n + i];
-        a[i] = s0 / dg;
-        b[i] = s1 / dg;
-    }
-    for i in (0..n).rev() {
-        let (mut s0, mut s1) = (a[i], b[i]);
-        {
-            let (ar, br) = (&a[..n], &b[..n]);
-            for (k, lrow) in l.chunks_exact(n).enumerate().take(n).skip(i + 1) {
-                let lki = lrow[i];
-                s0 -= lki * ar[k];
-                s1 -= lki * br[k];
-            }
-        }
-        let dg = l[i * n + i];
-        a[i] = s0 / dg;
-        b[i] = s1 / dg;
-    }
 }
 
 /// BACK substitution alone — verbatim the second half of `chol_solve`

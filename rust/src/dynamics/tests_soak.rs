@@ -81,9 +81,9 @@ fn soak_state_stays_bounded() {
                 cs.contacts.len(),
                 cs.limit_rows()
             );
-            let nweld = cs.weld_rows();
+            let nground = cs.ground_rows();
             for (ci, c) in cs.contacts.iter().enumerate() {
-                let row = nweld + ci;
+                let row = nground + ci;
                 println!(
                     "    contact pair {:2} gap {:+.5} diag {:.6e} jv_pre {:+9.3} lam {:9.3}",
                     c.pair, c.gap, cs.row_diag(row), cs.jv_pre[row], cs.lambda[row]
@@ -98,7 +98,7 @@ fn soak_state_stays_bounded() {
                 }
             }
             assert!(st.v.iter().all(|x| x.is_finite()), "non-finite velocity");
-            // kinematic envelope: welded feet + capped joints bound the
+            // kinematic envelope: grounded feet + capped joints bound the
             // root rotation by the leg-chain rate sum (~6*16) plus slack
             assert!(w < 200.0, "root spin {w} outside the kinematic envelope");
         }
@@ -157,14 +157,24 @@ pub(crate) fn escape_state() -> State {
 }
 
 /// A1's central guarantee: the root position increment of a substep is
-/// bounded by the envelope times h, UNCONDITIONALLY — even when the
-/// step-8 solve diverges. Also pins the escape SIGNAL: the
-/// pre-integration envelope must engage on this state (which is what the
-/// env layer's C backstop terminates on).
+/// bounded by the envelope times h, UNCONDITIONALLY. Also pins the
+/// escape SIGNAL: the pre-integration envelope must engage (which is
+/// what the env layer's C backstop terminates on).
+///
+/// 2026-09-27 (weld removal, issue #2): the escape fixture's divergence
+/// was the §23 OBLIQUE projector — the weld-null projection of the cap /
+/// limit columns — which left with the welds; on the env constraint set
+/// the captured state steps benignly. So the runaway is now INJECTED: an
+/// over-envelope root velocity pointing up and away from the floor,
+/// which the unilateral ground rows cannot absorb (they only push), with
+/// the full env constraint set live.
 #[test]
 fn root_step_bounded_on_the_escape_state() {
     let m = &HUMANOID;
     let mut st = escape_state();
+    st.v[0] = 30.0;
+    st.v[1] = 45.0; // upward: no ground row can take it out
+    st.v[2] = -30.0;
     let mut ws = Workspace::new(m);
     let mut cs = ConstraintSet::new(m, true, true);
     let tau = gear_tau(&ESC_A);
@@ -243,13 +253,13 @@ fn soak_state_engages_the_envelope_and_stays_bounded() {
     // 2026-08-17 human leg caps: the captured state's §23 divergence
     // was POWERED by the old 485/300 hip torques — at human caps it no
     // longer diverges (0 engagements over 48 ticks; 2x and 4x joint-
-    // rate amplification did not re-trigger it either), and with welds
-    // active any injected root velocity is absorbed by the solve
+    // rate amplification did not re-trigger it either), and with the
+    // feet constrained any injected root velocity is absorbed by the solve
     // before the check. The clamp mechanism is pinned directly
     // instead: constraints OFF so a runaway root velocity survives to
     // the pre-integration check — the envelope must engage, count,
     // and hold the per-substep dp bound while doing so.
-    let mut cs = ConstraintSet::new_modes(m, false, false, false);
+    let mut cs = ConstraintSet::new(m, false, false);
     let tau = gear_tau(&BLOW_A);
     let bound = H_SUB * ROOT_V_MAX;
     st.v[0] = 40.0;
@@ -271,8 +281,9 @@ fn soak_state_engages_the_envelope_and_stays_bounded() {
 /// The `p2_adversarial.py` generator, ported: states far worse than the
 /// env can reach — 60 % of joints parked exactly ON a stop, every joint
 /// rate saturated at its cap, the root at the envelope, a uniformly
-/// random root orientation, and the foot welds pre-violated by up to
-/// 0.10 m. Pre-A1 this class goes NON-FINITE in f32 and reaches |dp| =
+/// random root orientation, and the root displaced by up to 0.10 m
+/// (under the v10 welds: the foot welds pre-violated by that much).
+/// Pre-A1 this class goes NON-FINITE in f32 and reaches |dp| =
 /// 3.0e10 m per substep in f64; post-A1 every substep is finite and
 /// inside the h*ROOT_V_MAX bound.
 #[test]
@@ -284,7 +295,7 @@ fn adversarial_states_stay_finite_and_bounded() {
     for state_i in 0..192u64 {
         let mut rng = Rng(0xA0A0_0000 + state_i);
         let mut st = State::neutral(m);
-        // root pose: uniform random orientation, welds violated <= 0.10 m
+        // root pose: uniform random orientation, displaced <= 0.10 m
         for i in 0..3 {
             st.p[i] = m.base_pos0[i] + rng.range(-0.10, 0.10);
         }

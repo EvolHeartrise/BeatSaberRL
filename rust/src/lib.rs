@@ -4,7 +4,9 @@
 //!
 //! Env v10 (P3, 2026-07-31): the v9 per-joint kinematic integrator and
 //! 2-arm FK are RETIRED — the body is the SPEC-v10 full humanoid
-//! (floating pelvis + 29 actuated revolutes, foot welds, self-collision)
+//! (floating pelvis + 29 actuated revolutes, self-collision; env v11
+//! unilateral ground contact on the soles — the v10 foot welds were
+//! removed 2026-09-27)
 //! stepped by the P1/P2 dynamics engine in `dynamics/`
 //! (`solver::substep_constrained`, 8 × h = 1/240 per 30 Hz control
 //! tick). Actions are 29 gear heads; τ_j = gear_fraction × τ_max[j],
@@ -152,12 +154,13 @@ const REACH_PAST_SHOULDER: Real = 0.65 + HANDLE_LEN + 1.0 + 0.75;
 // z < head_z(t) (v9's -Z_MISS = -0.65 at the reference pose). The
 // episode tail must cover the slowest object's trip from the hit plane
 // to the WORST-CASE head plane; the head cannot physically reach
-// z < -1.5 on the welded-feet body (waist z -0.65, head lever 1.09 m
+// z < -1.5 on the standing body (waist z -0.65, head lever 1.09 m
 // fully folded back still > -1.8, and the spine/hip limits stop far
-// short) — P3 divergence note, SPEC-v10 Divergences §18.
+// short; a body that falls further terminates on FALL_ROOT_Y first) —
+// P3 divergence note, SPEC-v10 Divergences §18.
 const Z_MISS_TAIL: Real = 1.5;
-// env v11 FALL termination (unilateral-contact spec §4), CONTACT MODE
-// ONLY: with the feet no longer welded the root can go to the floor, and
+// env v11 FALL termination (unilateral-contact spec §4): with the feet
+// on unilateral ground contact the root can go to the floor, and
 // a fallen body's observations/rewards are not the task. Reference-pose
 // root y is 0.94; the original 0.55 was a deep crouch the policy cannot
 // reach by squatting within the leg limits and holding the sole flat.
@@ -168,7 +171,7 @@ const Z_MISS_TAIL: Real = 1.5;
 // §20e "reported, never hidden"): per-tick bool, popped cumulative
 // count, episode counter.
 const FALL_ROOT_Y: Real = 0.25;
-// TILT termination (2026-08-20), contact mode only: CHEST up-axis
+// TILT termination (2026-08-20): CHEST up-axis
 // tilted more than 40 deg FORWARD, 20 deg BACKWARD (asymmetric
 // sagittal, user 2026-08-20 — the tight back bound targets the v30
 // backbend exploit; forward stays duck-sized) or 40 deg to the side
@@ -179,7 +182,7 @@ const FALL_ROOT_Y: Real = 0.25;
 const TILT_TAN2_FWD: Real = 0.7040881910418472; // tan^2(40 deg)
 const TILT_TAN2_BACK: Real = 0.1324743314317942; // tan^2(20 deg) — 2026-08-21: briefly 10 deg, reverted to 20 same day (user)
 const TILT_TAN2_ROLL: Real = 0.7040881910418472; // tan^2(40 deg)
-// FOOT-LIFT penalty (2026-08-20), contact mode only: flat charge on
+// FOOT-LIFT penalty (2026-08-20): flat charge on
 // the TICK a foot leaves the ground (edge: that foot's tick-summed
 // ground normal impulse hits zero after a grounded tick), per foot.
 const FOOT_LIFT_PEN: Real = -0.1;
@@ -206,9 +209,7 @@ const WREV_HYST: Real = 0.34906585;   // 20 deg
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
 // env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
 // +-8 deg, ankle_roll counter-rolls so the soles stay flat (verified
-// via the fk_body mirror: foot up-vector exactly (0,1,0)). CONTACT
-// MODE ONLY: in weld mode the feet are welded at the v10 reference,
-// and a leg stance would fight the welds.
+// via the fk_body mirror: foot up-vector exactly (0,1,0)).
 const Q_START_LEG: [(usize, Real); 4] = [
     (19, -0.13962634015954636),  // l_hip_roll  -8 deg
     (22, 0.13962634015954636),   // l_ankle_roll +8 deg (counter)
@@ -279,9 +280,7 @@ const OFF_NOTES: usize = OFF_CONTACT + 2; // 102 (env v19)
 const OFF_NOTE_MASK: usize = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT; // 532
 // env v12 (unilateral-contact spec §7): per-foot ground-contact lanes
 // [L_heel, L_toe, R_heel, R_toe] — tick-summed normal impulse (N·s) per
-// front/back sole-corner pair, / GROUND_IMP_NORM. All-zero in weld mode
-// (the ground block does not exist there), so lanes 0..340 are the v10
-// obs verbatim.
+// front/back sole-corner pair, / GROUND_IMP_NORM.
 const OFF_GROUND_IMP: usize = OFF_NOTE_MASK + N_NOTE_SLOTS; // 556
 const N_GROUND_IMP_LANES: usize = 4;
 // env v13 (contact spec §8): explicit FK shortcuts — world positions of
@@ -728,12 +727,8 @@ struct Body {
     // that). Measured incidence on a converged policy: 0 in 204,800
     // env-ticks.
     escaped: bool,
-    // env v11 (unilateral-contact spec §1): foot_mode. false = weld
-    // (v10, the DEFAULT — every existing trajectory is bitwise
-    // unchanged), true = unilateral frictional ground contact.
-    foot_contact: bool,
     // Contact spec §4: was the root below FALL_ROOT_Y at the END of
-    // this tick (per-TICK since 2026-08-20)? Contact mode only. Same
+    // this tick (per-TICK since 2026-08-20)? Same
     // envelope pattern as `escaped`: the env terminates the episode
     // and zeroes the reward.
     fell: bool,
@@ -752,15 +747,9 @@ struct Body {
     foot_down_prev: [bool; 2],
     foot_lifts_tick: u8,
     foot_lift_hits: [u64; 2],
-    // P6 (additive introspection): tick-summed foot-weld impulses (N·s),
-    // solver rows 0–11 — [foot_l lin xyz, ang xyz, foot_r lin, ang].
-    // λ is the constraint impulse ON the body (world frame): the ground
-    // reaction; vertical force ≈ weld_imp[1 or 7] / DT.
-    weld_imp: [Real; 12],
     // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
     // front/back sole-corner pair — [L_heel, L_toe, R_heel, R_toe]
-    // (N·s). Contact mode only; stays 0 under welds. Feeds the four
-    // OFF_GROUND_IMP obs lanes.
+    // (N·s). Feeds the four OFF_GROUND_IMP obs lanes.
     ground_imp: [Real; 4],
     // env v34 (2026-08-21): tick-summed joint-limit-row impulses
     // (N·m·s) the stops carried, bucketed [legs, spine]. Scope is
@@ -775,20 +764,18 @@ struct Body {
     // replay fix (2026-08-17): tick-summed ground-reaction impulse per
     // foot [L, R] x [x friction, y normal, z friction] (N·s, world
     // frame) — ALL rows of every active sole corner, not just the §7
-    // normal buckets. Contact mode only; stays 0 under welds. Feeds
-    // the replay "feet" lanes, which read all-zero in contact mode
-    // while they were wired to the retired welds' impulses.
+    // normal buckets. Feeds the replay "feet" lanes.
     foot_grf: [[Real; 3]; 2],
 }
 
 const MODEL: &Model = &HUMANOID;
 
 impl Body {
-    fn new(foot_contact: bool) -> Body {
+    fn new() -> Body {
         let st = State::neutral(MODEL);
         let ws = Workspace::new(MODEL);
-        // contact spec §1: contact mode DROPS the 12 weld rows
-        let cs = ConstraintSet::new_modes(MODEL, !foot_contact, true, foot_contact);
+        // self-collision rows + the contact spec §3 ground block
+        let cs = ConstraintSet::new(MODEL, true, true);
         let mut b = Body {
             st,
             ws,
@@ -812,7 +799,6 @@ impl Body {
             tau_axis: [1.0; TAU_FEAT],
             tau_scale: [1.0; NQ],
             escaped: false,
-            foot_contact,
             fell: false,
             tilted: false,
             fall_hits: 0,
@@ -820,7 +806,6 @@ impl Body {
             foot_down_prev: [false, false],
             foot_lifts_tick: 0,
             foot_lift_hits: [0, 0],
-            weld_imp: [0.0; 12],
             ground_imp: [0.0; 4],
             limit_imp: [0.0; 3],
             foot_grf: [[0.0; 3]; 2],
@@ -848,12 +833,9 @@ impl Body {
         for (j, v) in Q_START_ARM {
             self.st.q[j] = v;
         }
-        // env v21 wide stance (contact mode only; weld mode's feet are
-        // welded at the v10 reference and a stance would fight them)
-        if self.foot_contact {
-            for (j, v) in Q_START_LEG {
-                self.st.q[j] = v;
-            }
+        // env v21 wide stance
+        for (j, v) in Q_START_LEG {
+            self.st.q[j] = v;
         }
         self.tau = [0.0; NQ];
         self.wrist_vel = [[0.0; 3]; 2];
@@ -875,7 +857,6 @@ impl Body {
         // actually been seen grounded.
         self.foot_down_prev = [false, false];
         self.foot_lifts_tick = 0;
-        self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
         self.foot_grf = [[0.0; 3]; 2];
         self.refresh_fk();
@@ -883,22 +864,20 @@ impl Body {
         // the root until the lowest sole corner sits exactly on the
         // ground (the v20 jitter's corner arithmetic; both engines
         // share this expression tree).
-        if self.foot_contact {
-            use dynamics::collide::{GROUND_CORNERS, GROUND_FRAMES};
-            let mut min_y = Real::INFINITY;
-            for fr in GROUND_FRAMES {
-                let (r, p) = (&self.ws.r[fr], &self.ws.p[fr]);
-                for c in &GROUND_CORNERS {
-                    let y = p[1] + r[1][0] * c[0] + r[1][1] * c[1]
-                        + r[1][2] * c[2];
-                    if y < min_y {
-                        min_y = y;
-                    }
+        use dynamics::collide::{GROUND_CORNERS, GROUND_FRAMES};
+        let mut min_y = Real::INFINITY;
+        for fr in GROUND_FRAMES {
+            let (r, p) = (&self.ws.r[fr], &self.ws.p[fr]);
+            for c in &GROUND_CORNERS {
+                let y = p[1] + r[1][0] * c[0] + r[1][1] * c[1]
+                    + r[1][2] * c[2];
+                if y < min_y {
+                    min_y = y;
                 }
             }
-            self.st.p[1] -= min_y;
-            self.refresh_fk();
         }
+        self.st.p[1] -= min_y;
+        self.refresh_fk();
     }
 
     /// FK caches from the current state: wrist = hand-frame origin,
@@ -955,7 +934,6 @@ impl Body {
         }
         self.contact_arm = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
-        self.weld_imp = [0.0; 12];
         self.ground_imp = [0.0; 4];
         self.limit_imp = [0.0; 3];
         self.foot_grf = [[0.0; 3]; 2];
@@ -974,30 +952,23 @@ impl Body {
 
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
-            let nweld = self.cs.weld_rows();
-            // the self-collision rows sit AFTER the ground block (0 rows
-            // in weld mode) — contact spec §3
-            let ncbase = nweld + self.cs.ground_rows();
-            // P6: tick-summed foot-weld impulses (ground reaction)
-            for r in 0..nweld {
-                self.weld_imp[r] += self.cs.lambda[r];
-            }
+            // the self-collision rows sit AFTER the ground block —
+            // contact spec §3
+            let ncbase = self.cs.ground_rows();
             // contact spec §7: tick-summed ground NORMAL impulses,
             // bucketed [L_heel, L_toe, R_heel, R_toe] — corner ids are
             // foot*4 + k with k odd = z+ (toe), so bucket =
             // foot*2 + (k & 1). Obs lanes read these after the tick.
-            if self.foot_contact {
-                for (gi, g) in self.cs.ground_contacts.iter().enumerate() {
-                    let b = (g.corner / CORNERS_PER_FOOT) * 2 + (g.corner & 1);
-                    let nrow = self.cs.ground_row(gi);
-                    self.ground_imp[b] += self.cs.lambda[nrow];
-                    // full ground reaction per foot for the replay
-                    // "feet" lanes: rows are normal ŷ, friction x̂, ẑ
-                    let f = g.corner / CORNERS_PER_FOOT;
-                    self.foot_grf[f][0] += self.cs.lambda[nrow + 1];
-                    self.foot_grf[f][1] += self.cs.lambda[nrow];
-                    self.foot_grf[f][2] += self.cs.lambda[nrow + 2];
-                }
+            for (gi, g) in self.cs.ground_contacts.iter().enumerate() {
+                let b = (g.corner / CORNERS_PER_FOOT) * 2 + (g.corner & 1);
+                let nrow = self.cs.ground_row(gi);
+                self.ground_imp[b] += self.cs.lambda[nrow];
+                // full ground reaction per foot for the replay
+                // "feet" lanes: rows are normal ŷ, friction x̂, ẑ
+                let f = g.corner / CORNERS_PER_FOOT;
+                self.foot_grf[f][0] += self.cs.lambda[nrow + 1];
+                self.foot_grf[f][1] += self.cs.lambda[nrow];
+                self.foot_grf[f][2] += self.cs.lambda[nrow + 2];
             }
             // env v34: joint-limit-row λ this substep, postural scope
             // ([legs, spine]; arms skipped). λ is already ≥ 0 (PGS
@@ -1032,7 +1003,7 @@ impl Body {
         self.escaped = self.ws.env_hits != env_hits0;
         // contact spec §4 (per-TICK since 2026-08-20): root below the
         // floor threshold at the end of the tick
-        if self.foot_contact && self.st.p[1] < FALL_ROOT_Y {
+        if self.st.p[1] < FALL_ROOT_Y {
             fell = true;
         }
         self.fell = fell;
@@ -1048,27 +1019,25 @@ impl Body {
         // backbend). Chest up-axis = R_root * Rx(spine_pitch) *
         // Ry(spine_yaw) * Rz(spine_roll) * yhat (§1.3 spine stack);
         // spine-local up composed first, then rotated by the root quat.
-        if self.foot_contact {
-            let (sp, sy, sr) = (self.st.q[0], self.st.q[1], self.st.q[2]);
-            let (cp, s_p) = (sp.cos(), sp.sin());
-            let (cy, s_y) = (sy.cos(), sy.sin());
-            let (cr, s_r) = (sr.cos(), sr.sin());
-            let v = [
-                -cy * s_r,
-                cp * cr - s_p * s_y * s_r,
-                s_p * cr + cp * s_y * s_r,
-            ];
-            let r = quat_to_rot(self.st.quat);
-            let upx = r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2];
-            let upy = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
-            let upz = r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2];
-            let sag2 = if upz > 0.0 { TILT_TAN2_FWD } else { TILT_TAN2_BACK };
-            if upy <= 0.0
-                || upz * upz > sag2 * upy * upy
-                || upx * upx > TILT_TAN2_ROLL * upy * upy
-            {
-                tilted = true;
-            }
+        let (sp, sy, sr) = (self.st.q[0], self.st.q[1], self.st.q[2]);
+        let (cp, s_p) = (sp.cos(), sp.sin());
+        let (cy, s_y) = (sy.cos(), sy.sin());
+        let (cr, s_r) = (sr.cos(), sr.sin());
+        let v = [
+            -cy * s_r,
+            cp * cr - s_p * s_y * s_r,
+            s_p * cr + cp * s_y * s_r,
+        ];
+        let r = quat_to_rot(self.st.quat);
+        let upx = r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2];
+        let upy = r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2];
+        let upz = r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2];
+        let sag2 = if upz > 0.0 { TILT_TAN2_FWD } else { TILT_TAN2_BACK };
+        if upy <= 0.0
+            || upz * upz > sag2 * upy * upy
+            || upx * upx > TILT_TAN2_ROLL * upy * upy
+        {
+            tilted = true;
         }
         self.tilted = tilted;
         if tilted {
@@ -1078,16 +1047,14 @@ impl Body {
         // normal impulse per foot (ground_imp buckets
         // [L_heel, L_toe, R_heel, R_toe]); charged in step_inner.
         self.foot_lifts_tick = 0;
-        if self.foot_contact {
-            for f in 0..2 {
-                let down =
-                    self.ground_imp[f * 2] + self.ground_imp[f * 2 + 1] > 0.0;
-                if !down && self.foot_down_prev[f] {
-                    self.foot_lifts_tick += 1;
-                    self.foot_lift_hits[f] += 1;
-                }
-                self.foot_down_prev[f] = down;
+        for f in 0..2 {
+            let down =
+                self.ground_imp[f * 2] + self.ground_imp[f * 2 + 1] > 0.0;
+            if !down && self.foot_down_prev[f] {
+                self.foot_lifts_tick += 1;
+                self.foot_lift_hits[f] += 1;
             }
+            self.foot_down_prev[f] = down;
         }
         self.refresh_fk();
         for s in 0..2 {
@@ -1273,7 +1240,7 @@ struct Core {
 }
 
 impl Core {
-    fn new_core(max_steps: u32, gears: u8, foot_contact: bool) -> Self {
+    fn new_core(max_steps: u32, gears: u8) -> Self {
         Core {
             max_steps,
             gear: gear_signed(gears),
@@ -1283,7 +1250,7 @@ impl Core {
             tick: 0,
             time: 0.0,
             first_pending: 0,
-            body: Body::new(foot_contact),
+            body: Body::new(),
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
             prev_idx: [0, 0],
@@ -1654,7 +1621,7 @@ impl Core {
         }
 
         // contact spec §7: per-foot ground-contact lanes
-        // [L_heel, L_toe, R_heel, R_toe]; all-zero under welds
+        // [L_heel, L_toe, R_heel, R_toe]
         for k in 0..N_GROUND_IMP_LANES {
             obs[OFF_GROUND_IMP + k] =
                 (self.body.ground_imp[k] / GROUND_IMP_NORM) as f32;
@@ -2271,11 +2238,9 @@ impl Core {
             }
         }
         // contact spec §7: the survival gradient — a per-tick alive
-        // bonus, contact mode only. Added BEFORE the terminal overrides
-        // below so a fall/escape tick never collects it.
-        if self.body.foot_contact {
-            reward += ALIVE_BONUS;
-        }
+        // bonus. Added BEFORE the terminal overrides below so a
+        // fall/escape tick never collects it.
+        reward += ALIVE_BONUS;
         if self.body.escaped {
             reward = 0.0;
         }
@@ -2303,12 +2268,12 @@ impl Core {
     /// `new_core` plus the per-env coefficients both Python
     /// constructors expose.
     #[allow(clippy::too_many_arguments)]
-    fn configured(max_steps: u32, gears: u8, foot_contact: bool,
+    fn configured(max_steps: u32, gears: u8,
                   fall_const: Real, foot_z_coef: Real, foot_x_coef: Real,
                   foot_hinge_r: Real, foot_shape_coef: Real,
                   energy_coef: Real, limit_coef: Real, limit_arms: bool,
                   wall_despawn: bool, self_contact_coef: Real) -> Self {
-        let mut core = Core::new_core(max_steps, gears, foot_contact);
+        let mut core = Core::new_core(max_steps, gears);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
         core.foot_x_coef = foot_x_coef;
@@ -2365,12 +2330,12 @@ struct RawBeatSim {
 
 #[pymethods]
 impl RawBeatSim {
-    /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
-    /// weld (v10 — TEST-HARNESS ONLY since 2026-08-16, production is
-    /// contact-only), true = unilateral frictional ground contact on
-    /// the 8 sole corners.
+    /// The body stands on unilateral frictional ground contact (8 sole
+    /// corners, unilateral-contact spec) — the only foot mode since the
+    /// v10 weld harness was removed (2026-09-27; `foot_contact=` is no
+    /// longer accepted).
     #[new]
-    #[pyo3(signature = (max_steps=690, gears=3, foot_contact=false,
+    #[pyo3(signature = (max_steps=690, gears=3,
                         fall_const=5.0, foot_z_coef=0.0,
                         foot_x_coef=0.0, foot_hinge_r=0.0,
                         foot_shape_coef=0.0, energy_coef=0.0,
@@ -2378,12 +2343,12 @@ impl RawBeatSim {
                         wall_despawn=false, self_contact_coef=0.0,
                         flux=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(max_steps: u32, gears: u8, foot_contact: bool, fall_const: Real,
+    fn new(max_steps: u32, gears: u8, fall_const: Real,
            foot_z_coef: Real, foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
            self_contact_coef: Real, flux: bool) -> Self {
-        let mut core = Core::configured(max_steps, gears, foot_contact,
+        let mut core = Core::configured(max_steps, gears,
                                         fall_const, foot_z_coef, foot_x_coef,
                                         foot_hinge_r, foot_shape_coef,
                                         energy_coef, limit_coef, limit_arms,
@@ -2551,23 +2516,10 @@ impl RawBeatSim {
             .collect()
     }
 
-    /// P6 (additive): tick-summed foot-weld impulses of the LAST tick,
-    /// per foot [L, R]: [jx, jy, jz, jax, jay, jaz] (N·s / N·m·s, world
-    /// frame) — the ground reaction through each welded foot. Vertical
-    /// reaction force ≈ j[1] / DT.
-    fn weld_impulses(&self) -> [[Real; 6]; 2] {
-        let w = &self.core.body.weld_imp;
-        [
-            [w[0], w[1], w[2], w[3], w[4], w[5]],
-            [w[6], w[7], w[8], w[9], w[10], w[11]],
-        ]
-    }
-
-    /// Contact-mode twin of `weld_impulses` (replay fix 2026-08-17):
-    /// tick-summed GROUND-CONTACT reaction impulse per foot [L, R],
-    /// [jx, jy, jz] (N·s, world frame) — jy sums the sole corners'
-    /// normal rows, jx/jz their friction rows. Vertical reaction force
-    /// ≈ jy / DT. Zero under welds (no ground rows exist there).
+    /// Replay fix (2026-08-17): tick-summed GROUND-CONTACT reaction
+    /// impulse of the LAST tick per foot [L, R], [jx, jy, jz] (N·s,
+    /// world frame) — jy sums the sole corners' normal rows, jx/jz their
+    /// friction rows. Vertical reaction force ≈ jy / DT.
     fn ground_reaction(&self) -> [[Real; 3]; 2] {
         self.core.body.foot_grf
     }
@@ -2673,8 +2625,7 @@ impl RawBeatSim {
 
     /// FALL terminations since the last pop (unilateral-contact spec
     /// §4) — the CUDA backend's `pop_fall_hits` mirror, same shape as
-    /// `pop_envelope_hits`. Returns the count and zeroes it. Always 0 in
-    /// weld mode (`foot_contact=False`), where the feet cannot let go.
+    /// `pop_envelope_hits`. Returns the count and zeroes it.
     fn pop_fall_hits(&mut self) -> u64 {
         self.core.pop_fall_hits()
     }
@@ -2731,7 +2682,7 @@ impl RawBeatSim {
 
     /// Did the root drop below FALL_ROOT_Y during the LAST tick
     /// (unilateral-contact spec §4)? Test introspection, `escaped`'s
-    /// twin. Always false in weld mode.
+    /// twin.
     #[getter]
     fn fell(&self) -> bool {
         self.core.body.fell
@@ -2906,14 +2857,11 @@ struct VecBeatSim {
 
 #[pymethods]
 impl VecBeatSim {
-    /// `foot_contact` (unilateral-contact spec §1 `foot_mode`): false =
-    /// weld (v10 — TEST-HARNESS ONLY since 2026-08-16, production is
-    /// contact-only), true = unilateral frictional ground contact on
-    /// the 8 sole corners.
+    /// Unilateral ground contact is the only foot mode (see RawBeatSim).
     #[new]
     #[pyo3(signature = (n, max_steps=690,
                         combo_walk=false, return_events=true,
-                        gears=3, foot_contact=false, fall_const=5.0,
+                        gears=3, fall_const=5.0,
                         foot_z_coef=0.0, foot_x_coef=0.0,
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         energy_coef=0.0, limit_coef=0.0,
@@ -2922,7 +2870,7 @@ impl VecBeatSim {
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, gears: u8,
-           foot_contact: bool, fall_const: Real, foot_z_coef: Real,
+           fall_const: Real, foot_z_coef: Real,
            foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
@@ -2931,7 +2879,7 @@ impl VecBeatSim {
             sims: (0..n)
                 .map(|_| {
                     let mut core = Core::configured(
-                        max_steps, gears, foot_contact, fall_const,
+                        max_steps, gears, fall_const,
                         foot_z_coef, foot_x_coef, foot_hinge_r,
                         foot_shape_coef, energy_coef, limit_coef,
                         limit_arms, wall_despawn, self_contact_coef);
@@ -3162,8 +3110,7 @@ impl VecBeatSim {
     /// FALL terminations summed over all envs since the last pop
     /// (unilateral-contact spec §4) — the CUDA backend's `pop_fall_hits`
     /// mirror, same shape as `pop_envelope_hits`. Returns the count and
-    /// zeroes the per-env counters. ADDITIVE getter; always 0 in weld
-    /// mode.
+    /// zeroes the per-env counters. ADDITIVE getter.
     fn pop_fall_hits(&mut self) -> u64 {
         self.sims.iter_mut().map(Core::pop_fall_hits).sum()
     }
@@ -3284,7 +3231,7 @@ mod env_tests {
         acts[10] = 2; // r arm pitch, full −
         acts[15] = 1; // r wrist bend, full +
         acts[20] = 4; // l knee, −1/4
-        let mut body = Body::new(false);
+        let mut body = Body::new();
         body.tick(&acts, &gear);
         let expect: Real = acts.iter().map(|&a| gear[a as usize].abs()).sum();
         assert_eq!(body.act_frac, expect, "total is the joint-order sum");
@@ -3305,14 +3252,14 @@ mod env_tests {
         // a wrist full gear is priced 1.06/600 of a spine full gear
         let mut w = [0u8; NQ];
         w[7] = 1;
-        let mut bw = Body::new(false);
+        let mut bw = Body::new();
         bw.tick(&w, &gear);
         let mut sp = [0u8; NQ];
         sp[0] = 1;
-        let mut bs = Body::new(false);
+        let mut bs = Body::new();
         bs.tick(&sp, &gear);
         assert!((bw.tau_abs / bs.tau_abs - MODEL.tau_max[7] / MODEL.tau_max[0]).abs() < 1e-12);
-        let mut b2 = Body::new(false);
+        let mut b2 = Body::new();
         b2.tick(&[0u8; NQ], &gear);
         assert_eq!(b2.act_frac, 0.0, "coast must read zero activation");
         assert_eq!(b2.act_group, [0.0; 3]);
@@ -3330,7 +3277,7 @@ mod env_tests {
         acts[3] = 2;
 
         // empty chart = the bench's idle slot: done on the FIRST tick
-        let mut core = Core::new_core(100_000_000, 5, false);
+        let mut core = Core::new_core(100_000_000, 5);
         core.set_chart_notes(Vec::new());
         assert!(!core.finished, "install must clear the latch");
         let (_r0, d0) = core.step_inner(&acts);
@@ -3376,7 +3323,7 @@ mod env_tests {
             .map(|i| (1.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
-        let mut core = Core::new_core(690, 5, false);
+        let mut core = Core::new_core(690, 5);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         let mut first_done = None;
@@ -3419,7 +3366,7 @@ mod env_tests {
             .collect();
         chart.push((9.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_BOMB,
                     false, false));
-        let mut core = Core::new_core(690, 5, true);
+        let mut core = Core::new_core(690, 5);
         core.set_chart_notes(chart);
         let mut acts = [0u8; NQ];
         acts[17] = 1; // l_hip_pitch, full +
@@ -3461,14 +3408,14 @@ mod env_tests {
     /// Replay fix (2026-08-17): in contact mode the per-foot ground-
     /// reaction accumulator (the replay "feet" lanes' new source) must
     /// carry the body weight — the tick-summed normal impulses of both
-    /// feet ≈ weight x DT while the body stands — and the weld lanes
-    /// must stay zero. Regression for the all-zero "feet" bug: the
-    /// recorder read the retired welds' impulses in contact mode.
+    /// feet ≈ weight x DT while the body stands. Regression for the
+    /// all-zero "feet" bug: the recorder read the retired welds'
+    /// impulses in contact mode.
     #[test]
     fn ground_reaction_carries_weight_in_contact_mode() {
         let chart: Vec<ChartTuple> = vec![(8.0, 0.0, 1.0, 0, 0.0, 6.0,
                                            false, KIND_NOTE, false, false)];
-        let mut core = Core::new_core(690, 5, true);
+        let mut core = Core::new_core(690, 5);
         core.set_chart_notes(chart);
         let acts = [0u8; NQ];
         // ticks 1-3: the first tick still carries the reset's settling
@@ -3493,37 +3440,6 @@ mod env_tests {
                 core.body.foot_grf[f][1]
             );
         }
-        assert!(
-            core.body.weld_imp.iter().all(|v| *v == 0.0),
-            "weld lanes must stay zero in contact mode"
-        );
-    }
-
-    /// The other half of the §5 (d) / §5 (f) contract: in WELD mode
-    /// (`foot_contact = false`, the default) the fall test never fires —
-    /// the feet cannot let go, and the flag must not perturb the v10 env.
-    #[test]
-    fn weld_mode_never_falls() {
-        let chart: Vec<ChartTuple> = (0u8..3)
-            .map(|i| {
-                (8.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0, false,
-                 KIND_NOTE, false, false)
-            })
-            .collect();
-        let mut core = Core::new_core(690, 5, false);
-        core.set_chart_notes(chart);
-        let mut acts = [0u8; NQ];
-        acts[17] = 1;
-        acts[23] = 1;
-        for _ in 0..30 {
-            let (_r, d) = core.step_inner(&acts);
-            assert!(!core.body.fell, "weld mode must never report a fall");
-            if d {
-                break;
-            }
-        }
-        assert_eq!(core.falls, 0);
-        assert_eq!(core.body.fall_hits, 0);
     }
 
     /// Live gates at the reference pose reproduce the v9 constants:
@@ -3531,7 +3447,7 @@ mod env_tests {
     /// (SPEC-v10 §4).
     #[test]
     fn live_gates_reference_values() {
-        let body = Body::new(false);
+        let body = Body::new();
         assert!((body.reach_z() - (1.75 + HANDLE_LEN)).abs() < 1e-12);
         assert!((body.head[2] - (-0.65)).abs() < 1e-12);
     }
