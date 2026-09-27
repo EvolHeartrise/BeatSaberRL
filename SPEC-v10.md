@@ -1288,9 +1288,22 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        that nudge exhibits too. f32: median 3.1e-5 vs the one-f32-ulp
        nudge's 3.8e-5.
     c. **Measured.** CUDA (RTX 5090, N = 32768, two interleaved rounds
-       vs 88573c0): flux 23.36 → 19.53 ms/tick (−16.4 %), standard
-       141.6 → 137.8 (−2.7 %); float contact kernel 255 regs, stack
+       vs 88573c0): flux 23.40 → 19.30 ms/tick (−17.5 %), standard
+       142.1 → 137.1 (−3.5 %); float contact kernel 254–255 regs, stack
        37,664 → 34,128 B (the profile factor is 341 words, was 1,225),
-       spills 48/48 B unchanged. Rust: see the commit message.
-    No golden re-baselined; weld mode shares the change (same factor).
-
+       spills 48/48 B unchanged (flux-game instantiation 68/88 → 48/48;
+       the weld kernel 2,192/3,784 → 668/704; the non-production f64
+       contact kernel 112/128 → 1,476/2,560). Rust VecBeatSim (pod Ryzen
+       7 7800X3D, env-steps/s, 2 interleaved rounds), 1 thread: f64 random
+       +30 %, coast +16 %, STANDING (closed-loop greedy Flux policy, 0
+       falls) +14 %; f32 +30 / +16 / +13 %; 14 threads: f64 +21 / +15 /
+       +13 %, f32 +26 / +16 / +13 %.
+    d. **Re-timed fixture.** No numeric golden moved. One trajectory
+       fixture did: `tests/test_convert_scoresaber.py` needs a scored
+       cut, and at its old 20/40-tick whip the whip had stopped
+       connecting (note 0 a miss in the old build too) — its score block
+       came from a single accidental flail-phase cut on the last tick,
+       which this rounding change moved. The whip is re-timed to 24/44,
+       where it cuts notes 0 and 1 with an identical event stream in the
+       old and new builds.
+    Weld and contact mode share the change (one factor for both).

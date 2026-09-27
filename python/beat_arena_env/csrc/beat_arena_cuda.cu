@@ -1,7 +1,7 @@
 // Beat Arena env v10 sim step as ONE CUDA kernel launch (P5).
 //
 // Full SPEC-v10 pipeline per env: 8 x substep (FK -> CRBA -> RNEA ->
-// dense Cholesky -> constraint solve [12 x weld-block / contacts /
+// tree-sparse Cholesky (audit #10, TreeTabs) -> constraint solve [12 x weld-block / contacts /
 // limit rows / omega-cap pass, weld-null-space projection, COMPOSITE_EPS
 // 1e-4] -> integrate -> step-11 clamp passes -> step-12 root envelope)
 // + gear->tau, activation + torque telemetry, blade sweep/cut judgment, scoring,
@@ -1497,6 +1497,11 @@ __device__ constexpr double WELD_TARGET_P[2][3] = {
 // through e2v (warp-uniform tables — the loop indices never depend on
 // data except in the per-column unit chains, which read the __device__
 // copy).
+// MEASURED (RTX 5090, N = 32768, 2 interleaved rounds vs 88573c0): flux
+// 23.40 -> 19.30 ms/tick (-17.5 %), standard 142.1 -> 137.1 (-3.5 %);
+// float contact kernel stack 37,664 -> 34,128 B, spills 48/48 unchanged.
+// Of that, interleaving the limit group's four unit chains
+// (tree_fwd_unit_b) is -1.1 % on flux by itself.
 constexpr int TC_NNZ = 341;
 constexpr int TC_BASE_E = NQ;  // e of base coordinate v0 (v_t at NQ + t)
 struct TreeTabs {
@@ -2954,6 +2959,14 @@ __device__ __forceinline__ void tf_store(T* __restrict__ a, int cj, int t0,
 // pivot riding the first block's k-loop (it needs the same L_jk loads).
 // IN PLACE is legal for the dense form's reason: column j reads only
 // columns k < j (final) and its own seeds, and writes only column j.
+// MEASURED AND REJECTED (2026-09-26): a COMPILE-TIME form (column j a
+// template parameter, every k-loop unrolled, every slot an immediate) —
+// both with all of a column's rows jammed into one k-loop and with these
+// same 4 / 2 / 1 blocks — took the float contact kernel from 48/48 to
+// 332/356 B of spills (the unrolled straight-line factor, not the
+// accumulator count: the two jam widths spilled identically) for a flux
+// gain of −0.5 % (19.28 → 19.19 ms/tick, 2 interleaved rounds). A
+// re-spilled build is a revert (K6); the factor runs once per substep.
 template <typename T>
 __device__ void tree_factor(T* __restrict__ a, bool* __restrict__ bad) {
   for (int j = 0; j < NV; j++) {
@@ -3199,6 +3212,49 @@ __device__ void tree_fwd_unit_n(const T* __restrict__ l, T* __restrict__ x,
     for (int r = 1; r < s; r++)
       acc -= l[TREE.cbslot[c0 + r] + (s - r)] * x[TREE.vslot[c0 + r]];
     x[TREE.vslot[c0 + s]] = acc / l[TREE.cbslot[c0 + s]];
+  }
+}
+
+// The same unit forward pass for B columns at once (the limit-row group),
+// INTERLEAVED so the B chains are independent accumulators in one loop —
+// the ILP chol_fwd_unit4_n bought for the dense form (K4a/K6). Chain row s
+// of every column sums r = 0..s-1 (a bound shared by all B), so the only
+// per-column difference is the chain length: a column whose chain ended is
+// predicated off (loads included — its slots past the chain are another
+// column's). Each column's values are bitwise tree_fwd_unit_n's.
+template <int B, typename T>
+__device__ void tree_fwd_unit_b(const T* __restrict__ l, T* const (&x)[B],
+                                const int (&vm)[B]) {
+  int c0[B], len[B];
+  T y0[B];
+  int lmax = 0;
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const int e0 = TREE.v2e[vm[b]];
+    c0[b] = TREE.cb[e0];
+    len[b] = TREE.d[e0];
+    y0[b] = T(1) / l[c0[b]];
+    x[b][vm[b]] = y0[b];
+    lmax = len[b] > lmax ? len[b] : lmax;
+  }
+  for (int s = 1; s <= lmax; s++) {
+    T acc[B];
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      acc[b] = T(0);
+      if (s <= len[b]) acc[b] -= l[c0[b] + s] * y0[b];
+    }
+    for (int r = 1; r < s; r++) {
+#pragma unroll
+      for (int b = 0; b < B; b++)
+        if (s <= len[b])
+          acc[b] -= l[TREE.cbslot[c0[b] + r] + (s - r)]
+                    * x[b][TREE.vslot[c0[b] + r]];
+    }
+#pragma unroll
+    for (int b = 0; b < B; b++)
+      if (s <= len[b])
+        x[b][TREE.vslot[c0[b] + s]] = acc[b] / l[TREE.cbslot[c0[b] + s]];
   }
 }
 
@@ -4061,11 +4117,13 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       ecol_seed(s, j2);
       ecol_seed(s, j3);
       // audit #10: each column's forward pass is its own ancestor
-      // chain (tree_fwd_unit_n); the dense back pass is batched
-      tree_fwd_unit_n(d.m, s.ecol[j0], VOFF + j0);
-      tree_fwd_unit_n(d.m, s.ecol[j1], VOFF + j1);
-      tree_fwd_unit_n(d.m, s.ecol[j2], VOFF + j2);
-      tree_fwd_unit_n(d.m, s.ecol[j3], VOFF + j3);
+      // chain, the four interleaved (tree_fwd_unit_b); the dense back
+      // pass is batched
+      {
+        T* const xs[4] = {s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]};
+        const int vs[4] = {VOFF + j0, VOFF + j1, VOFF + j2, VOFF + j3};
+        tree_fwd_unit_b<4>(d.m, xs, vs);
+      }
       tree_back4_n(d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
@@ -4076,8 +4134,11 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       ecol_seed(s, j0);
       ecol_seed(s, j1);
-      tree_fwd_unit_n(d.m, s.ecol[j0], VOFF + j0);
-      tree_fwd_unit_n(d.m, s.ecol[j1], VOFF + j1);
+      {
+        T* const xs[2] = {s.ecol[j0], s.ecol[j1]};
+        const int vs[2] = {VOFF + j0, VOFF + j1};
+        tree_fwd_unit_b<2>(d.m, xs, vs);
+      }
       tree_back2_n(d.m, s.ecol[j0], s.ecol[j1]);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
