@@ -31,7 +31,7 @@ KNEES = (20, 26)
 def _env(n=64, **kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(n, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=True, **kw)
+                          **kw)
 
 
 def _q36(env, e):
@@ -51,7 +51,7 @@ def _min_corner_y(q36):
     return m
 
 
-Q0_LEGS = [q_start(foot_contact=True)[j] for j in LEGS]
+Q0_LEGS = [q_start()[j] for j in LEGS]
 
 
 @cuda

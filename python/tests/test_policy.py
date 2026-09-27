@@ -15,7 +15,7 @@ ACTION_NVEC = [3] * N_JOINTS
 
 def _obs_batch(n=6):
     # short chart -> fewer pending notes than slots, so masked slots exist
-    env = RustBeatEnv(foot_contact=False, seed=1, chart_len_s=6.0)
+    env = RustBeatEnv(seed=1, chart_len_s=6.0)
     obs, _ = env.reset()
     rows = [obs]
     rng = np.random.default_rng(0)

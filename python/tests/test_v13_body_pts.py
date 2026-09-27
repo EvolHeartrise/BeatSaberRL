@@ -10,10 +10,9 @@ import beat_arena_rs
 from tests._helpers import FAR_NOTE
 
 
-def _reset_obs(foot_contact):
+def _reset_obs():
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5,
-                                   foot_contact=foot_contact)
+                                   gears=5)
     return np.asarray(sim.set_chart([note_tuple(FAR_NOTE)]),
                       dtype=np.float64)
 
@@ -23,10 +22,10 @@ def test_body_pt_lanes_reference_pose():
     geometry exactly: elbows at (∓0.20, 1.47, −0.30), knees at
     (∓0.10, 0.50, −0.65), feet (ankles) at (∓0.10, 0.07, −0.65) — in
     lane space, x/1, (y−Y0)/0.75, (z+0.65)/1."""
-    obs = _reset_obs(True)
+    obs = _reset_obs()
     pts = obs[OFF_BODY_PTS:OFF_BODY_PTS + 18].reshape(6, 3)
     # env v21: ALL six points derive from the fk_body mirror of the
-    # CONTACT start pose (arm ready stance + wide leg stance) with the
+    # start pose (arm ready stance + wide leg stance) with the
     # exact sole-corner root drop applied
     from beat_arena_env.constants import q_start
     from beat_arena_env.kinematics import (F_L_ELBOW, F_L_FOOT, F_R_ELBOW,
@@ -34,7 +33,7 @@ def test_body_pt_lanes_reference_pose():
     corners = ((-0.045, -0.070, -0.075), (-0.045, -0.070, 0.175),
                (0.045, -0.070, -0.075), (0.045, -0.070, 0.175))
     rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0]
-                        + q_start(foot_contact=True))
+                        + q_start())
     drop = min(pos[fr][1] + sum(rots[fr][1][k] * c[k] for k in range(3))
                for fr in (F_L_FOOT, F_R_FOOT) for c in corners)
     exp = []
@@ -47,27 +46,6 @@ def test_body_pt_lanes_reference_pose():
     assert np.abs(pts - exp).max() < 1e-6, f"\n{pts}\nvs\n{exp}"
 
 
-def test_body_pt_lanes_present_in_weld_mode():
-    """Positions exist in every mode. env v21: RESET poses differ by
-    mode (the wide leg stance is contact-only), so the cross-mode
-    identity is asserted at an EXPLICITLY matched state instead."""
-    w = _reset_obs(False)
-    assert w.shape == (OBS_DIM,)
-    assert np.abs(w[OFF_BODY_PTS:]).max() > 0.05
-    from beat_arena_env.constants import q_start
-    q36 = [0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start()
-    obs2 = []
-    for fc in (False, True):
-        sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                       gears=5,
-                                       foot_contact=fc)
-        sim.set_chart([note_tuple(FAR_NOTE)])
-        sim.set_joints(list(q36), [0.0] * 35)
-        obs2.append(np.asarray(sim.obs(), dtype=np.float64))
-    np.testing.assert_array_equal(obs2[0][OFF_BODY_PTS:],
-                                  obs2[1][OFF_BODY_PTS:])
-
-
 def test_body_pt_lanes_track_motion():
     """Driving the left knee moves the l_knee/l_foot lanes and leaves
     the right side's lanes untouched relative to... the right side also
@@ -75,8 +53,7 @@ def test_body_pt_lanes_track_motion():
     lane moves MORE than the right, and elbows move with hip torque far
     less than feet."""
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5,
-                                   foot_contact=False)
+                                   gears=5)
     sim.set_chart([note_tuple(FAR_NOTE)])
     # env v20: this script is calibrated to the pre-v20 zero-arm pose;
     # pin it (the ready stance only moves the episode START pose, not
@@ -90,7 +67,7 @@ def test_body_pt_lanes_track_motion():
     act[20] = 1  # l_knee full flex (one-way joint, gear id 1 = +1.0)
     obs = o0
     # drive 10 -> 5 ticks (2026-08-20 ankle_p +35): the wider ankle
-    # range lets the welded body ROCK further, and by 10 ticks the
+    # range let the (then welded) body ROCK further, and by 10 ticks the
     # whole-body rock drowns the driven side (ratio 1.07); the knee
     # flexion itself saturates early, so 5 ticks keeps the signal
     # (measured l 0.247 / r 0.161, ratio 1.53)
@@ -102,8 +79,9 @@ def test_body_pt_lanes_track_motion():
                - o0[OFF_BODY_PTS:OFF_BODY_PTS + 18]).reshape(6, 3)
     l_knee_move, r_knee_move = d[2].max(), d[3].max()
     assert l_knee_move > 1e-3, f"driven knee's lanes froze: {d}"
-    # welded feet rock the whole body, so the passive side moves too —
-    # only the RATIO is side-selective. Threshold 2x -> 1.25x at the
+    # the reaction rocks the whole body (on ground contact since the
+    # weld harness was removed, 2026-09-27), so the passive side moves
+    # too — only the RATIO is side-selective. Threshold 2x -> 1.25x at the
     # 2026-08-20 knee 250 -> 150: the driven side's flexion shrank with
     # the cap while the reaction rocking scales with the same torque
     # (measured ratio 1.39 at knee-150)

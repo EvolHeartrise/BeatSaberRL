@@ -101,14 +101,13 @@ def test_cuda_rust_parity():
                              speed))]
     kw = dict(charts=[notes], walls=[walls], max_steps=max_steps, gears=3,
               device="cuda", dtype=torch.float64, auto_reset=False,
-              foot_contact=False, seed=0)
+              seed=0)
     env = CudaBeatVecEnv(1, **kw)
     env2 = CudaBeatVecEnv(1, z_asinh=2.0, **kw)
     assert env.z_asinh == 8.0
     env.reset()
     env2.reset()
-    sim = beat_arena_rs.RawBeatSim(max_steps=max_steps, gears=3,
-                                   foot_contact=False)
+    sim = beat_arena_rs.RawBeatSim(max_steps=max_steps, gears=3)
     sim.set_chart([note_tuple(n) for n in notes], walls)
     ent = slice(OFF_NOTES, OFF_NOTE_MASK)
     zl = np.zeros((OFF_NOTE_MASK - OFF_NOTES) // NOTE_FEAT * NOTE_FEAT,
@@ -122,7 +121,12 @@ def test_cuda_rust_parity():
         q36, v35 = rust_state(sim)
         resync(env, [q36], [v35])
         resync(env2, [q36], [v35])
-        o_r, _, _, _ = sim.step([0] * N_JOINTS)
+        o_r, _, d_r, _ = sim.step([0] * N_JOINTS)
+        if d_r:
+            # the coasting body tipped over (ground contact since the
+            # weld harness was removed, 2026-09-27): a finished env's
+            # frozen obs is no longer a lockstep comparison
+            break
         o_c, _, _, _ = env.step(act)
         o_2, _, _, _ = env2.step(act)
         o_r = np.asarray(o_r)
@@ -136,6 +140,7 @@ def test_cuda_rust_parity():
         for o in (o_c, o_2):
             assert (o[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]
                     == o_r[OFF_NOTE_MASK:OFF_NOTE_MASK + 24]).all(), tick
+    assert tick >= 15, tick
     # f64 lockstep: the lanes agree to the FK ulp level (v17 gate: 1e-4)
     assert worst < 1e-4, worst
     assert worst2 < 1e-4, worst2

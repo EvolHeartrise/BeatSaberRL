@@ -55,7 +55,7 @@ def _play(job):
     policy, dev = _W["policy"], _W["dev"]
     chart = generate_flux_chart(_W["cfg"], np.random.default_rng(seed))
     env = RustFluxEnv(external_chart=chart, gears=policy.n_gears,
-                      foot_contact=True, sim_dtype=_W["sim_dtype"])
+                      sim_dtype=_W["sim_dtype"])
     tmp = os.path.join(out_dir, f".{tag}_{k}.jsonl")
     env.set_record(tmp)
     obs, _ = env.reset()

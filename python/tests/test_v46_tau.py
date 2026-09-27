@@ -29,7 +29,7 @@ COAST = [0] * N_JOINTS
 
 def _rust(**kw):
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5, foot_contact=False, **kw)
+                                   gears=5, **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim
 
@@ -181,7 +181,7 @@ def test_replay_header_carries_tau_scale(tmp_path):
     from beat_arena_env.rust_env import RustBeatEnv
     n = Note(hit_time=2.0, col=1, row=1, x=-0.3, y=1.4, color=0,
              angle=4.712, speed=6.0)
-    env = RustBeatEnv(foot_contact=False, external_chart=[n], seed=0, gears=5)   # short episode
+    env = RustBeatEnv(external_chart=[n], seed=0, gears=5)   # short episode
     s = parse_tau_scale("arms=1.2,legs=0.9")
     env.set_tau_scale(s)
     path = tmp_path / "r.jsonl"
@@ -201,7 +201,7 @@ def test_replay_header_carries_tau_scale(tmp_path):
 def _cuda_env(n=8, tau_rand=0.0, seed=0, **kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(n, chart_len_s=8.0, seed=seed, device="cuda",
-                          foot_contact=False, gears=5, tau_rand=tau_rand,
+                          gears=5, tau_rand=tau_rand,
                           **kw)
 
 
@@ -268,17 +268,26 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
                          energy_coef=COEF)
     env.reset(); env.set_tau_scale(s)
     sim = beat_arena_rs.RawBeatSim(max_steps=6900, gears=5,
-                                   foot_contact=False, energy_coef=COEF)
+                                   energy_coef=COEF)
     sim.set_chart([note_tuple(FAR_NOTE)]); sim.set_tau_scale(s)
     rng = np.random.default_rng(1)
+    ticks = 0
     for _ in range(30):
         a = [int(x) for x in rng.integers(0, 5, N_JOINTS)]
-        tobs, trew, *_ = env.step(torch.tensor([a], device="cuda"))
-        robs, rrew, *_ = sim.step(a)
+        tobs, trew, tdone, _ = env.step(torch.tensor([a], device="cuda"))
+        robs, rrew, rdone, _ = sim.step(a)
         np.testing.assert_allclose(tobs[0, OFF_TAU:OBS_DIM].cpu().numpy(),
                                    np.asarray(robs)[OFF_TAU:OBS_DIM], atol=1e-6)
+        ticks += 1
+        assert bool(tdone[0]) == rdone
+        if rdone:
+            # random gears tip the body over on ground contact (weld
+            # harness removed 2026-09-27); a finished env is no longer
+            # stepped by Rust, so the telemetry comparison stops here
+            break
         q, v = rust_state(sim)
         resync(env, [q], [v])
+    assert ticks >= 3
     tot_c = env.pop_torque()[0]; tot_r = sim.pop_torque()[0]
     assert abs(tot_c - tot_r) < 1e-6 * max(1.0, tot_r)
 

@@ -25,10 +25,11 @@ COEF = 1e-4
 
 
 def _rust(**kw):
-    # weld mode: the charge is COMMAND-based; contact-mode terminals
-    # (reward = -fall_const replaces the tick) could erase a gap
+    # the charge is COMMAND-based; a fall/tilt terminal (reward =
+    # -fall_const replaces the tick) would erase a gap, so the scenarios
+    # stay inside the standing window
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5, foot_contact=False, **kw)
+                                   gears=5, **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim
 
@@ -77,8 +78,7 @@ def test_rust_coast_is_free_and_wrist_vs_spine_ratio():
 
 def _cuda_pair():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    kw = dict(chart_len_s=8.0, seed=0, device="cuda", foot_contact=False,
-              gears=5)
+    kw = dict(chart_len_s=8.0, seed=0, device="cuda", gears=5)
     env0 = CudaBeatVecEnv(64, **kw)
     env1 = CudaBeatVecEnv(64, energy_coef=COEF, **kw)
     env0.reset()

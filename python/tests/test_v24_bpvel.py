@@ -21,8 +21,7 @@ DT = 1.0 / 30.0
 def _env():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(64, chart_len_s=8.0, seed=0, device="cuda",
-                          dtype=torch.float64, foot_contact=True,
-                          gears=5)
+                          dtype=torch.float64, gears=5)
 
 
 def _vel_lanes(obs):

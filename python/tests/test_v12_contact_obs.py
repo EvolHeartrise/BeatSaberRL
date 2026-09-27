@@ -12,10 +12,9 @@ import beat_arena_rs
 from tests._helpers import FAR_NOTE, ZERO_ACT
 
 
-def _sim(foot_contact):
+def _sim():
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5,
-                                   foot_contact=foot_contact)
+                                   gears=5)
     sim.set_chart([note_tuple(FAR_NOTE)])
     # env v20: this script is calibrated to the pre-v20 zero-arm pose;
     # pin it (the ready stance only moves the episode START pose, not
@@ -34,7 +33,7 @@ def test_settled_stance_lanes_carry_body_weight():
     load. NOT more ticks: an unactuated body starts tipping at ~0.7 s
     (heels unload, then the fall envelope ends the episode) — the very
     behavior the v12 lanes exist to let a policy prevent."""
-    sim = _sim(True)
+    sim = _sim()
     obs = None
     for _ in range(10):
         obs, _r, _d, _ev = sim.step(ZERO_ACT)
@@ -46,27 +45,11 @@ def test_settled_stance_lanes_carry_body_weight():
     assert (lanes > 0.0).all(), f"unloaded bucket in settled stance: {lanes}"
 
 
-def test_weld_mode_lanes_stay_zero():
-    """foot_contact=False: the ground block does not exist, so the four
-    v12 lanes are exactly 0 and lanes 0..340 remain the v10 obs. (The
-    v13 body-point lanes after them are NOT zero — positions exist in
-    every mode.)"""
-    sim = _sim(False)
-    obs = None
-    for _ in range(5):
-        obs, _r, _d, _ev = sim.step(ZERO_ACT)
-    assert obs.shape == (OBS_DIM,)
-    assert not np.asarray(obs[OFF_GROUND_IMP:OFF_GROUND_IMP + 4]).any()
-
-
 def test_alive_bonus_priced_per_tick():
-    """Zero torque (no effort tax), FAR_NOTE (no judgments): a contact
-    tick's reward is exactly ALIVE_BONUS, and the same weld tick is
-    exactly 0 — the bonus is contact-mode only."""
-    _obs, rew, _d, _ev = _sim(True).step(ZERO_ACT)
+    """Zero torque (no effort tax), FAR_NOTE (no judgments): a tick's
+    reward is exactly ALIVE_BONUS."""
+    _obs, rew, _d, _ev = _sim().step(ZERO_ACT)
     assert rew == ALIVE_BONUS
-    _obs, rew, _d, _ev = _sim(False).step(ZERO_ACT)
-    assert rew == 0.0
 
 
 def test_ground_imp_norm_is_the_spec_literal():
