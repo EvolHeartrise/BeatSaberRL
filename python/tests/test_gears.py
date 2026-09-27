@@ -100,7 +100,13 @@ def test_omega_caps_observable():
         for _ in range(10):
             obs, _, _, _ = sim.step(act)
             peak = max(peak, _qd_obs(obs, j))
-        assert peak == pytest.approx(1.0, abs=1e-6), f"joint {j}"
+        # abs 1e-6 -> 1e-4 (2026-09-27, ground contact replaced the
+        # weld harness): the step-11 guarantee pass now clamps other
+        # joints of the free-standing body in the same substeps, and
+        # their momentum-consistent impulses couple ~1e-5 of relative
+        # rate into the capped wrist (measured 0.9999925; the elbow
+        # still reads exactly 1.0)
+        assert peak == pytest.approx(1.0, abs=1e-4), f"joint {j}"
 
 
 def test_ternary_prefix_identical_across_k():
@@ -123,10 +129,10 @@ def test_ternary_prefix_identical_across_k():
 
 
 def test_env_action_space_and_header():
-    env = RustBeatEnv(foot_contact=False, gears=5, seed=0)
+    env = RustBeatEnv(gears=5, seed=0)
     assert list(env.action_space.nvec) == [5] * N_JOINTS
     with pytest.raises(AssertionError):
-        RustBeatEnv(foot_contact=False, gears=4)
+        RustBeatEnv(gears=4)
 
 
 def test_policy_head_width_roundtrip():
@@ -136,7 +142,7 @@ def test_policy_head_width_roundtrip():
     import torch
     from policy import NotePolicy, load_policy
 
-    env = RustBeatEnv(foot_contact=False, gears=5, seed=0, chart_len_s=6.0)
+    env = RustBeatEnv(gears=5, seed=0, chart_len_s=6.0)
     obs, _ = env.reset()
     for k in (3, 5, 7):
         torch.manual_seed(0)

@@ -41,7 +41,7 @@ def env_phase(num_envs, iters, policy, pool_sample=999999):
                             device=device, lead_s=0.5, mirror=True)
     from beat_arena_env.ranked_pool import pool_max_steps
     venv = CudaBeatVecEnv(num_envs, pool=pool, max_steps=pool_max_steps(pool),
-                          foot_contact=True, gears=5, seed=0,
+                          gears=5, seed=0,
                           device=device)
     venv.reset()
     obs = venv._obs

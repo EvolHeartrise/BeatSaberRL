@@ -54,16 +54,32 @@ def _q36(joints=None):
 
 # --- obs layout (§5, every offset) -------------------------------------------
 
+def _reset_drop():
+    """The reset's root drop (env v21): the wide leg stance lifts the
+    ankles, and the root is lowered until the lowest sole corner sits
+    exactly on the ground — fk_body mirror of the same corner arithmetic."""
+    from beat_arena_env.constants import q_start
+    from beat_arena_env.kinematics import F_L_FOOT, F_R_FOOT, fk_body
+    corners = ((-0.045, -0.070, -0.075), (-0.045, -0.070, 0.175),
+               (0.045, -0.070, -0.075), (0.045, -0.070, 0.175))
+    rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q_start())
+    return min(pos[fr][1] + sum(rots[fr][1][k] * c[k] for k in range(3))
+               for fr in (F_L_FOOT, F_R_FOOT) for c in corners)
+
+
 def test_obs_length_and_reset_layout():
     sim = _sim([_note(5.0, 0.3, 1.4)])
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
+    drop = _reset_drop()
+    assert 0.0 < drop < 0.02         # ~8.5 mm
     assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 86,
                                           97, 100, 102, 534)
-    # root at reference: centered position zero, identity rotation 6D
-    assert np.allclose(obs[OFF_ROOT_POS:OFF_ROOT_POS + 3], 0.0)
+    # root at reference less the stance drop, identity rotation 6D
+    assert np.allclose(obs[OFF_ROOT_POS:OFF_ROOT_POS + 3],
+                       [0.0, -drop / 0.75, 0.0], atol=1e-6)
     assert np.allclose(obs[OFF_ROOT_ROT:OFF_ROOT_ROT + 6],
                        [1, 0, 0, 0, 1, 0])
     assert not obs[OFF_ROOT_VLIN:OFF_ROOT_VANG + 3].any()
@@ -97,27 +113,28 @@ def test_obs_length_and_reset_layout():
     # from the fk_body python mirror of the same start pose
     from beat_arena_env.kinematics import (F_L_HAND, F_L_WRIST, F_R_HAND,
                                            F_R_WRIST, fk_body)
-    rots, pos = fk_body([0.0, 0.94, -0.65, 1.0, 0.0, 0.0, 0.0] + q0)
+    rots, pos = fk_body([0.0, 0.94 - drop, -0.65, 1.0, 0.0, 0.0, 0.0] + q0)
     for base, fw, fh in ((OFF_HAND_L, F_L_WRIST, F_L_HAND),
                          (OFF_HAND_R, F_R_WRIST, F_R_HAND)):
         w, r = pos[fw], rots[fh]
-        # env v38: wrist x/y head-relative (reference head (0, 1.70))
+        # env v38: wrist x/y head-relative (live head (0, 1.70 - drop))
         assert obs[base] == pytest.approx(w[0] - 0.0, abs=1e-6)
-        assert obs[base + 1] == pytest.approx((w[1] - 1.70) / 0.75,
+        assert obs[base + 1] == pytest.approx((w[1] - (1.70 - drop)) / 0.75,
                                               abs=1e-6)
         assert obs[base + 2] == pytest.approx(w[2], abs=1e-6)
         assert not obs[base + 3:base + 6].any()          # wrist vel
         assert np.allclose(obs[base + 6:base + 9],
                            [r[0][2], r[1][2], r[2][2]], atol=1e-6)
         assert obs[base + 9] == 0.0                      # swing meter
-    # head at reference (0, 1.70, -0.65) => centered zeros
-    assert np.allclose(obs[OFF_HEAD:OFF_HEAD + 3], 0.0, atol=1e-9)
+    # head at reference (0, 1.70, -0.65) less the drop
+    assert np.allclose(obs[OFF_HEAD:OFF_HEAD + 3], [0.0, -drop / 0.75, 0.0],
+                       atol=1e-6)
     assert not obs[OFF_CONTACT:OFF_CONTACT + 2].any()
     # one pending note
     base = OFF_NOTES
-    # env v38: entity x/y are head-relative (head at reference (0, 1.70))
+    # env v38: entity x/y are head-relative (live head (0, 1.70 - drop))
     assert obs[base] == pytest.approx(0.3 - 0.0)
-    assert obs[base + 1] == pytest.approx((1.4 - 1.70) / 0.75)
+    assert obs[base + 1] == pytest.approx((1.4 - (1.70 - drop)) / 0.75)
     assert obs[base + 3] == pytest.approx(-4.0 / 8.0)
     assert obs[base + 13] == 0.0        # ex-valid lane, retired 2026-08-22
     assert obs[OFF_NOTE_MASK] == 1.0
@@ -176,7 +193,7 @@ def test_obs_q_and_qd_track_state():
 
 def test_note_block_and_mask_track_pending():
     from beat_arena_env.chart import ChartConfig, generate_chart
-    env = RustBeatEnv(foot_contact=False, seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
+    env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     n_pending = min(len(env.chart), N_NOTE_SLOTS)
     assert obs[OFF_NOTE_MASK:OFF_NOTE_MASK + N_NOTE_SLOTS].sum() == n_pending
@@ -205,7 +222,7 @@ def test_note_block_and_mask_track_pending():
 
 def test_determinism_all_kinds():
     def run():
-        env = RustBeatEnv(foot_contact=False, colors="both", bomb_prob=0.3, extra_prob=0.3,
+        env = RustBeatEnv(colors="both", bomb_prob=0.3, extra_prob=0.3,
                           dot_prob=0.2, chart_len_s=8.0, seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
@@ -233,18 +250,23 @@ def _park_arms(joints):
 
 def _miss_tick(spine_pitch, speed=8.0):
     """Tick at which a high, fast note's miss event fires with the body
-    held (by torque) at a given spine lean."""
-    sim = _sim([_note(0.5, -0.9, 1.9, speed=speed)], max_steps=300)
+    started at a given spine lean (reference stance otherwise).
+
+    2026-09-27 (weld harness removed): the body stands on ground contact
+    and coasts — a torque-held lean now throws it over the chest-tilt
+    envelope within a few ticks — so the note arrives early (0.2 s) and
+    the lean is 0.3 rad (~17 deg), which the coasting body still holds
+    well inside the tilt bound when the miss fires."""
+    sim = _sim([_note(0.2, -0.9, 1.9, speed=speed)], max_steps=300)
     joints = _park_arms(np.zeros(N_JOINTS))
     joints[0] = spine_pitch
     sim.set_joints(list(_q36(joints)), [0.0] * NV)
-    a = list(COAST)
-    a[0] = 1 if spine_pitch > 0 else 0   # hold the lean against gravity
     for t in range(120):
-        _, _, _, ev = sim.step(a)
+        _, _, done, ev = sim.step(list(COAST))
         for i, code, *_ in ev:
             if code == 4:
                 return t
+        assert not done, f"episode ended at tick {t} before the miss"
     raise AssertionError("miss never fired")
 
 
@@ -256,7 +278,7 @@ def test_miss_boundary_is_head_invariant():
     at any lean. (Pre-v15 this asserted leaning < upright: the boundary
     used to move with the head while the track stood still.)"""
     upright = _miss_tick(0.0)
-    leaning = _miss_tick(JOINT_LIMITS[0][1])    # +45 deg, torque-pinned
+    leaning = _miss_tick(0.3)                   # ~17 deg forward
     assert leaning == upright, (upright, leaning)
 
 
@@ -268,23 +290,27 @@ def test_reach_gate_moves_with_shoulders():
     start-pose blade (spans z 0..1) grazes an approaching note exactly
     when it enters reach; with the shoulders pulled back the graze
     happens later (fewer pre-hit ticks with contact chances) — assert
-    via first-contact tick of a slow note against a stationary blade."""
+    via first-contact tick of a slow note against a stationary blade.
+
+    2026-09-27 (weld harness removed): the body stands on ground contact
+    and coasts (a torque-held -20 deg lean now trips the 20 deg backward
+    chest-tilt envelope at once), so the lean is -0.2 rad (~11 deg) and
+    the note enters reach ~0.15 s in, before the coasting body tips."""
     def first_contact_tick(spine_pitch):
-        sim = _sim([_note(2.0, 0.2, 1.47, speed=2.0)], max_steps=300)
+        sim = _sim([_note(1.1, 0.2, 1.47, speed=2.0)], max_steps=300)
         joints = np.zeros(N_JOINTS)
         joints[0] = spine_pitch
         sim.set_joints(list(_q36(joints)), [0.0] * NV)
-        a = list(COAST)
-        if spine_pitch < 0:
-            a[0] = 2                     # hold the backward lean
         for t in range(90):
-            _, _, _, ev = sim.step(a)
+            _, _, done, ev = sim.step(list(COAST))
             if ev:
                 return t, ev[0][1]
+            if done:
+                break
         return None, None
 
     t_ref, code_ref = first_contact_tick(0.0)
-    t_back, code_back = first_contact_tick(JOINT_LIMITS[0][0])  # -20 deg
+    t_back, code_back = first_contact_tick(-0.2)   # ~11 deg back
     assert t_ref is not None and t_back is not None
     # pulled-back shoulders + blade => later first contact
     assert t_back > t_ref, (t_ref, t_back)
@@ -294,7 +320,7 @@ def test_reach_gate_moves_with_shoulders():
 
 def test_replay_v10_roundtrip(tmp_path):
     path = str(tmp_path / "ep.jsonl")
-    env = RustBeatEnv(foot_contact=False, seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
+    env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
                       colors="both")
     env.set_record(path)
     env.reset(seed=5)
@@ -366,9 +392,11 @@ def test_sim_plays_a_chart_scripted_torques():
     at P3 (seeded search over whip ticks kept as fallback)."""
     def run(whip_tick):
         # hit 0.9 -> 0.8 (env v15, contact spec §10): the head-anchored
-        # track moves with the whip's trunk reaction; 0.8 re-lands the
-        # hand-tuned whip_tick=17 primary path (fist-only hand era)
-        sim = _sim([_note(0.8, 0.3, 1.4, speed=4.0)], max_steps=300)
+        # track moves with the whip's trunk reaction. 0.8 -> 0.6
+        # (2026-09-27, ground contact replaced the weld harness): the
+        # whip tips the free-standing body within ~17 ticks, so the cut
+        # comes earlier (swept: whip 8..12 all land 100-109 at 0.6)
+        sim = _sim([_note(0.6, 0.3, 1.4, speed=4.0)], max_steps=300)
         # env v20: this script is calibrated to the pre-v20 zero-arm pose;
         # pin it (the ready stance only moves the episode START pose, not
         # the mechanics under test)
@@ -390,7 +418,8 @@ def test_sim_plays_a_chart_scripted_torques():
     # 17 -> 14 (env v42 hilt grip: the blade base moved 0.16 m out along
     # the blade, so the same whip meets the note 3 ticks earlier in the
     # swing; whip 14 scores the full 115 on v42, 17 misses the box)
-    sim, events = run(14)
+    # 14 -> 10 (2026-09-27, ground contact: see the hit note above)
+    sim, events = run(10)
     if not any(c == 0 for _, c, *_ in events):
         # crude deterministic fallback search (seeded ordering)
         for whip in (12, 14, 16, 18, 13, 17):

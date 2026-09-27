@@ -10,6 +10,16 @@ do NOT re-derive them. Scoring, notes, judgment, chart generation, and the
 obs note semantics); this file specifies only what v10 changes. The MuJoCo
 oracle twin is `mjcf/body_v10.xml`.
 
+**Amendment 2026-09-27 (weld removal, issue #2).** The v10 FOOT WELDS are
+gone from every engine: env v11 (research/2026-08-08-unilateral-contact-
+spec.md) put the feet on unilateral frictional ground contact, weld mode
+survived only as a test harness from 2026-08-16, and on 2026-09-27 it was
+deleted (Rust solver, CUDA `FC=false` instantiation, the `foot_contact=`
+constructor argument). §3 step 8 below is rewritten to the single
+remaining row set; the weld-era text elsewhere in this file (§1.2 notes,
+§7 P2 gates, the Divergences log) is kept as the historical record it is,
+and weld-era statements there no longer describe the running engines.
+
 Units: meters, kilograms, seconds, radians, N·m. World: y up, floor y = 0,
 hit plane z = 0, notes approach from +z. Gravity **9.81** along −y.
 
@@ -327,39 +337,40 @@ happening in exactly this order:**
    2026-09-26 (Divergences §25; the same M and linear systems).
 6. Unconstrained velocity `v* = v + h·M⁻¹(τ − C)`.
 7. **Collision detection** over the 55-pair table (margin 0.01).
-8. **Constraint solve (REVISED at P2 — Divergences §15, §16): exactly
-   12 iterations, fixed order, no warm starting** (λ = 0 each substep —
+8. **Constraint solve (REVISED at P2 — Divergences §15, §16; env v11
+   ground block; weld rows REMOVED 2026-09-27): exactly 12 iterations,
+   fixed order, no warm starting** (λ = 0 each substep —
    determinism/parity simplicity). Row set:
-   - rows 0–5: foot_l weld (3 linear, then 3 angular),
-   - rows 6–11: foot_r weld (same layout),
+   - the GROUND BLOCK (unilateral-contact spec §2/§3): 3 rows per ACTIVE
+     sole corner (normal ŷ, friction x̂, friction ẑ), corners in the
+     spec's normative order (foot_l then foot_r),
    - one normal row per ACTIVE contact, in pair-id order (§2),
    - one unilateral joint-limit row per joint whose NEARER stop is
      within `h·ω_cap[j]` of `q_j`, joint order 0..28 (ties → lower
      stop; row +e_j at the lower stop / −e_j at the upper).
    Each of the 12 iterations, in order:
-   (a) the 12 bilateral weld rows solved EXACTLY as a dense block —
-       `Δλ_w = A_ww⁻¹(b_w − J_w·v)` with `A_ww = J_w M⁻¹ J_wᵀ`
-       no-pivot-Cholesky-factored once per substep;
+   (a) the ground block, per corner: the normal row projected to
+       λ_n ≥ 0, then its two friction rows box-clamped to
+       |λ_t| ≤ μ·λ_n (μ = 0.9) against THIS sweep's λ_n (unilateral-
+       contact spec §3; evaluated per contacting foot from its 6-D
+       spatial Jacobian — Divergences §24);
    (b) contact rows then limit rows, projected Gauss-Seidel to λ ≥ 0,
        in row order;
    (c) ω-cap pass, joint order 0..28: hard clamp of `q̇_j` to ±ω_cap
        via momentum-consistent impulses (exact assignment).
    `M⁻¹Jᵀ` columns and effective masses via Cholesky solves of THIS
-   substep's factor. Limit-row and ω-cap impulse directions are
-   projected into the WELD NULL SPACE:
-   `c_j = M⁻¹e_j − M⁻¹J_wᵀ·A_ww⁻¹·(J_w M⁻¹ e_j)` (so `J_w·c_j = 0` —
-   limit/cap impulses can never break the welds); a direction whose
-   composite mobility ≤ **1e-4** × its plain `(M⁻¹)_jj` is immobile
-   given the welds and its row is inert (REVISED at P3 from 1e-10 —
-   Divergences §19a: the threshold is an impulse-amplification bound,
-   not a numerical-noise floor).
-   **Right-hand sides** (`J·v = b` welds; `J·v ≥ b`, λ ≥ 0 unilaterals):
-   - welds: `b = −(β_weld/h)·C_pose`, β_weld = **0.2** (position error
-     3-vector; orientation error via the log map, 3-vector),
-   - contacts: `b = −gap/h` while gap ≥ 0 (speculative activation
-     inside the margin — Divergences §16), else
+   substep's factor. Limit-row and ω-cap impulse directions are the
+   plain `M⁻¹e_j` columns. (Until 2026-09-27 they were projected into
+   the null space of the v10 foot welds; the ω-cap pass keeps that
+   era's guard verbatim — a column with `(M⁻¹)_jj` not above
+   **1e-4** × itself, i.e. zero / NaN / ∞, is inert — Divergences §19a.)
+   **Right-hand sides** (`J·v ≥ b`, λ ≥ 0 unilaterals):
+   - contacts and ground normals: `b = −gap/h` while gap ≥ 0
+     (speculative activation inside the margin — Divergences §16), else
      `(β_c/h)·max(penetration − slop, 0)`, β_c = **0.2**, slop 0.005,
-   - limits: same shape with slop 0 and β_weld pushback.
+   - ground friction: `b = 0`,
+   - limits: same shape as contacts with slop 0 and β = **0.2**
+     pushback (the former β_weld value).
 9. `v ← v* + M⁻¹Jᵀλ`.
 10. **Semi-implicit Euler positions**: `q₂₉ ← q₂₉ + h·q̇₂₉`; root position
     `p ← p + h·v_lin`; root quaternion via exp map of the WORLD angular
@@ -387,13 +398,14 @@ happening in exactly this order:**
     11** (both applications are the identical expression tree): if
     `|ω_root| > 96` rad/s, rescale the root angular 3-vector onto 96;
     if `|v_root| > 48` m/s, rescale the linear 3-vector onto 48. The
-    welded feet + capped joints kinematically bound the true root
+    grounded feet (derived on the v10 welded feet) + capped joints
+    kinematically bound the true root
     velocity (6-joint leg chain × 16 rad/s; ≤ ~0.5 m root–foot
     levers) — beyond the envelope is integrator/solver artifact, not
     physics; ordinary motion never approaches it.
     The **pre-step-10** application is what bounds the INTEGRATED root
     motion: `‖Δp‖ ≤ h·48` and `|Δθ| ≤ h·96` per substep,
-    unconditionally, and hence the next substep's Baumgarte weld bias.
+    unconditionally, and hence the next substep's Baumgarte biases.
     The **post-step-11** application is what bounds the STORED
     velocity (step 11's momentum-consistent joint impulses
     `Δv = M⁻¹e_j·λ` have non-zero ROOT rows and can re-exceed the
@@ -410,9 +422,11 @@ happening in exactly this order:**
     reach the policy. The post-step-11 application is deliberately not
     counted (it is the measured subset; see Divergences §23).
 
-Feet weld definition: foot body frames held at their reference-pose world
-poses — foot_l at (−0.10, 0.07, −0.65), foot_r at (+0.10, 0.07, −0.65),
-identity orientation (6 bilateral rows each).
+Feet: the v10 weld definition (foot frames held at their reference-pose
+world poses, foot_l (−0.10, 0.07, −0.65), foot_r (+0.10, 0.07, −0.65),
+6 bilateral rows each) was REMOVED 2026-09-27; the feet stand on the
+env v11 ground block (unilateral-contact spec). Those reference poses
+remain the neutral stance, where all 8 sole corners touch y = 0.
 
 ## 4. Actuation & effort
 
@@ -646,6 +660,13 @@ bounds re-read against measured physics, reasoning in §17):
 - Capsule–capsule distance on 10k random pairs incl. parallel and
   degenerate (sphere) cases: brute-force-sampling upper bound + convex
   box-KKT certificate ≤ 1e-9 (measured 8.2e-16).
+(The three weld gates below are the P2 record. 2026-09-27, with the
+welds removed: the RNEA hold runs on the free-floating body, the weight
+sum is tests_ground.rs `no_pull_and_weight_is_carried`, and the load /
+torture gates became `stance_under_two_arm_swing` (feet do not slip) and
+`ground_integrity_random_full_gears` (soles do not sink) in
+tests_constraints.rs; the MuJoCo oracle refdata were regenerated for the
+free-floating body.)
 - Welded stance + constant full 35-DoF RNEA(q_ref, 0, 0) compensation
   incl. the root wrench: **2 s**, max joint drift ≤ 1e-6 rad (measured
   3.1e-13), weld violation ≤ 1e-8 m (measured 6.2e-15). Muscle-tone
@@ -732,6 +753,7 @@ PD-over-IK bot ≥ 50 % good cuts on the default chart (v9 solvability bar).
 1. **Hand-rolled engine, MuJoCo as tolerance-band oracle** (not MJX
    backend) — triple-mirror f64 parity is the house quality mechanism.
 2. **Feet welded** in v10; ungluing is v11+ (same constraint machinery).
+   (Done: env v11 ground contact; the welds were removed 2026-09-27.)
 3. **Hard ω clamps kept** (v9-style, post-solve, dissipative); motor
    curves later. DRAG → physical joint damping b = 0.6·I_ref.
 4. **Spine 3-DoF, neck fixed** (head welded to chest).

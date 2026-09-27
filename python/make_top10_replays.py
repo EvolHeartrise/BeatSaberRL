@@ -116,9 +116,6 @@ def _make_one(job):
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
                       sim_dtype=_W["sim_dtype"],
-                      # contact physics is the only mode: every production
-                      # ckpt is contact-trained and the bench forces it
-                      foot_contact=True,
                       external_walls=meta["walls"])
     if _W.get("tau") is not None:
         env.set_tau_scale(_W["tau"])

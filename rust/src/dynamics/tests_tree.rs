@@ -11,7 +11,7 @@
 //!   · ROUNDING-LEVEL: tree solves vs the old root-first dense solves on
 //!     random SPD mass matrices from real states;
 //!   · the per-substep old-vs-new solver comparison (#9's discipline),
-//!     weld AND contact mode;
+//!     contact mode and the free-floating (no ground) harness mode;
 //!   · the pivot floor on the new pivots (singular matrix).
 
 use super::algo::{
@@ -284,8 +284,9 @@ fn tree_pivot_floor_on_singular_matrix() {
 }
 
 /// audit #10 EQUIVALENCE GATE, #9's discipline: at every substep of
-/// random-gear trajectories (contact mode, both amplitudes, and weld
-/// mode) the SAME pre-substep state is stepped twice — once with the
+/// random-gear trajectories (contact mode, both amplitudes, and the
+/// free-floating harness mode — the tier the v10 weld mode held until
+/// 2026-09-27) the SAME pre-substep state is stepped twice — once with the
 /// tree layout, once with `TreeChol::dense` (= the old root-first
 /// arithmetic, bitwise — `dense_layout_is_the_old_arithmetic`) — and
 /// the velocity leaving the step-7..9 constraint stage (which includes
@@ -301,15 +302,9 @@ fn tree_matches_dense_per_substep() {
     for (mode, seed, amp) in [
         ("contact", 0x5EED_0000_0000_A0C1u64, 1.0),
         ("contact", 0x5EED_0000_0000_A0C2, 0.25),
-        ("weld", 0x5EED_0000_0000_A0C3, 1.0),
+        ("floating", 0x5EED_0000_0000_A0C3, 1.0),
     ] {
-        let mk = || {
-            if mode == "weld" {
-                ConstraintSet::new(m, true, true)
-            } else {
-                ConstraintSet::new_modes(m, false, true, true)
-            }
-        };
+        let mk = || ConstraintSet::new(m, true, mode == "contact");
         let mut ws = Workspace::new(m);
         let mut ws_ref = Workspace::new(m);
         ws_ref.tc = TreeChol::dense(m.nv());

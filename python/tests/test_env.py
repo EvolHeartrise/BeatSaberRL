@@ -40,6 +40,8 @@ from beat_arena_env.kinematics import fk
 
 from beat_arena_rs import RawBeatSim
 
+from tests._helpers import ALIVE, plant_reference
+
 
 DOWN = 6 * np.pi / 4  # downward swing angle
 COAST = (0,) * N_JOINTS
@@ -64,10 +66,14 @@ def _note(hit_time, col, row, color=1, angle=DOWN, speed=4.0, any_dir=False,
 
 
 def _sim_with_notes(notes, max_steps=690, **kw):
+    """A sim at the v10 reference stance (tests._helpers.plant_reference
+    — the retired weld reset's state, now on ground contact: the cut
+    scenarios below are a few ticks long, well inside the ~0.5 s before
+    an unactuated body starts to tip)."""
     from beat_arena_env.chart import note_tuple
     sim = RawBeatSim(max_steps=max_steps, **kw)
     sim.set_chart([note_tuple(n) for n in notes])
-    return sim
+    return plant_reference(sim)
 
 
 def _sim_with_note(note, max_steps=690, **kw):
@@ -163,7 +169,7 @@ def test_flat_pose_geometry():
 def test_obs_reset_hands_and_notes():
     # bombs/dots/extras off: this test pins slot/feature offsets against
     # chart[0], which must be a plain arrow note for the color/dir asserts
-    env = RustBeatEnv(foot_contact=False, seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
+    env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
     assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
     assert OFF_NOTES == 102 and OFF_NOTE_MASK == 534   # env v19
@@ -245,7 +251,7 @@ def test_obs_kind_flags():
 def test_swing_meter_tracks_rotation():
     """The pre-swing obs feature rises while swinging, resets on reversal.
     Uses the right BEND joint torque (action index 15, env v10)."""
-    env = RustBeatEnv(foot_contact=False, seed=3)
+    env = RustBeatEnv(seed=3)
     env.reset()
     # env v20: script calibrated to the pre-v20 zero-arm pose
     _set_arm(env.sim, 0, [0.0] * 7, [0.0] * 7)
@@ -280,7 +286,7 @@ def test_z_is_time_times_speed():
     from beat_arena_env.constants import OFF_HEAD, PLANE_Z0, X_NORM
     from beat_arena_env.constants import note_center as nc
     from tests._helpers import z_lane_m
-    env = RustBeatEnv(foot_contact=False, seed=9)
+    env = RustBeatEnv(seed=9)
     obs, _ = env.reset()
     checked = 0
     for _ in range(60):
@@ -324,7 +330,7 @@ def test_z_is_time_times_speed():
 
 def test_determinism():
     def run():
-        env = RustBeatEnv(foot_contact=False, colors="both", bomb_prob=0.3, extra_prob=0.3,
+        env = RustBeatEnv(colors="both", bomb_prob=0.3, extra_prob=0.3,
                           seed=7)
         env.reset(seed=7)
         rng = np.random.default_rng(1)
@@ -357,8 +363,9 @@ def test_good_swing_cut_scores_integer_points():
     # blade plane sits ~0.2 m behind the note center); v10 measured 26
     assert 15.0 <= pts <= 45.0
     assert pts == int(pts)                    # real BS scores are integers
-    # coast tick: zero torque => zero activation price, reward is exactly pts/115
-    assert r == pytest.approx(pts / 115.0, abs=1e-9)
+    # coast tick: zero torque => zero activation price, reward is exactly
+    # pts/115 plus the per-tick alive bonus
+    assert r == pytest.approx(pts / 115.0 + ALIVE, abs=1e-9)
 
 
 def test_gentle_swing_is_good():
@@ -538,13 +545,13 @@ def _whip_events(kind=0, ticks=60):
     beyond reach, then whip down at full gear through a note — > 100
     deg of blade arc banks the full 70 pre-swing, and the follow-through
     keeps sweeping for the full 30."""
-    # hit 0.9 -> 0.8 (env v15, contact spec §10): the whip's reaction
-    # rocks the trunk (head z swings ~1 m), and the head-anchored track
-    # moves with it. 0.8 -> PER-KIND (2026-08-20 ankle_p hi 20 -> 35
-    # deg: the weld-mode passive rock grew again and split the two
-    # kinds' timing windows — swept on-pod at windup 19: regular note
-    # lands full pre/post at 0.75, chain head at 0.85).
-    hit = 0.85 if kind == KIND_CHAIN_HEAD else 0.75
+    # The whip's reaction rocks the trunk and the head-anchored track
+    # moves with it, so hit time and windup are a swept pair. 2026-09-27
+    # (weld harness removed): on ground contact the whip tips the body
+    # over — the episode ends on the tilt envelope ~17 ticks in — so the
+    # windup is 13 ticks and both kinds use hit 0.75 (swept: the regular
+    # note lands 70 pre + 30 post there, the chain head 70 pre, no post).
+    hit = 0.75
     sim = _sim_with_note(_note(hit, 2, 1, kind=kind), max_steps=300)
     # env v20: the whip is hand-tuned against the zero-arm start
     _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)
@@ -556,8 +563,9 @@ def _whip_events(kind=0, ticks=60):
         # lighter arm whips ~10% faster, so the old timing slammed the
         # -90 deg pitch stop mid-follow-through (post accrued 0); two
         # more windup ticks re-land the cut with full sweep room.
-        # 17 -> 19 (2026-08-20 ankle_p +35: rock retune, see hit above)
-        a[A_R_ARM] = 1 if t < 19 else 2
+        # 17 -> 19 (2026-08-20 ankle_p +35: rock retune), 19 -> 13
+        # (2026-09-27, ground contact: see hit above)
+        a[A_R_ARM] = 1 if t < 13 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:
@@ -642,7 +650,7 @@ def test_chain_link_pays_flat_20_any_direction():
     ev, r = _coast(sim)
     assert _codes(ev) == [(0, 0)]
     assert ev[0][2] == 20.0
-    assert r == pytest.approx(20.0 / 115.0, abs=1e-9)
+    assert r == pytest.approx(20.0 / 115.0 + ALIVE, abs=1e-9)
     for _ in range(6):                        # no post event ever
         ev, _ = _coast(sim)
         assert all(c != 5 for _, c, *_ in ev)
@@ -691,7 +699,7 @@ def test_bomb_hit_and_bomb_pass():
     ev, r = _coast(sim)
     assert _codes(ev) == [(0, 6)]
     # env v7.8: bombs cost 3x a bad cut/miss (combo-break repricing)
-    assert r == pytest.approx(-1.5)
+    assert r == pytest.approx(-1.5 + ALIVE)
     assert sim.bombs_hit == 1 and sim.bad_cuts == 0 and sim.n_notes == 0
     # pass: park both arms, let it fly through the miss boundary
     sim = _sim_with_note(bomb)

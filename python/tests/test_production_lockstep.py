@@ -135,7 +135,7 @@ def _build(a, charts, walls, max_steps, tau):
     # kwarg; zeroed = training-only randomness the Rust twin lacks
     env = CudaBeatVecEnv(
         N, charts=charts, walls=wt, max_steps=max_steps,
-        gears=a.gears, foot_contact=a.foot_contact, fall_const=a.fall_pen,
+        gears=a.gears, fall_const=a.fall_pen,
         push_prob=0.0, push_vmax=a.push_vmax, start_jitter=0.0,
         foot_z_coef=a.foot_z_coef, foot_x_coef=a.foot_x_coef,
         foot_hinge_r=a.foot_hinge_r, foot_shape_coef=a.foot_shape_coef,
@@ -149,7 +149,7 @@ def _build(a, charts, walls, max_steps, tau):
     sims = []
     for ch, ws in zip(charts, wt):
         sim = beat_arena_rs.RawBeatSim(
-            max_steps=max_steps, gears=a.gears, foot_contact=a.foot_contact,
+            max_steps=max_steps, gears=a.gears,
             fall_const=a.fall_pen, foot_z_coef=a.foot_z_coef,
             foot_x_coef=a.foot_x_coef, foot_hinge_r=a.foot_hinge_r,
             foot_shape_coef=a.foot_shape_coef, energy_coef=a.energy_coef,

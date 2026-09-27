@@ -2,10 +2,12 @@
 judgment on the live sim (circle touch / wrong hand / bar crossing and
 its sweet spot / misses), obs lanes, mode separation, vec == single.
 
-The live-sim cases run in weld mode (the test harness body that never
-falls) with coast actions and place each object so that its hitbox
-slab holds the palm on the FIRST tick — the palm barely moves in one
-1/30 s tick, so the expected points are exact."""
+The live-sim cases run with coast actions and place each object so that
+its hitbox slab holds the palm on the FIRST tick — the palm barely moves
+in one 1/30 s tick, so the expected points are exact. Every object
+resolves within ~11 ticks, well before the unactuated body (on ground
+contact since the weld harness was removed, 2026-09-27) starts to tip;
+`_run` reports reward totals NET of the per-tick alive bonus."""
 import math
 
 import numpy as np
@@ -22,13 +24,15 @@ from beat_arena_env.flux_env import FluxVecEnv, RustFluxEnv
 
 from beat_arena_rs import RawBeatSim, VecBeatSim
 
+from tests._helpers import ALIVE
+
 ZERO = [0] * N_JOINTS
 DT = 1.0 / 30.0
 SPEED = 12.0
 
 
 def _sim():
-    return RawBeatSim(max_steps=400, foot_contact=False, flux=True)
+    return RawBeatSim(max_steps=400, flux=True)
 
 
 def _arrive_now(sim, palm_z, lead=0.2):
@@ -39,14 +43,18 @@ def _arrive_now(sim, palm_z, lead=0.2):
 
 
 def _run(sim, chart, ticks=30):
+    """Coast until done; returns (events, reward total net of the
+    per-tick alive bonus). A fall/tilt terminal would be priced flat at
+    -fall_const — asserted absent, the windows are too short for one."""
     sim.set_flux_chart([flux_tuple(o) for o in chart])
     events, total = [], 0.0
     for _ in range(ticks):
         _obs, r, done, ev = sim.step(ZERO)
         events += ev
-        total += r
+        total += r - ALIVE
         if done:
             break
+    assert not (sim.fell or sim.tilts), "body fell inside a judgment window"
     return events, total
 
 
@@ -285,7 +293,7 @@ def test_prev_block_records_a_resolved_circle():
 # -- mode separation / plumbing ----------------------------------------------------
 
 def test_modes_reject_each_others_charts():
-    std = RawBeatSim(max_steps=10, foot_contact=False)
+    std = RawBeatSim(max_steps=10)
     with pytest.raises(BaseException):
         std.set_flux_chart([])
     flux = _sim()
@@ -297,7 +305,7 @@ def test_modes_reject_each_others_charts():
 
 def test_vec_matches_single():
     n, steps = 3, 40
-    vec = FluxVecEnv(n, seed=5, foot_contact=True)
+    vec = FluxVecEnv(n, seed=5)
     obs_v = vec.reset().copy()
     charts = []
     rng = np.random.default_rng(11)
@@ -306,8 +314,7 @@ def test_vec_matches_single():
         ch = generate_flux_chart(vec.cfg, np.random.default_rng(100 + i))
         charts.append(ch)
         vec.sim.set_flux_chart(i, [flux_tuple(o) for o in ch])
-        s = RawBeatSim(max_steps=int(20.0 * 30) + 90, foot_contact=True,
-                       flux=True)
+        s = RawBeatSim(max_steps=int(20.0 * 30) + 90, flux=True)
         s.set_flux_chart([flux_tuple(o) for o in ch])
         singles.append(s)
     obs_v = vec.sim.obs().reshape(n, -1)
@@ -324,7 +331,7 @@ def test_vec_matches_single():
 
 
 def test_gym_env_rollout_and_recording(tmp_path):
-    env = RustFluxEnv(foot_contact=True, seed=2)
+    env = RustFluxEnv(seed=2)
     path = tmp_path / "flux.jsonl"
     env.set_record(str(path))
     env.reset()

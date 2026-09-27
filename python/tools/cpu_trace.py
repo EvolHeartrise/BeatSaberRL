@@ -118,8 +118,7 @@ def make_sim(mod, levels, gears):
     from beat_arena_env.constants import parse_tau_scale
     n = len(levels)
     sim = mod.VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
-                         return_events=False, gears=gears,
-                         foot_contact=True)
+                         return_events=False, gears=gears)
     sim.set_tau_scale([float(x) for x in parse_tau_scale(None)])
     for i in range(n):
         sim.set_chart(i, [])

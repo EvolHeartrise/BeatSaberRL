@@ -264,6 +264,17 @@ def test_contact_rich_parity_midline_press():
     acts = [0] * N_JOINTS
     acts[4] = 2   # l_arm_yaw toward the midline (limits are mirrored)
     acts[11] = 1  # r_arm_yaw toward the midline
+    # 2026-09-27 (weld harness removed): the coasting body on ground
+    # contact tips over long before the press (and a free spine slumps
+    # the chest past the tilt envelope — which the welded body never
+    # checked), so the TRUNK is pinned: after every tick the Rust root,
+    # spine and legs are written back to the start stance at rest
+    # (set_joints; the stand-in for the old welded feet) and CUDA resyncs
+    # to that, wrist velocity zeroed on both sides (set_joints
+    # semantics). Arms, contacts and the whole solve stay free; first
+    # touch now at t~29 (was t56 on the welded body).
+    trunk = [0, 1, 2] + list(range(17, 29))
+    stance = [list(q) for q in q36s]
     saw_contact = saw_bits = False
     # v14: the pressed yaws bounce at their stops instead of teleport-
     # pinning, so the forearms cross ~1 s later — first touch measured
@@ -306,16 +317,28 @@ def test_contact_rich_parity_midline_press():
             rust_imp = np.zeros(55)
             for p, _x, _y, _z, j in sim.contacts():
                 rust_imp[p] = j
+            # rtol 1e-3 added 2026-09-27: against the pinned torso the
+            # pressed pair's impulse amplifies the seed to 1.6e-4
+            # RELATIVE (4.2e-5 on a 0.26 N.s impulse, t29 env3); the
+            # absolute band still holds every small impulse
             np.testing.assert_allclose(rust_imp, imp_c[e], atol=1e-5,
+                                       rtol=1e-3,
                                        err_msg=f"t{t} env{e} contacts")
             if sim.contacts():
                 saw_contact = True
             if np.asarray(obs_r)[98:100].any():
                 saw_bits = True
             q, v = rust_state(sim)
+            q[:7] = stance[e][:7]
+            v[:6] = [0.0] * 6
+            for j in trunk:
+                q[7 + j] = stance[e][7 + j]
+                v[6 + j] = 0.0
+            sim.set_joints(q, v)
             q36s.append(q)
             v35s.append(v)
         resync(env, q36s, v35s)
+        env.wrist_vel.zero_()
     assert saw_contact, "press scenario produced no contact impulses"
     assert saw_bits, "press scenario never set the obs contact bits"
 
@@ -385,9 +408,16 @@ def test_parity_f32_bounded():
     caps = np.array(OMEGA_CAP)
     r_rews = np.zeros(4)
     t_rews = np.zeros(4)
+    # 2026-09-27 (weld harness removed): random gears now tip each body
+    # over (ground contact) and each engine ends its episode on its own
+    # tick; a finished auto_reset=False CUDA env keeps re-reporting its
+    # terminal reward, so each side's return is summed up to ITS done and
+    # the lane ceiling compares live ticks only
+    t_done = [False] * 4
+    r_done = [False] * 4
     for t in range(40):
         acts = rng.integers(0, 5, size=(4, N_JOINTS))
-        tobs, trew, _td, _ = env.step(torch.as_tensor(acts))
+        tobs, trew, tdone, _ = env.step(torch.as_tensor(acts))
         assert torch.isfinite(tobs).all(), f"t{t}: non-finite obs"
         q = env.q.cpu().numpy()
         qd = env.v[:, 6:].cpu().numpy()
@@ -407,11 +437,16 @@ def test_parity_f32_bounded():
         assert (np.linalg.norm(root_w, axis=1) <= 96.0 + 1e-2).all()
         assert (np.linalg.norm(root_v, axis=1) <= 48.0 + 1e-2).all()
         for e, sim in enumerate(sims):
-            obs_r, rew_r, _d, _ev = sim.step([int(x) for x in acts[e]])
-            d = np.abs(tobs[e].cpu().numpy() - np.asarray(obs_r))
-            assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
-            r_rews[e] += rew_r
-            t_rews[e] += float(trew[e])
+            obs_r, rew_r, d_r, _ev = sim.step([int(x) for x in acts[e]])
+            if not (t_done[e] or r_done[e]):
+                d = np.abs(tobs[e].cpu().numpy() - np.asarray(obs_r))
+                assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
+            if not r_done[e]:
+                r_rews[e] += rew_r
+            if not t_done[e]:
+                t_rews[e] += float(trew[e])
+            r_done[e] |= d_r
+            t_done[e] |= bool(tdone[e])
     np.testing.assert_allclose(t_rews, r_rews, atol=3.0)
     for e, sim in enumerate(sims):
         for a, b in ((sim.good_cuts, int(env.good[e])),

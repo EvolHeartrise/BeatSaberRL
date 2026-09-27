@@ -141,28 +141,6 @@ pub fn rot_to_quat(r: &Mat3) -> [Real; 4] {
     }
 }
 
-/// SO(3) log map: the rotation vector φ with R = exp([φ]×). Used for
-/// the weld orientation error (SPEC-v10 §3 step 8). Small-angle guard
-/// θ < 1e-9 → first-order φ = ½·vee(R − Rᵀ); weld errors are held tiny
-/// by Baumgarte, so the near-π branch never engages (θ/(2 sin θ) is
-/// still finite and correct up to θ < π).
-pub fn rot_log(r: &Mat3) -> [Real; 3] {
-    let w = [
-        r[2][1] - r[1][2],
-        r[0][2] - r[2][0],
-        r[1][0] - r[0][1],
-    ];
-    let tr = r[0][0] + r[1][1] + r[2][2];
-    let c = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0);
-    let theta = c.acos();
-    let factor = if theta < 1e-9 {
-        0.5
-    } else {
-        theta / (2.0 * theta.sin())
-    };
-    [w[0] * factor, w[1] * factor, w[2] * factor]
-}
-
 pub fn quat_mul(a: [Real; 4], b: [Real; 4]) -> [Real; 4] {
     [
         a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],

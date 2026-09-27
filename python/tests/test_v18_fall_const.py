@@ -30,7 +30,7 @@ def _fall_reward(chart, fall_const=None):
     kw = {} if fall_const is None else {"fall_const": fall_const}
     sim = beat_arena_rs.RawBeatSim(max_steps=600,
                                    gears=5,
-                                   foot_contact=True, **kw)
+                                   **kw)
     sim.set_chart([note_tuple(n) for n in chart], [])
     for _ in range(600):
         _obs, r, done, _ev = sim.step(ZERO_ACT)
@@ -63,8 +63,7 @@ def test_cuda_const_pricing_and_push_smoke():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
 
     charts = [DENSE, SPARSE, DENSE, SPARSE]
-    env = CudaBeatVecEnv(4, charts=charts, gears=5, foot_contact=True,
-                         fall_const=5.0, auto_reset=False,
+    env = CudaBeatVecEnv(4, charts=charts, gears=5, fall_const=5.0, auto_reset=False,
                          device="cuda", dtype=torch.float64)
     env.reset()
     acts = torch.zeros(4, 29, dtype=torch.long, device="cuda")
@@ -80,8 +79,7 @@ def test_cuda_const_pricing_and_push_smoke():
     assert torch.allclose(done_r, torch.full_like(done_r, -5.0))
 
     # push smoke: prob 1, vmax 1 -> root linear velocity must move
-    env2 = CudaBeatVecEnv(4, charts=charts, gears=5, foot_contact=True,
-                          push_prob=1.0, push_vmax=1.0,
+    env2 = CudaBeatVecEnv(4, charts=charts, gears=5, push_prob=1.0, push_vmax=1.0,
                           device="cuda", dtype=torch.float64)
     env2.reset()
     v0 = env2.v[:, :3].clone()

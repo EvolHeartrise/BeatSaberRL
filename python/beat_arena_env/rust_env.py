@@ -36,20 +36,18 @@ class RustBeatEnv(gym.Env):
                  note_prob=0.25, extra_prob=0.125, dot_prob=0.1,
                  bomb_prob=0.125,
                  external_chart=None, gears=3, seed=0, *,
-                 foot_contact, fall_const=5.0,
+                 fall_const=5.0,
                  external_walls=None, sim_dtype="f64"):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
         external_walls: list[Wall] riding along (env v17, spec §12) —
         real maps only; the procedural generator emits no walls.
 
-        foot_contact: REQUIRED keyword (no default) — env v11 foot_mode
-        (unilateral-contact spec §1). True = unilateral frictional ground
-        contact on the 8 sole corners, with the fall (root y below
-        FALL_ROOT_Y, rust/src/lib.rs) and chest-tilt terminations: the
-        ONLY production mode (every ckpt is contact-trained). False =
-        the retired v10 foot welds, kept as a TEST HARNESS only. Required so no caller silently gets weld physics
-        by forgetting it."""
+        The body stands on unilateral frictional ground contact at the 8
+        sole corners (env v11), with the fall (root y below FALL_ROOT_Y,
+        rust/src/lib.rs) and chest-tilt terminations. The retired v10
+        foot-weld harness and its `foot_contact=` keyword were removed
+        2026-09-27 (issue #2); passing it is a TypeError."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),
@@ -79,9 +77,8 @@ class RustBeatEnv(gym.Env):
         else:
             Sim = RawBeatSim
         self.sim = Sim(max_steps=max_steps, gears=gears,
-                       foot_contact=foot_contact, fall_const=fall_const)
+                       fall_const=fall_const)
         self.gears = gears
-        self.foot_contact = bool(foot_contact)
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the
         # v45 body); recorded in the replay header (record_rev 5)
         self.tau_scale = [1.0] * TAU_FEAT
@@ -174,9 +171,10 @@ class RustBeatEnv(gym.Env):
         # contact events (pair id, world point, tick-summed impulse),
         # score events unchanged from v7+.
         # P6 ADDITIVE fields (version stays "v10"; readers must treat
-        # them as optional): "feet" = per-foot [L, R] tick-summed weld
-        # impulses [jx, jy, jz, jax, jay, jaz] (N·s; ground reaction —
-        # vertical force ≈ jy/DT). τ per joint is NOT logged: it is
+        # them as optional): "feet" = per-foot [L, R] tick-summed ground
+        # reaction impulses [jx, jy, jz, 0, 0, 0] (N·s — vertical force
+        # ≈ jy/DT; lanes 3..5 were the retired welds' angular impulses
+        # and stay 0 so the schema is unchanged). τ per joint is NOT logged: it is
         # exactly gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
         # record_rev 3 (2026-09-13): the P6 "effort" (positive work, J)
         # field is GONE; "activation" = this tick's commanded |gear
@@ -207,16 +205,11 @@ class RustBeatEnv(gym.Env):
                                                 round(z, 4)],
                           "j": round(imp, 4)}
                          for p, x, y, z, imp in self.sim.contacts()],
-            # replay fix (2026-08-17): "feet" was wired to the retired
-            # welds' impulses and read all-zero in contact mode. Sum
-            # both sources — exactly one is nonzero per mode (weld rows
-            # don't exist in contact mode and vice versa); the ground
-            # reaction has no angular part, so lanes 3..5 keep the weld
-            # value (0 in contact mode) and the schema is unchanged.
-            "feet": [[round(w + (g[k] if k < 3 else 0.0), 4)
-                      for k, w in enumerate(wf)]
-                     for wf, g in zip(self.sim.weld_impulses(),
-                                      self.sim.ground_reaction())],
+            # replay fix (2026-08-17): the ground reaction per foot; it
+            # has no angular part, so lanes 3..5 are 0 (schema unchanged)
+            "feet": [[round(g[0], 4), round(g[1], 4), round(g[2], 4),
+                      0.0, 0.0, 0.0]
+                     for g in self.sim.ground_reaction()],
             "activation": [round(v, 4) for v in self.sim.last_activation()],
             # record_rev 4 (env v43): applied |tau| summed [total, spine,
             # arms, legs] in N.m — the energy-priced quantity (derivable
@@ -274,8 +267,7 @@ class RustBeatEnv(gym.Env):
                         misses=self.sim.misses, n_notes=self.sim.n_notes,
                         score=self.sim.score, bombs_hit=self.sim.bombs_hit,
                         # contact spec §4: 0 or 1 — a fall ends the
-                        # episode. Reported, never hidden; always 0 in
-                        # weld mode.
+                        # episode. Reported, never hidden.
                         falls=self.sim.falls,
                         # env v17: head-in-wall ticks + wall entries
                         # (= combo breaks, spec §12b)
