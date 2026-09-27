@@ -1673,7 +1673,23 @@ struct Solver : GroundRows<T> {
   // minvjt/capcol/solcache columns (linear solves commute with the +-1
   // row sign exactly; recomputation of the same expression tree is
   // deterministic).
+  //
+  // COLUMN SLOTS (perf/kernel-limits, audit-2 #6a). A column is stored
+  // in SLOT eslot[j], not row j: local memory interleaves words across
+  // the warp, so only a SAME-word access coalesces, and a limit row's
+  // joint differs per lane — s.ecol[l_j[li]][i] put every lane of the
+  // seed / back-substitution / PGS axpy on its own 128-byte line. Slots
+  // are handed out in computation order: the limit-row group (always the
+  // substep's first columns, see constraint_solve) takes slots 0..nl-1 in
+  // row order, so row li's column is s.ecol[li], a warp-uniform word; a
+  // lazy cap / clamp column takes the next free slot (nslot). At most NQ
+  // distinct joints per substep, so NQ slots suffice. Storage only: every
+  // value and the order anything is computed or applied in are unchanged.
+  // Measured on the RTX 5090 at N=32768 (trained standard, sampled):
+  // 69.5 -> 60.9 ms/tick alone, before the register passes (#6c).
   T ecol[NQ][NV], pdiag[NQ];
+  int nslot;
+  uint8_t eslot[NQ];
   bool ecomp[NQ], pcomp[NQ];
   bool hit[NQ];
 };
@@ -2689,22 +2705,28 @@ __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
 // skipped forward rows keep these +0.0 for the dense back substitution
 // to read).
 template <typename T>
-__device__ __forceinline__ void ecol_seed(Solver<T>& __restrict__ s,
-                                          int j) {
-  T* col = s.ecol[j];
+__device__ __forceinline__ void ecol_seed(T* __restrict__ col, int j) {
   for (int i = 0; i < NV; i++) col[i] = T(0);
   col[VOFF + j] = T(1);
 }
 
+// joint j's computed plain column (its slot — see the Solver note)
+template <typename T>
+__device__ __forceinline__ T* ecol_of(Solver<T>& s, int j) {
+  return s.ecol[s.eslot[j]];
+}
+
 // Lazily compute the plain M^-1 e_j column (shared by step-8 cap/limit
 // rows and the step-11 clamps — same expression tree as Rust's three
-// separate caches).
+// separate caches) into the next free slot.
 template <typename T>
 __device__ void ensure_ecol(Dyn<T>& __restrict__ d,
                             Solver<T>& __restrict__ s, int j) {
   if (s.ecomp[j]) return;
-  ecol_seed(s, j);
-  tree_solve_unit_n(d.m, s.ecol[j], VOFF + j);
+  s.eslot[j] = uint8_t(s.nslot++);
+  T* const col = ecol_of(s, j);
+  ecol_seed(col, j);
+  tree_solve_unit_n(d.m, col, VOFF + j);
   s.ecomp[j] = true;
 }
 
@@ -2720,7 +2742,7 @@ __device__ void ensure_pdiag(Dyn<T>& __restrict__ d,
                              Solver<T>& __restrict__ s, int j) {
   if (s.pcomp[j]) return;
   ensure_ecol(d, s, j);
-  const T plain = s.ecol[j][VOFF + j];
+  const T plain = ecol_of(s, j)[VOFF + j];
   s.pdiag[j] = plain > T(COMPOSITE_EPS) * plain
                    ? plain
                    : std::numeric_limits<T>::infinity();
@@ -3086,24 +3108,35 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
   // steps/s) for ~30 more lines — dropped. See the block-size note in
   // the header: the gain saturates at four independent chains.
+  // #6a: row li's column goes to SLOT li (see the Solver note), so the
+  // seed stores and every back-pass access are warp-uniform words; the
+  // scalar tail's ensure_ecol hands out the same slot li (nslot == li).
   {
     int li = 0;
     for (; li + 3 < s.nl; li += 4) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       const int j2 = s.l_j[li + 2], j3 = s.l_j[li + 3];
-      ecol_seed(s, j0);
-      ecol_seed(s, j1);
-      ecol_seed(s, j2);
-      ecol_seed(s, j3);
+      s.eslot[j0] = uint8_t(li);
+      s.eslot[j1] = uint8_t(li + 1);
+      s.eslot[j2] = uint8_t(li + 2);
+      s.eslot[j3] = uint8_t(li + 3);
+      T* const x0 = s.ecol[li];
+      T* const x1 = s.ecol[li + 1];
+      T* const x2 = s.ecol[li + 2];
+      T* const x3 = s.ecol[li + 3];
+      ecol_seed(x0, j0);
+      ecol_seed(x1, j1);
+      ecol_seed(x2, j2);
+      ecol_seed(x3, j3);
       // audit #10: each column's forward pass is its own ancestor
       // chain, the four interleaved (tree_fwd_unit_b); the dense back
       // pass is batched
       {
-        T* const xs[4] = {s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]};
+        T* const xs[4] = {x0, x1, x2, x3};
         const int vs[4] = {VOFF + j0, VOFF + j1, VOFF + j2, VOFF + j3};
         tree_fwd_unit_b<4>(d.m, xs, vs);
       }
-      tree_back4_n(d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
+      tree_back4_n(d.m, x0, x1, x2, x3);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       s.ecomp[j2] = true;
@@ -3111,18 +3144,23 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
     if (li + 1 < s.nl) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
-      ecol_seed(s, j0);
-      ecol_seed(s, j1);
+      s.eslot[j0] = uint8_t(li);
+      s.eslot[j1] = uint8_t(li + 1);
+      T* const x0 = s.ecol[li];
+      T* const x1 = s.ecol[li + 1];
+      ecol_seed(x0, j0);
+      ecol_seed(x1, j1);
       {
-        T* const xs[2] = {s.ecol[j0], s.ecol[j1]};
+        T* const xs[2] = {x0, x1};
         const int vs[2] = {VOFF + j0, VOFF + j1};
         tree_fwd_unit_b<2>(d.m, xs, vs);
       }
-      tree_back2_n(d.m, s.ecol[j0], s.ecol[j1]);
+      tree_back2_n(d.m, x0, x1);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       li += 2;
     }
+    s.nslot = li;
     for (; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
   }
 
@@ -3281,7 +3319,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       if (dd != T(0)) {
         const T sd = s.l_sign[li] * dd;
 #pragma unroll
-        for (int i = 0; i < NV; i++) vr[i] += s.ecol[j][i] * sd;
+        for (int i = 0; i < NV; i++) vr[i] += s.ecol[li][i] * sd;  // #6a
       }
     }
     // (d) omega-cap pass, joint order: momentum-consistent impulses
@@ -3314,7 +3352,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
         if (!isinf(s.pdiag[j])) {
           const T lam = (target - v[vj]) / s.pdiag[j];
           {
-            for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * lam;
+            const T* const col = ecol_of(s, j);
+            for (int i = 0; i < NV; i++) v[i] += col[i] * lam;
           }
           v[vj] = target;  // exact — the cap is a hard bound
         }
@@ -3462,7 +3501,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       }
       if (target != d.v[vj]) {
         ensure_ecol(d, s, j);
-        const T* col = s.ecol[j];
+        const T* col = ecol_of(s, j);
         const T lam = (target - d.v[vj]) / col[vj];
         for (int i = 0; i < NV; i++) d.v[i] += col[i] * lam;
         d.v[vj] = target;  // exact — the clamp is a hard bound
