@@ -33,7 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import fp16_linear as _fl
-from fp16_linear import fp16_linear, fp16_linear_nobias, fp16_linear_relu
+from fp16_linear import (fp16_linear, fp16_linear_nobias, fp16_linear_relu,
+                         fp16_relu_chain)
 from fused_ln import FusedLayerNorm
 
 # (The round-4 fused single-head attention kernel was DELETED
@@ -50,6 +51,16 @@ from fused_ln import FusedLayerNorm
 # reinstated the pre-ladder kernels were removed 2026-09-22 (last used
 # 2026-09-02); the fp32 record path is the reference and stays bitwise
 # stable regardless.
+# Since 2026-09-27 every fp16 Linear-ReLU-...-Linear chain with an
+# 8-aligned input (block FFNs, note encoder, SimBa trunk, critic MLP)
+# runs its ReLUs in cuBLASLt epilogues (fp16_linear.fp16_relu_chain:
+# RELU_AUX_BIAS forward, DRELU on the next Linear's dgrad) — no
+# standalone relu_bwd pass. And at the production attention shape
+# (29 keys, d 192, 4 heads) every attention site — the blocks' packed
+# self-attention, the final block's lead queries, the critic's pool —
+# runs the fused T = 29 kernel (fp16_linear.attn29_*, csrc/
+# small_attn.cu) in BOTH phases instead of SDPA; SDPA remains for any
+# other shape.
 
 
 def _lin(m: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -75,6 +86,13 @@ def _seq(seq: nn.Sequential, x: torch.Tensor, fold_tail: bool = False):
         tail = ms[-1]
         if (x.dtype is torch.float16 and isinstance(tail, nn.Linear)
                 and _fl.ext_ok()):
+            # whole Sequential is one Linear-ReLU-...-Linear chain (the
+            # block FFN): ReLUs in the GEMM epilogues, tail bias-free
+            chain = _relu_chain_at(ms, 0)
+            if chain is not None and len(chain) * 2 - 1 == len(ms):
+                out = fp16_relu_chain(x, chain, tail_bias=False)
+                if out is not None:
+                    return out, tail.bias
             return (fp16_linear_nobias(_run(ms[:-1], x), tail.weight,
                                        tail.bias),
                     tail.bias)
@@ -82,11 +100,35 @@ def _seq(seq: nn.Sequential, x: torch.Tensor, fold_tail: bool = False):
     return _run(ms, x)
 
 
+def _relu_chain_at(ms: list, i: int):
+    """The maximal Linear (ReLU Linear)+ run starting at ms[i], as the
+    list of its Linears, or None when ms[i] does not start one."""
+    chain = []
+    while (i < len(ms) and isinstance(ms[i], nn.Linear)):
+        chain.append(ms[i])
+        if (i + 2 < len(ms) and isinstance(ms[i + 1], nn.ReLU)
+                and isinstance(ms[i + 2], nn.Linear)):
+            i += 2
+        else:
+            break
+    return chain if len(chain) >= 2 else None
+
+
 def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
     i = 0
     while i < len(ms):
         m = ms[i]
         if isinstance(m, nn.Linear):
+            # fp16 Linear-ReLU-...-Linear chains: every ReLU in a GEMM
+            # epilogue (fp16_linear.fp16_relu_chain, 2026-09-27)
+            if x.dtype is torch.float16 and _fl.ext_ok():
+                chain = _relu_chain_at(ms, i)
+                if chain is not None:
+                    out = fp16_relu_chain(x, chain)
+                    if out is not None:
+                        x = out
+                        i += 2 * len(chain) - 1
+                        continue
             # fp16 Linear+ReLU pairs take the bias_relu epilogue path
             # (bias-free mm + in-place relu(y + b_fp32)) — round-4 #2
             if (x.dtype is torch.float16 and i + 1 < len(ms)
@@ -456,6 +498,12 @@ class Block(nn.Module):
             scores = torch.baddbmm(attn_bias, q, k.transpose(1, 2),
                                    alpha=self.d ** -0.5)      # (B, Tq, T)
             att = torch.softmax(scores, dim=-1) @ v
+        elif qkv is not None and _fl.attn29_ok(T, self.d, self.n_heads):
+            # non-final fp16 block: the T = 29 fused attention kernel
+            # (fp16_linear.attn29_packed, 2026-09-27) straight off the
+            # packed projection -> (B, T, d) in the out-projection's
+            # layout; gradient = ONE packed (B, T, 3d) tensor
+            att = _lin(self.out_proj, _fl.attn29_packed(qkv, attn_bias))
         elif qkv is not None:
             # non-final fp16 block: fused attention straight off the
             # packed projection; the backward writes dq|dk|dv as ONE
@@ -466,6 +514,11 @@ class Block(nn.Module):
                                   self.n_heads)
             att = att.transpose(1, 2).reshape(B, Tq, self.d)
             att = _lin(self.out_proj, att)
+        elif (q.dtype is torch.float16 and n_queries
+                and _fl.attn29_ok(T, self.d, self.n_heads)):
+            # final fp16 block: the lead-token queries over the packed
+            # k|v (same T = 29 kernel as every other attention site)
+            att = _lin(self.out_proj, _fl.attn29_qkv(q, kv, attn_bias))
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
@@ -714,12 +767,17 @@ class NotePolicy(nn.Module):
         # last-rounding class, like every other Linear+ReLU site).
         # fp32 / no extension: _lin then F.relu, bitwise as before.
         u = self.trunk_ln1(x)
+        d = None
         if u.dtype is torch.float16 and _fl.ext_ok():
-            r = fp16_linear_relu(u, self.trunk_fc1.weight,
-                                 self.trunk_fc1.bias)
+            # fc1 -> ReLU -> fc2 as one epilogue chain (2026-09-27)
+            d = fp16_relu_chain(u, [self.trunk_fc1, self.trunk_fc2])
+            if d is None:
+                r = fp16_linear_relu(u, self.trunk_fc1.weight,
+                                     self.trunk_fc1.bias)
         else:
             r = F.relu(_lin(self.trunk_fc1, u))
-        d = _lin(self.trunk_fc2, r)
+        if d is None:
+            d = _lin(self.trunk_fc2, r)
         _, h = self.trunk_ln2.forward_add(x, d)
         return h
 
@@ -880,22 +938,28 @@ class NotePolicy(nn.Module):
             k = _lin(self.critic_k, hv)
             v = _lin(self.critic_v, hv)
         nh, dh = self.n_heads, d // self.n_heads
-        q = q.view(B, 1, nh, dh).transpose(1, 2)
-        k = k.view(B, T, nh, dh).transpose(1, 2)
-        v = v.view(B, T, nh, dh).transpose(1, 2)
-        if q.dtype is torch.float16:
-            # Tq = 1 fused attention under the same additive key mask
-            # the blocks use (no all-masked rows: the 3 lead lanes are
-            # always attendable). Replaces two batched matmuls whose
-            # non-collapsible (B, nh) batch strides forced hidden
-            # reshape COPIES of k and v, forward and backward.
-            a = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias.unsqueeze(1))   # (B,nh,1,dh)
+        if hv.dtype is torch.float16 and _fl.attn29_ok(T, d, nh):
+            # Tq = 1 on the T = 29 fused attention kernel (2026-09-27,
+            # fp16_linear.attn29_qkv): (B, 1, d), heads concatenated
+            a = _fl.attn29_qkv(q, kv, attn_bias).view(B, d)
         else:
-            scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
-            scores = scores + attn_bias.unsqueeze(1)     # (B, nh, 1, T)
-            a = torch.softmax(scores, dim=-1) @ v
-        a = _lin(self.critic_out, a.transpose(1, 2).reshape(B, d))
+            q = q.view(B, 1, nh, dh).transpose(1, 2)
+            k = k.view(B, T, nh, dh).transpose(1, 2)
+            v = v.view(B, T, nh, dh).transpose(1, 2)
+            if q.dtype is torch.float16:
+                # Tq = 1 fused attention under the same additive key mask
+                # the blocks use (no all-masked rows: the 3 lead lanes
+                # are always attendable). Replaces two batched matmuls
+                # whose non-collapsible (B, nh) batch strides forced
+                # hidden reshape COPIES of k and v, forward and backward.
+                a = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_bias.unsqueeze(1))  # (B,nh,1,dh)
+            else:
+                scores = (q * dh ** -0.5) @ k.transpose(-2, -1)
+                scores = scores + attn_bias.unsqueeze(1)    # (B, nh, 1, T)
+                a = torch.softmax(scores, dim=-1) @ v
+            a = a.transpose(1, 2).reshape(B, d)
+        a = _lin(self.critic_out, a)
         logits = _seq(self.critic_mlp, torch.cat([a, h], dim=-1)).float()
         # HL-Gauss: bins -> expectation; the (B, K) logits are kept for
         # the update's cross-entropy (grad-enabled calls only)
