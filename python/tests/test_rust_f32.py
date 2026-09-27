@@ -12,15 +12,14 @@ from beat_arena_env.constants import N_JOINTS, OBS_DIM
 rs32 = pytest.importorskip("beat_arena_rs32")
 
 
-def _pair(n=4, foot_contact=True):
+def _pair(n=4):
     rng = np.random.default_rng(3)
     charts = [[note_tuple(x) for x in generate_chart(ChartConfig(), rng)]
               for _ in range(n)]
     sims = []
     for mod in (beat_arena_rs, rs32):
         s = mod.VecBeatSim(n, max_steps=100_000, combo_walk=True,
-                           return_events=False, gears=7,
-                           foot_contact=foot_contact)
+                           return_events=False, gears=7)
         for i, c in enumerate(charts):
             s.set_chart(i, c, [])
         sims.append(s)

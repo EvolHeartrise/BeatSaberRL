@@ -61,11 +61,11 @@ def _crouch_act():
 
 
 def test_crouch_rests_on_leg_stops_and_upright_does_not():
-    sim = _sim(foot_contact=True)
+    sim = _sim()
     _run(sim, _crouch_act(), 60)
     legs_c, _spine_c, _arms_c, ticks_c = sim.pop_limit_rest()
     assert ticks_c > 0
-    sim2 = _sim(foot_contact=True)
+    sim2 = _sim()
     _run(sim2, [0] * N_JOINTS, ticks_c)
     legs_u, _spine_u, _arms_u, ticks_u = sim2.pop_limit_rest()
     assert ticks_u > 0
@@ -76,34 +76,47 @@ def test_crouch_rests_on_leg_stops_and_upright_does_not():
         f"crouch {legs_c} vs upright {legs_u} (ticks {ticks_c}/{ticks_u})"
 
 
+def _priced_ticks(s0, s1, act, ticks):
+    """Step a (coef 0, coef c) pair with identical actions; returns the
+    summed reward gap and postural flow over the NON-terminal ticks. A
+    fall/tilt tick's reward is replaced by the flat terminal override
+    (erasing that tick's penalty gap while its lambda is still carried),
+    so the flow is popped per tick and the terminal tick is left out."""
+    gap = flow = 0.0
+    n = 0
+    s0.pop_limit_rest()
+    for _ in range(ticks):
+        _o, r0, d0, _e = s0.step(act)
+        _o, r1, d1, _e = s1.step(act)
+        assert d0 == d1                # identical physics, identical episode
+        legs, spine, _arms, _t = s0.pop_limit_rest()
+        if d0:
+            break
+        gap += r0 - r1
+        flow += legs + spine
+        n += 1
+    return gap, flow, n
+
+
 def test_pricing_gap_equals_coef_times_flow():
-    # WELD mode: fall/tilt are structurally impossible, so no tick's
-    # reward is replaced by the terminal override (which would erase
-    # that tick's penalty gap while the pop still counts its lambda —
-    # the contact-mode fixture tripped exactly that)
     act = [0] * N_JOINTS
     act[L_KNEE] = act[R_KNEE] = 1     # 150 N*m into the flexion stop
-    s0 = _sim(foot_contact=False)
-    s1 = _sim(foot_contact=False, limit_coef=COEF)
-    r0, t0 = _run(s0, act, 60)
-    r1, t1 = _run(s1, act, 60)
-    assert t0 == t1               # identical physics, identical episode
-    legs, spine, _arms, _ = s0.pop_limit_rest()
-    assert legs + spine > 1.0
+    gap, flow, n = _priced_ticks(_sim(), _sim(limit_coef=COEF), act, 60)
+    assert n > 5 and flow > 1.0
     # the penalty is the ONLY reward difference, and it prices exactly
     # the popped flow (same trajectory, f64)
-    assert r0 - r1 == pytest.approx(COEF * (legs + spine), abs=1e-9)
+    assert gap == pytest.approx(COEF * flow, abs=1e-9)
 
 
 def test_coef_default_is_off():
     act = _crouch_act()
-    r_default, _ = _run(_sim(foot_contact=True), act, 40)
-    r_zero, _ = _run(_sim(foot_contact=True, limit_coef=0.0), act, 40)
+    r_default, _ = _run(_sim(), act, 40)
+    r_zero, _ = _run(_sim(limit_coef=0.0), act, 40)
     assert r_default == r_zero
 
 
 def test_spine_stop_lands_in_spine_bucket():
-    sim = _sim(foot_contact=False)          # weld: isolate the spine
+    sim = _sim()
     act = [0] * N_JOINTS
     act[SPINE_P] = 2                        # full extension, -20 deg stop
     _run(sim, act, 40)
@@ -119,10 +132,10 @@ def test_arm_stops_are_exempt():
     # If arm rows were in scope the pop would show their lambda; the
     # contract is that it shows EXACTLY zero.
     from beat_arena_env.constants import JOINT_LIMITS
-    # CALM start: the weld reset pose with zero velocity (a mid-range-
+    # CALM start: the reset pose with zero velocity (a mid-range-
     # everything pose is violently out of equilibrium — the whole body
     # whips at the omega-cap and flings the elbow off any stop). The
-    # only postural joints the weld reset rests on stops are the KNEES
+    # only postural joints the reset rests on stops are the KNEES
     # (0-deg extension) — nudge those 17 deg off; from REST nothing
     # postural can close a >=17 deg gap within one tick. The right
     # elbow goes ON its 0-deg stop with a full gear pressing in
@@ -131,7 +144,7 @@ def test_arm_stops_are_exempt():
     act = [0] * N_JOINTS
     act[R_ELBOW] = 2
     for coef in (0.0, 1.0):
-        sim = _sim(foot_contact=False, limit_coef=coef)
+        sim = _sim(limit_coef=coef)
         q = list(sim.qpos())
         q[7 + L_KNEE] = q[7 + R_KNEE] = 0.3
         q[7 + R_ELBOW] = JOINT_LIMITS[R_ELBOW][0]
@@ -162,7 +175,7 @@ def test_limit_arms_prices_arm_rows():
     rs = []
     flows = []
     for kw in ({}, {"limit_coef": COEF, "limit_arms": True}):
-        sim = _sim(foot_contact=False, **kw)
+        sim = _sim(**kw)
         q = list(sim.qpos())
         q[7 + L_KNEE] = q[7 + R_KNEE] = 0.3
         q[7 + R_ELBOW] = JOINT_LIMITS[R_ELBOW][0]
@@ -183,28 +196,32 @@ def test_cuda_flow_and_pricing_consistency():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
 
     def env(**kw):
-        kw.setdefault("foot_contact", True)
         e = CudaBeatVecEnv(1, charts=[[FAR_NOTE]], seed=0,
                            device="cuda", gears=5,
                            max_steps=6900, auto_reset=False, **kw)
         e.reset()
         return e
 
-    # (a) pricing identity in WELD mode (no terminal overrides)
+    # (a) pricing identity over the non-terminal ticks (a fall/tilt
+    # tick's reward is the flat terminal override — see _priced_ticks)
     act = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
     act[0, L_KNEE] = act[0, R_KNEE] = 1
-    w0 = env(foot_contact=False)
-    w1 = env(foot_contact=False, limit_coef=COEF)
-    tot0 = tot1 = 0.0
+    w0 = env()
+    w1 = env(limit_coef=COEF)
+    tot = flow_w = 0.0
+    n = 0
+    w0.pop_limit_rest()
     for _ in range(60):
-        _o, r0, _d, _i = w0.step(act)
+        _o, r0, d0, _i = w0.step(act)
         _o, r1, _d1, _i = w1.step(act)
-        tot0 += float(r0[0].item())
-        tot1 += float(r1[0].item())
-    legs_w, spine_w, _arms_w, ticks_w = w0.pop_limit_rest()
-    assert ticks_w > 0 and legs_w > 1.0
-    assert tot0 - tot1 == pytest.approx(COEF * (legs_w + spine_w),
-                                        rel=5e-3)
+        legs_t, spine_t, _a, _t = w0.pop_limit_rest()
+        if bool(d0[0].item()):
+            break
+        tot += float(r0[0].item()) - float(r1[0].item())
+        flow_w += legs_t + spine_t
+        n += 1
+    assert n > 5 and flow_w > 1.0
+    assert tot == pytest.approx(COEF * flow_w, rel=5e-3)
     # (b) contact mode: the collapsed pose carries far more than coast
     cact = act.clone()
     cact[0, L_HIP_P] = cact[0, R_HIP_P] = 1
@@ -224,7 +241,7 @@ def test_cuda_flow_and_pricing_consistency():
     assert legs > 5.0 * max(legs_u, 1e-9)
     # cross-engine magnitude sanity vs the Rust fixture (statics
     # dominate the parked pose, so the engines agree to a factor)
-    rs = _sim(foot_contact=True)
+    rs = _sim()
     _run(rs, _crouch_act(), 60)
     legs_r, spine_r, _arms_r, _ = rs.pop_limit_rest()
     ratio = (legs + spine) / max(legs_r + spine_r, 1e-9)

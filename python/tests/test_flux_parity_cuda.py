@@ -6,10 +6,12 @@ test_production_lockstep.py), on Flux charts:
 
  - reset obs at f64 rounding (the Flux hand + entity lanes included);
  - scripted placements (tests/test_flux.py's circle / wrong-hand /
-   miss / bar / sweet-spot / crossing-angle cases) in weld mode, the
-   body resynced to Rust every tick: the exact points, counters,
-   statuses and rewards of Rust;
- - LOCKSTEP-RESYNC whole episodes (weld and contact) on generated
+   miss / bar / sweet-spot / crossing-angle cases), the body resynced to
+   Rust every tick: the exact points, counters, statuses and rewards of
+   Rust (every object resolves before the coasting body tips over);
+ - LOCKSTEP-RESYNC whole episodes (contact mode — the only mode since
+   the weld harness was removed, 2026-09-27; the posture joints held at
+   the stance so episodes run their full length) on generated
    Flux charts with a scripted prefix that guarantees circle and bar
    hits: the CUDA dynamics re-take Rust's state every tick (the palm
    and wrist finite-difference velocities carried across, as
@@ -50,18 +52,17 @@ POSTURE_J = [0, 1, 2] + list(range(17, 29))
 HOLD_EVERY = 3
 
 
-def _build(charts, max_steps, foot_contact, dtype=torch.float64,
+def _build(charts, max_steps, dtype=torch.float64,
            combo_walk=False, energy_coef=7.5e-6):
     tups = [[flux_tuple(o) for o in ch] for ch in charts]
     env = CudaBeatVecEnv(len(charts), game="flux", flux_charts=tups,
                          max_steps=max_steps, gears=GEARS,
-                         foot_contact=foot_contact, energy_coef=energy_coef,
+                         energy_coef=energy_coef,
                          combo_walk=combo_walk, device="cuda", dtype=dtype,
                          auto_reset=False, want_contacts=True)
     sims = []
     for ch in tups:
         s = beat_arena_rs.RawBeatSim(max_steps=max_steps, gears=GEARS,
-                                     foot_contact=foot_contact,
                                      energy_coef=energy_coef, flux=True)
         s.set_flux_chart(ch)
         sims.append(s)
@@ -85,8 +86,7 @@ def _resync(env, sims):
 # -- scripted placements (tests/test_flux.py geometry) -------------------------
 
 def _reset_rust():
-    s = beat_arena_rs.RawBeatSim(max_steps=400, foot_contact=False,
-                                 flux=True)
+    s = beat_arena_rs.RawBeatSim(max_steps=400, flux=True)
     s.set_flux_chart([])
     return s
 
@@ -141,7 +141,7 @@ def test_flux_reset_obs():
     charts = [generate_flux_chart(FluxConfig(chart_len_s=4.0),
                                   np.random.default_rng(s))
               for s in (10, 11, 12)]
-    env, sims = _build(charts, 400, foot_contact=False)
+    env, sims = _build(charts, 400)
     obs = env.reset().cpu().numpy()
     for i, s in enumerate(sims):
         o_r = np.asarray(s.obs())
@@ -157,7 +157,7 @@ def test_flux_reset_obs():
 
 def test_flux_scripted_points_match_rust():
     charts, expect = _scripted_charts()
-    env, sims = _build(charts, 400, foot_contact=False)
+    env, sims = _build(charts, 400)
     env.reset()
     done = [False] * len(sims)
     flips = 0
@@ -234,13 +234,14 @@ def _lockstep_charts(seeds, chart_s):
     return charts
 
 
-@pytest.mark.parametrize("foot_contact", [False, True])
-def test_flux_lockstep_parity(foot_contact):
+def test_flux_lockstep_parity():
+    # (2026-09-27: the unheld weld-mode twin of this tier retired with
+    # the weld harness — an unheld body on ground contact falls at once)
     N = 6
-    held = range(N) if foot_contact else ()
+    held = range(N)
     charts = _lockstep_charts(range(900, 900 + N), chart_s=3.0)
     max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
-    env, sims = _build(charts, max_steps, foot_contact, combo_walk=True)
+    env, sims = _build(charts, max_steps, combo_walk=True)
     env.reset()
     stance_q, _ = rust_state(sims[0])
     stance_v = [0.0] * 35
@@ -333,7 +334,7 @@ def test_flux_lockstep_parity(foot_contact):
             env.wrist_vel[zero_v] = 0.0
             env.palm_vel[zero_v] = 0.0
     assert all(done), "episodes did not finish inside max_steps"
-    print(f"flux lockstep (contact={foot_contact}): {ticks} env-ticks, "
+    print(f"flux lockstep: {ticks} env-ticks, "
           f"{flips} flips ({macro} > 1e-3)")
     assert flips <= 0.2 * ticks and macro <= 0.08 * ticks
     # coverage: circles hit by the right hand, bars crossed, misses
@@ -349,23 +350,33 @@ def test_flux_parity_f32_bounded():
     """f32 well-formedness + bounded agreement (the standard f32 tier)."""
     charts = _lockstep_charts(range(950, 954), chart_s=3.0)
     max_steps = max(int((ch[-1].hit_time + 0.5) * 30) + 90 for ch in charts)
-    env, sims = _build(charts, max_steps, foot_contact=False,
-                       dtype=torch.float32)
+    env, sims = _build(charts, max_steps, dtype=torch.float32)
     env.reset()
     rng = np.random.default_rng(4)
     r_rew = np.zeros(4)
     c_rew = np.zeros(4)
+    # each side's return summed up to ITS done (the bodies fall under
+    # random gears on ground contact, and a finished auto_reset=False
+    # CUDA env keeps re-reporting its terminal reward — see the standard
+    # f32 tier); the lane ceiling compares live ticks only
+    c_done = [False] * 4
+    r_done = [False] * 4
     for t in range(60):
         acts = rng.integers(0, GEARS, size=(4, N_JOINTS))
-        tobs, trew, _td, _ = env.step(torch.as_tensor(acts))
+        tobs, trew, tdone, _ = env.step(torch.as_tensor(acts))
         assert torch.isfinite(tobs).all(), f"t{t}: non-finite obs"
         assert torch.isfinite(env.palm_vel).all()
         for e, s in enumerate(sims):
-            o_r, r_r, _d, _ev = s.step([int(x) for x in acts[e]])
-            d = np.abs(tobs[e].cpu().numpy() - np.asarray(o_r))
-            assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
-            r_rew[e] += r_r
-            c_rew[e] += float(trew[e])
+            o_r, r_r, d_r, _ev = s.step([int(x) for x in acts[e]])
+            if not (c_done[e] or r_done[e]):
+                d = np.abs(tobs[e].cpu().numpy() - np.asarray(o_r))
+                assert (d > 5e-3).mean() <= 0.75, f"t{t} env{e} lane ceiling"
+            if not r_done[e]:
+                r_rew[e] += r_r
+            if not c_done[e]:
+                c_rew[e] += float(trew[e])
+            r_done[e] |= d_r
+            c_done[e] |= bool(tdone[e])
     np.testing.assert_allclose(c_rew, r_rew, atol=3.0)
     for e, s in enumerate(sims):
         assert abs(s.good_cuts - int(env.good[e])) <= 3
@@ -374,8 +385,7 @@ def test_flux_parity_f32_bounded():
 
 def test_flux_procedural_pool_and_auto_reset():
     env = CudaBeatVecEnv(4, game="flux", seed=3, chart_pool=8,
-                         chart_len_s=2.0, dtype=torch.float32,
-                         foot_contact=True)
+                         chart_len_s=2.0, dtype=torch.float32)
     assert env.flux and bool((env.pool["len"] > 0).any())
     obs = env.reset()
     assert obs.shape == (4, OBS_DIM)

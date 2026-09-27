@@ -36,11 +36,11 @@ class RustFluxEnv(gym.Env):
                  note_speed_min=10.0, note_speed_max=18.0,
                  circle_prob=0.3, bar_prob=0.15,
                  external_chart=None, gears=3, seed=0, *,
-                 foot_contact, fall_const=5.0, energy_coef=0.0,
+                 fall_const=5.0, energy_coef=0.0,
                  sim_dtype="f64"):
         """external_chart: a fixed list[FluxObj] played on every reset.
-        foot_contact: REQUIRED keyword, as RustBeatEnv (True = the
-        production unilateral ground contact). sim_dtype: "f64" (the
+        Unilateral ground contact is the only foot mode (as RustBeatEnv).
+        sim_dtype: "f64" (the
         reference build every test pins) or "f32" (beat_arena_rs32, the
         CUDA training kernel's regime — the bench/replay default)."""
         self.cfg = _flux_cfg(chart_len_s, cols, rows, note_speed_min,
@@ -62,11 +62,9 @@ class RustFluxEnv(gym.Env):
         else:
             Sim = RawBeatSim
         self.sim = Sim(max_steps=max_steps, gears=gears,
-                              foot_contact=foot_contact,
-                              fall_const=fall_const,
-                              energy_coef=energy_coef, flux=True)
+                       fall_const=fall_const,
+                       energy_coef=energy_coef, flux=True)
         self.gears = gears
-        self.foot_contact = bool(foot_contact)
         self.tau_scale = [1.0] * TAU_FEAT
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
@@ -127,10 +125,9 @@ class RustFluxEnv(gym.Env):
                                                 round(z, 4)],
                           "j": round(imp, 4)}
                          for p, x, y, z, imp in self.sim.contacts()],
-            "feet": [[round(w + (g[k] if k < 3 else 0.0), 4)
-                      for k, w in enumerate(wf)]
-                     for wf, g in zip(self.sim.weld_impulses(),
-                                      self.sim.ground_reaction())],
+            "feet": [[round(g[0], 4), round(g[1], 4), round(g[2], 4),
+                      0.0, 0.0, 0.0]
+                     for g in self.sim.ground_reaction()],
             "activation": [round(v, 4) for v in self.sim.last_activation()],
             "torque": [round(v, 3) for v in self.sim.last_torque()],
             "events": [
@@ -190,13 +187,12 @@ class FluxVecEnv:
                  circle_prob=0.3, bar_prob=0.15,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, energy_coef=0.0, self_contact_coef=0.0,
-                 gears=3, seed=0, foot_contact=False, fall_const=5.0):
+                 gears=3, seed=0, fall_const=5.0):
         self.num_envs = num_envs
         self.cfg = _flux_cfg(chart_len_s, cols, rows, note_speed_min,
                              note_speed_max, circle_prob, bar_prob)
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,
                               return_events=False, gears=gears,
-                              foot_contact=foot_contact,
                               fall_const=fall_const,
                               foot_z_coef=foot_z_coef,
                               foot_x_coef=foot_x_coef,
@@ -205,7 +201,6 @@ class FluxVecEnv:
                               energy_coef=energy_coef,
                               self_contact_coef=self_contact_coef,
                               flux=True)
-        self.foot_contact = bool(foot_contact)
         self._rng = np.random.default_rng(seed)
         self._returns = np.zeros(num_envs, dtype=np.float64)
         self._obs = np.zeros((num_envs, OBS_DIM), dtype=np.float32)

@@ -30,7 +30,7 @@ TICKS = 90
 def _sim(**kw):
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
                                    gears=5,
-                                   foot_contact=True, **kw)
+                                   **kw)
     sim.set_chart([note_tuple(FAR_NOTE)])
     return sim
 
@@ -113,7 +113,7 @@ def test_cuda_pricing_matches_telemetry():
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     n = 4
     charts = [[FAR_NOTE]] * n
-    kw = dict(charts=charts, gears=5, max_steps=6900, foot_contact=True, device="cuda", dtype=torch.float64,
+    kw = dict(charts=charts, gears=5, max_steps=6900, device="cuda", dtype=torch.float64,
               auto_reset=False)
     e0 = CudaBeatVecEnv(n, **kw)
     e1 = CudaBeatVecEnv(n, self_contact_coef=COEF, **kw)

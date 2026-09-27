@@ -28,15 +28,27 @@ from beat_arena_env.constants import (A_L_ARM, A_R_ARM, DT, EVENT_REASONS,
 from beat_arena_env.mirror import mirror_tuples
 from tests._helpers import FAR_NOTE, cuda, resync, rust_state
 
+# 2026-09-27 (weld harness removed): the coasting body stands on ground
+# contact and tips over after ~1 s (arms parked), so the miss fixtures
+# arrive EARLY and FAST — the miss fires ~8 ticks in, while the body
+# still stands.
+EARLY = 0.2
+FAST = 8.0
+
 DOWN = 3 * math.pi / 2
 UPLEFT = 3 * math.pi / 4
 COAST = [0] * N_JOINTS
 
 
 def _sim(tuples):
+    """Both arms PARKED (down and outward, `_park`): at the early miss
+    times the ready-stance arms are still swinging down through the grid
+    and would cut the fixtures' notes. Cut scenarios set their own arm."""
     sim = beat_arena_rs.RawBeatSim(max_steps=6900,
-                                   gears=5, foot_contact=False)
+                                   gears=5)
     sim.set_chart(tuples)
+    _park(sim, 0)
+    _park(sim, 1)
     return sim
 
 
@@ -89,8 +101,8 @@ def test_reset_all_zero():
 # --- misses ------------------------------------------------------------------
 
 def test_miss_fills_the_colour_block():
-    n = Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4, color=1,
-             angle=DOWN, speed=4.0)
+    n = Note(hit_time=EARLY, col=2, row=1, x=0.6, y=1.4, color=1,
+             angle=DOWN, speed=FAST)
     sim = _sim([note_tuple(n), note_tuple(FAR_NOTE)])
     obs, hits = _step_until_event(sim, 4)
     assert hits[0][0] == 0
@@ -101,15 +113,20 @@ def test_miss_fills_the_colour_block():
 
 
 def test_record_persists_through_a_gap_tracking_the_live_head():
-    """No time lane: after a long coast the block is identical except
-    that x/y follow the LIVE head."""
-    n = Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4, color=0,
-             angle=DOWN, speed=4.0)
+    """No time lane: after a coast the block is identical except that
+    x/y follow the LIVE head. (The gap is 12 ticks — the v10 weld body
+    coasted 200 — inside which the tipping body moves the head by
+    centimetres, which is exactly what the x/y lanes must follow.)"""
+    n = Note(hit_time=EARLY, col=2, row=1, x=0.6, y=1.4, color=0,
+             angle=DOWN, speed=FAST)
     sim = _sim([note_tuple(n), note_tuple(FAR_NOTE)])
     obs0, _ = _step_until_event(sim, 4)
     l0, _ = _blocks(obs0)
-    for _ in range(200):
-        obs, *_ = sim.step(COAST)
+    head0 = np.array(sim.head_pose()[:2])
+    for _ in range(12):
+        obs, _r, done, _ev = sim.step(COAST)
+        assert not done
+    assert np.abs(np.array(sim.head_pose()[:2]) - head0).max() > 1e-3
     l, r = _blocks(obs)
     assert not r.any()
     np.testing.assert_allclose(l, _expect_block(sim, n), atol=1e-6)
@@ -118,8 +135,8 @@ def test_record_persists_through_a_gap_tracking_the_live_head():
 
 
 def test_dot_note_hides_direction():
-    n = Note(hit_time=1.0, col=1, row=1, x=-0.3, y=1.4, color=0,
-             angle=UPLEFT, speed=4.0, any_dir=True)
+    n = Note(hit_time=EARLY, col=1, row=1, x=-0.3, y=1.4, color=0,
+             angle=UPLEFT, speed=FAST, any_dir=True)
     sim = _sim([note_tuple(n), note_tuple(FAR_NOTE)])
     obs, _ = _step_until_event(sim, 4)
     l, r = _blocks(obs)
@@ -128,11 +145,12 @@ def test_dot_note_hides_direction():
 
 
 def test_bomb_pass_never_updates():
-    b = Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4, color=0,
-             angle=0.0, speed=4.0, kind=KIND_BOMB)
+    b = Note(hit_time=EARLY, col=2, row=1, x=0.6, y=1.4, color=0,
+             angle=0.0, speed=FAST, kind=KIND_BOMB)
     sim = _sim([note_tuple(b), note_tuple(FAR_NOTE)])
-    for _ in range(120):
-        obs, *_ = sim.step(COAST)
+    for _ in range(15):
+        obs, _r, done, _ev = sim.step(COAST)
+        assert not done
     assert sim.status()[0] == 4, "bomb passed clean"
     l, r = _blocks(obs)
     assert not l.any() and not r.any()
@@ -140,10 +158,10 @@ def test_bomb_pass_never_updates():
 
 
 def test_latest_chart_index_wins_within_a_tick():
-    a = Note(hit_time=1.0, col=0, row=1, x=-0.9, y=1.4, color=1,
-             angle=DOWN, speed=4.0)
-    b = Note(hit_time=1.0, col=3, row=1, x=0.9, y=1.4, color=1,
-             angle=DOWN, speed=4.0)
+    a = Note(hit_time=EARLY, col=0, row=1, x=-0.9, y=1.4, color=1,
+             angle=DOWN, speed=FAST)
+    b = Note(hit_time=EARLY, col=3, row=1, x=0.9, y=1.4, color=1,
+             angle=DOWN, speed=FAST)
     sim = _sim([note_tuple(a), note_tuple(b), note_tuple(FAR_NOTE)])
     obs, hits = _step_until_event(sim, 4)
     assert sorted(h[0] for h in hits) == [0, 1], "both miss on one tick"
@@ -158,8 +176,8 @@ def test_mirror_augment_reflects_the_block():
     """The trainer's --mirror-augment mirrors CHARTS (mirror.py), not
     obs; the block must then come out mirrored by construction: L <-> R,
     x and dir_cos negated, y / dir_sin / valid equal."""
-    n = Note(hit_time=1.0, col=3, row=1, x=0.9, y=1.4, color=0,
-             angle=UPLEFT, speed=4.0)
+    n = Note(hit_time=EARLY, col=3, row=1, x=0.9, y=1.4, color=0,
+             angle=UPLEFT, speed=FAST)
     tuples = [note_tuple(n), note_tuple(FAR_NOTE)]
     sim_a = _sim(tuples)
     sim_b = _sim(mirror_tuples(tuples))
@@ -320,8 +338,8 @@ def test_policy_arch_marker_forward_and_refusal():
     from policy import NotePolicy, load_policy
     pol = NotePolicy()
     assert pol.arch["obs_dim"] == 624
-    sim = _sim([note_tuple(Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4,
-                                color=1, angle=DOWN, speed=4.0)),
+    sim = _sim([note_tuple(Note(hit_time=EARLY, col=2, row=1, x=0.6, y=1.4,
+                                color=1, angle=DOWN, speed=FAST)),
                 note_tuple(FAR_NOTE)])
     obs, _ = _step_until_event(sim, 4)
     x = torch.as_tensor(np.asarray(obs)).unsqueeze(0)
@@ -348,14 +366,16 @@ def _cuda_env(charts, max_steps=6900):
 
 @cuda
 def test_cuda_miss_block_matches_rust():
-    n = Note(hit_time=1.0, col=2, row=1, x=0.6, y=1.4, color=1,
-             angle=DOWN, speed=4.0)
+    n = Note(hit_time=EARLY, col=2, row=1, x=0.6, y=1.4, color=1,
+             angle=DOWN, speed=FAST)
     chart = [n, FAR_NOTE]
     env = _cuda_env([chart])
     env.reset()
     sim = _sim([note_tuple(x) for x in chart])
+    q, v = rust_state(sim)
+    resync(env, [q], [v])          # start from the Rust sim's parked arms
     zero = torch.zeros((1, N_JOINTS), dtype=torch.int64, device="cuda")
-    for _ in range(130):
+    for _ in range(25):            # the miss fires ~8 ticks in (EARLY)
         tobs, *_ = env.step(zero)
         robs, *_ = sim.step(COAST)
         # Discrete lanes bitwise. The head-relative x/y lanes are the

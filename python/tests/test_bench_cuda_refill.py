@@ -45,8 +45,7 @@ def _play(charts, n_slots, device="cuda"):
     env = CudaBeatVecEnv(n, charts=charts, max_steps=max_steps, gears=5,
                          device=device,
                          dtype=torch.float32, auto_reset=False,
-                         want_contacts=False, foot_contact=True,
-                         combo_walk=True, bench_refill=True, seed=0)
+                         want_contacts=False, combo_walk=True, bench_refill=True, seed=0)
     current = [q.pop(0) for q in queues]
     cand = np.array([(q[0] if q else -1) for q in queues], dtype=np.int64)
     # reset() starts each slot on the candidate chart: first the FIRST

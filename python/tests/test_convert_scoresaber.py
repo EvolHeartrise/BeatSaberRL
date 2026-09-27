@@ -176,16 +176,23 @@ def decode_dat(path):
 
 # --- fixture map + recorded episode -----------------------------------------
 
+# 2026-09-27 (weld harness removed): the whip tips the body on ground
+# contact and the episode ends on the tilt envelope ~17 ticks in, so the
+# fixture is COMPRESSED — notes 0.05 s apart from 0.35 s, NJS 8 — to
+# resolve every object inside that window (swept: the whip at windup 10
+# cuts notes 0, 1 and 3 'ok', note 4 is a wrong-hand cut, the bomb
+# passes). The first note stays at 3 beats = 1.5 s real, which the
+# offset arithmetic below pins.
 RAW_NOTES = [
     # (_time beats@120, line, layer, type(color), cutDirection)
     (3.0, 2, 1, 1, 1),      # down-swing, right/blue — the whipped cut
-    (5.0, 2, 0, 1, 1),
-    (7.0, 3, 2, 1, 8),      # dot
-    (9.0, 0, 0, 0, 1),      # left/red
+    (3.1, 2, 0, 1, 1),
+    (3.2, 3, 2, 1, 8),      # dot
+    (3.3, 0, 0, 0, 1),      # left/red
 ]
-BOMB = (6.0, 0, 2)
-FIRST_NOTE_S = 1.0          # sim time of the first note (whip window;
-                            # 0.9 -> 1.0 at the 2026-08-20 shoulder -25%)
+BOMB = (3.15, 0, 2)
+FIRST_NOTE_S = 0.35         # sim time of the first note (whip window)
+NJS = 8.0
 
 
 @pytest.fixture(scope="module")
@@ -196,7 +203,7 @@ def converted(tmp_path_factory):
                 "_beatmapCharacteristicName": "Standard",
                 "_difficultyBeatmaps": [
                     {"_difficulty": "Expert", "_beatmapFilename": "Expert.dat",
-                     "_noteJumpMovementSpeed": 4.0}]}]}
+                     "_noteJumpMovementSpeed": NJS}]}]}
     (tmp / "Info.dat").write_text(json.dumps(info))
     v2 = {"_version": "2.0.0", "_notes":
           [{"_time": t, "_lineIndex": x, "_lineLayer": y, "_type": c,
@@ -206,27 +213,21 @@ def converted(tmp_path_factory):
     (tmp / "Expert.dat").write_text(json.dumps(v2))
 
     notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
-    env = RustBeatEnv(foot_contact=False, external_chart=notes, seed=0)
+    env = RustBeatEnv(external_chart=notes, seed=0)
     replay_path = str(tmp / "ep.jsonl")
     env.set_record(replay_path)
     obs, _ = env.reset()
     rng = np.random.default_rng(5)
     events, done, t = [], False, 0
     while not done:
-        # ticks 0-23: raise/hold the right arm at the +65 pitch stop;
-        # 24-43: whip down through the first note (the P3 gate recipe,
-        # retimed 15/27 -> 20/40 at the 2026-08-20 shoulder -25%, then
-        # 20/40 -> 24/44 on 2026-09-26: at 20/40 the whip no longer
-        # connected at all — note 0 was a MISS and the score block came
-        # from one accidental flail-phase cut at the episode's last
-        # tick, which the audit-#10 factorization's rounding moved. At
-        # 24/44 the whip cuts notes 0 AND 1 ('ok', 15 + 74 pts) with an
-        # identical event stream in the pre- and post-audit-#10 builds);
-        # then seeded random gears (flail) for the rest of the episode
+        # ticks 0-9: raise the right arm; 10-29: whip down through the
+        # notes (the P3 gate recipe, retimed for ground contact — see
+        # RAW_NOTES); then seeded random gears (flail) for the rest of
+        # the episode
         a = np.zeros(29, dtype=np.int64)
-        if t < 24:
+        if t < 10:
             a[10] = 1
-        elif t < 44:
+        elif t < 30:
             a[10] = 2
         else:
             a = rng.integers(0, 3, size=29)
@@ -296,7 +297,7 @@ def test_frames_wellformed(converted):
     times = [f["time"] for f in frames]
     assert times[0] > 0 and all(b > a for a, b in zip(times, times[1:]))
     # fixture first note: 3 beats @120 = 1.5 s real vs FIRST_NOTE_S sim
-    # -> +0.6 s offset, +1/30 for the start-of-tick labeling (see
+    # -> +1.15 s offset, +1/30 for the start-of-tick labeling (see
     # test_times_are_end_of_tick)
     for f in frames:
         assert f["fps"] == 30

@@ -104,8 +104,13 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
     finished level must freeze."""
     import beat_arena_rs
     from beat_arena_env.cuda_env import CudaBeatVecEnv
+    # 2026-09-27 (weld harness removed): the body stands on ground
+    # contact and falls within ~17 ticks under random ARM gears (legs
+    # and spine coast), so the notes start at 0.3 s — every env still
+    # sees cuts / misses / bombs before it falls, and the fall-ended
+    # level is the one that must freeze
     cfg = dict(colors="both", chart_len_s=2.5, bomb_prob=0.25,
-               extra_prob=0.3, dot_prob=0.15)
+               extra_prob=0.3, dot_prob=0.15, first_note_s=0.3)
     charts = [generate_chart(ChartConfig(**cfg), np.random.default_rng(s))
               for s in range(900, 906)]
     n = len(charts)
@@ -127,7 +132,8 @@ def test_cuda_combo_walk_matches_reference_walk_under_resync():
     done_r = [False] * n
     frozen = {}
     for t in range(max_steps + 60):
-        acts = rng.integers(0, gears, size=(n, N_JOINTS))
+        acts = np.zeros((n, N_JOINTS), dtype=np.int64)
+        acts[:, 3:17] = rng.integers(0, gears, size=(n, 14))   # arms only
         _tobs, _trew, tdone, _ = env.step(torch.as_tensor(acts))
         cw_s, cw_c, cw_b = [x.cpu().numpy() for x in env.combo()]
         q36s, v35s = [], []

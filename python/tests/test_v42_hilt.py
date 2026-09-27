@@ -93,8 +93,7 @@ def test_cuda_handle_does_not_cut_but_blade_does():
     n_handle = _note_along_blade(probe, HANDLE_ONLY)
     n_blade = _note_along_blade(probe, BLADE_EDGE)
     env = CudaBeatVecEnv(2, charts=[[n_handle], [n_blade]], gears=5,
-                         max_steps=690, foot_contact=False,
-                         device="cuda", dtype=torch.float64,
+                         max_steps=690, device="cuda", dtype=torch.float64,
                          auto_reset=False)
     env.reset()
     env.set_state(torch.tensor([q36] * 2, dtype=torch.float64),

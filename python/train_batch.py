@@ -513,15 +513,11 @@ def parse_args():
                         "geared checkpoint needs the matching --gears")
     p.add_argument("--foot-contact", default=True,
                    action=argparse.BooleanOptionalAction,
-                   help="DEPRECATED NO-OP (2026-08-16, user decision): "
-                        "contact mode (env v11 foot_mode = 1) is the ONLY "
-                        "training mode — the flag is accepted so older "
-                        "drivers keep running, and --no-foot-contact is "
-                        "IGNORED with a notice. Weld mode survives solely "
-                        "as an internal test harness. Historical text: "
-                        "PHYSICS-REGIME BREAK — "
-                        "checkpoints and bench numbers do not carry "
-                        "across the weld/contact boundary")
+                   help="DEPRECATED NO-OP: contact mode (env v11) is the "
+                        "only physics — the v10 weld harness was removed "
+                        "from the engines 2026-09-27. --foot-contact is "
+                        "accepted so older drivers keep running; "
+                        "--no-foot-contact is an ERROR")
     p.add_argument("--ranked-maps", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="train on WHOLE LEVELS of the real ranked ScoreSaber "
@@ -818,13 +814,12 @@ def main():
     CLIP = float(args.clip)
     if CLIP != 0.3:
         print(f"--clip {CLIP}: joint PPO clip epsilon (default 0.3)")
-    # env v21 (2026-08-16, user decision): weld mode is REMOVED from the
-    # production surface — contact is the only mode this trainer runs.
+    # env v21 (2026-08-16) made contact the only training mode; the weld
+    # harness left the engines 2026-09-27 (issue #2), so there is no
+    # other physics to select.
     if not args.foot_contact:
-        print("[foot-contact] --no-foot-contact is a deprecated no-op: "
-              "contact mode is the only training mode (weld = test "
-              "harness only)", flush=True)
-        args.foot_contact = True
+        sys.exit("--no-foot-contact: weld mode was removed (2026-09-27); "
+                 "contact physics is the only mode")
     # game mode (SPEC.md §Flux): per-mode generator speed defaults; Flux
     # has no real maps, so the ranked pool and its ep-stats walk are off
     _speeds = (10.0, 18.0) if args.game == "flux" else (2.0, 8.0)
@@ -1035,7 +1030,6 @@ def main():
         venv = VecCls(N, pool=pool,
                       max_steps=pool_steps,
                       gears=args.gears,
-                      foot_contact=args.foot_contact,
                       fall_const=args.fall_pen,
                       push_prob=args.push_prob, push_vmax=args.push_vmax,
                       start_jitter=args.start_jitter,
@@ -1064,7 +1058,7 @@ def main():
             note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
             circle_prob=args.circle_prob, bar_prob=args.bar_prob,
-            gears=args.gears, foot_contact=args.foot_contact,
+            gears=args.gears,
             fall_const=args.fall_pen,
             push_prob=args.push_prob, push_vmax=args.push_vmax,
             start_jitter=args.start_jitter,
@@ -1091,7 +1085,7 @@ def main():
             note_speed_min=args.note_speed_min,
             note_speed_max=args.note_speed_max,
             circle_prob=args.circle_prob, bar_prob=args.bar_prob,
-            foot_contact=args.foot_contact, fall_const=args.fall_pen,
+            fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
@@ -1108,7 +1102,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            gears=args.gears, foot_contact=args.foot_contact,
+            gears=args.gears,
             fall_const=args.fall_pen,
             push_prob=args.push_prob, push_vmax=args.push_vmax,
             start_jitter=args.start_jitter,
@@ -1130,7 +1124,7 @@ def main():
             note_speed_max=args.note_speed_max,
             note_prob=args.note_prob, extra_prob=args.extra_prob,
             dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            foot_contact=args.foot_contact, fall_const=args.fall_pen,
+            fall_const=args.fall_pen,
             foot_z_coef=args.foot_z_coef,
             foot_x_coef=args.foot_x_coef,
             foot_hinge_r=args.foot_hinge_r,
@@ -2132,8 +2126,7 @@ def main():
         # v11.1: each fall is PRICED at REWARD_MISS x the remaining
         # scoreable notes (the reward-0 version bred the 8h suicide
         # optimum). Reported, never hidden, on BOTH backends (unlike
-        # [envelope], a CUDA-only counter): structurally 0 without
-        # --foot-contact.
+        # [envelope], a CUDA-only counter).
         if hasattr(venv, "pop_fall_hits"):
             fh = venv.pop_fall_hits()
             m_ev["falls"] = fh

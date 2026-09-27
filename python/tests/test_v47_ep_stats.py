@@ -78,20 +78,26 @@ def test_pp_from_rows():
 
 
 def _cuda_env(n, chart_len_s=8.0, **kw):
-    """Synthetic 8-s charts (no falls: foot_contact=False), like the v46
-    tests — a level ends by its notes draining unless max_steps caps it."""
+    """Synthetic charts, like the v46 tests. (2026-09-27, weld harness
+    removed: the coasting body stands on ground contact and tips over
+    ~23 ticks in, so tests that need episodes to end some OTHER way keep
+    them shorter than that — see the two ep_stats tests.)"""
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(n, chart_len_s=chart_len_s, seed=0, device="cuda",
-                          foot_contact=False, gears=5, **kw)
+                          gears=5, **kw)
 
 
 @cuda
 def test_cuda_ep_stats_rows_completed_and_no_freeze():
     from beat_arena_env.cuda_env import EP_REC
-    # 3-s levels: last note <= ~3 s + tail <= 0.5 + 1.5 / 2 m/s, so every
-    # level drains in < ~130 ticks, well under the 250-tick cap
-    e = _cuda_env(16, chart_len_s=3.0, chart_pool=64, ep_stats=True,
-                  max_steps=250)
+    from beat_arena_env.chart import Note
+    # tiny fast levels: two 20 m/s notes at 0.02 / 0.05 s, so the level
+    # drains at 0.05 + tail (0.5 + 1.5 / 20) s = tick ~19 — before the
+    # coasting body tips (~23 ticks) and well under the 250-tick cap
+    chart = [Note(hit_time=t, col=c, row=1, x=0.9 * (2 * c - 3) / 3,
+                  y=1.4, color=c % 2, angle=4.712, speed=20.0)
+             for t, c in ((0.02, 0), (0.05, 3))]
+    e = _cuda_env(16, charts=[chart] * 16, ep_stats=True, max_steps=250)
     assert e.combo_walk and e.ep_stats
     e.reset()
     act = torch.zeros((16, N_JOINTS), dtype=torch.int64, device="cuda")
@@ -108,7 +114,7 @@ def test_cuda_ep_stats_rows_completed_and_no_freeze():
     # levels end by their notes draining (< the 250-tick cap): completed
     assert np.all(rows[:, 16] < 250)
     assert np.all(rows[:, 25] == 1.0)
-    assert np.all(rows[:, 18] == 0.0)                 # no falls (weld mode)
+    assert np.all(rows[:, 18] == 0.0)                 # no falls
     # combo-walk fields: finite, non-negative, cut counts bounded by notes
     assert np.all(rows[:, 22:25] >= 0)
     assert np.all(rows[:, 19] + rows[:, 26] + rows[:, 27] >= 0)
@@ -117,15 +123,18 @@ def test_cuda_ep_stats_rows_completed_and_no_freeze():
 @cuda
 def test_cuda_ep_stats_tick_cap_is_not_completed():
     from beat_arena_env.cuda_env import EP_REC
-    e = _cuda_env(8, ep_stats=True, max_steps=100)
+    # cap 100 -> 15 ticks (2026-09-27): inside the coasting body's
+    # standing window, so the cap — not a tilt — ends every episode
+    e = _cuda_env(8, ep_stats=True, max_steps=15)
     e.reset()
     act = torch.zeros((8, N_JOINTS), dtype=torch.int64, device="cuda")
     rows = np.zeros((0, EP_REC), dtype=np.float32)
-    for _ in range(105):
+    for _ in range(20):
         e.step(act)
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[0] >= 8
-    assert np.all(rows[:, 16] == 100) and np.all(rows[:, 25] == 0.0)
+    assert np.all(rows[:, 16] == 15) and np.all(rows[:, 25] == 0.0)
+    assert np.all(rows[:, 18] == 0.0)                 # no falls
 
 
 @cuda

@@ -20,7 +20,7 @@ TICKS = 30
 def _env(**kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(N, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=True, gears=5, **kw)
+                          gears=5, **kw)
 
 
 def _acts(rng):

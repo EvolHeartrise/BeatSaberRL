@@ -62,8 +62,7 @@ def pose(K, c1, c2, c4=0.0):
 
 def mk(q36):
     sim = beat_arena_rs.RawBeatSim(max_steps=20000,
-                                   gears=5,
-                                   foot_contact=True)
+                                   gears=5)
     sim.set_chart([note_tuple(n) for n in FAR], [])
     sim.set_joints(q36, [0.0] * 35)
     return sim

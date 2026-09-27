@@ -1,7 +1,11 @@
 """Scripted Flux replay for the viewer's fixtures (SPEC.md §Flux).
 
-The body plays a deterministic square-wave arm pattern in the weld
-harness (it never falls). A first pass records the palm path; the chart
+The body plays a deterministic square-wave arm pattern with its trunk
+PINNED: after every tick the root, spine and legs are written back to the
+reset stance at rest (`pin_trunk`, via set_joints), so the body never
+falls while the arms move freely. (The v10 weld harness used to provide
+this platform; it was removed from the engines 2026-09-27.) A first pass
+records the palm path; the chart
 is then built ON that path — circles at a palm, bars across the Flux
 with random sweet spots (every other one turned 75 deg off square, a
 bad "angle" cut), a wrong-hand circle and a few deliberate misses — and a second pass records the episode. Objects never touch the
@@ -40,12 +44,30 @@ def arm_actions(t):
     return a
 
 
+POSTURE_J = [0, 1, 2] + list(range(17, 29))
+
+
+def pin_trunk(sim, stance_q):
+    """Write root + spine + legs back to the stance at rest; the arms
+    keep their state (q and rates)."""
+    q = list(sim.qpos())
+    v = list(sim.twist()) + list(sim.omega())
+    q[:7] = stance_q[:7]
+    v[:6] = [0.0] * 6
+    for j in POSTURE_J:
+        q[7 + j] = stance_q[7 + j]
+        v[6 + j] = 0.0
+    sim.set_joints(q, v)
+
+
 def rollout(env, ticks):
     """Palms + head z per step (index k = after step k+1)."""
     env.reset()
+    stance_q = list(env.sim.qpos())
     palms, head_z = [], []
     for t in range(ticks):
         _o, _r, done, _t, _i = env.step(arm_actions(t))
+        pin_trunk(env.sim, stance_q)
         palms.append(env.sim.palms())
         head_z.append(env.sim.head_pose()[2])
         if done:
@@ -65,7 +87,7 @@ def main():
     # the episode alive for the whole window)
     far = [FluxObj(hit_time=args.ticks * DT + 5.0, x=0.0, y=1.4,
                    kind=KIND_CIRCLE, speed=SPEED)]
-    env = RustFluxEnv(external_chart=far, foot_contact=False, seed=args.seed)
+    env = RustFluxEnv(external_chart=far, seed=args.seed)
     palms, head_z = rollout(env, args.ticks)
 
     def hit_time(k, pz):
@@ -112,13 +134,14 @@ def main():
                                  sweet=0.5))
     chart.sort(key=lambda o: o.hit_time)
 
-    env = RustFluxEnv(external_chart=chart, foot_contact=False,
-                      seed=args.seed)
+    env = RustFluxEnv(external_chart=chart, seed=args.seed)
     env.set_record(args.out)
     env.reset()
+    stance_q = list(env.sim.qpos())
     t, done = 0, False
     while not done:
         _o, _r, done, _tr, info = env.step(arm_actions(t))
+        pin_trunk(env.sim, stance_q)
         t += 1
     print(f"{args.out}: {len(chart)} objects, {t} ticks — good "
           f"{info['good']}, bad {info['bad']}, miss {info['misses']}, "

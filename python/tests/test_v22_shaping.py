@@ -19,7 +19,7 @@ from tests._helpers import cuda
 def _env(**kw):
     from beat_arena_env.cuda_env import CudaBeatVecEnv
     return CudaBeatVecEnv(64, chart_len_s=8.0, seed=0, device="cuda",
-                          foot_contact=True, **kw)
+                          **kw)
 
 
 def _feet(obs):
