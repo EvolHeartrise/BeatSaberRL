@@ -1816,9 +1816,67 @@ struct Solver : WeldRows<T, FC>, GroundRows<T, FC> {
   bool hit[NQ];
 };
 
+// ---- float twins of the double constant tables (audit #5c) -----------------
+// Every hot read of a model table is `T(TABLE[...])`: under T = float
+// that was a double load plus a runtime f64->f32 conversion (reduced
+// rate on GeForce parts) inside the rolled 30-frame FK/CRBA/RNEA loops
+// and the per-substep limit/cap passes. The twins hold the SAME values
+// converted at compile time — round-to-nearest either way, so every
+// float result is bit-identical — and CT(X, [i]...) picks the twin for
+// T = float and the original (converted as before) for T = double.
+// Reads that do double ARITHMETIC before converting keep their double
+// form (or fold it at compile time exactly: PAIR_RSUM below).
+template <int A>
+struct FTab1 { float v[A]; };
+template <int A, int B>
+struct FTab2 { float v[A][B]; };
+template <int A>
+constexpr FTab1<A> f32_tab(const double (&x)[A]) {
+  FTab1<A> o{};
+  for (int i = 0; i < A; i++) o.v[i] = (float)x[i];
+  return o;
+}
+template <int A, int B>
+constexpr FTab2<A, B> f32_tab(const double (&x)[A][B]) {
+  FTab2<A, B> o{};
+  for (int i = 0; i < A; i++)
+    for (int j = 0; j < B; j++) o.v[i][j] = (float)x[i][j];
+  return o;
+}
+__device__ constexpr auto F_ANCHOR_F = f32_tab(F_ANCHOR);
+__device__ constexpr auto F_AXIS_F = f32_tab(F_AXIS);
+__device__ constexpr auto F_MASS_F = f32_tab(F_MASS);
+__device__ constexpr auto F_COM_F = f32_tab(F_COM);
+__device__ constexpr auto F_INERTIA_F = f32_tab(F_INERTIA);
+__device__ constexpr auto BASE_COM_F = f32_tab(BASE_COM);
+__device__ constexpr auto ARMATURE_F = f32_tab(ARMATURE);
+__device__ constexpr auto DAMPING_F = f32_tab(DAMPING);
+__device__ constexpr auto LIMIT_LO_F = f32_tab(LIMIT_LO);
+__device__ constexpr auto LIMIT_HI_F = f32_tab(LIMIT_HI);
+__device__ constexpr auto OMEGA_CAP_F = f32_tab(OMEGA_CAP);
+__device__ constexpr auto TAU_MAX_F = f32_tab(TAU_MAX);
+__device__ constexpr auto COL_A_F = f32_tab(COL_A);
+__device__ constexpr auto COL_B_F = f32_tab(COL_B);
+__device__ constexpr auto COL_R_F = f32_tab(COL_R);
+__device__ constexpr auto GROUND_CORNERS_F = f32_tab(GROUND_CORNERS);
+__device__ constexpr auto GROUND_DIRS_F = f32_tab(GROUND_DIRS);
+__device__ constexpr auto WELD_TARGET_P_F = f32_tab(WELD_TARGET_P);
+// T(COL_R[a] + COL_R[b]) per pair: the double sum folded at compile time
+// (an IEEE double add either way), then converted like any table
+struct PairRSum { double v[NUM_PAIRS]; };
+constexpr PairRSum pair_rsum() {
+  PairRSum t{};
+  for (int p = 0; p < NUM_PAIRS; p++) t.v[p] = COL_R[PAIR_A[p]] + COL_R[PAIR_B[p]];
+  return t;
+}
+__device__ constexpr PairRSum PAIR_RSUM = pair_rsum();
+__device__ constexpr auto PAIR_RSUM_F = f32_tab(PAIR_RSUM.v);
+#define CT(X, IDX) \
+  (std::is_same<T, float>::value ? T(X##_F.v IDX) : T(X IDX))
+
 // ---- fk.rs ------------------------------------------------------------------
-template <typename T>
-__device__ void rot_axis(const double axis_d[3], T angle, T out[3][3]) {
+template <typename T, typename A>
+__device__ void rot_axis(const A axis_d[3], T angle, T out[3][3]) {
   T s = sin(angle), cth = cos(angle);
   T k = T(1) - cth;
   T x = T(axis_d[0]), y = T(axis_d[1]), z = T(axis_d[2]);
@@ -1933,21 +1991,24 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
     const T* pl = par < 0 ? d.p : d.pos[par];
     T av[3];
     for (int i = 0; i < 3; i++) {
-      av[i] = rl[i][0] * T(F_ANCHOR[k][0]) + rl[i][1] * T(F_ANCHOR[k][1])
-              + rl[i][2] * T(F_ANCHOR[k][2]);
+      av[i] = rl[i][0] * CT(F_ANCHOR, [k][0]) + rl[i][1] * CT(F_ANCHOR, [k][1])
+              + rl[i][2] * CT(F_ANCHOR, [k][2]);
       d.pos[k][i] = pl[i] + av[i];
     }
     if (F_COORD[k] >= 0) {
       T rj[3][3];
-      rot_axis(F_AXIS[k], d.q[F_COORD[k]], rj);
+      if constexpr (std::is_same<T, float>::value)
+        rot_axis(F_AXIS_F.v[k], d.q[F_COORD[k]], rj);
+      else
+        rot_axis(F_AXIS[k], d.q[F_COORD[k]], rj);
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
           d.r[k][i][j] = rl[i][0] * rj[0][j] + rl[i][1] * rj[1][j]
                          + rl[i][2] * rj[2][j];
       for (int i = 0; i < 3; i++)
-        d.axw[k][i] = d.r[k][i][0] * T(F_AXIS[k][0])
-                      + d.r[k][i][1] * T(F_AXIS[k][1])
-                      + d.r[k][i][2] * T(F_AXIS[k][2]);
+        d.axw[k][i] = d.r[k][i][0] * CT(F_AXIS, [k][0])
+                      + d.r[k][i][1] * CT(F_AXIS, [k][1])
+                      + d.r[k][i][2] * CT(F_AXIS, [k][2]);
     } else {
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) d.r[k][i][j] = rl[i][j];
@@ -1961,8 +2022,8 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
 // the one register value v (K4e): crba needs a MUTABLE composite seed
 // and a pristine copy for rnea_bias, and both get identical bits with
 // no read-back.
-template <typename T>
-__device__ void inertia_world2(const T r[3][3], const double idiag[3],
+template <typename T, typename A>
+__device__ void inertia_world2(const T r[3][3], const A idiag[3],
                                T out[3][3], T keep[3][3]) {
   for (int a = 0; a < 3; a++)
     for (int b = a; b < 3; b++) {
@@ -2005,14 +2066,17 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
     for (int j = 0; j <= i; j++) d.m[j * NV + i] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
-    const T mk = T(F_MASS[k]);
+    const T mk = CT(F_MASS, [k]);
     d.cm[k] = mk;
-    if (F_MASS[k] > 0.0) {
+    if (CT(F_MASS, [k]) > T(0)) {
       for (int i = 0; i < 3; i++)
-        d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * T(F_COM[k][0])
-                                    + d.r[k][i][1] * T(F_COM[k][1])
-                                    + d.r[k][i][2] * T(F_COM[k][2]));
-      inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
+        d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * CT(F_COM, [k][0])
+                                    + d.r[k][i][1] * CT(F_COM, [k][1])
+                                    + d.r[k][i][2] * CT(F_COM, [k][2]));
+      if constexpr (std::is_same<T, float>::value)
+        inertia_world2(d.r[k], F_INERTIA_F.v[k], d.ci[k], d.iw[k]);
+      else
+        inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
     } else {
       for (int i = 0; i < 3; i++) d.cc[k][i] = d.pos[k][i];
       for (int i = 0; i < 3; i++)
@@ -2022,9 +2086,9 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   // base composite (pelvis)
   d.bm = T(BASE_MASS);
   for (int i = 0; i < 3; i++)
-    d.bc[i] = d.p[i] + (d.r0[i][0] * T(BASE_COM[0])
-                        + d.r0[i][1] * T(BASE_COM[1])
-                        + d.r0[i][2] * T(BASE_COM[2]));
+    d.bc[i] = d.p[i] + (d.r0[i][0] * CT(BASE_COM, [0])
+                        + d.r0[i][1] * CT(BASE_COM, [1])
+                        + d.r0[i][2] * CT(BASE_COM, [2]));
   inertia_world2(d.r0, BASE_INERTIA, d.bi, d.iw0);
 
   // leaf->root accumulation with column fill before parent merge
@@ -2181,11 +2245,11 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       d.al[k][i] = alk[i];
       d.ao[k][i] = aok[i];
     }
-    if (F_MASS[k] > 0.0) {
+    if (CT(F_MASS, [k]) > T(0)) {
       T e[3];
       for (int i = 0; i < 3; i++)
-        e[i] = d.r[k][i][0] * T(F_COM[k][0]) + d.r[k][i][1] * T(F_COM[k][1])
-               + d.r[k][i][2] * T(F_COM[k][2]);
+        e[i] = d.r[k][i][0] * CT(F_COM, [k][0]) + d.r[k][i][1] * CT(F_COM, [k][1])
+               + d.r[k][i][2] * CT(F_COM, [k][2]);
       T alxe[3], omxe[3], omxomxe[3];
       cross3(alk, e, alxe);
       cross3(omk, e, omxe);
@@ -2194,7 +2258,7 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       for (int i = 0; i < 3; i++) ac[i] = (aok[i] + alxe[i]) + omxomxe[i];
       const T(&iw)[3][3] = d.iw[k];  // K4e
       T fbk[3];
-      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * T(F_MASS[k]);
+      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * CT(F_MASS, [k]);
       T iwal[3], iwom[3];
       for (int i = 0; i < 3; i++) {
         iwal[i] = iw[i][0] * alk[0] + iw[i][1] * alk[1] + iw[i][2] * alk[2];
@@ -2222,8 +2286,8 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   {
     T e[3];
     for (int i = 0; i < 3; i++)
-      e[i] = d.r0[i][0] * T(BASE_COM[0]) + d.r0[i][1] * T(BASE_COM[1])
-             + d.r0[i][2] * T(BASE_COM[2]);
+      e[i] = d.r0[i][0] * CT(BASE_COM, [0]) + d.r0[i][1] * CT(BASE_COM, [1])
+             + d.r0[i][2] * CT(BASE_COM, [2]);
     T omxe[3], omxomxe[3];
     cross3(om0, e, omxe);
     cross3(om0, omxe, omxomxe);
@@ -3478,7 +3542,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     for (int t = 0; t < 3; t++) {
       s.mw[3 + t][r0 + 3 + t] = T(1);
       s.bias_w[r0 + t] =
-          -(T(BETA_WELD) * hinv) * (pf[t] - T(WELD_TARGET_P[widx][t]));
+          -(T(BETA_WELD) * hinv) * (pf[t] - CT(WELD_TARGET_P, [widx][t]));
     }
     T phi[3];
     rot_log(d.r[frame], phi);
@@ -3565,12 +3629,12 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   for (int c = 0; c < NUM_COLLIDERS; c++) {
     const int f = COL_FRAME[c];
     for (int i = 0; i < 3; i++) {
-      ca[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_A[c][0])
-                                + d.r[f][i][1] * T(COL_A[c][1])
-                                + d.r[f][i][2] * T(COL_A[c][2]));
-      cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_B[c][0])
-                                + d.r[f][i][1] * T(COL_B[c][1])
-                                + d.r[f][i][2] * T(COL_B[c][2]));
+      ca[c][i] = d.pos[f][i] + (d.r[f][i][0] * CT(COL_A, [c][0])
+                                + d.r[f][i][1] * CT(COL_A, [c][1])
+                                + d.r[f][i][2] * CT(COL_A, [c][2]));
+      cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * CT(COL_B, [c][0])
+                                + d.r[f][i][1] * CT(COL_B, [c][1])
+                                + d.r[f][i][2] * CT(COL_B, [c][2]));
       mid[c][i] = (ca[c][i] + cb[c][i]) * T(0.5);
     }
     const double ex = COL_B[c][0] - COL_A[c][0];
@@ -3592,7 +3656,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     T c1[3], c2[3], dist2;
     seg_seg_closest(ca[ia], cb[ia], ca[ib], cb[ib], c1, c2, &dist2);
     const T dist = sqrt(dist2);
-    const T gap = dist - T(COL_R[ia] + COL_R[ib]);
+    const T rsum = std::is_same<T, float>::value ? T(PAIR_RSUM_F.v[pid])
+                                                 : T(PAIR_RSUM.v[pid]);
+    const T gap = dist - rsum;
     if (gap < T(MARGIN)) {
       T n[3];
       if (dist > T(1e-9)) {
@@ -3606,8 +3672,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int ci = s.nc;
       s.c_pair[ci] = pid;
       for (int i = 0; i < 3; i++) {
-        const T s1 = c1[i] + n[i] * T(COL_R[ia]);
-        const T s2 = c2[i] - n[i] * T(COL_R[ib]);
+        const T s1 = c1[i] + n[i] * CT(COL_R, [ia]);
+        const T s2 = c2[i] - n[i] * CT(COL_R, [ib]);
         s.c_pt[ci][i] = (s1 + s2) * T(0.5);
       }
       T* jr = s.c_J[ci];
@@ -3625,9 +3691,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // -- assembly: joint-limit rows, joint order (Divergences §15) --------------
   s.nl = 0;
   for (int j = 0; j < NQ; j++) {
-    const T gl = qpre[j] - T(LIMIT_LO[j]);
-    const T gh = T(LIMIT_HI[j]) - qpre[j];
-    const T reach = T(H_SUB) * T(OMEGA_CAP[j]);
+    const T gl = qpre[j] - CT(LIMIT_LO, [j]);
+    const T gh = CT(LIMIT_HI, [j]) - qpre[j];
+    const T reach = T(H_SUB) * CT(OMEGA_CAP, [j]);
     T sign, gap;
     if (gl <= gh) {
       sign = T(1);
@@ -4025,7 +4091,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // (d) omega-cap pass, joint order: weld-consistent impulses
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = CT(OMEGA_CAP, [j]);
       const T target = tclamp(v[vj], -cap, cap);
       if (target != v[vj]) {
         ensure_pcol(d, s, j);
@@ -4055,7 +4121,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   for (int i = 0; i < VOFF; i++) d.rhs[i] = T(0) - d.c[i];
   for (int j = 0; j < NQ; j++)
     d.rhs[VOFF + j] =
-        tau[j] - T(DAMPING[j]) * d.v[VOFF + j] - d.c[VOFF + j];
+        tau[j] - CT(DAMPING, [j]) * d.v[VOFF + j] - d.c[VOFF + j];
   // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
   // substep (crba rewrites all NV*NV of it next substep)
   chol_factor_n(NV, d.m, &d.pd_bad);
@@ -4138,7 +4204,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   //     of external force when many joints pinned (step.rs step-11
   //     comment has the audit).
   for (int j = 0; j < NQ; j++) {
-    const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+    const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
     s.hit[j] = d.q[j] < lo || d.q[j] > hi;
     // env v14: no routine position teleport (reaction-free q writes
     // are the phantom-force class — step.rs comment); deep-violation
@@ -4152,14 +4218,14 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     bool changed = false;
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = CT(OMEGA_CAP, [j]);
       // v14: at a stop the target is a Baumgarte recovery toward the
       // bound with a SLOP_LIMIT dead-band (mirrors step.rs) — the
       // impulse restores position reciprocally; a parked joint inside
       // the slop fires nothing
       T target;
       if (s.hit[j]) {
-        const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+        const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
         const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
         const T rec = fabs(over) - T(SLOP_LIMIT);
         target = rec <= T(0)
@@ -4886,7 +4952,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
         const int j = 17 + k;
         T jit = P.pose_jit[e * 14 + k] * P.start_pose_jitter;
         if (j == 20 || j == 26) jit = fabs(jit);
-        d.q[j] = tclamp(d.q[j] + jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
+        d.q[j] = tclamp(d.q[j] + jit, CT(LIMIT_LO, [j]), CT(LIMIT_HI, [j]));
       }
     }
     fk_all(d);
@@ -4896,7 +4962,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
       for (int c = 0; c < CORNERS_PER_FOOT; c++) {
         T y = d.pos[fr][1];
         for (int k = 0; k < 3; k++)
-          y += d.r[fr][1][k] * T(GROUND_CORNERS[c][k]);
+          y += d.r[fr][1][k] * CT(GROUND_CORNERS, [c][k]);
         min_y = tmin(min_y, y);
       }
     }
@@ -5054,17 +5120,17 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       obs[lane + 1] = (float)sin(qj);
       lane += 2;
     } else if (j == 6 || j == 13 || j == 20 || j == 26) {
-      const T hi = T(LIMIT_HI[j]);
+      const T hi = CT(LIMIT_HI, [j]);
       obs[lane] = (float)((T(2) * qj - hi) / hi);
       lane += 1;
     } else {
-      const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+      const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
       obs[lane] = (float)(qj / tmax(fabs(lo), fabs(hi)));
       lane += 1;
     }
   }
   for (int j = 0; j < NQ; j++)
-    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / T(OMEGA_CAP[j]));
+    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / CT(OMEGA_CAP, [j]));
   // hand derived blocks
   const int bases[2] = {OFF_HAND_L, OFF_HAND_R};
   if constexpr (FX) {
@@ -5360,7 +5426,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     const double frac = a < 7 ? gr[a] : 0.0;
     // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
     const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
-    tau[j] = T(frac) * T(TAU_MAX[j]) * T(ts);
+    tau[j] = T(frac) * CT(TAU_MAX, [j]) * T(ts);
     const double f = fabs(frac);
     act += f;
     const int g = j < 3 ? 0 : (j < 17 ? 1 : 2);
@@ -6314,6 +6380,7 @@ enum {
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
+
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps,
           bool auto_reset, int64_t gears,
@@ -6497,7 +6564,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     // the v10 one to the byte.
     // Flux (FX) is a second compile-time switch (4 instantiations per
     // dtype, ~2x compile time); the standard game's arithmetic is
-    // untouched.
+    // untouched. (Audit #5a, 2026-09-26: forcing the max-L1 carveout via
+    // cudaFuncSetAttribute measured null on the RTX 5090 — the driver
+    // already picks it for this 0 B-shared kernel — so it is not set.)
     auto stream = at::cuda::getCurrentCUDAStream();
     if (flux) {
       if (foot_contact)
