@@ -109,7 +109,8 @@ def _load():
                                "beat_arena_env", "csrc")
             bdir = os.path.join(src, "build_fp16")
             os.makedirs(bdir, exist_ok=True)
-            srcs = [os.path.join(src, "fp16_gemm.cu")]
+            srcs = [os.path.join(src, "fp16_gemm.cu"),
+                    os.path.join(src, "small_attn.cu")]
             cublas = ["cublas.lib", "cublasLt.lib"] if os.name == "nt" \
                 else ["-lcublas", "-lcublasLt"]
 
@@ -818,3 +819,82 @@ def packed_sdpa(qkv, attn_bias, n_heads):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
     return _PackedSdpa.apply(qkv, attn_bias, n_heads)
 
+
+# --- T = 29 fused attention (csrc/small_attn.cu, 2026-09-27, #10) ----------
+# One CTA per sample (4 warps = 4 heads, lane = query), fp32 softmax/P/dS,
+# no logsumexp or output saved (the backward recomputes P exactly). Used by
+# BOTH the rollout (grad-free) and the update forwards at every attention
+# site on the fp16 stream — the non-final blocks' packed self-attention,
+# the final block's 5 lead-token queries and the critic's 1-query pool —
+# so rollout and update logp stay bitwise consistent (r1) at identical
+# weights. Numerics vs torch's mem-efficient SDPA (which rounds P and dS
+# to fp16 for its tensor-core GEMMs): fp16 last-rounding class, closer to
+# an fp32 reference (tests/test_attn29.py). Other shapes keep SDPA.
+_ATTN29 = (29, 192, 4)          # (keys, d, heads) the kernel is built for
+
+
+def attn29_ok(T, d, n_heads):
+    ext = _load()
+    return (ext is not None and hasattr(ext, "attn29_fwd")
+            and (T, d, n_heads) == _ATTN29)
+
+
+class _Attn29Packed(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv, bias2):
+        d = qkv.shape[-1] // 3
+        out = _load().attn29_fwd(*qkv.split(d, dim=-1), bias2)
+        ctx.save_for_backward(qkv, bias2)
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        qkv, bias2 = ctx.saved_tensors
+        d = qkv.shape[-1] // 3
+        g = torch.empty_like(qkv)
+        _load().attn29_bwd(*qkv.split(d, dim=-1), bias2,
+                           gout.contiguous(), *g.split(d, dim=-1))
+        return g, None
+
+
+class _Attn29QKV(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, bias2):
+        out = _load().attn29_fwd(q, *kv.split(q.shape[-1], dim=-1), bias2)
+        ctx.save_for_backward(q, kv, bias2)
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        q, kv, bias2 = ctx.saved_tensors
+        dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        dkv = torch.empty_like(kv)
+        _load().attn29_bwd(q, *kv.split(q.shape[-1], dim=-1), bias2,
+                           gout.contiguous(), dq,
+                           *dkv.split(q.shape[-1], dim=-1))
+        return dq, dkv, None
+
+
+def attn29_packed(qkv, attn_bias):
+    """Self-attention over the packed (B, 29, 3d) q|k|v projection ->
+    contiguous (B, 29, d), heads concatenated (the out-projection's input
+    layout). attn_bias: the (B, 1, 29) additive fp16 key mask. Gradient:
+    ONE packed (B, 29, 3d) tensor."""
+    B, T, W = qkv.shape
+    bias2 = attn_bias.reshape(B, T)
+    if not torch.is_grad_enabled():
+        return _load().attn29_fwd(*qkv.split(W // 3, dim=-1), bias2)
+    return _Attn29Packed.apply(qkv, bias2)
+
+
+def attn29_qkv(q, kv, attn_bias):
+    """Attention of TQ in {29, 5, 1} queries q (B, TQ, d) over the packed
+    (B, 29, 2d) k|v projection -> contiguous (B, TQ, d). Gradients: dq
+    and ONE packed (B, 29, 2d) dkv."""
+    B, T, _ = kv.shape
+    bias2 = attn_bias.reshape(B, T)
+    if q.stride(-1) != 1 or q.stride(1) % 8 or q.stride(0) % 8:
+        q = q.contiguous()
+    if not torch.is_grad_enabled():
+        return _load().attn29_fwd(q, *kv.split(q.shape[-1], dim=-1), bias2)
+    return _Attn29QKV.apply(q, kv, bias2)
