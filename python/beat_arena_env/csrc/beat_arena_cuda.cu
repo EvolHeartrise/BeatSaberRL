@@ -1695,7 +1695,6 @@ struct Solver : GroundRows<T> {
   // built, eprev = the previous substep's emask (0 at the tick's start)
   uint32_t emask, eprev;
   bool ecomp[NQ], pcomp[NQ];
-  bool hit[NQ];
 };
 
 // ---- float twins of the double constant tables (audit #5c) -----------------
@@ -3511,13 +3510,17 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   //     engines — its reaction-free writes manufactured up to ~335 N
   //     of external force when many joints pinned (step.rs step-11
   //     comment has the audit).
+  // hitm bit j: joint j is past a stop (was bool s.hit[NQ] in local
+  // memory, re-read by every one of up to 64 unrolled passes below)
+  uint32_t hitm = 0;
   for (int j = 0; j < NQ; j++) {
     const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
-    s.hit[j] = d.q[j] < lo || d.q[j] > hi;
+    const bool hit = d.q[j] < lo || d.q[j] > hi;
+    hitm |= uint32_t(hit) << j;
     // env v14: no routine position teleport (reaction-free q writes
     // are the phantom-force class — step.rs comment); deep-violation
     // backstop only
-    if (s.hit[j]) {
+    if (hit) {
       const T over = d.q[j] < lo ? lo - d.q[j] : d.q[j] - hi;
       if (over > T(LIMIT_TELEPORT_BACKSTOP)) d.q[j] = tclamp(d.q[j], lo, hi);
     }
@@ -3545,7 +3548,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       // impulse restores position reciprocally; a parked joint inside
       // the slop fires nothing
       T target;
-      if (s.hit[j]) {
+      if ((hitm >> j) & 1u) {
         const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
         const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
         const T rec = fabs(over) - T(SLOP_LIMIT);
