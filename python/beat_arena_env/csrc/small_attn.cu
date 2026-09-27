@@ -6,8 +6,9 @@
 // queries x 29 keys at ~45% useful work per tile across B x H CTAs and
 // its backward re-reads K/V per query tile — 15.5 ms of an 83.5 ms PPO
 // minibatch and 8.8 ms of a 53.5 ms rollout forward (N = 32768) on the
-// RTX 5090 (2026-09-27 profile). Here ONE CTA owns one sample: q/k/v
-// (and dO) are staged in shared memory once, and each of the 4 warps
+// RTX 5090 (2026-09-27 profile). Here ONE CTA owns one sample: k/v (and
+// in the backward q and dO) are staged in shared memory once (the
+// forward's q A-fragments come straight from global), and each of the 4 warps
 // computes one head with m16n8k16 MMAs over the whole 32-padded score
 // tile, the softmax row statistics reduced within a lane quad.
 //
@@ -228,13 +229,32 @@ template <int TQ>
 __global__ void __launch_bounds__(NT)
 attn29_fwd_kernel(AttnP a, __half* __restrict__ out) {
   constexpr int MQ = (TQ + 15) / 16;
-  __shared__ __align__(16) __half sQ[TQ * LDS];
+  // Q is not staged: each thread loads its own m16n8k16 A fragments
+  // straight from global (issued before the K/V staging wait; the same
+  // values ldmatrix would deliver, so the MMAs are unchanged). 24 KB of
+  // smem per CTA -> 4 CTAs / SM instead of 2.
   __shared__ __align__(16) __half sK[T * LDS];
   __shared__ __align__(16) __half sV[T * LDS];
   __shared__ __align__(16) __half sZ[LDS];
   __shared__ float sBias[32];
   const int b = blockIdx.x, tid = threadIdx.x;
-  stage(sQ, a.q + b * a.q_bs, a.q_rs, TQ, tid);
+  const int h = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  uint32_t qa[MQ][DH / 16][4];
+  {
+    const __half* qg = a.q + b * a.q_bs + h * DH + t * 2;
+#pragma unroll
+    for (int m = 0; m < MQ; m++)
+#pragma unroll
+      for (int ks = 0; ks < DH / 16; ks++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          const int r = m * 16 + g + (e & 1) * 8;
+          qa[m][ks][e] = r < TQ
+              ? *reinterpret_cast<const uint32_t*>(
+                    qg + r * a.q_rs + ks * 16 + (e >> 1) * 8)
+              : 0u;
+        }
+  }
   stage(sK, a.k + b * a.k_bs, a.k_rs, T, tid);
   stage(sV, a.v + b * a.v_bs, a.v_rs, T, tid);
   for (int c = tid; c < LDS / 8; c += NT)
@@ -243,9 +263,27 @@ attn29_fwd_kernel(AttnP a, __half* __restrict__ out) {
     sBias[tid] = tid < T ? __half2float(a.bias[b * a.bias_bs + tid])
                          : -INFINITY;
   __syncthreads();
-  const int h = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   float s[MQ][KT][4];
-  gemm_nt<MQ, KT>(s, sQ, TQ, sK, T, sZ, h, lane);
+#pragma unroll
+  for (int m = 0; m < MQ; m++)
+#pragma unroll
+    for (int n = 0; n < KT; n++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) s[m][n][e] = 0.f;
+#pragma unroll
+  for (int ks = 0; ks < DH / 16; ks++) {
+#pragma unroll
+    for (int np = 0; np < KT / 2; np++) {
+      uint32_t bf[4];
+      ldsm4(bf, rowp(sK, np * 16 + (lane & 7) + (lane >> 4) * 8, T, sZ)
+                    + h * DH + ks * 16 + ((lane >> 3) & 1) * 8);
+#pragma unroll
+      for (int m = 0; m < MQ; m++) {
+        mma(s[m][2 * np], qa[m][ks], bf[0], bf[1]);
+        mma(s[m][2 * np + 1], qa[m][ks], bf[2], bf[3]);
+      }
+    }
+  }
   float inv[MQ][2];
 #pragma unroll
   for (int m = 0; m < MQ; m++)
