@@ -987,6 +987,15 @@ class CudaBeatVecEnv:
                                       device=self.device)
         self._env_order_on = bool(env_order)
         self._gbits = torch.tensor([1, 2, 4, 8], device=self.device)
+        # audit-2 #6b sort-key tables: joint limits / speed caps (the
+        # kernel's LIMIT_LO/HI and OMEGA_CAP; a proxy, exactness moot)
+        from .constants import H_SUB, JOINT_LIMITS, OMEGA_CAP
+        _lim = torch.tensor(JOINT_LIMITS, dtype=self.dtype,
+                            device=self.device)
+        _cap = torch.tensor(OMEGA_CAP, dtype=self.dtype, device=self.device)
+        self._ord_lo, self._ord_hi = _lim[:, 0], _lim[:, 1]
+        self._ord_reach = _cap * H_SUB
+        self._ord_cap = _cap * (1.0 - 1e-6)
         # episode-return ring buffer (device-side)
         self._cap = 4096
         self._ret_buf = z(self._cap)
@@ -1188,9 +1197,22 @@ class CudaBeatVecEnv:
             # (-0.06%); this key measured +8.7% ms/tick at N=32768
             # (2026-08-21 A/B, r12_dyn_ab). stable=True is part of the
             # run-to-run determinism gate.
+            # audit-2 #6b (perf/kernel-limits): the height is binned 4x
+            # coarser (4 cm) and the LAST key is the limit / cap
+            # activity — joints inside their limit-row reach plus joints
+            # at their speed cap, the drivers of the kernel's per-lane
+            # limit-row count, cap pass and step-11 passes (a warp pays
+            # its worst lane). Measured at N=32768 on the #6c/#6e kernel:
+            # standard -2.2%, Flux -2.0%, trained standard even; the
+            # other orders tried (activity above the contact mask, above
+            # the height, or bucketed) were null or worse.
             gmask = ((self.ground_imp > 0).long() * self._gbits).sum(1)
-            key = (gmask * 4096
-                   + (self.p[:, 1] * 100).long().clamp(0, 4095))
+            hq = (self.p[:, 1] * 100).long().clamp(0, 4095)
+            gap = torch.minimum(self.q - self._ord_lo,
+                                self._ord_hi - self.q)
+            act = ((gap < self._ord_reach).sum(1)
+                   + (self.v[:, 6:].abs() >= self._ord_cap).sum(1))
+            key = (gmask * 1024 + hq // 4) * 64 + act
             self.env_order.copy_(
                 torch.argsort(key, stable=True).to(torch.int32))
         self._launch(actions, cand, 0)
