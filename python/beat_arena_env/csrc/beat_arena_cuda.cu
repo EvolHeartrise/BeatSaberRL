@@ -1509,6 +1509,16 @@ __device__ constexpr double GROUND_CORNERS[CORNERS_PER_FOOT][3] = {
 // — no second chain to subtract (contrast the §2 self-collision rows).
 __device__ constexpr double GROUND_DIRS[GROUND_ROWS_PER_CORNER][3] = {
     {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 1.0}};
+// G1: the world axis of each row direction (GROUND_DIRS[t] = e_axis), so
+// row t is a weld-LINEAR-shaped row with WJ_ONE = axis (see GroundRows)
+__device__ constexpr int GROUND_AXIS[GROUND_ROWS_PER_CORNER] = {1, 0, 2};
+static_assert(GROUND_DIRS[0][GROUND_AXIS[0]] == 1.0
+                  && GROUND_DIRS[1][GROUND_AXIS[1]] == 1.0
+                  && GROUND_DIRS[2][GROUND_AXIS[2]] == 1.0
+                  && GROUND_DIRS[0][0] == 0.0 && GROUND_DIRS[0][2] == 0.0
+                  && GROUND_DIRS[1][1] == 0.0 && GROUND_DIRS[1][2] == 0.0
+                  && GROUND_DIRS[2][0] == 0.0 && GROUND_DIRS[2][1] == 0.0,
+              "G1: ground row t is the unit direction e_{GROUND_AXIS[t]}");
 
 // ---- env constants (lib.rs, verbatim) ---------------------------------------
 constexpr double V_NORM = 6.0;
@@ -1774,15 +1784,24 @@ struct WeldRows<T, true> {};  // contact mode: the weld block is dropped
 // M^-1 J^T column, bias / diag / lambda — because the normal row's PGS
 // update IS the contact path's and the friction rows differ from it only
 // in the projection.
+//
+// G1 (2026-09-26) — FIXED SLOTS + SUPPORT-ONLY STORAGE, the weld block's
+// K5/K8/K9/K11 layout carried over. Row slot 3*c + t belongs to corner
+// c = 4*foot + k (spec §2 order) whatever the active set is; bit c of
+// g_act says whether the corner is in contact. Row t of a corner is
+// point_jacobian_acc with n = e_{GROUND_AXIS[t]}, i.e. EXACTLY a weld
+// LINEAR row (K8 derivation, verbatim): one entry of 1.0 at column
+// GROUND_AXIS[t], two root values at WJ_R2[axis], six chain values at
+// WJ_L0 / WJ_R0 + 0..5; every other column is the zero fill's +0.0.
+// g_jr / g_jc hold the 8 non-unit support values (the 1.0 is implicit);
+// g_minv[f] is foot f's 12 M^-1 J^T columns RHS-MINOR ([NV][12], K11's
+// shape) so one chol_solve_multi_tn<12> per foot produces them.
 template <typename T, bool FC>
 struct GroundRows {
-  int ng;  // ACTIVE corners this substep, 0..NUM_GROUND_CORNERS
-  T g_J[N_GROUND_ROWS][NV], g_minv[N_GROUND_ROWS][NV];
+  uint32_t g_act;  // bit c: corner c in contact this substep (0..7)
+  T g_jr[N_GROUND_ROWS][2], g_jc[N_GROUND_ROWS][6];
+  T g_minv[2][NV][3 * CORNERS_PER_FOOT];
   T g_bias[N_GROUND_ROWS], g_diag[N_GROUND_ROWS], g_lam[N_GROUND_ROWS];
-  // contact spec §7: 2-bit obs bucket (foot*2 + toe) of each ACTIVE
-  // slot, packed 2 bits/slot — the compaction drops corner ids, and the
-  // per-tick ground_imp aggregation needs them back after the solve.
-  uint32_t g_bucket;
 };
 template <typename T>
 struct GroundRows<T, false> {};  // weld mode: no ground rows exist
@@ -1816,9 +1835,67 @@ struct Solver : WeldRows<T, FC>, GroundRows<T, FC> {
   bool hit[NQ];
 };
 
+// ---- float twins of the double constant tables (audit #5c) -----------------
+// Every hot read of a model table is `T(TABLE[...])`: under T = float
+// that was a double load plus a runtime f64->f32 conversion (reduced
+// rate on GeForce parts) inside the rolled 30-frame FK/CRBA/RNEA loops
+// and the per-substep limit/cap passes. The twins hold the SAME values
+// converted at compile time — round-to-nearest either way, so every
+// float result is bit-identical — and CT(X, [i]...) picks the twin for
+// T = float and the original (converted as before) for T = double.
+// Reads that do double ARITHMETIC before converting keep their double
+// form (or fold it at compile time exactly: PAIR_RSUM below).
+template <int A>
+struct FTab1 { float v[A]; };
+template <int A, int B>
+struct FTab2 { float v[A][B]; };
+template <int A>
+constexpr FTab1<A> f32_tab(const double (&x)[A]) {
+  FTab1<A> o{};
+  for (int i = 0; i < A; i++) o.v[i] = (float)x[i];
+  return o;
+}
+template <int A, int B>
+constexpr FTab2<A, B> f32_tab(const double (&x)[A][B]) {
+  FTab2<A, B> o{};
+  for (int i = 0; i < A; i++)
+    for (int j = 0; j < B; j++) o.v[i][j] = (float)x[i][j];
+  return o;
+}
+__device__ constexpr auto F_ANCHOR_F = f32_tab(F_ANCHOR);
+__device__ constexpr auto F_AXIS_F = f32_tab(F_AXIS);
+__device__ constexpr auto F_MASS_F = f32_tab(F_MASS);
+__device__ constexpr auto F_COM_F = f32_tab(F_COM);
+__device__ constexpr auto F_INERTIA_F = f32_tab(F_INERTIA);
+__device__ constexpr auto BASE_COM_F = f32_tab(BASE_COM);
+__device__ constexpr auto ARMATURE_F = f32_tab(ARMATURE);
+__device__ constexpr auto DAMPING_F = f32_tab(DAMPING);
+__device__ constexpr auto LIMIT_LO_F = f32_tab(LIMIT_LO);
+__device__ constexpr auto LIMIT_HI_F = f32_tab(LIMIT_HI);
+__device__ constexpr auto OMEGA_CAP_F = f32_tab(OMEGA_CAP);
+__device__ constexpr auto TAU_MAX_F = f32_tab(TAU_MAX);
+__device__ constexpr auto COL_A_F = f32_tab(COL_A);
+__device__ constexpr auto COL_B_F = f32_tab(COL_B);
+__device__ constexpr auto COL_R_F = f32_tab(COL_R);
+__device__ constexpr auto GROUND_CORNERS_F = f32_tab(GROUND_CORNERS);
+__device__ constexpr auto GROUND_DIRS_F = f32_tab(GROUND_DIRS);
+__device__ constexpr auto WELD_TARGET_P_F = f32_tab(WELD_TARGET_P);
+// T(COL_R[a] + COL_R[b]) per pair: the double sum folded at compile time
+// (an IEEE double add either way), then converted like any table
+struct PairRSum { double v[NUM_PAIRS]; };
+constexpr PairRSum pair_rsum() {
+  PairRSum t{};
+  for (int p = 0; p < NUM_PAIRS; p++) t.v[p] = COL_R[PAIR_A[p]] + COL_R[PAIR_B[p]];
+  return t;
+}
+__device__ constexpr PairRSum PAIR_RSUM = pair_rsum();
+__device__ constexpr auto PAIR_RSUM_F = f32_tab(PAIR_RSUM.v);
+#define CT(X, IDX) \
+  (std::is_same<T, float>::value ? T(X##_F.v IDX) : T(X IDX))
+
 // ---- fk.rs ------------------------------------------------------------------
-template <typename T>
-__device__ void rot_axis(const double axis_d[3], T angle, T out[3][3]) {
+template <typename T, typename A>
+__device__ void rot_axis(const A axis_d[3], T angle, T out[3][3]) {
   T s = sin(angle), cth = cos(angle);
   T k = T(1) - cth;
   T x = T(axis_d[0]), y = T(axis_d[1]), z = T(axis_d[2]);
@@ -1933,21 +2010,24 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
     const T* pl = par < 0 ? d.p : d.pos[par];
     T av[3];
     for (int i = 0; i < 3; i++) {
-      av[i] = rl[i][0] * T(F_ANCHOR[k][0]) + rl[i][1] * T(F_ANCHOR[k][1])
-              + rl[i][2] * T(F_ANCHOR[k][2]);
+      av[i] = rl[i][0] * CT(F_ANCHOR, [k][0]) + rl[i][1] * CT(F_ANCHOR, [k][1])
+              + rl[i][2] * CT(F_ANCHOR, [k][2]);
       d.pos[k][i] = pl[i] + av[i];
     }
     if (F_COORD[k] >= 0) {
       T rj[3][3];
-      rot_axis(F_AXIS[k], d.q[F_COORD[k]], rj);
+      if constexpr (std::is_same<T, float>::value)
+        rot_axis(F_AXIS_F.v[k], d.q[F_COORD[k]], rj);
+      else
+        rot_axis(F_AXIS[k], d.q[F_COORD[k]], rj);
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
           d.r[k][i][j] = rl[i][0] * rj[0][j] + rl[i][1] * rj[1][j]
                          + rl[i][2] * rj[2][j];
       for (int i = 0; i < 3; i++)
-        d.axw[k][i] = d.r[k][i][0] * T(F_AXIS[k][0])
-                      + d.r[k][i][1] * T(F_AXIS[k][1])
-                      + d.r[k][i][2] * T(F_AXIS[k][2]);
+        d.axw[k][i] = d.r[k][i][0] * CT(F_AXIS, [k][0])
+                      + d.r[k][i][1] * CT(F_AXIS, [k][1])
+                      + d.r[k][i][2] * CT(F_AXIS, [k][2]);
     } else {
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) d.r[k][i][j] = rl[i][j];
@@ -1961,8 +2041,8 @@ __device__ void fk_all(Dyn<T>& __restrict__ d) {
 // the one register value v (K4e): crba needs a MUTABLE composite seed
 // and a pristine copy for rnea_bias, and both get identical bits with
 // no read-back.
-template <typename T>
-__device__ void inertia_world2(const T r[3][3], const double idiag[3],
+template <typename T, typename A>
+__device__ void inertia_world2(const T r[3][3], const A idiag[3],
                                T out[3][3], T keep[3][3]) {
   for (int a = 0; a < 3; a++)
     for (int b = a; b < 3; b++) {
@@ -2005,14 +2085,17 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
     for (int j = 0; j <= i; j++) d.m[j * NV + i] = T(0);
   // composite seeds
   for (int k = 0; k < NF; k++) {
-    const T mk = T(F_MASS[k]);
+    const T mk = CT(F_MASS, [k]);
     d.cm[k] = mk;
-    if (F_MASS[k] > 0.0) {
+    if (CT(F_MASS, [k]) > T(0)) {
       for (int i = 0; i < 3; i++)
-        d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * T(F_COM[k][0])
-                                    + d.r[k][i][1] * T(F_COM[k][1])
-                                    + d.r[k][i][2] * T(F_COM[k][2]));
-      inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
+        d.cc[k][i] = d.pos[k][i] + (d.r[k][i][0] * CT(F_COM, [k][0])
+                                    + d.r[k][i][1] * CT(F_COM, [k][1])
+                                    + d.r[k][i][2] * CT(F_COM, [k][2]));
+      if constexpr (std::is_same<T, float>::value)
+        inertia_world2(d.r[k], F_INERTIA_F.v[k], d.ci[k], d.iw[k]);
+      else
+        inertia_world2(d.r[k], F_INERTIA[k], d.ci[k], d.iw[k]);
     } else {
       for (int i = 0; i < 3; i++) d.cc[k][i] = d.pos[k][i];
       for (int i = 0; i < 3; i++)
@@ -2022,9 +2105,9 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   // base composite (pelvis)
   d.bm = T(BASE_MASS);
   for (int i = 0; i < 3; i++)
-    d.bc[i] = d.p[i] + (d.r0[i][0] * T(BASE_COM[0])
-                        + d.r0[i][1] * T(BASE_COM[1])
-                        + d.r0[i][2] * T(BASE_COM[2]));
+    d.bc[i] = d.p[i] + (d.r0[i][0] * CT(BASE_COM, [0])
+                        + d.r0[i][1] * CT(BASE_COM, [1])
+                        + d.r0[i][2] * CT(BASE_COM, [2]));
   inertia_world2(d.r0, BASE_INERTIA, d.bi, d.iw0);
 
   // leaf->root accumulation with column fill before parent merge
@@ -2114,7 +2197,7 @@ __device__ void crba(Dyn<T>& __restrict__ d) {
   for (int k = 0; k < NF; k++)
     if (F_COORD[k] >= 0) {
       const int j = VOFF + F_COORD[k];
-      d.m[j * NV + j] += T(ARMATURE[F_COORD[k]]);
+      d.m[j * NV + j] += CT(ARMATURE, [F_COORD[k]]);
     }
 
   // root 6x6 from the total composite
@@ -2181,11 +2264,11 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       d.al[k][i] = alk[i];
       d.ao[k][i] = aok[i];
     }
-    if (F_MASS[k] > 0.0) {
+    if (CT(F_MASS, [k]) > T(0)) {
       T e[3];
       for (int i = 0; i < 3; i++)
-        e[i] = d.r[k][i][0] * T(F_COM[k][0]) + d.r[k][i][1] * T(F_COM[k][1])
-               + d.r[k][i][2] * T(F_COM[k][2]);
+        e[i] = d.r[k][i][0] * CT(F_COM, [k][0]) + d.r[k][i][1] * CT(F_COM, [k][1])
+               + d.r[k][i][2] * CT(F_COM, [k][2]);
       T alxe[3], omxe[3], omxomxe[3];
       cross3(alk, e, alxe);
       cross3(omk, e, omxe);
@@ -2194,7 +2277,7 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
       for (int i = 0; i < 3; i++) ac[i] = (aok[i] + alxe[i]) + omxomxe[i];
       const T(&iw)[3][3] = d.iw[k];  // K4e
       T fbk[3];
-      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * T(F_MASS[k]);
+      for (int i = 0; i < 3; i++) fbk[i] = (ac[i] - g[i]) * CT(F_MASS, [k]);
       T iwal[3], iwom[3];
       for (int i = 0; i < 3; i++) {
         iwal[i] = iw[i][0] * alk[0] + iw[i][1] * alk[1] + iw[i][2] * alk[2];
@@ -2222,8 +2305,8 @@ __device__ void rnea_bias(Dyn<T>& __restrict__ d) {
   {
     T e[3];
     for (int i = 0; i < 3; i++)
-      e[i] = d.r0[i][0] * T(BASE_COM[0]) + d.r0[i][1] * T(BASE_COM[1])
-             + d.r0[i][2] * T(BASE_COM[2]);
+      e[i] = d.r0[i][0] * CT(BASE_COM, [0]) + d.r0[i][1] * CT(BASE_COM, [1])
+             + d.r0[i][2] * CT(BASE_COM, [2]);
     T omxe[3], omxomxe[3];
     cross3(om0, e, omxe);
     cross3(om0, omxe, omxomxe);
@@ -3394,6 +3477,24 @@ __device__ void ensure_pcol_multi(Solver<T, FC>& __restrict__ s,
   }
 }
 
+// G1 — support dot of one ground row (a weld-LINEAR-shaped row, see
+// GroundRows) against a dense NV-vector read through g(i): the exactly-1.0
+// column `axis` as a bare add, the two root values at WJ_R2[axis], then
+// the six chain columns ch0..ch0+5 — ascending column order, the K8
+// A_ww / PGS-dot contraction. Callers pass compile-time axis / ch0
+// (unrolled loops) so every column index folds to an immediate.
+template <typename T, typename G>
+__device__ __forceinline__ T ground_row_dot(int axis, int ch0, const T jr[2],
+                                            const T jc[6], G g) {
+  T sum = T(0);
+  sum += g(axis);
+  sum += jr[0] * g(WJ_R2[axis][0]);
+  sum += jr[1] * g(WJ_R2[axis][1]);
+#pragma unroll
+  for (int e = 0; e < 6; e++) sum += jc[e] * g(ch0 + e);
+  return sum;
+}
+
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
 template <typename T, bool FC>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
@@ -3478,7 +3579,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     for (int t = 0; t < 3; t++) {
       s.mw[3 + t][r0 + 3 + t] = T(1);
       s.bias_w[r0 + t] =
-          -(T(BETA_WELD) * hinv) * (pf[t] - T(WELD_TARGET_P[widx][t]));
+          -(T(BETA_WELD) * hinv) * (pf[t] - CT(WELD_TARGET_P, [widx][t]));
     }
     T phi[3];
     rot_log(d.r[frame], phi);
@@ -3488,62 +3589,115 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   }
 
   // -- env v11 GROUND BLOCK, where the weld rows used to be -------------------
-  // MIRROR of collide.rs `ground_phase` + solver.rs `assemble_ground_rows`,
-  // transcribed SERIALLY and without any of the K5/K8/K9 weld tricks: the
-  // corner order is the spec §2 normative one (foot_l then foot_r,
+  // MIRROR of collide.rs `ground_phase` + solver.rs `assemble_ground_rows`.
+  // The corner order is the spec §2 normative one (foot_l then foot_r,
   // GROUND_CORNERS order within a foot), the row order the §3 one (normal,
-  // friction x, friction z), and each row is the plain
-  // `zero-fill + point_jacobian_acc` the Rust reference writes. The active
-  // set is data-dependent exactly as the 55-pair contact set is, and it
-  // uses the SAME compaction convention (s.ng counts ACTIVE corners, rows
-  // packed from 0), so a thread assembles the rows Rust assembles, in
-  // Rust's order. Trip count over the block is fixed by s.ng, with no
-  // early exit inside it — the §2 contact loop's contract.
+  // friction x, friction z). Rust packs the ACTIVE corners' rows from 0;
+  // G1 keeps every corner in its FIXED slot (3*c + t) with an active bit
+  // instead — the consumers walk the slots in ascending order and skip
+  // inactive ones, which visits exactly Rust's rows in Rust's order.
+  // Rows of an inactive corner ARE assembled (and solved, below) when
+  // its foot has any active corner: the 12 rows of a foot are mutually
+  // independent (A1), so an extra row changes no active value.
+  //
+  // G1 (the weld block's K8 / K9a / K9b / K9c, verbatim in spirit): each
+  // row is `zero-fill + point_jacobian_acc(frame, pt, e_axis, +1)`, i.e.
+  // a weld LINEAR row with the corner in place of the foot origin, so
+  //   chain col   = +0.0 + dot3(e_axis, w) == T(0) + w[axis]
+  //   root col a  = +0.0 + 1.0 == 1.0            (a = axis)
+  //   root 0..2\a = +0.0 + 0.0 == +0.0
+  //   root 3..5   = +0.0 + cross(rel0, e_axis)[.]: the closed forms
+  //                 below; component `axis` is a structural +-0.0 the
+  //                 +0.0 fill absorbs (Divergences 20c)
+  // for finite w / rel0. ONE ancestor walk per FOOT emits all 12 rows'
+  // chain entries (the 4 corners share pos[k] / axw[k]); each column is
+  // written once, as the single `T(0) + x` store K9b documents.
+  // The RHS is seeded straight into g_minv[f] (RHS-minor, K11), the
+  // support values teed off into g_jr / g_jc (K9c).
   if constexpr (FC) {
-    s.ng = 0;
-    s.g_bucket = 0;
+    s.g_act = 0;
+#pragma unroll
     for (int f = 0; f < 2; f++) {
       const int frame = GROUND_FRAMES[f];
+      T pt[CORNERS_PER_FOOT][3];
+      uint32_t fact = 0;
+#pragma unroll
       for (int k = 0; k < CORNERS_PER_FOOT; k++) {
         // world corner = p[frame] + R[frame] * corner_k  (fk.rs
         // add3(ws.p, mat_vec(ws.r, .)), same term order as the capsule
         // endpoints hoisted below)
-        T pt[3];
         for (int i = 0; i < 3; i++)
-          pt[i] = d.pos[frame][i]
-                  + (d.r[frame][i][0] * T(GROUND_CORNERS[k][0])
-                     + d.r[frame][i][1] * T(GROUND_CORNERS[k][1])
-                     + d.r[frame][i][2] * T(GROUND_CORNERS[k][2]));
+          pt[k][i] = d.pos[frame][i]
+                     + (d.r[frame][i][0] * CT(GROUND_CORNERS, [k][0])
+                        + d.r[frame][i][1] * CT(GROUND_CORNERS, [k][1])
+                        + d.r[frame][i][2] * CT(GROUND_CORNERS, [k][2]));
         // the plane is y = 0 and its normal is +y, so the signed gap is
         // the corner's world y outright
-        const T gap = pt[1];
-        if (gap < T(MARGIN)) {
-          const int nrow = s.ng * GROUND_ROWS_PER_CORNER;
-          for (int t = 0; t < GROUND_ROWS_PER_CORNER; t++) {
-            T* jr = s.g_J[nrow + t];
-            for (int i = 0; i < NV; i++) jr[i] = T(0);
-            const T n[3] = {T(GROUND_DIRS[t][0]), T(GROUND_DIRS[t][1]),
-                            T(GROUND_DIRS[t][2])};
-            // static ground: only the corner's OWN chain contributes, so
-            // this is one signed point_jacobian_acc, not the contact
-            // rows' subtract-a-then-add-b pair
-            point_jacobian_acc(d, frame, pt, n, T(1), jr);
+        const T gap = pt[k][1];
+        const int r0 = 3 * (CORNERS_PER_FOOT * f + k);
+        // NORMAL row rhs: the §3-step-8 contact pipeline verbatim —
+        // speculative approach limit while the gap is open, Baumgarte
+        // push-out beyond SLOP once penetrating
+        s.g_bias[r0] = gap >= T(0)
+                           ? -gap * hinv
+                           : (T(BETA_CONTACT) * hinv)
+                                 * tmax(-gap - T(SLOP), T(0));
+        // FRICTION rows rhs = 0: friction stabilizes nothing, so it
+        // gets no Baumgarte term (contact spec §3)
+        s.g_bias[r0 + 1] = T(0);
+        s.g_bias[r0 + 2] = T(0);
+        if (gap < T(MARGIN)) fact |= 1u << k;
+      }
+      s.g_act |= fact << (CORNERS_PER_FOOT * f);
+      if (fact != 0) {
+        T(*x)[3 * CORNERS_PER_FOOT] = s.g_minv[f];
+        const int c0 = CORNERS_PER_FOOT * f;
+        for (int i = 0; i < NV; i++)
+#pragma unroll
+          for (int m = 0; m < 3 * CORNERS_PER_FOOT; m++) x[i][m] = T(0);
+        for (int kk = frame; kk >= 0; kk = F_PARENT[kk]) {
+          if (F_COORD[kk] < 0) continue;
+          const int col = VOFF + F_COORD[kk];
+          const int e = col - (WJ_L0 + 6 * f);
+#pragma unroll
+          for (int k = 0; k < CORNERS_PER_FOOT; k++) {
+            T rel[3], w[3];
+            sub3v(pt[k], d.pos[kk], rel);
+            cross3(d.axw[kk], rel, w);
+#pragma unroll
+            for (int t = 0; t < GROUND_ROWS_PER_CORNER; t++) {
+              const T lv = T(0) + w[GROUND_AXIS[t]];
+              x[col][3 * k + t] = lv;
+              s.g_jc[3 * (c0 + k) + t][e] = lv;
+            }
           }
-          // NORMAL row rhs: the §3-step-8 contact pipeline verbatim —
-          // speculative approach limit while the gap is open, Baumgarte
-          // push-out beyond SLOP once penetrating
-          s.g_bias[nrow] = gap >= T(0)
-                               ? -gap * hinv
-                               : (T(BETA_CONTACT) * hinv)
-                                     * tmax(-gap - T(SLOP), T(0));
-          // FRICTION rows rhs = 0: friction stabilizes nothing, so it
-          // gets no Baumgarte term (contact spec §3)
-          s.g_bias[nrow + 1] = T(0);
-          s.g_bias[nrow + 2] = T(0);
-          // contact spec §7: GROUND_CORNERS order puts z+ (toe) at odd
-          // k, so the obs bucket is foot*2 + (k & 1)
-          s.g_bucket |= (uint32_t)(f * 2 + (k & 1)) << (2 * s.ng);
-          s.ng = s.ng + 1;
+        }
+#pragma unroll
+        for (int k = 0; k < CORNERS_PER_FOOT; k++) {
+          T rel0[3];
+          sub3v(pt[k], d.p, rel0);
+          const int m = 3 * k, r = 3 * (c0 + k);
+          // t = 0: normal, axis 1 -> cols {3, 5}
+          const T n3 = T(0) - rel0[2], n5 = T(0) + rel0[0];
+          // t = 1: friction x, axis 0 -> cols {4, 5}
+          const T x4 = T(0) + rel0[2], x5 = T(0) - rel0[1];
+          // t = 2: friction z, axis 2 -> cols {3, 4}
+          const T z3 = T(0) + rel0[1], z4 = T(0) - rel0[0];
+          x[1][m] = T(1);
+          x[3][m] = n3;
+          x[5][m] = n5;
+          x[0][m + 1] = T(1);
+          x[4][m + 1] = x4;
+          x[5][m + 1] = x5;
+          x[2][m + 2] = T(1);
+          x[3][m + 2] = z3;
+          x[4][m + 2] = z4;
+          s.g_jr[r][0] = n3;
+          s.g_jr[r][1] = n5;
+          s.g_jr[r + 1][0] = x4;
+          s.g_jr[r + 1][1] = x5;
+          s.g_jr[r + 2][0] = z3;
+          s.g_jr[r + 2][1] = z4;
         }
       }
     }
@@ -3565,12 +3719,12 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   for (int c = 0; c < NUM_COLLIDERS; c++) {
     const int f = COL_FRAME[c];
     for (int i = 0; i < 3; i++) {
-      ca[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_A[c][0])
-                                + d.r[f][i][1] * T(COL_A[c][1])
-                                + d.r[f][i][2] * T(COL_A[c][2]));
-      cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * T(COL_B[c][0])
-                                + d.r[f][i][1] * T(COL_B[c][1])
-                                + d.r[f][i][2] * T(COL_B[c][2]));
+      ca[c][i] = d.pos[f][i] + (d.r[f][i][0] * CT(COL_A, [c][0])
+                                + d.r[f][i][1] * CT(COL_A, [c][1])
+                                + d.r[f][i][2] * CT(COL_A, [c][2]));
+      cb[c][i] = d.pos[f][i] + (d.r[f][i][0] * CT(COL_B, [c][0])
+                                + d.r[f][i][1] * CT(COL_B, [c][1])
+                                + d.r[f][i][2] * CT(COL_B, [c][2]));
       mid[c][i] = (ca[c][i] + cb[c][i]) * T(0.5);
     }
     const double ex = COL_B[c][0] - COL_A[c][0];
@@ -3592,7 +3746,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     T c1[3], c2[3], dist2;
     seg_seg_closest(ca[ia], cb[ia], ca[ib], cb[ib], c1, c2, &dist2);
     const T dist = sqrt(dist2);
-    const T gap = dist - T(COL_R[ia] + COL_R[ib]);
+    const T rsum = std::is_same<T, float>::value ? T(PAIR_RSUM_F.v[pid])
+                                                 : T(PAIR_RSUM.v[pid]);
+    const T gap = dist - rsum;
     if (gap < T(MARGIN)) {
       T n[3];
       if (dist > T(1e-9)) {
@@ -3606,8 +3762,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const int ci = s.nc;
       s.c_pair[ci] = pid;
       for (int i = 0; i < 3; i++) {
-        const T s1 = c1[i] + n[i] * T(COL_R[ia]);
-        const T s2 = c2[i] - n[i] * T(COL_R[ib]);
+        const T s1 = c1[i] + n[i] * CT(COL_R, [ia]);
+        const T s2 = c2[i] - n[i] * CT(COL_R, [ib]);
         s.c_pt[ci][i] = (s1 + s2) * T(0.5);
       }
       T* jr = s.c_J[ci];
@@ -3625,9 +3781,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // -- assembly: joint-limit rows, joint order (Divergences §15) --------------
   s.nl = 0;
   for (int j = 0; j < NQ; j++) {
-    const T gl = qpre[j] - T(LIMIT_LO[j]);
-    const T gh = T(LIMIT_HI[j]) - qpre[j];
-    const T reach = T(H_SUB) * T(OMEGA_CAP[j]);
+    const T gl = qpre[j] - CT(LIMIT_LO, [j]);
+    const T gh = CT(LIMIT_HI, [j]) - qpre[j];
+    const T reach = T(H_SUB) * CT(OMEGA_CAP, [j]);
     T sign, gap;
     if (gl <= gh) {
       sign = T(1);
@@ -3654,44 +3810,36 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // K9c: the assembly above already wrote J_w here, so the 420-element
   // seed copy that used to stand at this point is gone.
   if constexpr (!FC) chol_solve_multi_tn<N_WELD>(NV, d.m, &s.mw[0][0]);
-  // Ground rows (contact mode): the SAME 4 / 2 / 1 ladder the contact
-  // rows take below. Rust runs ONE ladder over ground++contacts, so one
-  // of its groups can straddle the block boundary; the rows are mutually
-  // independent and the batch is a pure loop interchange (A1), so every
-  // M^-1 J^T column and every diag is bit-for-bit what any grouping
-  // produces — running the two blocks as two ladders changes no value.
+  // Ground rows (contact mode), G1: ONE chol_solve_multi_tn<12> per foot
+  // with any active corner, on the RHS-minor seed the assembly wrote
+  // (K11's entry point, the weld block's own width). Rust runs a 4 / 2 /
+  // 1 ladder over ground++contacts; the rows are mutually independent
+  // and every batched / blocked form of the solve is a pure loop
+  // interchange with each RHS keeping its own ascending accumulator
+  // chains (A1, chol_solve_multi_n / _tn / chol_solve_n headers), so
+  // every M^-1 J^T column is bit-for-bit what any grouping produces —
+  // and so is the value of an active row when inactive rows of its foot
+  // ride along in the same batch.
+  // diag = J . M^-1 J^T visits only the row's support, ascending (K8's
+  // A_ww contraction, same argument: the dropped products are
+  // (+0.0) * finite into a +0.0-seeded accumulator, and the 1.0 entry is
+  // a bare add). All 12 rows of the foot are dotted (compile-time m);
+  // an inactive row's diag is never read.
   if constexpr (FC) {
-    const int ngr = s.ng * GROUND_ROWS_PER_CORNER;
-    int gi = 0;
-    for (; gi + 3 < ngr; gi += 4) {
-      for (int t = 0; t < 4; t++)
-        for (int i = 0; i < NV; i++) s.g_minv[gi + t][i] = s.g_J[gi + t][i];
-      chol_solve_multi_n<4>(NV, d.m, &s.g_minv[gi][0]);
-      for (int t = 0; t < 4; t++) {
-        T diag = T(0);
-        for (int i = 0; i < NV; i++)
-          diag += s.g_J[gi + t][i] * s.g_minv[gi + t][i];
-        s.g_diag[gi + t] = diag;
+#pragma unroll
+    for (int f = 0; f < 2; f++) {
+      if ((s.g_act >> (CORNERS_PER_FOOT * f)) & 0xFu) {
+        chol_solve_multi_tn<3 * CORNERS_PER_FOOT>(NV, d.m,
+                                                  &s.g_minv[f][0][0]);
+#pragma unroll
+        for (int m = 0; m < 3 * CORNERS_PER_FOOT; m++) {
+          const int r = 3 * CORNERS_PER_FOOT * f + m;
+          const T(*x)[3 * CORNERS_PER_FOOT] = s.g_minv[f];
+          s.g_diag[r] = ground_row_dot(
+              GROUND_AXIS[m % GROUND_ROWS_PER_CORNER], WJ_L0 + 6 * f,
+              s.g_jr[r], s.g_jc[r], [&](int i) { return x[i][m]; });
+        }
       }
-    }
-    if (gi + 1 < ngr) {
-      for (int t = 0; t < 2; t++)
-        for (int i = 0; i < NV; i++) s.g_minv[gi + t][i] = s.g_J[gi + t][i];
-      chol_solve_multi_n<2>(NV, d.m, &s.g_minv[gi][0]);
-      for (int t = 0; t < 2; t++) {
-        T diag = T(0);
-        for (int i = 0; i < NV; i++)
-          diag += s.g_J[gi + t][i] * s.g_minv[gi + t][i];
-        s.g_diag[gi + t] = diag;
-      }
-      gi += 2;
-    }
-    for (; gi < ngr; gi++) {
-      for (int i = 0; i < NV; i++) s.g_minv[gi][i] = s.g_J[gi][i];
-      chol_solve_n(NV, d.m, s.g_minv[gi]);
-      T diag = T(0);
-      for (int i = 0; i < NV; i++) diag += s.g_J[gi][i] * s.g_minv[gi][i];
-      s.g_diag[gi] = diag;
     }
   }
   // Contact rows: s.nc is RUNTIME (0..55, typically a handful), so the
@@ -3861,10 +4009,17 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   }
   for (int ci = 0; ci < s.nc; ci++) s.c_lam[ci] = T(0);
   if constexpr (FC)
-    for (int gi = 0; gi < s.ng * GROUND_ROWS_PER_CORNER; gi++)
-      s.g_lam[gi] = T(0);
+    for (int gi = 0; gi < N_GROUND_ROWS; gi++) s.g_lam[gi] = T(0);
 
   // -- step 8: exactly 12 iterations, fixed order -----------------------------
+  // G2/G5 (contact mode): the whole PGS loop runs on vr, a register copy
+  // of the local-memory `v` (see the G2 note at the ground block), taken
+  // here and written back after the last iteration. Weld mode keeps `v`.
+  T vr[NV];
+  if constexpr (FC) {
+#pragma unroll
+    for (int i = 0; i < NV; i++) vr[i] = v[i];
+  }
   for (int iter = 0; iter < PGS_ITERS; iter++) {
     // (a) weld block: exact solve of the current residual.
     // Both halves are LOOP INTERCHANGES of the 12 x NV nests (bitwise —
@@ -3940,40 +4095,83 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // the PGS_ITERS iterations. MIRROR of solver.rs `pgs_ground_sweep` +
     // `pgs_row_update_box`. It runs where the weld block would, with the
     // same fixed iteration count and no early exit.
+    // G1: fixed slots walked in ascending corner order, inactive corners
+    // skipped (= Rust's packed order); foot f and row t are compile-time
+    // so each dot is the 9-term support contraction (ground_row_dot)
+    // instead of the dense 35-term one — the K8 PGS-dot argument. The
+    // axpy stays dense (M^-1 J^T has no structural zeros).
+    // G2 (audit #5b): `v` is a local-memory array (the limit / cap passes
+    // index it at runtime), so every term above was an LDL and every
+    // axpy element an LDL + STL. The sweep runs on a register copy vr
+    // instead — every index into it is compile-time (i unrolled, f / t
+    // compile-time) — and writes it back once. A copy is the identity
+    // on every value; the arithmetic is unchanged operation for
+    // operation.
+    // G4: the register copy also carries the (b) contact sweep below
+    // (contact mode only).
     if constexpr (FC) {
-      for (int gi = 0; gi < s.ng; gi++) {
-        const int nrow = gi * GROUND_ROWS_PER_CORNER;
-        {
-          T jv = T(0);
-          for (int i = 0; i < NV; i++) jv += s.g_J[nrow][i] * v[i];
-          const T dl = (s.g_bias[nrow] - jv) / s.g_diag[nrow];
-          const T newl = tmax(s.g_lam[nrow] + dl, T(0));  // lambda_n >= 0
-          const T dd = newl - s.g_lam[nrow];
-          s.g_lam[nrow] = newl;
-          if (dd != T(0))
-            for (int i = 0; i < NV; i++) v[i] += s.g_minv[nrow][i] * dd;
+#pragma unroll
+      for (int f = 0; f < 2; f++) {
+        const int ch0 = WJ_L0 + 6 * f;
+#pragma unroll 1
+        for (int k = 0; k < CORNERS_PER_FOOT; k++) {
+          const int c = CORNERS_PER_FOOT * f + k;
+          if (!((s.g_act >> c) & 1u)) continue;
+          const int nrow = GROUND_ROWS_PER_CORNER * c;
+          const T(*x)[3 * CORNERS_PER_FOOT] = s.g_minv[f];
+          const int m0 = GROUND_ROWS_PER_CORNER * k;
+          {
+            const T jv =
+                ground_row_dot(GROUND_AXIS[0], ch0, s.g_jr[nrow],
+                               s.g_jc[nrow], [&](int i) { return vr[i]; });
+            const T dl = (s.g_bias[nrow] - jv) / s.g_diag[nrow];
+            const T newl = tmax(s.g_lam[nrow] + dl, T(0));  // lambda_n >= 0
+            const T dd = newl - s.g_lam[nrow];
+            s.g_lam[nrow] = newl;
+            if (dd != T(0))
+#pragma unroll
+              for (int i = 0; i < NV; i++) vr[i] += x[i][m0] * dd;
+          }
+          // the friction cone is read AFTER the normal update, so a corner
+          // that just lost its normal impulse loses its friction in the
+          // same sweep
+          const T bound = T(GROUND_MU) * s.g_lam[nrow];
+#pragma unroll
+          for (int t = 1; t < GROUND_ROWS_PER_CORNER; t++) {
+            const int row = nrow + t;
+            const T jv =
+                ground_row_dot(GROUND_AXIS[t], ch0, s.g_jr[row],
+                               s.g_jc[row], [&](int i) { return vr[i]; });
+            const T dl = (s.g_bias[row] - jv) / s.g_diag[row];
+            // |lambda_t| <= MU * lambda_n. Rust writes
+            // `(lambda + dl).min(bound).max(-bound)`; tmin/tmax reproduce
+            // f64::min/max including the NaN rule (both `a < b` and
+            // `a > b` are false on NaN, so the OTHER operand is returned,
+            // exactly as minnum/maxnum do) — an artifact lambda collapses
+            // onto the bound instead of propagating.
+            const T newl = tmax(tmin(s.g_lam[row] + dl, bound), -bound);
+            const T dd = newl - s.g_lam[row];
+            s.g_lam[row] = newl;
+            if (dd != T(0))
+#pragma unroll
+              for (int i = 0; i < NV; i++) vr[i] += x[i][m0 + t] * dd;
+          }
         }
-        // the friction cone is read AFTER the normal update, so a corner
-        // that just lost its normal impulse loses its friction in the
-        // same sweep
-        const T bound = T(GROUND_MU) * s.g_lam[nrow];
-        for (int t = 1; t < GROUND_ROWS_PER_CORNER; t++) {
-          const int row = nrow + t;
-          T jv = T(0);
-          for (int i = 0; i < NV; i++) jv += s.g_J[row][i] * v[i];
-          const T dl = (s.g_bias[row] - jv) / s.g_diag[row];
-          // |lambda_t| <= MU * lambda_n. Rust writes
-          // `(lambda + dl).min(bound).max(-bound)`; tmin/tmax reproduce
-          // f64::min/max including the NaN rule (both `a < b` and
-          // `a > b` are false on NaN, so the OTHER operand is returned,
-          // exactly as minnum/maxnum do) — an artifact lambda collapses
-          // onto the bound instead of propagating.
-          const T newl = tmax(tmin(s.g_lam[row] + dl, bound), -bound);
-          const T dd = newl - s.g_lam[row];
-          s.g_lam[row] = newl;
-          if (dd != T(0))
-            for (int i = 0; i < NV; i++) v[i] += s.g_minv[row][i] * dd;
-        }
+      }
+      // (b) contacts, contact mode — G4: the weld-mode loop below,
+      // operation for operation, on vr (see there for why the dot stays
+      // dense).
+      for (int ci = 0; ci < s.nc; ci++) {
+        T jv = T(0);
+#pragma unroll
+        for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * vr[i];
+        const T dl = (s.c_bias[ci] - jv) / s.c_diag[ci];
+        const T newl = tmax(s.c_lam[ci] + dl, T(0));
+        const T dd = newl - s.c_lam[ci];
+        s.c_lam[ci] = newl;
+        if (dd != T(0))
+#pragma unroll
+          for (int i = 0; i < NV; i++) vr[i] += s.c_minv[ci][i] * dd;
       }
     }
     // (b) contacts, pair-id order: projected GS, lambda >= 0
@@ -3983,6 +4181,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // three forms, all reverted. The bound would be runtime, which
     // costs this loop its full unrolling — see the K14 block in the
     // header before touching it.
+    // (contact mode runs this sweep on vr inside the G2 block above)
+    if constexpr (!FC)
     for (int ci = 0; ci < s.nc; ci++) {
       T jv = T(0);
       for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * v[i];
@@ -4003,6 +4203,29 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // pays the UNION of the ladder's widths. The same .pyd is +2.26% on
     // warp-uniform traffic. Read the K13 block in the header before
     // touching this loop.
+    // G5: contact mode runs the same rows on vr. The runtime-indexed read
+    // v[VOFF + j] becomes a select chain over compile-time slots (a copy
+    // of the one selected value — exact), and the axpy has compile-time
+    // i. Operation for operation the weld-mode arm below.
+    if constexpr (FC)
+    for (int li = 0; li < s.nl; li++) {
+      const int j = s.l_j[li];
+      T vj = vr[VOFF];
+#pragma unroll
+      for (int jj = 1; jj < NQ; jj++)
+        if (j == jj) vj = vr[VOFF + jj];
+      const T jv = s.l_sign[li] * vj;
+      const T dl = (s.l_bias[li] - jv) / s.l_diag[li];
+      const T newl = tmax(s.l_lam[li] + dl, T(0));
+      const T dd = newl - s.l_lam[li];
+      s.l_lam[li] = newl;
+      if (dd != T(0)) {
+        const T sd = s.l_sign[li] * dd;
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] += s.ecol[j][i] * sd;
+      }
+    }
+    if constexpr (!FC)
     for (int li = 0; li < s.nl; li++) {
       const int j = s.l_j[li];
       const T jv = s.l_sign[li] * v[VOFF + j];
@@ -4023,9 +4246,28 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       }
     }
     // (d) omega-cap pass, joint order: weld-consistent impulses
-    for (int j = 0; j < NQ; j++) {
+    // G5 (contact mode): scan the 29 joints on vr with the loop's own
+    // test, compile-time j. Until the first joint whose test fires the
+    // original loop changes nothing, so if none fires the pass is done;
+    // otherwise vr goes back to `v`, the original loop runs from that
+    // joint on (bodies included, unchanged), and vr is reloaded.
+    int j0 = 0;
+    if constexpr (FC) {
+      j0 = NQ;
+#pragma unroll
+      for (int j = NQ - 1; j >= 0; j--) {
+        const T cap = CT(OMEGA_CAP, [j]);
+        const T target = tclamp(vr[VOFF + j], -cap, cap);
+        if (target != vr[VOFF + j]) j0 = j;
+      }
+      if (j0 < NQ) {
+#pragma unroll
+        for (int i = 0; i < NV; i++) v[i] = vr[i];
+      }
+    }
+    for (int j = j0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = CT(OMEGA_CAP, [j]);
       const T target = tclamp(v[vj], -cap, cap);
       if (target != v[vj]) {
         ensure_pcol(d, s, j);
@@ -4040,6 +4282,16 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
         }
       }
     }
+    if constexpr (FC) {
+      if (j0 < NQ) {
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] = v[i];
+      }
+    }
+  }
+  if constexpr (FC) {
+#pragma unroll
+    for (int i = 0; i < NV; i++) v[i] = vr[i];
   }
 }
 
@@ -4055,7 +4307,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   for (int i = 0; i < VOFF; i++) d.rhs[i] = T(0) - d.c[i];
   for (int j = 0; j < NQ; j++)
     d.rhs[VOFF + j] =
-        tau[j] - T(DAMPING[j]) * d.v[VOFF + j] - d.c[VOFF + j];
+        tau[j] - CT(DAMPING, [j]) * d.v[VOFF + j] - d.c[VOFF + j];
   // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
   // substep (crba rewrites all NV*NV of it next substep)
   chol_factor_n(NV, d.m, &d.pd_bad);
@@ -4138,7 +4390,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
   //     of external force when many joints pinned (step.rs step-11
   //     comment has the audit).
   for (int j = 0; j < NQ; j++) {
-    const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+    const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
     s.hit[j] = d.q[j] < lo || d.q[j] > hi;
     // env v14: no routine position teleport (reaction-free q writes
     // are the phantom-force class — step.rs comment); deep-violation
@@ -4152,14 +4404,14 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     bool changed = false;
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
-      const T cap = T(OMEGA_CAP[j]);
+      const T cap = CT(OMEGA_CAP, [j]);
       // v14: at a stop the target is a Baumgarte recovery toward the
       // bound with a SLOP_LIMIT dead-band (mirrors step.rs) — the
       // impulse restores position reciprocally; a parked joint inside
       // the slop fires nothing
       T target;
       if (s.hit[j]) {
-        const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+        const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
         const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
         const T rec = fabs(over) - T(SLOP_LIMIT);
         target = rec <= T(0)
@@ -4886,7 +5138,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
         const int j = 17 + k;
         T jit = P.pose_jit[e * 14 + k] * P.start_pose_jitter;
         if (j == 20 || j == 26) jit = fabs(jit);
-        d.q[j] = tclamp(d.q[j] + jit, T(LIMIT_LO[j]), T(LIMIT_HI[j]));
+        d.q[j] = tclamp(d.q[j] + jit, CT(LIMIT_LO, [j]), CT(LIMIT_HI, [j]));
       }
     }
     fk_all(d);
@@ -4896,7 +5148,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
       for (int c = 0; c < CORNERS_PER_FOOT; c++) {
         T y = d.pos[fr][1];
         for (int k = 0; k < 3; k++)
-          y += d.r[fr][1][k] * T(GROUND_CORNERS[c][k]);
+          y += d.r[fr][1][k] * CT(GROUND_CORNERS, [c][k]);
         min_y = tmin(min_y, y);
       }
     }
@@ -5054,17 +5306,17 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
       obs[lane + 1] = (float)sin(qj);
       lane += 2;
     } else if (j == 6 || j == 13 || j == 20 || j == 26) {
-      const T hi = T(LIMIT_HI[j]);
+      const T hi = CT(LIMIT_HI, [j]);
       obs[lane] = (float)((T(2) * qj - hi) / hi);
       lane += 1;
     } else {
-      const T lo = T(LIMIT_LO[j]), hi = T(LIMIT_HI[j]);
+      const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
       obs[lane] = (float)(qj / tmax(fabs(lo), fabs(hi)));
       lane += 1;
     }
   }
   for (int j = 0; j < NQ; j++)
-    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / T(OMEGA_CAP[j]));
+    obs[OFF_QD + j] = (float)(d.v[VOFF + j] / CT(OMEGA_CAP, [j]));
   // hand derived blocks
   const int bases[2] = {OFF_HAND_L, OFF_HAND_R};
   if constexpr (FX) {
@@ -5360,7 +5612,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     const double frac = a < 7 ? gr[a] : 0.0;
     // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
     const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
-    tau[j] = T(frac) * T(TAU_MAX[j]) * T(ts);
+    tau[j] = T(frac) * CT(TAU_MAX, [j]) * T(ts);
     const double f = fabs(frac);
     act += f;
     const int g = j < 3 ? 0 : (j < 17 ? 1 : 2);
@@ -5397,9 +5649,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T, FC>& __restrict__ s,
     substep(d, s, tau);
     for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
     if constexpr (FC)
-      for (int gi = 0; gi < s.ng; gi++)
-        gimp[(s.g_bucket >> (2 * gi)) & 3u] +=
-            s.g_lam[gi * GROUND_ROWS_PER_CORNER];
+      for (int c = 0; c < NUM_GROUND_CORNERS; c++)  // G1 fixed slots
+        if ((s.g_act >> c) & 1u)  // ascending = the packed order
+          gimp[(c / CORNERS_PER_FOOT) * 2 + (c & 1)] +=
+              s.g_lam[c * GROUND_ROWS_PER_CORNER];
     // env v34: joint-limit-row lambda this substep, postural scope
     // ([legs, spine]; arms skipped). l_lam is already >= 0 (PGS
     // unilateral clamp) — tmax is belt-and-suspenders (lib.rs mirror).
@@ -6314,6 +6567,7 @@ enum {
   RBUF, RTOT, OOBS, OREW, ODONE, T_COUNT
 };
 
+
 void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
           int64_t mode, int64_t max_steps,
           bool auto_reset, int64_t gears,
@@ -6497,7 +6751,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     // the v10 one to the byte.
     // Flux (FX) is a second compile-time switch (4 instantiations per
     // dtype, ~2x compile time); the standard game's arithmetic is
-    // untouched.
+    // untouched. (Audit #5a, 2026-09-26: forcing the max-L1 carveout via
+    // cudaFuncSetAttribute measured null on the RTX 5090 — the driver
+    // already picks it for this 0 B-shared kernel — so it is not set.)
     auto stream = at::cuda::getCurrentCUDAStream();
     if (flux) {
       if (foot_contact)

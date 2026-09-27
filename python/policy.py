@@ -708,13 +708,26 @@ class NotePolicy(nn.Module):
         per-head Linears stay separate modules (state_dict unchanged);
         their weights are concatenated per call."""
         fp16 = self.fp16 and obs.is_cuda
+        if fp16 and obs.dtype != torch.float16:
+            # the fp16 stream consumes the fp16-ROUNDED obs in BOTH phases
+            # (2026-09-26): `--fp16 all` stores b_obs half, so the update
+            # forwards rounded obs while the rollout forwarded fp32 obs —
+            # and several consumers (the note-geo lanes, and fp32 paths
+            # before their casts) read the fp32 values at full precision,
+            # so the acting and the updated policy disagreed at identical
+            # weights (the fp16 diag r1; up to ~1 logit on a random net).
+            # Rounding once here makes the two forwards bit-identical.
+            obs = obs.half()
         sabers, body, notes, note_mask = self._split(obs)
         B = obs.shape[0]
         if self.note_geo:
-            # fp32 geometry from the fp32 obs slices, then one cast+copy
+            # geometry in fp32 from the (possibly fp16) lanes, then one
+            # cast+copy
             notes = torch.cat(
-                [notes, _note_geo(notes, sabers.reshape(B, 2, SABER_FEAT),
-                                  self.z_asinh, self.game == "flux")],
+                [notes, _note_geo(notes.float(),
+                                  sabers.float().reshape(B, 2, SABER_FEAT),
+                                  self.z_asinh, self.game == "flux")
+                 .to(notes.dtype)],
                 dim=-1)                                              # (B,24,32)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
