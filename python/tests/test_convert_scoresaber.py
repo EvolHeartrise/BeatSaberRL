@@ -213,16 +213,20 @@ def converted(tmp_path_factory):
     rng = np.random.default_rng(5)
     events, done, t = [], False, 0
     while not done:
-        # ticks 0-19: raise/hold the right arm at the +65 pitch stop;
-        # 20-39: whip down through the first note (the P3 gate recipe,
-        # retimed 15/27 -> 20/40 at the 2026-08-20 shoulder -25%: the
-        # slower arm needs a longer raise and whip to connect — swept
-        # on-pod, 4 cuts / 185 pts at this timing);
+        # ticks 0-23: raise/hold the right arm at the +65 pitch stop;
+        # 24-43: whip down through the first note (the P3 gate recipe,
+        # retimed 15/27 -> 20/40 at the 2026-08-20 shoulder -25%, then
+        # 20/40 -> 24/44 on 2026-09-26: at 20/40 the whip no longer
+        # connected at all — note 0 was a MISS and the score block came
+        # from one accidental flail-phase cut at the episode's last
+        # tick, which the audit-#10 factorization's rounding moved. At
+        # 24/44 the whip cuts notes 0 AND 1 ('ok', 15 + 74 pts) with an
+        # identical event stream in the pre- and post-audit-#10 builds);
         # then seeded random gears (flail) for the rest of the episode
         a = np.zeros(29, dtype=np.int64)
-        if t < 20:
+        if t < 24:
             a[10] = 1
-        elif t < 40:
+        elif t < 44:
             a[10] = 2
         else:
             a = rng.integers(0, 3, size=29)

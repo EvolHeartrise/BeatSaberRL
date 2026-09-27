@@ -322,7 +322,9 @@ happening in exactly this order:**
    g = 9.81 −y).
 4. Applied generalized force `τ = τ_gear − b ∘ q̇` (actuation §4 + per-joint
    damping; root rows 0).
-5. **Dense Cholesky** `M = L·Lᵀ` (lower, no pivoting).
+5. **Cholesky** `M = L·Lᵀ` (lower, no pivoting) — factored in the
+   fill-free leaves-first elimination order of the kinematic tree since
+   2026-09-26 (Divergences §25; the same M and linear systems).
 6. Unconstrained velocity `v* = v + h·M⁻¹(τ − C)`.
 7. **Collision detection** over the 55-pair table (margin 0.01).
 8. **Constraint solve (REVISED at P2 — Divergences §15, §16): exactly
@@ -1208,3 +1210,100 @@ Deviations from the proposal / v9 conventions made at P0, with reasons:
        and the ‖Δp‖ ≤ N_SUB·h·ROOT_V_MAX bound all pinned exactly, the
        state to the single-tick f64 band. The retired torch mirror
        additionally pinned the escape tick BITWISE until 2026-08-03).
+24. **Ground rows solved through each foot's 6-D spatial Jacobian
+    (2026-09-26, audit #9) — a REFORMULATION, not a physics change.**
+    In contact mode (`foot_mode` = 1) a sole-corner row is
+    `e_a·(v_o + ω × r) = [e_a; r × e_a]·(J_f v)` with `r = p_corner −
+    p_foot` and `J_f` the foot's six spatial rows (3 linear at the foot
+    origin + 3 world angular — the weld rows of that foot). Both engines
+    now solve `G_f = M⁻¹J_fᵀ` once per contacting foot (≤ 12 columns,
+    was up to 24 corner columns; CUDA solves both feet in one 12-RHS
+    batch whenever any corner is down), form `Φ_f = J_f G_f`, per row
+    `u = Φ_f c`, `diag = c·u`, and run the ground PGS per foot on
+    `V = J_f v`: each active corner's rows in the §3 order with residual
+    `c·V`, the unchanged per-row clamps (λ_n ≥ 0, then the box against
+    this sweep's λ_n), `Λ += c·Δλ`, `V += u·Δλ` on a non-zero step, and
+    `v += G_f Λ` once at the end of the foot. In exact arithmetic every
+    row sees the residual and `v` leaves the foot with the value of the
+    per-row form, so the constraint set, row order, Gauss-Seidel
+    semantics, clamps, Baumgarte terms and iteration count are
+    unchanged; only rounding moves. Gate:
+    `tests_ground::ground_6d_matches_rowwise_per_substep` runs the old
+    per-row solve (`ground_rowwise_ref` test hook) against the new one on
+    the same FK/factor/v* every contact substep (worst |Δv|/max(|v|,1)
+    5.5e-13 f64); trajectories diverge afterwards only by chaotic
+    amplification of that rounding (the step-11 clamps are
+    discontinuous), exactly as a 1-ulp input nudge of the old build does.
+    Weld mode is untouched. CUDA: flux bench −18.6 % ms/tick.
+25. **Mass-matrix factorization in the fill-free tree elimination order
+    (2026-09-26, audit #10) — a REFORMULATION, not a physics change.**
+    The root-first coordinate order made step 5's dense Cholesky
+    eliminate the six floating-base columns first, so every row of L
+    filled (7,140 factor MACs; a dense-RHS solve 1,190; a unit RHS dense
+    after its pivot). Both engines now factor `P·M·Pᵀ` in a fixed,
+    data-independent LEAVES-FIRST order: the reversed DFS pre-order of
+    the coordinate tree (joints in reversed frame order, e 0..28 = r leg,
+    l leg, r arm, l arm, spine; the base v0..v5 LAST, e 29..34). That is
+    a post-order, so L has exactly the tree's ancestor sparsity — row e
+    spans its subtree `[lo_e, e]`, column e its ancestor chain (≤ 15
+    entries) — and there is no fill: 341 structural non-zeros, 1,742
+    factor MACs, 612 per dense-RHS solve, and a unit or single-foot RHS
+    forward-solves only its own chain (≤ 16 rows). The permutation
+    between actuated and elimination order is explicit (`TreeChol::e2v`
+    / `TreeTabs::e2v`; stacking ≠ actuated order in the shoulder and
+    wrist clusters); every RHS and solution stays in v-order at the call
+    sites. Canonical arithmetic (algo.rs header, mirrored term for term
+    by the .cu tree routines): the dense Cholesky of `P·M·Pᵀ` with its
+    structural zeros — exact +0.0 — skipped, pinned BITWISE by
+    `tests_tree::tree_factor_matches_dense_permuted`.
+    a. **Pivot floor.** §22 (f64, 1e-17, counted on `!(d ≥ floor)`) and
+       §20e (f32, 1e-8, counted on `d ≤ 0`) apply verbatim to the NEW
+       pivots, at the same point of the recurrence. A pivot is the
+       Schur complement of M on its coordinate given everything
+       eliminated before it, so what is tested moves with the order
+       (root-first: "given the base and the lower-index joints";
+       leaves-first: "given the coordinate's own subtree"). For the
+       humanoid every joint pivot is still ≥ its armature in either
+       order and the base pivots are ≥ the pelvis' own spatial inertia,
+       so a healthy M never engages the floor in either — it stays a
+       NaN/degenerate-matrix guard. On a genuinely singular M the
+       engagement can land on a different coordinate (and a
+       rank-deficient pivot is rounding noise, so the count can differ):
+       the only semantic difference, confined to states the floor
+       already reports as non-physical
+       (`tests_tree::tree_pivot_floor_on_singular_matrix`,
+       `tests_dyn::substep_survives_pd_loss_and_counts`).
+    b. **Equivalence.** `tests_tree::tree_matches_dense_per_substep`
+       steps the same pre-substep state with the tree layout and with
+       `TreeChol::dense` (identity permutation — bitwise the old
+       root-first arithmetic, `dense_layout_is_the_old_arithmetic`) and
+       compares the velocity leaving steps 5–9: worst |Δv|/max(|v|,1)
+       9.5e-13 over 1,440 f64 substeps (contact at two gear amplitudes,
+       weld). Single-tick RawBeatSim steps from 400 contact-rich states,
+       new vs the 88573c0 build (f64): median 6.4e-14, p90 1.1e-12
+       relative; a one-ulp nudge of every state coordinate in the OLD
+       build gives median 9.3e-14, p90 5.5e-9 — the reformulation moves
+       less than a 1-ulp input change, and trajectories separate only
+       by the chaotic amplification (step-11 clamps are discontinuous)
+       that nudge exhibits too. f32: median 3.1e-5 vs the one-f32-ulp
+       nudge's 3.8e-5.
+    c. **Measured.** CUDA (RTX 5090, N = 32768, two interleaved rounds
+       vs 88573c0): flux 23.40 → 19.30 ms/tick (−17.5 %), standard
+       142.1 → 137.1 (−3.5 %); float contact kernel 254–255 regs, stack
+       37,664 → 34,128 B (the profile factor is 341 words, was 1,225),
+       spills 48/48 B unchanged (flux-game instantiation 68/88 → 48/48;
+       the weld kernel 2,192/3,784 → 668/704; the non-production f64
+       contact kernel 112/128 → 1,476/2,560). Rust VecBeatSim (pod Ryzen
+       7 7800X3D, env-steps/s, 2 interleaved rounds), 1 thread: f64 random
+       +30 %, coast +16 %, STANDING (closed-loop greedy Flux policy, 0
+       falls) +14 %; f32 +30 / +16 / +13 %; 14 threads: f64 +21 / +15 /
+       +13 %, f32 +26 / +16 / +13 %.
+    d. **Re-timed fixture.** No numeric golden moved. One trajectory
+       fixture did: `tests/test_convert_scoresaber.py` needs a scored
+       cut, and at its old 20/40-tick whip the whip had stopped
+       connecting (note 0 a miss in the old build too) — its score block
+       came from a single accidental flail-phase cut on the last tick,
+       which this rounding change moved. The whip is re-timed to 24/44,
+       where it cuts notes 0 and 1 with an identical event stream in the
+       old and new builds.
+    Weld and contact mode share the change (one factor for both).
