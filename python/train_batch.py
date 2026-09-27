@@ -1473,6 +1473,17 @@ def main():
     # res_pre = resident bytes at the START of a rollout, i.e. what the
     # previous update left behind (the perm copies, before 1.2).
     peak_roll = peak_upd = res_pre = 0
+    # --bench only: per-tick CUDA events (fwd / env / book) recorded in
+    # the eager rollout loop, read after the post-rollout drain (no sync
+    # inside the loop). ev[t] = (pre-fwd, pre-env, post-env, post-book);
+    # book = post-env -> next tick's pre-fwd (buffer writes + b_obs copy).
+    # Update 1 is warmup and excluded from the averages.
+    tick_ev = None
+    tick_ms = [0.0, 0.0, 0.0]
+    tick_n = 0
+    if args.bench and device.type == "cuda" and graph_roll is None:
+        tick_ev = [[torch.cuda.Event(enable_timing=True) for _ in range(4)]
+                   for _ in range(T)]
     diag_probe_obs = None    # frozen first-diag batch (psrank probe)
     start = time.time()
 
@@ -1578,6 +1589,8 @@ def main():
                 obs = venv._obs
                 global_step += N
                 continue
+            if tick_ev is not None:
+                tick_ev[t][0].record()
             with torch.no_grad():
                 # t == 0 only: pay the entropy reduction (~4 kernels and
                 # one (N,29,3) probs buffer, ONCE per update) to get a
@@ -1599,8 +1612,12 @@ def main():
                 torch.mean(policy._ent_h, dim=0, out=ent_head)
                 policy._ent_h = None
             b_act[t], b_logp[t] = a, logp
+            if tick_ev is not None:
+                tick_ev[t][1].record()
             if tensor_env:
                 nobs, rew, done, infos = venv.step(a)
+                if tick_ev is not None:
+                    tick_ev[t][2].record()
                 b_rew[t] = rew.to(b_rew.dtype)
                 b_done[t].copy_(done)
                 obs = nobs
@@ -1614,6 +1631,8 @@ def main():
             # the main stream enqueues the env kernel first; b_val[t] has
             # no other reader until GAE.
             b_val[t].copy_(v).mul_(ret_sig).add_(ret_mu)
+            if tick_ev is not None:
+                tick_ev[t][3].record()
             for info in infos:
                 ep_returns.append(info["episode_return"])
             global_step += N
@@ -1656,6 +1675,15 @@ def main():
             pk_r = torch.cuda.max_memory_allocated()
             peak_roll = max(peak_roll, pk_r)
             torch.cuda.reset_peak_memory_stats()
+            if (tick_ev is not None and tensor_env
+                    and update > start_update):
+                for t in range(T):
+                    ev = tick_ev[t]
+                    nxt = tick_ev[t + 1][0] if t + 1 < T else ev[3]
+                    tick_ms[0] += ev[0].elapsed_time(ev[1])
+                    tick_ms[1] += ev[1].elapsed_time(ev[2])
+                    tick_ms[2] += ev[2].elapsed_time(nxt)
+                tick_n += T
         t_rollout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -2509,6 +2537,11 @@ def main():
                              "ent_floor": ent_floor,
                              "num_updates": num_updates}},
                os.path.join(args.run_dir, final_name))
+    if tick_n:
+        f, e, k = (x / tick_n for x in tick_ms)
+        print(f"[tick] fwd {f:.2f} / env {e:.2f} / book {k:.2f} ms "
+              f"(sum {f + e + k:.2f} ms/tick, mean over {tick_n} ticks, "
+              f"update 1 excluded)", flush=True)
     tot = t_rollout + t_update
     split_kind = "exec-true" if args.bench else \
         "enqueue-attributed, NOT execution time — use --bench"
