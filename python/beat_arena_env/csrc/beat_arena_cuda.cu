@@ -1662,7 +1662,8 @@ struct Solver : GroundRows<T> {
   T c_J[NUM_PAIRS][NV], c_minv[NUM_PAIRS][NV];
   T c_bias[NUM_PAIRS], c_diag[NUM_PAIRS], c_lam[NUM_PAIRS];
   T c_pt[NUM_PAIRS][3];
-  // limit rows (joint order)
+  // limit rows (joint order); l_j[nl..] carries the #6e predicted
+  // column list transiently (read by nothing past the column block)
   int nl;
   int l_j[NQ];
   T l_sign[NQ], l_bias[NQ], l_lam[NQ], l_diag[NQ];
@@ -1673,9 +1674,27 @@ struct Solver : GroundRows<T> {
   // minvjt/capcol/solcache columns (linear solves commute with the +-1
   // row sign exactly; recomputation of the same expression tree is
   // deterministic).
+  //
+  // COLUMN SLOTS (perf/kernel-limits, audit-2 #6a). A column is stored
+  // in SLOT eslot[j], not row j: local memory interleaves words across
+  // the warp, so only a SAME-word access coalesces, and a limit row's
+  // joint differs per lane — s.ecol[l_j[li]][i] put every lane of the
+  // seed / back-substitution / PGS axpy on its own 128-byte line. Slots
+  // are handed out in computation order: the limit-row group (always the
+  // substep's first columns, see constraint_solve) takes slots 0..nl-1 in
+  // row order, so row li's column is s.ecol[li], a warp-uniform word; a
+  // lazy cap / clamp column takes the next free slot (nslot). At most NQ
+  // distinct joints per substep, so NQ slots suffice. Storage only: every
+  // value and the order anything is computed or applied in are unchanged.
+  // Measured on the RTX 5090 at N=32768 (trained standard, sampled):
+  // 69.5 -> 60.9 ms/tick alone, before the register passes (#6c).
   T ecol[NQ][NV], pdiag[NQ];
+  int nslot;
+  uint8_t eslot[NQ];
+  // #6e column prediction: emask = joints whose column this substep
+  // built, eprev = the previous substep's emask (0 at the tick's start)
+  uint32_t emask, eprev;
   bool ecomp[NQ], pcomp[NQ];
-  bool hit[NQ];
 };
 
 // ---- float twins of the double constant tables (audit #5c) -----------------
@@ -2689,22 +2708,29 @@ __device__ void point_jacobian_acc(const Dyn<T>& d, int frame, const T p[3],
 // skipped forward rows keep these +0.0 for the dense back substitution
 // to read).
 template <typename T>
-__device__ __forceinline__ void ecol_seed(Solver<T>& __restrict__ s,
-                                          int j) {
-  T* col = s.ecol[j];
+__device__ __forceinline__ void ecol_seed(T* __restrict__ col, int j) {
   for (int i = 0; i < NV; i++) col[i] = T(0);
   col[VOFF + j] = T(1);
 }
 
+// joint j's computed plain column (its slot — see the Solver note)
+template <typename T>
+__device__ __forceinline__ T* ecol_of(Solver<T>& s, int j) {
+  return s.ecol[s.eslot[j]];
+}
+
 // Lazily compute the plain M^-1 e_j column (shared by step-8 cap/limit
 // rows and the step-11 clamps — same expression tree as Rust's three
-// separate caches).
+// separate caches) into the next free slot.
 template <typename T>
 __device__ void ensure_ecol(Dyn<T>& __restrict__ d,
                             Solver<T>& __restrict__ s, int j) {
   if (s.ecomp[j]) return;
-  ecol_seed(s, j);
-  tree_solve_unit_n(d.m, s.ecol[j], VOFF + j);
+  s.eslot[j] = uint8_t(s.nslot++);
+  s.emask |= 1u << j;
+  T* const col = ecol_of(s, j);
+  ecol_seed(col, j);
+  tree_solve_unit_n(d.m, col, VOFF + j);
   s.ecomp[j] = true;
 }
 
@@ -2720,11 +2746,37 @@ __device__ void ensure_pdiag(Dyn<T>& __restrict__ d,
                              Solver<T>& __restrict__ s, int j) {
   if (s.pcomp[j]) return;
   ensure_ecol(d, s, j);
-  const T plain = s.ecol[j][VOFF + j];
+  const T plain = ecol_of(s, j)[VOFF + j];
   s.pdiag[j] = plain > T(COMPOSITE_EPS) * plain
                    ? plain
                    : std::numeric_limits<T>::infinity();
   s.pcomp[j] = true;
+}
+
+// OUT-OF-LINE lazy column builds for the register-resident cap pass and
+// step-11 clamps (#6c): those loops are unrolled over the 29 joints, and
+// an inlined tree solve per joint would be 29 copies of it. The ecomp /
+// pcomp early-out stays inline at the call site, so the call (and the
+// register save / restore around it) is paid only on a genuine miss — a
+// few per substep against dozens of firings. Measured alternatives
+// (trained standard, sampled, N=32768): dropping to the old
+// local-memory loop at the first miss, 32.0 ms/tick vs 29.9 here; a
+// "restart" form (leave the unrolled sweep at the miss, build inline
+// once, resume at that joint) wins without the #6e column prediction
+// (25.7) but loses with it (23.8 vs 23.5), and in step 11 either way.
+// ptxas: this costs f32 +60 B / +124 B of spill stores (standard /
+// Flux), f64 about +1.2 KB — static counts; the timings above are net.
+template <typename T>
+__device__ __noinline__ void ensure_ecol_ool(Dyn<T>& __restrict__ d,
+                                             Solver<T>& __restrict__ s,
+                                             int j) {
+  ensure_ecol(d, s, j);
+}
+template <typename T>
+__device__ __noinline__ void ensure_pdiag_ool(Dyn<T>& __restrict__ d,
+                                              Solver<T>& __restrict__ s,
+                                              int j) {
+  ensure_pdiag(d, s, j);
 }
 
 // audit #9 — support dot of foot spatial row m (0..2 linear, 3..5
@@ -3086,44 +3138,89 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
   // steps/s) for ~30 more lines — dropped. See the block-size note in
   // the header: the gain saturates at four independent chains.
+  // #6a: row li's column goes to SLOT li (see the Solver note), so the
+  // seed stores and every back-pass access are warp-uniform words; the
+  // scalar tail's ensure_ecol hands out the same slot li (nslot == li).
+  //
+  // #6e COLUMN PREDICTION (perf/kernel-limits). The cap pass and step 11
+  // build their columns lazily, one at a time — each a serial 35-row
+  // back substitution through local memory, run once per distinct
+  // (joint, sweep position) any lane of the warp misses at. Columns
+  // likely to be needed join this batched block instead, appended to
+  // the limit group in s.l_j[nl..nx-1] (ascending; slots nl..nx-1, so
+  // the limit rows keep slots 0..nl-1): every joint whose column the
+  // previous substep built (eprev — caps and clamps persist across
+  // substeps) and every joint already within 10% of its speed cap in
+  // the unconstrained v*. A column is a pure function of this substep's
+  // factor, so building it early, or building one that is never used,
+  // changes no value — only when and where it is computed. The alpha
+  // was swept: 0.9 / 0.95 best, 0.8 / 0.7 progressively worse; eprev
+  // alone recovers little, the v* test alone about two thirds.
   {
+    uint32_t lmask = 0;
+    for (int li = 0; li < s.nl; li++) lmask |= 1u << s.l_j[li];
+    uint32_t want = s.eprev;
+#pragma unroll
+    for (int j = 0; j < NQ; j++)
+      if (fabs(v[VOFF + j]) >= T(0.9) * CT(OMEGA_CAP, [j])) want |= 1u << j;
+    want &= ~lmask;
+    int nx = s.nl;
+    while (want) {
+      s.l_j[nx++] = __ffs(want) - 1;
+      want &= want - 1;
+    }
     int li = 0;
-    for (; li + 3 < s.nl; li += 4) {
+    for (; li + 3 < nx; li += 4) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
       const int j2 = s.l_j[li + 2], j3 = s.l_j[li + 3];
-      ecol_seed(s, j0);
-      ecol_seed(s, j1);
-      ecol_seed(s, j2);
-      ecol_seed(s, j3);
+      s.eslot[j0] = uint8_t(li);
+      s.eslot[j1] = uint8_t(li + 1);
+      s.eslot[j2] = uint8_t(li + 2);
+      s.eslot[j3] = uint8_t(li + 3);
+      T* const x0 = s.ecol[li];
+      T* const x1 = s.ecol[li + 1];
+      T* const x2 = s.ecol[li + 2];
+      T* const x3 = s.ecol[li + 3];
+      ecol_seed(x0, j0);
+      ecol_seed(x1, j1);
+      ecol_seed(x2, j2);
+      ecol_seed(x3, j3);
       // audit #10: each column's forward pass is its own ancestor
       // chain, the four interleaved (tree_fwd_unit_b); the dense back
       // pass is batched
       {
-        T* const xs[4] = {s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]};
+        T* const xs[4] = {x0, x1, x2, x3};
         const int vs[4] = {VOFF + j0, VOFF + j1, VOFF + j2, VOFF + j3};
         tree_fwd_unit_b<4>(d.m, xs, vs);
       }
-      tree_back4_n(d.m, s.ecol[j0], s.ecol[j1], s.ecol[j2], s.ecol[j3]);
+      tree_back4_n(d.m, x0, x1, x2, x3);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       s.ecomp[j2] = true;
       s.ecomp[j3] = true;
     }
-    if (li + 1 < s.nl) {
+    if (li + 1 < nx) {
       const int j0 = s.l_j[li], j1 = s.l_j[li + 1];
-      ecol_seed(s, j0);
-      ecol_seed(s, j1);
+      s.eslot[j0] = uint8_t(li);
+      s.eslot[j1] = uint8_t(li + 1);
+      T* const x0 = s.ecol[li];
+      T* const x1 = s.ecol[li + 1];
+      ecol_seed(x0, j0);
+      ecol_seed(x1, j1);
       {
-        T* const xs[2] = {s.ecol[j0], s.ecol[j1]};
+        T* const xs[2] = {x0, x1};
         const int vs[2] = {VOFF + j0, VOFF + j1};
         tree_fwd_unit_b<2>(d.m, xs, vs);
       }
-      tree_back2_n(d.m, s.ecol[j0], s.ecol[j1]);
+      tree_back2_n(d.m, x0, x1);
       s.ecomp[j0] = true;
       s.ecomp[j1] = true;
       li += 2;
     }
-    for (; li < s.nl; li++) ensure_ecol(d, s, s.l_j[li]);
+    s.nslot = li;
+    s.emask = 0;
+    for (int k = 0; k < li; k++) s.emask |= 1u << s.l_j[k];
+    for (; li < nx; li++) ensure_ecol(d, s, s.l_j[li]);  // sets its bit
   }
 
   // -- limit rows: mobility verdict of each plain column ----------------------
@@ -3281,49 +3378,34 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       if (dd != T(0)) {
         const T sd = s.l_sign[li] * dd;
 #pragma unroll
-        for (int i = 0; i < NV; i++) vr[i] += s.ecol[j][i] * sd;
+        for (int i = 0; i < NV; i++) vr[i] += s.ecol[li][i] * sd;  // #6a
       }
     }
     // (d) omega-cap pass, joint order: momentum-consistent impulses
     // along the plain M^-1 e_j columns.
-    // G5: scan the 29 joints on vr with the loop's own test, compile-time
-    // j. Until the first joint whose test fires the original loop changes
-    // nothing, so if none fires the pass is done; otherwise vr goes back
-    // to `v`, the original loop runs from that joint on (bodies included,
-    // unchanged), and vr is reloaded.
-    int j0 = 0;
-    {
-      j0 = NQ;
+    // #6c (perf/kernel-limits; was G5's scan + local-memory fallback
+    // loop): the pass runs on vr, unrolled over the 29 joints — per
+    // joint the same test, impulse and hard write, in the same ascending
+    // order, so every value is unchanged (the old scan only skipped the
+    // joints before the first firing one, which change nothing). v never
+    // takes the round trip through local memory, every vr index is
+    // compile-time, and a column miss builds out of line. Trained
+    // standard traffic caps ~21 times per env-substep (warp worst lane
+    // ~54), in every one of the 12 iterations.
 #pragma unroll
-      for (int j = NQ - 1; j >= 0; j--) {
-        const T cap = CT(OMEGA_CAP, [j]);
-        const T target = tclamp(vr[VOFF + j], -cap, cap);
-        if (target != vr[VOFF + j]) j0 = j;
-      }
-      if (j0 < NQ) {
-#pragma unroll
-        for (int i = 0; i < NV; i++) v[i] = vr[i];
-      }
-    }
-    for (int j = j0; j < NQ; j++) {
+    for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = CT(OMEGA_CAP, [j]);
-      const T target = tclamp(v[vj], -cap, cap);
-      if (target != v[vj]) {
-        ensure_pdiag(d, s, j);
+      const T target = tclamp(vr[vj], -cap, cap);
+      if (target != vr[vj]) {
+        if (!s.pcomp[j]) ensure_pdiag_ool(d, s, j);
         if (!isinf(s.pdiag[j])) {
-          const T lam = (target - v[vj]) / s.pdiag[j];
-          {
-            for (int i = 0; i < NV; i++) v[i] += s.ecol[j][i] * lam;
-          }
-          v[vj] = target;  // exact — the cap is a hard bound
-        }
-      }
-    }
-    {
-      if (j0 < NQ) {
+          const T lam = (target - vr[vj]) / s.pdiag[j];
+          const T* const col = ecol_of(s, j);
 #pragma unroll
-        for (int i = 0; i < NV; i++) vr[i] = v[i];
+          for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+          vr[vj] = target;  // exact — the cap is a hard bound
+        }
       }
     }
   }
@@ -3428,19 +3510,36 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   //     engines — its reaction-free writes manufactured up to ~335 N
   //     of external force when many joints pinned (step.rs step-11
   //     comment has the audit).
+  // hitm bit j: joint j is past a stop (was bool s.hit[NQ] in local
+  // memory, re-read by every one of up to 64 unrolled passes below)
+  uint32_t hitm = 0;
   for (int j = 0; j < NQ; j++) {
     const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
-    s.hit[j] = d.q[j] < lo || d.q[j] > hi;
+    const bool hit = d.q[j] < lo || d.q[j] > hi;
+    hitm |= uint32_t(hit) << j;
     // env v14: no routine position teleport (reaction-free q writes
     // are the phantom-force class — step.rs comment); deep-violation
     // backstop only
-    if (s.hit[j]) {
+    if (hit) {
       const T over = d.q[j] < lo ? lo - d.q[j] : d.q[j] - hi;
       if (over > T(LIMIT_TELEPORT_BACKSTOP)) d.q[j] = tclamp(d.q[j], lo, hi);
     }
   }
+  // #6c (perf/kernel-limits): the passes run on a register copy of d.v,
+  // unrolled over the 29 joints — the same targets, impulses and hard
+  // writes in the same order (a copy is the identity), with compile-time
+  // indices and no store -> load chain through local d.v per firing; a
+  // column miss builds out of line. On trained standard traffic the
+  // warp's worst lane runs ~57 of the 64 passes (~27 firings per
+  // env-substep, worst lane ~210), so this loop was the kernel's
+  // dominant cost: 69.5 -> 29.9 ms/tick together with the cap pass
+  // above (RTX 5090, N=32768, sampled actions).
+  T vr[NV];
+#pragma unroll
+  for (int i = 0; i < NV; i++) vr[i] = d.v[i];
   for (int pass = 0; pass < CLAMP_PASSES; pass++) {
     bool changed = false;
+#pragma unroll
     for (int j = 0; j < NQ; j++) {
       const int vj = VOFF + j;
       const T cap = CT(OMEGA_CAP, [j]);
@@ -3449,7 +3548,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       // impulse restores position reciprocally; a parked joint inside
       // the slop fires nothing
       T target;
-      if (s.hit[j]) {
+      if ((hitm >> j) & 1u) {
         const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
         const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
         const T rec = fabs(over) - T(SLOP_LIMIT);
@@ -3458,20 +3557,24 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                      : tclamp(T(BETA_LIMIT) * (over < T(0) ? -rec : rec) / T(H_SUB),
                               -cap, cap);
       } else {
-        target = tclamp(d.v[vj], -cap, cap);
+        target = tclamp(vr[vj], -cap, cap);
       }
-      if (target != d.v[vj]) {
-        ensure_ecol(d, s, j);
-        const T* col = s.ecol[j];
-        const T lam = (target - d.v[vj]) / col[vj];
-        for (int i = 0; i < NV; i++) d.v[i] += col[i] * lam;
-        d.v[vj] = target;  // exact — the clamp is a hard bound
+      if (target != vr[vj]) {
+        if (!s.ecomp[j]) ensure_ecol_ool(d, s, j);
+        const T* const col = ecol_of(s, j);
+        const T lam = (target - vr[vj]) / col[vj];
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+        vr[vj] = target;  // exact — the clamp is a hard bound
         changed = true;
       }
     }
     if (!changed) break;
   }
+#pragma unroll
+  for (int i = 0; i < NV; i++) d.v[i] = vr[i];
   // (env v14: no direct-write guarantee pass — mirror of step.rs.)
+  s.eprev = s.emask;  // #6e: this substep's columns predict the next's
   // 12. root velocity envelope guarantee, SECOND application
   //     (Divergences §19b; the first is the 12-PRE block above, §23).
   //     Bounds the STORED velocity — step 11's joint impulses have
@@ -5532,6 +5635,7 @@ step_kernel(Sim<T> P) {
   // coalesced across the warp for same-index access)
   Dyn<T> d;
   Solver<T> s;
+  s.eprev = 0;  // #6e: no column history at the tick's first substep
   if (P.mode == 1) {
     reset_env(d, P, e, P.cand[e]);
   } else if (P.mode == 2) {
