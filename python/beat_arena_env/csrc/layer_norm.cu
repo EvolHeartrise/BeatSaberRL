@@ -34,7 +34,11 @@ namespace {
 constexpr int WARP = 32;
 constexpr int THREADS = 256;
 constexpr int WPB = THREADS / WARP;  // warps (rows in flight) per block
-constexpr int MAX_D = 256;           // smem budget: 2 * WPB * MAX_D floats
+// 384 since 2026-09-26 (the SimBa trunk's two LNs at trunk_dim 384 had
+// been taking the stock fp32 fallback). The Python gate (fused_ln.py
+// _eligible) only sends rows > 256 here on the fp16 stream — the fp32
+// record path keeps its stock-LN bits above 256.
+constexpr int MAX_D = 384;           // smem budget: 2 * WPB * MAX_D floats
 constexpr int MAX_COLS = MAX_D / WARP;
 
 __inline__ __device__ float warp_allsum(float v) {
@@ -135,7 +139,8 @@ __global__ void ln_fwd_add_kernel(const float* __restrict__ a,
 // fp32; activations round exactly once on store. Lane-owns-one-half2
 // keeps warp transactions at a full 128 B sector (scalar half loads
 // would halve effective bandwidth). COLS2_C counts half2 columns per
-// lane: 1 -> d=64, 2 -> d=128, 0 -> runtime d.
+// lane: 1 -> d=64, 2 -> d=128, 3 -> d=192, 6 -> d=384 (the last two
+// 2026-09-26, the 192/384 recipe), 0 -> runtime d.
 // The fp32 kernels above are UNTOUCHED — the seed-0 bit-exactness of
 // the fp32 path is a regression detector this file must not disturb.
 
@@ -291,8 +296,18 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
                                 __half2* __restrict__ dx,
                                 float* __restrict__ pdw,  // (gridDim.x, d)
                                 float* __restrict__ pdb,  // (gridDim.x, d)
+                                float* __restrict__ pdbb, // nullable, PIN only
                                 int64_t rows, int d2) {
-  extern __shared__ float sm[];  // [2][WPB][d]
+  extern __shared__ float sm[];  // [2 or 3][WPB][d]
+  // PIN (the 192/384 specializations, 2026-09-26): with d pinned and
+  // the column loops fully unrolled, nvcc re-associates this kernel's
+  // arithmetic (it reuses the first loop's rounded gw in the dx loop and
+  // contracts `sum * inv_d` into the subtraction) — 1-ulp fp16 dx
+  // differences vs the generic <0> kernel d=192 ran before. The PIN
+  // body spells out <0>'s exact SASS sequence with __f*_rn intrinsics
+  // (no contraction freedom), so <3> is BITWISE the old <0> result.
+  // <1>/<2> keep their historical (unpinned) bodies untouched.
+  constexpr bool PIN = COLS2_C == 3 || COLS2_C == 6;
   if (COLS2_C > 0) d2 = COLS2_C * WARP;
   const int d = 2 * d2;
   const float inv_d = 1.f / d;
@@ -300,6 +315,11 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
   const int wid = threadIdx.x / WARP;
   float acc_dw[COLS2_C > 0 ? 2 * COLS2_C : MAX_COLS] = {};
   float acc_db[COLS2_C > 0 ? 2 * COLS2_C : MAX_COLS] = {};
+  // pdbb (PIN kernels only, 2026-09-26): column sums of the ROUNDED dx
+  // this kernel stores — _LnAddFn's folded-bias gradient (dbb), which
+  // used to be a separate full re-read of dx by a torch sum(0). Same
+  // summands, different order: near-tie with the torch sum.
+  float acc_dbb[PIN ? 2 * COLS2_C : 1] = {};
   int64_t row = (int64_t)blockIdx.x * WPB + wid;
   const int64_t stride = (int64_t)gridDim.x * WPB;
   for (; row < rows; row += stride) {
@@ -308,6 +328,57 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
     const float mu = mean[row];
     const float r = rstd[row];
     float s1 = 0.f, s2 = 0.f;
+    if constexpr (PIN) {
+      // explicit-rounding twin of the generic <0> kernel's SASS (see
+      // PIN above): identical operations, contraction pinned
+#pragma unroll
+      for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+        const float2 xv = __half22float2(xr[c]);
+        const float2 gv = __half22float2(gr[c]);
+        const float2 wv = w[c];
+        const float xh0 = __fmul_rn(__fsub_rn(xv.x, mu), r);
+        const float xh1 = __fmul_rn(__fsub_rn(xv.y, mu), r);
+        const float gw0 = __fmul_rn(gv.x, wv.x);
+        const float gw1 = __fmul_rn(gv.y, wv.y);
+        s1 = __fadd_rn(s1, __fadd_rn(gw0, gw1));
+        s2 = __fadd_rn(s2, __fmaf_rn(gw0, xh0, __fmul_rn(gw1, xh1)));
+        acc_dw[2 * k] = __fmaf_rn(gv.x, xh0, acc_dw[2 * k]);
+        acc_dw[2 * k + 1] = __fmaf_rn(gv.y, xh1, acc_dw[2 * k + 1]);
+        acc_db[2 * k] = __fadd_rn(acc_db[2 * k], gv.x);
+        acc_db[2 * k + 1] = __fadd_rn(acc_db[2 * k + 1], gv.y);
+      }
+      s1 = __fmul_rn(warp_allsum(s1), inv_d);
+      s2 = __fmul_rn(warp_allsum(s2), inv_d);
+      __half2* dxr = dx + row * d2;
+      const __half2* gxr = gx ? gx + row * d2 : nullptr;
+#pragma unroll
+      for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+        const float2 xv = __half22float2(xr[c]);
+        const float2 gv = __half22float2(gr[c]);
+        const float2 wv = w[c];
+        const float t0 = __fmaf_rn(-s2, __fmul_rn(__fsub_rn(xv.x, mu), r),
+                                   __fmaf_rn(gv.x, wv.x, -s1));
+        const float t1 = __fmaf_rn(-s2, __fmul_rn(__fsub_rn(xv.y, mu), r),
+                                   __fmaf_rn(gv.y, wv.y, -s1));
+        float2 o;
+        if (gxr) {
+          const float2 gxv = __half22float2(gxr[c]);
+          o.x = __fmaf_rn(r, t0, gxv.x);
+          o.y = __fmaf_rn(r, t1, gxv.y);
+        } else {
+          o.x = __fmul_rn(r, t0);
+          o.y = __fmul_rn(r, t1);
+        }
+        const __half2 oh = __float22half2_rn(o);
+        dxr[c] = oh;
+        if (pdbb) {
+          const float2 of = __half22float2(oh);
+          acc_dbb[2 * k] = __fadd_rn(acc_dbb[2 * k], of.x);
+          acc_dbb[2 * k + 1] = __fadd_rn(acc_dbb[2 * k + 1], of.y);
+        }
+      }
+      continue;
+    }
 #pragma unroll
     for (int c = lane, k = 0; c < d2; c += WARP, k++) {
       const float2 xv = __half22float2(xr[c]);
@@ -358,6 +429,21 @@ __global__ void ln_bwd_h_kernel(const __half2* __restrict__ x,
     }
     pdw[(int64_t)blockIdx.x * d + c] = tdw;
     pdb[(int64_t)blockIdx.x * d + c] = tdb;
+  }
+  if constexpr (PIN) {
+    if (pdbb) {   // uniform branch; the smem region [2][WPB][d] is ours
+#pragma unroll
+      for (int c = lane, k = 0; c < d2; c += WARP, k++) {
+        sm[(2 * WPB + wid) * d + 2 * c] = acc_dbb[2 * k];
+        sm[(2 * WPB + wid) * d + 2 * c + 1] = acc_dbb[2 * k + 1];
+      }
+      __syncthreads();
+      for (int c = threadIdx.x; c < d; c += blockDim.x) {
+        float t = 0.f;
+        for (int i = 0; i < WPB; i++) t += sm[(2 * WPB + i) * d + c];
+        pdbb[(int64_t)blockIdx.x * d + c] = t;
+      }
+    }
   }
 }
 
@@ -481,6 +567,8 @@ std::vector<at::Tensor> ln_fwd(at::Tensor x, at::Tensor w, at::Tensor b,
     };
     if (d == 64) launch(ln_fwd_h_kernel<1>);
     else if (d == 128) launch(ln_fwd_h_kernel<2>);
+    else if (d == 192) launch(ln_fwd_h_kernel<3>);
+    else if (d == 384) launch(ln_fwd_h_kernel<6>);
     else launch(ln_fwd_h_kernel<0>);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -546,6 +634,8 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
     };
     if (d == 64) launch(ln_fwd_add_h_kernel<1>);
     else if (d == 128) launch(ln_fwd_add_h_kernel<2>);
+    else if (d == 192) launch(ln_fwd_add_h_kernel<3>);
+    else if (d == 384) launch(ln_fwd_add_h_kernel<6>);
     else launch(ln_fwd_add_h_kernel<0>);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -554,7 +644,8 @@ std::vector<at::Tensor> ln_fwd_add(at::Tensor a, at::Tensor b, at::Tensor w,
 
 std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
                                at::Tensor mean, at::Tensor rstd,
-                               c10::optional<at::Tensor> gx_opt) {
+                               c10::optional<at::Tensor> gx_opt,
+                               bool want_dbb) {
   const at::Tensor gx = gx_opt.value_or(at::Tensor());
   const c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && dy.is_contiguous()
@@ -582,8 +673,15 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
   const int blocks = std::max(grid_for(rows, 1024), 1);
   auto pdw = at::empty({blocks, d}, x.options().dtype(at::kFloat));
   auto pdb = at::empty({blocks, d}, x.options().dtype(at::kFloat));
+  // want_dbb: column sums of the stored dx, fused (PIN widths 192/384 on
+  // the fp16 path only; elsewhere the 4th output is undefined and the
+  // caller sums dx itself)
+  const bool fuse_dbb = want_dbb && x.scalar_type() == at::kHalf
+      && (d == 192 || d == 384) && rows > 0;
+  at::Tensor pdbb;
+  if (fuse_dbb) pdbb = at::empty({blocks, d}, x.options().dtype(at::kFloat));
   if (rows > 0) {
-    const size_t smem = 2 * WPB * d * sizeof(float);
+    const size_t smem = (fuse_dbb ? 3 : 2) * WPB * d * sizeof(float);
     if (x.scalar_type() == at::kFloat) {
       auto launch = [&](auto kernel) {
         kernel<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
@@ -612,10 +710,13 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
                 ? reinterpret_cast<const __half2*>(gx.data_ptr<at::Half>())
                 : nullptr,
             reinterpret_cast<__half2*>(dx.data_ptr<at::Half>()),
-            pdw.data_ptr<float>(), pdb.data_ptr<float>(), rows, d2);
+            pdw.data_ptr<float>(), pdb.data_ptr<float>(),
+            fuse_dbb ? pdbb.data_ptr<float>() : nullptr, rows, d2);
       };
       if (d == 64) launch(ln_bwd_h_kernel<1>);
       else if (d == 128) launch(ln_bwd_h_kernel<2>);
+      else if (d == 192) launch(ln_bwd_h_kernel<3>);
+      else if (d == 384) launch(ln_bwd_h_kernel<6>);
       else launch(ln_bwd_h_kernel<0>);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -623,6 +724,7 @@ std::vector<at::Tensor> ln_bwd(at::Tensor x, at::Tensor dy, at::Tensor w,
     pdw.zero_();
     pdb.zero_();
   }
+  if (fuse_dbb) return {dx, pdw.sum(0), pdb.sum(0), pdbb.sum(0)};
   return {dx, pdw.sum(0), pdb.sum(0)};
 }
 
@@ -638,7 +740,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("eps"), py::arg("b_bias") = py::none());
   m.def("ln_bwd", &ln_bwd,
         "LayerNorm backward -> (dx, dw, db); optional gx is a residual "
-        "gradient fused into the dx store (dx += gx)",
+        "gradient fused into the dx store (dx += gx); want_dbb appends "
+        "the column sums of dx as a 4th output where fused (fp16, d "
+        "192/384), else the result stays 3 long",
         py::arg("x"), py::arg("dy"), py::arg("w"), py::arg("mean"),
-        py::arg("rstd"), py::arg("gx") = py::none());
+        py::arg("rstd"), py::arg("gx") = py::none(),
+        py::arg("want_dbb") = false);
 }

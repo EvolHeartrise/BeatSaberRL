@@ -125,3 +125,51 @@ def test_fused_is_one_kernel():
     bh = big[1:513]
     mis = _kernels(lambda: fl._relu_forward(x, wh, bh, b))
     assert len(mis) == 2 and any("bias_relu" in k for k in mis), mis
+
+
+@pytest.mark.parametrize("d", [192, 384, 768, 64, 512])
+def test_relu_bwd_widths(d):
+    """relu_bwd covers the 192/384/768 recipe widths (2026-09-26, 384-
+    thread blocks): the masked grad is bitwise threshold_backward, the
+    column-sum partials match gm.sum(0) to fp32 near-tie level."""
+    ext = fl._load()
+    g = torch.Generator(device="cuda").manual_seed(d)
+    for rows in (1, 37, 8192 * 3):
+        y = torch.relu(torch.randn(rows, d, device="cuda",
+                                   generator=g)).half()
+        gy = torch.randn(rows, d, device="cuda", generator=g).half()
+        gm, part = ext.relu_bwd(gy, y)
+        ref = torch.ops.aten.threshold_backward(gy, y, 0)
+        assert torch.equal(gm, ref)
+        torch.testing.assert_close(part.sum(0),
+                                   ref.sum(0, dtype=torch.float32),
+                                   atol=1e-3, rtol=1e-5)
+    assert d in fl._RELU_BWD_DIMS
+
+
+@pytest.mark.parametrize("R,M,K", [(fl._LT_BGRAD_MIN_ROWS, 576, 192),
+                                   (98304 + 3, 192, 192),
+                                   (70000, 384, 192)])
+def test_wgrad_bgrad_matches_wgrad_plus_sum(R, M, K):
+    """wgrad_bgrad (2026-09-26): one cublasLt GEMM with the BGRADB
+    epilogue returns (dW, db) at near-tie level vs GemmEx wgrad + a
+    torch column sum, db at least as close to fp64 as the torch sum."""
+    ext = fl._load()
+    g = torch.Generator(device="cuda").manual_seed(R)
+    dy = (torch.randn(R, M, device="cuda", generator=g) * 0.1).half()
+    x = torch.randn(R, K, device="cuda", generator=g).half()
+    r = ext.wgrad_bgrad(dy, x)
+    assert r, "no cublasLt BGRADB algo for a production shape"
+    dw, db = r
+    dw0 = ext.wgrad(dy, x)
+    assert _rel(dw, dw0) < 2e-4
+    ref = dy.double().sum(0)
+    e_lt = (db.double() - ref).abs().max()
+    e_sum = (dy.sum(0, dtype=torch.float32).double() - ref).abs().max()
+    assert e_lt <= 2 * e_sum + 1e-6
+    # routed through the Linear Functions above the row gate
+    w = torch.nn.Parameter(torch.randn(M, K, device="cuda") / K ** 0.5)
+    b = torch.nn.Parameter(torch.zeros(M, device="cuda"))
+    xg = x.clone().requires_grad_(True)
+    fl.fp16_linear(xg, w, b).backward(dy)
+    assert torch.equal(w.grad, dw) and torch.equal(b.grad, db)
