@@ -13,6 +13,7 @@
   // (x, y, -z). An explicit offset rather than getOffsetReferenceSpace:
   // one mechanism for the view and the reads, on every runtime.
   import { useTask, useThrelte } from "@threlte/core";
+  import { Group } from "three";
   import { XR, XROrigin } from "@threlte/xr";
   import { KIND_CIRCLE, PLANE_Z0 } from "./replay.js";
   import { quatSceneToEnv, rank, sceneToEnv } from "./fluxgame.js";
@@ -29,6 +30,14 @@
   // the wrist and the middle knuckle, i.e. the palm centre. A hand that
   // loses tracking keeps its last position for the frame.
   const HANDS = { left: 0, right: 1 };
+  // The player's avatar is the palm orbs + Flux beam; controller / hand
+  // meshes are never drawn. Empty model factories keep @threlte/xr from
+  // fetching controller profiles off a CDN (a LAN-only headset has no
+  // internet) and from racing a quick session exit.
+  const NO_MODELS = {
+    createControllerModel: () => new Group(),
+    createHandModel: () => new Group(),
+  };
   // local-floor -> scene: the origin offset
   const ORIGIN_Z = -PLANE_Z0;
   const toEnv = (p) => sceneToEnv([p.x, p.y, p.z + ORIGIN_Z]);
@@ -153,6 +162,7 @@
 </script>
 
 <XR referenceSpace="local-floor" offerSession={false} enterGrantedSession={false}
+  controllerFactory={NO_MODELS} handFactory={NO_MODELS}
   onsessionstart={onSessionStart} onsessionend={onSessionEnd} />
 <XROrigin position={[0, 0, ORIGIN_Z]} />
 
@@ -178,7 +188,7 @@
   <TextSprite
     text={`good ${st.good} · bad ${st.bad} · miss ${st.misses} · max combo ${st.max_combo}`}
     size={0.09} bold={false} position={[MSG[0], MSG[1] - 0.3, MSG[2]]} />
-  <TextSprite text={play.newBest ? "new best!" : `best ${fmt(play.best[play.chartId])}`}
+  <TextSprite text={play.newBest ? "new best!" : `best ${fmt(play.best[play.runId])}`}
     size={0.09} color="#ffd166" position={[MSG[0], MSG[1] - 0.47, MSG[2]]} />
   {#if play.presenting}
     <TextSprite text="trigger: play again  ·  grip: change chart" size={0.08}

@@ -157,6 +157,20 @@ fn bar_angle_ok(n: &Note, l: [Real; 3], r: [Real; 3]) -> bool {
 /// code 0 good, 2 bad "angle", 3 wrong hand, 4 miss (the standard codes).
 pub(crate) type Event = (u32, u8, f32, f32, f32);
 
+/// A bar's rotation as (sin, cos). The f64 build — the env reference AND
+/// the WebXR game's wasm — uses geom::det_sin_cos, so the two install
+/// bit-identical bars (the platform libms differ in the last bit). The f32
+/// build (the CUDA kernel's precision twin, no game counterpart) keeps
+/// the f32 libm.
+#[cfg(not(feature = "f32"))]
+fn bar_sin_cos(rot: Real) -> (Real, Real) {
+    det_sin_cos(rot)
+}
+#[cfg(feature = "f32")]
+fn bar_sin_cos(rot: Real) -> (Real, Real) {
+    (rot.sin(), rot.cos())
+}
+
 /// Chart tuple -> the sim's object record, with the install-time checks
 /// (the env panics on an Err, the wasm game reports it).
 pub(crate) fn flux_note(t: FluxTuple) -> Result<Note, &'static str> {
@@ -172,6 +186,7 @@ pub(crate) fn flux_note(t: FluxTuple) -> Result<Note, &'static str> {
         return Err("speed must be positive");
     }
     let is_bar = kind == KIND_BAR;
+    let (sin_r, cos_r) = if is_bar { bar_sin_cos(rot) } else { (0.0, 1.0) };
     if is_bar {
         if !(len > 0.0) {
             return Err("bar length must be positive");
@@ -185,8 +200,8 @@ pub(crate) fn flux_note(t: FluxTuple) -> Result<Note, &'static str> {
         x,
         y,
         color: if is_bar { 0 } else { color },
-        sin_a: if is_bar { rot.sin() } else { 0.0 },
-        cos_a: if is_bar { rot.cos() } else { 1.0 },
+        sin_a: sin_r,
+        cos_a: cos_r,
         speed,
         any_dir: true,
         kind,
@@ -432,5 +447,58 @@ mod tests {
         assert!(sweep_hits_box(&[[la, ra, ra], [la, ra, la]], bc, h, &frame));
         let (lb, rb) = ([-0.3, 1.75, -0.2], [0.3, 1.75, -0.2]);
         assert!(!sweep_hits_box(&[[lb, rb, rb], [lb, rb, lb]], bc, h, &frame));
+    }
+
+    /// ulp distance between two finite f64s of the same sign region
+    fn ulps(a: f64, b: f64) -> u64 {
+        let key = |x: f64| {
+            let b = x.to_bits() as i64;
+            if b < 0 { i64::MIN - b } else { b }
+        };
+        (key(a) - key(b)).unsigned_abs()
+    }
+
+    #[test]
+    fn det_sin_cos_is_within_one_ulp_of_libm_everywhere_a_chart_goes() {
+        // dense sweep over [-4π, 4π] (bars live in [0, 2π)) plus the
+        // octant boundaries, where the range reduction switches branches
+        let mut worst = 0;
+        let mut pts: Vec<f64> = (-400_000..=400_000)
+            .map(|k| k as f64 * (4.0 * std::f64::consts::PI / 400_000.0))
+            .collect();
+        for k in -16..=16 {
+            let b = k as f64 * std::f64::consts::FRAC_PI_4;
+            pts.extend([b, f64::from_bits(b.to_bits() + 1), f64::from_bits(b.to_bits().wrapping_sub(1))]);
+        }
+        for x in pts {
+            let (s, c) = det_sin_cos(x);
+            // near a zero of sin/cos the ulp scale collapses: compare in
+            // absolute terms there
+            for (got, want) in [(s, x.sin()), (c, x.cos())] {
+                if want.abs() < 1e-8 {
+                    assert!((got - want).abs() < 1e-16, "{x}: {got} vs {want}");
+                } else {
+                    worst = worst.max(ulps(got, want));
+                }
+            }
+        }
+        assert!(worst <= 1, "worst {worst} ulp");
+        assert_eq!(det_sin_cos(0.0), (0.0, 1.0));
+        assert!(det_sin_cos(f64::NAN).0.is_nan() && det_sin_cos(f64::INFINITY).1.is_nan());
+        // huge angles fold by the exact remainder
+        let (s, c) = det_sin_cos(1.0e7);
+        assert!((s * s + c * c - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn bars_install_with_the_deterministic_trig() {
+        for rot in [0.3, 1.0, 2.5, 4.0, 5.9] {
+            let n = flux_note((1.0, 0.0, 1.4, KIND_BAR, 0, rot, 10.0, 0.5, 0.0)).unwrap();
+            let (s, c) = det_sin_cos(rot);
+            assert_eq!((n.sin_a.to_bits(), n.cos_a.to_bits()), (s.to_bits(), c.to_bits()));
+        }
+        // circles carry the identity rotation
+        let n = flux_note((1.0, 0.0, 1.4, KIND_CIRCLE, 1, 2.0, 10.0, 0.0, 0.0)).unwrap();
+        assert_eq!((n.sin_a, n.cos_a), (0.0, 1.0));
     }
 }

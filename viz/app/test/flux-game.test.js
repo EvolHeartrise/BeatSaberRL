@@ -158,6 +158,31 @@ function playerFor(chart) {
   s.free();
 }
 
+// ---- rebase: a resumed / regained pose does not sweep the gap -------------
+// A left circle sits midway on the path of a left palm that "jumps" 0.8 m
+// across a pause. A plain feed sweeps the palm through it (touch); after
+// rebase the sweep starts at the new pose (the player never moved there).
+{
+  const circle = { t: 0.2, x: 0, y: 1.2, kind: 4, color: 0, rot: 0, speed: 1,
+                   len: 0, sweet: 0 };
+  // the circle's slab (z in [-0.75, +0.25] about its centre) holds the palm
+  // from t = 0 until well after the jump
+  const from = [[-0.4, 1.2, 0.15], REST[1]];
+  const to = [[0.4, 1.2, 0.15], REST[1]];
+  const run = (rebase) => {
+    const s = new FluxSession(core, { id: "gap", chart: [circle] });
+    s.feed(0, from, HEAD);
+    s.feed(DT, from, HEAD);            // tick 0: palm resting left
+    if (rebase) s.rebase(1.5 * DT, { palms: to, head: HEAD });
+    s.feed(2 * DT, to, HEAD);          // tick 1: palm now right
+    const good = s.stats.good;
+    s.free();
+    return good;
+  };
+  assert.equal(run(false), 1, "a real 0.8 m sweep through the circle touches it");
+  assert.equal(run(true), 0, "a rebased jump sweeps nothing");
+}
+
 // ---- a finished session is inert --------------------------------------------
 {
   const s = new FluxSession(core, { id: "one", chart: [

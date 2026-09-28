@@ -164,7 +164,8 @@ export const play = $state({
   phase: "menu",      // menu | countdown | playing | done
   presenting: false,  // an immersive-vr session is running
   xrSupported: null,  // null = still asking the browser
-  chartId: null,      // selected chart (pack id, or "replay")
+  chartId: null,      // selected chart (pack id, or "replay:<hash>")
+  runId: null,        // the chart of the current / last run
   time: 0,            // game time (s), negative during the countdown
   paused: false,      // headset off / system menu open
   stats: null,        // the judge's tallies (fluxcore STAT_NAMES)

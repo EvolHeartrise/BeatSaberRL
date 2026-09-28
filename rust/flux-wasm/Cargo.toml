@@ -24,3 +24,8 @@ lto = true
 codegen-units = 1
 opt-level = 3
 panic = "abort"
+
+# the shared files have `feature = "f32"` branches for the env's f32 build;
+# this crate is f64 only and never enables it
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("f32"))'] }

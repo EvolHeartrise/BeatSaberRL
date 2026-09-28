@@ -101,9 +101,11 @@ in.
 yourself in a headset, judged by the env's own code. The Flux rules
 live in three body-free Rust files (`rust/src/geom.rs`, `flux.rs`,
 `combo.rs`) that compile into the env crate AND into `rust/flux-wasm`
-(wasm32), which the viewer app runs, so the game and the env the agent
-trains on cannot drift apart. A parity test replays real env
-episodes through the wasm build and requires identical events tick for
+(wasm32), which the viewer app runs, so the game and the env cannot
+drift apart. The game matches the f64 Rust reference env bit for bit;
+the f32 CUDA training kernel is tied to that reference by its own parity
+tests. A parity test replays real env episodes through the wasm build
+and requires the same installed chart and identical events, tick for
 tick. Charts come from the training generator (plus any open agent
 replay's chart, so you can race the agent). Runs save as replays the
 viewer plays back.
