@@ -11,10 +11,6 @@ import { sfx } from "./sfx.js";
 
 export const DEFAULT_CHART = "train-1";
 
-/** Best scores are per chart AND judge rate (a finer clock judges a finer
- * path — the rates are not one leaderboard). */
-export const bestKey = (id, hz) => `${id}@${hz}`;
-
 // A standing player with the hands down — the pose the game holds when
 // nothing is tracked at all ("start (no headset)")
 const REST_POSE = {
@@ -114,7 +110,7 @@ export function startRun() {
   if (!game.core || !entry) return false;
   endRun();
   try {
-    game.session = new FluxSession(game.core, entry, { onEvent, hz: play.hz });
+    game.session = new FluxSession(game.core, entry, { onEvent });
   } catch (e) {
     play.error = e.message;
     return false;
@@ -193,7 +189,7 @@ export function advance(dt, getSample) {
 function finishRun() {
   play.phase = "done";
   const st = game.session.stats;
-  play.newBest = recordBest(bestKey(game.session.entry.id, game.session.hz), st.score);
+  play.newBest = recordBest(game.session.entry.id, st.score);
   sfx.finish();
 }
 

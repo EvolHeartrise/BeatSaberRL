@@ -423,17 +423,16 @@ which is tied to that reference by the existing CUDA parity tests
   z = 0.65 for the view, the same offset added to every pose read).
 - **Rendering vs judging**: everything is DRAWN at the headset's display
   rate (72–120 Hz): objects on continuous chart time, the palms / beam
-  from each frame's pose. The JUDGE runs at `judge_hz` = 30·k — default
-  120 Hz, selectable 60, or 30 = the env's own tick (like-for-like with
-  the agent). The judge rate is only the scoring clock (k judge ticks per
-  30 Hz env tick; unrelated to the body sim's physics substeps — the
-  game has no body): the same `flux::judge` on a finer sampling of the
+  from each frame's pose. The JUDGE always runs at 120 Hz (flux-wasm
+  `judge_hz` = 30·k, k = 4 judge ticks per 30 Hz env tick) — only the
+  scoring clock, unrelated to the body sim's physics substeps (the game
+  has no body): the same `flux::judge` on a finer sampling of the
   player's path, so hits resolve (and burst, and sound) within 1/120 s of
-  happening instead of at the env tick's end. At 30 Hz it is the env's
-  tick bit for bit (the parity gate runs there); above it the game judges
-  a finer path than the env's 30 Hz discretization of the body — same
-  rules, finer sampling, so scores across rates are not one leaderboard
-  (bests are kept per chart and rate).
+  happening instead of at the env tick's end. At `judge_hz` = 30 the
+  wasm is the env's tick bit for bit (the parity gate and the session
+  plumbing tests run there); at 120 the game judges a finer path than
+  the env's 30 Hz discretization of the body — same rules, finer
+  sampling.
 - **Ticks**: poses arrive at the display rate; judge tick j's palms /
   head are the pose track linearly interpolated to its end time
   (j + 1)·DT/k (a sample exactly on a tick is used verbatim), and
