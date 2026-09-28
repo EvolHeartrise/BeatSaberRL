@@ -51,9 +51,10 @@ assert.deepEqual(quatSceneToEnv([0, 0.5, 0, 0.8]), [-0, -0.5, 0, 0.8]);
 assert.deepEqual(quatSceneToEnv([0, 0, 0.5, 0.8]), [-0, -0, 0.5, 0.8]);
 
 // ---- tick plumbing: samples ON tick times == stepping the judge directly ----
+// at the env's own rate (hz 30: one judge tick per env tick, the env's clock)
 {
   const chart = train.chart;
-  const s = new FluxSession(core, train);
+  const s = new FluxSession(core, train, { hz: 30 });
   const g = core.newGame(chart);
   // a wandering palm path, sampled exactly at each tick's end time, plus
   // an off-tick sample in between (which must not change anything)
@@ -79,7 +80,7 @@ assert.deepEqual(quatSceneToEnv([0, 0, 0.5, 0.8]), [-0, -0, 0.5, 0.8]);
 
 // ---- interpolation: 90 Hz samples of a linear path land on tick times ------
 {
-  const s = new FluxSession(core, train);
+  const s = new FluxSession(core, train, { hz: 30 });
   const lin = (t) => [[-0.4 + 0.5 * t, 1.2, -0.3], [0.4, 1.2 + 0.2 * t, -0.3]];
   for (let f = -LEAD_IN_S * 90; f <= 90; f++) s.feed(f / 90, lin(f / 90), HEAD);
   assert.equal(s.rep.ticks.length, 30, "1 s of 30 Hz ticks");
@@ -90,6 +91,69 @@ assert.deepEqual(quatSceneToEnv([0, 0, 0.5, 0.8]), [-0, -0, 0.5, 0.8]);
         assert.ok(Math.abs(tk.palms[h][i] - want[h][i]) < 2e-5, `tick ${k}`);
   });
   s.free();
+}
+
+// ---- judging faster than the env's tick (the default 120 Hz) ---------------
+{
+  assert.equal(new FluxSession(core, train).hz, 120, "default judge rate");
+  assert.throws(() => new FluxSession(core, train, { hz: 100 }), /multiple of 30/);
+  // plumbing: a 120 Hz session == the judge stepped directly at 120 Hz
+  const s = new FluxSession(core, train, { hz: 120 });
+  const g = core.newGame(train.chart, 0, 120);
+  const path = (t) => [
+    [-0.3 + 0.25 * Math.sin(2.1 * t), 1.25 + 0.3 * Math.sin(1.3 * t), -0.35],
+    [0.3 + 0.25 * Math.sin(1.7 * t + 1), 1.3 + 0.3 * Math.cos(1.1 * t), -0.35]];
+  s.feed(0, path(0), HEAD);
+  let prev = path(0);
+  for (let j = 0; j < 4 * 300 && !s.done; j++) {
+    const T = (j + 1) * (DT / 4);
+    s.feed(T, path(T), HEAD);
+    g.step(prev, path(T), HEAD, HEAD[2]);
+    prev = path(T);
+  }
+  assert.deepEqual(s.judge.status(), g.status(), "120 Hz session == the judge stepped at 120 Hz");
+  assert.deepEqual(s.stats, g.stats());
+  // the recording stays in 30 Hz frames (the viewer's clock) ...
+  assert.equal(s.rep.ticks.length, Math.ceil(s.stats.tick / 4));
+  // ... and every outcome carries its exact judge time, inside its frame
+  let n = 0;
+  s.rep.outcomes.forEach((o) => {
+    if (!o) return;
+    n++;
+    assert.ok(o.t > o.tick * DT - 1e-12 && o.t <= (o.tick + 1) * DT + 1e-12,
+      `outcome at ${o.t} outside frame ${o.tick}`);
+    // on the 120 Hz grid
+    const q = o.t / (DT / 4);
+    assert.ok(Math.abs(q - Math.round(q)) < 1e-9);
+  });
+  assert.ok(n > 10);
+  // round trip: the viewer keeps the exact times
+  const back = parseReplay(s.toJSONL());
+  assert.equal(back.judgeHz, 120);
+  back.outcomes.forEach((o, i) => {
+    if (o) assert.equal(o.t, s.rep.outcomes[i].t);
+  });
+  s.free(); g.free();
+}
+// a hit is judged (and drawn) when it happens: a palm crossing a circle
+// half-way through an env tick resolves it on that 120 Hz sub-tick (t =
+// DT/2), where the env's clock only judges it at the tick's end (t = DT)
+{
+  const c = { t: 0.5 * DT + 0.2 / 12, x: 0, y: 1.2, kind: 4, color: 0, rot: 0,
+              speed: 12, len: 0, sweet: 0 };
+  const at = (hz) => {
+    const s = new FluxSession(core, { id: "x", chart: [c] }, { hz });
+    const p = (u) => [[-0.4 + 0.8 * u, 1.2, 0.0], [0.6, 1.2, 0.0]];
+    s.feed(0, p(0), HEAD);
+    for (let f = 1; f <= 16; f++) s.feed(f * DT / 8, p(Math.min(1, f / 8)), HEAD);
+    const o = s.rep.outcomes[0];
+    s.free();
+    return o;
+  };
+  const o30 = at(30), o120 = at(120);
+  assert.equal(o30.kind, "good"); assert.equal(o120.kind, "good");
+  assert.equal(o30.t, DT, "30 Hz: judged at the env tick's end");
+  assert.equal(o120.t, 2 * (DT / 4), "120 Hz: judged on the sub-tick it happens");
 }
 
 // ---- a scripted player clears a pack chart via the headset code path ------

@@ -3,20 +3,30 @@
 //
 // Everything that decides an outcome is the env's own Rust (fluxcore.js ->
 // rust/flux-wasm -> rust/src/flux.rs). This file only does what the body
-// does for the agent: it turns the player's tracked palms into the env's
-// 30 Hz tick inputs. Poses arrive at the display rate (72-120 Hz); each
+// does for the agent: it turns the player's tracked palms into judge-tick
+// inputs. The judge runs at `hz` = 30·S (default 120): S judge ticks per
+// 30 Hz env tick, on the same rules — 30 is the env's own clock, bit for
+// bit. (Nothing to do with the body sim's physics substeps: there is no
+// body here.) Poses arrive at the display rate (72-120 Hz); each judge
 // tick's palms are the pose track linearly interpolated to the tick's END
-// time (k + 1)·DT — the instant the env judges tick k at — and the swept
-// Flux runs from the previous tick's palms, exactly the env's p0 -> p1.
+// time (j + 1)·DT/S, and the swept Flux runs from the previous tick's palms —
+// the env's p0 -> p1 on a finer clock. Everything is DRAWN at the display
+// rate regardless (objects on continuous time, palms from each frame).
 //
 // The session also RECORDS itself in the viewer's replay format (header
-// "game": "flux", "player": "human", per-tick palms + head + events), so
-// the existing renderers draw the live game unchanged and a finished run
-// exports as a .jsonl the viewer plays back.
+// "game": "flux", "player": "human", "judge_hz"; 30 Hz frames of palms +
+// head + events, each event stamped with its exact judge time "t"), so
+// the existing renderers draw the live game unchanged — a hit bursts when
+// it is judged, not at the frame's end — and a finished run exports as a
+// .jsonl the viewer plays back.
 import { DT, arcPairs } from "./replay.js";
 
 /** Countdown before chart time 0 (s). */
 export const LEAD_IN_S = 3.0;
+
+/** Judge rates the game offers (Hz): 30 = the env's own tick. */
+export const JUDGE_HZ = [120, 60, 30];
+export const DEFAULT_JUDGE_HZ = 120;
 
 // ---- scene <-> env frames -----------------------------------------------------
 // The viewer draws world (x, y, z) at scene (x, y, -z). In XR the player's
@@ -59,13 +69,22 @@ export class LiveReplay {
 export class FluxSession {
   /**
    * `core` = loadFluxCore()'s module; `entry` = {id, name, chart, config}
-   * (a chart-pack entry, or a loaded Flux replay's chart). `onEvent(e,
-   * obj)` fires for every judged event as it happens (sound, haptics).
+   * (a chart-pack entry, or a loaded Flux replay's chart). `hz`: the judge
+   * rate, a multiple of 30 (JUDGE_HZ). `onEvent(e, obj)` fires for every
+   * judged event as it happens (sound, haptics).
    */
-  constructor(core, entry, { onEvent = null } = {}) {
+  constructor(core, entry, { onEvent = null, hz = DEFAULT_JUDGE_HZ } = {}) {
+    const S = Math.round(hz / 30);
+    if (!(S >= 1 && S * 30 === hz)) throw new Error(`judge rate ${hz} Hz: need a multiple of 30`);
     this.entry = entry;
     this.chart = entry.chart;
-    this.judge = core.newGame(this.chart); // throws on a chart the env refuses
+    this.hz = hz;
+    this.S = S;
+    // judge tick length: the wasm's own expression (DT / S; DT at S = 1)
+    this.tickDt = DT / S;
+    this.j = 0; // judge ticks done
+    // throws on a chart the env refuses
+    this.judge = core.newGame(this.chart, 0, hz);
     this.rep = new LiveReplay(this.chart, entry.config,
       { id: entry.id ?? null, name: entry.name ?? null });
     this.onEvent = onEvent;
@@ -73,11 +92,12 @@ export class FluxSession {
     this.last = null;      // last pose sample {t, palms, head, quat}
     this.done = false;
     this.stats = this.judge.stats();
+    this.frame = { events: [], reward: 0 }; // the 30 Hz frame being filled
   }
 
-  /** Game time of the next tick's judgment (its end time). */
+  /** Game time of the next judge tick (its end time), as the wasm has it. */
   nextTickTime() {
-    return (this.rep.ticks.length + 1) * DT;
+    return (this.j + 1) * this.tickDt;
   }
 
   /**
@@ -129,36 +149,44 @@ export class FluxSession {
 
   /** Judge one tick with palms p1 and head `head` (env world). */
   tick(p1, head, quat) {
-    const k = this.rep.ticks.length;
+    const T = this.nextTickTime();
+    const k = this.rep.ticks.length; // the 30 Hz frame this tick falls in
     // a standing human's shoulders sit in the head's frontal plane — the
     // env's reference pose has shoulder z = head z = PLANE_Z0 too
     const { done, events } = this.judge.step(this.prevPalms, p1, head, head[2]);
     this.prevPalms = p1;
+    this.j++;
     const before = this.stats.reward;
     this.stats = this.judge.stats();
-    const rec = [];
+    const f = this.frame;
+    f.reward += this.stats.reward - before;
     for (const e of events) {
       if (e.code === 4) {
-        rec.push({ miss: { note: e.i } });
-        this.rep.outcomes[e.i] = { kind: "miss", reason: "miss", tick: k, points: 0 };
+        f.events.push({ miss: { note: e.i, t: T } });
+        this.rep.outcomes[e.i] = { kind: "miss", reason: "miss", tick: k, t: T, points: 0 };
       } else {
         const good = e.code === 0;
-        rec.push({ cut: { note: e.i, good, reason: e.reason, points: e.pts,
-                          pre: e.pre, acc: e.acc } });
+        f.events.push({ cut: { note: e.i, good, reason: e.reason, points: e.pts,
+                               pre: e.pre, acc: e.acc, t: T } });
         this.rep.outcomes[e.i] = { kind: good ? "good" : "bad",
-                                   reason: e.reason, tick: k, points: e.pts };
+                                   reason: e.reason, tick: k, t: T, points: e.pts };
       }
       this.onEvent?.(e, this.chart[e.i]);
     }
-    this.rep.ticks.push({
-      t: k,
-      time: r5(k * DT),
-      palms: p1.map((p) => p.map(r5)),
-      head: [...head.map(r5), ...quat.map(r5)],
-      reward: r5(this.stats.reward - before),
-      events: rec,
-    });
     if (done) this.done = true;
+    // a 30 Hz frame closes on every S-th judge tick (its end is the env
+    // tick's end) — or early, on the run's last judge tick
+    if (this.j % this.S === 0 || done) {
+      this.rep.ticks.push({
+        t: k,
+        time: r5(k * DT),
+        palms: p1.map((p) => p.map(r5)),
+        head: [...head.map(r5), ...quat.map(r5)],
+        reward: r5(f.reward),
+        events: f.events,
+      });
+      this.frame = { events: [], reward: 0 };
+    }
   }
 
   /** The run as a viewer-loadable .jsonl (the env recorder's layout). */
@@ -169,6 +197,7 @@ export class FluxSession {
       record_rev: 5,
       game: "flux",
       player: "human",
+      judge_hz: this.hz,
       track_anchor: "head",
       config: this.rep.config,
       chart: this.chart,

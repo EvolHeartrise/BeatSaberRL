@@ -48,10 +48,11 @@ class FluxCore {
   /**
    * A new game over `chart` — viewer/replay-header objects
    * {t, x, y, kind, color, rot, speed, len, sweet} or set_flux_chart tuples.
-   * `maxSteps` 0 = the env's fixed-chart budget. Throws with the env's own
-   * message on a chart the env would refuse.
+   * `maxSteps` (env ticks) 0 = the env's fixed-chart budget; `judgeHz` the
+   * judge rate, a multiple of 30 (30 = the env's own tick). Throws with the
+   * env's own message on a chart (or rate) the judge refuses.
    */
-  newGame(chart, maxSteps = 0) {
+  newGame(chart, maxSteps = 0, judgeHz = 30) {
     const n = chart.length;
     const buf = this.x.fg_alloc(Math.max(1, n * OBJ_F));
     const v = this.f64(buf, Math.max(1, n * OBJ_F));
@@ -62,7 +63,7 @@ class FluxCore {
            o.len ?? 0, o.sweet ?? 0];
       for (let j = 0; j < OBJ_F; j++) v[k * OBJ_F + j] = row[j];
     });
-    const g = this.x.fg_new(buf, n, maxSteps);
+    const g = this.x.fg_new(buf, n, maxSteps, judgeHz);
     this.x.fg_dealloc(buf, Math.max(1, n * OBJ_F));
     if (!g) {
       const msg = new TextDecoder().decode(
@@ -83,7 +84,7 @@ export class FluxJudge {
   }
 
   /**
-   * One 30 Hz tick. `p0` / `p1` = [[lx, ly, lz], [rx, ry, rz]] palms (env
+   * One judge tick. `p0` / `p1` = [[lx, ly, lz], [rx, ry, rz]] palms (env
    * world) at the previous and this tick, `head` = [x, y, z], `shoulderZ` =
    * the forward-most shoulder's z (the reach gate). Returns
    * {done, events: [{i, code, reason, pts, pre, acc}]}.
