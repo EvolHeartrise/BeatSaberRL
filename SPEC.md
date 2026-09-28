@@ -479,6 +479,26 @@ which is tied to that reference by the existing CUDA parity tests
   `test/flux-play-browser.mjs` (scripted poses) and
   `test/flux-xr-browser.mjs` (a real WebXR session on an emulated
   Quest 3, iwer). CI: `.github/workflows/ci.yml`.
+- **Hosted** at `https://flux.flee.systems` (`viz/flux-host`, 2026-09-27):
+  a Cloudflare Worker (`flux-game`, custom domain only — no workers.dev /
+  preview URLs) that bundles the committed `viz/replay.html` INTO its
+  script, so the game is never a public asset. `GET /` returns it only
+  for an HMAC-signed session cookie (7 days) whose Discord user id is in
+  the `ALLOWED_DISCORD_IDS` secret, re-checked on every request (removing
+  an id revokes at once); everyone else gets a small login / "not
+  whitelisted — your id is …" page with no game bytes. Login is Discord
+  OAuth2 (`identify` scope, CSRF state cookie; both cookies `__Host-`),
+  redirect URI `PUBLIC_ORIGIN/callback` = `https://flux.flee.systems/callback`
+  (a wrangler.jsonc var, never the request Host). Secrets:
+  `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `SESSION_SECRET` (≥ 32
+  chars; rotating it logs everyone out — the only way to kill one stolen
+  cookie short of de-listing its id), `ALLOWED_DISCORD_IDS`; missing
+  config fails closed (503). A whitelisted player receives the whole
+  single-file game and could keep a copy; de-listing stops future loads
+  only.
+  Deploy: `cd viz/app && npm run build`, then `cd viz/flux-host && npm run
+  deploy`. Whitelist: `npx wrangler secret put ALLOWED_DISCORD_IDS`
+  (comma-separated ids). Tests: `viz/flux-host/test/app.test.js` (CI).
 
 ## Chart generation (`beat_arena_env/chart.py`) — generator v2
 
