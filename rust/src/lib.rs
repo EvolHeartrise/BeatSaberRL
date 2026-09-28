@@ -3728,6 +3728,31 @@ mod env_tests {
     /// blade across the tick, / V_NORM, per hand [L xyz, R xyz]; zero
     /// at reset; different from the wrist velocity on a rotating blade
     /// (the reason they exist).
+    /// exp/tick-rate x I07: at 60 Hz the tip lanes divide by the
+    /// runtime tick length (1/60 s), not the 30 Hz constant.
+    #[test]
+    fn tip_vel_lanes_use_the_runtime_tick_at_60hz() {
+        let rate = TickRate::new(60).unwrap();
+        let mut core = Core::new_core_rate(1380, 5, rate);
+        core.set_chart_notes(far_chart());
+        let l = HANDLE_LEN + SABER_LEN;
+        let dt = 1.0 / 60.0;
+        assert!((core.body.rate.dt - dt).abs() < 1e-12);
+        for _ in 0..6 {
+            let (w0, b0) = swing_tick(&mut core);
+            let (w1, b1) = (core.body.wrist, core.body.blade);
+            for s in 0..2 {
+                for k in 0..3 {
+                    let fd = ((w1[s][k] + l * b1[s][k])
+                        - (w0[s][k] + l * b0[s][k])) / dt;
+                    let tv = core.body.tip_vel[s][k];
+                    let tol = 1e3 * Real::EPSILON * (1.0 + fd.abs()) + 1e-9;
+                    assert!((tv - fd).abs() <= tol, "s{s} k{k}: {tv} vs {fd}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn tip_vel_lanes_are_the_tip_finite_difference() {
         let mut core = Core::new_core(690, 5);
@@ -3746,7 +3771,7 @@ mod env_tests {
             for s in 0..2 {
                 for k in 0..3 {
                     let fd = ((w1[s][k] + l * b1[s][k])
-                        - (w0[s][k] + l * b0[s][k])) / DT;
+                        - (w0[s][k] + l * b0[s][k])) / core.body.rate.dt;
                     let tv = core.body.tip_vel[s][k];
                     let tol = 1e3 * Real::EPSILON * (1.0 + fd.abs());
                     assert!((tv - fd).abs() <= tol,
