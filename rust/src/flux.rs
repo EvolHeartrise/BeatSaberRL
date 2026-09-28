@@ -280,17 +280,30 @@ pub(crate) fn judge(
             [p0[0][0], p0[0][1], p0[0][2] - travel],
             [p0[1][0], p0[1][1], p0[1][2] - travel],
         ];
+        // the sweep ends where the object crosses the head plane (past it,
+        // it is a miss): on that tick the relative paths stop at the
+        // crossing fraction s, so a palm behind the head never scores
+        let e1 = if z < head_z {
+            let s = ((z + travel - head_z) / travel).clamp(0.0, 1.0);
+            let cut = |a: [Real; 3], b: [Real; 3]| {
+                [a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1]),
+                 a[2] + s * (b[2] - a[2])]
+            };
+            [cut(q0[0], p1[0]), cut(q0[1], p1[1])]
+        } else {
+            *p1
+        };
 
         if n.kind == KIND_CIRCLE {
             let m = n.color as usize;
-            if let Some(d) = circle_touch(q0[m], p1[m], center) {
+            if let Some(d) = circle_touch(q0[m], e1[m], center) {
                 let acc = round_pts(
                     CIRCLE_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
                 let pts = CIRCLE_PTS + acc;
                 status[i] = 1;
                 *reward += pts / SCORE_MAX;
                 events.push((i as u32, 0, pts as f32, CIRCLE_PTS as f32, acc as f32));
-            } else if circle_touch(q0[1 - m], p1[1 - m], center).is_some() {
+            } else if circle_touch(q0[1 - m], e1[1 - m], center).is_some() {
                 status[i] = 2;
                 *reward += REWARD_BAD;
                 events.push((i as u32, 3, 0.0, 0.0, 0.0));
@@ -301,7 +314,7 @@ pub(crate) fn judge(
             let h = [BAR_HALF_W, 0.5 * n.len, SLAB_HALF];
             // the swept Flux (relative): quad (L0 -> R0) to (L1 -> R1),
             // triangulated like the saber sweep
-            let tris = [[q0[0], q0[1], p1[1]], [q0[0], p1[1], p1[0]]];
+            let tris = [[q0[0], q0[1], e1[1]], [q0[0], e1[1], e1[0]]];
             if sweep_hits_box(&tris, center, h, &frame) {
                 if !bar_angle_ok(n, p1[0], p1[1]) {
                     // crossed, but more than 60 deg off square: a bad
@@ -542,6 +555,34 @@ mod tests {
         let ev = judge_one(circ, t_end, DT, &away, &away);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].1, 4);
+    }
+
+    #[test]
+    fn a_palm_behind_the_head_plane_never_scores() {
+        // the sweep stops where the object crosses the head plane, so a
+        // palm held behind it is untouched on every tick phase and at
+        // both judge rates (the env and the game agree); one just in
+        // front of it is always touched
+        for (behind, want) in [(0.3, 0), (0.1, 0), (0.06, 0), (-0.04, 1)] {
+            for speed in [10.0, 18.0] {
+                for dt in [DT, DT / 4.0] {
+                    let pz = PLANE_Z0 - behind;
+                    let circ = (1.0, 0.0, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+                    let p = [[-0.5, 1.0, pz], [0.0, 1.4, pz]];
+                    // every tick that ends while the object is anywhere
+                    // between just before the palm and just past the head
+                    let t_head = 1.0 - PLANE_Z0 / speed;
+                    let mut goods = 0;
+                    for k in 0..50 {
+                        let t_end = t_head + dt * k as Real / 50.0;
+                        let ev = judge_one(circ, t_end, dt, &p, &p);
+                        goods += ev.iter().filter(|e| e.1 == 0).count();
+                    }
+                    let exp = if want == 1 { 50 } else { 0 };
+                    assert_eq!(goods, exp, "behind={behind} v={speed} dt={dt}");
+                }
+            }
+        }
     }
 
     #[test]

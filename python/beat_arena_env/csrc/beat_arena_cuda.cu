@@ -5105,7 +5105,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   }
 
   if constexpr (FX) {
-    // ---- Flux judgment (lib.rs Core::flux_judge verbatim) ----------
+    // ---- Flux judgment (flux_sim.rs flux_judge + flux.rs judge verbatim)
     T p0[2][3], p1[2][3];
     for (int h = 0; h < 2; h++)
       for (int k = 0; k < 3; k++) {
@@ -5132,9 +5132,21 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       const T travel = P.p_speed[cb] * T(DT);
       const T q0[2][3] = {{p0[0][0], p0[0][1], p0[0][2] - travel},
                           {p0[1][0], p0[1][1], p0[1][2] - travel}};
+      // the sweep ends where the object crosses the head plane (flux.rs
+      // judge's e1): past it the object is a miss, never a touch
+      T e1[2][3];
+      if (z < head_z) {
+        const T sc = tclamp((z + travel - head_z) / travel, T(0), T(1));
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++)
+            e1[h][k] = q0[h][k] + sc * (p1[h][k] - q0[h][k]);
+      } else {
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++) e1[h][k] = p1[h][k];
+      }
       if (!is_bar) {
         const int m = P.p_is_right[cb] ? 1 : 0;
-        const T dm = flux_circle_touch(q0[m], p1[m], center);
+        const T dm = flux_circle_touch(q0[m], e1[m], center);
         if (dm >= T(0)) {
           const T acc = round_pts(
               T(CIRCLE_ACC_PTS)
@@ -5151,7 +5163,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           cw_cut(P, e, i, pts);
           P.prev_idx[e * 2 + m] = i;
           P.prev_valid[e * 2 + m] = 1;
-        } else if (flux_circle_touch(q0[1 - m], p1[1 - m], center)
+        } else if (flux_circle_touch(q0[1 - m], e1[1 - m], center)
                    >= T(0)) {
           P.status[e * C + i] = 2;
           P.bad[e] += 1;
@@ -5169,7 +5181,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         // swept Flux quad (L0 -> R0) to (L1 -> R1), relative: triangles
         // (L0, R0, R1) and (L0, R1, L1) — sweep_hits_box's (w0, t0, t1)
         // + (w0, t1, w1) split with w0 = L0, t0 = R0, t1 = R1, w1 = L1
-        if (sweep_hits_box(q0[0], q0[1], p1[1], p1[0], center, bh, frame)) {
+        if (sweep_hits_box(q0[0], q0[1], e1[1], e1[0], center, bh, frame)) {
           if (!flux_bar_angle_ok(P.p_rot[cb * 2], P.p_rot[cb * 2 + 1],
                                  p1[0], p1[1])) {
             // crossed > 60 deg off square: bad cut (event 2 "angle")
