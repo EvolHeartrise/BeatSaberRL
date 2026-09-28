@@ -118,6 +118,8 @@ VENV=.venv
 $VENV/bin/python -m pytest tests/
 # the trainer: its defaults ARE the production recipe (the v58 trunk,
 # since 2026-09-22), so a bare launch is a v58-recipe trunk on the cuda env
+# (plus fp16-accumulate GEMMs, --fp16-accum all, the default since
+# 2026-09-27; a --resume keeps its checkpoint's accumulate mode)
 $VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
 # leaf: branch a cooldown off a numbered trunk checkpoint. A resume
 # takes only lr/ent/schedule/z/arch from the checkpoint; every other

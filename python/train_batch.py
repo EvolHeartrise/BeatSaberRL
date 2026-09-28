@@ -434,9 +434,10 @@ def parse_args():
                         "ReLU-epilogue GEMMs stay fp32 in every mode. "
                         "Rollout and update always share the mode (their "
                         "forwards stay bitwise at equal row counts). "
-                        "Stamped in the checkpoint arch; "
-                        "default: the --init-from/--resume checkpoint's "
-                        "mode, else 'off'")
+                        "Stamped in the checkpoint arch. Default: 'all' "
+                        "for fresh runs and --init-from warm starts; a "
+                        "--resume keeps its checkpoint's mode (absent = "
+                        "'off')")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -1029,11 +1030,17 @@ def main():
     # every downgrade above so it records the RESOLVED config, not the
     # requested one; the same snapshot is embedded in every checkpoint.
     if args.fp16_accum is None:
-        # a warm-started / resumed policy keeps the accumulate mode it was
-        # trained with (checkpoint arch; absent = "off")
-        _ck = resume_ckpt if resume_ckpt is not None else init_ckpt
-        args.fp16_accum = (_ck.get("arch", {}).get("fp16_accum", "off")
-                           if _ck is not None else "off")
+        # default "all" (2026-09-27, issue #3 A/B: +5.5% e2e, acc at
+        # parity at update 500, r1 ~10x lower). A --resume (trunk
+        # continuation or cooldown leaf) keeps the mode its checkpoint
+        # was trained with (arch; absent = "off", the pre-#3 path) so a
+        # leaf never switches numerics mid-run; fresh runs and
+        # --init-from warm starts take the default.
+        if resume_ckpt is not None:
+            args.fp16_accum = resume_ckpt.get("arch", {}).get(
+                "fp16_accum", "off")
+        else:
+            args.fp16_accum = "all"
     args_snapshot = {k: v for k, v in sorted(vars(args).items())}
     with open(os.path.join(args.run_dir, "args.json"), "w",
               encoding="utf-8") as f:
