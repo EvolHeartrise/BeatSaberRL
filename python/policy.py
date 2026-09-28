@@ -592,7 +592,8 @@ class NotePolicy(nn.Module):
                  value_bins: int = 101, value_vmax: float = 6.0,
                  value_sigma: float = 0.75,
                  trunk_hidden: int | None = None,
-                 z_asinh: float = 8.0, game: str = "standard"):
+                 z_asinh: float = 8.0, game: str = "standard",
+                 fp16_accum: str = "off"):
         super().__init__()
         # game mode the policy plays (SPEC.md §Flux): same network,
         # different obs lane meanings — never cross-loaded
@@ -604,6 +605,9 @@ class NotePolicy(nn.Module):
         # in the arch record. Default = the env/trainer default C = 8.
         if not float(z_asinh) > 0:
             raise ValueError(f"z_asinh must be > 0 (metres), got {z_asinh}")
+        if fp16_accum not in _fl.ACCUM_MODES:
+            raise ValueError(f"fp16_accum must be one of {_fl.ACCUM_MODES}, "
+                             f"got {fp16_accum!r}")
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
@@ -650,7 +654,13 @@ class NotePolicy(nn.Module):
                      "value_bins": int(value_bins),
                      "value_vmax": float(value_vmax),
                      "value_sigma": float(value_sigma),
-                     "game": game}
+                     "game": game,
+                     # GEMM accumulate mode of the fp16 stream (issue #3,
+                     # fp16_linear.fp16_accum): part of the forward the
+                     # policy was TRAINED with, so every fp16 consumer
+                     # (rollout, update, fp16 benches) runs the same one.
+                     # The fp32 record path ignores it. Absent = "off".
+                     "fp16_accum": fp16_accum}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -741,6 +751,8 @@ class NotePolicy(nn.Module):
         # all PPO math stay fp32. Weights stay fp32 masters (state_dict
         # unchanged). Plain attribute, NOT in state_dict.
         self.fp16 = False
+        # accumulate mode of the fp16 stream's GEMMs (arch "fp16_accum")
+        self.fp16_accum = fp16_accum
 
     def _split(self, obs: torch.Tensor):
         sabers = obs.index_select(1, self._saber_idx)                # (B, 50)
@@ -785,7 +797,16 @@ class NotePolicy(nn.Module):
         """Trunk + ONE fused (trunk_dim -> 29K) head GEMM: stacked
         logits (B, 29, K) + the adapool critic's value (B,). The 29
         per-head Linears stay separate modules (state_dict unchanged);
-        their weights are concatenated per call."""
+        their weights are concatenated per call. On the fp16 stream the
+        GEMMs run under the policy's accumulate mode (self.fp16_accum,
+        fp16_linear.fp16_accum); the backward of a grad-mode call
+        inherits it (the Functions latch it at forward time)."""
+        if self.fp16 and obs.is_cuda and self.fp16_accum != "off":
+            with _fl.fp16_accum(self.fp16_accum):
+                return self._forward_stacked(obs)
+        return self._forward_stacked(obs)
+
+    def _forward_stacked(self, obs: torch.Tensor):
         fp16 = self.fp16 and obs.is_cuda
         if fp16 and obs.dtype != torch.float16:
             # the fp16 stream consumes the fp16-ROUNDED obs in BOTH phases
@@ -886,7 +907,7 @@ class NotePolicy(nn.Module):
             # EPOCH (fp16_linear.bump_weights_version — tensor _version
             # is not bumped by fused Adam) instead of rebuilt 128 times
             c = self._refresh_head_cache()
-            out = F.linear(h, c[1], c[2]).float()
+            out = _fl._linear_f(h, c[1], c[2]).float()
         elif fp16:
             # Tier 1.5: the update path reuses the rollout's fused-head
             # cache — no per-head weight/bias cats (or their backward
@@ -1139,6 +1160,8 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         value_bins=arch["value_bins"],
         value_vmax=arch.get("value_vmax", 6.0),
         value_sigma=arch.get("value_sigma", 0.75),
-        z_asinh=float(z_asinh), game=game)
+        z_asinh=float(z_asinh), game=game,
+        # absent (every checkpoint before issue #3) = fp32 accumulate
+        fp16_accum=arch.get("fp16_accum", "off"))
     policy.load_state_dict(ckpt["state_dict"])
     return policy

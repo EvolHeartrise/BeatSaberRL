@@ -87,6 +87,10 @@ def main():
     p.add_argument("--ns", type=int, nargs="+", default=[2048, 16384])
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--fp16-accum", default=None,
+                   choices=("off", "fwd", "all"),
+                   help="GEMM accumulate mode of the fp16 stream (issue "
+                        "#3); default = the checkpoint arch's mode")
     p.add_argument("--fp16", action="store_true",
                    help="production rollout config: fp16 stream via the "
                         "flat replica path")
@@ -102,6 +106,9 @@ def main():
         policy = NotePolicy(n_gears=5)
         print("weights: random init (checkpoint not found)")
     policy = policy.to(device).eval()
+    if args.fp16_accum is not None:
+        policy.fp16_accum = policy.arch["fp16_accum"] = args.fp16_accum
+    print(f"fp16 accumulate: {policy.fp16_accum}")
     if args.fp16:
         policy.fp16 = True
         policy.flatten_fp16()

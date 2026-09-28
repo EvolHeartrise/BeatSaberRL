@@ -68,6 +68,89 @@ _RELU_BWD_DIMS = (64, 128, 256, 512, 192, 384, 768)
 # fallback below.)
 
 
+# --- fp16-ACCUMULATE GEMMs (issue #3, 2026-09-27) --------------------------
+# The RTX 5090's fp16 tensor cores run ~2x the fp32-accumulate peak with
+# an fp16 accumulator (measured 353 vs 222 TFLOPS on 8192^3; the policy's
+# K = 192/768 GEMMs are near memory-bound and gain 1.0-1.5x). The mode is
+# a POLICY property (NotePolicy.fp16_accum, stamped in the checkpoint arch):
+#   "off"  every GEMM accumulates in fp32 (the historical path)
+#   "fwd"  the forward GEMMs that go through torch mm/addmm accumulate
+#          in fp16 (torch's allow_fp16_accumulation -> CUBLAS_COMPUTE_16F)
+#   "all"  "fwd" plus the torch dgrad GEMMs (dx = g @ W)
+# NEVER flipped, in any mode:
+#   - the wgrad GEMMs (dW = dY^T X: GemmEx COMPUTE_32F / the Lt BGRADB
+#     plan) and every bias-grad reduction — they sum over ~475k rows;
+#   - the Lt RELU_AUX_BIAS forward / DRELU dgrad epilogue GEMMs (block
+#     FFN up-projection forward, the chains' mid dgrads): cuBLASLt on
+#     sm_120 has no fast COMPUTE_16F kernel with an aux epilogue (every
+#     heuristic algo measured 26-39 TFLOPS vs 160-170 at 32F);
+#   - the odd-K encoder first layers' _addmm_activation (raw obs inputs;
+#     measured no speed gain from the flag there).
+# Both phases run the same GEMM calls under the same mode, so rollout ==
+# update logp (r1) stays bitwise. The flag is set per call (host-side,
+# read by cuBLAS at launch), so CUDA-graph capture records the mode in
+# force at capture time.
+ACCUM_MODES = ("off", "fwd", "all")
+_ACC_FWD = False
+_ACC_DGRAD = False
+
+
+class fp16_accum:
+    """Context manager: run the enclosed fp16-stream forward (and the
+    backward of every Function it creates — they latch the dgrad mode at
+    forward time) under accumulate mode `mode` (ACCUM_MODES)."""
+
+    def __init__(self, mode):
+        if mode not in ACCUM_MODES:
+            raise ValueError(f"fp16 accumulate mode must be one of "
+                             f"{ACCUM_MODES}, got {mode!r}")
+        self.mode = mode
+
+    def __enter__(self):
+        global _ACC_FWD, _ACC_DGRAD
+        self.prev = (_ACC_FWD, _ACC_DGRAD)
+        _ACC_FWD = self.mode in ("fwd", "all")
+        _ACC_DGRAD = self.mode == "all"
+        return self
+
+    def __exit__(self, *exc):
+        global _ACC_FWD, _ACC_DGRAD
+        _ACC_FWD, _ACC_DGRAD = self.prev
+        return False
+
+
+def _acc16(on, fn, *args):
+    """fn(*args) with torch's cuBLAS fp16-accumulate flag set when `on`."""
+    if not on:
+        return fn(*args)
+    prev = torch._C._get_cublas_allow_fp16_accumulation()
+    torch._C._set_cublas_allow_fp16_accumulation(True)
+    try:
+        return fn(*args)
+    finally:
+        torch._C._set_cublas_allow_fp16_accumulation(prev)
+
+
+def _addmm_f(b, x, wt):
+    """Forward bias GEMM on the fp16 stream (mode-dependent accumulate)."""
+    return _acc16(_ACC_FWD, torch.addmm, b, x, wt)
+
+
+def _mm_f(x, wt):
+    """Forward bias-free GEMM on the fp16 stream."""
+    return _acc16(_ACC_FWD, torch.mm, x, wt)
+
+
+def _linear_f(x, w, b):
+    """F.linear on the fp16 stream (the rollout head)."""
+    return _acc16(_ACC_FWD, F.linear, x, w, b)
+
+
+def _dgrad(g, wh, on):
+    """dx = g @ wh; `on` = the dgrad mode latched at forward time."""
+    return _acc16(on, torch.mm, g, wh)
+
+
 def _lt_epilogue_ok(x2, wh, bh):
     """True when torch will actually route `_addmm_activation` to the
     cublasLt epilogue: row-major contiguous operands with a contiguous
@@ -385,9 +468,10 @@ class _Fp16PackedLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, wh, bh, splits, *params):
         x2 = x.reshape(-1, x.shape[-1])
-        y = torch.addmm(bh, x2, wh.t())
+        y = _addmm_f(bh, x2, wh.t())
         ctx.save_for_backward(x2, wh)
         ctx.splits = splits
+        ctx.acc = _ACC_DGRAD
         return y.view(*x.shape[:-1], wh.shape[0])
 
     @staticmethod
@@ -399,7 +483,7 @@ class _Fp16PackedLinear(torch.autograd.Function):
             g2 = g2.contiguous()
         dx = None
         if ctx.needs_input_grad[0]:
-            dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
+            dx = _dgrad(g2, wh, ctx.acc).view(*gy.shape[:-1], wh.shape[1])
         n = len(splits)
         dws = [None] * n
         dbs = [None] * n
@@ -425,7 +509,7 @@ def fp16_packed_linear(x, wh, bh, ms):
     group)."""
     if not torch.is_grad_enabled():
         x2 = x.reshape(-1, x.shape[-1])
-        return torch.addmm(bh, x2, wh.t()).view(*x.shape[:-1], wh.shape[0])
+        return _addmm_f(bh, x2, wh.t()).view(*x.shape[:-1], wh.shape[0])
     splits = tuple(m.weight.shape[0] for m in ms)
     ws = [m.weight for m in ms]
     bs = [m.bias for m in ms]
@@ -444,8 +528,9 @@ class _Fp16Linear(torch.autograd.Function):
             # leading-dim stride but wgrad's cublasGemmEx contract needs
             # a contiguous x — copy here, once (2 MB at micro 8192).
             x2 = x2.contiguous()
-        y = torch.addmm(bh, x2, wh.t())
+        y = _addmm_f(bh, x2, wh.t())
         ctx.save_for_backward(x2, wh)
+        ctx.acc = _ACC_DGRAD
         return y.view(*x.shape[:-1], w.shape[0])
 
     @staticmethod
@@ -456,7 +541,7 @@ class _Fp16Linear(torch.autograd.Function):
             g2 = g2.contiguous()
         dx = dw = db = None
         if ctx.needs_input_grad[0]:
-            dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
+            dx = _dgrad(g2, wh, ctx.acc).view(*gy.shape[:-1], wh.shape[1])
         dw, db = _wgrad_db(g2, x2, ctx.needs_input_grad[1],
                            ctx.needs_input_grad[2])
         return dx, dw, db
@@ -471,8 +556,9 @@ class _Fp16LinearNoBias(torch.autograd.Function):
     def forward(ctx, x, w, b):
         wh, _ = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
-        y = torch.mm(x2, wh.t())
+        y = _mm_f(x2, wh.t())
         ctx.save_for_backward(x2, wh)
+        ctx.acc = _ACC_DGRAD
         return y.view(*x.shape[:-1], w.shape[0])
 
     @staticmethod
@@ -483,7 +569,7 @@ class _Fp16LinearNoBias(torch.autograd.Function):
             g2 = g2.contiguous()
         dx = dw = None
         if ctx.needs_input_grad[0]:
-            dx = (g2 @ wh).view(*gy.shape[:-1], wh.shape[1])
+            dx = _dgrad(g2, wh, ctx.acc).view(*gy.shape[:-1], wh.shape[1])
         if ctx.needs_input_grad[1]:
             ext = _load()
             dw = (ext.wgrad(g2, x2) if ext is not None
@@ -496,7 +582,7 @@ def fp16_linear_nobias(x, w, b):
     if not torch.is_grad_enabled():
         wh, _ = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
-        return torch.mm(x2, wh.t()).view(*x.shape[:-1], w.shape[0])
+        return _mm_f(x2, wh.t()).view(*x.shape[:-1], w.shape[0])
     return _Fp16LinearNoBias.apply(x, w, b)
 
 
@@ -514,6 +600,7 @@ class _Fp16LinearReLU(torch.autograd.Function):
         x2 = x.reshape(-1, x.shape[-1])
         y = _relu_forward(x2, wh, bh, b)
         ctx.save_for_backward(x2, wh, y)
+        ctx.acc = _ACC_DGRAD
         return y.view(*x.shape[:-1], w.shape[0])
 
     @staticmethod
@@ -533,7 +620,7 @@ class _Fp16LinearReLU(torch.autograd.Function):
             gm = torch.ops.aten.threshold_backward(g2, y, 0)
         dx = dw = db = None
         if ctx.needs_input_grad[0]:
-            dx = (gm @ wh).view(*gy.shape[:-1], wh.shape[1])
+            dx = _dgrad(gm, wh, ctx.acc).view(*gy.shape[:-1], wh.shape[1])
         if ctx.needs_input_grad[1]:
             dw = ext.wgrad(gm, x2)
         if ctx.needs_input_grad[2]:
@@ -593,9 +680,9 @@ def _chain_forward(x2, ms, tail_bias, ext):
             h, mk = r
             masks.append(mk)
         elif tail_bias:
-            h = torch.addmm(bh, h, wh.t())
+            h = _addmm_f(bh, h, wh.t())
         else:
-            h = torch.mm(h, wh.t())
+            h = _mm_f(h, wh.t())
     return h, ins, masks
 
 
@@ -610,6 +697,7 @@ class _Fp16ReluChain(torch.autograd.Function):
         ctx.ms = ms
         ctx.tail_bias = tail_bias
         ctx.lead = x.shape[:-1]
+        ctx.acc = _ACC_DGRAD
         return out.view(*x.shape[:-1], out.shape[-1])
 
     @staticmethod
@@ -636,7 +724,7 @@ class _Fp16ReluChain(torch.autograd.Function):
             if i > 0:
                 g = ext.dgrad_drelu(g, wh, masks[i - 1])
             elif nig[0]:
-                dx = (g @ wh).view(*ctx.lead, wh.shape[1])
+                dx = _dgrad(g, wh, ctx.acc).view(*ctx.lead, wh.shape[1])
         return (dx, None, None, *dws, *dbs)
 
 
@@ -712,7 +800,7 @@ def fp16_linear(x, w, b):
         # sites, not the input casts the ledger blamed)
         wh, bh = _half_params(w, b)
         x2 = x.reshape(-1, x.shape[-1])
-        return torch.addmm(bh, x2, wh.t()).view(*x.shape[:-1], w.shape[0])
+        return _addmm_f(bh, x2, wh.t()).view(*x.shape[:-1], w.shape[0])
     return _Fp16Linear.apply(x, w, b)
 
 
