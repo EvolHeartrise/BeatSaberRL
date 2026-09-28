@@ -29,3 +29,4 @@ python/pool_cache/
 python/sweeps/
 .runpod_api_key
 .claude/worktrees/
+.wrangler/
