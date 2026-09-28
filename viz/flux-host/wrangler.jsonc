@@ -1,0 +1,19 @@
+// flux.flee.systems — the Flux WebXR game behind a Discord login.
+// Deploy: npm run deploy (from viz/flux-host, after `npm run build` in
+// viz/app refreshes viz/replay.html). Secrets: see src/app.js.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flux-game",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "account_id": "b58167de977e01448829f9265b761cd3",
+  // Only the custom domain: no *.workers.dev or preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "flux.flee.systems", "custom_domain": true }],
+  // OAuth redirect URI = PUBLIC_ORIGIN + "/callback" (registered in the
+  // Discord app). For `wrangler dev`, override in .dev.vars.
+  "vars": { "PUBLIC_ORIGIN": "https://flux.flee.systems" },
+  "rules":[{ "type": "Text", "globs": ["**/*.html"], "fallthrough": false }],
+  "observability": { "enabled": true }
+}
