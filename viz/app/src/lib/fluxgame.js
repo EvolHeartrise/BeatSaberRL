@@ -4,9 +4,10 @@
 // Everything that decides an outcome is the env's own Rust (fluxcore.js ->
 // rust/flux-wasm -> rust/src/flux.rs). This file only does what the body
 // does for the agent: it turns the player's tracked palms into judge-tick
-// inputs. The judge runs at `hz` = 30·S (default 120): S judge ticks per
-// 30 Hz env tick, on the same rules — 30 is the env's own clock, bit for
-// bit. (Nothing to do with the body sim's physics substeps: there is no
+// inputs. The game judges at 120 Hz (JUDGE_HZ): S = 4 judge ticks per
+// 30 Hz env tick, on the same rules (the session's `hz` option — a
+// multiple of 30 — exists for the tests, which pin 30 Hz = the env's own
+// clock, bit for bit). (Nothing to do with the body sim's physics substeps: there is no
 // body here.) Poses arrive at the display rate (72-120 Hz); each judge
 // tick's palms are the pose track linearly interpolated to the tick's END
 // time (j + 1)·DT/S, and the swept Flux runs from the previous tick's palms —
@@ -24,9 +25,8 @@ import { DT, arcPairs } from "./replay.js";
 /** Countdown before chart time 0 (s). */
 export const LEAD_IN_S = 3.0;
 
-/** Judge rates the game offers (Hz): 30 = the env's own tick. */
-export const JUDGE_HZ = [120, 60, 30];
-export const DEFAULT_JUDGE_HZ = 120;
+/** The game's judge rate (Hz); the env's own tick is 30. */
+export const JUDGE_HZ = 120;
 
 // ---- scene <-> env frames -----------------------------------------------------
 // The viewer draws world (x, y, z) at scene (x, y, -z). In XR the player's
@@ -70,10 +70,11 @@ export class FluxSession {
   /**
    * `core` = loadFluxCore()'s module; `entry` = {id, name, chart, config}
    * (a chart-pack entry, or a loaded Flux replay's chart). `hz`: the judge
-   * rate, a multiple of 30 (JUDGE_HZ). `onEvent(e, obj)` fires for every
+   * rate, a multiple of 30 (the game: JUDGE_HZ; the tests also run the
+   * env's 30). `onEvent(e, obj)` fires for every
    * judged event as it happens (sound, haptics).
    */
-  constructor(core, entry, { onEvent = null, hz = DEFAULT_JUDGE_HZ } = {}) {
+  constructor(core, entry, { onEvent = null, hz = JUDGE_HZ } = {}) {
     const S = Math.round(hz / 30);
     if (!(S >= 1 && S * 30 === hz)) throw new Error(`judge rate ${hz} Hz: need a multiple of 30`);
     this.entry = entry;
