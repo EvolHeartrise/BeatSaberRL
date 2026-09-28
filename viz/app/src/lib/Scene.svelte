@@ -7,15 +7,17 @@
   import { T, useTask, useThrelte } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
-  import { gfx, pb, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
+  import { gfx, pb, play, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
   import { followClock } from "./sync.js";
   import {
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, reachZ,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
     frameQuatScene, headQuats, noteFrame, poseQ36, qAt, quatNlerp,
     rotQuatScene, smoothQuats, viewerTrackOffset, isFlux,
+    PLANE_Z0, humanHeadAt, humanHeadQuatScene, humanPalmsAt, isHuman,
   } from "./replay.js";
   import Flux from "./Flux.svelte";
+  import FluxPlay from "./FluxPlay.svelte";
   import Body from "./Body.svelte";
   import { RAMP } from "./toon.js";
   import Notes from "./Notes.svelte";
@@ -69,8 +71,19 @@
   const u = $derived(pb.rep ? pb.cur - tickIdx : 0);
   const q36 = $derived(pose.on
     ? poseQ36(pose)
-    : (pb.rep ? qAt(pb.rep, tickIdx, u) : null));
+    : (pb.rep && !isHuman(pb.rep) ? qAt(pb.rep, tickIdx, u) : null));
   const fkAll = $derived(q36 ? bodyFK(q36) : null);
+
+  // ---- a PERSON's Flux run (WebXR game): no body, tracked palms + head -----
+  // Live while playing (play.palms / play.head, this frame's poses), else
+  // interpolated from the recording like any replay.
+  const human = $derived(!pose.on && isHuman(pb.rep));
+  const humanTicks = $derived(human && pb.rep.ticks.length > 0);
+  // (in play mode the live palms show from the menu on, before any run)
+  const humanPalms = $derived(play.on ? play.palms
+    : humanTicks ? humanPalmsAt(pb.rep, tickIdx, u) : null);
+  const humanHead = $derived(play.on ? play.head
+    : humanTicks ? humanHeadAt(pb.rep, tickIdx, u) : null);
 
   // ---- first-person camera ('f') --------------------------------------------
   // FOV and rotation smoothing are bar sliders (pb.fpFov / pb.fpSmooth;
@@ -83,10 +96,18 @@
   // fractional tick nlerps between two filtered ticks — so it stays a
   // pure function of the tick. Pose mode and tau = 0 use the live frame.
   const FP_NEAR = 0.05;
-  const fpTrack = $derived(pb.firstPerson && pb.rep ? headQuats(pb.rep) : null);
+  const fpTrack = $derived(
+    pb.firstPerson && pb.rep && !play.on ? headQuats(pb.rep) : null);
   const fpSmoothed = $derived(
     fpTrack ? smoothQuats(fpTrack, pb.fpSmooth) : null);
   const fpQuat = $derived.by(() => {
+    if (human && humanTicks && !play.on) {
+      if (!fpSmoothed || !(pb.fpSmooth > 0))
+        return humanHeadQuatScene(pb.rep, tickIdx, u);
+      const n = fpSmoothed.length;
+      return quatNlerp(fpSmoothed[Math.min(tickIdx, n - 1)],
+        fpSmoothed[Math.min(tickIdx + 1, n - 1)], u);
+    }
     if (!fkAll) return null;
     if (pose.on || !fpSmoothed || !(pb.fpSmooth > 0))
       return rotQuatScene(fkAll.r[F_HEAD]);
@@ -100,7 +121,11 @@
   // notes can never drift from the sabers. Taking it here (from the FK
   // that is already computed) also keeps the notes and the track scenery
   // in lockstep. viewerTrackOffset holds the strict header gate.
-  const zOff = $derived(viewerTrackOffset(pb.rep, pose.on, fkAll));
+  // A person's run anchors the track to their own (tracked) head, exactly
+  // as the env anchors it to the body's.
+  const zOff = $derived(human || play.on
+    ? (humanHead ? humanHead[2] - PLANE_Z0 : 0)
+    : viewerTrackOffset(pb.rep, pose.on, fkAll));
 
   // self-collision contact markers (replay contact events, flash 0.4 s)
   const contacts = $derived(
@@ -177,6 +202,8 @@
   // per contact, and radius-in-`args` geometry would be recreated — and
   // held undisposed — every frame the flash is alive)
   const contactGeo = new THREE.SphereGeometry(1, 12, 8);
+  // a headset (visor box) for recorded human Flux runs
+  const visorGeo = new THREE.BoxGeometry(0.19, 0.1, 0.11);
 
   // pose-mode reference note: the real note model (neutral gray) at a
   // chosen cell, z = 0, with its bounding-box outline.
@@ -190,13 +217,16 @@
 </script>
 
 <T.PerspectiveCamera makeDefault position={[0, 2.1, 3.4]} fov={55}>
-  <OrbitControls
-    enableDamping
-    dampingFactor={0.12}
-    target={[0, 1.4, -1.5]}
-    maxDistance={25}
-  />
-  {#if (pb.rep || pose.on) && pb.gauges && !pb.firstPerson}
+  <!-- in the headset the XR camera owns the view; orbiting would fight it -->
+  {#if !play.presenting}
+    <OrbitControls
+      enableDamping
+      dampingFactor={0.12}
+      target={[0, 1.4, -1.5]}
+      maxDistance={25}
+    />
+  {/if}
+  {#if fkAll && pb.gauges && !pb.firstPerson}
     <BodyGauges />
   {/if}
 </T.PerspectiveCamera>
@@ -217,8 +247,8 @@
      the active camera; the head sphere is hidden while on (Body
      showHead). Mounted only while on: unmounting hands the default back
      to the orbit camera. -->
-{#if fkAll && pb.firstPerson}
-  {@const hp = fkAll.p[F_HEAD]}
+{#if pb.firstPerson && !play.on && (fkAll || (human && humanHead))}
+  {@const hp = fkAll ? fkAll.p[F_HEAD] : humanHead}
   <T.Group position={[hp[0], hp[1], -hp[2]]} quaternion={fpQuat}>
     <T.PerspectiveCamera makeDefault fov={pb.fpFov} near={FP_NEAR}>
       {#if pb.gauges}
@@ -303,6 +333,23 @@
       </T.LineSegments>
     {/if}
   </T.Group>
+{/if}
+
+{#if play.on}
+  <FluxPlay />
+{/if}
+
+{#if humanPalms}
+  <!-- a person's Flux run: their palms + the Flux beam; recordings also
+       show where their headset was (in the headset you ARE the head) -->
+  <Flux palms={humanPalms} />
+  {#if humanHead && !play.presenting && !pb.firstPerson}
+    <T.Mesh geometry={visorGeo} position={[humanHead[0], humanHead[1], -humanHead[2]]}
+      quaternion={humanTicks && !play.on ? humanHeadQuatScene(pb.rep, tickIdx, u)
+        : [0, 0, 0, 1]}>
+      <T.MeshToonMaterial color="#d7dbe4" gradientMap={RAMP} />
+    </T.Mesh>
+  {/if}
 {/if}
 
 {#if fkAll}

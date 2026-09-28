@@ -30,26 +30,35 @@
 //! Events reuse the standard codes (0 good, 3 wrong hand, 4 miss) so
 //! ComboWalk runs unchanged; a good event's `pre` slot carries the base
 //! contact points (50/100) and `acc` the accuracy points.
+//!
+//! **Shared with the WebXR game.** This file holds the Flux RULES only —
+//! no body, no obs, no pyo3 — and is compiled into both the Python env
+//! crate (`mod flux`, driven by `flux_sim.rs`) and the browser game's
+//! wasm crate (`rust/flux-wasm`, fed by tracked controller palms). One
+//! source, two builds: the game cannot judge a touch differently from
+//! the env the agent trains on. It may only use `crate::Real` and the
+//! other shared files (`geom.rs`, `combo.rs`).
 
-use super::*;
+use crate::geom::*;
+use crate::Real;
 
 /// Palm centre along the hand axis from the wrist (m) — the fist
 /// sphere / hand CoM offset in mjcf/body_v10.xml.
 pub(crate) const PALM_OFF: Real = 0.06;
 /// Circle hitbox radius (m): the ~35 cm visual disc.
-const CIRCLE_R: Real = 0.175;
-const CIRCLE_PTS: Real = 50.0;
-const CIRCLE_ACC_PTS: Real = 10.0;
-const BAR_PTS: Real = 100.0;
-const BAR_ACC_PTS: Real = 15.0;
+pub(crate) const CIRCLE_R: Real = 0.175;
+pub(crate) const CIRCLE_PTS: Real = 50.0;
+pub(crate) const CIRCLE_ACC_PTS: Real = 10.0;
+pub(crate) const BAR_PTS: Real = 100.0;
+pub(crate) const BAR_ACC_PTS: Real = 15.0;
 /// Bar half width (m): 5 cm wide.
-const BAR_HALF_W: Real = 0.025;
+pub(crate) const BAR_HALF_W: Real = 0.025;
 /// Hitbox depth slab relative to the object centre — the standard good
 /// box's convention (1.0 m deep, shifted 0.25 m toward the player).
-const SLAB_LO: Real = GOOD_Z_SHIFT - GOOD_HALF_Z; // -0.75
-const SLAB_HI: Real = GOOD_Z_SHIFT + GOOD_HALF_Z; // +0.25
+pub(crate) const SLAB_LO: Real = GOOD_Z_SHIFT - GOOD_HALF_Z; // -0.75
+pub(crate) const SLAB_HI: Real = GOOD_Z_SHIFT + GOOD_HALF_Z; // +0.25
 /// Live broad-phase reach: arm (0.65) + palm + the slab's near face.
-const FLUX_REACH_PAST_SHOULDER: Real = 0.65 + PALM_OFF - SLAB_LO;
+pub(crate) const FLUX_REACH_PAST_SHOULDER: Real = 0.65 + PALM_OFF - SLAB_LO;
 
 /// set_flux_chart tuple: (hit_time, x, y, kind, color, rot_rad, speed,
 /// length, sweet).
@@ -144,229 +153,155 @@ fn bar_angle_ok(n: &Note, l: [Real; 3], r: [Real; 3]) -> bool {
     dn * dn >= COS_TOL * COS_TOL * ff
 }
 
-impl Core {
-    /// Install a Flux chart (flux sims only). Walls do not exist in
-    /// Flux; any previous ones are cleared.
-    pub(crate) fn set_flux_chart(&mut self, chart: Vec<FluxTuple>) {
-        assert!(self.flux, "set_flux_chart needs a sim built with flux=True");
-        self.set_walls(Vec::new());
-        self.chart = chart
-            .into_iter()
-            .map(|(t, x, y, kind, color, rot, speed, len, sweet)| {
-                assert!(kind == KIND_CIRCLE || kind == KIND_BAR,
-                        "flux chart kinds are 4 (circle) / 5 (bar)");
-                assert!(color <= 1, "colour must be 0 (left) or 1 (right)");
-                assert!(speed > 0.0, "speed must be positive");
-                if kind == KIND_BAR {
-                    assert!(len > 0.0, "bar length must be positive");
-                    assert!((-1.0..=1.0).contains(&sweet),
-                            "sweet-spot offset must be in [-1, 1]");
-                }
-                let is_bar = kind == KIND_BAR;
-                Note {
-                    hit_time: t,
-                    x,
-                    y,
-                    color: if is_bar { 0 } else { color },
-                    sin_a: if is_bar { rot.sin() } else { 0.0 },
-                    cos_a: if is_bar { rot.cos() } else { 1.0 },
-                    speed,
-                    any_dir: true,
-                    kind,
-                    free_pre: false,
-                    free_post: false,
-                    len: if is_bar { len } else { 0.0 },
-                    sweet: if is_bar { sweet } else { 0.0 },
-                }
-            })
-            .collect();
-        self.finish_chart_install();
+/// One judgment event: (chart index, code, points, base, accuracy) —
+/// code 0 good, 2 bad "angle", 3 wrong hand, 4 miss (the standard codes).
+pub(crate) type Event = (u32, u8, f32, f32, f32);
+
+/// A bar's rotation as (sin, cos). The f64 build — the env reference AND
+/// the WebXR game's wasm — uses geom::det_sin_cos, so the two install
+/// bit-identical bars (the platform libms differ in the last bit). The f32
+/// build (the CUDA kernel's precision twin, no game counterpart) keeps
+/// the f32 libm.
+#[cfg(not(feature = "f32"))]
+fn bar_sin_cos(rot: Real) -> (Real, Real) {
+    det_sin_cos(rot)
+}
+#[cfg(feature = "f32")]
+fn bar_sin_cos(rot: Real) -> (Real, Real) {
+    (rot.sin(), rot.cos())
+}
+
+/// Chart tuple -> the sim's object record, with the install-time checks
+/// (the env panics on an Err, the wasm game reports it).
+pub(crate) fn flux_note(t: FluxTuple) -> Result<Note, &'static str> {
+    let (hit_time, x, y, kind, color, rot, speed, len, sweet) = t;
+    if kind != KIND_CIRCLE && kind != KIND_BAR {
+        return Err("flux chart kinds are 4 (circle) / 5 (bar)");
     }
-
-    /// The Flux object pass of `step_inner` (replaces the saber cut
-    /// loop): miss boundary, circle touches, bar crossings. prev_* are
-    /// last tick's wrist/hand-axis caches.
-    pub(crate) fn flux_judge(
-        &mut self,
-        reward: &mut Real,
-        prev_pos: &[[Real; 3]; 2],
-        prev_dir: &[[Real; 3]; 2],
-    ) {
-        let p0 = [palm(prev_pos[0], prev_dir[0]), palm(prev_pos[1], prev_dir[1])];
-        let p1 = [
-            palm(self.body.wrist[0], self.body.blade[0]),
-            palm(self.body.wrist[1], self.body.blade[1]),
-        ];
-        for s in 0..2 {
-            for k in 0..3 {
-                self.palm_vel[s][k] = (p1[s][k] - p0[s][k]) / DT;
-            }
+    if color > 1 {
+        return Err("colour must be 0 (left) or 1 (right)");
+    }
+    // written so a NaN fails too (as the env's assert!(speed > 0.0) did)
+    if !(speed > 0.0) {
+        return Err("speed must be positive");
+    }
+    let is_bar = kind == KIND_BAR;
+    let (sin_r, cos_r) = if is_bar { bar_sin_cos(rot) } else { (0.0, 1.0) };
+    if is_bar {
+        if !(len > 0.0) {
+            return Err("bar length must be positive");
         }
-        // the swept Flux: quad (L0 -> R0) to (L1 -> R1), triangulated
-        // like the saber sweep
-        let tris = [[p0[0], p0[1], p1[1]], [p0[0], p1[1], p1[0]]];
+        if !(-1.0..=1.0).contains(&sweet) {
+            return Err("sweet-spot offset must be in [-1, 1]");
+        }
+    }
+    Ok(Note {
+        hit_time,
+        x,
+        y,
+        color: if is_bar { 0 } else { color },
+        sin_a: sin_r,
+        cos_a: cos_r,
+        speed,
+        any_dir: true,
+        kind,
+        free_pre: false,
+        free_post: false,
+        len: if is_bar { len } else { 0.0 },
+        sweet: if is_bar { sweet } else { 0.0 },
+    })
+}
 
-        let reach_z = self.body.shoulder_z[0].max(self.body.shoulder_z[1])
-            + FLUX_REACH_PAST_SHOULDER;
-        let head_z = self.body.head[2];
-        let head = self.body.head;
-        let z_off = head_z - PLANE_Z0;
+/// Live broad-phase reach gate from the forward-most shoulder's z.
+pub(crate) fn reach_z(shoulder_z_max: Real) -> Real {
+    shoulder_z_max + FLUX_REACH_PAST_SHOULDER
+}
 
-        for i in self.first_pending..self.chart.len() {
-            if self.status[i] != 0 {
-                continue;
-            }
-            let n = &self.chart[i];
-            if (n.hit_time - self.time) * self.min_speed + z_off > reach_z {
-                break; // sorted-chart bound, as in the saber loop
-            }
-            let z = (n.hit_time - self.time) * n.speed + z_off;
-            if z < head_z {
-                self.status[i] = 3;
-                self.misses += 1;
-                *reward += REWARD_MISS;
-                self.events_buf.push((i as u32, 4, 0.0, 0.0, 0.0));
-                if n.kind == KIND_CIRCLE {
-                    let h = n.color as usize;
-                    self.prev_idx[h] = i as u32;
-                    self.prev_valid[h] = true;
-                }
-                continue;
-            }
-            if z > reach_z {
-                continue;
-            }
-            let center = [n.x, n.y, z];
+/// The Flux object pass of one tick (replaces the saber cut loop): miss
+/// boundary, circle touches, bar crossings. `p0` / `p1` are last tick's
+/// and this tick's palms [left, right] (world), `head` this tick's head
+/// position, `time` this tick's END time, `reach_z` the live reach
+/// gate. Resolves objects in `status` (1 good, 2 bad, 3 missed), adds
+/// the reward terms to `reward` in chart order and appends one Event per
+/// resolution; the caller keeps its own tallies from the events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn judge(
+    chart: &[Note],
+    status: &mut [u8],
+    first_pending: usize,
+    min_speed: Real,
+    time: Real,
+    head: [Real; 3],
+    reach_z: Real,
+    p0: &[[Real; 3]; 2],
+    p1: &[[Real; 3]; 2],
+    reward: &mut Real,
+    events: &mut Vec<Event>,
+) {
+    // the swept Flux: quad (L0 -> R0) to (L1 -> R1), triangulated
+    // like the saber sweep
+    let tris = [[p0[0], p0[1], p1[1]], [p0[0], p1[1], p1[0]]];
 
-            if n.kind == KIND_CIRCLE {
-                let m = n.color as usize;
-                if let Some(d) = circle_touch(p0[m], p1[m], center) {
-                    let acc = round_pts(
-                        CIRCLE_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
-                    let pts = CIRCLE_PTS + acc;
-                    self.status[i] = 1;
-                    self.good_cuts += 1;
-                    *reward += pts / SCORE_MAX;
-                    self.score += pts;
-                    self.score_pre += CIRCLE_PTS;
-                    self.score_acc += acc;
-                    self.events_buf.push((i as u32, 0, pts as f32,
-                                          CIRCLE_PTS as f32, acc as f32));
-                    self.prev_idx[m] = i as u32;
-                    self.prev_valid[m] = true;
-                } else if circle_touch(p0[1 - m], p1[1 - m], center).is_some() {
-                    self.status[i] = 2;
-                    self.bad_cuts += 1;
+    let head_z = head[2];
+    let z_off = head_z - PLANE_Z0;
+
+    for i in first_pending..chart.len() {
+        if status[i] != 0 {
+            continue;
+        }
+        let n = &chart[i];
+        if (n.hit_time - time) * min_speed + z_off > reach_z {
+            break; // sorted-chart bound, as in the saber loop
+        }
+        let z = (n.hit_time - time) * n.speed + z_off;
+        if z < head_z {
+            status[i] = 3;
+            *reward += REWARD_MISS;
+            events.push((i as u32, 4, 0.0, 0.0, 0.0));
+            continue;
+        }
+        if z > reach_z {
+            continue;
+        }
+        let center = [n.x, n.y, z];
+
+        if n.kind == KIND_CIRCLE {
+            let m = n.color as usize;
+            if let Some(d) = circle_touch(p0[m], p1[m], center) {
+                let acc = round_pts(
+                    CIRCLE_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
+                let pts = CIRCLE_PTS + acc;
+                status[i] = 1;
+                *reward += pts / SCORE_MAX;
+                events.push((i as u32, 0, pts as f32, CIRCLE_PTS as f32, acc as f32));
+            } else if circle_touch(p0[1 - m], p1[1 - m], center).is_some() {
+                status[i] = 2;
+                *reward += REWARD_BAD;
+                events.push((i as u32, 3, 0.0, 0.0, 0.0));
+            }
+        } else {
+            // bar: z-roll frame (no look-at), local y' = the axis u
+            let frame = note_frame(center, n.cos_a, n.sin_a, 0.0, head);
+            let box_c = [center[0], center[1], center[2] + GOOD_Z_SHIFT];
+            let h = [BAR_HALF_W, 0.5 * n.len, GOOD_HALF_Z];
+            if sweep_hits_box(&tris, box_c, h, &frame) {
+                if !bar_angle_ok(n, p1[0], p1[1]) {
+                    // crossed, but more than 60 deg off square: a bad
+                    // cut (event 2 "angle", like an off-direction note)
+                    status[i] = 2;
                     *reward += REWARD_BAD;
-                    self.events_buf.push((i as u32, 3, 0.0, 0.0, 0.0));
-                    self.prev_idx[m] = i as u32;
-                    self.prev_valid[m] = true;
+                    events.push((i as u32, 2, 0.0, 0.0, 0.0));
+                    continue;
                 }
-            } else {
-                // bar: z-roll frame (no look-at), local y' = the axis u
-                let frame = note_frame(center, n.cos_a, n.sin_a, 0.0, head);
-                let box_c = [center[0], center[1], center[2] + GOOD_Z_SHIFT];
-                let h = [BAR_HALF_W, 0.5 * n.len, GOOD_HALF_Z];
-                if sweep_hits_box(&tris, box_c, h, &frame) {
-                    if !bar_angle_ok(n, p1[0], p1[1]) {
-                        // crossed, but more than 60 deg off square: a bad
-                        // cut (event 2 "angle", like an off-direction note)
-                        self.status[i] = 2;
-                        self.bad_cuts += 1;
-                        *reward += REWARD_BAD;
-                        self.events_buf.push((i as u32, 2, 0.0, 0.0, 0.0));
-                        continue;
-                    }
-                    let u = [-n.sin_a, n.cos_a];
-                    let d = bar_sweet_dist(n, u, p1[0], p1[1]);
-                    let acc = round_pts(
-                        BAR_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
-                    let pts = BAR_PTS + acc;
-                    self.status[i] = 1;
-                    self.good_cuts += 1;
-                    *reward += pts / SCORE_MAX;
-                    self.score += pts;
-                    self.score_pre += BAR_PTS;
-                    self.score_acc += acc;
-                    self.events_buf.push((i as u32, 0, pts as f32,
-                                          BAR_PTS as f32, acc as f32));
-                }
+                let u = [-n.sin_a, n.cos_a];
+                let d = bar_sweet_dist(n, u, p1[0], p1[1]);
+                let acc = round_pts(
+                    BAR_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
+                let pts = BAR_PTS + acc;
+                status[i] = 1;
+                *reward += pts / SCORE_MAX;
+                events.push((i as u32, 0, pts as f32, BAR_PTS as f32, acc as f32));
             }
-        }
-    }
-
-    /// Flux hand blocks (HAND_FEAT lanes each): palm x/y head-relative,
-    /// palm z world, palm velocity /V_NORM, hand axis; lanes 9–10 zero
-    /// (the standard swing meter / follow-through lanes have no Flux
-    /// meaning).
-    pub(crate) fn write_flux_hands(&self, obs: &mut [f32]) {
-        for (s, base) in [(0usize, OFF_HAND_L), (1usize, OFF_HAND_R)] {
-            let b = &self.body;
-            let p = palm(b.wrist[s], b.blade[s]);
-            obs[base] = ((p[0] - b.head[0]) / X_NORM) as f32;
-            obs[base + 1] = ((p[1] - b.head[1]) / Y_NORM) as f32;
-            obs[base + 2] = p[2] as f32;
-            for k in 0..3 {
-                obs[base + 3 + k] = (self.palm_vel[s][k] / V_NORM) as f32;
-                obs[base + 6 + k] = b.blade[s][k] as f32;
-            }
-        }
-    }
-
-    /// Flux entity window: the standard nearest-first selection over
-    /// pending objects (no walls in Flux), Flux lane meanings (SPEC.md
-    /// §Flux obs): 0–3 as standard, 4/5 circle colour, 6/7 bar axis u,
-    /// 8 is_circle, 9 is_bar, 10 bar length (m), 11 sweet offset,
-    /// 12/13 sweet-spot head-relative x/y; 14–17 zero.
-    pub(crate) fn write_flux_entities(&self, obs: &mut [f32]) {
-        let z_off = self.body.head[2] - PLANE_Z0;
-        let z_lo = self.body.head[2];
-        let head = &self.body.head;
-        let mut sel = [(Real::INFINITY, false, 0usize); N_NOTE_SLOTS];
-        let mut n_sel = 0usize;
-        for i in self.first_pending..self.chart.len() {
-            if self.status[i] != 0 {
-                continue;
-            }
-            let n = &self.chart[i];
-            let dz_lb = (n.hit_time - self.time) * self.min_speed - PLANE_Z0;
-            if n_sel == N_NOTE_SLOTS && dz_lb > 0.0
-                && dz_lb * dz_lb >= sel[N_NOTE_SLOTS - 1].0
-            {
-                break;
-            }
-            let dz = (n.hit_time - self.time) * n.speed - PLANE_Z0;
-            if dz < 0.0 {
-                continue;
-            }
-            let dx = n.x - head[0];
-            let dy = n.y - head[1];
-            slot_insert(&mut sel, &mut n_sel, (dx * dx + dy * dy + dz * dz, false, i));
-        }
-        for slot in 0..n_sel {
-            let (_, _, idx) = sel[slot];
-            let base = OFF_NOTES + slot * NOTE_FEAT;
-            let n = &self.chart[idx];
-            let zu = (n.hit_time - self.time) * n.speed + z_off;
-            obs[base] = ((n.x - head[0]) / X_NORM) as f32;
-            obs[base + 1] = ((n.y - head[1]) / Y_NORM) as f32;
-            obs[base + 2] = z_lane(zu, z_lo) as f32;
-            obs[base + 3] = (-n.speed / Z_SCALE) as f32;
-            if n.kind == KIND_CIRCLE {
-                obs[base + 4 + n.color as usize] = 1.0;
-                obs[base + 8] = 1.0;
-            } else {
-                let (ux, uy) = (-n.sin_a, n.cos_a);
-                let s_sweet = n.sweet * 0.5 * n.len;
-                obs[base + 6] = ux as f32;
-                obs[base + 7] = uy as f32;
-                obs[base + 9] = 1.0;
-                obs[base + 10] = n.len as f32;
-                obs[base + 11] = n.sweet as f32;
-                obs[base + 12] = ((n.x + s_sweet * ux - head[0]) / X_NORM) as f32;
-                obs[base + 13] = ((n.y + s_sweet * uy - head[1]) / Y_NORM) as f32;
-            }
-            obs[OFF_NOTE_MASK + slot] = 1.0;
         }
     }
 }
@@ -512,5 +447,58 @@ mod tests {
         assert!(sweep_hits_box(&[[la, ra, ra], [la, ra, la]], bc, h, &frame));
         let (lb, rb) = ([-0.3, 1.75, -0.2], [0.3, 1.75, -0.2]);
         assert!(!sweep_hits_box(&[[lb, rb, rb], [lb, rb, lb]], bc, h, &frame));
+    }
+
+    /// ulp distance between two finite f64s of the same sign region
+    fn ulps(a: f64, b: f64) -> u64 {
+        let key = |x: f64| {
+            let b = x.to_bits() as i64;
+            if b < 0 { i64::MIN - b } else { b }
+        };
+        (key(a) - key(b)).unsigned_abs()
+    }
+
+    #[test]
+    fn det_sin_cos_is_within_one_ulp_of_libm_everywhere_a_chart_goes() {
+        // dense sweep over [-4π, 4π] (bars live in [0, 2π)) plus the
+        // octant boundaries, where the range reduction switches branches
+        let mut worst = 0;
+        let mut pts: Vec<f64> = (-400_000..=400_000)
+            .map(|k| k as f64 * (4.0 * std::f64::consts::PI / 400_000.0))
+            .collect();
+        for k in -16..=16 {
+            let b = k as f64 * std::f64::consts::FRAC_PI_4;
+            pts.extend([b, f64::from_bits(b.to_bits() + 1), f64::from_bits(b.to_bits().wrapping_sub(1))]);
+        }
+        for x in pts {
+            let (s, c) = det_sin_cos(x);
+            // near a zero of sin/cos the ulp scale collapses: compare in
+            // absolute terms there
+            for (got, want) in [(s, x.sin()), (c, x.cos())] {
+                if want.abs() < 1e-8 {
+                    assert!((got - want).abs() < 1e-16, "{x}: {got} vs {want}");
+                } else {
+                    worst = worst.max(ulps(got, want));
+                }
+            }
+        }
+        assert!(worst <= 1, "worst {worst} ulp");
+        assert_eq!(det_sin_cos(0.0), (0.0, 1.0));
+        assert!(det_sin_cos(f64::NAN).0.is_nan() && det_sin_cos(f64::INFINITY).1.is_nan());
+        // huge angles fold by the exact remainder
+        let (s, c) = det_sin_cos(1.0e7);
+        assert!((s * s + c * c - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn bars_install_with_the_deterministic_trig() {
+        for rot in [0.3, 1.0, 2.5, 4.0, 5.9] {
+            let n = flux_note((1.0, 0.0, 1.4, KIND_BAR, 0, rot, 10.0, 0.5, 0.0)).unwrap();
+            let (s, c) = det_sin_cos(rot);
+            assert_eq!((n.sin_a.to_bits(), n.cos_a.to_bits()), (s.to_bits(), c.to_bits()));
+        }
+        // circles carry the identity rotation
+        let n = flux_note((1.0, 0.0, 1.4, KIND_CIRCLE, 1, 2.0, 10.0, 0.0, 0.0)).unwrap();
+        assert_eq!((n.sin_a, n.cos_a), (0.0, 1.0));
     }
 }

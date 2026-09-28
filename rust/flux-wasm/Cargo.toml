@@ -1,0 +1,31 @@
+# The Flux WebXR game's judge, built to wasm32 for the browser
+# (viz/app, `npm run wasm`). It compiles the env crate's OWN rule files —
+# ../src/geom.rs, ../src/flux.rs, ../src/combo.rs, via #[path] — so the
+# game and the env the agent trains on judge every touch with the same
+# source. No dependencies: the JS side talks to a plain C ABI.
+[package]
+name = "beat-arena-flux-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "flux_wasm"
+path = "src/lib.rs"
+# cdylib = the .wasm; rlib so `cargo test` runs the shared rule tests and
+# this crate's game-loop tests natively
+crate-type = ["cdylib", "rlib"]
+
+# standalone: never a member of a parent workspace
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+# the shared files have `feature = "f32"` branches for the env's f32 build;
+# this crate is f64 only and never enables it
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("f32"))'] }

@@ -15,7 +15,7 @@
     aftermaths, cutPlaneLocal, frameQuatScene, hitboxRot, landedPost,
     noteCenter,
     noteFrame, noteLam, noteRot, pendingNotes, pendingWalls,
-    BAR_W, CIRCLE_R, FLUX_DEPTH, KIND_CIRCLE, isFluxKind,
+    BAR_W, CIRCLE_R, FLUX_DEPTH, KIND_CIRCLE, isFluxKind, outcomeTime,
   } from "./replay.js";
   // the REAL object models + colours, as ScoreSaber's replay viewer draws
   // them (the canonical visual reference — see models.js)
@@ -435,7 +435,7 @@
   {#if isFluxKind(n)}
     <!-- Flux: a touched circle/bar bursts outward and fades (no cut plane
          to slice by); a bad touch or a miss leaves its outline + mark -->
-    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS) + oz}
+    {@const zEv = Math.max((n.t - outcomeTime(o)) * n.speed, -Z_MISS) + oz}
     {@const good = o.kind === "good"}
     {@const col = good ? "#ffffff" : o.kind === "bad" ? BAD_COL : MISS_COL}
     {#if n.kind === KIND_CIRCLE}
@@ -468,7 +468,7 @@
   {:else if o.kind === "bomb"}
     <!-- bomb hit: red flash at the bomb, X mark on the indicator (the
          reference viewer shows the X for bombs and bad cuts alike) -->
-    {@const zHit = (n.t - (o.tick + 1) * DT) * n.speed + oz}
+    {@const zHit = (n.t - outcomeTime(o)) * n.speed + oz}
     {@const ind = indicator(cx, cy, i, age, true, oz)}
     <T.Mesh geometry={flashGeo} position={[cx, cy, -zHit]}
       scale={BOMB_RADIUS + age * 1.2}>
@@ -481,7 +481,7 @@
       position={ind.pos} opacity={ind.alpha} />
   {:else if o.kind === "good" && n.kind === KIND_CHAIN_LINK}
     <!-- link good cut: quick shrink/pop of the slab -->
-    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
+    {@const zCut = Math.max((n.t - outcomeTime(o)) * n.speed, -0.4) + oz}
     {@const sc = Math.max(0.02, 1 - age * 2.4)}
     <T.Mesh geometry={linkGeo} position={[cx, cy, -zCut]}
       rotation={[0, 0, noteRot(n)]} scale={[sc, sc, sc]}>
@@ -499,7 +499,7 @@
          pieces separate along the plane normal, get carried along the
          sweep, tumble about the blade axis, fade. Off-center cuts
          produce honestly unequal chunks. -->
-    {@const zCut = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -0.4) + oz}
+    {@const zCut = Math.max((n.t - outcomeTime(o)) * n.speed, -0.4) + oz}
     {@const sp = splitFor(i)}
     {#each sp.sides as side}
       {#if age < DEBRIS_S}
@@ -546,7 +546,7 @@
          boundary is base z < PLANE_Z0), then the frozen offset carries
          the outline onto the live miss plane at world z = head_z. -->
     {@const col = o.kind === "bad" ? BAD_COL : MISS_COL}
-    {@const zEv = Math.max((n.t - (o.tick + 1) * DT) * n.speed, -Z_MISS) + oz}
+    {@const zEv = Math.max((n.t - outcomeTime(o)) * n.speed, -Z_MISS) + oz}
     <T.LineSegments geometry={failGeo} position={[cx, cy, -zEv]}
       rotation={[0, 0, noteRot(n)]}>
       <T.LineBasicMaterial color={col} transparent opacity={alpha} />

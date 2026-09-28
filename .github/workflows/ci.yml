@@ -1,0 +1,117 @@
+# CPU CI: the Rust env + the Flux wasm judge, the Python suite (CUDA
+# tests skip), and the viewer / Flux WebXR game (node tests + headless
+# Chrome, incl. a real WebXR session on an emulated Quest). The GPU paths
+# (csrc/, the CUDA parity tests) stay pod-side.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (env crate + flux-wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust
+            rust/flux-wasm
+      - name: env crate tests
+        working-directory: rust
+        run: cargo test --release
+      - name: flux-wasm tests (the shared rule files + the game loop)
+        working-directory: rust/flux-wasm
+        run: cargo test --release
+      - name: flux-wasm builds for the browser
+        working-directory: rust/flux-wasm
+        run: cargo build --release --target wasm32-unknown-unknown
+
+  python:
+    name: python (env suite + live env<->wasm parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust
+            rust32
+            rust/flux-wasm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: venv + deps
+        run: |
+          python -m venv python/.venv
+          python/.venv/bin/pip install -q --upgrade pip
+          python/.venv/bin/pip install -q numpy gymnasium pytest maturin scipy
+          python/.venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+      - name: build the env extensions (f64 + f32)
+        run: |
+          (cd rust && VIRTUAL_ENV=$PWD/../python/.venv ../python/.venv/bin/maturin develop --release)
+          (cd rust32 && VIRTUAL_ENV=$PWD/../python/.venv ../python/.venv/bin/maturin develop --release)
+      - name: pytest
+        working-directory: python
+        run: .venv/bin/python -m pytest -q tests/
+
+  viz:
+    name: viewer + Flux WebXR game
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/flux-wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: viz/app/package-lock.json
+      - name: npm ci
+        working-directory: viz/app
+        run: npm ci
+      - name: node tests (incl. the committed env<->wasm parity fixture)
+        working-directory: viz/app
+        run: npm test
+      - name: build
+        working-directory: viz/app
+        run: npm run build
+      - name: headless browser (replay viewer, Flux replay, Flux game, WebXR session)
+        working-directory: viz/app
+        env:
+          PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
+        run: |
+          node test/browser.test.js
+          node test/flux-browser.mjs
+          node test/flux-play-browser.mjs
+          node test/flux-xr-browser.mjs
+      - name: screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: viz-screenshots
+          path: viz/app/test/out/
+          if-no-files-found: ignore

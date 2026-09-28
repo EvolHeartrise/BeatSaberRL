@@ -97,6 +97,26 @@ Flux crosses them. Charts come from a procedural generator
 checkpoints). The standard game is bit-identical with Flux compiled
 in.
 
+**Flux WebXR game (2026-09-27 — SPEC.md §Flux WebXR game):** play Flux
+yourself in a headset, judged by the env's own code. The Flux rules
+live in three body-free Rust files (`rust/src/geom.rs`, `flux.rs`,
+`combo.rs`) that compile into the env crate AND into `rust/flux-wasm`
+(wasm32), which the viewer app runs, so the game and the env cannot
+drift apart. The game matches the f64 Rust reference env bit for bit;
+the f32 CUDA training kernel is tied to that reference by its own parity
+tests. A parity test replays real env episodes through the wasm build
+and requires the same installed chart and identical events, tick for
+tick. Charts come from the training generator (plus any open agent
+replay's chart, so you can race the agent). Runs save as replays the
+viewer plays back.
+
+```bash
+rustup target add wasm32-unknown-unknown   # once
+cd viz/app && npm ci && npm run xr         # HTTPS on the LAN
+# on the headset: https://<laptop-ip>:5173 → "🥽 play Flux" → "enter VR"
+# (accept the self-signed certificate once); trigger starts, grip = next chart
+```
+
 ## Quick start
 
 Uses its own venv at `python/.venv` (gitignored). One-time setup
