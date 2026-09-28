@@ -422,6 +422,21 @@ def parse_args():
                         "(the pre-gate default); 'off' = full fp32 "
                         "(record-attempt fallback). Checkpoints stay "
                         "fp32 in every mode. Forced off on CPU devices")
+    p.add_argument("--fp16-accum", choices=["off", "fwd", "all"],
+                   default=None,
+                   help="GEMM accumulate mode of the fp16 stream (issue "
+                        "#3, fp16_linear.fp16_accum): 'off' = fp32 "
+                        "accumulate everywhere (the historical path); "
+                        "'fwd' = the torch forward GEMMs accumulate in "
+                        "fp16 (CUBLAS_COMPUTE_16F, ~2x tensor-core peak "
+                        "on the RTX 5090); 'all' = 'fwd' + the dgrad "
+                        "GEMMs. The wgrad / bias-grad reductions and the "
+                        "ReLU-epilogue GEMMs stay fp32 in every mode. "
+                        "Rollout and update always share the mode (their "
+                        "forwards stay bitwise at equal row counts). "
+                        "Stamped in the checkpoint arch; "
+                        "default: the --init-from/--resume checkpoint's "
+                        "mode, else 'off'")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -1013,6 +1028,12 @@ def main():
     # nothing recorded what any run was launched with). Written AFTER
     # every downgrade above so it records the RESOLVED config, not the
     # requested one; the same snapshot is embedded in every checkpoint.
+    if args.fp16_accum is None:
+        # a warm-started / resumed policy keeps the accumulate mode it was
+        # trained with (checkpoint arch; absent = "off")
+        _ck = resume_ckpt if resume_ckpt is not None else init_ckpt
+        args.fp16_accum = (_ck.get("arch", {}).get("fp16_accum", "off")
+                           if _ck is not None else "off")
     args_snapshot = {k: v for k, v in sorted(vars(args).items())}
     with open(os.path.join(args.run_dir, "args.json"), "w",
               encoding="utf-8") as f:
@@ -1196,6 +1217,10 @@ def main():
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma,
                             z_asinh=args.z_asinh, game=args.game)
+    # accumulate mode: the CLI (resolved above — inherited from the
+    # checkpoint when not given) wins, and the arch records it
+    policy.fp16_accum = args.fp16_accum
+    policy.arch["fp16_accum"] = args.fp16_accum
     print(f"HL-Gauss critic: {policy.value_bins} bins over "
           f"[-{policy.arch['value_vmax']:g}, {policy.arch['value_vmax']:g}] "
           f"(normalized return), sigma {policy.value_sigma_bins:g} bins",
@@ -1216,8 +1241,8 @@ def main():
     if args.fp16 != "off":
         print(f"--fp16 {args.fp16}: fp16-storage activations, fp32 "
               f"masters, dynamic loss scale (init {args.fp16_scale:.0f}, "
-              f"halve/overflow-mb, x2/{FP16_GROWTH_INTERVAL:.0f} clean)",
-              flush=True)
+              f"halve/overflow-mb, x2/{FP16_GROWTH_INTERVAL:.0f} clean), "
+              f"GEMM accumulate: {args.fp16_accum}", flush=True)
         # flat fp32 masters + flat fp16 replica mirror (2026-07-28):
         # every replica refresh (once per update for the graphed
         # rollout, once per minibatch after opt.step) becomes ONE cast
