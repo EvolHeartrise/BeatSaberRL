@@ -28,6 +28,9 @@ let nTicks = 0, nEvents = 0;
 const seen = new Set();
 for (const ep of fx.episodes) {
   const g = core.newGame(ep.chart, ep.max_steps);
+  // the installed rotation record: bit for bit the env's (the platform
+  // libms differ in the last bit — both builds use geom::det_sin_cos)
+  assert.deepEqual(g.trig(), ep.trig, `${ep.name}: installed sin/cos`);
   ep.ticks.forEach((tk, k) => {
     const { done, events } = g.stepFlat(tk.in);
     const got = events.map((e) => [e.i, e.code, e.pts, e.pre, e.acc]);
@@ -50,6 +53,20 @@ for (const ep of fx.episodes) {
   assert.equal(st.filter((v) => v === 0).length, 0, `${ep.name}: all resolved`);
   g.free();
 }
+// the trig probe: hundreds of bar rotations — the wasm install's sin/cos
+// must be the env's bit for bit (the platform libms are not)
+{
+  const { rot, trig } = fx.trig_probe;
+  const g = core.newGame(rot.map((r, i) => ({ t: 1 + 0.01 * i, x: 0, y: 1.4,
+    kind: 5, color: 0, rot: r, speed: 10, len: 0.5, sweet: 0 })));
+  const got = g.trig();
+  rot.forEach((r, i) => {
+    assert.ok(Object.is(got[i][0], trig[i][0]) && Object.is(got[i][1], trig[i][1]),
+      `bar rot ${r}: wasm sin/cos ${got[i]} != env ${trig[i]}`);
+  });
+  g.free();
+}
+
 // the fixture must exercise every Flux outcome
 for (const code of [0, 2, 3, 4]) assert.ok(seen.has(code), `event code ${code}`);
 console.log(`flux-parity: ${fx.episodes.length} episodes, ${nTicks} ticks, ` +

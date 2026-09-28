@@ -82,6 +82,8 @@ pub struct FluxGame {
     walk: ComboWalk,
     stats: Stats,
     ev_out: Vec<f64>,
+    /// installed (sin_a, cos_a) per object, flat — the parity record
+    trig: Vec<f64>,
 }
 
 /// Max objects score: 60 per circle, 115 per bar, before multipliers.
@@ -136,6 +138,7 @@ impl FluxGame {
             walk: ComboWalk::new(n),
             stats,
             ev_out: Vec::new(),
+            trig: notes.iter().flat_map(|n| [n.sin_a, n.cos_a]).collect(),
             chart: notes,
         })
     }
@@ -299,6 +302,9 @@ pub unsafe extern "C" fn fg_free(g: *mut FluxGame) {
 /// `g` from fg_new; `input` points at STEP_F readable f64s.
 #[no_mangle]
 pub unsafe extern "C" fn fg_step(g: *mut FluxGame, input: *const f64) -> u32 {
+    if g.is_null() || input.is_null() {
+        return 1; // no game: nothing left to play
+    }
     let g = &mut *g;
     let v = std::slice::from_raw_parts(input, STEP_F);
     let p0 = [[v[0], v[1], v[2]], [v[3], v[4], v[5]]];
@@ -312,6 +318,9 @@ pub unsafe extern "C" fn fg_step(g: *mut FluxGame, input: *const f64) -> u32 {
 /// `g` from fg_new.
 #[no_mangle]
 pub unsafe extern "C" fn fg_events_ptr(g: *const FluxGame) -> *const f64 {
+    if g.is_null() {
+        return std::ptr::null();
+    }
     (*g).ev_out.as_ptr()
 }
 
@@ -319,6 +328,9 @@ pub unsafe extern "C" fn fg_events_ptr(g: *const FluxGame) -> *const f64 {
 /// `g` from fg_new.
 #[no_mangle]
 pub unsafe extern "C" fn fg_events_len(g: *const FluxGame) -> u32 {
+    if g.is_null() {
+        return 0;
+    }
     (*g).events.len() as u32
 }
 
@@ -326,6 +338,9 @@ pub unsafe extern "C" fn fg_events_len(g: *const FluxGame) -> u32 {
 /// `g` from fg_new.
 #[no_mangle]
 pub unsafe extern "C" fn fg_stats_ptr(g: *const FluxGame) -> *const f64 {
+    if g.is_null() {
+        return std::ptr::null();
+    }
     &(*g).stats as *const Stats as *const f64
 }
 
@@ -340,7 +355,23 @@ pub extern "C" fn fg_stats_len() -> u32 {
 /// `g` from fg_new.
 #[no_mangle]
 pub unsafe extern "C" fn fg_status_ptr(g: *const FluxGame) -> *const u8 {
+    if g.is_null() {
+        return std::ptr::null();
+    }
     (*g).status.as_ptr()
+}
+
+/// The installed rotation record: (sin_a, cos_a) per object, 2 floats
+/// each (the env's `RawBeatSim.chart_trig()` twin).
+///
+/// # Safety
+/// `g` from fg_new (or null).
+#[no_mangle]
+pub unsafe extern "C" fn fg_trig_ptr(g: *const FluxGame) -> *const f64 {
+    if g.is_null() {
+        return std::ptr::null();
+    }
+    (*g).trig.as_ptr()
 }
 
 #[no_mangle]

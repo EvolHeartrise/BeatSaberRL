@@ -98,6 +98,118 @@ pub(crate) fn round_pts(x: Real) -> Real {
     (x + 0.5).floor()
 }
 
+// ---- deterministic sin / cos ---------------------------------------------
+// `f64::sin` is the PLATFORM libm: glibc for the Linux env, Rust's musl
+// port for wasm32 — they disagree in the last bit for ~6% of angles, which
+// would let the WebXR game (rust/flux-wasm) and the env install a bar with
+// different sin/cos. Every judge-shared angle goes through this pure-Rust
+// copy of musl's algorithm instead (medium-range Cody-Waite reduction +
+// the __sin/__cos kernels, < 1 ulp): plain f64 arithmetic, no FMA
+// contraction in Rust, so every build computes the same bits.
+
+const TOINT: f64 = 1.5 / f64::EPSILON;
+const PIO4: f64 = 0.785_398_163_397_448_279; // 0x1.921fb54442d18p-1
+const INVPIO2: f64 = 6.36619772367581382433e-01;
+const PIO2_1: f64 = 1.57079632673412561417e+00;
+const PIO2_1T: f64 = 6.07710050650619224932e-11;
+const PIO2_2: f64 = 6.07710050630396597660e-11;
+const PIO2_2T: f64 = 2.02226624879595063154e-21;
+const PIO2_3: f64 = 2.02226624871116645580e-21;
+const PIO2_3T: f64 = 8.47842766036889956997e-32;
+
+fn k_sin(x: f64, y: f64, iy: bool) -> f64 {
+    const S1: f64 = -1.66666666666666324348e-01;
+    const S2: f64 = 8.33333333332248946124e-03;
+    const S3: f64 = -1.98412698298579493134e-04;
+    const S4: f64 = 2.75573137070700676789e-06;
+    const S5: f64 = -2.50507602534068634195e-08;
+    const S6: f64 = 1.58969099521155010221e-10;
+    let z = x * x;
+    let w = z * z;
+    let r = S2 + z * (S3 + z * S4) + z * w * (S5 + z * S6);
+    let v = z * x;
+    if !iy {
+        x + v * (S1 + z * r)
+    } else {
+        x - ((z * (0.5 * y - v * r) - y) - v * S1)
+    }
+}
+
+fn k_cos(x: f64, y: f64) -> f64 {
+    const C1: f64 = 4.16666666666666019037e-02;
+    const C2: f64 = -1.38888888888741095749e-03;
+    const C3: f64 = 2.48015872894767294178e-05;
+    const C4: f64 = -2.75573143513906633035e-07;
+    const C5: f64 = 2.08757232129817482790e-09;
+    const C6: f64 = -1.13596475577881948265e-11;
+    let z = x * x;
+    let w = z * z;
+    let r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6));
+    let hz = 0.5 * z;
+    let w = 1.0 - hz;
+    w + (((1.0 - w) - hz) + (z * r - x * y))
+}
+
+/// x = n·π/2 + (y0 + y1), |y0 + y1| <= π/4 — musl's medium-range path,
+/// valid for |x| < 2^20·π/2 (callers fold larger |x| first).
+fn rem_pio2(x: f64) -> (i32, f64, f64) {
+    let ex = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    let mut f = x * INVPIO2 + TOINT - TOINT;
+    let mut n = f as i32;
+    let mut r = x - f * PIO2_1;
+    let mut w = f * PIO2_1T;
+    if r - w < -PIO4 {
+        n -= 1;
+        f -= 1.0;
+        r = x - f * PIO2_1;
+        w = f * PIO2_1T;
+    } else if r - w > PIO4 {
+        n += 1;
+        f += 1.0;
+        r = x - f * PIO2_1;
+        w = f * PIO2_1T;
+    }
+    let mut y0 = r - w;
+    let ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+    if ex - ey > 16 {
+        let t = r;
+        w = f * PIO2_2;
+        r = t - w;
+        w = f * PIO2_2T - ((t - r) - w);
+        y0 = r - w;
+        let ey = ((y0.to_bits() >> 52) & 0x7ff) as i32;
+        if ex - ey > 49 {
+            let t = r;
+            w = f * PIO2_3;
+            r = t - w;
+            w = f * PIO2_3T - ((t - r) - w);
+            y0 = r - w;
+        }
+    }
+    (n, y0, (r - y0) - w)
+}
+
+/// (sin x, cos x), bit-identical on every target (see above).
+#[cfg_attr(feature = "f32", allow(dead_code))]
+pub(crate) fn det_sin_cos(x: f64) -> (f64, f64) {
+    if !x.is_finite() {
+        return (x - x, x - x);
+    }
+    // fold huge angles with the exact IEEE remainder (never in a real chart)
+    let x = if x.abs() >= 1.0e6 { x % std::f64::consts::TAU } else { x };
+    if x.abs() <= PIO4 {
+        return (k_sin(x, 0.0, false), k_cos(x, 0.0));
+    }
+    let (n, y0, y1) = rem_pio2(x);
+    let (s, c) = (k_sin(y0, y1, true), k_cos(y0, y1));
+    match n & 3 {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    }
+}
+
 // 3-vector ops (dynamics::fk re-exports these for the physics)
 pub fn sub3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]

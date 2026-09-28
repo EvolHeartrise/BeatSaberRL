@@ -116,6 +116,17 @@ export class FluxSession {
     return n;
   }
 
+  /**
+   * Restart the pose track at this sample, dropping the gap before it: the
+   * next tick interpolates from here and its swept Flux starts at these
+   * palms. For a resume after a pause or a regained track — the player
+   * did not move through the gap, so it must not sweep objects.
+   */
+  rebase(t, { palms, head, quat = [0, 0, 0, 1] }) {
+    this.last = { t, palms, head, quat };
+    if (this.prevPalms !== null) this.prevPalms = palms;
+  }
+
   /** Judge one tick with palms p1 and head `head` (env world). */
   tick(p1, head, quat) {
     const k = this.rep.ticks.length;

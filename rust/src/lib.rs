@@ -2226,6 +2226,13 @@ impl RawBeatSim {
         self.core.body.shoulder_z
     }
 
+    /// The installed chart's rotation record, (sin_a, cos_a) per object —
+    /// the WebXR game parity fixture pins the wasm build's install to it
+    /// bit for bit.
+    fn chart_trig(&self) -> Vec<(Real, Real)> {
+        self.core.chart.iter().map(|n| (n.sin_a, n.cos_a)).collect()
+    }
+
     /// env v41 self-contact telemetry since the last pop: (summed
     /// self-collision impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.

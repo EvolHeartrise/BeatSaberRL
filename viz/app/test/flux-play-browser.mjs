@@ -49,6 +49,18 @@ try {
   const options = await page.$$eval("#play select option", (os) => os.map((o) => o.value));
   if (!options.includes("warmup-1") || options.length < 6)
     throw new Error("chart list: " + options.join(","));
+  // no headset, no script: nothing is tracked, the resting pose is held
+  // and the chart must still play out (resting palms may even catch a low
+  // circle) and END
+  await page.select("#play select", "train-2");
+  await page.evaluate(() => window.__fluxPlay.setClockScale(12));
+  await click(page, "#play button", "start");
+  await page.waitForFunction(() => window.__fluxPlay.play.phase === "done",
+    { timeout: 120000 });
+  const idle = await page.evaluate(() => ({ ...window.__fluxPlay.play.stats }));
+  if (idle.misses + idle.bad + idle.good !== idle.n_objects || !idle.finished)
+    throw new Error("untracked run: " + JSON.stringify(idle));
+
   await page.select("#play select", "warmup-1");
 
   // the scripted player: each palm on the next circle of its colour as it
@@ -75,7 +87,7 @@ try {
     });
   });
   await page.screenshot({ path: "test/out/flux-play-menu.png" });
-  await click(page, "#play button", "start");
+  await click(page, "#play button", "play again");
   await page.waitForFunction(() => window.__fluxPlay.play.phase === "playing",
     { timeout: 20000 });
   await page.waitForFunction(() => window.__fluxPlay.play.time > 4, { timeout: 60000 });
@@ -101,9 +113,17 @@ try {
     .find((b) => b.textContent.includes("pause"))?.click());
   await new Promise((r) => setTimeout(r, 800));
   await page.screenshot({ path: "test/out/flux-play-watch.png" });
-  const hud = await page.$eval("#hud", (e) => e.textContent);
-  if (!hud.includes(`good ${st.good}`) && !hud.includes("good"))
-    throw new Error("viewer HUD: " + hud);
+  // the viewer's HUD at the last tick shows the run's own tallies
+  await page.evaluate(() => {
+    const r = document.querySelector("#bottom input[type=range]");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+      .set.call(r, r.max);
+    r.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await new Promise((r) => setTimeout(r, 400));
+  const hud = await page.$eval("#hud", (e) => e.textContent.replace(/\s+/g, " "));
+  for (const want of [`good ${st.good}`, `bad ${st.bad}`, `miss ${st.misses}`])
+    if (!hud.includes(want)) throw new Error(`viewer HUD lacks "${want}": ${hud}`);
 
   if (errors.length) throw new Error(errors.join("\n"));
   console.log(`flux-play-browser OK: ${st.n_objects} objects, good ${st.good}, ` +

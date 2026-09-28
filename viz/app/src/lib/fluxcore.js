@@ -89,6 +89,7 @@ export class FluxJudge {
    * {done, events: [{i, code, reason, pts, pre, acc}]}.
    */
   step(p0, p1, head, shoulderZ) {
+    this.live();
     const v = this.core.f64(this.inp, STEP_F);
     v.set(p0[0], 0); v.set(p0[1], 3); v.set(p1[0], 6); v.set(p1[1], 9);
     v.set(head, 12); v[15] = shoulderZ;
@@ -97,12 +98,19 @@ export class FluxJudge {
 
   /** Same, from a flat STEP_F array (the parity fixture's rows). */
   stepFlat(row) {
+    this.live();
     this.core.f64(this.inp, STEP_F).set(row);
     return this.stepRaw();
   }
 
+  /** Throws once free()d: a freed game must never reach the wasm. */
+  live() {
+    if (!this.ptr) throw new Error("FluxJudge used after free()");
+    return this.core.x;
+  }
+
   stepRaw() {
-    const x = this.core.x;
+    const x = this.live();
     const done = x.fg_step(this.ptr, this.inp) === 1;
     const ne = x.fg_events_len(this.ptr);
     const events = [];
@@ -119,13 +127,20 @@ export class FluxJudge {
 
   /** Running tallies ({tick, time, good, ..., score, combo, multiplier}). */
   stats() {
-    const s = this.core.f64(this.core.x.fg_stats_ptr(this.ptr), STAT_NAMES.length);
+    const s = this.core.f64(this.live().fg_stats_ptr(this.ptr), STAT_NAMES.length);
     return Object.fromEntries(STAT_NAMES.map((k, i) => [k, s[i]]));
   }
 
   /** Per-object status: 0 pending, 1 good, 2 bad, 3 missed. */
   status() {
-    return Array.from(this.core.u8(this.core.x.fg_status_ptr(this.ptr), this.n));
+    return Array.from(this.core.u8(this.live().fg_status_ptr(this.ptr), this.n));
+  }
+
+  /** The installed rotation record, [[sin_a, cos_a]] per object — the
+   * env's RawBeatSim.chart_trig() twin (pinned bitwise by the parity test). */
+  trig() {
+    const t = this.core.f64(this.live().fg_trig_ptr(this.ptr), 2 * this.n);
+    return Array.from({ length: this.n }, (_, i) => [t[2 * i], t[2 * i + 1]]);
   }
 
   free() {
@@ -137,9 +152,11 @@ export class FluxJudge {
 }
 
 let loading = null;
-/** The (singleton) judge module; resolves once the wasm is instantiated. */
+/** The (singleton) judge module; resolves once the wasm is instantiated.
+ * A failed load is not cached: the next call tries again. */
 export function loadFluxCore() {
   loading ??= WebAssembly.instantiate(decodeB64(WASM_B64), {})
-    .then(({ instance }) => new FluxCore(instance.exports));
+    .then(({ instance }) => new FluxCore(instance.exports))
+    .catch((e) => { loading = null; throw e; });
   return loading;
 }

@@ -269,6 +269,8 @@
   // ---- the Flux WebXR game (play mode) ------------------------------------
   const entries = $derived(play.on ? chartEntries() : []);
   const entry = $derived(entries.find((c) => c.id === play.chartId) ?? null);
+  // the chart the shown results belong to (the select may have moved on)
+  const runEntry = $derived(entries.find((c) => c.id === play.runId) ?? null);
   const running = $derived(play.phase === "countdown" || play.phase === "playing");
   const fmtScore = (v) => Math.round(v ?? 0).toLocaleString("en-US");
 
@@ -520,8 +522,11 @@
           {#if play.newBest}<span class="best">new best!</span>{/if}
           · {fmtScore(st.raw_score)}/{fmtScore(st.max_score)} pts unmultiplied ·
           max combo {st.max_combo}
-          {#if entry?.agentScore != null}
-            · agent {fmtScore(entry.agentScore)} unmultiplied
+          {#if runEntry && runEntry.id !== play.chartId}
+            · {runEntry.name}
+          {/if}
+          {#if runEntry?.agentScore != null}
+            · agent {fmtScore(runEntry.agentScore)} unmultiplied
           {/if}
           <button onclick={exportRun} title="save this run as a replay .jsonl">
             💾 save run</button>
