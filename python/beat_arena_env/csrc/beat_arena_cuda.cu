@@ -1465,7 +1465,8 @@ constexpr double SWING_BREAK = 0.005;
 // each hand is its palm centre PALM_OFF along the hand axis; circles
 // (colour, disc radius CIRCLE_R) score on the matching palm's touch,
 // bars (colourless, 2*BAR_HALF_W wide) on the swept Flux segment
-// between the palms. Hitbox depth slab = the good box's convention.
+// between the palms. Hitbox depth slab: 5 cm either side of the flat
+// visual, swept in the object's frame (flux.rs judge).
 constexpr double PALM_OFF = 0.06;
 constexpr double CIRCLE_R = 0.175;
 constexpr double CIRCLE_PTS = 50.0;
@@ -1473,8 +1474,9 @@ constexpr double CIRCLE_ACC_PTS = 10.0;
 constexpr double BAR_PTS = 100.0;
 constexpr double BAR_ACC_PTS = 15.0;
 constexpr double BAR_HALF_W = 0.025;
-constexpr double FLUX_SLAB_LO = GOOD_Z_SHIFT - GOOD_HALF_Z;  // -0.75
-constexpr double FLUX_SLAB_HI = GOOD_Z_SHIFT + GOOD_HALF_Z;  // +0.25
+constexpr double FLUX_SLAB_HALF = 0.05;
+constexpr double FLUX_SLAB_LO = -FLUX_SLAB_HALF;
+constexpr double FLUX_SLAB_HI = FLUX_SLAB_HALF;
 constexpr double FLUX_REACH_PAST_SHOULDER = 0.65 + PALM_OFF - FLUX_SLAB_LO;
 // env v19 flail telemetry: a tick is "note-free" when the next
 // scoreable note is further out than this (s). Telemetry only — no
@@ -5103,7 +5105,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   }
 
   if constexpr (FX) {
-    // ---- Flux judgment (lib.rs Core::flux_judge verbatim) ----------
+    // ---- Flux judgment (flux_sim.rs flux_judge + flux.rs judge verbatim)
     T p0[2][3], p1[2][3];
     for (int h = 0; h < 2; h++)
       for (int k = 0; k < 3; k++) {
@@ -5123,23 +5125,28 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb] + z_off;
       const T blen = P.p_len[cb];
       const bool is_bar = blen > T(0);
-      if (z < head_z) {
-        P.status[e * C + i] = 3;
-        P.miss[e] += 1;
-        cw_break(P, e);
-        reward += T(REWARD_MISS);
-        if (!is_bar) {  // circles record on their colour; bars never
-          const int h = P.p_is_right[cb] ? 1 : 0;
-          P.prev_idx[e * 2 + h] = i;
-          P.prev_valid[e * 2 + h] = 1;
-        }
-        continue;
-      }
       if (z > freach) continue;
       const T center[3] = {P.p_center[cb * 2], P.p_center[cb * 2 + 1], z};
+      // last tick's palms in the object's frame: it was speed*DT further
+      // out then (flux.rs judge's q0)
+      const T travel = P.p_speed[cb] * T(DT);
+      const T q0[2][3] = {{p0[0][0], p0[0][1], p0[0][2] - travel},
+                          {p0[1][0], p0[1][1], p0[1][2] - travel}};
+      // the sweep ends where the object crosses the head plane (flux.rs
+      // judge's e1): past it the object is a miss, never a touch
+      T e1[2][3];
+      if (z < head_z) {
+        const T sc = tclamp((z + travel - head_z) / travel, T(0), T(1));
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++)
+            e1[h][k] = q0[h][k] + sc * (p1[h][k] - q0[h][k]);
+      } else {
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++) e1[h][k] = p1[h][k];
+      }
       if (!is_bar) {
         const int m = P.p_is_right[cb] ? 1 : 0;
-        const T dm = flux_circle_touch(p0[m], p1[m], center);
+        const T dm = flux_circle_touch(q0[m], e1[m], center);
         if (dm >= T(0)) {
           const T acc = round_pts(
               T(CIRCLE_ACC_PTS)
@@ -5156,7 +5163,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           cw_cut(P, e, i, pts);
           P.prev_idx[e * 2 + m] = i;
           P.prev_valid[e * 2 + m] = 1;
-        } else if (flux_circle_touch(p0[1 - m], p1[1 - m], center)
+        } else if (flux_circle_touch(q0[1 - m], e1[1 - m], center)
                    >= T(0)) {
           P.status[e * C + i] = 2;
           P.bad[e] += 1;
@@ -5170,12 +5177,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         T frame[3][3];
         note_frame(center, P.p_rot[cb * 2], P.p_rot[cb * 2 + 1], T(0),
                    head_pos, frame);
-        const T bc[3] = {center[0], center[1], center[2] + T(GOOD_Z_SHIFT)};
-        const T bh[3] = {T(BAR_HALF_W), T(0.5) * blen, T(GOOD_HALF_Z)};
-        // swept Flux quad (L0 -> R0) to (L1 -> R1): triangles
+        const T bh[3] = {T(BAR_HALF_W), T(0.5) * blen, T(FLUX_SLAB_HALF)};
+        // swept Flux quad (L0 -> R0) to (L1 -> R1), relative: triangles
         // (L0, R0, R1) and (L0, R1, L1) — sweep_hits_box's (w0, t0, t1)
         // + (w0, t1, w1) split with w0 = L0, t0 = R0, t1 = R1, w1 = L1
-        if (sweep_hits_box(p0[0], p0[1], p1[1], p1[0], bc, bh, frame)) {
+        if (sweep_hits_box(q0[0], q0[1], e1[1], e1[0], center, bh, frame)) {
           if (!flux_bar_angle_ok(P.p_rot[cb * 2], P.p_rot[cb * 2 + 1],
                                  p1[0], p1[1])) {
             // crossed > 60 deg off square: bad cut (event 2 "angle")
@@ -5206,6 +5212,19 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
             P.acc_cuts[e * 2 + h] += 1;
           }
           cw_cut(P, e, i, pts);
+        }
+      }
+      // untouched and past the head plane: a miss (contact first — an
+      // object can pass a palm and the head within one tick)
+      if (P.status[e * C + i] == 0 && z < head_z) {
+        P.status[e * C + i] = 3;
+        P.miss[e] += 1;
+        cw_break(P, e);
+        reward += T(REWARD_MISS);
+        if (!is_bar) {  // circles record on their colour; bars never
+          const int h = P.p_is_right[cb] ? 1 : 0;
+          P.prev_idx[e * 2 + h] = i;
+          P.prev_valid[e * 2 + h] = 1;
         }
       }
     }

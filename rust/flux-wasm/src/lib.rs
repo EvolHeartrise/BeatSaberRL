@@ -179,7 +179,7 @@ impl FluxGame {
         self.time = (self.tick + 1) as Real * self.tick_dt;
         let mut reward = 0.0;
         flux::judge(&self.chart, &mut self.status, self.first_pending,
-                    self.min_speed, self.time, head,
+                    self.min_speed, self.time, self.tick_dt, head,
                     flux::reach_z(shoulder_z_max), p0, p1, &mut reward,
                     &mut self.events);
         self.tick += 1;
@@ -509,7 +509,9 @@ mod tests {
     fn a_hit_is_judged_when_it_happens_not_at_the_env_tick_end() {
         // a palm sweeps across a circle between t = 0 and DT; at 120 Hz
         // the touch is judged on the 1/120 s tick it happens in
-        let c = circle(0.5 * DTT + 0.2 / SPEED, 0.0, 1.2, 0);
+        // the circle reaches the palms' plane (z = 0) half-way through
+        // the env tick, as the palm crosses its centre
+        let c = circle(0.5 * DTT, 0.0, 1.2, 0);
         let mut g = FluxGame::new(&[c], 0, 120).unwrap();
         let path = |u: f64| [[-0.4 + 0.8 * u, 1.2, 0.0], [0.6, 1.2, 0.0]];
         let mut hit_tick = None;
@@ -537,7 +539,7 @@ mod tests {
         unsafe {
             let l = [-0.3, 1.2, -0.45];
             let chart = fg_alloc(OBJ_F as u32);
-            let c = circle(arrive(l[2], 0.2), l[0], l[1], 0);
+            let c = circle(arrive(l[2], 0.02), l[0], l[1], 0);
             let v = [c.0, c.1, c.2, 4.0, 0.0, 0.0, c.6, 0.0, 0.0];
             std::ptr::copy_nonoverlapping(v.as_ptr(), chart, OBJ_F);
             let g = fg_new(chart, 1, 0, 30);

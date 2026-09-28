@@ -90,7 +90,10 @@ points and the "Flux" is the segment between them. Circles (coloured,
 35 cm discs) score 50 + up to 10 accuracy when touched by the matching
 palm (the other palm = a bad hit); bars (colourless, thin, rotated,
 with a sweet-spot offset) score 100 + up to 15 accuracy when the swept
-Flux crosses them. Charts come from a procedural generator
+Flux crosses them. Hitboxes hug the visuals: 5 cm either side of the
+flat object (2026-09-28; was the good box's 1 m slab reaching 0.75 m
+early), with contact swept in each object's frame so fast objects
+cannot tunnel through a still hand. Charts come from a procedural generator
 (`flux_chart.py`) that places objects along two imaginary palm paths.
 `train_batch.py --game flux` trains its own policy from scratch
 (arch marker `game="flux"`; never cross-loaded with standard
