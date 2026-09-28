@@ -84,6 +84,9 @@ export const CIRCLE_R = 0.175;
 export const BAR_W = 0.05;
 export const FLUX_DEPTH = 1.0;
 export const isFlux = (rep) => rep?.game === "flux";
+/** A Flux run PLAYED BY A PERSON in the WebXR game (header "player":
+ * "human"): per-tick palms + head, no body (no q / sabers / feet). */
+export const isHuman = (rep) => rep?.player === "human";
 export const isFluxKind = (n) => n.kind === KIND_CIRCLE || n.kind === KIND_BAR;
 /** Bar axis u = (-sin rot, cos rot): rot 0 points up, CCW from the
  * player's view. */
@@ -212,6 +215,7 @@ export function quatNlerp(a, b, u) {
  * the logged root quaternion is unit only to ~1e-5 (JSONL float
  * precision) and the filter below compounds it. */
 export function headQuats(rep) {
+  if (isHuman(rep)) return rep.ticks.map((_, k) => humanHeadQuatScene(rep, k, 0));
   return rep.ticks.map((t) => {
     const q = rotQuatScene(bodyFK(t.q).r[F_HEAD]);
     const n = Math.hypot(q[0], q[1], q[2], q[3]);
@@ -558,6 +562,11 @@ export function parseReplay(text) {
     // ADDITIVE header field: "flux" for the Flux game mode (SPEC.md
     // §Flux); absent = the standard game
     game: head.header.game ?? "standard",
+    // ADDITIVE header field: "human" for a WebXR game run (fluxgame.js);
+    // absent = an agent (sim) recording
+    player: head.header.player ?? "agent",
+    // human runs: the game's final tallies ({score, good, ...})
+    result: head.header.result ?? null,
     config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
@@ -594,7 +603,30 @@ const _offTicks = new WeakMap(); // rep -> Map(k -> z_off at (k, 0))
  * the same head the viewer draws the skeleton's head from, and the one
  * the sim anchors the track to (lib.rs `self.body.head[2]`). */
 export function headZAt(rep, tickIdx, u = 0) {
+  if (isHuman(rep)) return humanHeadAt(rep, tickIdx, u)[2];
   return bodyFK(qAt(rep, tickIdx, u)).p[F_HEAD][2];
+}
+
+// ---- human (WebXR game) runs: no body, the tracked palms + head ------------
+const tickAt = (rep, k) => rep.ticks[Math.max(0, Math.min(k, rep.ticks.length - 1))];
+
+/** Palms [[x,y,z] L, R] (world) at fractional tick (tickIdx + u). */
+export function humanPalmsAt(rep, tickIdx, u = 0) {
+  const a = tickAt(rep, tickIdx).palms, b = tickAt(rep, tickIdx + 1).palms;
+  return [0, 1].map((h) => [0, 1, 2].map((i) => lerp(a[h][i], b[h][i], u)));
+}
+
+/** Head position [x, y, z] (world) at fractional tick (tickIdx + u). */
+export function humanHeadAt(rep, tickIdx, u = 0) {
+  const a = tickAt(rep, tickIdx).head, b = tickAt(rep, tickIdx + 1).head;
+  return [0, 1, 2].map((i) => lerp(a[i], b[i], u));
+}
+
+/** Head orientation as a SCENE quaternion at fractional tick — the logged
+ * env-frame quaternion conjugated by S = diag(1, 1, -1), then nlerped. */
+export function humanHeadQuatScene(rep, tickIdx, u = 0) {
+  const sq = (h) => [-h[3], -h[4], h[5], h[6]];
+  return quatNlerp(sq(tickAt(rep, tickIdx).head), sq(tickAt(rep, tickIdx + 1).head), u);
 }
 
 /** v15 track offset z_off = head_z - PLANE_Z0 at fractional tick
@@ -666,12 +698,13 @@ export function maxScore(chart) {
 }
 
 export function configSummary(rep) {
-  const c = rep.config;
+  const c = rep.config ?? {};
   if (isFlux(rep)) {
     const nc = rep.chart.filter((n) => n.kind === KIND_CIRCLE).length;
     const spd = c.note_speed_min != null
       ? `${c.note_speed_min}-${c.note_speed_max} m/s` : null;
-    return `FLUX: ${nc} circles, ${rep.chart.length - nc} bars, ` +
+    return (isHuman(rep) ? "FLUX (played in VR): " : "FLUX: ") +
+      `${nc} circles, ${rep.chart.length - nc} bars, ` +
       `${rep.ticks.length} ticks` + (spd ? ` (${spd})` : "");
   }
   const spd = c.note_speed_min != null

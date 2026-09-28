@@ -46,6 +46,14 @@ use rayon::prelude::*;
 pub mod dynamics;
 // Flux game mode (circles + bars, no sabers) — SPEC.md §Flux.
 mod flux;
+// judge-shared geometry / constants / combo walk (also compiled into the
+// Flux WebXR game's wasm crate, rust/flux-wasm)
+mod combo;
+mod geom;
+mod flux_sim;
+
+use combo::ComboWalk;
+use geom::*;
 
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
@@ -74,16 +82,11 @@ fn dbg_stats_dict(s: &DbgStats) -> HashMap<String, u64> {
     out
 }
 
-const DT: Real = 1.0 / 30.0;
 const V_NORM: Real = 6.0; // wrist-velocity obs normalizer (m/s)
 const V_MIN_CUT: Real = 1.0;
-const ACC_NORM: Real = 0.3; // real BS accuracy normalizer (m)
-const COS_TOL: Real = 0.5;
 // lanes at x = -0.9 .. 0.9 (0.6 m pitch), rows at y = 0.85/1.40/1.90 —
 // positions arrive PRE-RESOLVED in the chart tuple (constants.py owns them)
 const Y_CENTER: Real = 1.40; // obs y normalization
-const REWARD_BAD: Real = -0.5;
-const REWARD_MISS: Real = -0.5;
 // env v12 (unilateral-contact spec §7, 2026-08-09): per-tick survival
 // bonus, CONTACT MODE ONLY. The v11.1 fall pricing left survival-time
 // flat BEFORE the first note (every pre-first-note fall prices the full
@@ -114,8 +117,6 @@ const GOOD_HALF_X: Real = 0.4;
 const GOOD_HALF_Y: Real = 0.25;
 const GOOD_HALF_Y_DOT: Real = 0.4;
 const GOOD_HALF_Y_LINK: Real = 0.1;
-const GOOD_HALF_Z: Real = 0.5;
-const GOOD_Z_SHIFT: Real = -0.25; // box center = note_z + shift (toward player)
 const BAD_HALF: Real = 0.175;
 const BAD_HALF_Y_LINK: Real = 0.05;
 const BOMB_RADIUS: Real = 0.18;
@@ -150,15 +151,6 @@ const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
 // near-face reach (0.75). At the reference pose (shoulder_z = -0.65)
 // this is 1.91 (v9's REACH_Z 1.75 before the v42 handle).
 const REACH_PAST_SHOULDER: Real = 0.65 + HANDLE_LEN + 1.0 + 0.75;
-// miss boundary: note consumed as missed past the LIVE head plane
-// z < head_z(t) (v9's -Z_MISS = -0.65 at the reference pose). The
-// episode tail must cover the slowest object's trip from the hit plane
-// to the WORST-CASE head plane; the head cannot physically reach
-// z < -1.5 on the standing body (waist z -0.65, head lever 1.09 m
-// fully folded back still > -1.8, and the spine/hip limits stop far
-// short; a body that falls further terminates on FALL_ROOT_Y first) —
-// P3 divergence note, SPEC-v10 Divergences §18.
-const Z_MISS_TAIL: Real = 1.5;
 // env v11 FALL termination (unilateral-contact spec §4): with the feet
 // on unilateral ground contact the root can go to the floor, and
 // a fallen body's observations/rewards are not the task. Reference-pose
@@ -193,7 +185,6 @@ const POST_FULL: Real = 1.0471975511965976; // 60 deg
 const PTS_PRE: Real = 70.0;
 const PTS_POST: Real = 30.0;
 const PTS_ACC: Real = 15.0;
-const SCORE_MAX: Real = 115.0;
 const CHAIN_LINK_PTS: Real = 20.0;
 const SWING_BREAK: Real = 0.005; // rad/tick below which the swing chain breaks
 const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
@@ -229,15 +220,6 @@ const Q_START_ARM: [(usize, Real); 6] = [
     (13, 1.7453292519943295),
     (15, 1.2217304763960306),
 ];
-
-// object kinds (mirrors constants.py)
-const KIND_NOTE: u8 = 0;
-const KIND_BOMB: u8 = 1;
-const KIND_CHAIN_HEAD: u8 = 2;
-const KIND_CHAIN_LINK: u8 = 3;
-// Flux mode objects (flux.rs; never appear in a standard chart)
-const KIND_CIRCLE: u8 = 4;
-const KIND_BAR: u8 = 5;
 
 // env v17 (contact spec §12): walls. The head CENTER is the collision
 // point (no sweep). WALL_PEN is charged ONCE, on the tick the head
@@ -382,22 +364,8 @@ fn z_lane(zu: Real, z_lo: Real) -> Real {
 }
 const ROOT_Y0: Real = 0.94; // reference root height (obs centering)
 const HEAD_Y0: Real = 1.70; // reference head height (obs centering)
-const PLANE_Z0: Real = -0.65; // reference body plane (obs centering)
-// env v15 (contact spec §10): the note track is head-anchored in z —
-// every note's world z carries the offset head_z − PLANE_Z0 (zero at
-// the reference pose). Real-BS room semantics: walking toward the
-// notes shifts them away by exactly the walked amount, so approach
-// distance (and therefore hit/miss timing) is invariant to root z.
-// Applied at every note-z evaluation: obs lane, broad-phase bound,
-// judgment. x/y stay world-fixed (lanes are body-independent).
 const ROOT_VLIN_NORM: Real = 6.0;
 const ROOT_VANG_NORM: Real = 16.0;
-
-/// Real BS scores are integers; explicit floor(x + 0.5) so every
-/// implementation (Rust, torch, Python tools) agrees on halves.
-fn round_pts(x: Real) -> Real {
-    (x + 0.5).floor()
-}
 
 /// env v17 obstacle (spec §12): a world-space AABB riding the
 /// head-anchored track. Geometry arrives FINISHED from the parser
@@ -412,61 +380,6 @@ struct Wall {
     half_h: Real,
     len: Real,        // full z extent (m)
     speed: Real,      // approach speed (m/s)
-}
-
-#[derive(Clone, Copy)]
-struct Note {
-    hit_time: Real,
-    x: Real, // world position at the hit plane (meters)
-    y: Real,
-    color: u8,
-    // required swing direction (0 = +x, CCW), stored as its sin/cos pair
-    sin_a: Real,
-    cos_a: Real,
-    speed: Real,     // approach speed toward the plane (m/s)
-    any_dir: bool,  // dot note / chain link: any swing direction scores
-    kind: u8,       // KIND_NOTE / _BOMB / _CHAIN_HEAD / _CHAIN_LINK
-    free_pre: bool, // arc tail: full 70 pre-swing granted
-    free_post: bool, // arc head: full 30 follow-through granted
-    // Flux bars only (0 elsewhere): length (m) and sweet-spot offset
-    // in [-1, 1] along the bar axis (sin_a/cos_a carry its rotation)
-    len: Real,
-    sweet: Real,
-}
-
-/// Triangle vs axis-aligned box (Akenine-Möller SAT). Verts are given
-/// RELATIVE to the box center; h = half extents.
-fn tri_box_overlap(v: [[Real; 3]; 3], h: [Real; 3]) -> bool {
-    // box-axis tests
-    for k in 0..3 {
-        let lo = v[0][k].min(v[1][k]).min(v[2][k]);
-        let hi = v[0][k].max(v[1][k]).max(v[2][k]);
-        if lo > h[k] || hi < -h[k] {
-            return false;
-        }
-    }
-    let e = [sub3(v[1], v[0]), sub3(v[2], v[1]), sub3(v[0], v[2])];
-    // 9 cross-axis tests: a = u_k x e_j (u_k = box axes)
-    for j in 0..3 {
-        let ax = [
-            [0.0, -e[j][2], e[j][1]],
-            [e[j][2], 0.0, -e[j][0]],
-            [-e[j][1], e[j][0], 0.0],
-        ];
-        for a in ax {
-            let p0 = dot3(v[0], a);
-            let p1 = dot3(v[1], a);
-            let p2 = dot3(v[2], a);
-            let r = h[0] * a[0].abs() + h[1] * a[1].abs() + h[2] * a[2].abs();
-            if p0.min(p1).min(p2) > r || p0.max(p1).max(p2) < -r {
-                return false;
-            }
-        }
-    }
-    // triangle-plane test
-    let n = cross3(e[0], e[1]);
-    let r = h[0] * n[0].abs() + h[1] * n[1].abs() + h[2] * n[2].abs();
-    dot3(n, v[0]).abs() <= r
 }
 
 /// Closest distance from point p to triangle (a, b, c) (Ericson,
@@ -576,66 +489,6 @@ fn sweep_tris(
         w1[2] + (HANDLE_LEN + SABER_LEN) * d1[2],
     ];
     [[b0, t0, t1], [b0, t1, b1]]
-}
-
-// Env v7.4: hitboxes ROTATE with the object about the approach (z)
-// axis by rot = angle - 270 deg. Env v7.6: plain notes additionally
-// billboard toward the player's head as they approach; env v10 the
-// head anchor is the LIVE FK head position (SPEC-v10 §4).
-const LOOK_VERT: Real = 0.8; // verticalLookStrength: head.y 80% toward note.y
-const LOOK_DIST: Real = 8.0; // full head-facing at z=0, none beyond 8 m
-
-/// Orthonormal note frame columns (x', y', z'): z' = the blended
-/// forward, up from the z-roll, x' = up x z'. `head` is the live FK
-/// head position (env v10).
-fn note_frame(
-    p: [Real; 3],
-    cos_r: Real,
-    sin_r: Real,
-    lam: Real,
-    head: [Real; 3],
-) -> [[Real; 3]; 3] {
-    let up = [-sin_r, cos_r, 0.0];
-    let hp = [head[0], head[1] + LOOK_VERT * (p[1] - head[1]), head[2]];
-    let d = sub3(p, hp);
-    let dn = dot3(d, d).sqrt().max(1e-9);
-    let g = [
-        lam * d[0] / dn,
-        lam * d[1] / dn,
-        (1.0 - lam) + lam * d[2] / dn,
-    ];
-    let gn = dot3(g, g).sqrt().max(1e-9);
-    let fz = [g[0] / gn, g[1] / gn, g[2] / gn];
-    let cx = cross3(up, fz);
-    let cn = dot3(cx, cx).sqrt().max(1e-9);
-    let fx = [cx[0] / cn, cx[1] / cn, cx[2] / cn];
-    let fy = cross3(fz, fx);
-    [fx, fy, fz]
-}
-
-/// p relative to `center`, expressed in the note frame.
-fn to_frame(p: [Real; 3], center: [Real; 3], f: &[[Real; 3]; 3]) -> [Real; 3] {
-    let q = sub3(p, center);
-    [dot3(q, f[0]), dot3(q, f[1]), dot3(q, f[2])]
-}
-
-fn sweep_hits_box(
-    tris: &[[[Real; 3]; 3]; 2],
-    center: [Real; 3],
-    h: [Real; 3],
-    frame: &[[Real; 3]; 3],
-) -> bool {
-    for t in tris {
-        let rel = [
-            to_frame(t[0], center, frame),
-            to_frame(t[1], center, frame),
-            to_frame(t[2], center, frame),
-        ];
-        if tri_box_overlap(rel, h) {
-            return true;
-        }
-    }
-    false
 }
 
 fn sweep_dist(tris: &[[[Real; 3]; 3]; 2], p: [Real; 3]) -> Real {
@@ -1358,17 +1211,8 @@ impl Core {
         // the episode tail must cover the slowest object's trip from the
         // plane to the WORST-CASE miss boundary (live head plane, env
         // v10), or final misses never register
-        let min_speed = self
-            .chart
-            .iter()
-            .map(|n| n.speed)
-            .fold(Real::INFINITY, Real::min);
-        self.min_speed = min_speed;
-        self.tail_s = if min_speed.is_finite() {
-            0.5 + Z_MISS_TAIL / min_speed
-        } else {
-            0.5
-        };
+        self.min_speed = chart_min_speed(&self.chart);
+        self.tail_s = chart_tail_s(self.min_speed);
         self.reset_state();
     }
 
@@ -2187,11 +2031,7 @@ impl Core {
             self.first_wall += 1;
         }
 
-        while self.first_pending < self.chart.len()
-            && self.status[self.first_pending] != 0
-        {
-            self.first_pending += 1;
-        }
+        advance_first_pending(&self.status, &mut self.first_pending);
         let last_hit = self.chart.last().map_or(0.0, |n| n.hit_time);
         let pending = self.first_pending < self.chart.len();
         let no_trackers = self.trackers[0].is_empty() && self.trackers[1].is_empty();
@@ -2215,11 +2055,9 @@ impl Core {
         if self.body.tilted {
             self.tilts += 1;
         }
-        let done = (!pending
-            && no_trackers
-            && (self.chart.is_empty() || self.time > last_hit))
-            || self.time > last_hit + self.tail_s
-            || self.tick >= self.max_steps
+        let done = chart_done(pending, no_trackers, self.chart.is_empty(),
+                              self.time, last_hit, self.tail_s,
+                              self.tick, self.max_steps)
             || self.body.escaped
             || self.body.fell
             || self.body.tilted;
@@ -2379,6 +2217,13 @@ impl RawBeatSim {
     /// the hand axis) — the circle contact points and Flux-line ends.
     fn palms(&self) -> [[Real; 3]; 2] {
         [0, 1].map(|s| flux::palm(self.core.body.wrist[s], self.core.body.blade[s]))
+    }
+
+    /// Shoulder z [L, R] (FK cache) — the reach gate's input; with
+    /// palms() and head_pose() the full input of a Flux judge tick (the
+    /// WebXR game parity fixture records all three).
+    fn shoulder_z(&self) -> [Real; 2] {
+        self.core.body.shoulder_z
     }
 
     /// env v41 self-contact telemetry since the last pop: (summed
@@ -2758,87 +2603,6 @@ impl RawBeatSim {
     /// decomposition; score − sum = chain-link flat points.
     fn score_components(&self) -> (Real, Real, Real) {
         (self.core.score_pre, self.core.score_acc, self.core.score_post)
-    }
-}
-
-/// ScoreSaber multiplied-score combo walk (bench-only; the training gym
-/// stays multiplier-free). Mirrors beat_arena_env/scoresaber.py's
-/// ComboTracker exactly — pinned by a cross-implementation test:
-/// promotion (1x/2x/4x/8x, bar 2/4/8 hits) applies to the hit that
-/// fills the bar; a note's cut AND its later post points commit at its
-/// cut-time multiplier; any break (bad cut / miss / bomb) zeroes the
-/// combo, halves the multiplier, resets the bar.
-struct ComboWalk {
-    multiplier: u32,
-    progress: u32,
-    combo: u32,
-    max_combo: u32,
-    breaks: u32,
-    score: Real,
-    note_mult: Vec<u32>, // 0 = not cut yet
-}
-
-impl ComboWalk {
-    fn new(n_objects: usize) -> Self {
-        ComboWalk {
-            multiplier: 1,
-            progress: 0,
-            combo: 0,
-            max_combo: 0,
-            breaks: 0,
-            score: 0.0,
-            note_mult: vec![0; n_objects],
-        }
-    }
-
-    fn progress_needed(m: u32) -> Option<u32> {
-        match m {
-            1 => Some(2),
-            2 => Some(4),
-            4 => Some(8),
-            _ => None, // 8x cap
-        }
-    }
-
-    fn consume(&mut self, note: u32, code: u8, pts: f32) {
-        let i = note as usize;
-        match code {
-            0 => {
-                // good cut: promote-before-commit, pin the multiplier
-                if let Some(need) = Self::progress_needed(self.multiplier) {
-                    self.progress += 1;
-                    if self.progress >= need {
-                        self.multiplier *= 2;
-                        self.progress = 0;
-                    }
-                }
-                self.note_mult[i] = self.multiplier;
-                self.combo += 1;
-                self.max_combo = self.max_combo.max(self.combo);
-                self.score += pts as Real * self.multiplier as Real;
-            }
-            5 => {
-                // follow-through: the note's cut-time multiplier
-                let m = if self.note_mult[i] == 0 {
-                    self.multiplier
-                } else {
-                    self.note_mult[i]
-                };
-                self.score += pts as Real * m as Real;
-            }
-            7 => {}
-            // 7 = head-in-wall drain tick: NO combo effect (spec §12b —
-            // only the ENTRY breaks; without this arm the catch-all
-            // below would have broken combo every tick inside a wall)
-            _ => {
-                // slow / angle / wrong_hand / miss / bomb / wall ENTRY
-                // (8): combo break
-                self.combo = 0;
-                self.breaks += 1;
-                self.multiplier = (self.multiplier / 2).max(1);
-                self.progress = 0;
-            }
-        }
     }
 }
 

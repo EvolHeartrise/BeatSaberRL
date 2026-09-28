@@ -3,14 +3,21 @@
   "private": true,
   "version": "10.0.0",
   "type": "module",
-  "description": "Beat Arena 3D replay viewer (env v10 full-body dynamics: articulated 29-joint skeleton via full-body FK, contact markers, per-joint torque/omega gauges, foot reaction forces; real Beat Saber object models baked from ScoreSaber's replay viewer) \u2014 Svelte + Threlte SPA, built to a single static HTML file",
+  "description": "Beat Arena 3D replay viewer (env v10 full-body dynamics: articulated 29-joint skeleton via full-body FK, contact markers, per-joint torque/omega gauges, foot reaction forces; real Beat Saber object models baked from ScoreSaber's replay viewer), and the Flux WebXR game (play Flux yourself in VR, judged by the env's own Rust compiled to wasm) — Svelte + Threlte SPA, built to a single static HTML file",
   "scripts": {
+    "wasm": "node tools/build-wasm.mjs",
+    "predev": "npm run wasm",
     "dev": "vite",
+    "xr": "npm run wasm && vite --mode xr",
+    "prebuild": "npm run wasm",
     "build": "vite build",
-    "test": "node test/replay.test.js && node test/models.test.js && node test/sync.test.js && node test/flux.test.js"
+    "pretest": "npm run wasm",
+    "test": "node test/replay.test.js && node test/models.test.js && node test/sync.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "iwer": "^2.5.0",
     "puppeteer-core": "^25.3.0",
     "svelte": "^5.0.0",
     "vite": "^6.0.0",
@@ -19,6 +26,7 @@
   "dependencies": {
     "@threlte/core": "^8.0.0",
     "@threlte/extras": "^9.0.0",
+    "@threlte/xr": "^1.6.1",
     "fflate": "^0.8.2",
     "three": "^0.170.0",
     "webm-muxer": "^5.1.4"

@@ -1,0 +1,185 @@
+// The Flux WebXR game's session (SPEC.md §Flux WebXR game): a human plays a
+// Flux chart with tracked hands. Framework-free (node tests drive it too).
+//
+// Everything that decides an outcome is the env's own Rust (fluxcore.js ->
+// rust/flux-wasm -> rust/src/flux.rs). This file only does what the body
+// does for the agent: it turns the player's tracked palms into the env's
+// 30 Hz tick inputs. Poses arrive at the display rate (72-120 Hz); each
+// tick's palms are the pose track linearly interpolated to the tick's END
+// time (k + 1)·DT — the instant the env judges tick k at — and the swept
+// Flux runs from the previous tick's palms, exactly the env's p0 -> p1.
+//
+// The session also RECORDS itself in the viewer's replay format (header
+// "game": "flux", "player": "human", per-tick palms + head + events), so
+// the existing renderers draw the live game unchanged and a finished run
+// exports as a .jsonl the viewer plays back.
+import { DT, arcPairs } from "./replay.js";
+
+/** Countdown before chart time 0 (s). */
+export const LEAD_IN_S = 3.0;
+
+// ---- scene <-> env frames -----------------------------------------------------
+// The viewer draws world (x, y, z) at scene (x, y, -z). In XR the player's
+// floor origin is placed at scene z = -PLANE_Z0 (the env body's plane,
+// world z = PLANE_Z0; FluxPlay.svelte's XROrigin), so a pose read there
+// converts with the same flip once that offset is added.
+export const sceneToEnv = (p) => [p[0], p[1], -p[2]];
+/** Scene quaternion [x, y, z, w] -> env frame (S R S, S = diag(1, 1, -1)). */
+export const quatSceneToEnv = (q) => [-q[0], -q[1], q[2], q[3]];
+
+const lerp3 = (a, b, u) => [
+  a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u];
+const r5 = (v) => Math.round(v * 1e5) / 1e5;
+
+/**
+ * The live recording: the same fields parseReplay() produces, so every
+ * viewer helper (pendingNotes, aftermaths, counts, ...) reads it as a
+ * replay. A CLASS on purpose — Svelte's $state proxies plain objects, and
+ * this one is mutated from the game loop every tick; left unproxied, the
+ * renderers re-read it whenever the clock (pb.cur) moves.
+ */
+export class LiveReplay {
+  constructor(chart, config, meta = {}) {
+    this.game = "flux";
+    this.player = "human";
+    this.config = config ?? {};
+    this.chart = chart;
+    this.ticks = [];
+    this.outcomes = chart.map(() => null);
+    this.posts = [];
+    this.postsByNote = [];
+    this.trackAnchor = "head";
+    this.map = null;
+    this.walls = [];
+    this.arcs = arcPairs(chart);
+    this.meta = meta;
+  }
+}
+
+export class FluxSession {
+  /**
+   * `core` = loadFluxCore()'s module; `entry` = {id, name, chart, config}
+   * (a chart-pack entry, or a loaded Flux replay's chart). `onEvent(e,
+   * obj)` fires for every judged event as it happens (sound, haptics).
+   */
+  constructor(core, entry, { onEvent = null } = {}) {
+    this.entry = entry;
+    this.chart = entry.chart;
+    this.judge = core.newGame(this.chart); // throws on a chart the env refuses
+    this.rep = new LiveReplay(this.chart, entry.config,
+      { id: entry.id ?? null, name: entry.name ?? null });
+    this.onEvent = onEvent;
+    this.prevPalms = null; // last tick's palms (the swept Flux's start)
+    this.last = null;      // last pose sample {t, palms, head, quat}
+    this.done = false;
+    this.stats = this.judge.stats();
+  }
+
+  /** Game time of the next tick's judgment (its end time). */
+  nextTickTime() {
+    return (this.rep.ticks.length + 1) * DT;
+  }
+
+  /**
+   * One pose sample at game time `t` (s; negative during the lead-in):
+   * palms [[x,y,z] L, R] and head [x,y,z] in ENV world coords, head
+   * orientation `quat` (env frame, optional). Runs every tick whose end
+   * time has been reached. Returns the number of ticks judged.
+   */
+  feed(t, palms, head, quat = [0, 0, 0, 1]) {
+    const s = { t, palms, head, quat };
+    if (this.done) { this.last = s; return 0; }
+    if (this.prevPalms === null && t >= 0) {
+      // chart time 0: the swept Flux starts where the palms are now
+      // (the env starts from the body's reset pose)
+      const a = this.last && this.last.t < 0 ? this.last : s;
+      const u = a === s ? 0 : (0 - a.t) / (s.t - a.t);
+      this.prevPalms = [lerp3(a.palms[0], s.palms[0], u),
+                        lerp3(a.palms[1], s.palms[1], u)];
+    }
+    let n = 0;
+    while (!this.done && this.prevPalms !== null && this.nextTickTime() <= t) {
+      const T = this.nextTickTime();
+      const a = this.last && this.last.t < T ? this.last : s;
+      if (a === s || s.t === T) {
+        // no earlier sample to interpolate from, or one landed on the
+        // tick exactly: take it verbatim (a lerp at u = 1 is not exact)
+        this.tick(s.palms, s.head, s.quat);
+      } else {
+        const u = (T - a.t) / (s.t - a.t);
+        this.tick([lerp3(a.palms[0], s.palms[0], u), lerp3(a.palms[1], s.palms[1], u)],
+          lerp3(a.head, s.head, u), u < 0.5 ? a.quat : s.quat);
+      }
+      n++;
+    }
+    this.last = s;
+    return n;
+  }
+
+  /** Judge one tick with palms p1 and head `head` (env world). */
+  tick(p1, head, quat) {
+    const k = this.rep.ticks.length;
+    // a standing human's shoulders sit in the head's frontal plane — the
+    // env's reference pose has shoulder z = head z = PLANE_Z0 too
+    const { done, events } = this.judge.step(this.prevPalms, p1, head, head[2]);
+    this.prevPalms = p1;
+    const before = this.stats.reward;
+    this.stats = this.judge.stats();
+    const rec = [];
+    for (const e of events) {
+      if (e.code === 4) {
+        rec.push({ miss: { note: e.i } });
+        this.rep.outcomes[e.i] = { kind: "miss", reason: "miss", tick: k, points: 0 };
+      } else {
+        const good = e.code === 0;
+        rec.push({ cut: { note: e.i, good, reason: e.reason, points: e.pts,
+                          pre: e.pre, acc: e.acc } });
+        this.rep.outcomes[e.i] = { kind: good ? "good" : "bad",
+                                   reason: e.reason, tick: k, points: e.pts };
+      }
+      this.onEvent?.(e, this.chart[e.i]);
+    }
+    this.rep.ticks.push({
+      t: k,
+      time: r5(k * DT),
+      palms: p1.map((p) => p.map(r5)),
+      head: [...head.map(r5), ...quat.map(r5)],
+      reward: r5(this.stats.reward - before),
+      events: rec,
+    });
+    if (done) this.done = true;
+  }
+
+  /** The run as a viewer-loadable .jsonl (the env recorder's layout). */
+  toJSONL() {
+    const s = this.stats;
+    const header = { header: {
+      version: "v10",
+      record_rev: 5,
+      game: "flux",
+      player: "human",
+      track_anchor: "head",
+      config: this.rep.config,
+      chart: this.chart,
+      walls: [],
+      chart_id: this.entry.id ?? null,
+      chart_name: this.entry.name ?? null,
+      result: { score: s.score, raw_score: s.raw_score, good: s.good,
+                bad: s.bad, misses: s.misses, max_combo: s.max_combo,
+                max_score: s.max_score },
+    } };
+    return [header, ...this.rep.ticks].map((o) => JSON.stringify(o)).join("\n") + "\n";
+  }
+
+  free() {
+    this.judge.free();
+  }
+}
+
+/** Rank letter for a run, from the unmultiplied accuracy (points / max). */
+export function rank(stats) {
+  const f = stats.max_score > 0 ? stats.raw_score / stats.max_score : 0;
+  return f >= 0.9 ? "SS" : f >= 0.8 ? "S" : f >= 0.65 ? "A" : f >= 0.5 ? "B"
+    : f >= 0.35 ? "C" : "D";
+}
+

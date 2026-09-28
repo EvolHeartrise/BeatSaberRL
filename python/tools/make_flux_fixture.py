@@ -75,20 +75,17 @@ def rollout(env, ticks):
     return palms, head_z
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("out")
-    ap.add_argument("--ticks", type=int, default=300)
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
-    rng = np.random.default_rng(args.seed)
+def build_chart(seed=0, ticks=300):
+    """Pass 1 + chart construction: the scripted palm path, then objects
+    placed ON it (see the module docstring). Deterministic in seed."""
+    rng = np.random.default_rng(seed)
 
     # pass 1: the palm path (an empty-ish chart far in the future keeps
     # the episode alive for the whole window)
-    far = [FluxObj(hit_time=args.ticks * DT + 5.0, x=0.0, y=1.4,
+    far = [FluxObj(hit_time=ticks * DT + 5.0, x=0.0, y=1.4,
                    kind=KIND_CIRCLE, speed=SPEED)]
-    env = RustFluxEnv(external_chart=far, seed=args.seed)
-    palms, head_z = rollout(env, args.ticks)
+    env = RustFluxEnv(external_chart=far, seed=seed)
+    palms, head_z = rollout(env, ticks)
 
     def hit_time(k, pz):
         # step k+1 ends at time (k+1)*DT; z_off from that tick's head
@@ -133,6 +130,16 @@ def main():
                                  KIND_BAR, SPEED, rot=1.2, length=0.3,
                                  sweet=0.5))
     chart.sort(key=lambda o: o.hit_time)
+    return chart
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    ap.add_argument("--ticks", type=int, default=300)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+    chart = build_chart(args.seed, args.ticks)
 
     env = RustFluxEnv(external_chart=chart, seed=args.seed)
     env.set_record(args.out)
