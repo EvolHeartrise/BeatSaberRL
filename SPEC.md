@@ -328,7 +328,14 @@ rollouts on both builds and both foot modes).
   hitbox. A palm or Flux held still in an object's path is touched at
   any speed and tick phase; nothing tunnels. `dt` is the judge tick:
   `DT` in the env, `DT / 4` in the WebXR game (`flux::judge`'s
-  `tick_dt`).
+  `tick_dt`). The sweep **stops at the head plane**: on the tick an
+  object crosses it, the relative paths end at the crossing fraction,
+  so a palm behind the head never scores (at either judge rate). Both
+  ends of a tick's sweep use this tick's head-anchored `z_off` (head
+  motion within a tick is ignored): consecutive sweeps overlap while
+  the head moves toward the objects and leave a gap of the head's
+  per-tick z change while it retreats — a miss only at retreat speeds
+  ≳ 3 m/s.
 - **Misses**: an untouched circle or bar passing the head plane is a
   miss (event 4, −0.5), exactly like a note. Contact is judged first:
   an object that went through a palm and past the head plane within
