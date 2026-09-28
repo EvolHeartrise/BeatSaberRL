@@ -372,6 +372,113 @@ rollouts on both builds and both foot modes).
   + mark. Fixture: `python/tools/make_flux_fixture.py` →
   `viz/app/test/fixtures/flux_scripted.jsonl`; tests
   `test/flux.test.js` (npm test) and `test/flux-browser.mjs`.
+- **Code layout** (2026-09-27): the rules are three body-free files —
+  `rust/src/geom.rs` (Note, the hitbox / sweep geometry, judge
+  constants, chart tail / cursor / end rule), `rust/src/flux.rs` (palm,
+  circle / bar tests, `flux_note`, `judge`), `rust/src/combo.rs`
+  (ComboWalk) — compiled into BOTH the env crate and the WebXR game's
+  wasm crate (below). `rust/src/flux_sim.rs` is the env-only glue
+  (chart install, the per-tick `flux::judge` call on the body's palms
+  plus the env's own tallies from its events, the Flux obs blocks).
+  The split was bitwise-neutral: seeded standard + Flux rollouts on the
+  f64 and f32 builds, single and vector, hash identically before and
+  after.
+
+## Flux WebXR game (`viz/app`, `rust/flux-wasm`) — 2026-09-27
+
+A person plays Flux in a headset, judged by the env's own code. There is
+no port of the rules: `rust/flux-wasm` compiles the env crate's
+`geom.rs` / `flux.rs` / `combo.rs` (via `#[path]`) to
+`wasm32-unknown-unknown` with a dependency-free C ABI, and
+`FluxGame::step` runs the Flux tick in the env's order (`Core::step_inner`):
+tick end time `(tick + 1)·DT`, `flux::judge` on last tick's → this
+tick's palms, `tick += 1`, the cursor, `geom::chart_done` (no trackers;
+a person has no fall / tilt / escape), then the bench's ScoreSaber
+`ComboWalk` for combo / multiplier / score. f64: the game matches the f64
+Rust REFERENCE env bit for bit; the agent trains on the f32 CUDA kernel,
+which is tied to that reference by the existing CUDA parity tests
+(tolerance bands, not bits).
+
+- **Deterministic trig**: a bar's rotation is installed as (sin, cos) via
+  `geom::det_sin_cos` (a pure-Rust copy of musl's algorithm, < 1 ulp)
+  in the f64 build, not the platform libm — glibc (native env) and
+  musl's port (wasm32) disagree in the last bit for ~6% of angles, which
+  would let the two builds install different bars. Nothing else in the
+  judge calls a transcendental (sqrt is IEEE-exact). The f32 build keeps
+  sinf/cosf (no game counterpart). Introducing it moved no seeded
+  fingerprint (standard or Flux, f64 or f32).
+
+- **The player is the body**: palms = the controller grip-space origin
+  (the handle centre the palm wraps), or for tracked hands without a
+  grip space the midpoint of wrist and middle knuckle; head = the viewer
+  pose; shoulder z (reach gate) = head z (the env's reference pose has
+  both at PLANE_Z0). Approximations, not rule changes: the headset pose
+  is the eyes, a few cm in front of the body's head-frame origin, so the
+  miss plane (head z) sits that much further forward than on the body;
+  and with shoulder z = head z the reach gate stops judging objects more
+  than ~1.46 m past the eyes (a palm > ~0.7 m in front of the face) —
+  about the body's own reach. Object positions are the env's absolute world
+  metres (no height scaling). The player's floor origin sits at world
+  z = PLANE_Z0, where the body stands (an `<XROrigin>` at scene
+  z = 0.65 for the view, the same offset added to every pose read).
+- **Rendering vs judging**: everything is DRAWN at the headset's display
+  rate (72–120 Hz): objects on continuous chart time, the palms / beam
+  from each frame's pose. The JUDGE always runs at 120 Hz (flux-wasm
+  `judge_hz` = 30·k, k = 4 judge ticks per 30 Hz env tick) — only the
+  scoring clock, unrelated to the body sim's physics substeps (the game
+  has no body): the same `flux::judge` on a finer sampling of the
+  player's path, so hits resolve (and burst, and sound) within 1/120 s of
+  happening instead of at the env tick's end. At `judge_hz` = 30 the
+  wasm is the env's tick bit for bit (the parity gate and the session
+  plumbing tests run there); at 120 the game judges a finer path than
+  the env's 30 Hz discretization of the body — same rules, finer
+  sampling.
+- **Ticks**: poses arrive at the display rate; judge tick j's palms /
+  head are the pose track linearly interpolated to its end time
+  (j + 1)·DT/k (a sample exactly on a tick is used verbatim), and
+  p0 is the previous tick's palms (the palms at chart time 0 for the
+  first tick). The recording keeps 30 Hz frames (the viewer's clock);
+  every event carries its exact judge time `t`, which the viewer uses
+  for the hit burst / removal (agent replays: the tick end, as before);
+  header `judge_hz`. A 3 s countdown precedes chart time 0; the clock pauses
+  while the session is hidden (headset off / system menu). With no pose
+  (no headset at all, or tracking lost) the last pose — else a resting
+  stance — is HELD, so the chart clock still runs to its end; on a
+  resume or a regained track the pose track REBASES (the next tick's
+  swept Flux starts at the new palms, never across the gap). A single
+  hand that loses tracking keeps its last position and does sweep to its
+  new one on reacquisition.
+- **Charts**: `viz/app/src/lib/fluxcharts.data.js`, generated by
+  `python/tools/make_flux_chart_pack.py` from generator f1 at full
+  precision (the "Training" entries are its default config — the
+  agent's training distribution — plus slow warm-ups, a 60 s marathon
+  and a bars-only chart), and the chart of any agent Flux replay open
+  when play mode starts (race the agent on its own level).
+- **Recording**: a run is a replay (`fluxgame.js` LiveReplay; header
+  `"game": "flux"`, `"player": "human"`, `"result"`; per tick `palms`,
+  `head` [x, y, z, qx, qy, qz, qw] (env frame), `reward` (judge terms
+  only), `events` in the env recorder's shape). The viewer renders the
+  live game from it (Notes / Flux unchanged) and plays saved runs back
+  (palms + beam + a headset marker; first-person = the head track).
+- **Play**: `cd viz/app && npm run xr` (HTTPS dev server on the LAN,
+  self-signed; WebXR needs a secure context), open
+  `https://<laptop-ip>:5173` on the headset, "🥽 play Flux", "enter VR";
+  trigger / pinch starts, grip changes chart; results offer save
+  (.jsonl) and watch-in-viewer.
+- **Parity gates**: `viz/app/test/flux-parity.test.js` replays env
+  episodes (`python/tools/make_flux_game_fixture.py`: every tick's full
+  judge input — both ticks' palms, head, shoulder z — at full precision,
+  plus the env's events and each chart's INSTALLED (sin_a, cos_a)) through
+  the wasm judge and requires the same install bit for bit, identical
+  events tick for tick, the same end tick and tallies, and every Flux
+  outcome exercised; a 400-rotation trig probe (≈ 23 angles where the
+  platform libms differ) pins the install beyond the episodes' few bars; npm test runs it on the committed fixture,
+  `python/tests/test_flux_game_parity.py` on one recorded fresh from the
+  env under test (and pins the chart pack to the generator). Game
+  plumbing: `test/flux-game.test.js`; the built app:
+  `test/flux-play-browser.mjs` (scripted poses) and
+  `test/flux-xr-browser.mjs` (a real WebXR session on an emulated
+  Quest 3, iwer). CI: `.github/workflows/ci.yml`.
 
 ## Chart generation (`beat_arena_env/chart.py`) — generator v2
 

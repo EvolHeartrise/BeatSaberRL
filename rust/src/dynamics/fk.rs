@@ -11,6 +11,10 @@ use crate::Real;
 use super::model::Model;
 use super::{State, Workspace};
 
+// the three judge-shared vector ops live in crate::geom (also compiled
+// into the Flux WebXR game's wasm build); re-exported here unchanged
+pub use crate::geom::{cross3, dot3, sub3};
+
 pub type Mat3 = [[Real; 3]; 3];
 
 pub const IDENT3: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -37,24 +41,8 @@ pub fn add3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-pub fn sub3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
 pub fn scale3(a: [Real; 3], s: Real) -> [Real; 3] {
     [a[0] * s, a[1] * s, a[2] * s]
-}
-
-pub fn dot3(a: [Real; 3], b: [Real; 3]) -> Real {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-pub fn cross3(a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
 }
 
 /// Rodrigues: R = I + sinθ·[a]x + (1−cosθ)·[a]x² for a UNIT axis.
