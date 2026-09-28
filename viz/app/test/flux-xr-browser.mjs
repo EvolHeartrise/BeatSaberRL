@@ -39,8 +39,10 @@ const HARNESS = `
   dev.installRuntime({ forceInstall: true });
   window.__xr = dev;
   const REST = [[-0.25, 1.1, -0.4], [0.25, 1.1, -0.4]];
+  // palms at env z -0.35, reached 0.35 / speed after the hit time: each
+  // palm holds its object until then
   window.__palmAt = (t, chart) => [0, 1].map((h) => {
-    const o = chart.find((o) => o.t >= t - 0.02 &&
+    const o = chart.find((o) => o.t + 0.35 / o.speed >= t - 0.02 &&
       ((o.kind === 4 && o.color === h) || o.kind === 5));
     if (!o) return REST[h];
     if (o.kind === 4) return [o.x, o.y, -0.35];

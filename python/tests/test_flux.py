@@ -35,9 +35,9 @@ def _sim():
     return RawBeatSim(max_steps=400, flux=True)
 
 
-def _arrive_now(sim, palm_z, lead=0.2):
+def _arrive_now(sim, palm_z, lead=0.02):
     """hit_time putting the object centre `lead` m beyond the palm on
-    tick 1 (so the palm sits inside the [-0.75, +0.25] slab)."""
+    tick 1 (so the palm sits inside the [-0.05, +0.05] slab)."""
     z_off = sim.head_pose()[2] - PLANE_Z0
     return DT + (palm_z + lead - z_off) / SPEED
 

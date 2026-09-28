@@ -45,7 +45,7 @@ impl Core {
             self.body.shoulder_z[0].max(self.body.shoulder_z[1]));
         let first = self.events_buf.len();
         flux::judge(&self.chart, &mut self.status, self.first_pending,
-                    self.min_speed, self.time, self.body.head, reach_z,
+                    self.min_speed, self.time, DT, self.body.head, reach_z,
                     &p0, &p1, reward, &mut self.events_buf);
         for k in first..self.events_buf.len() {
             let (i, code, pts, pre, acc) = self.events_buf[k];
