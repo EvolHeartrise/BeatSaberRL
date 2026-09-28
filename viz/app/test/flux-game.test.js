@@ -137,9 +137,10 @@ assert.deepEqual(quatSceneToEnv([0, 0, 0.5, 0.8]), [-0, -0, 0.5, 0.8]);
 }
 // a hit is judged (and drawn) when it happens: a palm crossing a circle
 // half-way through an env tick resolves it on that 120 Hz sub-tick (t =
-// DT/2), where the env's clock only judges it at the tick's end (t = DT)
+// DT/2), where the env's clock only judges it at the tick's end (t = DT).
+// The circle reaches the palms' depth (z = 0) at t = DT/2 too.
 {
-  const c = { t: 0.5 * DT + 0.2 / 12, x: 0, y: 1.2, kind: 4, color: 0, rot: 0,
+  const c = { t: 0.5 * DT, x: 0, y: 1.2, kind: 4, color: 0, rot: 0,
               speed: 12, len: 0, sweet: 0 };
   const at = (hz) => {
     const s = new FluxSession(core, { id: "x", chart: [c] }, { hz });
@@ -160,21 +161,26 @@ assert.deepEqual(quatSceneToEnv([0, 0, 0.5, 0.8]), [-0, -0, 0.5, 0.8]);
 // The "player" moves each palm onto the next circle of its colour as that
 // circle arrives, and holds the Flux square across each bar through its
 // sweet spot — what a person does, as an env-world pose track.
+// Palms sit at env z = PZ, 0.35 m past the hit plane (z_off = 0 with the
+// head at PLANE_Z0), which an object reaches PZ / speed after its hit time;
+// each palm holds its object until then.
+const PZ = -0.35;
 function playerFor(chart) {
-  const next = (h, t) => chart.find((o) => o.t >= t - 0.02 &&
+  const reaches = (o) => o.t - PZ / o.speed;
+  const next = (h, t) => chart.find((o) => reaches(o) >= t - 0.02 &&
     ((o.kind === KIND_CIRCLE && o.color === h) || o.kind === KIND_BAR));
   return (t) => {
     const palms = [0, 1].map((h) => {
       const o = next(h, t);
       if (!o) return REST[h];
-      if (o.kind === KIND_CIRCLE) return [o.x, o.y, -0.35];
+      if (o.kind === KIND_CIRCLE) return [o.x, o.y, PZ];
       // bar: palms either side of the sweet spot, along the bar normal
       const [ux, uy] = barAxis(o.rot);
       const [sx, sy] = sweetPoint(o);
       const nx = uy, ny = -ux; // perpendicular to the axis
       const side = h === 0 ? -1 : 1;
       const d = side * 0.3 * (nx < 0 ? -1 : 1);
-      return [sx + d * nx, sy + d * ny, -0.35];
+      return [sx + d * nx, sy + d * ny, PZ];
     });
     return { palms, head: HEAD, quat: [0, 0, 0, 1] };
   };
@@ -227,12 +233,12 @@ function playerFor(chart) {
 // across a pause. A plain feed sweeps the palm through it (touch); after
 // rebase the sweep starts at the new pose (the player never moved there).
 {
-  const circle = { t: 0.2, x: 0, y: 1.2, kind: 4, color: 0, rot: 0, speed: 1,
-                   len: 0, sweet: 0 };
-  // the circle's slab (z in [-0.75, +0.25] about its centre) holds the palm
-  // from t = 0 until well after the jump
-  const from = [[-0.4, 1.2, 0.15], REST[1]];
-  const to = [[0.4, 1.2, 0.15], REST[1]];
+  const circle = { t: 1.5 * DT, x: 0, y: 1.2, kind: 4, color: 0, rot: 0,
+                   speed: 1, len: 0, sweet: 0 };
+  // at 1 m/s the circle's thin slab (5 cm either side) is at the palm's
+  // depth (z 0, within reach) through tick 1, when the jump happens
+  const from = [[-0.4, 1.2, 0], REST[1]];
+  const to = [[0.4, 1.2, 0], REST[1]];
   const run = (rebase) => {
     const s = new FluxSession(core, { id: "gap", chart: [circle] });
     s.feed(0, from, HEAD);
