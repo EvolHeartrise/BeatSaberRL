@@ -180,6 +180,10 @@ def main():
     ap.add_argument("--profile", action="store_true",
                     help="torch.profiler kernel table over --iters "
                          "updates instead of the timing loop")
+    ap.add_argument("--fp16-accum", default=None,
+                    choices=("off", "fwd", "all"),
+                    help="GEMM accumulate mode of the fp16 stream (issue "
+                         "#3); default = the checkpoint arch's mode")
     ap.add_argument("--grad-dump", default=None,
                     help="save logits/value/grads of one fwd+bwd at the "
                          "loaded weights to this path (then exit)")
@@ -207,6 +211,9 @@ def main():
     hdr = (f"{'mb':>7}{'accum':>7}{'ms/update':>12}{'peak MB':>10}")
     print(hdr)
     print("-" * len(hdr))
+    if args.fp16_accum is not None:
+        src.fp16_accum = src.arch["fp16_accum"] = args.fp16_accum
+    print(f"fp16 accumulate: {src.fp16_accum}")
     for n in args.mbs:
         pol = fresh_policy(src, device)
         if args.fp16:                    # mirror train_batch.py order:
