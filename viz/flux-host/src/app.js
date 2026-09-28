@@ -13,10 +13,15 @@
 //
 // Config (wrangler secrets): DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
 // SESSION_SECRET (random, >= 32 chars), ALLOWED_DISCORD_IDS (comma /
-// whitespace separated Discord user ids). Missing config fails closed.
+// whitespace separated Discord user ids); var PUBLIC_ORIGIN (wrangler.jsonc;
+// the OAuth redirect URI is PUBLIC_ORIGIN + "/callback", registered with the
+// Discord app). Missing config fails closed.
+//
+// `__Host-` cookies: Secure, Path=/, no Domain — no other *.flee.systems host
+// can plant or overwrite them (login CSRF / session fixation).
 
-const SESSION_COOKIE = "flux_session";
-const STATE_COOKIE = "flux_oauth_state";
+const SESSION_COOKIE = "__Host-flux_session";
+const STATE_COOKIE = "__Host-flux_oauth_state";
 const SESSION_TTL_S = 7 * 24 * 3600;
 const STATE_TTL_S = 600;
 const DISCORD_AUTHORIZE = "https://discord.com/oauth2/authorize";
@@ -68,13 +73,18 @@ export async function verify(token, secret, now = Date.now() / 1000) {
 
 // ---- config ----------------------------------------------------------------
 export function allowedIds(env) {
-  return new Set(String(env.ALLOWED_DISCORD_IDS ?? "")
-    .split(/[\s,]+/).filter((s) => /^\d{5,25}$/.test(s)));
+  const ids = new Set();
+  for (const s of String(env.ALLOWED_DISCORD_IDS ?? "").split(/[\s,]+/)) {
+    if (/^\d{5,25}$/.test(s)) ids.add(s);
+    else if (s) console.warn(`ALLOWED_DISCORD_IDS: ignoring ${JSON.stringify(s)} (not a Discord user id)`);
+  }
+  return ids;
 }
 
 function configured(env) {
   return Boolean(env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET
-    && env.SESSION_SECRET && String(env.SESSION_SECRET).length >= 32);
+    && env.SESSION_SECRET && String(env.SESSION_SECRET).length >= 32
+    && /^https?:\/\/[^/]+$/.test(env.PUBLIC_ORIGIN ?? ""));
 }
 
 // ---- cookies -----------------------------------------------------------------
@@ -137,8 +147,9 @@ const logoutForm = `<form method="post" action="/logout"><button class="ghost">l
 export async function handle(request, env, gameHtml, fetchImpl = fetch) {
   const url = new URL(request.url);
   const method = request.method;
-  // Must match the redirect URI registered with the Discord app exactly.
-  const callback = `https://${url.host}/callback`;
+  // Must match the redirect URI registered with the Discord app exactly;
+  // fixed by config, never taken from the request's Host.
+  const callback = `${env.PUBLIC_ORIGIN}/callback`;
 
   if (!configured(env)) {
     return page("Flux", "<p>This site is not configured yet.</p>", 503);
@@ -183,22 +194,28 @@ but this Discord account isn't whitelisted.</p>
       return page("Login failed", `<p>The login link expired or was invalid.</p>
 <a class="btn" href="/login">Try again</a>`, 400, { "Set-Cookie": clearState });
     }
-    const tokenRes = await fetchImpl(DISCORD_TOKEN, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: callback,
-        client_id: env.DISCORD_CLIENT_ID,
-        client_secret: env.DISCORD_CLIENT_SECRET,
-      }),
-    });
-    const token = tokenRes.ok ? await tokenRes.json() : null;
-    const meRes = token?.access_token
-      ? await fetchImpl(DISCORD_ME, { headers: { Authorization: `Bearer ${token.access_token}` } })
-      : null;
-    const me = meRes?.ok ? await meRes.json() : null;
+    let me = null;
+    try {
+      const tokenRes = await fetchImpl(DISCORD_TOKEN, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: callback,
+          client_id: env.DISCORD_CLIENT_ID,
+          client_secret: env.DISCORD_CLIENT_SECRET,
+        }),
+      });
+      const token = tokenRes.ok ? await tokenRes.json() : null;
+      const meRes = token?.access_token
+        ? await fetchImpl(DISCORD_ME, { headers: { Authorization: `Bearer ${token.access_token}` } })
+        : null;
+      me = meRes?.ok ? await meRes.json() : null;
+    } catch (e) {
+      // Network error or a non-JSON 200 (e.g. a challenge page).
+      console.warn(`Discord OAuth exchange failed: ${e}`);
+    }
     if (!me || typeof me.id !== "string" || !/^\d+$/.test(me.id)) {
       return page("Login failed", `<p>Discord didn't confirm the login.</p>
 <a class="btn" href="/login">Try again</a>`, 502, { "Set-Cookie": clearState });

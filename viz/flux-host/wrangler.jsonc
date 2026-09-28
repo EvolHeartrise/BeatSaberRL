@@ -11,6 +11,9 @@
   "workers_dev": false,
   "preview_urls": false,
   "routes": [{ "pattern": "flux.flee.systems", "custom_domain": true }],
-  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": false }],
+  // OAuth redirect URI = PUBLIC_ORIGIN + "/callback" (registered in the
+  // Discord app). For `wrangler dev`, override in .dev.vars.
+  "vars": { "PUBLIC_ORIGIN": "https://flux.flee.systems" },
+  "rules":[{ "type": "Text", "globs": ["**/*.html"], "fallthrough": false }],
   "observability": { "enabled": true }
 }
