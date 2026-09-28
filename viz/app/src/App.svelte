@@ -8,9 +8,9 @@
     restart, seekTo, setPlaying, setSpeed, step, toggleMapCard,
     togglePose } from "./lib/state.svelte.js";
   import { toggleXRSession } from "@threlte/xr";
-  import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
+  import { bestKey, chartEntries, enterPlay, exitPlay, exportRun, startRun,
     watchRun } from "./lib/playctl.js";
-  import { rank } from "./lib/fluxgame.js";
+  import { JUDGE_HZ, rank } from "./lib/fluxgame.js";
   import { sfx } from "./lib/sfx.js";
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
@@ -472,9 +472,19 @@
         <label>chart
           <select bind:value={play.chartId} disabled={running}>
             {#each entries as c (c.id)}
+              {@const b = play.best[bestKey(c.id, play.hz)]}
               <option value={c.id}>
-                {c.name}{play.best[c.id] != null ? ` — best ${fmtScore(play.best[c.id])}` : ""}
+                {c.name}{b != null ? ` — best ${fmtScore(b)}` : ""}
               </option>
+            {/each}
+          </select>
+        </label>
+        <label title="how often the hits are judged. Drawing is always at the
+                      headset's rate; 30 Hz is the env's own tick — play the
+                      agent's clock like-for-like">judged at
+          <select bind:value={play.hz} disabled={running}>
+            {#each JUDGE_HZ as hz (hz)}
+              <option value={hz}>{hz} Hz{hz === 30 ? " (the env's tick)" : ""}</option>
             {/each}
           </select>
         </label>

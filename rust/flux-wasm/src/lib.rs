@@ -9,6 +9,13 @@
 //! chart end rule), then the bench's ScoreSaber combo walk. The f64
 //! build: the env's reference precision.
 //!
+//! Judge rate: the env judges once per 30 Hz tick (DT). The game may judge
+//! at `judge_hz` = 30·k (k judge ticks per env tick: finer palm paths,
+//! hits judged closer to when they happen) — the SAME judge on a finer
+//! sampling of the player's motion; judge tick j ends at (j + 1)·DT/k.
+//! 30 Hz is the env's tick, bit for bit (the parity fixture pins it).
+//! (Unrelated to the body sim's physics substeps: the game has no body.)
+//!
 //! The JS side (viz/app/src/lib/fluxcore.js) talks to a plain C ABI over
 //! linear memory — no bindings generator, no dependencies.
 
@@ -75,6 +82,8 @@ pub struct FluxGame {
     min_speed: Real,
     tail_s: Real,
     max_steps: u32,
+    /// judge tick length: DT / (judge_hz / 30) (DT itself at 30 Hz)
+    tick_dt: Real,
     tick: u32,
     time: Real,
     finished: bool,
@@ -101,9 +110,17 @@ fn max_points(chart: &[geom::Note]) -> Real {
 impl FluxGame {
     /// Install a chart exactly as `Core::set_flux_chart` does: the same
     /// per-object checks and the same sorted-order requirement, the same
-    /// slowest-object tail. `max_steps` = 0 picks the env's fixed-chart
-    /// budget (`RustFluxEnv(external_chart=...)`: (last hit + 0.5)·30 + 90).
-    pub fn new(chart: &[FluxTuple], max_steps: u32) -> Result<Self, &'static str> {
+    /// slowest-object tail. `max_steps` (in ENV ticks) = 0 picks the env's
+    /// fixed-chart budget (`RustFluxEnv(external_chart=...)`: (last hit +
+    /// 0.5)·30 + 90). `judge_hz`: the judge rate, a multiple of 30 in
+    /// 30..=480 (30 = the env's tick).
+    pub fn new(chart: &[FluxTuple], max_steps: u32, judge_hz: u32)
+               -> Result<Self, &'static str> {
+        if judge_hz % 30 != 0 || !(30..=480).contains(&judge_hz) {
+            return Err("judge_hz must be a multiple of 30 in 30..=480");
+        }
+        // judge ticks per env tick
+        let per_tick = judge_hz / 30;
         let notes = chart
             .iter()
             .map(|&t| flux::flux_note(t))
@@ -117,7 +134,7 @@ impl FluxGame {
         } else {
             let last = notes.last().map_or(0.0, |n| n.hit_time);
             ((last + 0.5) * 30.0) as u32 + 90
-        };
+        } * per_tick;
         let n = notes.len();
         let stats = Stats {
             n_objects: n as f64,
@@ -131,6 +148,8 @@ impl FluxGame {
             min_speed,
             tail_s: chart_tail_s(min_speed),
             max_steps,
+            // exactly DT at 30 Hz (x / 1.0 == x)
+            tick_dt: DT / per_tick as Real,
             tick: 0,
             time: 0.0,
             finished: false,
@@ -143,7 +162,8 @@ impl FluxGame {
         })
     }
 
-    /// One 30 Hz tick in the env's Flux order (lib.rs `step_inner`):
+    /// One judge tick (at `judge_hz`) in the env's Flux order (lib.rs
+    /// `step_inner`):
     /// the tick's end time, `flux::judge` on (p0 → p1), tick += 1, the
     /// low-water cursor, then the chart end rule (`geom::chart_done`;
     /// Flux never has follow-through trackers, and the player has no
@@ -156,7 +176,7 @@ impl FluxGame {
         if self.finished {
             return true;
         }
-        self.time = (self.tick + 1) as Real * DT;
+        self.time = (self.tick + 1) as Real * self.tick_dt;
         let mut reward = 0.0;
         flux::judge(&self.chart, &mut self.status, self.first_pending,
                     self.min_speed, self.time, head,
@@ -249,13 +269,15 @@ pub unsafe extern "C" fn fg_dealloc(p: *mut f64, n: u32) {
     }
 }
 
-/// New game over `n` objects of OBJ_F floats at `chart`; null on an
-/// invalid chart (reason via fg_error_ptr / fg_error_len).
+/// New game over `n` objects of OBJ_F floats at `chart`, judged at
+/// `judge_hz`; null on an invalid chart or rate (reason via fg_error_ptr /
+/// fg_error_len).
 ///
 /// # Safety
 /// `chart` must point at `n * OBJ_F` readable f64s.
 #[no_mangle]
-pub unsafe extern "C" fn fg_new(chart: *const f64, n: u32, max_steps: u32) -> *mut FluxGame {
+pub unsafe extern "C" fn fg_new(chart: *const f64, n: u32, max_steps: u32,
+                                judge_hz: u32) -> *mut FluxGame {
     let raw = if n == 0 {
         &[][..]
     } else {
@@ -268,7 +290,7 @@ pub unsafe extern "C" fn fg_new(chart: *const f64, n: u32, max_steps: u32) -> *m
         let small = |v: f64| if v >= 0.0 && v <= 255.0 && v.fract() == 0.0 { v as u8 } else { 255 };
         tuples.push((o[0], o[1], o[2], small(o[3]), small(o[4]), o[5], o[6], o[7], o[8]));
     }
-    match FluxGame::new(&tuples, max_steps) {
+    match FluxGame::new(&tuples, max_steps, judge_hz) {
         Ok(g) => Box::into_raw(Box::new(g)),
         Err(e) => {
             LAST_ERR.with(|m| *m.borrow_mut() = e);
@@ -424,7 +446,7 @@ mod tests {
             circle(arrive(r[2], 0.2) + 0.001, r[0], r[1], 0), // left on right: bad
             circle(arrive(0.0, 0.0) + 0.002, 0.9, 1.9, 1),   // nobody: miss
         ];
-        let mut g = FluxGame::new(&chart, 0).unwrap();
+        let mut g = FluxGame::new(&chart, 0, 30).unwrap();
         let ev = run(&mut g, [l, r], 60);
         let codes: Vec<(u32, u8)> = ev.iter().map(|e| (e.0, e.1)).collect();
         assert_eq!(codes, vec![(0, 0), (1, 3), (2, 4)]);
@@ -443,19 +465,70 @@ mod tests {
     #[test]
     fn invalid_charts_are_refused_with_the_env_messages() {
         let bad_kind = [(1.0, 0.0, 1.4, 0u8, 0u8, 0.0, SPEED, 0.0, 0.0)];
-        assert_eq!(FluxGame::new(&bad_kind, 0).err(),
+        assert_eq!(FluxGame::new(&bad_kind, 0, 30).err(),
                    Some("flux chart kinds are 4 (circle) / 5 (bar)"));
         let unsorted = [circle(2.0, 0.0, 1.4, 0), circle(1.0, 0.0, 1.4, 1)];
-        assert_eq!(FluxGame::new(&unsorted, 0).err(),
+        assert_eq!(FluxGame::new(&unsorted, 0, 30).err(),
                    Some("chart must be sorted by hit_time"));
         let bar = [(1.0, 0.0, 1.4, KIND_BAR, 0u8, 0.0, SPEED, 0.5, 1.5)];
-        assert_eq!(FluxGame::new(&bar, 0).err(),
+        assert_eq!(FluxGame::new(&bar, 0, 30).err(),
                    Some("sweet-spot offset must be in [-1, 1]"));
     }
 
     #[test]
+    fn a_faster_judge_rate_runs_the_same_rules_on_a_finer_clock() {
+        let l = [-0.3, 1.2, -0.45];
+        let r = [0.3, 1.2, -0.45];
+        let chart = [
+            circle(arrive(l[2], 0.2), l[0] + 0.03, l[1], 0),
+            circle(arrive(r[2], 0.2) + 0.001, r[0], r[1], 0),
+            circle(arrive(0.0, 0.0) + 0.002, 0.9, 1.9, 1),
+        ];
+        let mut g1 = FluxGame::new(&chart, 0, 30).unwrap();
+        let mut g4 = FluxGame::new(&chart, 0, 120).unwrap();
+        let e1 = run(&mut g1, [l, r], 60);
+        let e4 = run(&mut g4, [l, r], 240);
+        // a static pose: the same outcomes and points at either rate ...
+        let k = |e: &Vec<Event>| e.iter().map(|e| (e.0, e.1, e.2)).collect::<Vec<_>>();
+        assert_eq!(k(&e1), k(&e4));
+        // ... on a clock 4x finer: tick k ends at (k + 1)·DT/4, and the
+        // budget is counted in judge ticks
+        assert_eq!(g4.tick_dt, DT / 4.0);
+        assert_eq!(g1.tick_dt, DT);
+        assert_eq!(g4.max_steps, 4 * g1.max_steps);
+        // the miss lands no later than at 30 Hz, and within one env tick
+        let (t1, t4) = (g1.stats().time, g4.stats().time);
+        assert!(t4 <= t1 && t1 - t4 < DT, "{t1} vs {t4}");
+        for bad in [0, 45, 100, 510] {
+            assert_eq!(FluxGame::new(&chart, 0, bad).err(),
+                       Some("judge_hz must be a multiple of 30 in 30..=480"));
+        }
+    }
+
+    #[test]
+    fn a_hit_is_judged_when_it_happens_not_at_the_env_tick_end() {
+        // a palm sweeps across a circle between t = 0 and DT; at 120 Hz
+        // the touch is judged on the 1/120 s tick it happens in
+        let c = circle(0.5 * DTT + 0.2 / SPEED, 0.0, 1.2, 0);
+        let mut g = FluxGame::new(&[c], 0, 120).unwrap();
+        let path = |u: f64| [[-0.4 + 0.8 * u, 1.2, 0.0], [0.6, 1.2, 0.0]];
+        let mut hit_tick = None;
+        for k in 0..8 {
+            let (u0, u1) = (k as f64 / 4.0, (k + 1) as f64 / 4.0);
+            g.step(&path(u0.min(1.0)), &path(u1.min(1.0)), HEAD, PLANE_Z0);
+            if !g.events().is_empty() {
+                hit_tick = Some(k);
+                break;
+            }
+        }
+        // the palm crosses x = 0 half-way through the env tick: sub-tick 1
+        assert_eq!(hit_tick, Some(1));
+        assert_eq!(g.events()[0].1, 0);
+    }
+
+    #[test]
     fn empty_chart_ends_on_the_first_tick() {
-        let mut g = FluxGame::new(&[], 0).unwrap();
+        let mut g = FluxGame::new(&[], 0, 30).unwrap();
         assert!(g.step(&[[0.0; 3]; 2], &[[0.0; 3]; 2], HEAD, PLANE_Z0));
     }
 
@@ -467,7 +540,7 @@ mod tests {
             let c = circle(arrive(l[2], 0.2), l[0], l[1], 0);
             let v = [c.0, c.1, c.2, 4.0, 0.0, 0.0, c.6, 0.0, 0.0];
             std::ptr::copy_nonoverlapping(v.as_ptr(), chart, OBJ_F);
-            let g = fg_new(chart, 1, 0);
+            let g = fg_new(chart, 1, 0, 30);
             fg_dealloc(chart, OBJ_F as u32);
             assert!(!g.is_null());
             let inp = fg_alloc(STEP_F as u32);
@@ -491,7 +564,7 @@ mod tests {
             let bad = fg_alloc(OBJ_F as u32);
             *bad.add(3) = 7.0;
             *bad.add(6) = 1.0;
-            assert!(fg_new(bad, 1, 0).is_null());
+            assert!(fg_new(bad, 1, 0, 30).is_null());
             let msg = std::slice::from_raw_parts(fg_error_ptr(), fg_error_len() as usize);
             assert_eq!(msg, b"flux chart kinds are 4 (circle) / 5 (bar)");
             fg_dealloc(bad, OBJ_F as u32);

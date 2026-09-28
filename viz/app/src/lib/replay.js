@@ -87,6 +87,11 @@ export const isFlux = (rep) => rep?.game === "flux";
 /** A Flux run PLAYED BY A PERSON in the WebXR game (header "player":
  * "human"): per-tick palms + head, no body (no q / sabers / feet). */
 export const isHuman = (rep) => rep?.player === "human";
+
+/** When an outcome happened (s): its exact judge time where recorded (the
+ * WebXR game judges faster than its 30 Hz frames), else the end of its
+ * tick — the env's judgment instant. */
+export const outcomeTime = (o) => o.t ?? (o.tick + 1) * DT;
 export const isFluxKind = (n) => n.kind === KIND_CIRCLE || n.kind === KIND_BAR;
 /** Bar axis u = (-sin rot, cos rot): rot 0 points up, CCW from the
  * player's view. */
@@ -538,13 +543,14 @@ export function parseReplay(text) {
           kind: e.cut.good ? "good" : "bad",
           reason: e.cut.reason,
           tick: t.t,
+          t: e.cut.t, // exact judge time (WebXR game runs; see outcomeTime)
           points: e.cut.points || 0,
         };
       if (e.post)
         posts.push({ note: e.post.note, tick: t.t, points: e.post.points });
       if (e.miss !== undefined)
         outcomes[e.miss.note] = {
-          kind: "miss", reason: "miss", tick: t.t, points: 0,
+          kind: "miss", reason: "miss", tick: t.t, t: e.miss.t, points: 0,
         };
       if (e.bomb !== undefined)
         outcomes[e.bomb.note] = {
@@ -565,8 +571,10 @@ export function parseReplay(text) {
     // ADDITIVE header field: "human" for a WebXR game run (fluxgame.js);
     // absent = an agent (sim) recording
     player: head.header.player ?? "agent",
-    // human runs: the game's final tallies ({score, good, ...})
+    // human runs: the game's final tallies ({score, good, ...}) and its
+    // judge rate (Hz; the env's is 30)
     result: head.header.result ?? null,
+    judgeHz: head.header.judge_hz ?? null,
     config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
@@ -935,7 +943,7 @@ export function pendingNotes(rep, time, zOff = 0) {
   const out = [];
   rep.chart.forEach((n, i) => {
     const o = rep.outcomes[i];
-    if (o && time >= (o.tick + 1) * DT) return;
+    if (o && time >= outcomeTime(o)) return;
     const zBase = (n.t - time) * n.speed;
     if (zBase <= Z_FAR && zBase >= -Z_MISS)
       out.push({ n, i, z: zBase + zOff, zBase });
@@ -974,7 +982,7 @@ export function aftermaths(rep, time) {
   rep.chart.forEach((n, i) => {
     const o = rep.outcomes[i];
     if (!o) return;
-    const age = time - (o.tick + 1) * DT;
+    const age = time - outcomeTime(o);
     if (age < 0 || age > FADE_S) return;
     out.push({
       n, i, o, age, alpha: 1 - age / FADE_S,

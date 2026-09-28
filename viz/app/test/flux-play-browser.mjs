@@ -97,6 +97,10 @@ try {
   await page.screenshot({ path: "test/out/flux-play-done.png" });
 
   const st = await page.evaluate(() => ({ ...window.__fluxPlay.play.stats }));
+  // the default judge rate: 120 Hz (4 judge ticks per 30 Hz frame)
+  const hz = await page.evaluate(() => window.__fluxPlay.session().hz);
+  if (hz !== 120 || !(st.tick > 3 * st.time * 30))
+    throw new Error(`judge rate ${hz} Hz, ${st.tick} ticks in ${st.time} s`);
   if (st.good + st.bad + st.misses !== st.n_objects)
     throw new Error("not every object judged: " + JSON.stringify(st));
   if (!(st.good > 0.5 * st.n_objects))

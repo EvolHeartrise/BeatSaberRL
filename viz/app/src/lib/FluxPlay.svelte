@@ -17,7 +17,7 @@
   import { XR, XROrigin } from "@threlte/xr";
   import { KIND_CIRCLE, PLANE_Z0 } from "./replay.js";
   import { quatSceneToEnv, rank, sceneToEnv } from "./fluxgame.js";
-  import { advance, cycleChart, entryById, startRun } from "./playctl.js";
+  import { advance, bestKey, cycleChart, entryById, startRun } from "./playctl.js";
   import { game, play } from "./state.svelte.js";
   import TextSprite from "./TextSprite.svelte";
 
@@ -176,8 +176,10 @@
     <TextSprite text="trigger: start  ·  grip: change chart" size={0.08}
       bold={false} color="#7aa2f7" position={[MSG[0], MSG[1] - 0.45, MSG[2]]} />
   {/if}
-  {#if play.best[play.chartId] != null}
-    <TextSprite text={`best ${fmt(play.best[play.chartId])}`} size={0.08}
+  <TextSprite text={`judged at ${play.hz} Hz`} size={0.07} bold={false}
+    color="#6b7180" position={[MSG[0], MSG[1] - 0.77, MSG[2]]} />
+  {#if play.best[bestKey(play.chartId, play.hz)] != null}
+    <TextSprite text={`best ${fmt(play.best[bestKey(play.chartId, play.hz)])}`} size={0.08}
       bold={false} color="#ffd166" position={[MSG[0], MSG[1] - 0.62, MSG[2]]} />
   {/if}
 {:else if play.phase === "countdown"}
@@ -188,7 +190,8 @@
   <TextSprite
     text={`good ${st.good} · bad ${st.bad} · miss ${st.misses} · max combo ${st.max_combo}`}
     size={0.09} bold={false} position={[MSG[0], MSG[1] - 0.3, MSG[2]]} />
-  <TextSprite text={play.newBest ? "new best!" : `best ${fmt(play.best[play.runId])}`}
+  <TextSprite text={play.newBest ? "new best!"
+      : `best ${fmt(play.best[bestKey(play.runId, game.session?.hz ?? play.hz)])}`}
     size={0.09} color="#ffd166" position={[MSG[0], MSG[1] - 0.47, MSG[2]]} />
   {#if play.presenting}
     <TextSprite text="trigger: play again  ·  grip: change chart" size={0.08}

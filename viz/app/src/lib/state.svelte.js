@@ -166,13 +166,14 @@ export const play = $state({
   xrSupported: null,  // null = still asking the browser
   chartId: null,      // selected chart (pack id, or "replay:<hash>")
   runId: null,        // the chart of the current / last run
+  hz: 120,            // judge rate (fluxgame JUDGE_HZ; 30 = the env's tick)
   time: 0,            // game time (s), negative during the countdown
   paused: false,      // headset off / system menu open
   stats: null,        // the judge's tallies (fluxcore STAT_NAMES)
   palms: null,        // live palms [[x,y,z] L, R] (env world), this frame
   head: null,         // live head [x, y, z] (env world), this frame
   error: "",
-  best: {},           // chartId -> best multiplied score this browser has seen
+  best: {},           // "chartId@hz" -> best multiplied score in this browser
   newBest: false,     // the finished run set a new best
 });
 
