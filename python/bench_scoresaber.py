@@ -151,10 +151,13 @@ class _Group:
                  "slots", "free", "n_active", "ev", "issued")
 
     def __init__(self, n, fwd, device, gears=3,
-                 tau_scale=None, sim_mod=beat_arena_rs):
+                 tau_scale=None, sim_mod=beat_arena_rs, tick_hz=30):
         self.n = n
+        # exp/tick-rate: tick_hz is the sim's control rate (240/tick_hz
+        # physics substeps per tick, per-tick rules rescaled to real time)
         self.sim = sim_mod.VecBeatSim(n, max_steps=100_000_000, combo_walk=True,
-                              return_events=False, gears=gears)
+                              return_events=False, gears=gears,
+                              tick_hz=tick_hz)
         # env v46: fixed body for the whole bench (all 1.0 = the v45 body)
         if tau_scale is not None:
             self.sim.set_tau_scale([float(x) for x in tau_scale])
@@ -262,6 +265,20 @@ def parse_args():
                         "kernel; same JSON schema, same forward kernels "
                         "(2048-row chunks, graphed); results carry "
                         "sim='cuda' and never merge into a rust file")
+    p.add_argument("--tick-hz", type=int, default=30,
+                   help="exp/tick-rate: the Rust sim's control rate (30, 60, "
+                        "120, 240). The physics substep stays 1/240 s (240/"
+                        "tick_hz substeps per tick, the action held for the "
+                        "tick) and every per-tick rule/obs lane is rescaled "
+                        "to its 30 Hz real-time meaning. 30 = the training "
+                        "rate, bit-identical to the fixed-rate sim. Stamped "
+                        "in the JSON; results never merge across rates. "
+                        "--sim rust only")
+    p.add_argument("--action-repeat", type=int, default=1,
+                   help="exp/tick-rate: the policy decides every N-th sim "
+                        "tick and its action is held for N ticks (obs from "
+                        "the decision tick). 1 = decide every tick. Stamped "
+                        "in the JSON; --sim rust only")
     p.add_argument("--sim-dtype", choices=["f32", "f64"], default="f32",
                    help="sim precision, both engines. f32 (default, "
                         "2026-09-16) = the trainer's regime: --sim rust "
@@ -318,9 +335,13 @@ def save_results(path, data, levels):
     # env v19: catalog-wide mean flail (rad per note-free tick) — the
     # phantom-swing judge for the post_rem obs A/B. .get() keeps old
     # results files (pre-v19 levels lack the fields) loadable.
+    # exp/tick-rate: per 30 Hz tick of real time (flail_ticks are sim
+    # ticks; × tick_hz/30 == × 1.0 at the default rate)
+    _hz = float(data.get("tick_hz", 30))
     _ft = sum(e.get("flail_ticks", 0) for e in evaluated)
     data["flail_rad_per_tick"] = round(
-        sum(e.get("flail_rad", 0.0) for e in evaluated) / _ft, 5) if _ft else 0.0
+        sum(e.get("flail_rad", 0.0) for e in evaluated) / _ft * (_hz / 30.0),
+        5) if _ft else 0.0
     # wrist-bend reversals (2026-09-22): catalog-wide totals per hand and
     # combined, plus the rate per second of played time per hand
     _wt = sum(e.get("ticks", 0) for e in evaluated)
@@ -330,8 +351,8 @@ def save_results(path, data, levels):
     data["wrist_rev_total_r"] = _wr
     data["wrist_rev_total"] = _wl + _wr
     data["wrist_rev_ticks"] = _wt
-    data["wrist_rev_per_s_l"] = round(30.0 * _wl / _wt, 4) if _wt else 0.0
-    data["wrist_rev_per_s_r"] = round(30.0 * _wr / _wt, 4) if _wt else 0.0
+    data["wrist_rev_per_s_l"] = round(_hz * _wl / _wt, 4) if _wt else 0.0
+    data["wrist_rev_per_s_r"] = round(_hz * _wr / _wt, 4) if _wt else 0.0
     data.update(term_totals(evaluated))
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -512,9 +533,10 @@ def producer(tasks, cache_dir, chart_cache, max_song_s, q, stop,
         q.put(None)                     # sentinel, unconditionally
 
 
-def finish_slot(slot, info, combo):
+def finish_slot(slot, info, combo, tick_hz=30):
     """Level-result entry from a finished rollout; combo =
-    (multiplied_score, max_combo, breaks) from whichever walk ran."""
+    (multiplied_score, max_combo, breaks) from whichever walk ran.
+    `ticks` / `flail_ticks` are SIM ticks (tick_hz per second)."""
     entry = slot["entry"]
     c_score, max_combo, breaks = combo
     score = round(c_score)
@@ -549,9 +571,9 @@ def finish_slot(slot, info, combo):
         "wrist_rev_l": int(info.get("wrist_rev_l", 0)),
         "wrist_rev_r": int(info.get("wrist_rev_r", 0)),
         "ticks": int(info.get("ticks", 0)),
-        "wrist_rev_per_s_l": (round(30.0 * info.get("wrist_rev_l", 0) / info["ticks"], 3)
+        "wrist_rev_per_s_l": (round(float(tick_hz) * info.get("wrist_rev_l", 0) / info["ticks"], 3)
                               if info.get("ticks") else 0.0),
-        "wrist_rev_per_s_r": (round(30.0 * info.get("wrist_rev_r", 0) / info["ticks"], 3)
+        "wrist_rev_per_s_r": (round(float(tick_hz) * info.get("wrist_rev_r", 0) / info["ticks"], 3)
                               if info.get("ticks") else 0.0),
         **_term_fields(breaks, info),
     }
@@ -960,6 +982,22 @@ def main():
                  f"but this run is --sim-dtype {args.sim_dtype}; use a "
                  f"different --out")
     data["sim_dtype"] = args.sim_dtype
+    # exp/tick-rate provenance: files without the keys are 30 Hz / repeat 1
+    # (the only regime before 2026-09-28); results never merge across them
+    if args.tick_hz not in (30, 60, 120, 240):
+        sys.exit(f"--tick-hz must be 30, 60, 120 or 240, got {args.tick_hz}")
+    if args.action_repeat < 1:
+        sys.exit("--action-repeat must be >= 1")
+    if args.sim == "cuda" and (args.tick_hz != 30 or args.action_repeat != 1):
+        sys.exit("--tick-hz / --action-repeat are --sim rust only (the "
+                 "CUDA kernel is fixed at 30 Hz)")
+    for key, val in (("tick_hz", args.tick_hz),
+                     ("action_repeat", args.action_repeat)):
+        prev = data.get(key, 30 if key == "tick_hz" else 1)
+        if prev != val and any("skipped" not in e for e in levels.values()):
+            sys.exit(f"error: {out_path} holds {key}={prev} results but this "
+                     f"run is {key}={val}; use a different --out")
+        data[key] = val
     if args.sim == "cuda":
         run_cuda(args, policy, device, tasks, data, levels, out_path,
                  durations, dur_path)
@@ -1017,7 +1055,7 @@ def main():
                  else _GraphedArgmax(policy, n_g, device))
         groups.append(_Group(n_g, fwd_g, device, policy.n_gears,
                              tau_scale=parse_tau_scale(args.tau_scale),
-                             sim_mod=sim_mod))
+                             sim_mod=sim_mod, tick_hz=args.tick_hz))
     fwd = groups[0].fwd                  # for the provenance stamp below
     # Forward-path provenance (2026-07-27): different forward paths
     # differ by ~4e-7 in the logits, enough to flip near-tie argmaxes —
@@ -1078,8 +1116,10 @@ def main():
                         gr.ev.synchronize()  # actions landed; obs H2D done
                     gr.issued = False
                     t1 = pc()
-                    _, dones, _events = gr.sim.step_into(gr.act_np,
-                                                         gr.obs_buf)
+                    # --action-repeat: the action is held for N sim ticks
+                    # inside the one call; obs = the next decision tick's
+                    _, dones, _events = gr.sim.step_into(
+                        gr.act_np, gr.obs_buf, repeat=args.action_repeat)
                     t2 = pc()
                     n_finished = 0
                     for i in np.flatnonzero(np.asarray(dones)):
@@ -1101,7 +1141,7 @@ def main():
                             "flail_ticks": fl_ticks,
                             "wrist_rev_l": wr_l, "wrist_rev_r": wr_r,
                             "ticks": wr_ticks, "wall_enters": w_ent,
-                            "term_flags": t_flags}, combo)
+                            "term_flags": t_flags}, combo, tick_hz=args.tick_hz)
                         levels[result["leaderboard_id"]] = result
                         n_done += 1
                         n_finished += 1
@@ -1254,7 +1294,8 @@ def main():
               f"sync {ph[2]:.1f}s ({ph[2] * ms:.2f}) | "
               f"step_into {ph[3]:.1f}s ({ph[3] * ms:.2f}) | "
               f"finish/save {ph[4]:.1f}s ({ph[4] * ms:.2f})", flush=True)
-    print(f"\ndone (rust, {args.sim_dtype}): {n_done} played ({n_new_skip} skipped), "
+    print(f"\ndone (rust, {args.sim_dtype}, {args.tick_hz} Hz, action repeat "
+          f"{args.action_repeat}): {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
           f"total weighted PP {data['total_weighted_pp']} | "
           f"unweighted PP {data['total_unweighted_pp']} | "
