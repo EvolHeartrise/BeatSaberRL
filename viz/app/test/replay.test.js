@@ -390,12 +390,15 @@ assert.equal(Z_MISS, -PLANE_Z0, "Z_MISS is the reference plane's depth");
 }
 
 // ---- (b) HEAD-ANCHORED replay: offset applied every tick --------------------
-// Prefer a real v15 recording; fall back to the legacy one with the
-// ADDITIVE field spliced into its header (exactly what the writer adds).
+// Prefer the local v15 probe recording (python/replays/ is gitignored);
+// without it, the committed Flux fixture — also a real head-anchored
+// recording ("track_anchor": "head", full q track, misses). The legacy
+// fixture with the field spliced in is NOT a stand-in: its misses were
+// judged on the fixed track, so the §10b miss timing below cannot hold.
 const V15_PATH = new URL(
   "../../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.jsonl",
   import.meta.url);
-const legacyText = readFileSync(path, "utf8");
+const HEAD_FALLBACK = new URL("./fixtures/flux_scripted.jsonl", import.meta.url);
 const anchored = (text, anchor = "head") => {
   const lines = text.split("\n");
   const h = JSON.parse(lines[0]);
@@ -403,14 +406,15 @@ const anchored = (text, anchor = "head") => {
   lines[0] = JSON.stringify(h);
   return lines.join("\n");
 };
-let v15, v15Src;
+let v15, v15Src, v15Text;
 try {
-  v15 = parseReplay(readFileSync(V15_PATH, "utf8"));
+  v15Text = readFileSync(V15_PATH, "utf8");
   v15Src = "recorded v15 probe";
 } catch {
-  v15 = parseReplay(anchored(legacyText));
-  v15Src = "legacy replay + spliced track_anchor";
+  v15Text = readFileSync(HEAD_FALLBACK, "utf8");
+  v15Src = "committed Flux fixture";
 }
+v15 = parseReplay(v15Text);
 {
   assert.equal(v15.trackAnchor, "head");
   assert.ok(isHeadAnchored(v15));
@@ -495,9 +499,7 @@ try {
   });
 
   // ---- A/B: the SAME ticks with the flag stripped render on the old track
-  const stripped = parseReplay(anchored(
-    v15Src === "recorded v15 probe"
-      ? readFileSync(V15_PATH, "utf8") : legacyText, "world"));
+  const stripped = parseReplay(anchored(v15Text, "world"));
   assert.equal(stripped.trackAnchor, "world");
   assert.equal(isHeadAnchored(stripped), false,
     "gate must accept ONLY the exact value \"head\"");

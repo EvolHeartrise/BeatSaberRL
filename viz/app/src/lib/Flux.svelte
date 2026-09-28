@@ -5,18 +5,19 @@
   // orb in the hand's colour, and the FLUX is the segment between the
   // two palms, drawn as a luminous beam. Positions come from the body
   // FK being drawn this frame (like the sabers), so the beam never lags
-  // the skeleton.
+  // the skeleton — or, for a person playing the WebXR game (no body),
+  // straight from `palms`: the tracked palms, live or from the recording.
   import { T } from "@threlte/core";
   import * as THREE from "three";
   import { fkSaber, palmOf } from "./replay.js";
   import { NOTE_COLORS } from "./models.js";
 
-  let { fk } = $props();
+  let { fk = null, palms: given = null } = $props();
 
   const Y = new THREE.Vector3(0, 1, 0);
   const toScene = (p) => new THREE.Vector3(p[0], p[1], -p[2]);
 
-  const palms = $derived([0, 1].map((h) => palmOf(fkSaber(fk, h))));
+  const palms = $derived(given ?? [0, 1].map((h) => palmOf(fkSaber(fk, h))));
 
   // y-aligned unit cylinder -> the palm-to-palm segment
   const beam = $derived.by(() => {

@@ -151,3 +151,49 @@ export function restart() {
   seekTo(0);
   setPlaying(true);
 }
+
+// ---- the Flux WebXR game (SPEC.md §Flux WebXR game) ------------------------
+// Play mode turns the viewer into the game: the scene renders a LIVE
+// recording (fluxgame.js LiveReplay, set as pb.rep) that FluxPlay.svelte
+// fills from the player's tracked palms, judged by the env's own Rust
+// compiled to wasm. `play` is the reactive surface for the HUD/menus; the
+// session object itself lives in `game` (plain, mutated every tick).
+export const play = $state({
+  on: false,          // play mode (vs replay viewing)
+  ready: false,       // the wasm judge is loaded
+  phase: "menu",      // menu | countdown | playing | done
+  presenting: false,  // an immersive-vr session is running
+  xrSupported: null,  // null = still asking the browser
+  chartId: null,      // selected chart (pack id, or "replay")
+  time: 0,            // game time (s), negative during the countdown
+  paused: false,      // headset off / system menu open
+  stats: null,        // the judge's tallies (fluxcore STAT_NAMES)
+  palms: null,        // live palms [[x,y,z] L, R] (env world), this frame
+  head: null,         // live head [x, y, z] (env world), this frame
+  error: "",
+  best: {},           // chartId -> best multiplied score this browser has seen
+  newBest: false,     // the finished run set a new best
+});
+
+// Not reactive: the running FluxSession, the loaded judge module, the
+// replay that was open before play mode (restored on exit), and an
+// optional scripted pose source — tests / automation drive the very game
+// path the headset does: (t) => {palms, head, quat} in env world coords.
+export const game = { session: null, core: null, script: null, saved: null };
+
+const BEST_KEY = "beat-arena.flux.best";
+try {
+  play.best = JSON.parse(localStorage.getItem(BEST_KEY) ?? "{}") ?? {};
+} catch {
+  play.best = {};
+}
+export function recordBest(id, score) {
+  if (id == null || !(score > (play.best[id] ?? -1))) return false;
+  play.best = { ...play.best, [id]: score };
+  try {
+    localStorage.setItem(BEST_KEY, JSON.stringify(play.best));
+  } catch {
+    /* a best score that cannot be remembered is still shown this session */
+  }
+  return true;
+}

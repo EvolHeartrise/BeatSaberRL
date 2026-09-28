@@ -4,9 +4,14 @@
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
-  import { audio, gfx, pb, pose, songClock, lastTick, loadText, restart,
-    seekTo, setPlaying, setSpeed, step, toggleMapCard,
+  import { audio, gfx, pb, play, pose, songClock, lastTick, loadText,
+    restart, seekTo, setPlaying, setSpeed, step, toggleMapCard,
     togglePose } from "./lib/state.svelte.js";
+  import { toggleXRSession } from "@threlte/xr";
+  import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
+    watchRun } from "./lib/playctl.js";
+  import { rank } from "./lib/fluxgame.js";
+  import { sfx } from "./lib/sfx.js";
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
   import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
@@ -15,7 +20,7 @@
 
   let wrap; // canvas container, for video export
   let dropHover = $state(false);
-  let fileInput;
+  let fileInput = $state(null);
 
   const tickIdx = $derived(
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
@@ -224,13 +229,20 @@
 
   function onFiles(files) {
     const f = files && files[0];
+    if (f && play.on) exitPlay();
     if (f) f.text().then((t) => load(t, f.name));
   }
 
   function onKey(e) {
     // keys aimed at the pose panel's own controls stay there (slider
     // arrow-key nudges must not step the replay)
-    if (e.target && e.target.closest && e.target.closest("#pose, #fp")) return;
+    if (e.target && e.target.closest && e.target.closest("#pose, #fp, #play")) return;
+    if (play.on) {
+      // the game owns the keyboard: Esc leaves, Enter (re)starts
+      if (e.key === "Escape") exitPlay();
+      else if (e.key === "Enter") startRun();
+      return;
+    }
     if (e.key === "p") { togglePose(); return; }
     if (e.key === " ") { e.preventDefault(); setPlaying(!pb.playing); }
     else if (e.key === "ArrowRight") step(1);
@@ -253,6 +265,28 @@
 
   const speedLabel = $derived(
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
+
+  // ---- the Flux WebXR game (play mode) ------------------------------------
+  const entries = $derived(play.on ? chartEntries() : []);
+  const entry = $derived(entries.find((c) => c.id === play.chartId) ?? null);
+  const running = $derived(play.phase === "countdown" || play.phase === "playing");
+  const fmtScore = (v) => Math.round(v ?? 0).toLocaleString("en-US");
+
+  function enterVR() {
+    sfx.unlock(); // the click is the user gesture WebAudio needs
+    play.error = "";
+    toggleXRSession("immersive-vr",
+      { optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"] },
+      "enter")
+      .catch((e) => { play.error = "could not enter VR: " + (e?.message ?? e); });
+  }
+  function exitVR() {
+    toggleXRSession("immersive-vr", undefined, "exit").catch(() => {});
+  }
+  function leavePlay() {
+    if (play.presenting) exitVR();
+    exitPlay();
+  }
 
   // ---- video export -------------------------------------------------------
   // Two paths. The frame-by-frame one is the default: it renders exactly one
@@ -398,6 +432,12 @@
   </div>
 
   <div id="top" class="overlay">
+    {#if play.on}
+    <div id="playtitle" class="panel">
+      <b>Flux</b> — play it yourself in VR · judged by the env's own Rust
+      (wasm), the rules the agent trains on
+    </div>
+    {:else}
     <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}>
       {#if pb.rep}
         {pb.name} — {configSummary(pb.rep)}
@@ -412,9 +452,10 @@
       bind:this={fileInput}
       onchange={(e) => onFiles(e.target.files)}
     />
+    {/if}
   </div>
 
-  {#if pb.mapCard}
+  {#if pb.mapCard && !play.on}
     <MapCard />
   {/if}
 
@@ -423,6 +464,74 @@
   {/if}
 
   <div id="bottom" class="overlay">
+    {#if play.on}
+    <div id="play" class="panel">
+      <div class="row">
+        <label>chart
+          <select bind:value={play.chartId} disabled={running}>
+            {#each entries as c (c.id)}
+              <option value={c.id}>
+                {c.name}{play.best[c.id] != null ? ` — best ${fmtScore(play.best[c.id])}` : ""}
+              </option>
+            {/each}
+          </select>
+        </label>
+        {#if entry}<span class="dim">{entry.chart.length} objects · {entry.blurb}</span>{/if}
+      </div>
+      <div class="row">
+        {#if play.presenting}
+          <button onclick={exitVR}>exit VR</button>
+        {:else if play.xrSupported}
+          <button class="on" onclick={enterVR}
+            title="then pull the trigger (or pinch) to start; grip changes the chart">
+            🥽 enter VR
+          </button>
+        {:else if play.xrSupported === false}
+          <span class="warn" title="WebXR needs a secure context: serve with
+            `npm run xr` and open https://<this-machine>:5173 on the headset">
+            no WebXR here — open this page on the headset (npm run xr)</span>
+        {/if}
+        <button onclick={startRun} disabled={running || !play.ready}
+          title="start the chart without a headset (objects fly, nothing is
+                 tracked) — Enter">
+          {play.phase === "done" ? "↺ play again" : "▶ start (no headset)"}
+        </button>
+        <button onclick={leavePlay} title="back to the replay viewer (Esc)">
+          ✕ replays
+        </button>
+      </div>
+      {#if play.stats && play.phase !== "menu"}
+        {@const st = play.stats}
+        <div class="row stats">
+          {#if play.phase === "countdown"}<b>get ready…</b> ·{/if}
+          {#if play.paused}<b>paused</b> ·{/if}
+          t <b>{Math.max(0, play.time).toFixed(1)}s</b> ·
+          score <b>{fmtScore(st.score)}</b> ·
+          ×<b>{st.multiplier}</b> · combo <b>{st.combo}</b> ·
+          <span class="good">good {st.good}</span> /
+          <span class="bad">bad {st.bad}</span> /
+          <span class="miss">miss {st.misses}</span> of {st.n_objects}
+        </div>
+      {/if}
+      {#if play.phase === "done" && play.stats}
+        {@const st = play.stats}
+        <div class="row result">
+          <b class="big">{fmtScore(st.score)}</b> <b>{rank(st)}</b>
+          {#if play.newBest}<span class="best">new best!</span>{/if}
+          · {fmtScore(st.raw_score)}/{fmtScore(st.max_score)} pts unmultiplied ·
+          max combo {st.max_combo}
+          {#if entry?.agentScore != null}
+            · agent {fmtScore(entry.agentScore)} unmultiplied
+          {/if}
+          <button onclick={exportRun} title="save this run as a replay .jsonl">
+            💾 save run</button>
+          <button onclick={watchRun} title="open this run in the replay viewer">
+            ▶ watch run</button>
+        </div>
+      {/if}
+      {#if play.error}<div class="row warn">{play.error}</div>{/if}
+    </div>
+    {:else}
     <div id="hud" class="panel">
       {#if pb.rep && c}
         t <b>{time.toFixed(2)}s</b> · tick <b>{tickIdx}</b>/{lastTick()} ·
@@ -470,6 +579,10 @@
           {pb.exportStop ? "■ saving…" : "■ stop & save"}
         </button>
       {/if}
+      <button onclick={enterPlay}
+        title="play a Flux chart yourself in VR — the same judge the env uses">
+        🥽 play Flux
+      </button>
       <button class:on={pose.on} onclick={togglePose}>
         {pose.on ? "🧍 posing" : "🧍 pose"}
       </button>
@@ -540,6 +653,7 @@
         oninput={(e) => { setPlaying(false); seekTo(+e.target.value); }}
       />
     </div>
+    {/if}
   </div>
 </main>
 
@@ -599,6 +713,21 @@
     font-variant-numeric: tabular-nums; color: #9aa0ae; padding: 5px 14px;
   }
   #hud b { color: #e8eaf0; }
+  #playtitle { padding: 6px 14px; color: #9aa0ae; }
+  #playtitle b { color: #e8eaf0; }
+  #play {
+    display: flex; flex-direction: column; gap: 6px; padding: 8px 14px;
+    max-width: 94vw; align-items: center;
+  }
+  #play .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    justify-content: center; }
+  #play label { display: flex; gap: 6px; align-items: center; color: #9aa0ae; }
+  #play .dim { color: #6b7180; font-size: 12px; }
+  #play .stats { font-variant-numeric: tabular-nums; color: #9aa0ae; }
+  #play .stats b, #play .result b { color: #e8eaf0; }
+  #play .big { font-size: 22px; }
+  #play .best { color: #ffd166; }
+  .warn { color: #f0a35e; }
   .good { color: #7dd3a0; }
   .bad { color: #f0a35e; }
   .miss { color: #e06c75; }

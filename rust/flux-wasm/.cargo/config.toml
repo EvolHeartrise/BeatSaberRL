@@ -1,0 +1,6 @@
+# rust/.cargo/config.toml sets target-cpu=native for the local maturin
+# extension; a browser module must stay portable. A matching
+# target.<triple>.rustflags REPLACES build.rustflags (cargo takes exactly
+# one rustflags source) — an empty list counts as unset, hence generic.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-cpu=generic"]
