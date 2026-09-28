@@ -186,8 +186,63 @@ const PTS_PRE: Real = 70.0;
 const PTS_POST: Real = 30.0;
 const PTS_ACC: Real = 15.0;
 const CHAIN_LINK_PTS: Real = 20.0;
-const SWING_BREAK: Real = 0.005; // rad/tick below which the swing chain breaks
-const FOLLOW_TIMEOUT: u32 = 15; // ticks a follow-through may keep accumulating
+// rad per 30 Hz tick below which the swing chain breaks (0.15 rad/s);
+// applied as SWING_BREAK * TickRate::tscale per sim tick
+const SWING_BREAK: Real = 0.005;
+// 30 Hz ticks a follow-through may keep accumulating (0.5 s); applied as
+// FOLLOW_TIMEOUT * TickRate::ratio sim ticks
+const FOLLOW_TIMEOUT: u32 = 15;
+
+// --- control rate (exp/tick-rate, 2026-09-28) --------------------------------
+// The physics substep is fixed at H_SUB = 1/240 s; the control tick is
+// DT = 1/tick_hz with N_SUB = 240/tick_hz substeps, the action held for
+// the whole tick. Every rule is written per 30 Hz tick (the training
+// rate) and rescaled so it keeps its REAL-TIME meaning at any rate:
+// per-tick thresholds / rewards × tscale, tick counts × ratio,
+// tick-summed obs × ratio, "any this tick" obs bits OR'ed over the last
+// `ratio` ticks (one 30 Hz tick of real time). At 30 Hz every factor is
+// exactly 1 (x * 1.0 == x, n * 1 == n): bit-identical to the fixed-rate
+// sim.
+const TICK_HZ_BASE: u32 = 30;
+const SUBSTEP_HZ: u32 = 240;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TickRate {
+    hz: u32,
+    dt: Real,       // control tick (s) = 1 / hz
+    n_sub: usize,   // physics substeps per tick = 240 / hz
+    ratio: u32,     // sim ticks per 30 Hz tick = hz / 30
+    ratio_r: Real,  // ratio as Real (tick-summed obs lanes × this)
+    tscale: Real,   // 30 / hz: per-30-Hz-tick amounts × this per sim tick
+}
+
+impl TickRate {
+    pub(crate) fn new(hz: u32) -> Result<TickRate, String> {
+        if hz == 0 || hz % TICK_HZ_BASE != 0 || SUBSTEP_HZ % hz != 0 {
+            return Err(format!(
+                "tick_hz must be a multiple of {TICK_HZ_BASE} that divides \
+                 {SUBSTEP_HZ} (30, 60, 120 or 240), got {hz}"));
+        }
+        let n_sub = (SUBSTEP_HZ / hz) as usize;
+        let ratio = hz / TICK_HZ_BASE;
+        Ok(TickRate {
+            hz,
+            // 1.0 / 30.0 at the default: the same correctly rounded
+            // constant as geom::DT_30
+            dt: 1.0 / hz as Real,
+            n_sub,
+            ratio,
+            ratio_r: ratio as Real,
+            tscale: TICK_HZ_BASE as Real / hz as Real,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base() -> TickRate {
+        TickRate::new(TICK_HZ_BASE).unwrap()
+    }
+}
+const _: () = assert!(N_SUB * TICK_HZ_BASE as usize == SUBSTEP_HZ as usize);
 // env v19 flail telemetry: a tick is "note-free" when the next pending
 // chart object is further out than this (s). Telemetry only.
 const FLAIL_LEAD_S: Real = 1.0;
@@ -544,6 +599,9 @@ type WallTuple = (Real, Real, Real, Real, Real, Real, Real);
 /// The v10 physical body: dynamics state + solver buffers + the derived
 /// per-tick caches the judgment/obs layers consume. One per env.
 struct Body {
+    // control rate (TickRate): substeps per tick, DT for the finite
+    // differences, the contact-bit window. Fixed at construction.
+    rate: TickRate,
     st: State,
     ws: Workspace,
     cs: ConstraintSet,
@@ -568,6 +626,10 @@ struct Body {
     axis: [Option<[Real; 3]>; 2], // last tick's rotation axis (unit)
     // per-tick contact aggregation (obs bits + replay events)
     contact_arm: [bool; 2],          // any active contact row touching the arm
+    // sim ticks since the arm last had an active contact row (saturating;
+    // u32::MAX = never). The obs bit is `age < rate.ratio`: "any contact
+    // in the last 30 Hz tick of real time" (== this tick at 30 Hz).
+    contact_arm_age: [u32; 2],
     contact_imp: [Real; NUM_PAIRS],   // tick-summed normal impulse per pair
     contact_pt: [[Real; 3]; NUM_PAIRS], // last substep's contact point
     // env v23 activation (user direction 2026-08-17): this tick's
@@ -639,12 +701,18 @@ struct Body {
 const MODEL: &Model = &HUMANOID;
 
 impl Body {
+    #[cfg(test)]
     fn new() -> Body {
+        Body::with_rate(TickRate::base())
+    }
+
+    fn with_rate(rate: TickRate) -> Body {
         let st = State::neutral(MODEL);
         let ws = Workspace::new(MODEL);
         // self-collision rows + the contact spec §3 ground block
         let cs = ConstraintSet::new(MODEL, true, true);
         let mut b = Body {
+            rate,
             st,
             ws,
             cs,
@@ -659,6 +727,7 @@ impl Body {
             swing_acc: [0.0; 2],
             axis: [None; 2],
             contact_arm: [false; 2],
+            contact_arm_age: [u32::MAX; 2],
             contact_imp: [0.0; NUM_PAIRS],
             contact_pt: [[0.0; 3]; NUM_PAIRS],
             act_frac: 0.0,
@@ -713,6 +782,7 @@ impl Body {
         self.swing_acc = [0.0; 2];
         self.axis = [None; 2];
         self.contact_arm = [false; 2];
+        self.contact_arm_age = [u32::MAX; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.act_frac = 0.0;
         self.act_group = [0.0; 3];
@@ -767,9 +837,10 @@ impl Body {
         self.shoulder_z = [self.ws.p[F_L_SHOULDER][2], self.ws.p[F_R_SHOULDER][2]];
     }
 
-    /// One 30 Hz control tick: gear ids -> torques, 8 × substep at
-    /// h = 1/240 (SPEC-v10 §3/§4), accumulating activation and
-    /// contact impulses, then FK-cache refresh + finite-diff wrist vel.
+    /// One control tick: gear ids -> torques, rate.n_sub × substep at
+    /// h = 1/240 (SPEC-v10 §3/§4; 8 at the 30 Hz default), accumulating
+    /// activation and contact impulses, then FK-cache refresh +
+    /// finite-diff wrist vel over rate.dt.
     fn tick(&mut self, actions: &[u8; NQ], gear: &[Real; 7]) {
         let mut act = 0.0;
         let mut grp = [0.0 as Real; 3];
@@ -803,7 +874,7 @@ impl Body {
         for (i, (f, _)) in BODY_PTS.iter().enumerate() {
             prev_bp[i] = self.ws.p[*f];
         }
-        self.contact_arm = [false; 2];
+        let mut arm_now = [false; 2];
         self.contact_imp = [0.0; NUM_PAIRS];
         self.ground_imp = [0.0; 4];
         self.limit_imp = [0.0; 3];
@@ -817,7 +888,7 @@ impl Body {
         // bounces back has still stopped being the standing task.
         let mut fell = false;
         let mut tilted = false;
-        for _ in 0..N_SUB {
+        for _ in 0..self.rate.n_sub {
             substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
 
@@ -864,12 +935,22 @@ impl Body {
                 let (ia, ib) = PAIRS[c.pair];
                 for id in [ia, ib] {
                     match id {
-                        2 | 4 | 6 => self.contact_arm[0] = true,
-                        3 | 5 | 7 => self.contact_arm[1] = true,
+                        2 | 4 | 6 => arm_now[0] = true,
+                        3 | 5 | 7 => arm_now[1] = true,
                         _ => {}
                     }
                 }
             }
+        }
+        // contact bits: OR over the last 30 Hz tick of real time (the
+        // last rate.ratio sim ticks; exactly this tick at 30 Hz)
+        for s in 0..2 {
+            self.contact_arm_age[s] = if arm_now[s] {
+                0
+            } else {
+                self.contact_arm_age[s].saturating_add(1)
+            };
+            self.contact_arm[s] = self.contact_arm_age[s] < self.rate.ratio;
         }
         self.escaped = self.ws.env_hits != env_hits0;
         // contact spec §4 (per-TICK since 2026-08-20): root below the
@@ -930,19 +1011,21 @@ impl Body {
         self.refresh_fk();
         for s in 0..2 {
             for k in 0..3 {
-                self.wrist_vel[s][k] = (self.wrist[s][k] - prev_wrist[s][k]) / DT;
+                self.wrist_vel[s][k] =
+                    (self.wrist[s][k] - prev_wrist[s][k]) / self.rate.dt;
                 // env v49: tip velocity — the judge's tip_move expression
-                // tree (step_inner), / DT; the .cu transcribes it
+                // tree (step_inner), / the runtime tick length; the .cu
+                // transcribes it (at the fixed 30 Hz DT)
                 self.tip_vel[s][k] = (self.wrist[s][k]
                     + (HANDLE_LEN + SABER_LEN) * self.blade[s][k]
                     - prev_wrist[s][k]
-                    - (HANDLE_LEN + SABER_LEN) * prev_blade[s][k]) / DT;
+                    - (HANDLE_LEN + SABER_LEN) * prev_blade[s][k]) / self.rate.dt;
             }
         }
         for (i, (f, _)) in BODY_PTS.iter().enumerate() {
             for k in 0..3 {
                 self.body_pt_vel[i][k] =
-                    (self.ws.p[*f][k] - prev_bp[i][k]) / DT;
+                    (self.ws.p[*f][k] - prev_bp[i][k]) / self.rate.dt;
             }
         }
     }
@@ -954,6 +1037,8 @@ impl Body {
 }
 
 struct Core {
+    // tick budget in SIM ticks (the constructor's max_steps is in 30 Hz
+    // ticks and is scaled by TickRate::ratio, so it keeps its real time)
     max_steps: u32,
     gear: [Real; 7],   // env v8: action id -> signed torque fraction
     chart: Vec<Note>,
@@ -1088,8 +1173,11 @@ struct Core {
     // combo break (event 8); STAYING inside drains (event 7 per tick)
     // but does not re-break; the head must be OUT for >= 1 tick before
     // the next entry breaks again — i.e. break on the rising edge of
-    // this latch, which holds last tick's in-wall state.
-    was_in_wall: bool,
+    // the in-wall state. exp/tick-rate: "out for >= 1 tick" is one 30 Hz
+    // tick of REAL time, so the edge re-arms after rate.ratio consecutive
+    // sim ticks out; this counts them (saturating; u32::MAX = never in).
+    // At 30 Hz `wall_out >= 1` is exactly the old `!was_in_wall`.
+    wall_out: u32,
     wall_enters: u32,
     // B4 (2026-08-03): sticky "this episode is over" latch. `done` is
     // recomputed from state every tick and each of its disjuncts is
@@ -1117,9 +1205,14 @@ struct Core {
 }
 
 impl Core {
+    #[cfg(test)]
     fn new_core(max_steps: u32, gears: u8) -> Self {
+        Core::new_core_rate(max_steps, gears, TickRate::base())
+    }
+
+    fn new_core_rate(max_steps: u32, gears: u8, rate: TickRate) -> Self {
         Core {
-            max_steps,
+            max_steps: max_steps.saturating_mul(rate.ratio),
             gear: gear_signed(gears),
             chart: Vec::new(),
             tail_s: 0.5,
@@ -1127,7 +1220,7 @@ impl Core {
             tick: 0,
             time: 0.0,
             first_pending: 0,
-            body: Body::new(),
+            body: Body::with_rate(rate),
             trackers: [Vec::new(), Vec::new()],
             status: Vec::new(),
             prev_idx: [0, 0],
@@ -1167,7 +1260,7 @@ impl Core {
             wall_passed: Vec::new(),
             first_wall: 0,
             walls_in: 0,
-            was_in_wall: false,
+            wall_out: u32::MAX,
             wall_enters: 0,
             finished: false,
             score: 0.0,
@@ -1252,7 +1345,7 @@ impl Core {
         self.wall_passed = vec![false; self.walls.len()];
         self.first_wall = 0;
         self.walls_in = 0;
-        self.was_in_wall = false;
+        self.wall_out = u32::MAX;
         self.wall_enters = 0;
         self.good_cuts = 0;
         self.bad_cuts = 0;
@@ -1491,8 +1584,10 @@ impl Core {
         // contact spec §7: per-foot ground-contact lanes
         // [L_heel, L_toe, R_heel, R_toe]
         for k in 0..N_GROUND_IMP_LANES {
-            obs[OFF_GROUND_IMP + k] =
-                (self.body.ground_imp[k] / GROUND_IMP_NORM) as f32;
+            // exp/tick-rate: the lanes are TICK-summed impulses, so scale
+            // them to one 30 Hz tick's worth (× ratio; × 1.0 at 30 Hz)
+            obs[OFF_GROUND_IMP + k] = (self.body.ground_imp[k]
+                * self.body.rate.ratio_r / GROUND_IMP_NORM) as f32;
         }
 
         // contact spec §8 (env v13): elbow/knee/foot world positions —
@@ -1589,11 +1684,13 @@ impl Core {
 
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
         let gear = self.gear;
+        let rate = self.body.rate;
         self.body.tick(actions, &gear);
         // env v43 energy price on the applied Σ|τ| (the v23 fraction
         // price retired 2026-09-14) + always-on activation and torque
         // telemetry (accumulate at coef 0 too)
-        reward -= self.energy_coef * self.body.tau_abs;
+        // (per-tick price × tscale: the same price per second at any rate)
+        reward -= self.energy_coef * self.body.tau_abs * rate.tscale;
         self.act_sum[0] += self.body.act_frac;
         self.act_sum[1] += self.body.act_group[0];
         self.act_sum[2] += self.body.act_group[1];
@@ -1639,7 +1736,8 @@ impl Core {
             let rf = &self.body.ws.p[F_R_FOOT];
             let hx = h(lf[0] + FOOT_X0) + h(rf[0] - FOOT_X0);
             let hz = h(lf[2] - PLANE_Z0) + h(rf[2] - PLANE_Z0);
-            reward -= self.foot_x_coef * hx + self.foot_z_coef * hz;
+            // per-tick rent × tscale (same rent per second at any rate)
+            reward -= (self.foot_x_coef * hx + self.foot_z_coef * hz) * rate.tscale;
             if self.foot_shape_coef > 0.0 {
                 let pot = hx + hz;
                 reward += self.foot_shape_coef * (self.prev_foot_pot - pot);
@@ -1658,7 +1756,7 @@ impl Core {
                 .clamp(-1.0, 1.0);
             let delta = dot.acos();
             deltas[s] = delta;
-            if delta < SWING_BREAK {
+            if delta < SWING_BREAK * rate.tscale {
                 self.body.swing_acc[s] = 0.0;
                 self.body.axis[s] = None;
             } else {
@@ -1687,7 +1785,7 @@ impl Core {
                 } else {
                     tr.acc += deltas[s];
                     tr.age += 1;
-                    tr.acc >= POST_FULL || tr.age >= FOLLOW_TIMEOUT
+                    tr.acc >= POST_FULL || tr.age >= FOLLOW_TIMEOUT * rate.ratio
                 };
                 if resolve {
                     let pts = round_pts(PTS_POST * (tr.acc / POST_FULL).min(1.0));
@@ -1702,7 +1800,7 @@ impl Core {
         }
         }
 
-        self.time = (self.tick + 1) as Real * DT;
+        self.time = (self.tick + 1) as Real * rate.dt;
 
         // env v19 flail telemetry (CUDA mirror, telemetry only): on
         // ticks whose next pending chart object is > FLAIL_LEAD_S out,
@@ -1895,11 +1993,11 @@ impl Core {
                 }
                 let vc = [
                     (wrist_m[0] + s_star * blade_m[0]
-                        - prev_pos[m][0] - s_star * prev_dir[m][0]) / DT,
+                        - prev_pos[m][0] - s_star * prev_dir[m][0]) / rate.dt,
                     (wrist_m[1] + s_star * blade_m[1]
-                        - prev_pos[m][1] - s_star * prev_dir[m][1]) / DT,
+                        - prev_pos[m][1] - s_star * prev_dir[m][1]) / rate.dt,
                     (wrist_m[2] + s_star * blade_m[2]
-                        - prev_pos[m][2] - s_star * prev_dir[m][2]) / DT,
+                        - prev_pos[m][2] - s_star * prev_dir[m][2]) / rate.dt,
                 ];
                 let vc_mag = (vc[0].powi(2) + vc[1].powi(2) + vc[2].powi(2)).sqrt();
                 // accuracy distance: note center to the INFINITE cutting
@@ -2025,7 +2123,7 @@ impl Core {
             // env v36 interval sweep — see the .cu mirror: charge if
             // the wall's head-plane window intersects this tick's
             // (time_old, time_new] span; sub-tick walls can't phase.
-            let z_hit = dzf <= 0.0 && dzf + w.len + w.speed * DT >= 0.0;
+            let z_hit = dzf <= 0.0 && dzf + w.len + w.speed * rate.dt >= 0.0;
             if dzf + w.len < 0.0 {
                 self.wall_passed[wi] = true; // back face behind the head
             }
@@ -2047,7 +2145,7 @@ impl Core {
             }
         }
         if in_wall {
-            if !self.was_in_wall {
+            if self.wall_out >= rate.ratio {
                 // rising edge: COMBO BREAK (event 8). The scoring
                 // layers (ComboWalk / ComboTracker / .dat walk) break
                 // on 8 and IGNORE 7 — spec §12b combo rule. Since
@@ -2061,7 +2159,7 @@ impl Core {
             // event code 7: head-in-wall tick (note id unused -> u32::MAX)
             self.events_buf.push((u32::MAX, 7, 0.0, 0.0, 0.0));
         }
-        self.was_in_wall = in_wall;
+        self.wall_out = if in_wall { 0 } else { self.wall_out.saturating_add(1) };
         while self.first_wall < self.walls.len() && self.wall_passed[self.first_wall] {
             self.first_wall += 1;
         }
@@ -2113,7 +2211,7 @@ impl Core {
         // contact spec §7: the survival gradient — a per-tick alive
         // bonus. Added BEFORE the terminal overrides below so a
         // fall/escape tick never collects it.
-        reward += ALIVE_BONUS;
+        reward += ALIVE_BONUS * rate.tscale;
         if self.body.escaped {
             reward = 0.0;
         }
@@ -2145,8 +2243,9 @@ impl Core {
                   fall_const: Real, foot_z_coef: Real, foot_x_coef: Real,
                   foot_hinge_r: Real, foot_shape_coef: Real,
                   energy_coef: Real, limit_coef: Real, limit_arms: bool,
-                  wall_despawn: bool, self_contact_coef: Real) -> Self {
-        let mut core = Core::new_core(max_steps, gears);
+                  wall_despawn: bool, self_contact_coef: Real,
+                  rate: TickRate) -> Self {
+        let mut core = Core::new_core_rate(max_steps, gears, rate);
         core.fall_const = fall_const;
         core.foot_z_coef = foot_z_coef;
         core.foot_x_coef = foot_x_coef;
@@ -2158,6 +2257,28 @@ impl Core {
         core.wall_despawn = wall_despawn;
         core.self_contact_coef = self_contact_coef;
         core
+    }
+
+    /// exp/tick-rate action repeat: `step_inner` with the same actions
+    /// for up to `repeat` sim ticks, handing each tick's events to
+    /// `on_events` in order. Rewards are summed; stops at the first done
+    /// tick (further ticks would be latched no-ops). repeat = 1 is
+    /// exactly one step_inner.
+    fn step_repeat(&mut self, actions: &[u8; NQ], repeat: u32,
+                   mut on_events: impl FnMut(&[(u32, u8, f32, f32, f32)]))
+                   -> (Real, bool) {
+        let (mut reward, mut done) = self.step_inner(actions);
+        on_events(&self.events_buf);
+        for _ in 1..repeat {
+            if done {
+                break;
+            }
+            let (r, d) = self.step_inner(actions);
+            on_events(&self.events_buf);
+            reward += r;
+            done = d;
+        }
+        (reward, done)
     }
 
     /// Raw self-contact accumulators (impulse N·s, ticks with contact,
@@ -2214,20 +2335,45 @@ impl RawBeatSim {
                         foot_shape_coef=0.0, energy_coef=0.0,
                         limit_coef=0.0, limit_arms=false,
                         wall_despawn=false, self_contact_coef=0.0,
-                        flux=false))]
+                        flux=false, tick_hz=30))]
     #[allow(clippy::too_many_arguments)]
     fn new(max_steps: u32, gears: u8, fall_const: Real,
            foot_z_coef: Real, foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: Real, flux: bool) -> Self {
+           self_contact_coef: Real, flux: bool, tick_hz: u32) -> PyResult<Self> {
+        let rate = TickRate::new(tick_hz)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let mut core = Core::configured(max_steps, gears,
                                         fall_const, foot_z_coef, foot_x_coef,
                                         foot_hinge_r, foot_shape_coef,
                                         energy_coef, limit_coef, limit_arms,
-                                        wall_despawn, self_contact_coef);
+                                        wall_despawn, self_contact_coef, rate);
         core.flux = flux;
-        RawBeatSim { core }
+        Ok(RawBeatSim { core })
+    }
+
+    /// Control rate (Hz): the sim ticks at 1/tick_hz s with 240/tick_hz
+    /// physics substeps per tick (exp/tick-rate; default 30). `max_steps`
+    /// is given in 30 Hz ticks and scaled to the rate.
+    #[getter]
+    fn tick_hz(&self) -> u32 {
+        self.core.body.rate.hz
+    }
+    /// Control tick length (s) = 1 / tick_hz.
+    #[getter]
+    fn dt(&self) -> Real {
+        self.core.body.rate.dt
+    }
+    /// Physics substeps per control tick = 240 / tick_hz.
+    #[getter]
+    fn n_sub(&self) -> usize {
+        self.core.body.rate.n_sub
+    }
+    /// The effective tick budget in SIM ticks (max_steps × tick_hz / 30).
+    #[getter]
+    fn max_steps(&self) -> u32 {
+        self.core.max_steps
     }
 
     /// Flux mode: the sim was built with `flux=True`.
@@ -2406,7 +2552,8 @@ impl RawBeatSim {
     /// Replay fix (2026-08-17): tick-summed GROUND-CONTACT reaction
     /// impulse of the LAST tick per foot [L, R], [jx, jy, jz] (N·s,
     /// world frame) — jy sums the sole corners' normal rows, jx/jz their
-    /// friction rows. Vertical reaction force ≈ jy / DT.
+    /// friction rows. Vertical reaction force ≈ jy / dt (the sim tick,
+    /// 1 / tick_hz; tick-summed, so NOT rescaled to 30 Hz like the obs).
     fn ground_reaction(&self) -> [[Real; 3]; 2] {
         self.core.body.foot_grf
     }
@@ -2673,7 +2820,7 @@ impl VecBeatSim {
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         energy_coef=0.0, limit_coef=0.0,
                         limit_arms=false, wall_despawn=false,
-                        self_contact_coef=0.0, flux=false))]
+                        self_contact_coef=0.0, flux=false, tick_hz=30))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, gears: u8,
@@ -2681,22 +2828,30 @@ impl VecBeatSim {
            foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: Real, flux: bool) -> Self {
-        VecBeatSim {
+           self_contact_coef: Real, flux: bool, tick_hz: u32) -> PyResult<Self> {
+        let rate = TickRate::new(tick_hz)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(VecBeatSim {
             sims: (0..n)
                 .map(|_| {
                     let mut core = Core::configured(
                         max_steps, gears, fall_const,
                         foot_z_coef, foot_x_coef, foot_hinge_r,
                         foot_shape_coef, energy_coef, limit_coef,
-                        limit_arms, wall_despawn, self_contact_coef);
+                        limit_arms, wall_despawn, self_contact_coef, rate);
                     core.flux = flux;
                     core
                 })
                 .collect(),
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             return_events,
-        }
+        })
+    }
+
+    /// Control rate (Hz) of every env (see RawBeatSim.tick_hz).
+    #[getter]
+    fn tick_hz(&self) -> u32 {
+        self.sims.first().map_or(TICK_HZ_BASE, |c| c.body.rate.hz)
     }
 
     #[pyo3(signature = (i, chart, walls = Vec::new()))]
@@ -2743,10 +2898,19 @@ impl VecBeatSim {
     /// env's own event ORDER preserved. Done envs must get a fresh
     /// set_chart before the next step; their returned obs row is the
     /// terminal obs.
+    ///
+    /// `repeat` (exp/tick-rate action repeat): hold each env's action for
+    /// this many sim ticks in the one call — rewards summed, done if any
+    /// tick was done (a finished env stops stepping; the latch would make
+    /// further ticks no-ops anyway), events concatenated in tick order,
+    /// and the obs is the one after the LAST tick (the next decision's).
+    /// 1 = the plain single-tick step.
+    #[pyo3(signature = (actions, repeat = 1))]
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         actions: PyReadonlyArray2<'py, i64>,
+        repeat: u32,
     ) -> (
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
@@ -2755,7 +2919,8 @@ impl VecBeatSim {
     ) {
         let n = self.sims.len();
         let mut flat = vec![0.0f32; n * OBS_DIM];
-        let (rewards, dones, all_events) = self.step_core(py, actions, &mut flat);
+        let (rewards, dones, all_events) =
+            self.step_core(py, actions, &mut flat, repeat);
         (
             PyArray1::from_vec_bound(py, flat),
             PyArray1::from_vec_bound(py, rewards),
@@ -2766,12 +2931,14 @@ impl VecBeatSim {
 
     /// Like `step`, but writes the obs into a caller-owned C-contiguous
     /// (N, 340) f32 array instead of allocating a fresh buffer per
-    /// step. Returns (rewards, dones, events).
+    /// step. Returns (rewards, dones, events). `repeat` as in `step`.
+    #[pyo3(signature = (actions, out_obs, repeat = 1))]
     fn step_into<'py>(
         &mut self,
         py: Python<'py>,
         actions: PyReadonlyArray2<'py, i64>,
         mut out_obs: PyReadwriteArray2<'py, f32>,
+        repeat: u32,
     ) -> (
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<bool>>,
@@ -2783,7 +2950,7 @@ impl VecBeatSim {
         let flat = out
             .as_slice_mut()
             .expect("out_obs must be C-contiguous");
-        let (rewards, dones, all_events) = self.step_core(py, actions, flat);
+        let (rewards, dones, all_events) = self.step_core(py, actions, flat, repeat);
         (
             PyArray1::from_vec_bound(py, rewards),
             PyArray1::from_vec_bound(py, dones),
@@ -2984,7 +3151,9 @@ impl VecBeatSim {
         py: Python<'_>,
         actions: PyReadonlyArray2<'_, i64>,
         flat: &mut [f32],
+        repeat: u32,
     ) -> (Vec<f32>, Vec<bool>, Vec<(u32, u32, u8, f32, f32, f32)>) {
+        assert!(repeat >= 1, "repeat must be >= 1");
         let acts = actions.as_array();
         let n = self.sims.len();
         assert_eq!(acts.shape(), &[n, NQ]);
@@ -3016,14 +3185,18 @@ impl VecBeatSim {
                         for j in 0..NQ {
                             acts_e[j] = a[j] as u8;
                         }
-                        let (r, d) = sim.step_inner(&acts_e);
-                        sim.write_obs(obs_chunk);
-                        if let Some(w) = walk.as_mut() {
-                            for &(note, code, pts, _, _) in &sim.events_buf {
-                                w.consume(note, code, pts);
+                        let mut ev = Vec::new();
+                        let (r, d) = sim.step_repeat(&acts_e, repeat, |events| {
+                            if let Some(w) = walk.as_mut() {
+                                for &(note, code, pts, _, _) in events {
+                                    w.consume(note, code, pts);
+                                }
                             }
-                        }
-                        let ev = if ret_ev { sim.events_buf.clone() } else { Vec::new() };
+                            if ret_ev {
+                                ev.extend_from_slice(events);
+                            }
+                        });
+                        sim.write_obs(obs_chunk);
                         (r as f32, d, ev)
                     })
                     .collect()
@@ -3276,6 +3449,245 @@ mod env_tests {
                 "foot {f} carries only {:.3} N·s",
                 core.body.foot_grf[f][1]
             );
+        }
+    }
+
+    // ---- exp/tick-rate: runtime control rate ---------------------------
+
+    /// DT / N_SUB / scale derivation; the 30 Hz default is exactly the
+    /// fixed-rate constants (bitwise), and only rates that are multiples
+    /// of 30 dividing 240 are accepted.
+    #[test]
+    fn tick_rate_derivation() {
+        let r30 = TickRate::new(30).unwrap();
+        assert_eq!(r30.dt.to_bits(), DT_30.to_bits(), "30 Hz DT must be DT_30 bitwise");
+        assert_eq!(r30.n_sub, N_SUB);
+        assert_eq!((r30.ratio, r30.ratio_r, r30.tscale), (1, 1.0, 1.0));
+        for (hz, n_sub, ratio, tscale) in [(60, 4, 2, 0.5), (120, 2, 4, 0.25), (240, 1, 8, 0.125)] {
+            let r = TickRate::new(hz).unwrap();
+            assert_eq!(r.n_sub, n_sub, "{hz} Hz");
+            assert_eq!(r.ratio, ratio, "{hz} Hz");
+            assert_eq!(r.ratio_r, ratio as Real, "{hz} Hz");
+            assert_eq!(r.tscale, tscale, "{hz} Hz");
+            assert_eq!(r.dt, 1.0 / hz as Real, "{hz} Hz");
+            // the substep never changes: n_sub · H_SUB = DT
+            assert!((r.n_sub as Real * H_SUB - r.dt).abs() < 1e-6, "{hz} Hz");
+        }
+        for bad in [0, 15, 45, 90, 480] {
+            assert!(TickRate::new(bad).is_err(), "{bad} Hz must be rejected");
+        }
+    }
+
+    /// Per-tick rules keep their real-time meaning: thresholds per tick
+    /// × tscale, tick counts × ratio, the tick budget × ratio.
+    #[test]
+    fn per_tick_thresholds_scale_with_rate() {
+        let r60 = TickRate::new(60).unwrap();
+        assert_eq!(SWING_BREAK * r60.tscale, 0.0025);
+        assert_eq!(FOLLOW_TIMEOUT * r60.ratio, 30);
+        assert_eq!(ALIVE_BONUS * r60.tscale, 0.001);
+        let r120 = TickRate::new(120).unwrap();
+        assert_eq!(SWING_BREAK * r120.tscale, 0.00125);
+        assert_eq!(FOLLOW_TIMEOUT * r120.ratio, 60);
+        assert_eq!(Core::new_core(690, 5).max_steps, 690);
+        assert_eq!(Core::new_core_rate(690, 5, r60).max_steps, 1380);
+        assert_eq!(Core::new_core_rate(690, 5, r120).max_steps, 2760);
+        assert_eq!(Core::new_core_rate(u32::MAX, 5, r120).max_steps, u32::MAX);
+        // the alive bonus per second is rate-independent: 1 s of standing
+        // pays the same at 30 and 60 Hz (far-future chart: nothing judged)
+        let chart: Vec<ChartTuple> = vec![(100.0, 0.0, 1.0, 0, 0.0, 6.0,
+                                           false, KIND_NOTE, false, false)];
+        let mut tot = [0.0 as Real; 2];
+        for (k, rate) in [TickRate::base(), r60].into_iter().enumerate() {
+            let mut core = Core::new_core_rate(100_000, 5, rate);
+            core.set_chart_notes(chart.clone());
+            for _ in 0..(15 * rate.ratio) {
+                let (r, d) = core.step_inner(&[0u8; NQ]);
+                assert!(!d);
+                tot[k] += r;
+            }
+            assert!((core.time - 0.5).abs() < 1e-9, "0.5 s elapsed at {} Hz", rate.hz);
+        }
+        assert!((tot[0] - tot[1]).abs() < 1e-12, "alive bonus / s: {tot:?}");
+    }
+
+    /// EQUAL STRENGTH: the same held action for 1 s is the same 240
+    /// substeps with the same torques at every control rate — the body
+    /// state at t = 1 s must match BITWISE (30 × 8 = 60 × 4 = 120 × 2
+    /// substeps). Nothing in the actuation or the physics runs per tick:
+    /// τ = gear · τ_max · tau_scale is recomputed each tick from the same
+    /// inputs, limit rows / ω-cap / step-11 clamps / contacts / the root
+    /// envelope all live inside `substep_constrained`, which carries no
+    /// per-tick state (no warm start). Checked for several gear patterns
+    /// incl. full-torque ones and a non-unit tau_scale body.
+    #[test]
+    fn equal_strength_across_tick_rates() {
+        let gear = gear_signed(5);
+        let mut patterns: Vec<(&str, [u8; NQ], bool)> = Vec::new();
+        patterns.push(("coast", [0u8; NQ], false));
+        patterns.push(("all full +", [1u8; NQ], false));
+        patterns.push(("all full -", [2u8; NQ], false));
+        let mut mixed = [0u8; NQ];
+        for j in 0..NQ {
+            mixed[j] = [1u8, 2, 3, 4, 0][j % 5];
+        }
+        patterns.push(("mixed gears", mixed, false));
+        let mut arms = [0u8; NQ];
+        for j in 3..17 {
+            arms[j] = if j % 2 == 0 { 1 } else { 2 }; // slams arm stops
+        }
+        patterns.push(("arms full (limit rows)", arms, false));
+        patterns.push(("mixed, tau_scale != 1", mixed, true));
+        let ts: [Real; TAU_FEAT] = [0.9012, 0.9804, 0.937, 0.9616, 0.8482, 0.8729,
+                                    1.1, 1.1889, 1.0567, 1.022, 0.9055, 1.0453,
+                                    1.0608, 1.0269, 1.0668, 1.1428];
+        for (name, acts, scaled) in &patterns {
+            let mut states = Vec::new();
+            let mut imp = Vec::new();
+            for hz in [30u32, 60, 120] {
+                let rate = TickRate::new(hz).unwrap();
+                let mut b = Body::with_rate(rate);
+                if *scaled {
+                    b.set_tau_axis(&ts);
+                }
+                b.reset();
+                let mut env_hits = 0;
+                let mut gimp = 0.0 as Real;
+                for _ in 0..hz {
+                    b.tick(acts, &gear);
+                    env_hits += b.escaped as u32;
+                    gimp += b.ground_imp.iter().sum::<Real>();
+                }
+                states.push((b.st.p, b.st.quat, b.st.q.clone(), b.st.v.clone(), b.ws.env_hits, env_hits));
+                imp.push(gimp);
+            }
+            for k in 1..3 {
+                let (p0, q0, j0, v0, e0, _) = &states[0];
+                let (p, q, j, v, e, _) = &states[k];
+                let bits = |x: &[Real]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(p), bits(p0), "{name}: root pos");
+                assert_eq!(bits(q), bits(q0), "{name}: root quat");
+                assert_eq!(bits(j), bits(j0), "{name}: joints");
+                assert_eq!(bits(v), bits(v0), "{name}: velocities");
+                assert_eq!(e, e0, "{name}: envelope engagements");
+                // tick-summed ground impulse over the second: the same
+                // substep lambdas, only grouped differently (rounding)
+                let rel = (imp[k] - imp[0]).abs() / imp[0].abs().max(1e-9);
+                assert!(rel < 1e-4, "{name}: 1 s ground impulse {} vs {}", imp[k], imp[0]);
+            }
+            println!("equal strength ok: {name} (root y {:.4}, envelope hits {})",
+                     states[0].0[1], states[0].4);
+        }
+    }
+
+    /// The ground-impulse obs lanes are rescaled to one 30 Hz tick's
+    /// worth: a standing body reads the same lanes at 30 / 60 / 120 Hz.
+    #[test]
+    fn ground_imp_lanes_rate_invariant() {
+        let chart: Vec<ChartTuple> = vec![(100.0, 0.0, 1.0, 0, 0.0, 6.0,
+                                           false, KIND_NOTE, false, false)];
+        let mut lanes = Vec::new();
+        for hz in [30u32, 60, 120] {
+            let rate = TickRate::new(hz).unwrap();
+            let mut core = Core::new_core_rate(100_000, 5, rate);
+            core.set_chart_notes(chart.clone());
+            // 0.1 s: past the reset's settling transient, well before the
+            // zero-torque topple unloads the stance
+            for _ in 0..(3 * rate.ratio) {
+                core.step_inner(&[0u8; NQ]);
+            }
+            let obs = core.build_obs();
+            let l: Vec<f32> = obs[OFF_GROUND_IMP..OFF_GROUND_IMP + N_GROUND_IMP_LANES].to_vec();
+            println!("{hz} Hz ground lanes {l:?} (sum {:.4})", l.iter().sum::<f32>());
+            lanes.push(l);
+        }
+        let s30: f32 = lanes[0].iter().sum();
+        assert!((s30 - 1.0).abs() < 0.1, "a settled stance sums to ~1: {s30}");
+        for k in 1..3 {
+            for i in 0..N_GROUND_IMP_LANES {
+                assert!((lanes[k][i] - lanes[0][i]).abs() < 0.02,
+                        "lane {i}: {:?} vs {:?}", lanes[k], lanes[0]);
+            }
+        }
+    }
+
+    /// Action repeat: step_repeat(a, n) is exactly n step_inner(a) calls
+    /// (state, summed reward, events in tick order) and stops at done.
+    #[test]
+    fn action_repeat_matches_repeated_steps() {
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| (0.3 + i as Real * 0.1, 0.0, 1.0, i % 2, 0.0, 6.0,
+                      false, KIND_NOTE, false, false))
+            .collect();
+        let rate = TickRate::new(60).unwrap();
+        let mut a = Core::new_core_rate(100_000, 5, rate);
+        let mut b = Core::new_core_rate(100_000, 5, rate);
+        a.set_chart_notes(chart.clone());
+        b.set_chart_notes(chart);
+        let mut acts = [0u8; NQ];
+        acts[10] = 1;
+        acts[15] = 2;
+        let mut steps = 0;
+        loop {
+            let mut ev_a = Vec::new();
+            let (ra, da) = a.step_repeat(&acts, 2, |e| ev_a.extend_from_slice(e));
+            let mut ev_b = Vec::new();
+            let (r1, d1) = b.step_inner(&acts);
+            ev_b.extend_from_slice(&b.events_buf);
+            let (mut rb, mut db) = (r1, d1);
+            if !d1 {
+                let (r2, d2) = b.step_inner(&acts);
+                ev_b.extend_from_slice(&b.events_buf);
+                rb += r2;
+                db = d2;
+            }
+            assert_eq!(ra.to_bits(), rb.to_bits(), "reward at decision {steps}");
+            assert_eq!(da, db);
+            assert_eq!(ev_a, ev_b);
+            assert_eq!(a.tick, b.tick);
+            assert_eq!(a.build_obs(), b.build_obs());
+            steps += 1;
+            if da {
+                break;
+            }
+            // flip the action every decision so holding is actually tested
+            acts[10] = if acts[10] == 1 { 2 } else { 1 };
+        }
+        assert!(a.misses + a.good_cuts + a.bad_cuts == 3, "every note resolved");
+        // repeat = 1 is one plain step
+        let mut c = Core::new_core_rate(100_000, 5, rate);
+        let mut d = Core::new_core_rate(100_000, 5, rate);
+        c.set_chart_notes(vec![(5.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_NOTE, false, false)]);
+        d.set_chart_notes(vec![(5.0, 0.0, 1.0, 0, 0.0, 6.0, false, KIND_NOTE, false, false)]);
+        let (rc, _) = c.step_repeat(&acts, 1, |_| {});
+        let (rd, _) = d.step_inner(&acts);
+        assert_eq!(rc.to_bits(), rd.to_bits());
+        assert_eq!(c.tick, 1);
+    }
+
+    /// The episode clock keeps real time: a chart ends at the same time
+    /// (to within one 30 Hz tick) with the same outcomes at every rate.
+    #[test]
+    fn episode_clock_is_real_time() {
+        let chart: Vec<ChartTuple> = (0u8..3)
+            .map(|i| (1.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
+                      false, KIND_NOTE, false, false))
+            .collect();
+        let mut ends = Vec::new();
+        for hz in [30u32, 60, 120] {
+            let rate = TickRate::new(hz).unwrap();
+            let mut core = Core::new_core_rate(690, 5, rate);
+            core.set_chart_notes(chart.clone());
+            let mut t = 0;
+            while !core.step_inner(&[0u8; NQ]).1 {
+                t += 1;
+                assert!(t < 100_000);
+            }
+            ends.push((core.time, core.misses, core.tick));
+        }
+        for k in 1..3 {
+            assert!((ends[k].0 - ends[0].0).abs() <= DT_30 + 1e-9, "{ends:?}");
+            assert_eq!(ends[k].1, ends[0].1, "{ends:?}");
         }
     }
 
