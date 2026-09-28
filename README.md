@@ -117,6 +117,13 @@ cd viz/app && npm ci && npm run xr         # HTTPS on the LAN
 # (accept the self-signed certificate once); trigger starts, grip = next chart
 ```
 
+Hosted at **https://flux.flee.systems** behind a Discord login, for
+whitelisted Discord accounts only (`viz/flux-host`, a Cloudflare Worker;
+non-whitelisted visitors are never sent the game). Redeploy after a
+viewer build: `cd viz/flux-host && npm ci && npm run deploy`; add a
+player with `npx wrangler secret put ALLOWED_DISCORD_IDS`
+(comma-separated Discord user ids).
+
 ## Quick start
 
 Uses its own venv at `python/.venv` (gitignored). One-time setup
