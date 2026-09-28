@@ -287,11 +287,12 @@ rollouts on both builds and both foot modes).
   centre at the hit plane).
 - **Circle** (`KIND_CIRCLE`, colour 0 left / 1 right): a flat disc
   facing the player, hitbox radius `CIRCLE_R = 0.175` (the ~35 cm
-  visual disc), with the standard good box's depth convention: 1.0 m
-  deep, shifted 0.25 m toward the player (`z ∈ [z − 0.75, z + 0.25]`).
-  No look-at tilt. Contact = the palm's path over the tick (last
-  tick's palm → this tick's) clipped to the slab passes within
-  `CIRCLE_R` of the centre in-plane. **Matching palm → good**:
+  visual disc), in a thin depth slab hugging the flat visual: 5 cm
+  either side (`SLAB_HALF = 0.05`, `z ∈ [z − 0.05, z + 0.05]`; user
+  rule 2026-09-28 — it was the good box's 1 m deep, 0.75 m-early slab).
+  No look-at tilt. Contact is swept **in the object's frame** (see
+  "Swept contact" below): the palm's relative path over the tick,
+  clipped to the slab, passes within `CIRCLE_R` of the centre in-plane. **Matching palm → good**:
   `50 + round(10 · (1 − clamp(d / 0.3, 0, 1)))`, `d` = that in-plane
   closest approach (the standard accuracy formula at 10 points; note
   the hitbox radius caps `d` at 0.175, so the accuracy floor is 4).
@@ -302,9 +303,9 @@ rollouts on both builds and both foot modes).
   facing the player, width `BAR_WIDTH = 0.05`, length `length` m,
   rotated `rot` about z: axis `u = (−sin rot, cos rot)` — 0 = vertical,
   CCW from the player's view (the note-angle convention). Hitbox: the
-  box `[0.025, length/2, 0.5]` half-extents in that z-roll frame,
-  centred 0.25 m toward the player (the circle slab). Contact = the
-  **swept Flux** — the quad from last tick's segment to this tick's,
+  box `[0.025, length/2, 0.05]` half-extents in that z-roll frame,
+  centred on the bar (the circle slab). Contact = the **swept Flux** —
+  the quad from last tick's segment to this tick's (relative, below),
   triangulated `(L0, R0, R1), (L0, R1, L1)` exactly like the saber
   sweep — overlaps the box (Akenine-Möller SAT). Score:
   `100 + round(15 · (1 − clamp(d / 0.3, 0, 1)))` with `d` = the
@@ -319,13 +320,24 @@ rollouts on both builds and both foot modes).
   `(cos rot, sin rot)` — undirected, so 0–90°: `(f · n)² ≥ 0.25 |f|²`.
   A crossing beyond that is a **bad cut** (event 2 "angle", −0.5,
   combo break); a collapsed Flux (palms coincident in xy) fails too.
+- **Swept contact** (2026-09-28): an object travels `speed · dt` per
+  judge tick (up to 0.6 m at 18 m/s and 30 Hz — six slab depths), so
+  contact is swept in each object's own frame: last tick's palms are
+  shifted by `−speed · dt` in z (where they were relative to the object
+  then) and the relative path is tested against the object's current
+  hitbox. A palm or Flux held still in an object's path is touched at
+  any speed and tick phase; nothing tunnels. `dt` is the judge tick:
+  `DT` in the env, `DT / 4` in the WebXR game (`flux::judge`'s
+  `tick_dt`).
 - **Misses**: an untouched circle or bar passing the head plane is a
-  miss (event 4, −0.5), exactly like a note.
+  miss (event 4, −0.5), exactly like a note. Contact is judged first:
+  an object that went through a palm and past the head plane within
+  one tick was touched.
 - **Reward / score**: good = `pts / 115` (circle max 60/115, bar
   115/115); bad and miss −0.5. `score_components()` returns (base
   contact points, accuracy points, 0); a good event's `pre` slot
   carries the base (50/100) and `acc` the accuracy points.
-- **Reach gate**: `max(shoulder_z) + 0.65 + PALM_OFF + 0.75` (the
+- **Reach gate**: `max(shoulder_z) + 0.65 + PALM_OFF + 0.05` (the
   slab's near face) replaces the saber reach.
 - **Obs** (same OBS_DIM and offsets as standard; Flux lane meanings,
   `constants.FLUX_LANE_*`): hand blocks = palm x/y head-relative, palm
