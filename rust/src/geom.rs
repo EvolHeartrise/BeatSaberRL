@@ -12,7 +12,13 @@
 use crate::Real;
 
 // --- tick, scoring and judgment constants -----------------------------------
-pub(crate) const DT: Real = 1.0 / 30.0;
+// The 30 Hz BASE control tick: the rate every policy is trained at and the
+// unit the per-tick rules below are written in. The Python env crate
+// runs at a runtime `tick_hz` (lib.rs `TickRate`, default 30 = exactly
+// this DT) and rescales every per-tick quantity to it; the Flux WebXR
+// game judges on k-times-finer ticks of it (rust/flux-wasm).
+#[allow(dead_code)] // the env crate derives its DT at runtime (TickRate)
+pub(crate) const DT_30: Real = 1.0 / 30.0;
 pub(crate) const ACC_NORM: Real = 0.3; // real BS accuracy normalizer (m)
 pub(crate) const COS_TOL: Real = 0.5;
 pub(crate) const REWARD_BAD: Real = -0.5;

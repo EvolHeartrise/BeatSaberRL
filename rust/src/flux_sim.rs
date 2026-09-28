@@ -38,7 +38,7 @@ impl Core {
         ];
         for s in 0..2 {
             for k in 0..3 {
-                self.palm_vel[s][k] = (p1[s][k] - p0[s][k]) / DT;
+                self.palm_vel[s][k] = (p1[s][k] - p0[s][k]) / self.body.rate.dt;
             }
         }
         let reach_z = flux::reach_z(
