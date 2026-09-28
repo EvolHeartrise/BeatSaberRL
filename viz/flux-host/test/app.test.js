@@ -78,6 +78,11 @@ assert.equal(allowedIds({}).size, 0);
     await noGame(res, why);
   }
 
+  // The login page's only visible text is the button.
+  const anon = await (await handle(req("/"), ENV, GAME, noFetch)).text();
+  const visible = anon.replace(/<head>[\s\S]*<\/head>/, "").replace(/<[^>]+>/g, "").trim();
+  assert.equal(visible, "Log in with Discord");
+
   // Revocation: dropping an id from the list locks out an existing session.
   const cookie = `__Host-flux_session=${await session("111111111111111111")}`;
   const revoked = await handle(req("/", { cookie }), { ...ENV, ALLOWED_DISCORD_IDS: "222222222222222222" }, GAME, noFetch);

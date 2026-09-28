@@ -137,7 +137,7 @@ main{max-width:26rem;padding:2rem 1.5rem;text-align:center}h1{font-size:1.6rem;m
 p{color:#a8acc0}a.btn,button{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border:0;
 border-radius:.5rem;background:#5865f2;color:#fff;font:inherit;text-decoration:none;cursor:pointer}
 button.ghost{background:#2a2e3d}code{background:#1c1f2b;padding:.1rem .35rem;border-radius:.25rem}
-</style></head><body><main><h1>${esc(title)}</h1>${inner}</main></body></html>`, status, extra);
+</style></head><body><main>${title ? `<h1>${esc(title)}</h1>` : ""}${inner}</main></body></html>`, status, extra);
 }
 
 const logoutForm = `<form method="post" action="/logout"><button class="ghost">log out</button></form>`;
@@ -158,8 +158,7 @@ export async function handle(request, env, gameHtml, fetchImpl = fetch) {
   if (url.pathname === "/" && (method === "GET" || method === "HEAD")) {
     const s = await verify(cookies(request)[SESSION_COOKIE], env.SESSION_SECRET);
     if (!s) {
-      return page("Flux", `<p>Play Flux in VR. Access is invite-only.</p>
-<a class="btn" href="/login">Log in with Discord</a>`, 401);
+      return page("", `<a class="btn" href="/login">Log in with Discord</a>`, 401);
     }
     if (!allowedIds(env).has(s.sub)) {
       return page("Not on the list", `<p>You're logged in as <b>${esc(s.name)}</b>,
