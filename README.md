@@ -604,8 +604,8 @@ Since 2026-09-14 a map card sits in the TOP-LEFT corner of the render area
 (`viz/app/src/lib/MapCard.svelte`, a DOM overlay over the canvas like the
 pose panel — so it is NOT captured by `export video`): cover art, song name,
 sub name, "by <song author> · mapped by <mapper>", the difficulty as a badge
-and a link to the map on BeatSaver. `m` (or the 💿 button) toggles it; the
-choice is remembered in localStorage and it defaults ON. A replay header only
+and a link to the map on BeatSaver. It is always shown for a replay that
+names a map (the `m` / 💿 toggle was removed 2026-09-29). A replay header only
 carries `map = {hash, difficulty, song, audio_offset_s}`, so everything else
 is looked up once per hash from the same BeatSaver API the song audio uses
 (`GET api.beatsaver.com/maps/hash/<hash>`, cached in memory and in
