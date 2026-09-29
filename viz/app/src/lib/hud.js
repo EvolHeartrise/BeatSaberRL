@@ -197,3 +197,94 @@ export function formatScore(score) {
 
 /** ScoreManager.GetPercentageString: two decimals and a percent sign. */
 export const pctString = (pct) => pct.toFixed(2) + "%";
+
+// ---- Flux ---------------------------------------------------------------------
+// The Flux judge (rust/src/combo.rs ComboWalk, compiled into the game's wasm)
+// defines combo, the 1/2/4/8 multiplier with its 2/4/8-hit bar, the
+// multiplied score, and "breaks" (bad cuts + misses). It has no energy and
+// no rank, so the Flux HUD shows neither. Its accuracy is the game's own
+// (the in-headset HUD's before this one): the unmultiplied points over the
+// max of every object resolved so far (circle 60, bar 115: KIND_MAX).
+
+const _fluxCache = new WeakMap(); // rep -> per-tick cumulative arrays
+
+/** combo.rs's walk over a Flux replay's recorded events. */
+function buildFlux(rep) {
+  const n = rep.ticks.length;
+  const out = {
+    score: new Float64Array(n), raw: new Float64Array(n),
+    max: new Float64Array(n), combo: new Int32Array(n),
+    multIdx: new Uint8Array(n), progress: new Uint8Array(n),
+    breaks: new Int32Array(n),
+  };
+  const noteMult = new Map(); // note -> multiplier at its cut
+  let mi = 0, prog = 0, combo = 0, breaks = 0, score = 0, raw = 0, max = 0;
+  const brk = () => { combo = 0; breaks++; if (mi > 0) mi--; prog = 0; };
+  for (let k = 0; k < n; k++) {
+    for (const e of rep.ticks[k].events) {
+      if (e.cut) {
+        const i = e.cut.note, pts = e.cut.points || 0;
+        max += KIND_MAX[rep.chart[i]?.kind] ?? 0;
+        raw += pts;
+        if (e.cut.good) {
+          // promote-before-commit: the hit that fills the bar scores at
+          // the new multiplier
+          if (mi < MULTS.length - 1 && ++prog >= NEED[mi]) { mi++; prog = 0; }
+          noteMult.set(i, MULTS[mi]);
+          combo++;
+          score += pts * MULTS[mi];
+        } else {
+          brk();
+        }
+      } else if (e.post) {
+        // follow-through at the note's cut-time multiplier (combo.rs code
+        // 5; the Flux judge emits none today)
+        raw += e.post.points;
+        score += e.post.points * (noteMult.get(e.post.note) ?? MULTS[mi]);
+      } else if (e.miss !== undefined) {
+        max += KIND_MAX[rep.chart[e.miss.note]?.kind] ?? 0;
+        brk();
+      }
+    }
+    out.score[k] = score; out.raw[k] = raw; out.max[k] = max;
+    out.combo[k] = combo; out.multIdx[k] = mi; out.progress[k] = prog;
+    out.breaks[k] = breaks;
+  }
+  return out;
+}
+
+/** The Flux HUD's numbers from the judge's tallies (fluxcore STAT_NAMES:
+ * score, combo, multiplier, progress, breaks, raw_score) and the max of
+ * the objects resolved so far. */
+export function fluxHud(st, resolvedMax) {
+  const mi = Math.max(0, MULTS.indexOf(st.multiplier));
+  return {
+    score: Math.round(st.score), combo: st.combo, mult: MULTS[mi],
+    progress: st.progress, fill: st.progress / NEED[mi],
+    misses: st.breaks, fullCombo: st.breaks <= 0,
+    pct: resolvedMax > 0 ? (100 * st.raw_score) / resolvedMax : 100,
+  };
+}
+
+/** The max points of every object a Flux recording has resolved. */
+export function fluxResolvedMax(rep) {
+  let m = 0;
+  rep.outcomes.forEach((o, i) => { if (o) m += KIND_MAX[rep.chart[i].kind] ?? 0; });
+  return m;
+}
+
+/** Flux HUD state after every event up to and including tick k, walked
+ * from a Flux replay's events with the judge's own rules. */
+export function fluxHudAt(rep, k) {
+  let a = _fluxCache.get(rep);
+  if (!a) { a = buildFlux(rep); _fluxCache.set(rep, a); }
+  const n = rep.ticks.length;
+  if (n === 0 || k < 0) {
+    return fluxHud({ score: 0, combo: 0, multiplier: 1, progress: 0,
+      breaks: 0, raw_score: 0 }, 0);
+  }
+  k = Math.min(Math.floor(k), n - 1);
+  return fluxHud({ score: a.score[k], combo: a.combo[k],
+    multiplier: MULTS[a.multIdx[k]], progress: a.progress[k],
+    breaks: a.breaks[k], raw_score: a.raw[k] }, a.max[k]);
+}

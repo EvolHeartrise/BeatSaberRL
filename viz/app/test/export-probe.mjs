@@ -40,7 +40,7 @@ page.on("dialog", async (d) => { errors.push("dialog: " + d.message()); await d.
 await page.goto("file://" + dist);
 await page.waitForSelector("#stage canvas", { timeout: 15000 });
 (await page.$("input[type=file]")).uploadFile(replay);
-await page.waitForFunction(() => /tick/i.test(document.body.innerText),
+await page.waitForFunction(() => window.__viewerState?.().loaded,
   { timeout: 20000 });
 // let the song settle (or report that this replay has none)
 await page.waitForFunction(() => {
@@ -49,8 +49,7 @@ await page.waitForFunction(() => {
     || /no song|no audio/.test(document.querySelector("#snd")?.textContent ?? "");
 }, { timeout: 120000, polling: 500 });
 await page.keyboard.press(" "); // pause playback
-const ticks = await page.evaluate(() =>
-  +(/tick \d+\/(\d+)/.exec(document.querySelector("#hud").textContent)?.[1] ?? 0));
+const ticks = await page.evaluate(() => window.__viewerState().lastTick);
 await page.select("select", fps);
 
 // keep the Blob instead of downloading it

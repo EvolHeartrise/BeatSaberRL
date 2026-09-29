@@ -40,11 +40,23 @@
   // matches ComboMeter.png: outer radius 75 units, 9.375 thick.
   // Skipped: the PP line (only for ScoreSaber-ranked leaderboards, off
   // without one) and "FC : xx.xx%" (off by default in the watch's settings).
+  //
+  // Flux (not in the site build): the same HUD with only what the Flux
+  // judge defines (hud.js §Flux): combo + FC bars, the multiplied score and
+  // the game's accuracy on the left (no rank letter), the multiplier ring
+  // and Misses (the judge's breaks) on the right, and no energy bar. In the
+  // WebXR game it reads the judge's live tallies (play.stats); for a Flux
+  // replay it walks the recorded events. The placement is the watch's in
+  // both: the game's XR origin is the env body's plane (scene z 0.65, the
+  // watch's "Player"), so the HUD sits where Beat Saber's does around the
+  // player's head.
   import { T } from "@threlte/core";
   import * as THREE from "three";
-  import { pb, play, pose } from "./state.svelte.js";
+  import { pb, play, pose, game } from "./state.svelte.js";
   import { isFlux } from "./replay.js";
-  import { formatScore, hudAt, pctString } from "./hud.js";
+  import { FLUX } from "./build.js";
+  import { formatScore, fluxHud, fluxHudAt, fluxResolvedMax, hudAt,
+    pctString } from "./hud.js";
 
   // ---- reference constants (Previewer.unity) --------------------------------
   const UNIT = 0.01;        // Main localScale: metres per canvas unit
@@ -64,24 +76,39 @@
   // world position of a canvas point (u, v) in units; z behind the canvas
   const at = (u, v, dz = 0) => [u * UNIT, CY + v * UNIT, -(CZ + dz * UNIT)];
 
-  // ---- visibility: standard replays only -----------------------------------
-  const shown = $derived(!!pb.rep && !isFlux(pb.rep) && !pose.on && !play.on
-    && pb.rep.ticks.length > 0);
+  // ---- visibility ------------------------------------------------------------
+  // "std": a standard replay; "flux": a Flux replay being watched;
+  // "live": the Flux game while a run is on (countdown / playing)
+  const mode = $derived(
+    FLUX && play.on
+      ? (play.stats && (play.phase === "countdown" || play.phase === "playing")
+        ? "live" : null)
+      : !pb.rep || pose.on || pb.rep.ticks.length === 0 ? null
+      : !isFlux(pb.rep) ? "std"
+      : FLUX ? "flux" : null);
+  const shown = $derived(mode !== null);
+  const flux = $derived(mode === "flux" || mode === "live");
 
   let fontReady = $state(false);
   $effect(() => {
     loadFont().then(() => (fontReady = true), () => (fontReady = true));
   });
 
-  // ---- the numbers at this tick (the DOM HUD's floor(cur) convention) ------
-  const h = $derived(shown
-    ? hudAt(pb.rep, Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1))
+  // ---- the numbers at this tick (the viewer's floor(cur) convention) -------
+  const tick = () => Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1);
+  const h = $derived(
+    mode === "std" ? hudAt(pb.rep, tick())
+    : mode === "flux" ? fluxHudAt(pb.rep, tick())
+    // live: the judge's tallies; the resolved max re-derives whenever they
+    // change (the live recording is not reactive itself)
+    : mode === "live" && game.session
+      ? fluxHud(play.stats, fluxResolvedMax(game.session.rep))
     : null);
   // strings, so a canvas only redraws when what it shows changes
-  const leftKey = $derived(h ? [h.combo, formatScore(h.score),
+  const leftKey = $derived(h ? [flux, h.combo, formatScore(h.score),
     pctString(h.pct), h.grade, h.fullCombo].join("|") : "");
   const rightKey = $derived(h ? [h.mult, h.fill, h.misses].join("|") : "");
-  const energy = $derived(h ? h.energy : 0);
+  const energy = $derived(h && !flux ? h.energy : 0);
 
   // ---- canvas panels ---------------------------------------------------------
   // A panel covers the canvas rect u in [u0, u1], v in [v0, v1].
@@ -165,8 +192,11 @@
     text(L, [{ t: formatScore(hh.score) }], -450, -300, 8, 45, { size: 50 });
     text(L, [{ t: pctString(hh.pct) }], -450, -300, -29, 8,
       { size: 40, color: GRAY });
-    text(L, [{ t: hh.grade }], -450, -300, -108, -29,
-      { size: 100, color: GRAY, spacing: -0.05 });
+    // the Flux judge defines no rank
+    if (!flux) {
+      text(L, [{ t: hh.grade }], -450, -300, -108, -29,
+        { size: 100, color: GRAY, spacing: -0.05 });
+    }
     L.tex.needsUpdate = true;
   }
 
@@ -264,24 +294,27 @@
         side={THREE.DoubleSide} toneMapped={false} />
     </T.Mesh>
   {/each}
-  <T.Mesh geometry={ebGeo} position={ebPos} renderOrder={1}>
-    <T.MeshBasicMaterial color="#141414" transparent opacity={0.6}
-      depthWrite={false} side={THREE.DoubleSide} toneMapped={false} />
-  </T.Mesh>
-  {#if energy > 0}
-    <T.Mesh geometry={ebGeo} renderOrder={2}
-      position={[ebPos[0] - (EB_W * UNIT * (1 - energy)) / 2, ebPos[1], ebPos[2]]}
-      scale={[energy, 1, 1]}>
-      <T.MeshBasicMaterial color={WHITE} transparent depthWrite={false}
+  <!-- the energy bar: standard replays only (the Flux judge has none) -->
+  {#if !flux}
+    <T.Mesh geometry={ebGeo} position={ebPos} renderOrder={1}>
+      <T.MeshBasicMaterial color="#141414" transparent opacity={0.6}
+        depthWrite={false} side={THREE.DoubleSide} toneMapped={false} />
+    </T.Mesh>
+    {#if energy > 0}
+      <T.Mesh geometry={ebGeo} renderOrder={2}
+        position={[ebPos[0] - (EB_W * UNIT * (1 - energy)) / 2, ebPos[1], ebPos[2]]}
+        scale={[energy, 1, 1]}>
+        <T.MeshBasicMaterial color={WHITE} transparent depthWrite={false}
+          side={THREE.DoubleSide} toneMapped={false} />
+      </T.Mesh>
+    {/if}
+    <T.Mesh geometry={iconGeo} position={failPos}>
+      <T.MeshBasicMaterial map={failTex} transparent depthWrite={false}
+        side={THREE.DoubleSide} toneMapped={false} />
+    </T.Mesh>
+    <T.Mesh geometry={iconGeo} position={energyPos}>
+      <T.MeshBasicMaterial map={energyTex} transparent depthWrite={false}
         side={THREE.DoubleSide} toneMapped={false} />
     </T.Mesh>
   {/if}
-  <T.Mesh geometry={iconGeo} position={failPos}>
-    <T.MeshBasicMaterial map={failTex} transparent depthWrite={false}
-      side={THREE.DoubleSide} toneMapped={false} />
-  </T.Mesh>
-  <T.Mesh geometry={iconGeo} position={energyPos}>
-    <T.MeshBasicMaterial map={energyTex} transparent depthWrite={false}
-      side={THREE.DoubleSide} toneMapped={false} />
-  </T.Mesh>
 {/if}

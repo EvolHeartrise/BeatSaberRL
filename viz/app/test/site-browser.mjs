@@ -78,10 +78,10 @@ try {
     await page.goto(url(fluxPath));
     await page.waitForSelector("#urlerror", { timeout: 60000 });
     const msg = await page.$eval("#urlerror", (el) => el.textContent.replace(/\s+/g, " ").trim());
-    const hud = await page.$eval("#hud", (el) => el.textContent.replace(/\s+/g, " ").trim());
-    console.log(`${fluxPath} -> ${msg} · HUD: ${hud}`);
+    const vs = await page.evaluate(() => window.__viewerState());
+    console.log(`${fluxPath} -> ${msg} · viewer: ${JSON.stringify(vs)}`);
     if (!/Flux replays aren't supported on this site/.test(msg)) fail("Flux replay: unexpected message");
-    if (await page.$("#watch") || await page.$("#title") || !/no replay loaded/.test(hud))
+    if (await page.$("#watch") || await page.$("#title") || vs.loaded)
       fail("a refused Flux replay must not open");
     await page.screenshot({ path: "test/out/site-flux-refused.png" });
   }

@@ -1,6 +1,6 @@
 // Headless-browser smoke test of the BUILT single-file viewer: loads
 // dist/index.html in Edge, uploads a real v10 replay through the file
-// input, plays a second, and asserts the HUD advanced with zero page
+// input, plays a second, and asserts playback advanced with zero page
 // errors. Also drives the v10 manual-pose panel (root + 29 joints) and
 // screenshots the articulated skeleton + per-joint gauges/forces, and
 // toggles the first-person (head-frame) camera on and back off.
@@ -98,7 +98,7 @@ try {
   const input = await page.$("input[type=file]");
   await input.uploadFile(replay);
   await page.waitForFunction(
-    () => document.querySelector("#hud").textContent.includes("tick"),
+    () => window.__viewerState?.().loaded,
     { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 1500)); // let it play a bit
   await page.screenshot({ path: "test/out/playing.png" });
@@ -108,7 +108,8 @@ try {
   // gauges show τ bars, foot N and joint activation) and to a late tick.
   await page.keyboard.press("h");
   const scrub = (tick) => page.evaluate((tick) => {
-    const r = document.querySelector("#bottom input[type=range]");
+    // the timeline is the last slider (volume / fov come first)
+    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
       .set.call(r, tick);
     r.dispatchEvent(new Event("input", { bubbles: true }));
@@ -120,9 +121,9 @@ try {
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/late.png" });
 
-  const hud = await page.$eval("#hud", (el) => el.textContent);
-  console.log("HUD:", hud.replace(/\s+/g, " ").trim());
-  if (!/t\s+[1-9]?\d\.\d+s/.test(hud)) throw new Error("time not advancing");
+  const vs = await page.evaluate(() => window.__viewerState());
+  console.log("viewer:", JSON.stringify(vs));
+  if (vs.tick !== 300 || !(vs.t > 0)) throw new Error("time not advancing");
 
   // ---- gauges button: mirrors the 'g' key (the panels are on at load)
   const GAUGES_ON = `[...document.querySelectorAll("#bar button")]
@@ -180,9 +181,9 @@ try {
     await scrub(60);
     await new Promise((r) => setTimeout(r, 500));
     await page.screenshot({ path: "test/out/v15-head-anchored.png" });
-    const hud15 = await page.$eval("#hud", (el) => el.textContent);
-    console.log("HUD (v15):", hud15.replace(/\s+/g, " ").trim());
-    if (!/tick\s*60\b/.test(hud15))
+    const vs15 = await page.evaluate(() => window.__viewerState());
+    console.log("viewer (v15):", JSON.stringify(vs15));
+    if (vs15.tick !== 60)
       throw new Error("v15 replay did not scrub");
 
     // ---- live A/V sync: the song must RUN, not be seeked about.

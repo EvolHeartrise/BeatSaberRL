@@ -9,7 +9,6 @@
   import { toggleXRSession } from "@threlte/xr";
   import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
     watchRun } from "./lib/playctl.js";
-  import { rank } from "./lib/fluxgame.js";
   import { sfx } from "./lib/sfx.js";
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
@@ -17,7 +16,7 @@
   import { flushSync, onMount } from "svelte";
   import { fetchReplay, fileToText, nameFor, replayPathFrom,
     replayUrl } from "./lib/urlload.js";
-  import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
+  import { DT, configSummary } from "./lib/replay.js";
   // site build (replays.flee.systems): no Flux game, no pose mode, no
   // file-picker button — see lib/build.js
   import { FLUX, POSE, PICKER } from "./lib/build.js";
@@ -26,18 +25,11 @@
   let dropHover = $state(false);
   let fileInput = $state(null);
 
+  // the timeline slider's position
   const tickIdx = $derived(
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
-  const time = $derived(pb.cur * DT);
   // the map card shows whenever the replay names a map (not in play mode)
   const cardShown = $derived(!!pb.rep?.map && !play.on);
-  const c = $derived(pb.rep ? counts(pb.rep, tickIdx) : null);
-  // bombs are not scoreable — they resolve silently unless hit
-  const scoreable = $derived(
-    pb.rep ? pb.rep.chart.filter((n) => n.kind !== 1).length : 0);
-  const nBombs = $derived(pb.rep ? pb.rep.chart.length - scoreable : 0);
-  // cached: the HUD re-renders every tick and maxScore is O(chart)
-  const maxPts = $derived(pb.rep ? maxScore(pb.rep.chart) : 0);
 
   // ---- song audio ---------------------------------------------------------
   // Fetch the map's audio whenever a replay that names one is loaded. The
@@ -322,10 +314,9 @@
   // ---- the Flux WebXR game (play mode) ------------------------------------
   const entries = $derived(FLUX && play.on ? chartEntries() : []);
   const entry = $derived(entries.find((c) => c.id === play.chartId) ?? null);
-  // the chart the shown results belong to (the select may have moved on)
+  // the chart the finished run belongs to (the select may have moved on)
   const runEntry = $derived(entries.find((c) => c.id === play.runId) ?? null);
   const running = $derived(play.phase === "countdown" || play.phase === "playing");
-  const fmtScore = (v) => Math.round(v ?? 0).toLocaleString("en-US");
 
   function enterVR() {
     sfx.unlock(); // the click is the user gesture WebAudio needs
@@ -560,10 +551,7 @@
         <label>chart
           <select bind:value={play.chartId} disabled={running}>
             {#each entries as c (c.id)}
-              {@const b = play.best[c.id]}
-              <option value={c.id}>
-                {c.name}{b != null ? ` — best ${fmtScore(b)}` : ""}
-              </option>
+              <option value={c.id}>{c.name}</option>
             {/each}
           </select>
         </label>
@@ -591,31 +579,13 @@
           ✕ replays
         </button>
       </div>
-      {#if play.stats && play.phase !== "menu"}
-        {@const st = play.stats}
-        <div class="row stats">
-          {#if play.phase === "countdown"}<b>get ready…</b> ·{/if}
-          {#if play.paused}<b>paused</b> ·{/if}
-          t <b>{Math.max(0, play.time).toFixed(1)}s</b> ·
-          score <b>{fmtScore(st.score)}</b> ·
-          ×<b>{st.multiplier}</b> · combo <b>{st.combo}</b> ·
-          <span class="good">good {st.good}</span> /
-          <span class="bad">bad {st.bad}</span> /
-          <span class="miss">miss {st.misses}</span> of {st.n_objects}
-        </div>
-      {/if}
+      <!-- no score readout here: the running numbers are the in-game HUD's
+           (Hud3D.svelte), the final ones the in-world results text's
+           (FluxPlay.svelte) -->
       {#if play.phase === "done" && play.stats}
-        {@const st = play.stats}
         <div class="row result">
-          <b class="big">{fmtScore(st.score)}</b> <b>{rank(st)}</b>
-          {#if play.newBest}<span class="best">new best!</span>{/if}
-          · {fmtScore(st.raw_score)}/{fmtScore(st.max_score)} pts unmultiplied ·
-          max combo {st.max_combo}
           {#if runEntry && runEntry.id !== play.chartId}
-            · {runEntry.name}
-          {/if}
-          {#if runEntry?.agentScore != null}
-            · agent {fmtScore(runEntry.agentScore)} unmultiplied
+            <span class="dim">last run: {runEntry.name}</span>
           {/if}
           <button onclick={exportRun} title="save this run as a replay .jsonl">
             💾 save run</button>
@@ -626,20 +596,6 @@
       {#if play.error}<div class="row warn">{play.error}</div>{/if}
     </div>
     {:else}
-    <div id="hud" class="panel">
-      {#if pb.rep && c}
-        t <b>{time.toFixed(2)}s</b> · tick <b>{tickIdx}</b>/{lastTick()} ·
-        return <b>{c.reward.toFixed(2)}</b> ·
-        score <b>{c.score.toFixed(0)}</b>/{maxPts} ·
-        <span class="good">good {c.good}</span> /
-        <span class="bad">bad {c.bad}</span> /
-        <span class="miss">miss {c.miss}</span> of {scoreable}
-        {#if nBombs}· <span class="miss">bombs {c.bombs}</span>/{nBombs}{/if}
-        {#if tickIdx >= lastTick()}· <b>END</b>{/if}
-      {:else}
-        no replay loaded
-      {/if}
-    </div>
     <div id="bar" class="panel">
       <button onclick={() => setPlaying(!pb.playing)}>
         {pb.playing ? "⏸ pause" : "▶ play"}
@@ -808,10 +764,6 @@
   #snd input[type="range"] { width: 70px; }
   #snd .dim { color: #6b7180; font-size: 12px; max-width: 22ch; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  #hud {
-    font-variant-numeric: tabular-nums; color: #9aa0ae; padding: 5px 14px;
-  }
-  #hud b { color: #e8eaf0; }
   #playtitle { padding: 6px 14px; color: #9aa0ae; }
   #playtitle b { color: #e8eaf0; }
   #play {
@@ -822,10 +774,6 @@
     justify-content: center; }
   #play label { display: flex; gap: 6px; align-items: center; color: #9aa0ae; }
   #play .dim { color: #6b7180; font-size: 12px; }
-  #play .stats { font-variant-numeric: tabular-nums; color: #9aa0ae; }
-  #play .stats b, #play .result b { color: #e8eaf0; }
-  #play .big { font-size: 22px; }
-  #play .best { color: #ffd166; }
   #urlload { top: 0; bottom: 0; justify-content: center; z-index: 3; }
   #urlload .box {
     display: flex; flex-direction: column; gap: 8px; align-items: center;
@@ -847,7 +795,4 @@
   #watch .big { font-size: 22px; color: #e8eaf0; }
   #watch:hover { border-color: #7aa2f7; }
   .warn { color: #f0a35e; }
-  .good { color: #7dd3a0; }
-  .bad { color: #f0a35e; }
-  .miss { color: #e06c75; }
 </style>
