@@ -5,8 +5,7 @@
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
   import { audio, gfx, pb, play, pose, songClock, lastTick, loadText,
-    restart, seekTo, setPlaying, setSpeed, step, toggleMapCard,
-    togglePose } from "./lib/state.svelte.js";
+    restart, seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
   import { toggleXRSession } from "@threlte/xr";
   import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
     watchRun } from "./lib/playctl.js";
@@ -27,7 +26,8 @@
   const tickIdx = $derived(
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
   const time = $derived(pb.cur * DT);
-  const cardShown = $derived(pb.mapCard && !!pb.rep?.map);
+  // the map card shows whenever the replay names a map (not in play mode)
+  const cardShown = $derived(!!pb.rep?.map && !play.on);
   const c = $derived(pb.rep ? counts(pb.rep, tickIdx) : null);
   // bombs are not scoreable — they resolve silently unless hit
   const scoreable = $derived(
@@ -304,7 +304,6 @@
     else if (e.key === "g") pb.gauges = !pb.gauges;
     else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
-    else if (e.key === "m") toggleMapCard();
   }
 
   // exported length so far, as m:ss — the export is scrubbed from t = 0,
@@ -540,7 +539,7 @@
     </div>
   {/if}
 
-  {#if pb.mapCard && !play.on}
+  {#if cardShown}
     <MapCard />
   {/if}
 
@@ -678,11 +677,6 @@
       <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
         title="per-joint dials, torque bars, foot forces and joint activation (g)">
         📊 gauges
-      </button>
-      <button class:on={pb.mapCard} onclick={toggleMapCard}
-        title="map card: cover art, song, author, mapper and the BeatSaver
-               link, top-left over the scene (m)">
-        💿 map info
       </button>
       <button class:on={pb.firstPerson}
         onclick={() => (pb.firstPerson = !pb.firstPerson)}

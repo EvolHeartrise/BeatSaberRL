@@ -3,26 +3,6 @@ import {
   clampQ29, mirrorQ29, parseReplay, setTickRate, tickHzOf,
 } from "./replay.js";
 
-// Remembered UI preferences. localStorage is not always there (node, a
-// private window, file:// with site data blocked), so every access is
-// guarded and falls back to the default.
-const PREF = "beat-arena.viewer.";
-function pref(key, dflt) {
-  try {
-    const v = localStorage.getItem(PREF + key);
-    return v === null ? dflt : v === "1";
-  } catch {
-    return dflt;
-  }
-}
-function setPref(key, on) {
-  try {
-    localStorage.setItem(PREF + key, on ? "1" : "0");
-  } catch {
-    /* a viewer that cannot remember the toggle still works */
-  }
-}
-
 export const pb = $state({
   rep: null,
   name: "",
@@ -40,15 +20,7 @@ export const pb = $state({
   firstPerson: false, // camera on the body's head frame ('f')
   fpFov: 75, // first-person vertical field of view, degrees
   fpSmooth: 0, // first-person head-rotation smoothing, seconds (0 = exact)
-  // map metadata card, top-left over the scene ('m'). On by default and
-  // remembered across sessions; it only draws for a replay that names a map.
-  mapCard: pref("mapCard", true),
 });
-
-export function toggleMapCard() {
-  pb.mapCard = !pb.mapCard;
-  setPref("mapCard", pb.mapCard);
-}
 
 // Threlte's render controls, published by Scene.svelte. The frame-by-frame
 // exporter drives the render loop one frame at a time, but it lives in the
