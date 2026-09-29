@@ -18,7 +18,13 @@
   // The in-game HUD in WORLD space, rebuilt from ScoreSaber's replay viewer
   // (github.com/ScoreSaber/watch @6926860, Previewer.unity "Preview/HUD/
   // Main" and ScoreManager.cs). It is a world-space canvas at localPosition
-  // (0, 1.8, 5), scale 0.01 (1 canvas unit = 1 cm), 900 x 350 units. The
+  // (0, 1.8, 5), scale 0.01 (1 canvas unit = 1 cm), 900 x 350 units; its
+  // parents HUD and Preview are identity transforms, the Canvas is World
+  // Space with no CanvasScaler and nothing rescales it at runtime. So the
+  // panel really is 9 m wide at 5 m: on screen the ring is ~0.18 of the
+  // height from our orbit camera and ~0.20 from the watch's default
+  // first-person camera (0.7 m behind the head, 70°, tilted 15° down,
+  // which lifts the HUD into the top corners). The
   // watch world is this env's world: floor y = 0, the "Notes" parent lifts
   // row 0 to y 0.85, notes are hit at z = 0, and "Player" sits at
   // z = -0.65 (= PLANE_Z0). So the reference's positions carry over
@@ -68,9 +74,14 @@
   const ICON = "#666666";                   // (0.4, 0.4, 0.4)
   // Teko-Medium SDF face info (point size 50): cap line 32, ascent 37.5,
   // descent -12.5, superscript offset 37.5 at size 0.5; TextMeshPro italic
-  // = a 0.35 shear (italicStyle 35), bold = dilate + 7/100 em spacing
+  // = a 0.35 shear (italicStyle 35), bold = dilate + 7/100 em spacing.
+  // TMP's <sup> (TMP_Text, MarkupTag.SUPERSCRIPT) first multiplies the
+  // font scale by superscriptSize, THEN raises the baseline by
+  // superscriptOffset x that reduced scale: 37.5 / 50 x 0.5 = 0.375 em of
+  // the full size, which puts the small x's top about level with the
+  // digit's cap line
   const CAP = 0.64, ASC = 0.75, DESC = -0.25;
-  const SUP_RISE = 0.75, SUP_SIZE = 0.5;
+  const SUP_SIZE = 0.5, SUP_RISE = (37.5 / 50) * SUP_SIZE;
   const SHEAR = 0.35, BOLD_SPACING = 0.07, BOLD_STROKE = 0.07;
 
   // world position of a canvas point (u, v) in units; z behind the canvas
@@ -131,7 +142,7 @@
   const py = (p, v) => (p.v1 - v) * PX;
 
   /** One TextMeshPro line, centred in the rect [u0, u1] x [v0, v1]. runs:
-   * [{ t, sup }] (a <sup> run is half size, raised 0.75 em). valign:
+   * [{ t, sup }] (a <sup> run is half size, raised 0.375 em). valign:
    * "middle" centres the ascent..descent box (TMP Middle), "capline"
    * centres the cap height (TMP Capline). */
   function text(p, runs, u0, u1, v0, v1, o) {
