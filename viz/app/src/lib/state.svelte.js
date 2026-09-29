@@ -125,13 +125,19 @@ export function setRep(rep) {
   pb.rep = rep;
 }
 
-export function loadText(text, name) {
+/** Make `text` the active replay. `name` is a file name (its extension is
+ * dropped for display) unless `opts.title` gives the display name outright
+ * (a function of the parsed replay, or a string). `opts.play` = false opens
+ * it paused: a replay opened from a link has had no user gesture yet, and
+ * the song could not start with it. */
+export function loadText(text, name, opts = {}) {
   const rep = parseReplay(text); // throws with a useful message on bad input
   setRep(rep);
-  pb.name = name.replace(/\.[^.]*$/, "");
+  const t = typeof opts.title === "function" ? opts.title(rep) : opts.title;
+  pb.name = t ?? name.replace(/\.[^.]*$/, "");
   pb.cur = 0;
   pb.seek++;
-  pb.playing = true;
+  pb.playing = opts.play ?? true;
   audio.song = rep.map?.song ?? "";
   audio.offset = rep.map?.audio_offset_s ?? 0;
   audio.status = rep.map ? "loading" : "none";
