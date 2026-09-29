@@ -21,6 +21,7 @@
   import Body from "./Body.svelte";
   import { RAMP } from "./toon.js";
   import Notes from "./Notes.svelte";
+  import Hud3D from "./Hud3D.svelte";
   import Saber from "./Saber.svelte";
   import BodyGauges from "./BodyGauges.svelte";
   import { modelGeo } from "./models.js";
@@ -310,6 +311,9 @@
 {#if pb.rep}
   <Notes {zOff} />
 {/if}
+
+<!-- the in-game HUD in world space (standard replays only) -->
+<Hud3D />
 
 {#if POSE && pose.on && pose.ref}
   <!-- Reference note at a chosen cell, for eyeballing reach. It sits at
