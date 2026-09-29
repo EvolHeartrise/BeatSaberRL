@@ -65,7 +65,7 @@ try {
   console.log(`replay opened in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   await cdp.send("Network.emulateNetworkConditions", {
     offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
-  const title = await page.$eval("#drop", (el) => el.textContent.replace(/\s+/g, " ").trim());
+  const title = await page.$eval("#drop, #title", (el) => el.textContent.replace(/\s+/g, " ").trim());
   console.log(`title: ${title}`);
   const hz = +(/(\d+) Hz/.exec(title)?.[1] ?? 30);
   const hud = () => page.$eval("#hud", (el) => el.textContent.replace(/\s+/g, " "));

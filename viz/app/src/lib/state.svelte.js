@@ -1,7 +1,8 @@
 // Playback state shared by the DOM shell and the 3D scene (Svelte 5 runes).
 import {
-  clampQ29, mirrorQ29, parseReplay, setTickRate, tickHzOf,
+  clampQ29, isFlux, mirrorQ29, parseReplay, setTickRate, tickHzOf,
 } from "./replay.js";
+import { FLUX, POSE } from "./build.js";
 
 export const pb = $state({
   rep: null,
@@ -62,6 +63,7 @@ export const pose = $state({
 });
 
 export function togglePose() {
+  if (!POSE) return; // the site build has no pose mode
   pose.on = !pose.on;
   if (pose.on) pb.playing = false; // posing pauses playback
 }
@@ -104,6 +106,8 @@ export function setRep(rep) {
  * the song could not start with it. */
 export function loadText(text, name, opts = {}) {
   const rep = parseReplay(text); // throws with a useful message on bad input
+  // the site build (replays.flee.systems) plays agent Beat Saber replays only
+  if (!FLUX && isFlux(rep)) throw new Error("Flux replays aren't supported on this site");
   setRep(rep);
   const t = typeof opts.title === "function" ? opts.title(rep) : opts.title;
   pb.name = t ?? name.replace(/\.[^.]*$/, "");

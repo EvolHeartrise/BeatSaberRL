@@ -633,7 +633,11 @@ camera-attached gauge sprites anchor to the actual viewport corners
 (aspect-aware) and sit above the floating bottom UI.
 Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 `npm install && npm run build`, then copy `dist/index.html` over
-`../replay.html`. `npm test` runs the pure-logic tests (node) and
+`../replay.html`. The hosted viewer at replays.flee.systems is a separate,
+watch-only build (`npm run build:site` → `dist-site/index.html`, taken by
+`viz/replays-site/scripts/build.mjs`; flags in `src/lib/build.js`): no
+Flux WebXR game, Flux replays refused with a message, no pose mode and no
+file-picker button (the title is plain text). `npm test` runs the pure-logic tests (node) and
 `node test/browser.test.js` drives the built file in headless Edge
 (loads a real replay via the file input, asserts playback advances with
 zero page errors, screenshots to `test/out/`). Scene (world → three.js:

@@ -12,9 +12,18 @@ import basicSsl from "@vitejs/plugin-basic-ssl";
 // secure context, and a headset reaches the laptop over the LAN, so the dev
 // server listens on every interface over HTTPS with a throwaway
 // self-signed certificate (accept the warning once on the headset).
+//
+// `--mode site` (npm run build:site): the replays.flee.systems viewer, into
+// dist-site/ — __SITE__ switches off the Flux game + Flux replays, pose mode
+// and the file-picker button (src/lib/build.js), and the gated code is
+// tree-shaken out of that bundle.
 export default defineConfig(({ mode }) => ({
   base: "./",
+  define: { __SITE__: JSON.stringify(mode === "site") },
   plugins: [svelte(), viteSingleFile(), ...(mode === "xr" ? [basicSsl()] : [])],
   server: mode === "xr" ? { host: true } : {},
-  build: { chunkSizeWarningLimit: 2048 },
+  build: {
+    chunkSizeWarningLimit: 2048,
+    ...(mode === "site" ? { outDir: "dist-site" } : {}),
+  },
 }));
