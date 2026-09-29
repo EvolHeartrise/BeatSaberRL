@@ -21,7 +21,9 @@ repo (mirrored at research/vendor/scoresaber-watch):
 
 Fidelity notes:
 - Pose frames are exact: replay v10 `sabers` carries the FK wrist
-  position + unit blade direction per hand directly, 30 fps, and
+  position + unit blade direction per hand directly, one frame per
+  sim tick (header tick_hz fps — 30 unless the recording says
+  otherwise, exp/tick-rate record_rev 6), and
   (record_rev 2) `head` carries the FK head frame's world position +
   rotation. Both go out unmapped except for the player-space z shift
   below: the env's world axes ARE the viewer's (x right, y up, z
@@ -221,6 +223,15 @@ def read_replay(path):
     return header, lines[1:]
 
 
+def tick_hz_of(header):
+    """The recording's control rate (frames/s): header "tick_hz" (replay
+    record_rev 6, exp/tick-rate); absent = 30, the only rate before."""
+    hz = int(header.get("tick_hz", 30))
+    if hz <= 0:
+        raise SystemExit(f"bad tick_hz {hz} in replay header")
+    return hz
+
+
 def align_charts(header, map_dir, difficulty, first_note_s=2.0):
     """Re-parse the original map and align its notes 1:1 (by order) with
     the replay's chart. `first_note_s` must match the convention the
@@ -246,9 +257,10 @@ def align_charts(header, map_dir, difficulty, first_note_s=2.0):
     # saber state and events are END-of-tick (rust_env.py stamps the
     # post-step state with sim.time - DT; viz/replay.html compensates by
     # placing outcomes at (tick+1)*DT). Without the shift every pose and
-    # event leads the song by one tick — 33 ms, 0.3-0.8 m of note travel
-    # at real NJS in the ScoreSaber viewer.
-    offset = real_notes[0].hit_time - sim_notes[0].hit_time + 1.0 / 30.0
+    # event leads the song by one tick — 33 ms at 30 Hz, 0.3-0.8 m of
+    # note travel at real NJS in the ScoreSaber viewer. DT = 1/tick_hz.
+    offset = (real_notes[0].hit_time - sim_notes[0].hit_time
+              + 1.0 / tick_hz_of(header))
     return real_notes, offset
 
 
@@ -273,12 +285,13 @@ def metadata_block(song_hash, difficulty):
     return bytes(b)
 
 
-def pose_block(ticks, offset):
+def pose_block(ticks, offset, fps=30):
     """Head + both hands per tick, in the game's player space.
 
     Frame layout (their ScoreSaberDecoder.ReadFrames): head, leftHand,
     rightHand — each 3 floats position + 4 floats quaternion (xyzw) —
-    then int fps and float time.
+    then int fps and float time. fps = the recording's tick_hz (one
+    frame per sim tick).
     """
     frames = []
     prev_head_q = None
@@ -315,7 +328,7 @@ def pose_block(ticks, offset):
         for pos, quat in hands:
             b = w_vec3(b, player_space(pos))
             b += struct.pack("<4f", *quat)
-        b = w_int(b, 30)                           # fps
+        b = w_int(b, fps)                          # fps
         b = w_float(b, t)
     return bytes(b)
 
@@ -328,12 +341,13 @@ _DIR_ANGLE_DEG = {0: 90.0, 1: 270.0, 2: 180.0, 3: 0.0,
                   4: 135.0, 5: 45.0, 6: 225.0, 7: 315.0}
 
 
-def cut_geometry(ticks, tick_idx, hand, note):
+def cut_geometry(ticks, tick_idx, hand, note, fps=30):
     """Real cut kinematics at a tick from the recorded joint state:
     blade dir, tip speed, contact point (closest blade point to the
     note), geometric center distance, cut-plane normal (unit, spans the
     blade and its motion — |normal.z| is the time-dependency stat), and
-    the swing's xy motion angle."""
+    the swing's xy motion angle. Tip velocity = one-tick finite
+    difference x fps (the recording's tick_hz)."""
     def state(i):
         s = ticks[i]["sabers"][hand]
         return s[0:3], s[3:6]          # replay v10: wrist + blade direct
@@ -341,7 +355,7 @@ def cut_geometry(ticks, tick_idx, hand, note):
     p_wrist, p_blade = state(max(tick_idx - 1, 0))
     tip = [wrist[j] + blade[j] for j in range(3)]
     p_tip = [p_wrist[j] + p_blade[j] for j in range(3)]
-    motion = [(tip[j] - p_tip[j]) * 30.0 for j in range(3)]
+    motion = [(tip[j] - p_tip[j]) * float(fps) for j in range(3)]
     speed = math.sqrt(sum(m * m for m in motion))
 
     center = (note_tuple(note)[1], note_tuple(note)[2], 0.0)
@@ -367,7 +381,7 @@ def wrap_deg(a):
     return (a + 180.0) % 360.0 - 180.0
 
 
-def build_events(ticks, real_notes, offset):
+def build_events(ticks, real_notes, offset, fps=30):
     """Note-event dicts + the score/combo/multiplier HUD timelines.
 
     The keyframe blocks use the game recorder's layouts (ComboEvent =
@@ -379,6 +393,8 @@ def build_events(ticks, real_notes, offset):
     note events and energy from the damage/heal constants — so for that
     viewer these blocks only keep the 9-pointer table valid. They are
     still written faithfully for other format consumers.
+    fps = the recording's tick_hz: the per-tick wall drain and the cut
+    tip speed are per-frame quantities.
     """
     sts = [scoring_type(n) for n in real_notes]
     walk = scoresaber.ComboTracker()
@@ -402,7 +418,7 @@ def build_events(ticks, real_notes, offset):
         # the energy stream once capped at 1.0). env v17 walls: i is
         # None (walls have no note); "wall" is the per-tick obstacle
         # drain at the base game's 1.3/s (GameEnergyCounter
-        # obstacleEnergyDrainPerSecond / 30 Hz), "wall_enter" is the
+        # obstacleEnergyDrainPerSecond / tick_hz), "wall_enter" is the
         # combo break itself (no energy cost of its own).
         if not combo_tl or combo_tl[-1][0] != walk.combo:
             combo_tl.append((walk.combo, t))
@@ -416,7 +432,7 @@ def build_events(ticks, real_notes, offset):
                  "bad": -0.025 if link else -0.1,
                  "miss": -0.03 if link else -0.15,
                  "bomb": -0.15,
-                 "wall": -1.3 / 30.0,
+                 "wall": -1.3 / fps,
                  "wall_enter": 0.0}[outcome]
         # floor above zero: at zero the game FAILS and the run would end;
         # our agent plays on regardless (No-Fail-like, without the
@@ -476,8 +492,8 @@ def build_events(ticks, real_notes, offset):
                 hud(t, i, "miss")
             elif kind == "bomb":
                 e["type"] = 4
-                g = cut_geometry(ticks, tick_idx, 0, n)
-                g2 = cut_geometry(ticks, tick_idx, 1, n)
+                g = cut_geometry(ticks, tick_idx, 0, n, fps)
+                g2 = cut_geometry(ticks, tick_idx, 1, n, fps)
                 if g2["center_dist"] < g["center_dist"]:   # closer saber
                     g, e["saber"] = g2, 1
                 else:
@@ -491,7 +507,7 @@ def build_events(ticks, real_notes, offset):
                 good = body["good"]
                 reason = body["reason"]
                 hand = n.color if reason != "wrong_hand" else 1 - n.color
-                g = cut_geometry(ticks, tick_idx, hand, n)
+                g = cut_geometry(ticks, tick_idx, hand, n, fps)
                 dir_dev = 0.0 if n.any_dir else wrap_deg(
                     g["swing_angle"] - math.degrees(n.angle))
                 e.update(saber=hand, saber_dir=g["blade"],
@@ -649,11 +665,12 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
     header, ticks = read_replay(replay_path)
     real_notes, offset = align_charts(header, map_dir, difficulty,
                                       first_note_s=first_note_s)
+    fps = tick_hz_of(header)
     events, timeline, combo_tl, mult_tl, energy_tl, final = build_events(
-        ticks, real_notes, offset)
+        ticks, real_notes, offset, fps)
     blocks = [
         metadata_block(song_hash, difficulty),
-        pose_block(ticks, offset),
+        pose_block(ticks, offset, fps),
         EMPTY,                                     # heights
         note_block(events),
         score_block(timeline),
@@ -666,6 +683,7 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
     with open(out_path, "wb") as f:
         f.write(data)
     return {"out": out_path, "bytes": len(data), "frames": len(ticks),
+            "fps": fps,
             "note_events": len(events), "final_score": final}
 
 
@@ -687,7 +705,8 @@ def main():
     r = convert(args.replay, map_dir, args.hash.lower(), args.difficulty,
                 out)
     print(f"wrote {r['out']} ({r['bytes']:,} bytes): {r['frames']} frames, "
-          f"{r['note_events']} note events, final score {r['final_score']}")
+          f"({r['fps']} fps), {r['note_events']} note events, final score "
+          f"{r['final_score']}")
 
 
 if __name__ == "__main__":
