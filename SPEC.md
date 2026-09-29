@@ -670,7 +670,18 @@ the roll dial (needle = blade azimuth inside the hand's allowed 280°
 arc, forbidden zone dark, limit ticks), the bend dial (±95°, up =
 toward the notes), and four bars for pitch/yaw/twist/elbow inside their
 anatomical ranges, with numeric angles + angular velocities; needles
-and bar markers turn orange within 10° of a joint limit. All in-scene text/panels are
+and bar markers turn orange within 10° of a joint limit. **In-game HUD**
+(2026-09-29, standard replays, `src/lib/Hud3D.svelte` + `hud.js`): ScoreSaber
+watch's world-space HUD rebuilt at its Previewer.unity placement (canvas
+centre world (0, 1.8, 5), 1 unit = 1 cm; the watch world is this env's world,
+so no conversion): COMBO + FC bars and score / accuracy / rank on the left,
+the multiplier ring and Misses on the right, the energy bar at y −0.65,
+z 5.9, in the watch's Teko Medium (embedded, OFL). Its numbers are a per-tick
+walk of the recorded events with the ComboTracker rules (multiplied score
+equals the published score; walls break combo and count as misses, like the
+watch), the no-break max so far as the accuracy denominator, and the
+converter's no-fail energy (0.5 start, base-game heal/damage, 1.3/s in
+walls). All in-scene text/panels are
 canvas-texture sprites (not DOM overlays) so exported videos keep them
 and the file works fully offline. Controls: space play/pause, ←/→
 tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
