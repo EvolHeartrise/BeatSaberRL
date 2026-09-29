@@ -15,7 +15,9 @@
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
   import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
-  import { flushSync } from "svelte";
+  import { flushSync, onMount } from "svelte";
+  import { fetchReplay, fileToText, nameFor, replayPathFrom,
+    replayUrl } from "./lib/urlload.js";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
 
   let wrap; // canvas container, for video export
@@ -222,6 +224,8 @@
   function load(text, name) {
     try {
       loadText(text, name);
+      urlLoad.error = "";   // a dropped file replaces a link's replay/error
+      urlLoad.gate = false;
     } catch (err) {
       alert("could not load replay: " + err.message);
     }
@@ -230,7 +234,51 @@
   function onFiles(files) {
     const f = files && files[0];
     if (f && play.on) exitPlay();
-    if (f) f.text().then((t) => load(t, f.name));
+    // .jsonl.gz works too: "x.jsonl.gz" -> "x.jsonl" -> loadText drops .jsonl
+    if (f) fileToText(f).then((t) => load(t, f.name.replace(/\.gz$/i, "")),
+                              (e) => alert("could not read file: " + e.message));
+  }
+
+  // ---- replay named by the page URL (?replay=/r/<file>) ---------------------
+  // The hosted viewer is opened from the records site's "watch" links. The
+  // replay opens PAUSED behind a play button: nothing on the page has had a
+  // user gesture yet, so the song could not start with it, and the replay
+  // would run ahead of its own music.
+  const urlLoad = $state({ stage: "", loaded: 0, total: 0, error: "",
+                           gate: false });
+  const pct = $derived(urlLoad.total
+    ? Math.min(100, Math.round((100 * urlLoad.loaded) / urlLoad.total)) : null);
+  const mb = (n) => (n / 1048576).toFixed(1);
+  onMount(async () => {
+    let path;
+    try {
+      path = replayPathFrom(location.search);
+    } catch (e) {
+      urlLoad.error = e.message;
+      return;
+    }
+    if (!path) return;
+    urlLoad.stage = "downloading";
+    try {
+      const text = await fetchReplay(replayUrl(path, location.origin), (p) => {
+        urlLoad.stage = p.stage;
+        urlLoad.loaded = p.loaded;
+        urlLoad.total = p.total;
+      });
+      urlLoad.stage = "opening";
+      await new Promise((r) => setTimeout(r, 30)); // let the label paint
+      if (pb.rep) return; // a file dropped meanwhile wins
+      loadText(text, path, { title: (rep) => nameFor(rep, path), play: false });
+      urlLoad.gate = true;
+    } catch (e) {
+      urlLoad.error = "could not load this replay: " + e.message;
+    } finally {
+      urlLoad.stage = "";
+    }
+  });
+  function startWatching() {
+    urlLoad.gate = false;
+    setPlaying(true);
   }
 
   function onKey(e) {
@@ -242,6 +290,9 @@
       if (e.key === "Escape") exitPlay();
       else if (e.key === "Enter") startRun();
       return;
+    }
+    if (urlLoad.gate && (e.key === " " || e.key === "Enter")) {
+      e.preventDefault(); startWatching(); return;
     }
     if (e.key === "p") { togglePose(); return; }
     if (e.key === " ") { e.preventDefault(); setPlaying(!pb.playing); }
@@ -444,18 +495,50 @@
       {#if pb.rep}
         {pb.name} — {configSummary(pb.rep)}
       {:else}
-        drop a replay <code>.jsonl</code> here, or click to choose
+        drop a replay <code>.jsonl</code> (or <code>.jsonl.gz</code>) here, or click to choose
       {/if}
     </button>
     <input
       type="file"
-      accept=".jsonl,.json"
+      accept=".jsonl,.json,.gz"
       hidden
       bind:this={fileInput}
       onchange={(e) => onFiles(e.target.files)}
     />
     {/if}
   </div>
+
+  {#if !play.on && (urlLoad.stage || urlLoad.error || urlLoad.gate)}
+    <div id="urlload" class="overlay">
+      {#if urlLoad.stage}
+        <div class="panel box" role="status" aria-live="polite">
+          <div>{urlLoad.stage === "downloading" ? "downloading replay"
+                : urlLoad.stage === "unpacking" ? "unpacking replay"
+                : "opening replay"}…</div>
+          <div class="meter" class:indet={urlLoad.stage === "downloading" && pct == null}>
+            <div style="width: {urlLoad.stage === 'downloading' ? (pct ?? 100) : 100}%"></div>
+          </div>
+          {#if urlLoad.stage === "downloading"}
+            <div class="dim">{mb(urlLoad.loaded)} MB{urlLoad.total ? ` of ${mb(urlLoad.total)} MB · ${pct}%` : ""}</div>
+          {/if}
+        </div>
+      {:else if urlLoad.error}
+        <div id="urlerror" class="panel box err" role="alert">
+          <div>{urlLoad.error}</div>
+          <div class="dim">you can still drop a replay file anywhere on this page</div>
+          <button onclick={() => (urlLoad.error = "")}>dismiss</button>
+        </div>
+      {:else if urlLoad.gate && pb.rep}
+        <button id="watch" class="panel box" onclick={startWatching}>
+          <span class="big">▶ watch</span>
+          <span>{pb.name}</span>
+          <span class="dim">{audio.status === "ready" ? "with the song"
+            : audio.status === "loading" ? "song loading from BeatSaver…"
+            : audio.status === "error" ? "no audio: " + audio.msg : ""}</span>
+        </button>
+      {/if}
+    </div>
+  {/if}
 
   {#if pb.mapCard && !play.on}
     <MapCard />
@@ -733,6 +816,26 @@
   #play .stats b, #play .result b { color: #e8eaf0; }
   #play .big { font-size: 22px; }
   #play .best { color: #ffd166; }
+  #urlload { top: 0; bottom: 0; justify-content: center; z-index: 3; }
+  #urlload .box {
+    display: flex; flex-direction: column; gap: 8px; align-items: center;
+    padding: 16px 22px; max-width: min(92vw, 460px); text-align: center;
+  }
+  #urlload .dim { color: #6b7180; font-size: 12px; }
+  #urlload .err { border-color: #e06c75; color: #e8eaf0; }
+  #urlload .meter {
+    width: min(70vw, 320px); height: 6px; border-radius: 3px;
+    background: #232733; overflow: hidden;
+  }
+  #urlload .meter > div { height: 100%; background: #7aa2f7;
+    transition: width 0.15s; }
+  #urlload .meter.indet > div { animation: indet 1.2s ease-in-out infinite;
+    width: 30% !important; }
+  @keyframes indet { from { transform: translateX(-100%); }
+                     to { transform: translateX(340%); } }
+  #watch { font: inherit; color: #cfd3dc; cursor: pointer; }
+  #watch .big { font-size: 22px; color: #e8eaf0; }
+  #watch:hover { border-color: #7aa2f7; }
   .warn { color: #f0a35e; }
   .good { color: #7dd3a0; }
   .bad { color: #f0a35e; }

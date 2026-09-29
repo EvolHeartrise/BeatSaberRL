@@ -1,0 +1,4 @@
+# assembled by scripts/build.mjs; the replay files live in the local store
+/dist
+.wrangler
+node_modules

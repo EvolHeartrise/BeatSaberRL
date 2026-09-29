@@ -615,6 +615,9 @@ export function parseReplay(text) {
     // played on, so the viewer can fetch its audio. Absent on synthetic
     // charts and on anything recorded before the annotator existed.
     map: head.header.map ?? null,
+    // ADDITIVE header field written by viz/replays-site's publish step: the
+    // public id of the model that played (e.g. "v60-60hz"). Display only.
+    model: typeof head.header.model === "string" ? head.header.model : null,
     // env v17 ADDITIVE header field: world-space wall AABBs, geometry
     // finished by the parser ({t, cx, cy, w, h, l, speed} per wall).
     // Pre-v17 recordings (field absent) render exactly as before.

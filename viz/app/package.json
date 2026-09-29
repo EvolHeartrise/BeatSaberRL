@@ -12,7 +12,7 @@
     "prebuild": "npm run wasm",
     "build": "vite build",
     "pretest": "npm run wasm",
-    "test": "node test/replay.test.js && node test/models.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
+    "test": "node test/replay.test.js && node test/urlload.test.js && node test/models.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
