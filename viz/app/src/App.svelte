@@ -324,7 +324,7 @@
     const mode = gfx.renderMode?.current;
     try {
       if (songData && !songBuf) songBuf = await decodeSong(songData);
-      // Output frames are decoupled from the replay's 30 ticks/s: frame i is
+      // Output frames are decoupled from the replay's tick_hz ticks/s: frame i is
       // at i/fps seconds, i.e. tick i*TPS/fps, which the viewer interpolates
       // between logged ticks. So 60 fps genuinely smooths the motion instead
       // of duplicating frames, and 24 subsamples it.
@@ -563,7 +563,7 @@
       <select
         bind:value={pb.fps}
         disabled={pb.exporting}
-        title="export frame rate — the replay itself is always 30 ticks/s, so
+        title="export frame rate — the replay itself runs at its tick_hz (30 ticks/s unless its header says otherwise), so
                above that the viewer interpolates between them"
       >
         {#each [24, 30, 60, 120] as f (f)}

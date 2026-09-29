@@ -6,7 +6,7 @@ import PACK from "./fluxcharts.data.js";
 import { loadFluxCore } from "./fluxcore.js";
 import { FluxSession, LEAD_IN_S } from "./fluxgame.js";
 import { DT, PLANE_Z0, counts, isFlux, isHuman } from "./replay.js";
-import { game, loadText, pb, play, recordBest } from "./state.svelte.js";
+import { game, loadText, pb, play, recordBest, setRep } from "./state.svelte.js";
 import { sfx } from "./sfx.js";
 
 export const DEFAULT_CHART = "train-1";
@@ -69,7 +69,7 @@ export async function enterPlay() {
   const ids = chartEntries().map((c) => c.id);
   const own = ids.find((id) => id.startsWith("replay:"));
   play.chartId = own ?? (ids.includes(play.chartId) ? play.chartId : DEFAULT_CHART);
-  pb.rep = null;
+  setRep(null);
   try {
     game.core ??= await loadFluxCore();
     play.ready = true;
@@ -89,7 +89,7 @@ export function exitPlay({ keepRep = false } = {}) {
   play.on = false;
   play.phase = "menu";
   if (!keepRep && game.saved) {
-    pb.rep = game.saved.rep;
+    setRep(game.saved.rep);
     pb.name = game.saved.name;
     pb.cur = game.saved.cur;
     pb.seek++;
@@ -125,7 +125,7 @@ export function startRun() {
   game.lastSample = null;
   game.tracking = true;
   game.wasPaused = false;
-  pb.rep = game.session.rep;
+  setRep(game.session.rep);
   pb.name = entry.name;
   pb.cur = 0;
   pb.seek++;

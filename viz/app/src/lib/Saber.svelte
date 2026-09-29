@@ -75,15 +75,16 @@
   //     tick, so the ribbon stays welded to the blade during playback (the
   //     old line lagged it by up to a tick).
   const TRAIL_S = 0.1;               // history window, seconds
-  const TRAIL_TICKS = TRAIL_S / DT;  // 3 logged saber samples at 30 Hz
-  // Resample at a fixed rate per logged tick rather than a fixed quad
-  // count: the smoothing below is a filter over SAMPLES, so pinning the
-  // sample density is what keeps its strength unchanged if the window
-  // length moves.
+  // Resample at a fixed rate per 30 Hz tick of replay time rather than a
+  // fixed quad count: the smoothing below is a filter over SAMPLES, so
+  // pinning the sample density is what keeps its strength unchanged if the
+  // window length moves. The density is per SECOND (not per logged tick) so
+  // the geometry is sized once for any replay rate; the window in ticks,
+  // TRAIL_S / DT, is read live (3 logged samples at 30 Hz, 6 at 60 Hz).
   const PER_TICK = 3;
-  const SEGS = Math.round(TRAIL_TICKS * PER_TICK); // quads along the ribbon
+  const SEGS = Math.round(TRAIL_S * 30 * PER_TICK); // quads along the ribbon
   const STEPS = [0.42, 0.24, 0.1];   // head -> tail alpha, no interpolation
-  // The logged sabers are 30 Hz and saberAt is linear between them, so a
+  // The logged sabers are tick_hz (30 by default) and saberAt is linear between them, so a
   // fast swing samples as a chain of chords no matter how finely it is
   // resampled. Two 3-tap passes over the interior round those corners; the
   // head and tail samples are left untouched, which keeps the ribbon
@@ -143,7 +144,7 @@
       inkGeo.setDrawRange(0, 0);
       return;
     }
-    const t0 = Math.max(0, cur - TRAIL_TICKS); // clamped at the replay start
+    const t0 = Math.max(0, cur - TRAIL_S / DT); // clamped at the replay start
     for (let i = 0; i < NS; i++) {
       const t = t0 + (cur - t0) * (i / SEGS);
       const k = Math.min(Math.floor(t), pb.rep.ticks.length - 1);

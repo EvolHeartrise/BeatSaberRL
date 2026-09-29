@@ -43,7 +43,7 @@
   gfx.renderMode = ctx.renderMode;
   gfx.scheduler = ctx.scheduler;
 
-  // ---- playback clock (30 ticks/s of replay time) --------------------------
+  // ---- playback clock (1/DT = the replay's tick_hz ticks/s) -----------------
   // The SONG is the master clock whenever one is sounding: this eases pb.cur
   // onto it instead of letting the two free-run apart and then yanking the
   // audio element back into line, which is what used to chop the sound
@@ -57,6 +57,7 @@
       target: songClock.tick?.() ?? null,
       delta,
       speed: pb.speed,
+      tps: 1 / DT, // the active replay's tick_hz
     });
     if (pb.cur < 0) pb.cur = 0;
     if (pb.cur >= lastTick()) {

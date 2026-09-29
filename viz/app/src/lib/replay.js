@@ -241,7 +241,33 @@ export function smoothQuats(qs, tau) {
   for (let i = 1; i < qs.length; i++) out.push(quatNlerp(out[i - 1], qs[i], a));
   return out;
 }
-export const V_MIN = 1, DT = 1 / 30;
+export const V_MIN = 1;
+
+// ---- control rate (exp/tick-rate, replay record_rev 6) ---------------------
+// One replay line per SIM tick at the header's "tick_hz" (absent = 30, the
+// only rate before 2026-09-29): tick k spans [k, k+1] * DT s. DT is a LIVE
+// binding — the viewer shows one replay at a time, and every place that
+// makes a replay the active one (state.svelte.js loadText, playctl.js) calls
+// setTickRate(tickHzOf(rep)), so all the tick <-> seconds conversions here
+// and in the components (pb.cur * DT, outcomes at (tick + 1) * DT, the song
+// clock, contact / popup ages, foot force = impulse / DT) follow it. At 30
+// Hz every value is exactly the old constant 1 / 30.
+export const TICK_HZ_DEFAULT = 30;
+export let DT = 1 / TICK_HZ_DEFAULT;
+/** A replay's control rate (Hz): its header tick_hz, else 30. Human
+ * (WebXR) runs and synthetic reps carry none: 30. */
+export const tickHzOf = (rep) => rep?.tickHz ?? TICK_HZ_DEFAULT;
+/** Make `hz` the active replay's rate (DT = 1 / hz). */
+export function setTickRate(hz = TICK_HZ_DEFAULT) {
+  DT = 1 / parseTickHz(hz);
+}
+function parseTickHz(v) {
+  if (v === undefined || v === null) return TICK_HZ_DEFAULT;
+  const h = Number(v);
+  if (!(Number.isFinite(h) && h > 0))
+    throw new Error("replay tick_hz " + v + " is not a rate");
+  return h;
+}
 
 // ============================================================================
 // v10 body model — MIRROR of rust/src/dynamics/model.rs (SPEC-v10 §1).
@@ -575,6 +601,11 @@ export function parseReplay(text) {
     // judge rate (Hz; the env's is 30)
     result: head.header.result ?? null,
     judgeHz: head.header.judge_hz ?? null,
+    // record_rev 6 (exp/tick-rate) ADDITIVE header field: the sim's control
+    // rate — one tick line per 1/tickHz s. Absent = 30. The viewer applies
+    // it with setTickRate(tickHzOf(rep)) when the replay becomes active.
+    tickHz: parseTickHz(head.header.tick_hz),
+    actionRepeat: head.header.action_repeat ?? 1,
     config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 ADDITIVE header field: "head" -> head-anchored note track.
     // Anything else (including absent) means the pre-v15 FIXED track.
@@ -724,6 +755,11 @@ export function configSummary(rep) {
   if (c.extra_prob) parts.push(`extras ${c.extra_prob}`);
   if (c.dot_prob) parts.push(`dots ${c.dot_prob}`);
   if (c.bomb_prob) parts.push(`bombs ${c.bomb_prob}`);
+  // exp/tick-rate: name a non-default control rate (30 Hz stays unsaid)
+  const hz = tickHzOf(rep);
+  if (hz !== TICK_HZ_DEFAULT)
+    parts.push(`${hz} Hz` + ((rep.actionRepeat ?? 1) > 1
+      ? ` / repeat ${rep.actionRepeat}` : ""));
   return `${rep.chart.length} objects, ${rep.ticks.length} ticks ` +
     `(${parts.filter(Boolean).join(", ")})`;
 }
