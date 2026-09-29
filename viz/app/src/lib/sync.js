@@ -67,7 +67,7 @@ export function syncAction({ sim, audio, now, active = NO_NUDGE, cfg = SYNC }) {
   return { action: "none", rate: 1, until: 0, drift };
 }
 
-/** Replay-clock follow filter, in TICKS (the replay is 30 ticks/s).
+/** Replay-clock follow filter, in TICKS (the replay runs `tps` ticks/s).
  *
  * `target` is the tick the song is currently sounding, or null when the song
  * is not the master (no song, paused, seeking, still buffering) — then the
@@ -80,11 +80,16 @@ export function syncAction({ sim, audio, now, active = NO_NUDGE, cfg = SYNC }) {
  * so that one is taken in a single step.
  */
 export const FOLLOW_TAU = 0.25; // s — time constant of the ease
-export const FOLLOW_SNAP = 15;  // ticks (0.5 s)
+export const FOLLOW_SNAP_S = 0.5; // s — a gap past this is a jump, not drift
+export const FOLLOW_SNAP = 15;  // ticks at 30 Hz (= FOLLOW_SNAP_S * 30)
 
+// `tps` = replay ticks per second: the replay header's tick_hz (1 / DT;
+// 30 unless the recording says otherwise). The snap threshold is 0.5 s of
+// replay time at any rate unless `snap` (ticks) is given.
 export function followClock({ cur, target, delta, speed = 1,
-                              tau = FOLLOW_TAU, snap = FOLLOW_SNAP }) {
-  const free = cur + delta * 30 * speed;
+                              tau = FOLLOW_TAU, tps = 30,
+                              snap = FOLLOW_SNAP_S * tps }) {
+  const free = cur + delta * tps * speed;
   if (target == null || !Number.isFinite(target)) return free;
   const err = target - free;
   if (Math.abs(err) > snap) return target;

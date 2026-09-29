@@ -1,5 +1,7 @@
 // Playback state shared by the DOM shell and the 3D scene (Svelte 5 runes).
-import { clampQ29, mirrorQ29, parseReplay } from "./replay.js";
+import {
+  clampQ29, mirrorQ29, parseReplay, setTickRate, tickHzOf,
+} from "./replay.js";
 
 // Remembered UI preferences. localStorage is not always there (node, a
 // private window, file:// with site data blocked), so every access is
@@ -32,7 +34,7 @@ export const pb = $state({
   exporting: false,
   exportPct: 0, // frame-by-frame export progress, 0..1
   exportStop: false, // 'stop & save' pressed: finish the file with what is done
-  fps: 30, // export frame rate; the replay itself is always 30 ticks/s
+  fps: 30, // export frame rate; the replay runs at its own tick_hz (30 unless its header says otherwise)
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
   firstPerson: false, // camera on the body's head frame ('f')
@@ -113,9 +115,19 @@ export function lastTick() {
   return pb.rep ? pb.rep.ticks.length - 1 : 0;
 }
 
+/** Make `rep` (or null) the active replay. Every assignment of pb.rep goes
+ * through here: the replay clock's tick length (replay.js DT) follows the
+ * active replay's header tick_hz (record_rev 6; absent / null = 30), and it
+ * is set BEFORE pb.rep so no derived value sees the new replay with the
+ * old rate. */
+export function setRep(rep) {
+  setTickRate(tickHzOf(rep));
+  pb.rep = rep;
+}
+
 export function loadText(text, name) {
   const rep = parseReplay(text); // throws with a useful message on bad input
-  pb.rep = rep;
+  setRep(rep);
   pb.name = name.replace(/\.[^.]*$/, "");
   pb.cur = 0;
   pb.seek++;
