@@ -1,13 +1,18 @@
 // Assemble replays.flee.systems' deploy dir (dist/) — a Cloudflare Worker
 // serving static assets only (wrangler.jsonc):
 //
-//   dist/index.html   the 3D replay viewer (viz/replay.html, the single-file
-//                     build of viz/app; it opens ?replay=/r/<file>)
+//   dist/index.html   the 3D replay viewer: viz/app's SITE build
+//                     (viz/app/dist-site/index.html, `npm run build:site`),
+//                     not viz/replay.html. It opens ?replay=/r/<file> and is
+//                     watch-only: no Flux WebXR game, no Flux replays (they
+//                     are refused with a message), no pose mode and no
+//                     file-picker button — see viz/app/src/lib/build.js.
 //   dist/r/*.jsonl.gz the published replays, pulled from the local replay
 //                     store (NOT in git) that scripts/publish_replays.py
 //                     writes — only the files its manifest lists
 //   dist/_headers     caching
 //
+//   (cd ../app && npm run build:site)
 //   node scripts/build.mjs [--src STORE]   (default: $REPLAYS_STORE, else
 //                                           ~/beat-arena-volume-backup/replays-site)
 //   npx wrangler deploy
@@ -17,7 +22,8 @@
 //      must verify EXACT against the bench, and carry header.map);
 //   2. python viz/replays-site/scripts/publish_replays.py --model <public id>
 //        --bench <its published bench.json> --ckpt <its checkpoint> <jsonl...>
-//   3. node scripts/build.mjs && npx wrangler deploy        (this dir)
+//   3. (cd ../app && npm run build:site) && node scripts/build.mjs
+//        && npx wrangler deploy                              (this dir)
 //   4. viz/site: npm run data && npm run deploy   (Watch links from the manifest)
 
 import fs from 'node:fs';
@@ -27,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const site = path.resolve(here, '..');
-const viewer = path.resolve(site, '../replay.html');
+const viewer = path.resolve(site, '../app/dist-site/index.html');
 const dist = path.join(site, 'dist');
 const MAX_BYTES = 25 * 1024 * 1024; // Cloudflare static assets, per file
 const NAME_RE = /^r\/[0-9a-f]{16}\.jsonl\.gz$/;
@@ -38,10 +44,18 @@ for (let i = 2; i < process.argv.length; i++) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(src, 'manifest.json'), 'utf8'));
-if (!fs.existsSync(viewer)) throw new Error(`${viewer} missing: build viz/app first`);
+if (!fs.existsSync(viewer)) throw new Error(`${viewer} missing: run \`npm run build:site\` in viz/app first`);
 const html = fs.readFileSync(viewer, 'utf8');
 if (!html.includes('under /r/ on this site'))
 	throw new Error(`${viewer} predates URL loading (?replay=): rebuild viz/app`);
+// the site ships the watch-only viewer: a FULL build (viz/replay.html, or
+// dist/ from a plain `npm run build`) still has these
+for (const [mark, what] of [['play Flux', 'the Flux WebXR game'], ['🧍 pose', 'pose mode'],
+                            ['click to choose', 'the file-picker button']])
+	if (html.includes(mark))
+		throw new Error(`${viewer} still has ${what} ("${mark}"): use \`npm run build:site\`, not a full build`);
+if (!html.includes("Flux replays aren't supported on this site"))
+	throw new Error(`${viewer} does not refuse Flux replays: use \`npm run build:site\``);
 
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(path.join(dist, 'r'), { recursive: true });

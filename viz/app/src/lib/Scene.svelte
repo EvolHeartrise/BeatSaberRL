@@ -24,6 +24,7 @@
   import Saber from "./Saber.svelte";
   import BodyGauges from "./BodyGauges.svelte";
   import { modelGeo } from "./models.js";
+  import { FLUX, POSE } from "./build.js";
 
   // ---- an OPAQUE stage ----------------------------------------------------
   // Threlte builds its renderer with alpha: true, and nothing here had ever
@@ -208,13 +209,14 @@
 
   // pose-mode reference note: the real note model (neutral gray) at a
   // chosen cell, z = 0, with its bounding-box outline.
-  const refNoteGeo = modelGeo("note");
-  const refEdgesGeo = new THREE.EdgesGeometry(
-    new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK));
-  const refGoodHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
-    2 * HB.goodHalf[0], 2 * HB.goodHalf[1], 2 * HB.goodHalf[2]));
-  const refBadHbGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(
-    2 * HB.badHalf[0], 2 * HB.badHalf[1], 2 * HB.badHalf[2]));
+  // (none in the site build, which has no pose mode)
+  const refNoteGeo = POSE ? modelGeo("note") : null;
+  const refEdgesGeo = POSE ? new THREE.EdgesGeometry(
+    new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK)) : null;
+  const refGoodHbGeo = POSE ? new THREE.EdgesGeometry(new THREE.BoxGeometry(
+    2 * HB.goodHalf[0], 2 * HB.goodHalf[1], 2 * HB.goodHalf[2])) : null;
+  const refBadHbGeo = POSE ? new THREE.EdgesGeometry(new THREE.BoxGeometry(
+    2 * HB.badHalf[0], 2 * HB.badHalf[1], 2 * HB.badHalf[2])) : null;
 </script>
 
 <T.PerspectiveCamera makeDefault position={[0, 2.1, 3.4]} fov={55}>
@@ -309,7 +311,7 @@
   <Notes {zOff} />
 {/if}
 
-{#if pose.on && pose.ref}
+{#if POSE && pose.on && pose.ref}
   <!-- Reference note at a chosen cell, for eyeballing reach. It sits at
        the hit plane, which under v15 is world z = zOff: leaning in moves
        the note away by the head's own z travel, so the panel can no
@@ -336,11 +338,11 @@
   </T.Group>
 {/if}
 
-{#if play.on}
+{#if FLUX && play.on}
   <FluxPlay />
 {/if}
 
-{#if humanPalms}
+{#if FLUX && humanPalms}
   <!-- a person's Flux run: their palms + the Flux beam; recordings also
        show where their headset was (in the headset you ARE the head) -->
   <Flux palms={humanPalms} />
@@ -356,7 +358,7 @@
 {#if fkAll}
   <!-- the articulated v10 body + blades -->
   <Body fk={fkAll} showHead={!pb.firstPerson} />
-  {#if isFlux(pb.rep)}
+  {#if FLUX && isFlux(pb.rep)}
     <!-- Flux game mode: palms + the Flux beam instead of sabers -->
     <Flux fk={fkAll} />
   {:else}

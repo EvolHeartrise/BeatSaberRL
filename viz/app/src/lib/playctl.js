@@ -8,6 +8,7 @@ import { FluxSession, LEAD_IN_S } from "./fluxgame.js";
 import { DT, PLANE_Z0, counts, isFlux, isHuman } from "./replay.js";
 import { game, loadText, pb, play, recordBest, setRep } from "./state.svelte.js";
 import { sfx } from "./sfx.js";
+import { FLUX } from "./build.js";
 
 export const DEFAULT_CHART = "train-1";
 
@@ -222,7 +223,9 @@ export function watchRun() {
 // Automation / test hook: drive the real game path without a headset.
 // `setScript((t) => ({palms, head, quat}))` supplies env-world poses per
 // frame exactly where the XR read would (FluxPlay.svelte).
-if (typeof window !== "undefined") {
+// Not in the site build, which has no Flux game (the hook would keep the
+// whole game in its bundle).
+if (FLUX && typeof window !== "undefined") {
   window.__fluxPlay = {
     play, pb, enterPlay, exitPlay, startRun, chartEntries,
     setScript: (fn) => { game.script = fn; },

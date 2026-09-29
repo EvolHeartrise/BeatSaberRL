@@ -18,6 +18,9 @@
   import { fetchReplay, fileToText, nameFor, replayPathFrom,
     replayUrl } from "./lib/urlload.js";
   import { DT, configSummary, counts, maxScore } from "./lib/replay.js";
+  // site build (replays.flee.systems): no Flux game, no pose mode, no
+  // file-picker button — see lib/build.js
+  import { FLUX, POSE, PICKER } from "./lib/build.js";
 
   let wrap; // canvas container, for video export
   let dropHover = $state(false);
@@ -233,7 +236,7 @@
 
   function onFiles(files) {
     const f = files && files[0];
-    if (f && play.on) exitPlay();
+    if (f && FLUX && play.on) exitPlay();
     // .jsonl.gz works too: "x.jsonl.gz" -> "x.jsonl" -> loadText drops .jsonl
     if (f) fileToText(f).then((t) => load(t, f.name.replace(/\.gz$/i, "")),
                               (e) => alert("could not read file: " + e.message));
@@ -285,7 +288,7 @@
     // keys aimed at the pose panel's own controls stay there (slider
     // arrow-key nudges must not step the replay)
     if (e.target && e.target.closest && e.target.closest("#pose, #fp, #play")) return;
-    if (play.on) {
+    if (FLUX && play.on) {
       // the game owns the keyboard: Esc leaves, Enter (re)starts
       if (e.key === "Escape") exitPlay();
       else if (e.key === "Enter") startRun();
@@ -294,7 +297,7 @@
     if (urlLoad.gate && (e.key === " " || e.key === "Enter")) {
       e.preventDefault(); startWatching(); return;
     }
-    if (e.key === "p") { togglePose(); return; }
+    if (POSE && e.key === "p") { togglePose(); return; }
     if (e.key === " ") { e.preventDefault(); setPlaying(!pb.playing); }
     else if (e.key === "ArrowRight") step(1);
     else if (e.key === "ArrowLeft") step(-1);
@@ -317,7 +320,7 @@
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
 
   // ---- the Flux WebXR game (play mode) ------------------------------------
-  const entries = $derived(play.on ? chartEntries() : []);
+  const entries = $derived(FLUX && play.on ? chartEntries() : []);
   const entry = $derived(entries.find((c) => c.id === play.chartId) ?? null);
   // the chart the shown results belong to (the select may have moved on)
   const runEntry = $derived(entries.find((c) => c.id === play.runId) ?? null);
@@ -484,12 +487,12 @@
   </div>
 
   <div id="top" class="overlay">
-    {#if play.on}
+    {#if FLUX && play.on}
     <div id="playtitle" class="panel">
       <b>Flux</b> — play it yourself in VR · judged by the env's own Rust
       (wasm), the rules the agent trains on
     </div>
-    {:else}
+    {:else if PICKER}
     <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}>
       {#if pb.rep}
         {pb.name} — {configSummary(pb.rep)}
@@ -504,6 +507,9 @@
       bind:this={fileInput}
       onchange={(e) => onFiles(e.target.files)}
     />
+    {:else if pb.rep}
+    <!-- site build: the replay's title as plain text, no picker -->
+    <div id="title">{pb.name} — {configSummary(pb.rep)}</div>
     {/if}
   </div>
 
@@ -543,12 +549,12 @@
     <MapCard />
   {/if}
 
-  {#if pose.on}
+  {#if POSE && pose.on}
     <PosePanel />
   {/if}
 
   <div id="bottom" class="overlay">
-    {#if play.on}
+    {#if FLUX && play.on}
     <div id="play" class="panel">
       <div class="row">
         <label>chart
@@ -667,13 +673,17 @@
           {pb.exportStop ? "■ saving…" : "■ stop & save"}
         </button>
       {/if}
-      <button onclick={enterPlay}
-        title="play a Flux chart yourself in VR — the same judge the env uses">
-        🥽 play Flux
-      </button>
-      <button class:on={pose.on} onclick={togglePose}>
-        {pose.on ? "🧍 posing" : "🧍 pose"}
-      </button>
+      {#if FLUX}
+        <button onclick={enterPlay}
+          title="play a Flux chart yourself in VR — the same judge the env uses">
+          🥽 play Flux
+        </button>
+      {/if}
+      {#if POSE}
+        <button class:on={pose.on} onclick={togglePose}>
+          {pose.on ? "🧍 posing" : "🧍 pose"}
+        </button>
+      {/if}
       <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
         title="per-joint dials, torque bars, foot forces and joint activation (g)">
         📊 gauges
@@ -769,6 +779,12 @@
     background: rgba(17, 19, 25, 0.72); backdrop-filter: blur(6px);
   }
   #drop.hover { border-color: #7aa2f7; color: #cfd3dc; }
+  /* site build: the replay's title in the same pill, as plain text */
+  #title {
+    border: 1.5px solid #2c313c; border-radius: 10px; padding: 8px 18px;
+    color: #9aa0ae; background: rgba(17, 19, 25, 0.72);
+    backdrop-filter: blur(6px); pointer-events: auto; cursor: auto;
+  }
   #bar {
     display: flex; gap: 10px; align-items: center; padding: 8px 14px;
     flex-wrap: wrap; justify-content: center; max-width: 94vw;
