@@ -241,7 +241,9 @@
   // on-screen size on the first-person camera at any fov
   const SCALE_Y = $derived(0.62 * HALF_H / Math.tan((55 / 2) * Math.PI / 180));
   const MARGIN = 0.015;
-  const BOTTOM_UI_PX = 130;
+  // the control bar wrapped to two rows (buttons + timeline) is ~97 px
+  // tall with its padding; keep a small gap above it
+  const BOTTOM_UI_PX = 104;
 </script>
 
 {#each panels as g, i (i)}

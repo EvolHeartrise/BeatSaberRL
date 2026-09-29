@@ -464,7 +464,10 @@ which is tied to that reference by the existing CUDA parity tests
   self-signed; WebXR needs a secure context), open
   `https://<laptop-ip>:5173` on the headset, "🥽 play Flux", "enter VR";
   trigger / pinch starts, grip changes chart; results offer save
-  (.jsonl) and watch-in-viewer.
+  (.jsonl) and watch-in-viewer. No DOM score readout (2026-09-29): during
+  a run the in-game HUD (`Hud3D.svelte`, below) shows the judge's live
+  tallies, and the final score / rank / best are in-world text; the page
+  panel keeps only the controls.
 - **Parity gates**: `viz/app/test/flux-parity.test.js` replays env
   episodes (`python/tools/make_flux_game_fixture.py`: every tick's full
   judge input — both ticks' palms, head, shoulder z — at full precision,
@@ -627,7 +630,8 @@ double-clickable, drop-a-`.jsonl`-in, zero-server page): real WebGL 3D
 with **OrbitControls** (drag = orbit, wheel = zoom, right-drag = pan).
 Since 2026-07-22 the viewport IS the page (fullscreen canvas) and all
 DOM chrome floats on top of it: title + file pill at the top,
-HUD/controls/help in translucent panels at the bottom
+controls in a translucent panel at the bottom (no DOM score strip since
+2026-09-29 — the score readout is the in-scene HUD below)
 (`pointer-events: none` containers so drags reach the canvas). The
 camera-attached gauge sprites anchor to the actual viewport corners
 (aspect-aware) and sit above the floating bottom UI.
@@ -671,7 +675,7 @@ arc, forbidden zone dark, limit ticks), the bend dial (±95°, up =
 toward the notes), and four bars for pitch/yaw/twist/elbow inside their
 anatomical ranges, with numeric angles + angular velocities; needles
 and bar markers turn orange within 10° of a joint limit. **In-game HUD**
-(2026-09-29, standard replays, `src/lib/Hud3D.svelte` + `hud.js`): ScoreSaber
+(2026-09-29, `src/lib/Hud3D.svelte` + `hud.js`): ScoreSaber
 watch's world-space HUD rebuilt at its Previewer.unity placement (canvas
 centre world (0, 1.8, 5), 1 unit = 1 cm; the watch world is this env's world,
 so no conversion): COMBO + FC bars and score / accuracy / rank on the left,
@@ -681,7 +685,16 @@ walk of the recorded events with the ComboTracker rules (multiplied score
 equals the published score; walls break combo and count as misses, like the
 watch), the no-break max so far as the accuracy denominator, and the
 converter's no-fail energy (0.5 start, base-game heal/damage, 1.3/s in
-walls). All in-scene text/panels are
+walls). **Flux** (not in the site build): the same HUD with only what the
+Flux judge defines — combo + FC bars, the multiplied score, the multiplier
+ring (1/2/4/8, bar 2/4/8) and Misses = the judge's `breaks` (bad + miss);
+accuracy is the game's own (unmultiplied points over circle 60 / bar 115
+of every object resolved so far); no rank letter and no energy bar. In the
+WebXR game it reads the judge's live `play.stats`; a Flux replay walks its
+events with combo.rs's rules (`hud.js` `fluxHudAt`, pinned frame by frame
+to the judge's tallies in test/flux-game.test.js). The game's XR origin is
+the watch's "Player" spot (scene z 0.65), so the HUD sits where Beat
+Saber's does around the player. All in-scene text/panels are
 canvas-texture sprites (not DOM overlays) so exported videos keep them
 and the file works fully offline. Controls: space play/pause, ←/→
 tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video

@@ -45,7 +45,7 @@ try {
   const input = await page.$("input[type=file]");
   await input.uploadFile(replay);
   await page.waitForFunction(
-    () => document.querySelector("#hud")?.textContent.includes("tick"),
+    () => window.__viewerState?.().loaded,
     { timeout: 60000 });
   // paused, so the scrubbed tick is the one on screen
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
@@ -67,7 +67,9 @@ try {
     for (const t of ticks) {
       await scrub(t);
       await sleep(900);
-      const hud = await page.$eval("#hud", (el) => el.textContent.replace(/\s+/g, " ").trim());
+      const vs = await page.evaluate(() => window.__viewerState());
+      if (vs.tick !== Math.min(t, vs.lastTick)) throw new Error(`scrub to ${t} landed on ${vs.tick}`);
+      const hud = `tick ${vs.tick}/${vs.lastTick} t ${vs.t.toFixed(2)}s`;
       const out = `test/out/hud-${view}-${t}${process.env.HUD_VIEW ? "-" + vw + "x" + vh : ""}.png`;
       await page.screenshot({ path: out });
       console.log(`${out}  (${hud})`);

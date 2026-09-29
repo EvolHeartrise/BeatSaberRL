@@ -68,11 +68,12 @@ try {
   const title = await page.$eval("#drop, #title", (el) => el.textContent.replace(/\s+/g, " ").trim());
   console.log(`title: ${title}`);
   const hz = +(/(\d+) Hz/.exec(title)?.[1] ?? 30);
-  const hud = () => page.$eval("#hud", (el) => el.textContent.replace(/\s+/g, " "));
-  const hudT = async () => {
-    const m = /t (\d+\.\d+)s · tick (\d+)/.exec(await hud());
-    return m ? { t: +m[1], tick: +m[2] } : null;
-  };
+  // the viewer's test hook: the tick on screen and its time
+  const hud = () => page.evaluate(() => JSON.stringify(window.__viewerState?.()));
+  const hudT = () => page.evaluate(() => {
+    const s = window.__viewerState?.();
+    return s?.loaded ? { t: s.t, tick: s.tick } : null;
+  });
   const still = await hudT();
   if (!still || still.tick !== 0) fail("a linked replay must open paused at tick 0: " + (await hud()));
 

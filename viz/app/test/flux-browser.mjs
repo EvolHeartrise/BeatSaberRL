@@ -39,14 +39,15 @@ try {
   const input = await page.$("input[type=file]");
   await input.uploadFile(replay);
   await page.waitForFunction(
-    () => document.querySelector("#hud").textContent.includes("tick"),
+    () => window.__viewerState?.().loaded,
     { timeout: 10000 });
   const top = await page.$eval("#drop", (el) => el.textContent);
   if (!top.includes("FLUX")) throw new Error("summary is not the Flux one: " + top);
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
     .find((b) => b.textContent.includes("pause"))?.click());
   const scrub = (tick) => page.evaluate((tick) => {
-    const r = document.querySelector("#bottom input[type=range]");
+    // the timeline is the last slider (volume / fov come first)
+    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
       .set.call(r, tick);
     r.dispatchEvent(new Event("input", { bubbles: true }));
@@ -61,8 +62,9 @@ try {
   await scrub(83);
   await new Promise((r) => setTimeout(r, 600));
   await page.screenshot({ path: "test/out/flux-hitboxes.png" });
-  const hud = await page.$eval("#hud", (el) => el.textContent);
-  console.log("HUD:", hud.replace(/\s+/g, " ").trim());
+  const vs = await page.evaluate(() => window.__viewerState());
+  console.log("viewer:", JSON.stringify(vs));
+  if (vs.tick !== 83) throw new Error("did not scrub to tick 83");
   if (errors.length) throw new Error("page errors:\n" + errors.join("\n"));
   console.log("flux browser OK");
 } finally {

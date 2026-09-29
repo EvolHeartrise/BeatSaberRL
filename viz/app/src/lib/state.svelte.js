@@ -1,8 +1,9 @@
 // Playback state shared by the DOM shell and the 3D scene (Svelte 5 runes).
 import {
-  clampQ29, isFlux, mirrorQ29, parseReplay, setTickRate, tickHzOf,
+  DT, clampQ29, counts, isFlux, mirrorQ29, parseReplay, setTickRate, tickHzOf,
 } from "./replay.js";
 import { FLUX, POSE } from "./build.js";
+import { fluxHudAt, hudAt } from "./hud.js";
 
 export const pb = $state({
   rep: null,
@@ -87,6 +88,23 @@ export function mirrorPoseLR() {
 
 export function lastTick() {
   return pb.rep ? pb.rep.ticks.length - 1 : 0;
+}
+
+// Test hook: a snapshot of what is on screen in the replay viewer — the
+// tick the timeline shows, its time, the tallies up to it and the in-game
+// HUD's numbers. The browser tests read playback through this (there is no
+// DOM score readout; the in-scene Hud3D shows the score). Read-only, and
+// nothing runs until a test calls it.
+if (typeof window !== "undefined") {
+  window.__viewerState = () => {
+    if (!pb.rep) return { loaded: false };
+    const tick = Math.min(Math.floor(pb.cur), lastTick());
+    // hud: the in-game HUD's numbers (Hud3D.svelte) at this tick
+    const hud = isFlux(pb.rep) ? (FLUX ? fluxHudAt(pb.rep, tick) : null)
+      : hudAt(pb.rep, tick);
+    return { loaded: true, tick, lastTick: lastTick(), t: pb.cur * DT,
+      playing: pb.playing, counts: { ...counts(pb.rep, tick) }, hud };
+  };
 }
 
 /** Make `rep` (or null) the active replay. Every assignment of pb.rep goes

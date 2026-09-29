@@ -2,9 +2,10 @@
 // headset: enter play mode from the viewer bar, pick a chart, start it, and
 // let a scripted "player" (window.__fluxPlay.setScript — poses fed exactly
 // where the XR read feeds them, FluxPlay.svelte) clear it at 4x clock
-// speed. Checks the run ends with every object judged, the in-page results
-// panel, "watch run" reopening it in the replay viewer as a human Flux run,
-// and no page errors. Screenshots -> test/out/flux-play-*.png.
+// speed. Checks the run ends with every object judged, the play panel's
+// save / watch buttons (and no DOM score readout), "watch run" reopening it
+// in the replay viewer as a human Flux run whose in-game HUD ends on the
+// judge's final score / combo / multiplier / breaks, and no page errors. Screenshots -> test/out/flux-play-*.png.
 // Run after `npm run build`: node test/flux-play-browser.mjs
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -105,8 +106,13 @@ try {
     throw new Error("not every object judged: " + JSON.stringify(st));
   if (!(st.good > 0.5 * st.n_objects))
     throw new Error("the scripted player should clear most of it: " + JSON.stringify(st));
-  const result = await page.$eval("#play .result", (e) => e.textContent);
-  if (!result.includes("watch run")) throw new Error("no results panel: " + result);
+  // the page shows no score: the run's numbers are the in-game HUD's and
+  // the in-world results text's; the DOM keeps only the run's actions
+  const panel = await page.$eval("#play", (e) => e.textContent.replace(/\s+/g, " "));
+  if (!/save run/.test(panel) || !/watch run/.test(panel))
+    throw new Error("no save / watch buttons after the run: " + panel);
+  if (panel.includes(String(Math.round(st.score))) || /good \d|miss \d|best /.test(panel))
+    throw new Error("the play panel still shows a score readout: " + panel);
 
   // the run reopens in the replay viewer as a human Flux run
   await click(page, "#play button", "watch run");
@@ -117,17 +123,26 @@ try {
     .find((b) => b.textContent.includes("pause"))?.click());
   await new Promise((r) => setTimeout(r, 800));
   await page.screenshot({ path: "test/out/flux-play-watch.png" });
-  // the viewer's HUD at the last tick shows the run's own tallies
+  // the viewer's tallies at the last tick are the run's own
   await page.evaluate(() => {
-    const r = document.querySelector("#bottom input[type=range]");
+    // the timeline is the last slider (volume / fov come first)
+    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
       .set.call(r, r.max);
     r.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await new Promise((r) => setTimeout(r, 400));
-  const hud = await page.$eval("#hud", (e) => e.textContent.replace(/\s+/g, " "));
-  for (const want of [`good ${st.good}`, `bad ${st.bad}`, `miss ${st.misses}`])
-    if (!hud.includes(want)) throw new Error(`viewer HUD lacks "${want}": ${hud}`);
+  const vs = await page.evaluate(() => window.__viewerState());
+  if (vs.tick !== vs.lastTick) throw new Error("did not scrub to the last tick: " + JSON.stringify(vs));
+  for (const [k, want] of [["good", st.good], ["bad", st.bad], ["miss", st.misses]])
+    if (vs.counts[k] !== want)
+      throw new Error(`viewer ${k} ${vs.counts[k]} != the run's ${want}: ` + JSON.stringify(vs));
+  // ... and so is its in-game HUD
+  if (vs.hud?.score !== Math.round(st.score) || vs.hud.combo !== st.combo
+      || vs.hud.mult !== st.multiplier || vs.hud.misses !== st.breaks)
+    throw new Error("the watched run's HUD differs from the judge's final tallies: "
+      + JSON.stringify({ hud: vs.hud, st }));
+  await page.screenshot({ path: "test/out/flux-play-watch-end.png" });
 
   if (errors.length) throw new Error(errors.join("\n"));
   console.log(`flux-play-browser OK: ${st.n_objects} objects, good ${st.good}, ` +

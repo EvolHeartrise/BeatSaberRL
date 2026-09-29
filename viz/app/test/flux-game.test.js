@@ -15,6 +15,7 @@ import {
   humanPalmsAt, isFlux, isHuman, parseReplay, pendingNotes, sweetPoint,
   trackOffset,
 } from "../src/lib/replay.js";
+import { fluxHud, fluxHudAt, fluxResolvedMax } from "../src/lib/hud.js";
 
 const core = await loadFluxCore();
 const HEAD = [0, 1.7, PLANE_Z0];
@@ -179,16 +180,60 @@ function playerFor(chart) {
     return { palms, head: HEAD, quat: [0, 0, 0, 1] };
   };
 }
-{
-  const entry = PACK.find((c) => c.id === "warmup-1");
+// A whole run at a 72 Hz display rate, keeping the judge's tallies as each
+// 30 Hz frame closes (for the HUD walk check).
+function playRun(entry, player) {
   const s = new FluxSession(core, entry, { onEvent: () => {} });
-  const player = playerFor(entry.chart);
+  const frameStats = [];
+  const judgeTick = s.tick.bind(s);
+  s.tick = (...a) => {
+    const n0 = s.rep.ticks.length;
+    judgeTick(...a);
+    if (s.rep.ticks.length > n0) frameStats[n0] = { ...s.stats };
+  };
   let t = -LEAD_IN_S;
   while (!s.done && t < 120) {
     const p = player(t);
     s.feed(t, p.palms, p.head, p.quat);
     t += 1 / 72;
   }
+  return { s, frameStats };
+}
+
+// The in-game HUD (Hud3D): walking a run's recorded events (a watched
+// Flux replay) gives the judge's own combo / multiplier / bar / score /
+// breaks at EVERY frame, and the live readout of the judge's tallies
+// agrees with it. Returns the walk's per-frame multipliers.
+function checkHudWalk(s, frameStats) {
+  const back = parseReplay(s.toJSONL());
+  assert.equal(frameStats.length, back.ticks.length);
+  let maxRes = 0;
+  const mults = [];
+  for (let k = 0; k < back.ticks.length; k++) {
+    const j = frameStats[k], w = fluxHudAt(back, k);
+    assert.deepEqual([w.score, w.combo, w.mult, w.progress, w.misses],
+      [Math.round(j.score), j.combo, j.multiplier, j.progress, j.breaks], `frame ${k}`);
+    for (const e of back.ticks[k].events) {
+      const i = e.cut ? e.cut.note : e.miss?.note;
+      if (i !== undefined) maxRes += back.chart[i].kind === KIND_CIRCLE ? 60 : 115;
+    }
+    assert.deepEqual(fluxHud(j, maxRes), w, `live == walked, frame ${k}`);
+    mults.push(w.mult);
+  }
+  assert.equal(fluxResolvedMax(s.rep), maxRes);
+  const st = s.stats, end = fluxHudAt(back, back.ticks.length - 1);
+  assert.equal(end.score, Math.round(st.score));
+  assert.equal(end.misses, st.bad + st.misses);
+  assert.ok(Math.abs(end.pct - (100 * st.raw_score) / st.max_score) < 1e-9,
+    "all resolved: accuracy = raw / the chart's max");
+  console.log(`flux HUD walk == judge on ${back.ticks.length} frames ` +
+    `(${st.breaks} breaks, final x${end.mult})`);
+  return mults;
+}
+
+{
+  const entry = PACK.find((c) => c.id === "warmup-1");
+  const { s, frameStats } = playRun(entry, playerFor(entry.chart));
   assert.ok(s.done, "the chart ends");
   const st = s.stats;
   assert.equal(st.good + st.bad + st.misses, entry.chart.length, "all resolved");
@@ -213,12 +258,34 @@ function playerFor(chart) {
   const c2 = counts(back, back.ticks.length - 1);
   assert.deepEqual([c2.good, c2.bad, c2.miss, c2.score],
     [st.good, st.bad, st.misses, st.raw_score]);
+  // the in-game HUD's numbers
+  const mults = checkHudWalk(s, frameStats);
+  assert.ok(mults.at(-1) > 1, "the walk promoted");
   // human runs: palms / head / head-anchored track straight from the log
   const k = 10;
   assert.deepEqual(humanPalmsAt(back, k, 0), back.ticks[k].palms);
   assert.deepEqual(humanHeadAt(back, k, 0), back.ticks[k].head.slice(0, 3));
   assert.ok(Math.abs(trackOffset(back, k) - (back.ticks[k].head[2] - PLANE_Z0)) < 1e-12);
   assert.ok(pendingNotes(back, back.chart[0].t, 0).length > 0);
+  s.free();
+}
+
+// ---- the HUD walk through breaks: a sloppy player -----------------------
+// The same player, resting through every third object: misses break the
+// combo and drop the multiplier, and the walk still matches the judge.
+{
+  const entry = PACK.find((c) => c.id === "warmup-1");
+  const good = playerFor(entry.chart);
+  const skip = new Set(entry.chart.map((o, i) => (i % 3 === 2 ? o : null)).filter(Boolean));
+  const player = (t) => {
+    const o = entry.chart.find((o) => o.t >= t - 0.02);
+    return o && skip.has(o) ? { palms: REST, head: HEAD, quat: [0, 0, 0, 1] } : good(t);
+  };
+  const { s, frameStats } = playRun(entry, player);
+  assert.ok(s.done);
+  assert.ok(s.stats.breaks >= 3, `the sloppy run breaks (${s.stats.breaks})`);
+  const mults = checkHudWalk(s, frameStats);
+  assert.ok(mults.some((m, k) => k > 0 && m < mults[k - 1]), "a break drops the multiplier");
   s.free();
 }
 

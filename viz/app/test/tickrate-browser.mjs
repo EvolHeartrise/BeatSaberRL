@@ -48,13 +48,15 @@ try {
   await page.goto("file:///" + dist);
   await page.waitForSelector("#stage canvas", { timeout: 15000 });
 
-  const hud = () => page.$eval("#hud", (el) => el.textContent.replace(/\s+/g, " "));
-  const hudT = async () => {
-    const m = /t (\d+\.\d+)s · tick (\d+)/.exec(await hud());
-    return m ? { t: +m[1], tick: +m[2] } : null;
-  };
+  // the viewer's test hook: the tick on screen and its time
+  const hud = () => page.evaluate(() => JSON.stringify(window.__viewerState?.()));
+  const hudT = () => page.evaluate(() => {
+    const s = window.__viewerState?.();
+    return s?.loaded ? { t: s.t, tick: s.tick } : null;
+  });
   const scrub = (tick) => page.evaluate((tick) => {
-    const r = document.querySelector("#bottom input[type=range]");
+    // the timeline is the last slider (volume / fov come first)
+    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(r, tick);
     r.dispatchEvent(new Event("input", { bubbles: true }));
   }, tick);
@@ -62,7 +64,7 @@ try {
     const input = await page.$("input[type=file]");
     await input.uploadFile(p);
     await page.waitForFunction(
-      () => document.querySelector("#hud").textContent.includes("tick"), { timeout: 30000 });
+      () => window.__viewerState?.().loaded, { timeout: 30000 });
     await new Promise((r) => setTimeout(r, 800));
   };
 
@@ -75,7 +77,7 @@ try {
     await scrub(secs * HZ);
     await new Promise((r) => setTimeout(r, 300));
     const h = await hudT();
-    console.log(`scrub tick ${secs * HZ}: HUD t ${h?.t}s tick ${h?.tick}`);
+    console.log(`scrub tick ${secs * HZ}: viewer t ${h?.t}s tick ${h?.tick}`);
     if (!h || h.tick !== secs * HZ || Math.abs(h.t - secs) > 0.011)
       fail(`tick ${secs * HZ} should read t ${secs}.00s at ${HZ} Hz: ${await hud()}`);
   }
@@ -93,7 +95,7 @@ try {
   await new Promise((r) => setTimeout(r, 3000));
   const a1 = await hudT(), wall = (Date.now() - w0) / 1000;
   const adv = a1.t - a0.t;
-  console.log(`playback: HUD advanced ${adv.toFixed(2)}s (${a1.tick - a0.tick} ticks) ` +
+  console.log(`playback: viewer advanced ${adv.toFixed(2)}s (${a1.tick - a0.tick} ticks) ` +
               `in ${wall.toFixed(2)}s wall`);
   // SwiftShader may drop frames, but the clock is delta-driven: a 30 Hz
   // clock on a 60 Hz replay would read half speed, a 1/60 DT on 30 Hz
@@ -123,7 +125,7 @@ try {
   await scrub(300);
   await new Promise((r) => setTimeout(r, 300));
   const h30 = await hudT();
-  console.log(`30 Hz replay, scrub tick 300: HUD t ${h30?.t}s`);
+  console.log(`30 Hz replay, scrub tick 300: viewer t ${h30?.t}s`);
   if (!h30 || h30.tick !== 300 || Math.abs(h30.t - 10) > 0.011)
     fail("30 Hz replay after a 60 Hz one does not read 30 ticks/s: " + (await hud()));
 

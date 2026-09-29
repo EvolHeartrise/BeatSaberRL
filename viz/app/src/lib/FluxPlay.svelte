@@ -2,7 +2,8 @@
   // The Flux WebXR game's in-canvas half (SPEC.md §Flux WebXR game): the
   // <XR> session, the per-frame pose read (controller grips or tracked
   // hands + the headset) that feeds the game clock (playctl.advance), the
-  // in-headset controls (trigger / grip), haptics, and the in-world HUD.
+  // in-headset controls (trigger / grip), haptics, and the in-world menu /
+  // countdown / results text (the running HUD is Hud3D.svelte).
   // Objects, palms and the Flux beam are drawn by the viewer's own Scene /
   // Notes / Flux components from the live recording (pb.rep).
   //
@@ -145,20 +146,10 @@
   const entry = $derived(entryById(play.chartId));
   const countdown = $derived(
     play.phase === "countdown" ? Math.max(1, Math.ceil(-play.time)) : 0);
-  const HUD_Z = -0.55, HUD_Y = 1.05, HUD_X = 1.45;
+  // the running score / combo / multiplier / accuracy during a run are the
+  // in-game HUD's (Hud3D.svelte, from the judge's tallies)
   const MSG = [0, 2.35, -2.4];
   const fmt = (v) => Math.round(v ?? 0).toLocaleString("en-US");
-  // accuracy so far: points over the max of every object resolved yet
-  // (circles 60, bars 115); re-derived whenever the tallies change
-  const accPct = $derived.by(() => {
-    const rep = st && game.session?.rep;
-    if (!rep) return null;
-    let m = 0;
-    rep.outcomes.forEach((o, i) => {
-      if (o) m += rep.chart[i].kind === KIND_CIRCLE ? 60 : 115;
-    });
-    return m ? Math.round((100 * st.raw_score) / m) : null;
-  });
 </script>
 
 <XR referenceSpace="local-floor" offerSession={false} enterGrantedSession={false}
@@ -200,18 +191,3 @@
 {#if play.paused && play.phase !== "menu"}
   <TextSprite text="paused" size={0.25} position={[0, 1.6, -1.8]} />
 {/if}
-
-{#if st && (play.phase === "playing" || play.phase === "countdown")}
-  <!-- left: combo + multiplier; right: score + accuracy -->
-  <TextSprite text={`${st.combo}`} size={0.22}
-    position={[-HUD_X, HUD_Y + 0.12, HUD_Z]} />
-  <TextSprite text="combo" size={0.07} bold={false} color="#9aa0ae"
-    position={[-HUD_X, HUD_Y - 0.04, HUD_Z]} />
-  <TextSprite text={`×${st.multiplier}`} size={0.14} color="#7aa2f7"
-    position={[-HUD_X, HUD_Y - 0.2, HUD_Z]} />
-  <TextSprite text={fmt(st.score)} size={0.18}
-    position={[HUD_X, HUD_Y + 0.12, HUD_Z]} />
-  <TextSprite text={accPct === null ? "—" : `${accPct}%`} size={0.1}
-    color="#9aa0ae" position={[HUD_X, HUD_Y - 0.06, HUD_Z]} />
-{/if}
-
