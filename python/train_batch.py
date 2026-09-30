@@ -455,6 +455,18 @@ def build_parser():
                         "for fresh runs and --init-from warm starts; a "
                         "--resume keeps its checkpoint's mode (absent = "
                         "'off')")
+    p.add_argument("--fused-ffn", choices=["off", "on", "up16"],
+                   default=None,
+                   help="fused block-FFN kernel on the fp16 stream (review "
+                        "I13, csrc/fused_ffn.cu): FFN + residual + the next "
+                        "LayerNorm in one kernel, the 768-wide hidden kept "
+                        "on-chip (rollout writes no hidden / ReLU mask). "
+                        "'on' = up-projection fp32-accumulated, down-"
+                        "projection per --fp16-accum; 'up16' = both fp16-"
+                        "accumulated (experimental). Near-tie numerics vs "
+                        "the unfused path; rollout and update stay bitwise. "
+                        "Stamped in the checkpoint arch. Default: 'off' "
+                        "(a --resume keeps its checkpoint's mode)")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -1457,6 +1469,9 @@ def main():
                 "fp16_accum", "off")
         else:
             args.fp16_accum = "all"
+    if args.fused_ffn is None:
+        args.fused_ffn = (resume_ckpt.get("arch", {}).get("fused_ffn", "off")
+                          if resume_ckpt is not None else "off")
     args_snapshot = {k: v for k, v in sorted(vars(args).items())}
     # the body --tau-center resolved to, so a resume inherits the body
     # itself, not a name whose value tau_fit moves (review 2026-09-30)
@@ -1575,6 +1590,7 @@ def main():
     # checkpoint when not given) wins, and the arch records it
     policy.fp16_accum = args.fp16_accum
     policy.arch["fp16_accum"] = args.fp16_accum
+    policy.fused_ffn = policy.arch["fused_ffn"] = args.fused_ffn
     print(f"HL-Gauss critic: {policy.value_bins} bins over "
           f"[-{policy.arch['value_vmax']:g}, {policy.arch['value_vmax']:g}] "
           f"(normalized return), sigma {policy.value_sigma_bins:g} bins",
