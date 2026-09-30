@@ -587,7 +587,7 @@ v15 = parseReplay(v15Text);
   console.log("rotQuatScene: identity, yaw, head frame OK");
 }
 
-// ---- first-person head track + smoothing ------------------------------------
+// ---- head-orientation track + smoothing (viz/reels' head cameras) -----------
 {
   const track = headQuats(rep);
   assert.equal(track.length, rep.ticks.length);
@@ -610,7 +610,7 @@ v15 = parseReplay(v15Text);
   near(sm[1], quatNlerp(I, Y90, a));
   // short arc: nlerp toward -q is the same as toward q
   near(quatNlerp(I, Y90.map((v) => -v), 0.5), quatNlerp(I, Y90, 0.5));
-  console.log("first-person head track: smoothing OK");
+  console.log("head track: smoothing OK");
 }
 
 // replays from retired parameterizations are rejected with the friendly

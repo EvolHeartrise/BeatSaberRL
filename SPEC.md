@@ -459,7 +459,8 @@ which is tied to that reference by the existing CUDA parity tests
   `head` [x, y, z, qx, qy, qz, qw] (env frame), `reward` (judge terms
   only), `events` in the env recorder's shape). The viewer renders the
   live game from it (Notes / Flux unchanged) and plays saved runs back
-  (palms + beam + a headset marker; first-person = the head track).
+  (palms + beam + a headset marker; first-person = a camera at the
+  recorded head position, looking straight down the track).
 - **Play**: `cd viz/app && npm run xr` (HTTPS dev server on the LAN,
   self-signed; WebXR needs a secure context), open
   `https://<laptop-ip>:5173` on the headset, "🥽 play Flux", "enter VR";

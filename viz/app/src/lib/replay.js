@@ -215,8 +215,10 @@ export function quatNlerp(a, b, u) {
   return o.map((v) => v / n);
 }
 
-/** The first-person camera track: the head frame's scene quaternion at
- * every tick (full-body FK per tick — cache per replay). Re-normalized:
+/** The head-orientation track: the head frame's scene quaternion at every
+ * tick (full-body FK per tick — cache per replay). Used by viz/reels'
+ * head cameras; the viewer's first-person camera no longer turns with the
+ * head (it looks straight down the track). Re-normalized:
  * the logged root quaternion is unit only to ~1e-5 (JSONL float
  * precision) and the filter below compounds it. */
 export function headQuats(rep) {

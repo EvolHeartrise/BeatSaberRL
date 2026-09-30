@@ -564,13 +564,14 @@ copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-st
 datum: the floating tunnel grid, hit-plane cells and the reach and
 miss/head planes — hidden otherwise since 2026-09-06; plus each in-reach
 note's own bounding box, hidden otherwise since 2026-09-09), `f` (or the
-👁 button) = first-person since 2026-09-11: the camera rides the FK head
-frame — origin and rotation, gaze = head local +z. Two sliders appear in
-the bar while it is on: vertical FOV (40–110°, default 75°) and
-head-rotation smoothing (0–1 s, default 0 = the exact head frame; a
-per-tick exponential filter over the recorded head track, so it is still
-a pure function of the tick — scrubbing and the frame-by-frame export
-match playback, and the export records whichever camera is active); the head sphere is hidden
+👁 button) = first-person since 2026-09-11: the camera sits at the FK
+head (or a person's tracked head) but, since 2026-09-30, ignores the
+head's rotation — it always looks straight down the track toward the
+incoming notes, level and unturned, so the view never swings with the
+head. A FOV slider (40–110°, default 75°) appears in the bar while it is
+on; the view is a pure function of the tick, so scrubbing and the
+frame-by-frame export match playback, and the export records whichever
+camera is active; the head sphere is hidden
 while it is on, the gauges move to that camera, and the orbit camera
 keeps its place for when you toggle back — drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required

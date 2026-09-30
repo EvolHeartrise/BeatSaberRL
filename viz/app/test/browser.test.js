@@ -3,7 +3,8 @@
 // input, plays a second, and asserts playback advanced with zero page
 // errors. Also drives the v10 manual-pose panel (root + 29 joints) and
 // screenshots the articulated skeleton + per-joint gauges/forces, and
-// toggles the first-person (head-frame) camera on and back off.
+// toggles the first-person camera (at the head, looking straight down the
+// track) on and back off.
 // Screenshots land in test/out/ for eyeball verification.
 // Run: node test/browser.test.js [path-to-replay.jsonl]
 import { existsSync, mkdirSync } from "node:fs";
@@ -135,7 +136,7 @@ try {
   await page.keyboard.press("g"); // the key toggles the same flag back on
   await page.waitForFunction(GAUGES_ON, { timeout: 5000 });
 
-  // ---- first-person ('f'): the camera rides the head frame. The bar
+  // ---- first-person ('f'): the camera sits at the head, fixed forward. The bar
   // button lights up, the frame renders with no page errors, and 'f'
   // again returns to the orbit camera.
   // (a string expression: waitForFunction cannot be handed a closure)
@@ -146,9 +147,10 @@ try {
   await page.waitForFunction(FP_ON, { timeout: 5000 });
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/first-person.png" });
-  // the two first-person sliders (fov, rotation smoothing) live in #fp
+  // the one first-person slider (fov) lives in #fp — no rotation smoothing
+  // since the camera no longer turns with the head
   const fpSliders = await page.$$eval("#fp input[type=range]", (els) => els.length);
-  if (fpSliders !== 2) throw new Error(`expected 2 first-person sliders, got ${fpSliders}`);
+  if (fpSliders !== 1) throw new Error(`expected 1 first-person slider, got ${fpSliders}`);
   const setFp = (idx, frac) => page.evaluate(({ idx, frac }) => {
     const r = document.querySelectorAll("#fp input[type=range]")[idx];
     const v = +r.min + frac * (+r.max - +r.min);
@@ -157,12 +159,11 @@ try {
     r.dispatchEvent(new Event("input", { bubbles: true }));
   }, { idx, frac });
   await setFp(0, 1.0);  // fov 110°
-  await setFp(1, 0.4);  // smoothing 0.4 s
   await new Promise((r) => setTimeout(r, 500));
   const fpLabels = await page.$eval("#fp", (el) => el.textContent.replace(/\s+/g, " "));
-  if (!/110°/.test(fpLabels) || !/0\.40s/.test(fpLabels))
-    throw new Error("first-person sliders did not take: " + fpLabels);
-  await page.screenshot({ path: "test/out/first-person-wide-smooth.png" });
+  if (!/110°/.test(fpLabels) || /smooth/.test(fpLabels))
+    throw new Error("first-person fov slider did not take: " + fpLabels);
+  await page.screenshot({ path: "test/out/first-person-wide.png" });
   await page.keyboard.press("f");
   await page.waitForFunction(`!(${FP_ON})`, { timeout: 5000 });
   await new Promise((r) => setTimeout(r, 300));

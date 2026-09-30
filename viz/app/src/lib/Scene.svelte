@@ -12,8 +12,7 @@
   import {
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, reachZ,
     ROW_EDGES, ROW_Y, Z_FAR, Z_MISS, activeContacts, bodyFK,
-    frameQuatScene, headQuats, noteFrame, poseQ36, qAt, quatNlerp,
-    rotQuatScene, smoothQuats, viewerTrackOffset, isFlux,
+    frameQuatScene, noteFrame, poseQ36, qAt, viewerTrackOffset, isFlux,
     PLANE_Z0, humanHeadAt, humanHeadQuatScene, humanPalmsAt, isHuman,
   } from "./replay.js";
   import Flux from "./Flux.svelte";
@@ -89,35 +88,16 @@
     : humanTicks ? humanHeadAt(pb.rep, tickIdx, u) : null);
 
   // ---- first-person camera ('f') --------------------------------------------
-  // FOV and rotation smoothing are bar sliders (pb.fpFov / pb.fpSmooth;
-  // the 75° default is the ScoreSaber watch viewer's original first-person
-  // FOV — its current default is a smoothed chase camera 0.7 m behind the
-  // head at 70°, pitch forced upright then tilted 15° down, not a head
-  // cam). Near plane at 5 cm so a blade handle raised to the face still
-  // draws. The smoothed orientation comes from the replay's whole head
-  // track (FK once per replay, filtered once per slider value), then the
-  // fractional tick nlerps between two filtered ticks — so it stays a
-  // pure function of the tick. Pose mode and tau = 0 use the live frame.
+  // The FOV is a bar slider (pb.fpFov; the 75° default is the ScoreSaber
+  // watch viewer's original first-person FOV). Near plane at 5 cm so a
+  // blade handle raised to the face still draws. The camera sits at the
+  // replay's head but does NOT take its orientation: it always looks
+  // straight down the track — level, unturned — toward the incoming
+  // notes. Notes spawn at world +z (Z_FAR) and travel to -z past the
+  // player at PLANE_Z0; world -> scene flips z, so "toward the notes" is
+  // scene -z, which is exactly where a three camera looks with the
+  // identity rotation. So the camera needs no quaternion at all.
   const FP_NEAR = 0.05;
-  const fpTrack = $derived(
-    pb.firstPerson && pb.rep && !play.on ? headQuats(pb.rep) : null);
-  const fpSmoothed = $derived(
-    fpTrack ? smoothQuats(fpTrack, pb.fpSmooth) : null);
-  const fpQuat = $derived.by(() => {
-    if (human && humanTicks && !play.on) {
-      if (!fpSmoothed || !(pb.fpSmooth > 0))
-        return humanHeadQuatScene(pb.rep, tickIdx, u);
-      const n = fpSmoothed.length;
-      return quatNlerp(fpSmoothed[Math.min(tickIdx, n - 1)],
-        fpSmoothed[Math.min(tickIdx + 1, n - 1)], u);
-    }
-    if (!fkAll) return null;
-    if (pose.on || !fpSmoothed || !(pb.fpSmooth > 0))
-      return rotQuatScene(fkAll.r[F_HEAD]);
-    const n = fpSmoothed.length;
-    return quatNlerp(fpSmoothed[Math.min(tickIdx, n - 1)],
-      fpSmoothed[Math.min(tickIdx + 1, n - 1)], u);
-  });
 
   // ---- env v15 head-anchored note track (contact spec §10) -----------------
   // z_off = head_z - PLANE_Z0 of the body being DRAWN this frame, so the
@@ -235,31 +215,29 @@
   {/if}
 </T.PerspectiveCamera>
 
-<!-- First-person ('f'): a SECOND camera parented to the FK head frame, so
-     it rides the body exactly — origin and rotation. SPEC-v10 §replay:
-     head local +z is the gaze and +y is up; a three camera looks down
-     its local -z, and the S = diag(1,1,-1) scene conjugation turns a
-     world +z gaze into scene -z, so the head frame's scene quaternion IS
-     the camera's, with no extra turn. It is the default camera only
-     while the mode is on. The orbit camera above is left alone rather
-     than moved: its controls rewrite its position every frame (damping
-     runs update() whether or not input is enabled), and leaving it
-     untouched also means toggling back lands exactly where you were.
-     The view is a pure function of the tick (smoothing included, see
-     fpQuat), so scrubbing and the frame-by-frame export stay exact (the
-     export records whichever camera is the default). The gauges follow
-     the active camera; the head sphere is hidden while on (Body
-     showHead). Mounted only while on: unmounting hands the default back
-     to the orbit camera. -->
+<!-- First-person ('f'): a SECOND camera placed at the head (FK head
+     joint, or a person's tracked head on a Flux run), looking straight
+     down the track: identity rotation = scene -z = world +z, toward the
+     incoming notes, level and unturned whatever the head does — so the
+     view never swings or tilts, only the eye point follows the player.
+     It is the default camera only while the mode is on. The orbit camera
+     above is left alone rather than moved: its controls rewrite its
+     position every frame (damping runs update() whether or not input is
+     enabled), and leaving it untouched also means toggling back lands
+     exactly where you were. The view is a pure function of the tick, so
+     scrubbing and the frame-by-frame export stay exact (the export
+     records whichever camera is the default). The gauges follow the
+     active camera; the head sphere is hidden while on (Body showHead).
+     Mounted only while on: unmounting hands the default back to the
+     orbit camera. Live XR play is excluded — the headset owns the camera. -->
 {#if pb.firstPerson && !play.on && (fkAll || (human && humanHead))}
   {@const hp = fkAll ? fkAll.p[F_HEAD] : humanHead}
-  <T.Group position={[hp[0], hp[1], -hp[2]]} quaternion={fpQuat}>
-    <T.PerspectiveCamera makeDefault fov={pb.fpFov} near={FP_NEAR}>
-      {#if pb.gauges}
-        <BodyGauges fov={pb.fpFov} />
-      {/if}
-    </T.PerspectiveCamera>
-  </T.Group>
+  <T.PerspectiveCamera makeDefault position={[hp[0], hp[1], -hp[2]]}
+    fov={pb.fpFov} near={FP_NEAR}>
+    {#if pb.gauges}
+      <BodyGauges fov={pb.fpFov} />
+    {/if}
+  </T.PerspectiveCamera>
 {/if}
 
 <!-- Cel lighting (2026-09-09): the toon ramp turns dot(N, L) into three
