@@ -52,7 +52,9 @@ def test_param_counts_exact():
     # The ctor's critic head is HL-Gauss 101 bins since the scalar head
     # was removed (2026-09-22): final layer 384 -> 101 instead of -> 1,
     # +38,500 over the scalar-head count (2,751,122)
-    assert tot(s384) == 2_789_622
+    # I07 / env v49 (2026-09-30): saber 44 -> 47 lanes (+3 x 192) and the
+    # note geo 14 -> 22 lanes (+8 x 192): +2,112
+    assert tot(s384) == 2_791_734
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
     assert names == {"trunk_proj.weight", "trunk_proj.bias",

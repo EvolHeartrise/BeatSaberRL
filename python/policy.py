@@ -166,8 +166,11 @@ def _run(ms: list, x: torch.Tensor) -> torch.Tensor:
 # 16 torque-limit SCALE lanes appended at 608..624 — one per axis
 # (spine 3, arm 7 shared L/R, leg 6 shared L/R), (s − 1)/0.25; the 7
 # arm lanes go into BOTH saber tokens (37 -> 44), spine + leg lanes
-# into the body token (78 -> 87). OBS_DIM 608 -> 624.
-OBS_DIM = 624
+# into the body token (78 -> 87). OBS_DIM 608 -> 624. Env v49
+# (2026-09-30, review item I07): 6 blade-TIP velocity lanes appended at
+# 624..630 ([L xyz, R xyz] / V_NORM, the judge's tip_move / DT); each
+# hand's 3 go LAST into its saber token (44 -> 47). OBS_DIM 624 -> 630.
+OBS_DIM = 630
 N_NOTE_SLOTS = 24
 NOTE_FEAT = 18
 OFF_NOTES = 102
@@ -183,10 +186,13 @@ OFF_NOTE_MASK = OFF_NOTES + N_NOTE_SLOTS * NOTE_FEAT  # 534
 # features. Each saber token gains its arm's elbow position (3, env
 # v13) and elbow velocity (3, env v24): 26 -> 32; and its colour's
 # previous-note block (5, env v45): 32 -> 37, appended LAST so the
-# note-geo lane constants (_S_WPOS/_S_WVEL/_S_BLADE) stay valid.
-SABER_FEAT = 44
+# note-geo lane constants (_S_WPOS/_S_WVEL/_S_BLADE) stay valid; then
+# the 7 arm tau-scale lanes (env v46): 37 -> 44; then that hand's
+# blade-tip velocity (3, env v49): 44 -> 47 (_S_TIPV).
+SABER_FEAT = 47
 PREV_FEAT = 5
 TAU_FEAT = 16
+TIP_FEAT = 3            # per hand (env v49)
 BODY_FEAT = 87
 # derived from the window size so a future slot change can't skew them
 _GI = OFF_NOTE_MASK + N_NOTE_SLOTS      # ground_imp block (4)
@@ -195,7 +201,8 @@ _BPV = _BP + 18                         # body_pt_vel block (18, env v24)
 _PREV_L = _BPV + 18                     # prev-note L block (5, env v45)
 _PREV_R = _PREV_L + PREV_FEAT           # prev-note R block (5, env v45)
 _TAU = _PREV_R + PREV_FEAT              # tau-scale lanes (16, env v46)
-assert _TAU + TAU_FEAT == OBS_DIM
+_TIP = _TAU + TAU_FEAT                  # blade-tip velocity [L, R] (6, env v49)
+assert _TIP + 2 * TIP_FEAT == OBS_DIM
 # env v46 routing: arm axes (7) to both saber tokens; spine (3) + leg (6)
 # axes to the body token — all appended LAST in their tokens
 _TAU_ARM = tuple(range(_TAU + 3, _TAU + 10))
@@ -204,12 +211,12 @@ _SABER_L_IDX = (tuple(range(18, 26)) + tuple(range(49, 56))
                 + tuple(range(75, 86)) + tuple(range(_BP, _BP + 3))
                 + tuple(range(_BPV, _BPV + 3))
                 + tuple(range(_PREV_L, _PREV_L + PREV_FEAT))
-                + _TAU_ARM)
+                + _TAU_ARM + tuple(range(_TIP, _TIP + TIP_FEAT)))
 _SABER_R_IDX = (tuple(range(26, 34)) + tuple(range(56, 63))
                 + tuple(range(86, 97)) + tuple(range(_BP + 3, _BP + 6))
                 + tuple(range(_BPV + 3, _BPV + 6))
                 + tuple(range(_PREV_R, _PREV_R + PREV_FEAT))
-                + _TAU_ARM)
+                + _TAU_ARM + tuple(range(_TIP + TIP_FEAT, _TIP + 2 * TIP_FEAT)))
 _BODY_IDX = (tuple(range(0, 18)) + tuple(range(34, 49))
              + tuple(range(63, 75)) + tuple(range(97, 102))
              + tuple(range(_GI, _GI + 4))
@@ -275,42 +282,74 @@ _BODY3_IDX = _TORSO_IDX + _LEG_L_IDX + _LEG_R_IDX
 #            in the obs since env v38 — same frame, same normalizers), z
 #            (world z on both sides) as asinh(m / 8)
 #   |dp| (1) asinh(m / 8)
-#   t_plane (1)  note z / speed = seconds until the note reaches the head
-#            plane, clipped to [-0.5, 3], / 3
+#   t_plane (1)  (note z − z_off) / speed = seconds until the note
+#            reaches the plane it is judged at (z_off = head_z − PLANE_Z0
+#            = obs lane 99, lib.rs step_inner; B12 2026-09-30 — it was
+#            z / speed, the time to world z = 0), clipped to [-0.5, 3], / 3
 #   v.d (1)  unit wrist-velocity . required cut direction (cos_a, sin_a, 0)
 #   b.d (1)  blade direction . required cut direction
 # = 7 per hand -> 14 lanes; the dot lanes are masked to 0 on wall rows
-# (walls have no cut direction). Obs, env, kernel untouched; only
-# note_mlp.0.weight widens (18 -> 32 input columns).
-NOTE_GEO_FEAT = 14
+# (walls have no cut direction). Only note_mlp.0.weight widens.
+# I07 (2026-09-30, env v49; review item I07 — the geometry the game
+# actually SCORES): 4 more per hand, appended AFTER the 14 as one block
+# [hand L (4), hand R (4)] so a pre-I07 note_mlp's 32 columns keep their
+# indices (load_policy zero-fills the 8 new ones):
+#   along (1)  dp·b − HANDLE_LEN, asinh(m / 2): where along the blade
+#              the note sits (the cutting span is [0, SABER_LEN])
+#   perp (1)   |dp − (dp·b) b|, asinh(m / 2): distance from the note to
+#              the blade LINE
+#   cut (1)    dp·n̂, n̂ = (b × v_tip) / (|b × v_tip| + 0.05 m/s),
+#              asinh(m / 2): the SIGNED distance to the plane the
+#              blade sweeps — the judge's accuracy d_min = |cw·(b ×
+#              tip_move)| / |b × tip_move| (lib.rs step_inner), signed
+#              positive on the b × v_tip side (pinned in lib.rs
+#              cut_plane_signed_distance_matches_the_judge); soft-
+#              normalised so a still blade (no plane) reads ~0
+#   vt.d (1)   v_tip · cut direction / V_NORM: the blade-TIP velocity
+#              (obs env v49) along the required direction — the direction
+#              check reads the contact point's velocity, not the wrist's;
+#              masked on walls like the other dots
+# = 11 per hand -> 22 lanes (note_mlp input 18 -> 40). The arch marker
+# "blade_geo" = 1 records the I07 layout (these lanes + obs 630).
+NOTE_GEO_FEAT_V55 = 14
+NOTE_GEO_FEAT = 22
 # obs normalizers, pinned against beat_arena_env.constants in
 # tests/test_policy.py (the obs is written by the Rust/CUDA sims)
 _X_NORM, _Y_NORM, _Z_SCALE, _V_NORM = 1.0, 0.75, 8.0, 6.0
+_HANDLE_LEN = 0.16       # constants.HANDLE_LEN (env v42 hilt grip)
+_OBS_HEAD_Z = 99         # obs lane (head_z − PLANE_Z0) / X_NORM = z_off
 # saber_feat lane order: q(8) qd(7) then the 11-lane hand block
-# [wrist pos(3), wrist vel(3), blade dir(3), meter, post_rem]
+# [wrist pos(3), wrist vel(3), blade dir(3), meter, post_rem], ... and
+# the blade-tip velocity LAST (env v49)
 _S_WPOS, _S_WVEL, _S_BLADE = 15, 18, 21
+_S_TIPV = SABER_FEAT - TIP_FEAT          # 44
 
 
 def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
-              z_asinh: float, flux: bool = False) -> torch.Tensor:
-    """(B, 24, 18) fp32 note lanes + (B, 2, 32) fp32 saber lanes ->
-    (B, 24, 14) geometry lanes (fp32; the caller casts with the notes).
+              z_asinh: float, flux: bool = False, *,
+              z_off: torch.Tensor) -> torch.Tensor:
+    """(B, 24, 18) fp32 note lanes + (B, 2, 47) fp32 saber lanes
+    (SABER_FEAT) + (B,) head z offset z_off = obs lane 99 (metres) ->
+    (B, 24, 22) geometry lanes (fp32; the caller casts with the notes):
+    [hand L v55 (7), hand R v55 (7), hand L I07 (4), hand R I07 (4)].
 
     Every lane O(1) (user 2026-09-21, v55; the only layout since
     2026-09-22 — the raw-metre lanes of earlier checkpoints were
     removed): z decoded from the lane's true encoding c sinh(lane) (c =
     z_asinh, the policy's recorded --z-asinh), the per-hand offset's z and
     the distance compressed as asinh(m / 8) (the lane-2 shape), x/y
-    offsets in half-metres, seconds-to-plane / 3. Motivation:
-    [gnorm-lanes] on v52-v54 put the note encoder's excess gradient in
-    its second layer, fed by far tokens' large hidden activations from
-    raw-metre lanes.
+    offsets in half-metres, seconds-to-plane / 3; the I07 blade-frame
+    lengths as asinh(m / 2) (half-metres near the blade, like the x/y
+    offsets; < 8 out to 2 km). Motivation: [gnorm-lanes] on
+    v52-v54 put the note encoder's excess gradient in its second layer,
+    fed by far tokens' large hidden activations from raw-metre lanes.
 
     Flux (SPEC.md §Flux obs): the hand block holds the PALM, lanes 6/7
     are a bar's axis (so vdot/bdot read palm-velocity / hand-axis · bar
     axis), and a bar's target point is its SWEET SPOT (lanes 12/13)
     rather than its centre — the per-hand offsets aim the palms at
-    circles and at the point the Flux must cross."""
+    circles and at the point the Flux must cross. The tip-velocity obs
+    lanes are zero there, so the cut / vt.d lanes read 0."""
     assert z_asinh > 0, f"the obs z encoding C must be > 0, got {z_asinh}"
     z_m = torch.sinh(notes[..., 2]) * float(z_asinh)
     tx, ty = notes[..., 0], notes[..., 1]
@@ -323,17 +362,20 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
     cutd = torch.stack([notes[..., 6], notes[..., 7],
                         torch.zeros_like(notes[..., 6])], -1)   # (B,24,3)
     not_wall = 1.0 - notes[..., 14:15]                          # (B,24,1)
-    # seconds to the head plane: z / speed with speed = -lane3 * Z_SCALE
+    # seconds to the judged plane: (z − z_off) / speed with speed =
+    # -lane3 * Z_SCALE (B12: the note is cut at z_off, not world z = 0)
     speed = (-notes[..., 3:4] * _Z_SCALE).clamp_min(1e-3)
-    tpl = (z_m[..., None] / speed).clamp(-0.5, 3.0)
+    zrel = z_m - (z_off.to(z_m.dtype) * _X_NORM)[:, None]
+    tpl = (zrel[..., None] / speed).clamp(-0.5, 3.0)
     tpl = tpl / 3.0
-    feats = []
+    feats, blade_feats = [], []
     for hnd in range(2):
-        w = sabers[:, hnd]                                       # (B,32)
+        w = sabers[:, hnd]                                       # (B,47)
         wpos = torch.stack([w[:, _S_WPOS] * _X_NORM,
                             w[:, _S_WPOS + 1] * _Y_NORM,
                             w[:, _S_WPOS + 2]], -1)              # (B,3) m
-        dp = (npos - wpos[:, None]) * 0.5                        # (B,24,3)
+        dpm = npos - wpos[:, None]                               # (B,24,3) m
+        dp = dpm * 0.5
         dist = dp.norm(dim=-1, keepdim=True)
         # z offset and distance: asinh(m / 8) keeps the near field
         # linear (2 dp units = 1 m) and bounds far tokens (~3 at
@@ -343,10 +385,22 @@ def _note_geo(notes: torch.Tensor, sabers: torch.Tensor,
         v = w[:, _S_WVEL:_S_WVEL + 3] * _V_NORM                  # (B,3) m/s
         vhat = v / (v.norm(dim=-1, keepdim=True) + 0.05)
         vdot = (vhat[:, None] * cutd).sum(-1, keepdim=True) * not_wall
-        bdot = (w[:, _S_BLADE:_S_BLADE + 3][:, None] * cutd).sum(
-            -1, keepdim=True) * not_wall
+        b = w[:, _S_BLADE:_S_BLADE + 3]                          # (B,3) unit
+        bdot = (b[:, None] * cutd).sum(-1, keepdim=True) * not_wall
         feats += [dp, dist, tpl, vdot, bdot]
-    return torch.cat(feats, -1)
+        # I07: the blade frame. along/perp decompose dpm on the blade
+        # line; cut = signed distance to the swept plane
+        ab = (dpm * b[:, None]).sum(-1, keepdim=True)            # (B,24,1) m
+        along = torch.asinh((ab - _HANDLE_LEN) * 0.5)
+        perp = torch.asinh(
+            (dpm - ab * b[:, None]).norm(dim=-1, keepdim=True) * 0.5)
+        vt = w[:, _S_TIPV:_S_TIPV + 3]                           # (B,3) /V_NORM
+        pn = torch.linalg.cross(b, vt * _V_NORM)                 # (B,3) m/s
+        nhat = pn / (pn.norm(dim=-1, keepdim=True) + 0.05)
+        cut = torch.asinh((dpm * nhat[:, None]).sum(-1, keepdim=True) * 0.5)
+        vtdot = (vt[:, None] * cutd).sum(-1, keepdim=True) * not_wall
+        blade_feats += [along, perp, cut, vtdot]
+    return torch.cat(feats + blade_feats, -1)
 # env v10: 29 factored joint heads (SPEC-v10 §1.4 actuated order —
 # spine 3, arm_l 7, arm_r 7, leg_l 6, leg_r 6); K = n_gears options
 # per head (env v8 gear tables). This module constant is the K=3
@@ -637,6 +691,15 @@ class NotePolicy(nn.Module):
                      # stamped because load_policy refuses a note_geo
                      # checkpoint without it (raw-metre lanes)
                      "note_geo_norm": True,
+                     # 2026-09-30 (review item I07, env v49): obs 630
+                     # with the blade-tip velocity lanes into the saber
+                     # tokens (SABER_FEAT 47) and the 22-lane note geo
+                     # (the I07 blade-frame block). Absent = a pre-I07
+                     # checkpoint (obs 624, SABER_FEAT 44, 14 geo
+                     # lanes), which load_policy UPGRADES in place:
+                     # zero input columns for every new lane
+                     # (upgrade_pre_i07_state_dict)
+                     "blade_geo": 1,
                      "z_asinh": float(z_asinh),
                      # 2026-09-15 (brainstorm item 2): readout-trunk
                      # layout. "simba" = residual + LayerNorm block,
@@ -753,6 +816,9 @@ class NotePolicy(nn.Module):
         self.fp16 = False
         # accumulate mode of the fp16 stream's GEMMs (arch "fp16_accum")
         self.fp16_accum = fp16_accum
+        # load_policy: "pre-i07" when the weights were upgraded from a
+        # pre-I07 checkpoint (zero-filled new input columns)
+        self.upgraded_from = None
 
     def _split(self, obs: torch.Tensor):
         sabers = obs.index_select(1, self._saber_idx)                # (B, 50)
@@ -826,9 +892,10 @@ class NotePolicy(nn.Module):
             notes = torch.cat(
                 [notes, _note_geo(notes.float(),
                                   sabers.float().reshape(B, 2, SABER_FEAT),
-                                  self.z_asinh, self.game == "flux")
+                                  self.z_asinh, self.game == "flux",
+                                  z_off=obs[:, _OBS_HEAD_Z].float())
                  .to(notes.dtype)],
-                dim=-1)                                              # (B,24,32)
+                dim=-1)                                              # (B,24,40)
         if fp16:
             notes = notes.half()   # C1: the cast IS the copy F.linear
         emb = _seq(self.note_mlp, notes)                             # (B, 16, 64)
@@ -1096,6 +1163,42 @@ class NotePolicy(nn.Module):
         return action, logprob, entropy, value
 
 
+# pre-I07 (env v46..v48) layout — the one a checkpoint without the
+# "blade_geo" arch marker was trained on; upgrade_pre_i07_state_dict
+# maps it onto the current one
+OBS_DIM_PRE_I07 = 624
+SABER_FEAT_PRE_I07 = 44
+
+
+def upgrade_pre_i07_state_dict(sd: dict, note_geo: bool) -> dict:
+    """Map a pre-I07 state_dict (obs 624: SABER_FEAT 44, 14 note-geo
+    lanes) onto the I07 layout with ZERO weights on every new input
+    column, so the upgraded policy's output is the old one's (up to the
+    B12 t_plane fix, which changes the forward by design):
+      saber_mlp.0.weight (E, 44 + 2) -> (E, 47 + 2): the 3 tip-velocity
+        columns are inserted before the hand one-hot (old cols 44:46 ->
+        47:49);
+      note_mlp.0.weight (E, 18 + 14) -> (E, 18 + 22) when note_geo: the
+        8 I07 blade-frame columns are appended.
+    Biases and every other tensor are untouched. Returns a new dict."""
+    sd = dict(sd)
+    w = sd["saber_mlp.0.weight"]
+    assert w.shape[1] == SABER_FEAT_PRE_I07 + 2, (
+        f"saber_mlp.0.weight {tuple(w.shape)} is not the pre-I07 layout")
+    nw = w.new_zeros(w.shape[0], SABER_FEAT + 2)
+    nw[:, :SABER_FEAT_PRE_I07] = w[:, :SABER_FEAT_PRE_I07]
+    nw[:, SABER_FEAT:] = w[:, SABER_FEAT_PRE_I07:]
+    sd["saber_mlp.0.weight"] = nw
+    if note_geo:
+        w = sd["note_mlp.0.weight"]
+        assert w.shape[1] == NOTE_FEAT + NOTE_GEO_FEAT_V55, (
+            f"note_mlp.0.weight {tuple(w.shape)} is not the pre-I07 layout")
+        nw = w.new_zeros(w.shape[0], NOTE_FEAT + NOTE_GEO_FEAT)
+        nw[:, :w.shape[1]] = w
+        sd["note_mlp.0.weight"] = nw
+    return sd
+
+
 def load_policy(ckpt, game: str = "standard") -> NotePolicy:
     """Rebuild a NotePolicy from a checkpoint dict. v10 checkpoints
     carry obs_dim/n_action_heads/body_token arch markers; anything else
@@ -1105,8 +1208,22 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
     note-geo lanes decode with; never defaulted), and a note_geo arch
     without the note_geo_norm marker (the raw-metre lanes, removed),
     and a checkpoint of the other GAME MODE (arch "game"; absent =
-    "standard") — the caller names the mode it will play."""
+    "standard") — the caller names the mode it will play.
+
+    Pre-I07 checkpoints (no "blade_geo" marker, obs 624; env v46..v48)
+    are UPGRADED, not refused: the returned policy has the current
+    layout (obs 630) with zero weights on the new input columns
+    (upgrade_pre_i07_state_dict), so it plays the v49 env exactly as
+    the old net played v48 except for the B12 t_plane fix — the
+    --init-from warm start. policy.upgraded_from = "pre-i07" marks it
+    (its optimizer state no longer matches: --resume refuses it)."""
     arch = ckpt.get("arch", {})
+    blade_geo = arch.get("blade_geo", 0)
+    if blade_geo not in (0, 1):
+        raise SystemExit(
+            f"checkpoint has blade_geo {blade_geo!r}; this policy knows "
+            "the pre-I07 layout (absent) and I07 (1)")
+    want_obs = OBS_DIM if blade_geo else OBS_DIM_PRE_I07
     if arch.get("game", "standard") != game:
         raise SystemExit(
             f"checkpoint plays game {arch.get('game', 'standard')!r} but "
@@ -1118,13 +1235,14 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
             "the body is now always [torso, leg_L, leg_R] and the old "
             "layout was removed (user: no back-compat). Check out a "
             "commit before 2026-09-22 to bench or replay it.")
-    if (arch.get("obs_dim") != OBS_DIM
+    if (arch.get("obs_dim") != want_obs
             or arch.get("n_action_heads") != N_ACTION_HEADS
             or "ffn_mult" not in arch
             or not arch.get("body_token", False)):
         raise SystemExit(
             f"checkpoint is not env v46 era (needs arch obs_dim="
-            f"{OBS_DIM}, n_action_heads=29, ffn_mult, body_token=True; "
+            f"{want_obs} (blade_geo {blade_geo}), n_action_heads=29, "
+            f"ffn_mult, body_token=True; "
             f"got {dict(arch)}). Env v46 (2026-09-16) appended the 16 "
             "torque-limit scale lanes (obs 608 -> 624; v45 was 608, "
             "the same-day v44 block 626); every earlier checkpoint "
@@ -1163,5 +1281,10 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         z_asinh=float(z_asinh), game=game,
         # absent (every checkpoint before issue #3) = fp32 accumulate
         fp16_accum=arch.get("fp16_accum", "off"))
-    policy.load_state_dict(ckpt["state_dict"])
+    sd = ckpt["state_dict"]
+    policy.upgraded_from = None
+    if not blade_geo:
+        sd = upgrade_pre_i07_state_dict(sd, policy.note_geo)
+        policy.upgraded_from = "pre-i07"
+    policy.load_state_dict(sd)
     return policy
