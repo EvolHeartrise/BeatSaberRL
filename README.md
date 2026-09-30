@@ -151,10 +151,14 @@ $VENV/bin/python -m pytest tests/
 # (plus fp16-accumulate GEMMs, --fp16-accum all, the default since
 # 2026-09-27; a --resume keeps its checkpoint's accumulate mode)
 $VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
-# leaf: branch a cooldown off a numbered trunk checkpoint. A resume
-# takes only lr/ent/schedule/z/arch from the checkpoint; every other
-# knob is CLI, so a leaf states where it departs from the trunk recipe
-# (walls stay solid as in the bench; --ent-final is the leaf's target)
+# leaf: branch a cooldown off a numbered trunk checkpoint. Since
+# 2026-09-30 a resume INHERITS every flag not typed on the command line
+# from the checkpoint's args (plus lr/ent/schedule/z/arch and the RNG
+# streams); typed flags that differ print as a diff, typed arch changes
+# are refused (--ignore-arch-flags), and run-dir/total-steps/ckpt-every/
+# cooldown/ent-final/device/env are never inherited. So a leaf states
+# only where it departs from the trunk (walls stay solid as in the
+# bench; --ent-final is the leaf's target)
 $VENV/bin/python train_batch.py --resume runs/NAME/trunk_updNNNNN.pt \
     --cooldown-updates 400 --no-wall-despawn --ent-final 3e-6 \
     --run-dir runs/NAME_leaf
@@ -309,7 +313,8 @@ episode structure the bench plays. The window machinery
 key is frozen at the whole-level form so existing caches are reused.
 
 **Env v46 (2026-09-16, user design) — per-env randomized joint torque
-limits, in the observation.** `--tau-rand r` (default 0 = off): at every
+limits, in the observation.** `--tau-rand r` (default 0.25 since the 2026-09-22 v58-recipe
+defaults, 03d6662; 0 = off): at every
 episode reset each env draws one scale per AXIS, s_a ~ U(1 − r, 1 + r),
 for 16 axes — spine 3, arm 7 shared by BOTH arms, leg 6 shared by BOTH
 legs (the user: the left side must always match the right) — and plays
