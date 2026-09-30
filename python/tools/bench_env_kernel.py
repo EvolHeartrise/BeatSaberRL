@@ -60,10 +60,11 @@ def ranked_pool(n_levels):
     """The training pool (train_batch --ranked-maps, seed 0, lead 0.5,
     mirror augment); n_levels None = every level, as training uses."""
     if n_levels not in _RANKED:
-        from beat_arena_env.ranked_pool import load_ranked_pool
+        from beat_arena_env.ranked_pool import (
+            RECIPE_LEAD_S, RECIPE_MIRROR, load_ranked_pool)
         _RANKED[n_levels] = load_ranked_pool(
-            sample=n_levels, seed=0, device="cuda", lead_s=0.5,
-            mirror=True, log=lambda *a, **k: None)
+            sample=n_levels, seed=0, device="cuda", lead_s=RECIPE_LEAD_S,
+            mirror=RECIPE_MIRROR, log=lambda *a, **k: None)
     return _RANKED[n_levels]
 
 
