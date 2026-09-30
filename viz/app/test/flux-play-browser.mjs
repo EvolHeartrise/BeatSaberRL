@@ -117,7 +117,7 @@ try {
   // the run reopens in the replay viewer as a human Flux run
   await click(page, "#play button", "watch run");
   await page.waitForFunction(
-    () => document.querySelector("#drop")?.textContent.includes("played in VR"),
+    () => { const s = window.__viewerState?.(); return s?.loaded && s.flux && s.human; },
     { timeout: 10000 });
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
     .find((b) => b.textContent.includes("pause"))?.click());

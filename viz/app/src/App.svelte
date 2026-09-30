@@ -4,7 +4,7 @@
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
-  import { audio, gfx, pb, play, pose, songClock, lastTick, loadText,
+  import { audio, pb, play, pose, songClock, lastTick, loadText,
     restart, seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
   import { toggleXRSession } from "@threlte/xr";
   import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
@@ -12,16 +12,14 @@
   import { sfx } from "./lib/sfx.js";
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
-  import { CAN_EXPORT_EXACT, decodeSong, exportExact } from "./lib/record.js";
-  import { flushSync, onMount } from "svelte";
+  import { onMount } from "svelte";
   import { fetchReplay, fileToText, nameFor, replayPathFrom,
     replayUrl } from "./lib/urlload.js";
-  import { DT, configSummary } from "./lib/replay.js";
+  import { DT } from "./lib/replay.js";
   // site build (replays.flee.systems): no Flux game, no pose mode, no
   // file-picker button — see lib/build.js
   import { FLUX, POSE, PICKER } from "./lib/build.js";
 
-  let wrap; // canvas container, for video export
   let dropHover = $state(false);
   let fileInput = $state(null);
 
@@ -39,8 +37,6 @@
   // write, so the sync effect below would never learn the element arrived.
   let audioEl = $state(null);
   let blobUrl = null;
-  let songData = null;   // the fetched Blob, for the frame-by-frame export
-  let songBuf = null;    // decoded once, reused across exports
   $effect(() => {
     const m = pb.rep?.map;
     if (!m) return;
@@ -49,8 +45,6 @@
       .then((blob) => {
         if (stale) return;
         if (!audioEl) return;
-        songData = blob;
-        songBuf = null;
         if (blobUrl) URL.revokeObjectURL(blobUrl);
         blobUrl = URL.createObjectURL(blob);
         audioEl.src = blobUrl;
@@ -97,17 +91,10 @@
     const ready = audio.status === "ready";
     const want = audio.offset + pb.cur * DT; // song time for this frame
     const rate = pb.speed, vol = audio.muted ? 0 : audio.vol;
-    const seek = pb.seek, exporting = pb.exporting;
-    const run = pb.playing && !pose.on && !exporting;
+    const seek = pb.seek;
+    const run = pb.playing && !pose.on;
     if (!el || !ready) return;
-    if (gain) gain.gain.value = vol; else el.volume = vol;
-
-    // the frame-by-frame export owns the clock and gets its audio from the
-    // decoded buffer by array slice — the element stays out of it entirely
-    if (exporting) {
-      if (!el.paused) el.pause();
-      return;
-    }
+    el.volume = vol;
 
     const jumped = seek !== seenSeek;
     seenSeek = seek;
@@ -168,7 +155,7 @@
   $effect(() => {
     const el = audioEl;
     songClock.tick = () => {
-      if (!el || audio.status !== "ready" || pb.exporting) return null;
+      if (!el || audio.status !== "ready") return null;
       // Mid-seek the element is silent but its official playback position is
       // already AT the target, so the replay holds there for the fraction of
       // a second the seek takes. Letting it free-run instead would leave it
@@ -179,35 +166,6 @@
     };
     return () => { songClock.tick = null; };
   });
-
-  // The recording's audio: tap the <audio> element through WebAudio and fork
-  // it — through a gain node to the speakers (what you hear) and straight to
-  // a MediaStreamDestination (what gets recorded). Two things to know:
-  //   - createMediaElementSource REROUTES the element permanently, so the
-  //     graph is built once and the speaker branch must stay connected or
-  //     the viewer goes silent;
-  //   - the element's own volume is upstream of the tap, so leaving the
-  //     mute/volume control on it would bake a muted viewer into a silent
-  //     export. The level moves into `gain`, which only feeds the speakers.
-  // Built lazily from the export click, which is the user gesture an
-  // AudioContext needs to start unsuspended.
-  let actx = null, tap = null, gain = null;
-  function audioTap() {
-    if (!audioEl || audio.status !== "ready") return null;
-    if (!actx) {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return null;
-      actx = new AC();
-      const src = actx.createMediaElementSource(audioEl);
-      gain = actx.createGain();
-      tap = actx.createMediaStreamDestination();
-      src.connect(gain).connect(actx.destination);
-      src.connect(tap);
-      audioEl.volume = 1; // the level lives in `gain` from here on
-    }
-    actx.resume?.();
-    return tap;
-  }
 
   const audioLabel = $derived(
     audio.status === "ready" ? (audio.song || "song")
@@ -301,13 +259,6 @@
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
   }
 
-  // exported length so far, as m:ss — the export is scrubbed from t = 0,
-  // so this is how much of the replay the file will contain if stopped now
-  const mmss = (s) =>
-    `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-  const exportLabel = $derived(
-    `⏺ ${Math.round(pb.exportPct * 100)}% · ${mmss(pb.exportPct * lastTick() * DT)}`);
-
   const speedLabel = $derived(
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
 
@@ -334,122 +285,6 @@
     exitPlay();
   }
 
-  // ---- video export -------------------------------------------------------
-  // Two paths. The frame-by-frame one is the default: it renders exactly one
-  // frame per replay tick and stamps each with its own timestamp, so the file
-  // is 30 fps no matter how long a frame took to draw, and the song is copied
-  // out of the decoded audio by array slice rather than recorded off the
-  // speakers. On a machine that cannot render 30 fps live, the old real-time
-  // pass could only produce a stretched video with choppy audio — that is
-  // what MediaRecorder does with late frames and a stalling audio graph, and
-  // no amount of tuning changes it. The real-time pass stays as the fallback
-  // for browsers without WebCodecs.
-  // Score popups/labels are in-scene sprites, so both paths capture them.
-  function download(blob) {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = (pb.name || "replay") + ".webm";
-    a.click();
-    // give the click a turn to be handled before the URL goes away
-    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-  }
-
-  async function exportVideo() {
-    if (!pb.rep || pb.exporting) return;
-    const canvas = wrap && wrap.querySelector("canvas");
-    if (!canvas) return;
-    if (!CAN_EXPORT_EXACT) return exportRealtime(canvas);
-
-    pb.exporting = true;
-    pb.exportPct = 0;
-    pb.exportStop = false;
-    setPlaying(false);
-    const wasCur = pb.cur;
-    const mode = gfx.renderMode?.current;
-    try {
-      if (songData && !songBuf) songBuf = await decodeSong(songData);
-      // Output frames are decoupled from the replay's tick_hz ticks/s: frame i is
-      // at i/fps seconds, i.e. tick i*TPS/fps, which the viewer interpolates
-      // between logged ticks. So 60 fps genuinely smooths the motion instead
-      // of duplicating frames, and 24 subsamples it.
-      const fps = pb.fps;
-      const TPS = 1 / DT; // replay ticks per second
-      const frames = Math.floor((lastTick() / TPS) * fps) + 1;
-      const t0 = performance.now(); // synthetic frame clock, monotonic
-      // stop Threlte's own loop: from here the exporter owns the frame clock
-      gfx.renderMode?.set("manual");
-      const blob = await exportExact({
-        canvas,
-        frames,
-        fps,
-        song: songBuf,
-        songStart: audio.offset,
-        onProgress: (p) => { pb.exportPct = p; },
-        // 'stop & save': the exporter ends at the next frame and still
-        // finalizes a complete file of everything rendered so far
-        shouldStop: () => pb.exportStop,
-        renderFrame: (i) => {
-          pb.cur = Math.min(lastTick(), (i * TPS) / fps);
-          flushSync(); // derived pose + the $effects that refill GPU buffers
-          // advance() only sets Threlte's "this frame wants a render" flag —
-          // the render itself happens inside scheduler.run(), which is what
-          // its requestAnimationFrame loop calls. Calling only advance() here
-          // marked frames and drew none, so every captured frame was an
-          // unrendered (black) canvas. run() takes a timestamp; feeding it
-          // synthetic ones spaced 1/fps apart keeps task deltas deterministic
-          // instead of tied to how long the export actually takes.
-          gfx.advance();
-          gfx.scheduler.run(t0 + (i * 1000) / fps);
-        },
-      });
-      download(blob);
-    } catch (e) {
-      alert("export failed: " + (e?.message ?? e));
-    } finally {
-      if (mode) gfx.renderMode?.set(mode);
-      seekTo(wasCur); // put the (silent) element back where the view is
-      pb.exporting = false;
-      pb.exportPct = 0;
-      pb.exportStop = false;
-    }
-  }
-
-  // Fallback: one real-time playback pass through MediaRecorder.
-  function exportRealtime(canvas) {
-    if (!("MediaRecorder" in window)) return;
-    pb.exporting = true;
-    pb.exportStop = false;
-    // one stream: the canvas video plus the song, when the replay has one
-    const track = audioTap()?.stream.getAudioTracks()[0] ?? null;
-    const stream = new MediaStream([
-      ...canvas.captureStream(30).getVideoTracks(),
-      ...(track ? [track] : []),
-    ]);
-    const mime = [
-      track ? "video/webm;codecs=vp9,opus" : "video/webm;codecs=vp9",
-      track ? "video/webm;codecs=vp8,opus" : "video/webm",
-      "video/webm",
-    ].find((m) => MediaRecorder.isTypeSupported(m)) ?? "video/webm";
-    const rec = new MediaRecorder(stream, {
-      mimeType: mime,
-      videoBitsPerSecond: 3_000_000,
-      audioBitsPerSecond: 128_000,
-    });
-    const chunks = [];
-    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-    rec.onstop = () => {
-      download(new Blob(chunks, { type: "video/webm" }));
-      pb.exporting = false;
-      pb.exportStop = false;
-    };
-    seekTo(0);
-    setPlaying(true);
-    rec.start();
-    const poll = setInterval(() => { // playback auto-pauses at the end
-      if (!pb.playing || pb.exportStop) { clearInterval(poll); rec.stop(); }
-    }, 200);
-  }
-
 </script>
 
 <svelte:window
@@ -467,7 +302,7 @@
 <!-- the pose panel shares the top-left corner with the map card, so it
      starts below whichever of the two is showing -->
 <main style="--panel-top: {cardShown ? '150px' : '64px'}">
-  <div id="stage" bind:this={wrap}>
+  <div id="stage">
     <!-- Threlte defaults to AgX tone mapping, which rolls the highlights
          off and desaturates: it turns the toon ramp's three flat bands
          into a soft gradient and mutes the saber red/blue. A cel look
@@ -484,9 +319,10 @@
       (wasm), the rules the agent trains on
     </div>
     {:else if PICKER}
-    <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}>
+    <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}
+      title="open a replay .jsonl (or .jsonl.gz) — or drop one anywhere">
       {#if pb.rep}
-        {pb.name} — {configSummary(pb.rep)}
+        📂 open replay…
       {:else}
         drop a replay <code>.jsonl</code> (or <code>.jsonl.gz</code>) here, or click to choose
       {/if}
@@ -498,10 +334,8 @@
       bind:this={fileInput}
       onchange={(e) => onFiles(e.target.files)}
     />
-    {:else if pb.rep}
-    <!-- site build: the replay's title as plain text, no picker -->
-    <div id="title">{pb.name} — {configSummary(pb.rep)}</div>
     {/if}
+    <!-- site build: nothing up here — the map card (top-left) names the song -->
   </div>
 
   {#if !play.on && (urlLoad.stage || urlLoad.error || urlLoad.gate)}
@@ -604,31 +438,6 @@
       <button onclick={() => setSpeed(pb.speed / 2)}>−</button>
       <span>{speedLabel}</span>
       <button onclick={() => setSpeed(pb.speed * 2)}>+</button>
-      <select
-        bind:value={pb.fps}
-        disabled={pb.exporting}
-        title="export frame rate — the replay itself runs at its tick_hz (30 ticks/s unless its header says otherwise), so
-               above that the viewer interpolates between them"
-      >
-        {#each [24, 30, 60, 120] as f (f)}
-          <option value={f}>{f} fps</option>
-        {/each}
-      </select>
-      <button onclick={exportVideo} disabled={pb.exporting || !pb.rep}
-        title={CAN_EXPORT_EXACT
-          ? "renders frame by frame at 30 fps — not real time, so a slow "
-            + "machine still gets a clean file"
-          : "no WebCodecs here: falls back to a real-time capture"}>
-        {pb.exporting ? exportLabel : "⏺ export video"}
-      </button>
-      {#if pb.exporting}
-        <button class="stop" onclick={() => (pb.exportStop = true)}
-          disabled={pb.exportStop}
-          title="end the export here and save a complete file of everything
-                 rendered so far (the song is cut to match)">
-          {pb.exportStop ? "■ saving…" : "■ stop & save"}
-        </button>
-      {/if}
       {#if FLUX}
         <button onclick={enterPlay}
           title="play a Flux chart yourself in VR — the same judge the env uses">
@@ -728,12 +537,6 @@
     background: rgba(17, 19, 25, 0.72); backdrop-filter: blur(6px);
   }
   #drop.hover { border-color: #7aa2f7; color: #cfd3dc; }
-  /* site build: the replay's title in the same pill, as plain text */
-  #title {
-    border: 1.5px solid #2c313c; border-radius: 10px; padding: 8px 18px;
-    color: #9aa0ae; background: rgba(17, 19, 25, 0.72);
-    backdrop-filter: blur(6px); pointer-events: auto; cursor: auto;
-  }
   #bar {
     display: flex; gap: 10px; align-items: center; padding: 8px 14px;
     flex-wrap: wrap; justify-content: center; max-width: 94vw;
@@ -746,7 +549,6 @@
   button:hover { background: #2d3342; }
   button:disabled { opacity: 0.5; cursor: default; }
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
-  button.stop { border-color: #e06c75; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
   #snd { display: flex; gap: 6px; align-items: center; }
   #fp { display: flex; gap: 10px; align-items: center; color: #9aa0ae;

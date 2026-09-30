@@ -1,9 +1,10 @@
 // Headless-browser check of the SITE build (npm run build:site, deployed at
 // https://replays.flee.systems) on a served viewer — the hosted one or
 // `wrangler dev` in viz/replays-site:
-//   - a ?replay= load shows the replay's title as plain text and the map
-//     card, and there is no file-picker button / file input, no "play Flux",
-//     no pose button and no map-info toggle; 'p' opens no pose panel;
+//   - a ?replay= load shows the map card and NOTHING at the top of the page
+//     (no title line), the viewer knows the replay's name (state + the watch
+//     button), and there is no file-picker button / file input, no "play
+//     Flux", no pose button and no map-info toggle; 'p' opens no pose panel;
 //   - a Flux replay (header "game": "flux") is refused with a clear message
 //     and nothing renders.
 // Playback itself (real time, song) is test/urlload-browser.mjs's job.
@@ -42,24 +43,26 @@ try {
   page.on("pageerror", (e) => errors.push("pageerror: " + e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push("console: " + m.text()); });
 
-  // ---- an agent replay: title text, map card, no picker / Flux / pose -------
+  // ---- an agent replay: map card, nothing up top, no picker / Flux / pose ---
   await page.goto(url(path));
   await page.waitForSelector("#watch", { timeout: 120000 });
   const ui = await page.evaluate(() => {
-    const t = document.querySelector("#title");
     const buttons = [...document.querySelectorAll("button")].map((b) => b.textContent.trim());
     return {
-      title: t?.textContent.replace(/\s+/g, " ").trim() ?? null,
-      titleTag: t?.tagName ?? null,
-      cursor: t ? getComputedStyle(t).cursor : null,
+      name: window.__viewerState().name,
+      watch: document.querySelector("#watch")?.textContent.replace(/\s+/g, " ").trim(),
+      top: document.querySelector("#top")?.textContent.trim() ?? null,
+      topKids: document.querySelector("#top")?.children.length ?? null,
+      title: !!document.querySelector("#title"),
       drop: !!document.querySelector("#drop"),
       fileInputs: document.querySelectorAll("input[type=file]").length,
       buttons,
     };
   });
-  console.log(`title (${ui.titleTag}, cursor ${ui.cursor}): ${ui.title}`);
-  if (!ui.title) fail("no replay title shown");
-  if (ui.titleTag === "BUTTON" || ui.cursor === "pointer") fail("the title must be plain text");
+  console.log(`name (state): ${ui.name} · watch: ${ui.watch}`);
+  if (!ui.name) fail("the viewer state has no replay name");
+  if (!ui.watch?.includes(ui.name)) fail("the watch button does not name the replay");
+  if (ui.title || ui.top || ui.topKids) fail("the top of the page must be empty: " + JSON.stringify(ui.top));
   if (ui.drop || ui.fileInputs) fail("the site build still has the file picker");
   const bad = ui.buttons.filter((b) => /play Flux|pose|map info|choose/.test(b));
   if (bad.length) fail("unexpected buttons: " + bad.join(" | "));

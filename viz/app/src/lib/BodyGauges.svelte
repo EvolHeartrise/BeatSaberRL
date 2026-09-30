@@ -11,9 +11,8 @@
   // field, derived from the action for older replays).
   //
   // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
-  // screen-fixed under orbiting, show up in exported videos, and need
-  // no DOM/fonts (offline + export safe) — same rationale as the score
-  // popups. Left sprite: spine + L arm + L leg. Right sprite: R arm +
+  // screen-fixed under orbiting and need no DOM/fonts (offline safe) —
+  // same rationale as the score popups. Left sprite: spine + L arm + L leg. Right sprite: R arm +
   // R leg + forces.
   import { T, useThrelte } from "@threlte/core";
   import * as THREE from "three";

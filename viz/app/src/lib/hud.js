@@ -7,7 +7,7 @@
 // and UpdateBeat shows the last event at or before the playhead. This module
 // does the same over our replay's recorded events, as per-tick cumulative
 // arrays built once per replay. hudAt(rep, k) is O(1) and a pure function
-// of the tick, so scrubbing and the frame-by-frame export stay exact.
+// of the tick, so scrubbing stays exact.
 //
 // The rules are this project's own scoring walk, which is also the watch's:
 //  - multiplier 1/2/4/8, the bar fills in 2/4/8 hits, and the promoted

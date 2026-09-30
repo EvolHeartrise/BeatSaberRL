@@ -7,7 +7,7 @@
   import { T, useTask, useThrelte } from "@threlte/core";
   import { OrbitControls } from "@threlte/extras";
   import * as THREE from "three";
-  import { gfx, pb, play, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
+  import { pb, play, pose, songClock, lastTick, setPlaying } from "./state.svelte.js";
   import { followClock } from "./sync.js";
   import {
     BLOCK, DT, F_HEAD, GX0, GX1, GY0, GY1, HB, LANE_X, CELL, REACH_Z, reachZ,
@@ -29,28 +29,23 @@
   // ---- an OPAQUE stage ----------------------------------------------------
   // Threlte builds its renderer with alpha: true, and nothing here had ever
   // set a scene background, so the canvas was genuinely transparent — the
-  // dark stage on screen was the #stage CSS behind it. Invisible in the
-  // browser and fatal for `export video`, which records the canvas itself
-  // and so produced clips with a transparent (black-keyed) background.
-  // Painting the same colour INTO the scene makes those pixels opaque and
-  // changes nothing on screen: a Color background clears with alpha 1, and
-  // three converts it back to the output colour space, so #0b0d11 in the
-  // CSS is #0b0d11 in the framebuffer.
+  // dark stage on screen was the #stage CSS behind it, and anything that
+  // read the canvas itself (a screenshot of just the canvas, a capture)
+  // got a transparent background. Painting the same colour INTO the scene
+  // makes those pixels opaque and changes nothing on screen: a Color
+  // background clears with alpha 1, and three converts it back to the output
+  // colour space, so #0b0d11 in the CSS is #0b0d11 in the framebuffer.
   const STAGE_BG = "#0b0d11"; // keep in step with #stage in App.svelte
   const ctx = useThrelte();
   ctx.scene.background = new THREE.Color(STAGE_BG);
-  // hand the frame loop to the DOM shell so `export video` can step it
-  gfx.advance = ctx.advance;
-  gfx.renderMode = ctx.renderMode;
-  gfx.scheduler = ctx.scheduler;
 
   // ---- playback clock (1/DT = the replay's tick_hz ticks/s) -----------------
   // The SONG is the master clock whenever one is sounding: this eases pb.cur
   // onto it instead of letting the two free-run apart and then yanking the
   // audio element back into line, which is what used to chop the sound
-  // (lib/sync.js). With no song — or while it is paused, seeking, buffering,
-  // or during a video export — followClock falls back to the frame delta,
-  // i.e. exactly the old behaviour.
+  // (lib/sync.js). With no song — or while it is paused, seeking or
+  // buffering — followClock falls back to the frame delta, i.e. exactly the
+  // old behaviour.
   useTask((delta) => {
     if (!pb.playing || !pb.rep) return;
     pb.cur = followClock({
@@ -225,8 +220,7 @@
      position every frame (damping runs update() whether or not input is
      enabled), and leaving it untouched also means toggling back lands
      exactly where you were. The view is a pure function of the tick, so
-     scrubbing and the frame-by-frame export stay exact (the export
-     records whichever camera is the default). The gauges follow the
+     scrubbing stays exact. The gauges follow the
      active camera; the head sphere is hidden while on (Body showHead).
      Mounted only while on: unmounting hands the default back to the
      orbit camera. Live XR play is excluded — the headset owns the camera. -->

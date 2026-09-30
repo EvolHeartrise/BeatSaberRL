@@ -41,8 +41,8 @@ try {
   await page.waitForFunction(
     () => window.__viewerState?.().loaded,
     { timeout: 10000 });
-  const top = await page.$eval("#drop", (el) => el.textContent);
-  if (!top.includes("FLUX")) throw new Error("summary is not the Flux one: " + top);
+  const kind = await page.evaluate(() => window.__viewerState());
+  if (!kind.flux) throw new Error("not opened as a Flux replay: " + JSON.stringify(kind));
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
     .find((b) => b.textContent.includes("pause"))?.click());
   const scrub = (tick) => page.evaluate((tick) => {

@@ -54,8 +54,7 @@ function upsample() {
 const rep60 = R.parseReplay(upsample());
 assert.equal(rep60.tickHz, 60);
 assert.equal(rep60.ticks.length, 2 * rep30.ticks.length);
-assert.match(R.configSummary(rep60), /60 Hz/);
-assert.doesNotMatch(R.configSummary(rep30), /Hz/, "30 Hz stays unsaid");
+assert.equal(R.tickHzOf(rep60), 60);
 
 // ---- DT follows the active replay -------------------------------------------
 R.setTickRate(R.tickHzOf(rep60));
