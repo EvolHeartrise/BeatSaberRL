@@ -465,8 +465,11 @@ def build_parser():
                         "projection per --fp16-accum; 'up16' = both fp16-"
                         "accumulated (experimental). Near-tie numerics vs "
                         "the unfused path; rollout and update stay bitwise. "
-                        "Stamped in the checkpoint arch. Default: 'off' "
-                        "(a --resume keeps its checkpoint's mode)")
+                        "Stamped in the checkpoint arch. Default: 'on' for "
+                        "fresh runs and --init-from since 2026-09-30 (pod "
+                        "bench: rollout forward 51.7 -> 45.9 ms at N 32768, "
+                        "r1 unchanged); a --resume keeps its checkpoint's "
+                        "mode (absent = 'off')")
     p.add_argument("--fp16-scale", type=float, default=131072.0,
                    help="initial loss scale for --fp16 (2^17 from the "
                         "2026-07-25 grad probe: max|g| 2.2e-2, 26%% of "
@@ -1470,8 +1473,11 @@ def main():
         else:
             args.fp16_accum = "all"
     if args.fused_ffn is None:
+        # like --fp16-accum: a resume never switches numerics mid-run
+        # (absent = the pre-I13 unfused path); fresh runs and --init-from
+        # take the default, 'on' since 2026-09-30
         args.fused_ffn = (resume_ckpt.get("arch", {}).get("fused_ffn", "off")
-                          if resume_ckpt is not None else "off")
+                          if resume_ckpt is not None else "on")
     args_snapshot = {k: v for k, v in sorted(vars(args).items())}
     # the body --tau-center resolved to, so a resume inherits the body
     # itself, not a name whose value tau_fit moves (review 2026-09-30)
