@@ -2803,6 +2803,24 @@ impl VecBeatSim {
         (s.wrev[0], s.wrev[1], s.tick)
     }
 
+    /// Bench termination record for env i, THIS episode (review B09,
+    /// 2026-09-30): (wall ENTRIES — the §12b combo-breaking edges, the
+    /// wall_enters counter; termination flags). Flags, valid once the
+    /// env is done (the B4 latch freezes the terminal tick's body
+    /// state): 1 = FALL (root below FALL_ROOT_Y), 2 = TILT, 4 = the
+    /// §23 root-envelope escape (C backstop), 8 = the max_steps cap;
+    /// 0 = the level itself ended (notes drained / tail). The CUDA
+    /// bench_rec cols 17/18 mirror this exactly. Same lifecycle as
+    /// flail(). ADDITIVE getter.
+    fn term(&self, i: usize) -> (u32, u32) {
+        let s = &self.sims[i];
+        let flags = (s.falls > 0) as u32
+            | ((s.tilts > 0) as u32) << 1
+            | (s.body.escaped as u32) << 2
+            | ((s.tick >= s.max_steps) as u32) << 3;
+        (s.wall_enters, flags)
+    }
+
     /// f64 Cholesky pivot-floor engagements summed over all envs since
     /// the last pop (SPEC-v10 Divergences §22) — the CUDA backend's
     /// pop_pd_hits mirror. Returns the count and zeroes the per-env

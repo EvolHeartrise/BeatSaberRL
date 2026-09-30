@@ -3906,7 +3906,8 @@ struct Sim {
   // (cand < 0: queue exhausted — the combo_walk early-out above keeps it
   // idle at ~zero cost). Row: [good, bad, miss, score, bombs, pre, acc,
   // post, flail_rad(2 hands), flail_ticks, cw_score, cw_maxc, cw_breaks,
-  // chart_idx, wrev_L, wrev_R, ticks].
+  // chart_idx, wrev_L, wrev_R, ticks, wall_enters, term_flags] + col 19,
+  // the live wall-entry accumulator (kernel scratch, never host-facing).
   bool bench_refill;
   T* __restrict__ bench_rec;
   uint8_t* __restrict__ bench_flag;
@@ -4186,7 +4187,23 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
 // score += pts x mult; follow-through points commit at the pinned
 // multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
 // on the event bus before multiplying — mirrored with the (float) cast.
-constexpr int BENCH_REC = 17;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
+constexpr int BENCH_REC = 20;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
+// review B09 (2026-09-30): + [wall_enters, term_flags] (cols 17/18, the
+// lib.rs VecBeatSim::term mirror) and col 19 = this level's running
+// wall-ENTRY count (the lib.rs wall_enters counter). The accumulator
+// lives in the slot's own bench_rec row instead of a new (N) tensor so
+// the kernel argument list is untouched: bumped at the two entry sites,
+// copied to col 17 at done, zeroed by reset_env. The host reads cols
+// 0..BENCH_COLS-1 = 0..18 only (cuda_env.BENCH_COLS).
+constexpr int BENCH_WALL_ACC = 19;
+// term_flags bits (lib.rs VecBeatSim::term): 0 = the level itself ended
+constexpr int TERM_FELL = 1, TERM_TILT = 2, TERM_ENVELOPE = 4,
+              TERM_TICKCAP = 8;
+
+template <typename T>
+__device__ __forceinline__ void bench_wall_enter(const Sim<T>& P, int e) {
+  if (P.bench_refill) P.bench_rec[(size_t)e * BENCH_REC + BENCH_WALL_ACC] += T(1);
+}
 
 template <typename T>
 __device__ __forceinline__ void cw_break(const Sim<T>& P, int e) {
@@ -4390,6 +4407,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
   P.in_wall_prev[e] = false;
+  if (P.bench_refill) P.bench_rec[(size_t)e * BENCH_REC + BENCH_WALL_ACC] = T(0);
   // arm-after-first-plant (user 2026-08-20): start UNARMED so a foot
   // that begins the episode in the air (start-pose jitter) is never
   // charged — the lift edge only arms once the foot has actually been
@@ -5490,6 +5508,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           // one fee per wall object, no lingering in-wall ticks.
           reward += T(WALL_PEN);
           cw_break(P, e);
+          bench_wall_enter(P, e);
           P.wall_passed[e * P.W + wi] = true;
           P.walls_in[e] += 1;  // counts entries in despawn mode
         } else {
@@ -5501,6 +5520,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       if (!P.in_wall_prev[e]) {
         reward += T(WALL_PEN);
         cw_break(P, e);
+        bench_wall_enter(P, e);
       }
       P.walls_in[e] += 1;
     }
@@ -5632,6 +5652,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     r[14] = T(P.wrev[e * 2]);        // wrist-bend reversals L / R this
     r[15] = T(P.wrev[e * 2 + 1]);    // level + the level's ticks
     r[16] = T(tick_new);
+    r[17] = r[BENCH_WALL_ACC];       // wall entries this level (B09)
+    r[18] = T((fell ? TERM_FELL : 0) | (tilted ? TERM_TILT : 0)
+              | (d.env_bad ? TERM_ENVELOPE : 0)
+              | (tick_new >= P.max_steps ? TERM_TICKCAP : 0));
     P.bench_flag[e] = 1;
     P.flail_rad[e * 2] = T(0);
     P.flail_rad[e * 2 + 1] = T(0);
@@ -5745,7 +5769,7 @@ enum {
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
   TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,28: v47 cols 22..28), flag (N) — 2026-09-16/19
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
-  TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
+  TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,BENCH_REC) + flag (N) — 2026-09-16
   TPALMV,   // Flux palm velocity (N, 2, 3)
   TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
