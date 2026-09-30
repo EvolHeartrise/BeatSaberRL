@@ -2848,6 +2848,18 @@ impl VecBeatSim {
         }
     }
 
+    /// env v46: set env i's 16 per-axis torque-limit scales — the
+    /// per-episode --tau-rand draw of the Python wrapper (vec_env.py
+    /// draws center * (1 + r U(-1,1)) at each env reset, as the CUDA
+    /// kernel does). Like set_tau_scale, untouched by set_chart/reset;
+    /// the obs tau lanes read it on the next obs.
+    fn set_tau_scale_env(&mut self, i: usize, s: Vec<Real>) {
+        assert_eq!(s.len(), TAU_FEAT, "tau scale must have 16 axis values");
+        let mut a = [1.0 as Real; TAU_FEAT];
+        a.copy_from_slice(&s);
+        self.sims[i].body.set_tau_axis(&a);
+    }
+
     /// Torque telemetry (env v43) summed over all envs since the last
     /// pop: (Σ total, Σ spine, Σ arms, Σ legs, env-ticks) of applied
     /// |τ| in N·m. CUDA `pop_torque` mirror.

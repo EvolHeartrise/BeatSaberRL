@@ -773,10 +773,13 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 + env config (`--colors --cols --rows --chart-len --note-speed-min
 --note-speed-max --note-prob --extra-prob --dot-prob --bomb-prob`).
 Checkpoints since 2026-07-24 carry Adam state + the LR-schedule anchors:
-`--resume <ckpt>` continues a stopped run EXACTLY (weights, optimizer
-moments, schedule position — lr/lr-final/lr-decay/num_updates come from
-the checkpoint, CLI values ignored; the env/chart stream restarts
-fresh, so only the optimization state is exact). `--init-from` remains
+`--resume <ckpt>` continues a stopped run (weights, optimizer
+moments, schedule position — lr/lr-final/num_updates come from the
+checkpoint; since 2026-09-30 also the torch/CUDA/numpy/python and
+CUDA-env RNG streams, and every flag not typed on the CLI is inherited
+from the checkpoint's args, typed differences printed as a diff and
+typed arch changes refused; the env/chart state restarts fresh, so only
+the optimization state and random streams are exact). `--init-from` remains
 the weights-only warm-start with a fresh schedule; older checkpoints
 without optimizer state are --init-from only. **`--cuda-graphs` REMOVED
 (2026-07-25)**: capture existed to hide the 12-head/12-Categorical
