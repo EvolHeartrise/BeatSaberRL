@@ -47,6 +47,9 @@ import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
 from beat_arena_env.constants import parse_tau_scale
+# the ranked pool's recipe (lead gap, mirror) lives with the pool: both
+# are in its npz cache key, so prefetch_maps and this trainer must agree
+from beat_arena_env.ranked_pool import RECIPE_LEAD_S, RECIPE_MIRROR
 from fp16_linear import bump_weights_version
 from metrics_log import dumps_record, update_record
 from policy import (hl_loss, HEAD_GROUPS, HEAD_SIZES, NotePolicy, OBS_DIM,
@@ -182,7 +185,7 @@ def format_kl_line(update, klf, kll, cff, cfl, gnorm, clipc, ent_head,
             + ("" if kl_stop is None else f"  STOP@mb{kl_stop}"))
 
 
-def parse_args():
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # DEFAULTS = THE PRODUCTION RECIPE (2026-09-22, user): a bare
     # `train_batch.py --run-dir X` launches the v58 trunk recipe
@@ -368,11 +371,25 @@ def parse_args():
                    help="warm-start WEIGHTS only; fresh optimizer + schedule")
     p.add_argument("--resume", type=str, default=None,
                    help="EXACT resume from a checkpoint of this trainer: "
-                        "restores weights, Adam state, and the original LR "
-                        "schedule position (lr/lr-final/lr-decay/total-steps "
-                        "come from the checkpoint, CLI values ignored). The "
-                        "env/chart stream restarts fresh — only the "
-                        "optimization state is exact.")
+                        "restores weights, optimizer state, value norm, "
+                        "the RNG streams and the original schedule "
+                        "position (lr/ent/warmup come from the checkpoint, "
+                        "CLI values ignored; a leaf's --lr-final / "
+                        "--ent-final are its own). Every other flag NOT "
+                        "given on this command line inherits the "
+                        "checkpoint's recorded value (args); given flags "
+                        "that differ are printed as a diff list. Never "
+                        "inherited: --run-dir, --total-steps, --time-cap, "
+                        "--ckpt-every, --cooldown-updates, --ent-final, "
+                        "--device, --env, --bench. The env/chart stream "
+                        "restarts fresh — only the optimization state is "
+                        "exact.")
+    p.add_argument("--ignore-arch-flags", action="store_true",
+                   help="--resume: proceed when an explicitly given arch "
+                        "flag (--embed/--n-blocks/--hl-bins/...) differs "
+                        "from the checkpoint's; the checkpoint's arch "
+                        "wins either way (refused by default so the flag "
+                        "is not silently dropped)")
     p.add_argument("--bench", action="store_true",
                    help="short run, prints steps/s split (rollout vs update)")
     p.add_argument("--device", type=str, default=None,
@@ -544,14 +561,14 @@ def parse_args():
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
-    p.add_argument("--lead-s", type=float, default=0.5,
+    p.add_argument("--lead-s", type=float, default=RECIPE_LEAD_S,
                    help="ranked-maps front gap (s) — notes before it are "
                         "dropped, walls clipped to it; the earliest "
                         "first note of an episode (env v16, contact spec "
                         "§11: shorter keeps note data in the mix when "
                         "falls spike, damping survival-drift)")
     p.add_argument("--mirror-augment", action=argparse.BooleanOptionalAction,
-                   default=True,
+                   default=RECIPE_MIRROR,
                    help="double the ranked-maps pool with left-right "
                         "mirrored copies of every level (handedness-"
                         "bias regularizer, 2026-08-14; --chart-pool "
@@ -622,22 +639,33 @@ def parse_args():
                         "AREAS), rent applies to the excess. 0 = the v21 "
                         "pure-linear behavior")
     p.add_argument("--foot-shape-coef", type=float, default=0.05,
-                   help="env v22: potential-based delta shaping on the "
-                        "total hinged foot deviation — reward/punish each "
-                        "tick's CHANGE in deviation (round trips net "
-                        "zero; sharpens credit assignment; provably "
-                        "optimum-preserving). 0 = off")
+                   help="env v22: delta shaping on the total hinged foot "
+                        "deviation — reward/punish each tick's CHANGE in "
+                        "deviation, coef * (prev - now) (round trips net "
+                        "zero; sharpens credit assignment). Potential-"
+                        "STYLE, not the Ng et al. form, so NOT guaranteed "
+                        "optimum-preserving: the difference is undiscounted "
+                        "(no gamma, while PPO discounts at --gamma), the "
+                        "potential starts each episode at 0 rather than at "
+                        "the start state's, and is not zeroed at "
+                        "termination — an episode's shaping sums to "
+                        "-coef * (deviation at its end), a term that "
+                        "depends on where (and how, e.g. a fall) the "
+                        "episode ends. 0 = off")
     p.add_argument("--limit-coef", type=float, default=5e-3,
                    help="env v34: per-tick price on the joint-limit-row "
-                        "impulse (N*m*s) the POSTURAL stops carry (spine "
-                        "+ legs; arms exempt) — resting a pose on its "
-                        "stops pays its gravity moment, an active hold "
-                        "does not. 0 = off (bitwise pre-v34 rewards)")
+                        "impulse (N*m*s) the stops carry — the POSTURAL "
+                        "stops (spine + legs), plus the 14 arm joints "
+                        "under --limit-arms (ON by default, so the "
+                        "default prices the whole body). Resting a pose "
+                        "on its stops pays its gravity moment, an active "
+                        "hold does not. 0 = off (bitwise pre-v34 rewards)")
     p.add_argument("--limit-arms", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="env v35: widen --limit-coef's scope to the 14 "
-                        "arm joints as well (all-body pricing; default "
-                        "postural-only keeps whip stop-slams free)")
+                        "arm joints as well (all-body pricing). DEFAULT "
+                        "ON; --no-limit-arms restores the v34 postural-"
+                        "only scope, which keeps whip stop-slams free")
     p.add_argument("--wall-despawn", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="env v37: walls despawn on the charged hit "
@@ -677,7 +705,11 @@ def parse_args():
                         "joints sampled U(-s, s) (knees |U|), clamped to "
                         "limits, root dropped so no sole corner clips the "
                         "ground. Teaches knee bend / balance variety")
-    return p.parse_args()
+    return p
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 # Newton-Schulz coefficient schedule, one (a, b, c) per step, applied as
@@ -870,8 +902,404 @@ def cpu_opt_state(opt):
     return s
 
 
+# --resume flag resolution (2026-09-30, review bug 1b). Until today a
+# resume took only lr/ent/schedule/z/arch from the checkpoint and every
+# other knob from the CLI DEFAULTS — i.e. from whatever the recipe was
+# on the day of the resume, not the day of the trunk: gamma, lambda,
+# clip, N/T, the reward coefficients all silently switched at the
+# branch point (cut_leaf.sh still passed the v16-era N 16384 / T 8 /
+# lambda 0.98 by hand to paper over it). Now a flag the user did NOT
+# type inherits the checkpoint's recorded value; a typed flag wins and,
+# if it differs, is printed in the diff list. Legit leaf departures
+# (--no-wall-despawn, --tau-rand, --ent-final, ...) keep working — they
+# are simply typed.
+#
+# never inherited: where/how long/which host this launch runs, plus the
+# leaf mode knobs (--ent-final is the LEAF's target; the checkpoint's
+# value is the trunk's anneal FLOOR, which the schedule already carries
+# as ent_floor)
+RESUME_NEVER_INHERIT = frozenset({
+    "run_dir", "resume", "init_from", "total_steps", "time_cap",
+    "ckpt_every", "cooldown_updates", "ent_final", "bench", "device",
+    "env", "ignore_arch_flags"})
+# schedule state: from ckpt["schedule"], as before; a typed value that
+# differs is IGNORED (loudly) — except a leaf's own --lr-final floor
+RESUME_SCHEDULE = ("lr", "lr_final", "ent_coef", "ent_tau", "warmup_updates")
+# the checkpoint's arch always wins (load_policy); a typed value that
+# differs would be silently dropped, so it is refused unless
+# --ignore-arch-flags. --gears / --game / --z-asinh have their own hard
+# guards downstream (n_gears check, load_policy, the z cross-check).
+RESUME_ARCH = frozenset({
+    "embed", "trunk_dim", "n_blocks", "n_heads", "ffn_mult",
+    "trunk_hidden", "note_geo", "hl_bins", "hl_vmax", "hl_sigma"})
+# resolved by their own arch-first inheritance in main()
+RESUME_OWN_GUARD = frozenset({"z_asinh"})
+
+
+def explicit_dests(argv):
+    """The argparse dests the user actually typed on `argv`: a re-parse
+    with every default SUPPRESSed leaves only the given flags in the
+    namespace (abbreviations and --no-X forms included, since it is the
+    same parser)."""
+    p = build_parser()
+    for a in p._actions:
+        if a.dest != "help":
+            a.default = argparse.SUPPRESS
+    return set(vars(p.parse_args(argv)))
+
+
+def resolve_resume_args(args, explicit, ckpt_args, sched, leaf):
+    """Apply --resume inheritance to `args` IN PLACE. Pure host logic
+    (no torch), unit-tested in tests/test_resume.py.
+
+    ckpt_args = ckpt["args"] (the resolved snapshot the run recorded),
+    sched = ckpt["schedule"], leaf = --cooldown-updates > 0. Returns a
+    report dict of (dest, value, checkpoint value) lists:
+      inherited — untyped flags whose CLI default differed (now = ckpt)
+      diffs     — typed flags that differ from the checkpoint (kept)
+      ignored   — typed schedule flags that differ (ckpt value used)
+      arch      — typed arch flags that differ (the caller refuses)
+      missing   — dests the checkpoint's snapshot predates (CLI kept)"""
+    rep = {k: [] for k in ("inherited", "diffs", "ignored", "arch",
+                           "missing")}
+    # the schedule block's own fallbacks, unchanged from before
+    sched_v = {"lr": sched.get("lr"), "lr_final": sched.get("lr_final"),
+               "ent_coef": sched.get("ent_coef", args.ent_coef),
+               "ent_tau": sched.get("ent_tau", 0),
+               "warmup_updates": sched.get("warmup_updates",
+                                           args.warmup_updates)}
+    for dest in sorted(vars(args)):
+        mine = getattr(args, dest)
+        typed = dest in explicit
+        if dest in RESUME_NEVER_INHERIT or dest in RESUME_OWN_GUARD:
+            continue
+        if dest in RESUME_SCHEDULE:
+            ck = sched_v[dest]
+            if ck is None:
+                continue
+            if typed and dest == "lr_final" and leaf:
+                if mine != ck:
+                    rep["diffs"].append((dest, mine, ck))
+                continue
+            if typed and mine != ck:
+                rep["ignored"].append((dest, mine, ck))
+            setattr(args, dest, ck)
+            continue
+        if dest not in ckpt_args:
+            rep["missing"].append((dest, mine, None))
+            continue
+        ck = ckpt_args[dest]
+        if dest == "tau_center" and not typed and "tau_center_body" in ckpt_args:
+            # "default" is a NAME for TAU_BODY_DEFAULT, which tau_fit
+            # moves between trunks: inherit the body the checkpoint
+            # actually played (its resolved 16 floats), not the name
+            body = [float(x) for x in ckpt_args["tau_center_body"]]
+            if parse_tau_scale(mine) != body:
+                rep["inherited"].append((dest, mine, "resolved body"))
+            setattr(args, dest, ",".join(repr(x) for x in body))
+            continue
+        if typed:
+            if mine != ck:
+                rep["arch" if dest in RESUME_ARCH else "diffs"].append(
+                    (dest, mine, ck))
+        elif mine != ck:
+            rep["inherited"].append((dest, mine, ck))
+            setattr(args, dest, ck)
+    return rep
+
+
+def flag_name(dest):
+    return "--" + dest.replace("_", "-")
+
+
+# RNG streams in the checkpoint (2026-09-30, review bug 1a): the
+# trainer reseeds from --seed at every launch, so before this an
+# extension replayed update 0's sampling / shuffle stream from its
+# branch point. Stored as tensors + plain ints so torch.load(...,
+# weights_only=True) reads them back (no numpy objects in the pickle).
+def rng_state(venv=None):
+    import random
+    np_s = np.random.get_state()
+    st = {"torch": torch.get_rng_state(),
+          "numpy": {"key": torch.from_numpy(np_s[1].astype(np.int64)),
+                    "pos": int(np_s[2]), "has_gauss": int(np_s[3]),
+                    "cached": float(np_s[4])},
+          "python": [int(random.getstate()[0]),
+                     list(random.getstate()[1])]}
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        st["cuda"] = torch.cuda.get_rng_state_all()
+    gen = getattr(venv, "_gen", None)   # the CUDA env's own generator
+    if isinstance(gen, torch.Generator):
+        st["env_gen"] = gen.get_state()
+    return st
+
+
+def restore_rng(st, venv=None, what=("torch", "cuda", "numpy", "python")):
+    """Inverse of rng_state for the streams in `what` ("env_gen" is
+    restored separately, before the env's first reset). Returns the
+    names restored."""
+    import random
+    done = []
+    if "torch" in what and "torch" in st:
+        torch.set_rng_state(st["torch"])
+        done.append("torch")
+    if "cuda" in what and "cuda" in st and torch.cuda.is_available():
+        cs = st["cuda"]
+        if len(cs) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cs)
+        else:
+            torch.cuda.set_rng_state(cs[0])
+        done.append("cuda")
+    if "numpy" in what and "numpy" in st:
+        n = st["numpy"]
+        np.random.set_state(("MT19937", n["key"].numpy().astype(np.uint32),
+                             n["pos"], n["has_gauss"], n["cached"]))
+        done.append("numpy")
+    if "python" in what and "python" in st:
+        v, key = st["python"]
+        random.setstate((v, tuple(key), None))
+        done.append("python")
+    if "env_gen" in what and "env_gen" in st:
+        gen = getattr(venv, "_gen", None)
+        if isinstance(gen, torch.Generator):
+            gen.set_state(st["env_gen"])
+            done.append("env_gen")
+    return done
+
+
+def value_loss(policy, ret, ret_mu, ret_sig):
+    """THE critic loss, unweighted (callers multiply by --vf-coef): the
+    HL-Gauss cross-entropy of the last grad-enabled forward's value
+    logits against the NORMALIZED return (T1: the critic learns
+    (ret - mu) / sig). One function for the minibatch loss and the
+    [diag] probe so the two can never drift apart again (review bug 3:
+    the diag differentiated a 0.5*MSE on the HL expectation, a loss
+    nothing trains)."""
+    return hl_loss(policy._value_logits, (ret - ret_mu) / ret_sig,
+                   policy.value_centers, policy.value_sigma)
+
+
+def diag_index(batch, dn, seed=0x5EED):
+    """Fixed row index for the [diag] minibatch over the FLAT T x N
+    buffer (row = t*N + n). `f_obs[:dn]` was t=0 of envs 0..dn-1 only —
+    one tick per env, and at a resume every env sits at an episode
+    start. A seeded permutation spans all ticks and envs, is the same
+    rows every diag of a process, and draws from its OWN generator, so
+    the training RNG stream is untouched. Sorted for gather locality."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randperm(batch, generator=g)[:dn].sort().values
+
+
+# ONE reward/body kwarg set for every env backend (2026-09-30). The five
+# constructor calls in main() each spelled out their own list and
+# drifted: procedural --env cuda never passed limit_coef / limit_arms /
+# wall_despawn / tau_rand / tau_center, and --env rust could not take
+# them (BeatVecEnv lacked the args), so every non-ranked run silently
+# trained without the limit-rest price at the nominal body while the
+# banner still announced --tau-rand. A backend that cannot simulate a
+# term now says so (check_unsupported) instead of dropping it.
+def env_kwargs(args):
+    """Reward + body terms every backend must honor."""
+    return dict(gears=args.gears, fall_const=args.fall_pen,
+                foot_z_coef=args.foot_z_coef, foot_x_coef=args.foot_x_coef,
+                foot_hinge_r=args.foot_hinge_r,
+                foot_shape_coef=args.foot_shape_coef,
+                energy_coef=args.energy_coef,
+                limit_coef=args.limit_coef, limit_arms=args.limit_arms,
+                wall_despawn=args.wall_despawn,
+                self_contact_coef=args.self_contact_coef,
+                tau_rand=args.tau_rand,
+                tau_center=parse_tau_scale(args.tau_center))
+
+
+# kernel-side episode-start / perturbation terms (help texts: "CUDA env
+# only"); the Rust sim resets deterministically and never kicks
+CUDA_ONLY_TERMS = ("push_prob", "push_vmax", "start_jitter",
+                   "start_pose_jitter", "crouch_start_prob")
+
+
+def cuda_env_kwargs(args, device):
+    return dict(push_prob=args.push_prob, push_vmax=args.push_vmax,
+                start_jitter=args.start_jitter,
+                start_pose_jitter=args.start_pose_jitter,
+                crouch_start_prob=args.crouch_start_prob,
+                z_asinh=args.z_asinh, env_order=True, device=device)
+
+
+def check_unsupported(args, names, backend):
+    """Terms `backend` cannot simulate: off (0 / False) is trivially
+    honored; the recipe DEFAULT gets a loud notice (these were always
+    documented CUDA-only, and a CPU smoke must not need a dozen --X 0
+    flags); any other value is refused — it was asked for and would be
+    dropped."""
+    dflt = vars(parse_args([]))
+    loud, bad = [], []
+    for n in names:
+        v = getattr(args, n)
+        if not v:
+            continue
+        (loud if v == dflt[n] else bad).append(f"{flag_name(n)} {v!r}")
+    if bad:
+        raise SystemExit(
+            f"{backend} cannot simulate {', '.join(bad)} — pass 0 / the "
+            f"--no- form, or train on --env cuda")
+    if loud:
+        print(f"!!! {backend}: NOT simulated (recipe defaults of "
+              f"CUDA-only terms): {'  '.join(loud)} !!!", flush=True)
+
+
+def make_env(args, N, device):
+    """Build the training vec-env for the resolved args (the ranked /
+    flux / procedural CUDA env, or the Rust twins)."""
+    kw = env_kwargs(args)
+    gen = dict(cols=tuple(args.cols), rows=tuple(args.rows),
+               chart_len_s=args.chart_len,
+               note_speed_min=args.note_speed_min,
+               note_speed_max=args.note_speed_max)
+    if args.env == "cuda":
+        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
+        ckw = cuda_env_kwargs(args, device)
+        if args.ranked_maps:
+            from beat_arena_env.ranked_pool import load_ranked_pool
+            from beat_arena_env.ranked_pool import pool_max_steps
+            pool = load_ranked_pool(sample=args.chart_pool, seed=args.seed,
+                                    device=device, lead_s=args.lead_s,
+                                    mirror=args.mirror_augment)
+            # whole-level episodes (the only mode since 2026-09-16): the
+            # episode limit comes from the longest level in the pool
+            pool_steps = pool_max_steps(pool)
+            print(f"[ranked-pool] WHOLE-LEVEL episodes: max_steps "
+                  f"{pool_steps} ({pool_steps / 30:.0f} s incl. tail + "
+                  f"margin), {int(pool['n_notes'].shape[0])} levels in "
+                  f"the pool", flush=True)
+            return VecCls(N, pool=pool, max_steps=pool_steps,
+                          ep_stats=args.ep_stats, seed=args.seed,
+                          **kw, **ckw)
+        if args.game == "flux":
+            return VecCls(N, game="flux", circle_prob=args.circle_prob,
+                          bar_prob=args.bar_prob, seed=args.seed,
+                          chart_pool=args.chart_pool, **gen, **kw, **ckw)
+        return VecCls(N, note_prob=args.note_prob,
+                      extra_prob=args.extra_prob, dot_prob=args.dot_prob,
+                      bomb_prob=args.bomb_prob, seed=args.seed,
+                      chart_pool=args.chart_pool, **gen, **kw, **ckw)
+    check_unsupported(args, CUDA_ONLY_TERMS, "--env rust")
+    if args.game == "flux":
+        # FluxVecEnv (flux_env.py) has no limit / wall / tau-draw args
+        # yet although its VecBeatSim does; a fixed body goes in through
+        # its set_tau_scale
+        from beat_arena_env.flux_env import FluxVecEnv
+        check_unsupported(args, ("limit_coef", "limit_arms",
+                                 "wall_despawn", "tau_rand"),
+                          "--env rust --game flux")
+        fkw = {k: v for k, v in kw.items()
+               if k not in ("limit_coef", "limit_arms", "wall_despawn",
+                            "tau_rand", "tau_center")}
+        venv = FluxVecEnv(N, circle_prob=args.circle_prob,
+                          bar_prob=args.bar_prob, seed=args.seed,
+                          **gen, **fkw)
+        venv.set_tau_scale(kw["tau_center"])
+        return venv
+    return BeatVecEnv(N, note_prob=args.note_prob,
+                      extra_prob=args.extra_prob, dot_prob=args.dot_prob,
+                      bomb_prob=args.bomb_prob, seed=args.seed,
+                      **gen, **kw)
+
+
 def main():
     args = parse_args()
+    # --resume: load FIRST and resolve the flags before anything below
+    # derives from them (the flux/speed defaults, CLIP, --bench's step
+    # count, the run dir). See resolve_resume_args.
+    resume_ckpt = None
+    resume_rep = None
+    explicit = explicit_dests(sys.argv[1:])
+    if args.resume:
+        assert not args.init_from, "--resume and --init-from are exclusive"
+        resume_ckpt = torch.load(args.resume, map_location="cpu",
+                                 weights_only=True)
+        if "optimizer" not in resume_ckpt:
+            raise SystemExit(
+                "--resume needs a checkpoint carrying optimizer + schedule "
+                "state (saved by this trainer version); older checkpoints "
+                "can only be --init-from warm-starts")
+        sched = resume_ckpt["schedule"]
+        if sched.get("lr_decay", "wsd") != "wsd":
+            raise SystemExit(
+                f"--resume: pre-WSD checkpoint (schedule "
+                f"'{sched['lr_decay']}') — the old schedules were removed "
+                f"2026-08-11; old-era checkpoints can only be --init-from "
+                f"warm-starts")
+        ck_args = resume_ckpt.get("args")
+        if not ck_args:
+            print("!!! resume: checkpoint carries no args snapshot — "
+                  "nothing to inherit, every non-schedule flag is CLI "
+                  "(the pre-2026-09-30 behavior) !!!", flush=True)
+            ck_args = {}
+        resume_rep = resolve_resume_args(
+            args, explicit, ck_args, sched, leaf=args.cooldown_updates > 0)
+        if resume_rep["inherited"]:
+            print("resume: inherited from the checkpoint (differs from "
+                  "today's CLI default): " + "  ".join(
+                      f"{flag_name(d)} {c!r} (default {m!r})"
+                      for d, m, c in resume_rep["inherited"]), flush=True)
+        if resume_rep["diffs"]:
+            print(f"!!! resume: {len(resume_rep['diffs'])} flag(s) given "
+                  f"on the command line DIFFER from the checkpoint's run "
+                  f"(the command line wins):", flush=True)
+            for d, m, c in resume_rep["diffs"]:
+                print(f"!!!   {flag_name(d)} {m!r}   (checkpoint {c!r})",
+                      flush=True)
+        if resume_rep["ignored"]:
+            print("!!! resume: schedule state comes from the checkpoint — "
+                  "IGNORED: " + "  ".join(
+                      f"{flag_name(d)} {m!r} (using {c!r})"
+                      for d, m, c in resume_rep["ignored"]) + " !!!",
+                  flush=True)
+        if resume_rep["missing"] and ck_args:
+            # today's default may not be what the trunk trained with
+            # (e.g. --tau-rand 0.25, --limit-arms on): say so loudly
+            print("!!! resume: checkpoint's args predate "
+                  + ", ".join(f"{flag_name(d)} (using today's {m!r})"
+                              for d, m, _ in resume_rep["missing"])
+                  + " — type the trunk's value if it trained without "
+                    "these !!!", flush=True)
+        if (ck_args and "tau_center" not in explicit
+                and "tau_center_body" not in ck_args):
+            print(f"!!! resume: checkpoint predates tau_center_body — "
+                  f"--tau-center {args.tau_center!r} resolves to TODAY's "
+                  f"body, which may not be the one the trunk played !!!",
+                  flush=True)
+        if resume_rep["arch"]:
+            _a = "  ".join(f"{flag_name(d)} {m!r} (checkpoint {c!r})"
+                           for d, m, c in resume_rep["arch"])
+            if not args.ignore_arch_flags:
+                raise SystemExit(
+                    f"--resume: arch flag(s) differ from the checkpoint: "
+                    f"{_a}. The checkpoint's arch always wins on a resume, "
+                    f"so these would be silently dropped — remove them, "
+                    f"or pass --ignore-arch-flags to continue with the "
+                    f"checkpoint's arch")
+            print(f"!!! --ignore-arch-flags: {_a} dropped — the "
+                  f"checkpoint's arch wins !!!", flush=True)
+            for d, _, c in resume_rep["arch"]:
+                setattr(args, d, c)
+        # a trunk at (or past) its planned length with no --total-steps
+        # extension would run zero updates and then crash at the final
+        # save on an undefined `update` — refuse up front instead
+        if args.cooldown_updates <= 0:
+            _at = int(resume_ckpt["update"])
+            _goal = int(sched["num_updates"])
+            if "total_steps" in explicit:     # see the WSD TRUNK EXTENDED note
+                _goal = max(_goal, args.total_steps
+                            // (args.num_envs * args.horizon))
+            if _at >= _goal:
+                raise SystemExit(
+                    f"--resume: trunk checkpoint is at update {_at:,} of "
+                    f"{int(sched['num_updates']):,} — nothing to run. "
+                    f"Extend with --total-steps > "
+                    f"{_at * args.num_envs * args.horizon:,}, or branch a "
+                    f"leaf with --cooldown-updates N")
     global CLIP
     CLIP = float(args.clip)
     if CLIP != 0.3:
@@ -901,33 +1329,17 @@ def main():
             args.chart_pool = 65536
     if args.bench:
         args.total_steps = args.num_envs * args.horizon * 4
-    resume_ckpt = None
     init_ckpt = None
     if args.init_from and not args.resume:
         init_ckpt = torch.load(args.init_from, map_location="cpu",
                                weights_only=True)
     if args.resume:
-        assert not args.init_from, "--resume and --init-from are exclusive"
-        resume_ckpt = torch.load(args.resume, map_location="cpu",
-                                 weights_only=True)
-        if "optimizer" not in resume_ckpt:
-            raise SystemExit(
-                "--resume needs a checkpoint carrying optimizer + schedule "
-                "state (saved by this trainer version); older checkpoints "
-                "can only be --init-from warm-starts")
-        sched = resume_ckpt["schedule"]
-        if sched.get("lr_decay", "wsd") != "wsd":
-            raise SystemExit(
-                f"--resume: pre-WSD checkpoint (schedule "
-                f"'{sched['lr_decay']}') — the old schedules were removed "
-                f"2026-08-11; old-era checkpoints can only be --init-from "
-                f"warm-starts")
-        args.lr, args.lr_final = sched["lr"], sched["lr_final"]
-        # trunk entropy curve is checkpoint state, like lr: an extension
-        # must continue the exact curve, and a leaf must start from the
-        # trunk's live value (--ent-final stays CLI: the leaf's target)
-        args.ent_coef = sched.get("ent_coef", args.ent_coef)
-        args.ent_tau = sched.get("ent_tau", 0)
+        # lr / lr_final / ent_coef / ent_tau / warmup_updates were set
+        # from ckpt["schedule"] by resolve_resume_args above: the trunk
+        # entropy curve is checkpoint state, like lr — an extension must
+        # continue the exact curve, and a leaf must start from the
+        # trunk's live value (--ent-final stays CLI: the leaf's target;
+        # a typed --lr-final is the leaf's floor)
         if args.run_dir is None:      # continue in the checkpoint's run dir
             args.run_dir = os.path.dirname(os.path.abspath(args.resume))
     if args.run_dir is None:
@@ -964,9 +1376,13 @@ def main():
         print("--fp16: CPU device, forcing off", flush=True)
         args.fp16 = "off"
     fp16_update = args.fp16 in ("update", "all")
-    # device-side loss-scaling state: NO host syncs in the minibatch
-    # loop (an overflow zeroes the grads device-side; the audit rides
-    # the existing once-per-update print sync). The scale itself is a
+    # device-side loss-scaling state: the loss-scale machinery adds NO
+    # host syncs to the minibatch loop (an overflow zeroes the grads
+    # device-side; the audit rides the existing once-per-update print
+    # sync). The loop is NOT sync-free overall: the --target-kl probe
+    # (default on, 1.0) reads float(kl) every --kl-check-every
+    # minibatches — one sync per probe, 7 per update at the recipe's
+    # 32 kept minibatches (mb64, --adv-filter 0.5) probed every 4. The scale itself is a
     # device tensor since 2026-08-02 so it can adapt PER MINIBATCH
     # (halve on overflow, x2 after GROWTH_INTERVAL clean steps, capped
     # at the initial value) without ever syncing — the old host-float
@@ -983,8 +1399,8 @@ def main():
     # --- Tier 0.3 diagnostics (2026-09-02 static audit, C §1.2 / §2.2 /
     # §5). ALL device-side, accumulated in the minibatch loop with
     # add_/copy_ and read exactly once at the existing per-update print
-    # sync: the minibatch loop still has ZERO host syncs, which is the
-    # invariant the loss-scale machinery above is built around. Cost is
+    # sync: they add no host sync to the minibatch loop (whose only
+    # syncs are the --target-kl probes, see above). Cost is
     # ~11 kernels on each of 4 micro-batches (first/last minibatch) plus
     # 2 per optimizer step, against ~46k launches/update.
     #   kl_*  = k3 approx-KL (Schulman, http://joschu.net/blog/kl-approx),
@@ -1042,10 +1458,32 @@ def main():
         else:
             args.fp16_accum = "all"
     args_snapshot = {k: v for k, v in sorted(vars(args).items())}
-    with open(os.path.join(args.run_dir, "args.json"), "w",
-              encoding="utf-8") as f:
-        json.dump({"argv": sys.argv[1:], "resolved": args_snapshot},
-                  f, indent=1, default=str)
+    # the body --tau-center resolved to, so a resume inherits the body
+    # itself, not a name whose value tau_fit moves (review 2026-09-30)
+    args_snapshot["tau_center_body"] = parse_tau_scale(args.tau_center)
+    # a resume IN PLACE (the trunk's own run dir) must not overwrite the
+    # trunk's original args.json — the launch record harvest_obs /
+    # metrics_backfill read. Each resume there gets its own
+    # args_resume_NNNNN.json (NNNNN = the update it resumed at; _2, _3
+    # for repeats) carrying the inheritance report as well.
+    args_path = os.path.join(args.run_dir, "args.json")
+    args_rec = {"argv": sys.argv[1:], "resolved": args_snapshot}
+    if resume_ckpt is not None:
+        args_rec.update(
+            resume_from=args.resume,
+            explicit=sorted(explicit),
+            # {dest: [cli value (default if untyped), checkpoint value]}
+            **{k: {d: [m, c] for d, m, c in v}
+               for k, v in resume_rep.items()
+               if k in ("inherited", "diffs", "ignored")})
+        if os.path.exists(args_path):
+            _base = os.path.join(
+                args.run_dir, f"args_resume_{int(resume_ckpt['update']):05d}")
+            args_path, _k = _base + ".json", 2
+            while os.path.exists(args_path):
+                args_path, _k = f"{_base}_{_k}.json", _k + 1
+    with open(args_path, "w", encoding="utf-8") as f:
+        json.dump(args_rec, f, indent=1, default=str)
     print(f"argv: {' '.join(sys.argv[1:]) or '(bare)'}", flush=True)
     print(f"config: {args_snapshot}", flush=True)
 
@@ -1087,131 +1525,37 @@ def main():
                     f"{_name}: checkpoint was trained with {_flag} {_prev} "
                     f"but this run asks for {_mine}; the obs z lanes "
                     f"would not match (pass the checkpoint's value)")
-    if tensor_env and args.ranked_maps:
-        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
-        from beat_arena_env.ranked_pool import load_ranked_pool
-        from beat_arena_env.ranked_pool import pool_max_steps
-        pool = load_ranked_pool(sample=args.chart_pool, seed=args.seed,
-                                device=device, lead_s=args.lead_s,
-                                mirror=args.mirror_augment)
-        # whole-level episodes (the only mode since 2026-09-16): the
-        # episode limit comes from the longest level in the pool
-        pool_steps = pool_max_steps(pool)
-        print(f"[ranked-pool] WHOLE-LEVEL episodes: max_steps "
-              f"{pool_steps} ({pool_steps / 30:.0f} s incl. tail + "
-              f"margin), {int(pool['n_notes'].shape[0])} levels in "
-              f"the pool", flush=True)
-        venv = VecCls(N, pool=pool,
-                      max_steps=pool_steps,
-                      gears=args.gears,
-                      fall_const=args.fall_pen,
-                      push_prob=args.push_prob, push_vmax=args.push_vmax,
-                      start_jitter=args.start_jitter,
-                      foot_z_coef=args.foot_z_coef,
-                      foot_x_coef=args.foot_x_coef,
-                      foot_hinge_r=args.foot_hinge_r,
-                      foot_shape_coef=args.foot_shape_coef,
-                      energy_coef=args.energy_coef,
-                      limit_coef=args.limit_coef,
-                      limit_arms=args.limit_arms,
-                      wall_despawn=args.wall_despawn,
-                      start_pose_jitter=args.start_pose_jitter,
-                      crouch_start_prob=args.crouch_start_prob,
-                      z_asinh=args.z_asinh,
-                      self_contact_coef=args.self_contact_coef,
-                      tau_rand=args.tau_rand,
-                      ep_stats=args.ep_stats,
-                      tau_center=parse_tau_scale(args.tau_center),
-                      env_order=True,
-                      seed=args.seed, device=device)
-    elif tensor_env and args.game == "flux":
-        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
-        venv = VecCls(
-            N, game="flux", cols=tuple(args.cols),
-            rows=tuple(args.rows), chart_len_s=args.chart_len,
-            note_speed_min=args.note_speed_min,
-            note_speed_max=args.note_speed_max,
-            circle_prob=args.circle_prob, bar_prob=args.bar_prob,
-            gears=args.gears,
-            fall_const=args.fall_pen,
-            push_prob=args.push_prob, push_vmax=args.push_vmax,
-            start_jitter=args.start_jitter,
-            foot_z_coef=args.foot_z_coef,
-            foot_x_coef=args.foot_x_coef,
-            foot_hinge_r=args.foot_hinge_r,
-            foot_shape_coef=args.foot_shape_coef,
-            energy_coef=args.energy_coef,
-            limit_coef=args.limit_coef,
-            limit_arms=args.limit_arms,
-            start_pose_jitter=args.start_pose_jitter,
-            crouch_start_prob=args.crouch_start_prob,
-            z_asinh=args.z_asinh,
-            self_contact_coef=args.self_contact_coef,
-            tau_rand=args.tau_rand,
-            tau_center=parse_tau_scale(args.tau_center),
-            env_order=True,
-            seed=args.seed, chart_pool=args.chart_pool, device=device)
-    elif args.game == "flux":
-        from beat_arena_env.flux_env import FluxVecEnv
-        venv = FluxVecEnv(
-            N, gears=args.gears, cols=tuple(args.cols),
-            rows=tuple(args.rows), chart_len_s=args.chart_len,
-            note_speed_min=args.note_speed_min,
-            note_speed_max=args.note_speed_max,
-            circle_prob=args.circle_prob, bar_prob=args.bar_prob,
-            fall_const=args.fall_pen,
-            foot_z_coef=args.foot_z_coef,
-            foot_x_coef=args.foot_x_coef,
-            foot_hinge_r=args.foot_hinge_r,
-            foot_shape_coef=args.foot_shape_coef,
-            energy_coef=args.energy_coef,
-            self_contact_coef=args.self_contact_coef,
-            seed=args.seed)
-    elif tensor_env:
-        from beat_arena_env.cuda_env import CudaBeatVecEnv as VecCls
-        venv = VecCls(
-            N, cols=tuple(args.cols),
-            rows=tuple(args.rows), chart_len_s=args.chart_len,
-            note_speed_min=args.note_speed_min,
-            note_speed_max=args.note_speed_max,
-            note_prob=args.note_prob, extra_prob=args.extra_prob,
-            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            gears=args.gears,
-            fall_const=args.fall_pen,
-            push_prob=args.push_prob, push_vmax=args.push_vmax,
-            start_jitter=args.start_jitter,
-            foot_z_coef=args.foot_z_coef,
-            foot_x_coef=args.foot_x_coef,
-            foot_hinge_r=args.foot_hinge_r,
-            foot_shape_coef=args.foot_shape_coef,
-            energy_coef=args.energy_coef,
-            start_pose_jitter=args.start_pose_jitter,
-            crouch_start_prob=args.crouch_start_prob,
-            z_asinh=args.z_asinh,
-            self_contact_coef=args.self_contact_coef, env_order=True,
-            seed=args.seed, chart_pool=args.chart_pool, device=device)
-    else:
-        venv = BeatVecEnv(
-            N, gears=args.gears, cols=tuple(args.cols),
-            rows=tuple(args.rows), chart_len_s=args.chart_len,
-            note_speed_min=args.note_speed_min,
-            note_speed_max=args.note_speed_max,
-            note_prob=args.note_prob, extra_prob=args.extra_prob,
-            dot_prob=args.dot_prob, bomb_prob=args.bomb_prob,
-            fall_const=args.fall_pen,
-            foot_z_coef=args.foot_z_coef,
-            foot_x_coef=args.foot_x_coef,
-            foot_hinge_r=args.foot_hinge_r,
-            foot_shape_coef=args.foot_shape_coef,
-            energy_coef=args.energy_coef,
-            self_contact_coef=args.self_contact_coef,
-            seed=args.seed)
+    venv = make_env(args, N, device)
+
+    # RNG streams (review bug 1a): restored only when this launch keeps
+    # the checkpoint's seed — a typed different --seed means "reseed"
+    # (e.g. a second leaf off the same trunk). The env's own generator
+    # goes back NOW, before its first reset draws the start states; the
+    # global torch/CUDA/numpy/python streams go back right before the
+    # update loop, after every construction below has consumed its
+    # seed-stream draws (policy init, pool shuffles), so update k+1 of a
+    # resumed run draws exactly what update k+1 of the uninterrupted run
+    # did. (The env STATE still restarts fresh, so trajectories — and
+    # hence losses — differ; only the streams are continued.)
+    rng_ck = None
+    if resume_ckpt is not None:
+        if "rng" not in resume_ckpt:
+            print("!!! resume: checkpoint predates RNG-state saving "
+                  "(2026-09-30) — sampling/shuffle streams restart from "
+                  f"--seed {args.seed}, replaying update 0's stream !!!",
+                  flush=True)
+        elif args.seed != resume_ckpt.get("args", {}).get("seed", args.seed):
+            print(f"resume: --seed {args.seed} differs from the "
+                  f"checkpoint's — RNG streams reseeded, not restored",
+                  flush=True)
+        else:
+            rng_ck = resume_ckpt["rng"]
+            restore_rng(rng_ck, venv, what=("env_gen",))
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt, game=args.game)
     elif args.init_from:
-        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=True)
-        policy = load_policy(ckpt, game=args.game)
+        policy = load_policy(init_ckpt, game=args.game)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",
               flush=True)
     else:
@@ -1325,6 +1669,21 @@ def main():
             raise SystemExit(
                 f"--resume optimizer state does not match this policy "
                 f"arch (pre-scale checkpoints were retired). [{e}]")
+        # load_state_dict REPLACES the group hyperparams with the saved
+        # ones, lr_mult included, so --critic-lr-mult was silently the
+        # checkpoint's on every resume (review bug 1b2) while the Muon
+        # groups (built fresh below) took the CLI's — the critic's Adam
+        # and Muon halves could disagree. Re-stamp this run's multipliers
+        # (inherited unless typed); the schedule loop sets
+        # lr = lr_now * lr_mult from the first update on.
+        _ck_mult = [g.get("lr_mult", 1.0) for g in opt.param_groups]
+        for g, m_ in zip(opt.param_groups, (1.0, args.critic_lr_mult)):
+            g["lr_mult"] = m_
+            g["lr"] = args.lr * m_
+        if _ck_mult[1] != args.critic_lr_mult:
+            print(f"resume: critic lr multiplier {_ck_mult[1]:g} -> "
+                  f"{args.critic_lr_mult:g} (Adam and Muon critic "
+                  f"groups)", flush=True)
 
     m_main = [p for n, p in policy.named_parameters()
               if n in muon_names
@@ -1453,18 +1812,40 @@ def main():
     ret_var = torch.ones((), device=device)
     ret_sig = torch.ones((), device=device)
     value_norm_init = True
-    if resume_ckpt is not None:
-        vn = resume_ckpt.get("value_norm")
+    # --init-from too (review bug 2): the warm-started critic outputs
+    # values NORMALIZED by its run's (mu, sig). Scaling them with the
+    # fresh mu=0 / sig=1 made the first rollout's b_val garbage, and
+    # value_norm_init then copied its stats from returns BUILT on that
+    # garbage. The pair is only meaningful with the critic it trained,
+    # and the critic head (HL-Gauss bins / support) comes from the same
+    # checkpoint's arch (load_policy; the --hl-* flags are ignored), so
+    # the stats and the support always agree. A recipe change on the
+    # warm start (gamma, reward coefs) moves the return scale; the EMA
+    # re-fits at --value-norm-beta from the checkpoint's stats instead
+    # of from garbage.
+    vn_ck = resume_ckpt if resume_ckpt is not None else init_ckpt
+    vn_name = "resume" if resume_ckpt is not None else "init-from"
+    if vn_ck is not None:
+        vn = vn_ck.get("value_norm")
         if vn is not None:
             ret_mu.fill_(vn["mu"])
             ret_var.fill_(vn["var"])
             torch.sqrt(ret_var.clamp_min(1e-8), out=ret_sig)
             value_norm_init = False
+            if init_ckpt is not None:
+                _g = init_ckpt.get("args", {}).get("gamma")
+                print(f"init-from: value normalizer loaded (mu "
+                      f"{float(vn['mu']):.4g}, sig "
+                      f"{float(vn['var']) ** 0.5:.4g})"
+                      + ("" if _g is None or float(_g) == args.gamma else
+                         f" — trained at gamma {_g:g}, this run "
+                         f"{args.gamma:g}: the EMA re-fits the return "
+                         f"scale"), flush=True)
         else:
-            print("!!! resume: checkpoint predates value normalization "
-                  "— the critic will RE-FIT to normalized targets over "
-                  "the first ~100 updates (EV dips, then recovers) !!!",
-                  flush=True)
+            print(f"!!! {vn_name}: checkpoint predates value "
+                  "normalization — the critic will RE-FIT to normalized "
+                  "targets over the first ~100 updates (EV dips, then "
+                  "recovers) !!!", flush=True)
 
     # bounded (2026-08-02, audit 4.1): only [-100:] is ever read, and
     # the unbounded list leaked ~monotonically on multi-B runs (both
@@ -1504,7 +1885,12 @@ def main():
         else:
             assert resume_ckpt.get("wsd_role", "trunk") == "trunk", \
                 "leaves are terminal — continue from the trunk checkpoint"
-            extended = max(1, args.total_steps // batch)
+            # only a TYPED --total-steps extends: the untyped default
+            # (1M steps) is 1 update at recipe shape but 15,625 at a
+            # 64-row test shape, where it silently turned "continue the
+            # trunk" into a runaway extension (2026-09-30)
+            extended = (max(1, args.total_steps // batch)
+                        if "total_steps" in explicit else 0)
             if extended > num_updates:
                 print(f"WSD TRUNK EXTENDED: {num_updates:,} -> "
                       f"{extended:,} updates (constant lr, absolute-index "
@@ -1563,6 +1949,13 @@ def main():
         tick_ev = [[torch.cuda.Event(enable_timing=True) for _ in range(4)]
                    for _ in range(T)]
     diag_probe_obs = None    # frozen first-diag batch (psrank probe)
+    if resume_ckpt is not None:
+        # persisted since 2026-09-30 so psrank stays comparable across
+        # a resume (see the psrank comment in the diag block)
+        _p = resume_ckpt.get("diag_probe_obs")
+        if _p is not None and _p.ndim == 2 and _p.shape[1] == OBS_DIM:
+            diag_probe_obs = _p.to(device=device, dtype=obs_dt)
+    diag_idx = None          # fixed [diag] rows over the flat T x N buffer
     start = time.time()
 
     filt = (f", adv-filter top |A| {train_n}/{batch} "
@@ -1621,10 +2014,55 @@ def main():
         print(f"--ep-stats: combo walk in the training envs; per-episode "
               f"score/acc/PP rows -> {ep_stats_path} "
               f"({EP_STATS_COLS} float32 cols)", flush=True)
-    if args.tau_rand > 0.0:
+    if args.tau_rand > 0.0 and getattr(venv, "tau_rand", 0.0) > 0.0:
+        # printed only when the env actually draws (the flux Rust env
+        # does not); the per-episode log needs the CUDA pop_episodes
+        _log = (f"episode log -> {tau_draws_path}"
+                if hasattr(venv, "pop_episodes")
+                else "no per-episode log on this backend")
         print(f"--tau-rand {args.tau_rand}: per-env joint torque limits "
-              f"drawn U(1-r, 1+r) per axis at every reset (16 axes, L/R "
-              f"shared); episode log -> {tau_draws_path}", flush=True)
+              f"drawn center*(1 +- r) per axis at every reset (16 axes, "
+              f"L/R shared); {_log}", flush=True)
+    if rng_ck is not None:
+        # last, after every construction above (see the rng_ck comment)
+        _r = restore_rng(rng_ck, venv)
+        print(f"resume: RNG streams restored ({', '.join(_r)})",
+              flush=True)
+    def save_ckpt(path, upd):
+        """One checkpoint schema for the numbered and the final saves
+        (they were two hand-kept copies of the same dict). `rng` (every
+        stream, captured at the save = the state entering update upd+1)
+        and `diag_probe_obs` (the frozen psrank probe, ~2.5 MB fp16 at
+        production) added 2026-09-30 for the exact resume. Reads the
+        loop's live locals at call time."""
+        torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
+                    "encoder": policy.encoder,
+                    "update": upd, "global_step": global_step,
+                    "recent_return": float(recent),
+                    "recent_acc": float(acc_now),
+                    "value_norm": {"mu": float(ret_mu),
+                                   "var": float(ret_var)},
+                    "optimizer": cpu_opt_state(opt),
+                    "muon": muon.state_dict(),
+                    "rng": rng_state(venv),
+                    "diag_probe_obs": (None if diag_probe_obs is None
+                                       else diag_probe_obs.cpu()),
+                    "args": args_snapshot,
+                    "wsd_role": ("leaf" if leaf_from is not None
+                                 else "trunk"),
+                    "branched_from_update": leaf_from,
+                    "schedule": {"lr": args.lr, "lr_final": args.lr_final,
+                                 "lr_decay": "wsd",
+                                 "warmup_updates": warmup_updates,
+                                 "ent_coef": args.ent_coef,
+                                 "ent_tau": args.ent_tau,
+                                 "ent_floor": ent_floor,
+                                 "num_updates": num_updates}},
+                   path)
+
+    update = start_update - 1    # the final save's index if 0 updates run
+    recent = float("nan")
+    acc_now = float("nan")
     for update in range(start_update, num_updates):
         if leaf_from is not None:
             # leaf cooldown: 1-sqrt decay to the floor (EPFL 2405.18392:
@@ -1858,18 +2296,35 @@ def main():
             # interference from gradient-propagation failure
             # (2506.15544's critic-independent collapse mode). Costs
             # one host sync at its print — diag-cadence only.
+            # Rows (2026-09-30, review bug 3): a fixed seeded sample of
+            # the whole flat T x N buffer (diag_index), the SAME index
+            # for every tensor sliced here — it was f_obs[:dn], i.e. t=0
+            # of envs 0..2047 only. Losses: exactly the minibatch loop's
+            # terms — the policy loss on advantages normalized the way
+            # the training path does (full-batch stats under
+            # --adv-filter), and vf_coef * value_loss (HL-Gauss CE on
+            # the normalized return) — where the value side used to be
+            # 0.5*MSE on the HL expectation without vf_coef, a loss
+            # nothing trains, so |g_v| and gradcos measured the wrong
+            # gradient.
             dn = min(2048, batch)
+            if diag_idx is None:
+                diag_idx = diag_index(batch, dn).to(device)
             policy._diag_stash = True
             _, dlogp, _, dval = policy.get_action_and_value(
-                f_obs[:dn], f_act[:dn], need_entropy=False)
+                f_obs[diag_idx], f_act[diag_idx], need_entropy=False)
             policy._diag_stash = False
-            da = f_adv[:dn]
-            da = (da - da.mean()) / (da.std() + 1e-8)
-            dratio = (dlogp - f_logp[:dn]).clamp(
+            da = f_adv[diag_idx]
+            if adv_filter_on:
+                da = (da - af_mu) / (af_sd + 1e-8)
+            else:
+                da = (da - da.mean()) / (da.std() + 1e-8)
+            dratio = (dlogp - f_logp[diag_idx]).clamp(
                 max=LOG_RATIO_CLAMP).exp()
             d_pg = pg_loss_fn(dratio, da, clip=CLIP)
-            d_v = 0.5 * ((dval - (f_ret[:dn] - ret_mu) / ret_sig)
-                         ** 2).mean()
+            d_v = args.vf_coef * value_loss(policy, f_ret[diag_idx],
+                                            ret_mu, ret_sig)
+            policy._value_logits = None
             dscale = fp16_scale if fp16_update else 1.0
             flat_grad.zero_()
             (d_pg * dscale).backward(retain_graph=True)
@@ -1906,10 +2361,14 @@ def main():
             # that have nothing to do with the network (seen at the T=32
             # 2250->4500 extension: psrank read 51 vs on-policy 56,
             # inverting the healthy ordering purely as an artifact).
-            # Compare psrank only WITHIN one process; persisting
-            # diag_probe_obs in the checkpoint would fix this.
+            # FIXED 2026-09-30: diag_probe_obs is saved in every
+            # checkpoint and restored by --resume, so a resumed run
+            # keeps measuring psrank on its trunk's probe; and the probe
+            # is captured from the diag_index rows (all ticks), not t=0.
+            # (Checkpoints from before carry none; the first diag after
+            # such a resume still re-captures.)
             if diag_probe_obs is None:
-                diag_probe_obs = f_obs[:dn].clone()
+                diag_probe_obs = f_obs[diag_idx].clone()
             with torch.no_grad():
                 policy._diag_stash = True
                 policy.get_action_and_value(diag_probe_obs,
@@ -2053,10 +2512,7 @@ def main():
                     a_mb = (p_adv[sl] - a_mu) / (a_sd + 1e-8)
                     pg_loss = pg_loss_fn(ratio, a_mb, clip=CLIP)
                     # T1: the critic learns the NORMALIZED target
-                    v_tgt = (p_ret[sl] - ret_mu) / ret_sig
-                    v_loss = hl_loss(policy._value_logits, v_tgt,
-                                     policy.value_centers,
-                                     policy.value_sigma)
+                    v_loss = value_loss(policy, p_ret[sl], ret_mu, ret_sig)
                     ent_loss = entropy.mean()
                     loss = (pg_loss - ent_now * ent_loss
                             + args.vf_coef * v_loss)
@@ -2537,27 +2993,7 @@ def main():
             name = (f"leaf_from{leaf_from:05d}_upd{update+1:05d}.pt"
                     if leaf_from is not None
                     else f"trunk_upd{update+1:05d}.pt")
-            torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
-                        "encoder": policy.encoder,
-                        "update": update + 1, "global_step": global_step,
-                        "recent_return": float(recent),
-                        "recent_acc": float(acc_now),
-                        "value_norm": {"mu": float(ret_mu),
-                                       "var": float(ret_var)},
-                        "optimizer": cpu_opt_state(opt),
-                        "muon": muon.state_dict(),
-                        "args": args_snapshot,
-                        "wsd_role": ("leaf" if leaf_from is not None
-                                     else "trunk"),
-                        "branched_from_update": leaf_from,
-                        "schedule": {"lr": args.lr, "lr_final": args.lr_final,
-                                     "lr_decay": "wsd",
-                                     "warmup_updates": warmup_updates,
-                                     "ent_coef": args.ent_coef,
-                                     "ent_tau": args.ent_tau,
-                                     "ent_floor": ent_floor,
-                                     "num_updates": num_updates}},
-                       os.path.join(args.run_dir, name))
+            save_ckpt(os.path.join(args.run_dir, name), update + 1)
             m_ckpt = name
             if device.type == "cuda":
                 # VRAM audit (GPU-tier decision prereq, 2026-08-19)
@@ -2594,27 +3030,7 @@ def main():
                   else float("nan"))
     final_name = (f"leaf_from_upd{leaf_from:05d}.pt"
                   if leaf_from is not None else "trunk_final.pt")
-    torch.save({"state_dict": cpu_state(policy), "arch": policy.arch,
-                "encoder": policy.encoder,
-                "update": update + 1, "global_step": global_step,
-                "recent_return": float(recent),
-                "recent_acc": float(acc_now),
-                "value_norm": {"mu": float(ret_mu),
-                               "var": float(ret_var)},
-                "optimizer": cpu_opt_state(opt),
-                        "muon": muon.state_dict(),
-                "args": args_snapshot,
-                "wsd_role": ("leaf" if leaf_from is not None
-                             else "trunk"),
-                "branched_from_update": leaf_from,
-                "schedule": {"lr": args.lr, "lr_final": args.lr_final,
-                             "lr_decay": "wsd",
-                             "warmup_updates": warmup_updates,
-                             "ent_coef": args.ent_coef,
-                             "ent_tau": args.ent_tau,
-                             "ent_floor": ent_floor,
-                             "num_updates": num_updates}},
-               os.path.join(args.run_dir, final_name))
+    save_ckpt(os.path.join(args.run_dir, final_name), update + 1)
     if tick_n:
         f, e, k = (x / tick_n for x in tick_ms)
         print(f"[tick] fwd {f:.2f} / env {e:.2f} / book {k:.2f} ms "

@@ -30,10 +30,21 @@ class BeatVecEnv:
                  bomb_prob=0.125,
                  foot_z_coef=0.0, foot_x_coef=0.0, foot_hinge_r=0.0,
                  foot_shape_coef=0.0, energy_coef=0.0, self_contact_coef=0.0,
-                 gears=3, seed=0, fall_const=5.0):
+                 gears=3, seed=0, fall_const=5.0,
+                 limit_coef=0.0, limit_arms=False, wall_despawn=False,
+                 tau_rand=0.0, tau_center=None):
         """Unilateral ground contact + the fall termination is the only
         foot mode (the v10 weld harness and its `foot_contact=` argument
-        were removed 2026-09-27)."""
+        were removed 2026-09-27).
+
+        limit_coef / limit_arms / wall_despawn / tau_rand / tau_center
+        (2026-09-30): the CudaBeatVecEnv reward/body kwargs, which the
+        trainer's --env rust path used to drop silently (the Rust sim
+        always had the first three). tau_rand > 0 draws each env's 16
+        axis scales center * (1 + r U(-1,1)) at every episode reset, the
+        CUDA semantics, from a numpy stream of its own (the chart stream
+        is unchanged); tau_rand 0 + tau_center fixes every env at the
+        center. No per-episode tau_draws log here (CUDA pop_episodes)."""
         self.num_envs = num_envs
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
@@ -54,8 +65,20 @@ class BeatVecEnv:
                               foot_hinge_r=foot_hinge_r,
                               foot_shape_coef=foot_shape_coef,
                               energy_coef=energy_coef,
+                              limit_coef=limit_coef,
+                              limit_arms=bool(limit_arms),
+                              wall_despawn=bool(wall_despawn),
                               self_contact_coef=self_contact_coef)
         self._rng = np.random.default_rng(seed)
+        self.tau_rand = float(tau_rand)
+        assert 0.0 <= self.tau_rand < 1.0, "tau_rand in [0, 1)"
+        tc = [1.0] * 16 if tau_center is None else [float(x) for x in tau_center]
+        assert len(tc) == 16 and all(x > 0 for x in tc), \
+            "tau_center: 16 positive floats"
+        self.tau_center = np.asarray(tc, dtype=np.float64)
+        self._tau_rng = np.random.default_rng([int(seed), 46])
+        if self.tau_rand == 0.0 and tau_center is not None:
+            self.sim.set_tau_scale(self.tau_center.tolist())
         self._returns = np.zeros(num_envs, dtype=np.float64)
         self._obs = np.zeros((num_envs, OBS_DIM), dtype=np.float32)
 
@@ -92,12 +115,19 @@ class BeatVecEnv:
 
     def set_tau_scale(self, s16):
         """env v46: fix the 16 per-axis torque-limit scales on every env
-        (CUDA set_tau_scale mirror; the Rust backend never randomizes)."""
+        (CUDA set_tau_scale mirror). Needs tau_rand == 0, otherwise the
+        next reset redraws them (as on CUDA)."""
+        assert self.tau_rand == 0.0, "set_tau_scale needs tau_rand == 0"
         self.sim.set_tau_scale([float(x) for x in s16])
 
     def _new_chart(self, i):
         rng = np.random.default_rng(int(self._rng.integers(0, 2**63 - 1)))
         self.sim.set_chart(i, [note_tuple(n) for n in generate_chart(self.cfg, rng)])
+        if self.tau_rand > 0.0:
+            # env v46 per-episode body draw (the CUDA reset's semantics)
+            u = self._tau_rng.uniform(-1.0, 1.0, 16)
+            self.sim.set_tau_scale_env(
+                int(i), (self.tau_center * (1.0 + self.tau_rand * u)).tolist())
 
     def reset(self):
         for i in range(self.num_envs):
