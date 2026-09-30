@@ -107,6 +107,14 @@ from policy import load_policy
 # different physics regime). Results never merge across versions.
 SCORING_VERSION = 3
 
+# Termination flags of a finished level (review B09, 2026-09-30) — the
+# bits of lib.rs VecBeatSim::term and of the CUDA bench_rec col 18
+# (cuda_env.TERM_*): 0 = the level itself ended (notes drained / tail).
+# TILT is the chest-angle fall envelope, priced exactly like a FALL, so
+# the JSON's `fell` covers both (`tilted` says which); ENVELOPE is the
+# §23 root-escape C backstop; TICKCAP the per-episode max_steps limit.
+TERM_FELL, TERM_TILT, TERM_ENVELOPE, TERM_TICKCAP = 1, 2, 4, 8
+
 
 class _GraphedArgmax(_Graphed):
     """Bench forward — policy logits + stacked argmax over the fixed
@@ -324,12 +332,30 @@ def save_results(path, data, levels):
     data["wrist_rev_ticks"] = _wt
     data["wrist_rev_per_s_l"] = round(30.0 * _wl / _wt, 4) if _wt else 0.0
     data["wrist_rev_per_s_r"] = round(30.0 * _wr / _wt, 4) if _wt else 0.0
+    data.update(term_totals(evaluated))
     data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
     os.replace(tmp, path)
+
+
+def term_totals(evaluated):
+    """Catalog-wide B09 totals over the levels that carry the fields
+    (older results files lack them: `term_levels` says how many of the
+    evaluated levels the totals cover)."""
+    tl = [e for e in evaluated if e.get("fell") is not None]
+    return {
+        "term_levels": len(tl),
+        "breaks_total": sum(int(e.get("breaks", 0)) for e in tl),
+        "wall_enters_total": sum(int(e.get("wall_enters") or 0) for e in tl),
+        "fell_levels": sum(bool(e["fell"]) for e in tl),
+        "tilted_levels": sum(bool(e.get("tilted")) for e in tl),
+        "envelope_levels": sum(bool(e.get("envelope")) for e in tl),
+        "terminated_levels": sum(e.get("terminated_tick") is not None
+                                 for e in tl),
+    }
 
 
 class _SaveWriter:
@@ -527,7 +553,35 @@ def finish_slot(slot, info, combo):
                               if info.get("ticks") else 0.0),
         "wrist_rev_per_s_r": (round(30.0 * info.get("wrist_rev_r", 0) / info["ticks"], 3)
                               if info.get("ticks") else 0.0),
+        **_term_fields(breaks, info),
     }
+
+
+def _term_fields(breaks, info):
+    """Review B09 (2026-09-30): combo breaks, wall entries and how the
+    level ended — the pp-loss buckets the results file used to discard
+    (breaks only fed full_combo; wall entries and falls were never
+    recorded, so wall head-entries had to be ESTIMATED). `fell` = FALL
+    or TILT termination (the two share the fall pricing; `tilted` says
+    which), `envelope` = the §23 root-escape backstop, and
+    `terminated_tick` = the tick the episode was cut short at (any flag,
+    incl. the max_steps cap), None when the level itself ended.
+    info["term_flags"] / info["wall_enters"] absent = an engine build
+    that cannot report them: the fields are None, never a fake 0."""
+    tf = info.get("term_flags")
+    we = info.get("wall_enters")
+    out = {"breaks": int(breaks),
+           "wall_enters": None if we is None else int(we)}
+    if tf is None:
+        out.update(fell=None, tilted=None, envelope=None,
+                   terminated_tick=None)
+        return out
+    tf = int(tf)
+    out.update(fell=bool(tf & (TERM_FELL | TERM_TILT)),
+               tilted=bool(tf & TERM_TILT),
+               envelope=bool(tf & TERM_ENVELOPE),
+               terminated_tick=int(info.get("ticks", 0)) if tf else None)
+    return out
 
 
 def plan_slots(expected_ticks, n_slots):
@@ -696,7 +750,8 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                     "score_post": float(r[7]), "flail_rad": float(r[8]),
                     "flail_ticks": int(r[9]),
                     "wrist_rev_l": int(r[14]), "wrist_rev_r": int(r[15]),
-                    "ticks": int(r[16])},
+                    "ticks": int(r[16]), "wall_enters": int(r[17]),
+                    "term_flags": int(r[18])},
                     (float(r[10]), int(r[11]), int(r[12])))
                 result["cuda_slot"] = int(e)
                 levels[result["leaderboard_id"]] = result
@@ -757,11 +812,19 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
           f"{data['total_unweighted_pp']} | wrist reversals "
           f"{data['wrist_rev_total']} (L {data['wrist_rev_total_l']} / R "
           f"{data['wrist_rev_total_r']}; {data['wrist_rev_per_s_l']} / "
-          f"{data['wrist_rev_per_s_r']} per s) | pd-floor hits "
+          f"{data['wrist_rev_per_s_r']} per s) | {_term_summary(data)} "
+          f"| pd-floor hits "
           f"{data['pd_floor_hits']} | envelope hits {data['envelope_hits']} "
           f"| {n_slots} slots, {tick} ticks (ideal {ideal:.0f}) in {wall:.0f}s "
           f"({useful / wall / 1e3:.0f}k useful env-steps/s) -> {out_path}",
           flush=True)
+
+
+def _term_summary(data):
+    return (f"breaks {data['breaks_total']}, wall entries "
+            f"{data['wall_enters_total']}, fell {data['fell_levels']} "
+            f"(tilt {data['tilted_levels']}), envelope "
+            f"{data['envelope_levels']} of {data['term_levels']} levels")
 
 
 def main():
@@ -944,6 +1007,10 @@ def main():
         sim_mod = beat_arena_rs32
     else:
         sim_mod = beat_arena_rs
+    if not hasattr(sim_mod.VecBeatSim, "term"):     # B09 getter
+        sys.exit(f"{sim_mod.__name__} predates VecBeatSim.term (wall "
+                 f"entries + termination flags, 2026-09-30): rebuild it "
+                 f"(maturin develop --release in rust/ or rust32/)")
     groups = []
     for n_g in sizes:
         fwd_g = (None if args.no_graphs or device.type != "cuda"
@@ -1025,6 +1092,7 @@ def main():
                         c_pre, c_acc, c_post = gr.sim.components(i)
                         fl_rad, fl_ticks = gr.sim.flail(i)
                         wr_l, wr_r, wr_ticks = gr.sim.wrist_rev(i)
+                        w_ent, t_flags = gr.sim.term(i)   # B09
                         result = finish_slot(s, {
                             "good_cuts": g, "bad_cuts": b, "misses": m,
                             "n_notes": n_scoreable, "bombs_hit": bombs,
@@ -1032,7 +1100,8 @@ def main():
                             "score_post": c_post, "flail_rad": fl_rad,
                             "flail_ticks": fl_ticks,
                             "wrist_rev_l": wr_l, "wrist_rev_r": wr_r,
-                            "ticks": wr_ticks}, combo)
+                            "ticks": wr_ticks, "wall_enters": w_ent,
+                            "term_flags": t_flags}, combo)
                         levels[result["leaderboard_id"]] = result
                         n_done += 1
                         n_finished += 1
@@ -1192,6 +1261,7 @@ def main():
           f"wrist reversals {data['wrist_rev_total']} (L "
           f"{data['wrist_rev_total_l']} / R {data['wrist_rev_total_r']}; "
           f"{data['wrist_rev_per_s_l']} / {data['wrist_rev_per_s_r']} per s) | "
+          f"{_term_summary(data)} | "
           f"pd-floor hits {pd_hits} (file total) "
           f"| envelope hits {env_hits} (file total) "
           f"-> {out_path}", flush=True)

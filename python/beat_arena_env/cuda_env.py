@@ -74,6 +74,15 @@ NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 # aggregate into ONE slot with a note COUNT — exact, not approximate.
 N_TRACKERS = FOLLOW_TIMEOUT + 1
 EP_REC = 28   # env v47 episode record width (cols 22..28 = ep_stats)
+# bench slot-refill record (kernel BENCH_REC): the host-facing columns
+# 0..18 = [good, bad, miss, score, bombs, pre, acc, post, flail_rad,
+# flail_ticks, cw_score, cw_maxc, cw_breaks, chart_idx, wrev_L, wrev_R,
+# ticks, wall_enters, term_flags] (cols 17/18: review B09, 2026-09-30),
+# plus col 19 = the kernel's live wall-entry accumulator (scratch)
+BENCH_REC = 20
+BENCH_COLS = 19
+# term_flags bits (= lib.rs VecBeatSim::term); 0 = the level itself ended
+TERM_FELL, TERM_TILT, TERM_ENVELOPE, TERM_TICKCAP = 1, 2, 4, 8
 
 # lib.rs Z_MISS_TAIL: the episode tail covers the slowest object's trip
 # from the hit plane to the WORST-CASE live head plane (env v10).
@@ -872,7 +881,7 @@ class CudaBeatVecEnv:
         self.cw_note_mult = (z(N, C, dt=torch.uint8) if self.combo_walk
                              else z(1, 1, dt=torch.uint8))
         self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
-        self.bench_rec = z(N, 17)   # + [wrev_L, wrev_R, ticks] (2026-09-22)
+        self.bench_rec = z(N, BENCH_REC)   # see BENCH_REC / BENCH_COLS
         self.bench_flag = z(N, dt=torch.uint8)
         # Flux: palm-centre finite-difference velocity (kernel-written in
         # Flux mode only; the start kick at reset, zeroed by set_state)
@@ -1162,19 +1171,20 @@ class CudaBeatVecEnv:
 
     def pop_bench_rows(self):
         """Levels that finished since the last pop: (env ids (M,) int64
-        numpy, rows (M, 17) float64 numpy) with the row layout of the
-        kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
+        numpy, rows (M, BENCH_COLS) float64 numpy) with the row layout of
+        the kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
         post, flail_rad, flail_ticks, cw_score, cw_maxc, cw_breaks,
-        chart_idx, wrev_L, wrev_R, ticks]. One row per env — pop every
-        tick (a level lasts >= 60 ticks, so no slot can finish twice
-        between pops)."""
+        chart_idx, wrev_L, wrev_R, ticks, wall_enters, term_flags]
+        (term_flags: TERM_* bits, 0 = the level itself ended). One row
+        per env — pop every tick (a level lasts >= 60 ticks, so no slot
+        can finish twice between pops)."""
         flags = self.bench_flag.bool()
         n = int(flags.sum().item())
         if n == 0:
             return (np.zeros((0,), dtype=np.int64),
-                    np.zeros((0, 17), dtype=np.float64))
+                    np.zeros((0, BENCH_COLS), dtype=np.float64))
         ids = flags.nonzero(as_tuple=False).squeeze(1)
-        rows = self.bench_rec[ids].double().cpu().numpy()
+        rows = self.bench_rec[ids, :BENCH_COLS].double().cpu().numpy()
         self.bench_flag.zero_()
         return ids.cpu().numpy(), rows
 
