@@ -35,7 +35,7 @@ import numpy as np
 import pytest
 
 from beat_arena_env.constants import (N_JOINTS, OFF_BODY_PT_VEL, OFF_HAND_L,
-                                      OFF_HAND_R, OFF_ROOT_VANG,
+                                      OFF_HAND_R, OFF_ROOT_VANG, OFF_TIP_VEL,
                                       OFF_ROOT_VLIN, ROOT_VLIN_NORM, V_NORM)
 from tests._helpers import cuda
 
@@ -68,6 +68,7 @@ def test_start_kick_tensor_slot_contract():
     i = enum.index("TSTARTKICK")
     assert py[i] == "self._start_kick"
     assert py[enum.index("TPALMV")] == "self.palm_vel"
+    assert py[enum.index("TTIPV")] == "self.tip_vel"      # env v49 (I07)
     assert py[enum.index("TPOSEJIT")] == "self._pose_jit"
 
 
@@ -113,6 +114,13 @@ def _vel_lane_checks(env, ids, kx, kz, tol):
     torch.testing.assert_close(env.wrist_vel[ids].double(),
                                lin[:, None].expand(-1, 2, -1),
                                rtol=0, atol=0)
+    # env v49 blade-tip lanes: the same rigid translation
+    torch.testing.assert_close(env.tip_vel[ids].double(),
+                               lin[:, None].expand(-1, 2, -1),
+                               rtol=0, atol=0)
+    torch.testing.assert_close(obs[:, OFF_TIP_VEL:OFF_TIP_VEL + 6],
+                               lin.repeat(1, 2) / V_NORM,
+                               rtol=1e-6, atol=tol)
 
 
 @cuda
@@ -195,7 +203,7 @@ def test_auto_reset_equals_fresh_reset():
     # reset_env is inlined at two sites (step_env / mode 1): allow an
     # FMA-contraction ulp on the FK-derived fields, demand exactness on
     # the pure copies (velocities, kick, tau)
-    for name in ("v", "tau_scale", "wrist_vel", "palm_vel", "_bp_vel",
+    for name in ("v", "tau_scale", "wrist_vel", "palm_vel", "tip_vel", "_bp_vel",
                  "chart_idx", "tick"):
         assert torch.equal(getattr(a, name)[ids], getattr(b, name)[ids]), name
     for name in ("p", "quat", "q", "wrist", "blade", "head", "_bp_pos"):
