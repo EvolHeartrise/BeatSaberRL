@@ -646,7 +646,7 @@
       </button>
       <button class:on={pb.firstPerson}
         onclick={() => (pb.firstPerson = !pb.firstPerson)}
-        title="camera on the body's head frame — what the headset sees (f)">
+        title="camera at the player's head, looking straight down the track (f)">
         👁 first-person
       </button>
       {#if pb.firstPerson}
@@ -655,13 +655,6 @@
             fov <input type="range" min="40" max="110" step="1"
               value={pb.fpFov} oninput={(e) => (pb.fpFov = +e.target.value)} />
             <span>{pb.fpFov}°</span>
-          </label>
-          <label title="head-rotation smoothing time constant — 0 = the exact
-                 head frame; a per-tick filter over the recorded head track, so
-                 scrubbing and the export match playback">
-            smooth <input type="range" min="0" max="1" step="0.05"
-              value={pb.fpSmooth} oninput={(e) => (pb.fpSmooth = +e.target.value)} />
-            <span>{pb.fpSmooth.toFixed(2)}s</span>
           </label>
         </span>
       {/if}

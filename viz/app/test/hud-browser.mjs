@@ -51,8 +51,7 @@ try {
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
     .find((b) => b.textContent.includes("pause"))?.click());
   const scrub = (tick) => page.evaluate((tick) => {
-    // the timeline is the last slider in the bar (fov / smoothing / volume
-    // come first)
+    // the timeline is the last slider in the bar (fov / volume come first)
     const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(r, tick);
     r.dispatchEvent(new Event("input", { bubbles: true }));
