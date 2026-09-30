@@ -311,7 +311,19 @@ const OFF_PREV_R: usize = OFF_PREV_L + PREV_FEAT; // 603
 const TAU_FEAT: usize = 16;
 const TAU_RAND_NORM: Real = 0.25;
 const OFF_TAU: usize = OFF_PREV_R + PREV_FEAT; // 608
-const OBS_DIM: usize = OFF_TAU + TAU_FEAT; // 624 (env v46)
+// env v49 (review item I07, 2026-09-30): per-hand BLADE-TIP world
+// velocity, [L xyz, R xyz] / V_NORM, appended after the tau lanes so
+// every earlier offset is unchanged. The tip is wrist + (HANDLE_LEN +
+// SABER_LEN)·blade; its finite difference across the tick is exactly
+// the judge's `tip_move / DT` — the vector the cut-plane accuracy rule
+// (d_min = |cw·norm(blade × tip_move)|) and, near the tip, the contact
+// velocity of the direction check are built from — which the wrist
+// velocity (hand block lanes 3..5) misses whenever the saber rotates
+// (a 1.16 m lever). World frame (like wrist_vel), zero at reset and
+// after a set_state refresh; zero in the Flux game (no blade).
+const TIP_VEL_FEAT: usize = 6;
+const OFF_TIP_VEL: usize = OFF_TAU + TAU_FEAT; // 624
+const OBS_DIM: usize = OFF_TIP_VEL + TIP_VEL_FEAT; // 630 (env v49)
 // joint -> axis (constants.TAU_AXIS_OF_JOINT mirror)
 const TAU_AXIS: [usize; NQ] = [
     0, 1, 2,
@@ -327,7 +339,7 @@ const BODY_PTS: [(usize, Real); N_BODY_PTS] = [
     (F_L_SHANK, KNEE_Y0), (F_R_SHANK, KNEE_Y0),
     (F_L_FOOT, FOOT_Y0), (F_R_FOOT, FOOT_Y0),
 ];
-const _: () = assert!(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
+const _: () = assert!(OBS_DIM == 630, "spec §12 (env v49 blade-tip velocity lanes): OBS_DIM must be 630");
 const KNEE_Y0: Real = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: Real = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
@@ -547,6 +559,9 @@ struct Body {
     shoulder_z: [Real; 2],
     // judgment caches
     wrist_vel: [[Real; 3]; 2], // finite difference across the last tick
+    // env v49: blade-TIP world velocity, the same finite difference on
+    // wrist + (HANDLE_LEN + SABER_LEN)·blade (= the judge's tip_move / DT)
+    tip_vel: [[Real; 3]; 2],
     // env v24: §8 body-point world velocities, same finite-diff scheme
     body_pt_vel: [[Real; 3]; N_BODY_PTS],
     swing_acc: [Real; 2],      // arc of the current continuous swing (rad)
@@ -639,6 +654,7 @@ impl Body {
             head: [0.0; 3],
             shoulder_z: [0.0; 2],
             wrist_vel: [[0.0; 3]; 2],
+            tip_vel: [[0.0; 3]; 2],
             body_pt_vel: [[0.0; 3]; N_BODY_PTS],
             swing_acc: [0.0; 2],
             axis: [None; 2],
@@ -692,6 +708,7 @@ impl Body {
         }
         self.tau = [0.0; NQ];
         self.wrist_vel = [[0.0; 3]; 2];
+        self.tip_vel = [[0.0; 3]; 2];
         self.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
         self.swing_acc = [0.0; 2];
         self.axis = [None; 2];
@@ -779,6 +796,7 @@ impl Body {
         self.tau_abs = tau_abs;
         self.tau_group = tgrp;
         let prev_wrist = self.wrist;
+        let prev_blade = self.blade;
         // env v24: last tick's §8 body-point positions (ws.p holds the
         // previous refresh_fk), the finite-diff base for body_pt_vel
         let mut prev_bp = [[0.0 as Real; 3]; N_BODY_PTS];
@@ -913,6 +931,12 @@ impl Body {
         for s in 0..2 {
             for k in 0..3 {
                 self.wrist_vel[s][k] = (self.wrist[s][k] - prev_wrist[s][k]) / DT;
+                // env v49: tip velocity — the judge's tip_move expression
+                // tree (step_inner), / DT; the .cu transcribes it
+                self.tip_vel[s][k] = (self.wrist[s][k]
+                    + (HANDLE_LEN + SABER_LEN) * self.blade[s][k]
+                    - prev_wrist[s][k]
+                    - (HANDLE_LEN + SABER_LEN) * prev_blade[s][k]) / DT;
             }
         }
         for (i, (f, _)) in BODY_PTS.iter().enumerate() {
@@ -1514,6 +1538,17 @@ impl Core {
         // (exactly 0 at s = 1.0); the CUDA writer transcribes this loop
         for a in 0..TAU_FEAT {
             obs[OFF_TAU + a] = ((self.body.tau_axis[a] - 1.0) / TAU_RAND_NORM) as f32;
+        }
+        // env v49: blade-tip world velocity [L xyz, R xyz] / V_NORM
+        // (standard game only — the Flux hands have no blade, the lanes
+        // stay at the fill's zero); the CUDA writer transcribes this loop
+        if !self.flux {
+            for s in 0..2 {
+                for k in 0..3 {
+                    obs[OFF_TIP_VEL + 3 * s + k] =
+                        (self.body.tip_vel[s][k] / V_NORM) as f32;
+                }
+            }
         }
     }
 
@@ -2408,6 +2443,7 @@ impl RawBeatSim {
         body.st.v.copy_from_slice(&v);
         body.refresh_fk();
         body.wrist_vel = [[0.0; 3]; 2];
+        body.tip_vel = [[0.0; 3]; 2];
         body.body_pt_vel = [[0.0; 3]; N_BODY_PTS];
         self.core.palm_vel = [[0.0; 3]; 2];
     }
@@ -3251,5 +3287,132 @@ mod env_tests {
         let body = Body::new();
         assert!((body.reach_z() - (1.75 + HANDLE_LEN)).abs() < 1e-12);
         assert!((body.head[2] - (-0.65)).abs() < 1e-12);
+    }
+
+    /// A swinging tick for the env v49 tests: both arms and wrists
+    /// under full gears, so the blades ROTATE (tip velocity != wrist
+    /// velocity) — returns (wrist, blade) before the tick.
+    fn swing_tick(core: &mut Core) -> ([[Real; 3]; 2], [[Real; 3]; 2]) {
+        let mut acts = [0u8; NQ];
+        acts[3] = 1; // l arm pitch +
+        acts[8] = 2; // l wrist bend −
+        acts[10] = 1; // r arm pitch +
+        acts[13] = 2; // r elbow −
+        acts[15] = 1; // r wrist bend +
+        let before = (core.body.wrist, core.body.blade);
+        core.step_inner(&acts);
+        before
+    }
+
+    fn far_chart() -> Vec<ChartTuple> {
+        (0u8..3)
+            .map(|i| (8.0 + i as Real * 0.25, 0.0, 1.0, i % 2, 0.0, 6.0,
+                      false, KIND_NOTE, false, false))
+            .collect()
+    }
+
+    /// env v49 (I07): the blade-tip velocity lanes are the finite
+    /// difference of the tip position wrist + (HANDLE_LEN + SABER_LEN)·
+    /// blade across the tick, / V_NORM, per hand [L xyz, R xyz]; zero
+    /// at reset; different from the wrist velocity on a rotating blade
+    /// (the reason they exist).
+    #[test]
+    fn tip_vel_lanes_are_the_tip_finite_difference() {
+        let mut core = Core::new_core(690, 5);
+        core.set_chart_notes(far_chart());
+        let obs0 = core.build_obs();
+        assert!(obs0[OFF_TIP_VEL..OFF_TIP_VEL + TIP_VEL_FEAT].iter()
+                    .all(|&x| x == 0.0), "tip lanes must be 0 at reset");
+        assert_eq!(OFF_TIP_VEL, 624);
+        assert_eq!(OBS_DIM, OFF_TIP_VEL + TIP_VEL_FEAT);
+        let l = HANDLE_LEN + SABER_LEN;
+        let mut max_gap: Real = 0.0;
+        for _ in 0..6 {
+            let (w0, b0) = swing_tick(&mut core);
+            let (w1, b1) = (core.body.wrist, core.body.blade);
+            let obs = core.build_obs();
+            for s in 0..2 {
+                for k in 0..3 {
+                    let fd = ((w1[s][k] + l * b1[s][k])
+                        - (w0[s][k] + l * b0[s][k])) / DT;
+                    let tv = core.body.tip_vel[s][k];
+                    let tol = 1e3 * Real::EPSILON * (1.0 + fd.abs());
+                    assert!((tv - fd).abs() <= tol,
+                            "hand {s} axis {k}: tip_vel {tv} vs FD {fd}");
+                    assert_eq!(obs[OFF_TIP_VEL + 3 * s + k],
+                               (tv / V_NORM) as f32, "lane encoding");
+                    max_gap = max_gap
+                        .max((tv - core.body.wrist_vel[s][k]).abs());
+                }
+            }
+        }
+        assert!(max_gap > 0.5,
+                "a rotating blade's tip must outrun the wrist (gap {max_gap} m/s)");
+        // a reset clears it
+        core.reset_state();
+        assert_eq!(core.body.tip_vel, [[0.0; 3]; 2]);
+        let obs = core.build_obs();
+        assert!(obs[OFF_TIP_VEL..].iter().all(|&x| x == 0.0));
+    }
+
+    /// env v49 (I07) sign convention of the policy's cut-plane lane,
+    /// pinned against the judge: from the OBS lanes alone (head-relative
+    /// wrist x/y, world z, blade dir, tip velocity), the signed distance
+    /// dp·norm(blade × v_tip) of a point p = wrist + a·blade + c·n̂ is
+    /// +c, where n̂ = norm(blade × tip_move) is the judge's cut-plane
+    /// normal (step_inner) — so positive = the side blade × v_tip points
+    /// to, and |signed| is exactly the judge's accuracy distance d_min.
+    #[test]
+    fn cut_plane_signed_distance_matches_the_judge() {
+        let mut core = Core::new_core(690, 5);
+        core.set_chart_notes(far_chart());
+        let l = HANDLE_LEN + SABER_LEN;
+        for _ in 0..4 {
+            swing_tick(&mut core);
+        }
+        let (w0, b0) = swing_tick(&mut core);
+        let (w1, b1) = (core.body.wrist, core.body.blade);
+        let head = core.body.head;
+        let obs = core.build_obs();
+        for s in 0..2 {
+            // the judge's plane (step_inner's tip_move / pn)
+            let mut tip_move = [0.0 as Real; 3];
+            for k in 0..3 {
+                tip_move[k] = w1[s][k] + l * b1[s][k] - w0[s][k] - l * b0[s][k];
+            }
+            let pn = cross3(b1[s], tip_move);
+            let pn_mag = dot3(pn, pn).sqrt();
+            assert!(pn_mag > 1e-6, "hand {s}: degenerate swing");
+            let nh = [pn[0] / pn_mag, pn[1] / pn_mag, pn[2] / pn_mag];
+            // decode the obs lanes the policy reads
+            let hb = if s == 0 { OFF_HAND_L } else { OFF_HAND_R };
+            let wx = obs[hb] as Real * X_NORM + head[0];
+            let wy = obs[hb + 1] as Real * Y_NORM + head[1];
+            let wz = obs[hb + 2] as Real;
+            let b = [obs[hb + 6] as Real, obs[hb + 7] as Real, obs[hb + 8] as Real];
+            let v = [
+                obs[OFF_TIP_VEL + 3 * s] as Real * V_NORM,
+                obs[OFF_TIP_VEL + 3 * s + 1] as Real * V_NORM,
+                obs[OFF_TIP_VEL + 3 * s + 2] as Real * V_NORM,
+            ];
+            let bv = cross3(b, v);
+            let bv_mag = dot3(bv, bv).sqrt();
+            for (a, c) in [(0.6 as Real, 0.2 as Real), (1.0, -0.15), (0.3, 0.0)] {
+                let p = [
+                    w1[s][0] + a * b1[s][0] + c * nh[0],
+                    w1[s][1] + a * b1[s][1] + c * nh[1],
+                    w1[s][2] + a * b1[s][2] + c * nh[2],
+                ];
+                let dp = [p[0] - wx, p[1] - wy, p[2] - wz];
+                let signed = dot3(dp, bv) / bv_mag;
+                assert!((signed - c).abs() < 2e-4,
+                        "hand {s} (a {a}, c {c}): obs-derived signed {signed}");
+                // the judge's accuracy distance (cw = centre - wrist)
+                let cw = [p[0] - w1[s][0], p[1] - w1[s][1], p[2] - w1[s][2]];
+                let d_min = (dot3(cw, pn) / pn_mag).abs();
+                assert!((signed.abs() - d_min).abs() < 2e-4,
+                        "hand {s}: |signed| {signed} vs judge d_min {d_min}");
+            }
+        }
     }
 }

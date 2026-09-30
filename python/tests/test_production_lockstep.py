@@ -42,7 +42,7 @@ whole episodes in frame without touching engine semantics:
     tick, zero actions): auto_reset is off but the kernel still steps
     it, and parking keeps its ticks out of the global pop counters.
 
-Asserted per tick: done timing; obs (tight band 1e-5 on all 624 lanes,
+Asserted per tick: done timing; obs (tight band 1e-5 on all 630 lanes,
 knife-edge flips counted and bounded as in test_v11; mask, tau and
 prev-valid lanes EXACT); reward (1e-9 tight, flips < 0.1); qpos;
 per-note status, prev-note record, counters, score decomposition,
@@ -68,7 +68,8 @@ from beat_arena_env.chart import (ChartConfig, Wall, generate_chart,
 from beat_arena_env.constants import (EVENT_REASONS, KIND_BOMB, N_JOINTS,
                                       OBS_DIM, OFF_CONTACT, OFF_GROUND_IMP,
                                       OFF_NOTE_MASK, OFF_NOTES, OFF_PREV_L,
-                                      OFF_PREV_R, OFF_TAU, PREV_FEAT,
+                                      OFF_PREV_R, OFF_TAU, OFF_TIP_VEL,
+                                      PREV_FEAT,
                                       TAU_BODY_DEFAULT, parse_tau_scale)
 from beat_arena_env.cuda_env import CudaBeatVecEnv
 from beat_arena_env.scoresaber import ComboTracker
@@ -106,7 +107,9 @@ _GROUPS = {
     "mask": (OFF_NOTE_MASK, OFF_GROUND_IMP),
     "ground_bodypts": (OFF_GROUND_IMP, OFF_PREV_L),
     "prev": (OFF_PREV_L, OFF_TAU),
-    "tau": (OFF_TAU, OBS_DIM),
+    "tau": (OFF_TAU, OFF_TIP_VEL),
+    # env v49 blade-tip velocity (continuous, finite-diff like wrist_vel)
+    "tip": (OFF_TIP_VEL, OBS_DIM),
 }
 _PREV_VALID = [OFF_PREV_L + PREV_FEAT - 1, OFF_PREV_R + PREV_FEAT - 1]
 
@@ -299,6 +302,12 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
                     assert od[lo:hi].max() < 1e-4, \
                         f"{tag} {g} lanes {od[lo:hi].max():.3e} off " \
                         f"with the state in the seed band"
+                # env v49: the tip velocity is a function of this tick's
+                # end state and the (resynced, shared) previous one
+                lo, hi = _GROUPS["tip"]
+                assert od[lo:hi].max() < 1e-5, \
+                    f"{tag} tip lanes {od[lo:hi].max():.3e} off with the " \
+                    f"state in the seed band"
             if rew_d < 1e-9 and od.max() < 1e-5 and q_d < 1e-9:
                 worst["rew"] = max(worst["rew"], rew_d)
                 worst["obs"] = max(worst["obs"], float(od.max()))
@@ -386,6 +395,7 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
         resync(env, q36s, v35s)
         if zero_wv:
             env.wrist_vel[zero_wv] = 0.0
+            env.tip_vel[zero_wv] = 0.0   # env v49: set_joints zeroes it too
     assert all(done), "episodes did not finish inside max_steps"
 
     print(f"lockstep (wall_despawn={a.wall_despawn}): {ticks} env-ticks, {flips} tight-band "
