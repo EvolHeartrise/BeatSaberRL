@@ -193,7 +193,8 @@ def _load():
             bdir = os.path.join(src, "build_fp16")
             os.makedirs(bdir, exist_ok=True)
             srcs = [os.path.join(src, "fp16_gemm.cu"),
-                    os.path.join(src, "small_attn.cu")]
+                    os.path.join(src, "small_attn.cu"),
+                    os.path.join(src, "fused_ffn.cu")]
             cublas = ["cublas.lib", "cublasLt.lib"] if os.name == "nt" \
                 else ["-lcublas", "-lcublasLt"]
 
@@ -986,3 +987,189 @@ def attn29_qkv(q, kv, attn_bias):
     if not torch.is_grad_enabled():
         return _load().attn29_fwd(q, *kv.split(q.shape[-1], dim=-1), bias2)
     return _Attn29QKV.apply(q, kv, bias2)
+
+
+# --- fused block FFN (csrc/fused_ffn.cu, 2026-09-30, review item I13) -----
+# A non-final block's FFN plus the NEXT block's residual add + ln_attn runs
+# as ONE kernel: out = x + relu(h2 W0^T + b0) W2^T + b2, hn = LN(out). The
+# 768-wide hidden stays on-chip; the grad-free (rollout) call writes only
+# out and hn — no hidden, no ReLU mask, no ffn.2 output, no separate LN
+# pass. The final block uses the residual-only variant (no LN).
+# Grad mode runs the SAME kernel (bitwise-identical out / hn: the r1
+# contract) and additionally writes what the backward needs: the fp16
+# hidden (ffn.2's wgrad input), the ReLU bitmask in cuBLASLt's RELU_AUX
+# layout (so ffn.2's dgrad is the same DRELU-epilogue GEMM the unfused
+# chain runs) and the LN mean / rstd. The backward is the unfused path's
+# kernels: ln_bwd (+ its fused bias-grad column sum), GemmEx / BGRADB
+# wgrads, dgrad_drelu, torch dgrad under the latched accumulate mode.
+# Numerics vs the unfused path: fp16 last-rounding class, NOT bitwise
+# (b0 enters as the fp32 master instead of the fp16 replica, ffn.2's
+# output is not rounded to fp16 before the residual add, and the MMA
+# order is not cuBLAS's). Accumulate: the up-projection stays fp32 (as
+# the unfused RELU_AUX GEMM), the down-projection follows the policy's
+# fp16_accum forward flag (as the unfused ffn.2 torch mm); mode "up16"
+# (experimental) also fp16-accumulates the up-projection. Opt-in per
+# policy (NotePolicy.fused_ffn, arch "fused_ffn"; "off" by default until
+# pod-verified).
+FFN_MODES = ("off", "on", "up16")
+_FFN_SHAPE = (192, 768)          # (d, hidden) the kernel is built for
+_FFN_MODE = "off"                # set by ffn_fusion() around a forward
+_ffn_dev_ok = {}                 # device index -> ext.ffn_fused_supported()
+
+
+class ffn_fusion:
+    """Context manager: run the enclosed fp16-stream forward with the
+    fused block FFN in mode `mode` (FFN_MODES). A Function created inside
+    latches what its backward needs — backward() may run outside."""
+
+    def __init__(self, mode):
+        if mode not in FFN_MODES:
+            raise ValueError(f"fused FFN mode must be one of {FFN_MODES}, "
+                             f"got {mode!r}")
+        self.mode = mode
+
+    def __enter__(self):
+        global _FFN_MODE
+        self.prev = _FFN_MODE
+        _FFN_MODE = self.mode
+        return self
+
+    def __exit__(self, *exc):
+        global _FFN_MODE
+        _FFN_MODE = self.prev
+        return False
+
+
+def fused_ffn_ok(x, ffn, ln=None):
+    """True when the fused kernel applies to a block FFN `ffn` (the
+    [Linear, ReLU, Linear] Sequential) on the activations `x` under the
+    current ffn_fusion mode, with `ln` (a LayerNorm, or None) as the
+    epilogue LN. False = the caller keeps the unfused path (mode off, not
+    fp16 CUDA, other widths, no extension, device without the smem)."""
+    if _FFN_MODE == "off" or x.dtype is not torch.float16 or not x.is_cuda:
+        return False
+    ms = list(ffn)
+    if (len(ms) != 3 or not isinstance(ms[1], torch.nn.ReLU)
+            or not all(isinstance(m, torch.nn.Linear) and m.bias is not None
+                       for m in (ms[0], ms[2]))
+            or (ms[0].in_features, ms[0].out_features) != _FFN_SHAPE
+            or (ms[2].in_features, ms[2].out_features) != _FFN_SHAPE[::-1]
+            or x.shape[-1] != _FFN_SHAPE[0]):
+        return False
+    if ln is not None and not (
+            tuple(ln.normalized_shape) == (_FFN_SHAPE[0],)
+            and ln.elementwise_affine and ln.weight is not None
+            and ln.bias is not None):
+        return False
+    ext = _load()
+    if ext is None or not hasattr(ext, "ffn_fused"):
+        return False
+    dev = (x.device.index if x.device.index is not None
+           else torch.cuda.current_device())
+    ok = _ffn_dev_ok.get(dev)
+    if ok is None:
+        with torch.cuda.device(dev):
+            ok = bool(ext.ffn_fused_supported())
+        _ffn_dev_ok[dev] = ok
+    return ok
+
+
+def _ffn_acc():
+    """Kernel accumulate code: 0 = fp32 both GEMMs, 1 = fp16 down-
+    projection (fp16_accum "fwd" / "all"), 2 = fp16 both ("up16")."""
+    if _FFN_MODE == "up16":
+        return 2
+    return 1 if _ACC_FWD else 0
+
+
+def _ffn_call(x2, h22, ffn0, ffn2, ln, acc, save):
+    """ext.ffn_fused on (R, 192) views; returns (result list, w0h, w2h)."""
+    w0h, _ = _half_params(ffn0.weight, ffn0.bias)
+    w2h, _ = _half_params(ffn2.weight, ffn2.bias)
+    r = _load().ffn_fused(
+        x2, h22, w0h, ffn0.bias.detach(), w2h, ffn2.bias.detach(),
+        None if ln is None else ln.weight.detach(),
+        None if ln is None else ln.bias.detach(),
+        float(ln.eps) if ln is not None else 0.0, acc, save)
+    return r, w0h, w2h
+
+
+class _FusedFfn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, h2, w0, b0, w2, b2, lnw, lnb, mods, acc):
+        # w0/b0/w2/b2/lnw/lnb: the fp32 masters, forward args purely for
+        # grad routing (the kernel reads the replicas / detached masters)
+        ffn0, ffn2, ln = mods
+        lead = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        h22 = h2.reshape(-1, h2.shape[-1])
+        r, w0h, w2h = _ffn_call(x2, h22, ffn0, ffn2, ln, acc, True)
+        xo, ho, mean, rstd, hid, mask = r
+        ctx.save_for_backward(h22, hid, mask, w0h, w2h, xo, mean, rstd,
+                              lnw)
+        ctx.ln = ln is not None
+        ctx.lead = lead
+        ctx.acc = _ACC_DGRAD
+        if ctx.ln:
+            return xo.view(*lead, -1), ho.view(*lead, -1)
+        return xo.view(*lead, -1)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        h22, hid, mask, w0h, w2h, xo, mean, rstd, lnw = ctx.saved_tensors
+        nig = ctx.needs_input_grad
+        ext = _load()
+        if ctx.ln:
+            import fused_ln
+            gxo, gho = (gr.reshape(-1, gr.shape[-1]).contiguous()
+                        for gr in grads)
+            # g = dL/d(out): the residual grad plus the LN's dx, summed in
+            # ln_bwd's store loop (exactly _LnAddFn.backward's call); db2 =
+            # its column sum (fused in the kernel at d = 192)
+            r = fused_ln._load().ln_bwd(xo, gho, lnw, mean, rstd, gxo,
+                                        nig[5])
+            g, dlnw, dlnb = r[0], r[1], r[2]
+            db2 = None
+            if nig[5]:
+                db2 = r[3] if len(r) > 3 else g.sum(0, dtype=torch.float32)
+            dw2, _ = _wgrad_db(g, hid, nig[4], False)
+        else:
+            g = grads[0].reshape(-1, grads[0].shape[-1]).contiguous()
+            dlnw = dlnb = None
+            dw2, db2 = _wgrad_db(g, hid, nig[4], nig[5])
+        # ffn.2's dgrad with the ReLU mask applied in the GEMM epilogue (the
+        # unfused chain's DRELU GEMM); relu_bwd over the saved hidden if no
+        # Lt plan exists at this row count
+        gm = ext.dgrad_drelu(g, w2h, mask)
+        if gm is None:
+            gm, _ = ext.relu_bwd(_dgrad(g, w2h, ctx.acc), hid)
+        dw0, db0 = _wgrad_db(gm, h22, nig[2], nig[3])
+        dh2 = None
+        if nig[1]:
+            dh2 = _dgrad(gm, w0h, ctx.acc).view(*ctx.lead, -1)
+        dx = g.view(*ctx.lead, -1) if nig[0] else None
+        return dx, dh2, dw0, db0, dw2, db2, dlnw, dlnb, None, None
+
+
+def fused_ffn(x, h2, ffn, ln=None):
+    """x + ffn(h2) for a block FFN on the fp16 stream as ONE kernel
+    (callers gate on fused_ffn_ok); with `ln` also LN(x + ffn(h2)).
+    Returns out, or (out, ln_out)."""
+    ffn0, ffn2 = ffn[0], ffn[2]
+    x = x if x.is_contiguous() else x.contiguous()
+    h2 = h2 if h2.is_contiguous() else h2.contiguous()
+    acc = _ffn_acc()
+    if not torch.is_grad_enabled():
+        # rollout fast path: no Function dispatch, no saved tensors — the
+        # kernel writes neither the hidden nor the mask
+        lead = x.shape[:-1]
+        r, _, _ = _ffn_call(x.reshape(-1, x.shape[-1]),
+                            h2.reshape(-1, h2.shape[-1]), ffn0, ffn2, ln,
+                            acc, False)
+        if ln is None:
+            return r[0].view(*lead, -1)
+        return r[0].view(*lead, -1), r[1].view(*lead, -1)
+    lnw = None if ln is None else ln.weight
+    lnb = None if ln is None else ln.bias
+    return _FusedFfn.apply(x, h2, ffn0.weight, ffn0.bias, ffn2.weight,
+                           ffn2.bias, lnw, lnb, (ffn0, ffn2, ln), acc)
