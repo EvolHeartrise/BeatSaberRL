@@ -3850,8 +3850,9 @@ struct Sim {
   // base) and the resulting world velocities (lib.rs body_pt_vel)
   T *__restrict__ body_pt, *__restrict__ body_pt_vel;
   // Flux: palm-centre finite-difference velocity (E, 2, 3) — lib.rs
-  // Core::palm_vel; zeroed by reset_env and the mode-2 refresh,
-  // written only by the Flux judgment (stays 0 in the standard game)
+  // Core::palm_vel; zeroed by the mode-2 refresh, set to the start
+  // kick by reset_env (0 without start_jitter), written only by the
+  // Flux judgment (read only by the Flux obs; dead in the standard game)
   T* __restrict__ palm_vel;
   // swing chain
   T *__restrict__ swing_acc, *__restrict__ axis;
@@ -4094,6 +4095,16 @@ struct Sim {
   // when start_pose_jitter > 0 (radians scale).
   const T* __restrict__ pose_jit;
   T start_pose_jitter;
+  // start-jitter velocity kick (review B10, 2026-09-30; TRAINING-ONLY,
+  // no lib.rs mirror — the Rust sim has no per-episode RNG): (N, 2)
+  // world [dvx, dvz] m/s, precomputed by the wrapper every launch
+  // (|dv| ~ U(0, start_jitter), direction uniform; all zeros when
+  // start_jitter == 0, so reset_env's stores are then the old zeros).
+  // reset_env installs it as the root's horizontal velocity BEFORE
+  // store_state / write_obs, so the reset obs shows the kicked state.
+  // Before B10 the wrapper added it to v AFTER the launch, so the first
+  // obs of every episode read root velocity 0 while the body moved.
+  const T* __restrict__ start_kick;
   // env v38 crouch-rich starts (user; TRAINING-ONLY, jitter
   // precedent): with prob crouch_prob a reset samples a continuous
   // depth along CROUCH_ROWS (physics-validated squat synergy:
@@ -4291,14 +4302,39 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
     }
     d.p[1] -= min_y;
   }
+  // review B10: the start-jitter kick — the root's horizontal velocity,
+  // installed before store_state so P.v and the reset obs (write_obs
+  // runs after this) carry it. A pure store over the zeroed d.v (the
+  // pose block above reads no velocity), bit-identical to the pre-B10
+  // wrapper's post-launch `v += dv` on a zero v. Zeros when the
+  // wrapper's start_jitter == 0 (parity / bench configs).
+  const T kick_x = P.start_kick[e * 2];
+  const T kick_z = P.start_kick[e * 2 + 1];
+  d.v[0] = kick_x;
+  d.v[2] = kick_z;
   store_state(d, P, e);
   refresh_fk(d, P, e);
   // env v24: seed the finite-diff base with the reset pose's §8
   // points, velocities zero (lib.rs Body reset mirror)
   seed_body_pts(d, P, e);
+  // review B10: with every joint rate and the root's angular velocity
+  // zero, the kick is a rigid translation, so the TRUE velocity of
+  // every body point, wrist and palm is exactly (kick_x, 0, kick_z) —
+  // the finite-diff velocity lanes start there instead of 0 (all zero
+  // without a kick: the lib.rs Body reset values). The next tick's
+  // finite difference overwrites them from the position bases, which
+  // the kick does not touch.
+  for (int i = 0; i < N_BODY_PTS; i++) {
+    P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3] = kick_x;
+    P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3 + 2] = kick_z;
+  }
   for (int s = 0; s < 2; s++) {
-    for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
-    for (int k = 0; k < 3; k++) P.palm_vel[(e * 2 + s) * 3 + k] = T(0);
+    P.wrist_vel[(e * 2 + s) * 3] = kick_x;
+    P.wrist_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.wrist_vel[(e * 2 + s) * 3 + 2] = kick_z;
+    P.palm_vel[(e * 2 + s) * 3] = kick_x;
+    P.palm_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.palm_vel[(e * 2 + s) * 3 + 2] = kick_z;
     P.swing_acc[e * 2 + s] = T(0);
     P.axis_valid[e * 2 + s] = false;
     P.tr_ptr[e * 2 + s] = 0;
@@ -5711,6 +5747,7 @@ enum {
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
   TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
   TPALMV,   // Flux palm velocity (N, 2, 3)
+  TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)
@@ -5894,6 +5931,10 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
+    TORCH_CHECK(ts[TSTARTKICK].numel() == 2 * N
+                && ts[TSTARTKICK].is_contiguous(),
+                "start_kick must be a contiguous (N, 2) tensor");
+    P.start_kick = ts[TSTARTKICK].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.crouch_prob = (scalar_t)crouch_prob;
     P.gears = (int)gears;
