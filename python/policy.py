@@ -26,6 +26,7 @@ factorization).
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -427,6 +428,12 @@ HEAD_GROUPS = (("spine", 0, 3), ("armL", 3, 10), ("armR", 10, 17),
 MASK_BIAS = 16384.0
 
 
+# Block.forward's delta_bias sentinel: the previous block's fused FFN
+# kernel (fp16_linear.fused_ffn, --fused-ffn) already ran THIS block's
+# residual add + ln_attn — x arrives resolved and delta IS ln_attn(x).
+_LN_DONE = object()
+
+
 def _mlp(sizes, act=nn.ReLU):
     layers = []
     for i in range(len(sizes) - 1):
@@ -468,7 +475,8 @@ class Block(nn.Module):
                 n_queries: int = 0, attn_bias: torch.Tensor | None = None,
                 delta: torch.Tensor | None = None,
                 delta_bias: torch.Tensor | None = None,
-                want_resolved: bool = False):
+                want_resolved: bool = False,
+                next_ln: nn.Module | None = None):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -500,8 +508,15 @@ class Block(nn.Module):
         # own k/v see. Returning it here is free (the tensor exists);
         # the caller used to RECOMPUTE it as tokens + delta + delta_b,
         # which promoted the fp16 stream to fp32 (fp32 bias Parameter).
+        # next_ln (non-final blocks): the NEXT block's ln_attn. Under
+        # --fused-ffn (fp16_linear.fused_ffn, 2026-09-30) this block's FFN,
+        # the residual add and that LN run as ONE kernel; the block then
+        # returns (x_resolved, ln_attn(x_resolved), _LN_DONE) and the next
+        # block skips its forward_add.
         B, T, _ = x.shape
-        if delta is not None:
+        if delta_bias is _LN_DONE:
+            h = delta
+        elif delta is not None:
             x, h = self.ln_attn.forward_add(x, delta, delta_bias)
         else:
             h = self.ln_attn(x)
@@ -593,9 +608,18 @@ class Block(nn.Module):
         x, h2 = self.ln_ffn.forward_add(x, att)
         if n_queries:
             # final block: nothing downstream fuses the residual add, so
-            # ffn.2 keeps its own bias
-            out = x + _seq(self.ffn, h2)
+            # ffn.2 keeps its own bias (fused: the kernel's residual-only
+            # variant)
+            if _fl.fused_ffn_ok(h2, self.ffn):
+                out = _fl.fused_ffn(x, h2, self.ffn)
+            else:
+                out = x + _seq(self.ffn, h2)
             return (out, x_full) if want_resolved else out
+        if next_ln is not None and _fl.fused_ffn_ok(h2, self.ffn, next_ln):
+            # --fused-ffn: FFN + residual + the next block's ln_attn in one
+            # kernel; the hidden never reaches memory in the rollout
+            x, h_next = _fl.fused_ffn(x, h2, self.ffn, next_ln)
+            return x, h_next, _LN_DONE
         # non-final block: the consumer is the NEXT block's
         # ln_attn.forward_add, which can absorb ffn.2's bias
         ffn_out, ffn_bias = _seq(self.ffn, h2, fold_tail=True)
@@ -647,7 +671,7 @@ class NotePolicy(nn.Module):
                  value_sigma: float = 0.75,
                  trunk_hidden: int | None = None,
                  z_asinh: float = 8.0, game: str = "standard",
-                 fp16_accum: str = "off"):
+                 fp16_accum: str = "off", fused_ffn: str = "off"):
         super().__init__()
         # game mode the policy plays (SPEC.md §Flux): same network,
         # different obs lane meanings — never cross-loaded
@@ -662,6 +686,9 @@ class NotePolicy(nn.Module):
         if fp16_accum not in _fl.ACCUM_MODES:
             raise ValueError(f"fp16_accum must be one of {_fl.ACCUM_MODES}, "
                              f"got {fp16_accum!r}")
+        if fused_ffn not in _fl.FFN_MODES:
+            raise ValueError(f"fused_ffn must be one of {_fl.FFN_MODES}, "
+                             f"got {fused_ffn!r}")
         assert encoder == "transformer", (
             f"unknown encoder: {encoder} (pool was removed 2026-07-20)")
         assert n_gears in (3, 5, 7), f"n_gears must be 3/5/7, got {n_gears}"
@@ -723,7 +750,13 @@ class NotePolicy(nn.Module):
                      # policy was TRAINED with, so every fp16 consumer
                      # (rollout, update, fp16 benches) runs the same one.
                      # The fp32 record path ignores it. Absent = "off".
-                     "fp16_accum": fp16_accum}
+                     "fp16_accum": fp16_accum,
+                     # fused block-FFN kernel of the fp16 stream (review
+                     # I13, fp16_linear.fused_ffn): near-tie numerics vs
+                     # the unfused path, so recorded like fp16_accum.
+                     # Ignored off the fp16 CUDA stream / at other widths.
+                     # Absent = "off".
+                     "fused_ffn": fused_ffn}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -819,6 +852,8 @@ class NotePolicy(nn.Module):
         # load_policy: "pre-i07" when the weights were upgraded from a
         # pre-I07 checkpoint (zero-filled new input columns)
         self.upgraded_from = None
+        # fused block-FFN kernel mode of the fp16 stream (arch "fused_ffn")
+        self.fused_ffn = fused_ffn
 
     def _split(self, obs: torch.Tensor):
         sabers = obs.index_select(1, self._saber_idx)                # (B, 50)
@@ -867,10 +902,16 @@ class NotePolicy(nn.Module):
         GEMMs run under the policy's accumulate mode (self.fp16_accum,
         fp16_linear.fp16_accum); the backward of a grad-mode call
         inherits it (the Functions latch it at forward time)."""
-        if self.fp16 and obs.is_cuda and self.fp16_accum != "off":
-            with _fl.fp16_accum(self.fp16_accum):
-                return self._forward_stacked(obs)
-        return self._forward_stacked(obs)
+        if not (self.fp16 and obs.is_cuda):
+            return self._forward_stacked(obs)
+        with contextlib.ExitStack() as modes:
+            if self.fp16_accum != "off":
+                modes.enter_context(_fl.fp16_accum(self.fp16_accum))
+            if self.fused_ffn != "off":
+                # the fused block FFN (--fused-ffn); fused_ffn_ok falls
+                # back per block wherever the kernel does not apply
+                modes.enter_context(_fl.ffn_fusion(self.fused_ffn))
+            return self._forward_stacked(obs)
 
     def _forward_stacked(self, obs: torch.Tensor):
         fp16 = self.fp16 and obs.is_cuda
@@ -936,9 +977,10 @@ class NotePolicy(nn.Module):
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
         delta = delta_b = None
-        for blk in self.blocks[:-1]:
+        for i, blk in enumerate(self.blocks[:-1]):
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
-                                         delta=delta, delta_bias=delta_b)
+                                         delta=delta, delta_bias=delta_b,
+                                         next_ln=self.blocks[i + 1].ln_attn)
         # final block: only the lead tokens' outputs are consumed.
         # adapool critic: it pools over the RESOLVED token stream
         # entering the final block — the same embeddings that block's
@@ -1280,7 +1322,9 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         value_sigma=arch.get("value_sigma", 0.75),
         z_asinh=float(z_asinh), game=game,
         # absent (every checkpoint before issue #3) = fp32 accumulate
-        fp16_accum=arch.get("fp16_accum", "off"))
+        fp16_accum=arch.get("fp16_accum", "off"),
+        # absent (every checkpoint before review I13) = unfused FFN
+        fused_ffn=arch.get("fused_ffn", "off"))
     sd = ckpt["state_dict"]
     policy.upgraded_from = None
     if not blade_geo:
