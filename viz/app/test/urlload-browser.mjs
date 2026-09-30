@@ -1,7 +1,8 @@
 // Headless-browser check of URL loading on a SERVED viewer — the hosted one
 // (https://replays.flee.systems) or `wrangler dev` in viz/replays-site:
 //   - ?replay=/r/<file>.jsonl.gz shows download progress, opens the replay
-//     paused behind a "watch" button, and names its tick rate;
+//     paused behind a "watch" button that names it (song [difficulty] ·
+//     model, from the header), at the header's tick rate;
 //   - the song is fetched from BeatSaver (the header's map hash);
 //   - after the click (a real user gesture: no autoplay flag here) the replay
 //     runs at the header's tick rate in real time, with the song sounding
@@ -65,9 +66,17 @@ try {
   console.log(`replay opened in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   await cdp.send("Network.emulateNetworkConditions", {
     offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
-  const title = await page.$eval("#drop, #title", (el) => el.textContent.replace(/\s+/g, " ").trim());
-  console.log(`title: ${title}`);
-  const hz = +(/(\d+) Hz/.exec(title)?.[1] ?? 30);
+  // the replay's name and tick rate, from the viewer's state (the page no
+  // longer prints a title line); the name is what the watch button shows
+  const opened = await page.evaluate(() => ({
+    ...window.__viewerState?.(),
+    watch: document.querySelector("#watch")?.textContent.replace(/\s+/g, " ").trim(),
+  }));
+  console.log(`name: ${opened.name} · ${opened.tickHz} Hz`);
+  if (!opened.loaded || !opened.name) fail("a linked replay must open with a name");
+  if (!opened.watch?.includes(opened.name)) fail("the watch button does not name the replay: " + opened.watch);
+  if (!(opened.tickHz > 0)) fail("no tick rate in the viewer state");
+  const hz = opened.tickHz;
   // the viewer's test hook: the tick on screen and its time
   const hud = () => page.evaluate(() => JSON.stringify(window.__viewerState?.()));
   const hudT = () => page.evaluate(() => {

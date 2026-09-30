@@ -630,7 +630,9 @@ rejected.
 double-clickable, drop-a-`.jsonl`-in, zero-server page): real WebGL 3D
 with **OrbitControls** (drag = orbit, wheel = zoom, right-drag = pan).
 Since 2026-07-22 the viewport IS the page (fullscreen canvas) and all
-DOM chrome floats on top of it: title + file pill at the top,
+DOM chrome floats on top of it: the file pill at the top (no replay
+title/summary line since 2026-09-30 — the map card names the song; with a
+replay loaded the pill just reads "📂 open replay…"),
 controls in a translucent panel at the bottom (no DOM score strip since
 2026-09-29 — the score readout is the in-scene HUD below)
 (`pointer-events: none` containers so drags reach the canvas). The
@@ -642,7 +644,7 @@ Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 watch-only build (`npm run build:site` → `dist-site/index.html`, taken by
 `viz/replays-site/scripts/build.mjs`; flags in `src/lib/build.js`): no
 Flux WebXR game, Flux replays refused with a message, no pose mode and no
-file-picker button (the title is plain text). `npm test` runs the pure-logic tests (node) and
+file-picker button — nothing at the top of the page at all. `npm test` runs the pure-logic tests (node) and
 `node test/browser.test.js` drives the built file in headless Edge
 (loads a real replay via the file input, asserts playback advances with
 zero page errors, screenshots to `test/out/`). Scene (world → three.js:
@@ -696,10 +698,10 @@ events with combo.rs's rules (`hud.js` `fluxHudAt`, pinned frame by frame
 to the judge's tallies in test/flux-game.test.js). The game's XR origin is
 the watch's "Player" spot (scene z 0.65), so the HUD sits where Beat
 Saber's does around the player. All in-scene text/panels are
-canvas-texture sprites (not DOM overlays) so exported videos keep them
+canvas-texture sprites (not DOM overlays) so they live in the 3D scene
 and the file works fully offline. Controls: space play/pause, ←/→
-tick-step, +/− speed, r restart, g gauges, scrub bar, ⏺ export video
-(MediaRecorder → .webm). Note positions and outcomes are DERIVED from
+tick-step, +/− speed, r restart, g gauges, scrub bar. There is no video
+export (removed 2026-09-30 from both builds). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
 Replays come from `python/make_top10_replays.py`, which sets up the
 production physics and plays a checkpoint on the bench's real maps

@@ -22,8 +22,6 @@
 //     ~10 MB blob is comfortably more than 80 ms, so the next frame sees the
 //     gap again and seeks again — the element spends its life seeking and
 //     never plays a clean second.
-// The export path never touched any of this: it slices the decoded song by
-// array index (lib/record.js), which is why the exported video was fine.
 
 /** Drift thresholds, in seconds unless noted. */
 export const SYNC = {

@@ -1,7 +1,7 @@
 <script>
   // Billboard text via a canvas texture — self-contained (system font, no
-  // network font fetch) and rendered IN the WebGL canvas, so exported
-  // videos keep score popups and fail labels.
+  // network font fetch) and rendered IN the WebGL canvas, so score popups
+  // and fail labels live in the 3D scene with everything else.
   import { T } from "@threlte/core";
   import * as THREE from "three";
 

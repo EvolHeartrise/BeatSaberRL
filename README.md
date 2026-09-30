@@ -569,9 +569,8 @@ head (or a person's tracked head) but, since 2026-09-30, ignores the
 head's rotation — it always looks straight down the track toward the
 incoming notes, level and unturned, so the view never swings with the
 head. A FOV slider (40–110°, default 75°) appears in the bar while it is
-on; the view is a pure function of the tick, so scrubbing and the
-frame-by-frame export match playback, and the export records whichever
-camera is active; the head sphere is hidden
+on; the view is a pure function of the tick, so scrubbing matches
+playback; the head sphere is hidden
 while it is on, the gauges move to that camera, and the orbit camera
 keeps its place for when you toggle back — drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
@@ -603,7 +602,7 @@ checkpoint.
 
 Since 2026-09-14 a map card sits in the TOP-LEFT corner of the render area
 (`viz/app/src/lib/MapCard.svelte`, a DOM overlay over the canvas like the
-pose panel — so it is NOT captured by `export video`): cover art, song name,
+pose panel): cover art, song name,
 sub name, "by <song author> · mapped by <mapper>", the difficulty as a badge
 and a link to the map on BeatSaver. It is always shown for a replay that
 names a map (the `m` / 💿 toggle was removed 2026-09-29). A replay header only
@@ -669,42 +668,10 @@ authoritative and the audio follows it — seeks when it drifts past 80 ms,
 `playbackRate` tracks the speed control, and it stays silent while the song
 time is still negative. Mute + volume sit in the bottom bar.
 
-`export video` renders FRAME BY FRAME (`viz/app/src/lib/record.js`), not in
-real time: it steps Threlte's render loop once per replay tick, stamps each
-frame with its own timestamp and encodes VP9 + Opus through WebCodecs into a
-WebM (`webm-muxer`). So the file is exactly `ticks + 1` frames at 30 fps
-however long a frame took to draw, and the song is copied out of the decoded
-audio by array slice — with silence padded wherever the recording runs
-outside it — rather than recorded off the speakers.
-
-That replaced a `captureStream` + MediaRecorder pass, which cannot be tuned
-into correctness on a machine that can't render 30 fps live: MediaRecorder
-timestamps frames by ARRIVAL time, so late frames stretch the video instead
-of dropping, and capturing a stalling audio graph gives genuinely choppy
-audio. The real-time pass survives as the fallback for browsers without
-WebCodecs, and there it still muxes the song by tapping the element through
-WebAudio and forking it — via a gain node to the speakers, straight to a
-MediaStreamDestination for the recorder. That gain node is where mute/volume
-live, since the element's own volume sits upstream of the tap and would
-otherwise bake a muted viewer into a silent file.
-
-`node test/export-probe.mjs [replay] [fps]` guards it: it runs a real export
-and fails if the file is blank. Structural checks cannot catch that — a
-broken exporter produced perfect frame counts, frame rate, duration, pixel
-format and audio track with 23k frames of pure black — but bytes-per-frame
-separates them cleanly (~0.5 kB blank vs ~13 kB with gameplay in it).
-
-Replays with no map export video-only. The frame rate is a dropdown next to
-the button (24 / 30 / 60 / 120): output frames are decoupled from the
-replay's 30 ticks/s — frame i renders at tick `i * 30 / fps`, which the
-viewer interpolates — so 60 fps genuinely smooths the motion rather than
-duplicating frames. The export always runs at 1x regardless of the speed
-control. Since 2026-09-11 a `■ stop & save` button sits next to the
-progress readout (which shows percent and the exported length as m:ss):
-it ends the export at the next frame and still writes a complete file of
-everything rendered so far, with the song cut to match — so the first
-3 minutes of a 6-minute replay cost 3 minutes of rendering, not 6. The
-real-time fallback path stops its recorder the same way.
+The viewer has no video export: the frame-by-frame WebCodecs exporter
+(`record.js`, `webm-muxer`), its real-time MediaRecorder fallback and the
+`export video` / fps / `■ stop & save` controls were removed 2026-09-30 from
+both the full build and the replays.flee.systems build.
 
 Cut debris lives half the aftermath window (0.35 s of the 0.7 s; the window
 itself is the flying score's lifetime and has to stay) and separates at
@@ -714,8 +681,8 @@ twice as fast rather than half as far.
 The scene also paints its own `#0b0d11` background as of 2026-09-09. Threlte
 builds its renderer with `alpha: true` and nothing had set `scene.background`,
 so the canvas was transparent and the dark stage was the `#stage` CSS behind
-it — invisible in the browser, but `captureStream` records the canvas, so
-exports came out black-keyed. Verified: `pix_fmt=yuv420p`, not `yuva420p`.
+it — invisible in the browser, but anything reading the canvas itself got a
+transparent background.
 
 Since 2026-09-06 the objects are the REAL Beat Saber models as
 ScoreSaber's replay viewer renders them — the canonical reference for

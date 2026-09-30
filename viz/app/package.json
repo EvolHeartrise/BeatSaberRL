@@ -29,7 +29,6 @@
     "@threlte/extras": "^9.0.0",
     "@threlte/xr": "^1.6.1",
     "fflate": "^0.8.2",
-    "three": "^0.170.0",
-    "webm-muxer": "^5.1.4"
+    "three": "^0.170.0"
   }
 }

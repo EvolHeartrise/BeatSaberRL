@@ -8,7 +8,7 @@
 // Screenshots land in test/out/ for eyeball verification.
 // Run: node test/browser.test.js [path-to-replay.jsonl]
 import { existsSync, mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import puppeteer from "puppeteer-core";
 
 // browser binary: $PUPPETEER_EXECUTABLE_PATH, else Edge on the Windows
@@ -60,6 +60,8 @@ try {
   page.on("console", (m) => {
     if (m.type() === "error") errors.push("console: " + m.text());
   });
+  // an alert() would hang the page: auto-dismiss it and count it as an error
+  page.on("dialog", (d) => { errors.push("dialog: " + d.message()); d.dismiss(); });
 
   await page.goto("file:///" + dist.replace(/\\/g, "/"));
   await page.waitForSelector("#stage canvas", { timeout: 15000 });
@@ -103,6 +105,22 @@ try {
     { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 1500)); // let it play a bit
   await page.screenshot({ path: "test/out/playing.png" });
+  // the top of the page no longer carries the replay's name / summary: the
+  // picker reads as a plain "open" action once a replay is loaded, and the
+  // name is still known to the viewer
+  const loaded = await page.evaluate(() => ({
+    drop: document.querySelector("#drop")?.textContent.replace(/\s+/g, " ").trim(),
+    name: window.__viewerState().name,
+    bar: [...document.querySelectorAll("#bar button, #bar select")]
+      .map((b) => b.textContent.trim()),
+  }));
+  console.log("loaded:", JSON.stringify(loaded));
+  if (loaded.drop !== "📂 open replay…")
+    throw new Error("the picker should read as an open action: " + loaded.drop);
+  if (loaded.name !== basename(replay).replace(/\.[^.]*$/, ""))
+    throw new Error("unexpected replay name in state: " + loaded.name);
+  if (loaded.bar.some((b) => /export|stop & save|fps/.test(b)))
+    throw new Error("video export controls are back in the bar: " + loaded.bar.join(" | "));
 
   // ---- skeleton + gauges + contact-marker eyeball shots ('h' hitboxes on):
   // scrub to a mid-episode tick (the bot swinging, weight on the welds —
@@ -176,7 +194,7 @@ try {
   if (existsSync(replayV15)) {
     await input.uploadFile(replayV15);
     await page.waitForFunction(
-      () => document.querySelector("#drop").textContent.includes("v15"),
+      () => window.__viewerState?.().name?.includes("v15"),
       { timeout: 10000 });
     await new Promise((r) => setTimeout(r, 800));
     await scrub(60);
@@ -237,30 +255,6 @@ try {
     }
   } else {
     console.log("no v15 recording at " + replayV15 + " — skipped");
-  }
-
-  // ---- export 'stop & save': start a frame-by-frame export, cut it off
-  // after a moment, and expect the exporter to finalize and return to
-  // idle with no page errors or alert() dialogs (a dialog would hang the
-  // page, so it is auto-dismissed and counted as an error).
-  page.on("dialog", (d) => { errors.push("dialog: " + d.message()); d.dismiss(); });
-  const canExact = await page.evaluate(
-    () => typeof VideoEncoder !== "undefined" && typeof AudioEncoder !== "undefined");
-  if (canExact) {
-    const clickBar = (text) => page.evaluate((text) =>
-      [...document.querySelectorAll("#bar button")]
-        .find((b) => b.textContent.includes(text)).click(), text);
-    await clickBar("export video");
-    await page.waitForFunction(() => [...document.querySelectorAll("#bar button")]
-      .some((b) => b.textContent.includes("stop & save")), { timeout: 10000 });
-    await new Promise((r) => setTimeout(r, 1500));
-    await page.screenshot({ path: "test/out/exporting.png" });
-    await clickBar("stop & save");
-    await page.waitForFunction(() => [...document.querySelectorAll("#bar button")]
-      .some((b) => b.textContent.includes("export video")), { timeout: 30000 });
-    console.log("export stop & save: exporter returned to idle");
-  } else {
-    console.log("no WebCodecs in this browser — export stop test skipped");
   }
 
   const webgl = await page.evaluate(() => {

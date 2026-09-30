@@ -1,6 +1,6 @@
 // Playback state shared by the DOM shell and the 3D scene (Svelte 5 runes).
 import {
-  DT, clampQ29, counts, isFlux, mirrorQ29, parseReplay, setTickRate, tickHzOf,
+  DT, clampQ29, counts, isFlux, isHuman, mirrorQ29, parseReplay, setTickRate, tickHzOf,
 } from "./replay.js";
 import { FLUX, POSE } from "./build.js";
 import { fluxHudAt, hudAt } from "./hud.js";
@@ -13,28 +13,18 @@ export const pb = $state({
            // than advancing — the only time the song is allowed to seek
   playing: false,
   speed: 1.0,
-  exporting: false,
-  exportPct: 0, // frame-by-frame export progress, 0..1
-  exportStop: false, // 'stop & save' pressed: finish the file with what is done
-  fps: 30, // export frame rate; the replay runs at its own tick_hz (30 unless its header says otherwise)
   gauges: true, // per-joint dial panels + force instrumentation
   hitboxes: false, // real v7 collision-volume wireframes ('h')
   firstPerson: false, // camera at the head, fixed forward-level ('f')
   fpFov: 75, // first-person vertical field of view, degrees
 });
 
-// Threlte's render controls, published by Scene.svelte. The frame-by-frame
-// exporter drives the render loop one frame at a time, but it lives in the
-// DOM shell OUTSIDE the <Canvas>, so it cannot call useThrelte itself. Plain
-// object: nothing reactive depends on these.
-export const gfx = { advance: null, renderMode: null, scheduler: null };
-
 // The SONG's clock, published by App.svelte for Scene.svelte's frame loop
 // (see lib/sync.js): `tick()` returns the replay tick the song is sounding
 // right now, or null when the song is not the master clock (no song, paused,
-// seeking, still buffering, or a video export in progress). Plain object on
-// purpose — the frame loop calls it every tick and must not turn the <audio>
-// element into a reactive dependency of the render.
+// seeking or still buffering). Plain object on purpose — the frame loop
+// calls it every tick and must not turn the <audio> element into a reactive
+// dependency of the render.
 export const songClock = { tick: null };
 
 // Song audio (2026-09-09). `offset` is the song time at replay t = 0, from
@@ -101,7 +91,11 @@ if (typeof window !== "undefined") {
     // hud: the in-game HUD's numbers (Hud3D.svelte) at this tick
     const hud = isFlux(pb.rep) ? (FLUX ? fluxHudAt(pb.rep, tick) : null)
       : hudAt(pb.rep, tick);
-    return { loaded: true, tick, lastTick: lastTick(), t: pb.cur * DT,
+    // name: the replay's display name (no longer shown at the top of the
+    // page); tickHz: its control rate; flux / human: what kind of replay
+    return { loaded: true, name: pb.name, tickHz: tickHzOf(pb.rep),
+      flux: isFlux(pb.rep), human: isHuman(pb.rep),
+      tick, lastTick: lastTick(), t: pb.cur * DT,
       playing: pb.playing, counts: { ...counts(pb.rep, tick) }, hud };
   };
 }

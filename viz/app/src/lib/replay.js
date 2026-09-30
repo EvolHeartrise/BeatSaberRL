@@ -232,9 +232,9 @@ export function headQuats(rep) {
 
 /** First-order smoothing of a per-tick quaternion track with time constant
  * `tau` seconds: q_s[t] = nlerp(q_s[t-1], q[t], 1 - exp(-DT / tau)). A pure
- * function of the track — scrubbing and the frame-by-frame export see the
- * same camera as playback (watch's SmoothDamp is deliberately frame-rate
- * dependent; this viewer's tick counter is authoritative). tau <= 0
+ * function of the track — scrubbing sees the same camera as playback
+ * (watch's SmoothDamp is deliberately frame-rate dependent; this viewer's
+ * tick counter is authoritative). tau <= 0
  * returns the input untouched. */
 export function smoothQuats(qs, tau) {
   if (!(tau > 0) || qs.length === 0) return qs;
@@ -739,34 +739,6 @@ export function arcPairs(chart) {
 
 export function maxScore(chart) {
   return chart.reduce((a, n) => a + KIND_MAX[n.kind], 0);
-}
-
-export function configSummary(rep) {
-  const c = rep.config ?? {};
-  if (isFlux(rep)) {
-    const nc = rep.chart.filter((n) => n.kind === KIND_CIRCLE).length;
-    const spd = c.note_speed_min != null
-      ? `${c.note_speed_min}-${c.note_speed_max} m/s` : null;
-    return (isHuman(rep) ? "FLUX (played in VR): " : "FLUX: ") +
-      `${nc} circles, ${rep.chart.length - nc} bars, ` +
-      `${rep.ticks.length} ticks` + (spd ? ` (${spd})` : "");
-  }
-  const spd = c.note_speed_min != null
-    ? `${c.note_speed_min}-${c.note_speed_max} m/s`
-    : (c.note_speed != null ? `${c.note_speed} m/s` : null);
-  const parts = [c.colors, spd];
-  if (c.gears != null) parts.push(`${c.gears} gears`);
-  if (c.note_prob != null) parts.push(`p ${c.note_prob}`);
-  if (c.extra_prob) parts.push(`extras ${c.extra_prob}`);
-  if (c.dot_prob) parts.push(`dots ${c.dot_prob}`);
-  if (c.bomb_prob) parts.push(`bombs ${c.bomb_prob}`);
-  // exp/tick-rate: name a non-default control rate (30 Hz stays unsaid)
-  const hz = tickHzOf(rep);
-  if (hz !== TICK_HZ_DEFAULT)
-    parts.push(`${hz} Hz` + ((rep.actionRepeat ?? 1) > 1
-      ? ` / repeat ${rep.actionRepeat}` : ""));
-  return `${rep.chart.length} objects, ${rep.ticks.length} ticks ` +
-    `(${parts.filter(Boolean).join(", ")})`;
 }
 
 /** In-plane world (x, y) — explicit in the v7+ chart. */

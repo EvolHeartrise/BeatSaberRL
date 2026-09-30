@@ -42,7 +42,7 @@
   //     (X) and energy (bolt) icons at its ends
   // The numbers come from lib/hud.js, a pure function of the tick. The
   // text and the ring are drawn into canvas textures IN the WebGL scene,
-  // so they show in both cameras and in the exported video. The ring
+  // so they show in both cameras (orbit and first-person). The ring
   // matches ComboMeter.png: outer radius 75 units, 9.375 thick.
   // Skipped: the PP line (only for ScoreSaber-ranked leaderboards, off
   // without one) and "FC : xx.xx%" (off by default in the watch's settings).

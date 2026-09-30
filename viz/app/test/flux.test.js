@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
   CIRCLE_R, KIND_BAR, KIND_CIRCLE, KIND_MAX, PALM_OFF, barAxis, bodyFK,
-  configSummary, counts, fkSaber, isFlux, isFluxKind, maxScore, palmOf,
+  counts, fkSaber, isFlux, isFluxKind, maxScore, palmOf,
   parseReplay, pendingNotes, sweetPoint,
 } from "../src/lib/replay.js";
 
@@ -20,7 +20,6 @@ assert.equal(KIND_MAX[KIND_CIRCLE], 60);
 assert.equal(KIND_MAX[KIND_BAR], 115);
 assert.equal(maxScore(rep.chart), rep.chart.reduce(
   (a, n) => a + (n.kind === KIND_CIRCLE ? 60 : 115), 0));
-assert.match(configSummary(rep), /^FLUX: \d+ circles, \d+ bars/);
 
 // palms: the logged "palms" field == wrist + PALM_OFF * hand axis, both
 // from the logged sabers and from the viewer's own body FK
