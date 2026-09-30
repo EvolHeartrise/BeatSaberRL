@@ -524,6 +524,13 @@ at::Tensor attn29_fwd(at::Tensor q, at::Tensor k, at::Tensor v,
                       at::Tensor bias);
 void attn29_bwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor bias,
                 at::Tensor dout, at::Tensor dq, at::Tensor dk, at::Tensor dv);
+// fused_ffn.cu (block FFN + residual + next LayerNorm, 2026-09-30, I13)
+bool ffn_fused_supported();
+std::vector<at::Tensor> ffn_fused(at::Tensor x, at::Tensor h2, at::Tensor w0,
+                                  at::Tensor b0, at::Tensor w2, at::Tensor b2,
+                                  c10::optional<at::Tensor> lnw,
+                                  c10::optional<at::Tensor> lnb,
+                                  double eps, int64_t acc, bool save);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn29_fwd", &attn29_fwd,
@@ -531,6 +538,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "additive fp16 key bias -> contiguous (B, TQ, 192) fp16");
   m.def("attn29_bwd", &attn29_bwd,
         "attn29 backward: writes dq/dk/dv into the given strided views");
+  m.def("ffn_fused_supported", &ffn_fused_supported,
+        "True when this device can run ffn_fused (sm_80+, enough opt-in "
+        "shared memory)");
+  m.def("ffn_fused", &ffn_fused,
+        "[xo, ho, mean, rstd, hid, mask]: xo = x + relu(h2 w0^T + b0) "
+        "w2^T + b2 and ho = LayerNorm(xo) (None without lnw) in one "
+        "kernel, d 192 / hidden 768; save adds the backward's mean/rstd, "
+        "fp16 hidden and cuBLASLt-layout ReLU mask; acc 0/1/2 = fp32 / "
+        "fp16-down / fp16-both accumulate");
   m.def("linear_relu_aux", &linear_relu_aux,
         "(y, mask): y = relu(x @ w^T + b) fp16 + its ReLU bitmask, one "
         "cublasLt GEMM (RELU_AUX_BIAS); [] if unsupported");
