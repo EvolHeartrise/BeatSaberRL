@@ -36,7 +36,16 @@ Space/bounds/protocol unchanged from s2 — its widened box is the
 prior; the GP restarts from Sobol on the new objective. First sweep
 where policies train with reachable accuracy gradient.
 
-  python sweep_ranked.py --max-runs 100 [--dir sweeps/s3_cutplane_upp]
+**WSD port (2026-09-30)**: see sweep_protein.py's WSD PORT note — a
+leg is a WSD trunk + leaf (not `--lr-decay cosine`, removed), the leaf
+checkpoint is benched without the retired `--fused-forward`, failures
+cost their real wall and a sub-minute crash aborts the sweep. Env
+flags: `--ranked-maps` (now the trainer default, kept explicit) with
+the recipe's other defaults (mirror augment, ep-stats, ...) — the env
+is the current one, not the 2026-07-29 cut-plane env, so s3 is FROZEN
+too and the default --dir is sweeps/s3_ranked_upp_wsd.
+
+  python sweep_ranked.py --max-runs 100 [--dir sweeps/s3_ranked_upp_wsd]
 """
 
 from __future__ import annotations
@@ -45,17 +54,17 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
-import time
 from copy import deepcopy
 
-from protein_sweep import Protein
+from sweep_protein import (PY, log_observation, replay, run_step,
+                           run_wsd_train, wsd_cmds)
 
-PY = sys.executable
+NUM_ENVS, HORIZON = 1024, 128
 # SEG_LEN retired 2026-09-16: whole-level episodes are the only pool mode
 SEG_POOL = 24576   # seeded segment subsample per leg (~0.6 GB VRAM;
 #                    identical across legs -> the pool npz caches once)
+ENV_FLAGS = ["--ranked-maps", "--chart-pool", str(SEG_POOL)]
 SPACE = {
     "metric": "catalog_unweighted_pp",
     "goal": "maximize",
@@ -88,59 +97,41 @@ SPACE = {
         # cut-plane scoring; keep widening until the optimum is
         # interior. At 128 a full-motion tick costs ~4x a note's
         # reward, so a floor above that would be physics, not bounds.
+        # (effort_coef itself left the space when the v10 effort price
+        # was retired — 737931c; the notes above are its history.)
         "total_steps": dict(distribution="log_normal", min=5e7, max=4e8, scale="time"),
     },
 }
 FILL = {"train": {k: None for k in SPACE["train"]}}
 
 
+def train_cmds(h, run_dir):
+    """(trunk_cmd, leaf_cmd, leaf_dir) for one WSD leg."""
+    return wsd_cmds(h, run_dir, NUM_ENVS, HORIZON, ENV_FLAGS)
+
+
+def bench_cmd(ck, out):
+    return [PY, "bench_scoresaber.py", "--ckpt", ck, "--out", out,
+            "--num-envs", "2048"]
+
+
 def run_leg(idx, h, run_dir):
-    """One ranked-segments training leg + full-catalog bench.
-    Returns (catalog_upp, wall_s) or None."""
+    """One ranked-maps WSD leg (trunk + leaf) + full-catalog bench of the
+    leaf. Returns (catalog_upp or None, train_wall_s)."""
     shutil.rmtree(run_dir, ignore_errors=True)  # leg = always fresh model
-    cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
-           "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", 
-           "--chart-pool", str(SEG_POOL),
-           "--lr", f"{h['lr']:.6g}",
-           "--ent-coef", f"{h['ent_coef']:.6g}",
-           "--ent-final", f"{h['ent_final']:.6g}",
-           "--gamma", f"{h['gamma']:.6g}",
-           "--gae-lambda", f"{h['gae_lambda']:.6g}",
-           "--total-steps", str(int(h["total_steps"])),
-           "--run-dir", run_dir]
-    t0 = time.time()
-    # this leg's own budget at a conservative 8,000 steps/s floor (v10
-    # measures 12.4k at 1024/128, 24.4k at 4096/32 — 2026-08-07) plus
-    # 1800 s startup; 4e8 (the cost-axis ceiling) -> 51,800 s
-    tmo = int(h["total_steps"]) // 8000 + 1800
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=tmo)
-    except subprocess.TimeoutExpired:
-        print(f"[run {idx:03d}] TRAIN TIMEOUT ({tmo}s)", flush=True)
-        return None
-    wall = time.time() - t0
-    ck = os.path.join(run_dir, "final.pt")
-    if r.returncode != 0 or not os.path.exists(ck):
-        tail = (r.stdout or "")[-400:] + (r.stderr or "")[-400:]
-        print(f"[run {idx:03d}] TRAIN FAILED ({wall:.0f}s): {tail}",
-              flush=True)
-        return None
+    # conservative 8,000 steps/s floor (v10 measures 12.4k at 1024/128,
+    # 24.4k at 4096/32 — 2026-08-07) plus 1800 s startup per step
+    ck, wall = run_wsd_train(idx, h, run_dir, NUM_ENVS, HORIZON,
+                             train_cmds(h, run_dir), 8000)
+    if ck is None:
+        return None, wall
     out = os.path.join(run_dir, "bench.json")
     # 7200 s: the v10 catalog bench runs ~1,900-2,400 s (2026-08-07),
     # so this is ~3x margin. The old 3000 s was a pre-v10 constant.
-    try:
-        b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                            "--out", out,
-                            "--num-envs", "2048", "--fused-forward"],
-                           capture_output=True, text=True, timeout=7200)
-    except subprocess.TimeoutExpired:
-        print(f"[run {idx:03d}] BENCH TIMEOUT (7200s)", flush=True)
-        return None
-    if b.returncode != 0 or not os.path.exists(out):
-        print(f"[run {idx:03d}] BENCH FAILED: {(b.stderr or '')[-300:]}",
-              flush=True)
-        return None
+    ok, _ = run_step(idx, "BENCH", bench_cmd(ck, out),
+                     os.path.join(run_dir, "bench.log"), 7200)
+    if not ok or not os.path.exists(out):
+        return None, wall
     upp = json.load(open(out))["total_unweighted_pp"]
     return upp, wall
 
@@ -148,26 +139,22 @@ def run_leg(idx, h, run_dir):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--max-runs", type=int, default=100)
-    p.add_argument("--dir", type=str, default="sweeps/s3_cutplane_upp")
+    p.add_argument("--dir", type=str, default="sweeps/s3_ranked_upp_wsd")
     args = p.parse_args()
     if os.path.normpath(args.dir).replace("\\", "/").endswith(
-            "sweeps/s2_ranked_upp"):
-        sys.exit("sweeps/s2_ranked_upp is FROZEN: scoring-v1 observations "
-                 "(pre-cut-plane-fix objective) must not mix with v2 legs. "
-                 "Use the s3 default or a fresh dir.")
+            ("sweeps/s2_ranked_upp", "sweeps/s3_cutplane_upp")):
+        sys.exit("sweeps/s2_ranked_upp and s3_cutplane_upp are FROZEN: "
+                 "their observations are older objectives (scoring v1; "
+                 "the pre-contact, pre-WSD env) and must not mix with "
+                 "current legs. Use the default or a fresh dir.")
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "observations.jsonl")
 
+    from protein_sweep import Protein   # gpytorch: sweep host only
     protein = Protein(SPACE, cost_param="train/total_steps")
 
-    start = 0
-    if os.path.exists(log_path):
-        for line in open(log_path, encoding="utf-8"):
-            o = json.loads(line)
-            protein.observe(o["hypers"], o["score"], o["cost"],
-                            o["is_failure"])
-            protein.suggestion_idx += 1
-            start += 1
+    start = replay(protein, log_path)
+    if start:
         print(f"resumed: replayed {start} observations", flush=True)
 
     for idx in range(start, args.max_runs):
@@ -178,17 +165,12 @@ def main():
               f"->{h['ent_final']:.2e} gamma {h['gamma']:.4f} "
               f"lam {h['gae_lambda']:.4f} "
               f"steps {h['total_steps']/1e6:.0f}M", flush=True)
-        res = run_leg(idx, h, run_dir)
-        if res is None:
-            score, cost, fail = 0.0, 1.0, True
-        else:
-            score, cost = res
-            fail = False
+        score, cost = run_leg(idx, h, run_dir)
+        fail = score is None
+        if fail:
+            score = 0.0   # Protein refits failures at the min score
         protein.observe(hypers, score, cost, fail)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"idx": idx, "hypers": hypers,
-                                "score": score, "cost": cost,
-                                "is_failure": fail}) + "\n")
+        log_observation(log_path, idx, hypers, score, cost, fail)
         print(f"[run {idx:03d}] -> catalog upp {score:,.0f} "
               f"({cost/60:.1f} min){' FAILED' if fail else ''}", flush=True)
 
