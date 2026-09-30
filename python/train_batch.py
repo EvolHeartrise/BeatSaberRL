@@ -1554,6 +1554,9 @@ def main():
 
     if resume_ckpt is not None:
         policy = load_policy(resume_ckpt, game=args.game)
+        if policy.upgraded_from:   # I07: its optimizer state is the old shape
+            raise SystemExit(f"--resume: {policy.upgraded_from} checkpoint "
+                             "(obs 624); warm-start it with --init-from")
     elif args.init_from:
         policy = load_policy(init_ckpt, game=args.game)
         print(f"warm-started from {args.init_from} (arch {policy.arch})",

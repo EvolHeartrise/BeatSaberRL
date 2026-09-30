@@ -739,7 +739,7 @@ def fp16_relu_chain(x, ms, tail_bias=True):
     if ext is None or not hasattr(ext, "linear_relu_aux"):
         return None
     if ms[0].in_features % 8:
-        # odd-K encoder inputs (saber 46 / torso 29 / leg 34): cuBLASLt
+        # odd-K encoder inputs (saber 49 / torso 29 / leg 34): cuBLASLt
         # has no fused RELU_AUX_BIAS kernel there (it appends a separate
         # epilogue kernel), so they keep the fused RELU_BIAS forward +
         # relu_bwd (their backward is tiny; the forward runs every tick)
