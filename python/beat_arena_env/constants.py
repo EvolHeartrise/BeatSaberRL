@@ -308,7 +308,16 @@ _OBS_BLOCKS = (
     # TAU_RAND_NORM (0.25, fixed), axis order below; all-zero when off.
     # Routed: arm lanes -> BOTH saber tokens, spine + leg -> body token.
     ("tau_scale", 16),
+    # env v49 (review item I07, 2026-09-30): per-hand BLADE-TIP world
+    # velocity [L xyz, R xyz] / V_NORM — the finite difference of the tip
+    # wrist + (HANDLE_LEN + SABER_LEN)·blade across the tick, i.e. the
+    # judge's tip_move / DT, from which the cut plane (accuracy) is
+    # built. The wrist velocity (hand lanes 3..5) misses the blade's
+    # rotation. Zero at reset / set_state, and in the Flux game.
+    # Routed: each hand's 3 lanes into its saber token (appended last).
+    ("tip_vel", 6),
 )
+TIP_VEL_FEAT = 6
 PREV_FEAT = 5
 TAU_FEAT = 16
 TAU_RAND_NORM = 0.25
@@ -408,7 +417,8 @@ OFF_BODY_PT_VEL = OBS_OFF["body_pt_vel"]  # 580 (env v24)
 OFF_PREV_L = OBS_OFF["prev_l"]          # 598 (env v45)
 OFF_PREV_R = OBS_OFF["prev_r"]          # 603 (env v45)
 OFF_TAU = OBS_OFF["tau_scale"]          # 608 (env v46)
-assert OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624"
+OFF_TIP_VEL = OBS_OFF["tip_vel"]        # 624 (env v49)
+assert OBS_DIM == 630, "spec §12 (env v49 blade-tip velocity lanes): OBS_DIM must be 630"
 KNEE_Y0 = 0.50   # contact spec §8 normalization centers
 FOOT_Y0 = 0.07
 # ≈ one tick of full-body weight (M_TOTAL*g*DT = 24.53 N*s), the spec

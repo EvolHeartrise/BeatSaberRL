@@ -886,6 +886,9 @@ class CudaBeatVecEnv:
         # Flux: palm-centre finite-difference velocity (kernel-written in
         # Flux mode only; the start kick at reset, zeroed by set_state)
         self.palm_vel = z(N, 2, 3)
+        # env v49: blade-tip finite-difference velocity (kernel-written
+        # every tick; zeroed at reset / set_state; obs lanes 624..630)
+        self.tip_vel = z(N, 2, 3)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -1060,6 +1063,7 @@ class CudaBeatVecEnv:
             self.bench_rec, self.bench_flag,
             self.palm_vel,
             self._start_kick,
+            self.tip_vel,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],

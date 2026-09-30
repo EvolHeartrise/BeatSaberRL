@@ -339,6 +339,7 @@ def test_contact_rich_parity_midline_press():
             v35s.append(v)
         resync(env, q36s, v35s)
         env.wrist_vel.zero_()
+        env.tip_vel.zero_()   # env v49: set_joints zeroed Rust's too
     assert saw_contact, "press scenario produced no contact impulses"
     assert saw_bits, "press scenario never set the obs contact bits"
 

@@ -773,8 +773,14 @@ constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
 constexpr int TAU_FEAT = 16;
 constexpr double TAU_RAND_NORM = 0.25;
 constexpr int OFF_TAU = OFF_PREV_R + PREV_FEAT;                       // 608
-constexpr int OBS_DIM = OFF_TAU + TAU_FEAT;                           // 624
-static_assert(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
+// env v49 (review item I07, 2026-09-30): per-hand blade-TIP world
+// velocity [L xyz, R xyz] / V_NORM (lib.rs OFF_TIP_VEL mirror — the
+// finite difference of wrist + (HANDLE_LEN + SABER_LEN)·blade, i.e. the
+// judge's tip_move / DT). Zero at reset / mode-2 refresh and in Flux.
+constexpr int TIP_VEL_FEAT = 6;
+constexpr int OFF_TIP_VEL = OFF_TAU + TAU_FEAT;                       // 624
+constexpr int OBS_DIM = OFF_TIP_VEL + TIP_VEL_FEAT;                   // 630
+static_assert(OBS_DIM == 630, "spec §12 (env v49 blade-tip velocity lanes): OBS_DIM must be 630");
 __device__ constexpr int TAU_AXIS[NQ] = {
     0, 1, 2,
     3, 4, 5, 6, 7, 8, 9,
@@ -3854,6 +3860,10 @@ struct Sim {
   // kick by reset_env (0 without start_jitter), written only by the
   // Flux judgment (read only by the Flux obs; dead in the standard game)
   T* __restrict__ palm_vel;
+  // env v49: blade-tip finite-difference velocity (E, 2, 3) — lib.rs
+  // Body::tip_vel; written every tick next to wrist_vel (both game
+  // modes, like wrist_vel), zeroed by reset_env and the mode-2 refresh
+  T* __restrict__ tip_vel;
   // swing chain
   T *__restrict__ swing_acc, *__restrict__ axis;
   bool* __restrict__ axis_valid;
@@ -4352,6 +4362,10 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
     P.palm_vel[(e * 2 + s) * 3] = kick_x;
     P.palm_vel[(e * 2 + s) * 3 + 1] = T(0);
     P.palm_vel[(e * 2 + s) * 3 + 2] = kick_z;
+    // env v49 tip lanes: the same rigid translation (0 without a kick)
+    P.tip_vel[(e * 2 + s) * 3] = kick_x;
+    P.tip_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.tip_vel[(e * 2 + s) * 3 + 2] = kick_z;
     P.swing_acc[e * 2 + s] = T(0);
     P.axis_valid[e * 2 + s] = false;
     P.tr_ptr[e * 2 + s] = 0;
@@ -4768,6 +4782,14 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   for (int a = 0; a < TAU_FEAT; a++)
     obs[OFF_TAU + a] = (float)(((double)P.tau_scale[e * TAU_FEAT + a] - 1.0)
                                / TAU_RAND_NORM);
+  // env v49: blade-tip world velocity [L xyz, R xyz] / V_NORM (lib.rs
+  // write_obs mirror; standard game only — Flux keeps the fill's zeros)
+  if constexpr (!FX) {
+    for (int s = 0; s < 2; s++)
+      for (int k = 0; k < 3; k++)
+        obs[OFF_TIP_VEL + 3 * s + k] =
+            (float)(P.tip_vel[(e * 2 + s) * 3 + k] / T(V_NORM));
+  }
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
@@ -4917,6 +4939,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       new_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
       P.wrist_vel[(e * 2 + h) * 3 + k] =
           (new_w[h][k] - prev_w[h][k]) / T(DT);
+      // env v49: blade-tip velocity — lib.rs Body::tick's expression
+      // tree (= the judge's tip_move below, / DT)
+      P.tip_vel[(e * 2 + h) * 3 + k] =
+          (new_w[h][k] + T(HANDLE_LEN + SABER_LEN) * new_d[h][k]
+           - prev_w[h][k] - T(HANDLE_LEN + SABER_LEN) * prev_d[h][k])
+          / T(DT);
     }
   // env v24: body-point world velocities — finite diff against the
   // last tick's stored positions, then advance the base (lib.rs
@@ -5725,6 +5753,7 @@ step_kernel(Sim<T> P) {
     refresh_fk(d, P, e);
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
     for (int k = 0; k < 6; k++) P.palm_vel[e * 6 + k] = T(0);  // Flux
+    for (int k = 0; k < 6; k++) P.tip_vel[e * 6 + k] = T(0);   // env v49
     // env v24: set_state semantics — re-seed the finite-diff base at
     // the refreshed pose, velocities zero (lib.rs set_state mirror)
     seed_body_pts(d, P, e);
@@ -5772,6 +5801,7 @@ enum {
   TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,BENCH_REC) + flag (N) — 2026-09-16
   TPALMV,   // Flux palm velocity (N, 2, 3)
   TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
+  TTIPV,    // env v49 blade-tip velocity (N, 2, 3) — 2026-09-30
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)
@@ -5884,6 +5914,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.bench_rec = ts[TBENCHREC].data_ptr<scalar_t>();
     P.bench_flag = ts[TBENCHFLAG].data_ptr<uint8_t>();
     P.palm_vel = ts[TPALMV].data_ptr<scalar_t>();
+    P.tip_vel = ts[TTIPV].data_ptr<scalar_t>();
     P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;
