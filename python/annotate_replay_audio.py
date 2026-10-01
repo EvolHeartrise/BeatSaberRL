@@ -96,12 +96,14 @@ def candidates(path, args):
             for e in cat if slug(e["song"]) == want]
 
 
-def stamp(path, map_hash, difficulty, song, audio_offset_s):
+def stamp(path, map_hash, difficulty, song, audio_offset_s, extra=None):
     """Write the additive header.map field into a recorded replay, in place.
 
     Streams the body rather than slurping it: a long recording's tick lines
     run to tens of MB and only the first line changes. Recorders call this
-    directly — they already know the map, so nothing needs proving there."""
+    directly — they already know the map, so nothing needs proving there.
+    `extra`: more additive header fields written in the same pass
+    (make_top10_replays: the weights hash and the level identity)."""
     tmp = path + ".tmp"
     with open(path) as src, open(tmp, "w") as dst:
         head = json.loads(src.readline())
@@ -111,6 +113,7 @@ def stamp(path, map_hash, difficulty, song, audio_offset_s):
             "song": song,
             "audio_offset_s": float(audio_offset_s),
         }
+        head["header"].update(extra or {})
         dst.write(json.dumps(head) + "\n")
         while True:
             chunk = src.read(1 << 20)
