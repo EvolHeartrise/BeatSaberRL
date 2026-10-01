@@ -99,6 +99,12 @@ jobs:
       - name: build
         working-directory: viz/app
         run: npm run build
+      - name: flux.flee.systems host (Discord gate tests + Worker bundles)
+        working-directory: viz/flux-host
+        run: |
+          npm ci
+          npm test
+          npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/flux-host"
       - name: headless browser (replay viewer, Flux replay, Flux game, WebXR session)
         working-directory: viz/app
         env:

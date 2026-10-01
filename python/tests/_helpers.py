@@ -49,11 +49,14 @@ def resync(env, q36s, v35s):
     """Lockstep resync (the v10 parity protocol): the CUDA env re-takes
     the given per-env Rust states. set_state zeroes the finite-diff wrist
     velocity (Rust semantics), which is env-layer state Rust keeps, so the
-    true velocity is carried across by hand."""
+    true velocity is carried across by hand — and likewise the env v49
+    blade-tip velocity (obs lanes 624..630)."""
     wv = env.wrist_vel.clone()
+    tv = env.tip_vel.clone()
     env.set_state(torch.tensor(q36s, dtype=torch.float64),
                   torch.tensor(v35s, dtype=torch.float64))
     env.wrist_vel.copy_(wv)
+    env.tip_vel.copy_(tv)
 
 
 def resync_from_sims(env, sims):

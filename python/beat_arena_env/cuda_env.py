@@ -74,6 +74,15 @@ NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 # aggregate into ONE slot with a note COUNT — exact, not approximate.
 N_TRACKERS = FOLLOW_TIMEOUT + 1
 EP_REC = 28   # env v47 episode record width (cols 22..28 = ep_stats)
+# bench slot-refill record (kernel BENCH_REC): the host-facing columns
+# 0..18 = [good, bad, miss, score, bombs, pre, acc, post, flail_rad,
+# flail_ticks, cw_score, cw_maxc, cw_breaks, chart_idx, wrev_L, wrev_R,
+# ticks, wall_enters, term_flags] (cols 17/18: review B09, 2026-09-30),
+# plus col 19 = the kernel's live wall-entry accumulator (scratch)
+BENCH_REC = 20
+BENCH_COLS = 19
+# term_flags bits (= lib.rs VecBeatSim::term); 0 = the level itself ended
+TERM_FELL, TERM_TILT, TERM_ENVELOPE, TERM_TICKCAP = 1, 2, 4, 8
 
 # lib.rs Z_MISS_TAIL: the episode tail covers the slowest object's trip
 # from the hit plane to the WORST-CASE live head plane (env v10).
@@ -691,11 +700,16 @@ class CudaBeatVecEnv:
         # env v18 perturbation training (push-recovery lit): with
         # probability push_prob per (env, tick) add a horizontal root
         # velocity kick, |dv| ~ U(0, push_vmax) m/s, direction uniform.
-        # start_jitter: same kick applied to every env that reset this
-        # tick (RSI-flavored start-state variety), |dv| ~ U(0, start_jitter).
-        # Python-side v[:, 0/2] mutation between kernel launches — an
-        # impulse by construction; seeded via self._gen. Training only:
-        # bench/replay use the Rust sim, which has no push path.
+        # start_jitter: same kick for every env that resets (RSI-flavored
+        # start-state variety), |dv| ~ U(0, start_jitter) — drawn into
+        # _start_kick before each launch and installed by the kernel's
+        # reset_env BEFORE the reset obs is written (review B10; it used
+        # to land after the launch, so every first obs read root
+        # velocity 0). Applies to auto-resets, reset() and bench
+        # refills alike. The push kick is a Python-side v[:, 0/2]
+        # mutation before the launch — an impulse by construction.
+        # Both draw from the default CUDA RNG (not self._gen). Training
+        # only: bench/replay use the Rust sim, which has neither path.
         self.push_prob = float(push_prob)
         self.push_vmax = float(push_vmax)
         self.start_jitter = float(start_jitter)
@@ -867,11 +881,14 @@ class CudaBeatVecEnv:
         self.cw_note_mult = (z(N, C, dt=torch.uint8) if self.combo_walk
                              else z(1, 1, dt=torch.uint8))
         self.tr_msum = z(N, 2, N_TRACKERS, dt=torch.int32)
-        self.bench_rec = z(N, 17)   # + [wrev_L, wrev_R, ticks] (2026-09-22)
+        self.bench_rec = z(N, BENCH_REC)   # see BENCH_REC / BENCH_COLS
         self.bench_flag = z(N, dt=torch.uint8)
         # Flux: palm-centre finite-difference velocity (kernel-written in
-        # Flux mode only; zeroed at reset / set_state)
+        # Flux mode only; the start kick at reset, zeroed by set_state)
         self.palm_vel = z(N, 2, 3)
+        # env v49: blade-tip finite-difference velocity (kernel-written
+        # every tick; zeroed at reset / set_state; obs lanes 624..630)
+        self.tip_vel = z(N, 2, 3)
         self.first_pending = z(N, dt=torch.int32)
         self.ep_return = z(N)
         self.good = z(N, dt=torch.int32); self.bad = z(N, dt=torch.int32)
@@ -958,6 +975,12 @@ class CudaBeatVecEnv:
         # offset handling makes replays draw fresh values, the _kick
         # precedent). Consumed only by envs that reset this launch.
         self._pose_jit = z(N, 14)  # 12 jitter + crouch gate/depth
+        # review B10: start-jitter kick [dvx, dvz] per env (N, 2), refilled
+        # before every launch while start_jitter > 0 (else stays zero);
+        # the kernel's reset_env installs it as the root's horizontal
+        # velocity before the reset obs is written. Fixed address =>
+        # CUDA-graph safe (the _pose_jit precedent).
+        self._start_kick = z(N, 2)
         # env v24: §8 body-point finite-diff base + world velocities
         self._bp_pos = z(N, 18)
         self._bp_vel = z(N, 18)
@@ -1039,6 +1062,8 @@ class CudaBeatVecEnv:
             self.cw_breaks, self.cw_score, self.cw_note_mult, self.tr_msum,
             self.bench_rec, self.bench_flag,
             self.palm_vel,
+            self._start_kick,
+            self.tip_vel,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -1058,6 +1083,13 @@ class CudaBeatVecEnv:
         ]
 
     def _launch(self, actions, cand, mode):
+        self._draw_reset_jitter(mode)
+        self._ext_step(actions, cand, mode)
+
+    def _draw_reset_jitter(self, mode):
+        """Refill the per-episode start draws the kernel's reset_env
+        consumes (pose jitter / crouch gate, tau body, start kick) —
+        every one of them lands BEFORE the reset obs is written."""
         if self.start_pose_jitter > 0.0 or self.crouch_start_prob > 0.0:
             self._pose_jit.uniform_(-1.0, 1.0)
         if self.tau_rand > 0.0:
@@ -1065,6 +1097,28 @@ class CudaBeatVecEnv:
             # the kernel installs this buffer as-is at reset (env v47b)
             self._tau_jit.uniform_(-1.0, 1.0, generator=self._gen)
             self._tau_jit.mul_(self.tau_rand).add_(1.0).mul_(self.tau_center)
+        if self.start_jitter > 0.0 and (
+                mode == 1 or (mode == 0 and (self.auto_reset
+                                             or self.bench_refill))):
+            # review B10: the start kick, precomputed for every env and
+            # consumed in-kernel only by envs that reset this launch
+            # (launches that can reset nobody — set_state, latched
+            # auto_reset=False steps — draw nothing, as before B10).
+            # Same default-RNG draws, in the same order, and the same
+            # arithmetic as the pre-B10 post-launch _kick(self._done, ..)
+            # (x * gate 1.0 is exact, 0 + dv is exact), so mode-0
+            # auto-reset trajectories keep their random stream and kick
+            # values; only the obs of the reset tick changes.
+            mag = torch.rand(self.num_envs, device=self.device,
+                             dtype=self.dtype) * self.start_jitter
+            ang = torch.rand(self.num_envs, device=self.device,
+                             dtype=self.dtype) * (2.0 * math.pi)
+            self._start_kick[:, 0].copy_(mag * torch.cos(ang))
+            self._start_kick[:, 1].copy_(mag * torch.sin(ang))
+
+    def _ext_step(self, actions, cand, mode):
+        """The raw kernel launch on the buffers as they stand (tests
+        replay a recorded set of start draws through it)."""
         self._ext.step(self._tensors, actions, cand, mode,
                        self.max_steps,
                        self.auto_reset, self.gears, self.want_contacts,
@@ -1121,19 +1175,20 @@ class CudaBeatVecEnv:
 
     def pop_bench_rows(self):
         """Levels that finished since the last pop: (env ids (M,) int64
-        numpy, rows (M, 17) float64 numpy) with the row layout of the
-        kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
+        numpy, rows (M, BENCH_COLS) float64 numpy) with the row layout of
+        the kernel's bench_rec [good, bad, miss, score, bombs, pre, acc,
         post, flail_rad, flail_ticks, cw_score, cw_maxc, cw_breaks,
-        chart_idx, wrev_L, wrev_R, ticks]. One row per env — pop every
-        tick (a level lasts >= 60 ticks, so no slot can finish twice
-        between pops)."""
+        chart_idx, wrev_L, wrev_R, ticks, wall_enters, term_flags]
+        (term_flags: TERM_* bits, 0 = the level itself ended). One row
+        per env — pop every tick (a level lasts >= 60 ticks, so no slot
+        can finish twice between pops)."""
         flags = self.bench_flag.bool()
         n = int(flags.sum().item())
         if n == 0:
             return (np.zeros((0,), dtype=np.int64),
-                    np.zeros((0, 17), dtype=np.float64))
+                    np.zeros((0, BENCH_COLS), dtype=np.float64))
         ids = flags.nonzero(as_tuple=False).squeeze(1)
-        rows = self.bench_rec[ids].double().cpu().numpy()
+        rows = self.bench_rec[ids, :BENCH_COLS].double().cpu().numpy()
         self.bench_flag.zero_()
         return ids.cpu().numpy(), rows
 
@@ -1218,10 +1273,8 @@ class CudaBeatVecEnv:
         self._launch(actions, cand, 0)
         if self.auto_reset:
             self._episode += 1
-            # envs that terminated this tick were auto-reset in-kernel;
-            # jitter their fresh start state (obs catches up next tick)
-            if self.start_jitter > 0.0:
-                self._kick(self._done, self.start_jitter)
+            # envs that terminated this tick were auto-reset in-kernel,
+            # start kick included (reset_env, before the obs write)
         return self._obs, self._reward, self._done, []
 
     # -- parity / tooling hooks (tests/test_v10_parity_cuda.py) ---------------

@@ -95,12 +95,19 @@ bash $REPO/setup_pod.sh > /workspace/leafcut_${TRUNK_RUN}_upd${UPD}.setup.log 2>
 export PATH=/root/.cargo/bin:/root/venv/bin:/usr/local/cuda/bin:\$PATH VIRTUAL_ENV=/root/venv
 cd $REPO/python
 mkdir -p "$LEAF_DIR"
+# the README leaf recipe: shape, gamma/lambda, pool, seed and reward
+# coefficients INHERIT from the trunk checkpoint's recorded args (a
+# --resume inherits every flag it is not given, since 2026-09-30); only
+# the leaf's departures are stated. The old hand-copied v16-era flags
+# (N 16384 / T 8 / lambda 0.98 / pool 24576) silently re-shaped every
+# leaf cut from a newer trunk. --no-wall-despawn = walls solid, as in
+# the bench. --mb-accum 2: the leaf now inherits the trunk's full batch
+# (v58: N 32768 x T 32), which peaks ~24 GB at accum 1 — the 4090 below
+# has 24; accum 2 is the same math (train_batch --mb-accum help).
 python train_batch.py \
-  --num-envs 16384 --horizon 8 --foot-contact --gears 5 --seed 0 \
-  --ranked-maps --chart-pool 24576 \
-  --gamma 0.965 --gae-lambda 0.98 --ent-coef 0.03 \
   --resume "$TRUNK_DIR/$CKPT_NAME" \
-  --cooldown-updates $COOLDOWN --ent-final $ENT_FINAL \
+  --cooldown-updates $COOLDOWN --ent-final $ENT_FINAL --no-wall-despawn \
+  --mb-accum 2 \
   --run-dir "$LEAF_DIR" 2>&1 | tee "$LEAF_DIR/leaf_train.log" | tail -3
 LEAF=\$(ls "$LEAF_DIR"/leaf_from_upd*.pt)
 python bench_scoresaber.py --ckpt "\$LEAF" --num-envs 2048 --foot-contact \

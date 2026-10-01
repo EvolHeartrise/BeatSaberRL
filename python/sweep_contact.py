@@ -33,7 +33,21 @@ Differences from sweep_ranked.py, each deliberate:
 - **Cost axis**: total_steps 6e7..1.2e9 (at the measured ~148k
   steps/s: ~7 min .. ~2.2 h/leg).
 
-  python sweep_contact.py --max-runs 100 [--dir sweeps/s4_contact_ret]
+**WSD port (2026-09-30)**: see sweep_protein.py's WSD PORT note (trunk
++ leaf instead of the removed `--lr-decay cosine`; honest failure cost;
+sub-minute crashes abort). Contact is the only physics now, so the
+deprecated no-op `--foot-contact` is no longer passed. The objective's
+`ep_return(last100)` field was dropped from the trainer's update line
+on 2026-09-12 (too noisy); the score is now the mean `return` (reward
+per env over the rollout, the trainer's stable population measure)
+over the final 10% (min 20) of the leg's update records, read from the
+trunk's and the leaf's metrics.jsonl — a different scale from s4, so
+s4 is FROZEN and the default --dir is sweeps/s4_contact_ret_wsd.
+FAIL_SCORE is only what the jsonl records: Protein refits every
+failure at the running min score. effort_coef (above) left the space
+with the v10 effort price.
+
+  python sweep_contact.py --max-runs 100 [--dir sweeps/s4_contact_ret_wsd]
 """
 
 from __future__ import annotations
@@ -41,23 +55,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
-import subprocess
 import sys
-import time
 from copy import deepcopy
 
-from protein_sweep import Protein
+from sweep_protein import (log_observation, replay, run_wsd_train,
+                           wsd_cmds)
 
-PY = sys.executable
 # SEG_LEN retired 2026-09-16: whole-level episodes are the only pool mode
 SEG_POOL = 24576
 NUM_ENVS, HORIZON = 16384, 8
+ENV_FLAGS = ["--gears", "5", "--ranked-maps", "--chart-pool", str(SEG_POOL)]
 FAIL_SCORE = -120.0
 
 SPACE = {
-    "metric": "final_ep_return",
+    "metric": "final_return",
     "goal": "maximize",
     "metric_distribution": "linear",
     "downsample": 1,
@@ -84,19 +96,22 @@ SPACE = {
 }
 FILL = {"train": {k: None for k in SPACE["train"]}}
 
-_UPD_RE = re.compile(r"^update\s+\d+/\d+\s+steps\s+\d+\s+"
-                     r"ep_return\(last100\)\s+(-?[\d.]+)")
-
-
-def final_ep_return(log_path):
-    """Mean ep_return(last100) over the final 10% of update lines
-    (min 20). None if no update lines survived."""
+def final_return(metrics_paths):
+    """Mean per-update `return` over the final 10% (min 20) of the update
+    records in these metrics.jsonl files, in order (trunk, then leaf).
+    None if no record carries a return."""
     vals = []
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            m = _UPD_RE.match(line)
-            if m:
-                vals.append(float(m.group(1)))
+    for path in metrics_paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    v = json.loads(line).get("return")
+                except json.JSONDecodeError:
+                    continue   # a torn last line from a killed trainer
+                if v is not None:
+                    vals.append(float(v))
     if not vals:
         return None
     tail = max(20, len(vals) // 10)
@@ -104,72 +119,47 @@ def final_ep_return(log_path):
     return sum(tail_vals) / len(tail_vals)
 
 
+def train_cmds(h, run_dir):
+    """(trunk_cmd, leaf_cmd, leaf_dir) for one WSD leg."""
+    return wsd_cmds(h, run_dir, NUM_ENVS, HORIZON, ENV_FLAGS)
+
+
 def run_leg(idx, h, run_dir):
-    """One contact-regime training leg. Returns (score, wall_s) or None."""
+    """One contact-regime WSD leg (trunk + leaf).
+    Returns (score or None, train_wall_s)."""
     shutil.rmtree(run_dir, ignore_errors=True)  # leg = always fresh model
-    cmd = [PY, "train_batch.py",
-           "--num-envs", str(NUM_ENVS), "--horizon", str(HORIZON),
-           "--foot-contact", "--gears", "5",
-           "--lr-decay", "cosine", "--seed", "0",
-           "--ranked-maps", 
-           "--chart-pool", str(SEG_POOL),
-           "--lr", f"{h['lr']:.6g}",
-           "--ent-coef", f"{h['ent_coef']:.6g}",
-           "--ent-final", f"{h['ent_final']:.6g}",
-           "--gamma", f"{h['gamma']:.6g}",
-           "--gae-lambda", f"{h['gae_lambda']:.6g}",
-           "--total-steps", str(int(h["total_steps"])),
-           "--run-dir", run_dir]
-    t0 = time.time()
     # 100k steps/s floor (contact measures ~148k at 16384/8) + startup
-    tmo = int(h["total_steps"]) // 100_000 + 1800
-    log_path = os.path.join(run_dir, "train.log")
-    os.makedirs(run_dir, exist_ok=True)
-    with open(log_path, "w", encoding="utf-8") as log:
-        try:
-            r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                               text=True, timeout=tmo)
-        except subprocess.TimeoutExpired:
-            print(f"[run {idx:03d}] TRAIN TIMEOUT ({tmo}s)", flush=True)
-            return None
-    wall = time.time() - t0
-    ck = os.path.join(run_dir, "final.pt")
-    if r.returncode != 0 or not os.path.exists(ck):
-        tail = open(log_path, encoding="utf-8").read()[-400:]
-        print(f"[run {idx:03d}] TRAIN FAILED ({wall:.0f}s): {tail}",
-              flush=True)
-        return None
-    score = final_ep_return(log_path)
+    cmds = train_cmds(h, run_dir)
+    ck, wall = run_wsd_train(idx, h, run_dir, NUM_ENVS, HORIZON, cmds,
+                             100_000)
+    if ck is None:
+        return None, wall
+    score = final_return([os.path.join(run_dir, "metrics.jsonl"),
+                          os.path.join(cmds[2], "metrics.jsonl")])
     if score is None:
-        print(f"[run {idx:03d}] no update lines in train.log", flush=True)
-        return None
+        print(f"[run {idx:03d}] no `return` in metrics.jsonl", flush=True)
     return score, wall
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--max-runs", type=int, default=100)
-    p.add_argument("--dir", type=str, default="sweeps/s4_contact_ret")
+    p.add_argument("--dir", type=str, default="sweeps/s4_contact_ret_wsd")
     args = p.parse_args()
     norm = os.path.normpath(args.dir).replace("\\", "/")
     if norm.endswith(("sweeps/s2_ranked_upp", "sweeps/s3_cutplane_upp",
-                      "sweeps/s1_upp")):
-        sys.exit("s1/s2/s3 are FROZEN weld-physics observations; the "
-                 "contact regime is a different objective. Use the s4 "
-                 "default or a fresh dir.")
+                      "sweeps/s1_upp", "sweeps/s4_contact_ret")):
+        sys.exit("s1-s4 are FROZEN observations of older objectives "
+                 "(weld physics; s4 = ep_return(last100) on the pre-WSD "
+                 "env). Use the default or a fresh dir.")
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "observations.jsonl")
 
+    from protein_sweep import Protein   # gpytorch: sweep host only
     protein = Protein(SPACE, cost_param="train/total_steps")
 
-    start = 0
-    if os.path.exists(log_path):
-        for line in open(log_path, encoding="utf-8"):
-            o = json.loads(line)
-            protein.observe(o["hypers"], o["score"], o["cost"],
-                            o["is_failure"])
-            protein.suggestion_idx += 1
-            start += 1
+    start = replay(protein, log_path)
+    if start:
         print(f"resumed: replayed {start} observations", flush=True)
 
     for idx in range(start, args.max_runs):
@@ -189,18 +179,13 @@ def main():
               f"->{h['ent_final']:.2e} gamma {h['gamma']:.4f} "
               f"lam {h['gae_lambda']:.4f} "
               f"steps {h['total_steps']/1e6:.0f}M", flush=True)
-        res = run_leg(idx, h, run_dir)
-        if res is None:
-            score, cost, fail = FAIL_SCORE, 1.0, True
-        else:
-            score, cost = res
-            fail = False
+        score, cost = run_leg(idx, h, run_dir)
+        fail = score is None
+        if fail:
+            score = FAIL_SCORE
         protein.observe(hypers, score, cost, fail)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"idx": idx, "hypers": hypers,
-                                "score": score, "cost": cost,
-                                "is_failure": fail}) + "\n")
-        print(f"[run {idx:03d}] -> ep_return {score:,.2f} "
+        log_observation(log_path, idx, hypers, score, cost, fail)
+        print(f"[run {idx:03d}] -> return {score:,.3f} "
               f"({cost/60:.1f} min){' FAILED' if fail else ''}", flush=True)
 
     print("SWEEP DONE", flush=True)

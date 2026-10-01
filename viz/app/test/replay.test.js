@@ -441,10 +441,13 @@ v15 = parseReplay(v15Text);
     `head-anchored offset never moves (${hi - lo} m)`);
 
   // interpolated ticks come from the interpolated pose, and stay bracketed
+  // to within 1 mm: FK of a slerped pose is not linear in the endpoints,
+  // so the head can overshoot its tick-end values by a fraction of a mm
+  // (0.2 mm worst in the committed Flux fixture)
   for (let k = 0; k + 1 < v15.ticks.length; k += 7) {
     const a = trackOffset(v15, k), b = trackOffset(v15, k + 1);
     const m = trackOffset(v15, k, 0.5);
-    assert.ok(m >= Math.min(a, b) - 1e-9 && m <= Math.max(a, b) + 1e-9,
+    assert.ok(m >= Math.min(a, b) - 1e-3 && m <= Math.max(a, b) + 1e-3,
       `interpolated z_off outside its bracket at ${k}`);
     assert.equal(m, bodyFK(qAt(v15, k, 0.5)).p[F_HEAD][2] - PLANE_Z0);
   }

@@ -76,13 +76,13 @@ export const KIND_NOTE = 0, KIND_BOMB = 1, KIND_CHAIN_HEAD = 2,
 // axis) and the Flux is the segment between the palms. Circles are
 // coloured discs facing the player; bars are thin rotated strips with a
 // sweet spot. Chart entries: {t, x, y, kind, color, rot, speed, len,
-// sweet}. Both hitboxes use the note good box's depth convention (1 m
-// deep, shifted 0.25 m toward the player).
+// sweet}. Both hitboxes are a thin depth slab centred on the flat visual:
+// FLUX_DEPTH (10 cm) deep, 5 cm either side (flux.rs SLAB_LO / SLAB_HI).
 export const KIND_CIRCLE = 4, KIND_BAR = 5;
 export const PALM_OFF = 0.06;
 export const CIRCLE_R = 0.175;
 export const BAR_W = 0.05;
-export const FLUX_DEPTH = 1.0;
+export const FLUX_DEPTH = 0.1;
 export const isFlux = (rep) => rep?.game === "flux";
 /** A Flux run PLAYED BY A PERSON in the WebXR game (header "player":
  * "human"): per-tick palms + head, no body (no q / sabers / feet). */

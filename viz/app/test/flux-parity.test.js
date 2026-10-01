@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { loadFluxCore } from "../src/lib/fluxcore.js";
-import { BAR_W, CIRCLE_R, DT, PALM_OFF, PLANE_Z0 } from "../src/lib/replay.js";
+import { BAR_W, CIRCLE_R, DT, FLUX_DEPTH, PALM_OFF, PLANE_Z0 } from "../src/lib/replay.js";
 
 const path = process.argv[2] ?? "test/fixtures/flux_game_parity.json";
 const fx = JSON.parse(readFileSync(path, "utf8"));
@@ -23,6 +23,9 @@ assert.equal(core.consts.PALM_OFF, PALM_OFF);
 assert.equal(core.consts.CIRCLE_R, CIRCLE_R);
 assert.ok(Math.abs(core.consts.BAR_W - BAR_W) < 1e-15);
 assert.equal(core.consts.PLANE_Z0, PLANE_Z0);
+// the viewer's hitbox overlay: FLUX_DEPTH deep, centred on the object
+assert.ok(Math.abs(core.consts.SLAB_HI - core.consts.SLAB_LO - FLUX_DEPTH) < 1e-15);
+assert.equal(core.consts.SLAB_LO + core.consts.SLAB_HI, 0);
 
 let nTicks = 0, nEvents = 0;
 const seen = new Set();

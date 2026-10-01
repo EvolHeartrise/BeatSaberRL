@@ -35,9 +35,9 @@ def _sim():
     return RawBeatSim(max_steps=400, flux=True)
 
 
-def _arrive_now(sim, palm_z, lead=0.2):
+def _arrive_now(sim, palm_z, lead=0.02):
     """hit_time putting the object centre `lead` m beyond the palm on
-    tick 1 (so the palm sits inside the [-0.75, +0.25] slab)."""
+    tick 1 (so the palm sits inside the [-0.05, +0.05] slab)."""
     z_off = sim.head_pose()[2] - PLANE_Z0
     return DT + (palm_z + lead - z_off) / SPEED
 
@@ -381,8 +381,9 @@ def test_flux_note_geo_aims_bars_at_the_sweet_spot():
     notes[0, 0, [0, 1, 8]] = torch.tensor([0.2, 0.1, 1.0])
     notes[0, 1, [0, 1, 9, 12, 13]] = torch.tensor([0.2, 0.1, 1.0, -0.4, 0.3])
     sabers = torch.zeros(1, 2, SABER_FEAT)
-    std = _note_geo(notes, sabers, 8.0)
-    flux = _note_geo(notes, sabers, 8.0, flux=True)
+    std = _note_geo(notes, sabers, 8.0, z_off=torch.zeros(1))
+    flux = _note_geo(notes, sabers, 8.0, flux=True,
+                     z_off=torch.zeros(1))
     assert torch.equal(std[0, 0], flux[0, 0])             # circles: centre
     assert torch.equal(std[0, 1], std[0, 0])              # standard: centre
     # flux bar: the per-hand x/y offset lanes point at the sweet spot

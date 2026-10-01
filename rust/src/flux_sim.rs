@@ -38,14 +38,14 @@ impl Core {
         ];
         for s in 0..2 {
             for k in 0..3 {
-                self.palm_vel[s][k] = (p1[s][k] - p0[s][k]) / DT;
+                self.palm_vel[s][k] = (p1[s][k] - p0[s][k]) / self.body.rate.dt;
             }
         }
         let reach_z = flux::reach_z(
             self.body.shoulder_z[0].max(self.body.shoulder_z[1]));
         let first = self.events_buf.len();
         flux::judge(&self.chart, &mut self.status, self.first_pending,
-                    self.min_speed, self.time, self.body.head, reach_z,
+                    self.min_speed, self.time, self.body.rate.dt, self.body.head, reach_z,
                     &p0, &p1, reward, &mut self.events_buf);
         for k in first..self.events_buf.len() {
             let (i, code, pts, pre, acc) = self.events_buf[k];

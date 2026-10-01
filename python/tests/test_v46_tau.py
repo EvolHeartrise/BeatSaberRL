@@ -54,7 +54,7 @@ def test_axis_map_is_symmetric_and_complete():
         assert e[3 + (a - 3)] == e[10 + (a - 3)] == s[a]
     for a in range(10, 16):
         assert e[17 + (a - 10)] == e[23 + (a - 10)] == s[a]
-    assert OFF_TAU == 608 and OFF_TAU + TAU_FEAT == OBS_DIM == 624
+    assert OFF_TAU == 608 and OFF_TAU + TAU_FEAT == 624   # tip lanes follow (env v49)
 
 
 def test_parse_tau_scale_both_syntaxes():
@@ -123,7 +123,7 @@ def test_rust_unit_scale_is_bit_identical_to_v45_path():
         oa = np.asarray(oa); ob = np.asarray(ob)
         np.testing.assert_array_equal(oa, ob)
         assert oa.shape == (OBS_DIM,)
-        np.testing.assert_array_equal(oa[OFF_TAU:OBS_DIM], np.zeros(16))
+        np.testing.assert_array_equal(oa[OFF_TAU:OFF_TAU + TAU_FEAT], np.zeros(16))
 
 
 def test_rust_obs_lanes_encode_scales():
@@ -131,14 +131,14 @@ def test_rust_obs_lanes_encode_scales():
     sim = _rust()
     sim.set_tau_scale(s)
     obs, *_ = sim.step(COAST)
-    lanes = np.asarray(obs)[OFF_TAU:OBS_DIM]
+    lanes = np.asarray(obs)[OFF_TAU:OFF_TAU + TAU_FEAT]
     np.testing.assert_allclose(lanes, [(x - 1.0) / TAU_RAND_NORM for x in s],
                                atol=1e-6)
     assert lanes.min() == pytest.approx(-1.0) and lanes.max() == pytest.approx(1.0)
     # persists across a reset (a new chart) until set again
     sim.set_chart([note_tuple(FAR_NOTE)])
     obs, *_ = sim.step(COAST)
-    np.testing.assert_allclose(np.asarray(obs)[OFF_TAU:OBS_DIM], lanes, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(obs)[OFF_TAU:OFF_TAU + TAU_FEAT], lanes, atol=1e-6)
 
 
 # --- policy routing ------------------------------------------------------------
@@ -146,16 +146,17 @@ def test_rust_obs_lanes_encode_scales():
 def test_policy_routes_tau_lanes():
     from policy import (BODY_FEAT, SABER_FEAT, _BODY_IDX, _SABER_L_IDX,
                         _SABER_R_IDX, OBS_DIM as P_OBS, NotePolicy)
-    assert P_OBS == 624 and SABER_FEAT == 44 and BODY_FEAT == 87
+    assert P_OBS == 630 and SABER_FEAT == 47 and BODY_FEAT == 87
     arm = tuple(range(OFF_TAU + 3, OFF_TAU + 10))
     body = tuple(range(OFF_TAU, OFF_TAU + 3)) + tuple(range(OFF_TAU + 10, OFF_TAU + 16))
-    assert _SABER_L_IDX[-7:] == arm and _SABER_R_IDX[-7:] == arm
+    # the env v49 tip-velocity lanes (3) are the saber tokens' tail
+    assert _SABER_L_IDX[-10:-3] == arm and _SABER_R_IDX[-10:-3] == arm
     assert _BODY_IDX[-9:] == body
     pol = NotePolicy(embed=32, trunk_dim=64, n_blocks=1, n_heads=2,
                      n_gears=5, ffn_mult=2, note_geo=True)
-    assert pol.arch["obs_dim"] == 624
+    assert pol.arch["obs_dim"] == 630
     obs = torch.zeros(4, OBS_DIM)
-    obs[:, OFF_TAU:OBS_DIM] = torch.linspace(-1, 1, 16)
+    obs[:, OFF_TAU:OFF_TAU + 16] = torch.linspace(-1, 1, 16)
     logits, value = pol.forward_stacked(obs)
     assert logits.shape == (4, 29, 5) and value.shape == (4,)
     assert torch.isfinite(logits).all()
@@ -216,7 +217,7 @@ def test_cuda_draws_deterministic_in_range_and_symmetric():
     assert s1.std() > 0.05                       # actually random
     assert not np.allclose(s1[0], s1[1])         # per env
     obs = e1._obs.cpu().numpy()
-    np.testing.assert_allclose(obs[:, OFF_TAU:OBS_DIM], (s1 - 1.0) / 0.25,
+    np.testing.assert_allclose(obs[:, OFF_TAU:OFF_TAU + TAU_FEAT], (s1 - 1.0) / 0.25,
                                atol=1e-5)
     e3 = _cuda_env(64, tau_rand=0.25, seed=8); e3.reset()
     assert not np.allclose(e3.tau_scale.cpu().numpy(), s1)
@@ -241,8 +242,8 @@ def test_cuda_scale_applies_symmetrically_and_prices_energy():
     assert n == 16 and abs(tot / 16 - per_tick) < 1e-3
     assert abs(ar / 16 - 0.25 * TAU_MAX[3] * 0.8 * 2) < 1e-3
     obs = e1._obs.cpu().numpy()
-    np.testing.assert_allclose(obs[:, OFF_TAU:OBS_DIM],
-                               np.broadcast_to((np.array(s) - 1.0) / 0.25, obs[:, OFF_TAU:OBS_DIM].shape),
+    np.testing.assert_allclose(obs[:, OFF_TAU:OFF_TAU + TAU_FEAT],
+                               np.broadcast_to((np.array(s) - 1.0) / 0.25, obs[:, OFF_TAU:OFF_TAU + TAU_FEAT].shape),
                                atol=1e-5)
 
 
@@ -257,7 +258,7 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
         act = torch.randint(0, 5, (4, N_JOINTS), device="cuda")
         o0, r0, d0, _ = e0.step(act); o1, r1, d1, _ = e1.step(act)
         assert torch.equal(o0, o1) and torch.equal(r0, r1) and torch.equal(d0, d1)
-        assert torch.equal(o0[:, OFF_TAU:OBS_DIM], torch.zeros_like(o0[:, OFF_TAU:OBS_DIM]))
+        assert torch.equal(o0[:, OFF_TAU:OFF_TAU + TAU_FEAT], torch.zeros_like(o0[:, OFF_TAU:OFF_TAU + TAU_FEAT]))
     # random body: Rust vs CUDA lanes + energy identity on the same body
     s = [float(x) for x in np.random.default_rng(5).uniform(0.75, 1.25, 16)]
     from beat_arena_env.cuda_env import CudaBeatVecEnv
@@ -276,8 +277,8 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
         a = [int(x) for x in rng.integers(0, 5, N_JOINTS)]
         tobs, trew, tdone, _ = env.step(torch.tensor([a], device="cuda"))
         robs, rrew, rdone, _ = sim.step(a)
-        np.testing.assert_allclose(tobs[0, OFF_TAU:OBS_DIM].cpu().numpy(),
-                                   np.asarray(robs)[OFF_TAU:OBS_DIM], atol=1e-6)
+        np.testing.assert_allclose(tobs[0, OFF_TAU:OFF_TAU + TAU_FEAT].cpu().numpy(),
+                                   np.asarray(robs)[OFF_TAU:OFF_TAU + TAU_FEAT], atol=1e-6)
         ticks += 1
         assert bool(tdone[0]) == rdone
         if rdone:

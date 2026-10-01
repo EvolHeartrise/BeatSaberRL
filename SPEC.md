@@ -287,11 +287,12 @@ rollouts on both builds and both foot modes).
   centre at the hit plane).
 - **Circle** (`KIND_CIRCLE`, colour 0 left / 1 right): a flat disc
   facing the player, hitbox radius `CIRCLE_R = 0.175` (the ~35 cm
-  visual disc), with the standard good box's depth convention: 1.0 m
-  deep, shifted 0.25 m toward the player (`z ∈ [z − 0.75, z + 0.25]`).
-  No look-at tilt. Contact = the palm's path over the tick (last
-  tick's palm → this tick's) clipped to the slab passes within
-  `CIRCLE_R` of the centre in-plane. **Matching palm → good**:
+  visual disc), in a thin depth slab hugging the flat visual: 5 cm
+  either side (`SLAB_HALF = 0.05`, `z ∈ [z − 0.05, z + 0.05]`; user
+  rule 2026-09-28 — it was the good box's 1 m deep, 0.75 m-early slab).
+  No look-at tilt. Contact is swept **in the object's frame** (see
+  "Swept contact" below): the palm's relative path over the tick,
+  clipped to the slab, passes within `CIRCLE_R` of the centre in-plane. **Matching palm → good**:
   `50 + round(10 · (1 − clamp(d / 0.3, 0, 1)))`, `d` = that in-plane
   closest approach (the standard accuracy formula at 10 points; note
   the hitbox radius caps `d` at 0.175, so the accuracy floor is 4).
@@ -302,9 +303,9 @@ rollouts on both builds and both foot modes).
   facing the player, width `BAR_WIDTH = 0.05`, length `length` m,
   rotated `rot` about z: axis `u = (−sin rot, cos rot)` — 0 = vertical,
   CCW from the player's view (the note-angle convention). Hitbox: the
-  box `[0.025, length/2, 0.5]` half-extents in that z-roll frame,
-  centred 0.25 m toward the player (the circle slab). Contact = the
-  **swept Flux** — the quad from last tick's segment to this tick's,
+  box `[0.025, length/2, 0.05]` half-extents in that z-roll frame,
+  centred on the bar (the circle slab). Contact = the **swept Flux** —
+  the quad from last tick's segment to this tick's (relative, below),
   triangulated `(L0, R0, R1), (L0, R1, L1)` exactly like the saber
   sweep — overlaps the box (Akenine-Möller SAT). Score:
   `100 + round(15 · (1 − clamp(d / 0.3, 0, 1)))` with `d` = the
@@ -319,13 +320,31 @@ rollouts on both builds and both foot modes).
   `(cos rot, sin rot)` — undirected, so 0–90°: `(f · n)² ≥ 0.25 |f|²`.
   A crossing beyond that is a **bad cut** (event 2 "angle", −0.5,
   combo break); a collapsed Flux (palms coincident in xy) fails too.
+- **Swept contact** (2026-09-28): an object travels `speed · dt` per
+  judge tick (up to 0.6 m at 18 m/s and 30 Hz — six slab depths), so
+  contact is swept in each object's own frame: last tick's palms are
+  shifted by `−speed · dt` in z (where they were relative to the object
+  then) and the relative path is tested against the object's current
+  hitbox. A palm or Flux held still in an object's path is touched at
+  any speed and tick phase; nothing tunnels. `dt` is the judge tick:
+  `DT` in the env, `DT / 4` in the WebXR game (`flux::judge`'s
+  `tick_dt`). The sweep **stops at the head plane**: on the tick an
+  object crosses it, the relative paths end at the crossing fraction,
+  so a palm behind the head never scores (at either judge rate). Both
+  ends of a tick's sweep use this tick's head-anchored `z_off` (head
+  motion within a tick is ignored): consecutive sweeps overlap while
+  the head moves toward the objects and leave a gap of the head's
+  per-tick z change while it retreats — a miss only at retreat speeds
+  ≳ 3 m/s.
 - **Misses**: an untouched circle or bar passing the head plane is a
-  miss (event 4, −0.5), exactly like a note.
+  miss (event 4, −0.5), exactly like a note. Contact is judged first:
+  an object that went through a palm and past the head plane within
+  one tick was touched.
 - **Reward / score**: good = `pts / 115` (circle max 60/115, bar
   115/115); bad and miss −0.5. `score_components()` returns (base
   contact points, accuracy points, 0); a good event's `pre` slot
   carries the base (50/100) and `acc` the accuracy points.
-- **Reach gate**: `max(shoulder_z) + 0.65 + PALM_OFF + 0.75` (the
+- **Reach gate**: `max(shoulder_z) + 0.65 + PALM_OFF + 0.05` (the
   slab's near face) replaces the saber reach.
 - **Obs** (same OBS_DIM and offsets as standard; Flux lane meanings,
   `constants.FLUX_LANE_*`): hand blocks = palm x/y head-relative, palm
@@ -483,6 +502,26 @@ which is tied to that reference by the existing CUDA parity tests
   `test/flux-play-browser.mjs` (scripted poses) and
   `test/flux-xr-browser.mjs` (a real WebXR session on an emulated
   Quest 3, iwer). CI: `.github/workflows/ci.yml`.
+- **Hosted** at `https://flux.flee.systems` (`viz/flux-host`, 2026-09-27):
+  a Cloudflare Worker (`flux-game`, custom domain only — no workers.dev /
+  preview URLs) that bundles the committed `viz/replay.html` INTO its
+  script, so the game is never a public asset. `GET /` returns it only
+  for an HMAC-signed session cookie (7 days) whose Discord user id is in
+  the `ALLOWED_DISCORD_IDS` secret, re-checked on every request (removing
+  an id revokes at once); everyone else gets a small login / "not
+  whitelisted — your id is …" page with no game bytes. Login is Discord
+  OAuth2 (`identify` scope, CSRF state cookie; both cookies `__Host-`),
+  redirect URI `PUBLIC_ORIGIN/callback` = `https://flux.flee.systems/callback`
+  (a wrangler.jsonc var, never the request Host). Secrets:
+  `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `SESSION_SECRET` (≥ 32
+  chars; rotating it logs everyone out — the only way to kill one stolen
+  cookie short of de-listing its id), `ALLOWED_DISCORD_IDS`; missing
+  config fails closed (503). A whitelisted player receives the whole
+  single-file game and could keep a copy; de-listing stops future loads
+  only.
+  Deploy: `cd viz/app && npm run build`, then `cd viz/flux-host && npm run
+  deploy`. Whitelist: `npx wrangler secret put ALLOWED_DISCORD_IDS`
+  (comma-separated ids). Tests: `viz/flux-host/test/app.test.js` (CI).
 
 ## Chart generation (`beat_arena_env/chart.py`) — generator v2
 
@@ -552,6 +591,27 @@ density ~1.4 notes/s around sub-4 m/s notes vs ~3.2 around 6+ m/s
 notes (pinned by test).
 
 ## Observation layout (exact, all f32) — order is a contract
+
+**Current layout (env v49, 2026-09-30): OBS_DIM 630.** The block table
+is `beat_arena_env/constants.py` `_OBS_BLOCKS` (offsets derived; the
+lib.rs `OFF_*` consts and the .cu mirror are pinned to it): root pose /
+velocity 0..15, q 15..46, qd 46..75, hand blocks 75..97, head 97..100,
+contact 100..102, the 24 × 18 entity window 102..534 + mask 534..558,
+ground contact 558..562, body points 562..580 and their velocities
+580..598 (env v24), previous-note blocks 598..608 (env v45), torque-
+limit scales 608..624 (env v46) and — **env v49 (review item I07)** —
+the per-hand blade-TIP world velocity 624..630, `[L xyz, R xyz] /
+V_NORM`: the finite difference of the tip `wrist + (HANDLE_LEN +
+SABER_LEN)·blade` across the tick, identical to the judge's `tip_move /
+DT` (the cut-plane accuracy rule below is built from it). Zero at reset,
+after a set_state refresh, and in the Flux game. Appended, so every
+earlier offset is unchanged; OBS_DIM 624 → 630. The policy routes each
+hand's 3 lanes into its saber token and derives the blade-frame note
+geometry from them (§Policy, `note_geo`); pre-v49 checkpoints are
+upgraded on load (zero input columns, arch marker `blade_geo`).
+
+The obs v6 text below is the historical base layout (kept for the lane
+semantics it still defines):
 
 Obs v6 (env v7 — 16 object slots × 14 features; sabers unchanged from
 obs v5 except y normalization):
@@ -722,6 +782,19 @@ measured numbers are in the README ("Historical reference points").
 
 ## Policy (`python/policy.py`)
 
+**Note-geo lanes (current, env v49 / I07):** with `note_geo` each note
+token carries 22 derived lanes after its 18 obs lanes — per hand the
+v55 seven [dp x/y (half-metres), dp z and |dp| (asinh(m/8)), t_plane =
+clip((z − z_off)/speed, −0.5, 3)/3 with z_off = obs lane 99 (B12), unit
+wrist-velocity · cutdir, blade · cutdir], then per hand the I07 four
+[asinh((dp·b − HANDLE_LEN)/2), asinh(|dp − (dp·b)b|/2), asinh(dp·n̂/2)
+with n̂ = (b × v_tip)/(|b × v_tip| + 0.05) — the signed distance to the
+swept cut plane, positive on the b × v_tip side — and v_tip · cutdir /
+V_NORM]; the cutdir dots are 0 on wall rows. Saber tokens are 47 lanes
+(+ the 2-lane hand one-hot), the tip velocity last. Arch marker
+`blade_geo = 1`; `load_policy` upgrades a checkpoint without it (obs
+624) with zero weights on the new saber / note input columns.
+
 `NotePolicy()` — transformer only (the pool baseline was deleted
 2026-07-20 after the easy-config studies concluded; checkpoints still
 record `encoder: "transformer"`):
@@ -765,10 +838,13 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 + env config (`--colors --cols --rows --chart-len --note-speed-min
 --note-speed-max --note-prob --extra-prob --dot-prob --bomb-prob`).
 Checkpoints since 2026-07-24 carry Adam state + the LR-schedule anchors:
-`--resume <ckpt>` continues a stopped run EXACTLY (weights, optimizer
-moments, schedule position — lr/lr-final/lr-decay/num_updates come from
-the checkpoint, CLI values ignored; the env/chart stream restarts
-fresh, so only the optimization state is exact). `--init-from` remains
+`--resume <ckpt>` continues a stopped run (weights, optimizer
+moments, schedule position — lr/lr-final/num_updates come from the
+checkpoint; since 2026-09-30 also the torch/CUDA/numpy/python and
+CUDA-env RNG streams, and every flag not typed on the CLI is inherited
+from the checkpoint's args, typed differences printed as a diff and
+typed arch changes refused; the env/chart state restarts fresh, so only
+the optimization state and random streams are exact). `--init-from` remains
 the weights-only warm-start with a fresh schedule; older checkpoints
 without optimizer state are --init-from only. **`--cuda-graphs` REMOVED
 (2026-07-25)**: capture existed to hide the 12-head/12-Categorical

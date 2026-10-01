@@ -164,6 +164,15 @@ randomization is off (bit-identical to the table). Both engines apply
 the scale in the same expression tree: τ_j = frac · TAU_MAX[j] · s, and
 the energy base |frac · TAU_MAX[j] · s|.
 
+> **Historical table (env v10).** Later env versions retuned the body;
+> the running values live in `python/beat_arena_env/constants.py`
+> (`JOINT_LIMITS`, `TAU_MAX`, `OMEGA_CAP`) and are mirrored in
+> `rust/src/lib.rs` / the CUDA kernel. As of 2026-09-30 the table below
+> is stale for, among others: every τ_max except the forearm/wrist rows
+> (e.g. spine_pitch 600, not 800), the wrist ω cap (50, not 40), and
+> the ankle-pitch upper limit (+35°, not +20°). Read the code, not this
+> table, for current values.
+
 Arm joint limits are v9 verbatim (per-hand mirrored where noted; values in
 rad). New-joint limits from anatomical range tables. τ_max derivation §1.5;
 damping b in N·m·s/rad; ω cap in rad/s.
