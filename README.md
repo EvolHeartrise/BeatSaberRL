@@ -615,10 +615,12 @@ equals the computed full-combo max on 3,794 of 3,869 levels; 72 of the 75
 others are maps with chains where BeatLeader's max is higher by multiples
 of 30x8 (it prices a chain head like a 115-point note), so the same play
 has a slightly lower BL accuracy (`bl_accuracy` / `bl.accuracy`) than
-its ScoreSaber one — BeatLeader's rule, reproduced, capped at 1. Caveat:
-passPP does not depend on accuracy, so a level the agent falls out of
-early still earns it (a 7* level is ~36 pp at 1% accuracy); in game such
-a play would be a fail with no pp.
+its ScoreSaber one — BeatLeader's rule, reproduced, capped at 1. A
+level the episode was cut short on (fall, tilt, envelope or the
+max-steps cap) scores **0 BL pp** (user decision, 2026-09-30): in game it
+is a failed play, but passPP does not depend on accuracy (a 7* level
+would pay ~36 pp at 1% accuracy). The raw curve value stays in
+`pp_formula` (with the pass/acc/tech parts) and `failed` marks the level.
 
 ## Exporting to ScoreSaber's replay viewer
 

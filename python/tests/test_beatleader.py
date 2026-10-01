@@ -475,3 +475,17 @@ def test_real_bench_beatleader_and_both(tmp_path):
     # bench_compare: the two modes' files never compare
     with pytest.raises(bc.CatalogMismatch):
         bc.compare(out_both, out_bl, out=lambda s: None)
+
+
+def test_failed_level_earns_no_bl_pp():
+    """A cut-short level (fall / tilt / envelope / max-steps) is a failed
+    play: 0 BL pp even though BL's pass term is accuracy-free; the raw
+    curve value stays in pp_formula (user decision, 2026-09-30)."""
+    import bench_scoresaber as bs
+    e = {"leaderboard_id": "x", "stars": 7.0, "pass_rating": 6.0,
+         "acc_rating": 7.0, "tech_rating": 5.0, "api_max_score": 100000}
+    ok = bs.bl_result(e, 1000, 100000)
+    bad = bs.bl_result(e, 1000, 100000, failed=True)
+    assert ok["pp"] > 0 and ok["pp"] == ok["pp_formula"] and not ok["failed"]
+    assert bad["pp"] == 0.0 and bad["failed"]
+    assert bad["pp_formula"] == ok["pp"] and bad["pass_pp"] == ok["pass_pp"] > 0
