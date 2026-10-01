@@ -11,6 +11,30 @@ counters and multiplied score against the bench entry, then convert to
 a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
 (Was a 598M one-off; parameterized 2026-07-24.)
 
+Control rate (2026-10-01): the bench header's tick_hz / action_repeat
+(absent = 30 / 1) are reproduced too — the sim runs at that rate, the
+policy decides every action_repeat-th tick (the action held in
+between, as the bench's step_into(repeat=N)), and the recording carries
+one line per SIM tick with the rate in its header, so the viewer and
+the .dat play it back at real speed. --tick-hz / --action-repeat
+override the header.
+
+--catalog both benches (2026-10-01): records are keyed by level_key and
+carry `ss` / `bl` sub-results (None where that leaderboard does not rank
+the level). --board picks the view — ss (default) ranks by ss.pp over
+the ScoreSaber-ranked levels, bl by bl.pp over the BeatLeader-ranked
+ones (BL-only levels included); the play itself is the record's either
+way. --levels KEY... records exactly those levels (level_key, or the
+leaderboard id on single-catalog benches) instead of a top-N, each in
+the --board view when that board ranks it, else the other's: how a
+best-of composite's picks are recorded, one SOURCE bench at a time
+(each pick in its own run's regime). Composites themselves are refused:
+their records mix runs. Every recording's header also carries the
+weights hash (`model_hash`) and the level identity (`level`: level_key,
+characteristic, SS / BL leaderboard ids) next to tick_hz and the body
+(tau_scale); maps missing from maps/scoresaber/ are fetched from
+BeatSaver (BL-only levels live there too, as in the bench).
+
 --workers N (2026-08-08, pod era): plays are independent, so they run
 in a spawn-context process pool — each worker loads its own policy and
 sim. Serial generation left a 256-core pod ~idle; outputs are byte-
@@ -33,6 +57,7 @@ import torch
 
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
+from bench_scoresaber import model_hash
 from beat_arena_env.constants import OBS_DIM, parse_tau_scale
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
@@ -49,8 +74,83 @@ def slug(s, n=24):
 _W = {}          # per-process state: {"policy", "dev", "push", "tau"} (set by _worker_init)
 
 
+BOARDS = ("ss", "bl")
+
+
+def task_key(rec):
+    """A bench record's identity: level_key (--catalog both), else its
+    leaderboard id (single-catalog benches) — as bench_scoresaber.task_key,
+    stringified (BL ids are strings, SS ids ints; --levels are strings)."""
+    return str(rec.get("level_key", rec.get("leaderboard_id")))
+
+
+def board_view(rec, board):
+    """`rec` as seen from one leaderboard, in the single-catalog record
+    shape (`pp`, `stars`, `accuracy`, `leaderboard_id` top-level), or None
+    when that board does not rank the level. A --catalog both record keeps
+    its play fields (score, counters, combo) and takes the board's sub-
+    result; single-catalog records are their board's view already."""
+    if "level_key" not in rec:
+        return dict(rec)
+    sub = rec.get(board)
+    if not sub:
+        return None
+    return {**rec, "pp": sub["pp"], "stars": sub["stars"],
+            "accuracy": sub.get("accuracy", rec["accuracy"]),
+            "leaderboard_id": sub["leaderboard_id"]}
+
+
+def bench_pool(bench, board="ss", fallback=False):
+    """The bench's played levels in `board`'s view (skips dropped). Levels
+    the board does not rank are dropped, or with `fallback` (explicit
+    --levels on a --catalog both bench) seen from the other board."""
+    if bench.get("composite"):
+        raise SystemExit("error: a best-of composite mixes runs (rates, "
+                         "bodies); record each pick from its SOURCE bench "
+                         "(composite ss_from / bl_from) with --levels")
+    cat = bench.get("catalog", "scoresaber")
+    if cat != "both" and board != {"scoresaber": "ss",
+                                   "beatleader": "bl"}.get(cat, board):
+        raise SystemExit(f"error: --board {board} on a catalog={cat} bench")
+    other = BOARDS[1 - BOARDS.index(board)]
+    pool = ((board_view(e, board) or
+             (board_view(e, other) if fallback else None))
+            for e in bench["levels"] if "skipped" not in e)
+    return [e for e in pool if e is not None]
+
+
+def select_levels(pool, keys):
+    """The records named by `keys`, in `keys` order; every key must name
+    exactly one played level of the pool."""
+    by = {}
+    for e in pool:
+        by.setdefault(task_key(e), []).append(e)
+    out = []
+    for k in keys:
+        hit = by.get(str(k), [])
+        if len(hit) != 1:
+            raise SystemExit(f"error: --levels {k}: {len(hit)} played "
+                             f"levels in this bench/board")
+        out.append(hit[0])
+    return out
+
+
+def level_identity(entry):
+    """header.level: which leaderboard level(s) the replay is a play of."""
+    ss, bl = entry.get("ss"), entry.get("bl")
+    if "level_key" not in entry:                  # single-catalog record
+        ss = {"leaderboard_id": entry["leaderboard_id"]} \
+            if "max_pp" in entry else None
+        bl = {"leaderboard_id": entry["leaderboard_id"]} \
+            if "pass_rating" in entry else None
+    return {"level_key": entry.get("level_key"),
+            "characteristic": entry.get("characteristic", "Standard"),
+            "ss_leaderboard_id": ss["leaderboard_id"] if ss else None,
+            "bl_leaderboard_id": bl["leaderboard_id"] if bl else None}
+
+
 def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None,
-                 sim_dtype="f32", width=1024):
+                 sim_dtype="f32", width=1024, rate=(30, 1), mhash=None):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     # env v48: the checkpoint's obs z encoding (asinh knee C); the rust
     # sim reads BEAT_Z_ASINH once per process (this runs before any sim
@@ -85,6 +185,8 @@ def _worker_init(ckpt_path, device, push=(0.0, 0.0, 0), tau_scale=None,
         _W["fwd"] = _eager
     _W["push"] = push
     _W["tau"] = tau_scale   # env v46 fixed body (None = all 1.0)
+    _W["rate"] = rate       # (tick_hz, action_repeat)
+    _W["mhash"] = mhash     # weights hash, stamped in the replay header
 
 
 def _kick(env, rng, vmax):
@@ -110,13 +212,17 @@ def _make_one(job):
     Returns (base, line, warn) for rank-ordered printing by the parent."""
     rank, n_top, entry, tag, label = job
     policy, dev = _W["policy"], _W["dev"]
-    map_dir = f"maps/scoresaber/{entry['song_hash']}"
+    # the bench's map cache (BL-only levels too), fetched on a miss: a pod
+    # gets chart_cache pickles, not raw maps
+    map_dir = scoresaber.ensure_map_dats(entry["song_hash"], "maps/scoresaber")
     notes, meta = load_beatmap(map_dir, entry["difficulty"], first_note_s=2.0)
     base = (f"replays/{tag}_{label}{rank:02d}_"
             f"{slug(entry['song'])}_{entry['pp']:.0f}pp")
+    tick_hz, repeat = _W.get("rate", (30, 1))
     env = RustBeatEnv(external_chart=notes, seed=0, gears=policy.n_gears,
                       sim_dtype=_W["sim_dtype"],
-                      external_walls=meta["walls"])
+                      external_walls=meta["walls"], tick_hz=tick_hz,
+                      action_repeat=repeat)
     if _W.get("tau") is not None:
         env.set_tau_scale(_W["tau"])
     env.set_record(base + ".jsonl")
@@ -138,7 +244,17 @@ def _make_one(job):
         walk.consume(info["events"])
     exact = (round(walk.score) == entry["score"]
              and walk.max_combo == entry["highest_combo"]
-             and info["good_cuts"] == entry["good_cuts"])
+             and info["good_cuts"] == entry["good_cuts"]
+             and info["bad_cuts"] == entry["bad_cuts"]
+             and info["misses"] == entry["misses"]
+             and info["bombs_hit"] == entry["bombs_hit"])
+    verify = (f"    verify: score {round(walk.score)}/{entry['score']} "
+              f"combo {walk.max_combo}/{entry['highest_combo']} "
+              f"good {info['good_cuts']}/{entry['good_cuts']} "
+              f"bad {info['bad_cuts']}/{entry['bad_cuts']} "
+              f"miss {info['misses']}/{entry['misses']} "
+              f"bombs {info['bombs_hit']}/{entry['bombs_hit']} "
+              f"(replay/bench) {'EXACT' if exact else 'MISMATCH'}")
     warn = None
     if not exact:
         # fp32 argmax near-tie flipped somewhere vs the bench run —
@@ -153,7 +269,9 @@ def _make_one(job):
     # first_note_s did to the clock; -shift is the song time at replay t=0)
     from annotate_replay_audio import stamp
     stamp(base + ".jsonl", entry["song_hash"], entry["difficulty"],
-          entry["song"], -meta["shift"])
+          entry["song"], -meta["shift"],
+          extra={"level": level_identity(entry),
+                 **({"model_hash": _W["mhash"]} if _W.get("mhash") else {})})
 
     conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
                  entry["difficulty"], base + ".dat")
@@ -166,7 +284,7 @@ def _make_one(job):
             f"{entry['song'][:34]!r} -> {base}.dat OK"
             + (f"  [pushes: {n_push} in {tick} ticks, replay score "
                f"{round(walk.score)} vs bench {entry['score']}]"
-               if push_prob > 0.0 else ""))
+               if push_prob > 0.0 else "")) + "\n" + verify
     return base, line, warn
 
 
@@ -177,7 +295,19 @@ def main():
     p.add_argument("--tag", required=True, help="replay filename prefix")
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--sort", choices=["pp", "accuracy"], default="pp",
-                   help="rank plays by pp (default) or by accuracy")
+                   help="rank plays by pp (default) or by accuracy (of "
+                        "the --board view)")
+    p.add_argument("--board", choices=BOARDS, default=None,
+                   help="leaderboard view of a --catalog both bench: ss "
+                        "(ScoreSaber pp / stars / accuracy, SS-ranked "
+                        "levels) or bl (BeatLeader's, BL-ranked levels "
+                        "incl. BL-only). Default: ss, or bl on a "
+                        "catalog=beatleader bench")
+    p.add_argument("--levels", nargs="+", default=None, metavar="KEY",
+                   help="record exactly these levels (level_key on a "
+                        "--catalog both bench, else leaderboard ids), in "
+                        "this order, instead of a top/bottom/random pick; "
+                        "label 'sel' unless --label")
     p.add_argument("--bottom", action="store_true",
                    help="take the WORST N by the sort key instead of "
                         "the best (2026-07-29: bottom-acc failure-mode "
@@ -212,6 +342,12 @@ def main():
     p.add_argument("--forward-width", type=int, default=None,
                    help="policy forward batch width. Default: the bench "
                         "JSON's forward_width (else 1024)")
+    p.add_argument("--tick-hz", type=int, default=None,
+                   help="sim control rate (30/60/120/240). Default: the "
+                        "bench JSON's tick_hz (else 30)")
+    p.add_argument("--action-repeat", type=int, default=None,
+                   help="sim ticks per policy decision. Default: the bench "
+                        "JSON's action_repeat (else 1)")
     p.add_argument("--push-prob", type=float, default=0.0,
                    help="replay the env v18 perturbation: per-tick "
                         "probability of a horizontal root-velocity kick "
@@ -233,18 +369,35 @@ def main():
     # reproduce the bench's regime unless told otherwise (2026-09-26)
     sim_dtype = args.sim_dtype or bench.get("sim_dtype", "f32")
     width = args.forward_width or int(bench.get("forward_width", 1024))
+    rate = (args.tick_hz or int(bench.get("tick_hz") or 30),
+            args.action_repeat or int(bench.get("action_repeat") or 1))
+    if bench.get("obs_window"):
+        sys.exit("error: obs_window benches are not reproducible on this "
+                 "sim (no obs-window variant)")
     if args.tau_scale is None:
         ts = bench.get("tau_scale")
         args.tau_scale = (",".join(f"{v:g}" for v in ts) if ts else "default")
+    board = args.board or ("bl" if bench.get("catalog") == "beatleader"
+                           else "ss")
     print(f"regime: sim {sim_dtype}, forward width {width}, tau_scale "
-          f"{args.tau_scale}", flush=True)
-    pool = [e for e in bench["levels"] if "skipped" not in e]
+          f"{args.tau_scale}, {rate[0]} Hz, action repeat {rate[1]}"
+          + (f", board {board}" if bench.get("catalog") == "both" else ""),
+          flush=True)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+    mhash = model_hash(ck["state_dict"])
+    del ck
+    if bench.get("model_hash") and mhash != bench["model_hash"]:
+        sys.exit(f"error: {args.ckpt} hashes to {mhash}, the bench was run "
+                 f"on {bench['model_hash']}")
+    pool = bench_pool(bench, board, fallback=bool(args.levels))
     if args.stars is not None:
         lo, hi = args.stars
         pool = [e for e in pool if lo <= float(e.get("stars", 0)) < hi]
         if not pool:
             sys.exit(f"error: no bench levels with {lo} <= stars < {hi}")
-    if args.random:
+    if args.levels:
+        top = select_levels(pool, args.levels)
+    elif args.random:
         import random
         top = random.Random(args.seed).sample(pool, min(args.random, len(pool)))
         top.sort(key=lambda e: -e["pp"])          # rank order = pp within the pick
@@ -253,7 +406,8 @@ def main():
         top = sorted(pool, key=lambda e: sgn * e[args.sort])[:args.top]
     # label carries the sort key too (2026-07-30, user request): the pp
     # and accuracy "top" sets used to collide on topNN names
-    label = args.label or ("rand" if args.random else
+    label = args.label or ("sel" if args.levels else
+                           "rand" if args.random else
                            ("bot" if args.bottom else "top") + (
                                "acc" if args.sort == "accuracy" else "pp"))
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -273,7 +427,8 @@ def main():
                                             args.push_seed),
                                            parse_tau_scale(args.tau_scale)
                                            if args.tau_scale else None,
-                                           sim_dtype, width)) as ex:
+                                           sim_dtype, width, rate,
+                                           mhash)) as ex:
             for base, line, warn in ex.map(_make_one, jobs):
                 if warn:
                     print(warn, flush=True)
@@ -283,7 +438,7 @@ def main():
         _worker_init(args.ckpt, device,
                      (args.push_prob, args.push_vmax, args.push_seed),
                      parse_tau_scale(args.tau_scale) if args.tau_scale
-                     else None, sim_dtype, width)
+                     else None, sim_dtype, width, rate, mhash)
         for job in jobs:
             base, line, warn = _make_one(job)
             if warn:
