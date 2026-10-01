@@ -495,7 +495,13 @@ Computed max scores match the API's `maxScore` field exactly (validated).
 
 Results land in `bench/<run>_<ckpt>.json`: checkpoint name + weight
 sha256, per-level entries (score, accuracy, pp, misses, bad cuts,
-bombs hit, highest combo, FC flag) and the weighted total PP. Reruns
+bombs hit, highest combo, FC flag, combo breaks / wall entries / how the
+level ended, and — since 2026-10-01 — the applied joint torque spent:
+`torque_nm` = Σ over the level's ticks of Σ_j|τ_j| in N·m, the env v43
+energy base, plus `torque_nm_spine/arms/legs`, the rate-invariant
+`torque_nms` = torque_nm / tick_hz in N·m·s (use it across --tick-hz),
+and `torque_per_tick`; catalog totals `torque_*_total`) and the weighted
+total PP. Reruns
 MERGE: already-evaluated levels are skipped (so star ranges accumulate
 across runs), previously-skipped ones are retried, `--force`
 re-evaluates, and a different model writing to the same file is an

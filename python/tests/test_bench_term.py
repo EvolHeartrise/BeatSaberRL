@@ -339,7 +339,7 @@ def test_cuda_bench_rec_term_columns_match_rust():
                     walks[i].consume(int(row[0]), int(row[1]), float(row[2]))
                 done_r[i] = d
         ids, rr = env.pop_bench_rows()
-        assert rr.shape[1] == BENCH_COLS == 19
+        assert rr.shape[1] == BENCH_COLS == 23
         for e, r in zip(ids.tolist(), rr):
             assert e not in rows, "a frozen slot re-reported"
             assert done_r[e], (t, e, "CUDA finished before Rust")

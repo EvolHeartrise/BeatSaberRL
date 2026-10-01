@@ -4197,15 +4197,22 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
 // score += pts x mult; follow-through points commit at the pinned
 // multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
 // on the event bus before multiplying — mirrored with the (float) cast.
-constexpr int BENCH_REC = 20;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
+constexpr int BENCH_REC = 28;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
 // review B09 (2026-09-30): + [wall_enters, term_flags] (cols 17/18, the
 // lib.rs VecBeatSim::term mirror) and col 19 = this level's running
 // wall-ENTRY count (the lib.rs wall_enters counter). The accumulator
 // lives in the slot's own bench_rec row instead of a new (N) tensor so
 // the kernel argument list is untouched: bumped at the two entry sites,
-// copied to col 17 at done, zeroed by reset_env. The host reads cols
-// 0..BENCH_COLS-1 = 0..18 only (cuda_env.BENCH_COLS).
-constexpr int BENCH_WALL_ACC = 19;
+// copied to col 17 at done, zeroed by reset_env.
+// 2026-10-01 (user): + this level's applied-torque totals, cols 19..22 =
+// Σ over ticks of [total, spine, arms, legs] |τ| (N·m; the tau_stat /
+// lib.rs pop_torque_env quantity), snapshotted at done from the running
+// accumulators at cols 24..27 (bumped next to tau_stat each tick,
+// zeroed by reset_env). The wall-entry accumulator moved 19 -> 23. The
+// host reads cols 0..BENCH_COLS-1 = 0..22 only (cuda_env.BENCH_COLS).
+constexpr int BENCH_TAU_OUT = 19;
+constexpr int BENCH_WALL_ACC = 23;
+constexpr int BENCH_TAU_ACC = 24;
 // term_flags bits (lib.rs VecBeatSim::term): 0 = the level itself ended
 constexpr int TERM_FELL = 1, TERM_TILT = 2, TERM_ENVELOPE = 4,
               TERM_TICKCAP = 8;
@@ -4421,7 +4428,11 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
   P.in_wall_prev[e] = false;
-  if (P.bench_refill) P.bench_rec[(size_t)e * BENCH_REC + BENCH_WALL_ACC] = T(0);
+  if (P.bench_refill) {
+    T* r = P.bench_rec + (size_t)e * BENCH_REC;
+    r[BENCH_WALL_ACC] = T(0);
+    for (int k = 0; k < 4; k++) r[BENCH_TAU_ACC + k] = T(0);
+  }
   // arm-after-first-plant (user 2026-08-20): start UNARMED so a foot
   // that begins the episode in the air (start-pose jitter) is never
   // charged — the lift edge only arms once the foot has actually been
@@ -4974,6 +4985,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   P.tau_stat[e * 5 + 2] += T(tau_grp[1]);
   P.tau_stat[e * 5 + 3] += T(tau_grp[2]);
   P.tau_stat[e * 5 + 4] += T(1);
+  if (P.bench_refill) {   // this level's torque (bench_rec cols 24..27)
+    T* rb = P.bench_rec + (size_t)e * BENCH_REC + BENCH_TAU_ACC;
+    rb[0] += T(tau_abs);
+    rb[1] += T(tau_grp[0]);
+    rb[2] += T(tau_grp[1]);
+    rb[3] += T(tau_grp[2]);
+  }
   // env v34: limit-rest penalty + always-on telemetry (accumulates at
   // coef 0 too, so stop-resting is observable before it is priced)
   reward -= P.limit_coef * (lrest_legs + lrest_spine
@@ -5681,6 +5699,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     r[15] = T(P.wrev[e * 2 + 1]);    // level + the level's ticks
     r[16] = T(tick_new);
     r[17] = r[BENCH_WALL_ACC];       // wall entries this level (B09)
+    for (int k = 0; k < 4; k++)      // this level's Σ|τ| [total, spine,
+      r[BENCH_TAU_OUT + k] = r[BENCH_TAU_ACC + k];   // arms, legs] N·m
     r[18] = T((fell ? TERM_FELL : 0) | (tilted ? TERM_TILT : 0)
               | (d.env_bad ? TERM_ENVELOPE : 0)
               | (tick_new >= P.max_steps ? TERM_TICKCAP : 0));
