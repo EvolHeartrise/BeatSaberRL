@@ -15,6 +15,15 @@ thing under test. A mismatch is an error; --force compares anyway (and
 says so). `sim` itself is deliberately NOT checked: cuda-vs-rust is the
 comparison this tool exists for.
 
+Catalog (2026-09-30, --catalog scoresaber|beatleader|both): files of
+different catalogs are REFUSED outright, --force or not — their level
+identities (ScoreSaber id / BeatLeader id / hash_difficulty_mode key)
+and pp scales differ, so there is no per-level join to make. Files
+without the stamp are scoresaber. beatleader files join on the BL
+leaderboard id and compare BL pp; `both` files join on level_key and
+compare ss_pp and bl_pp per level; the BL totals print whenever both
+files carry them.
+
 Termination telemetry (review B09): when both files carry the per-level
 breaks / wall_enters / fell / envelope / terminated_tick fields, their
 totals over the common levels are printed and they join the per-field
@@ -35,11 +44,53 @@ class HeaderMismatch(SystemExit):
     """The two files were benched under different regimes (B14)."""
 
 
+class CatalogMismatch(HeaderMismatch):
+    """The two files bench different catalogs (never --force-able)."""
+
+
+def catalog_of(d):
+    return d.get("catalog", "scoresaber")
+
+
+def _key(e):
+    return e.get("level_key", e.get("leaderboard_id"))
+
+
+def _flat(e):
+    """A `both` record's per-leaderboard pp as flat ss_pp / bl_pp fields
+    (None where that leaderboard does not rank the level)."""
+    if "level_key" not in e:
+        return e
+    f = dict(e)
+    f["ss_pp"] = e["ss"]["pp"] if e.get("ss") else None
+    f["bl_pp"] = e["bl"]["pp"] if e.get("bl") else None
+    return f
+
+
 def load(path):
     d = json.load(open(path))
-    lv = {e["leaderboard_id"]: e for e in d.get("levels", [])
+    lv = {_key(e): _flat(e) for e in d.get("levels", [])
           if "skipped" not in e}
     return d, lv
+
+
+def check_catalogs(da, db, out=print):
+    ca, cb = catalog_of(da), catalog_of(db)
+    if ca != cb:
+        out(f"error: catalog differs: A={ca!r} B={cb!r}")
+        raise CatalogMismatch(
+            f"bench_compare: the files bench different catalogs ({ca} vs "
+            f"{cb}) — there is no per-level join across leaderboards "
+            f"(--force does not override this)")
+    return ca
+
+
+def _pp(e):
+    """The primary per-level pp: the file's leaderboard; `both` = SS
+    where ranked, else BL."""
+    if "pp" in e:
+        return float(e["pp"])
+    return float(e["ss_pp"] if e.get("ss_pp") is not None else e["bl_pp"])
 
 
 def _header(d, has_levels):
@@ -83,16 +134,32 @@ def _has_term(e):
 def compare(a_path, b_path, worst=10, out=print, force=False):
     da, la = load(a_path)
     db, lb = load(b_path)
+    cat = check_catalogs(da, db, out)
     mismatched = check_headers(da, db, bool(la), bool(lb), force, out)
     common = sorted(set(la) & set(lb))
+    out(f"catalog: {cat}")
     out(f"A: {a_path}  sim={da.get('sim', 'rust')}  levels {len(la)}  "
         f"upp {da.get('total_unweighted_pp')}  wpp {da.get('total_weighted_pp')}")
     out(f"B: {b_path}  sim={db.get('sim', 'rust')}  levels {len(lb)}  "
         f"upp {db.get('total_unweighted_pp')}  wpp {db.get('total_weighted_pp')}")
+    bl_tot = None
+    if "bl_total_weighted_pp" in da and "bl_total_weighted_pp" in db:
+        bl_tot = {k: (da[k], db[k]) for k in ("bl_total_unweighted_pp",
+                                              "bl_total_weighted_pp")}
+        out(f"BeatLeader totals (A / B): upp {da['bl_total_unweighted_pp']} "
+            f"/ {db['bl_total_unweighted_pp']}  wpp "
+            f"{da['bl_total_weighted_pp']} / {db['bl_total_weighted_pp']}")
+    if cat == "both":
+        out(f"ScoreSaber totals (A / B): upp {da.get('ss_total_unweighted_pp')}"
+            f" / {db.get('ss_total_unweighted_pp')}  wpp "
+            f"{da.get('ss_total_weighted_pp')} / "
+            f"{db.get('ss_total_weighted_pp')}")
+    fields_base = (tuple(f for f in FIELDS if f != "pp") + ("ss_pp", "bl_pp")
+                   if cat == "both" else FIELDS)
     out(f"common levels: {len(common)}  (A-only {len(set(la) - set(lb))}, "
         f"B-only {len(set(lb) - set(la))})")
     diff_levels = 0
-    field_diff = {f: 0 for f in FIELDS + TERM_FIELDS}
+    field_diff = {f: 0 for f in fields_base + TERM_FIELDS}
     sum_abs_dpp = 0.0
     max_dacc = 0.0
     rows = []
@@ -100,10 +167,10 @@ def compare(a_path, b_path, worst=10, out=print, force=False):
     term_set = set(term_common)
     for k in common:
         ea, eb = la[k], lb[k]
-        fields = FIELDS + (TERM_FIELDS if k in term_set else ())
+        fields = fields_base + (TERM_FIELDS if k in term_set else ())
         d = {f: (ea.get(f), eb.get(f)) for f in fields
              if _ne(ea.get(f), eb.get(f))}
-        dpp = float(ea["pp"]) - float(eb["pp"])
+        dpp = _pp(ea) - _pp(eb)
         dacc = float(ea["accuracy"]) - float(eb["accuracy"])
         sum_abs_dpp += abs(dpp)
         max_dacc = max(max_dacc, abs(dacc))
@@ -115,7 +182,7 @@ def compare(a_path, b_path, worst=10, out=print, force=False):
     out(f"levels with any scored field differing: {diff_levels} of "
         f"{len(common)} ({100.0 * diff_levels / max(1, len(common)):.2f}%)")
     out(f"sum |dpp| {sum_abs_dpp:,.1f} | net dpp (A-B) "
-        f"{sum(float(la[k]['pp']) - float(lb[k]['pp']) for k in common):+,.1f} "
+        f"{sum(_pp(la[k]) - _pp(lb[k]) for k in common):+,.1f} "
         f"| max |dacc| {100 * max_dacc:.3f} pt")
     term = None
     if term_common:
@@ -132,13 +199,18 @@ def compare(a_path, b_path, worst=10, out=print, force=False):
         f"{f} {n}" for f, n in field_diff.items() if n))
     rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
     for _, k, ea, dpp, dacc, d in rows[:worst]:
+        stars = ea.get("stars")
+        if stars is None:
+            stars = (ea.get("ss_stars") if ea.get("ss_stars") is not None
+                     else ea.get("bl_stars"))
         out(f"  {ea['song'][:28]!r:30s} {ea['difficulty'][:6]:6s} "
-            f"{ea['stars']:5.2f}* dpp {dpp:+7.1f} dacc {100 * dacc:+.3f} pt | "
+            f"{stars:5.2f}* dpp {dpp:+7.1f} dacc {100 * dacc:+.3f} pt | "
             + " ".join(f"{f}={va}/{vb}" for f, (va, vb) in d.items()))
     return {"common": len(common), "diff_levels": diff_levels,
             "sum_abs_dpp": sum_abs_dpp, "max_dacc": max_dacc,
             "fields": field_diff, "term": term,
-            "header_mismatch": mismatched}
+            "header_mismatch": mismatched, "catalog": cat,
+            "bl_totals": bl_tot}
 
 
 def term_totals(levels):
@@ -170,6 +242,7 @@ if __name__ == "__main__":
     p.add_argument("--worst", type=int, default=10)
     p.add_argument("--force", action="store_true",
                    help="compare even if tau_scale / mirror / "
-                        "scoring_version / sim_dtype differ")
+                        "scoring_version / sim_dtype differ (never "
+                        "across catalogs)")
     a = p.parse_args()
     compare(a.a, a.b, a.worst, force=a.force)
