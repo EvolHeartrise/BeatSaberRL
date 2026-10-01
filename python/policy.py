@@ -443,6 +443,34 @@ def _mlp(sizes, act=nn.ReLU):
     return nn.Sequential(*layers)
 
 
+@torch.no_grad()
+def apply_depth_init(policy):
+    """Depth-safe init for a FRESH policy (train_batch --depth-init,
+    architecture review 2026-10-01). Every write into a residual stream
+    (each block's attention out_proj and FFN second layer, the SimBa
+    trunk's fc2) is scaled by 1/sqrt(2 * n_blocks) with zero bias, so a
+    deep pre-LN stack starts near identity instead of growing the
+    stream with depth (GPT-2's residual scaling); the 29 action heads
+    are scaled by 0.01 with zero bias, so the initial policy is ~uniform
+    over the gears. Returns a one-line summary."""
+    n = len(policy.blocks)
+    f = (2.0 * n) ** -0.5
+    layers = []
+    for blk in policy.blocks:
+        if blk.out_proj is not None:
+            layers.append(blk.out_proj)
+        layers.append(blk.ffn[-1])
+    layers.append(policy.trunk_fc2)
+    for lin in layers:
+        lin.weight.mul_(f)
+        lin.bias.zero_()
+    for h in policy.heads:
+        h.weight.mul_(0.01)
+        h.bias.zero_()
+    return (f"{len(layers)} residual writes x{f:.4f} (1/sqrt(2*{n})), "
+            f"{len(policy.heads)} heads x0.01, biases 0")
+
+
 class Block(nn.Module):
     """Full pre-LN transformer block.
 
