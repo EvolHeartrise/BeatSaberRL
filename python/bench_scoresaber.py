@@ -33,6 +33,17 @@ tasks run LONGEST-FIRST (durations sidecar, populated as maps are
 parsed) so long maps can't straggle at the tail with mostly-idle
 slots, and results are saved on a wall-clock timer instead of every 25
 finishes (the every-25 rewrite was quadratic in catalog size).
+
+BeatLeader (--catalog, 2026-09-30): `--catalog scoresaber` (default,
+unchanged files and behavior), `beatleader` (every playable BL-ranked
+level, maps/beatleader_catalog.json; per-level BL stars + ratings and
+BL pp — beat_arena_env/beatleader.py) or `both` (the UNION keyed by
+(song hash, difficulty, characteristic): each level plays ONCE and its
+record carries `ss` and `bl` sub-results, null where unranked on that
+leaderboard). The agent's score and accuracy are one measurement; each
+leaderboard's pp is computed with its own rules from it. Files carry
+`catalog`, default out paths get a _beatleader / _both suffix, and
+results never merge across catalogs.
 """
 
 from __future__ import annotations
@@ -53,7 +64,7 @@ from datetime import datetime, timezone
 import numpy as np
 import torch
 
-from beat_arena_env import scoresaber
+from beat_arena_env import beatleader, scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
@@ -178,7 +189,7 @@ class _Group:
         self.issued = False
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--ckpt", required=True, help="checkpoint .pt to bench")
     p.add_argument("--stars", type=float, nargs=2, metavar=("MIN", "MAX"),
@@ -241,8 +252,24 @@ def parse_args():
     p.add_argument("--chart-cache", type=str, default="maps/chart_cache",
                    help="parsed-chart pickle cache (auto-invalidated by a "
                         "parser-source hash); empty string disables")
-    p.add_argument("--catalog", type=str, default="maps/scoresaber_catalog.json")
-    p.add_argument("--refresh-catalog", action="store_true")
+    p.add_argument("--catalog", type=str, default="scoresaber",
+                   help="which ranked levels to bench: scoresaber (default; "
+                        "every ScoreSaber-ranked level, the historical "
+                        "file format), beatleader (every playable "
+                        "BeatLeader-ranked level, BL stars + BL pp), or "
+                        "both (the union keyed by song hash + difficulty "
+                        "+ characteristic, each level played ONCE, with "
+                        "ss and bl sub-results per level and both "
+                        "leaderboards' totals). Stamped in the JSON; "
+                        "results never merge across catalogs. (A .json "
+                        "path here is the pre-2026-09-30 meaning: "
+                        "--catalog scoresaber --ss-catalog-path PATH)")
+    p.add_argument("--ss-catalog-path", type=str,
+                   default="maps/scoresaber_catalog.json")
+    p.add_argument("--bl-catalog-path", type=str,
+                   default="maps/beatleader_catalog.json")
+    p.add_argument("--refresh-catalog", action="store_true",
+                   help="refetch the catalog(s) --catalog uses")
     p.add_argument("--mirror", action="store_true",
                    help="bench on left-right mirrored charts (handedness-"
                         "bias diagnostic; scores are NOT ScoreSaber-"
@@ -286,7 +313,126 @@ def parse_args():
                         "same sources), --sim cuda the f32 kernel. f64 = "
                         "the exact-parity regime the Rust tests pin "
                         "(slower). Results never merge across dtypes")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.catalog.endswith(".json"):        # the old path meaning
+        args.ss_catalog_path, args.catalog = args.catalog, "scoresaber"
+    if args.catalog not in CATALOGS:
+        p.error(f"--catalog must be one of {', '.join(CATALOGS)} (or a "
+                f".json ScoreSaber catalog path), got {args.catalog!r}")
+    return args
+
+
+CATALOGS = ("scoresaber", "beatleader", "both")
+
+
+# ---------------------------------------------------------------------------
+# Catalogs: ScoreSaber, BeatLeader, and their union (--catalog)
+# ---------------------------------------------------------------------------
+
+def task_key(entry):
+    """The results-file identity of a level: a `both` entry/record has a
+    level_key (hash_difficulty_characteristic); scoresaber and
+    beatleader ones are keyed by their own leaderboard id (SS ints, BL
+    strings — never mixed in one file, the catalog stamp sees to it)."""
+    return entry.get("level_key", entry.get("leaderboard_id"))
+
+
+def merge_catalogs(ss_catalog, bl_catalog):
+    """The `both` task list: the union of both catalogs keyed by
+    beatleader.entry_key (song hash + difficulty + characteristic; SS
+    entries are SoloStandard = "Standard"). One entry per level, with
+    the leaderboard-specific catalog entries under `ss` / `bl` (None
+    where that leaderboard does not rank it). Ordered by SS stars, then
+    BL stars, then key (deterministic)."""
+    by_key = {}
+    for lb, cat in (("ss", ss_catalog), ("bl", bl_catalog)):
+        for e in cat:
+            k = beatleader.entry_key(e)
+            m = by_key.get(k)
+            if m is None:
+                m = by_key[k] = {
+                    "level_key": k, "hash": e["hash"].lower(),
+                    "song": e["song"], "mapper": e["mapper"],
+                    "difficulty": e["difficulty"],
+                    "characteristic": e.get("characteristic", "Standard"),
+                    "ss": None, "bl": None}
+            if m[lb] is not None:
+                raise ValueError(f"duplicate {lb} level {k}")
+            m[lb] = e
+    out = list(by_key.values())
+    out.sort(key=lambda m: (m["ss"] is None,
+                            m["ss"]["stars"] if m["ss"] else 0.0,
+                            m["bl"]["stars"] if m["bl"] else 0.0,
+                            m["level_key"]))
+    return out
+
+
+def catalog_counts(tasks_or_records):
+    """Shared / SS-only / BL-only counts over `both` entries or records."""
+    n_ss = sum(1 for e in tasks_or_records if e.get("ss") is not None)
+    n_bl = sum(1 for e in tasks_or_records if e.get("bl") is not None)
+    n_sh = sum(1 for e in tasks_or_records
+               if e.get("ss") is not None and e.get("bl") is not None)
+    return {"n_ss_ranked": n_ss, "n_bl_ranked": n_bl, "n_shared": n_sh,
+            "n_ss_only": n_ss - n_sh, "n_bl_only": n_bl - n_sh}
+
+
+def in_star_range(entry, stars, mode):
+    """--stars filter: each leaderboard's OWN stars (BL stars are not SS
+    stars). A `both` level is in range if either leaderboard's rating
+    is."""
+    if stars is None:
+        return True
+    lo, hi = stars
+    if mode != "both":
+        return lo <= entry["stars"] <= hi
+    return any(sub is not None and lo <= sub["stars"] <= hi
+               for sub in (entry["ss"], entry["bl"]))
+
+
+def _record_stars(e):
+    """Sort key of a level record: its stars, or (`both`) SS stars then
+    BL stars."""
+    if "stars" in e:
+        return (e["stars"], 0.0)
+    ss, bl = e.get("ss_stars"), e.get("bl_stars")
+    return (ss if ss is not None else -1.0, bl if bl is not None else -1.0)
+
+
+def load_catalog(path, which, refresh):
+    """A cached catalog (fetched + cached on first use or --refresh)."""
+    if refresh or not os.path.exists(path):
+        name = {"scoresaber": "ScoreSaber", "beatleader": "BeatLeader"}[which]
+        print(f"[catalog] fetching all ranked leaderboards from {name} "
+              f"(one-time)...", flush=True)
+        if which == "scoresaber":
+            catalog = scoresaber.fetch_ranked_catalog(log=print)
+        else:
+            catalog, _excl = beatleader.fetch_ranked_catalog(log=print)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(catalog, f)
+        print(f"[catalog] {len(catalog)} ranked leaderboards cached at "
+              f"{path}", flush=True)
+        return catalog
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_tasks(args):
+    """(task list, header stamp) for args.catalog."""
+    if args.catalog == "scoresaber":
+        return load_catalog(args.ss_catalog_path, "scoresaber",
+                            args.refresh_catalog), {}
+    bl_cat = load_catalog(args.bl_catalog_path, "beatleader",
+                          args.refresh_catalog)
+    if args.catalog == "beatleader":
+        return bl_cat, {}
+    ss_cat = load_catalog(args.ss_catalog_path, "scoresaber",
+                          args.refresh_catalog)
+    merged = merge_catalogs(ss_cat, bl_cat)
+    return merged, {"catalog_levels": {"n_levels": len(merged),
+                                       **catalog_counts(merged)}}
 
 
 def model_hash(state_dict) -> str:
@@ -322,16 +468,10 @@ def load_results(path, mhash):
 
 def save_results(path, data, levels):
     evaluated = [e for e in levels.values() if "skipped" not in e]
-    data["levels"] = sorted(levels.values(), key=lambda e: e["stars"])
+    data["levels"] = sorted(levels.values(), key=_record_stars)
     data["n_evaluated"] = len(evaluated)
     data["n_skipped"] = len(levels) - len(evaluated)
-    data["total_weighted_pp"] = round(
-        scoresaber.weighted_total_pp([e["pp"] for e in evaluated]), 2)
-    # unweighted sum (2026-07-26, user request): wpp saturates once the
-    # top-300 dominate the 0.965^rank series; the raw sum keeps
-    # measuring breadth across the whole evaluated set
-    data["total_unweighted_pp"] = round(
-        sum(e["pp"] for e in evaluated), 2)
+    data.update(pp_totals(data.get("catalog", "scoresaber"), evaluated))
     # env v19: catalog-wide mean flail (rad per note-free tick) — the
     # phantom-swing judge for the post_rem obs A/B. .get() keeps old
     # results files (pre-v19 levels lack the fields) loadable.
@@ -360,6 +500,41 @@ def save_results(path, data, levels):
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
     os.replace(tmp, path)
+
+
+def pp_totals(mode, evaluated):
+    """Header pp totals for a catalog mode. `total_weighted_pp` /
+    `total_unweighted_pp` are the file's PRIMARY leaderboard: ScoreSaber
+    for scoresaber (the historical fields, unchanged) and both,
+    BeatLeader for beatleader. beatleader and both files also carry
+    explicit bl_total_* (and both: ss_total_* + shared / SS-only /
+    BL-only counts over the evaluated levels). Each leaderboard weights
+    its own pp 0.965^rank best-first (same rule on both, see
+    beatleader.py) over the levels IT ranks.
+    Unweighted sum (2026-07-26, user request): wpp saturates once the
+    top-300 dominate the 0.965^rank series; the raw sum keeps measuring
+    breadth across the whole evaluated set."""
+    if mode == "scoresaber":
+        pps = [e["pp"] for e in evaluated]
+        return {"total_weighted_pp": round(
+                    scoresaber.weighted_total_pp(pps), 2),
+                "total_unweighted_pp": round(sum(pps), 2)}
+    if mode == "beatleader":
+        pps = [e["pp"] for e in evaluated]
+        w = round(beatleader.weighted_total_pp(pps), 2)
+        u = round(sum(pps), 2)
+        return {"total_weighted_pp": w, "total_unweighted_pp": u,
+                "bl_total_weighted_pp": w, "bl_total_unweighted_pp": u}
+    ss = [e["ss"]["pp"] for e in evaluated if e.get("ss") is not None]
+    bl = [e["bl"]["pp"] for e in evaluated if e.get("bl") is not None]
+    out = {"ss_total_weighted_pp": round(scoresaber.weighted_total_pp(ss), 2),
+           "ss_total_unweighted_pp": round(sum(ss), 2),
+           "bl_total_weighted_pp": round(beatleader.weighted_total_pp(bl), 2),
+           "bl_total_unweighted_pp": round(sum(bl), 2),
+           **catalog_counts(evaluated)}
+    out["total_weighted_pp"] = out["ss_total_weighted_pp"]
+    out["total_unweighted_pp"] = out["ss_total_unweighted_pp"]
+    return out
 
 
 def term_totals(evaluated):
@@ -541,17 +716,55 @@ def finish_slot(slot, info, combo, tick_hz=30):
     c_score, max_combo, breaks = combo
     score = round(c_score)
     acc = score / slot["max_score"] if slot["max_score"] else 0.0
+    if "level_key" in entry:                  # --catalog both
+        ss, bl = entry["ss"], entry["bl"]
+        head = {
+            "level_key": entry["level_key"],
+            "song_hash": entry["hash"], "song": entry["song"],
+            "mapper": entry["mapper"], "difficulty": entry["difficulty"],
+            "characteristic": entry["characteristic"],
+            "ss_stars": ss["stars"] if ss else None,
+            "bl_stars": bl["stars"] if bl else None,
+            "duration_s": round(slot["duration_s"], 1),
+            "n_notes": info["n_notes"],
+            "score": score, "max_score": slot["max_score"],
+            "accuracy": round(acc, 5),
+            "ss": ss_result(ss, score, slot["max_score"]) if ss else None,
+            "bl": bl_result(bl, score, slot["max_score"]) if bl else None}
+    elif "pass_rating" in entry:              # --catalog beatleader
+        blr = bl_result(entry, score, slot["max_score"])
+        head = {
+            "leaderboard_id": entry["leaderboard_id"],
+            "song_hash": entry["hash"], "song": entry["song"],
+            "mapper": entry["mapper"], "difficulty": entry["difficulty"],
+            "characteristic": entry["characteristic"],
+            "stars": entry["stars"],
+            "pass_rating": entry["pass_rating"],
+            "acc_rating": entry["acc_rating"],
+            "tech_rating": entry["tech_rating"],
+            "predicted_acc": entry.get("predicted_acc"),
+            "duration_s": round(slot["duration_s"], 1),
+            "n_notes": info["n_notes"],
+            "score": score, "max_score": slot["max_score"],
+            "api_max_score": entry["api_max_score"],
+            "accuracy": round(acc, 5),
+            "bl_accuracy": blr["accuracy"],
+            "pp": blr["pp"], "pass_pp": blr["pass_pp"],
+            "acc_pp": blr["acc_pp"], "tech_pp": blr["tech_pp"]}
+    else:                                     # --catalog scoresaber
+        head = {
+            "leaderboard_id": entry["leaderboard_id"],
+            "song_hash": entry["hash"], "song": entry["song"],
+            "mapper": entry["mapper"], "difficulty": entry["difficulty"],
+            "stars": entry["stars"], "max_pp": entry["max_pp"],
+            "duration_s": round(slot["duration_s"], 1),
+            "n_notes": info["n_notes"],
+            "score": score, "max_score": slot["max_score"],
+            "api_max_score": entry["api_max_score"],
+            "accuracy": round(acc, 5),
+            "pp": round(scoresaber.pp_value(acc, entry["max_pp"]), 2)}
     return {
-        "leaderboard_id": entry["leaderboard_id"],
-        "song_hash": entry["hash"], "song": entry["song"],
-        "mapper": entry["mapper"], "difficulty": entry["difficulty"],
-        "stars": entry["stars"], "max_pp": entry["max_pp"],
-        "duration_s": round(slot["duration_s"], 1),
-        "n_notes": info["n_notes"],
-        "score": score, "max_score": slot["max_score"],
-        "api_max_score": entry["api_max_score"],
-        "accuracy": round(acc, 5),
-        "pp": round(scoresaber.pp_value(acc, entry["max_pp"]), 2),
+        **head,
         "good_cuts": info["good_cuts"], "bad_cuts": info["bad_cuts"],
         "misses": info["misses"], "bombs_hit": info["bombs_hit"],
         "highest_combo": max_combo,
@@ -577,6 +790,93 @@ def finish_slot(slot, info, combo, tick_hz=30):
                               if info.get("ticks") else 0.0),
         **_term_fields(breaks, info),
     }
+
+
+def ss_result(e, score, max_score):
+    """ScoreSaber's view of one played level (`both` records): accuracy
+    against the computed full-combo max (== ScoreSaber's API maxScore,
+    validated) and pp = curve(acc) x maxPP."""
+    acc = score / max_score if max_score else 0.0
+    return {"leaderboard_id": e["leaderboard_id"], "stars": e["stars"],
+            "max_pp": e["max_pp"], "api_max_score": e["api_max_score"],
+            "accuracy": round(acc, 5),
+            "pp": round(scoresaber.pp_value(acc, e["max_pp"]), 2)}
+
+
+def bl_result(e, score, max_score):
+    """BeatLeader's view of one played level. BL accuracy = score / the
+    difficulty's maxScore (BeatLeader-Server ReplayUtils.ProcessReplay).
+    That maxScore equals the computed full-combo max on ~99% of
+    levels; on maps with chains BeatLeader's is HIGHER (it prices a
+    chain head like a full 115-point note: every 2026-09-30 mismatch is a
+    multiple of 30x8 pts), so the same play has a slightly lower BL
+    accuracy — BeatLeader's own rule, reproduced. No API maxScore: the
+    computed max. Capped at 1 (BeatLeader zeroes pp above 1; a real
+    play cannot exceed its own max)."""
+    bl_max = e.get("api_max_score") or max_score
+    acc = min(1.0, score / bl_max) if bl_max else 0.0
+    r = beatleader.pp_from_accuracy(acc, e["pass_rating"], e["acc_rating"],
+                                    e["tech_rating"])
+    return {"leaderboard_id": e["leaderboard_id"], "stars": e["stars"],
+            "pass_rating": e["pass_rating"], "acc_rating": e["acc_rating"],
+            "tech_rating": e["tech_rating"],
+            "predicted_acc": e.get("predicted_acc"),
+            "api_max_score": e.get("api_max_score"),
+            "accuracy": round(acc, 5),
+            "pp": round(r["pp"], 2), "pass_pp": round(r["pass_pp"], 2),
+            "acc_pp": round(r["acc_pp"], 2), "tech_pp": round(r["tech_pp"], 2)}
+
+
+def skip_record(entry, reason):
+    """Results-file entry for a level that could not be played."""
+    if "level_key" in entry:
+        return {"level_key": entry["level_key"],
+                "song_hash": entry["hash"], "song": entry["song"],
+                "difficulty": entry["difficulty"],
+                "ss_stars": entry["ss"]["stars"] if entry["ss"] else None,
+                "bl_stars": entry["bl"]["stars"] if entry["bl"] else None,
+                "ss_leaderboard_id": (entry["ss"]["leaderboard_id"]
+                                      if entry["ss"] else None),
+                "bl_leaderboard_id": (entry["bl"]["leaderboard_id"]
+                                      if entry["bl"] else None),
+                "skipped": reason}
+    return {"leaderboard_id": entry["leaderboard_id"],
+            "song_hash": entry["hash"], "song": entry["song"],
+            "difficulty": entry["difficulty"],
+            "stars": entry["stars"], "skipped": reason}
+
+
+def level_line(result):
+    """The per-level progress line's score part."""
+    if "level_key" in result:
+        parts = []
+        for lb, name in (("ss", "SS"), ("bl", "BL")):
+            sub = result[lb]
+            if sub is not None:
+                parts.append(f"{name} {sub['stars']:.2f}* pp {sub['pp']:.1f}")
+        return (f"{result['song']!r} [{result['difficulty']}] acc "
+                f"{100 * result['accuracy']:.2f}% | " + " | ".join(parts))
+    return (f"{result['stars']:.2f}* {result['song']!r} "
+            f"[{result['difficulty']}] acc {100 * result['accuracy']:.2f}% "
+            f"pp {result['pp']:.1f}")
+
+
+def totals_line(data):
+    """The summary's pp part, per catalog."""
+    mode = data.get("catalog", "scoresaber")
+    if mode == "scoresaber":
+        return (f"total weighted PP {data['total_weighted_pp']} | "
+                f"unweighted PP {data['total_unweighted_pp']}")
+    if mode == "beatleader":
+        return (f"BeatLeader weighted PP {data['bl_total_weighted_pp']} | "
+                f"unweighted PP {data['bl_total_unweighted_pp']}")
+    return (f"ScoreSaber weighted PP {data['ss_total_weighted_pp']} / "
+            f"unweighted {data['ss_total_unweighted_pp']} over "
+            f"{data['n_ss_ranked']} | BeatLeader weighted PP "
+            f"{data['bl_total_weighted_pp']} / unweighted "
+            f"{data['bl_total_unweighted_pp']} over {data['n_bl_ranked']} | "
+            f"shared {data['n_shared']}, SS-only {data['n_ss_only']}, "
+            f"BL-only {data['n_bl_only']}")
 
 
 def _term_fields(breaks, info):
@@ -655,11 +955,7 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
             pl, skip = None, f"{type(e).__name__}: {e}"
         if skip is not None:
             n_skip += 1
-            levels[entry["leaderboard_id"]] = {
-                "leaderboard_id": entry["leaderboard_id"],
-                "song_hash": entry["hash"], "song": entry["song"],
-                "difficulty": entry["difficulty"],
-                "stars": entry["stars"], "skipped": skip}
+            levels[task_key(entry)] = skip_record(entry, skip)
             continue
         tup = mirror_tuples(pl["tuples"]) if args.mirror else pl["tuples"]
         wl = pl.get("walls", [])
@@ -776,13 +1072,10 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                     "term_flags": int(r[18])},
                     (float(r[10]), int(r[11]), int(r[12])))
                 result["cuda_slot"] = int(e)
-                levels[result["leaderboard_id"]] = result
+                levels[task_key(result)] = result
                 n_done_levels += 1
                 if not args.quiet:
-                    print(f"[{n_done_levels}/{n_lv}] {result['stars']:.2f}* "
-                          f"{result['song']!r} [{result['difficulty']}] "
-                          f"acc {100 * result['accuracy']:.2f}% pp "
-                          f"{result['pp']:.1f}"
+                    print(f"[{n_done_levels}/{n_lv}] {level_line(result)}"
                           f"{'  FC' if result['full_combo'] else ''}",
                           flush=True)
                 # the kernel already reset slot e onto cand_host[e]; advance
@@ -799,14 +1092,11 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                                          device=device)
     wall = time.perf_counter() - t0
     for lv, slot in enumerate(slots):
-        lid = slot["entry"]["leaderboard_id"]
+        lid = task_key(slot["entry"])
         if lid not in levels:
-            levels[lid] = {
-                "leaderboard_id": lid, "song_hash": slot["entry"]["hash"],
-                "song": slot["entry"]["song"],
-                "difficulty": slot["entry"]["difficulty"],
-                "stars": slot["entry"]["stars"],
-                "skipped": f"not finished by tick {tick} (guard {tick_guard})"}
+            levels[lid] = skip_record(
+                slot["entry"],
+                f"not finished by tick {tick} (guard {tick_guard})")
     data["pd_floor_hits"] = data.get("pd_floor_hits", 0) + env.pop_pd_hits()
     data["envelope_hits"] = (data.get("envelope_hits", 0)
                              + env.pop_envelope_hits())
@@ -829,9 +1119,8 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
             json.dump(durations, f)
         os.replace(tmp, dur_path)
     print(f"\ndone (cuda, {args.sim_dtype}): {n_lv} played ({n_skip} skipped), "
-          f"{data['n_evaluated']} levels on file | total weighted PP "
-          f"{data['total_weighted_pp']} | unweighted PP "
-          f"{data['total_unweighted_pp']} | wrist reversals "
+          f"{data['n_evaluated']} levels on file | {totals_line(data)} "
+          f"| wrist reversals "
           f"{data['wrist_rev_total']} (L {data['wrist_rev_total_l']} / R "
           f"{data['wrist_rev_total_r']}; {data['wrist_rev_per_s_l']} / "
           f"{data['wrist_rev_per_s_r']} per s) | {_term_summary(data)} "
@@ -882,6 +1171,9 @@ def main():
     policy = policy.to(device).eval()
 
     out_path = args.out or default_out_path(args.ckpt)
+    if args.catalog != "scoresaber" and not args.out:   # own default file
+        root, ext = os.path.splitext(out_path)          # per catalog
+        out_path = f"{root}_{args.catalog}{ext}"
     if args.mirror and not args.out:     # never merge mirrored scores into
         root, ext = os.path.splitext(out_path)   # the normal results file
         out_path = f"{root}_mirror{ext}"
@@ -899,29 +1191,29 @@ def main():
         sys.exit(f"error: {out_path} holds mirror={data.get('mirror')} "
                  f"results but this run has --mirror={args.mirror} — "
                  f"use a different --out")
-    levels = {e["leaderboard_id"]: e for e in data.get("levels", [])}
+    # --catalog provenance (2026-09-30): a file holds ONE catalog's levels
+    # (files without the stamp are scoresaber — the only kind before);
+    # level identities differ per catalog (SS id / BL id / level_key), so
+    # a cross-catalog merge would silently double-count — refused, even
+    # for a skipped-only file
+    prev_cat = data.get("catalog", "scoresaber")
+    if prev_cat != args.catalog and data.get("levels"):
+        sys.exit(f"error: {out_path} holds catalog={prev_cat!r} results "
+                 f"but this run is --catalog {args.catalog}; use a "
+                 f"different --out")
+    data["catalog"] = args.catalog
+    levels = {task_key(e): e for e in data.get("levels", [])}
 
-    if args.refresh_catalog or not os.path.exists(args.catalog):
-        print("[catalog] fetching all ranked leaderboards from ScoreSaber "
-              "(one-time, ~2 min)...", flush=True)
-        catalog = scoresaber.fetch_ranked_catalog(log=print)
-        os.makedirs(os.path.dirname(args.catalog) or ".", exist_ok=True)
-        with open(args.catalog, "w") as f:
-            json.dump(catalog, f)
-        print(f"[catalog] {len(catalog)} ranked leaderboards cached at "
-              f"{args.catalog}", flush=True)
-    else:
-        with open(args.catalog) as f:
-            catalog = json.load(f)
+    catalog, cat_stamp = build_tasks(args)
+    data.update(cat_stamp)
 
     tasks = [e for e in catalog
-             if (args.stars is None
-                 or args.stars[0] <= e["stars"] <= args.stars[1])]
+             if in_star_range(e, args.stars, args.catalog)]
     in_range = len(tasks)
     if not args.force:                   # merge policy: evaluated = skip,
         tasks = [e for e in tasks        # previously-skipped = retry
-                 if e["leaderboard_id"] not in levels
-                 or "skipped" in levels[e["leaderboard_id"]]]
+                 if task_key(e) not in levels
+                 or "skipped" in levels[task_key(e)]]
     if args.limit > 0:
         tasks = tasks[:args.limit]
     # longest-first (durations sidecar, filled in as maps get parsed):
@@ -934,14 +1226,26 @@ def main():
             durations = json.load(f)
     tasks.sort(key=lambda e: durations.get(dur_key(e), float("inf")),
                reverse=True)
-    print(f"=== ScoreSaber bench: {ckpt_name} ({mhash[:19]}...) on {device}\n"
-          f"    {in_range} leaderboards in range, {len(tasks)} to play, "
-          f"{len(levels)} already on file -> {out_path}", flush=True)
+    title = {"scoresaber": "ScoreSaber", "beatleader": "BeatLeader",
+             "both": "ScoreSaber + BeatLeader"}[args.catalog]
+    unit = "levels" if args.catalog == "both" else "leaderboards"
+    extra = ""
+    if args.catalog == "both":
+        c = catalog_counts(tasks)
+        extra = (f" (in range: shared {c['n_shared']}, SS-only "
+                 f"{c['n_ss_only']}, BL-only {c['n_bl_only']})")
+    print(f"=== {title} bench: {ckpt_name} ({mhash[:19]}...) on {device}\n"
+          f"    {in_range} {unit} in range, {len(tasks)} to play, "
+          f"{len(levels)} already on file -> {out_path}{extra}", flush=True)
     if not tasks:
         save_results(out_path, data, levels)
-        print(f"nothing to do; totals refreshed "
-              f"(weighted PP {data['total_weighted_pp']}, unweighted "
-              f"{data['total_unweighted_pp']})", flush=True)
+        if args.catalog == "scoresaber":
+            print(f"nothing to do; totals refreshed "
+                  f"(weighted PP {data['total_weighted_pp']}, unweighted "
+                  f"{data['total_unweighted_pp']})", flush=True)
+        else:
+            print(f"nothing to do; totals refreshed ({totals_line(data)})",
+                  flush=True)
         return
 
     # small lookahead (2026-07-27): the warm producer is ~70x faster than
@@ -1142,16 +1446,12 @@ def main():
                             "wrist_rev_l": wr_l, "wrist_rev_r": wr_r,
                             "ticks": wr_ticks, "wall_enters": w_ent,
                             "term_flags": t_flags}, combo, tick_hz=args.tick_hz)
-                        levels[result["leaderboard_id"]] = result
+                        levels[task_key(result)] = result
                         n_done += 1
                         n_finished += 1
                         if not args.quiet:
                             print(f"[{n_done}/{len(tasks)}] "
-                                  f"{result['stars']:.2f}* "
-                                  f"{result['song']!r} "
-                                  f"[{result['difficulty']}] "
-                                  f"acc {100 * result['accuracy']:.2f}% "
-                                  f"pp {result['pp']:.1f}"
+                                  f"{level_line(result)}"
                                   f"{'  FC' if result['full_combo'] else ''}",
                                   flush=True)
                         gr.slots[i] = None
@@ -1199,11 +1499,7 @@ def main():
                         print(f"[{n_done}/{len(tasks)}] skip "
                               f"{entry['song']!r} "
                               f"[{entry['difficulty']}]: {skip}", flush=True)
-                        levels[entry["leaderboard_id"]] = {
-                            "leaderboard_id": entry["leaderboard_id"],
-                            "song_hash": entry["hash"], "song": entry["song"],
-                            "difficulty": entry["difficulty"],
-                            "stars": entry["stars"], "skipped": skip}
+                        levels[task_key(entry)] = skip_record(entry, skip)
                         continue
                     i = gr.free.pop()
                     if args.mirror:
@@ -1297,8 +1593,7 @@ def main():
     print(f"\ndone (rust, {args.sim_dtype}, {args.tick_hz} Hz, action repeat "
           f"{args.action_repeat}): {n_done} played ({n_new_skip} skipped), "
           f"{data['n_evaluated']} levels on file | "
-          f"total weighted PP {data['total_weighted_pp']} | "
-          f"unweighted PP {data['total_unweighted_pp']} | "
+          f"{totals_line(data)} | "
           f"wrist reversals {data['wrist_rev_total']} (L "
           f"{data['wrist_rev_total_l']} / R {data['wrist_rev_total_r']}; "
           f"{data['wrist_rev_per_s_l']} / {data['wrist_rev_per_s_r']} per s) | "

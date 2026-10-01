@@ -550,6 +550,76 @@ and is also stale — walls and the (since-retired) 1,536-object window cap land
 is very uneven across the catalog (a high-star stretch runs ~134
 levels/min), so do NOT extrapolate a total from a short sample.
 
+## BeatLeader bench (`--catalog beatleader|both`, 2026-09-30)
+
+```bash
+$VENV/bin/python prefetch_maps.py --catalog beatleader     # one-time maps
+$VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt --catalog beatleader
+$VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt --catalog both
+```
+
+`--catalog` picks the levels: `scoresaber` (the default — files and
+behavior unchanged), `beatleader` (every playable BeatLeader-ranked
+level) or `both` (the union of the two). Files are stamped `catalog`;
+the default out path gets a `_beatleader` / `_both` suffix; results never
+merge across catalogs (a different `--catalog` into an existing file is
+an error) and `bench_compare.py` refuses to compare files of different
+catalogs, `--force` or not. (`--catalog PATH.json` still means a
+ScoreSaber catalog path; the paths are now `--ss-catalog-path` /
+`--bl-catalog-path`.)
+
+**Catalog.** `maps/beatleader_catalog.json` (`beat_arena_env/beatleader.py`,
+`GET api.beatleader.com/leaderboards?type=ranked`, 100 per page): 3,952
+ranked leaderboards on 2026-09-30, of which 74 OneSaber are excluded (the
+env plays the Standard characteristic only, like the SoloStandard-only
+ScoreSaber catalog) → 3,878 playable; 9 more fail the chart parser
+(`KeyError('b')`, 3 songs, all BeatLeader-only) and are pruned by the
+prefetch failure policy → **3,869** (original in
+`beatleader_catalog.orig.json`, drops in `prefetch_failures_beatleader.json`).
+Each entry carries BeatLeader's OWN numbers — `stars`, `pass_rating`,
+`acc_rating`, `tech_rating`, `predicted_acc`, `api_max_score` — never
+mixed with ScoreSaber's stars (different scale and model: on shared
+levels BL/SS stars has median 1.08, 10-90% range 0.75-1.21). Maps share the ScoreSaber
+caches (`maps/scoresaber/<hash>/` dats, `maps/chart_cache/`).
+
+**Shared levels.** A level is (song hash, difficulty, characteristic).
+2,520 levels are ranked on both leaderboards, 3,577 ScoreSaber-only,
+1,349 BeatLeader-only (union 7,446). `--catalog both` plays each union
+level ONCE; its record carries the play (score, accuracy, counters,
+termination) once plus `ss` and `bl` sub-results (`null` where that
+leaderboard does not rank it), so shared levels are never benched twice.
+Totals: `ss_total_{weighted,unweighted}_pp` over the SS-ranked levels,
+`bl_total_*` over the BL-ranked ones, and `n_shared` / `n_ss_only` /
+`n_bl_only` (evaluated levels; `catalog_levels` holds the catalog-wide
+counts). `total_*_pp` is the file's primary leaderboard: ScoreSaber for
+`scoresaber` and `both`, BeatLeader for `beatleader`. `--stars` filters
+on each leaderboard's own stars (a `both` level is in range if either
+rating is).
+
+**BeatLeader PP** — transcribed from BeatLeader-Server
+`Utils/ReplayUtils.cs` @ `1474312940511b2810f403649cae80a15684baac`
+(GetPp / Inflate / Curve2 / PpFromScore), General context, no modifiers:
+
+    passPP = max(0, 15.2 * exp(passRating^(1/2.62)) - 30)
+    accPP  = Curve2(acc) * accRating * 34        (32-point curve, 100% = 7.424, 95% = 1.0)
+    techPP = exp(1.9 * acc) * 1.08 * techRating
+    pp     = 650 * (passPP + accPP + techPP)^1.3 / 650^1.3
+
+Accuracy = score / the difficulty's `maxScore` (ReplayUtils.ProcessReplay).
+Validated against 52 real no-modifier ranked scores over 26 leaderboards
+(0.39*–15.8*, `tests/data/beatleader_pp_scores.json`): max |pp error|
+0.0011 (float32 server vs float64 here); stars = Inflate(GetPp at 96%)/52
+reproduced too. Profile weighting (`Utils/PlayerUtils.cs`) is the same
+0.965^i over pp-descending plays as ScoreSaber's. BeatLeader's maxScore
+equals the computed full-combo max on 3,794 of 3,869 levels; 72 of the 75
+others are maps with chains where BeatLeader's max is higher by multiples
+of 30x8 (it prices a chain head like a 115-point note), so the same play
+has a slightly lower BL accuracy (`bl_accuracy` / `bl.accuracy`) than
+its ScoreSaber one — BeatLeader's rule, reproduced, capped at 1. Caveat:
+passPP does not depend on accuracy, so a level the agent falls out of
+early still earns it (a 7* level is ~36 pp at 1% accuracy); in game such
+a play would be a fail with no pp.
+
 ## Exporting to ScoreSaber's replay viewer
 
 ```bash
