@@ -346,6 +346,9 @@ pub(crate) fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // the env's 30 Hz judge tick (exp/tick-rate made the sim's DT a
+    // runtime rate; these fixtures are 30 Hz, as flux-wasm's are)
+    use crate::geom::DT_30 as DT;
 
     const C: [Real; 3] = [0.3, 1.4, 0.5];
 
