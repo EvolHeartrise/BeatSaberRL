@@ -572,10 +572,10 @@ ScoreSaber catalog path; the paths are now `--ss-catalog-path` /
 `GET api.beatleader.com/leaderboards?type=ranked`, 100 per page): 3,952
 ranked leaderboards on 2026-09-30, of which 74 OneSaber are excluded (the
 env plays the Standard characteristic only, like the SoloStandard-only
-ScoreSaber catalog) → 3,878 playable; 9 more fail the chart parser
-(`KeyError('b')`, 3 songs, all BeatLeader-only) and are pruned by the
-prefetch failure policy → **3,869** (original in
-`beatleader_catalog.orig.json`, drops in `prefetch_failures_beatleader.json`).
+ScoreSaber catalog) → **3,878** playable, all parsed (9 levels of 3
+songs first failed with `KeyError('b')`: their v3 files omit zero-valued
+fields, e.g. the initial-tempo bpmEvent `{"m": 180.002}` with no beat —
+the parser now defaults omitted beat fields to 0, 2026-09-30).
 Each entry carries BeatLeader's OWN numbers — `stars`, `pass_rating`,
 `acc_rating`, `tech_rating`, `predicted_acc`, `api_max_score` — never
 mixed with ScoreSaber's stars (different scale and model: on shared
@@ -584,7 +584,7 @@ caches (`maps/scoresaber/<hash>/` dats, `maps/chart_cache/`).
 
 **Shared levels.** A level is (song hash, difficulty, characteristic).
 2,520 levels are ranked on both leaderboards, 3,577 ScoreSaber-only,
-1,349 BeatLeader-only (union 7,446). `--catalog both` plays each union
+1,358 BeatLeader-only (union 7,455). `--catalog both` plays each union
 level ONCE; its record carries the play (score, accuracy, counters,
 termination) once plus `ss` and `bl` sub-results (`null` where that
 leaderboard does not rank it), so shared levels are never benched twice.
@@ -611,7 +611,7 @@ Validated against 52 real no-modifier ranked scores over 26 leaderboards
 0.0011 (float32 server vs float64 here); stars = Inflate(GetPp at 96%)/52
 reproduced too. Profile weighting (`Utils/PlayerUtils.cs`) is the same
 0.965^i over pp-descending plays as ScoreSaber's. BeatLeader's maxScore
-equals the computed full-combo max on 3,794 of 3,869 levels; 72 of the 75
+equals the computed full-combo max on 3,794 of the 3,869 levels checked on 2026-09-30; 72 of the 75
 others are maps with chains where BeatLeader's max is higher by multiples
 of 30x8 (it prices a chain head like a 115-point note), so the same play
 has a slightly lower BL accuracy (`bl_accuracy` / `bl.accuracy`) than

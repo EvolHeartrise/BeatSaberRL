@@ -265,15 +265,79 @@ def fetch_ranked_catalog(log=None):
 _CHART_EXT = (".dat", ".json")
 
 
+def _info_named_files(info):
+    """Every file Info.dat names as chart data: the difficulty beatmaps
+    (v2 `_beatmapFilename`, v4 `beatmapDataFilename`) and v4's audio
+    data. Mappers may give these ANY extension (VENTEN ships `ben.ben`,
+    `benben.ben`, ...), which the .dat/.json allowlist alone dropped —
+    5 ScoreSaber levels pruned as unparseable (2026-08-08)."""
+    out = set()
+    for d in info.get("difficultyBeatmaps", []) or []:          # v4
+        if d.get("beatmapDataFilename"):
+            out.add(d["beatmapDataFilename"])
+    for st in info.get("_difficultyBeatmapSets", []) or []:     # v2/v3
+        for d in st.get("_difficultyBeatmaps", []) or []:
+            if d.get("_beatmapFilename"):
+                out.add(d["_beatmapFilename"])
+    aud = (info.get("audio") or {}).get("audioDataFilename")
+    if aud:
+        out.add(aud)
+    return {os.path.basename(n).lower() for n in out}
+
+
+def _extract_chart_files(z, dest):
+    """Copy the chart files out of map zip `z` into dest: .dat/.json plus
+    exactly the files Info.dat names (any extension). Nothing else —
+    the zip is an untrusted upload."""
+    names = z.namelist()
+    info_name = next((n for n in names
+                      if os.path.basename(n).lower() == "info.dat"), None)
+    named = set()
+    if info_name is not None:
+        try:
+            named = _info_named_files(json.loads(z.read(info_name)))
+        except (ValueError, UnicodeDecodeError):
+            named = set()
+    for name in names:
+        base = os.path.basename(name)
+        if not base:
+            continue
+        if not (base.lower().endswith(_CHART_EXT) or base.lower() in named):
+            continue
+        with z.open(name) as src, open(os.path.join(dest, base), "wb") as f:
+            shutil.copyfileobj(src, f)
+
+
+def _missing_named_charts(dest):
+    """Cached map dir whose Info.dat names chart files that are absent
+    (cached before the named-file rule above): re-download it."""
+    for cand in ("Info.dat", "info.dat"):
+        path = os.path.join(dest, cand)
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    named = _info_named_files(json.load(f))
+            except (ValueError, UnicodeDecodeError):
+                return False
+            have = {n.lower() for n in os.listdir(dest)}
+            # only the bug class: a named chart the extension allowlist
+            # dropped (a .dat the zip never had would re-fetch forever)
+            return any(n not in have and not n.endswith(_CHART_EXT)
+                       for n in named)
+    return False
+
+
 def ensure_map_dats(song_hash, cache_dir):
     """Chart files for song_hash, downloading from BeatSaver on a cache
     miss. Returns the map directory (feed it to load_beatmap). Only
-    .dat/.json chart files are kept (the zip's audio/art/video and any
-    other payload are dropped)."""
+    .dat/.json chart files and the files Info.dat names are kept (the
+    zip's audio/art/video and any other payload are dropped)."""
     song_hash = song_hash.lower()
     dest = os.path.join(cache_dir, song_hash)
     if os.path.isdir(dest):
-        return dest
+        if not _missing_named_charts(dest):
+            return dest
+        shutil.rmtree(dest)               # pre-fix cache: charts dropped
     os.makedirs(cache_dir, exist_ok=True)
     info = _get_json(BEATSAVER_API.format(song_hash))
     url = None
@@ -290,12 +354,7 @@ def ensure_map_dats(song_hash, cache_dir):
         with open(os.path.join(tmp, "map.zip"), "wb") as f:
             f.write(blob)
         with zipfile.ZipFile(os.path.join(tmp, "map.zip")) as z:
-            for name in z.namelist():
-                base = os.path.basename(name)
-                if not base or not base.lower().endswith(_CHART_EXT):
-                    continue
-                with z.open(name) as src, open(os.path.join(tmp, base), "wb") as f:
-                    shutil.copyfileobj(src, f)
+            _extract_chart_files(z, tmp)
         os.remove(os.path.join(tmp, "map.zip"))
         os.replace(tmp, dest)             # atomic: cache dir appears complete
     except BaseException:
