@@ -334,8 +334,12 @@ def test_replay_v10_roundtrip(tmp_path):
     # additive per-tick schema revision (§6): 2 = "head" on every tick,
     # 3 = "activation" replaced the P6 "effort" field (2026-09-13),
     # 4 = "torque" [total, spine, arms, legs] applied |tau| (env v43),
-    # 5 = header "tau_scale" (env v46 per-axis torque-limit scales)
-    assert head["header"]["record_rev"] == 5
+    # 5 = header "tau_scale" (env v46 per-axis torque-limit scales),
+    # 6 = header "tick_hz" / "action_repeat" (tick-rate)
+    assert head["header"]["record_rev"] == 6
+    assert head["header"]["tick_hz"] == 30
+    assert head["header"]["action_repeat"] == 1
+    assert "obs_window" not in head["header"]
     assert head["header"]["tau_scale"] == [1.0] * 16
     assert head["header"]["config"]["gears"] == 3
     assert len(head["header"]["chart"]) == len(env.chart)
