@@ -9,16 +9,14 @@ scaling-law trick); cost signal = wall seconds of the training leg.
 downsample=1 (one bench per leg) which also enables Protein's
 success-probability classifier.
 
-Space (8 dims; gae_lambda added 2026-07-27 before resuming — gamma and
-lambda jointly set the credit window, so sweeping gamma alone against a
-fixed lambda 0.95 would under/over-state its effect; the three pre-add
-observations are replayed with the implicit lambda 0.95 they ran with):
-  lr          log     1e-4 .. 8e-3   (cosine to 1e-4 fixed)
+Space (7 dims; gae_lambda added 2026-07-27 — gamma and lambda jointly
+set the credit window; effort_coef left the space with the v10 effort
+price's retirement, see WSD PORT below):
+  lr          log     1e-4 .. 8e-3   trunk lr; the leaf decays it to 1e-4
   ent_coef    log     1e-4 .. 0.3    initial entropy coef
-  ent_final   log     1e-5 .. 0.1    linear anneal target (new flag)
+  ent_final   log     1e-5 .. 0.1    trunk anneal floor + leaf target
   gamma       logit   0.87 .. 0.997  user hypothesis: ~1 s horizon (~0.967)
   gae_lambda  logit   0.65 .. 0.99   trace decay (gamma*lambda = PG window)
-  effort_coef log     0.002 .. 8     flailing tax (log cannot express 0)
   bomb_prob   log     0.003 .. 0.4   bomb density (72%-of-reward question)
   total_steps log     5e7  .. 4e8    THE COST AXIS (1.2-9.3 h at the
                                      v10 env's ~12k steps/s, measured
@@ -36,12 +34,38 @@ State: every observation appended to <dir>/observations.jsonl and
 replayed through observe() on restart (observe() is pure, so this fully
 reconstructs the GP state — Protein itself has no save/load).
 
-  python sweep_protein.py --max-runs 100 [--dir sweeps/s1_entropy_gamma]
+**WSD PORT (2026-09-30).** All three drivers died on argparse in
+seconds against the current trainer/bench and were logged as failures
+at cost 1.0 s. What changed, per the CLIs as of this date:
+  - `--lr-decay cosine` is gone (WSD is the only schedule since
+    2026-08-11). A leg is now a WSD TRUNK (warmup -> constant --lr,
+    exponential ent anneal ent_coef -> floor ent_final, --ent-tau
+    recipe default) for (1 - COOLDOWN_FRAC) of total_steps, then a
+    LEAF (`--resume trunk_final.pt --cooldown-updates N`: lr 1-sqrt to
+    --lr-final 1e-4, ent linear to ent_final, `--no-wall-despawn` as
+    the README leaf launch) for the rest. total_steps and the cost
+    (trunk + leaf wall) keep their meaning; the leaf checkpoint is
+    what gets benched. The trainer writes trunk_final.pt /
+    leaf_from_updNNNNN.pt — `final.pt` no longer exists, so even a
+    working leg would have been scored a failure.
+  - `--ranked-maps` is the trainer default now; this s1 driver is the
+    PROCEDURAL sweep (bomb_prob is ignored on real maps), so it passes
+    `--no-ranked-maps --no-ep-stats --chart-pool 65536`.
+  - bench: `--fused-forward` is gone (the fused forward is the only
+    path); the bench keeps --num-envs 2048 explicit.
+  - failures are honest: cost = the real wall seconds spent, and a
+    step that dies in < FAST_FAIL_S is a config/CLI error — the sweep
+    ABORTS with the log tail instead of observing it.
+  - observations carry `"era": ERA`; replay refuses pre-port lines
+    (a different trainer, schedule and env — the s1-s4 dirs are frozen).
+
+  python sweep_protein.py --max-runs 100 [--dir sweeps/s1_upp_wsd]
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -50,9 +74,137 @@ import sys
 import time
 from copy import deepcopy
 
-from protein_sweep import Protein
-
 PY = sys.executable
+# ---- shared leg plumbing (sweep_ranked.py / sweep_contact.py import it)
+ERA = "wsd-2026-09-30"   # observations.jsonl tag; replay refuses others
+FAST_FAIL_S = 60.0       # non-zero exit this fast = config/CLI error
+COOLDOWN_FRAC = 0.2      # leaf share of a leg's updates (EPFL
+#                          2405.18392: 10-20% of trunk; recipe cd300)
+LR_FINAL = 1e-4          # the old cosine floor, now the leaf's floor
+
+
+def split_budget(total_steps, num_envs, horizon):
+    """(trunk_steps, cooldown_updates) for a leg of total_steps."""
+    batch = num_envs * horizon
+    n_upd = max(2, int(total_steps) // batch)
+    cd = max(1, round(COOLDOWN_FRAC * n_upd))
+    return (n_upd - cd) * batch, cd
+
+
+def wsd_cmds(h, run_dir, num_envs, horizon, env_flags):
+    """(trunk_cmd, leaf_cmd, leaf_dir) for one WSD leg. A --resume
+    takes only lr/ent/schedule/z/arch from the checkpoint, so the leaf
+    repeats every env/shape flag of the trunk."""
+    trunk_steps, cd = split_budget(h["total_steps"], num_envs, horizon)
+    common = [PY, "train_batch.py",
+              "--num-envs", str(num_envs), "--horizon", str(horizon),
+              "--seed", "0", *env_flags,
+              "--gamma", f"{h['gamma']:.6g}",
+              "--gae-lambda", f"{h['gae_lambda']:.6g}",
+              "--ent-final", f"{h['ent_final']:.6g}"]
+    trunk = common + ["--lr", f"{h['lr']:.6g}",
+                      "--lr-final", f"{LR_FINAL:g}",
+                      "--ent-coef", f"{h['ent_coef']:.6g}",
+                      "--total-steps", str(trunk_steps),
+                      "--run-dir", run_dir]
+    leaf_dir = os.path.join(run_dir, "leaf")
+    leaf = common + ["--resume", os.path.join(run_dir, "trunk_final.pt"),
+                     "--cooldown-updates", str(cd),
+                     "--no-wall-despawn",   # walls solid, as in the bench
+                     "--run-dir", leaf_dir]
+    return trunk, leaf, leaf_dir
+
+
+def run_step(idx, what, cmd, log_path, timeout):
+    """Run one subprocess with stdout+stderr to log_path. Returns
+    (ok, wall_s). A non-zero exit inside FAST_FAIL_S is a CLI/config
+    error, not a result: abort the sweep with the log tail rather than
+    teach the optimizer that the config is a (free) failure."""
+    t0 = time.time()
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            r = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                               text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            wall = time.time() - t0
+            print(f"[run {idx:03d}] {what} TIMEOUT ({timeout}s)", flush=True)
+            return False, wall
+    wall = time.time() - t0
+    if r.returncode == 0:
+        return True, wall
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        tail = f.read()[-1500:]
+    if wall < FAST_FAIL_S:
+        sys.exit(f"[run {idx:03d}] {what} exited {r.returncode} after "
+                 f"{wall:.1f}s (< {FAST_FAIL_S:.0f}s: a CLI/config error, "
+                 f"not a result) — sweep ABORTED, nothing observed.\n"
+                 f"cmd: {' '.join(cmd)}\n--- {log_path} tail ---\n{tail}")
+    print(f"[run {idx:03d}] {what} FAILED rc {r.returncode} ({wall:.0f}s): "
+          f"{tail[-400:]}", flush=True)
+    return False, wall
+
+
+def run_wsd_train(idx, h, run_dir, num_envs, horizon, cmds,
+                  steps_per_s):
+    """Trunk then leaf (cmds = a driver's train_cmds(h, run_dir)).
+    Returns (leaf_ckpt or None, train_wall_s); the wall is the real
+    time spent even when a step failed."""
+    trunk, leaf, leaf_dir = cmds
+    trunk_steps, cd = split_budget(h["total_steps"], num_envs, horizon)
+    os.makedirs(run_dir, exist_ok=True)
+    ok, wall = run_step(idx, "TRUNK", trunk,
+                        os.path.join(run_dir, "train.log"),
+                        trunk_steps // steps_per_s + 1800)
+    if not ok:
+        return None, wall
+    if not os.path.exists(os.path.join(run_dir, "trunk_final.pt")):
+        print(f"[run {idx:03d}] TRUNK exited 0 without trunk_final.pt",
+              flush=True)
+        return None, wall
+    os.makedirs(leaf_dir, exist_ok=True)
+    ok, w = run_step(idx, "LEAF", leaf,
+                     os.path.join(leaf_dir, "leaf_train.log"),
+                     cd * num_envs * horizon // steps_per_s + 1800)
+    wall += w
+    cks = sorted(glob.glob(os.path.join(leaf_dir, "leaf_from_upd*.pt")))
+    if not ok or not cks:
+        if ok:
+            print(f"[run {idx:03d}] LEAF exited 0 without a leaf ckpt",
+                  flush=True)
+        return None, wall
+    return cks[-1], wall
+
+
+def replay(protein, log_path):
+    """Replay observations.jsonl into Protein; refuses pre-port lines.
+    Returns the number replayed."""
+    n = 0
+    if not os.path.exists(log_path):
+        return 0
+    for line in open(log_path, encoding="utf-8"):
+        o = json.loads(line)
+        if o.get("era") != ERA:
+            sys.exit(f"{log_path}: observation idx {o.get('idx')} is era "
+                     f"{o.get('era')!r}, this driver writes {ERA!r} — a "
+                     f"different trainer/schedule/env. Use a fresh --dir.")
+        protein.observe(o["hypers"], o["score"], o["cost"],
+                        o["is_failure"])
+        protein.suggestion_idx += 1  # keep Sobol phase consumed
+        n += 1
+    return n
+
+
+def log_observation(log_path, idx, hypers, score, cost, fail):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"idx": idx, "era": ERA, "hypers": hypers,
+                            "score": score, "cost": cost,
+                            "is_failure": fail}) + "\n")
+
+
+# ---- s1 (this driver)
+NUM_ENVS, HORIZON = 1024, 128
+# procedural charts: bomb_prob is a generator dial, ignored on real maps
+ENV_FLAGS = ["--no-ranked-maps", "--no-ep-stats", "--chart-pool", "65536"]
 SPACE = {
     "metric": "catalog_unweighted_pp",
     "goal": "maximize",
@@ -78,57 +230,40 @@ SPACE = {
 FILL = {"train": {k: None for k in SPACE["train"]}}
 
 
+def train_cmds(h, run_dir):
+    """(trunk_cmd, leaf_cmd, leaf_dir); bomb_prob rides on both."""
+    flags = ENV_FLAGS + ["--bomb-prob", f"{h['bomb_prob']:.6g}"]
+    return wsd_cmds(h, run_dir, NUM_ENVS, HORIZON, flags)
+
+
+def bench_cmd(ck, out):
+    # explicit width (2026-07-27): don't let a future default change
+    # silently slow or re-class the sweep. --fused-forward retired: the
+    # fused forward is the bench's only path now.
+    return [PY, "bench_scoresaber.py", "--ckpt", ck, "--out", out,
+            "--num-envs", "2048"]
+
+
 def run_leg(idx, h, run_dir):
-    """One training leg + band bench. Returns (band_wpp, wall_s) or None."""
+    """One WSD leg (trunk + leaf) + catalog bench of the leaf.
+    Returns (catalog_upp or None, train_wall_s)."""
     # a leg is always a fresh model — a stale dir (e.g. from a run that
     # was in-flight at a pause) would make the bench refuse the
     # different-model overwrite and record a spurious failure
     shutil.rmtree(run_dir, ignore_errors=True)
-    cmd = [PY, "train_batch.py", "--num-envs", "1024", "--horizon", "128",
-           "--lr-decay", "cosine", "--seed", "0",
-           "--lr", f"{h['lr']:.6g}",
-           "--ent-coef", f"{h['ent_coef']:.6g}",
-           "--ent-final", f"{h['ent_final']:.6g}",
-           "--gamma", f"{h['gamma']:.6g}",
-           "--gae-lambda", f"{h['gae_lambda']:.6g}",
-           "--bomb-prob", f"{h['bomb_prob']:.6g}",
-           "--total-steps", str(int(h["total_steps"])),
-           "--run-dir", run_dir]
-    t0 = time.time()
-    # this leg's own budget at a conservative 8,000 steps/s floor (v10
-    # measures 12.4k at 1024/128, 24.4k at 4096/32 — 2026-08-07) plus
-    # 1800 s startup; 4e8 (the cost-axis ceiling) -> 51,800 s
-    tmo = int(h["total_steps"]) // 8000 + 1800
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=tmo)
-    except subprocess.TimeoutExpired:
-        print(f"[run {idx:03d}] TRAIN TIMEOUT ({tmo}s)", flush=True)
-        return None
-    wall = time.time() - t0
-    ck = os.path.join(run_dir, "final.pt")
-    if r.returncode != 0 or not os.path.exists(ck):
-        tail = (r.stdout or "")[-400:] + (r.stderr or "")[-400:]
-        print(f"[run {idx:03d}] TRAIN FAILED ({wall:.0f}s): {tail}",
-              flush=True)
-        return None
+    # conservative 8,000 steps/s floor (v10 measures 12.4k at 1024/128,
+    # 24.4k at 4096/32 — 2026-08-07) plus 1800 s startup per step
+    ck, wall = run_wsd_train(idx, h, run_dir, NUM_ENVS, HORIZON,
+                             train_cmds(h, run_dir), 8000)
+    if ck is None:
+        return None, wall
     out = os.path.join(run_dir, "bench.json")
     # 7200 s: the v10 catalog bench runs ~1,900-2,400 s (2026-08-07),
     # so this is ~3x margin. The old 3000 s was a pre-v10 constant.
-    try:
-        b = subprocess.run([PY, "bench_scoresaber.py", "--ckpt", ck,
-                            "--out", out,
-                            # explicit best path (2026-07-27): don't let a
-                            # future default change silently slow or
-                            # re-class the sweep
-                            "--num-envs", "2048", "--fused-forward"],
-                           capture_output=True, text=True, timeout=7200)
-    except subprocess.TimeoutExpired:
-        print(f"[run {idx:03d}] BENCH TIMEOUT (7200s)", flush=True)
-        return None
-    if b.returncode != 0 or not os.path.exists(out):
-        print(f"[run {idx:03d}] BENCH FAILED: {(b.stderr or '')[-300:]}",
-              flush=True)
-        return None
+    ok, _ = run_step(idx, "BENCH", bench_cmd(ck, out),
+                     os.path.join(run_dir, "bench.log"), 7200)
+    if not ok or not os.path.exists(out):
+        return None, wall
     upp = json.load(open(out))["total_unweighted_pp"]
     return upp, wall
 
@@ -136,24 +271,16 @@ def run_leg(idx, h, run_dir):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--max-runs", type=int, default=100)
-    p.add_argument("--dir", type=str, default="sweeps/s1_upp")
+    p.add_argument("--dir", type=str, default="sweeps/s1_upp_wsd")
     args = p.parse_args()
     os.makedirs(args.dir, exist_ok=True)
     log_path = os.path.join(args.dir, "observations.jsonl")
 
+    from protein_sweep import Protein   # gpytorch: sweep host only
     protein = Protein(SPACE, cost_param="train/total_steps")
 
-    start = 0
-    if os.path.exists(log_path):
-        for line in open(log_path, encoding="utf-8"):
-            o = json.loads(line)
-            # observations logged before a dim was added ran the
-            # then-hardcoded default; from_dict asserts on missing keys
-            o["hypers"]["train"].setdefault("gae_lambda", 0.95)
-            protein.observe(o["hypers"], o["score"], o["cost"],
-                            o["is_failure"])
-            protein.suggestion_idx += 1  # keep Sobol phase consumed
-            start += 1
+    start = replay(protein, log_path)
+    if start:
         print(f"resumed: replayed {start} observations", flush=True)
 
     for idx in range(start, args.max_runs):
@@ -165,17 +292,12 @@ def main():
               f"lam {h['gae_lambda']:.4f} "
               f"bomb {h['bomb_prob']:.3f} "
               f"steps {h['total_steps']/1e6:.0f}M", flush=True)
-        res = run_leg(idx, h, run_dir)
-        if res is None:
-            score, cost, fail = 0.0, 1.0, True
-        else:
-            score, cost = res
-            fail = False
+        score, cost = run_leg(idx, h, run_dir)
+        fail = score is None
+        if fail:
+            score = 0.0   # Protein refits failures at the min score
         protein.observe(hypers, score, cost, fail)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"idx": idx, "hypers": hypers,
-                                "score": score, "cost": cost,
-                                "is_failure": fail}) + "\n")
+        log_observation(log_path, idx, hypers, score, cost, fail)
         print(f"[run {idx:03d}] -> catalog upp {score:,.0f} "
               f"({cost/60:.1f} min){' FAILED' if fail else ''}", flush=True)
 

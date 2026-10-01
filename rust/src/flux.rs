@@ -8,11 +8,12 @@
 //! Objects ride the same head-anchored track as notes
 //! (`z = (hit_time − t)·speed + z_off`) and miss at the head plane:
 //! - **Circle** (KIND_CIRCLE, has a colour): a flat disc facing the
-//!   player, radius CIRCLE_R, with the good box's depth convention
-//!   (z ∈ [z − 0.75, z + 0.25]). Touching it with the matching palm
+//!   player, radius CIRCLE_R, in a thin depth slab hugging the visual
+//!   (z ∈ [z − 0.05, z + 0.05]). Touching it with the matching palm
 //!   scores CIRCLE_PTS + round(10·(1 − clamp(d/0.3, 0, 1))), d = the
 //!   in-plane distance from the centre at the palm path's closest
-//!   approach inside the slab. The other palm touching it is a bad hit
+//!   approach inside the slab (both swept over the tick in the object's
+//!   frame — see `judge`). The other palm touching it is a bad hit
 //!   (event 3, wrong hand). No speed or direction requirement.
 //! - **Bar** (KIND_BAR, colourless): a thin rectangle in the plane
 //!   facing the player — width 2·BAR_HALF_W, length `len`, rotated by
@@ -53,10 +54,14 @@ pub(crate) const BAR_PTS: Real = 100.0;
 pub(crate) const BAR_ACC_PTS: Real = 15.0;
 /// Bar half width (m): 5 cm wide.
 pub(crate) const BAR_HALF_W: Real = 0.025;
-/// Hitbox depth slab relative to the object centre — the standard good
-/// box's convention (1.0 m deep, shifted 0.25 m toward the player).
-pub(crate) const SLAB_LO: Real = GOOD_Z_SHIFT - GOOD_HALF_Z; // -0.75
-pub(crate) const SLAB_HI: Real = GOOD_Z_SHIFT + GOOD_HALF_Z; // +0.25
+/// Hitbox depth slab relative to the object centre (user rule
+/// 2026-09-28): 5 cm either side of the flat visual, so a touch lands
+/// where the object is drawn. Thinner than one tick of object travel
+/// (up to 0.6 m at 18 m/s, 30 Hz) — `judge` sweeps it in the object's
+/// frame, so nothing tunnels.
+pub(crate) const SLAB_HALF: Real = 0.05;
+pub(crate) const SLAB_LO: Real = -SLAB_HALF;
+pub(crate) const SLAB_HI: Real = SLAB_HALF;
 /// Live broad-phase reach: arm (0.65) + palm + the slab's near face.
 pub(crate) const FLUX_REACH_PAST_SHOULDER: Real = 0.65 + PALM_OFF - SLAB_LO;
 
@@ -220,9 +225,21 @@ pub(crate) fn reach_z(shoulder_z_max: Real) -> Real {
 /// The Flux object pass of one tick (replaces the saber cut loop): miss
 /// boundary, circle touches, bar crossings. `p0` / `p1` are last tick's
 /// and this tick's palms [left, right] (world), `head` this tick's head
-/// position, `time` this tick's END time, `reach_z` the live reach
-/// gate. Resolves objects in `status` (1 good, 2 bad, 3 missed), adds
-/// the reward terms to `reward` in chart order and appends one Event per
+/// position, `time` this tick's END time, `tick_dt` the tick length
+/// (DT in the env; the WebXR game's finer judge tick), `reach_z` the
+/// live reach gate.
+///
+/// Contact is swept in each object's own frame: over the tick the
+/// object travelled `speed·tick_dt` toward the player along z, so last
+/// tick's palms are taken relative to where it was then (`p0` shifted
+/// by −speed·tick_dt in z) and this tick's relative to where it is now —
+/// the relative path cannot skip the thin slab however fast it closes.
+/// Contact is judged BEFORE the miss boundary: an object that went
+/// through a palm and past the head plane within the same tick (18 m/s
+/// covers 0.6 m per 30 Hz tick) was touched, not missed.
+///
+/// Resolves objects in `status` (1 good, 2 bad, 3 missed), adds the
+/// reward terms to `reward` in chart order and appends one Event per
 /// resolution; the caller keeps its own tallies from the events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn judge(
@@ -231,6 +248,7 @@ pub(crate) fn judge(
     first_pending: usize,
     min_speed: Real,
     time: Real,
+    tick_dt: Real,
     head: [Real; 3],
     reach_z: Real,
     p0: &[[Real; 3]; 2],
@@ -238,10 +256,6 @@ pub(crate) fn judge(
     reward: &mut Real,
     events: &mut Vec<Event>,
 ) {
-    // the swept Flux: quad (L0 -> R0) to (L1 -> R1), triangulated
-    // like the saber sweep
-    let tris = [[p0[0], p0[1], p1[1]], [p0[0], p1[1], p1[0]]];
-
     let head_z = head[2];
     let z_off = head_z - PLANE_Z0;
 
@@ -254,27 +268,42 @@ pub(crate) fn judge(
             break; // sorted-chart bound, as in the saber loop
         }
         let z = (n.hit_time - time) * n.speed + z_off;
-        if z < head_z {
-            status[i] = 3;
-            *reward += REWARD_MISS;
-            events.push((i as u32, 4, 0.0, 0.0, 0.0));
-            continue;
-        }
         if z > reach_z {
             continue;
         }
         let center = [n.x, n.y, z];
+        // last tick's palms in the object's frame (it was travel
+        // further out then): shifting them by -travel and testing against
+        // the object's current position is the relative path
+        let travel = n.speed * tick_dt;
+        let q0 = [
+            [p0[0][0], p0[0][1], p0[0][2] - travel],
+            [p0[1][0], p0[1][1], p0[1][2] - travel],
+        ];
+        // the sweep ends where the object crosses the head plane (past it,
+        // it is a miss): on that tick the relative paths stop at the
+        // crossing fraction s, so a palm behind the head never scores
+        let e1 = if z < head_z {
+            let s = ((z + travel - head_z) / travel).clamp(0.0, 1.0);
+            let cut = |a: [Real; 3], b: [Real; 3]| {
+                [a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1]),
+                 a[2] + s * (b[2] - a[2])]
+            };
+            [cut(q0[0], p1[0]), cut(q0[1], p1[1])]
+        } else {
+            *p1
+        };
 
         if n.kind == KIND_CIRCLE {
             let m = n.color as usize;
-            if let Some(d) = circle_touch(p0[m], p1[m], center) {
+            if let Some(d) = circle_touch(q0[m], e1[m], center) {
                 let acc = round_pts(
                     CIRCLE_ACC_PTS * (1.0 - (d / ACC_NORM).clamp(0.0, 1.0)));
                 let pts = CIRCLE_PTS + acc;
                 status[i] = 1;
                 *reward += pts / SCORE_MAX;
                 events.push((i as u32, 0, pts as f32, CIRCLE_PTS as f32, acc as f32));
-            } else if circle_touch(p0[1 - m], p1[1 - m], center).is_some() {
+            } else if circle_touch(q0[1 - m], e1[1 - m], center).is_some() {
                 status[i] = 2;
                 *reward += REWARD_BAD;
                 events.push((i as u32, 3, 0.0, 0.0, 0.0));
@@ -282,9 +311,11 @@ pub(crate) fn judge(
         } else {
             // bar: z-roll frame (no look-at), local y' = the axis u
             let frame = note_frame(center, n.cos_a, n.sin_a, 0.0, head);
-            let box_c = [center[0], center[1], center[2] + GOOD_Z_SHIFT];
-            let h = [BAR_HALF_W, 0.5 * n.len, GOOD_HALF_Z];
-            if sweep_hits_box(&tris, box_c, h, &frame) {
+            let h = [BAR_HALF_W, 0.5 * n.len, SLAB_HALF];
+            // the swept Flux (relative): quad (L0 -> R0) to (L1 -> R1),
+            // triangulated like the saber sweep
+            let tris = [[q0[0], q0[1], e1[1]], [q0[0], e1[1], e1[0]]];
+            if sweep_hits_box(&tris, center, h, &frame) {
                 if !bar_angle_ok(n, p1[0], p1[1]) {
                     // crossed, but more than 60 deg off square: a bad
                     // cut (event 2 "angle", like an off-direction note)
@@ -303,12 +334,21 @@ pub(crate) fn judge(
                 events.push((i as u32, 0, pts as f32, BAR_PTS as f32, acc as f32));
             }
         }
+        // untouched and past the head plane: a miss
+        if status[i] == 0 && z < head_z {
+            status[i] = 3;
+            *reward += REWARD_MISS;
+            events.push((i as u32, 4, 0.0, 0.0, 0.0));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // the env's 30 Hz judge tick (exp/tick-rate made the sim's DT a
+    // runtime rate; these fixtures are 30 Hz, as flux-wasm's are)
+    use crate::geom::DT_30 as DT;
 
     const C: [Real; 3] = [0.3, 1.4, 0.5];
 
@@ -322,7 +362,7 @@ mod tests {
 
     #[test]
     fn circle_static_palm_inside_the_slab_touches() {
-        let p = [0.35, 1.45, 0.3]; // 7 cm off-centre, 0.2 m in front
+        let p = [0.35, 1.45, 0.46]; // 7 cm off-centre, 4 cm in front
         let d = circle_touch(p, p, C).expect("touch");
         assert!((d - (0.05f64.powi(2) * 2.0).sqrt() as Real).abs() < 1e-6);
     }
@@ -331,17 +371,17 @@ mod tests {
     fn circle_misses_outside_radius_and_outside_the_slab() {
         let wide = [C[0] + 0.18, C[1], C[2]];
         assert!(circle_touch(wide, wide, C).is_none());
-        let behind = [C[0], C[1], C[2] + 0.3]; // past the far face (+0.25)
+        let behind = [C[0], C[1], C[2] + 0.06]; // past the far face (+0.05)
         assert!(circle_touch(behind, behind, C).is_none());
-        let deep = [C[0], C[1], C[2] - 0.8]; // before the near face (-0.75)
-        assert!(circle_touch(deep, deep, C).is_none());
+        let front = [C[0], C[1], C[2] - 0.06]; // before the near face (-0.05)
+        assert!(circle_touch(front, front, C).is_none());
     }
 
     #[test]
     fn circle_fast_pass_through_is_caught_by_the_sweep() {
         // both endpoints 0.5 m either side of the centre, in the slab
-        let a = [C[0] - 0.5, C[1] + 0.02, C[2] - 0.2];
-        let b = [C[0] + 0.5, C[1] + 0.02, C[2] - 0.2];
+        let a = [C[0] - 0.5, C[1] + 0.02, C[2] - 0.02];
+        let b = [C[0] + 0.5, C[1] + 0.02, C[2] - 0.02];
         let d = circle_touch(a, b, C).expect("swept touch");
         assert!((d - 0.02).abs() < 1e-9);
     }
@@ -350,11 +390,11 @@ mod tests {
     fn circle_closest_approach_is_taken_inside_the_slab_only() {
         // the path passes the centre line only beyond the far face
         // (unclipped closest approach at t = 0.5, beyond the far face)
-        let a = [C[0] - 0.2, C[1], C[2] - 0.5];
-        let b = [C[0] + 0.2, C[1], C[2] + 1.5];
-        // clipped at z = C+0.25: t = 0.75/2 = 0.375 -> x = -0.2 + 0.15
+        let a = [C[0] - 0.2, C[1], C[2] - 0.15];
+        let b = [C[0] + 0.2, C[1], C[2] + 0.45];
+        // clipped at z = C+0.05: t = 0.2/0.6 = 1/3 -> x = -0.2 + 0.4/3
         let d = circle_touch(a, b, C).expect("touch");
-        assert!((d - 0.05).abs() < 1e-9, "{d}");
+        assert!((d - 0.2 / 3.0).abs() < 1e-9, "{d}");
     }
 
     #[test]
@@ -432,10 +472,10 @@ mod tests {
         let n = bar(0.0, 1.4, 0.0, 0.6, 0.0);
         let frame = note_frame([0.0, 1.4, 0.0], n.cos_a, n.sin_a, 0.0,
                                [0.0, 1.7, -0.65]);
-        let h = [BAR_HALF_W, 0.3, GOOD_HALF_Z];
-        let bc = [0.0, 1.4, GOOD_Z_SHIFT];
-        let (l0, r0) = ([-0.8, 1.4, -0.2], [-0.2, 1.4, -0.2]);
-        let (l1, r1) = ([0.2, 1.4, -0.2], [0.8, 1.4, -0.2]);
+        let h = [BAR_HALF_W, 0.3, SLAB_HALF];
+        let bc = [0.0, 1.4, 0.0];
+        let (l0, r0) = ([-0.8, 1.4, -0.02], [-0.2, 1.4, -0.02]);
+        let (l1, r1) = ([0.2, 1.4, -0.02], [0.8, 1.4, -0.02]);
         let stat = [[l0, r0, r0], [l0, r0, l0]];
         assert!(!sweep_hits_box(&stat, bc, h, &frame));
         let stat1 = [[l1, r1, r1], [l1, r1, l1]];
@@ -443,10 +483,131 @@ mod tests {
         let swept = [[l0, r0, r1], [l0, r1, l1]];
         assert!(sweep_hits_box(&swept, bc, h, &frame));
         // a static Flux crossing the bar hits; one above its top misses
-        let (la, ra) = ([-0.3, 1.5, -0.2], [0.3, 1.5, -0.2]);
+        let (la, ra) = ([-0.3, 1.5, -0.02], [0.3, 1.5, -0.02]);
         assert!(sweep_hits_box(&[[la, ra, ra], [la, ra, la]], bc, h, &frame));
-        let (lb, rb) = ([-0.3, 1.75, -0.2], [0.3, 1.75, -0.2]);
+        let (lb, rb) = ([-0.3, 1.75, -0.02], [0.3, 1.75, -0.02]);
         assert!(!sweep_hits_box(&[[lb, rb, rb], [lb, rb, lb]], bc, h, &frame));
+    }
+
+    /// One judge tick over a one-object chart: the object reaches its
+    /// head at PLANE_Z0, so z_off = 0 and an object sits at (hit − t)·speed.
+    fn judge_one(obj: FluxTuple, time: Real, tick_dt: Real,
+                 p0: &[[Real; 3]; 2], p1: &[[Real; 3]; 2]) -> Vec<Event> {
+        let chart = [flux_note(obj).unwrap()];
+        let mut status = [0u8];
+        let mut reward = 0.0;
+        let mut ev = Vec::new();
+        let head = [0.0, 1.7, PLANE_Z0];
+        judge(&chart, &mut status, 0, obj.6, time, tick_dt, head, 99.0,
+              p0, p1, &mut reward, &mut ev);
+        ev
+    }
+
+    #[test]
+    fn a_still_palm_is_touched_at_any_speed_and_tick_phase() {
+        // the slab (10 cm) is far thinner than one tick of travel; the
+        // object-frame sweep must still catch a palm held in its path,
+        // wherever the tick boundaries fall
+        let pz = PLANE_Z0 + 0.4; // palm 0.4 m out from the head plane
+        for speed in [7.0, 10.0, 18.0, 30.0] {
+            for dt in [DT, DT / 4.0] {
+                // the circle passes the palm's z at t_pass; sample 40
+                // tick phases across one tick
+                for k in 0..40 {
+                    let hit_time = 1.0;
+                    let t_pass = hit_time - pz / speed;
+                    let t_end = t_pass + dt * (k as Real + 0.5) / 40.0;
+                    let circ = (hit_time, 0.3, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+                    let p = [[-0.3, 1.0, pz], [0.3 + 0.1, 1.4, pz]];
+                    let ev = judge_one(circ, t_end, dt, &p, &p);
+                    assert_eq!(ev.len(), 1, "circle v={speed} dt={dt} k={k}");
+                    assert_eq!(ev[0].1, 0);
+                    assert_eq!(ev[0].2, 57.0); // d = 0.1 -> 50 + round(6.67)
+                    // a still horizontal Flux across a vertical bar
+                    let bar = (hit_time, 0.0, 1.4, KIND_BAR, 0, 0.0, speed, 0.6, 0.0);
+                    let f = [[-0.3, 1.4, pz], [0.3, 1.4, pz]];
+                    let ev = judge_one(bar, t_end, dt, &f, &f);
+                    assert_eq!(ev.len(), 1, "bar v={speed} dt={dt} k={k}");
+                    assert_eq!(ev[0].1, 0);
+                    assert_eq!(ev[0].2, 115.0);
+                }
+                // one tick earlier the object has not reached the palm
+                let circ = (1.0, 0.3, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+                let t_pass = 1.0 - pz / speed;
+                let early = t_pass - SLAB_HALF / speed - 1e-6;
+                let p = [[-0.3, 1.0, pz], [0.3, 1.4, pz]];
+                assert!(judge_one(circ, early, dt, &p, &p).is_empty(), "v={speed}");
+            }
+        }
+    }
+
+    #[test]
+    fn contact_wins_over_the_miss_boundary_within_one_tick() {
+        // 18 m/s, palm 0.4 m out: the circle passes the palm and the
+        // head plane (0.022 s apart) inside one 30 Hz tick
+        let (speed, hit) = (18.0, 1.0);
+        let circ = (hit, 0.0, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+        let pz = PLANE_Z0 + 0.4;
+        let t_end = hit - PLANE_Z0 / speed + 0.001; // just past the head
+        let p = [[-0.5, 1.0, pz], [0.0, 1.4, pz]];
+        let ev = judge_one(circ, t_end, DT, &p, &p);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, 0, "touched, not missed");
+        // with the palm out of the way it is a miss
+        let away = [[-0.5, 1.0, pz], [0.5, 1.4, pz]];
+        let ev = judge_one(circ, t_end, DT, &away, &away);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, 4);
+    }
+
+    #[test]
+    fn a_palm_behind_the_head_plane_never_scores() {
+        // the sweep stops where the object crosses the head plane, so a
+        // palm held behind it is untouched on every tick phase and at
+        // both judge rates (the env and the game agree); one just in
+        // front of it is always touched
+        for (behind, want) in [(0.3, 0), (0.1, 0), (0.06, 0), (-0.04, 1)] {
+            for speed in [10.0, 18.0] {
+                for dt in [DT, DT / 4.0] {
+                    let pz = PLANE_Z0 - behind;
+                    let circ = (1.0, 0.0, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+                    let p = [[-0.5, 1.0, pz], [0.0, 1.4, pz]];
+                    // every tick that ends while the object is anywhere
+                    // between just before the palm and just past the head
+                    let t_head = 1.0 - PLANE_Z0 / speed;
+                    let mut goods = 0;
+                    for k in 0..50 {
+                        let t_end = t_head + dt * k as Real / 50.0;
+                        let ev = judge_one(circ, t_end, dt, &p, &p);
+                        goods += ev.iter().filter(|e| e.1 == 0).count();
+                    }
+                    let exp = if want == 1 { 50 } else { 0 };
+                    assert_eq!(goods, exp, "behind={behind} v={speed} dt={dt}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_slab_is_5cm_either_side_of_the_visual() {
+        // a still palm 4 cm in front of / behind where the disc sits at
+        // the tick's end touches; 6 cm does not — and neither does one
+        // the object never reached during the tick
+        let (speed, dt, hit) = (10.0, DT, 1.0);
+        let circ = (hit, 0.0, 1.4, KIND_CIRCLE, 1, 0.0, speed, 0.0, 0.0);
+        let z_at = |t: Real| (hit - t) * speed; // head at PLANE_Z0: z_off = 0
+        let t = 0.8;
+        let at = |dz: Real| {
+            let p = [[-0.5, 1.0, 0.0], [0.0, 1.4, z_at(t) + dz]];
+            judge_one(circ, t, dt, &p, &p).len()
+        };
+        assert_eq!(at(0.04), 1); // behind the disc now (it swept past)
+        assert_eq!(at(-0.04), 1); // in front, inside the near face
+        assert_eq!(at(-0.06), 0); // not reached yet
+        // behind the disc's position at the tick START + 6 cm: the disc
+        // never came within 5 cm of it during this tick
+        assert_eq!(at(speed * dt + 0.06), 0);
+        assert_eq!(at(speed * dt + 0.04), 1);
     }
 
     /// ulp distance between two finite f64s of the same sign region

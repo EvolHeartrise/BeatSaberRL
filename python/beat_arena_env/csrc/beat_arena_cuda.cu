@@ -773,8 +773,14 @@ constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
 constexpr int TAU_FEAT = 16;
 constexpr double TAU_RAND_NORM = 0.25;
 constexpr int OFF_TAU = OFF_PREV_R + PREV_FEAT;                       // 608
-constexpr int OBS_DIM = OFF_TAU + TAU_FEAT;                           // 624
-static_assert(OBS_DIM == 624, "spec §12 (env v46 tau-scale lanes): OBS_DIM must be 624");
+// env v49 (review item I07, 2026-09-30): per-hand blade-TIP world
+// velocity [L xyz, R xyz] / V_NORM (lib.rs OFF_TIP_VEL mirror — the
+// finite difference of wrist + (HANDLE_LEN + SABER_LEN)·blade, i.e. the
+// judge's tip_move / DT). Zero at reset / mode-2 refresh and in Flux.
+constexpr int TIP_VEL_FEAT = 6;
+constexpr int OFF_TIP_VEL = OFF_TAU + TAU_FEAT;                       // 624
+constexpr int OBS_DIM = OFF_TIP_VEL + TIP_VEL_FEAT;                   // 630
+static_assert(OBS_DIM == 630, "spec §12 (env v49 blade-tip velocity lanes): OBS_DIM must be 630");
 __device__ constexpr int TAU_AXIS[NQ] = {
     0, 1, 2,
     3, 4, 5, 6, 7, 8, 9,
@@ -1465,7 +1471,8 @@ constexpr double SWING_BREAK = 0.005;
 // each hand is its palm centre PALM_OFF along the hand axis; circles
 // (colour, disc radius CIRCLE_R) score on the matching palm's touch,
 // bars (colourless, 2*BAR_HALF_W wide) on the swept Flux segment
-// between the palms. Hitbox depth slab = the good box's convention.
+// between the palms. Hitbox depth slab: 5 cm either side of the flat
+// visual, swept in the object's frame (flux.rs judge).
 constexpr double PALM_OFF = 0.06;
 constexpr double CIRCLE_R = 0.175;
 constexpr double CIRCLE_PTS = 50.0;
@@ -1473,8 +1480,9 @@ constexpr double CIRCLE_ACC_PTS = 10.0;
 constexpr double BAR_PTS = 100.0;
 constexpr double BAR_ACC_PTS = 15.0;
 constexpr double BAR_HALF_W = 0.025;
-constexpr double FLUX_SLAB_LO = GOOD_Z_SHIFT - GOOD_HALF_Z;  // -0.75
-constexpr double FLUX_SLAB_HI = GOOD_Z_SHIFT + GOOD_HALF_Z;  // +0.25
+constexpr double FLUX_SLAB_HALF = 0.05;
+constexpr double FLUX_SLAB_LO = -FLUX_SLAB_HALF;
+constexpr double FLUX_SLAB_HI = FLUX_SLAB_HALF;
 constexpr double FLUX_REACH_PAST_SHOULDER = 0.65 + PALM_OFF - FLUX_SLAB_LO;
 // env v19 flail telemetry: a tick is "note-free" when the next
 // scoreable note is further out than this (s). Telemetry only — no
@@ -3848,9 +3856,14 @@ struct Sim {
   // base) and the resulting world velocities (lib.rs body_pt_vel)
   T *__restrict__ body_pt, *__restrict__ body_pt_vel;
   // Flux: palm-centre finite-difference velocity (E, 2, 3) — lib.rs
-  // Core::palm_vel; zeroed by reset_env and the mode-2 refresh,
-  // written only by the Flux judgment (stays 0 in the standard game)
+  // Core::palm_vel; zeroed by the mode-2 refresh, set to the start
+  // kick by reset_env (0 without start_jitter), written only by the
+  // Flux judgment (read only by the Flux obs; dead in the standard game)
   T* __restrict__ palm_vel;
+  // env v49: blade-tip finite-difference velocity (E, 2, 3) — lib.rs
+  // Body::tip_vel; written every tick next to wrist_vel (both game
+  // modes, like wrist_vel), zeroed by reset_env and the mode-2 refresh
+  T* __restrict__ tip_vel;
   // swing chain
   T *__restrict__ swing_acc, *__restrict__ axis;
   bool* __restrict__ axis_valid;
@@ -3903,7 +3916,8 @@ struct Sim {
   // (cand < 0: queue exhausted — the combo_walk early-out above keeps it
   // idle at ~zero cost). Row: [good, bad, miss, score, bombs, pre, acc,
   // post, flail_rad(2 hands), flail_ticks, cw_score, cw_maxc, cw_breaks,
-  // chart_idx, wrev_L, wrev_R, ticks].
+  // chart_idx, wrev_L, wrev_R, ticks, wall_enters, term_flags] + col 19,
+  // the live wall-entry accumulator (kernel scratch, never host-facing).
   bool bench_refill;
   T* __restrict__ bench_rec;
   uint8_t* __restrict__ bench_flag;
@@ -4092,6 +4106,16 @@ struct Sim {
   // when start_pose_jitter > 0 (radians scale).
   const T* __restrict__ pose_jit;
   T start_pose_jitter;
+  // start-jitter velocity kick (review B10, 2026-09-30; TRAINING-ONLY,
+  // no lib.rs mirror — the Rust sim has no per-episode RNG): (N, 2)
+  // world [dvx, dvz] m/s, precomputed by the wrapper every launch
+  // (|dv| ~ U(0, start_jitter), direction uniform; all zeros when
+  // start_jitter == 0, so reset_env's stores are then the old zeros).
+  // reset_env installs it as the root's horizontal velocity BEFORE
+  // store_state / write_obs, so the reset obs shows the kicked state.
+  // Before B10 the wrapper added it to v AFTER the launch, so the first
+  // obs of every episode read root velocity 0 while the body moved.
+  const T* __restrict__ start_kick;
   // env v38 crouch-rich starts (user; TRAINING-ONLY, jitter
   // precedent): with prob crouch_prob a reset samples a continuous
   // depth along CROUCH_ROWS (physics-validated squat synergy:
@@ -4173,7 +4197,23 @@ __device__ __constant__ double CROUCH_ROWS[N_CROUCH][4] = {
 // score += pts x mult; follow-through points commit at the pinned
 // multipliers of the tracker's notes (tr_msum). Rust rounds pts to f32
 // on the event bus before multiplying — mirrored with the (float) cast.
-constexpr int BENCH_REC = 17;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
+constexpr int BENCH_REC = 20;   // + [wrev_L, wrev_R, ticks] (2026-09-22)
+// review B09 (2026-09-30): + [wall_enters, term_flags] (cols 17/18, the
+// lib.rs VecBeatSim::term mirror) and col 19 = this level's running
+// wall-ENTRY count (the lib.rs wall_enters counter). The accumulator
+// lives in the slot's own bench_rec row instead of a new (N) tensor so
+// the kernel argument list is untouched: bumped at the two entry sites,
+// copied to col 17 at done, zeroed by reset_env. The host reads cols
+// 0..BENCH_COLS-1 = 0..18 only (cuda_env.BENCH_COLS).
+constexpr int BENCH_WALL_ACC = 19;
+// term_flags bits (lib.rs VecBeatSim::term): 0 = the level itself ended
+constexpr int TERM_FELL = 1, TERM_TILT = 2, TERM_ENVELOPE = 4,
+              TERM_TICKCAP = 8;
+
+template <typename T>
+__device__ __forceinline__ void bench_wall_enter(const Sim<T>& P, int e) {
+  if (P.bench_refill) P.bench_rec[(size_t)e * BENCH_REC + BENCH_WALL_ACC] += T(1);
+}
 
 template <typename T>
 __device__ __forceinline__ void cw_break(const Sim<T>& P, int e) {
@@ -4289,14 +4329,43 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
     }
     d.p[1] -= min_y;
   }
+  // review B10: the start-jitter kick — the root's horizontal velocity,
+  // installed before store_state so P.v and the reset obs (write_obs
+  // runs after this) carry it. A pure store over the zeroed d.v (the
+  // pose block above reads no velocity), bit-identical to the pre-B10
+  // wrapper's post-launch `v += dv` on a zero v. Zeros when the
+  // wrapper's start_jitter == 0 (parity / bench configs).
+  const T kick_x = P.start_kick[e * 2];
+  const T kick_z = P.start_kick[e * 2 + 1];
+  d.v[0] = kick_x;
+  d.v[2] = kick_z;
   store_state(d, P, e);
   refresh_fk(d, P, e);
   // env v24: seed the finite-diff base with the reset pose's §8
   // points, velocities zero (lib.rs Body reset mirror)
   seed_body_pts(d, P, e);
+  // review B10: with every joint rate and the root's angular velocity
+  // zero, the kick is a rigid translation, so the TRUE velocity of
+  // every body point, wrist and palm is exactly (kick_x, 0, kick_z) —
+  // the finite-diff velocity lanes start there instead of 0 (all zero
+  // without a kick: the lib.rs Body reset values). The next tick's
+  // finite difference overwrites them from the position bases, which
+  // the kick does not touch.
+  for (int i = 0; i < N_BODY_PTS; i++) {
+    P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3] = kick_x;
+    P.body_pt_vel[((size_t)e * N_BODY_PTS + i) * 3 + 2] = kick_z;
+  }
   for (int s = 0; s < 2; s++) {
-    for (int k = 0; k < 3; k++) P.wrist_vel[(e * 2 + s) * 3 + k] = T(0);
-    for (int k = 0; k < 3; k++) P.palm_vel[(e * 2 + s) * 3 + k] = T(0);
+    P.wrist_vel[(e * 2 + s) * 3] = kick_x;
+    P.wrist_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.wrist_vel[(e * 2 + s) * 3 + 2] = kick_z;
+    P.palm_vel[(e * 2 + s) * 3] = kick_x;
+    P.palm_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.palm_vel[(e * 2 + s) * 3 + 2] = kick_z;
+    // env v49 tip lanes: the same rigid translation (0 without a kick)
+    P.tip_vel[(e * 2 + s) * 3] = kick_x;
+    P.tip_vel[(e * 2 + s) * 3 + 1] = T(0);
+    P.tip_vel[(e * 2 + s) * 3 + 2] = kick_z;
     P.swing_acc[e * 2 + s] = T(0);
     P.axis_valid[e * 2 + s] = false;
     P.tr_ptr[e * 2 + s] = 0;
@@ -4352,6 +4421,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.first_wall[e] = 0;
   P.walls_in[e] = 0;
   P.in_wall_prev[e] = false;
+  if (P.bench_refill) P.bench_rec[(size_t)e * BENCH_REC + BENCH_WALL_ACC] = T(0);
   // arm-after-first-plant (user 2026-08-20): start UNARMED so a foot
   // that begins the episode in the air (start-pose jitter) is never
   // charged — the lift edge only arms once the foot has actually been
@@ -4712,6 +4782,14 @@ __device__ void write_obs(Dyn<T>& __restrict__ d, const Sim<T>& P, int e) {
   for (int a = 0; a < TAU_FEAT; a++)
     obs[OFF_TAU + a] = (float)(((double)P.tau_scale[e * TAU_FEAT + a] - 1.0)
                                / TAU_RAND_NORM);
+  // env v49: blade-tip world velocity [L xyz, R xyz] / V_NORM (lib.rs
+  // write_obs mirror; standard game only — Flux keeps the fill's zeros)
+  if constexpr (!FX) {
+    for (int s = 0; s < 2; s++)
+      for (int k = 0; k < 3; k++)
+        obs[OFF_TIP_VEL + 3 * s + k] =
+            (float)(P.tip_vel[(e * 2 + s) * 3 + k] / T(V_NORM));
+  }
 }
 
 // One 30 Hz control tick + judgment + bookkeeping (lib.rs step_inner),
@@ -4861,6 +4939,12 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       new_d[h][k] = P.blade[(e * 2 + h) * 3 + k];
       P.wrist_vel[(e * 2 + h) * 3 + k] =
           (new_w[h][k] - prev_w[h][k]) / T(DT);
+      // env v49: blade-tip velocity — lib.rs Body::tick's expression
+      // tree (= the judge's tip_move below, / DT)
+      P.tip_vel[(e * 2 + h) * 3 + k] =
+          (new_w[h][k] + T(HANDLE_LEN + SABER_LEN) * new_d[h][k]
+           - prev_w[h][k] - T(HANDLE_LEN + SABER_LEN) * prev_d[h][k])
+          / T(DT);
     }
   // env v24: body-point world velocities — finite diff against the
   // last tick's stored positions, then advance the base (lib.rs
@@ -5103,7 +5187,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   }
 
   if constexpr (FX) {
-    // ---- Flux judgment (lib.rs Core::flux_judge verbatim) ----------
+    // ---- Flux judgment (flux_sim.rs flux_judge + flux.rs judge verbatim)
     T p0[2][3], p1[2][3];
     for (int h = 0; h < 2; h++)
       for (int k = 0; k < 3; k++) {
@@ -5123,23 +5207,28 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       const T z = (P.p_hit[cb] - time_new) * P.p_speed[cb] + z_off;
       const T blen = P.p_len[cb];
       const bool is_bar = blen > T(0);
-      if (z < head_z) {
-        P.status[e * C + i] = 3;
-        P.miss[e] += 1;
-        cw_break(P, e);
-        reward += T(REWARD_MISS);
-        if (!is_bar) {  // circles record on their colour; bars never
-          const int h = P.p_is_right[cb] ? 1 : 0;
-          P.prev_idx[e * 2 + h] = i;
-          P.prev_valid[e * 2 + h] = 1;
-        }
-        continue;
-      }
       if (z > freach) continue;
       const T center[3] = {P.p_center[cb * 2], P.p_center[cb * 2 + 1], z};
+      // last tick's palms in the object's frame: it was speed*DT further
+      // out then (flux.rs judge's q0)
+      const T travel = P.p_speed[cb] * T(DT);
+      const T q0[2][3] = {{p0[0][0], p0[0][1], p0[0][2] - travel},
+                          {p0[1][0], p0[1][1], p0[1][2] - travel}};
+      // the sweep ends where the object crosses the head plane (flux.rs
+      // judge's e1): past it the object is a miss, never a touch
+      T e1[2][3];
+      if (z < head_z) {
+        const T sc = tclamp((z + travel - head_z) / travel, T(0), T(1));
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++)
+            e1[h][k] = q0[h][k] + sc * (p1[h][k] - q0[h][k]);
+      } else {
+        for (int h = 0; h < 2; h++)
+          for (int k = 0; k < 3; k++) e1[h][k] = p1[h][k];
+      }
       if (!is_bar) {
         const int m = P.p_is_right[cb] ? 1 : 0;
-        const T dm = flux_circle_touch(p0[m], p1[m], center);
+        const T dm = flux_circle_touch(q0[m], e1[m], center);
         if (dm >= T(0)) {
           const T acc = round_pts(
               T(CIRCLE_ACC_PTS)
@@ -5156,7 +5245,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           cw_cut(P, e, i, pts);
           P.prev_idx[e * 2 + m] = i;
           P.prev_valid[e * 2 + m] = 1;
-        } else if (flux_circle_touch(p0[1 - m], p1[1 - m], center)
+        } else if (flux_circle_touch(q0[1 - m], e1[1 - m], center)
                    >= T(0)) {
           P.status[e * C + i] = 2;
           P.bad[e] += 1;
@@ -5170,12 +5259,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         T frame[3][3];
         note_frame(center, P.p_rot[cb * 2], P.p_rot[cb * 2 + 1], T(0),
                    head_pos, frame);
-        const T bc[3] = {center[0], center[1], center[2] + T(GOOD_Z_SHIFT)};
-        const T bh[3] = {T(BAR_HALF_W), T(0.5) * blen, T(GOOD_HALF_Z)};
-        // swept Flux quad (L0 -> R0) to (L1 -> R1): triangles
+        const T bh[3] = {T(BAR_HALF_W), T(0.5) * blen, T(FLUX_SLAB_HALF)};
+        // swept Flux quad (L0 -> R0) to (L1 -> R1), relative: triangles
         // (L0, R0, R1) and (L0, R1, L1) — sweep_hits_box's (w0, t0, t1)
         // + (w0, t1, w1) split with w0 = L0, t0 = R0, t1 = R1, w1 = L1
-        if (sweep_hits_box(p0[0], p0[1], p1[1], p1[0], bc, bh, frame)) {
+        if (sweep_hits_box(q0[0], q0[1], e1[1], e1[0], center, bh, frame)) {
           if (!flux_bar_angle_ok(P.p_rot[cb * 2], P.p_rot[cb * 2 + 1],
                                  p1[0], p1[1])) {
             // crossed > 60 deg off square: bad cut (event 2 "angle")
@@ -5206,6 +5294,19 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
             P.acc_cuts[e * 2 + h] += 1;
           }
           cw_cut(P, e, i, pts);
+        }
+      }
+      // untouched and past the head plane: a miss (contact first — an
+      // object can pass a palm and the head within one tick)
+      if (P.status[e * C + i] == 0 && z < head_z) {
+        P.status[e * C + i] = 3;
+        P.miss[e] += 1;
+        cw_break(P, e);
+        reward += T(REWARD_MISS);
+        if (!is_bar) {  // circles record on their colour; bars never
+          const int h = P.p_is_right[cb] ? 1 : 0;
+          P.prev_idx[e * 2 + h] = i;
+          P.prev_valid[e * 2 + h] = 1;
         }
       }
     }
@@ -5435,6 +5536,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           // one fee per wall object, no lingering in-wall ticks.
           reward += T(WALL_PEN);
           cw_break(P, e);
+          bench_wall_enter(P, e);
           P.wall_passed[e * P.W + wi] = true;
           P.walls_in[e] += 1;  // counts entries in despawn mode
         } else {
@@ -5446,6 +5548,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       if (!P.in_wall_prev[e]) {
         reward += T(WALL_PEN);
         cw_break(P, e);
+        bench_wall_enter(P, e);
       }
       P.walls_in[e] += 1;
     }
@@ -5577,6 +5680,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     r[14] = T(P.wrev[e * 2]);        // wrist-bend reversals L / R this
     r[15] = T(P.wrev[e * 2 + 1]);    // level + the level's ticks
     r[16] = T(tick_new);
+    r[17] = r[BENCH_WALL_ACC];       // wall entries this level (B09)
+    r[18] = T((fell ? TERM_FELL : 0) | (tilted ? TERM_TILT : 0)
+              | (d.env_bad ? TERM_ENVELOPE : 0)
+              | (tick_new >= P.max_steps ? TERM_TICKCAP : 0));
     P.bench_flag[e] = 1;
     P.flail_rad[e * 2] = T(0);
     P.flail_rad[e * 2 + 1] = T(0);
@@ -5646,6 +5753,7 @@ step_kernel(Sim<T> P) {
     refresh_fk(d, P, e);
     for (int k = 0; k < 6; k++) P.wrist_vel[e * 6 + k] = T(0);
     for (int k = 0; k < 6; k++) P.palm_vel[e * 6 + k] = T(0);  // Flux
+    for (int k = 0; k < 6; k++) P.tip_vel[e * 6 + k] = T(0);   // env v49
     // env v24: set_state semantics — re-seed the finite-diff base at
     // the refreshed pose, velocities zero (lib.rs set_state mirror)
     seed_body_pts(d, P, e);
@@ -5690,8 +5798,10 @@ enum {
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
   TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,28: v47 cols 22..28), flag (N) — 2026-09-16/19
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
-  TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,14) + flag (N) — 2026-09-16
+  TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,BENCH_REC) + flag (N) — 2026-09-16
   TPALMV,   // Flux palm velocity (N, 2, 3)
+  TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
+  TTIPV,    // env v49 blade-tip velocity (N, 2, 3) — 2026-09-30
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)
@@ -5804,6 +5914,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.bench_rec = ts[TBENCHREC].data_ptr<scalar_t>();
     P.bench_flag = ts[TBENCHFLAG].data_ptr<uint8_t>();
     P.palm_vel = ts[TPALMV].data_ptr<scalar_t>();
+    P.tip_vel = ts[TTIPV].data_ptr<scalar_t>();
     P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;
@@ -5875,6 +5986,10 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
+    TORCH_CHECK(ts[TSTARTKICK].numel() == 2 * N
+                && ts[TSTARTKICK].is_contiguous(),
+                "start_kick must be a contiguous (N, 2) tensor");
+    P.start_kick = ts[TSTARTKICK].data_ptr<scalar_t>();
     P.start_pose_jitter = (scalar_t)start_pose_jitter;
     P.crouch_prob = (scalar_t)crouch_prob;
     P.gears = (int)gears;

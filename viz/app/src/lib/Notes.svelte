@@ -72,8 +72,8 @@
   // circle: a flat disc facing the player (hitbox radius = the disc) with
   // a bright rim; bar: a thin strip, unit plane scaled (BAR_W, len) and
   // rolled by its rot, with a gold sweet-spot notch. Hitboxes ('h'): the
-  // circle's 1 m deep cylinder / the bar's box, both shifted 0.25 m
-  // toward the player like the note good box.
+  // circle's cylinder / the bar's box, FLUX_DEPTH (10 cm) deep and
+  // centred on the visual.
   const circleGeo = new THREE.CircleGeometry(CIRCLE_R, 40);
   const circleRimGeo = new THREE.RingGeometry(CIRCLE_R * 0.8, CIRCLE_R, 40);
   const circleEdgeGeo = new THREE.EdgesGeometry(
@@ -398,12 +398,11 @@
       position={[cx, cy + HALF + 0.1, -z]} opacity={alpha * 0.85} />
   {/if}
   {#if pb.hitboxes && n.kind === KIND_CIRCLE}
-    <T.LineSegments geometry={circleHbGeo}
-      position={[cx, cy, -(z + HB.goodZShift)]}>
+    <T.LineSegments geometry={circleHbGeo} position={[cx, cy, -z]}>
       <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
     </T.LineSegments>
   {:else if pb.hitboxes && isFluxKind(n)}
-    <T.Group position={[cx, cy, -(z + HB.goodZShift)]} rotation={[0, 0, n.rot]}>
+    <T.Group position={[cx, cy, -z]} rotation={[0, 0, n.rot]}>
       <T.LineSegments geometry={unitBoxEdges} scale={[BAR_W, n.len, FLUX_DEPTH]}>
         <T.LineBasicMaterial color="#7dd3a0" transparent opacity={0.5} />
       </T.LineSegments>

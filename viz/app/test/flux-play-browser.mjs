@@ -65,7 +65,9 @@ try {
   await page.select("#play select", "warmup-1");
 
   // the scripted player: each palm on the next circle of its colour as it
-  // arrives, the Flux square across each bar through its sweet spot
+  // arrives, the Flux square across each bar through its sweet spot; palms
+  // at env z -0.35, which an object reaches 0.35 / speed after its hit
+  // time — each palm holds its object until then
   await page.evaluate(() => {
     const P = window.__fluxPlay;
     P.setClockScale(4);
@@ -73,7 +75,7 @@ try {
     P.setScript((t) => {
       const chart = P.session()?.chart ?? [];
       const palms = [0, 1].map((h) => {
-        const o = chart.find((o) => o.t >= t - 0.02 &&
+        const o = chart.find((o) => o.t + 0.35 / o.speed >= t - 0.02 &&
           ((o.kind === 4 && o.color === h) || o.kind === 5));
         if (!o) return REST[h];
         if (o.kind === 4) return [o.x, o.y, -0.35];

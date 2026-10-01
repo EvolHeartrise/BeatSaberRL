@@ -90,7 +90,10 @@ points and the "Flux" is the segment between them. Circles (coloured,
 35 cm discs) score 50 + up to 10 accuracy when touched by the matching
 palm (the other palm = a bad hit); bars (colourless, thin, rotated,
 with a sweet-spot offset) score 100 + up to 15 accuracy when the swept
-Flux crosses them. Charts come from a procedural generator
+Flux crosses them. Hitboxes hug the visuals: 5 cm either side of the
+flat object (2026-09-28; was the good box's 1 m slab reaching 0.75 m
+early), with contact swept in each object's frame so fast objects
+cannot tunnel through a still hand. Charts come from a procedural generator
 (`flux_chart.py`) that places objects along two imaginary palm paths.
 `train_batch.py --game flux` trains its own policy from scratch
 (arch marker `game="flux"`; never cross-loaded with standard
@@ -117,6 +120,13 @@ cd viz/app && npm ci && npm run xr         # HTTPS on the LAN
 # (accept the self-signed certificate once); trigger starts, grip = next chart
 ```
 
+Hosted at **https://flux.flee.systems** behind a Discord login, for
+whitelisted Discord accounts only (`viz/flux-host`, a Cloudflare Worker;
+non-whitelisted visitors are never sent the game). Redeploy after a
+viewer build: `cd viz/flux-host && npm ci && npm run deploy`; add a
+player with `npx wrangler secret put ALLOWED_DISCORD_IDS`
+(comma-separated Discord user ids).
+
 ## Quick start
 
 Uses its own venv at `python/.venv` (gitignored). One-time setup
@@ -139,12 +149,21 @@ $VENV/bin/python -m pytest tests/
 # the trainer: its defaults ARE the production recipe (the v58 trunk,
 # since 2026-09-22), so a bare launch is a v58-recipe trunk on the cuda env
 # (plus fp16-accumulate GEMMs, --fp16-accum all, the default since
-# 2026-09-27; a --resume keeps its checkpoint's accumulate mode)
+# 2026-09-27, and the fused block-FFN kernel, --fused-ffn on, the
+# default since 2026-09-30; a --resume keeps its checkpoint's modes).
+# --fused-ffn up16 (fp16-accumulated up-projection too) is LIKELY WORSE
+# for training: the 2026-09-30 A/B (one seed per arm, recipe trunk +
+# cd400 leaf, bench/ab_*_cd400*.json) benched it -2.7% wpp at the default
+# body and -2.9% at each leaf's own fit for a 1.8% wall-clock saving
 $VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
-# leaf: branch a cooldown off a numbered trunk checkpoint. A resume
-# takes only lr/ent/schedule/z/arch from the checkpoint; every other
-# knob is CLI, so a leaf states where it departs from the trunk recipe
-# (walls stay solid as in the bench; --ent-final is the leaf's target)
+# leaf: branch a cooldown off a numbered trunk checkpoint. Since
+# 2026-09-30 a resume INHERITS every flag not typed on the command line
+# from the checkpoint's args (plus lr/ent/schedule/z/arch and the RNG
+# streams); typed flags that differ print as a diff, typed arch changes
+# are refused (--ignore-arch-flags), and run-dir/total-steps/ckpt-every/
+# cooldown/ent-final/device/env are never inherited. So a leaf states
+# only where it departs from the trunk (walls stay solid as in the
+# bench; --ent-final is the leaf's target)
 $VENV/bin/python train_batch.py --resume runs/NAME/trunk_updNNNNN.pt \
     --cooldown-updates 400 --no-wall-despawn --ent-final 3e-6 \
     --run-dir runs/NAME_leaf
@@ -234,7 +253,10 @@ lanes, wall rows masked), computed inside the policy from lanes the obs
 already carries and appended to the 18 note lanes before `note_mlp`
 (+2,688 params). Obs/env untouched; the `note_geo` arch marker is stamped
 so bench/replay rebuild it; pre-flag checkpoints load unchanged. First
-probe: v42_hilt_geo (with env v42) on the winning recipe.
+probe: v42_hilt_geo (with env v42) on the winning recipe. Since env v49
+(I07, below) 22 lanes: + the blade-frame block (along-blade position,
+distance to the blade line, signed cut-plane distance, tip velocity ·
+cut direction per hand), and t_plane counts to the judged plane z_off.
 
 **Architecture: embed 192 / trunk 384 is the default since 2026-09-13**
 (2,414,930 params, 1.90M actor + 0.52M critic; was 128/256 = 1.09M).
@@ -299,7 +321,8 @@ episode structure the bench plays. The window machinery
 key is frozen at the whole-level form so existing caches are reused.
 
 **Env v46 (2026-09-16, user design) — per-env randomized joint torque
-limits, in the observation.** `--tau-rand r` (default 0 = off): at every
+limits, in the observation.** `--tau-rand r` (default 0.25 since the 2026-09-22 v58-recipe
+defaults, 03d6662; 0 = off): at every
 episode reset each env draws one scale per AXIS, s_a ~ U(1 − r, 1 + r),
 for 16 axes — spine 3, arm 7 shared by BOTH arms, leg 6 shared by BOTH
 legs (the user: the left side must always match the right) — and plays
@@ -326,6 +349,35 @@ accuracy, return) with bootstrap CIs. The CUDA env draws from its seeded
 generator (reproducible per seed); the Rust sim has no per-episode RNG
 and takes scales explicitly. Probe pending.
 
+**Env v49 (2026-09-30, review item I07) — the geometry the game
+scores, in the obs and the note tokens.** Accuracy is the note's
+distance to the plane the blade sweeps (`d_min = |cw·(blade ×
+tip_move)| / |…|`) and the direction check reads the contact point's
+velocity, but the policy only saw the WRIST velocity — blind to the
+saber's rotation on a 1.16 m lever. Six obs lanes are appended at
+624..630 (OBS_DIM 624 → 630, every earlier offset unchanged): per hand
+[L xyz, R xyz] the blade-TIP world velocity / V_NORM, the finite
+difference of wrist + (HANDLE_LEN + SABER_LEN)·blade across the tick —
+exactly the judge's `tip_move / DT`. Zero at reset and after a
+set_state refresh, zero in the Flux game (no blade). Rewards and
+dynamics are untouched. Both sims (CUDA: new `tip_vel` state tensor)
++ parity gate. Policy: each hand's 3 lanes go last into its saber token
+(SABER_FEAT 44 → 47), and `--note-geo` gains 4 lanes per hand × note,
+appended after the 14 as one block (22 lanes, note_mlp 18 → 40 inputs):
+the note's position along the blade (dp·b − HANDLE_LEN), its distance
+to the blade line, its SIGNED distance to the swept cut plane
+dp·norm(b × v_tip) (positive on the b × v_tip side; |·| is the judge's
+d_min), and v_tip · cut direction. Bundled bug fix B12: the t_plane
+lane is now (z − z_off)/speed with z_off = head_z − PLANE_Z0 (obs lane
+99, where notes are judged), not z/speed. Arch marker `blade_geo = 1`.
+**Pre-I07 checkpoints still load** (`--init-from` warm starts, benches,
+replays): `load_policy` upgrades a checkpoint without the marker (obs
+624) by zero-filling every new input column, so it plays v49 exactly as
+it played v48 except for the B12 fix; `--resume` refuses such a
+checkpoint (its optimizer state has the old shapes).
+tests/test_i07_blade_geo.py; lib.rs `tip_vel_lanes_are_the_tip_finite_difference`
+/ `cut_plane_signed_distance_matches_the_judge`.
+
 **SimBa readout trunk (2026-09-15, research/2026-09-14-architecture-brainstorm.md
 #2; the only trunk since 2026-09-22 — the plain MLP trunk and
 `--trunk-arch` were removed):** the readout trunk that turns the lead
@@ -337,7 +389,8 @@ residual block `x + fc2(relu(fc1(LN1 x)))`, and a final LN2 (modules
 `trunk_proj`, `trunk_ln1`, `trunk_fc1`, `trunk_fc2`, `trunk_ln2`;
 `--trunk-hidden` sets the block width, default = trunk dim). Params
 (today's 960-lane input, 192/384, hidden 384): trunk 666,240, total
-2,789,622; hidden 1536 adds 885,888. Why: SimBa (2410.09754) and
+2,791,734 (2,789,622 before env v49 widened the encoders); hidden 1536
+adds 885,888. Why: SimBa (2410.09754) and
 SimBaV2 (2502.15280) show plain MLPs lose monotone width scaling in RL
 while LN + residual blocks keep it; Creus Castanyer et al. (2506.15544)
 report the same for shared-trunk PPO on IsaacGym humanoids; Kumar et al.

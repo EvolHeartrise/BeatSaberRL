@@ -44,6 +44,11 @@ from .constants import KIND_BOMB
 from .mirror import mirror_tuples, mirror_walls
 
 LEAD_S = 1.5          # k>0 windows: drop notes cut mid-flight
+# The training recipe's pool (train_batch --lead-s / --mirror-augment
+# defaults). Both are in the npz cache key, so anything that pre-builds
+# the cache (prefetch_maps) must use these or it writes a pool no run loads.
+RECIPE_LEAD_S = 0.5
+RECIPE_MIRROR = True
 MIN_SCOREABLE = 4     # drop near-empty tail windows
 
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

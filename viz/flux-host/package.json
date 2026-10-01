@@ -1,0 +1,14 @@
+{
+  "name": "flux-host",
+  "private": true,
+  "type": "module",
+  "description": "flux.flee.systems: the Flux WebXR game (viz/replay.html) served by a Cloudflare Worker behind a Discord login + whitelist",
+  "scripts": {
+    "test": "node test/app.test.js",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  }
+}

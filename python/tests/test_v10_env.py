@@ -72,7 +72,7 @@ def test_obs_length_and_reset_layout():
     obs = np.asarray(sim.set_chart([_note(5.0, 0.3, 1.4)]))
     drop = _reset_drop()
     assert 0.0 < drop < 0.02         # ~8.5 mm
-    assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
+    assert obs.shape == (OBS_DIM,) == (630,)   # env v49: blade-tip velocity lanes
     assert (OFF_ROOT_POS, OFF_ROOT_ROT, OFF_ROOT_VLIN, OFF_ROOT_VANG,
             OFF_Q, OFF_QD, OFF_HAND_L, OFF_HAND_R, OFF_HEAD, OFF_CONTACT,
             OFF_NOTES, OFF_NOTE_MASK) == (0, 3, 9, 12, 15, 46, 75, 86,
