@@ -716,6 +716,11 @@ def finish_slot(slot, info, combo, tick_hz=30):
     c_score, max_combo, breaks = combo
     score = round(c_score)
     acc = score / slot["max_score"] if slot["max_score"] else 0.0
+    # BeatLeader pp of a cut-short level is 0 (user, 2026-09-30): in the
+    # game a fall / tilt / envelope / max-steps cut is a failed play,
+    # which earns nothing, but BL's pass term does not depend on acc.
+    tf = info.get("term_flags")
+    failed = bool(tf) if tf is not None else False
     if "level_key" in entry:                  # --catalog both
         ss, bl = entry["ss"], entry["bl"]
         head = {
@@ -730,9 +735,10 @@ def finish_slot(slot, info, combo, tick_hz=30):
             "score": score, "max_score": slot["max_score"],
             "accuracy": round(acc, 5),
             "ss": ss_result(ss, score, slot["max_score"]) if ss else None,
-            "bl": bl_result(bl, score, slot["max_score"]) if bl else None}
+            "bl": (bl_result(bl, score, slot["max_score"], failed)
+                   if bl else None)}
     elif "pass_rating" in entry:              # --catalog beatleader
-        blr = bl_result(entry, score, slot["max_score"])
+        blr = bl_result(entry, score, slot["max_score"], failed)
         head = {
             "leaderboard_id": entry["leaderboard_id"],
             "song_hash": entry["hash"], "song": entry["song"],
@@ -749,7 +755,8 @@ def finish_slot(slot, info, combo, tick_hz=30):
             "api_max_score": entry["api_max_score"],
             "accuracy": round(acc, 5),
             "bl_accuracy": blr["accuracy"],
-            "pp": blr["pp"], "pass_pp": blr["pass_pp"],
+            "pp": blr["pp"], "pp_formula": blr["pp_formula"],
+            "pass_pp": blr["pass_pp"],
             "acc_pp": blr["acc_pp"], "tech_pp": blr["tech_pp"]}
     else:                                     # --catalog scoresaber
         head = {
@@ -803,7 +810,7 @@ def ss_result(e, score, max_score):
             "pp": round(scoresaber.pp_value(acc, e["max_pp"]), 2)}
 
 
-def bl_result(e, score, max_score):
+def bl_result(e, score, max_score, failed=False):
     """BeatLeader's view of one played level. BL accuracy = score / the
     difficulty's maxScore (BeatLeader-Server ReplayUtils.ProcessReplay).
     That maxScore equals the computed full-combo max on ~99% of
@@ -812,7 +819,11 @@ def bl_result(e, score, max_score):
     multiple of 30x8 pts), so the same play has a slightly lower BL
     accuracy — BeatLeader's own rule, reproduced. No API maxScore: the
     computed max. Capped at 1 (BeatLeader zeroes pp above 1; a real
-    play cannot exceed its own max)."""
+    play cannot exceed its own max). `failed` (the episode was cut
+    short: fall, tilt, envelope or the max-steps cap) zeroes `pp` — a
+    failed play earns nothing in the game, yet BL's pass term is
+    accuracy-free (a 7* level pays ~36 pp at 1% acc); `pp_formula` and
+    the pass/acc/tech parts keep the raw curve for diagnostics."""
     bl_max = e.get("api_max_score") or max_score
     acc = min(1.0, score / bl_max) if bl_max else 0.0
     r = beatleader.pp_from_accuracy(acc, e["pass_rating"], e["acc_rating"],
@@ -823,7 +834,9 @@ def bl_result(e, score, max_score):
             "predicted_acc": e.get("predicted_acc"),
             "api_max_score": e.get("api_max_score"),
             "accuracy": round(acc, 5),
-            "pp": round(r["pp"], 2), "pass_pp": round(r["pass_pp"], 2),
+            "pp": 0.0 if failed else round(r["pp"], 2),
+            "pp_formula": round(r["pp"], 2), "failed": failed,
+            "pass_pp": round(r["pass_pp"], 2),
             "acc_pp": round(r["acc_pp"], 2), "tech_pp": round(r["tech_pp"], 2)}
 
 
