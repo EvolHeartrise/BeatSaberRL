@@ -254,7 +254,12 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         song_name = info.get("_songName", "?")
         changes = []
         if "bpmEvents" in data:                       # v3
-            changes = [(float(e["b"]), float(e["m"])) for e in data["bpmEvents"]]
+            # an omitted "b" is beat 0 (zero-valued fields are dropped by
+            # some serializers: {"m": 180.002} is the initial tempo — it
+            # KeyError'd 9 BeatLeader levels, 2026-09-30); no "m" = no
+            # tempo, skipped
+            changes = [(float(e.get("b", 0)), float(e["m"]))
+                       for e in data["bpmEvents"] if e.get("m")]
         elif "_events" in data:                       # v2 (type 100)
             changes = [(float(e["_time"]), float(e["_floatValue"]))
                        for e in data["_events"]
@@ -384,50 +389,51 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
         cdata = data.get("colorNotesData", [])
         for n in data.get("colorNotes", []):
             d = cdata[n["i"]] if n.get("i") is not None else {}
-            add_note(n["b"], d.get("x", 0), d.get("y", 0), d.get("c", 0),
+            add_note(n.get("b", 0), d.get("x", 0), d.get("y", 0), d.get("c", 0),
                      d.get("d", 0), d.get("a", 0))
         bdata = data.get("bombNotesData", [])
         for n in data.get("bombNotes", []):
             d = bdata[n["i"]] if n.get("i") is not None else {}
-            add_bomb(n["b"], d.get("x", 0), d.get("y", 0))
+            add_bomb(n.get("b", 0), d.get("x", 0), d.get("y", 0))
         ch_data = data.get("chainsData", [])
         for c in data.get("chains", []):
             hd = cdata[c["i"]] if c.get("i") is not None else {}
             cd = ch_data[c["ci"]] if c.get("ci") is not None else {}
-            add_chain(c["hb"], hd.get("x", 0), hd.get("y", 0),
-                      hd.get("c", 0), hd.get("d", 0), c["tb"],
+            add_chain(c.get("hb", 0), hd.get("x", 0), hd.get("y", 0),
+                      hd.get("c", 0), hd.get("d", 0), c.get("tb", 0),
                       cd.get("tx", 0), cd.get("ty", 0),
                       cd.get("c", 3), cd.get("s", 1.0))
         for a in data.get("arcs", []):
             hd = cdata[a["hi"]] if a.get("hi") is not None else {}
             td = cdata[a["ti"]] if a.get("ti") is not None else {}
-            add_arc(a["hb"], hd.get("x", 0), hd.get("y", 0), hd.get("c", 0),
-                    a["tb"], td.get("x", 0), td.get("y", 0), td.get("c", 0))
+            add_arc(a.get("hb", 0), hd.get("x", 0), hd.get("y", 0), hd.get("c", 0),
+                    a.get("tb", 0), td.get("x", 0), td.get("y", 0), td.get("c", 0))
         odata = data.get("obstaclesData", [])
         for o in data.get("obstacles", []):
             d = odata[o["i"]] if o.get("i") is not None else {}
-            add_wall(o["b"], d.get("x", 0), d.get("y", 0), d.get("w", 1),
+            add_wall(o.get("b", 0), d.get("x", 0), d.get("y", 0), d.get("w", 1),
                      d.get("h", 1), float(d.get("d", 0)), v4_walls=True)
     elif "colorNotes" in data:                        # v3 schema
         # .get(..., 0) throughout: some serializers omit zero-valued
         # fields (KeyError 'y'/'c' skipped 6 catalog levels; the v4
-        # branch above already guards the same way)
+        # branch above already guards the same way) — the beat fields
+        # b / tb / hb included (an object on beat 0 has no "b")
         for n in data["colorNotes"]:
-            add_note(n["b"], n.get("x", 0), n.get("y", 0), n.get("c", 0),
+            add_note(n.get("b", 0), n.get("x", 0), n.get("y", 0), n.get("c", 0),
                      n.get("d", 0), n.get("a", 0))
         for n in data.get("bombNotes", []):
-            add_bomb(n["b"], n.get("x", 0), n.get("y", 0))
+            add_bomb(n.get("b", 0), n.get("x", 0), n.get("y", 0))
         for c in data.get("burstSliders", []):
-            add_chain(c["b"], c.get("x", 0), c.get("y", 0), c.get("c", 0),
-                      c.get("d", 0), c["tb"],
+            add_chain(c.get("b", 0), c.get("x", 0), c.get("y", 0), c.get("c", 0),
+                      c.get("d", 0), c.get("tb", 0),
                       c.get("tx", 0), c.get("ty", 0), c.get("sc", 3),
                       c.get("s", 1.0))
         for a in data.get("sliders", []):
-            add_arc(a["b"], a.get("x", 0), a.get("y", 0), a.get("c", 0),
-                    a["tb"], a.get("tx", 0), a.get("ty", 0),
+            add_arc(a.get("b", 0), a.get("x", 0), a.get("y", 0), a.get("c", 0),
+                    a.get("tb", 0), a.get("tx", 0), a.get("ty", 0),
                     a.get("tc", a.get("c", 0)))
         for o in data.get("obstacles", []):
-            add_wall(o["b"], o.get("x", 0), o.get("y", 0), o.get("w", 1),
+            add_wall(o.get("b", 0), o.get("x", 0), o.get("y", 0), o.get("w", 1),
                      o.get("h", 1), float(o.get("d", 0)), v4_walls=False)
     else:                                             # v2 schema
         for n in data["_notes"]:
