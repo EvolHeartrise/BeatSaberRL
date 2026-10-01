@@ -63,7 +63,7 @@ def test_junk_in_masked_slots_cannot_leak():
 
 
 def test_obs_dim_contract():
-    assert OBS_DIM == 624   # env v46: tau-scale lanes
+    assert OBS_DIM == 630   # env v49: blade-tip velocity lanes
     assert N_ACTION_HEADS == N_JOINTS == 29
 
 
@@ -124,11 +124,17 @@ def test_note_geo_normalizers_pinned():
         assert P._Y_NORM == C.Y_NORM
     if hasattr(C, "X_NORM"):
         assert P._X_NORM == C.X_NORM
-    # hand block lanes inside the 32-lane saber token: q(8)+qd(7) then
+    # hand block lanes inside the 47-lane saber token: q(8)+qd(7) then
     # [wrist pos(3), wrist vel(3), blade(3), meter, post_rem]
     assert (P._S_WPOS, P._S_WVEL, P._S_BLADE) == (15, 18, 21)
     assert P._SABER_L_IDX[15:26] == tuple(range(C.OFF_HAND_L, C.OFF_HAND_L + 11))
-    assert P.NOTE_GEO_FEAT == 14
+    # env v49: the blade-tip velocity is the saber token's tail (I07)
+    assert P._S_TIPV == 44
+    assert P._SABER_L_IDX[44:47] == tuple(range(C.OFF_TIP_VEL, C.OFF_TIP_VEL + 3))
+    assert P._SABER_R_IDX[44:47] == tuple(range(C.OFF_TIP_VEL + 3, C.OFF_TIP_VEL + 6))
+    assert P._HANDLE_LEN == C.HANDLE_LEN
+    assert P._OBS_HEAD_Z == C.OFF_HEAD + 2
+    assert P.NOTE_GEO_FEAT == 22 and P.NOTE_GEO_FEAT_V55 == 14
 
 
 def test_note_geo_lanes_geometry():
@@ -154,7 +160,8 @@ def test_note_geo_lanes_geometry():
     obs[0, OFF_NOTE_MASK] = 1.0
     pol = NotePolicy(note_geo=True)
     sabers, body, notes, mask = pol._split(obs)
-    geo = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0)
+    geo = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0,
+                      z_off=obs[:, 99])
     assert geo.shape == (1, N_NOTE_SLOTS, P.NOTE_GEO_FEAT)
     g = geo[0, 0]
     dm = torch.tensor([0.5 - 0.2, 0.15 - (-0.3), 4.0 - (-0.5)])   # metres
@@ -170,7 +177,8 @@ def test_note_geo_lanes_geometry():
     # wall rows have no cut direction: dots masked to 0
     obs[0, n0 + 14] = 1.0
     sabers, body, notes, mask = pol._split(obs)
-    g2 = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0)[0, 0]
+    g2 = P._note_geo(notes, sabers.reshape(1, 2, P.SABER_FEAT), 8.0,
+                     z_off=obs[:, 99])[0, 0]
     assert g2[5] == 0 and g2[6] == 0 and torch.allclose(g2[0:3], want, atol=1e-5)
 
 
@@ -178,7 +186,8 @@ def test_note_geo_forward_and_arch_marker():
     torch.manual_seed(0)
     pol = NotePolicy(note_geo=True)
     assert pol.arch["note_geo"] is True
-    assert pol.note_mlp[0].in_features == NOTE_FEAT + 14
+    assert pol.note_mlp[0].in_features == NOTE_FEAT + 22
+    assert pol.arch["blade_geo"] == 1
     obs = _obs_batch()
     logits, value = pol(obs)
     assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]

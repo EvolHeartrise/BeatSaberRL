@@ -588,6 +588,27 @@ notes (pinned by test).
 
 ## Observation layout (exact, all f32) — order is a contract
 
+**Current layout (env v49, 2026-09-30): OBS_DIM 630.** The block table
+is `beat_arena_env/constants.py` `_OBS_BLOCKS` (offsets derived; the
+lib.rs `OFF_*` consts and the .cu mirror are pinned to it): root pose /
+velocity 0..15, q 15..46, qd 46..75, hand blocks 75..97, head 97..100,
+contact 100..102, the 24 × 18 entity window 102..534 + mask 534..558,
+ground contact 558..562, body points 562..580 and their velocities
+580..598 (env v24), previous-note blocks 598..608 (env v45), torque-
+limit scales 608..624 (env v46) and — **env v49 (review item I07)** —
+the per-hand blade-TIP world velocity 624..630, `[L xyz, R xyz] /
+V_NORM`: the finite difference of the tip `wrist + (HANDLE_LEN +
+SABER_LEN)·blade` across the tick, identical to the judge's `tip_move /
+DT` (the cut-plane accuracy rule below is built from it). Zero at reset,
+after a set_state refresh, and in the Flux game. Appended, so every
+earlier offset is unchanged; OBS_DIM 624 → 630. The policy routes each
+hand's 3 lanes into its saber token and derives the blade-frame note
+geometry from them (§Policy, `note_geo`); pre-v49 checkpoints are
+upgraded on load (zero input columns, arch marker `blade_geo`).
+
+The obs v6 text below is the historical base layout (kept for the lane
+semantics it still defines):
+
 Obs v6 (env v7 — 16 object slots × 14 features; sabers unchanged from
 obs v5 except y normalization):
 
@@ -730,6 +751,19 @@ measured numbers are in the README ("Historical reference points").
 
 ## Policy (`python/policy.py`)
 
+**Note-geo lanes (current, env v49 / I07):** with `note_geo` each note
+token carries 22 derived lanes after its 18 obs lanes — per hand the
+v55 seven [dp x/y (half-metres), dp z and |dp| (asinh(m/8)), t_plane =
+clip((z − z_off)/speed, −0.5, 3)/3 with z_off = obs lane 99 (B12), unit
+wrist-velocity · cutdir, blade · cutdir], then per hand the I07 four
+[asinh((dp·b − HANDLE_LEN)/2), asinh(|dp − (dp·b)b|/2), asinh(dp·n̂/2)
+with n̂ = (b × v_tip)/(|b × v_tip| + 0.05) — the signed distance to the
+swept cut plane, positive on the b × v_tip side — and v_tip · cutdir /
+V_NORM]; the cutdir dots are 0 on wall rows. Saber tokens are 47 lanes
+(+ the 2-lane hand one-hot), the tip velocity last. Arch marker
+`blade_geo = 1`; `load_policy` upgrades a checkpoint without it (obs
+624) with zero weights on the new saber / note input columns.
+
 `NotePolicy()` — transformer only (the pool baseline was deleted
 2026-07-20 after the easy-config studies concluded; checkpoints still
 record `encoder: "transformer"`):
@@ -773,10 +807,13 @@ one policy forward per vector step; GAE(γ=0.99, λ=0.95), dual-clip
 + env config (`--colors --cols --rows --chart-len --note-speed-min
 --note-speed-max --note-prob --extra-prob --dot-prob --bomb-prob`).
 Checkpoints since 2026-07-24 carry Adam state + the LR-schedule anchors:
-`--resume <ckpt>` continues a stopped run EXACTLY (weights, optimizer
-moments, schedule position — lr/lr-final/lr-decay/num_updates come from
-the checkpoint, CLI values ignored; the env/chart stream restarts
-fresh, so only the optimization state is exact). `--init-from` remains
+`--resume <ckpt>` continues a stopped run (weights, optimizer
+moments, schedule position — lr/lr-final/num_updates come from the
+checkpoint; since 2026-09-30 also the torch/CUDA/numpy/python and
+CUDA-env RNG streams, and every flag not typed on the CLI is inherited
+from the checkpoint's args, typed differences printed as a diff and
+typed arch changes refused; the env/chart state restarts fresh, so only
+the optimization state and random streams are exact). `--init-from` remains
 the weights-only warm-start with a fresh schedule; older checkpoints
 without optimizer state are --init-from only. **`--cuda-graphs` REMOVED
 (2026-07-25)**: capture existed to hide the 12-head/12-Categorical

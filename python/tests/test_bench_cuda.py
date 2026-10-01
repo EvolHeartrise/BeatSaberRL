@@ -62,7 +62,10 @@ def test_finish_slot_schema_and_full_combo():
                       "bombs_hit", "highest_combo", "full_combo",
                       "score_pre", "score_acc", "score_post", "flail_rad",
                       "flail_ticks", "wrist_rev_l", "wrist_rev_r", "ticks",
-                      "wrist_rev_per_s_l", "wrist_rev_per_s_r"}
+                      "wrist_rev_per_s_l", "wrist_rev_per_s_r",
+                      # review B09 (tests/test_bench_term.py)
+                      "breaks", "wall_enters", "fell", "tilted",
+                      "envelope", "terminated_tick"}
     assert r["score"] == 900 and r["accuracy"] == 0.9 and r["full_combo"]
     r2 = bs.finish_slot(slot, dict(info, good_cuts=9, misses=1),
                         (600.0, 6, 1))
@@ -77,8 +80,10 @@ def test_bench_compare(tmp_path):
            "highest_combo": 5, "full_combo": True, "score_pre": 1.0,
            "score_acc": 1.0, "score_post": 1.0, "flail_rad": 0.0,
            "flail_ticks": 0} for i in range(4)]
+    # sim_dtype stamped: bench_compare's B14 header check reads an
+    # unstamped cuda file as f32 and an unstamped rust file as f64
     a = {"levels": lv, "total_unweighted_pp": 60.0, "total_weighted_pp": 50.0,
-         "sim": "cuda"}
+         "sim": "cuda", "sim_dtype": "f32"}
     b = json.loads(json.dumps(a))
     b["sim"] = "rust"
     b["levels"][2]["pp"] = 25.0

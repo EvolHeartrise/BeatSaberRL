@@ -26,7 +26,7 @@ def _notes(zs, c):
 def test_norm_lanes_are_order_one_at_any_distance():
     zs = [0.0, 0.6, 2.0, 12.0, 40.0, 100.0, 2000.0]
     notes, sabers = _notes(zs, c=8.0)
-    g = _note_geo(notes, sabers, 8.0)
+    g = _note_geo(notes, sabers, 8.0, z_off=torch.zeros(1))
     assert g.shape == (1, 24, NOTE_GEO_FEAT)
     assert g[0, :len(zs)].abs().max() < 8.0
     # per hand: dp(3) dist(1) tpl(1) vdot(1) bdot(1); z offset lane = asinh((z - wz)/8)
@@ -41,7 +41,7 @@ def test_norm_lanes_are_order_one_at_any_distance():
 
 def test_norm_true_decodes_true_z():
     notes, sabers = _notes([100.0], c=8.0)
-    g = _note_geo(notes, sabers, 8.0)
+    g = _note_geo(notes, sabers, 8.0, z_off=torch.zeros(1))
     # tpl uses the TRUE 100 m (clipped at 3 s -> lane 1.0), not 8*asinh(100/8) = 25.8 m (1.3 s)
     assert abs(g[0, 0, 4].item() - 1.0) < 1e-6
 

@@ -34,6 +34,8 @@ mod combo;
 use combo::ComboWalk;
 use flux::{Event, FluxTuple};
 use geom::*;
+// the env's 30 Hz base tick (the env crate itself runs at a runtime rate)
+use geom::DT_30 as DT;
 use std::cell::RefCell;
 
 /// Floats per chart object in `fg_new`'s input: the set_flux_chart tuple

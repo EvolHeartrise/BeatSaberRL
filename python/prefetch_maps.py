@@ -98,6 +98,16 @@ def main():
                         "(implies --skip-pool; never prunes the catalog)")
     p.add_argument("--skip-pool", action="store_true",
                    help="stop after dats + chart_cache; no pool npz")
+    # both are in the pool cache key: default to the training recipe
+    # (ranked_pool.RECIPE_*, resolved lazily to keep torch off the
+    # --skip-pool path) or the npz is one no training run loads
+    p.add_argument("--lead-s", type=float, default=None,
+                   help="pool npz front gap (default: the trainer's "
+                        "--lead-s recipe value)")
+    p.add_argument("--mirror-augment", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="pool npz mirror doubling (default: the trainer's "
+                        "--mirror-augment recipe value)")
     p.add_argument("--workers", type=int, default=8,
                    help="parallel download+parse threads (BeatSaver "
                         "latency-bound; 8 measured fine, 1 = the old "
@@ -159,8 +169,12 @@ def main():
               flush=True)
 
     if not args.skip_pool:
-        from beat_arena_env.ranked_pool import load_ranked_pool
-        load_ranked_pool(device="cpu")
+        from beat_arena_env.ranked_pool import (
+            RECIPE_LEAD_S, RECIPE_MIRROR, load_ranked_pool)
+        lead_s = RECIPE_LEAD_S if args.lead_s is None else args.lead_s
+        mirror = (RECIPE_MIRROR if args.mirror_augment is None
+                  else args.mirror_augment)
+        load_ranked_pool(device="cpu", lead_s=lead_s, mirror=mirror)
         print("[prefetch] pool npz built; cache complete", flush=True)
 
 
