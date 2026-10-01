@@ -250,6 +250,7 @@ def test_checkpoint_carries_rng_and_args(trunk):
     assert {"torch", "numpy", "python"} <= set(ck["rng"])
     assert ck["args"]["gamma"] == 0.9
     assert "diag_probe_obs" in ck        # None on CPU (the diag is CUDA)
+    assert "diag_probe_upd" in ck        # capture update (None until then)
 
 
 def test_resume_continues_the_rng_stream_and_inherits(trunk, tmp_path):
