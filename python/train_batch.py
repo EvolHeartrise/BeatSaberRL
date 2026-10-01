@@ -224,6 +224,13 @@ def build_parser():
     p.add_argument("--critic-lr-mult", type=float, default=3.0,
                    help="critic param-group lr multiplier (T1, "
                         "ProtoMotions ships 5x; 1.0 disables)")
+    p.add_argument("--probe-capture-update", type=int, default=250,
+                   help="psrank probe: freeze the [diag] batch of the "
+                        "first diag at or after this update (the trained "
+                        "policy's own states; earlier diags print no "
+                        "psrank). Before 2026-10-01 the probe was the "
+                        "update-0 batch, i.e. states of the random "
+                        "initial policy")
     p.add_argument("--diag-every", type=int, default=50,
                    help="every N updates run the critic/trunk "
                         "diagnostics minibatch (grad cosine, dormant "
@@ -1989,13 +1996,24 @@ def main():
     if args.bench and device.type == "cuda" and graph_roll is None:
         tick_ev = [[torch.cuda.Event(enable_timing=True) for _ in range(4)]
                    for _ in range(T)]
-    diag_probe_obs = None    # frozen first-diag batch (psrank probe)
+    diag_probe_obs = None    # frozen post-warmup diag batch (psrank probe)
+    diag_probe_upd = None    # the update it was captured at
     if resume_ckpt is not None:
         # persisted since 2026-09-30 so psrank stays comparable across
-        # a resume (see the psrank comment in the diag block)
+        # a resume (see the psrank comment in the diag block). A probe
+        # without "diag_probe_upd" predates 2026-10-01 and is the
+        # update-0 random-policy batch: dropped, so the resumed run
+        # re-captures one from its own states.
         _p = resume_ckpt.get("diag_probe_obs")
-        if _p is not None and _p.ndim == 2 and _p.shape[1] == OBS_DIM:
+        _u = resume_ckpt.get("diag_probe_upd")
+        if (_p is not None and _u is not None and _p.ndim == 2
+                and _p.shape[1] == OBS_DIM):
             diag_probe_obs = _p.to(device=device, dtype=obs_dt)
+            diag_probe_upd = int(_u)
+        elif _p is not None:
+            print("resume: dropping the checkpoint's pre-2026-10-01 "
+                  "psrank probe (update-0 random-policy states); "
+                  "re-capturing at the first diag", flush=True)
     diag_idx = None          # fixed [diag] rows over the flat T x N buffer
     start = time.time()
 
@@ -2088,6 +2106,7 @@ def main():
                     "rng": rng_state(venv),
                     "diag_probe_obs": (None if diag_probe_obs is None
                                        else diag_probe_obs.cpu()),
+                    "diag_probe_upd": diag_probe_upd,
                     "args": args_snapshot,
                     "wsd_role": ("leaf" if leaf_from is not None
                                  else "trunk"),
@@ -2408,18 +2427,31 @@ def main():
             # is captured from the diag_index rows (all ticks), not t=0.
             # (Checkpoints from before carry none; the first diag after
             # such a resume still re-captures.)
-            if diag_probe_obs is None:
+            # FIXED 2026-10-01 (architecture review): the probe was the
+            # update-0 batch — states of the RANDOM initial policy, off
+            # the trained policy's distribution for the whole run (on
+            # v61 its value read -2.1 sd vs -1.0 on-policy). It is now
+            # captured at the first diag at/after --probe-capture-update
+            # (default 250, past warmup and the early collapse of the
+            # random-policy states); earlier diags print no psrank.
+            psrank = None
+            if (diag_probe_obs is None
+                    and update >= args.probe_capture_update):
                 diag_probe_obs = f_obs[diag_idx].clone()
-            with torch.no_grad():
-                policy._diag_stash = True
-                policy.get_action_and_value(diag_probe_obs,
-                                            need_entropy=False)
-                policy._diag_stash = False
-            hp = policy._diag_h.float()
-            policy._diag_h = None
-            svp = torch.linalg.svdvals(hp - hp.mean(0))
-            cump = svp.cumsum(0) / svp.sum().clamp_min(1e-12)
-            psrank = int((cump < 0.99).sum().item()) + 1
+                diag_probe_upd = update
+                print(f"[diag] psrank probe captured at update "
+                      f"{update + 1}", flush=True)
+            if diag_probe_obs is not None:
+                with torch.no_grad():
+                    policy._diag_stash = True
+                    policy.get_action_and_value(diag_probe_obs,
+                                                need_entropy=False)
+                    policy._diag_stash = False
+                hp = policy._diag_h.float()
+                policy._diag_h = None
+                svp = torch.linalg.svdvals(hp - hp.mean(0))
+                cump = svp.cumsum(0) / svp.sum().clamp_min(1e-12)
+                psrank = int((cump < 0.99).sum().item()) + 1
             # same .item() calls as before, hoisted so the metrics line
             # can reuse them without a second sync each
             per_gv = [(nm, g_pi[a:b].norm().item(), g_v[a:b].norm().item())
@@ -2430,12 +2462,15 @@ def main():
             print(f"[diag] upd {update + 1}  gradcos {gcos_v:+.3f}"
                   f"  |g_pi| {npi_v:.2e}  |g_v| {nv_v:.2e}"
                   f"  dormant {dorm_v:.3f}  srank {srank}/"
-                  f"{h_d.shape[1]}  psrank {psrank}"
-                  f"  pi/v: {per_g}", flush=True)
+                  f"{h_d.shape[1]}"
+                  + (f"  psrank {psrank}" if psrank is not None else "")
+                  + f"  pi/v: {per_g}", flush=True)
             m_diag = {"gradcos": gcos_v, "gpi": npi_v, "gv": nv_v,
                       "dormant": dorm_v, "srank": srank,
                       "srank_dim": int(h_d.shape[1]), "psrank": psrank,
                       "groups": {nm: [a, b] for nm, a, b in per_gv}}
+            if psrank is None:           # before the probe is captured
+                del m_diag["psrank"]
 
         kl_stop_mb = None   # --target-kl: minibatch index the update stopped at
         gn_sq = None        # [gnorm] per-module grad norm^2 of the last minibatch
