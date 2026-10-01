@@ -150,7 +150,11 @@ $VENV/bin/python -m pytest tests/
 # since 2026-09-22), so a bare launch is a v58-recipe trunk on the cuda env
 # (plus fp16-accumulate GEMMs, --fp16-accum all, the default since
 # 2026-09-27, and the fused block-FFN kernel, --fused-ffn on, the
-# default since 2026-09-30; a --resume keeps its checkpoint's modes)
+# default since 2026-09-30; a --resume keeps its checkpoint's modes).
+# --fused-ffn up16 (fp16-accumulated up-projection too) is LIKELY WORSE
+# for training: the 2026-09-30 A/B (one seed per arm, recipe trunk +
+# cd400 leaf, bench/ab_*_cd400*.json) benched it -2.7% wpp at the default
+# body and -2.9% at each leaf's own fit for a 1.8% wall-clock saving
 $VENV/bin/python train_batch.py --run-dir runs/NAME --total-steps N
 # leaf: branch a cooldown off a numbered trunk checkpoint. Since
 # 2026-09-30 a resume INHERITS every flag not typed on the command line
