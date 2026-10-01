@@ -551,7 +551,20 @@ def term_totals(evaluated):
         "envelope_levels": sum(bool(e.get("envelope")) for e in tl),
         "terminated_levels": sum(e.get("terminated_tick") is not None
                                  for e in tl),
+        **torque_totals(evaluated),
     }
+
+
+def torque_totals(evaluated):
+    """Catalog-wide applied-torque totals (2026-10-01) over the levels
+    that carry them (`torque_levels`); N·m summed per tick and the
+    rate-invariant N·m·s (see _torque_fields)."""
+    tq = [e for e in evaluated if e.get("torque_nm") is not None]
+    out = {"torque_levels": len(tq)}
+    for k in ("torque_nm", "torque_nm_spine", "torque_nm_arms",
+              "torque_nm_legs", "torque_nms"):
+        out[k + "_total"] = round(sum(float(e[k]) for e in tq), 1)
+    return out
 
 
 class _SaveWriter:
@@ -796,6 +809,7 @@ def finish_slot(slot, info, combo, tick_hz=30):
         "wrist_rev_per_s_r": (round(float(tick_hz) * info.get("wrist_rev_r", 0) / info["ticks"], 3)
                               if info.get("ticks") else 0.0),
         **_term_fields(breaks, info),
+        **_torque_fields(info, tick_hz),
     }
 
 
@@ -890,6 +904,29 @@ def totals_line(data):
             f"{data['bl_total_unweighted_pp']} over {data['n_bl_ranked']} | "
             f"shared {data['n_shared']}, SS-only {data['n_ss_only']}, "
             f"BL-only {data['n_bl_only']}")
+
+
+def _torque_fields(info, tick_hz):
+    """Applied joint torque spent on this level (2026-10-01, user): the
+    env v43 Σ_j|τ_j| (N·m — exactly the --energy-coef base) summed over
+    the level's control ticks, in total and per group (spine / arms /
+    legs). `torque_nm` sums per TICK, so it scales with --tick-hz for the
+    same motion; `torque_nms` = torque_nm / tick_hz (N·m·s, the torque
+    impulse) is rate-invariant — compare 30 vs 60 Hz on it — and
+    `torque_per_tick` is the mean Σ|τ| per tick (the trainer's
+    [torque] line unit). info["torque"] absent = an engine build that
+    cannot report it: the fields are None."""
+    tq = info.get("torque")
+    if tq is None:
+        return {"torque_nm": None, "torque_nm_spine": None,
+                "torque_nm_arms": None, "torque_nm_legs": None,
+                "torque_nms": None, "torque_per_tick": None}
+    total, spine, arms, legs = (float(x) for x in tq[:4])
+    ticks = int(info.get("ticks", 0))
+    return {"torque_nm": round(total, 1), "torque_nm_spine": round(spine, 1),
+            "torque_nm_arms": round(arms, 1), "torque_nm_legs": round(legs, 1),
+            "torque_nms": round(total / float(tick_hz), 2),
+            "torque_per_tick": round(total / ticks, 3) if ticks else None}
 
 
 def _term_fields(breaks, info):
@@ -1082,7 +1119,9 @@ def run_cuda(args, policy, device, tasks, data, levels, out_path,
                     "flail_ticks": int(r[9]),
                     "wrist_rev_l": int(r[14]), "wrist_rev_r": int(r[15]),
                     "ticks": int(r[16]), "wall_enters": int(r[17]),
-                    "term_flags": int(r[18])},
+                    "term_flags": int(r[18]),
+                    "torque": (float(r[19]), float(r[20]),
+                               float(r[21]), float(r[22]))},
                     (float(r[10]), int(r[11]), int(r[12])))
                 result["cuda_slot"] = int(e)
                 levels[task_key(result)] = result
@@ -1148,7 +1187,11 @@ def _term_summary(data):
     return (f"breaks {data['breaks_total']}, wall entries "
             f"{data['wall_enters_total']}, fell {data['fell_levels']} "
             f"(tilt {data['tilted_levels']}), envelope "
-            f"{data['envelope_levels']} of {data['term_levels']} levels")
+            f"{data['envelope_levels']} of {data['term_levels']} levels"
+            + (f" | torque {data['torque_nms_total']:,.0f} N·m·s "
+               f"({data['torque_nm_total']:,.0f} N·m over ticks) on "
+               f"{data['torque_levels']} levels"
+               if data.get("torque_levels") else ""))
 
 
 def main():
@@ -1450,6 +1493,8 @@ def main():
                         fl_rad, fl_ticks = gr.sim.flail(i)
                         wr_l, wr_r, wr_ticks = gr.sim.wrist_rev(i)
                         w_ent, t_flags = gr.sim.term(i)   # B09
+                        tq = (gr.sim.pop_torque_env(i)[:4]
+                              if hasattr(gr.sim, "pop_torque_env") else None)
                         result = finish_slot(s, {
                             "good_cuts": g, "bad_cuts": b, "misses": m,
                             "n_notes": n_scoreable, "bombs_hit": bombs,
@@ -1458,7 +1503,8 @@ def main():
                             "flail_ticks": fl_ticks,
                             "wrist_rev_l": wr_l, "wrist_rev_r": wr_r,
                             "ticks": wr_ticks, "wall_enters": w_ent,
-                            "term_flags": t_flags}, combo, tick_hz=args.tick_hz)
+                            "term_flags": t_flags, "torque": tq},
+                            combo, tick_hz=args.tick_hz)
                         levels[task_key(result)] = result
                         n_done += 1
                         n_finished += 1
@@ -1521,6 +1567,8 @@ def main():
                                      mirror_walls(payload.get("walls", []))
                                      if args.mirror
                                      else payload.get("walls", []))
+                    if hasattr(gr.sim, "pop_torque_env"):
+                        gr.sim.pop_torque_env(i)   # this level's torque only
                     gr.sim.obs_one_into(i, gr.obs_buf)  # in-place row write
                     gr.slots[i] = {
                         "entry": entry,
