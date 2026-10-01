@@ -103,7 +103,7 @@ def test_cuda_matches_reference_on_its_own_angles():
     refs = [[Ref(), Ref()] for _ in range(N)]
     rng = np.random.default_rng(0)
     ids, rows = env.pop_bench_rows()
-    assert rows.shape == (0, 17)                      # widened bench row
+    assert rows.shape == (0, 19)                      # widened bench row (B09)
     steps = 0
     for t in range(T):
         a = np.zeros((N, N_JOINTS), dtype=np.int64)

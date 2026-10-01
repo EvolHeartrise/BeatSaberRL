@@ -171,7 +171,7 @@ def test_obs_reset_hands_and_notes():
     # chart[0], which must be a plain arrow note for the color/dir asserts
     env = RustBeatEnv(seed=3, bomb_prob=0.0, dot_prob=0.0, extra_prob=0.0)
     obs, _ = env.reset()
-    assert obs.shape == (OBS_DIM,) == (624,)   # env v46: tau-scale lanes
+    assert obs.shape == (OBS_DIM,) == (630,)   # env v49: blade-tip velocity lanes
     assert OFF_NOTES == 102 and OFF_NOTE_MASK == 534   # env v19
     # hand blocks at reset (env v20 ready stance): wrists/blades from
     # the fk_body mirror of the shared start pose

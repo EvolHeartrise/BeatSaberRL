@@ -17,7 +17,12 @@ timing — same work every iteration, and the per-minibatch replica
 refresh is exactly production's).
 
 (The perf-ladder env toggles were removed 2026-09-22; run one
-process per configuration.
+process per configuration.)
+
+--fused-ffn off on [up16] (2026-09-30, review I13) times the fused
+block-FFN kernel (grad-mode variant + its backward) against the unfused
+path in one process — a fresh policy per (mode, mb) row, the `ffn`
+column names the mode.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import time
 import torch
 import torch.nn as nn
 
+import fp16_linear as _fl
 from fp16_linear import bump_weights_version
 from policy import (N_ACTION_HEADS, N_NOTE_SLOTS, NotePolicy, OBS_DIM,
                     OFF_NOTE_MASK, hl_loss, load_policy)
@@ -184,6 +190,11 @@ def main():
                     choices=("off", "fwd", "all"),
                     help="GEMM accumulate mode of the fp16 stream (issue "
                          "#3); default = the checkpoint arch's mode")
+    ap.add_argument("--fused-ffn", nargs="+", default=None,
+                    choices=_fl.FFN_MODES,
+                    help="fused block-FFN kernel mode(s) to time, one row "
+                         "set each (review I13); default = the checkpoint "
+                         "arch's mode")
     ap.add_argument("--grad-dump", default=None,
                     help="save logits/value/grads of one fwd+bwd at the "
                          "loaded weights to this path (then exit)")
@@ -208,13 +219,17 @@ def main():
     print(f"best of {args.reps} x {args.iters} updates, ms/update "
           f"(update = fwd + losses + bwd + clip + Adam)\n")
 
-    hdr = (f"{'mb':>7}{'accum':>7}{'ms/update':>12}{'peak MB':>10}")
+    hdr = (f"{'ffn':<6}{'mb':>7}{'accum':>7}{'ms/update':>12}"
+           f"{'peak MB':>10}")
     print(hdr)
     print("-" * len(hdr))
     if args.fp16_accum is not None:
         src.fp16_accum = src.arch["fp16_accum"] = args.fp16_accum
     print(f"fp16 accumulate: {src.fp16_accum}")
-    for n in args.mbs:
+    rows = [(m, n) for m in (args.fused_ffn or [src.fused_ffn])
+            for n in args.mbs]
+    for mode, n in rows:
+        src.fused_ffn = src.arch["fused_ffn"] = mode
         pol = fresh_policy(src, device)
         if args.fp16:                    # mirror train_batch.py order:
             pol.fp16 = True              # flatten BEFORE the optimizer is
@@ -241,7 +256,7 @@ def main():
             return
         t = bench(upd, args.iters, args.reps)
         mem = peak_mem_mb(upd)
-        print(f"{n:>7}{args.mb_accum:>7}{t:>12.2f}{mem:>10.1f}")
+        print(f"{mode:<6}{n:>7}{args.mb_accum:>7}{t:>12.2f}{mem:>10.1f}")
     print()
 
 

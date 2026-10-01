@@ -381,8 +381,9 @@ def test_flux_note_geo_aims_bars_at_the_sweet_spot():
     notes[0, 0, [0, 1, 8]] = torch.tensor([0.2, 0.1, 1.0])
     notes[0, 1, [0, 1, 9, 12, 13]] = torch.tensor([0.2, 0.1, 1.0, -0.4, 0.3])
     sabers = torch.zeros(1, 2, SABER_FEAT)
-    std = _note_geo(notes, sabers, 8.0)
-    flux = _note_geo(notes, sabers, 8.0, flux=True)
+    std = _note_geo(notes, sabers, 8.0, z_off=torch.zeros(1))
+    flux = _note_geo(notes, sabers, 8.0, flux=True,
+                     z_off=torch.zeros(1))
     assert torch.equal(std[0, 0], flux[0, 0])             # circles: centre
     assert torch.equal(std[0, 1], std[0, 0])              # standard: centre
     # flux bar: the per-hand x/y offset lanes point at the sweet spot
