@@ -78,9 +78,11 @@ EP_REC = 28   # env v47 episode record width (cols 22..28 = ep_stats)
 # 0..18 = [good, bad, miss, score, bombs, pre, acc, post, flail_rad,
 # flail_ticks, cw_score, cw_maxc, cw_breaks, chart_idx, wrev_L, wrev_R,
 # ticks, wall_enters, term_flags] (cols 17/18: review B09, 2026-09-30),
-# plus col 19 = the kernel's live wall-entry accumulator (scratch)
-BENCH_REC = 20
-BENCH_COLS = 19
+# 19..22 = this level's applied torque Σ|tau| over ticks [total, spine,
+# arms, legs] in N.m (2026-10-01), then scratch: col 23 = the live
+# wall-entry accumulator, cols 24..27 = the live torque accumulators
+BENCH_REC = 28
+BENCH_COLS = 23
 # term_flags bits (= lib.rs VecBeatSim::term); 0 = the level itself ended
 TERM_FELL, TERM_TILT, TERM_ENVELOPE, TERM_TICKCAP = 1, 2, 4, 8
 

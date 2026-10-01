@@ -3081,6 +3081,17 @@ impl VecBeatSim {
         self.sims[i].body.set_tau_axis(&a);
     }
 
+    /// Per-env torque telemetry since that env's last pop: (Σ total,
+    /// Σ spine, Σ arms, Σ legs, ticks) of applied |τ| in N·m (one add
+    /// per control tick), zeroed. The bench reads it when a level ends
+    /// (before set_chart) and pops it again right after loading the next
+    /// level, so each result carries exactly its own level's torque.
+    /// CUDA bench_rec cols 19..22 mirror. ADDITIVE getter.
+    fn pop_torque_env(&mut self, i: usize) -> (Real, Real, Real, Real, u64) {
+        let (a, t) = self.sims[i].pop_torque();
+        (a[0], a[1], a[2], a[3], t)
+    }
+
     /// Torque telemetry (env v43) summed over all envs since the last
     /// pop: (Σ total, Σ spine, Σ arms, Σ legs, env-ticks) of applied
     /// |τ| in N·m. CUDA `pop_torque` mirror.
