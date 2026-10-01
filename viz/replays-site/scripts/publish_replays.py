@@ -35,6 +35,25 @@ by annotate_replay_audio.py):
      reads to put "Watch" links on the records site (it re-checks the
      weights hash, rate and level against the published bench), and which
      viz/replays-site/scripts/build.mjs reads to assemble the deploy dir.
+
+Best-of composites (tools/bench_combine.py; bench header `composite`,
+2026-10-01). A composite picks each level's ScoreSaber and BeatLeader play
+independently from several runs of ONE checkpoint at different control
+rates / bodies, so its replays have no single rate. For a composite:
+  - --ckpt must hash to the composite's `weights_hash` (its model_hash is
+    a pseudo-hash of the inputs);
+  - the level is the header's `level.level_key` (make_top10_replays.py
+    stamps it), else the unique Standard level of header.map;
+  - the replay must reproduce a PICK of that level: the input run named by
+    ss_from (or bl_from) must have the replay's tick_hz (action_repeat 1,
+    no obs window) and body (header tau_scale), and the play counters must
+    equal that pick's play (the record's own fields for the SS pick,
+    `bl_play` for the BL pick). A replay matching neither pick aborts;
+  - its file id is sha256("<weights>|<rate>|<level_key>|<body>")[:16] (a
+    level can have two replays, one per pick run), and its manifest entry
+    (keyed by that id) carries the level and the run it was recorded in
+    (tickHz, tauScale) plus which picks it reproduces — never a file name.
+    viz/site's build-data.mjs re-checks each against the composite.
 """
 
 from __future__ import annotations
@@ -56,8 +75,10 @@ DEFAULT_STORE = os.path.expanduser("~/beat-arena-volume-backup/replays-site")
 # what the viewer's parseReplay reads, plus harmless run metadata
 HEADER_KEYS = ["version", "record_rev", "tick_hz", "action_repeat",
                "obs_window", "tau_scale", "track_anchor", "config", "chart",
-               "walls", "map", "game", "player"]
+               "walls", "map", "level", "game", "player"]
 MAP_KEYS = ["hash", "difficulty", "song", "audio_offset_s"]
+LEVEL_KEYS = ["level_key", "characteristic", "ss_leaderboard_id",
+              "bl_leaderboard_id"]
 CONFIG_KEYS = ["chart_len_s", "colors", "note_speed_min", "note_speed_max",
                "note_prob", "extra_prob", "dot_prob", "bomb_prob", "gears",
                "handle_len"]
@@ -129,10 +150,46 @@ def sanitize_header(h, model_id, mhash, dropped):
     out = pick(h, HEADER_KEYS, "header.", dropped)
     if isinstance(out.get("map"), dict):
         out["map"] = pick(out["map"], MAP_KEYS, "header.map.", dropped)
+    if isinstance(out.get("level"), dict):
+        out["level"] = pick(out["level"], LEVEL_KEYS, "header.level.", dropped)
     if isinstance(out.get("config"), dict):
         out["config"] = pick(out["config"], CONFIG_KEYS, "header.config.", dropped)
     out["model"] = model_id
     out["model_hash"] = mhash.replace("sha256:", "")[:12]
+    return out
+
+
+def same_body(a, b, tol=1e-6):
+    """Two tau_scale lists (None = all 1.0) name the same body."""
+    a = a or [1.0] * 16
+    b = b or [1.0] * 16
+    return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def body_key(tau):
+    return ",".join(f"{v:.4f}" for v in (tau or [1.0] * 16))
+
+
+def composite_matches(bench, rec, header, got):
+    """Which picks ("ss" / "bl") of composite record `rec` this replay
+    reproduces: the pick's input run has the replay's rate and body, and the
+    pick's play has the replay's counters."""
+    runs = {r["file"]: r for r in bench["composite"]["inputs"]}
+    out = []
+    for board, play in (("ss", rec), ("bl", rec.get("bl_play"))):
+        src = rec.get(f"{board}_from")
+        if not rec.get(board) or src is None or play is None:
+            continue
+        run = runs[src]
+        if rate_of(header) != (int(run.get("tick_hz") or 30), 1, False):
+            continue
+        if not same_body(header.get("tau_scale"), run.get("tau_scale")):
+            continue
+        want = {"score": play["score"], "combo": play["highest_combo"],
+                "good": play["good_cuts"], "bad": play["bad_cuts"],
+                "miss": play["misses"], "bombs": play["bombs_hit"]}
+        if got == want:
+            out.append(board)
     return out
 
 
@@ -148,15 +205,19 @@ def main():
     a = p.parse_args()
 
     bench = json.load(open(a.bench, encoding="utf-8"))
+    comp = bool(bench.get("composite"))
     brate = rate_of(bench)
     mhash = weights_hash(a.ckpt)
-    if mhash != bench["model_hash"]:
+    want_hash = bench["weights_hash"] if comp else bench["model_hash"]
+    if mhash != want_hash:
         sys.exit(f"error: {a.ckpt} hashes to {mhash}, the bench is "
-                 f"{bench['model_hash']}")
-    levels = {}
+                 f"{want_hash}")
+    levels, by_key = {}, {}
     for e in bench["levels"]:
         if "skipped" not in e:
             levels.setdefault((e["song_hash"].lower(), e["difficulty"]), []).append(e)
+            if "level_key" in e:
+                by_key[e["level_key"]] = e
 
     # ---- check everything first; write nothing unless all pass ----------
     plans = []
@@ -170,34 +231,55 @@ def main():
             sys.exit(f"error: {name}: replay version {h.get('version')}")
         if h.get("model_hash") and h["model_hash"] not in (mhash, mhash.replace("sha256:", "")):
             sys.exit(f"error: {name}: header model_hash {h['model_hash']} != {mhash}")
-        if rate_of(h) != brate:
+        if not comp and rate_of(h) != brate:
             sys.exit(f"error: {name}: rate {rate_of(h)} != bench {brate}")
         m = h.get("map")
         if not m:
             sys.exit(f"error: {name}: no header.map — run python/annotate_replay_audio.py")
         cands = levels.get((m["hash"].lower(), m["difficulty"]), [])
+        lk = (h.get("level") or {}).get("level_key")
+        if lk:
+            cands = [by_key[lk]] if lk in by_key else []
+        elif comp:
+            cands = [e for e in cands if e.get("characteristic", "Standard") == "Standard"]
         if len(cands) != 1:
             sys.exit(f"error: {name}: {len(cands)} bench levels for "
                      f"{m['hash']} {m['difficulty']}")
         e = cands[0]
         got = walk_events(ticks)
-        want = {"score": e["score"], "combo": e["highest_combo"],
-                "good": e["good_cuts"], "bad": e["bad_cuts"],
-                "miss": e["misses"], "bombs": e["bombs_hit"]}
-        if got != want:
-            sys.exit(f"error: {name}: replay {got} != bench entry {want}")
+        picks = None
+        if comp:
+            picks = composite_matches(bench, e, h, got)
+            if not picks:
+                sys.exit(f"error: {name}: replay {got} at rate {rate_of(h)} "
+                         f"reproduces neither pick of {e['level_key']} "
+                         f"(ss_from {e.get('ss_from')}, bl_from "
+                         f"{e.get('bl_from')})")
+        else:
+            want = {"score": e["score"], "combo": e["highest_combo"],
+                    "good": e["good_cuts"], "bad": e["bad_cuts"],
+                    "miss": e["misses"], "bombs": e["bombs_hit"]}
+            if got != want:
+                sys.exit(f"error: {name}: replay {got} != bench entry {want}")
         dropped = set()
         header = sanitize_header(h, a.model, mhash, dropped)
         clean = [json.dumps({"header": header}, separators=(",", ":"))]
         for t in ticks:
             clean.append(json.dumps(pick(t, TICK_KEYS, "tick.", dropped),
                                     separators=(",", ":")))
-        fid = file_id(mhash, *brate, e["leaderboard_id"])
+        if comp:
+            fid = file_id(mhash, *rate_of(h),
+                          f"{e['level_key']}|{body_key(h.get('tau_scale'))}")
+        else:
+            fid = file_id(mhash, *brate, e["leaderboard_id"])
         blob = gzip.compress(("\n".join(clean) + "\n").encode(), 9, mtime=0)
         if len(blob) >= MAX_BYTES:
             sys.exit(f"error: {name}: {len(blob)} bytes gzipped, over the "
                      f"25 MiB asset limit")
-        plans.append((name, e, fid, blob, dropped, got))
+        if any(p[2] == fid for p in plans):
+            sys.exit(f"error: {name}: a second replay of the same level, "
+                     f"rate and body in this batch")
+        plans.append((name, e, fid, blob, dropped, got, picks, h))
 
     # ---- write ------------------------------------------------------------
     os.makedirs(os.path.join(a.store, "r"), exist_ok=True)
@@ -205,22 +287,50 @@ def main():
     manifest = (json.load(open(mpath, encoding="utf-8"))
                 if os.path.exists(mpath) else {"version": 1, "models": {}})
     entry = manifest["models"].setdefault(a.model, {})
-    if entry.get("modelHash") not in (None, mhash):
+    bhash = bench["model_hash"]          # composite: its pseudo-hash
+    if entry.get("modelHash") not in (None, bhash):
         sys.exit(f"error: the store already has {a.model} with weights "
                  f"{entry['modelHash']}")
-    entry.update({"modelHash": mhash, "tickHz": brate[0],
-                  "actionRepeat": brate[1], "obsWindow": brate[2]})
+    if comp:
+        entry.update({"modelHash": bhash, "weightsHash": mhash,
+                      "composite": True})
+    else:
+        entry.update({"modelHash": mhash, "tickHz": brate[0],
+                      "actionRepeat": brate[1], "obsWindow": brate[2]})
+    # never overwrite another model's published file (ids are per weights,
+    # so this cannot happen short of a hash collision)
+    others = {r["file"] for mid, mm in manifest["models"].items() if mid != a.model
+              for r in mm.get("replays", {}).values()}
+    for _, _, fid, *_ in plans:
+        if f"r/{fid}.jsonl.gz" in others:
+            sys.exit(f"error: r/{fid}.jsonl.gz belongs to another model")
     reps = entry.setdefault("replays", {})
-    for name, e, fid, blob, dropped, got in plans:
+    for name, e, fid, blob, dropped, got, picks, h in plans:
         rel = f"r/{fid}.jsonl.gz"
         with open(os.path.join(a.store, rel), "wb") as f:
             f.write(blob)
-        reps[str(e["leaderboard_id"])] = {
-            "file": rel, "song": e["song"], "difficulty": e["difficulty"],
-            "pp": round(e["pp"], 2), "score": e["score"], "bytes": len(blob)}
-        print(f"{rel}  {len(blob) / 1048576:5.2f} MiB  {e['pp']:7.2f}pp  "
+        if comp:
+            pp = max((e[b]["pp"] for b in picks), default=0.0)
+            hz, rep_, obs = rate_of(h)
+            reps[fid] = {
+                "file": rel, "song": e["song"], "difficulty": e["difficulty"],
+                "levelKey": e["level_key"],
+                "ssId": (e.get("ss") or {}).get("leaderboard_id"),
+                "blId": (e.get("bl") or {}).get("leaderboard_id"),
+                "tickHz": hz, "actionRepeat": rep_, "obsWindow": obs,
+                "tauScale": [round(v, 6) for v in (h.get("tau_scale") or [1.0] * 16)],
+                "picks": picks, "score": got["score"],
+                "pp": {b: round(e[b]["pp"], 2) for b in picks},
+                "bytes": len(blob)}
+        else:
+            pp = e["pp"]
+            reps[str(e["leaderboard_id"])] = {
+                "file": rel, "song": e["song"], "difficulty": e["difficulty"],
+                "pp": round(e["pp"], 2), "score": e["score"], "bytes": len(blob)}
+        print(f"{rel}  {len(blob) / 1048576:5.2f} MiB  {pp:7.2f}pp  "
               f"{e['song'][:40]} [{e['difficulty']}]  <- {name}  "
-              f"(score {got['score']} = bench, dropped: "
+              + (f"[{'+'.join(picks)} pick, {rate_of(h)[0]} Hz] " if comp else "")
+              + f"(score {got['score']} = bench, dropped: "
               f"{', '.join(sorted(dropped)) or 'nothing'})")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
