@@ -582,6 +582,14 @@ def build_parser():
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
+    p.add_argument("--catalog", type=str, default="scoresaber",
+                   choices=("scoresaber", "beatleader", "both"),
+                   help="--ranked-maps level catalog: scoresaber (the "
+                        "historical pool), beatleader, or both (the union "
+                        "keyed like bench_scoresaber --catalog both, each "
+                        "shared level once). Non-SS levels carry no SS pp "
+                        "in the ep-stats telemetry (level_lb -1, max_pp "
+                        "0). (2026-10-01)")
     p.add_argument("--lead-s", type=float, default=RECIPE_LEAD_S,
                    help="ranked-maps front gap (s) — notes before it are "
                         "dropped, walls clipped to it; the earliest "
@@ -1183,9 +1191,11 @@ def make_env(args, N, device):
         if args.ranked_maps:
             from beat_arena_env.ranked_pool import load_ranked_pool
             from beat_arena_env.ranked_pool import pool_max_steps
+            from beat_arena_env.ranked_pool import train_catalog_path
             pool = load_ranked_pool(sample=args.chart_pool, seed=args.seed,
                                     device=device, lead_s=args.lead_s,
-                                    mirror=args.mirror_augment)
+                                    mirror=args.mirror_augment,
+                                    catalog=train_catalog_path(args.catalog))
             # whole-level episodes (the only mode since 2026-09-16): the
             # episode limit comes from the longest level in the pool
             pool_steps = pool_max_steps(pool)

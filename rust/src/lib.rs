@@ -136,6 +136,16 @@ const GEAR_SIGNED: [Real; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
                                0.125, -0.125];
 const GEAR_SIGNED_5: [Real; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
 
+// wrist-body exp (user 2026-10-01): the wrist-bend joints (8, 15) take
+// their fine gears (ids >= 3) at 2x — K=5's 1/4 gear becomes 1/2 there.
+// Mirrored by the kernel's FINE_GEAR_MULT and constants.gear_fraction.
+const FINE_GEAR_MULT: [Real; NQ] = {
+    let mut m = [1.0; NQ];
+    m[8] = 2.0;
+    m[15] = 2.0;
+    m
+};
+
 fn gear_signed(gears: u8) -> [Real; 7] {
     match gears {
         5 => GEAR_SIGNED_5,
@@ -848,7 +858,13 @@ impl Body {
         let mut tgrp = [0.0 as Real; 3];
         for j in 0..NQ {
             let a = actions[j] as usize;
-            let frac = if a < 7 { gear[a] } else { 0.0 };
+            let frac = if a >= 7 {
+                0.0
+            } else if a >= 3 {
+                gear[a] * FINE_GEAR_MULT[j]
+            } else {
+                gear[a]
+            };
             // env v46: τ_max scaled per env (s = 1.0 is exact: bit-
             // identical to v45); same expression tree as the kernel
             self.tau[j] = frac * MODEL.tau_max[j] * self.tau_scale[j];

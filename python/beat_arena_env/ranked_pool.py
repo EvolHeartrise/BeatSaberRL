@@ -74,6 +74,54 @@ def _cache_path(ver, catalog_path, lead_s, mirror=False):
     return os.path.join(cdir, f"ranked_{key}.npz")
 
 
+def train_catalog_path(which="scoresaber"):
+    """The ranked-pool catalog file for train_batch --catalog. scoresaber
+    is the historical maps/scoresaber_catalog.json (unchanged path and
+    bytes, so its pool cache keys do not move); beatleader / both write
+    a derived SS-format catalog (hash, difficulty, SS leaderboard_id /
+    stars / max_pp where SS ranks the level, else -1 / 0 / 0) next to
+    it — deterministic bytes, so the npz cache key is stable."""
+    import json
+    import sys
+    ss = os.path.join(_BASE, "maps", "scoresaber_catalog.json")
+    if which == "scoresaber":
+        return ss
+    sys.path.insert(0, _BASE)
+    import bench_scoresaber as bs
+    bl = json.load(open(os.path.join(_BASE, "maps",
+                                     "beatleader_catalog.json"),
+                        encoding="utf-8"))
+    if which == "beatleader":
+        tasks = bs.merge_catalogs([], bl)
+    elif which == "both":
+        tasks = bs.merge_catalogs(
+            json.load(open(ss, encoding="utf-8")), bl)
+    else:
+        raise ValueError(f"unknown catalog {which!r}")
+    out = []
+    for m in tasks:
+        s = m["ss"]
+        out.append({"leaderboard_id": s["leaderboard_id"] if s else -1,
+                    "hash": m["hash"], "song": m["song"],
+                    "mapper": m["mapper"], "difficulty": m["difficulty"],
+                    "stars": s["stars"] if s else 0.0,
+                    "max_pp": s.get("max_pp", 0.0) if s else 0.0,
+                    "level_key": m["level_key"]})
+    path = os.path.join(_BASE, "maps", f"train_catalog_{which}.json")
+    data = json.dumps(out, sort_keys=True).encode()
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return path
+    except OSError:
+        pass
+    tmp = path + f".tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+
 def _tuple_note(t):
     # note_tuple order: (hit, x, y, color, angle, speed, any_dir, kind,
     # free_pre, free_post); col/row are dead when x/y are explicit
@@ -100,6 +148,19 @@ def _window_walls(wtups, lo, hi, base):
     return out
 
 
+def _payload_or_none(bs, entry, ver):
+    """bench_scoresaber.load_or_parse, or None when the level cannot be
+    loaded (the bench skips the same levels: maps BeatSaver no longer
+    serves, or files the parser cannot read — the BL catalog has a few)."""
+    try:
+        return bs.load_or_parse(entry, os.path.join(_BASE, "maps",
+                                                    "scoresaber"),
+                                os.path.join(_BASE, "maps", "chart_cache"),
+                                ver)
+    except Exception:
+        return None
+
+
 def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
     """One entry per level: notes with hit >= lead_s (rebased to song
     time 0, i.e. unchanged — the parser's 2.0-s first-note anchor is the
@@ -116,11 +177,12 @@ def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
     catalog = json.load(open(catalog_path, encoding="utf-8"))
     segments, seg_walls, dropped_sparse = [], [], 0
     meta = []   # env v47: (leaderboard_id, max_pp, max_score) per segment
+    n_fail = 0
     for i, entry in enumerate(catalog):
-        payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
-                                                       "scoresaber"),
-                                   os.path.join(_BASE, "maps",
-                                                "chart_cache"), ver)
+        payload = _payload_or_none(bs, entry, ver)
+        if payload is None:
+            n_fail += 1
+            continue
         tup = sorted(payload["tuples"], key=lambda t: t[0])
         wtups = sorted(payload.get("walls", []), key=lambda t: t[0])
         if not tup:
@@ -155,8 +217,8 @@ def _build_segments(catalog_path, log, lead_s=LEAD_S, mirror=False):
     n_wall_segs = sum(1 for w in seg_walls if w)
     n_max = max((len(sg) for sg in segments), default=0)
     log(f"[ranked-pool] {len(segments)} whole-level segments "
-        f"({n_wall_segs} with walls; dropped {dropped_sparse} sparse; "
-        f"max {n_max} objects)", flush=True)
+        f"({n_wall_segs} with walls; dropped {dropped_sparse} sparse, "
+        f"{n_fail} unloadable; max {n_max} objects)", flush=True)
     return segments, seg_walls, meta
 
 
@@ -183,10 +245,9 @@ def _level_meta(catalog_path, lead_s=LEAD_S, mirror=False):
     catalog = json.load(open(catalog_path, encoding="utf-8"))
     meta = []
     for entry in catalog:
-        payload = bs.load_or_parse(entry, os.path.join(_BASE, "maps",
-                                                       "scoresaber"),
-                                   os.path.join(_BASE, "maps",
-                                                "chart_cache"), ver)
+        payload = _payload_or_none(bs, entry, ver)
+        if payload is None:
+            continue
         tup = sorted(payload["tuples"], key=lambda t: t[0])
         if not tup or tup[-1][0] < lead_s:
             continue
