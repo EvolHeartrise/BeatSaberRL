@@ -37,7 +37,8 @@ class RustBeatEnv(gym.Env):
                  bomb_prob=0.125,
                  external_chart=None, gears=3, seed=0, *,
                  fall_const=5.0,
-                 external_walls=None, sim_dtype="f64"):
+                 external_walls=None, sim_dtype="f64",
+                 tick_hz=30, action_repeat=1):
         """external_chart: a fixed list[Note] (e.g. a parsed BeatSaver map)
         played on EVERY reset instead of procedural generation.
         external_walls: list[Wall] riding along (env v17, spec §12) —
@@ -47,7 +48,16 @@ class RustBeatEnv(gym.Env):
         sole corners (env v11), with the fall (root y below FALL_ROOT_Y,
         rust/src/lib.rs) and chest-tilt terminations. The retired v10
         foot-weld harness and its `foot_contact=` keyword were removed
-        2026-09-27 (issue #2); passing it is a TypeError."""
+        2026-09-27 (issue #2); passing it is a TypeError.
+
+        exp/tick-rate (2026-09-29): tick_hz = the sim's control rate
+        (30/60/120/240; physics substep fixed at 1/240 s, per-tick rules
+        rescaled to real time), action_repeat = sim ticks each step()
+        holds its action for (obs/done from the last of them, events
+        concatenated in tick order — the bench's step_into(repeat=N)).
+        Defaults are the 30 Hz regime, bit-identical to before. Every SIM
+        tick is recorded (the replay keeps the sim's own frame rate) and
+        the rate goes into the replay header (record_rev 6)."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),
@@ -76,8 +86,15 @@ class RustBeatEnv(gym.Env):
             from beat_arena_rs32 import RawBeatSim as Sim
         else:
             Sim = RawBeatSim
+        # max_steps is in 30 Hz ticks; the sim scales it to its rate
+        assert int(action_repeat) >= 1, action_repeat
         self.sim = Sim(max_steps=max_steps, gears=gears,
-                       fall_const=fall_const)
+                       fall_const=fall_const, tick_hz=int(tick_hz))
+        self.tick_hz = int(self.sim.tick_hz)
+        # python double 1/tick_hz (== the pre-tick-rate 1.0 / 30.0 at the
+        # default, so 30 Hz `time` stamps stay byte-identical)
+        self.dt = 1.0 / self.tick_hz
+        self.action_repeat = int(action_repeat)
         self.gears = gears
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the
         # v45 body); recorded in the replay header (record_rev 5)
@@ -122,7 +139,15 @@ class RustBeatEnv(gym.Env):
             # never as an error. 5 = header "tau_scale" (env v46, the 16
             # per-axis torque-limit scales this episode played with;
             # 2026-09-16) — a HEADER field, per-tick record unchanged.
-            "record_rev": 5,
+            # 6 = header "tick_hz" / "action_repeat" (exp/tick-rate,
+            # 2026-09-29): one JSONL line per SIM tick at tick_hz (tick k
+            # spans [k, k+1] / tick_hz s; `time` = k / tick_hz); absent =
+            # 30 / 1, the only regime before. (Readers also accept an
+            # "obs_window" flag, absent = false; this sim has no
+            # obs-window variant, so it is never written.)
+            "record_rev": 6,
+            "tick_hz": self.tick_hz,
+            "action_repeat": self.action_repeat,
             "tau_scale": [round(v, 6) for v in self.tau_scale],
             # env v15 (contact spec §10), ADDITIVE: the note track is
             # head-anchored — viewers must add head_z - PLANE_Z0 to
@@ -190,7 +215,7 @@ class RustBeatEnv(gym.Env):
         # driven straight off the .dat's head frame.
         self._record_lines.append(json.dumps({
             "t": self.sim.tick - 1,
-            "time": round(self.sim.time - 1.0 / 30.0, 5),
+            "time": round(self.sim.time - self.dt, 5),
             "q": [round(v, 5) for v in self.sim.qpos()],
             "twist": [round(v, 4) for v in self.sim.twist()],
             "omega": [round(v, 4) for v in self.sim.omega()],
@@ -251,15 +276,24 @@ class RustBeatEnv(gym.Env):
 
     def step(self, action):
         a = np.asarray(action).reshape(-1)
-        obs, reward, done, events = self.sim.step([int(x) for x in a])
-        if self._record_lines is not None:
-            self._record_tick(a, reward, events)
+        acts = [int(x) for x in a]
+        # action_repeat: hold the action for N sim ticks (stops early on
+        # done); reward summed, events concatenated in tick order
+        all_events, reward = [], 0.0
+        for _ in range(self.action_repeat):
+            obs, r, done, events = self.sim.step(acts)
+            reward += r
+            all_events.extend(events)
+            if self._record_lines is not None:
+                self._record_tick(a, r, events)
+                if done:
+                    with open(self._record_path, "w") as f:
+                        f.write("\n".join(self._record_lines) + "\n")
+                    self._record_lines = None
             if done:
-                with open(self._record_path, "w") as f:
-                    f.write("\n".join(self._record_lines) + "\n")
-                self._record_lines = None
+                break
         info = {"events": [(int(i), EVENT_REASONS[c], float(p))
-                           for i, c, p, _pre, _acc in events]}
+                           for i, c, p, _pre, _acc in all_events]}
         if done:
             pre, acc, post = self.sim.score_components()
             info.update(score_pre=pre, score_acc=acc, score_post=post)
