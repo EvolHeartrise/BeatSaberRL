@@ -65,7 +65,10 @@ def test_finish_slot_schema_and_full_combo():
                       "wrist_rev_per_s_l", "wrist_rev_per_s_r",
                       # review B09 (tests/test_bench_term.py)
                       "breaks", "wall_enters", "fell", "tilted",
-                      "envelope", "terminated_tick"}
+                      "envelope", "terminated_tick",
+                      # per-level torque (tests/test_bench_torque.py)
+                      "torque_nm", "torque_nm_spine", "torque_nm_arms",
+                      "torque_nm_legs", "torque_nms", "torque_per_tick"}
     assert r["score"] == 900 and r["accuracy"] == 0.9 and r["full_combo"]
     r2 = bs.finish_slot(slot, dict(info, good_cuts=9, misses=1),
                         (600.0, 6, 1))
