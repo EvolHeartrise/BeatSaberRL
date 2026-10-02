@@ -7,7 +7,7 @@
 //                     watch-only: no Flux WebXR game, no Flux replays (they
 //                     are refused with a message), no pose mode and no
 //                     file-picker button — see viz/app/src/lib/build.js.
-//   dist/r/*.jsonl.gz the published replays, pulled from the local replay
+//   dist/r/*.rpl.gz   the published replays, pulled from the local replay
 //                     store (NOT in git) that scripts/publish_replays.py
 //                     writes — only the files its manifest lists
 //   dist/_headers     caching
@@ -23,7 +23,7 @@
 //      the bench, or be written back into it with --write-back, and carry
 //      header.map);
 //   2. python viz/replays-site/scripts/publish_replays.py --model <public id>
-//        --bench <its published bench.json> --ckpt <its checkpoint> <jsonl...>
+//        --bench <its published bench.json> --ckpt <its checkpoint> <rpl.gz...>
 //   3. (cd ../app && npm run build:site) && node scripts/build.mjs
 //        && npx wrangler deploy                              (this dir)
 //   4. viz/site: npm run data && npm run deploy   (Watch links from the manifest)
@@ -38,7 +38,7 @@ const site = path.resolve(here, '..');
 const viewer = path.resolve(site, '../app/dist-site/index.html');
 const dist = path.join(site, 'dist');
 const MAX_BYTES = 25 * 1024 * 1024; // Cloudflare static assets, per file
-const NAME_RE = /^r\/[0-9a-f]{16}\.jsonl\.gz$/;
+const NAME_RE = /^r\/[0-9a-f]{16}\.rpl\.gz$/;
 
 let src = process.env.REPLAYS_STORE || path.join(os.homedir(), 'beat-arena-volume-backup/replays-site');
 for (let i = 2; i < process.argv.length; i++) {

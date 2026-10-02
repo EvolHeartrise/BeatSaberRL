@@ -3,12 +3,14 @@
 // header's tick_hz, a scrubbed tick shows tick / tick_hz seconds, playback
 // covers real time, the song stays locked to the replay clock, and loading
 // a 30 Hz replay afterwards puts the clock back at 30 ticks/s.
-// Run: node test/tickrate-browser.mjs <60hz-replay.jsonl> [30hz-replay.jsonl]
+// Run: node test/tickrate-browser.mjs <60hz-replay.rpl.gz> [30hz-replay.rpl.gz]
 // (one Chrome, SwiftShader — keep it to one run at a time on the laptop)
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { gunzipSync } from "node:zlib";
 import puppeteer from "puppeteer-core";
+import { decodeReplay } from "../src/lib/replay.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -23,12 +25,10 @@ function findBrowser() {
 const dist = resolve("dist/index.html");
 if (!existsSync(dist)) throw new Error("run `npm run build` first");
 const fast = process.argv[2] && resolve(process.argv[2]);
-if (!fast) throw new Error("usage: tickrate-browser.mjs <replay.jsonl> [30hz.jsonl]");
-const slow = resolve(process.argv[3] ?? "test/fixtures/v10_scripted_ep00_seed0.jsonl");
-const headerOf = (p) => {
-  const fd = readFileSync(p, "utf8");
-  return JSON.parse(fd.slice(0, fd.indexOf("\n"))).header;
-};
+if (!fast) throw new Error("usage: tickrate-browser.mjs <replay.rpl.gz> [30hz.rpl.gz]");
+const slow = resolve(process.argv[3] ?? "test/fixtures/v10_scripted_ep00_seed0.rpl.gz");
+const headerOf = (p) =>
+  decodeReplay(new Uint8Array(gunzipSync(readFileSync(p)))).header;
 const HZ = headerOf(fast).tick_hz ?? 30;
 if (HZ === 30) throw new Error(fast + " is a 30 Hz replay");
 

@@ -2,9 +2,8 @@
 // file -> a blob URL an <audio> element can play. No Svelte in here; the
 // playback wiring lives in App.svelte.
 //
-// A replay only knows which song it is if it was stamped by
-// python/annotate_replay_audio.py, which writes header.map =
-// {hash, difficulty, song, audio_offset_s}. audio_offset_s is the song time
+// A replay knows which song it is from header.map = {hash, difficulty,
+// song, audio_offset_s}, written by the recorders (rust_env.record_header). audio_offset_s is the song time
 // at replay t = 0 — recordings re-base the chart so the first note lands at
 // 2 s, which throws the song's clock away, and the observed offsets run from
 // -0.04 s to +19.6 s, so it is not a detail that can be guessed.

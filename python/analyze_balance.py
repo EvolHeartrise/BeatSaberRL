@@ -2,15 +2,16 @@
 body leans back + rides the right leg's extension stops because the
 lower body cannot hold itself upright actively).
 
-Per tick, from the JSONL: root pitch (lean), leg-joint limit-riding
+Per tick, from the replays: root pitch (lean), leg-joint limit-riding
 (within 0.5 deg of a stop), gear usage per leg joint, per-foot vertical
 reaction force. Statics computed separately from model.rs numbers.
 """
 
 import glob
-import json
 import math
 import sys
+
+from beat_arena_env.replay_format import read_replay
 
 # model.rs leg rows (q index = 7 + joint index; action index = joint index)
 LEG = {
@@ -36,7 +37,7 @@ def root_pitch(qw, qx, qy, qz):
                       1 - 2 * (qx * qx + qy * qy))
 
 files = sorted(glob.glob(sys.argv[1] if len(sys.argv) > 1
-                         else "replays/c2h_*.jsonl"))
+                         else "replays/c2h_*.rpl.gz"))
 ticks = 0
 pitch_sum = pitch_min = pitch_max = 0.0
 pitches = []
@@ -47,27 +48,24 @@ fy_l = fy_r = 0.0
 fy_l_only = 0        # ticks where |fy_r| carries >80% of vertical load
 
 for path in files:
-    with open(path) as f:
-        next(f)                              # header
-        for line in f:
-            d = json.loads(line)
-            q = d["q"]
-            ticks += 1
-            p = root_pitch(q[3], q[4], q[5], q[6])
-            pitches.append(p)
-            for j, (nm, lo, hi, _tm) in LEG.items():
-                qq = q[7 + j]
-                if qq - lo < EPS:
-                    at_lo[j] += 1
-                elif hi - qq < EPS:
-                    at_hi[j] += 1
-                gear_use[j][d["action"][j]] += 1
-            fl, fr = d["feet"][0][1], d["feet"][1][1]
-            fy_l += fl
-            fy_r += fr
-            tot = abs(fl) + abs(fr)
-            if tot > 1e-9 and abs(fr) / tot > 0.8:
-                fy_l_only += 1
+    for d in read_replay(path)[1]:
+        q = d["q"]
+        ticks += 1
+        p = root_pitch(q[3], q[4], q[5], q[6])
+        pitches.append(p)
+        for j, (nm, lo, hi, _tm) in LEG.items():
+            qq = q[7 + j]
+            if qq - lo < EPS:
+                at_lo[j] += 1
+            elif hi - qq < EPS:
+                at_hi[j] += 1
+            gear_use[j][d["action"][j]] += 1
+        fl, fr = d["feet"][0][1], d["feet"][1][1]
+        fy_l += fl
+        fy_r += fr
+        tot = abs(fl) + abs(fr)
+        if tot > 1e-9 and abs(fr) / tot > 0.8:
+            fy_l_only += 1
 
 pitches.sort()
 n = len(pitches)

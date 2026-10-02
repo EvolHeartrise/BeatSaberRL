@@ -1,9 +1,9 @@
-"""viz/replays-site/scripts/publish_replays.py (2026-10-02): compact
-.jsonl.gz replays keep their tick lines verbatim (only event lines are
-parsed), the store gets the same bytes as from the plain recording, each
-replay is written as it passes (a failing one is skipped, exit 1), and
---allow-mismatch publishes a replay whose play differs from the bench."""
-import gzip
+"""viz/replays-site/scripts/publish_replays.py on format-2 replays
+(2026-10-02): the score walk reads the event blocks alone, the published
+file keeps the column blocks verbatim under a sanitized header (named
+r/<id>.rpl.gz), each replay is written as it passes (a failing one is
+skipped, exit 1), and --allow-mismatch publishes a replay whose play
+differs from the bench."""
 import importlib.util
 import json
 import os
@@ -12,6 +12,7 @@ import sys
 import numpy as np
 import pytest
 
+from beat_arena_env import replay_format as rf
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
 from test_replay_batched import FIRST, LEVEL, MAP, _actions, _write_map
@@ -33,43 +34,23 @@ def recorded(tmp_path_factory):
     _write_map(tmp / "map")
     notes, meta = load_beatmap(str(tmp / "map"), "Expert", first_note_s=FIRST)
     env = RustBeatEnv(external_chart=notes, seed=0)
-    plain = str(tmp / "rep.jsonl")
+    path = str(tmp / "rep.rpl.gz")
     # a single-catalog bench's level identity (no level_key)
-    env.set_record(plain, map=MAP, level={**LEVEL, "level_key": None},
+    env.set_record(path, map=MAP, level={**LEVEL, "level_key": None},
                    model_hash=MH)
     env.reset()
     rng, k, done = np.random.default_rng(3), 0, False
     while not done:
         _, _, done, _, _ = env.step(_actions(k, rng))
         k += 1
-    lines = open(plain).read().split("\n")
-    compact = str(tmp / "rep.jsonl.gz")
-    with gzip.open(compact, "wt") as f:
-        for l in lines:
-            if l.strip():
-                f.write(json.dumps(json.loads(l), separators=(",", ":"))
-                        + "\n")
-    return {"tmp": tmp, "plain": plain, "compact": compact}
+    _, ticks = rf.read_replay(path)
+    return {"tmp": tmp, "path": path, "ticks": ticks}
 
 
-def test_compact_lines_kept_verbatim(recorded, monkeypatch):
-    plain = pr.read_lines(recorded["plain"])[1:]
-    compact = pr.read_lines(recorded["compact"])[1:]
-    parsed = []
-    real_loads = json.loads
-    monkeypatch.setattr(pr.json, "loads",
-                        lambda s: parsed.append(s) or real_loads(s))
-    a, ev_a = pr.clean_ticks(plain, set())
-    n_plain = len(parsed)
-    parsed.clear()
-    b, ev_b = pr.clean_ticks(compact, set())
-    assert a == b == compact and ev_a == ev_b and ev_a
-    assert n_plain == len(plain)
-    # compact: the first event-free line (proof) + the event lines only
-    assert len(parsed) == 1 + sum(1 for l in compact
-                                  if not l.endswith(',"events":[]}'))
-    assert pr.walk_events(ev_b) == pr.walk_events(
-        [json.loads(l) for l in plain])
+def test_events_only_is_the_full_decode(recorded):
+    meta, data = rf.unpack(rf.read_raw(recorded["path"]))
+    evs = rf.events_only(meta, data)
+    assert evs == [t["events"] for t in recorded["ticks"]] and any(evs)
 
 
 def _bench(tmp, got, score_delta=0):
@@ -94,33 +75,60 @@ def _publish(monkeypatch, store, bench, files, *extra):
     pr.main()
 
 
-def test_publish_plain_and_compact_same_bytes(recorded, monkeypatch,
-                                              tmp_path):
-    got = pr.walk_events([json.loads(l)
-                          for l in pr.read_lines(recorded["plain"])[1:]])
-    bench = _bench(recorded["tmp"], got)
-    blobs = []
-    for src in ("plain", "compact"):
-        store = tmp_path / src
-        _publish(monkeypatch, store, bench, [recorded[src]])
-        man = json.load(open(store / "manifest.json"))
-        rel = man["models"]["m"]["replays"]["7"]["file"]
-        blobs.append(open(store / rel, "rb").read())
-        assert not [f for f in os.listdir(store / "r") if ".tmp" in f]
-    assert blobs[0] == blobs[1]
-    head = json.loads(gzip.decompress(blobs[0]).split(b"\n")[0])["header"]
-    assert head["model"] == "m" and head["model_hash"] == "ab" * 6
+def _got(recorded):
+    return pr.walk_events(t["events"] for t in recorded["ticks"])
+
+
+def test_publish_sanitizes_header_keeps_blocks(recorded, monkeypatch,
+                                               tmp_path):
+    bench = _bench(recorded["tmp"], _got(recorded))
+    store = tmp_path / "s"
+    _publish(monkeypatch, store, bench, [recorded["path"]])
+    man = json.load(open(store / "manifest.json"))
+    rel = man["models"]["m"]["replays"]["7"]["file"]
+    assert rel.startswith("r/") and rel.endswith(".rpl.gz")
+    assert not [f for f in os.listdir(store / "r") if ".tmp" in f]
+    src_meta, src_data = rf.unpack(rf.read_raw(recorded["path"]))
+    meta, data = rf.unpack(rf.read_raw(str(store / rel)))
+    h = meta["header"]
+    assert h["model"] == "m" and h["model_hash"] == "ab" * 6
+    assert h["format"] == 2 and h["body"] == src_meta["header"]["body"]
+    assert meta["blocks"] == src_meta["blocks"] and data == src_data
+    # the published file decodes to the recorded ticks
+    assert rf.to_ticks(rf.decode(rf.read_raw(str(store / rel)))) == \
+        recorded["ticks"]
+    # byte-identical re-runs
+    blob = open(store / rel, "rb").read()
+    _publish(monkeypatch, tmp_path / "t", bench, [recorded["path"]])
+    assert open(tmp_path / "t" / rel, "rb").read() == blob
+
+
+def test_unknown_blocks_and_header_keys_dropped(recorded, monkeypatch,
+                                                tmp_path):
+    meta, data = rf.unpack(rf.read_raw(recorded["path"]))
+    meta["header"]["run_dir"] = "/workspace/secret"
+    meta["blocks"].append({"name": "debug", "dtype": "u8", "rows": 1,
+                           "len": 3})
+    path = str(tmp_path / "x.rpl.gz")
+    with open(path, "wb") as f:
+        f.write(rf.gz(rf.pack(meta, data + [b"abc"])))
+    bench = _bench(recorded["tmp"], _got(recorded))
+    _publish(monkeypatch, tmp_path / "s", bench, [path])
+    man = json.load(open(tmp_path / "s" / "manifest.json"))
+    rel = man["models"]["m"]["replays"]["7"]["file"]
+    m2, _ = rf.unpack(rf.read_raw(str(tmp_path / "s" / rel)))
+    assert "run_dir" not in m2["header"]
+    assert "debug" not in [b["name"] for b in m2["blocks"]]
 
 
 def test_mismatch_refused_unless_allowed(recorded, monkeypatch, tmp_path):
-    got = pr.walk_events([json.loads(l)
-                          for l in pr.read_lines(recorded["plain"])[1:]])
+    got = _got(recorded)
     bench = _bench(recorded["tmp"], got, score_delta=5)
     with pytest.raises(SystemExit):
-        _publish(monkeypatch, tmp_path / "s", bench, [recorded["compact"]])
+        _publish(monkeypatch, tmp_path / "s", bench, [recorded["path"]])
     man = json.load(open(tmp_path / "s" / "manifest.json"))
     assert man["models"]["m"]["replays"] == {}
-    _publish(monkeypatch, tmp_path / "s", bench, [recorded["compact"]],
+    _publish(monkeypatch, tmp_path / "s", bench, [recorded["path"]],
              "--allow-mismatch")
     man = json.load(open(tmp_path / "s" / "manifest.json"))
     assert man["models"]["m"]["replays"]["7"]["score"] == got["score"]
