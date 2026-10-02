@@ -50,6 +50,20 @@ if (!fs.existsSync(viewer)) throw new Error(`${viewer} missing: run \`npm run bu
 const html = fs.readFileSync(viewer, 'utf8');
 if (!html.includes('under /r/ on this site'))
 	throw new Error(`${viewer} predates URL loading (?replay=): rebuild viz/app`);
+if (!html.includes('like /r/0123456789abcdef.rpl.gz'))
+	throw new Error(`${viewer} predates replay format 2 (.rpl.gz): rebuild viz/app (npm run build:site)`);
+// a viewer older than any app source is a stale build: deploying it shipped a
+// viewer that refused every .rpl.gz link (2026-10-02)
+const newest = (dir) => {
+	let t = 0;
+	for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+		const p = path.join(dir, e.name);
+		t = Math.max(t, e.isDirectory() ? newest(p) : fs.statSync(p).mtimeMs);
+	}
+	return t;
+};
+if (fs.statSync(viewer).mtimeMs < newest(path.resolve(site, '../app/src')))
+	throw new Error(`${viewer} is older than viz/app/src: rebuild it (cd ../app && npm run build:site)`);
 // the site ships the watch-only viewer: a FULL build (viz/replay.html, or
 // dist/ from a plain `npm run build`) still has these
 for (const [mark, what] of [['play Flux', 'the Flux WebXR game'], ['🧍 pose', 'pose mode'],
