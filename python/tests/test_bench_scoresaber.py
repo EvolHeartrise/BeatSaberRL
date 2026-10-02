@@ -128,6 +128,32 @@ def test_max_multiplied_score_kinds():
     assert scoresaber.max_multiplied_score(chart[::-1]) == expected
 
 
+def test_max_score_arc_attached_chain_head_is_115():
+    """Scoring v4: a chain head that is also an arc head or tail is a
+    115-point note (ChainHeadArcHead / ChainHeadArcTail); a plain one 85."""
+    from dataclasses import replace
+    base = [Note(hit_time=1.0 + 0.1 * i, col=1, row=1, color=1, angle=0.0,
+                 speed=4.0) for i in range(20)]
+    head = Note(hit_time=5.0, col=1, row=1, color=1, angle=0.0, speed=4.0,
+                kind=KIND_CHAIN_HEAD)
+    plain = scoresaber.max_multiplied_score(base + [head])
+    for kw in ({"free_post": True}, {"free_pre": True}):
+        assert (scoresaber.max_multiplied_score(base + [replace(head, **kw)])
+                == plain + 30 * 8)
+
+
+def test_ss_result_uses_scoresabers_max_score():
+    """ScoreSaber accuracy is against its own API maxScore, not the env's
+    computed max (they differ on Bad Apple!!: arc-attached chain heads),
+    capped at 1."""
+    import bench_scoresaber as bs
+    e = {"leaderboard_id": 1, "stars": 10.0, "max_pp": 400.0,
+         "api_max_score": 1000}
+    assert bs.ss_result(e, 950, 1100)["accuracy"] == 0.95
+    assert bs.ss_result(e, 1050, 1100)["accuracy"] == 1.0
+    assert bs.ss_result(dict(e, api_max_score=None), 950, 1000)["accuracy"] == 0.95
+
+
 # ---------------------------------------------------------------------------
 # Catalog + map cache (network monkeypatched)
 # ---------------------------------------------------------------------------

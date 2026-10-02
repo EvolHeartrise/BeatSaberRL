@@ -116,7 +116,7 @@ from policy import load_policy
 # cut-plane accuracy (user-caught fix, 2026-07-29); 3 = REAL note speeds
 # (speed_scale removed 2026-07-30 — v1/v2 played maps at NJS*0.3, a
 # different physics regime). Results never merge across versions.
-SCORING_VERSION = 3
+SCORING_VERSION = 4
 
 # Termination flags of a finished level (review B09, 2026-09-30) — the
 # bits of lib.rs VecBeatSim::term and of the CUDA bench_rec col 18
@@ -649,7 +649,8 @@ def parser_version():
         h.update(f.read())
     for sym in (chart.Note, chart.note_tuple, chart.chain_links,
                 chart.Wall, chart.wall_tuple,
-                scoresaber.ComboTracker, scoresaber.max_multiplied_score):
+                scoresaber.ComboTracker, scoresaber.max_multiplied_score,
+                scoresaber.max_unit_points):
         h.update(inspect.getsource(sym).encode())
     h.update(repr(sorted(scoresaber.MAX_UNIT_POINTS.items())).encode())
     return h.hexdigest()[:10]
@@ -772,6 +773,10 @@ def finish_slot(slot, info, combo, tick_hz=30):
             "pass_pp": blr["pass_pp"],
             "acc_pp": blr["acc_pp"], "tech_pp": blr["tech_pp"]}
     else:                                     # --catalog scoresaber
+        # ScoreSaber's accuracy is against its own API maxScore (see
+        # ss_result); `env_accuracy` keeps the env's computed max
+        ss_max = entry.get("api_max_score") or slot["max_score"]
+        ss_acc = min(1.0, score / ss_max) if ss_max else 0.0
         head = {
             "leaderboard_id": entry["leaderboard_id"],
             "song_hash": entry["hash"], "song": entry["song"],
@@ -781,8 +786,9 @@ def finish_slot(slot, info, combo, tick_hz=30):
             "n_notes": info["n_notes"],
             "score": score, "max_score": slot["max_score"],
             "api_max_score": entry["api_max_score"],
-            "accuracy": round(acc, 5),
-            "pp": round(scoresaber.pp_value(acc, entry["max_pp"]), 2)}
+            "accuracy": round(ss_acc, 5),
+            "env_accuracy": round(acc, 5),
+            "pp": round(scoresaber.pp_value(ss_acc, entry["max_pp"]), 2)}
     return {
         **head,
         "good_cuts": info["good_cuts"], "bad_cuts": info["bad_cuts"],
@@ -815,9 +821,13 @@ def finish_slot(slot, info, combo, tick_hz=30):
 
 def ss_result(e, score, max_score):
     """ScoreSaber's view of one played level (`both` records): accuracy
-    against the computed full-combo max (== ScoreSaber's API maxScore,
-    validated) and pp = curve(acc) x maxPP."""
-    acc = score / max_score if max_score else 0.0
+    against ScoreSaber's own API maxScore (the computed full-combo max
+    when the catalog has none) and pp = curve(acc) x maxPP. The two maxes
+    agree on every SS level except chain maps (2026-10-02: Bad Apple!!,
+    where ScoreSaber prices arc-attached chain heads at 85 like BeatSaver
+    while the game grants 115); capped at 1 like BeatLeader's view."""
+    ss_max = e.get("api_max_score") or max_score
+    acc = min(1.0, score / ss_max) if ss_max else 0.0
     return {"leaderboard_id": e["leaderboard_id"], "stars": e["stars"],
             "max_pp": e["max_pp"], "api_max_score": e["api_max_score"],
             "accuracy": round(acc, 5),
@@ -827,12 +837,12 @@ def ss_result(e, score, max_score):
 def bl_result(e, score, max_score, failed=False):
     """BeatLeader's view of one played level. BL accuracy = score / the
     difficulty's maxScore (BeatLeader-Server ReplayUtils.ProcessReplay).
-    That maxScore equals the computed full-combo max on ~99% of
-    levels; on maps with chains BeatLeader's is HIGHER (it prices a
-    chain head like a full 115-point note: every 2026-09-30 mismatch is a
-    multiple of 30x8 pts), so the same play has a slightly lower BL
-    accuracy — BeatLeader's own rule, reproduced. No API maxScore: the
-    computed max. Capped at 1 (BeatLeader zeroes pp above 1; a real
+    That maxScore equals the computed full-combo max: BeatLeader prices
+    a chain head that is also an arc head/tail at 115 (the game's
+    ChainHeadArc* types), and so does the env since scoring v4
+    (2026-10-02; before it, the env scored those heads 85 and every
+    mismatch was a multiple of 30x8 pts). No API maxScore: the computed
+    max. Capped at 1 (BeatLeader zeroes pp above 1; a real
     play cannot exceed its own max). `failed` (the episode was cut
     short: fall, tilt, envelope or the max-steps cap) zeroes `pp` — a
     failed play earns nothing in the game, yet BL's pass term is
