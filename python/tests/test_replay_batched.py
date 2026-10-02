@@ -1,11 +1,10 @@
-"""Fast replay generation (2026-10-02): the VecBeatSim recorder + the
-columnar writer reproduce RustBeatEnv's per-tick recording, the header
-built up front equals the old stamp() rewrite, and make_replays_batched.py
-(batched sim + one fixed-width forward per step, CPU eager here) plays
-exactly what the single-env path plays at the same forward width — then
---write-back makes the source benches and the composite agree with it.
-CPU only, synthetic maps, a tiny random policy."""
-import gzip
+"""Fast replay generation (2026-10-02): the VecBeatSim recorder captures
+exactly what RustBeatEnv's recorder captures (the two format-2 files are
+byte-identical), and make_replays_batched.py (batched sim + one
+fixed-width forward per step, CPU eager here) plays exactly what the
+single-env path plays at the same forward width — then --write-back makes
+the source benches and the composite agree with it. CPU only, synthetic
+maps, a tiny random policy."""
 import json
 import os
 
@@ -17,8 +16,8 @@ import beat_arena_rs
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
 from beat_arena_env.constants import OBS_DIM
-from beat_arena_env.rust_env import (RustBeatEnv, record_header,
-                                     write_replay_jsonl)
+from beat_arena_env.replay_format import read_raw, read_replay, write_replay
+from beat_arena_env.rust_env import RustBeatEnv, record_header
 from test_convert_scoresaber import BOMB, NJS, RAW_NOTES
 
 FIRST = 0.35
@@ -26,9 +25,6 @@ MAP = {"hash": "ab" * 20, "difficulty": "Expert", "song": "fixture",
        "audio_offset_s": -0.5}
 LEVEL = {"level_key": "k", "characteristic": "Standard",
          "ss_leaderboard_id": 7, "bl_leaderboard_id": None}
-# decimals of each per-tick numeric field (RustBeatEnv._record_tick)
-DEC = {"time": 5, "q": 5, "twist": 4, "omega": 4, "sabers": 4, "head": 6,
-       "reward": 4, "feet": 4, "activation": 4, "torque": 3}
 
 
 def _write_map(d, shift_beats=0.0):
@@ -60,38 +56,18 @@ def _actions(k, rng):
     return a
 
 
-def _lines(path):
-    op = gzip.open if path.endswith(".gz") else open
-    with op(path, "rt") as f:
-        return [json.loads(l) for l in f if l.strip()]
-
-
-def _same_tick(a, b):
-    assert a.keys() == b.keys() and list(a) == list(b)
-    for key in ("t", "action", "events"):
-        assert a[key] == b[key], key
-    assert [c["pair"] for c in a["contacts"]] == \
-        [c["pair"] for c in b["contacts"]]
-    for ca, cb in zip(a["contacts"], b["contacts"]):
-        np.testing.assert_allclose(ca["p"] + [ca["j"]], cb["p"] + [cb["j"]],
-                                   rtol=0, atol=1.01e-4)
-    for key, d in DEC.items():
-        np.testing.assert_allclose(np.ravel(a[key]), np.ravel(b[key]),
-                                   rtol=0, atol=1.01 * 10.0 ** -d)
-
-
 def test_recorder_writer_matches_rust_env_recording(tmp_path):
     """60 Hz, action repeat 2, on a map with cuts: env 0 of a two-env
     VecBeatSim (env 1 at 30 Hz / repeat 1 alongside) records what
-    RustBeatEnv records for the same actions — every sim tick, same
-    fields, values equal up to last-digit rounding; the header line is
-    byte-identical; compact gzip parses to the same objects."""
+    RustBeatEnv records for the same actions — every sim tick: the two
+    format-2 files are byte-identical (and so deterministic), with the
+    full header written up front."""
     _write_map(tmp_path / "map")
     notes, meta = load_beatmap(str(tmp_path / "map"), "Expert",
                                first_note_s=FIRST)
     env = RustBeatEnv(external_chart=notes, external_walls=meta["walls"],
                       seed=0, tick_hz=60, action_repeat=2)
-    ref = str(tmp_path / "ref.jsonl")
+    ref = str(tmp_path / "ref.rpl.gz")
     env.set_record(ref, map=MAP, level=LEVEL, model_hash="sha256:ff")
     env.reset()
     max_steps = int((notes[-1].hit_time + 0.5) * 30) + 90
@@ -119,51 +95,28 @@ def test_recorder_writer_matches_rust_env_recording(tmp_path):
     head = record_header(tup, walls, tick_hz=60, action_repeat=2,
                          tau_scale=[1.0] * 16, gears=3, map=MAP,
                          level=LEVEL, model_hash="sha256:ff")
-    out = str(tmp_path / "new.jsonl")
-    n = write_replay_jsonl(out, head, rec)
-    with open(ref) as f, open(out) as g:
-        assert f.readline() == g.readline()      # header, byte for byte
-    want, got = _lines(ref), _lines(out)
-    assert n == len(want) - 1 == len(got) - 1 > 2 * (k - 1)
-    assert any(t["events"] for t in want[1:]), "fixture produced no events"
-    for a, b in zip(want[1:], got[1:]):
-        _same_tick(a, b)
-    gz = str(tmp_path / "new.jsonl.gz")
-    write_replay_jsonl(gz, head, rec, compact=True, gzip_level=6)
-    assert _lines(gz) == got
-    raw = gzip.decompress(open(gz, "rb").read()).decode()
-    assert ", " not in raw.split("\n", 1)[1]     # compact tick lines
-    write_replay_jsonl(str(tmp_path / "b.jsonl.gz"), head, rec, compact=True,
-                       gzip_level=6)
-    assert open(gz, "rb").read() == open(tmp_path / "b.jsonl.gz",
-                                         "rb").read()   # deterministic
+    out = str(tmp_path / "new.rpl.gz")
+    stats = {}
+    n = write_replay(out, head, rec, stats=stats)
+    assert open(ref, "rb").read() == open(out, "rb").read()
+    h, ticks = read_replay(out)
+    assert n == len(ticks) > 2 * (k - 1)
+    assert [t["t"] for t in ticks] == list(range(n))
+    assert any(t["events"] for t in ticks), "fixture produced no events"
+    assert (h["map"], h["level"], h["model_hash"]) == (MAP, LEVEL,
+                                                       "sha256:ff")
+    assert h["format"] == 2 and h["tick_hz"] == 60
+    assert h["action_repeat"] == 2
+    # every derived field reproduced within tolerance: nothing stored
+    assert stats["stored"] == [], stats
+    assert stats["activation"] < 1e-9 and stats["torque"] < 1e-9
+    write_replay(str(tmp_path / "b.rpl.gz"), head, rec)
+    assert read_raw(out) == read_raw(str(tmp_path / "b.rpl.gz"))
     # the recorder keeps running empty after a take; off = an error
     assert len(sim.take_record_env(0)["tick"]) == 0
     sim.set_record_env(0, False)
     with pytest.raises(RuntimeError):
         sim.take_record_env(0)
-
-
-def test_header_up_front_equals_the_stamp_rewrite(tmp_path):
-    from annotate_replay_audio import stamp
-    _write_map(tmp_path / "map")
-    notes, meta = load_beatmap(str(tmp_path / "map"), "Expert",
-                               first_note_s=FIRST)
-    paths = []
-    for name, extra in (("a", {}), ("b", {"map": MAP, "level": LEVEL,
-                                          "model_hash": "sha256:ff"})):
-        env = RustBeatEnv(external_chart=notes, seed=0)
-        p = str(tmp_path / f"{name}.jsonl")
-        env.set_record(p, **extra)
-        env.reset()
-        done = False
-        while not done:
-            _, _, done, _, _ = env.step(np.zeros(29, dtype=np.int64))
-        paths.append(p)
-    stamp(paths[0], MAP["hash"], MAP["difficulty"], MAP["song"],
-          MAP["audio_offset_s"],
-          extra={"level": LEVEL, "model_hash": "sha256:ff"})
-    assert open(paths[0]).read() == open(paths[1]).read()
 
 
 def test_vec_beat_sim_rate_args_validated():
@@ -276,8 +229,7 @@ def test_batched_tool_matches_single_env_and_writes_back(tmp_path,
     assert picks == want
     for r in res:
         src, job = r["job"]["src"], r["job"]
-        lines = _lines(r["write"]["out"])
-        h = lines[0]["header"]
+        h, ticks = read_replay(r["write"]["out"])
         assert h["tick_hz"] == src.tick_hz and h["tau_scale"] == tau
         assert h["map"]["hash"] == job["row"]["song_hash"]
         assert h["level"]["level_key"] == job["row"]["level_key"]
@@ -285,7 +237,7 @@ def test_batched_tool_matches_single_env_and_writes_back(tmp_path,
         # batched play == single-env play at the same forward width
         acts, counts = _single_env_play(job["payload"], tau, src.tick_hz,
                                         src.repeat, policy)
-        assert [t["action"] for t in lines[1:]] == acts
+        assert [t["action"] for t in ticks] == acts
         assert counts == (r["row"]["good_cuts"], r["row"]["bad_cuts"],
                           r["row"]["misses"])
     # write-back: sources and composite now hold the replays' plays

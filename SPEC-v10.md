@@ -579,6 +579,15 @@ are unchanged.
 
 ## 6. Replay v10 (JSONL)
 
+**Since 2026-10-02 the FILE is replay format 2** (`<name>.rpl.gz`, layout in
+`python/beat_arena_env/replay_format.py`; header `"format": 2` + `"body"`):
+gzip around a JSON header and integer column blocks. The per-tick record
+below is now the IN-MEMORY tick both decoders rebuild (Python `read_replay`,
+the viewer's `decodeReplay`), with `feet` = `[[jx, jy, jz], [jx, jy, jz]]`
+and `sabers` / `head` / `activation` / `torque` derived from `q` (FK) and
+`action` x `header.body`. JSONL replay files are no longer read (Flux runs
+excepted).
+
 Header line: `{"header": {"version": "v10", "record_rev": 2,
 "config": {...}, "chart": [...]}}` — chart entries unchanged from v7+.
 Viewers reject non-"v10" versions (all v9 replays/checkpoints retire,

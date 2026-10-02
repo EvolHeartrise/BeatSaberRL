@@ -8,7 +8,8 @@
 //   - a Flux replay (header "game": "flux") is refused with a clear message
 //     and nothing renders.
 // Playback itself (real time, song) is test/urlload-browser.mjs's job.
-// Run: node test/site-browser.mjs <base-url> </r/replay.jsonl.gz> [</r/flux.jsonl.gz>]
+// Run: node test/site-browser.mjs <base-url> </r/replay.rpl.gz> [</r/flux.rpl.gz>]
+// (the Flux file: a gzipped Flux JSONL served under a .rpl.gz name)
 // (one Chrome, SwiftShader — keep it to one run at a time on the laptop)
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -26,7 +27,7 @@ function findBrowser() {
   throw new Error("no browser found: set PUPPETEER_EXECUTABLE_PATH");
 }
 const [base, path, fluxPath] = process.argv.slice(2);
-if (!base || !path) throw new Error("usage: site-browser.mjs <base-url> </r/file.jsonl.gz> [</r/flux.jsonl.gz>]");
+if (!base || !path) throw new Error("usage: site-browser.mjs <base-url> </r/file.rpl.gz> [</r/flux.rpl.gz>]");
 const url = (p) => `${base.replace(/\/$/, "")}/?replay=${encodeURIComponent(p)}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fail = (m) => { throw new Error(m); };

@@ -2,7 +2,7 @@
 // on the built viewer: loads a replay into dist/index.html, scrubs to a few
 // ticks and screenshots them in the orbit and first-person cameras, into
 // test/out/hud-*.png. Fails on page errors.
-// Run: npm run build && node test/hud-browser.mjs <replay.jsonl> [tick ...]
+// Run: npm run build && node test/hud-browser.mjs <replay.rpl.gz> [tick ...]
 // (one Chrome, SwiftShader — keep it to one run at a time on the laptop)
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -20,7 +20,7 @@ function findBrowser() {
   throw new Error("no browser found: set PUPPETEER_EXECUTABLE_PATH");
 }
 const dist = resolve("dist/index.html");
-const replay = resolve(process.argv[2] ?? "test/fixtures/v10_scripted_ep00_seed0.jsonl");
+const replay = resolve(process.argv[2] ?? "test/fixtures/v10_scripted_ep00_seed0.rpl.gz");
 const ticks = process.argv.slice(3).map(Number);
 if (!ticks.length) ticks.push(60, 200);
 if (!existsSync(dist)) throw new Error("run `npm run build` first");

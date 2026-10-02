@@ -4,14 +4,14 @@ built from (viz/replays-site; the store itself is NOT in git).
     python viz/replays-site/scripts/publish_replays.py \\
         --model v60-60hz --bench <bench.json> --ckpt <leaf.pt> \\
         [--store ~/beat-arena-volume-backup/replays-site] [--jobs N] \\
-        [--allow-mismatch] replays/*.jsonl[.gz]
+        [--allow-mismatch] replays/*.rpl.gz
 
 Run it with the repo's python venv (it needs torch to hash the checkpoint,
 and python/ for the score walk).
 
-For each replay (a make_top10_replays.py recording, or a compact .jsonl.gz
-from make_replays_batched.py; header.map written by the recorder or stamped
-by annotate_replay_audio.py):
+For each replay (a format-2 .rpl.gz from make_replays_batched.py or
+make_top10_replays.py — python/beat_arena_env/replay_format.py; header.map
+written by the recorder):
 
   1. MATCH it to the bench it must be linked from. The weights hash of
      --ckpt must equal the bench's model_hash (and the header's, if it has
@@ -27,15 +27,14 @@ by annotate_replay_audio.py):
      on disk, i.e. the written-back one).
   2. SANITIZE it. The header is rebuilt from an allow-list (what playback
      needs plus harmless metadata), then gains `model` (the PUBLIC id) and
-     `model_hash` (a 12-hex prefix of the weights hash). Tick lines keep
-     only the per-tick fields the viewer reads. Everything dropped is
-     printed. Checkpoint paths, run names, bench file names and pod paths
-     never reach the store: none of them is on the allow-list.
-  3. WRITE r/<16 hex>.jsonl.gz (gzip -6, no name, mtime 0: byte-identical
+     `model_hash` (a 12-hex prefix of the weights hash). Only the column
+     blocks the decoders know are kept, verbatim (the score walk decodes
+     the event blocks alone). Everything dropped is printed. Checkpoint
+     paths, run names, bench file names and pod paths never reach the
+     store: none of them is on the allow-list.
+  3. WRITE r/<16 hex>.rpl.gz (gzip -6, no name, mtime 0: byte-identical
      re-runs; each file as soon as it passes, files checked in parallel
-     with --jobs). An already-compact .jsonl.gz (make_replays_batched.py)
-     keeps its tick lines verbatim: only lines carrying events are parsed
-     (for the score walk). The name is sha256("<model_hash>|<tick_hz>|<action_repeat>|
+     with --jobs). The name is sha256("<model_hash>|<tick_hz>|<action_repeat>|
      <obs_window 0/1>|<leaderboard_id>")[:16]: opaque on purpose — ad-block
      lists match URL substrings, and a model id like "v60" in a path got
      results/v60.json blocked by EasyPrivacy's `/v60.js` rule. It has to
@@ -68,7 +67,6 @@ rates / bodies, so its replays have no single rate. For a composite:
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
 import os
@@ -78,21 +76,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "python"))
 
+from beat_arena_env import replay_format as rf  # noqa: E402
+
 MAX_BYTES = 25 * 1024 * 1024          # Cloudflare static assets, per file
 DEFAULT_STORE = os.path.expanduser("~/beat-arena-volume-backup/replays-site")
 
 # what the viewer's parseReplay reads, plus harmless run metadata
-HEADER_KEYS = ["version", "record_rev", "tick_hz", "action_repeat",
-               "obs_window", "tau_scale", "track_anchor", "config", "chart",
-               "walls", "map", "level", "game", "player"]
+HEADER_KEYS = ["version", "format", "record_rev", "tick_hz",
+               "action_repeat", "obs_window", "tau_scale", "body",
+               "track_anchor", "config", "chart", "walls", "map", "level",
+               "game", "player"]
 MAP_KEYS = ["hash", "difficulty", "song", "audio_offset_s"]
 LEVEL_KEYS = ["level_key", "characteristic", "ss_leaderboard_id",
               "bl_leaderboard_id"]
 CONFIG_KEYS = ["chart_len_s", "colors", "note_speed_min", "note_speed_max",
                "note_prob", "extra_prob", "dot_prob", "bomb_prob", "gears",
                "handle_len"]
-TICK_KEYS = ["t", "time", "q", "twist", "omega", "sabers", "head", "action",
-             "reward", "contacts", "feet", "activation", "torque", "events"]
+# the column blocks the decoders read (replay_format.py)
+BLOCK_KEYS = ["omega", "q", "twist", "feet", "reward", "action", "sabers",
+              "head", "activation", "torque", "contact_n", "contact_pair",
+              "contact_p", "contact_j", "event_n", "event_code", "event_note",
+              "event_val"]
 
 
 def file_id(model_hash, tick_hz, repeat, obs_window, leaderboard_id):
@@ -113,15 +117,15 @@ def weights_hash(ckpt_path):
     return model_hash(ck["state_dict"])
 
 
-def walk_events(ticks):
-    """Replay tallies from the recorded events (the viewer's event form)
-    through the bench's own multiplied-score walk."""
+def walk_events(tick_events):
+    """Replay tallies from the recorded per-tick event lists (the viewer's
+    event form) through the bench's own multiplied-score walk."""
     from beat_arena_env.scoresaber import ComboTracker
     walk = ComboTracker()
     good = bad = miss = bombs = 0
-    for t in ticks:
+    for events in tick_events:
         evs = []
-        for e in t["events"]:
+        for e in events:
             if "cut" in e:
                 c = e["cut"]
                 if c["good"]:
@@ -211,38 +215,6 @@ def _init(ctx):
     _CTX.update(ctx)
 
 
-def read_lines(path):
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as f:
-        return [l for l in f.read().split("\n") if l.strip()]
-
-
-def clean_ticks(lines, dropped):
-    """(compact tick lines with only TICK_KEYS, the parsed ticks that carry
-    events). Fast path: a line that is already compact, starts like a
-    replay tick and ends with an empty event list is kept verbatim once
-    the first such line proved the file's lines are exactly TICK_KEYS in
-    order (make_replays_batched.py output) — no per-tick parse."""
-    out, with_events = [], []
-    fast = None                     # unknown until the first candidate
-    tail = ',"events":[]}'
-    for line in lines:
-        cand = (fast is not False and line.endswith(tail)
-                and line.startswith('{"t":') and " " not in line)
-        if cand and fast:
-            out.append(line)
-            continue
-        t = json.loads(line)
-        if t["events"]:
-            with_events.append(t)
-        c = json.dumps(pick(t, TICK_KEYS, "tick.", dropped),
-                       separators=(",", ":"))
-        if cand:                    # first candidate decides the fast path
-            fast = list(t) == TICK_KEYS and c == line
-        out.append(c)
-    return out, with_events
-
-
 def check_one(path):
     """Verify + sanitize one replay and write it to a temp file in the
     store. Returns a plan dict, or {"name", "error"}."""
@@ -256,18 +228,21 @@ def check_one(path):
 def _check_one(path, name):
     c = _CTX
     bench, comp, mhash = c["bench"], c["comp"], c["mhash"]
-    lines = read_lines(path)
-    h = json.loads(lines[0])["header"]
+    meta, data = rf.unpack(rf.read_raw(path))
+    h = meta["header"]
     err = lambda msg: {"name": name, "error": msg}
     if h.get("version") != "v10":
         return err(f"replay version {h.get('version')}")
+    if h.get("format") != rf.FORMAT:
+        return err(f"replay format {h.get('format')} (need {rf.FORMAT})")
     if h.get("model_hash") and h["model_hash"] not in (mhash, mhash.replace("sha256:", "")):
         return err(f"header model_hash {h['model_hash']} != {mhash}")
     if not comp and rate_of(h) != c["brate"]:
         return err(f"rate {rate_of(h)} != bench {c['brate']}")
     m = h.get("map")
     if not m:
-        return err("no header.map — run python/annotate_replay_audio.py")
+        return err("no header.map (record with map=..., as the replay "
+                   "tools do)")
     cands = c["levels"].get((m["hash"].lower(), m["difficulty"]), [])
     lk = (h.get("level") or {}).get("level_key")
     if lk:
@@ -278,9 +253,7 @@ def _check_one(path, name):
         return err(f"{len(cands)} bench levels for {m['hash']} {m['difficulty']}")
     e = cands[0]
     dropped = set()
-    ticks, with_events = clean_ticks(lines[1:], dropped)
-    del lines
-    got = walk_events(with_events)
+    got = walk_events(rf.events_only(meta, data))
     picks, warn = None, None
     if comp:
         picks = composite_matches(bench, e, h, got)
@@ -308,14 +281,19 @@ def _check_one(path, name):
                       f"{e['level_key']}|{body_key(h.get('tau_scale'))}")
     else:
         fid = file_id(mhash, *c["brate"], e["leaderboard_id"])
-    text = json.dumps({"header": header}, separators=(",", ":")) + "\n" + \
-        "\n".join(ticks) + "\n"
-    del ticks
-    blob = gzip.compress(text.encode(), 6, mtime=0)
-    del text
+    keep = []
+    for i, b in enumerate(meta["blocks"]):
+        if b["name"] in BLOCK_KEYS:
+            keep.append(i)
+        else:
+            dropped.add(f"block.{b['name']}")
+    blob = rf.gz(rf.pack({"header": header, "ticks": meta["ticks"],
+                          "blocks": [meta["blocks"][i] for i in keep]},
+                         [data[i] for i in keep]), 6)
+    del data
     if len(blob) >= MAX_BYTES:
         return err(f"{len(blob)} bytes gzipped, over the 25 MiB asset limit")
-    tmp = os.path.join(c["store"], "r", f".{fid}.jsonl.gz.tmp{os.getpid()}")
+    tmp = os.path.join(c["store"], "r", f".{fid}{rf.EXT}.tmp{os.getpid()}")
     with open(tmp, "wb") as f:
         f.write(blob)
     keep = {k: h.get(k) for k in ("tick_hz", "action_repeat", "obs_window",
@@ -410,7 +388,7 @@ def main():
             failed.append(name)
             print(f"error: {name}: {r['error']}", flush=True)
             continue
-        fid, rel = r["fid"], f"r/{r['fid']}.jsonl.gz"
+        fid, rel = r["fid"], f"r/{r['fid']}{rf.EXT}"
         problem = (f"a second replay of the same level, rate and body in "
                    f"this batch" if fid in done_fids else
                    f"{rel} belongs to another model" if rel in others

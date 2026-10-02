@@ -7,34 +7,27 @@
 // Hz tick's end (k+1)/30 s. So at any real time the two replays must show
 // the same scene: same pose, same flying notes, same outcomes / popups /
 // contacts, same track offset. Run: node test/tickrate.test.js
-import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import * as R from "../src/lib/replay.js";
 import { FOLLOW_SNAP, followClock } from "../src/lib/sync.js";
+import { FIXTURE, readReplayFile } from "./fixture.js";
 
-const text = readFileSync(
-  new URL("./fixtures/v10_scripted_ep00_seed0.jsonl", import.meta.url), "utf8");
-const lines = text.split("\n").filter((l) => l.trim());
+const bytes = readReplayFile(FIXTURE);
+const { header, ticks } = R.decodeReplay(bytes);
 
 // ---- header parsing ----------------------------------------------------------
-const rep30 = R.parseReplay(text);
+const rep30 = R.parseReplay(bytes);
 assert.equal(rep30.tickHz, 30, "absent tick_hz = 30");
 assert.equal(R.tickHzOf(rep30), 30);
 assert.equal(R.tickHzOf(null), 30, "no replay = 30");
 assert.equal(R.tickHzOf({ ticks: [] }), 30, "human/synthetic reps = 30");
-{
-  const h = JSON.parse(lines[0]);
-  h.header.tick_hz = "bogus";
-  assert.throws(() => R.parseReplay([JSON.stringify(h), ...lines.slice(1)].join("\n")));
-}
+assert.throws(() => R.replayFromParts({ ...header, tick_hz: "bogus" }, ticks));
 
 // ---- the 60 Hz upsample ------------------------------------------------------
 const mid = (a, b) => a.map((v, i) => Array.isArray(v) ? mid(v, b[i]) : (v + b[i]) / 2);
 function upsample() {
-  const head = JSON.parse(lines[0]);
-  head.header.tick_hz = 60;
-  head.header.action_repeat = 1;
-  const t30 = lines.slice(1).map((l) => JSON.parse(l));
+  const head = { ...header, tick_hz: 60, action_repeat: 1 };
+  const t30 = ticks;
   const out = [];
   t30.forEach((t, k) => {
     const nxt = t30[Math.min(k + 1, t30.length - 1)];
@@ -49,9 +42,9 @@ function upsample() {
       feet: t.feet, events: t.events, contacts: t.contacts,
     });
   });
-  return [JSON.stringify(head), ...out.map((t) => JSON.stringify(t))].join("\n");
+  return R.replayFromParts(head, out);
 }
-const rep60 = R.parseReplay(upsample());
+const rep60 = upsample();
 assert.equal(rep60.tickHz, 60);
 assert.equal(rep60.ticks.length, 2 * rep30.ticks.length);
 assert.equal(R.tickHzOf(rep60), 60);

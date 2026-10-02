@@ -6,7 +6,8 @@
 For each top play: greedy re-rollout with the bench protocol (cached
 map, real NJS speeds, seed 0) in the bench's own regime — its sim dtype
 (f32 by default), its forward batch width via the bench's graphed
-argmax, and its recorded body (tau_scale) — recording JSONL, verify the outcome
+argmax, and its recorded body (tau_scale) — recording a format-2 replay
+(<name>.rpl.gz, beat_arena_env/replay_format.py), verify the outcome
 counters and multiplied score against the bench entry, and (--dat,
 opt-in since 2026-10-02) convert to a ScoreSaber .dat and verify the
 decode. Deterministic sim ⇒ exact. A failing play is reported and the
@@ -247,7 +248,7 @@ def _make_one_inner(job):
     # did to the clock; -shift is the song time at replay t=0), the level
     # identity and the weights hash — written into the header up front
     # (2026-10-02; was a stamp() rewrite of the finished file)
-    env.set_record(base + ".jsonl",
+    env.set_record(base + ".rpl.gz",
                    map={"hash": entry["song_hash"],
                         "difficulty": entry["difficulty"],
                         "song": entry["song"],
@@ -294,13 +295,13 @@ def _make_one_inner(job):
                 f"(near-tie drift; replay is self-consistent)")
 
     # ScoreSaber .dat + decode check: opt-in (--dat, 2026-10-02) — the
-    # replay site plays the JSONL; the .dat is for watch.scoresaber.com
-    out = base + ".jsonl"
+    # replay site plays the .rpl.gz; the .dat is for watch.scoresaber.com
+    out = base + ".rpl.gz"
     if dat:
         sys.path.insert(0, os.path.join(os.path.dirname(
             os.path.abspath(__file__)), "tests"))
         from test_convert_scoresaber import decode_dat
-        conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
+        conv.convert(base + ".rpl.gz", map_dir, entry["song_hash"],
                      entry["difficulty"], base + ".dat")
         d = decode_dat(base + ".dat")
         assert d["final_score"] == round(walk.score), \
@@ -358,7 +359,7 @@ def main():
     p.add_argument("--dat", action="store_true",
                    help="also convert each replay to a ScoreSaber .dat and "
                         "decode-check it (off by default since 2026-10-02: "
-                        "the replay site plays the JSONL)")
+                        "the replay site plays the .rpl.gz)")
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
