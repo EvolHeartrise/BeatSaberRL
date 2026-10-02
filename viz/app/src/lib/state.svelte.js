@@ -110,13 +110,14 @@ export function setRep(rep) {
   pb.rep = rep;
 }
 
-/** Make `text` the active replay. `name` is a file name (its extension is
+/** Make `data` (parseReplay's input: format-2 replay bytes, or a Flux
+ * run's JSONL text) the active replay. `name` is a file name (its extension is
  * dropped for display) unless `opts.title` gives the display name outright
  * (a function of the parsed replay, or a string). `opts.play` = false opens
  * it paused: a replay opened from a link has had no user gesture yet, and
  * the song could not start with it. */
-export function loadText(text, name, opts = {}) {
-  const rep = parseReplay(text); // throws with a useful message on bad input
+export function loadReplay(data, name, opts = {}) {
+  const rep = parseReplay(data); // throws with a useful message on bad input
   // the site build (replays.flee.systems) plays agent Beat Saber replays only
   if (!FLUX && isFlux(rep)) throw new Error("Flux replays aren't supported on this site");
   setRep(rep);
@@ -128,7 +129,7 @@ export function loadText(text, name, opts = {}) {
   audio.song = rep.map?.song ?? "";
   audio.offset = rep.map?.audio_offset_s ?? 0;
   audio.status = rep.map ? "loading" : "none";
-  audio.msg = rep.map ? "" : "no map in this replay — annotate_replay_audio.py";
+  audio.msg = rep.map ? "" : "no map in this replay";
 }
 
 export function setPlaying(p) {

@@ -1,11 +1,11 @@
-"""Dead-gear census over replay .jsonl files (the Dead Gear Census artifact's
+"""Dead-gear census over replay .rpl.gz files (the Dead Gear Census artifact's
 data). Per joint: share of ticks on each gear id (0 coast, 1 +1.0, 2 -1.0,
 3 +1/4, 4 -1/4 of tau_max), the mean |tau| the gear choices imply (gear
 fraction x TAU_MAX x the replay's tau_scale for that axis), group summaries,
 and the count of (joint, gear) cells under 1% use. Cross-checks the
 gear-derived total against the replay's own torque telemetry.
 
-  python tools/gear_census.py --out census.json replays/v51_cd400_lf2_toppp*.jsonl
+  python tools/gear_census.py --out census.json replays/v51_cd400_lf2_toppp*.rpl.gz
 """
 import argparse
 import importlib.util
@@ -23,6 +23,8 @@ _spec.loader.exec_module(_c)
 TAU_MAX = np.asarray(_c.TAU_MAX, dtype=np.float64)
 TAU_AXIS_OF_JOINT = list(_c.TAU_AXIS_OF_JOINT)
 GEAR = np.asarray(_c.gear_table(5))
+sys.path.insert(0, PY)
+from beat_arena_env.replay_format import decode, read_raw  # noqa: E402
 
 JOINTS = (["spine pitch", "spine yaw", "spine roll"]
           + [f"{s} {n}" for s in ("L", "R") for n in
@@ -48,18 +50,13 @@ def main():
     n_ticks = 0
     per_file = []
     for f in a.files:
-        acts = []
-        with open(f) as fh:
-            hdr = json.loads(fh.readline())["header"]
-            ts = hdr.get("tau_scale") or [1.0] * 16
-            if tau_scale is None:
-                tau_scale = ts
-            assert list(ts) == list(tau_scale), (f, ts)
-            for line in fh:
-                r = json.loads(line)
-                acts.append(r["action"])
-                tele += np.asarray(r["torque"], dtype=np.float64)
-        acts = np.asarray(acts, dtype=np.int64)
+        d = decode(read_raw(f))
+        ts = d["header"].get("tau_scale") or [1.0] * 16
+        if tau_scale is None:
+            tau_scale = ts
+        assert list(ts) == list(tau_scale), (f, ts)
+        acts = d["action"].astype(np.int64)
+        tele += d["torque"].sum(axis=0)
         for j in range(29):
             counts[j] += np.bincount(acts[:, j], minlength=5)
         n_ticks += len(acts)

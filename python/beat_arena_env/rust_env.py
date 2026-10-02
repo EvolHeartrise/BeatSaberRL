@@ -1,9 +1,9 @@
 """Gymnasium env over the Rust sim core — THE single-env implementation.
 
 Env v10 (P3): the body is the SPEC-v10 dynamic humanoid — 29 gear-id
-action heads (SPEC-v10 §1.4 joint order), obs 340 (§5), replay JSONL
-v10 (§6: q36 + root twist + omega29 + per-hand FK sabers + contact
-events with pair ids). Chart generation stays in Python (once per
+action heads (SPEC-v10 §1.4 joint order), obs 340 (§5), replays in
+format 2 (replay_format.py: q36 + root twist + omega29 + contacts with
+pair ids + score events). Chart generation stays in Python (once per
 episode); physics, cut logic, scoring, and obs building live in
 rust/src/lib.rs. Per-step cut/miss events come back from Rust and are
 exposed in `info["events"]` as (note_idx, reason, points) tuples.
@@ -14,17 +14,110 @@ Build the extension once with:
 
 from __future__ import annotations
 
-import json
-
 import gymnasium as gym
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
-from .constants import (TAU_FEAT, HANDLE_LEN, 
-    EVENT_REASONS, N_JOINTS, OBS_DIM, note_center,
+from .constants import (TAU_FEAT, HANDLE_LEN,
+    EVENT_REASONS, N_JOINTS, OBS_DIM,
 )
 
+from . import replay_format
 from beat_arena_rs import RawBeatSim
+
+
+def record_header(chart, walls, *, tick_hz, action_repeat, tau_scale, gears,
+                  cfg=None, map=None, level=None, model_hash=None):
+    """The replay header object (SPEC-v10 §6; replay_format.py), shared
+    by RustBeatEnv's recorder and the batched writer
+    (make_replays_batched.py). chart / walls are the sim's note_tuple /
+    wall_tuple tuples; cfg the ChartConfig (default: RustBeatEnv's);
+    tau_scale the 16 per-axis torque-limit scales the sim plays with.
+    map ({hash, difficulty, song, audio_offset_s}: the viewer fetches
+    the song's audio with it), level (level identity) and model_hash
+    (weights hash) are optional."""
+    cfg = cfg if cfg is not None else ChartConfig()
+    head = {
+        "version": "v10",     # env v10 body: viewers reject others
+        # replay file format (replay_format.py): 2 = the compact binary
+        # replay, the only one (the gzip-JSONL format 1 was retired
+        # 2026-10-02)
+        "format": replay_format.FORMAT,
+        # RECORD-SCHEMA revision, additive-only (SPEC-v10 §6).
+        # "version" names the BODY generation and is hard-gated
+        # ("v10" exactly) by viz/app/src/lib/replay.js and
+        # convert_scoresaber.py, so bumping it to advertise a new
+        # per-tick FIELD would retire every reader for no reason —
+        # schema growth is versioned here instead. Absent/1 = the
+        # pre-2026-08-13 record (no "head"); 2 = per-tick "head"
+        # (FK head pose) present on every tick; 3 = per-tick
+        # "activation" [total, spine, arms, legs] replaces the P6
+        # "effort" work reading (2026-09-13); 4 = per-tick "torque"
+        # [total, spine, arms, legs] applied |tau| in N.m (env v43
+        # energy-price base, 2026-09-14). Readers must treat a
+        # HIGHER rev as "fields I do not know about are present",
+        # never as an error. 5 = header "tau_scale" (env v46, the 16
+        # per-axis torque-limit scales this episode played with;
+        # 2026-09-16) — a HEADER field, per-tick record unchanged.
+        # 6 = header "tick_hz" / "action_repeat" (exp/tick-rate,
+        # 2026-09-29): one record per SIM tick at tick_hz (tick k
+        # spans [k, k+1] / tick_hz s; `time` = k / tick_hz); absent =
+        # 30 / 1, the only regime before. (Readers also accept an
+        # "obs_window" flag, absent = false; this sim has no
+        # obs-window variant, so it is never written.)
+        "record_rev": 6,
+        "tick_hz": int(tick_hz),
+        "action_repeat": int(action_repeat),
+        "tau_scale": [round(v, 6) for v in tau_scale],
+        # format 2: the per-joint effective torque limits and signed gear
+        # fractions this sim applied — the decoders derive per-tick
+        # activation / torque from the actions with them
+        "body": replay_format.body_tables(gears, tau_scale),
+        # env v15 (contact spec §10), ADDITIVE: the note track is
+        # head-anchored — viewers must add head_z - PLANE_Z0 to
+        # every note's world z. Absent on pre-v15 recordings
+        # (fixed track); readers treat absence as fixed.
+        "track_anchor": "head",
+        "config": {
+            "chart_len_s": cfg.chart_len_s,
+            "colors": cfg.colors,
+            "note_speed_min": cfg.note_speed_min,
+            "note_speed_max": cfg.note_speed_max,
+            "note_prob": cfg.note_prob,
+            "extra_prob": cfg.extra_prob,
+            "dot_prob": cfg.dot_prob,
+            "bomb_prob": cfg.bomb_prob,
+            "gears": int(gears),       # env v8 action-table size
+            # env v42 hilt grip: blade base sits HANDLE_LEN in front
+            # of the wrist along the blade dir; absent = 0 (pre-v42)
+            "handle_len": HANDLE_LEN,
+        },
+        # explicit world positions (meters), object kinds and arc
+        # grants; the viewer derives everything from these
+        "chart": [{"t": t, "x": round(x, 4), "y": round(y, 4),
+                   "color": color, "angle": round(angle, 5),
+                   "speed": round(speed, 4), "any": any_dir,
+                   "kind": kind, "fpre": fpre, "fpost": fpost}
+                  for t, x, y, color, angle, speed, any_dir, kind, fpre,
+                  fpost in chart],
+        # env v17 (spec §12): obstacles — world-space AABBs on the
+        # same head-anchored track; front face runs 0.25 m behind
+        # the note plane (the sim applies the offset, the header
+        # carries the parser's finished geometry)
+        "walls": [{"t": t0, "cx": round(cx, 4), "cy": round(cy, 4),
+                   "w": round(w, 4), "h": round(h, 4), "l": round(length, 4),
+                   "speed": round(speed, 4)}
+                  for t0, cx, cy, w, h, length, speed in walls],
+    }
+    if map is not None:
+        head["map"] = {"hash": map["hash"], "difficulty": map["difficulty"],
+                       "song": map["song"],
+                       "audio_offset_s": float(map["audio_offset_s"])}
+    if level is not None:
+        head["level"] = level
+    if model_hash is not None:
+        head["model_hash"] = model_hash
+    return {"header": head}
 
 
 class RustBeatEnv(gym.Env):
@@ -57,7 +150,7 @@ class RustBeatEnv(gym.Env):
         concatenated in tick order — the bench's step_into(repeat=N)).
         Defaults are the 30 Hz regime, bit-identical to before. Every SIM
         tick is recorded (the replay keeps the sim's own frame rate) and
-        the rate goes into the replay header (record_rev 6)."""
+        the rate goes into the replay header."""
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),
@@ -68,7 +161,8 @@ class RustBeatEnv(gym.Env):
         self._base_seed = seed
         self._episode = 0
         self._record_path = None
-        self._record_lines = None
+        self._record_extra = {}
+        self._rec = None
         self.chart = []
         self._external = list(external_chart) if external_chart else None
         self.walls = list(external_walls) if external_walls else []
@@ -115,150 +209,62 @@ class RustBeatEnv(gym.Env):
         self.sim.set_tau_scale(s)
         self.tau_scale = s
 
-    # -- recording (JSONL v10 — SPEC-v10 §6, same format the viewer reads) ----
-    def set_record(self, path: str):
-        """Record the NEXT episode (and later ones) to JSONL at path."""
+    # -- recording (replay format 2, replay_format.py) -----------------------
+    def set_record(self, path: str, **extra):
+        """Record the NEXT episode (and later ones) to a format-2 replay at
+        path (conventionally <name>.rpl.gz). extra: record_header's
+        optional fields (map, level, model_hash)."""
         self._record_path = path
+        self._record_extra = extra
 
     def _start_record(self):
-        header = {"header": {
-            "version": "v10",     # env v10 body: viewers reject others
-            # RECORD-SCHEMA revision, additive-only (SPEC-v10 §6).
-            # "version" names the BODY generation and is hard-gated
-            # ("v10" exactly) by viz/app/src/lib/replay.js and
-            # convert_scoresaber.py, so bumping it to advertise a new
-            # per-tick FIELD would retire every reader for no reason —
-            # schema growth is versioned here instead. Absent/1 = the
-            # pre-2026-08-13 record (no "head"); 2 = per-tick "head"
-            # (FK head pose) present on every tick; 3 = per-tick
-            # "activation" [total, spine, arms, legs] replaces the P6
-            # "effort" work reading (2026-09-13); 4 = per-tick "torque"
-            # [total, spine, arms, legs] applied |tau| in N.m (env v43
-            # energy-price base, 2026-09-14). Readers must treat a
-            # HIGHER rev as "fields I do not know about are present",
-            # never as an error. 5 = header "tau_scale" (env v46, the 16
-            # per-axis torque-limit scales this episode played with;
-            # 2026-09-16) — a HEADER field, per-tick record unchanged.
-            # 6 = header "tick_hz" / "action_repeat" (exp/tick-rate,
-            # 2026-09-29): one JSONL line per SIM tick at tick_hz (tick k
-            # spans [k, k+1] / tick_hz s; `time` = k / tick_hz); absent =
-            # 30 / 1, the only regime before. (Readers also accept an
-            # "obs_window" flag, absent = false; this sim has no
-            # obs-window variant, so it is never written.)
-            "record_rev": 6,
-            "tick_hz": self.tick_hz,
-            "action_repeat": self.action_repeat,
-            "tau_scale": [round(v, 6) for v in self.tau_scale],
-            # env v15 (contact spec §10), ADDITIVE: the note track is
-            # head-anchored — viewers must add head_z - PLANE_Z0 to
-            # every note's world z. Absent on pre-v15 recordings
-            # (fixed track); readers treat absence as fixed.
-            "track_anchor": "head",
-            "config": {
-                "chart_len_s": self.cfg.chart_len_s,
-                "colors": self.cfg.colors,
-                "note_speed_min": self.cfg.note_speed_min,
-                "note_speed_max": self.cfg.note_speed_max,
-                "note_prob": self.cfg.note_prob,
-                "extra_prob": self.cfg.extra_prob,
-                "dot_prob": self.cfg.dot_prob,
-                "bomb_prob": self.cfg.bomb_prob,
-                "gears": self.gears,       # env v8 action-table size
-                # env v42 hilt grip: blade base sits HANDLE_LEN in front
-                # of the wrist along the blade dir; absent = 0 (pre-v42)
-                "handle_len": HANDLE_LEN,
-            },
-            # explicit world positions (meters), object kinds and arc
-            # grants; the viewer derives everything from these
-            "chart": [{"t": n.hit_time,
-                       "x": round(note_center(n)[0], 4),
-                       "y": round(note_center(n)[1], 4),
-                       "color": n.color, "angle": round(n.angle, 5),
-                       "speed": round(n.speed, 4), "any": n.any_dir,
-                       "kind": n.kind,
-                       "fpre": n.free_pre, "fpost": n.free_post}
-                      for n in self.chart],
-            # env v17 (spec §12): obstacles — world-space AABBs on the
-            # same head-anchored track; front face runs 0.25 m behind
-            # the note plane (the sim applies the offset, the header
-            # carries the parser's finished geometry)
-            "walls": [{"t": w.start_time, "cx": round(w.cx, 4),
-                       "cy": round(w.cy, 4), "w": round(w.width, 4),
-                       "h": round(w.height, 4), "l": round(w.length, 4),
-                       "speed": round(w.speed, 4)}
-                      for w in self.walls],
-        }}
-        self._record_lines = [json.dumps(header)]
+        self._rec_header = record_header(
+            [note_tuple(n) for n in self.chart],
+            [wall_tuple(w) for w in self.walls],
+            tick_hz=self.tick_hz, action_repeat=self.action_repeat,
+            tau_scale=self.tau_scale, gears=self.gears, cfg=self.cfg,
+            **self._record_extra)
+        self._rec = {"frame": [], "action": [], "contact_off": [0],
+                     "contact_pair": [], "contact_val": [],
+                     "event_off": [0], "event_note": [], "event_code": [],
+                     "event_val": []}
 
     def _record_tick(self, action, reward, events):
-        # SPEC-v10 §6 per-tick record: q36 (root pos + quat wxyz + 29
-        # joints), root twist, omega29, per-hand FK sabers [w3 + b3],
-        # contact events (pair id, world point, tick-summed impulse),
-        # score events unchanged from v7+.
-        # P6 ADDITIVE fields (version stays "v10"; readers must treat
-        # them as optional): "feet" = per-foot [L, R] tick-summed ground
-        # reaction impulses [jx, jy, jz, 0, 0, 0] (N·s — vertical force
-        # ≈ jy/DT; lanes 3..5 were the retired welds' angular impulses
-        # and stay 0 so the schema is unchanged). τ per joint is NOT logged: it is
-        # exactly gear_table(gears)[action[j]] × TAU_MAX[j] (derivable).
-        # record_rev 3 (2026-09-13): the P6 "effort" (positive work, J)
-        # field is GONE; "activation" = this tick's commanded |gear
-        # fraction| summed [total, spine, arms, legs] (the retired v23
-        # --iso-coef base — derivable from "action" too; logged for the viewer
-        # meter and energy-conservation stats).
-        # record_rev 2 ADDITIVE field: "head" = the FK head frame's
-        # world pose [px, py, pz, qw, qx, qy, qz] (quaternion scalar-
-        # first, like q's root block). Derivable from q by a tree walk
-        # — logged for the same reason "sabers" is (§6 "viewer
-        # convenience"), and because convert_scoresaber.py needs the
-        # head ROTATION: watch.scoresaber.com's first-person camera is
-        # driven straight off the .dat's head frame.
-        self._record_lines.append(json.dumps({
-            "t": self.sim.tick - 1,
-            "time": round(self.sim.time - self.dt, 5),
-            "q": [round(v, 5) for v in self.sim.qpos()],
-            "twist": [round(v, 4) for v in self.sim.twist()],
-            "omega": [round(v, 4) for v in self.sim.omega()],
-            "sabers": [[round(v, 4) for v in s] for s in self.sim.sabers()],
-            # 6 decimals on the quaternion too: it is REnormalized
-            # downstream, and 1e-6 keeps the residual well under the
-            # 1e-4 unit-norm tolerance the .dat round-trip asserts
-            "head": [round(v, 6) for v in self.sim.head_pose()],
-            "action": [int(a) for a in action],
-            "reward": round(float(reward), 4),
-            "contacts": [{"pair": int(p), "p": [round(x, 4), round(y, 4),
-                                                round(z, 4)],
-                          "j": round(imp, 4)}
-                         for p, x, y, z, imp in self.sim.contacts()],
-            # replay fix (2026-08-17): the ground reaction per foot; it
-            # has no angular part, so lanes 3..5 are 0 (schema unchanged)
-            "feet": [[round(g[0], 4), round(g[1], 4), round(g[2], 4),
-                      0.0, 0.0, 0.0]
-                     for g in self.sim.ground_reaction()],
-            "activation": [round(v, 4) for v in self.sim.last_activation()],
-            # record_rev 4 (env v43): applied |tau| summed [total, spine,
-            # arms, legs] in N.m — the energy-priced quantity (derivable
-            # from "action" x TAU_MAX; logged for energy stats)
-            "torque": [round(v, 3) for v in self.sim.last_torque()],
-            "events": [
-                {"miss": {"note": int(i)}} if code == 4 else
-                {"post": {"note": int(i), "points": round(float(pts), 2)}}
-                if code == 5 else
-                {"bomb": {"note": int(i)}} if code == 6 else
-                # env v17 (spec §12b): wall drain tick / wall-entry
-                # combo break — no note id (the sim sends u32::MAX)
-                {"wall": {}} if code == 7 else
-                {"wall_enter": {}} if code == 8 else
-                # good cuts carry the component split (2026-07-25):
-                # points = pre + acc (+30 on arc-headed free_post grants)
-                {"cut": {"note": int(i), "good": code == 0,
-                         "reason": EVENT_REASONS[code],
-                         "points": round(float(pts), 2),
-                         "pre": round(float(pre), 2),
-                         "acc": round(float(acc), 2)}}
-                for i, code, pts, pre, acc in events
-            ],
-        }))
+        # one recorder frame per SIM tick: the lanes of VecBeatSim's Rust
+        # recorder (replay_format.REC_LANES layout), from the same getters
+        r = self._rec
+        s = self.sim
+        sab = s.sabers()
+        gr = s.ground_reaction()
+        r["frame"].append([*s.qpos(), *s.twist(), *s.omega(), *sab[0],
+                           *sab[1], *s.head_pose(), *gr[0], *gr[1],
+                           *s.last_activation(), *s.last_torque(),
+                           float(reward)])
+        r["action"].append([int(a) for a in action])
+        for p, x, y, z, imp in s.contacts():
+            r["contact_pair"].append(p)
+            r["contact_val"].append((x, y, z, imp))
+        r["contact_off"].append(len(r["contact_pair"]))
+        for i, code, pts, pre, acc in events:
+            r["event_note"].append(i)
+            r["event_code"].append(code)
+            r["event_val"].append((pts, pre, acc))
+        r["event_off"].append(len(r["event_note"]))
+
+    def _finish_record(self):
+        r, self._rec = self._rec, None
+        T = len(r["frame"])
+        rec = {"lanes": replay_format.REC_LANES, "tick": np.arange(T),
+               "frame": np.asarray(r["frame"], dtype=np.float64).ravel(),
+               "action": np.asarray(r["action"], dtype=np.uint8).ravel(),
+               "contact_val": np.asarray(r["contact_val"],
+                                         dtype=np.float64).ravel(),
+               "event_val": np.asarray(r["event_val"],
+                                       dtype=np.float64).ravel()}
+        for k in ("contact_off", "contact_pair", "event_off", "event_note",
+                  "event_code"):
+            rec[k] = np.asarray(r[k], dtype=np.int64)
+        replay_format.write_replay(self._record_path, self._rec_header, rec)
 
     # -- gym API --------------------------------------------------------------
     def reset(self, seed=None, options=None):
@@ -284,12 +290,10 @@ class RustBeatEnv(gym.Env):
             obs, r, done, events = self.sim.step(acts)
             reward += r
             all_events.extend(events)
-            if self._record_lines is not None:
+            if self._rec is not None:
                 self._record_tick(a, r, events)
                 if done:
-                    with open(self._record_path, "w") as f:
-                        f.write("\n".join(self._record_lines) + "\n")
-                    self._record_lines = None
+                    self._finish_record()
             if done:
                 break
         info = {"events": [(int(i), EVENT_REASONS[c], float(p))

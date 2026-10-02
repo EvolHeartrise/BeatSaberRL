@@ -28,6 +28,7 @@ import pytest
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
+from beat_arena_env.replay_format import read_replay
 from beat_arena_env.rust_env import RustBeatEnv
 
 
@@ -214,7 +215,7 @@ def converted(tmp_path_factory):
 
     notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
     env = RustBeatEnv(external_chart=notes, seed=0)
-    replay_path = str(tmp / "ep.jsonl")
+    replay_path = str(tmp / "ep.rpl.gz")
     env.set_record(replay_path)
     obs, _ = env.reset()
     rng = np.random.default_rng(5)
@@ -238,10 +239,10 @@ def converted(tmp_path_factory):
     out = str(tmp / "ep.dat")
     r = conv.convert(replay_path, str(tmp), "ab" * 20, "Expert", out,
                      first_note_s=FIRST_NOTE_S)
-    with open(replay_path) as f:
-        ticks = [json.loads(l) for l in f][1:]
+    _, ticks = read_replay(replay_path)
     return {"map_dir": str(tmp), "events": events, "result": r,
-            "ticks": ticks, "decoded": decode_dat(out)}
+            "ticks": ticks, "decoded": decode_dat(out),
+            "replay_path": replay_path, "out": out}
 
 
 def test_metadata_and_magic(converted):
@@ -535,3 +536,23 @@ def test_scoring_type_mapping():
     assert conv.scoring_type(note(KIND_CHAIN_HEAD, post=True)) == conv.ST_CHAINHEADARCHEAD
     assert conv.scoring_type(note(KIND_CHAIN_LINK)) == conv.ST_CHAINLINK
     assert conv.scoring_type(note(KIND_BOMB)) == conv.ST_NOSCORE
+
+
+def test_in_place_writers_are_byte_identical(converted, monkeypatch,
+                                             tmp_path):
+    """2026-10-02: the w_* writers append in place instead of copying the
+    growing buffer per field — the .dat must not change by one byte (the
+    copying writers are reinstated here as the reference)."""
+    ref = open(converted["out"], "rb").read()
+    monkeypatch.setattr(conv, "w_float",
+                        lambda b, v: b + struct.pack("<f", float(v)))
+    monkeypatch.setattr(conv, "w_bool",
+                        lambda b, v: b + (b"\x01" if v else b"\x00"))
+    monkeypatch.setattr(conv, "w_str", lambda b, s: b + struct.pack(
+        "<i", len(s.encode("utf-8"))) + s.encode("utf-8"))
+    monkeypatch.setattr(conv, "w_vec3",
+                        lambda b, v: b + struct.pack("<3f", *v))
+    conv.convert(converted["replay_path"], converted["map_dir"], "ab" * 20,
+                 "Expert", str(tmp_path / "copy.dat"),
+                 first_note_s=FIRST_NOTE_S)
+    assert open(tmp_path / "copy.dat", "rb").read() == ref

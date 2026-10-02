@@ -1218,6 +1218,9 @@ struct Core {
     flux: bool,
     // Flux: palm-centre finite-difference velocity across the last tick
     palm_vel: [[Real; 3]; 2],
+    // replay recorder (VecBeatSim.set_record_env): one frame per sim
+    // tick stepped through step_repeat; None = not recording
+    rec: Option<Box<Recorder>>,
 }
 
 impl Core {
@@ -1286,6 +1289,7 @@ impl Core {
             events_buf: Vec::new(),
             flux: false,
             palm_vel: [[0.0; 3]; 2],
+            rec: None,
         }
     }
 
@@ -2288,21 +2292,36 @@ impl Core {
     /// `on_events` in order. Rewards are summed; stops at the first done
     /// tick (further ticks would be latched no-ops). repeat = 1 is
     /// exactly one step_inner.
+    /// A recording env (`rec`) also captures one frame per sim tick
+    /// (latched no-op ticks of a finished env excluded).
     fn step_repeat(&mut self, actions: &[u8; NQ], repeat: u32,
                    mut on_events: impl FnMut(&[(u32, u8, f32, f32, f32)]))
                    -> (Real, bool) {
-        let (mut reward, mut done) = self.step_inner(actions);
+        let (mut reward, mut done) = self.step_recorded(actions);
         on_events(&self.events_buf);
         for _ in 1..repeat {
             if done {
                 break;
             }
-            let (r, d) = self.step_inner(actions);
+            let (r, d) = self.step_recorded(actions);
             on_events(&self.events_buf);
             reward += r;
             done = d;
         }
         (reward, done)
+    }
+
+    /// `step_inner`, plus the recorder frame when this env records.
+    fn step_recorded(&mut self, actions: &[u8; NQ]) -> (Real, bool) {
+        let tick0 = self.tick;
+        let (r, d) = self.step_inner(actions);
+        if self.tick != tick0 {
+            if let Some(mut rec) = self.rec.take() {
+                rec.push(self, actions, r);
+                self.rec = Some(rec);
+            }
+        }
+        (r, d)
     }
 
     /// Raw self-contact accumulators (impulse N·s, ticks with contact,
@@ -2338,6 +2357,147 @@ impl Core {
     #[cfg(feature = "stats")]
     fn pop_dbg_stats(&mut self) -> DbgStats {
         std::mem::take(&mut self.body.ws.stats)
+    }
+}
+
+/// Replay v10 per-tick getters (SPEC-v10 §6) shared by RawBeatSim's
+/// Python getters and the batched Recorder, so both read identical values.
+impl Core {
+    /// `q`: root position (3), root quaternion wxyz (4), 29 joint angles.
+    fn rec_qpos(&self) -> [Real; 7 + NQ] {
+        let st = &self.body.st;
+        let mut out = [0.0 as Real; 7 + NQ];
+        out[..3].copy_from_slice(&st.p);
+        out[3..7].copy_from_slice(&st.quat);
+        out[7..].copy_from_slice(&st.q);
+        out
+    }
+
+    /// `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
+    fn rec_twist(&self) -> [Real; 6] {
+        let v = &self.body.st.v;
+        [v[0], v[1], v[2], v[3], v[4], v[5]]
+    }
+
+    /// `omega`: the 29 joint rates.
+    fn rec_omega(&self) -> &[Real] {
+        &self.body.st.v[6..]
+    }
+
+    /// `sabers`: per hand [L, R] FK wrist position + unit blade direction.
+    fn rec_sabers(&self) -> [[Real; 6]; 2] {
+        [0, 1].map(|s| {
+            let w = self.body.wrist[s];
+            let b = self.body.blade[s];
+            [w[0], w[1], w[2], b[0], b[1], b[2]]
+        })
+    }
+
+    /// `head`: FK head frame [px, py, pz, qw, qx, qy, qz].
+    fn rec_head_pose(&self) -> [Real; 7] {
+        let ws = &self.body.ws;
+        let p = ws.p[F_HEAD];
+        let q = dynamics::fk::rot_to_quat(&ws.r[F_HEAD]);
+        [p[0], p[1], p[2], q[0], q[1], q[2], q[3]]
+    }
+
+    /// `contacts` of the last tick: (pair_id, px, py, pz, j) per pair
+    /// with nonzero tick-summed normal impulse.
+    fn rec_contacts(&self) -> impl Iterator<Item = (u32, Real, Real, Real, Real)> + '_ {
+        let b = &self.body;
+        (0..NUM_PAIRS)
+            .filter(|&p| b.contact_imp[p] != 0.0)
+            .map(|p| {
+                let pt = b.contact_pt[p];
+                (p as u32, pt[0], pt[1], pt[2], b.contact_imp[p])
+            })
+    }
+
+    /// `activation`: last tick's [total, spine, arms, legs] |gear fraction|.
+    fn rec_activation(&self) -> [Real; 4] {
+        let b = &self.body;
+        [b.act_frac, b.act_group[0], b.act_group[1], b.act_group[2]]
+    }
+
+    /// `torque`: last tick's [total, spine, arms, legs] applied |tau| N.m.
+    fn rec_torque(&self) -> [Real; 4] {
+        let b = &self.body;
+        [b.tau_abs, b.tau_group[0], b.tau_group[1], b.tau_group[2]]
+    }
+}
+
+// Recorder frame layout (lanes per tick, Real): q 36, twist 6, omega 29,
+// sabers 2x6, head 7, feet (ground reaction) 2x3, activation 4, torque 4,
+// reward 1. beat_arena_env/replay_writer.py mirrors it (REC_LANES checked).
+const REC_Q: usize = 0;
+const REC_TWIST: usize = REC_Q + 7 + NQ;
+const REC_OMEGA: usize = REC_TWIST + 6;
+const REC_SABERS: usize = REC_OMEGA + NQ;
+const REC_HEAD: usize = REC_SABERS + 12;
+const REC_FEET: usize = REC_HEAD + 7;
+const REC_ACT: usize = REC_FEET + 6;
+const REC_TORQUE: usize = REC_ACT + 4;
+const REC_REWARD: usize = REC_TORQUE + 4;
+const REC_LANES: usize = REC_REWARD + 1;
+const _: () = assert!(REC_LANES == 105);
+
+/// Fast replay generation (2026-10-02): a per-env columnar capture of the
+/// replay v10 per-tick record, filled inside the batched step (one frame
+/// per SIM tick, action-repeat ticks included) so a bench-style wave
+/// records without a per-tick Python round trip. Values come from the
+/// same Core getters RawBeatSim exposes; contacts and events are
+/// variable-length, stored flat with per-tick prefix offsets.
+#[derive(Default)]
+struct Recorder {
+    tick: Vec<u32>,           // the tick's index (Core::tick - 1 after it)
+    time: Vec<Real>,          // raw Core::time after the tick
+    frame: Vec<Real>,         // REC_LANES per tick
+    action: Vec<u8>,          // NQ per tick
+    contact_off: Vec<u32>,    // ticks + 1 prefix offsets into contact_*
+    contact_pair: Vec<u32>,
+    contact_val: Vec<Real>,   // px, py, pz, j per contact
+    event_off: Vec<u32>,      // ticks + 1 prefix offsets into event_*
+    event_note: Vec<u32>,
+    event_code: Vec<u8>,
+    event_val: Vec<f32>,      // points, pre, acc per event
+}
+
+impl Recorder {
+    fn new() -> Recorder {
+        Recorder { contact_off: vec![0], event_off: vec![0], ..Default::default() }
+    }
+
+    fn push(&mut self, core: &Core, actions: &[u8; NQ], reward: Real) {
+        self.tick.push(core.tick - 1);
+        self.time.push(core.time);
+        let base = self.frame.len();
+        self.frame.resize(base + REC_LANES, 0.0);
+        let f = &mut self.frame[base..];
+        f[REC_Q..REC_TWIST].copy_from_slice(&core.rec_qpos());
+        f[REC_TWIST..REC_OMEGA].copy_from_slice(&core.rec_twist());
+        f[REC_OMEGA..REC_SABERS].copy_from_slice(core.rec_omega());
+        let sb = core.rec_sabers();
+        f[REC_SABERS..REC_SABERS + 6].copy_from_slice(&sb[0]);
+        f[REC_SABERS + 6..REC_HEAD].copy_from_slice(&sb[1]);
+        f[REC_HEAD..REC_FEET].copy_from_slice(&core.rec_head_pose());
+        let g = core.body.foot_grf;
+        f[REC_FEET..REC_FEET + 3].copy_from_slice(&g[0]);
+        f[REC_FEET + 3..REC_ACT].copy_from_slice(&g[1]);
+        f[REC_ACT..REC_TORQUE].copy_from_slice(&core.rec_activation());
+        f[REC_TORQUE..REC_REWARD].copy_from_slice(&core.rec_torque());
+        f[REC_REWARD] = reward;
+        self.action.extend_from_slice(actions);
+        for (p, x, y, z, j) in core.rec_contacts() {
+            self.contact_pair.push(p);
+            self.contact_val.extend_from_slice(&[x, y, z, j]);
+        }
+        self.contact_off.push(self.contact_pair.len() as u32);
+        for &(note, code, pts, pre, acc) in &core.events_buf {
+            self.event_note.push(note);
+            self.event_code.push(code);
+            self.event_val.extend_from_slice(&[pts, pre, acc]);
+        }
+        self.event_off.push(self.event_note.len() as u32);
     }
 }
 
@@ -2498,33 +2658,23 @@ impl RawBeatSim {
     /// Replay v10 `q`: the 36 position coordinates — root position (3),
     /// root quaternion wxyz (4), then the 29 joint angles (§1.4 order).
     fn qpos(&self) -> Vec<Real> {
-        let st = &self.core.body.st;
-        let mut out = Vec::with_capacity(36);
-        out.extend_from_slice(&st.p);
-        out.extend_from_slice(&st.quat);
-        out.extend_from_slice(&st.q);
-        out
+        self.core.rec_qpos().to_vec()
     }
 
     /// Replay v10 `twist`: root world-frame [vx, vy, vz, wx, wy, wz].
     fn twist(&self) -> [Real; 6] {
-        let v = &self.core.body.st.v;
-        [v[0], v[1], v[2], v[3], v[4], v[5]]
+        self.core.rec_twist()
     }
 
     /// Replay v10 `omega`: the 29 joint rates (§1.4 order).
     fn omega(&self) -> Vec<Real> {
-        self.core.body.st.v[6..].to_vec()
+        self.core.rec_omega().to_vec()
     }
 
     /// Replay v10 `sabers`: per hand [L, R] the FK wrist position and
     /// unit blade direction — [wx, wy, wz, bx, by, bz].
     fn sabers(&self) -> [[Real; 6]; 2] {
-        [0, 1].map(|s| {
-            let w = self.core.body.wrist[s];
-            let b = self.core.body.blade[s];
-            [w[0], w[1], w[2], b[0], b[1], b[2]]
-        })
+        self.core.rec_sabers()
     }
 
     /// Replay v10 `head` (record_rev 2, ADDITIVE): the FK head frame's
@@ -2548,10 +2698,7 @@ impl RawBeatSim {
     /// the note track (the same local-+z-is-forward convention `blade`
     /// uses for the hands).
     fn head_pose(&self) -> [Real; 7] {
-        let ws = &self.core.body.ws;
-        let p = ws.p[F_HEAD];
-        let q = dynamics::fk::rot_to_quat(&ws.r[F_HEAD]);
-        [p[0], p[1], p[2], q[0], q[1], q[2], q[3]]
+        self.core.rec_head_pose()
     }
 
     /// Blade unit directions [[x, y, z]; 2] (FK cache).
@@ -2563,14 +2710,7 @@ impl RawBeatSim {
     /// per live pair with nonzero tick-summed normal impulse (N·s);
     /// the point is the last substep's world contact point.
     fn contacts(&self) -> Vec<(u32, Real, Real, Real, Real)> {
-        let b = &self.core.body;
-        (0..NUM_PAIRS)
-            .filter(|&p| b.contact_imp[p] != 0.0)
-            .map(|p| {
-                let pt = b.contact_pt[p];
-                (p as u32, pt[0], pt[1], pt[2], b.contact_imp[p])
-            })
-            .collect()
+        self.core.rec_contacts().collect()
     }
 
     /// Replay fix (2026-08-17): tick-summed GROUND-CONTACT reaction
@@ -2639,8 +2779,8 @@ impl RawBeatSim {
     /// since env v43).
     /// Telemetry (replay "activation" field, viewer meter, tests).
     fn last_activation(&self) -> (Real, Real, Real, Real) {
-        let b = &self.core.body;
-        (b.act_frac, b.act_group[0], b.act_group[1], b.act_group[2])
+        let a = self.core.rec_activation();
+        (a[0], a[1], a[2], a[3])
     }
 
     /// Activation telemetry since the last pop: (Σ total, Σ spine,
@@ -2654,8 +2794,8 @@ impl RawBeatSim {
     /// spine, arms, legs); total is the env v43 energy-priced quantity.
     /// Telemetry (replay "torque" field, tests).
     fn last_torque(&self) -> (Real, Real, Real, Real) {
-        let b = &self.core.body;
-        (b.tau_abs, b.tau_group[0], b.tau_group[1], b.tau_group[2])
+        let t = self.core.rec_torque();
+        (t[0], t[1], t[2], t[3])
     }
 
     /// Torque telemetry since the last pop: (Σ total, Σ spine, Σ arms,
@@ -2831,11 +2971,20 @@ struct VecBeatSim {
     sims: Vec<Core>,
     walks: Option<Vec<ComboWalk>>,
     return_events: bool,
+    // per-env action repeat overriding the step call's `repeat`
+    // (action_repeat_env; None = the call's value for every env)
+    repeat_env: Option<Vec<u32>>,
 }
 
 #[pymethods]
 impl VecBeatSim {
     /// Unilateral ground contact is the only foot mode (see RawBeatSim).
+    ///
+    /// Fast replay generation (2026-10-02): `tick_hz_env` (length n)
+    /// gives each env its own control rate instead of `tick_hz`, and
+    /// `action_repeat_env` (length n) its own action repeat, replacing
+    /// the step call's `repeat` — so one vector step is one policy
+    /// decision for every env, whatever run regime each replays.
     #[new]
     #[pyo3(signature = (n, max_steps=690,
                         combo_walk=false, return_events=true,
@@ -2844,7 +2993,8 @@ impl VecBeatSim {
                         foot_hinge_r=0.0, foot_shape_coef=0.0,
                         energy_coef=0.0, limit_coef=0.0,
                         limit_arms=false, wall_despawn=false,
-                        self_contact_coef=0.0, flux=false, tick_hz=30))]
+                        self_contact_coef=0.0, flux=false, tick_hz=30,
+                        tick_hz_env=None, action_repeat_env=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(n: usize, max_steps: u32, combo_walk: bool,
            return_events: bool, gears: u8,
@@ -2852,30 +3002,91 @@ impl VecBeatSim {
            foot_x_coef: Real, foot_hinge_r: Real,
            foot_shape_coef: Real, energy_coef: Real, limit_coef: Real,
            limit_arms: bool, wall_despawn: bool,
-           self_contact_coef: Real, flux: bool, tick_hz: u32) -> PyResult<Self> {
-        let rate = TickRate::new(tick_hz)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+           self_contact_coef: Real, flux: bool, tick_hz: u32,
+           tick_hz_env: Option<Vec<u32>>,
+           action_repeat_env: Option<Vec<u32>>) -> PyResult<Self> {
+        let hz = tick_hz_env.unwrap_or_else(|| vec![tick_hz; n]);
+        if hz.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("tick_hz_env has {} rates for {n} envs", hz.len())));
+        }
+        if let Some(r) = &action_repeat_env {
+            if r.len() != n || r.iter().any(|&x| x < 1) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "action_repeat_env must hold n values >= 1"));
+            }
+        }
+        let mut sims = Vec::with_capacity(n);
+        for &h in &hz {
+            let rate = TickRate::new(h)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let mut core = Core::configured(
+                max_steps, gears, fall_const,
+                foot_z_coef, foot_x_coef, foot_hinge_r,
+                foot_shape_coef, energy_coef, limit_coef,
+                limit_arms, wall_despawn, self_contact_coef, rate);
+            core.flux = flux;
+            sims.push(core);
+        }
         Ok(VecBeatSim {
-            sims: (0..n)
-                .map(|_| {
-                    let mut core = Core::configured(
-                        max_steps, gears, fall_const,
-                        foot_z_coef, foot_x_coef, foot_hinge_r,
-                        foot_shape_coef, energy_coef, limit_coef,
-                        limit_arms, wall_despawn, self_contact_coef, rate);
-                    core.flux = flux;
-                    core
-                })
-                .collect(),
+            sims,
             walks: combo_walk.then(|| (0..n).map(|_| ComboWalk::new(0)).collect()),
             return_events,
+            repeat_env: action_repeat_env,
         })
     }
 
-    /// Control rate (Hz) of every env (see RawBeatSim.tick_hz).
+    /// Control rate (Hz) of every env (see RawBeatSim.tick_hz) — env 0's
+    /// under tick_hz_env (see env_tick_hz).
     #[getter]
     fn tick_hz(&self) -> u32 {
         self.sims.first().map_or(TICK_HZ_BASE, |c| c.body.rate.hz)
+    }
+
+    /// Env i's control rate (Hz).
+    fn env_tick_hz(&self, i: usize) -> u32 {
+        self.sims[i].body.rate.hz
+    }
+
+    /// Start (`on`, discarding anything captured so far) or stop env i's
+    /// replay recorder. A recording env captures one frame per sim tick
+    /// it steps (action-repeat ticks included); see take_record_env.
+    fn set_record_env(&mut self, i: usize, on: bool) {
+        self.sims[i].rec = on.then(|| Box::new(Recorder::new()));
+    }
+
+    /// Env i's captured frames since set_record_env / the last take, as
+    /// a dict of flat numpy arrays (the recorder keeps running, empty):
+    /// `tick` u32 (T,), `time` f64 (T,) raw sim time after each tick,
+    /// `frame` f64 (T * lanes,) — q 36, twist 6, omega 29, sabers 2x6,
+    /// head 7, feet 2x3 (ground reaction), activation 4, torque 4,
+    /// reward 1 —, `action` u8 (T * 29,), `contact_off` / `event_off`
+    /// u32 (T + 1,) prefix offsets, `contact_pair` u32, `contact_val` f64
+    /// (px, py, pz, j per contact), `event_note` u32, `event_code` u8,
+    /// `event_val` f64 (points, pre, acc per event), `lanes` int.
+    fn take_record_env<'py>(&mut self, py: Python<'py>, i: usize)
+                            -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let rec = match self.sims[i].rec.as_mut() {
+            Some(r) => std::mem::replace(r.as_mut(), Recorder::new()),
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("env {i} is not recording (set_record_env)"))),
+        };
+        let f64v = |v: Vec<Real>| v.into_iter().map(|x| x as f64).collect::<Vec<f64>>();
+        let d = pyo3::types::PyDict::new_bound(py);
+        d.set_item("tick", PyArray1::from_vec_bound(py, rec.tick))?;
+        d.set_item("time", PyArray1::from_vec_bound(py, f64v(rec.time)))?;
+        d.set_item("frame", PyArray1::from_vec_bound(py, f64v(rec.frame)))?;
+        d.set_item("action", PyArray1::from_vec_bound(py, rec.action))?;
+        d.set_item("contact_off", PyArray1::from_vec_bound(py, rec.contact_off))?;
+        d.set_item("contact_pair", PyArray1::from_vec_bound(py, rec.contact_pair))?;
+        d.set_item("contact_val", PyArray1::from_vec_bound(py, f64v(rec.contact_val)))?;
+        d.set_item("event_off", PyArray1::from_vec_bound(py, rec.event_off))?;
+        d.set_item("event_note", PyArray1::from_vec_bound(py, rec.event_note))?;
+        d.set_item("event_code", PyArray1::from_vec_bound(py, rec.event_code))?;
+        let ev: Vec<f64> = rec.event_val.into_iter().map(|x| x as f64).collect();
+        d.set_item("event_val", PyArray1::from_vec_bound(py, ev))?;
+        d.set_item("lanes", REC_LANES)?;
+        Ok(d)
     }
 
     #[pyo3(signature = (i, chart, walls = Vec::new()))]
@@ -2928,7 +3139,8 @@ impl VecBeatSim {
     /// tick was done (a finished env stops stepping; the latch would make
     /// further ticks no-ops anyway), events concatenated in tick order,
     /// and the obs is the one after the LAST tick (the next decision's).
-    /// 1 = the plain single-tick step.
+    /// 1 = the plain single-tick step. A sim built with
+    /// `action_repeat_env` uses its per-env values instead.
     #[pyo3(signature = (actions, repeat = 1))]
     fn step<'py>(
         &mut self,
@@ -3198,6 +3410,10 @@ impl VecBeatSim {
             None => acts.iter().copied().collect(),
         };
         let ret_ev = self.return_events;
+        let reps: Vec<u32> = match &self.repeat_env {
+            Some(r) => r.clone(),
+            None => vec![repeat; n],
+        };
         let sims = &mut self.sims;
         let walks = &mut self.walks;
         // Rayon over envs: envs are independent; the index-order
@@ -3215,13 +3431,14 @@ impl VecBeatSim {
                     .zip_eq(walk_opts)
                     .zip_eq(flat.par_chunks_mut(OBS_DIM))
                     .zip_eq(flat_acts.par_chunks(NQ))
-                    .map(|(((sim, mut walk), obs_chunk), a)| {
+                    .zip_eq(reps.par_iter())
+                    .map(|((((sim, mut walk), obs_chunk), a), &rep)| {
                         let mut acts_e = [0u8; NQ];
                         for j in 0..NQ {
                             acts_e[j] = a[j] as u8;
                         }
                         let mut ev = Vec::new();
-                        let (r, d) = sim.step_repeat(&acts_e, repeat, |events| {
+                        let (r, d) = sim.step_repeat(&acts_e, rep, |events| {
                             if let Some(w) = walk.as_mut() {
                                 for &(note, code, pts, _, _) in events {
                                     w.consume(note, code, pts);
@@ -3699,6 +3916,100 @@ mod env_tests {
         assert_eq!(rc.to_bits(), rd.to_bits());
         assert_eq!(c.tick, 1);
     }
+
+    /// Fast replay generation: the batched Recorder captures, per SIM
+    /// tick (inside action repeat too), exactly what RawBeatSim's replay
+    /// getters read after that tick — checked bit for bit against a
+    /// single-tick RawBeatSim twin at 60 Hz with repeat 2, through cuts,
+    /// self-contacts and the terminal (fall) tick; latched ticks after
+    /// done add nothing.
+    #[test]
+    fn recorder_frames_equal_raw_getters() {
+        let chart: Vec<ChartTuple> = (0u8..6)
+            .map(|i| (0.4 + i as Real * 0.15, -0.3 + 0.2 * (i % 4) as Real,
+                      1.0, i % 2, 0.0, 6.0, i % 3 == 0, KIND_NOTE, false, false))
+            .collect();
+        let rate = TickRate::new(60).unwrap();
+        let mut a = Core::new_core_rate(100_000, 5, rate);
+        a.set_chart_notes(chart.clone());
+        a.rec = Some(Box::new(Recorder::new()));
+        let mut core_b = Core::new_core_rate(100_000, 5, rate);
+        core_b.set_chart_notes(chart);
+        let mut b = RawBeatSim { core: core_b };
+        let mut acts = [0u8; NQ];
+        acts[3] = 1;
+        acts[8] = 2;
+        acts[10] = 1;
+        acts[13] = 2;
+        acts[15] = 1;
+        let mut want: Vec<(u32, Real, Vec<Real>, Vec<(u32, Real, Real, Real, Real)>,
+                           Vec<(u32, u8, f32, f32, f32)>, [u8; NQ])> = Vec::new();
+        let mut n_events = 0;
+        for decision in 0..10_000 {
+            let (_, da) = a.step_repeat(&acts, 2, |_| {});
+            for _ in 0..2 {
+                let (r, db) = b.core.step_inner(&acts);
+                let mut f: Vec<Real> = b.qpos();
+                f.extend_from_slice(&b.twist());
+                f.extend(b.omega());
+                for s in b.sabers() {
+                    f.extend_from_slice(&s);
+                }
+                f.extend_from_slice(&b.head_pose());
+                for g in b.ground_reaction() {
+                    f.extend_from_slice(&g);
+                }
+                let (a0, a1, a2, a3) = b.last_activation();
+                f.extend_from_slice(&[a0, a1, a2, a3]);
+                let (t0, t1, t2, t3) = b.last_torque();
+                f.extend_from_slice(&[t0, t1, t2, t3]);
+                f.push(r);
+                n_events += b.core.events_buf.len();
+                want.push((b.tick() - 1, b.time(), f, b.contacts(),
+                           b.core.events_buf.clone(), acts));
+                if db {
+                    break;
+                }
+            }
+            assert_eq!(da, b.core.finished, "done at decision {decision}");
+            if da {
+                break;
+            }
+            // vary the action so the arms keep swinging through the chart
+            acts[10] = if decision % 6 < 3 { 1 } else { 2 };
+            acts[13] = if decision % 4 < 2 { 2 } else { 1 };
+        }
+        assert!(a.finished, "the chart never finished");
+        assert!(n_events > 0, "the test chart produced no events");
+        // latched ticks of a finished env record nothing
+        a.step_repeat(&acts, 2, |_| {});
+        let rec = a.rec.take().unwrap();
+        assert_eq!(rec.tick.len(), want.len());
+        assert_eq!(rec.event_off.len(), want.len() + 1);
+        for (k, (tick, time, f, contacts, events, act)) in want.iter().enumerate() {
+            assert_eq!(rec.tick[k], *tick);
+            assert_eq!(rec.time[k].to_bits(), time.to_bits(), "time at {k}");
+            let got = &rec.frame[k * REC_LANES..(k + 1) * REC_LANES];
+            assert_eq!(got.len(), f.len());
+            for (l, (x, y)) in got.iter().zip(f).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "tick {k} lane {l}");
+            }
+            assert_eq!(&rec.action[k * NQ..(k + 1) * NQ], &act[..], "action at {k}");
+            let (c0, c1) = (rec.contact_off[k] as usize, rec.contact_off[k + 1] as usize);
+            assert_eq!(c1 - c0, contacts.len(), "contacts at {k}");
+            for (m, &(p, x, y, z, j)) in contacts.iter().enumerate() {
+                assert_eq!(rec.contact_pair[c0 + m], p);
+                assert_eq!(&rec.contact_val[4 * (c0 + m)..4 * (c0 + m) + 4], &[x, y, z, j]);
+            }
+            let (e0, e1) = (rec.event_off[k] as usize, rec.event_off[k + 1] as usize);
+            let got_ev: Vec<(u32, u8, f32, f32, f32)> = (e0..e1)
+                .map(|m| (rec.event_note[m], rec.event_code[m], rec.event_val[3 * m],
+                          rec.event_val[3 * m + 1], rec.event_val[3 * m + 2]))
+                .collect();
+            assert_eq!(&got_ev, events, "events at {k}");
+        }
+        assert_eq!(rec.tick[0], 0);
+        assert!(rec.tick.windows(2).all(|w| w[1] == w[0] + 1));    }
 
     /// The episode clock keeps real time: a chart ends at the same time
     /// (to within one 30 Hz tick) with the same outcomes at every rate.

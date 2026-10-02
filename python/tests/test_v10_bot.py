@@ -10,13 +10,13 @@ gravity/stance feedforward helpers were removed 2026-09-22; these
 support-layer checks stay.
 """
 
-import json
 import math
 
 import numpy as np
 import pytest
 
 from beat_arena_env import RustBeatEnv
+from beat_arena_env.replay_format import read_replay
 from beat_arena_env.constants import (
     DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0, gear_table,
 )
@@ -104,11 +104,11 @@ def test_ground_reaction_carries_body_weight():
 
 
 def test_replay_additive_fields(tmp_path):
-    """Replay v10 stays v10; "feet" and "activation" ride along
-    additively and reconstruct from the sim getters / the logged
-    actions (activation = Σ|gear fraction| of the tick's action,
-    [total, spine, arms, legs])."""
-    path = str(tmp_path / "ep.jsonl")
+    """Replay v10 (format 2): "feet" (per-foot ground reaction
+    impulse) rides along, and "activation" (= Σ|gear fraction| of the
+    tick's action, [total, spine, arms, legs]) decodes from the logged
+    actions."""
+    path = str(tmp_path / "ep.rpl.gz")
     env = RustBeatEnv(seed=2, chart_len_s=4.0, gears=5)
     env.set_record(path)
     env.reset(seed=2)
@@ -116,13 +116,11 @@ def test_replay_additive_fields(tmp_path):
     done = False
     while not done:
         _, _, done, _, _ = env.step(rng.integers(0, 5, N_JOINTS))
-    lines = [json.loads(l) for l in open(path) if l.strip()]
-    head, ticks = lines[0], lines[1:]
-    assert head["header"]["version"] == "v10"
-    assert head["header"]["record_rev"] >= 3
+    h, ticks = read_replay(path)
+    assert h["version"] == "v10" and h["format"] == 2
     gear = [abs(g) for g in gear_table(5)]
     for t in ticks:
-        assert len(t["feet"]) == 2 and all(len(f) == 6 for f in t["feet"])
+        assert len(t["feet"]) == 2 and all(len(f) == 3 for f in t["feet"])
         a = t["activation"]
         assert len(a) == 4 and all(v >= 0.0 for v in a)
         act = t["action"]
