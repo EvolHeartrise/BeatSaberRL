@@ -86,6 +86,19 @@ PLAY_KEYS = (("score", "score"), ("combo", "highest_combo"),
              ("good", "good_cuts"), ("bad", "bad_cuts"),
              ("miss", "misses"), ("bombs", "bombs_hit"))
 FAST_WIDTH = 32
+# --fast only pays below this many plays: a width-32 forward handles 32
+# envs per step, so a big job takes ~n/32 waves of ~1.3 ms steps, while
+# the bench-width (1024) forward runs up to 1024 envs per ~6 ms step and
+# is exact. Measured on an RTX 5090 (2026-10-02, 20 plays: exact 84 s,
+# fast 17 s) and modelled, the crossover is ~200-300 plays, so from
+# FAST_MAX_PLAYS on --fast runs as --exact (faster AND bench-exact).
+FAST_MAX_PLAYS = 256
+
+
+def fast_mode(requested, n_plays):
+    """Whether a run uses the width-32 forward: only when asked AND the
+    job is small enough for it to be the faster one."""
+    return bool(requested) and n_plays < FAST_MAX_PLAYS
 
 
 def slug(s, n=24):
@@ -549,7 +562,9 @@ def parse_args(argv=None):
                            "(absent = 1024) — the default")
     mode.add_argument("--fast", action="store_true",
                       help=f"forward at width {FAST_WIDTH} (plays may "
-                           f"drift from their bench rows)")
+                           f"drift from their bench rows); jobs of "
+                           f"{FAST_MAX_PLAYS}+ plays run as --exact, which "
+                           f"is faster there")
     p.add_argument("--forward-width", type=int, default=None,
                    help="override the forward width (tests / debugging)")
     p.add_argument("--max-envs", type=int, default=0,
@@ -707,13 +722,18 @@ def main(argv=None):
         while len(futures) > 4 * args.writers:
             collect(block=True)
 
+    fast = fast_mode(args.fast, len(ok_jobs))
+    if args.fast and not fast:
+        print(f"--fast: {len(ok_jobs)} plays >= {FAST_MAX_PLAYS}, running "
+              f"--exact instead (the bench-width forward is faster at this "
+              f"size, and exact)", flush=True)
     groups = {}
     for job in ok_jobs:
         src = job["src"]
         width = (args.forward_width or
-                 (FAST_WIDTH if args.fast else src.width))
+                 (FAST_WIDTH if fast else src.width))
         # a --no-graphs bench ran the eager forward: reproduce that too
-        eager = args.no_graphs or (not args.fast and
+        eager = args.no_graphs or (not fast and
                                    src.data.get("forward") == "eager")
         groups.setdefault((src.sim_dtype, width, eager), []).append(job)
     stats = []
@@ -760,7 +780,7 @@ def main(argv=None):
                  "device": device.type,
                  "forward": sorted({st["forward"] for _, _, st in stats}),
                  "forward_width": sorted({w for _, w, _ in stats}),
-                 "mode": "fast" if args.fast else "exact"}
+                 "mode": "fast" if fast else "exact"}
         write_back(results, sources, comp, args, stamp)
     elif args.write_back:
         print("[write-back] skipped: --max-ticks plays are truncated",
