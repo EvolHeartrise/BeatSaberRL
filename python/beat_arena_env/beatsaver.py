@@ -349,24 +349,42 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
     def find_note(beat, x, y, color):
         t = clock.time(beat)
         for i, n in enumerate(notes):
-            if (n.kind in (KIND_NOTE, KIND_CHAIN_HEAD) and n.color == color
+            if (n.kind in (KIND_NOTE, KIND_CHAIN_HEAD)
+                    and (color is None or n.color == color)
                     and n.col == x and n.row == y
                     and abs(n.hit_time - t) < _SAME_BEAT_S):
                 return i
         return None
 
     def add_chain(head_beat, x, y, color, d, tail_beat, tx, ty, sc, squish):
+        # 2026-10-02 (SS/BL max-score study): a HEADLESS chain (no colour
+        # note at its head) has no head in the game — BeatSaver's and
+        # BeatLeader's max scores count its links only — so the head is
+        # built just to lay out the links and is not kept; the slice
+        # count includes the head, so sc = 1 is a head with no links
+        # (was synthesized head + max(sc, 2): notes that do not exist)
         i = find_note(head_beat, x, y, color)
         if i is not None:
             notes[i] = replace(notes[i], kind=KIND_CHAIN_HEAD)
             head = notes[i]
-        else:                                  # headless chain: synthesize
+        else:                                  # headless chain: links only
             head = add_note(head_beat, x, y, color, d, kind=KIND_CHAIN_HEAD)
             if head is None:
                 return
+            notes.pop()                        # layout only, not a note
         tx, ty = int(min(max(tx, 0), 3)), int(min(max(ty, 0), 2))
+        # a colour note sitting at the chain's TAIL (beat + cell, any
+        # colour) scores like an arc tail: a fixed 70 pre-swing, and a
+        # chain head there becomes ChainHeadArcTail (115). BeatLeader's
+        # MapPostprocessor tags it so, and real scores need it (Halo
+        # Reach - Lone Wolf Hard: a 247,062 play is above the max without
+        # it). The links' own geometry is unchanged.
+        if tail_beat != head_beat:
+            j = find_note(tail_beat, tx, ty, None)
+            if j is not None:
+                notes[j] = replace(notes[j], free_pre=True)
         notes.extend(chain_links(head, col_x(tx), ROW_Y[ty],
-                                 clock.time(tail_beat), max(int(sc), 2),
+                                 clock.time(tail_beat), int(sc),
                                  float(squish)))
 
     def add_arc(head_beat, x, y, color, tail_beat, tx, ty, tcolor):
@@ -429,9 +447,15 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
                       c.get("tx", 0), c.get("ty", 0), c.get("sc", 3),
                       c.get("s", 1.0))
         for a in data.get("sliders", []):
+            # v3 slider "tc" is the TAIL CUT DIRECTION, not a colour (an
+            # arc joins two notes of its one colour "c"); reading it as the
+            # tail colour (until 2026-10-02) made the tail match fail
+            # whenever the direction was not 0/1 = the colour, so most arc
+            # tails lost their free pre-swing (and arc-tail chain heads
+            # their 115 pricing)
             add_arc(a.get("b", 0), a.get("x", 0), a.get("y", 0), a.get("c", 0),
                     a.get("tb", 0), a.get("tx", 0), a.get("ty", 0),
-                    a.get("tc", a.get("c", 0)))
+                    a.get("c", 0))
         for o in data.get("obstacles", []):
             add_wall(o.get("b", 0), o.get("x", 0), o.get("y", 0), o.get("w", 1),
                      o.get("h", 1), float(o.get("d", 0)), v4_walls=False)
@@ -442,6 +466,12 @@ def load_beatmap(map_path, difficulty="Normal", first_note_s=None):
                          n["_type"], n["_cutDirection"])
             elif n["_type"] == 3:
                 add_bomb(n["_time"], n["_lineIndex"], n["_lineLayer"])
+        # v2.6 arcs ("_sliders", one colour per arc); v2 has no chains
+        for a in data.get("_sliders", []):
+            c = a.get("_colorType", 0)
+            add_arc(a.get("_headTime", 0), a.get("_headLineIndex", 0),
+                    a.get("_headLineLayer", 0), c, a.get("_tailTime", 0),
+                    a.get("_tailLineIndex", 0), a.get("_tailLineLayer", 0), c)
         for o in data.get("_obstacles", []):
             t = int(o.get("_type", 0))
             if t >= 1000:            # Mapping Extensions wall: out of scope
