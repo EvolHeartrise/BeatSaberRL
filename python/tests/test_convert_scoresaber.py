@@ -241,7 +241,8 @@ def converted(tmp_path_factory):
     with open(replay_path) as f:
         ticks = [json.loads(l) for l in f][1:]
     return {"map_dir": str(tmp), "events": events, "result": r,
-            "ticks": ticks, "decoded": decode_dat(out)}
+            "ticks": ticks, "decoded": decode_dat(out),
+            "replay_path": replay_path, "out": out}
 
 
 def test_metadata_and_magic(converted):
@@ -535,3 +536,33 @@ def test_scoring_type_mapping():
     assert conv.scoring_type(note(KIND_CHAIN_HEAD, post=True)) == conv.ST_CHAINHEADARCHEAD
     assert conv.scoring_type(note(KIND_CHAIN_LINK)) == conv.ST_CHAINLINK
     assert conv.scoring_type(note(KIND_BOMB)) == conv.ST_NOSCORE
+
+
+def test_in_place_writers_are_byte_identical(converted, monkeypatch,
+                                             tmp_path):
+    """2026-10-02: the w_* writers append in place instead of copying the
+    growing buffer per field — the .dat must not change by one byte (the
+    copying writers are reinstated here as the reference)."""
+    import gzip
+    import shutil
+    ref = open(converted["out"], "rb").read()
+    # a gzipped replay (make_replays_batched.py output) converts the same
+    gz = str(tmp_path / "ep.jsonl.gz")
+    with open(converted["replay_path"], "rb") as src, \
+            gzip.open(gz, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    conv.convert(gz, converted["map_dir"], "ab" * 20, "Expert",
+                 str(tmp_path / "gz.dat"), first_note_s=FIRST_NOTE_S)
+    assert open(tmp_path / "gz.dat", "rb").read() == ref
+    monkeypatch.setattr(conv, "w_float",
+                        lambda b, v: b + struct.pack("<f", float(v)))
+    monkeypatch.setattr(conv, "w_bool",
+                        lambda b, v: b + (b"\x01" if v else b"\x00"))
+    monkeypatch.setattr(conv, "w_str", lambda b, s: b + struct.pack(
+        "<i", len(s.encode("utf-8"))) + s.encode("utf-8"))
+    monkeypatch.setattr(conv, "w_vec3",
+                        lambda b, v: b + struct.pack("<3f", *v))
+    conv.convert(converted["replay_path"], converted["map_dir"], "ab" * 20,
+                 "Expert", str(tmp_path / "copy.dat"),
+                 first_note_s=FIRST_NOTE_S)
+    assert open(tmp_path / "copy.dat", "rb").read() == ref
