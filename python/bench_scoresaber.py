@@ -683,6 +683,10 @@ def load_or_parse(entry, cache_dir, chart_cache, ver):
         "max_score": scoresaber.max_multiplied_score(notes) if notes else 0,
         "duration_s": meta["duration_s"] if notes else 0.0,
         "last_hit_s": notes[-1].hit_time if notes else 0.0,
+        # first_note_s clock shift (chart_t = song_t + shift): the replay
+        # header's audio_offset_s is -shift (make_replays_batched.py).
+        # Pickles written before 2026-10-02 lack it.
+        "shift": meta["shift"],
     }
     if cpath:
         tmp = cpath + f".tmp{os.getpid()}"

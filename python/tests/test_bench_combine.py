@@ -51,3 +51,17 @@ def test_refuses_mixed_models_and_catalogs(tmp_path):
     c.write_text(json.dumps({"catalog": "scoresaber", "model_hash": "sha256:aa", "levels": []}))
     with pytest.raises(SystemExit):
         bc.combine([a, str(c)])
+
+
+def test_recompute_totals_after_a_patched_pick(tmp_path):
+    a = _bench(tmp_path, "a.json", [_rec("k1", 100, 50, 900), _rec("k2", 80, 40, 800)])
+    out = bc.combine([a])
+    assert list(out)[-1] == "levels"
+    out["levels"][1]["ss"]["pp"] = 120.0      # a written-back SS pick
+    out["levels"][0]["bl"] = None
+    bc.recompute_totals(out)
+    assert out["ss_total_unweighted_pp"] == 220
+    assert out["ss_total_weighted_pp"] == round(120 + 100 * 0.965, 2)
+    assert out["total_weighted_pp"] == out["ss_total_weighted_pp"]
+    assert out["bl_total_unweighted_pp"] == 40
+    assert list(out)[-1] == "levels"

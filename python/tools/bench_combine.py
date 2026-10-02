@@ -125,8 +125,6 @@ def combine(paths, bl_derived=BL_DERIVED):
         if pick["ss"] is not None:
             src["ss"][rec["ss_from"]] = src["ss"].get(rec["ss_from"], 0) + 1
         levels.append(rec)
-    ssw, ssu = _weighted([_pp(l, "ss") for l in levels if l.get("ss")])
-    blw, blu = _weighted([_pp(l, "bl") for l in levels if l.get("bl")])
     pseudo = "sha256:" + hashlib.sha256(
         ("composite:" + base["model_hash"] + ":" + ",".join(
             sorted(n for n, _, _ in runs))).encode()).hexdigest()
@@ -143,10 +141,6 @@ def combine(paths, bl_derived=BL_DERIVED):
                         "bl_total_weighted_pp": d.get("bl_total_weighted_pp")}
                        for n, d, _ in runs],
             "levels_from": src},
-        "n_evaluated": len(levels), "n_skipped": 0,
-        "ss_total_weighted_pp": round(ssw, 2), "ss_total_unweighted_pp": round(ssu, 2),
-        "bl_total_weighted_pp": round(blw, 2), "bl_total_unweighted_pp": round(blu, 2),
-        "total_weighted_pp": round(ssw, 2), "total_unweighted_pp": round(ssu, 2),
     })
     for k in [k for k in head if k.startswith(("torque_", "breaks_total", "wall_enters_total",
                                                  "fell_levels", "tilted_levels",
@@ -154,7 +148,26 @@ def combine(paths, bl_derived=BL_DERIVED):
                                                  "term_levels", "wrist_rev", "flail_rad_per"))]:
         head.pop(k)   # per-run aggregates do not survive a per-level mix
     head["levels"] = levels
-    return head
+    return recompute_totals(head)
+
+
+def recompute_totals(comp):
+    """(Re)compute a composite's header totals from its records' current
+    pick views (`ss` / `bl` pp) — after combine(), and after
+    make_replays_batched.py --write-back patched a pick's play in place
+    (the pick selection itself is never re-run). Returns `comp`, with
+    `levels` kept last (the file layout)."""
+    levels = comp.pop("levels")
+    ssw, ssu = _weighted([_pp(l, "ss") for l in levels if l.get("ss")])
+    blw, blu = _weighted([_pp(l, "bl") for l in levels if l.get("bl")])
+    comp.update({
+        "n_evaluated": len(levels), "n_skipped": 0,
+        "ss_total_weighted_pp": round(ssw, 2), "ss_total_unweighted_pp": round(ssu, 2),
+        "bl_total_weighted_pp": round(blw, 2), "bl_total_unweighted_pp": round(blu, 2),
+        "total_weighted_pp": round(ssw, 2), "total_unweighted_pp": round(ssu, 2),
+    })
+    comp["levels"] = levels
+    return comp
 
 
 def main(argv):
