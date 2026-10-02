@@ -4,7 +4,7 @@
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
-  import { audio, pb, play, pose, songClock, lastTick, loadText,
+  import { audio, pb, play, pose, songClock, lastTick, loadReplay,
     restart, seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
   import { toggleXRSession } from "@threlte/xr";
   import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
@@ -13,7 +13,7 @@
   import { songBlob } from "./lib/audio.js";
   import { NO_NUDGE, syncAction } from "./lib/sync.js";
   import { onMount } from "svelte";
-  import { fetchReplay, fileToText, nameFor, replayPathFrom,
+  import { fetchReplay, fileToReplay, nameFor, replayPathFrom,
     replayUrl } from "./lib/urlload.js";
   import { DT } from "./lib/replay.js";
   // site build (replays.flee.systems): no Flux game, no pose mode, no
@@ -174,9 +174,9 @@
     : audio.status === "none" ? "no song"
     : "");
 
-  function load(text, name) {
+  function load(data, name) {
     try {
-      loadText(text, name);
+      loadReplay(data, name);
       urlLoad.error = "";   // a dropped file replaces a link's replay/error
       urlLoad.gate = false;
     } catch (err) {
@@ -187,8 +187,8 @@
   function onFiles(files) {
     const f = files && files[0];
     if (f && FLUX && play.on) exitPlay();
-    // .jsonl.gz works too: "x.jsonl.gz" -> "x.jsonl" -> loadText drops .jsonl
-    if (f) fileToText(f).then((t) => load(t, f.name.replace(/\.gz$/i, "")),
+    // "x.rpl.gz" -> "x.rpl" -> loadReplay drops .rpl (a Flux run: x.jsonl)
+    if (f) fileToReplay(f).then((t) => load(t, f.name.replace(/\.gz$/i, "")),
                               (e) => alert("could not read file: " + e.message));
   }
 
@@ -213,7 +213,7 @@
     if (!path) return;
     urlLoad.stage = "downloading";
     try {
-      const text = await fetchReplay(replayUrl(path, location.origin), (p) => {
+      const data = await fetchReplay(replayUrl(path, location.origin), (p) => {
         urlLoad.stage = p.stage;
         urlLoad.loaded = p.loaded;
         urlLoad.total = p.total;
@@ -221,7 +221,7 @@
       urlLoad.stage = "opening";
       await new Promise((r) => setTimeout(r, 30)); // let the label paint
       if (pb.rep) return; // a file dropped meanwhile wins
-      loadText(text, path, { title: (rep) => nameFor(rep, path), play: false });
+      loadReplay(data, path, { title: (rep) => nameFor(rep, path), play: false });
       urlLoad.gate = true;
     } catch (e) {
       urlLoad.error = "could not load this replay: " + e.message;
@@ -320,16 +320,16 @@
     </div>
     {:else if PICKER}
     <button id="drop" class:hover={dropHover} onclick={() => fileInput.click()}
-      title="open a replay .jsonl (or .jsonl.gz) — or drop one anywhere">
+      title="open a replay .rpl.gz (or a Flux run .jsonl) — or drop one anywhere">
       {#if pb.rep}
         📂 open replay…
       {:else}
-        drop a replay <code>.jsonl</code> (or <code>.jsonl.gz</code>) here, or click to choose
+        drop a replay <code>.rpl.gz</code> (or a Flux run <code>.jsonl</code>) here, or click to choose
       {/if}
     </button>
     <input
       type="file"
-      accept=".jsonl,.json,.gz"
+      accept=".gz,.jsonl,.json"
       hidden
       bind:this={fileInput}
       onchange={(e) => onFiles(e.target.files)}

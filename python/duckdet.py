@@ -8,14 +8,14 @@ collision test (beat_arena_cuda.cu ~L5650, env v36 interval sweep):
 The head is a POINT in the env (no radius). A wall is DUCKABLE when its
 bottom edge (cy - h/2) is above 0.9 m, i.e. crouching clears it.
 """
-import json, sys, glob, os, statistics as st
+import sys, glob, os, statistics as st
+
+from beat_arena_env.replay_format import read_replay
 
 PLANE_Z0, WALL_FRONT_OFF, DT = -0.65, 0.25, 1.0 / 30.0
 
 def analyze(path):
-    with open(path) as fh:
-        head = json.loads(fh.readline())["header"]
-        ticks = [json.loads(l) for l in fh]
+    head, ticks = read_replay(path)
     walls = head.get("walls") or []
     if not walls:
         return None
@@ -49,7 +49,7 @@ def analyze(path):
                                                 for t in ticks))
 
 if __name__ == "__main__":
-    pat = sys.argv[1] if len(sys.argv) > 1 else "*.jsonl"
+    pat = sys.argv[1] if len(sys.argv) > 1 else "*.rpl.gz"
     T = dict(walls=0, duckable=0, zt=0, hit=0, duck_hit=0, ducked=0, cleared_lat=0)
     for f in sorted(glob.glob(pat)):
         r = analyze(f)

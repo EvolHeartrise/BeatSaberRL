@@ -1,6 +1,7 @@
 // Node smoke test for the viewer's pure logic (src/lib/replay.js) against a
-// real recorded v10 replay + a full-precision FK fixture generated from the
-// Rust sim (test/fk_fixture.json). Run: npm test [path-to-replay.jsonl]
+// real recorded v10 replay (format 2) + a full-precision FK fixture generated
+// from the Rust sim (test/fk_fixture.json).
+// Run: npm test [path-to-replay.rpl.gz]
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
@@ -11,14 +12,15 @@ import {
   activationAt, counts, cutPlaneLocal, fkSaber, footForces, frameQuatScene,
   gearTable, headZAt, hitboxRot, isHeadAnchored, maxScore, mirrorQ29,
   noteFrame, noteLam, noteRot, parseReplay, pendingNotes, poseQ36, qAt,
+  replayFromParts,
   headQuats, quatNlerp, rotQuatScene, smoothQuats,
   baseOf, handleLen, reachZ, saberAt, tauOf, tipOf, tipSpeed, trackOffset, trackOffsetAt,
   trackOffsetOfFK, viewerTrackOffset,
 } from "../src/lib/replay.js";
+import { FIXTURE, readReplayFile } from "./fixture.js";
 
-const path = process.argv[2] ??
-  "test/fixtures/v10_scripted_ep00_seed0.jsonl";
-const rep = parseReplay(readFileSync(path, "utf8"));
+const path = process.argv[2] ?? FIXTURE;
+const rep = parseReplay(readReplayFile(path));
 console.log(`loaded: ${rep.chart.length} objects, ${rep.ticks.length} ticks, ` +
             `${rep.posts.length} post events, ${rep.arcs.length} arc pairs`);
 
@@ -88,7 +90,9 @@ console.log(`bodyFK vs sim fixture: worst |Δ| = ${worstFK.toExponential(2)}`);
   assert.ok(close(s, [0.2, 1.47, 0, 0, 0, 1]), "neutral r saber");
 }
 
-// ---- replay-level FK: logged sabers == bodyFK(logged q) (rounded 5dp/4dp) --
+// ---- replay-level FK: decoded sabers == bodyFK(decoded q) ------------------
+// (format 2 rebuilds the sabers by FK of q with the root quaternion
+// renormalized; the raw q's ~1e-4 quaternion rounding stays well inside)
 for (let k = 0; k < rep.ticks.length; k += 7) {
   const t = rep.ticks[k];
   const fk = bodyFK(t.q);
@@ -390,15 +394,11 @@ assert.equal(Z_MISS, -PLANE_Z0, "Z_MISS is the reference plane's depth");
 }
 
 // ---- (b) HEAD-ANCHORED replay: offset applied every tick --------------------
-// Prefer the local v15 probe recording (python/replays/ is gitignored);
-// without it, the committed Flux fixture — also a real head-anchored
-// recording ("track_anchor": "head", full q track, misses). The legacy
-// fixture with the field spliced in is NOT a stand-in: its misses were
-// judged on the fixed track, so the §10b miss timing below cannot hold.
-const V15_PATH = new URL(
-  "../../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.jsonl",
-  import.meta.url);
-const HEAD_FALLBACK = new URL("./fixtures/flux_scripted.jsonl", import.meta.url);
+// The committed Flux fixture — a real head-anchored recording
+// ("track_anchor": "head", full q track, misses). The legacy fixture with
+// the field spliced in is NOT a stand-in: its misses were judged on the
+// fixed track, so the §10b miss timing below cannot hold.
+const HEAD_FIXTURE = new URL("./fixtures/flux_scripted.jsonl", import.meta.url);
 const anchored = (text, anchor = "head") => {
   const lines = text.split("\n");
   const h = JSON.parse(lines[0]);
@@ -406,15 +406,9 @@ const anchored = (text, anchor = "head") => {
   lines[0] = JSON.stringify(h);
   return lines.join("\n");
 };
-let v15, v15Src, v15Text;
-try {
-  v15Text = readFileSync(V15_PATH, "utf8");
-  v15Src = "recorded v15 probe";
-} catch {
-  v15Text = readFileSync(HEAD_FALLBACK, "utf8");
-  v15Src = "committed Flux fixture";
-}
-v15 = parseReplay(v15Text);
+const v15Text = readFileSync(HEAD_FIXTURE, "utf8");
+const v15Src = "committed Flux fixture";
+const v15 = parseReplay(v15Text);
 {
   assert.equal(v15.trackAnchor, "head");
   assert.ok(isHeadAnchored(v15));
@@ -539,8 +533,7 @@ v15 = parseReplay(v15Text);
     q: [0, 0.94, rootZ[k], 1, 0, 0, 0, pitch, ...Array(28).fill(0)],
     events: [], reward: 0,
   }));
-  const build = (header) => parseReplay([JSON.stringify({ header }),
-    ...ticks.map((t) => JSON.stringify(t))].join("\n"));
+  const build = (header) => replayFromParts(header, ticks);
   const base = { version: "v10", config: { gears: 5 }, chart };
   const withFlag = build({ ...base, track_anchor: "head" });
   const noFlag = build(base);
@@ -619,14 +612,18 @@ v15 = parseReplay(v15Text);
 // replays from retired parameterizations are rejected with the friendly
 // "re-record" message (v10 viewers reject EVERYTHING else — house rule)
 assert.throws(
-  () => parseReplay('{"header": {"version": 8, "config": {}, "chart": []}}'),
+  () => replayFromParts({ version: 8, config: {}, chart: [] }, []),
   /version 8.*re-record/s);
 assert.throws(
-  () => parseReplay('{"header": {"version": 6, "config": {}, "chart": []}}'),
+  () => replayFromParts({ version: 6, config: {}, chart: [] }, []),
   /version 6/);
 assert.throws(
-  () => parseReplay('{"header": {"version": "v9", "config": {}, "chart": []}}'),
+  () => replayFromParts({ version: "v9", config: {}, chart: [] }, []),
   /version v9/);
+// the retired JSONL agent replay format: only Flux runs are JSONL now
+assert.throws(
+  () => parseReplay('{"header": {"version": "v10", "config": {}, "chart": []}}'),
+  /old JSONL replay.*rpl\.gz/s);
 
 console.log("replay.js smoke test OK");
 

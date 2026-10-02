@@ -1,6 +1,6 @@
 // Headless-browser check of URL loading on a SERVED viewer — the hosted one
 // (https://replays.flee.systems) or `wrangler dev` in viz/replays-site:
-//   - ?replay=/r/<file>.jsonl.gz shows download progress, opens the replay
+//   - ?replay=/r/<file>.rpl.gz shows download progress, opens the replay
 //     paused behind a "watch" button that names it (song [difficulty] ·
 //     model, from the header), at the header's tick rate;
 //   - the song is fetched from BeatSaver (the header's map hash);
@@ -8,7 +8,7 @@
 //     runs at the header's tick rate in real time, with the song sounding
 //     and locked to it;
 //   - a missing file and a foreign URL each end in a clear error, not a crash.
-// Run: node test/urlload-browser.mjs <base-url> </r/file.jsonl.gz> [referrer-page]
+// Run: node test/urlload-browser.mjs <base-url> </r/file.rpl.gz> [referrer-page]
 // (one Chrome, SwiftShader — keep it to one run at a time on the laptop)
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -26,7 +26,7 @@ function findBrowser() {
   throw new Error("no browser found: set PUPPETEER_EXECUTABLE_PATH");
 }
 const [base, path] = process.argv.slice(2);
-if (!base || !path) throw new Error("usage: urlload-browser.mjs <base-url> </r/file.jsonl.gz>");
+if (!base || !path) throw new Error("usage: urlload-browser.mjs <base-url> </r/file.rpl.gz>");
 const url = (p) => `${base.replace(/\/$/, "")}/?replay=${encodeURIComponent(p)}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fail = (m) => { throw new Error(m); };
@@ -119,8 +119,8 @@ try {
   if (errors.length) fail("page errors:\n" + errors.join("\n"));
 
   // ---- failures are explained (the 404 itself is logged by the browser) ------
-  for (const [p, want] of [["/r/0000000000000000.jsonl.gz", /does not exist/],
-                           ["https://evil.example/r/x.jsonl.gz", /under \/r\//],
+  for (const [p, want] of [["/r/0000000000000000.rpl.gz", /does not exist/],
+                           ["https://evil.example/r/x.rpl.gz", /under \/r\//],
                            ["/r/../index.html", /under \/r\//]]) {
     await page.goto(url(p));
     await page.waitForSelector("#urlerror", { timeout: 30000 });

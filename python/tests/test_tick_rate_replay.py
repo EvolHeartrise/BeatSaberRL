@@ -18,6 +18,7 @@ import pytest
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
+from beat_arena_env.replay_format import read_replay
 from beat_arena_env.rust_env import RustBeatEnv
 from test_convert_scoresaber import (
     BOMB, FIRST_NOTE_S, NJS, RAW_NOTES, decode_dat)
@@ -55,7 +56,7 @@ def _record(tmp, tick_hz, repeat=1, name="ep"):
     notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
     env = RustBeatEnv(external_chart=notes, seed=0, tick_hz=tick_hz,
                       action_repeat=repeat)
-    path = str(tmp / f"{name}.jsonl")
+    path = str(tmp / f"{name}.rpl.gz")
     env.set_record(path)
     env.reset()
     events, done, k = [], False, 0
@@ -63,9 +64,8 @@ def _record(tmp, tick_hz, repeat=1, name="ep"):
         _, _, done, _, info = env.step(_whip(k * repeat / tick_hz))
         events.extend(info["events"])
         k += 1
-    with open(path) as f:
-        lines = [json.loads(l) for l in f if l.strip()]
-    return path, lines[0]["header"], lines[1:], events
+    head, ticks = read_replay(path)
+    return path, head, ticks, events
 
 
 @pytest.fixture(scope="module")
@@ -93,7 +93,7 @@ def test_tick_times_are_sim_ticks(rec60):
     ticks = rec60["ticks"]
     assert [t["t"] for t in ticks] == list(range(len(ticks)))
     for t in ticks:
-        assert t["time"] == pytest.approx(t["t"] / 60.0, abs=2e-5)
+        assert t["time"] == t["t"] / 60.0
 
 
 def test_default_rate_header(tmp_path):
@@ -101,7 +101,7 @@ def test_default_rate_header(tmp_path):
     _, h, ticks, _ = _record(tmp_path, 30)
     assert h["tick_hz"] == 30 and h["action_repeat"] == 1
     for t in ticks:
-        assert t["time"] == pytest.approx(t["t"] / 30.0, abs=2e-5)
+        assert t["time"] == t["t"] / 30.0
 
 
 def test_action_repeat_records_every_sim_tick(tmp_path):
@@ -114,7 +114,7 @@ def test_action_repeat_records_every_sim_tick(tmp_path):
     notes, _ = load_beatmap(str(tmp_path), "Expert",
                             first_note_s=FIRST_NOTE_S)
     env = RustBeatEnv(external_chart=notes, seed=0, tick_hz=60)
-    path = str(tmp_path / "held.jsonl")
+    path = str(tmp_path / "held.rpl.gz")
     env.set_record(path)
     env.reset()
     ev1, done, k = [], False, 0
@@ -122,7 +122,7 @@ def test_action_repeat_records_every_sim_tick(tmp_path):
         _, _, done, _, info = env.step(_whip((k // 2) * 2 / 60))
         ev1.extend(info["events"])
         k += 1
-    t1 = [json.loads(l) for l in open(path) if l.strip()][1:]
+    t1 = read_replay(path)[1]
     assert len(t1) == len(t2)
     for a, b in zip(t1, t2):
         assert a["q"] == b["q"] and a["events"] == b["events"]

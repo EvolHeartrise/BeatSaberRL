@@ -1,6 +1,6 @@
-"""Convert a beat-arena JSONL v10 replay to a ScoreSaber replay .dat.
+"""Convert a beat-arena v10 replay (.rpl.gz) to a ScoreSaber replay .dat.
 
-    python convert_scoresaber.py --replay replays/x.jsonl \\
+    python convert_scoresaber.py --replay replays/x.rpl.gz \\
         --hash <song-hash> --difficulty Hard [--out x.dat]
 
 The output loads in ScoreSaber's web viewer (watch.scoresaber.com — an
@@ -20,11 +20,11 @@ repo (mirrored at research/vendor/scoresaber-watch):
   deviation) recomputed from the recorded joint state via FK.
 
 Fidelity notes:
-- Pose frames are exact: replay v10 `sabers` carries the FK wrist
-  position + unit blade direction per hand directly, one frame per
-  sim tick (header tick_hz fps — 30 unless the recording says
-  otherwise, exp/tick-rate record_rev 6), and
-  (record_rev 2) `head` carries the FK head frame's world position +
+- Pose frames are exact to the replay's precision: the decoded
+  `sabers` are the FK wrist position + unit blade direction per hand
+  (rebuilt from q by replay_format.py, <= 1 mm / 0.1 deg of the sim's),
+  one frame per sim tick (header tick_hz fps — 30 unless the recording
+  says otherwise), and `head` is the FK head frame's world position +
   rotation. Both go out unmapped except for the player-space z shift
   below: the env's world axes ARE the viewer's (x right, y up, z
   forward down the note track), and both write the same local-+z-is-
@@ -79,7 +79,6 @@ Fidelity notes:
 from __future__ import annotations
 
 import argparse
-import json
 import lzma
 import math
 import os
@@ -90,6 +89,7 @@ from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import (KIND_BOMB, KIND_CHAIN_HEAD,
                                       KIND_CHAIN_LINK, KIND_NOTE)
+from beat_arena_env.replay_format import read_replay
 
 MAGIC = (b"ScoreSaber Replay " + "\U0001F44C\U0001F920".encode() + b"\r\n")
 assert len(MAGIC) == 28
@@ -146,26 +146,35 @@ def scoring_type(n: Note) -> int:
 
 # -- binary writers ----------------------------------------------------------
 
+# All writers append IN PLACE to the caller's bytearray and return it
+# (2026-10-02: `b + ...` copied the whole growing buffer per field —
+# quadratic in the replay length; output bytes unchanged).
+
 def w_int(b, v):
     b += struct.pack("<i", int(v))
     return b
 
 
 def w_float(b, v):
-    return b + struct.pack("<f", float(v))
+    b += struct.pack("<f", float(v))
+    return b
 
 
 def w_bool(b, v):
-    return b + (b"\x01" if v else b"\x00")
+    b += b"\x01" if v else b"\x00"
+    return b
 
 
 def w_str(b, s):
     raw = s.encode("utf-8")
-    return b + struct.pack("<i", len(raw)) + raw
+    b += struct.pack("<i", len(raw))
+    b += raw
+    return b
 
 
 def w_vec3(b, v):
-    return b + struct.pack("<3f", *v)
+    b += struct.pack("<3f", *v)
+    return b
 
 
 def head_frame(tick):
@@ -212,16 +221,6 @@ def quat_from_forward(d):
 
 
 # -- replay reading ----------------------------------------------------------
-
-def read_replay(path):
-    with open(path) as f:
-        lines = [json.loads(l) for l in f if l.strip()]
-    assert "header" in lines[0], "not a beat-arena replay"
-    header = lines[0]["header"]
-    assert header.get("version") == "v10", (
-        f"need replay v10 (env v10 dynamic body), got {header.get('version')}")
-    return header, lines[1:]
-
 
 def tick_hz_of(header):
     """The recording's control rate (frames/s): header "tick_hz" (replay
@@ -689,7 +688,7 @@ def convert(replay_path, map_dir, song_hash, difficulty, out_path,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--replay", required=True, help="JSONL v7 replay")
+    p.add_argument("--replay", required=True, help="replay (.rpl.gz)")
     p.add_argument("--hash", required=True, help="song hash (BeatSaver)")
     p.add_argument("--difficulty", required=True,
                    choices=list(DIFF_RAW))
@@ -701,7 +700,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     map_dir = args.map or os.path.join(here, "maps", "scoresaber",
                                        args.hash.lower())
-    out = args.out or os.path.splitext(args.replay)[0] + ".dat"
+    out = args.out or args.replay.removesuffix(".gz").rsplit(".", 1)[0] + ".dat"
     r = convert(args.replay, map_dir, args.hash.lower(), args.difficulty,
                 out)
     print(f"wrote {r['out']} ({r['bytes']:,} bytes): {r['frames']} frames, "
