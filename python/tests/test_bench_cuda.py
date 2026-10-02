@@ -58,7 +58,7 @@ def test_finish_slot_schema_and_full_combo():
     assert set(r) == {"leaderboard_id", "song_hash", "song", "mapper",
                       "difficulty", "stars", "max_pp", "duration_s",
                       "n_notes", "score", "max_score", "api_max_score",
-                      "accuracy", "pp", "good_cuts", "bad_cuts", "misses",
+                      "accuracy", "env_accuracy", "pp", "good_cuts", "bad_cuts", "misses",
                       "bombs_hit", "highest_combo", "full_combo",
                       "score_pre", "score_acc", "score_post", "flail_rad",
                       "flail_ticks", "wrist_rev_l", "wrist_rev_r", "ticks",

@@ -118,6 +118,17 @@ _PROGRESS_NEEDED = {1: 2, 2: 4, 4: 8}   # hits to fill the bar at each tier
 MAX_UNIT_POINTS = {KIND_NOTE: 115, KIND_CHAIN_HEAD: 85, KIND_CHAIN_LINK: 20}
 
 
+def max_unit_points(n) -> int:
+    """A scoreable note's max cut points. A chain head that is also an
+    arc head or arc tail (the game's ChainHeadArcHead / ChainHeadArcTail
+    scoring types, 1.40+) gets the 30 follow-through points as a fixed
+    grant: 115, not 85 (BeatLeader's max score and the game agree;
+    2026-10-02 SS/BL max-score study)."""
+    if n.kind == KIND_CHAIN_HEAD and (n.free_pre or n.free_post):
+        return 115
+    return MAX_UNIT_POINTS[n.kind]
+
+
 class ComboTracker:
     """Multiplied-score walk over the sim's event stream.
 
@@ -194,7 +205,7 @@ def max_multiplied_score(chart) -> int:
              if n.kind != KIND_BOMB]
     for i, n in enumerate(units):
         walk.on_cut(i)
-        walk.on_points(i, MAX_UNIT_POINTS[n.kind])
+        walk.on_points(i, max_unit_points(n))
     return round(walk.score)
 
 
