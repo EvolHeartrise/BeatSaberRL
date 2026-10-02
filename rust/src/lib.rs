@@ -2073,7 +2073,15 @@ impl Core {
                             round_pts(PTS_ACC * (1.0 - (d_min / ACC_NORM).clamp(0.0, 1.0)));
                         let mut p = pre + acc;
                         if n.kind == KIND_CHAIN_HEAD {
-                            // chain heads have no follow-through (max 85)
+                            // chain heads have no follow-through (max 85),
+                            // except one that is also an arc head or tail
+                            // (ChainHeadArcHead / ChainHeadArcTail): the
+                            // 30 post points are a fixed grant (scoring v4,
+                            // 2026-10-02; kernel mirror)
+                            if n.free_pre || n.free_post {
+                                p += PTS_POST;
+                                self.score_post += PTS_POST;
+                            }
                         } else if n.free_post {
                             p += PTS_POST; // arc head: granted in full
                             self.score_post += PTS_POST;

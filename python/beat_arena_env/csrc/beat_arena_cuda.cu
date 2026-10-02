@@ -5470,7 +5470,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           pre_pts = pre;
           acc_pts = acc;
           if (is_head) {
-            // chain heads: no follow-through (max 85)
+            // chain heads: no follow-through (max 85), except one that is
+            // also an arc head or tail (ChainHeadArcHead/ArcTail): the 30
+            // post points are a fixed grant (scoring v4, lib.rs mirror)
+            if (P.p_free_pre[cb] || P.p_free_post[cb]) {
+              pts += T(PTS_POST);
+              P.score_post[e] += T(PTS_POST);
+            }
           } else if (P.p_free_post[cb]) {
             pts += T(PTS_POST);
             P.score_post[e] += T(PTS_POST);
