@@ -690,6 +690,28 @@ def test_arc_grants_free_pre_and_post():
         assert all(c != 5 for _, c, *_ in ev)
 
 
+@pytest.mark.parametrize("free_pre,free_post", [(False, True), (True, False), (True, True)])
+def test_arc_attached_chain_head_gets_fixed_post(free_pre, free_post):
+    """Scoring v4 (2026-10-02): a chain head that is also an arc head or
+    tail (the game's ChainHeadArcHead / ChainHeadArcTail types) gets the
+    30 follow-through points as a fixed grant at the cut tick (max 115,
+    BeatLeader's max score), and opens no tracker; an arc tail also
+    grants the full 70 pre-swing."""
+    n = _note(DT, 3, 1, kind=KIND_CHAIN_HEAD, free_pre=free_pre,
+              free_post=free_post)
+    sim = _sim_with_note(n)
+    _set_flat(sim, 1, 0.0, om_roll=-15.0)     # one tick of swing only
+    ev, r = _coast(sim)
+    assert _codes(ev) == [(0, 0)]
+    pts, pre = ev[0][2], ev[0][3]
+    if free_pre:
+        assert pre == 70.0
+    assert pts == pytest.approx(pre + ev[0][4] + 30.0)
+    for _ in range(6):
+        ev, _ = _coast(sim)
+        assert all(c != 5 for _, c, *_ in ev)
+
+
 def test_bomb_hit_and_bomb_pass():
     """Sweeping through a bomb = penalty event (code 6); letting it pass
     is silent and free."""
@@ -1037,6 +1059,71 @@ def test_beatsaver_parser_v3_chains_arcs_bpm(tmp_path):
     t9 = [n for n in notes if n.free_pre][0].hit_time
     assert t9 - t8 == pytest.approx(60.0 / 240.0)
     assert t8 == pytest.approx(8 * 0.5)             # pre-change beats @120
+
+
+def test_beatsaver_parser_headless_and_single_slice_chains(tmp_path):
+    """2026-10-02: a chain with no colour note at its head has no head in
+    the game (links only, as BeatSaver and BeatLeader count it), and the
+    slice count includes the head, so sc = 1 adds no links."""
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    v3 = {"version": "3.3.0",
+          "colorNotes": [{"b": 6, "x": 1, "y": 0, "c": 1, "d": 1}],
+          "burstSliders": [
+              # headed, sc = 1: the head only
+              {"b": 6, "x": 1, "y": 0, "c": 1, "d": 1,
+               "tb": 6.5, "tx": 1, "ty": 2, "sc": 1, "s": 1.0},
+              # headless, sc = 4: three links, no head
+              {"b": 8, "x": 2, "y": 0, "c": 0, "d": 1,
+               "tb": 8.5, "tx": 2, "ty": 2, "sc": 4, "s": 1.0}]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal")
+    heads = [n for n in notes if n.kind == KIND_CHAIN_HEAD]
+    links = [n for n in notes if n.kind == KIND_CHAIN_LINK]
+    assert len(heads) == 1 and heads[0].color == 1
+    assert len(links) == 3 and all(l.color == 0 for l in links)
+
+
+def test_beatsaver_parser_v3_arc_tail_ignores_tc(tmp_path):
+    """v3 slider "tc" is the tail CUT DIRECTION, not a colour: the arc
+    tail must match its note whatever tc is (until 2026-10-02 a tc other
+    than the arc colour silently dropped the tail's free pre-swing)."""
+    import json
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    v3 = {"version": "3.2.0",
+          "colorNotes": [{"b": 4, "x": 1, "y": 0, "c": 1, "d": 1},
+                         {"b": 6, "x": 2, "y": 0, "c": 1, "d": 3}],
+          "sliders": [{"b": 4, "c": 1, "x": 1, "y": 0, "d": 1, "mu": 1,
+                       "tb": 6, "tx": 2, "ty": 0, "tc": 3, "tmu": 1, "m": 0}]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal")
+    assert [n.free_post for n in notes] == [True, False]
+    assert [n.free_pre for n in notes] == [False, True]
+
+
+def test_beatsaver_parser_chain_tail_note_is_arc_tail(tmp_path):
+    """A colour note at a chain's tail scores like an arc tail (free
+    pre-swing); a chain head there is ChainHeadArcTail (115) — the
+    BeatLeader max-score rule, which real scores require."""
+    import json
+    from beat_arena_env import scoresaber
+    from beat_arena_env.beatsaver import load_beatmap
+    _write_info(tmp_path)
+    v3 = {"version": "3.2.0",
+          "colorNotes": [{"b": 4, "x": 1, "y": 0, "c": 1, "d": 1},
+                         {"b": 6, "x": 2, "y": 0, "c": 1, "d": 3}],
+          "burstSliders": [
+              {"b": 4, "c": 1, "x": 1, "y": 0, "d": 1, "tb": 6, "tx": 2,
+               "ty": 0, "sc": 3, "s": 1},
+              {"b": 6, "c": 1, "x": 2, "y": 0, "d": 3, "tb": 6.5, "tx": 3,
+               "ty": 0, "sc": 3, "s": 1}]}
+    (tmp_path / "Normal.dat").write_text(json.dumps(v3))
+    notes, _ = load_beatmap(str(tmp_path), "Normal")
+    heads = [n for n in notes if n.kind == KIND_CHAIN_HEAD]
+    assert [h.free_pre for h in heads] == [False, True]
+    assert [scoresaber.max_unit_points(h) for h in heads] == [85, 115]
 
 
 def test_beatsaver_parser_reversed_arc(tmp_path):
