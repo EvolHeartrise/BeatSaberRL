@@ -28,16 +28,43 @@ const IWER = readFileSync(resolve("node_modules/iwer/build/iwer.min.js"), "utf8"
 
 // Page-side harness, installed before the app: the emulated headset (head
 // 1.7 m up at the floor origin, mono, small views so software GL keeps up)
-// and a per-frame driver that puts each controller at the scripted
+// and a per-frame driver that puts each controller's GRIP at the scripted
 // player's palm — converted env world -> XR local-floor coords, the
 // inverse of FluxPlay's read: env (x, y, z) = scene (x, y, -z), scene =
 // local + (0, 0, -PLANE_Z0).
+//
+// iwer's controller.position is the TARGET-RAY origin; the grip space the
+// app reads is that pose times the controller profile's gripOffsetMatrix
+// (Touch Plus: (-/+0.004, -0.016, +0.050) m, plus a ~45 deg tilt). The
+// controllers keep iwer's identity orientation, so the driver subtracts the
+// offset's translation to land the grip — the palm — on the path.
+//
+// Timing: the driver is a window rAF and can only use the LAST frame's
+// play.time; iwer snapshots controller poses at the start of its next XR
+// frame, and that frame's game tick advances play.time again before the
+// test can look. So play.palms trail play.time by one frame (3x clock on a
+// slow software-GL frame: 0.1-0.3 s of chart time, across a palm jump).
+// The harness therefore stamps what it drove — {t, palms} — and, in an XR
+// frame callback (after iwer's snapshot, in the same frame as the app's
+// read), latches the stamp the snapshot used: window.__gripDriven.
 const HARNESS = `
   const dev = new IWER.XRDevice(IWER.metaQuest3);
   dev.stereoEnabled = false;
   dev.position.set(0, 1.7, 0);
   dev.installRuntime({ forceInstall: true });
   window.__xr = dev;
+  const GRIP = Object.fromEntries(["left", "right"].map((side) => {
+    const m = IWER.metaQuest3.controllerConfig.layout[side].gripOffsetMatrix;
+    return [side, [m[12], m[13], m[14]]];
+  }));
+  let driven = null;
+  const xrs = navigator.xr, request = xrs.requestSession.bind(xrs);
+  xrs.requestSession = async (...args) => {
+    const s = await request(...args);
+    const latch = () => { window.__gripDriven = driven; s.requestAnimationFrame(latch); };
+    s.requestAnimationFrame(latch);
+    return s;
+  };
   const REST = [[-0.25, 1.1, -0.4], [0.25, 1.1, -0.4]];
   // palms at env z -0.35, reached 0.35 / speed after the hit time: each
   // palm holds its object until then
@@ -56,12 +83,14 @@ const HARNESS = `
     const P = window.__fluxPlay;
     if (P) {
       const chart = P.session()?.chart ?? [];
-      const palms = window.__palmAt(P.play.time, chart);
+      const t = P.play.time;
+      const palms = window.__palmAt(t, chart);
       [["left", 0], ["right", 1]].forEach(([side, h]) => {
         const c = dev.controllers[side];
-        const [x, y, z] = palms[h];
-        if (c) c.position.set(x, y, -z - 0.65);
+        const [x, y, z] = palms[h], g = GRIP[side];
+        if (c) c.position.set(x - g[0], y - g[1], -z - 0.65 - g[2]);
       });
+      driven = { t, palms };
     }
     requestAnimationFrame(drive);
   };
@@ -121,16 +150,21 @@ try {
   await waitPlay(page, () => window.__fluxPlay.play.phase === "countdown" ||
     window.__fluxPlay.play.phase === "playing", null, 10000);
 
-  // the palms are the controllers' grips, in env coords
+  // the palms are the controllers' grips, in env coords: play.palms (read
+  // this frame) against the palms the harness drove into the pose iwer
+  // snapshotted for this frame, stamped with the game time they were
+  // scripted for — not play.time, which has since advanced a frame
   await waitPlay(page, () => window.__fluxPlay.play.time > 2, null, 90000);
   const pal = await page.evaluate(() => {
-    const P = window.__fluxPlay;
+    const P = window.__fluxPlay, d = window.__gripDriven;
     return { got: P.play.palms.map((p) => Array.from(p)),
-             want: window.__palmAt(P.play.time, P.session().chart) };
+             want: d.palms, at: d.t, now: P.play.time };
   });
   const off = Math.max(...[0, 1].flatMap((h) =>
     [0, 1, 2].map((i) => Math.abs(pal.got[h][i] - pal.want[h][i]))));
-  if (!(off < 0.2)) throw new Error("grip palms vs driven: " + JSON.stringify(pal));
+  // float32 pose math only: no lag, no grip-offset slack
+  if (!(off < 1e-3) || !(pal.at <= pal.now))
+    throw new Error("grip palms vs driven: " + JSON.stringify(pal));
   await page.screenshot({ path: "test/out/flux-xr-mid.png" });
 
   await waitPlay(page, () => window.__fluxPlay.play.phase === "done", null, 240000);
@@ -148,8 +182,9 @@ try {
   await waitPlay(page, () => !window.__fluxPlay.play.presenting, null, 10000);
   if (errors.length) throw new Error(errors.join("\n"));
   console.log(`flux-xr-browser OK: head ${head.map((v) => v.toFixed(3))}, grip ` +
-    `offset ${off.toFixed(3)} m; ${st.n_objects} objects, good ${st.good}, ` +
-    `bad ${st.bad}, miss ${st.misses}, score ${st.score}`);
+    `offset ${off.toExponential(1)} m (${(pal.now - pal.at).toFixed(3)} s behind ` +
+    `play.time); ${st.n_objects} objects, good ${st.good}, bad ${st.bad}, ` +
+    `miss ${st.misses}, score ${st.score}`);
 } finally {
   await browser.close();
 }
