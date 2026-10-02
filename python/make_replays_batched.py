@@ -241,7 +241,9 @@ def plan_composite(args, mhash):
             name = rec.get(f"{board}_from")
             if not rec.get(board) or name is None:
                 continue
-            path = os.path.join(args.sources, name)
+            # keyed by absolute path: write_back looks sources up by
+            # Source.path (abspath), so a relative --sources must match
+            path = os.path.abspath(os.path.join(args.sources, name))
             if path not in sources:
                 sources[path] = Source(path)
                 if sources[path].data.get("model_hash") != mhash:
