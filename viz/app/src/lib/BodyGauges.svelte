@@ -120,7 +120,8 @@
     ctx.lineTo(bmid, y + 5);
     ctx.stroke();
     if (tau !== 0) {
-      const t = Math.max(-1, Math.min(1, tau / TAU_MAX[j]));
+      // the fraction of this joint's limit (the replay body's, if it has one)
+      const t = Math.max(-1, Math.min(1, tau / (pb.rep?.body?.tau_max[j] ?? TAU_MAX[j])));
       ctx.strokeStyle = t > 0 ? "#7dd3a0" : "#e06c75";
       ctx.lineWidth = 5;
       ctx.beginPath();
@@ -222,7 +223,8 @@
     const q29 = Array.from({ length: 29 },
       (_, j) => lerp(qa[7 + j], qb[7 + j], u));
     const om29 = pb.rep.ticks[k1].omega;
-    const tau29 = tauOf(pb.rep.ticks[k1].action, pb.rep.config.gears ?? 3);
+    const tau29 = tauOf(pb.rep.ticks[k1].action, pb.rep.config.gears ?? 3,
+      pb.rep.body);
     draw(panels[0], q29, om29, tau29, null, null);
     draw(panels[1], q29, om29, tau29, footForces(pb.rep, k1),
       activationAt(pb.rep, k1));

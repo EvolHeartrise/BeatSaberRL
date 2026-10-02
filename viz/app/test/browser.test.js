@@ -6,7 +6,7 @@
 // toggles the first-person camera (at the head, looking straight down the
 // track) on and back off.
 // Screenshots land in test/out/ for eyeball verification.
-// Run: node test/browser.test.js [path-to-replay.jsonl]
+// Run: node test/browser.test.js [path-to-replay.rpl.gz]
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import puppeteer from "puppeteer-core";
@@ -32,12 +32,12 @@ function findBrowser() {
 const EDGE = findBrowser();
 const dist = resolve("dist/index.html");
 const replay = resolve(process.argv[2] ??
-  "test/fixtures/v10_scripted_ep00_seed0.jsonl");
+  "test/fixtures/v10_scripted_ep00_seed0.rpl.gz");
 // env v15: a recording whose header carries "track_anchor": "head", so the
 // built bundle is exercised on the head-anchored track as well as on the
 // legacy fixed one above (skipped if the probe recording is not present).
 const replayV15 = resolve(process.argv[3] ??
-  "../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.jsonl");
+  "../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.rpl.gz");
 if (!existsSync(dist)) throw new Error("run `npm run build` first");
 mkdirSync("test/out", { recursive: true });
 
@@ -117,7 +117,7 @@ try {
   console.log("loaded:", JSON.stringify(loaded));
   if (loaded.drop !== "📂 open replay…")
     throw new Error("the picker should read as an open action: " + loaded.drop);
-  if (loaded.name !== basename(replay).replace(/\.[^.]*$/, ""))
+  if (loaded.name !== basename(replay).replace(/\.rpl\.gz$|\.[^.]*$/, ""))
     throw new Error("unexpected replay name in state: " + loaded.name);
   if (loaded.bar.some((b) => /export|stop & save|fps/.test(b)))
     throw new Error("video export controls are back in the bar: " + loaded.bar.join(" | "));

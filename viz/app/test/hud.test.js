@@ -4,6 +4,7 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { parseReplay } from "../src/lib/replay.js";
+import { FIXTURE, readReplayFile } from "./fixture.js";
 import {
   ENERGY_FLOOR, ENERGY_START, formatScore, gradeOf, hudAt, pctString,
 } from "../src/lib/hud.js";
@@ -150,8 +151,7 @@ for (const [p, g] of [[100, "SS"], [90, "SS"], [89.99, "S"], [80, "S"], [79.9, "
 // (publish_replays.walk_events): score 881, max combo 2, final combo 1 at
 // 1x, 29 breaks (17 bad cuts + 9 misses + 3 bombs).
 {
-  const r = parseReplay(readFileSync(
-    new URL("./fixtures/v10_scripted_ep00_seed0.jsonl", import.meta.url), "utf8"));
+  const r = parseReplay(readReplayFile(FIXTURE));
   const s = hudAt(r, r.ticks.length - 1);
   assert.deepEqual([s.score, s.maxCombo, s.combo, s.mult, s.misses],
     [881, 2, 1, 1, 29]);

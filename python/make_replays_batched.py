@@ -8,8 +8,8 @@
       [--exact (default) | --fast] [--write-back] [--dat] [--writers N]
 
 make_top10_replays.py records one play at a time: a RustBeatEnv, a per-
-tick Python JSON record, and a width-1024 forward carrying ONE real row
-per tick. This tool plays every selected level at once, the way the bench
+tick Python record, and a width-1024 forward carrying ONE real row per
+tick. This tool plays every selected level at once, the way the bench
 played them (2026-10-02):
 
   - one VecBeatSim (combo_walk=True, the bench's max_steps), each env with
@@ -28,10 +28,11 @@ played them (2026-10-02):
   - each env records in Rust (VecBeatSim.set_record_env /
     take_record_env: one frame per SIM tick, action-repeat ticks
     included), and a finished env's capture goes to a spawn process pool
-    (started before CUDA init) that writes the publish-ready compact
-    .jsonl.gz with its full header (map, level, weights hash) through
-    rust_env.record_header / write_replay_jsonl — and the ScoreSaber .dat
-    plus its decode check only with --dat;
+    (started before CUDA init) that writes the publish-ready replay
+    (<name>.rpl.gz, replay format 2) with its full header (map, level,
+    weights hash) through rust_env.record_header /
+    replay_format.write_replay — and the ScoreSaber .dat plus its decode
+    check only with --dat;
   - the bench-style result row is built by the bench's own finish_slot
     from the same VecBeatSim getters the bench reads, and compared to the
     source bench row (play counters: score, combo, good / bad / miss /
@@ -286,7 +287,8 @@ def write_replay(task):
     back as {"error": ...}."""
     t0 = time.perf_counter()
     try:
-        from beat_arena_env.rust_env import record_header, write_replay_jsonl
+        from beat_arena_env.rust_env import record_header
+        from beat_arena_env.replay_format import write_replay
         m = dict(task["map"])
         if m["audio_offset_s"] is None:
             # a chart-cache pickle from before 2026-10-02 has no clock
@@ -301,18 +303,21 @@ def write_replay(task):
             action_repeat=task["repeat"], tau_scale=task["tau"],
             gears=task["gears"], map=m, level=task["level"],
             model_hash=task["model_hash"])
-        gz = task["out"].endswith(".gz")
-        n = write_replay_jsonl(task["out"], header, task["rec"],
-                               compact=gz, gzip_level=6 if gz else None)
+        stats = {}
+        n = write_replay(task["out"], header, task["rec"], stats=stats)
         out = {"out": task["out"], "bytes": os.path.getsize(task["out"]),
                "ticks": n}
+        if stats["stored"]:
+            # the decoders could not rebuild these from q / action within
+            # tolerance (an unknown body?): they ride as columns instead
+            out["stored"] = stats["stored"]
         if task["dat"]:
             import convert_scoresaber as conv
             from beat_arena_env import scoresaber
             sys.path.insert(0, os.path.join(HERE, "tests"))
             from test_convert_scoresaber import decode_dat
             md = scoresaber.ensure_map_dats(m["hash"], task["map_cache"])
-            dat = re.sub(r"\.jsonl(\.gz)?$", ".dat", task["out"])
+            dat = re.sub(r"\.rpl\.gz$", ".dat", task["out"])
             conv.convert(task["out"], md, m["hash"], m["difficulty"], dat)
             d = decode_dat(dat)
             if d["final_score"] != task["score"]:
@@ -574,9 +579,6 @@ def parse_args(argv=None):
                         "and patch the composite's picks")
     p.add_argument("--dat", action="store_true",
                    help="also write + decode-check ScoreSaber .dat files")
-    p.add_argument("--jsonl", action="store_true",
-                   help="write plain .jsonl (make_top10_replays' format) "
-                        "instead of compact .jsonl.gz")
     p.add_argument("--writers", type=int,
                    default=max(1, min(4, (os.cpu_count() or 2) - 1)),
                    help="writer processes (0 = write inline)")
@@ -661,7 +663,7 @@ def main(argv=None):
         "cuda" if torch.cuda.is_available() else "cpu"))
     policy = policy.to(device).eval()
     os.makedirs(args.out_dir, exist_ok=True)
-    ext = ".jsonl" if args.jsonl else ".jsonl.gz"
+    from beat_arena_env.replay_format import EXT as ext
 
     futures = {}
     n_total = len(jobs)
@@ -683,6 +685,9 @@ def main(argv=None):
                   flush=True)
         else:
             r["write"] = w
+            if w.get("stored"):
+                print(f"warning {r['job']['name']}: derived fields stored "
+                      f"as columns: {', '.join(w['stored'])}", flush=True)
 
     def on_done(job, row, rec, truncated, fwd_path):
         want = play_of(job["row"])
