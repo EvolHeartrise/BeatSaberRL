@@ -7,8 +7,11 @@ For each top play: greedy re-rollout with the bench protocol (cached
 map, real NJS speeds, seed 0) in the bench's own regime — its sim dtype
 (f32 by default), its forward batch width via the bench's graphed
 argmax, and its recorded body (tau_scale) — recording JSONL, verify the outcome
-counters and multiplied score against the bench entry, then convert to
-a ScoreSaber .dat and verify the decode. Deterministic sim ⇒ exact.
+counters and multiplied score against the bench entry, and (--dat,
+opt-in since 2026-10-02) convert to a ScoreSaber .dat and verify the
+decode. Deterministic sim ⇒ exact. A failing play is reported and the
+run goes on (exit status 1 at the end). Many plays at once: see
+make_replays_batched.py (one batched sim + forward for a whole set).
 (Was a 598M one-off; parameterized 2026-07-24.)
 
 Control rate (2026-10-01): the bench header's tick_hz / action_repeat
@@ -62,9 +65,6 @@ from beat_arena_env.constants import OBS_DIM, parse_tau_scale
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.rust_env import RustBeatEnv
 from policy import load_policy
-
-sys.path.insert(0, "tests")
-from test_convert_scoresaber import decode_dat
 
 
 def slug(s, n=24):
@@ -208,9 +208,26 @@ def _kick(env, rng, vmax):
 
 
 def _make_one(job):
-    """One play: re-rollout, verify vs bench entry, convert, verify decode.
-    Returns (base, line, warn) for rank-ordered printing by the parent."""
-    rank, n_top, entry, tag, label = job
+    """One play, with per-job error handling (2026-10-02): a failing play
+    (map fetch, parse, convert) is reported by the parent and the run
+    goes on. Returns (base, line, warn, error)."""
+    try:
+        return (*_make_one_inner(job), None)
+    except Exception as e:
+        import traceback
+        rank, n_top, entry = job[0], job[1], job[2]
+        return (None, None, None,
+                f"[{rank:2}/{n_top}] FAILED {entry.get('song', '?')!r} "
+                f"[{entry.get('difficulty')}]: {type(e).__name__}: {e}\n"
+                + traceback.format_exc())
+
+
+def _make_one_inner(job):
+    """One play: re-rollout, verify vs bench entry, and (--dat) convert +
+    verify the decode. Returns (base, line, warn) for rank-ordered
+    printing by the parent."""
+    rank, n_top, entry, tag, label = job[:5]
+    dat = job[5] if len(job) > 5 else False
     policy, dev = _W["policy"], _W["dev"]
     # the bench's map cache (BL-only levels too), fetched on a miss: a pod
     # gets chart_cache pickles, not raw maps
@@ -225,7 +242,19 @@ def _make_one(job):
                       action_repeat=repeat)
     if _W.get("tau") is not None:
         env.set_tau_scale(_W["tau"])
-    env.set_record(base + ".jsonl")
+    # the map on the recording so the 3D viewer can pull this song's audio
+    # from BeatSaver and line it up (meta["shift"] is what first_note_s
+    # did to the clock; -shift is the song time at replay t=0), the level
+    # identity and the weights hash — written into the header up front
+    # (2026-10-02; was a stamp() rewrite of the finished file)
+    env.set_record(base + ".jsonl",
+                   map={"hash": entry["song_hash"],
+                        "difficulty": entry["difficulty"],
+                        "song": entry["song"],
+                        "audio_offset_s": -meta["shift"]},
+                   level=level_identity(entry),
+                   **({"model_hash": _W["mhash"]} if _W.get("mhash")
+                      else {}))
     obs, _ = env.reset()
     walk = scoresaber.ComboTracker()
     push_prob, push_vmax, push_seed = _W.get("push", (0.0, 0.0, 0))
@@ -264,24 +293,23 @@ def _make_one(job):
                 f"{round(walk.score)} != bench {entry['score']} "
                 f"(near-tie drift; replay is self-consistent)")
 
-    # stamp the map on the recording so the 3D viewer can pull this song's
-    # audio from BeatSaver and line it up (meta["shift"] is what
-    # first_note_s did to the clock; -shift is the song time at replay t=0)
-    from annotate_replay_audio import stamp
-    stamp(base + ".jsonl", entry["song_hash"], entry["difficulty"],
-          entry["song"], -meta["shift"],
-          extra={"level": level_identity(entry),
-                 **({"model_hash": _W["mhash"]} if _W.get("mhash") else {})})
-
-    conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
-                 entry["difficulty"], base + ".dat")
-    d = decode_dat(base + ".dat")
-    assert d["final_score"] == round(walk.score), \
-        f".dat decode {d['final_score']} != replay {round(walk.score)}"
+    # ScoreSaber .dat + decode check: opt-in (--dat, 2026-10-02) — the
+    # replay site plays the JSONL; the .dat is for watch.scoresaber.com
+    out = base + ".jsonl"
+    if dat:
+        sys.path.insert(0, os.path.join(os.path.dirname(
+            os.path.abspath(__file__)), "tests"))
+        from test_convert_scoresaber import decode_dat
+        conv.convert(base + ".jsonl", map_dir, entry["song_hash"],
+                     entry["difficulty"], base + ".dat")
+        d = decode_dat(base + ".dat")
+        assert d["final_score"] == round(walk.score), \
+            f".dat decode {d['final_score']} != replay {round(walk.score)}"
+        out = base + ".dat"
     line = (f"[{rank:2}/{n_top}] {entry['pp']:6.1f}pp "
             f"{entry['stars']:5.2f}* acc {entry['accuracy']:.3f} "
             f"{'FC ' if entry['full_combo'] else ''}"
-            f"{entry['song'][:34]!r} -> {base}.dat OK"
+            f"{entry['song'][:34]!r} -> {out} OK"
             + (f"  [pushes: {n_push} in {tick} ticks, replay score "
                f"{round(walk.score)} vs bench {entry['score']}]"
                if push_prob > 0.0 else "")) + "\n" + verify
@@ -327,6 +355,10 @@ def main():
                         "from --sort/--bottom, e.g. toppp/botacc). Used "
                         "by curated selections (2026-08-21 wall-heavy "
                         "set) where the sort key isn't the story")
+    p.add_argument("--dat", action="store_true",
+                   help="also convert each replay to a ScoreSaber .dat and "
+                        "decode-check it (off by default since 2026-10-02: "
+                        "the replay site plays the JSONL)")
     p.add_argument("--workers", type=int, default=1,
                    help="parallel plays (spawn pool; each worker owns a "
                         "policy + sim). Outputs byte-identical to serial.")
@@ -414,9 +446,9 @@ def main():
     # replays/ is gitignored and absent on fresh checkouts (third
     # "output dir assumed to exist" bug of the 2026-08-08 migration)
     os.makedirs("replays", exist_ok=True)
-    jobs = [(rank, len(top), entry, args.tag, label)
+    jobs = [(rank, len(top), entry, args.tag, label, args.dat)
             for rank, entry in enumerate(top, 1)]
-    made = []
+    made, failed = [], []
     if args.workers > 1:
         ctx = multiprocessing.get_context("spawn")   # CUDA-safe
         with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs)),
@@ -429,7 +461,11 @@ def main():
                                            if args.tau_scale else None,
                                            sim_dtype, width, rate,
                                            mhash)) as ex:
-            for base, line, warn in ex.map(_make_one, jobs):
+            for base, line, warn, err in ex.map(_make_one, jobs):
+                if err:
+                    print(err, flush=True)
+                    failed.append(err.splitlines()[0])
+                    continue
                 if warn:
                     print(warn, flush=True)
                 print(line, flush=True)
@@ -440,12 +476,19 @@ def main():
                      parse_tau_scale(args.tau_scale) if args.tau_scale
                      else None, sim_dtype, width, rate, mhash)
         for job in jobs:
-            base, line, warn = _make_one(job)
+            base, line, warn, err = _make_one(job)
+            if err:
+                print(err, flush=True)
+                failed.append(err.splitlines()[0])
+                continue
             if warn:
                 print(warn, flush=True)
             print(line, flush=True)
             made.append(base)
     print("\nall verified:", len(made))
+    if failed:
+        print(f"{len(failed)} FAILED:\n  " + "\n  ".join(failed))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
