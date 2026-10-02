@@ -79,6 +79,7 @@ Fidelity notes:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import lzma
 import math
@@ -146,26 +147,35 @@ def scoring_type(n: Note) -> int:
 
 # -- binary writers ----------------------------------------------------------
 
+# All writers append IN PLACE to the caller's bytearray and return it
+# (2026-10-02: `b + ...` copied the whole growing buffer per field —
+# quadratic in the replay length; output bytes unchanged).
+
 def w_int(b, v):
     b += struct.pack("<i", int(v))
     return b
 
 
 def w_float(b, v):
-    return b + struct.pack("<f", float(v))
+    b += struct.pack("<f", float(v))
+    return b
 
 
 def w_bool(b, v):
-    return b + (b"\x01" if v else b"\x00")
+    b += b"\x01" if v else b"\x00"
+    return b
 
 
 def w_str(b, s):
     raw = s.encode("utf-8")
-    return b + struct.pack("<i", len(raw)) + raw
+    b += struct.pack("<i", len(raw))
+    b += raw
+    return b
 
 
 def w_vec3(b, v):
-    return b + struct.pack("<3f", *v)
+    b += struct.pack("<3f", *v)
+    return b
 
 
 def head_frame(tick):
@@ -214,7 +224,10 @@ def quat_from_forward(d):
 # -- replay reading ----------------------------------------------------------
 
 def read_replay(path):
-    with open(path) as f:
+    """(header, tick lines) of a JSONL replay; .jsonl.gz is read as gzip
+    (make_replays_batched.py writes publish-ready gz directly)."""
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as f:
         lines = [json.loads(l) for l in f if l.strip()]
     assert "header" in lines[0], "not a beat-arena replay"
     header = lines[0]["header"]
