@@ -1,4 +1,5 @@
-// Replay format v10 (SPEC-v10 §6): env v10 full-body dynamics.
+// Replay v10 (SPEC-v10 §6): env v10 full-body dynamics, stored as replay
+// format 2 (decodeReplay below; python/beat_arena_env/replay_format.py).
 // Pure logic only (no three/svelte imports) — unit-tested in node.
 //
 // World: floor-based coordinates, y = 0 is the floor. Lanes at
@@ -6,20 +7,15 @@
 // 1.90. Hit plane z = 0; objects approach from +z. Per-tick records
 // carry the FULL body state: q(36) = root pos + root quat (wxyz) + 29
 // joint angles (§1.4 actuated order), root twist(6), omega(29), the
-// per-hand FK sabers [wrist(3), blade(3)] (viewer convenience — the
-// skeleton is drawn from full-body FK over q), 29 gear-id actions,
-// contact events {pair, p, j} (§2 pair ids, tick-summed impulse), and
-// the P6 ADDITIVE field "feet" (per-foot tick-summed weld impulses
-// [jx,jy,jz,jax,jay,jaz]; vertical reaction N ≈ jy/DT) and, since
-// record_rev 3 (2026-09-13), "activation" = the tick's commanded
-// Σ|gear fraction| as [total, spine, arms, legs] (the --iso-coef base;
-// it replaced the P6 "effort" work reading) — additive: readers must
-// tolerate their absence, and activation is derived from "action" when
-// the field is missing. Since record_rev 4 (env v43, 2026-09-14) the
-// tick also carries "torque" = applied Σ|τ| as [total, spine, arms,
-// legs] in N·m (the --energy-coef base) — additive, ignored by this
-// viewer; per-joint torque is exactly
-// gearTable(config.gears)[action[j]] * TAU_MAX29[j].
+// per-hand FK sabers [wrist(3), blade(3)] (rebuilt from q by the decoder —
+// the skeleton is drawn from full-body FK over q too), 29 gear-id actions,
+// contact events {pair, p, j} (§2 pair ids, tick-summed impulse), "feet"
+// (per-foot tick-summed ground reaction impulse [jx, jy, jz]; vertical
+// reaction N ≈ jy/DT), "activation" = the tick's commanded Σ|gear
+// fraction| as [total, spine, arms, legs] and "torque" = applied Σ|τ| in
+// the same groups (N·m) — both derived from "action" x the header's body
+// tables. Per-joint torque is body.gear_frac[j][action[j]] *
+// body.tau_max[j] (tauOf). Flux runs (JSONL) may lack any of these.
 // The Three.js scene maps world (x, y, z) -> (x, y, -z): the camera sits at
 // scene +z looking down -z, preserving the player's view (x right, y up,
 // notes approaching).
@@ -249,7 +245,7 @@ export const V_MIN = 1;
 // One replay line per SIM tick at the header's "tick_hz" (absent = 30, the
 // only rate before 2026-09-29): tick k spans [k, k+1] * DT s. DT is a LIVE
 // binding — the viewer shows one replay at a time, and every place that
-// makes a replay the active one (state.svelte.js loadText, playctl.js) calls
+// makes a replay the active one (state.svelte.js loadReplay, playctl.js) calls
 // setTickRate(tickHzOf(rep)), so all the tick <-> seconds conversions here
 // and in the components (pb.cur * DT, outcomes at (tick + 1) * DT, the song
 // clock, contact / popup ages, foot force = impulse / DT) follow it. At 30
@@ -324,8 +320,11 @@ export function gearTable(n) {
   return out;
 }
 
-/** Applied torque per joint this tick: gear fraction × τ_max. */
-export function tauOf(action, gears) {
+/** Applied torque per joint this tick: gear fraction × τ_max — from the
+ * replay's own body tables (format 2 header.body: per-joint effective
+ * limits and gear fractions) when given, else the nominal TAU_MAX. */
+export function tauOf(action, gears, body = null) {
+  if (body) return action.map((a, j) => (body.gear_frac[j][a] ?? 0) * body.tau_max[j]);
   const table = gearTable(gears);
   return action.map((a, j) => (table[a] ?? 0) * TAU_MAX[j]);
 }
@@ -550,18 +549,212 @@ export const GOOD_COL = "#7dd3a0", BAD_COL = "#f0a35e", MISS_COL = "#e06c75";
 // Flux: 60 circle, 115 bar)
 export const KIND_MAX = [115, 0, 85, 20, 60, 115];
 
-export function parseReplay(text) {
-  const lines = text.split("\n").filter((l) => l.trim());
+// ---- replay format 2 (python/beat_arena_env/replay_format.py) -------------
+// The agent replay file: gzip (inflated by urlload.js) around MAGIC, a u32
+// JSON length, {header, ticks, blocks} JSON, then column blocks (u8 raw, or
+// "z32" = zigzagged int32 as 4 byte planes; value = int / scale, `delta`
+// rows are running sums, q's joint rows add the omega trapezoid prediction).
+// decodeReplay rebuilds the per-tick objects the viewer reads ({t, time, q,
+// twist, omega, sabers, head, action, reward, contacts, feet, activation,
+// torque, events}); sabers / head come from full-body FK of q and
+// activation / torque from action x header.body unless the file stores them
+// (the writer stores whatever it could not verify).
+export const REPLAY_MAGIC = "BARPLAY2";
+const EVENT_REASONS = ["ok", "slow", "angle", "wrong_hand", "miss", "post",
+  "bomb", "wall", "wall_enter"];
+
+/** True when `b` (bytes, already inflated) is a format-2 replay. */
+export function isReplayBytes(b) {
+  if (!(b instanceof Uint8Array) || b.length < 12) return false;
+  for (let i = 0; i < 8; i++)
+    if (b[i] !== REPLAY_MAGIC.charCodeAt(i)) return false;
+  return true;
+}
+
+/** wxyz quaternion of a world-from-body rotation — rust fk.rs rot_to_quat's
+ * branches, so the sign matches the sim's head pose. */
+export function rotToQuatWxyz(r) {
+  const m00 = r[0][0], m11 = r[1][1], m22 = r[2][2], tr = m00 + m11 + m22;
+  if (tr > 0) {
+    const s = Math.sqrt(tr + 1) * 2;
+    return [0.25 * s, (r[2][1] - r[1][2]) / s, (r[0][2] - r[2][0]) / s,
+      (r[1][0] - r[0][1]) / s];
+  } else if (m00 > m11 && m00 > m22) {
+    const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    return [(r[2][1] - r[1][2]) / s, 0.25 * s, (r[0][1] + r[1][0]) / s,
+      (r[0][2] + r[2][0]) / s];
+  } else if (m11 > m22) {
+    const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    return [(r[0][2] - r[2][0]) / s, (r[0][1] + r[1][0]) / s, 0.25 * s,
+      (r[1][2] + r[2][1]) / s];
+  }
+  const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+  return [(r[1][0] - r[0][1]) / s, (r[0][2] + r[2][0]) / s,
+    (r[1][2] + r[2][1]) / s, 0.25 * s];
+}
+
+/** [activation, torque] ([total, spine, arms, legs] each) of one tick's
+ * gear-id action under header.body {tau_max, gear_frac}. */
+export function effortOf(action, body) {
+  const a = [0, 0, 0, 0], t = [0, 0, 0, 0];
+  for (let j = 0; j < action.length; j++) {
+    const f = body.gear_frac[j][action[j]] ?? 0;
+    const g = j < 3 ? 1 : j < 17 ? 2 : 3;
+    const fa = Math.abs(f), ta = Math.abs(f * body.tau_max[j]);
+    a[0] += fa; a[g] += fa; t[0] += ta; t[g] += ta;
+  }
+  return [a, t];
+}
+
+/** Decode an inflated format-2 replay: { header, ticks }. */
+export function decodeReplay(bytes) {
+  if (!isReplayBytes(bytes)) throw new Error("not a beat-arena replay");
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = dv.getUint32(8, true);
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(12, 12 + n)));
+  const header = meta.header, T = meta.ticks;
+  if (header.format !== 2)
+    throw new Error("replay format " + header.format + " — this viewer reads format 2");
+  const hz = parseTickHz(header.tick_hz);
+  // name -> { ent, v }: v = the block's integer values, row-major
+  const blocks = {};
+  let off = 12 + n;
+  off += (8 - (off % 8)) % 8;
+  for (const ent of meta.blocks) {
+    const len = ent.rows * ent.len;
+    const size = ent.dtype === "u8" ? len : 4 * len;
+    if (off + size > bytes.length) throw new Error("the replay file is truncated");
+    let v;
+    if (ent.dtype === "u8") {
+      v = bytes.subarray(off, off + len);
+    } else {
+      v = new Float64Array(len);
+      const p1 = off + len, p2 = off + 2 * len, p3 = off + 3 * len;
+      for (let i = 0; i < len; i++) {
+        const z = (bytes[off + i] | (bytes[p1 + i] << 8) | (bytes[p2 + i] << 16)
+          | (bytes[p3 + i] << 24)) >>> 0;
+        v[i] = z & 1 ? -(z + 1) / 2 : z / 2;
+      }
+    }
+    off += size + (8 - (size % 8)) % 8;
+    blocks[ent.name] = { ent, v };
+  }
+  const need = (name) => {
+    const b = blocks[name];
+    if (!b) throw new Error("the replay has no " + name + " block");
+    return b;
+  };
+  const om = need("omega"), qb = need("q");
+  const Q = Float64Array.from(qb.v);
+  if (qb.ent.pred === "omega") {
+    // integer-exact: the quotient of two exact integers, floored
+    const c = qb.ent.scale / om.ent.scale;
+    for (let r = 7; r < 36; r++) {
+      const o = (r - 7) * T;
+      for (let k = 1; k < T; k++)
+        Q[r * T + k] += Math.floor((c * (om.v[o + k] + om.v[o + k - 1]) + hz) / (2 * hz));
+    }
+  }
+  if (qb.ent.delta)
+    for (let r = 0; r < 36; r++)
+      for (let k = 1; k < T; k++) Q[r * T + k] += Q[r * T + k - 1];
+  // the `rows` values of block b at tick k, scaled
+  const col = (b, k, rows) => {
+    const out = new Array(rows);
+    for (let r = 0; r < rows; r++) out[r] = b.v[r * T + k] / b.ent.scale;
+    return out;
+  };
+  const tw = need("twist"), ft = need("feet"), rw = need("reward");
+  const ac = need("action"), sab = blocks.sabers, hd = blocks.head;
+  const actB = blocks.activation, trqB = blocks.torque;
+  const cn = need("contact_n").v, cpair = need("contact_pair").v;
+  const cp = need("contact_p"), cj = need("contact_j");
+  const en = need("event_n").v, ecode = need("event_code").v;
+  const enote = need("event_note"), ev = need("event_val");
+  const nC = cpair.length, nE = ecode.length;
+  const ticks = new Array(T);
+  let ci = 0, ei = 0;
+  for (let k = 0; k < T; k++) {
+    const q = new Array(36);
+    for (let r = 0; r < 36; r++) q[r] = Q[r * T + k] / qb.ent.scale;
+    const action = new Array(29);
+    for (let j = 0; j < 29; j++) action[j] = ac.v[j * T + k];
+    let sabers, head;
+    if (!sab || !hd) {
+      const qn = q.slice();
+      const nq = Math.hypot(qn[3], qn[4], qn[5], qn[6]) || 1;
+      for (let i = 3; i < 7; i++) qn[i] /= nq;
+      const fk = bodyFK(qn);
+      sabers = [fkSaber(fk, 0), fkSaber(fk, 1)];
+      head = [...fk.p[F_HEAD], ...rotToQuatWxyz(fk.r[F_HEAD])];
+    }
+    if (sab) {
+      const s = col(sab, k, 12);
+      sabers = [s.slice(0, 6), s.slice(6)];
+    }
+    if (hd) head = col(hd, k, 7);
+    let activation, torque;
+    if (!actB || !trqB) [activation, torque] = effortOf(action, header.body);
+    if (actB) activation = col(actB, k, 4);
+    if (trqB) torque = col(trqB, k, 4);
+    const contacts = [];
+    for (const end = ci + cn[k]; ci < end; ci++)
+      contacts.push({
+        pair: cpair[ci],
+        p: [cp.v[ci] / cp.ent.scale, cp.v[nC + ci] / cp.ent.scale,
+          cp.v[2 * nC + ci] / cp.ent.scale],
+        j: cj.v[ci] / cj.ent.scale,
+      });
+    const events = [];
+    for (const end = ei + en[k]; ei < end; ei++) {
+      const code = ecode[ei], note = enote.v[ei], s = ev.ent.scale;
+      const points = ev.v[ei] / s;
+      events.push(code === 4 ? { miss: { note } }
+        : code === 5 ? { post: { note, points } }
+        : code === 6 ? { bomb: { note } }
+        : code === 7 ? { wall: {} }
+        : code === 8 ? { wall_enter: {} }
+        : { cut: { note, good: code === 0, reason: EVENT_REASONS[code], points,
+          pre: ev.v[nE + ei] / s, acc: ev.v[2 * nE + ei] / s } });
+    }
+    const f = col(ft, k, 6);
+    ticks[k] = {
+      t: k, time: k / hz, q, twist: col(tw, k, 6), omega: col(om, k, 29),
+      sabers, head, action, reward: rw.v[k] / rw.ent.scale, contacts,
+      feet: [f.slice(0, 3), f.slice(3)], activation, torque, events,
+    };
+  }
+  return { header, ticks };
+}
+
+/** Parse a replay: format-2 bytes (agent Beat Saber replays — the only
+ * agent format), or JSONL text (Flux runs: the Flux env's recordings and
+ * WebXR game runs). */
+export function parseReplay(input) {
+  if (typeof input !== "string") {
+    const b = input instanceof Uint8Array ? input : new Uint8Array(input);
+    const { header, ticks } = decodeReplay(b);
+    return replayFromParts(header, ticks);
+  }
+  const lines = input.split("\n").filter((l) => l.trim());
   const head = JSON.parse(lines[0]);
   if (!head.header) throw new Error("not a beat-arena replay");
-  const v = head.header.version;
+  if (head.header.game !== "flux")
+    throw new Error("this is an old JSONL replay: agent replays are .rpl.gz " +
+      "(format 2) now; re-record it with make_replays_batched.py");
+  return replayFromParts(head.header, lines.slice(1).map((l) => JSON.parse(l)));
+}
+
+/** The viewer's replay object from a header and its tick objects (what
+ * parseReplay returns; also how tests build synthetic replays). */
+export function replayFromParts(header, ticks) {
+  const v = header.version;
   if (v !== "v10")
     throw new Error(
       "replay version " + v + " — this viewer reads v10 (env v10 " +
       "full-body dynamics); re-record from a current checkpoint",
     );
-  const ticks = lines.slice(1).map((l) => JSON.parse(l));
-  const chart = head.header.chart;
+  const chart = header.chart;
   const outcomes = chart.map(() => null);
   const posts = []; // follow-through resolutions: {note, tick, points}
   ticks.forEach((t) =>
@@ -593,37 +786,38 @@ export function parseReplay(text) {
   for (const p of posts) (postsByNote[p.note] ??= []).push(p);
 
   return {
-    // ADDITIVE header field: "flux" for the Flux game mode (SPEC.md
-    // §Flux); absent = the standard game
-    game: head.header.game ?? "standard",
-    // ADDITIVE header field: "human" for a WebXR game run (fluxgame.js);
-    // absent = an agent (sim) recording
-    player: head.header.player ?? "agent",
+    // header field: "flux" for the Flux game mode (SPEC.md §Flux); absent =
+    // the standard game
+    game: header.game ?? "standard",
+    // header field: "human" for a WebXR game run (fluxgame.js); absent = an
+    // agent (sim) recording
+    player: header.player ?? "agent",
     // human runs: the game's final tallies ({score, good, ...}) and its
     // judge rate (Hz; the env's is 30)
-    result: head.header.result ?? null,
-    judgeHz: head.header.judge_hz ?? null,
-    // record_rev 6 (exp/tick-rate) ADDITIVE header field: the sim's control
-    // rate — one tick line per 1/tickHz s. Absent = 30. The viewer applies
-    // it with setTickRate(tickHzOf(rep)) when the replay becomes active.
-    tickHz: parseTickHz(head.header.tick_hz),
-    actionRepeat: head.header.action_repeat ?? 1,
-    config: head.header.config, chart, ticks, outcomes, posts, postsByNote,
-    // env v15 ADDITIVE header field: "head" -> head-anchored note track.
-    // Anything else (including absent) means the pre-v15 FIXED track.
-    trackAnchor: head.header.track_anchor ?? null,
-    // ADDITIVE header field written by python/annotate_replay_audio.py:
-    // {hash, difficulty, song, audio_offset_s} — the map this recording was
+    result: header.result ?? null,
+    judgeHz: header.judge_hz ?? null,
+    // record_rev 6 (exp/tick-rate) header field: the sim's control rate —
+    // one tick per 1/tickHz s. Absent = 30. The viewer applies it with
+    // setTickRate(tickHzOf(rep)) when the replay becomes active.
+    tickHz: parseTickHz(header.tick_hz),
+    actionRepeat: header.action_repeat ?? 1,
+    // format 2: the body this replay was played with ({tau_max, gear_frac}
+    // per joint); null on Flux recordings (tauOf falls back to TAU_MAX)
+    body: header.body ?? null,
+    config: header.config, chart, ticks, outcomes, posts, postsByNote,
+    // env v15 header field: "head" -> head-anchored note track. Anything
+    // else (including absent) means the pre-v15 FIXED track.
+    trackAnchor: header.track_anchor ?? null,
+    // {hash, difficulty, song, audio_offset_s}: the map this recording was
     // played on, so the viewer can fetch its audio. Absent on synthetic
-    // charts and on anything recorded before the annotator existed.
-    map: head.header.map ?? null,
-    // ADDITIVE header field written by viz/replays-site's publish step: the
-    // public id of the model that played (e.g. "v60-60hz"). Display only.
-    model: typeof head.header.model === "string" ? head.header.model : null,
-    // env v17 ADDITIVE header field: world-space wall AABBs, geometry
-    // finished by the parser ({t, cx, cy, w, h, l, speed} per wall).
-    // Pre-v17 recordings (field absent) render exactly as before.
-    walls: head.header.walls ?? [],
+    // charts.
+    map: header.map ?? null,
+    // header field written by viz/replays-site's publish step: the public
+    // id of the model that played (e.g. "v60-60hz"). Display only.
+    model: typeof header.model === "string" ? header.model : null,
+    // env v17 header field: world-space wall AABBs, geometry finished by
+    // the parser ({t, cx, cy, w, h, l, speed} per wall).
+    walls: header.walls ?? [],
     arcs: arcPairs(chart),
   };
 }
@@ -756,9 +950,8 @@ export function lerpAng(a, b, u) {
 }
 
 /** Interpolated 6-field saber [wx,wy,wz,bx,by,bz] at (tickIdx + u):
- * wrist lerped, blade lerp-normalized — from the LOGGED sabers (the
- * sim's own FK; the skeleton uses bodyFK(qAt(...)) instead, and the
- * two agree because the logged fields ARE that FK's outputs). */
+ * wrist lerped, blade lerp-normalized — from the tick sabers (FK of the
+ * tick's q; the skeleton uses bodyFK(qAt(...)), which agrees at ticks). */
 export function saberAt(rep, tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];

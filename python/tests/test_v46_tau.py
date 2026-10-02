@@ -9,7 +9,6 @@ The Rust sim takes scales EXPLICITLY (set_tau_scale — it has no per-
 episode RNG); the CUDA env draws them at every reset when tau_rand > 0
 from a seeded generator, or takes set_tau_scale at tau_rand == 0.
 """
-import json
 import os
 
 import numpy as np
@@ -185,16 +184,20 @@ def test_replay_header_carries_tau_scale(tmp_path):
     env = RustBeatEnv(external_chart=[n], seed=0, gears=5)   # short episode
     s = parse_tau_scale("arms=1.2,legs=0.9")
     env.set_tau_scale(s)
-    path = tmp_path / "r.jsonl"
+    path = tmp_path / "r.rpl.gz"
     env.set_record(str(path))
     env.reset()
     done = False
     while not done:          # the recorder flushes at episode end
         _, _, done, _, _ = env.step(np.zeros(N_JOINTS, dtype=np.int64))
-    with open(path) as f:
-        head = json.loads(f.readline())["header"]
+    from beat_arena_env.replay_format import read_replay
+    head, ticks = read_replay(str(path))
     assert head["record_rev"] >= 5
     assert head["tau_scale"] == pytest.approx(s)
+    # format 2: the body tables carry the scaled per-joint limits, so the
+    # decoded torque is the applied one
+    assert head["body"]["tau_max"] == pytest.approx(
+        [TAU_MAX[j] * s[TAU_AXIS_OF_JOINT[j]] for j in range(N_JOINTS)])
 
 
 # --- CUDA ----------------------------------------------------------------------

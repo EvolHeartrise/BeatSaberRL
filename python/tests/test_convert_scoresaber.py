@@ -28,6 +28,7 @@ import pytest
 import convert_scoresaber as conv
 from beat_arena_env import scoresaber
 from beat_arena_env.beatsaver import load_beatmap
+from beat_arena_env.replay_format import read_replay
 from beat_arena_env.rust_env import RustBeatEnv
 
 
@@ -214,7 +215,7 @@ def converted(tmp_path_factory):
 
     notes, _ = load_beatmap(str(tmp), "Expert", first_note_s=FIRST_NOTE_S)
     env = RustBeatEnv(external_chart=notes, seed=0)
-    replay_path = str(tmp / "ep.jsonl")
+    replay_path = str(tmp / "ep.rpl.gz")
     env.set_record(replay_path)
     obs, _ = env.reset()
     rng = np.random.default_rng(5)
@@ -238,8 +239,7 @@ def converted(tmp_path_factory):
     out = str(tmp / "ep.dat")
     r = conv.convert(replay_path, str(tmp), "ab" * 20, "Expert", out,
                      first_note_s=FIRST_NOTE_S)
-    with open(replay_path) as f:
-        ticks = [json.loads(l) for l in f][1:]
+    _, ticks = read_replay(replay_path)
     return {"map_dir": str(tmp), "events": events, "result": r,
             "ticks": ticks, "decoded": decode_dat(out),
             "replay_path": replay_path, "out": out}
@@ -543,17 +543,7 @@ def test_in_place_writers_are_byte_identical(converted, monkeypatch,
     """2026-10-02: the w_* writers append in place instead of copying the
     growing buffer per field — the .dat must not change by one byte (the
     copying writers are reinstated here as the reference)."""
-    import gzip
-    import shutil
     ref = open(converted["out"], "rb").read()
-    # a gzipped replay (make_replays_batched.py output) converts the same
-    gz = str(tmp_path / "ep.jsonl.gz")
-    with open(converted["replay_path"], "rb") as src, \
-            gzip.open(gz, "wb") as dst:
-        shutil.copyfileobj(src, dst)
-    conv.convert(gz, converted["map_dir"], "ab" * 20, "Expert",
-                 str(tmp_path / "gz.dat"), first_note_s=FIRST_NOTE_S)
-    assert open(tmp_path / "gz.dat", "rb").read() == ref
     monkeypatch.setattr(conv, "w_float",
                         lambda b, v: b + struct.pack("<f", float(v)))
     monkeypatch.setattr(conv, "w_bool",

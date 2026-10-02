@@ -9,7 +9,6 @@ deterministic scripted-torque sequence achieving a good cut through
 the full dynamics -> blade sweep -> cut -> score loop.
 """
 
-import json
 import math
 
 import numpy as np
@@ -17,6 +16,7 @@ import pytest
 
 from beat_arena_env import Note, RustBeatEnv
 from beat_arena_env.chart import note_tuple
+from beat_arena_env.replay_format import read_replay
 from beat_arena_env.constants import (
     A_L_ARM, A_R_ARM, DT, HAND_FEAT, JOINT_LIMITS, N_JOINTS,
     N_NOTE_SLOTS, NOTE_FEAT, NV, NQPOS, OBS_DIM, OFF_CONTACT, OFF_HAND_L,
@@ -316,10 +316,10 @@ def test_reach_gate_moves_with_shoulders():
     assert t_back > t_ref, (t_ref, t_back)
 
 
-# --- replay v10 round-trip ---------------------------------------------------
+# --- replay v10 round-trip (format 2) ---------------------------------------
 
 def test_replay_v10_roundtrip(tmp_path):
-    path = str(tmp_path / "ep.jsonl")
+    path = str(tmp_path / "ep.rpl.gz")
     env = RustBeatEnv(seed=5, chart_len_s=6.0, bomb_prob=0.3, extra_prob=0.3,
                       colors="both")
     env.set_record(path)
@@ -328,9 +328,10 @@ def test_replay_v10_roundtrip(tmp_path):
     done = False
     while not done:
         _, _, done, _, info = env.step(rng.integers(0, 3, N_JOINTS))
-    lines = [json.loads(l) for l in open(path) if l.strip()]
-    head, ticks = lines[0], lines[1:]
+    h, ticks = read_replay(path)
+    head = {"header": h}
     assert head["header"]["version"] == "v10"
+    assert head["header"]["format"] == 2
     # additive per-tick schema revision (§6): 2 = "head" on every tick,
     # 3 = "activation" replaced the P6 "effort" field (2026-09-13),
     # 4 = "torque" [total, spine, arms, legs] applied |tau| (env v43),
@@ -355,12 +356,11 @@ def test_replay_v10_roundtrip(tmp_path):
         for c in t["contacts"]:
             assert 0 <= c["pair"] < 55 and len(c["p"]) == 3
             assert c["j"] != 0.0
-        # blade dirs are unit (rounded to 4 dp)
+        # blade dirs are unit (FK of the decoded q)
         for s in t["sabers"]:
             assert np.hypot(np.hypot(s[3], s[4]), s[5]) == pytest.approx(
                 1.0, abs=1e-3)
-        # record_rev 2: FK head pose [p(3), quat wxyz(4)], unit
-        # quaternion (rounded to 6 dp)
+        # FK head pose [p(3), quat wxyz(4)], unit quaternion
         assert len(t["head"]) == 7
         assert np.linalg.norm(t["head"][3:7]) == pytest.approx(1.0, abs=1e-5)
     # the head starts at the §1.1 neutral anchor and is NOT a constant:

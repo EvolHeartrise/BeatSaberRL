@@ -631,11 +631,11 @@ would pay ~36 pp at 1% accuracy). The raw curve value stays in
 ## Exporting to ScoreSaber's replay viewer
 
 ```bash
-$VENV/bin/python convert_scoresaber.py --replay replays/<x>.jsonl \
+$VENV/bin/python convert_scoresaber.py --replay replays/<x>.rpl.gz \
     --hash <song-hash> --difficulty Hard
 ```
 
-Converts a JSONL v7 replay of a REAL map into a ScoreSaber replay
+Converts a replay of a REAL map into a ScoreSaber replay
 `.dat` that loads on watch.scoresaber.com (open/drag the file onto the
 page; the viewer fetches the map from BeatSaver by the embedded hash).
 Format reverse-engineered from the viewer's own source — vendored
@@ -645,9 +645,7 @@ Pose frames come from the recorded joint state via the FK mirror —
 including the HEAD pose (position + rotation), which the viewer uses
 for real: first person is its default camera and its note-arrival
 plane sits at `head.z + 0.65`, so the exported head both aims the
-camera and reproduces env v15's head-anchored note track. Recordings
-older than record_rev 2 have no head rotation and still convert, to
-the old fixed forward-facing placeholder. The
+camera and reproduces env v15's head-anchored note track. The
 final score reproduces the ScoreSaber bench's multiplied score exactly
 (per-note totals exact; the pre/acc split of a cut is reconstructed
 assuming full pre-swing, so per-component popups can differ on
@@ -686,7 +684,21 @@ $VENV/bin/python make_top10_replays.py --ckpt <ckpt.pt> --bench <bench.json> --t
 body, asinh z) on the real maps, which must already be under
 `python/maps/scoresaber/` (see `prefetch_maps.py`).
 Then open `viz/replay.html` in a browser and drop a
-`python/replays/*.jsonl` file in. Since 2026-07-21 the viewer is a
+`python/replays/*.rpl.gz` file in (many plays at once:
+`make_replays_batched.py`, one batched sim for a whole set).
+
+Replays are **format 2** (2026-10-02, `python/beat_arena_env/replay_format.py`
+documents the layout): gzip around a JSON header and integer column blocks —
+q at 1e-4 (deltas, joint rows predicted from omega), omega at 1e-2, twist /
+feet at 1e-3, reward at 1e-4, actions, contacts and score events. Sabers,
+head pose, activation and torque are NOT stored: both decoders (Python
+`replay_format.decode` / `read_replay`, the viewer's `decodeReplay`) rebuild
+them from q (full-body FK) and from the actions x the header's `body` tables
+(the per-joint limits and gear fractions the replay was played with), and the
+writer checks that against the sim's own values (<= 1 mm / 0.1 deg,
+1e-4 / 1e-3 N.m), storing whatever fails as a column instead. ~95 B per
+60 Hz tick, ~3.5x smaller than the retired JSONL format (~345 B), which no
+reader accepts any more (Flux runs are still JSONL). Since 2026-07-21 the viewer is a
 Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
 wheel = zoom, right-drag = pan), compiled to that single static file —
 source in `viz/app/`, rebuild with `npm install && npm run build` and
@@ -770,26 +782,12 @@ it stays welded to the blade instead of lagging a tick behind it.
 
 Since 2026-09-09 the viewer plays the real song under a replay, pulled from
 BeatSaver at view time (both its hosts send `access-control-allow-origin: *`,
-so it works from the `file://` page):
-
-```bash
-$VENV/bin/python annotate_replay_audio.py 'replays/*.jsonl'
-```
-
-A recording only knows which song it is if it carries the ADDITIVE header
-field that writes: `"map": {hash, difficulty, song, audio_offset_s}`.
-`make_top10_replays.py` stamps new recordings itself. `audio_offset_s` is the
-song time at replay t=0 and is NOT optional — recordings re-base the chart so
-the first note lands at 2 s, and the real offsets across the replay library
-run from −0.04 s to +19.6 s.
-
-The annotator can be run over recordings made before the field existed
-because the header carries the whole chart: a candidate (map, difficulty)
-from the ScoreSaber catalog is re-parsed at the recording convention and its
-note times compared against the header's, so the map, the difficulty and the
-time base are all PROVEN before anything is written. A wrong guess can't
-silently desync the audio — the failure mode is "not annotated". 604 of the
-639 replays on disk annotate; the rest are synthetic charts with no song.
+so it works from the `file://` page). A recording knows which song it is from
+its header field `"map": {hash, difficulty, song, audio_offset_s}`, which
+`make_top10_replays.py` / `make_replays_batched.py` write up front.
+`audio_offset_s` is the song time at replay t=0 and is NOT optional —
+recordings re-base the chart so the first note lands at 2 s, and the real
+offsets run from −0.04 s to +19.6 s.
 
 Viewer side (`viz/app/src/lib/audio.js`): BeatSaver hash lookup → map `.zip`
 → the audio file `Info.dat` names (`.egg` is Ogg Vorbis, so it needs an

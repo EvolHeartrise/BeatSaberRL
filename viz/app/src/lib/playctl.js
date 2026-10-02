@@ -6,7 +6,7 @@ import PACK from "./fluxcharts.data.js";
 import { loadFluxCore } from "./fluxcore.js";
 import { FluxSession, LEAD_IN_S } from "./fluxgame.js";
 import { DT, PLANE_Z0, counts, isFlux, isHuman } from "./replay.js";
-import { game, loadText, pb, play, recordBest, setRep } from "./state.svelte.js";
+import { game, loadReplay, pb, play, recordBest, setRep } from "./state.svelte.js";
 import { sfx } from "./sfx.js";
 import { FLUX } from "./build.js";
 
@@ -217,7 +217,7 @@ export function watchRun() {
   const text = game.session.toJSONL();
   const name = runName();
   exitPlay({ keepRep: true });
-  loadText(text, name);
+  loadReplay(text, name);
 }
 
 // Automation / test hook: drive the real game path without a headset.
