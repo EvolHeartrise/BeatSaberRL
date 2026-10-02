@@ -45,7 +45,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # pinned 2026-10-02: rustc 1.99.0 (stable since 2026-10-01) dies with
+      # SIGILL compiling beat-arena-rs in the release profile (lto,
+      # codegen-units 1, target-cpu=native from rust/.cargo/config.toml)
+      # on the hosted runners; the same sources build with 1.99.0 on the
+      # laptop and with 1.98.1 everywhere. Unpin once a runner build passes.
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
