@@ -310,3 +310,13 @@ def test_batched_tool_matches_single_env_and_writes_back(tmp_path,
     # a second run reproduces the written-back rows exactly
     res2 = mrb.main(argv + ["--tag", "t2"])
     assert [r["status"] for r in res2] == ["match"] * len(res)
+
+
+def test_fast_mode_switches_to_exact_for_large_jobs():
+    """--fast only applies below FAST_MAX_PLAYS plays; bigger jobs run the
+    bench-width forward, which is faster there and bench-exact."""
+    import make_replays_batched as mrb
+    n = mrb.FAST_MAX_PLAYS
+    assert mrb.fast_mode(True, 20) and mrb.fast_mode(True, n - 1)
+    assert not mrb.fast_mode(True, n) and not mrb.fast_mode(True, 7455)
+    assert not mrb.fast_mode(False, 20)
