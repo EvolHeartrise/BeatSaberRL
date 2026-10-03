@@ -37,6 +37,11 @@ Alternative with nothing but `http.server`: copy `viz/dash/dist/*` into
 from there — the page finds `./index.json` first, `/archive/index.json`
 second (`?archive=/some/prefix/` overrides). Development:
 `npm run dev` (vite on :5173, proxies `/archive` to serve.py on :8765).
+Test: `npm test` builds and runs `test/refresh-browser.mjs` — one
+headless Chrome (from `~/.cache/puppeteer/chrome`, or
+`PUPPETEER_EXECUTABLE_PATH`) against a fake archive in `test/.archive`
+served by serve.py: idle refreshes must not redraw or reset a zoom
+(Live, window lock, Compare), appended rows must reach every chart.
 
 ## Views
 
@@ -50,17 +55,25 @@ second (`?archive=/some/prefix/` overrides). Development:
   checkpoint peak VRAM.
   Panels an era did not measure are marked "no data". X axis:
   samples | updates | wall-clock (hours; from `t` stamps, else
-  cumulative `elapsed`). Auto-refresh every 30 s re-fetches index.json
-  and the run's metrics.jsonl; the status line shows "last update N /
+  cumulative `elapsed`). Auto-refresh every 15 s (`?refresh=<s>`
+  overrides) re-checks index.json and the run's metrics.jsonl; the
+  status line shows "last update N /
   total · samples · T ago" (T from the record's `t`, i.e. the log's
   mtime for backfilled runs). **Window lock** (2026-09-14): "window:
   last N" pins every panel's x axis to the most recent N units of the
   current x mode (M samples / updates / hours; 0 or "all" = whole run),
-  remembered per mode in localStorage, re-applied after each refresh so
-  the view follows the run. Refreshes now update the plots in place
-  instead of rebuilding them, so a manual drag-zoom (with the lock off)
-  also survives the 30 s refresh; a view showing the full run keeps
-  extending to the new tail.
+  remembered per mode in localStorage, re-applied when new rows arrive so
+  the view follows the run. **Idle refreshes leave the charts alone**
+  (2026-10-02): a refresh that brought nothing new does not redraw,
+  re-zoom or re-window anything, so a drag-zoom (with or without the
+  lock) survives while no run is training. Detection: serve.py sends an
+  ETag (mtime + size) and the page polls with If-None-Match (304 = no
+  body); a 200 is still compared with what the page holds (metrics bytes;
+  index.json minus its `generated` stamp, which the backfill bumps every
+  pass), and the charts compare points before touching uPlot. When rows
+  do arrive the plots update in place: a zoomed view keeps its window
+  and redraws, a full-run view extends to the new tail. Switching run
+  rebuilds the plots (no inherited zoom).
 - **Compare** — tick any runs (filter box), align on samples (default)
   / updates / wall; small multiples per metric (acc, return, ent, entfull,
   ev, steps/s, falls / 1M and tilts / 1M on log axes, clipfrac, KL, gnorm,
