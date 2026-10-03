@@ -34,6 +34,13 @@
   const time = $derived(pb.cur * DT);
   const pend = $derived(pendingNotes(pb.rep, time, zOff));
   const after = $derived(aftermaths(pb.rep, time));
+  // free the debris of every cut whose aftermath has left the window (its
+  // meshes are gone by the time effects run), and all of it on unmount
+  $effect(() => {
+    const live = new Set(after.map((a) => a.i));
+    for (const [i, sp] of splits) if (!live.has(i)) { freeSplit(sp); splits.delete(i); }
+  });
+  $effect(() => freeSplits);
   const arcs = $derived(activeArcs(pb.rep, time, zOff));
   const walls = $derived(pendingWalls(pb.rep, time, zOff));
 
@@ -121,19 +128,27 @@
     kind === KIND_CHAIN_HEAD ? headGeo : noteGeo,
     [cp.p[0], cp.p[1], -cp.p[2]], [cp.n[0], cp.n[1], -cp.n[2]]);
 
-  // halves + frame per cut note, built once (cached per loaded replay)
-  const _splitCache = new WeakMap();
+  // halves + frame per cut note, built when its aftermath appears and
+  // freed when it ends (the effect below). They used to be kept for the
+  // whole replay, and as T.Mesh never disposes a geometry it is handed,
+  // every cut left its two halves' GPU buffers behind: ~4 buffers, ~200 kB
+  // per cut, hundreds of MB over a dense song. Scrubbing back re-slices.
+  let splits = new Map(), splitRep = null; // note index -> split, for splitRep
+  const freeSplit = (sp) => sp.sides.forEach((side) => side.geo.dispose());
+  function freeSplits() {
+    splits.forEach(freeSplit);
+    splits = new Map();
+  }
   function splitFor(i) {
-    let m = _splitCache.get(pb.rep);
-    if (!m) _splitCache.set(pb.rep, (m = new Map()));
-    if (!m.has(i)) {
+    if (splitRep !== pb.rep) { freeSplits(); splitRep = pb.rep; }
+    if (!splits.has(i)) {
       const cp = cutPlaneLocal(pb.rep, i) ?? CANONICAL;
       const kind = pb.rep.chart[i].kind;
       let sides = sliceModel(kind, cp);
       if (!sides) sides = sliceModel(kind, { ...cp, p: [0, 0, 0] }); // grazing plane
-      m.set(i, { cp, sides: sides ?? [] });
+      splits.set(i, { cp, sides: sides ?? [] });
     }
-    return m.get(i);
+    return splits.get(i);
   }
 
   const aaq = (axis, ang) => {
