@@ -22,7 +22,8 @@ _c = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_c)
 TAU_MAX = np.asarray(_c.TAU_MAX, dtype=np.float64)
 TAU_AXIS_OF_JOINT = list(_c.TAU_AXIS_OF_JOINT)
-GEAR = np.asarray(_c.gear_table(5))
+# per joint: the bend joints' fine gears are 2x (constants.FINE_GEAR_MULT)
+GEAR = np.asarray([_c.joint_gear_table(5, j) for j in range(29)])
 sys.path.insert(0, PY)
 from beat_arena_env.replay_format import decode, read_raw  # noqa: E402
 
@@ -63,7 +64,7 @@ def main():
         per_file.append({"file": os.path.basename(f), "ticks": int(len(acts))})
     share = counts / max(n_ticks, 1)
     lim = TAU_MAX * np.asarray([tau_scale[TAU_AXIS_OF_JOINT[j]] for j in range(29)])
-    mean_tau = (share * np.abs(GEAR)[None, :]).sum(axis=1) * lim
+    mean_tau = (share * np.abs(GEAR)).sum(axis=1) * lim
     dead = int((share < 0.01).sum())
     groups = {}
     for g, js in GROUPS.items():

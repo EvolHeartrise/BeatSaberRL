@@ -171,7 +171,11 @@ the energy base |frac · TAU_MAX[j] · s|.
 > is stale for, among others: every τ_max except the forearm/wrist rows
 > (e.g. spine_pitch 600, not 800), the wrist ω cap (50, not 40), and
 > the ankle-pitch upper limit (+35°, not +20°). Read the code, not this
-> table, for current values.
+> table, for current values. Since 2026-10-03 main runs the v63x2 body:
+> wrist bend τ_max 1.431 N·m with a 90 rad/s ω cap, 2× fine gears on
+> the bend joints, 0.50 kg hands (74.80 kg total; §1.2's 0.61 kg hand
+> became 0.35 on 2026-08-18, then 0.50) — README "Main's body". The
+> previous body is on branch `body/original` (v60/v61 reproduce there).
 
 Arm joint limits are v9 verbatim (per-hand mirrored where noted; values in
 rad). New-joint limits from anatomical range tables. τ_max derivation §1.5;

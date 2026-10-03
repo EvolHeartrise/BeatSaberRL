@@ -7,7 +7,8 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import {
-  REPLAY_MAGIC, decodeReplay, effortOf, isReplayBytes, parseReplay,
+  BEND_JOINTS, OMEGA_CAP, REPLAY_MAGIC, TAU_MAX, decodeReplay, effortOf,
+  isReplayBytes, parseReplay, replayBody, tauOf,
 } from "../src/lib/replay.js";
 import { FIXTURE, readReplayFile } from "./fixture.js";
 
@@ -90,5 +91,52 @@ for (const [name, file] of [["main", FIXTURE], ["stored", STORED]]) {
   // a rep built from it is the viewer's replay object
   const rep = parseReplay(bytes);
   assert.ok(rep.body && rep.body.tau_max.length === 29);
+}
+
+// replayBody: per-joint body tables for both bodies. The original body
+// (v60/v61, branch body/original) passes through; the legacy wrist-body
+// headers (v62..v63x2: bend tau_max 1.431 x scale, uniform gear rows
+// although the sim applied 2x fine gears on joints 8/15) get their bend
+// rows doubled; headers since 2026-10-03 carry omega_cap and per-joint
+// rows and pass through untouched.
+{
+  const uni = [0, 1, -1, 0.25, -0.25];
+  const scale = Array(16).fill(1);
+  scale[8] = 1.2579;
+  const hdr = (bend, model, extra = {}) => ({
+    model, tau_scale: scale,
+    body: {
+      tau_max: TAU_MAX.map((t, j) => (BEND_JOINTS.includes(j) ? bend * 1.2579 : t)),
+      gear_frac: Array.from({ length: 29 }, () => uni.slice()), ...extra,
+    },
+  });
+  const orig = replayBody(hdr(1.06, "v61"));
+  assert.deepEqual(orig.gear_frac[8], uni);
+  assert.equal(orig.omega_cap[8], 50);
+  assert.equal(orig.omega_cap[3], 16);
+  for (const [model, cap] of [["v62", 65], ["v63", 65], ["v63x", 65],
+    ["v63x-60hz", 65], ["v63x2", 90], ["v63x2-60hz", 90], [undefined, 90]]) {
+    const b = replayBody(hdr(1.431, model));
+    assert.deepEqual(b.gear_frac[8], [0, 1, -1, 0.5, -0.5], `${model}: bend row`);
+    assert.deepEqual(b.gear_frac[15], [0, 1, -1, 0.5, -0.5], `${model}: bend row`);
+    assert.deepEqual(b.gear_frac[7], uni, `${model}: roll row untouched`);
+    assert.equal(b.omega_cap[8], cap, `${model}: bend cap`);
+    assert.equal(b.omega_cap[7], 50, `${model}: roll cap`);
+  }
+  const cur = hdr(1.431, "v64", {
+    omega_cap: OMEGA_CAP.map((c, j) => (BEND_JOINTS.includes(j) ? 90 : c)),
+  });
+  cur.body.gear_frac[8] = cur.body.gear_frac[15] = [0, 1, -1, 0.5, -0.5];
+  const b = replayBody(cur);
+  assert.deepEqual(b.gear_frac[8], [0, 1, -1, 0.5, -0.5]);
+  assert.equal(b.omega_cap[15], 90);
+  assert.equal(replayBody({}), null);
+  // the joint gauge's tau for a bend 1/4-id under the legacy header is
+  // the 1/2 the sim applied
+  const leg = replayBody(hdr(1.431, "v63x2"));
+  const act = Array(29).fill(0);
+  act[8] = 3;
+  assert.ok(Math.abs(tauOf(act, 5, leg)[8] - 0.5 * 1.431 * 1.2579) < 1e-12);
+  assert.ok(Math.abs(effortOf(act, leg)[1][0] - 0.5 * 1.431 * 1.2579) < 1e-12);
 }
 console.log("replay format 2 decoder OK");

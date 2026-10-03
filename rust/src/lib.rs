@@ -136,8 +136,9 @@ const GEAR_SIGNED: [Real; 7] = [0.0, 1.0, -1.0, 1.0 / 3.0, -1.0 / 3.0,
                                0.125, -0.125];
 const GEAR_SIGNED_5: [Real; 7] = [0.0, 1.0, -1.0, 0.25, -0.25, 0.0, 0.0];
 
-// wrist-body exp (user 2026-10-01): the wrist-bend joints (8, 15) take
-// their fine gears (ids >= 3) at 2x — K=5's 1/4 gear becomes 1/2 there.
+// Main's body (v63x2, since 2026-10-03; all 1.0 on branch body/original):
+// the wrist-bend joints (8, 15) take their fine gears (ids >= 3) at 2x —
+// K=5's 1/4 gear becomes 1/2 there.
 // Mirrored by the kernel's FINE_GEAR_MULT and constants.gear_fraction.
 const FINE_GEAR_MULT: [Real; NQ] = {
     let mut m = [1.0; NQ];
@@ -408,7 +409,8 @@ const _: () = assert!(OBS_DIM == 630, "spec §12 (env v49 blade-tip velocity lan
 const KNEE_Y0: Real = 0.50; // hip 0.94 − thigh 0.44
 const FOOT_Y0: Real = 0.07; // ankle height at reference (contact spec §2)
 // ≈ one tick of full-body weight: M_TOTAL·g·DT = 74.50 kg · 9.81 · (1/30)
-// = 24.53 N·s, rounded to a spec literal both engines share. A settled
+// = 24.53 N·s (24.46 at main's 74.80 kg since 2026-10-03; the literal is
+// kept), rounded to a spec literal both engines share. A settled
 // two-foot stance sums to ≈ 1.0 across the four lanes.
 const GROUND_IMP_NORM: Real = 24.5;
 const _: () = assert!(OFF_QD == 46 && OFF_HAND_L == 75 && OFF_NOTES == 102);
@@ -3688,7 +3690,7 @@ mod env_tests {
         core.step_inner(&acts);
         core.step_inner(&acts);
         let jy = core.body.foot_grf[0][1] + core.body.foot_grf[1][1];
-        let weight_dt = 74.50 * dynamics::model::G / 30.0;
+        let weight_dt = 74.80 * dynamics::model::G / 30.0; // v63x2 body
         assert!(
             (jy - weight_dt).abs() < 0.15 * weight_dt,
             "both feet's normal impulse {jy:.3} N·s vs weight x DT \

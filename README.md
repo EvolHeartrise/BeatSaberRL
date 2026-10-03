@@ -83,6 +83,20 @@ carry `config.handle_len` so the viewer places the saber correctly for
 both eras). Every pre-v42 checkpoint plays a different game on this
 geometry — their bench numbers are not comparable; retrain.
 
+**Main's body since 2026-10-03: the v63x2 body** (user decision; from
+the `exp/wrist-body-90` experiment). Versus the body before it: hands
+0.35 → **0.50 kg** (inertia rescaled, total mass 74.50 → 74.80 kg);
+wrist **bend** τ_max 1.06 → **1.431 N·m** and its ω cap 50 → **90 rad/s**
+(roll/dev stay 1.06 N·m / 50 rad/s); the bend joints (8, 15) take their
+fine gears at 2× (`FINE_GEAR_MULT`: K=5's ±¼ is ±½ there); the saved
+default body (`TAU_BODY_DEFAULT`) has wrist-bend scale 1.2579, i.e.
+1.80 N·m. Values live in `rust/src/dynamics/model.rs`, `rust/src/lib.rs`,
+`csrc/beat_arena_cuda.cu` and `constants.py`. **The original body lives
+on branch `body/original`**: v60/v61 benches, replays and checkpoints
+(and anything earlier) must be reproduced from that branch — they are a
+different body here. Replays carry their body (format 2 `header.body`),
+so the viewer shows either era correctly.
+
 **Flux game mode (2026-09-26, user-specified — SPEC.md §Flux):** a
 second Beat Saber mode alongside the standard game, on the same body,
 physics, track and reward terms. No sabers: the hands are palm-centre
