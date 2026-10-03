@@ -460,7 +460,10 @@ def apply_depth_init(policy):
         if blk.out_proj is not None:
             layers.append(blk.out_proj)
         layers.append(blk.ffn[-1])
-    layers.append(policy.trunk_fc2)
+    # the SimBa trunk's residual write; a SimBaV2 trunk (--trunk-arch
+    # simbav2) has no fc2 and keeps its unit-norm rows (projected)
+    if getattr(policy, "trunk_fc2", None) is not None:
+        layers.append(policy.trunk_fc2)
     for lin in layers:
         lin.weight.mul_(f)
         lin.bias.zero_()
@@ -480,7 +483,8 @@ class Block(nn.Module):
     a concat-heads output projection.
     """
 
-    def __init__(self, d: int, n_heads: int = 1, ffn_mult: int = 2):
+    def __init__(self, d: int, n_heads: int = 1, ffn_mult: int = 2,
+                 value_residual: bool = False, dwa_n: int = 0):
         super().__init__()
         assert d % n_heads == 0, f"embed {d} not divisible by {n_heads} heads"
         # FusedLayerNorm == nn.LayerNorm in state_dict/params; on CUDA
@@ -498,13 +502,38 @@ class Block(nn.Module):
         self.d = d
         self.n_heads = n_heads
         self.dh = d // n_heads
+        # --value-residual (ResFormer, arXiv 2410.17897; arch
+        # "value_residual"): every block after the first mixes block 0's
+        # attention values into its own, v <- a v + b v_0, with learnable
+        # scalars initialised to (a, b) = (1, 0) so training starts at the
+        # baseline. Registered LAST in the block (the diag groups slice the
+        # flat grad buffer at each block's ln_attn.weight) and only when
+        # on, so an off policy's parameters() order is untouched.
+        if value_residual:
+            self.vres_a = nn.Parameter(torch.ones(1))
+            self.vres_b = nn.Parameter(torch.zeros(1))
+        else:
+            self.vres_a = self.vres_b = None
+        # --dwa (DenseFormer depth-weighted average, arXiv 2402.02622; arch
+        # "dwa"): this block's output stream is sum_j w_j x_j over
+        # [embedding, block 0 out, ..., this block's out] (dwa_n = its
+        # index + 2 entries), initialised to the identity (w = e_last).
+        # 1-D, so it lands on Adam and outside --weight-decay.
+        if dwa_n:
+            w = torch.zeros(dwa_n)
+            w[-1] = 1.0
+            self.dwa = nn.Parameter(w)
+        else:
+            self.dwa = None
 
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
                 n_queries: int = 0, attn_bias: torch.Tensor | None = None,
                 delta: torch.Tensor | None = None,
                 delta_bias: torch.Tensor | None = None,
                 want_resolved: bool = False,
-                next_ln: nn.Module | None = None):
+                next_ln: nn.Module | None = None,
+                v0: torch.Tensor | None = None, want_v: bool = False,
+                resolve: bool = False):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -541,6 +570,18 @@ class Block(nn.Module):
         # the residual add and that LN run as ONE kernel; the block then
         # returns (x_resolved, ln_attn(x_resolved), _LN_DONE) and the next
         # block skips its forward_add.
+        # v0 (--value-residual, blocks 1..L-1): block 0's attention values
+        # (B, T, d), a view of its projection output so the gradient
+        # reaches it; mixed into this block's v as a v + b v0 (fp32
+        # arithmetic, rounded once to the stream dtype — bitwise v at
+        # (a, b) = (1, 0)), out of place, BEFORE the attention: the packed
+        # q|k|v (non-final) or k|v (final block) buffer is rebuilt with
+        # the mixed v, so the fused T = 29 kernels run unchanged.
+        # want_v (block 0, non-final): also return its v as a 4th element.
+        # resolve (non-final, --dwa): return the RESOLVED output
+        # (x + ffn(h2), the final block's residual-only FFN path) as
+        # (x_out, None, None) — no delayed residual, no next-LN fusion —
+        # so the caller can form the depth-weighted average.
         B, T, _ = x.shape
         if delta_bias is _LN_DONE:
             h = delta
@@ -548,7 +589,7 @@ class Block(nn.Module):
             x, h = self.ln_attn.forward_add(x, delta, delta_bias)
         else:
             h = self.ln_attn(x)
-        qkv = None
+        qkv = kv = None
         if h.dtype is torch.float16:
             # Tier 1.4: q/k/v share input h -> one GEMM against the cat
             # replicas. The final block's q runs on the SLICED h, so
@@ -566,6 +607,14 @@ class Block(nn.Module):
                 q, k, v = qkv.split(self.d, dim=-1)
         else:
             k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
+        v_own = v
+        if v0 is not None:
+            v = (v.float() * self.vres_a
+                 + v0.float() * self.vres_b).to(v.dtype)
+            if qkv is not None:
+                qkv = torch.cat([qkv[..., :2 * self.d], v], dim=-1)
+            elif kv is not None:
+                kv = torch.cat([k, v], dim=-1)
         if n_queries:
             # x.contiguous() is load-bearing, not hygiene: a (B, T, d)
             # row slice is NOT contiguous, and FusedLayerNorm._eligible
@@ -643,15 +692,55 @@ class Block(nn.Module):
             else:
                 out = x + _seq(self.ffn, h2)
             return (out, x_full) if want_resolved else out
+        if resolve:
+            # --dwa: the resolved stream (the final block's residual-only
+            # FFN path; the fused kernel without the LN where it applies)
+            if _fl.fused_ffn_ok(h2, self.ffn):
+                out = _fl.fused_ffn(x, h2, self.ffn)
+            else:
+                out = x + _seq(self.ffn, h2)
+            return (out, None, None, v_own) if want_v else (out, None, None)
         if next_ln is not None and _fl.fused_ffn_ok(h2, self.ffn, next_ln):
             # --fused-ffn: FFN + residual + the next block's ln_attn in one
             # kernel; the hidden never reaches memory in the rollout
             x, h_next = _fl.fused_ffn(x, h2, self.ffn, next_ln)
+            if want_v:
+                return x, h_next, _LN_DONE, v_own
             return x, h_next, _LN_DONE
         # non-final block: the consumer is the NEXT block's
         # ln_attn.forward_add, which can absorb ffn.2's bias
         ffn_out, ffn_bias = _seq(self.ffn, h2, fold_tail=True)
+        if want_v:
+            return x, ffn_out, ffn_bias, v_own
         return x, ffn_out, ffn_bias
+
+
+def _dwa_mix(w: torch.Tensor, xs: list) -> torch.Tensor:
+    """--dwa depth-weighted average sum_j w[j] xs[j] (DenseFormer): fp32
+    accumulation (one addcmul per term), rounded once to the stream
+    dtype. Exactly xs[-1] at the identity init w = e_last (0 * x = 0,
+    0 + x = x), so an identity-initialised DWA policy computes the
+    baseline's resolved stream bit for bit on the fp32 path."""
+    y = xs[0].float() * w[0]
+    for j in range(1, len(xs)):
+        y = torch.addcmul(y, xs[j], w[j])
+    return y.to(xs[-1].dtype)
+
+
+def _l2n(x: torch.Tensor) -> torch.Tensor:
+    """Row l2 normalisation (SimBaV2's hypersphere projection)."""
+    return F.normalize(x, dim=-1, eps=1e-6)
+
+
+# readout-trunk layouts (arch "trunk_arch"): "simba" = residual + LN
+# block (the production trunk); "simbav2" = the hyperspherical SimBaV2
+# trunk (arXiv 2502.15280, --trunk-arch simbav2, NotePolicy._trunk_v2).
+# Its scalers use the paper's parametrisation: a learnable vector p with
+# s = p * (s_init / s_scale), p initialised to s_scale — s_init sets the
+# value, s_scale the effective step size under Adam. Scalers: s_init =
+# s_scale = sqrt(2 / width) (the reference config); the residual LERP
+# alpha: init 1 / (L + 1) = 0.5 (L = 1 block), scale 1 / sqrt(trunk_dim).
+TRUNK_ARCHS = ("simba", "simbav2")
 
 
 def hl_target(v: torch.Tensor, centers: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -699,8 +788,14 @@ class NotePolicy(nn.Module):
                  value_sigma: float = 0.75,
                  trunk_hidden: int | None = None,
                  z_asinh: float = 8.0, game: str = "standard",
-                 fp16_accum: str = "off", fused_ffn: str = "off"):
+                 fp16_accum: str = "off", fused_ffn: str = "off",
+                 emb_ln: bool = False, value_residual: bool = False,
+                 final_ln: bool = False, dwa: bool = False,
+                 trunk_arch: str = "simba"):
         super().__init__()
+        if trunk_arch not in TRUNK_ARCHS:
+            raise ValueError(f"trunk_arch must be one of {TRUNK_ARCHS}, "
+                             f"got {trunk_arch!r}")
         # game mode the policy plays (SPEC.md §Flux): same network,
         # different obs lane meanings — never cross-loaded
         if game not in ("standard", "flux"):
@@ -761,7 +856,9 @@ class NotePolicy(nn.Module):
                      # below — the only layout since 2026-09-22 (the
                      # plain MLP trunk is gone); still stamped because
                      # load_policy refuses anything else.
-                     "trunk_arch": "simba",
+                     # "simbav2" (2026-10-03, --trunk-arch simbav2): the
+                     # hyperspherical SimBaV2 trunk (_trunk_v2)
+                     "trunk_arch": trunk_arch,
                      "trunk_hidden": (int(trunk_hidden) if trunk_hidden
                                       else trunk_dim),
                      # HL-Gauss critic head (2026-09-19; the only head
@@ -784,7 +881,17 @@ class NotePolicy(nn.Module):
                      # the unfused path, so recorded like fp16_accum.
                      # Ignored off the fp16 CUDA stream / at other widths.
                      # Absent = "off".
-                     "fused_ffn": fused_ffn}
+                     "fused_ffn": fused_ffn,
+                     # architecture A/B options (2026-10-03; each off by
+                     # default, absent = off): LayerNorm on the 29 input
+                     # tokens (--emb-ln), ResFormer value residual
+                     # (--value-residual), LayerNorm on the 5 lead
+                     # outputs before the trunk (--final-ln), DenseFormer
+                     # depth-weighted averages (--dwa)
+                     "emb_ln": bool(emb_ln),
+                     "value_residual": bool(value_residual),
+                     "final_ln": bool(final_ln),
+                     "dwa": bool(dwa)}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -809,8 +916,26 @@ class NotePolicy(nn.Module):
         # the trainer's "enc" diag group covers them.
         self.torso_mlp = _mlp([TORSO_FEAT, embed, embed])
         self.leg_mlp = _mlp([LEG_FEAT + 2, embed, embed])
+        # architecture A/B options (2026-10-03). Every new module is
+        # created ONLY when its option is on (LayerNorms and the 1-D
+        # scalars draw no RNG), so an all-off policy has today's
+        # parameters, order and init stream exactly.
+        self.value_residual = bool(value_residual)
+        self.dwa_on = bool(dwa)
+        # --emb-ln: LayerNorm (learnable gain/bias) on the 29 input tokens
+        # before block 0 — block 0 writes 15-27x the embeddings' RMS, so
+        # the raw input barely survives in the stream. Registered before
+        # the blocks: the trainer's "enc" diag group covers it.
+        self.emb_ln = FusedLayerNorm(embed) if emb_ln else None
         self.blocks = nn.ModuleList(
-            Block(embed, n_heads, ffn_mult) for _ in range(n_blocks))
+            Block(embed, n_heads, ffn_mult,
+                  value_residual=bool(value_residual) and i > 0,
+                  dwa_n=(i + 2) if dwa else 0)
+            for i in range(n_blocks))
+        # --final-ln: LayerNorm on the 5 lead tokens' final-block outputs
+        # before trunk_proj (they enter it at RMS ~30 otherwise)
+        self.final_ln = FusedLayerNorm(embed) if final_ln else None
+        self.trunk_arch = trunk_arch
         # readout = the 5 lead tokens' output embeddings
         # SimBa-style readout trunk (2026-09-15, brainstorm item 2;
         # SimBa 2410.09754 / SimBaV2 2502.15280, Creus Castanyer
@@ -824,11 +949,44 @@ class NotePolicy(nn.Module):
         # trunk -> heads -> critic) keep their order; the trainer's
         # diag looks the trunk group up by name prefix.
         H = int(trunk_hidden) if trunk_hidden else trunk_dim
-        self.trunk_proj = nn.Linear(self.n_lead * embed, trunk_dim)
-        self.trunk_ln1 = FusedLayerNorm(trunk_dim)
-        self.trunk_fc1 = nn.Linear(trunk_dim, H)
-        self.trunk_fc2 = nn.Linear(H, trunk_dim)
-        self.trunk_ln2 = FusedLayerNorm(trunk_dim)
+        if trunk_arch == "simba":
+            self.trunk_proj = nn.Linear(self.n_lead * embed, trunk_dim)
+            self.trunk_ln1 = FusedLayerNorm(trunk_dim)
+            self.trunk_fc1 = nn.Linear(trunk_dim, H)
+            self.trunk_fc2 = nn.Linear(H, trunk_dim)
+            self.trunk_ln2 = FusedLayerNorm(trunk_dim)
+        else:
+            # SimBaV2 (arXiv 2502.15280), one block, hidden H:
+            #   x = l2n(s_in * W_in z)
+            #   y = l2n(W2 relu(s_1 * W1 x)); x = l2n(x + alpha (y - x))
+            #   h = sqrt(trunk_dim) x   (RMS 1 per element, like LN2's)
+            # W_in/W1/W2 rows are kept UNIT-NORM by project_trunk_weights
+            # (here at init, and by the trainer after every optimizer
+            # step). The paper's layers have no bias: these are nn.Linear
+            # (the fp16 machinery — flat replicas, fp16_linear — wants a
+            # bias tensor) with the bias zeroed and FROZEN
+            # (requires_grad False; the trainer leaves frozen params out
+            # of its optimizers). Orthogonal init, as the paper.
+            D = trunk_dim
+            self.trunk_in = nn.Linear(self.n_lead * embed, D)
+            self.trunk_w1 = nn.Linear(D, H)
+            self.trunk_w2 = nn.Linear(H, D)
+            for lin in (self.trunk_in, self.trunk_w1, self.trunk_w2):
+                nn.init.orthogonal_(lin.weight)
+                nn.init.zeros_(lin.bias)
+                lin.bias.requires_grad_(False)
+            # scalers: p init s_scale, forward factor s_init / s_scale
+            # (= 1 for these, kept explicit for the parametrisation)
+            self._v2_c_in = 1.0
+            self._v2_c_1 = 1.0
+            self.trunk_s_in = nn.Parameter(
+                torch.full((D,), math.sqrt(2.0 / D)))
+            self.trunk_s_1 = nn.Parameter(
+                torch.full((H,), math.sqrt(2.0 / H)))
+            a_init, a_scale = 0.5, 1.0 / math.sqrt(D)
+            self._v2_c_alpha = a_init / a_scale
+            self.trunk_alpha = nn.Parameter(torch.full((D,), a_scale))
+            self.project_trunk_weights()
         # 29 factored joint heads, K = n_gears options each (env v8)
         self.heads = nn.ModuleList(
             nn.Linear(trunk_dim, n) for n in self.head_sizes)
@@ -900,6 +1058,8 @@ class NotePolicy(nn.Module):
         kernel on the fp16 stream — the fp32 record path keeps the stock
         fallback above 256). Same helpers as the blocks, so the fp16 stream (fp16
         activations, fp32 LN stats/affine) is honoured end to end."""
+        if self.trunk_arch == "simbav2":
+            return self._trunk_v2(x)
         x = _lin(self.trunk_proj, x)
         # fc1 + ReLU: on the fp16 stream fp16_linear_relu (cublasLt
         # RELU_BIAS epilogue forward, fused relu_bwd backward —
@@ -921,6 +1081,45 @@ class NotePolicy(nn.Module):
             d = _lin(self.trunk_fc2, r)
         _, h = self.trunk_ln2.forward_add(x, d)
         return h
+
+    def _trunk_v2(self, z: torch.Tensor) -> torch.Tensor:
+        """SimBaV2 readout trunk (--trunk-arch simbav2): (B, n_lead*embed)
+        -> (B, trunk_dim). GEMMs on the stream dtype (fp16_linear on the
+        fp16 stream, the zero frozen bias adds exactly 0); scalers, ReLU,
+        normalisations and the LERP in fp32, rounded once before each
+        GEMM and at the output. The same arithmetic in rollout and update
+        (no grad-mode branches), so r1 is unaffected."""
+        dt = z.dtype
+        x = _l2n(_lin(self.trunk_in, z).float()
+                 * (self.trunk_s_in * self._v2_c_in))
+        u = _lin(self.trunk_w1, x.to(dt)).float()
+        u = F.relu(u * (self.trunk_s_1 * self._v2_c_1))
+        y = _l2n(_lin(self.trunk_w2, u.to(dt)).float())
+        alpha = self.trunk_alpha * self._v2_c_alpha
+        x = _l2n(x + alpha * (y - x))
+        return (x * math.sqrt(x.shape[-1])).to(dt)
+
+    def trunk_projected(self):
+        """The (W_in, W1, W2) Linears whose rows project_trunk_weights
+        keeps unit-norm ([] unless --trunk-arch simbav2)."""
+        if self.trunk_arch != "simbav2":
+            return []
+        return [self.trunk_in, self.trunk_w1, self.trunk_w2]
+
+    @torch.no_grad()
+    def project_trunk_weights(self) -> bool:
+        """SimBaV2 weight projection: every output row of W_in / W1 / W2
+        back onto the unit sphere (and their frozen biases at 0). In place
+        on the fp32 masters, so flat-buffer views and CUDA-graph-captured
+        storages stay valid; the CALLER bumps the fp16 weights version
+        (fp16_linear.bump_weights_version) afterwards, exactly as after
+        an optimizer step. No-op (False) for the SimBa trunk."""
+        lins = self.trunk_projected()
+        for lin in lins:
+            w = lin.weight
+            w.div_(w.norm(dim=1, keepdim=True).clamp_min(1e-12))
+            lin.bias.zero_()
+        return bool(lins)
 
     def forward_stacked(self, obs: torch.Tensor):
         """Trunk + ONE fused (trunk_dim -> 29K) head GEMM: stacked
@@ -1004,8 +1203,33 @@ class NotePolicy(nn.Module):
                           (self.n_lead, 0))
         if fp16:
             attn_bias = attn_bias.half()  # C3: 2^14 is fp16-exact
+        if self.emb_ln is not None:
+            tokens = self.emb_ln(tokens)                 # --emb-ln
         delta = delta_b = None
+        # --value-residual: block 0 hands back its attention values v_0;
+        # every later block mixes them in (Block.forward v0)
+        v0 = None
+        # --dwa: every block returns its RESOLVED output (resolve=True:
+        # no delayed residual add, no fused next-LN — the DWA needs each
+        # x_j materialised); the stream entering block i + 1 is the
+        # depth-weighted average over [x_0 = the embedding, x_1..x_{i+1}]
+        dwa = self.dwa_on
+        xs = [tokens] if dwa else None
         for i, blk in enumerate(self.blocks[:-1]):
+            if dwa or self.value_residual:
+                r = blk(tokens, None, attn_bias=attn_bias, delta=delta,
+                        delta_bias=delta_b,
+                        next_ln=None if dwa else self.blocks[i + 1].ln_attn,
+                        v0=v0, want_v=self.value_residual and i == 0,
+                        resolve=dwa)
+                if len(r) == 4:
+                    tokens, delta, delta_b, v0 = r
+                else:
+                    tokens, delta, delta_b = r
+                if dwa:
+                    xs.append(tokens)
+                    tokens = _dwa_mix(blk.dwa, xs)
+                continue
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
                                          delta=delta, delta_bias=delta_b,
                                          next_ln=self.blocks[i + 1].ln_attn)
@@ -1030,10 +1254,18 @@ class NotePolicy(nn.Module):
         # there). fp16: the value moves at fp16-rounding level, the
         # class already accepted for the actor; r1 is untouched (the
         # value is not in the ratio). Pinned by tests/test_critic_fp16.
+        # (--dwa: x_res is the mixed stream entering the final block)
         tokens, x_res = self.blocks[-1](tokens, None, n_queries=self.n_lead,
                                         attn_bias=attn_bias, delta=delta,
                                         delta_bias=delta_b,
-                                        want_resolved=True)
+                                        want_resolved=True, v0=v0)
+        if dwa:
+            # the final block exists for the lead rows only: its mix runs
+            # over the lead rows of every earlier x_j
+            tokens = _dwa_mix(self.blocks[-1].dwa,
+                              [x[:, :self.n_lead] for x in xs] + [tokens])
+        if self.final_ln is not None:
+            tokens = self.final_ln(tokens)               # --final-ln
         h = self._trunk(tokens.reshape(B, -1))          # lead-token readout
         if self._diag_stash:
             self._diag_h = h
@@ -1332,12 +1564,13 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
             "marker, pre-v55); the normalised lanes are the only layout "
             "since 2026-09-22 (user: no back-compat). Check out a commit "
             "before 2026-09-22 to bench or replay it.")
-    if arch.get("trunk_arch") != "simba":
+    if arch.get("trunk_arch") not in TRUNK_ARCHS:
         raise SystemExit(
             f"checkpoint has readout trunk {arch.get('trunk_arch')!r}; the "
-            "SimBa trunk is the only layout since 2026-09-22 (the plain "
-            "MLP trunk was removed, no back-compat). Check out a commit "
-            "before 2026-09-22 to bench or replay it.")
+            "SimBa trunk is the only layout since 2026-09-22 (plus the "
+            "opt-in 'simbav2', 2026-10-03; the plain MLP trunk was "
+            "removed, no back-compat). Check out a commit before "
+            "2026-09-22 to bench or replay it.")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
@@ -1352,7 +1585,13 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         # absent (every checkpoint before issue #3) = fp32 accumulate
         fp16_accum=arch.get("fp16_accum", "off"),
         # absent (every checkpoint before review I13) = unfused FFN
-        fused_ffn=arch.get("fused_ffn", "off"))
+        fused_ffn=arch.get("fused_ffn", "off"),
+        # architecture A/B options (2026-10-03): absent = off
+        emb_ln=arch.get("emb_ln", False),
+        value_residual=arch.get("value_residual", False),
+        final_ln=arch.get("final_ln", False),
+        dwa=arch.get("dwa", False),
+        trunk_arch=arch["trunk_arch"])
     sd = ckpt["state_dict"]
     policy.upgraded_from = None
     if not blade_geo:

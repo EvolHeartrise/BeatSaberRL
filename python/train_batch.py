@@ -522,13 +522,49 @@ def build_parser():
     p.add_argument("--n-blocks", type=int, default=6)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--ffn-mult", type=int, default=4)
-    # readout trunk: always SimBa (Linear projection -> residual block
+    # readout trunk: SimBa (Linear projection -> residual block
     # x + fc2(relu(fc1(LN x))) -> LN, SimBa 2410.09754; the plain MLP
-    # trunk and --trunk-arch were removed 2026-09-22)
+    # trunk was removed 2026-09-22) unless --trunk-arch simbav2
     p.add_argument("--trunk-hidden", type=int, default=None,
                    help="hidden width of the SimBa trunk's residual "
                         "block (default = --trunk-dim; 1536 = the ffn x4 "
                         "rung, +885,888 params at 192/384)")
+    # --- architecture A/B options (2026-10-03). All OFF by default; off
+    # = today's network bit for bit. Each is stamped in the checkpoint
+    # arch (load_policy rebuilds it; absent = off) and inherited by a
+    # --resume (RESUME_ARCH).
+    p.add_argument("--emb-ln", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="LayerNorm (learnable gain/bias) on the 29 input "
+                        "tokens before block 0 (block 0 writes 15-27x the "
+                        "embeddings' RMS into the stream)")
+    p.add_argument("--value-residual", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="ResFormer value residual (arXiv 2410.17897): "
+                        "blocks 1..L-1 use v <- a v + b v_0 with block 0's "
+                        "attention values v_0; learnable per-block scalars "
+                        "init (a, b) = (1, 0) = the baseline")
+    p.add_argument("--final-ln", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="LayerNorm on the 5 lead tokens' final-block "
+                        "outputs before trunk_proj (they arrive at RMS "
+                        "~30 otherwise)")
+    p.add_argument("--dwa", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="DenseFormer depth-weighted average (arXiv "
+                        "2402.02622): after each block the stream is a "
+                        "learned mix of the embedding and every block "
+                        "output so far, init identity = the baseline. "
+                        "Bypasses the delayed-residual and --fused-ffn "
+                        "next-LN fusions (the residual-only fused FFN "
+                        "still runs)")
+    p.add_argument("--trunk-arch", choices=["simba", "simbav2"],
+                   default="simba",
+                   help="readout trunk: simba (the production trunk) or "
+                        "simbav2 (SimBaV2 arXiv 2502.15280: hyperspherical "
+                        "normalisation, unit-norm weight rows re-projected "
+                        "after every optimizer step, learnable scalers and "
+                        "LERP residual; hidden width = --trunk-hidden)")
     p.add_argument("--note-geo", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="DEFAULT ON since 2026-09-14 (user decision: part of "
@@ -987,7 +1023,45 @@ RESUME_SCHEDULE = ("lr", "lr_final", "ent_coef", "ent_tau", "warmup_updates")
 # guards downstream (n_gears check, load_policy, the z cross-check).
 RESUME_ARCH = frozenset({
     "embed", "trunk_dim", "n_blocks", "n_heads", "ffn_mult",
-    "trunk_hidden", "note_geo", "hl_bins", "hl_vmax", "hl_sigma"})
+    "trunk_hidden", "note_geo", "hl_bins", "hl_vmax", "hl_sigma",
+    "emb_ln", "value_residual", "final_ln", "dwa", "trunk_arch"})
+# the 2026-10-03 architecture A/B options: (args dest, arch key, value
+# when the checkpoint arch predates the key). A checkpoint's arch
+# decides them on --resume / --init-from (check_arch_options).
+ARCH_OPTIONS = (("emb_ln", "emb_ln", False),
+                ("value_residual", "value_residual", False),
+                ("final_ln", "final_ln", False),
+                ("dwa", "dwa", False),
+                ("trunk_arch", "trunk_arch", "simba"))
+
+
+def check_arch_options(args, explicit, ckpt, what):
+    """Make args agree with the checkpoint's arch for ARCH_OPTIONS (the
+    checkpoint's network is what load_policy builds). A typed flag that
+    differs is refused unless --ignore-arch-flags (then dropped, loudly);
+    an untyped one is set from the arch — this also covers checkpoints
+    whose args snapshot predates the flag (resolve_resume_args reports
+    those as 'missing' and keeps the CLI value). Pure host logic; returns
+    the [(dest, cli value, checkpoint value)] it changed."""
+    arch = ckpt.get("arch", {})
+    changed = []
+    for dest, key, absent in ARCH_OPTIONS:
+        ck = arch.get(key, absent)
+        mine = getattr(args, dest)
+        if mine == ck:
+            continue
+        if dest in explicit and not args.ignore_arch_flags:
+            raise SystemExit(
+                f"{what}: {flag_name(dest)} {mine!r} but the checkpoint's "
+                f"arch has {key}={ck!r}; the checkpoint's network is what "
+                f"loads — remove the flag, or pass --ignore-arch-flags")
+        if dest in explicit:
+            print(f"!!! --ignore-arch-flags: {flag_name(dest)} {mine!r} "
+                  f"dropped — the checkpoint's arch has {ck!r} !!!",
+                  flush=True)
+        setattr(args, dest, ck)
+        changed.append((dest, mine, ck))
+    return changed
 # resolved by their own arch-first inheritance in main()
 RESUME_OWN_GUARD = frozenset({"z_asinh"})
 
@@ -1391,6 +1465,11 @@ def main():
     if args.init_from and not args.resume:
         init_ckpt = torch.load(args.init_from, map_location="cpu",
                                weights_only=True)
+    # architecture A/B options: the checkpoint's arch decides (before the
+    # args snapshot below, so args.json records the network that runs)
+    for _what, _ck in (("--resume", resume_ckpt), ("--init-from", init_ckpt)):
+        if _ck is not None:
+            check_arch_options(args, explicit, _ck, _what)
     if args.resume:
         # lr / lr_final / ent_coef / ent_tau / warmup_updates were set
         # from ckpt["schedule"] by resolve_resume_args above: the trunk
@@ -1634,7 +1713,11 @@ def main():
                             value_bins=args.hl_bins,
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma,
-                            z_asinh=args.z_asinh, game=args.game)
+                            z_asinh=args.z_asinh, game=args.game,
+                            emb_ln=args.emb_ln,
+                            value_residual=args.value_residual,
+                            final_ln=args.final_ln, dwa=args.dwa,
+                            trunk_arch=args.trunk_arch)
         if args.depth_init:
             from policy import apply_depth_init
             print(f"--depth-init: {apply_depth_init(policy)}", flush=True)
@@ -1661,6 +1744,13 @@ def main():
     print(f"readout trunk: {policy.arch['trunk_arch']} "
           f"(hidden {policy.arch.get('trunk_hidden')}) — {n_trunk:,} params",
           flush=True)
+    _opts_on = [k for k in ("emb_ln", "value_residual", "final_ln", "dwa")
+                if policy.arch.get(k)]
+    if _opts_on or policy.arch["trunk_arch"] != "simba":
+        print(f"arch options: {', '.join(_opts_on) or '-'}; trunk "
+              f"{policy.arch['trunk_arch']}"
+              + (" (DWA: delayed-residual / fused next-LN bypassed)"
+                 if policy.arch.get("dwa") else ""), flush=True)
     policy = policy.to(device)
     policy.fp16 = args.fp16 == "all"
     if args.fp16 != "off":
@@ -1712,12 +1802,13 @@ def main():
     # (extra param_group keys survive state_dict round trips).
     # hybrid Muon: the hidden matrices leave the Adam groups
     muon_names = set(muon_param_names(policy, args.muon_enc_hidden))
+    # frozen params (the SimBaV2 trunk's zero biases) join no optimizer
     crit_p = [p for n, p in policy.named_parameters()
               if n.startswith("critic_")
-              and n not in muon_names]
+              and n not in muon_names and p.requires_grad]
     main_p = [p for n, p in policy.named_parameters()
               if not n.startswith("critic_")
-              and n not in muon_names]
+              and n not in muon_names and p.requires_grad]
     opt = torch.optim.Adam(
         [{"params": main_p, "lr": args.lr, "lr_mult": 1.0},
          {"params": crit_p, "lr": args.lr * args.critic_lr_mult,
@@ -1787,9 +1878,15 @@ def main():
     # decay at that group's live lr (see the flag's comment)
     wd = float(args.weight_decay)
     wd_groups = []
+    # --trunk-arch simbav2: its W_in/W1/W2 are re-projected onto unit
+    # rows after every step (policy.project_trunk_weights), so decay
+    # would be undone — leave them out of it
+    proj_lins = policy.trunk_projected()
+    proj_ids = {id(m_.weight) for m_ in proj_lins}
     if wd > 0.0:
         for g in all_groups:
-            ps = [p_ for p_ in g["params"] if p_.ndim >= 2]
+            ps = [p_ for p_ in g["params"] if p_.ndim >= 2
+                  and id(p_) not in proj_ids]
             if ps:
                 wd_groups.append((g, ps))
         n_wd = sum(p_.numel() for _, ps in wd_groups for p_ in ps)
@@ -1837,8 +1934,11 @@ def main():
         # boundaries feed the [diag] per-layer grad norms.
         shared_end = name_off.get("heads.0.weight", off)
         # the trunk group's first param by NAME PREFIX (trunk_proj.weight)
+        # (--final-ln's LayerNorm, registered right before the trunk, is
+        # the readout's input norm: it joins the trunk group)
         trunk_start = min((o_ for n_, o_ in name_off.items()
-                           if n_.startswith("trunk")), default=shared_end)
+                           if n_.startswith(("trunk", "final_ln"))),
+                          default=shared_end)
         diag_groups = [("enc", 0, name_off.get("blocks.0.ln_attn.weight",
                                                shared_end))]
         for i in range(len(policy.blocks)):
@@ -2731,6 +2831,11 @@ def main():
                             torch._foreach_mul_(ps_, 1.0 - g_["lr"] * wd)
                 opt.step()
                 muon.step()
+                if proj_lins:
+                    # SimBaV2: rows back onto the unit sphere after EVERY
+                    # step (Muon and Adam both ran), in place on the fp32
+                    # masters, before the replica invalidation below
+                    policy.project_trunk_weights()
                 bump_weights_version()  # invalidate fp16 replica caches
         # Tier 1.2 (2026-09-02 audit A §3): the permuted copies (p_obs
         # 1.25 GB + p_act at production shape) are dead once the epoch
