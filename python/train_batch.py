@@ -302,6 +302,21 @@ def build_parser():
     # --resume needs such a checkpoint (Adam-era ones are --init-from
     # only). User decision after the v40 probes: 0.9409 vs Adam 0.9099
     # training acc at matched 1.12B samples, seed 1 tracking seed 0.
+    p.add_argument("--muon-enc-hidden", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="also put the encoders' hidden 192x192 layers "
+                        "(note/saber/torso/leg_mlp.2) on Muon; only their "
+                        "input layers stay on Adam (architecture review "
+                        "2026-10-01). Changes the optimizer layout: a "
+                        "--resume inherits it from the checkpoint")
+    p.add_argument("--depth-init", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="fresh runs: scale every residual write (block "
+                        "out_proj, ffn.2, trunk_fc2) by 1/sqrt(2*n_blocks) "
+                        "with zero bias, and the 29 action heads by 0.01 "
+                        "with zero bias (GPT-2 style depth-safe init; "
+                        "architecture review 2026-10-01). Ignored with "
+                        "--resume / --init-from")
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon Nesterov momentum (Jordan default 0.95; "
                         "raise it under noisier gradients)")
@@ -589,6 +604,14 @@ def build_parser():
                         "subsample size; generator dials "
                         "(--note-prob/--bomb-prob/...) are ignored. "
                         "Requires --env cuda. (sweep s2, 2026-07-29)")
+    p.add_argument("--catalog", type=str, default="scoresaber",
+                   choices=("scoresaber", "beatleader", "both"),
+                   help="--ranked-maps level catalog: scoresaber (the "
+                        "historical pool), beatleader, or both (the union "
+                        "keyed like bench_scoresaber --catalog both, each "
+                        "shared level once). Non-SS levels carry no SS pp "
+                        "in the ep-stats telemetry (level_lb -1, max_pp "
+                        "0). (2026-10-01)")
     p.add_argument("--lead-s", type=float, default=RECIPE_LEAD_S,
                    help="ranked-maps front gap (s) — notes before it are "
                         "dropped, walls clipped to it; the earliest "
@@ -890,17 +913,22 @@ class Muon:
             self.state[p].copy_(src.to(p.device))
 
 
-def muon_param_names(policy):
+def muon_param_names(policy, enc_hidden=False):
     """Which params Muon owns: hidden 2-D matrices only. Encoder input
     layers (note/saber/torso/leg_mlp), the 29 heads, the critic's final
     K-bin HL-Gauss layer, biases and LN gains stay on Adam (Jordan's
-    rule)."""
+    rule). Historically the WHOLE encoder modules stayed on Adam,
+    including their hidden second layers; enc_hidden=True
+    (--muon-enc-hidden) moves those to Muon and keeps only the input
+    layers (`*_mlp.0`) on Adam."""
     names = []
+    enc = ("note_mlp", "saber_mlp", "torso_mlp", "leg_mlp")
     for n, p in policy.named_parameters():
         if p.ndim != 2:
             continue
-        if n.startswith(("note_mlp", "saber_mlp", "torso_mlp", "leg_mlp",
-                         "heads.")):
+        if n.startswith("heads."):
+            continue
+        if n.startswith(enc) and (not enc_hidden or ".0." in n):
             continue
         if n == f"critic_mlp.{len(policy.critic_mlp) - 1}.weight":
             continue                      # the K-bin HL-Gauss output layer
@@ -1190,9 +1218,11 @@ def make_env(args, N, device):
         if args.ranked_maps:
             from beat_arena_env.ranked_pool import load_ranked_pool
             from beat_arena_env.ranked_pool import pool_max_steps
+            from beat_arena_env.ranked_pool import train_catalog_path
             pool = load_ranked_pool(sample=args.chart_pool, seed=args.seed,
                                     device=device, lead_s=args.lead_s,
-                                    mirror=args.mirror_augment)
+                                    mirror=args.mirror_augment,
+                                    catalog=train_catalog_path(args.catalog))
             # whole-level episodes (the only mode since 2026-09-16): the
             # episode limit comes from the longest level in the pool
             pool_steps = pool_max_steps(pool)
@@ -1605,6 +1635,12 @@ def main():
                             value_vmax=args.hl_vmax,
                             value_sigma=args.hl_sigma,
                             z_asinh=args.z_asinh, game=args.game)
+        if args.depth_init:
+            from policy import apply_depth_init
+            print(f"--depth-init: {apply_depth_init(policy)}", flush=True)
+    if args.depth_init and (resume_ckpt is not None or args.init_from):
+        print("--depth-init: ignored (weights come from the checkpoint)",
+              flush=True)
     # accumulate mode: the CLI (resolved above — inherited from the
     # checkpoint when not given) wins, and the arch records it
     policy.fp16_accum = args.fp16_accum
@@ -1675,7 +1711,7 @@ def main():
     # schedule loop re-applies every update via the "lr_mult" key
     # (extra param_group keys survive state_dict round trips).
     # hybrid Muon: the hidden matrices leave the Adam groups
-    muon_names = set(muon_param_names(policy))
+    muon_names = set(muon_param_names(policy, args.muon_enc_hidden))
     crit_p = [p for n, p in policy.named_parameters()
               if n.startswith("critic_")
               and n not in muon_names]
