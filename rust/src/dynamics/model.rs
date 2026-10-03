@@ -261,12 +261,13 @@ pub const HUMANOID_TAU_MAX: [Real; NQ] = [
 // omega caps: 16 rad/s everywhere except the wrist tier's 50
 // (§1.4; 40 -> 50 per user 2026-08-18 — with the fist-only hand the
 // full-gear bend swing was cap-clipped mid-arc); bend 50 -> 65 (user
-// 2026-10-01, wrist-body experiment).
+// 2026-10-01, wrist-body experiment); 65 -> 90 (user 2026-10-03,
+// exp/wrist-body-90).
 #[rustfmt::skip]
 pub const HUMANOID_OMEGA_CAP: [Real; NQ] = [
     16.0, 16.0, 16.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 65.0, 50.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 65.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
 ];
