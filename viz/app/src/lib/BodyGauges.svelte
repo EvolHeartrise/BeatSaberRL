@@ -27,7 +27,7 @@
   import { pb, pose } from "./state.svelte.js";
   import {
     GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
-    TAU_MAX, activationAt, footForces, gearTable, lerp,
+    TAU_MAX, activationAt, footForces, gearTable, lerp, omegaCapOf,
   } from "./replay.js";
 
   const W = 252;
@@ -119,7 +119,7 @@
   }
 
   /** One joint's dial + numbers + τ bar (τ as the fraction of its limit). */
-  function joint(j, q, om, t) {
+  function joint(j, q, om, t, cap = OMEGA_CAP[j]) {
     const [lo, hi] = JOINT_LIMITS[j];
     const r = J[j];
     const hot = Math.min(q - lo, hi - q) < NEAR;
@@ -130,7 +130,7 @@
     ends(r.omTick, radial(r.cy, Math.min(hi, Math.max(lo, q + om / 8)), R + 1, R + 4));
     text(r.ang, `${deg(q).toFixed(0)}°`);
     text(r.om, `ω ${om.toFixed(1)}`);
-    cls(r.om, "hot", Math.abs(om) > 0.9 * OMEGA_CAP[j]);
+    cls(r.om, "hot", Math.abs(om) > 0.9 * cap);
     cls(r.tau, "off", t === 0);
     cls(r.tau, "neg", t < 0);
     if (t !== 0) attr(r.tau, "x2", (BMID + t * (BX1 - BX0) / 2).toFixed(2));
@@ -174,7 +174,9 @@
     const u = cur - k;
     const qa = rep.ticks[k].q, tb = rep.ticks[k1], qb = tb.q;
     // applied τ (tauOf, one joint at a time) as the fraction of this
-    // joint's limit (the replay body's, if it has one)
+    // joint's limit, and the ω cap — the replay body's (replayBody: per
+    // joint, so original-body and v63x2-body replays both read right),
+    // else the nominal tables
     const body = rep.body, table = body ? null : gearTable(rep.config.gears ?? 3);
     for (let j = 0; j < 29; j++) {
       const a = tb.action[j];
@@ -182,7 +184,7 @@
         : (table[a] ?? 0) * TAU_MAX[j];
       const t = tau === 0 ? 0
         : Math.max(-1, Math.min(1, tau / (body?.tau_max[j] ?? TAU_MAX[j])));
-      joint(j, lerp(qa[7 + j], qb[7 + j], u), tb.omega[j], t);
+      joint(j, lerp(qa[7 + j], qb[7 + j], u), tb.omega[j], t, omegaCapOf(rep, j));
     }
     forces(footForces(rep, k1), activationAt(rep, k1));
   });

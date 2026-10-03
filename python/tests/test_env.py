@@ -564,8 +564,11 @@ def _whip_events(kind=0, ticks=60):
         # -90 deg pitch stop mid-follow-through (post accrued 0); two
         # more windup ticks re-land the cut with full sweep room.
         # 17 -> 19 (2026-08-20 ankle_p +35: rock retune), 19 -> 13
-        # (2026-09-27, ground contact: see hit above)
-        a[A_R_ARM] = 1 if t < 13 else 2
+        # (2026-09-27, ground contact: see hit above), 13 -> 11
+        # (2026-10-03, 0.50 kg hands: swept hit 0.6-0.85 x windup
+        # 11-16, hit 0.75 / windup 11 is the cell where the regular note
+        # lands 70 + 30 and the chain head 70; windup 13 now misses)
+        a[A_R_ARM] = 1 if t < 11 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:

@@ -41,13 +41,28 @@ def test_pop_torque_env_is_per_env_and_resets(mod_name):
         assert 1 <= p[4] <= 5          # one add per tick (an env may end early)
         assert abs(p[0] - (p[1] + p[2] + p[3])) <= 1e-3 * max(1.0, p[0])
     assert all(vec.pop_torque_env(i)[0] == 0.0 for i in range(n))  # reset
-    # the per-env pops partition the all-env accumulator
+    # the per-env pops partition the all-env accumulator — over the SAME
+    # window: a twin sim (deterministic, same charts + actions) pops the
+    # total while this one pops per env. (Comparing two consecutive
+    # windows of one sim only held while every env was alive in both or
+    # dead in both; with constant random gears the envs tilt-terminate
+    # within ~10 ticks, so which side of that a window falls on is
+    # body-dependent.)
+    twin = mod.VecBeatSim(n, max_steps=MAX_STEPS, gears=5,
+                          return_events=False)
+    for i in range(n):
+        twin.set_chart(i, [note_tuple(x) for x in SCENARIOS[0][0]], [])
+    twin.pop_torque()
+    obs2 = np.zeros_like(obs)
+    for _ in range(5):
+        twin.step_into(acts, obs2)
+    twin.pop_torque()
     for _ in range(3):
         vec.step_into(acts, obs)
+        twin.step_into(acts, obs2)
     per = [vec.pop_torque_env(i) for i in range(n)]
-    for _ in range(3):
-        vec.step_into(acts, obs)
-    tot = vec.pop_torque()
+    tot = twin.pop_torque()
+    assert sum(p[4] for p in per) == tot[4]
     assert abs(tot[0] - sum(p[0] for p in per)) <= 1e-3 * max(1.0, tot[0])
 
 

@@ -40,7 +40,9 @@ Expected: `max |ref - mujoco| ≈ 1.3e-15` (gate ≤ 1e-8). Also asserts the
 
 ## check_static.py — statics
 
-- (a) total mass = **75.02 kg** exactly (gate ±0.01).
+- (a) total mass = **74.80 kg** exactly (gate ±0.01) — 0.50 kg hands
+  (2026-10-03; the 0.35 kg-hand body, 74.50 kg, lives on branch
+  `body/original`).
 - (b1) informational: 2 s zero-torque free settle, per-joint drift
   printed. An unactuated skeleton has no position hold — gravity-loaded
   joints (horizontal arms, elbows, knee-buckle modes) fall to their
@@ -52,9 +54,9 @@ Expected: `max |ref - mujoco| ≈ 1.3e-15` (gate ≤ 1e-8). Also asserts the
   driven through the root rows). Expected drift **0.0** (gate < 5e-2).
 - (c) gate: "muscle tone" spring-held stance (kp = τ_max/0.2 to neutral,
   near-critical damping, set in-memory only) settles in 4 s; foot weld
-  vertical constraint forces must sum to body weight **735.95 N** ±5 %.
-  Expected ≈ 734.9 N (367.4 per foot), weld violation ≈ 4.5 mm, droop
-  ≈ 0.066 rad (shoulder pitch).
+  vertical constraint forces must sum to body weight **733.79 N** ±5 %.
+  Expected ≈ 732.8 N (366.4 per foot), weld violation ≈ 4.1 mm, droop
+  ≈ 0.054 rad (shoulder pitch).
 
 ## check_contacts.py — contact wiring
 
@@ -88,6 +90,10 @@ Regenerated 2026-09-27 when the engines dropped the v10 foot welds
 `ConstraintSet::new(m, contacts = true, ground = false)`. (The welds stay
 in the MJCF for the check_static.py statics gates, which are
 MuJoCo-internal.)
+Regenerated again 2026-10-03 for the 0.50 kg hands (the v63x2 body that
+became main's; MJCF `hand_l`/`hand_r` mass 0.35 → 0.50, inertia
+0.000264 → 0.000377). Regenerating the pre-change MJCF reproduces the
+previous files to 1.6e-14 (qvel), so the diff is the body change alone.
 
 | file | scenario |
 |---|---|
