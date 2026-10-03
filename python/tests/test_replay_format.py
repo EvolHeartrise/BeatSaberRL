@@ -58,8 +58,12 @@ def test_round_trip_within_quantization(capture):
     head, rec = capture
     st = {}
     raw = rf.encode(head, rec, stats=st)
+    # activation / torque derive from header.body — incl. the bend joints'
+    # 2x fine gears (FINE_GEAR_MULT), which this play exercises
     assert st["stored"] == [], st
     d = rf.decode(rf.gz(raw))
+    assert np.isin(d["action"][:, [8, 15]], (3, 4)).any()
+    assert head["header"]["body"]["gear_frac"][8][3] == 0.5
     fr = _frame(rec)
     T = len(fr)
     assert d["T"] == T and (d["t"] == np.arange(T)).all()

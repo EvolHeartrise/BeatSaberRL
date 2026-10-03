@@ -423,7 +423,9 @@ def test_sim_plays_a_chart_scripted_torques():
     # the blade, so the same whip meets the note 3 ticks earlier in the
     # swing; whip 14 scores the full 115 on v42, 17 misses the box)
     # 14 -> 10 (2026-09-27, ground contact: see the hit note above)
-    sim, events = run(10)
+    # 10 -> 8 (2026-10-03, 0.50 kg hands: swept whip 6..16 at hit 0.6,
+    # whips 7/8/9 land 112/105/100; 10 now misses)
+    sim, events = run(8)
     if not any(c == 0 for _, c, *_ in events):
         # crude deterministic fallback search (seeded ordering)
         for whip in (12, 14, 16, 18, 13, 17):

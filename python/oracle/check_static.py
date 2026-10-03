@@ -1,7 +1,8 @@
 """P2b gate 2: static sanity of the MuJoCo oracle (mjcf/body_v10.xml).
 
 Checks (gates marked GATE, the rest informational):
-(a) GATE  total body mass == SPEC-v10 75.02 kg (+/- 0.01).
+(a) GATE  total body mass == 74.80 kg (+/- 0.01) (SPEC-v10's 75.02 with
+          0.50 kg hands, 2026-10-03; 74.50 on branch body/original).
 (b1)      zero-torque free settle, 2 s at h = 1/240, welds active:
           per-joint drift recorded. NOT a gate: an unactuated skeleton has
           no position hold - gravity-loaded joints (shoulders horizontal
@@ -18,7 +19,7 @@ Checks (gates marked GATE, the rest informational):
           kp = tau_max/0.2, near-critically damped - set in-memory, not in
           the MJCF) hold the stance; after a 4 s settle the foot weld
           vertical constraint forces must sum to body weight
-          75.02 * 9.81 = 735.95 N within 5%. (Static equilibrium: welds
+          74.80 * 9.81 = 733.79 N within 5%. (Static equilibrium: welds
           are the only world attachment, so they carry exactly m*g.)
 
 Run:  python check_static.py     (exit 0 = PASS)
@@ -32,7 +33,7 @@ import mujoco
 HERE = os.path.dirname(os.path.abspath(__file__))
 MJCF = os.path.join(HERE, "..", "..", "mjcf", "body_v10.xml")
 
-MASS_SPEC = 75.02
+MASS_SPEC = 74.80
 G = 9.81
 H = 1.0 / 240.0
 DRIFT_TOL = 5e-2
