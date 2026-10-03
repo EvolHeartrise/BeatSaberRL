@@ -7,12 +7,16 @@
 //     task on the renderer's main thread), split into script, GC and
 //     style/layout, plus the garbage the minor GCs swept (MB/s) — the
 //     allocation rate;
-//   - GL: per frame, the draw calls, texture uploads (count + MB) and buffer
-//     uploads (count + MB) — counted by wrapping the WebGL2 entry points
-//     before the page loads;
+//   - GL: per frame, the draw calls, texture uploads (count + MB, and the
+//     sizes sent) and buffer uploads (count + MB), plus how many buffers /
+//     textures were created and never deleted over the window (a steady
+//     climb is a leak) — counted by wrapping the WebGL2 entry points before
+//     the page loads;
 //   - --profile <file>: also writes a CPU profile of the window (open it in
 //     DevTools > Performance, or pass --top N to print the hottest self-time
-//     functions; build with `npx vite build --minify false` for names).
+//     functions; build with `npx vite build --minify false` for names);
+//   - NAMES=1 in the environment: also prints the main thread's trace events
+//     by total time.
 // Run: node test/perf-browser.mjs <replay.rpl.gz> [--seconds 12] [--start T]
 //        [--gauges on|off] [--speed 1] [--runs 1] [--profile out.cpuprofile]
 //        [--top 25] [--size 1100x800] [--dist dist/index.html]
@@ -81,6 +85,13 @@ const COUNT_GL = () => {
   wrap("bufferData", (a) => { c.bufUp++; c.bufBytes += a[1]?.byteLength ?? 0; });
   wrap("bufferSubData", (a) => { c.bufUp++; c.bufBytes += a[2]?.byteLength ?? 0; });
   wrap("linkProgram", () => c.programs++);
+  // GPU objects alive: buffers / textures created minus deleted (a steady
+  // climb during playback is a leak)
+  c.buffers = 0; c.textures = 0;
+  wrap("createBuffer", () => c.buffers++);
+  wrap("deleteBuffer", () => c.buffers--);
+  wrap("createTexture", () => c.textures++);
+  wrap("deleteTexture", () => c.textures--);
   // frames: one per rAF callback batch
   window.__frames = 0;
   const tick = () => { window.__frames++; requestAnimationFrame(tick); };
@@ -95,12 +106,13 @@ function analyzeTrace(events, frames) {
   const names = new Map();
   for (const e of events)
     if (e.ph === "M" && e.name === "thread_name") names.set(`${e.pid}:${e.tid}`, e.args.name);
-  const busy = { main: 0, gpu: 0 }, by = {}, styleBy = {};
+  const busy = { main: 0, gpu: 0 }, by = {}, styleBy = {}, allBy = {};
   let garbage = 0, gcCount = 0;
   // nested events of interest on the main thread (durations in µs)
   const KIND = {
     script: ["FunctionCall", "EvaluateScript", "V8.Execute", "TimerFire",
-      "FireAnimationFrame", "EventDispatch"],
+      "FireAnimationFrame", "EventDispatch", "v8.callFunction", "v8.run",
+      "RunMicrotasks"],
     gc: ["MinorGC", "MajorGC", "V8.GC_SCAVENGER", "V8.GC_MARK_COMPACTOR",
       "V8.GC_MC_INCREMENTAL", "V8.GC_MINOR_MARK_SWEEPER", "BlinkGC.AtomicPhase"],
     style: ["UpdateLayoutTree", "RecalculateStyles", "Layout", "PrePaint",
@@ -120,6 +132,7 @@ function analyzeTrace(events, frames) {
       else if (th === "CrGpuMain") busy.gpu += e.dur;
     }
     if (th !== "CrRendererMain") continue;
+    if (process.env.NAMES) allBy[e.name] = (allBy[e.name] ?? 0) + e.dur;
     if ((e.name === "MinorGC" || e.name === "V8.GC_SCAVENGER") && e.args?.usedHeapSizeBefore) {
       garbage += e.args.usedHeapSizeBefore - e.args.usedHeapSizeAfter;
     }
@@ -134,6 +147,9 @@ function analyzeTrace(events, frames) {
     st.push(end);
   }
   const perF = (us) => +(us / 1000 / frames).toFixed(2);
+  if (process.env.NAMES)
+    console.log(Object.entries(allBy).sort((a, b) => b[1] - a[1]).slice(0, 30)
+      .map(([k, v]) => `${perF(v)} ${k}`).join("\n"));
   return {
     mainMsPerFrame: perF(busy.main), gpuMsPerFrame: perF(busy.gpu),
     scriptMsPerFrame: perF(by.script ?? 0), gcMsPerFrame: perF(by.gc ?? 0),
@@ -238,6 +254,7 @@ try {
       drawsPerFrame: pf("draws"), texUploadsPerFrame: pf("texUp", 2),
       texMBPerFrame: mb("texBytes"), bufUploadsPerFrame: pf("bufUp", 1),
       bufMBPerFrame: mb("bufBytes"), programsLinked: g1.programs - g0.programs,
+      liveBuffersGrowth: g1.buffers - g0.buffers, liveTexturesGrowth: g1.textures - g0.textures,
       texSizes: Object.fromEntries(Object.entries(g1.sizes)
         .map(([k, v]) => [k, v - (g0.sizes[k] ?? 0)]).filter(([, v]) => v > 0)
         .sort((a, b) => b[1] - a[1]).slice(0, 6)),

@@ -44,6 +44,10 @@
   }
 
   const blade = $derived(seg(base, tip));
+  // the contact-capable core, built once: as `args` geometry it was rebuilt
+  // (and uploaded) every time the blade came up to speed
+  const coreGeo = new THREE.CylinderGeometry(0.008, 0.011, SABER_LEN * 1.001, 8);
+  $effect(() => () => coreGeo.dispose());
 
   // the saber model: blade along scene -z from the grip, handle behind it.
   // Orientation = the rotation taking local -z onto the blade direction
@@ -225,8 +229,7 @@
 </T.Group>
 {#if capable}
   <!-- contact-capable: white-hot core inside the blade (viewer cue) -->
-  <T.Mesh position={blade.pos} quaternion={blade.quat}>
-    <T.CylinderGeometry args={[0.008, 0.011, SABER_LEN * 1.001, 8]} />
+  <T.Mesh geometry={coreGeo} position={blade.pos} quaternion={blade.quat}>
     <T.MeshBasicMaterial color="#e8eaf0" />
   </T.Mesh>
 {/if}
