@@ -1,5 +1,5 @@
 <script>
-  import { store, loadIndex, loadMetrics, runById } from "./data.svelte.js";
+  import { store, loadIndex, loadMetrics, runById, REFRESH_MS } from "./data.svelte.js";
   import { COMPARE_KEYS, DIFF_KEYS, X_MODES, xValues, seriesValues, hasAny,
     label, color, interp, rolling, atSamples, fmt, fmtSamples, parseSampleList } from "./series.js";
   import Chart from "./Chart.svelte";
@@ -103,7 +103,7 @@
     }
   }
   $effect(() => {
-    const h = setInterval(refresh, 15000);
+    const h = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(h);
   });
 </script>

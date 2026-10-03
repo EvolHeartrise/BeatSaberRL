@@ -2,14 +2,20 @@
 // dist/index.html in Edge, uploads a real v10 replay through the file
 // input, plays a second, and asserts playback advanced with zero page
 // errors. Also drives the v10 manual-pose panel (root + 29 joints) and
-// screenshots the articulated skeleton + per-joint gauges/forces, and
-// toggles the first-person camera (at the head, looking straight down the
-// track) on and back off.
+// screenshots the articulated skeleton + per-joint gauges/forces, checks
+// the DOM gauges show the replay's own numbers at a known tick (and the
+// posed angles in pose mode), and toggles the first-person camera (at the
+// head, looking straight down the track) on and back off.
 // Screenshots land in test/out/ for eyeball verification.
 // Run: node test/browser.test.js [path-to-replay.rpl.gz]
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import puppeteer from "puppeteer-core";
+import {
+  JOINT_LIMITS, TAU_MAX, activationAt, footForces, gearTable, parseReplay,
+  setTickRate, tickHzOf,
+} from "../src/lib/replay.js";
+import { readReplayFile } from "./fixture.js";
 
 // browser binary: $PUPPETEER_EXECUTABLE_PATH, else Edge on the Windows
 // box, else the Chrome that `npx puppeteer browsers install chrome` put
@@ -40,6 +46,89 @@ const replayV15 = resolve(process.argv[3] ??
   "../../python/replays/v15_probe_toppp01_delightful-introduction_1pp.rpl.gz");
 if (!existsSync(dist)) throw new Error("run `npm run build` first");
 mkdirSync("test/out", { recursive: true });
+
+// ---- the DOM gauges (BodyGauges.svelte) against the replay itself --------
+// Paused on a whole tick k, every joint row must read the replay's angle
+// (q at k), ω and applied τ (both at k + 1, as the viewer draws them), each
+// needle must point at the angle, and the force block must show tick k + 1's
+// foot reactions and joint activation. Also: the two panels sit in the
+// bottom corners at the sprites' old size (0.62 / (2 tan 27.5°) of the
+// stage height, 104 px above the bottom), and let pointer events through.
+async function checkGauges(page, file, k) {
+  const rep = parseReplay(readReplayFile(file));
+  setTickRate(tickHzOf(rep)); // footForces divides by the replay's DT
+  const k1 = Math.min(k + 1, rep.ticks.length - 1);
+  const tb = rep.ticks[k1];
+  const table = rep.body ? null : gearTable(rep.config.gears ?? 3);
+  const deg = (r) => (r * 180) / Math.PI;
+  const want = JOINT_LIMITS.map(([lo, hi], j) => {
+    const q = rep.ticks[k].q[7 + j], om = tb.omega[j], a = tb.action[j];
+    const lim = rep.body ? rep.body.tau_max[j] : TAU_MAX[j];
+    const tau = rep.body ? (rep.body.gear_frac[j][a] ?? 0) * lim : (table[a] ?? 0) * lim;
+    const t = tau === 0 ? 0 : Math.max(-1, Math.min(1, tau / lim));
+    return { q, ang: `${deg(q).toFixed(0)}°`, om: `ω ${om.toFixed(1)}`,
+      hot: Math.min(q - lo, hi - q) < (10 * Math.PI) / 180, t };
+  });
+  const got = await page.evaluate(() => {
+    const $ = (s) => document.querySelector(".gauges " + s);
+    return {
+      joints: Array.from({ length: 29 }, (_, j) => {
+        const g = $(`g[data-joint="${j}"]`), n = g.querySelector(".needle");
+        const tau = g.querySelector(".tau");
+        return {
+          ang: $(`.ang[data-joint="${j}"]`).textContent,
+          om: $(`.om[data-joint="${j}"]`).textContent,
+          needle: ["x1", "y1", "x2", "y2"].map((a) => +n.getAttribute(a)),
+          hot: n.classList.contains("hot"),
+          tauOff: tau.classList.contains("off"), tauNeg: tau.classList.contains("neg"),
+          tauX2: +tau.getAttribute("x2"),
+        };
+      }),
+      feet: [0, 1].map((i) => $(`[data-foot="${i}"]`).textContent),
+      act: $("[data-act]").textContent,
+      panels: [...document.querySelectorAll(".gauges .panel")].map((p) => {
+        const r = p.getBoundingClientRect();
+        return { left: r.left, right: r.right, bottom: r.bottom, height: r.height };
+      }),
+      stage: document.querySelector("#stage").getBoundingClientRect().toJSON(),
+      events: getComputedStyle($(".panel")).pointerEvents,
+    };
+  });
+  const bad = [];
+  want.forEach((w, j) => {
+    const g = got.joints[j];
+    if (g.ang !== w.ang) bad.push(`joint ${j} angle ${g.ang} != ${w.ang}`);
+    if (g.om !== w.om) bad.push(`joint ${j} ${g.om} != ${w.om}`);
+    if (g.hot !== w.hot) bad.push(`joint ${j} limit warning ${g.hot} != ${w.hot}`);
+    // the needle runs from the dial centre toward the angle (0 = up, clockwise)
+    const [x1, y1, x2, y2] = g.needle;
+    const a = Math.atan2(x2 - x1, y1 - y2);
+    if (Math.abs(a - w.q) > 2e-3) bad.push(`joint ${j} needle at ${deg(a)}° != ${deg(w.q)}°`);
+    // τ bar: hidden at zero, else from the middle (189) by t × 49 units
+    if (g.tauOff !== (w.t === 0)) bad.push(`joint ${j} τ bar shown ${!g.tauOff}, τ ${w.t}`);
+    if (w.t !== 0 && (g.tauNeg !== w.t < 0 || Math.abs(g.tauX2 - (189 + w.t * 49)) > 0.01))
+      bad.push(`joint ${j} τ bar to ${g.tauX2}${g.tauNeg ? " (neg)" : ""} != ${189 + w.t * 49}`);
+  });
+  const feet = footForces(rep, k1), act = activationAt(rep, k1);
+  [0, 1].forEach((i) => {
+    const s = feet ? `${feet[i].toFixed(0)} N` : "n/a";
+    if (got.feet[i] !== s) bad.push(`foot ${i}: ${got.feet[i]} != ${s}`);
+  });
+  const as = act ? `${act[0].toFixed(1)}/29` : "n/a";
+  if (got.act !== as) bad.push(`activation ${got.act} != ${as}`);
+  const H = got.stage.height, hWant = (0.62 / (2 * Math.tan((27.5 * Math.PI) / 180))) * H;
+  if (got.panels.length !== 2) bad.push(`${got.panels.length} gauge panels`);
+  for (const [i, p] of got.panels.entries()) {
+    if (Math.abs(p.height - hWant) > 1) bad.push(`panel ${i} height ${p.height} != ${hWant}`);
+    if (Math.abs(p.bottom - (H - 104)) > 1) bad.push(`panel ${i} bottom ${p.bottom}`);
+  }
+  if (!(got.panels[0]?.left < 30) || !(got.panels[1]?.right > got.stage.width - 30))
+    bad.push("panels not in the corners: " + JSON.stringify(got.panels));
+  if (got.events !== "none") bad.push("the panels catch pointer events");
+  if (bad.length) throw new Error(`gauges at tick ${k}:\n  ` + bad.join("\n  "));
+  console.log(`gauges at tick ${k}: 29 joints, feet ${got.feet.join(" / ")}, ` +
+    `activation ${got.act} — match the replay`);
+}
 
 const browser = await puppeteer.launch({
   executablePath: EDGE,
@@ -93,6 +182,19 @@ try {
   await new Promise((r) => setTimeout(r, 400));
   const fk1 = await page.$eval("#pose .fk", (el) => el.textContent);
   if (fk0 === fk1) throw new Error("pose sliders did not move the FK readout");
+  // the gauges show the posed joints (ω = τ = 0): L arm pitch (joint 3,
+  // slider 9) reads the slider's angle
+  const posed = await page.evaluate(() => ({
+    slider: +document.querySelectorAll("#pose input[type=range]")[9].value,
+    ang: document.querySelector('.gauges .ang[data-joint="3"]')?.textContent,
+    om: document.querySelector('.gauges .om[data-joint="3"]')?.textContent,
+    tauOff: document.querySelector('.gauges g[data-joint="3"] .tau')
+      ?.classList.contains("off"),
+    feet: document.querySelector('.gauges [data-foot="0"]')?.textContent,
+  }));
+  if (!posed.ang || Math.abs(parseFloat(posed.ang) - posed.slider) > 0.51
+      || posed.om !== "ω 0.0" || !posed.tauOff || posed.feet !== "n/a")
+    throw new Error("pose-mode gauges do not show the pose: " + JSON.stringify(posed));
   await page.screenshot({ path: "test/out/pose.png" });
   await page.keyboard.press("p"); // leave pose mode
   await page.waitForFunction(() => !document.querySelector("#pose"),
@@ -136,6 +238,7 @@ try {
   await scrub(100);
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/skeleton-gauges.png" });
+  await checkGauges(page, replay, 100);
   await scrub(300);
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/late.png" });
@@ -151,8 +254,10 @@ try {
   await page.evaluate(() => [...document.querySelectorAll("#bar button")]
     .find((b) => b.textContent.includes("gauges")).click());
   await page.waitForFunction(`!(${GAUGES_ON})`, { timeout: 5000 });
+  await page.waitForFunction(() => !document.querySelector(".gauges"), { timeout: 5000 });
   await page.keyboard.press("g"); // the key toggles the same flag back on
   await page.waitForFunction(GAUGES_ON, { timeout: 5000 });
+  await page.waitForSelector(".gauges .panel", { timeout: 5000 });
 
   // ---- first-person ('f'): the camera sits at the head, fixed forward. The bar
   // button lights up, the frame renders with no page errors, and 'f'
@@ -165,6 +270,8 @@ try {
   await page.waitForFunction(FP_ON, { timeout: 5000 });
   await new Promise((r) => setTimeout(r, 500));
   await page.screenshot({ path: "test/out/first-person.png" });
+  // the gauges do not depend on the camera: same panels, same numbers
+  await checkGauges(page, replay, 300);
   // the one first-person slider (fov) lives in #fp — no rotation smoothing
   // since the camera no longer turns with the head
   const fpSliders = await page.$$eval("#fp input[type=range]", (els) => els.length);

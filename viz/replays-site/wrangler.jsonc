@@ -2,14 +2,19 @@
 	"$schema": "https://unpkg.com/wrangler/config-schema.json",
 	"name": "beat-arena-replays",
 	"compatibility_date": "2026-09-24",
-	// static assets only — no Worker script. dist/ is assembled by
-	// scripts/build.mjs (the viewer as index.html + the replay store's r/).
+	// the viewer is a static asset (dist/, assembled by scripts/build.mjs:
+	// the viewer as index.html + _headers); the replays are objects in the
+	// R2 bucket below (r/<16 hex>.rpl.gz, uploaded by scripts/upload_r2.mjs),
+	// served by src/worker.js, which runs only for /r/*.
 	// A missing replay must answer 404, not the viewer page, so the viewer
 	// can say "this replay does not exist".
+	"main": "src/worker.js",
 	"assets": {
 		"directory": "./dist",
-		"not_found_handling": "none"
+		"not_found_handling": "none",
+		"run_worker_first": ["/r/*"]
 	},
+	"r2_buckets": [{ "binding": "REPLAYS", "bucket_name": "beat-arena-replays" }],
 	"routes": [{ "pattern": "replays.flee.systems", "custom_domain": true }],
 	"workers_dev": false
 }

@@ -1,5 +1,6 @@
 // Assemble replays.flee.systems' deploy dir (dist/) — a Cloudflare Worker
-// serving static assets only (wrangler.jsonc):
+// (wrangler.jsonc): the viewer as a static asset, the replays as objects in
+// the R2 bucket beat-arena-replays served by src/worker.js (2026-10-03):
 //
 //   dist/index.html   the 3D replay viewer: viz/app's SITE build
 //                     (viz/app/dist-site/index.html, `npm run build:site`),
@@ -7,12 +8,15 @@
 //                     watch-only: no Flux WebXR game, no Flux replays (they
 //                     are refused with a message), no pose mode and no
 //                     file-picker button — see viz/app/src/lib/build.js.
-//   dist/r/*.rpl.gz   the published replays, pulled from the local replay
-//                     store (NOT in git) that scripts/publish_replays.py
-//                     writes — only the files its manifest lists
 //   dist/_headers     caching
 //
+// The replays (r/<16 hex>.rpl.gz) are listed by the local replay store's
+// manifest.json (NOT in git; written by scripts/publish_replays.py) and must
+// all be uploaded (scripts/upload_r2.mjs, recorded in r2-ledger.json) before
+// a deploy.
+//
 //   (cd ../app && npm run build:site)
+//   node scripts/upload_r2.mjs [--src STORE] [--prune]
 //   node scripts/build.mjs [--src STORE]   (default: $REPLAYS_STORE, else
 //                                           ~/beat-arena-volume-backup/replays-site)
 //   npx wrangler deploy
@@ -24,9 +28,10 @@
 //      header.map);
 //   2. python viz/replays-site/scripts/publish_replays.py --model <public id>
 //        --bench <its published bench.json> --ckpt <its checkpoint> <rpl.gz...>
-//   3. (cd ../app && npm run build:site) && node scripts/build.mjs
+//   3. node scripts/upload_r2.mjs [--prune]                 (this dir)
+//   4. (cd ../app && npm run build:site) && node scripts/build.mjs
 //        && npx wrangler deploy                              (this dir)
-//   4. viz/site: npm run data && npm run deploy   (Watch links from the manifest)
+//   5. viz/site: npm run data && npm run deploy   (Watch links from the manifest)
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,7 +42,6 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const site = path.resolve(here, '..');
 const viewer = path.resolve(site, '../app/dist-site/index.html');
 const dist = path.join(site, 'dist');
-const MAX_BYTES = 25 * 1024 * 1024; // Cloudflare static assets, per file
 const NAME_RE = /^r\/[0-9a-f]{16}\.rpl\.gz$/;
 
 let src = process.env.REPLAYS_STORE || path.join(os.homedir(), 'beat-arena-volume-backup/replays-site');
@@ -74,46 +78,36 @@ if (!html.includes("Flux replays aren't supported on this site"))
 	throw new Error(`${viewer} does not refuse Flux replays: use \`npm run build:site\``);
 
 fs.rmSync(dist, { recursive: true, force: true });
-fs.mkdirSync(path.join(dist, 'r'), { recursive: true });
+fs.mkdirSync(dist, { recursive: true });
 // the viewer names no icon, so every visit would log a /favicon.ico 404
 const page = /rel=["']?icon/.test(html) ? html : html.replace('<head>', '<head><link rel="icon" href="data:,">');
 fs.writeFileSync(path.join(dist, 'index.html'), page);
 
+// the replays are R2 objects (src/worker.js, scripts/upload_r2.mjs), not
+// assets: dist is the viewer alone. Every file the manifest lists must be in
+// the bucket already (r2-ledger.json), so a deploy never links a replay the
+// Worker cannot serve
+const lpath = path.join(src, 'r2-ledger.json');
+const ledger = fs.existsSync(lpath) ? JSON.parse(fs.readFileSync(lpath, 'utf8')) : {};
 let n = 0,
 	bytes = 0;
+const notUp = [];
 for (const [model, m] of Object.entries(manifest.models)) {
 	for (const [lb, r] of Object.entries(m.replays ?? {})) {
 		if (!NAME_RE.test(r.file)) throw new Error(`${model} ${lb}: bad file name ${r.file}`);
-		const from = path.join(src, r.file);
-		const size = fs.statSync(from).size;
-		const magic = Buffer.alloc(2);
-		const fd = fs.openSync(from, 'r');
-		fs.readSync(fd, magic, 0, 2, 0);
-		fs.closeSync(fd);
-		if (magic[0] !== 0x1f || magic[1] !== 0x8b) throw new Error(`${from}: not gzip`);
-		if (size >= MAX_BYTES) throw new Error(`${from}: ${size} bytes, over 25 MiB`);
-		// hard link, not a copy (2026-10-02): the store's files are written
-		// once and replaced (never edited in place) by publish_replays.py, so
-		// dist can share their inodes; a copy only across filesystems
-		const to = path.join(dist, r.file);
-		try {
-			fs.linkSync(from, to);
-		} catch (e) {
-			if (e.code !== 'EXDEV' && e.code !== 'EPERM' && e.code !== 'ENOTSUP') throw e;
-			fs.copyFileSync(from, to);
-		}
+		if (!ledger[r.file]) notUp.push(r.file);
 		n++;
-		bytes += size;
-		console.log(`  ${r.file}  ${(size / 1048576).toFixed(2).padStart(5)} MiB  ${model}  ${r.song} [${r.difficulty}]`);
+		bytes += ledger[r.file]?.bytes ?? 0;
 	}
 }
+if (notUp.length)
+	throw new Error(`${notUp.length} replays are not in R2 yet (e.g. ${notUp[0]}): run node scripts/upload_r2.mjs first`);
 
 // the viewer is revalidated so a redeploy reaches open-ended visitors at
-// once; replay files are named by (weights, rate, level) and deterministic,
-// so they can sit in caches for a day
+// once (the replays' caching is set by src/worker.js)
 fs.writeFileSync(
 	path.join(dist, '_headers'),
 	['/', '  Cache-Control: no-cache', '/index.html', '  Cache-Control: no-cache',
-	 '/r/*', '  Cache-Control: public, max-age=86400', '  X-Content-Type-Options: nosniff', ''].join('\n')
+	 ''].join('\n')
 );
-console.log(`dist: viewer + ${n} replays (${(bytes / 1048576).toFixed(1)} MiB) from ${src}`);
+console.log(`dist: viewer; ${n} replays (${(bytes / 1048576).toFixed(1)} MiB) listed by ${src}, all in R2`);

@@ -18,8 +18,74 @@ const CANDIDATES = (() => {
   return c;
 })();
 
+// Auto-refresh period: 15 s; `?refresh=<seconds>` overrides (the
+// headless refresh test runs at 1 s).
+export const REFRESH_MS = (() => {
+  const v = Number(new URLSearchParams(location.search).get("refresh"));
+  return v > 0 ? v * 1000 : 15000;
+})();
+
 function bust(url) {
   return url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
+}
+
+// Change detection (2026-10-02, user request: an idle refresh reset the
+// zoom). A refresh must not write to `store` unless the data changed:
+// every write re-derives the panels and pokes the charts. Two layers:
+//   1. conditional GET: serve.py answers If-None-Match with 304 when the
+//      file's (mtime, size) ETag is unchanged, so there is no body to parse;
+//   2. content compare: a 200 whose bytes (metrics.jsonl), or whose JSON
+//      minus the `generated` stamp (index.json, which the backfill
+//      rewrites every pass), match what we already hold is a no-op. This
+//      layer alone also works on a plain `python -m http.server`.
+// Unchanged run entries keep their object identity across index updates,
+// so views on one run do not re-derive when another run changes.
+const etags = new Map(); // url (no cache-buster) -> ETag of what we hold
+const bodies = new Map(); // metrics url -> raw text parsed last
+let indexSig = null; // JSON of the held index minus `generated`
+const runSigs = new Map(); // run id -> JSON of its held index entry
+
+async function fetchIfChanged(url, holding) {
+  const headers = {};
+  const tag = holding ? etags.get(url) : null;
+  if (tag) headers["If-None-Match"] = tag;
+  const r = await fetch(bust(url), { cache: "no-store", headers });
+  if (r.status === 304) return null;
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  const text = await r.text();
+  const et = r.headers.get("ETag");
+  if (et) etags.set(url, et);
+  else etags.delete(url);
+  return text;
+}
+
+// merge a freshly fetched index into store.index, writing only what changed
+function applyIndex(idx) {
+  const { generated, ...rest } = idx;
+  const sig = JSON.stringify(rest);
+  if (store.index && sig === indexSig) {
+    if (store.index.generated !== generated) store.index.generated = generated;
+    return;
+  }
+  indexSig = sig;
+  const prev = new Map((store.index?.runs ?? []).map((r) => [r.id, r]));
+  const runs = idx.runs.map((r) => {
+    const rs = JSON.stringify(r);
+    const old = prev.get(r.id);
+    const same = old && runSigs.get(r.id) === rs;
+    runSigs.set(r.id, rs);
+    return same ? old : r;
+  });
+  if (!store.index) {
+    store.index = { ...idx, runs };
+    return;
+  }
+  for (const k of Object.keys(idx)) {
+    if (k === "runs") continue;
+    if (JSON.stringify(store.index[k]) !== JSON.stringify(idx[k])) store.index[k] = idx[k];
+  }
+  const cur = store.index.runs;
+  if (cur.length !== runs.length || runs.some((r, i) => r !== cur[i])) store.index.runs = runs;
 }
 
 export async function loadIndex() {
@@ -27,14 +93,15 @@ export async function loadIndex() {
   let lastErr = null;
   for (const b of bases) {
     try {
-      const r = await fetch(bust(b + "index.json"), { cache: "no-store" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      const idx = await r.json();
-      if (!idx || !Array.isArray(idx.runs)) throw new Error("not an index");
-      store.base = b;
-      store.index = idx;
-      store.error = null;
-      return idx;
+      const text = await fetchIfChanged(b + "index.json", !!store.index && store.base === b);
+      if (text != null) {
+        const idx = JSON.parse(text);
+        if (!idx || !Array.isArray(idx.runs)) throw new Error("not an index");
+        if (store.base !== b) store.base = b;
+        applyIndex(idx);
+      }
+      if (store.error) store.error = null;
+      return store.index;
     } catch (e) {
       lastErr = e;
     }
@@ -69,19 +136,28 @@ export async function loadMetrics(run, { force = false } = {}) {
   const cur = store.metrics[run.id];
   if (cur && !force) return cur.recs;
   if (store.loading[run.id]) return cur?.recs ?? null;
-  store.loading[run.id] = true;
+  // flag only a first fetch: the flag is reactive, and a background
+  // re-check has nothing to show for itself
+  if (!cur) store.loading[run.id] = true;
+  const url = store.base + run.metrics;
   try {
-    const r = await fetch(bust(store.base + run.metrics), { cache: "no-store" });
-    if (!r.ok) throw new Error(`${r.status} for ${run.metrics}`);
-    const text = await r.text();
+    let text;
+    try {
+      text = await fetchIfChanged(url, !!cur);
+    } catch (e) {
+      throw new Error(`${e.message} for ${run.metrics}`);
+    }
+    // 304, or the same bytes as last time: leave the store alone
+    if (cur && (text == null || bodies.get(url) === text)) return cur.recs;
     const recs = parseJsonl(text);
+    bodies.set(url, text);
     store.metrics[run.id] = { recs, at: Date.now(), bytes: text.length };
     return recs;
   } catch (e) {
     store.error = `metrics for ${run.id}: ${e.message}`;
     return cur?.recs ?? null;
   } finally {
-    delete store.loading[run.id];
+    if (store.loading[run.id]) delete store.loading[run.id];
   }
 }
 
