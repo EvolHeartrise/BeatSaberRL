@@ -696,8 +696,9 @@ replay loaded the pill just reads "📂 open replay…"),
 controls in a translucent panel at the bottom (no DOM score strip since
 2026-09-29 — the score readout is the in-scene HUD below)
 (`pointer-events: none` containers so drags reach the canvas). The
-camera-attached gauge sprites anchor to the actual viewport corners
-(aspect-aware) and sit above the floating bottom UI.
+gauge panels (a DOM overlay since 2026-10-02, camera-attached canvas
+sprites before) anchor to the viewport's bottom corners and sit above
+the floating bottom UI.
 Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 `npm install && npm run build`, then copy `dist/index.html` over
 `../replay.html`. The hosted viewer at replays.flee.systems is a separate,
@@ -759,7 +760,8 @@ to the judge's tallies in test/flux-game.test.js). The game's XR origin is
 the watch's "Player" spot (scene z 0.65), so the HUD sits where Beat
 Saber's does around the player. All in-scene text/panels are
 canvas-texture sprites (not DOM overlays) so they live in the 3D scene
-and the file works fully offline. Controls: space play/pause, ←/→
+(and in the headset) and the file works fully offline; the screen-fixed
+joint gauges are DOM (HTML + SVG, system fonts — still offline). Controls: space play/pause, ←/→
 tick-step, +/− speed, r restart, g gauges, scrub bar. There is no video
 export (removed 2026-09-30 from both builds). Note positions and outcomes are DERIVED from
 the chart + event stream (single source of truth), not re-simulated.
