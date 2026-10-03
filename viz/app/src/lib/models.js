@@ -134,46 +134,84 @@ export const WALL_COLOR = "#ff2f2f", WALL_ALPHA = 0.34;
 // geometries [{geo, sign: -1}, {geo, sign: +1}] (sign −1 = the side the
 // plane normal points away from), or null if the plane misses the mesh.
 // `p`/`n` are in the geometry's own (scene-local) frame.
+// Scratch output, reused by every slice: per side, positions and normals
+// as float32 (exactly what the attribute arrays hold), grown on demand.
+const _sliceOut = [0, 1].map(() => ({ p: new Float32Array(0), n: new Float32Array(0), len: 0 }));
+
 export function sliceGeometry(geo, p, n) {
-  const pos = geo.attributes.position, nrm = geo.attributes.normal;
+  // (flat scratch buffers instead of an array per vertex, normal and
+  // crossing: a cut slices a ~3k-triangle model on the frame its debris
+  // appears, and the per-vertex garbage made that the costliest thing in a
+  // dense replay's frame loop. Same arithmetic in the same order, so the
+  // halves are the very same floats.)
+  const P = geo.attributes.position.array, NR = geo.attributes.normal.array;
   const idx = geo.index ? geo.index.array : null;
   const nl = Math.hypot(n[0], n[1], n[2]);
   const N = [n[0] / nl, n[1] / nl, n[2] / nl];
-  const sdist = (v) => (v[0] - p[0]) * N[0] + (v[1] - p[1]) * N[1] + (v[2] - p[2]) * N[2];
-  const V = (i) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
-  const Nv = (i) => [nrm.getX(i), nrm.getY(i), nrm.getZ(i)];
-  const lerp = (a, b, t) => [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])];
-  const out = [{ p: [], n: [] }, { p: [], n: [] }]; // 0 = negative side, 1 = positive
-  const ring = []; // crossing points (duplicates welded below)
-  const push = (side, tri) => {
-    for (const [v, nn] of tri) { out[side].p.push(...v); out[side].n.push(...nn); }
+  const ntri = idx ? idx.length / 3 : P.length / 9;
+  // 0 = negative side, 1 = positive; a side keeps at most 2 sub-triangles
+  // per triangle, plus its cap fan (at most 2 crossings per triangle)
+  const out = _sliceOut;
+  for (const o of out) {
+    o.len = 0;
+    if (o.p.length < 36 * ntri) { o.p = new Float32Array(36 * ntri); o.n = new Float32Array(36 * ntri); }
+  }
+  const ring = []; // crossing points, flat x y z (duplicates welded below)
+  // this triangle's corners and its clipped polygon per side, 6 numbers a
+  // vertex (position, normal); a plane leaves at most 4 corners a side
+  const tri = new Float64Array(18), ds = new Float64Array(3), x = new Float64Array(6);
+  const poly = [new Float64Array(24), new Float64Array(24)], cnt = [0, 0];
+  const keep = (side, src, o) => {
+    const d = poly[side], k = 6 * cnt[side]++;
+    for (let c = 0; c < 6; c++) d[k + c] = src[o + c];
+  };
+  const emit = (side, src, o) => {
+    const d = out[side], k = d.len;
+    d.p[k] = src[o]; d.p[k + 1] = src[o + 1]; d.p[k + 2] = src[o + 2];
+    d.n[k] = src[o + 3]; d.n[k + 1] = src[o + 4]; d.n[k + 2] = src[o + 5];
+    d.len += 3;
   };
   const EPS = 1e-7;
-  const ntri = idx ? idx.length / 3 : pos.count / 3;
   for (let t = 0; t < ntri; t++) {
-    const ids = idx ? [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]] : [3 * t, 3 * t + 1, 3 * t + 2];
-    const vs = ids.map(V), ns = ids.map(Nv), ds = vs.map(sdist);
-    const neg = [], posv = [];
+    for (let i = 0; i < 3; i++) {
+      const id = idx ? idx[3 * t + i] : 3 * t + i;
+      for (let c = 0; c < 3; c++) {
+        tri[6 * i + c] = P[3 * id + c];
+        tri[6 * i + 3 + c] = NR[3 * id + c];
+      }
+      ds[i] = (tri[6 * i] - p[0]) * N[0] + (tri[6 * i + 1] - p[1]) * N[1]
+        + (tri[6 * i + 2] - p[2]) * N[2];
+    }
+    cnt[0] = cnt[1] = 0;
     // Sutherland–Hodgman around the triangle, keeping both sides
     for (let i = 0; i < 3; i++) {
       const j = (i + 1) % 3;
-      const a = [vs[i], ns[i]], b = [vs[j], ns[j]], da = ds[i], db = ds[j];
-      if (da <= EPS) neg.push(a);
-      if (da >= -EPS) posv.push(a);
+      const da = ds[i], db = ds[j];
+      if (da <= EPS) keep(0, tri, 6 * i);
+      if (da >= -EPS) keep(1, tri, 6 * i);
       if ((da < -EPS && db > EPS) || (da > EPS && db < -EPS)) {
         const tt = da / (da - db);
-        const x = [lerp(a[0], b[0], tt), lerp(a[1], b[1], tt)];
-        neg.push(x); posv.push(x); ring.push(x[0]);
+        for (let c = 0; c < 6; c++) x[c] = tri[6 * i + c] + tt * (tri[6 * j + c] - tri[6 * i + c]);
+        keep(0, x, 0); keep(1, x, 0); ring.push(x[0], x[1], x[2]);
       }
     }
-    for (const [side, poly] of [[0, neg], [1, posv]])
-      for (let k = 1; k + 1 < poly.length; k++) push(side, [poly[0], poly[k], poly[k + 1]]);
+    for (let side = 0; side < 2; side++)
+      for (let k = 1; k + 1 < cnt[side]; k++) {
+        emit(side, poly[side], 0); emit(side, poly[side], 6 * k);
+        emit(side, poly[side], 6 * (k + 1));
+      }
   }
-  if (!out[0].p.length || !out[1].p.length || ring.length < 3) return null;
+  if (!out[0].len || !out[1].len || ring.length < 9) return null;
+  const push = (side, verts) => {
+    for (const [v, nn] of verts) emit(side, [...v, ...nn], 0);
+  };
   // cap: weld crossing points, sort by angle in the plane, fan both ways
   const key = (v) => v.map((x) => Math.round(x * 1e4)).join(",");
   const seen = new Set(), pts = [];
-  for (const v of ring) { const k = key(v); if (!seen.has(k)) { seen.add(k); pts.push(v); } }
+  for (let r = 0; r < ring.length; r += 3) {
+    const v = [ring[r], ring[r + 1], ring[r + 2]], k = key(v);
+    if (!seen.has(k)) { seen.add(k); pts.push(v); }
+  }
   if (pts.length >= 3) {
     const c = [0, 1, 2].map((k) => pts.reduce((s, v) => s + v[k], 0) / pts.length);
     // in-plane basis
@@ -195,8 +233,8 @@ export function sliceGeometry(geo, p, n) {
   }
   return out.map((o, i) => {
     const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute(o.p, 3));
-    g.setAttribute("normal", new THREE.Float32BufferAttribute(o.n, 3));
+    g.setAttribute("position", new THREE.BufferAttribute(o.p.slice(0, o.len), 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(o.n.slice(0, o.len), 3));
     g.computeBoundingSphere();
     return { geo: g, sign: i === 0 ? -1 : 1 };
   });
