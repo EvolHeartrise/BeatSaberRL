@@ -5,19 +5,25 @@ import {
 import { FLUX, POSE } from "./build.js";
 import { fluxHudAt, hudAt } from "./hud.js";
 
-export const pb = $state({
-  rep: null,
-  name: "",
-  cur: 0, // fractional tick
-  seek: 0, // bumped whenever `cur` JUMPS (scrub/step/restart/load) rather
-           // than advancing — the only time the song is allowed to seek
-  playing: false,
-  speed: 1.0,
-  gauges: true, // per-joint dial panels + force instrumentation
-  hitboxes: false, // real v7 collision-volume wireframes ('h')
-  firstPerson: false, // camera at the head, fixed forward-level ('f')
-  fpFov: 75, // first-person vertical field of view, degrees
-});
+class Playback {
+  // The active replay (set it through setRep). $state.raw: a parsed replay
+  // is never mutated, and plain $state would deep-proxy it — every tick,
+  // note and number array the frame loop reads went through a proxy trap
+  // and grew a signal, for reactivity nothing used. Only replacing the
+  // replay is reactive. (The game's LiveReplay, a class, never was proxied.)
+  rep = $state.raw(null);
+  name = $state("");
+  cur = $state(0); // fractional tick
+  seek = $state(0); // bumped whenever `cur` JUMPS (scrub/step/restart/load)
+                    // rather than advancing — the only time the song may seek
+  playing = $state(false);
+  speed = $state(1.0);
+  gauges = $state(true); // per-joint dial panels + force instrumentation
+  hitboxes = $state(false); // real v7 collision-volume wireframes ('h')
+  firstPerson = $state(false); // camera at the head, fixed forward-level ('f')
+  fpFov = $state(75); // first-person vertical field of view, degrees
+}
+export const pb = new Playback();
 
 // The SONG's clock, published by App.svelte for Scene.svelte's frame loop
 // (see lib/sync.js): `tick()` returns the replay tick the song is sounding
