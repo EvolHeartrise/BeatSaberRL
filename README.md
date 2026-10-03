@@ -714,7 +714,7 @@ incoming notes, level and unturned, so the view never swings with the
 head. A FOV slider (40–110°, default 75°) appears in the bar while it is
 on; the view is a pure function of the tick, so scrubbing matches
 playback; the head sphere is hidden
-while it is on, the gauges move to that camera, and the orbit camera
+while it is on (the gauges stay where they are), and the orbit camera
 keeps its place for when you toggle back — drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
@@ -738,7 +738,13 @@ arms / legs: limit arcs, ω, near-limit orange, applied-τ bars derived
 from the logged gear actions) plus per-foot vertical ground-reaction
 N and the joint-activation meter (total/29 with the spine / arms /
 legs split; from the replay's `activation` field, derived from the
-logged actions on older recordings).
+logged actions on older recordings). Since 2026-10-02 the gauges are a
+DOM overlay (`BodyGauges.svelte`: HTML text over SVG dials and bars,
+system fonts, the two panels in the bottom corners at the size the old
+camera-attached canvas sprites had) rather than canvas textures redrawn
+and re-uploaded every frame; the frame loop writes only the values that
+changed into the elements. They show whenever there is a body (an agent
+replay or pose mode), never in the Flux WebXR game.
 Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
 q36 export. Non-"v10" replays are rejected — re-record from a current
 checkpoint.
