@@ -10,21 +10,25 @@
   // fraction|, 0..29 — the --iso-coef base; record_rev 3 "activation"
   // field, derived from the action for older replays).
   //
-  // Drawn as canvas-texture sprites ATTACHED TO THE CAMERA: they stay
-  // screen-fixed under orbiting and need no DOM/fonts (offline safe) —
-  // same rationale as the score popups. Left sprite: spine + L arm + L leg. Right sprite: R arm +
-  // R leg + forces.
-  import { T, useThrelte } from "@threlte/core";
-  import * as THREE from "three";
+  // A DOM overlay over the WebGL canvas (2026-10-02; until then two
+  // canvas-texture sprites hung off the camera, re-drawn and re-uploaded
+  // every frame — canvas only so that a video export of the canvas kept
+  // them, and the export is gone). Left panel: spine + L arm + L leg.
+  // Right panel: R arm + R leg + forces. App.svelte mounts it whenever
+  // there is a body to instrument.
+  //
+  // The markup is built ONCE: the rows, dials and bars never change shape,
+  // only the values in them. The frame loop writes those values straight
+  // into the elements — a needle's end point, a bar's end, a label's text —
+  // and only the ones that changed: no per-frame Svelte re-render of 29
+  // rows. Each panel is one SVG (arcs, needles, bars) under HTML text, laid
+  // out in the old canvas's pixel units (252 wide) and scaled as a whole to
+  // the on-screen size the sprites had.
   import { pb, pose } from "./state.svelte.js";
   import {
-    DT, GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
-    TAU_MAX, activationAt, footForces, lerp, tauOf,
+    GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
+    TAU_MAX, activationAt, footForces, gearTable, lerp,
   } from "./replay.js";
-
-  // the fov of the camera these sprites hang off (the corner placement
-  // below is in camera space, so a wider camera needs a wider anchor)
-  let { fov = 55 } = $props();
 
   const W = 252;
   const ROW_H = 25, HEAD_H = 20, PAD = 10;
@@ -41,221 +45,299 @@
     p.groups.reduce((a, g) => a + HEAD_H + GROUPS[g].joints.length * ROW_H, 0) +
     (p.forces ? HEAD_H + FORCES_H : 0);
 
-  const panels = PANELS.map((p) => {
-    const cv = document.createElement("canvas");
-    cv.width = W;
-    cv.height = panelH(p);
-    const tex = new THREE.CanvasTexture(cv);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return { ...p, cv, ctx: cv.getContext("2d"), tex, h: panelH(p) };
-  });
-
   const groupColor = (g) =>
     g === 1 || g === 3 ? SABER_COLORS[0]
     : g === 2 || g === 4 ? SABER_COLORS[1]
     : "#c5b3f0";
 
-  function label(ctx, text, x, y, color = "#9aa0ae", size = 12, bold = false,
-                 align = "left") {
-    ctx.fillStyle = color;
-    ctx.font = `${bold ? "bold " : ""}${size}px system-ui, sans-serif`;
-    ctx.textAlign = align;
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, x, y);
+  // ---- layout, in panel units ----------------------------------------------
+  // dial: centre (24, row middle), radius 10; 0 points up and positive
+  // angles turn clockwise, as on the canvas. Every v10 range fits in ±180°,
+  // so the allowed arc is one SVG arc lo→hi.
+  const R = 10, DX = 24;
+  const at = (cy, a, r) => [DX + r * Math.sin(a), cy - r * Math.cos(a)];
+  function arcD(cy, [lo, hi]) {
+    const [x0, y0] = at(cy, lo, R), [x1, y1] = at(cy, hi, R);
+    return `M${x0} ${y0}A${R} ${R} 0 ${hi - lo > Math.PI ? 1 : 0} 1 ${x1} ${y1}`;
   }
+  const radial = (cy, a, r0, r1) => {
+    const [x1, y1] = at(cy, a, r0), [x2, y2] = at(cy, a, r1);
+    return { x1, y1, x2, y2 };
+  };
+  // τ bar: centre-anchored, ± τ_max full-scale
+  const BX0 = 140, BX1 = W - 14, BMID = (BX0 + BX1) / 2;
+  // force bars: per-foot vertical reaction (full scale 1200 N) and the
+  // activation meter (full scale 29 = every joint at full gear)
+  const FX0 = 60, FX1 = W - 64, FS = 1200;
+  const forceY = (y0, row) => y0 + HEAD_H + 4 + 24 * row;
 
-  /** One joint row at baseline y: dial + name + numbers + τ bar. */
-  function jointRow(ctx, y, j, q, om, tau, col) {
-    const [lo, hi] = JOINT_LIMITS[j];
-    const cx = 24, cy = y, r = 10;
-    // dial: allowed arc drawn lo→hi with 0 pointing up (canvas angle
-    // -PI/2 + angle; every v10 range fits in ±180°)
-    const cAng = (p) => -Math.PI / 2 + p;
-    ctx.lineWidth = 3.5;
-    ctx.strokeStyle = "#3a4050";
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, cAng(lo), cAng(hi));
-    ctx.stroke();
-    for (const b of [lo, hi]) { // limit ticks
-      ctx.strokeStyle = "#f0a35e";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(cx + (r - 3) * Math.cos(cAng(b)), cy + (r - 3) * Math.sin(cAng(b)));
-      ctx.lineTo(cx + (r + 3) * Math.cos(cAng(b)), cy + (r + 3) * Math.sin(cAng(b)));
-      ctx.stroke();
-    }
-    const hot = Math.min(q - lo, hi - q) < NEAR;
-    const nc = hot ? "#f0a35e" : col;
-    ctx.strokeStyle = nc;
-    ctx.lineWidth = 2.5;
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(cx + (r - 1) * Math.cos(cAng(q)), cy + (r - 1) * Math.sin(cAng(q)));
-    ctx.stroke();
-    // ω needle: short outer tick at the needle + q + ω·(1/8 s) preview
-    const qn = Math.min(hi, Math.max(lo, q + om / 8));
-    ctx.strokeStyle = nc;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(cx + (r + 1) * Math.cos(cAng(qn)), cy + (r + 1) * Math.sin(cAng(qn)));
-    ctx.lineTo(cx + (r + 4) * Math.cos(cAng(qn)), cy + (r + 4) * Math.sin(cAng(qn)));
-    ctx.stroke();
-    label(ctx, JOINT_NAMES[j], 40, y - 5, "#9aa0ae", 11);
-    label(ctx, `${deg(q).toFixed(0)}°`, 40, y + 7, "#6b7180", 10);
-    label(ctx, `ω ${om.toFixed(1)}`, 84, y + 7,
-      Math.abs(om) > 0.9 * OMEGA_CAP[j] ? "#f0a35e" : "#6b7180", 10);
-    // τ bar: center-anchored, ± τ_max full-scale
-    const bx0 = 140, bx1 = W - 14, bmid = (bx0 + bx1) / 2;
-    ctx.strokeStyle = "#3a4050";
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(bx0, y);
-    ctx.lineTo(bx1, y);
-    ctx.stroke();
-    ctx.strokeStyle = "#6b7180";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(bmid, y - 5);
-    ctx.lineTo(bmid, y + 5);
-    ctx.stroke();
-    if (tau !== 0) {
-      // the fraction of this joint's limit (the replay body's, if it has one)
-      const t = Math.max(-1, Math.min(1, tau / (pb.rep?.body?.tau_max[j] ?? TAU_MAX[j])));
-      ctx.strokeStyle = t > 0 ? "#7dd3a0" : "#e06c75";
-      ctx.lineWidth = 5;
-      ctx.beginPath();
-      ctx.moveTo(bmid, y);
-      ctx.lineTo(bmid + t * (bx1 - bx0) / 2, y);
-      ctx.stroke();
-    }
-  }
-
-  function forcesBlock(ctx, y0, feet, act) {
-    label(ctx, "forces", PAD, y0 + 8, "#e8eaf0", 12, true);
-    let y = y0 + HEAD_H + 4;
-    // per-foot vertical reaction bars, full scale 1200 N
-    const FS = 1200;
-    for (const [i, name] of [[0, "L foot"], [1, "R foot"]]) {
-      const n = feet ? feet[i] : null;
-      label(ctx, name, PAD, y, "#9aa0ae", 11);
-      const bx0 = 60, bx1 = W - 64;
-      ctx.strokeStyle = "#3a4050";
-      ctx.lineWidth = 5;
-      ctx.beginPath();
-      ctx.moveTo(bx0, y);
-      ctx.lineTo(bx1, y);
-      ctx.stroke();
-      if (n !== null) {
-        const t = Math.max(0, Math.min(1, n / FS));
-        ctx.strokeStyle = n < 0 ? "#e06c75" : "#7aa2f7";
-        ctx.lineWidth = 6;
-        ctx.beginPath();
-        ctx.moveTo(bx0, y);
-        ctx.lineTo(bx0 + t * (bx1 - bx0), y);
-        ctx.stroke();
-        label(ctx, `${n.toFixed(0)} N`, W - 58, y, "#cfd3dc", 11);
-      } else {
-        label(ctx, "n/a", W - 58, y, "#6b7180", 11);
-      }
-      y += 24;
-    }
-    // joint-activation meter: commanded Σ|gear fraction| this tick,
-    // full scale 29 (every joint at full gear); the --iso-coef base
-    label(ctx, "activ.", PAD, y, "#9aa0ae", 11);
-    const bx0 = 60, bx1 = W - 64;
-    ctx.strokeStyle = "#3a4050";
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(bx0, y);
-    ctx.lineTo(bx1, y);
-    ctx.stroke();
-    if (act !== null) {
-      const t = Math.max(0, Math.min(1, act[0] / 29));
-      ctx.strokeStyle = "#c5b3f0";
-      ctx.lineWidth = 6;
-      ctx.beginPath();
-      ctx.moveTo(bx0, y);
-      ctx.lineTo(bx0 + t * (bx1 - bx0), y);
-      ctx.stroke();
-      label(ctx, `${act[0].toFixed(1)}/29`, W - 58, y, "#cfd3dc", 11);
-      // group split on the next line: spine / arms / legs
-      label(ctx, `spine ${act[1].toFixed(1)}  arms ${act[2].toFixed(1)}  `
-        + `legs ${act[3].toFixed(1)}`, bx0, y + 20, "#9aa0ae", 10);
-    } else {
-      label(ctx, "n/a", W - 58, y, "#6b7180", 11);
-    }
-  }
-
-  function draw(panel, q29, om29, tau29, feet, act) {
-    const { ctx, groups, forces, h } = panel;
-    ctx.clearRect(0, 0, W, h);
-    ctx.fillStyle = "rgba(11,13,17,0.72)";
-    ctx.beginPath();
-    ctx.roundRect(0, 0, W, h, 14);
-    ctx.fill();
+  // each panel's blocks top to bottom: group headings, joint rows (cy =
+  // the row's middle) and the force block
+  const panels = PANELS.map((p) => {
+    const heads = [], joints = [];
     let y = PAD;
-    for (const g of groups) {
-      const grp = GROUPS[g];
-      const col = groupColor(g);
-      label(ctx, grp.name, PAD, y + 8, col, 12, true);
+    for (const g of p.groups) {
+      heads.push({ g, y });
       y += HEAD_H;
-      for (const j of grp.joints) {
-        jointRow(ctx, y + ROW_H / 2, j, q29[j], om29[j], tau29[j], col);
+      for (const j of GROUPS[g].joints) {
+        joints.push({ g, j, cy: y + ROW_H / 2 });
         y += ROW_H;
       }
     }
-    if (forces) forcesBlock(ctx, y, feet, act);
-    panel.tex.needsUpdate = true;
-  }
-
-  $effect(() => {
-    if (pose.on) { // gauges reflect the manually posed joints (ω = τ = 0)
-      const z = Array(29).fill(0);
-      for (const p of panels) draw(p, pose.q, z, z, null, null);
-      return;
-    }
-    if (!pb.rep) return;
-    const k = Math.min(Math.floor(pb.cur), pb.rep.ticks.length - 1);
-    const k1 = Math.min(k + 1, pb.rep.ticks.length - 1);
-    const u = pb.cur - k;
-    const qa = pb.rep.ticks[k].q, qb = pb.rep.ticks[k1].q;
-    const q29 = Array.from({ length: 29 },
-      (_, j) => lerp(qa[7 + j], qb[7 + j], u));
-    const om29 = pb.rep.ticks[k1].omega;
-    const tau29 = tauOf(pb.rep.ticks[k1].action, pb.rep.config.gears ?? 3,
-      pb.rep.body);
-    draw(panels[0], q29, om29, tau29, null, null);
-    draw(panels[1], q29, om29, tau29, footForces(pb.rep, k1),
-      activationAt(pb.rep, k1));
+    return { ...p, heads, joints, forcesY: p.forces ? y : null, h: panelH(p) };
   });
 
-  $effect(() => () => panels.forEach((g) => g.tex.dispose()));
+  // ---- the elements the frame loop writes ----------------------------------
+  // per joint: needle, ω tick, angle text, ω text, τ bar (and the row's
+  // centre); the force block's bars and texts. Each write remembers what it
+  // last wrote, so a value that did not change costs a comparison and no
+  // DOM write.
+  const J = Array.from({ length: 29 }, () => ({}));
+  const F = { feet: [{}, {}], act: {} };
+  const last = new Map();
+  function put(el, key, v, write) {
+    if (!el) return;
+    let m = last.get(el);
+    if (!m) last.set(el, (m = {}));
+    if (m[key] === v) return;
+    m[key] = v;
+    write(el, v);
+  }
+  // text changes in place (the span keeps its one text node)
+  const text = (el, s) => put(el, "t", s, (e, v) => {
+    if (e.firstChild) e.firstChild.data = v;
+    else e.textContent = v;
+  });
+  const attr = (el, name, v) => put(el, name, v, (e, s) => e.setAttribute(name, s));
+  // (classList, not the class attribute: that would drop Svelte's scoping class)
+  const cls = (el, name, on) => put(el, name, on, (e, v) => e.classList.toggle(name, v));
+  // a line's end points — plain attributes, not CSS properties, so moving
+  // one never costs a style recalc (a `transform` would)
+  function ends(el, { x1, y1, x2, y2 }) {
+    attr(el, "x1", x1.toFixed(2)); attr(el, "y1", y1.toFixed(2));
+    attr(el, "x2", x2.toFixed(2)); attr(el, "y2", y2.toFixed(2));
+  }
 
-  // camera-space placement: at z = -1 the view half-height is
-  // tan(fov / 2) (0.52 for the orbit camera's 55°); anchor the panels to
-  // the screen corners, above the floating bottom UI.
-  const { size } = useThrelte();
-  const HALF_H = $derived(Math.tan((fov / 2) * Math.PI / 180));
-  // sprite size in camera units at z = -1: 0.62 was tuned for the 55°
-  // orbit camera, so scale it with the half-height to keep the same
-  // on-screen size on the first-person camera at any fov
-  const SCALE_Y = $derived(0.62 * HALF_H / Math.tan((55 / 2) * Math.PI / 180));
-  const MARGIN = 0.015;
+  /** One joint's dial + numbers + τ bar (τ as the fraction of its limit). */
+  function joint(j, q, om, t) {
+    const [lo, hi] = JOINT_LIMITS[j];
+    const r = J[j];
+    const hot = Math.min(q - lo, hi - q) < NEAR;
+    cls(r.needle, "hot", hot);
+    cls(r.omTick, "hot", hot);
+    ends(r.needle, radial(r.cy, q, 0, R - 1));
+    // ω needle: short outer tick at q + ω·(1/8 s), clamped to the range
+    ends(r.omTick, radial(r.cy, Math.min(hi, Math.max(lo, q + om / 8)), R + 1, R + 4));
+    text(r.ang, `${deg(q).toFixed(0)}°`);
+    text(r.om, `ω ${om.toFixed(1)}`);
+    cls(r.om, "hot", Math.abs(om) > 0.9 * OMEGA_CAP[j]);
+    cls(r.tau, "off", t === 0);
+    cls(r.tau, "neg", t < 0);
+    if (t !== 0) attr(r.tau, "x2", (BMID + t * (BX1 - BX0) / 2).toFixed(2));
+  }
+
+  function forces(feet, act) {
+    for (const i of [0, 1]) {
+      const n = feet ? feet[i] : null, f = F.feet[i];
+      cls(f.bar, "off", n === null);
+      cls(f.bar, "neg", n !== null && n < 0);
+      if (n !== null)
+        attr(f.bar, "x2", (FX0 + Math.max(0, Math.min(1, n / FS)) * (FX1 - FX0)).toFixed(2));
+      text(f.val, n === null ? "n/a" : `${n.toFixed(0)} N`);
+      cls(f.val, "na", n === null);
+    }
+    const a = F.act;
+    cls(a.bar, "off", act === null);
+    if (act !== null)
+      attr(a.bar, "x2", (FX0 + Math.max(0, Math.min(1, act[0] / 29)) * (FX1 - FX0)).toFixed(2));
+    text(a.val, act === null ? "n/a" : `${act[0].toFixed(1)}/29`);
+    cls(a.val, "na", act === null);
+    // group split on the next line: spine / arms / legs
+    text(a.split, act === null ? "" : `spine ${act[1].toFixed(1)}  arms ${act[2].toFixed(1)}  `
+      + `legs ${act[3].toFixed(1)}`);
+  }
+
+  // The frame loop: Scene.svelte's clock moves pb.cur every frame while
+  // playing, which re-runs this; nothing is allocated per joint.
+  $effect(() => {
+    if (pose.on) { // gauges reflect the manually posed joints (ω = τ = 0)
+      const q = pose.q;
+      for (let j = 0; j < 29; j++) joint(j, q[j], 0, 0);
+      forces(null, null);
+      return;
+    }
+    const rep = pb.rep, cur = pb.cur;
+    if (!rep) return;
+    const n = rep.ticks.length;
+    const k = Math.min(Math.floor(cur), n - 1);
+    const k1 = Math.min(k + 1, n - 1);
+    const u = cur - k;
+    const qa = rep.ticks[k].q, tb = rep.ticks[k1], qb = tb.q;
+    // applied τ (tauOf, one joint at a time) as the fraction of this
+    // joint's limit (the replay body's, if it has one)
+    const body = rep.body, table = body ? null : gearTable(rep.config.gears ?? 3);
+    for (let j = 0; j < 29; j++) {
+      const a = tb.action[j];
+      const tau = body ? (body.gear_frac[j][a] ?? 0) * body.tau_max[j]
+        : (table[a] ?? 0) * TAU_MAX[j];
+      const t = tau === 0 ? 0
+        : Math.max(-1, Math.min(1, tau / (body?.tau_max[j] ?? TAU_MAX[j])));
+      joint(j, lerp(qa[7 + j], qb[7 + j], u), tb.omega[j], t);
+    }
+    forces(footForces(rep, k1), activationAt(rep, k1));
+  });
+
+  // ---- on-screen placement -------------------------------------------------
+  // The sprites were sized in camera space: 0.62 units tall at z = -1 under
+  // the orbit camera's 55° fov (rescaled with the fov on the first-person
+  // camera, so the same on-screen size at any fov), anchored 0.015 units in
+  // from the side and just above the floating bottom UI. As fractions of the
+  // stage height that is:
+  const VIEW_H = 2 * Math.tan((55 / 2) * Math.PI / 180); // camera units
+  const SCREEN_H = 0.62 / VIEW_H;  // each panel's height
+  const MARGIN = 0.015 / VIEW_H;   // gap to the left / right edge
   // the control bar wrapped to two rows (buttons + timeline) is ~97 px
   // tall with its padding; keep a small gap above it
   const BOTTOM_UI_PX = 104;
+  let stageH = $state(0);
 </script>
 
-{#each panels as g, i (i)}
-  {@const sc = [SCALE_Y * (W / g.h), SCALE_Y * 1, 1]}
-  {@const gx = HALF_H * ($size.width / $size.height) - MARGIN - sc[0] / 2}
-  {@const gy = -HALF_H + 2 * HALF_H * (BOTTOM_UI_PX / $size.height) + sc[1] / 2}
-  <T.Sprite
-    position={[i === 0 ? -gx : gx, gy, -1]}
-    scale={sc}
-    renderOrder={20}
-  >
-    <T.SpriteMaterial map={g.tex} transparent depthTest={false} />
-  </T.Sprite>
-{/each}
+<div class="gauges" bind:clientHeight={stageH}>
+  {#each panels as p, i (i)}
+    <div class="panel" class:right={i === 1}
+      style:height="{p.h}px"
+      style:bottom="{BOTTOM_UI_PX}px"
+      style:--margin="{MARGIN * stageH}px"
+      style:transform="scale({(SCREEN_H * stageH) / p.h})">
+      <!-- two SVGs: what never changes (arcs, limit ticks, bar tracks) and
+           what the frame loop moves (needles, ω ticks, bars) — the browser
+           then keeps the static one's paint and re-records only the other -->
+      <svg width={W} height={p.h} viewBox="0 0 {W} {p.h}" aria-hidden="true">
+        {#each p.joints as { j, cy } (j)}
+          <path class="arc" d={arcD(cy, JOINT_LIMITS[j])} />
+          {#each JOINT_LIMITS[j] as b, s (s)}
+            <line class="lim" {...radial(cy, b, R - 3, R + 3)} />
+          {/each}
+          <line class="track" x1={BX0} x2={BX1} y1={cy} y2={cy} />
+          <line class="mid" x1={BMID} x2={BMID} y1={cy - 5} y2={cy + 5} />
+        {/each}
+        {#if p.forces}
+          {#each [0, 1, 2] as row (row)}
+            {@const y = forceY(p.forcesY, row)}
+            <line class="ftrack" x1={FX0} x2={FX1} y1={y} y2={y} />
+          {/each}
+        {/if}
+      </svg>
+      <svg width={W} height={p.h} viewBox="0 0 {W} {p.h}" aria-hidden="true">
+        {#each p.joints as { g, j, cy } (j)}
+          {@const r = Object.assign(J[j], { cy })}
+          <g style:--c={groupColor(g)} data-joint={j}>
+            <line class="needle" bind:this={r.needle} />
+            <line class="omtick" bind:this={r.omTick} />
+            <line class="tau off" x1={BMID} x2={BMID} y1={cy} y2={cy}
+              bind:this={r.tau} />
+          </g>
+        {/each}
+        {#if p.forces}
+          {#each [0, 1, 2] as row (row)}
+            {@const y = forceY(p.forcesY, row)}
+            {#if row < 2}
+              <line class="fill off" x1={FX0} x2={FX0} y1={y} y2={y}
+                bind:this={F.feet[row].bar} />
+            {:else}
+              <line class="fill act off" x1={FX0} x2={FX0} y1={y} y2={y}
+                bind:this={F.act.bar} />
+            {/if}
+          {/each}
+        {/if}
+      </svg>
+      {#each p.heads as { g, y } (g)}
+        <span class="head" style:top="{y + 8}px" style:color={groupColor(g)}>
+          {GROUPS[g].name}</span>
+      {/each}
+      {#each p.joints as { j, cy } (j)}
+        <span class="name" style:top="{cy - 5}px">{JOINT_NAMES[j]}</span>
+        <span class="ang" style:top="{cy + 7}px" bind:this={J[j].ang} data-joint={j}> </span>
+        <span class="om" style:top="{cy + 7}px" bind:this={J[j].om} data-joint={j}> </span>
+      {/each}
+      {#if p.forces}
+        {@const y0 = p.forcesY}
+        <span class="head fh" style:top="{y0 + 8}px">forces</span>
+        {#each ["L foot", "R foot", "activ."] as name, row (row)}
+          <span class="fname" style:top="{forceY(y0, row)}px">{name}</span>
+          {#if row < 2}
+            <span class="val na" style:top="{forceY(y0, row)}px"
+              bind:this={F.feet[row].val} data-foot={row}> </span>
+          {:else}
+            <span class="val na" style:top="{forceY(y0, row)}px"
+              bind:this={F.act.val} data-act=""> </span>
+          {/if}
+        {/each}
+        <span class="split" style:top="{forceY(y0, 2) + 20}px"
+          bind:this={F.act.split}> </span>
+      {/if}
+    </div>
+  {/each}
+</div>
+
+<style>
+  /* the stage-sized layer the two corner panels hang in: under every other
+     overlay (they are drawn over it, as they were over the sprites) and
+     never in the way of the orbit drag */
+  .gauges {
+    position: absolute; inset: 0; z-index: 1;
+    pointer-events: none; overflow: hidden;
+    font-family: system-ui, sans-serif; line-height: 1;
+    user-select: none;
+  }
+  .panel {
+    position: absolute; left: var(--margin); width: 252px;
+    transform-origin: bottom left;
+    background: rgba(11, 13, 17, 0.72); border-radius: 14px;
+    contain: strict; /* the per-frame writes lay out + paint inside it only */
+  }
+  .panel.right { left: auto; right: var(--margin); transform-origin: bottom right; }
+  svg { position: absolute; left: 0; top: 0; }
+
+  /* text sits on its vertical middle at `top` (half its 1 em box up), as
+     the canvas drew it — plus 0.1 em: textBaseline "middle" is the middle
+     of the em box, while a CSS line box centres the taller ascent + descent
+     box, ~0.1 em lower */
+  span {
+    position: absolute; height: 1em; margin-top: -0.6em; white-space: pre;
+  }
+  /* the spans rewritten every frame are sized boxes with strict
+     containment, so a new number lays out that box alone */
+  .ang, .om, .val, .split { contain: strict; }
+  .head { left: 10px; font-size: 12px; font-weight: bold; }
+  .fh { color: #e8eaf0; }
+
+  /* the dial: allowed arc, orange limit ticks, needle + ω tick in the
+     group colour (orange within 10° of a limit) */
+  line, path { fill: none; stroke-linecap: round; }
+  .arc { stroke: #3a4050; stroke-width: 3.5; }
+  .lim { stroke: #f0a35e; stroke-width: 1.5; }
+  .needle { stroke: var(--c); stroke-width: 2.5; }
+  .omtick { stroke: var(--c); stroke-width: 1; }
+  .needle.hot, .omtick.hot { stroke: #f0a35e; }
+  .track { stroke: #3a4050; stroke-width: 4; }
+  .mid { stroke: #6b7180; stroke-width: 1; }
+  .tau { stroke: #7dd3a0; stroke-width: 5; }
+  .tau.neg { stroke: #e06c75; }
+  .off { visibility: hidden; }
+
+  .name { left: 40px; font-size: 11px; color: #9aa0ae; }
+  .ang, .om { font-size: 10px; color: #6b7180; }
+  .ang { left: 40px; width: 40px; }
+  .om { left: 84px; width: 54px; }
+  .om.hot { color: #f0a35e; }
+
+  .ftrack { stroke: #3a4050; stroke-width: 5; }
+  .fill { stroke: #7aa2f7; stroke-width: 6; }
+  .fill.neg { stroke: #e06c75; }
+  .fill.act { stroke: #c5b3f0; }
+  .fname { left: 10px; font-size: 11px; color: #9aa0ae; }
+  .val { left: 194px; width: 56px; font-size: 11px; color: #cfd3dc; }
+  .val.na { color: #6b7180; }
+  .split { left: 60px; width: 190px; font-size: 10px; color: #9aa0ae; }
+</style>

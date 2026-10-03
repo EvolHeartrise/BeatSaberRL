@@ -47,6 +47,9 @@ try {
 
   await click(page, "#bar button", "play Flux");
   await page.waitForSelector("#play select", { timeout: 10000 });
+  // the joint gauges instrument a body: none in the game (they are on by
+  // default in the viewer)
+  if (await page.$(".gauges")) throw new Error("joint gauges shown in play mode");
   const options = await page.$$eval("#play select option", (os) => os.map((o) => o.value));
   if (!options.includes("warmup-1") || options.length < 6)
     throw new Error("chart list: " + options.join(","));
@@ -125,6 +128,12 @@ try {
     .find((b) => b.textContent.includes("pause"))?.click());
   await new Promise((r) => setTimeout(r, 800));
   await page.screenshot({ path: "test/out/flux-play-watch.png" });
+  // a person's run has no body to instrument — no gauges, not even from
+  // the first-person camera (which once mounted them for any run)
+  await page.keyboard.press("f");
+  await new Promise((r) => setTimeout(r, 500));
+  if (await page.$(".gauges")) throw new Error("joint gauges shown on a person's run");
+  await page.keyboard.press("f");
   // the viewer's tallies at the last tick are the run's own
   await page.evaluate(() => {
     // the timeline is the last slider (volume / fov come first)

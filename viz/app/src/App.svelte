@@ -4,6 +4,7 @@
   import Scene from "./lib/Scene.svelte";
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
+  import BodyGauges from "./lib/BodyGauges.svelte";
   import { audio, pb, play, pose, songClock, lastTick, loadReplay,
     restart, seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
   import { toggleXRSession } from "@threlte/xr";
@@ -15,7 +16,7 @@
   import { onMount } from "svelte";
   import { fetchReplay, fileToReplay, nameFor, replayPathFrom,
     replayUrl } from "./lib/urlload.js";
-  import { DT } from "./lib/replay.js";
+  import { DT, isHuman } from "./lib/replay.js";
   // site build (replays.flee.systems): no Flux game, no pose mode, no
   // file-picker button — see lib/build.js
   import { FLUX, POSE, PICKER } from "./lib/build.js";
@@ -28,6 +29,13 @@
     pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
   // the map card shows whenever the replay names a map (not in play mode)
   const cardShown = $derived(!!pb.rep?.map && !play.on);
+  // the joint gauges ('g') instrument a BODY: a manual pose, or an agent
+  // replay (Scene.svelte draws the skeleton for exactly these). A person's
+  // Flux run has none, and the WebXR game (play mode, whose live recording
+  // is a person's) never shows them — in the headset a DOM overlay could
+  // not be seen anyway.
+  const gaugesShown = $derived(pb.gauges && !play.on
+    && (pose.on || (!!pb.rep && !isHuman(pb.rep))));
 
   // ---- song audio ---------------------------------------------------------
   // Fetch the map's audio whenever a replay that names one is loaded. The
@@ -311,6 +319,10 @@
       <Scene />
     </Canvas>
   </div>
+
+  {#if gaugesShown}
+    <BodyGauges />
+  {/if}
 
   <div id="top" class="overlay">
     {#if FLUX && play.on}
