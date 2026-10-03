@@ -116,7 +116,8 @@ JOINT_LIMITS = (
     (0.0, _D(150)), (_D(-50), _D(35)), (_D(-20), _D(20)),
 )
 # wrist bend 1.06 -> 1.431 (+35%) and its omega cap 50 -> 65 rad/s
-# (user 2026-10-01, wrist-body experiment)
+# (user 2026-10-01, wrist-body experiment); cap 65 -> 90 rad/s (user
+# 2026-10-03, exp/wrist-body-90: the v63x trunk extension)
 TAU_MAX = (
     600.00, 239.95, 375.00,
     85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
@@ -124,7 +125,7 @@ TAU_MAX = (
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
 )
-OMEGA_CAP = ((16.0,) * 7 + (50.0, 65.0, 50.0) + (16.0,) * 4 + (50.0, 65.0, 50.0)
+OMEGA_CAP = ((16.0,) * 7 + (50.0, 90.0, 50.0) + (16.0,) * 4 + (50.0, 90.0, 50.0)
              + (16.0,) * 12)
 
 # §19b root-velocity envelope (dynamics/step.rs ROOT_W_MAX / ROOT_V_MAX,
@@ -354,8 +355,10 @@ TAU_GROUPS = {"spine": (0, 1, 2), "arms": (3, 4, 5, 6),
 # 1.0608,1,1.0668,1.1428; v56 leaf-fit (2026-09-22, current) — arms
 # -10%, wrist roll 1.19, wrist dev 1.02, knee 1.03, spine yaw/roll -2%;
 # bench 2,946,594 upp vs 2,895,798 at the v51 body (+1.75%).
+# exp/wrist-body-90 (user 2026-10-03): wrist bend 1.0567 -> 1.2579, i.e.
+# 1.51 -> 1.80 N.m on this branch's 1.431 table.
 TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
-                    1.1000, 1.1889, 1.0567, 1.0220, 0.9055, 1.0453,
+                    1.1000, 1.1889, 1.2579, 1.0220, 0.9055, 1.0453,
                     1.0608, 1.0269, 1.0668, 1.1428)
 TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
 assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)
