@@ -43,8 +43,29 @@ def make_handler(archive):
             rest = path.lstrip("/")
             return os.path.join(DIST, *[p for p in rest.split("/") if p])
 
+        # ETag = (mtime_ns, size): the dashboard's poll sends If-None-Match
+        # and gets a body-less 304 while a file is unchanged (it also
+        # compares content, so a plain http.server without this works too)
+        def send_head(self):
+            self._etag = None
+            path = self.translate_path(self.path)
+            try:
+                st = os.stat(path)
+            except OSError:
+                st = None
+            if st is not None and os.path.isfile(path):
+                self._etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+                inm = self.headers.get("If-None-Match")
+                if inm and self._etag in [t.strip() for t in inm.split(",")]:
+                    self.send_response(304)
+                    self.end_headers()
+                    return None
+            return super().send_head()
+
         def end_headers(self):
             self.send_header("Cache-Control", "no-store")
+            if getattr(self, "_etag", None):
+                self.send_header("ETag", self._etag)
             super().end_headers()
 
         def log_message(self, fmt, *args):
