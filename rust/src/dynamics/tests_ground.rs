@@ -21,8 +21,10 @@ use super::solver::{substep_constrained, ConstraintSet, GROUND_ROWS_PER_CORNER, 
 use super::{State, Workspace};
 
 const H: f64 = 1.0 / 240.0;
-/// SPEC-v10 §1.2 total body mass — the weight the ground must carry.
-const BODY_MASS: f64 = 74.50;
+/// SPEC-v10 §1.2 total body mass — the weight the ground must carry
+/// (74.50 with the 0.35 kg hands of branch body/original; 74.80 with
+/// main's 0.50 kg hands since 2026-10-03).
+const BODY_MASS: f64 = 74.80;
 const WEIGHT: f64 = BODY_MASS * super::model::G;
 
 fn contact_set(m: &super::model::Model) -> ConstraintSet {
@@ -169,6 +171,25 @@ fn no_pull_and_weight_is_carried() {
 /// CONTRACT is unchanged; 40 N is the posture-holdable load at the new
 /// gains (measured: 0.57 mm slip, 2 corners loaded, 0.59 m lean).
 ///
+/// STIFF DAMPED STANCE (2026-10-03, the 0.50 kg-hand body becoming
+/// main's): that "0.59 m lean" was not a lean. Logged per 0.1 s window
+/// over 4 s of push, the undamped τ_max/0.2 spring stance has no static
+/// equilibrium under 40 N on EITHER body — it is a slow topple (root
+/// past 1 m ~1 s after the window) and the old gate passed because its
+/// window happened to catch the 0.35 kg-hand body pivoting on two stuck
+/// toe corners. The 0.50 kg-hand body falls slightly slower and the
+/// same window lands in the rolling phase (13.9 mm "slip"); even 10 N,
+/// and with the stiffer 1.431 N·m wrist bend gain 0 N, eventually
+/// topples the undamped stance, while plain damping alone (the §5 (a)/(b)
+/// protocol) holds 20 N but not 10 N — a posture knife-edge, not a
+/// contact property. The gate now holds the posture with 4x the
+/// muscle-tone P-gains plus the implicit near-critical kd (scaled by
+/// √4 to stay critical), the same muscle_gains() law the other stance
+/// gates use. 40 N then reaches a TRUE static lean (root 2.5 cm, settled
+/// by 0.7 s) with 6-7 corners loaded and < 0.6 mm per 0.1 s on both
+/// bodies over the whole 4 s, so the measurement is friction alone. The
+/// thresholds (1 mm / 0.1 s, 40 N, 1000 N) are unchanged.
+///
 /// AMBIGUITY RESOLVED (recorded, not silently deviated from), two
 /// points, both about WHAT IS MEASURED — the scenario and the forces are
 /// the spec's:
@@ -204,7 +225,12 @@ fn no_pull_and_weight_is_carried() {
 #[test]
 fn static_friction_holds_at_40n_and_slides_at_1000n() {
     let m = super::testutil::muscle_model();
-    let (kp, _kd) = super::testutil::muscle_gains();
+    let (mut kp, mut kd) = super::testutil::muscle_gains();
+    // stiff damped stance (see above): 4x kp, kd x √4 = 2 stays critical
+    for j in 0..NQ {
+        kp[j] *= 4.0;
+        kd[j] *= 2.0;
+    }
     let mut slip_load = [0.0f64; 2]; // corners penetrating at both ends
     let mut slip_near = [0.0f64; 2]; // corners inside the margin at both
     let mut tracked = [0usize; 2];
@@ -225,7 +251,9 @@ fn static_friction_holds_at_40n_and_slides_at_1000n() {
                 // world +x force on the root origin (§3 step 4's applied
                 // root wrench — the harness path the stance gates use)
                 let wrench = [fx, 0.0, 0.0, 0.0, 0.0, 0.0];
-                super::solver::substep_constrained_wrench(&m, st, &tau, &wrench, H, ws, cs);
+                super::solver::substep_constrained_damped_wrench(
+                    &m, st, &tau, &wrench, &kd, H, ws, cs,
+                );
             }
         };
         // all 8 corners' (world x, gap) — the narrow phase's own
@@ -278,11 +306,11 @@ fn static_friction_holds_at_40n_and_slides_at_1000n() {
         "40 N steady-state creep {:.4} m / 0.1 s — the μ = 0.9 cone should hold",
         slip_load[0]
     );
-    // lean bound 0.15 -> 0.7: at the 2026-08-17 human leg caps the
-    // stance springs are softer and 100 N held for 1.0 s leans the body
-    // ~0.56 m (feet STUCK at 0.15 mm — the friction contract holds; the
-    // lean is posture, not sliding, and posture is not this gate's job)
-    assert!(root[0] < 0.7, "40 N moved the root {:.4} m (lean bound)", root[0]);
+    // lean bound: on the stiff damped stance 40 N leans the root
+    // ~0.02 m and stops (it was 0.15, then 0.7 while the undamped
+    // stance was slowly toppling — see above); 0.1 m keeps the bound
+    // honest that the posture actually held
+    assert!(root[0] < 0.1, "40 N moved the root {:.4} m (lean bound)", root[0]);
     // SLIDE arm: past the cone the stance runs away at meter scale
     // (nothing stays penetrating or in-margin, so corner travel is
     // unmeasurable — the root IS the metric here)

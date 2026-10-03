@@ -1037,8 +1037,8 @@ __device__ constexpr double F_AXIS[NF][3] = {
 // hand 0.61 -> 0.35 (user 2026-08-18): fist only, no controller mass
 // — real players exploit controller motion prediction and never truly
 // swing the composite mass; inertia rescaled with it (model.rs mirror).
-// 0.35 -> 0.50 (user 2026-10-01, wrist-body experiment), inertia
-// rescaled again (0.000460 x 0.50/0.61).
+// 0.35 -> 0.50 (main's v63x2 body since 2026-10-03; 0.35 on branch
+// body/original), inertia rescaled again (0.000460 x 0.50/0.61).
 __device__ constexpr double F_MASS[NF] = {
     0, 0, 24.20, 5.20, 0, 0, 2.00, 1.20, 0, 0, 0.50,
     0, 0, 2.00, 1.20, 0, 0, 0.50,
@@ -1111,15 +1111,14 @@ __device__ constexpr double LIMIT_HI[NQ] = {
     2.6179938779914944, 0.6108652381980153, 0.3490658503988659,
     2.0943951023931953, 0.7853981633974483, 0.7853981633974483,
     2.6179938779914944, 0.6108652381980153, 0.3490658503988659};
-// wrist bend 1.06 -> 1.431 (+35%, user 2026-10-01 wrist-body exp)
+// wrist bend 1.06 -> 1.431 (+35%; main's v63x2 body, model.rs mirror)
 __device__ constexpr double TAU_MAX[NQ] = {
     600.00, 239.95, 375.00,
     85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
     85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50};
-// wrist bend 50 -> 65 rad/s (user 2026-10-01 wrist-body exp); 65 -> 90
-// rad/s (user 2026-10-03, exp/wrist-body-90)
+// wrist bend 50 -> 65 -> 90 rad/s (main's v63x2 body since 2026-10-03)
 __device__ constexpr double OMEGA_CAP[NQ] = {
     16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
@@ -1553,7 +1552,7 @@ __device__ constexpr double GEAR_TAB[3][7] = {
 __device__ __forceinline__ const double* gear_row(int gears) {
   return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
 }
-// wrist-body exp (user 2026-10-01): the wrist-bend joints (8, 15) take
+// main's v63x2 body (since 2026-10-03): the wrist-bend joints (8, 15) take
 // their fine gears (ids >= 3) at 2x — K=5's 1/4 gear becomes 1/2 there
 // (lib.rs FINE_GEAR_MULT mirror; exact in both dtypes)
 __device__ constexpr double FINE_GEAR_MULT[NQ] = {

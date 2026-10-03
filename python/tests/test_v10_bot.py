@@ -18,7 +18,7 @@ import pytest
 from beat_arena_env import RustBeatEnv
 from beat_arena_env.replay_format import read_replay
 from beat_arena_env.constants import (
-    DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0, gear_table,
+    DT, JOINT_LIMITS, N_JOINTS, NV, NQPOS, ROOT_POS0, joint_gear_table,
 )
 from beat_arena_env.kinematics import (
     F_HEAD, F_L_WRIST, F_R_WRIST, FRAMES, blade_of, fk_body,
@@ -118,16 +118,17 @@ def test_replay_additive_fields(tmp_path):
         _, _, done, _, _ = env.step(rng.integers(0, 5, N_JOINTS))
     h, ticks = read_replay(path)
     assert h["version"] == "v10" and h["format"] == 2
-    gear = [abs(g) for g in gear_table(5)]
+    # per joint: the bend joints' fine gears are 2x (FINE_GEAR_MULT)
+    gear = [[abs(g) for g in joint_gear_table(5, j)] for j in range(N_JOINTS)]
     for t in ticks:
         assert len(t["feet"]) == 2 and all(len(f) == 3 for f in t["feet"])
         a = t["activation"]
         assert len(a) == 4 and all(v >= 0.0 for v in a)
-        act = t["action"]
-        assert a[0] == pytest.approx(sum(gear[x] for x in act), abs=1e-3)
-        assert a[1] == pytest.approx(sum(gear[x] for x in act[:3]), abs=1e-3)
-        assert a[2] == pytest.approx(sum(gear[x] for x in act[3:17]), abs=1e-3)
-        assert a[3] == pytest.approx(sum(gear[x] for x in act[17:]), abs=1e-3)
+        f = [gear[j][x] for j, x in enumerate(t["action"])]
+        assert a[0] == pytest.approx(sum(f), abs=1e-3)
+        assert a[1] == pytest.approx(sum(f[:3]), abs=1e-3)
+        assert a[2] == pytest.approx(sum(f[3:17]), abs=1e-3)
+        assert a[3] == pytest.approx(sum(f[17:]), abs=1e-3)
         assert "effort" not in t
     # some tick carries weight through the feet and commands torque
     assert max(t["feet"][0][1] + t["feet"][1][1] for t in ticks) > 0.5

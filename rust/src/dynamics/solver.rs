@@ -1631,3 +1631,32 @@ pub fn substep_constrained_damped(
         Some(&mut hook),
     );
 }
+
+/// `substep_constrained_damped` with an applied root wrench (the §5 (c)
+/// static-friction push on the damped muscle-tone stance). The env
+/// never uses this.
+#[allow(clippy::too_many_arguments)]
+pub fn substep_constrained_damped_wrench(
+    model: &Model,
+    st: &mut State,
+    tau_act: &[Real],
+    root_wrench: &[Real; 6],
+    implicit_damp: &[Real],
+    h: Real,
+    ws: &mut Workspace,
+    cs: &mut ConstraintSet,
+) {
+    cs.h = h;
+    let mut hook =
+        |m: &Model, w: &mut Workspace, q: &[Real], v: &mut [Real]| cs.solve(m, w, q, v);
+    super::step::substep_opts(
+        model,
+        st,
+        tau_act,
+        root_wrench,
+        Some(implicit_damp),
+        h,
+        ws,
+        Some(&mut hook),
+    );
+}

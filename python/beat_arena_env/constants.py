@@ -115,9 +115,13 @@ JOINT_LIMITS = (
     (_D(-20), _D(120)), (_D(-40), _D(45)), (_D(-30), _D(45)),         # r leg
     (0.0, _D(150)), (_D(-50), _D(35)), (_D(-20), _D(20)),
 )
-# wrist bend 1.06 -> 1.431 (+35%) and its omega cap 50 -> 65 rad/s
-# (user 2026-10-01, wrist-body experiment); cap 65 -> 90 rad/s (user
-# 2026-10-03, exp/wrist-body-90: the v63x trunk extension)
+# Main's body since 2026-10-03 (the v63x2 body, from exp/wrist-body-90):
+# wrist bend tau_max 1.431 N.m (1.06 before, +35%) with a 90 rad/s omega
+# cap (50 before; 65 in the v62/v63/v63x interim), 0.50 kg hands
+# (model.rs M_HAND) and 1/2 fine gears on the bend joints
+# (FINE_GEAR_MULT below). The previous body (1.06 / 50 / 0.35 kg / 1/4)
+# lives on branch body/original; v60/v61 benches and replays reproduce
+# only from there.
 TAU_MAX = (
     600.00, 239.95, 375.00,
     85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
@@ -187,6 +191,20 @@ def gear_table(n_gears):
     for m in mags:
         out += [m, -m]
     return tuple(out)
+
+
+# Per-joint multiplier on the FINE gears (ids >= 3; ids 0-2 = coast and
+# +/-full are untouched): the wrist-bend joints 8 and 15 take theirs at
+# 2x, so K=5's 1/4 gear is 1/2 there (v63x2 body, 2026-10-03; all 1 on
+# body/original). Mirrors lib.rs / the kernel's FINE_GEAR_MULT.
+FINE_GEAR_MULT = tuple(2.0 if j in (8, 15) else 1.0 for j in range(N_JOINTS))
+
+
+def joint_gear_table(n_gears, j):
+    """gear_table(n_gears) as joint j applies it (FINE_GEAR_MULT on the
+    fine ids) — the signed fraction of tau_max[j] per action id."""
+    return tuple(g * FINE_GEAR_MULT[j] if i >= 3 else g
+                 for i, g in enumerate(gear_table(n_gears)))
 
 
 # --- look-at-player (env v7.6; v10 head anchor is the LIVE FK head) ----------
@@ -355,8 +373,8 @@ TAU_GROUPS = {"spine": (0, 1, 2), "arms": (3, 4, 5, 6),
 # 1.0608,1,1.0668,1.1428; v56 leaf-fit (2026-09-22, current) — arms
 # -10%, wrist roll 1.19, wrist dev 1.02, knee 1.03, spine yaw/roll -2%;
 # bench 2,946,594 upp vs 2,895,798 at the v51 body (+1.75%).
-# exp/wrist-body-90 (user 2026-10-03): wrist bend 1.0567 -> 1.2579, i.e.
-# 1.51 -> 1.80 N.m on this branch's 1.431 table.
+# v63x2 body (user 2026-10-03, main's since): wrist bend 1.0567 ->
+# 1.2579, i.e. 1.51 -> 1.80 N.m on the 1.431 table.
 TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
                     1.1000, 1.1889, 1.2579, 1.0220, 0.9055, 1.0453,
                     1.0608, 1.0269, 1.0668, 1.1428)
