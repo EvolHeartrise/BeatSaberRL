@@ -167,6 +167,23 @@ def test_dwa_at_identity_is_the_baseline():
         assert (blk.dwa.grad.abs() > 0).all()
 
 
+def test_vmix_function_matches_plain_autograd():
+    torch.manual_seed(3)
+    leaves = [torch.randn(4, 29, 8, requires_grad=True),
+              torch.randn(4, 29, 8, requires_grad=True),
+              torch.tensor([0.7], requires_grad=True),
+              torch.tensor([0.3], requires_grad=True)]
+    g = torch.randn(4, 29, 8)
+    out = P._VMix.apply(*leaves)
+    got = torch.autograd.grad(out, leaves, g)
+    v, v0, a, b = leaves
+    ref = a * v + b * v0
+    want = torch.autograd.grad(ref, leaves, g)
+    assert torch.allclose(out, ref, atol=1e-6)
+    for x, y in zip(got, want):
+        assert torch.allclose(x, y, rtol=1e-5, atol=1e-5)
+
+
 def test_dwa_mix_is_the_weighted_sum():
     xs = [torch.randn(4, 29, 8) for _ in range(3)]
     w = torch.tensor([0.2, -0.5, 1.3])
@@ -398,6 +415,58 @@ def test_cpu_trainer_all_options_and_resume(tmp_path):
 
 
 # --- CUDA: the production fp16 stream ---------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_vres_attention_matches_the_rebuilt_buffer_path():
+    import fp16_linear as fl
+    if not fl.attn29_ok(29, 192, 4):
+        pytest.skip("attn29 kernel unavailable")
+    torch.manual_seed(5)
+    B, T, d = 64, 29, 192
+    bias = torch.zeros(B, 1, T, device="cuda", dtype=torch.float16)
+    bias[:, :, 20:] = -P.MASK_BIAS
+    a = torch.tensor([0.8], device="cuda", requires_grad=True)
+    b = torch.tensor([0.4], device="cuda", requires_grad=True)
+    src0 = (torch.randn(B, T, 3 * d, device="cuda") * 0.5).half()
+    gout = torch.randn(B, T, d, device="cuda").half()
+    gq = torch.randn(B, 5, d, device="cuda").half()
+
+    def run(fused, final):
+        qkv = qkv0.clone().requires_grad_(True)
+        z = src0.clone().requires_grad_(True)
+        v0 = z[..., 2 * d:]
+        for p_ in (a, b):
+            p_.grad = None
+        if final:
+            q = qkv[:, :5, :d]
+            kv = qkv[..., d:]
+            if fused:
+                out = fl.attn29_qkv_vres(q, kv, v0, a, b, bias)
+            else:
+                vm = fl.vres_mix(kv[..., d:], v0, a, b)
+                out = fl.attn29_qkv(q, torch.cat([kv[..., :d], vm], -1),
+                                    bias)
+            out.backward(gq)
+        else:
+            if fused:
+                out = fl.attn29_packed_vres(qkv, v0, a, b, bias)
+            else:
+                vm = fl.vres_mix(qkv[..., 2 * d:], v0, a, b)
+                out = fl.attn29_packed(
+                    torch.cat([qkv[..., :2 * d], vm], -1), bias)
+            out.backward(gout)
+        return (out.detach(), qkv.grad, z.grad, a.grad.clone(),
+                b.grad.clone())
+
+    qkv0 = (torch.randn(B, T, 3 * d, device="cuda") * 0.5).half()
+    for final in (False, True):
+        f, r = run(True, final), run(False, final)
+        assert torch.equal(f[0], r[0])               # same forward bits
+        assert torch.allclose(f[1].float(), r[1].float(), atol=2e-3)
+        assert torch.allclose(f[2].float(), r[2].float(), atol=2e-3)
+        assert torch.allclose(f[3], r[3], rtol=1e-3, atol=1e-3)
+        assert torch.allclose(f[4], r[4], rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("name", ["off"] + sorted(OPTS))

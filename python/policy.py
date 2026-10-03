@@ -572,11 +572,14 @@ class Block(nn.Module):
         # block skips its forward_add.
         # v0 (--value-residual, blocks 1..L-1): block 0's attention values
         # (B, T, d), a view of its projection output so the gradient
-        # reaches it; mixed into this block's v as a v + b v0 (fp32
-        # arithmetic, rounded once to the stream dtype — bitwise v at
-        # (a, b) = (1, 0)), out of place, BEFORE the attention: the packed
-        # q|k|v (non-final) or k|v (final block) buffer is rebuilt with
-        # the mixed v, so the fused T = 29 kernels run unchanged.
+        # reaches it; mixed into this block's v as a v + b v0
+        # (fp16_linear.vres_mix: fp32 arithmetic, rounded once to the
+        # stream dtype — bitwise v at (a, b) = (1, 0)), out of place,
+        # BEFORE the attention. On the fused T = 29 kernels the mix runs
+        # inside fp16_linear.attn29_packed_vres / attn29_qkv_vres (mixed v
+        # as its own buffer, q/k still views of the packed projection, ONE
+        # packed gradient back); elsewhere the packed q|k|v / k|v buffer is
+        # rebuilt with the mixed v.
         # want_v (block 0, non-final): also return its v as a 4th element.
         # resolve (non-final, --dwa): return the RESOLVED output
         # (x + ffn(h2), the final block's residual-only FFN path) as
@@ -608,9 +611,14 @@ class Block(nn.Module):
         else:
             k, v = _lin(self.k_proj, h), _lin(self.v_proj, h)
         v_own = v
-        if v0 is not None:
-            v = (v.float() * self.vres_a
-                 + v0.float() * self.vres_b).to(v.dtype)
+        # value residual on the fused T = 29 kernels: the mix runs inside
+        # fp16_linear.attn29_*_vres (packed gradient, no rebuilt buffer);
+        # every other path mixes here and rebuilds the packed buffer
+        vres_fused = (v0 is not None and self.n_heads > 1
+                      and (qkv is not None or kv is not None)
+                      and _fl.attn29_ok(T, self.d, self.n_heads))
+        if v0 is not None and not vres_fused:
+            v = _VMix.apply(v, v0, self.vres_a, self.vres_b)
             if qkv is not None:
                 qkv = torch.cat([qkv[..., :2 * self.d], v], dim=-1)
             elif kv is not None:
@@ -649,7 +657,12 @@ class Block(nn.Module):
             # (fp16_linear.attn29_packed, 2026-09-27) straight off the
             # packed projection -> (B, T, d) in the out-projection's
             # layout; gradient = ONE packed (B, T, 3d) tensor
-            att = _lin(self.out_proj, _fl.attn29_packed(qkv, attn_bias))
+            if vres_fused:
+                att = _fl.attn29_packed_vres(qkv, v0, self.vres_a,
+                                             self.vres_b, attn_bias)
+            else:
+                att = _fl.attn29_packed(qkv, attn_bias)
+            att = _lin(self.out_proj, att)
         elif qkv is not None:
             # non-final fp16 block: fused attention straight off the
             # packed projection; the backward writes dq|dk|dv as ONE
@@ -664,7 +677,12 @@ class Block(nn.Module):
                 and _fl.attn29_ok(T, self.d, self.n_heads)):
             # final fp16 block: the lead-token queries over the packed
             # k|v (same T = 29 kernel as every other attention site)
-            att = _lin(self.out_proj, _fl.attn29_qkv(q, kv, attn_bias))
+            if vres_fused:
+                att = _fl.attn29_qkv_vres(q, kv, v0, self.vres_a,
+                                          self.vres_b, attn_bias)
+            else:
+                att = _fl.attn29_qkv(q, kv, attn_bias)
+            att = _lin(self.out_proj, att)
         else:
             q = q.view(B, Tq, self.n_heads, self.dh).transpose(1, 2)
             k = k.view(B, T, self.n_heads, self.dh).transpose(1, 2)
@@ -713,6 +731,30 @@ class Block(nn.Module):
         if want_v:
             return x, ffn_out, ffn_bias, v_own
         return x, ffn_out, ffn_bias
+
+
+class _VMix(torch.autograd.Function):
+    """--value-residual mix a v + b v0 -> v's dtype: fp32 arithmetic,
+    rounded once (bitwise v at (a, b) = (1, 0)). A Function rather than
+    autograd ops so the backward saves only v and v0 — views of the
+    blocks' q|k|v projections the attention already keeps — instead of
+    two fp32 (B, T, d) upcasts per block (+23% peak memory measured with
+    plain ops)."""
+
+    @staticmethod
+    def forward(ctx, v, v0, a, b):
+        ctx.save_for_backward(v, v0, a, b)
+        return _fl.vres_mix(v, v0, a, b)
+
+    @staticmethod
+    def backward(ctx, g):
+        v, v0, a, b = ctx.saved_tensors
+        gf = g.float()
+        dv = (gf * a).to(v.dtype) if ctx.needs_input_grad[0] else None
+        dv0 = (gf * b).to(v0.dtype) if ctx.needs_input_grad[1] else None
+        da = (gf * v.float()).sum().view(1) if ctx.needs_input_grad[2] else None
+        db = (gf * v0.float()).sum().view(1) if ctx.needs_input_grad[3] else None
+        return dv, dv0, da, db
 
 
 def _dwa_mix(w: torch.Tensor, xs: list) -> torch.Tensor:

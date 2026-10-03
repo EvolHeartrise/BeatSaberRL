@@ -989,6 +989,106 @@ def attn29_qkv(q, kv, attn_bias):
     return _Attn29QKV.apply(q, kv, bias2)
 
 
+# --- value residual on the T = 29 kernels (--value-residual, 2026-10-03) ---
+# ResFormer's v <- a v + b v0 for blocks 1..L-1. The kernel takes q / k / v
+# as separate strided views and writes dq / dk / dv into caller views, so
+# the mixed v goes in as its own contiguous (B, 29, d) buffer while q and
+# k stay views of the packed projection, and the backward still hands the
+# projection ONE packed gradient [dq | dk | a dv] (no rebuilt q|k|v buffer,
+# no split-backward cat). The mix (vres_mix) is the same function on every
+# path — rollout, update, and the policy's generic fallback — so r1 holds.
+
+
+def vres_mix(v, v0, a, b):
+    """a v + b v0 rounded once to v's dtype: (v * a) is fp32 (a is an fp32
+    (1,) Parameter), the addcmul accumulates b v0 in fp32. Exactly v at
+    (a, b) = (1, 0)."""
+    return torch.addcmul(v * a, v0, b).to(v.dtype)
+
+
+def _vres_grads(ctx, dvm, v, v0, a, b, n0):
+    """(dv, dv0, da, db) of vres_mix from dvm = dL/d(mixed v); input-grad
+    flags start at index n0 (v0, a, b)."""
+    gf = dvm.float()
+    nig = ctx.needs_input_grad
+    dv = (gf * a).to(v.dtype)
+    dv0 = (gf * b).to(v0.dtype) if nig[n0] else None
+    da = (gf * v.float()).sum().view(1) if nig[n0 + 1] else None
+    db = (gf * v0.float()).sum().view(1) if nig[n0 + 2] else None
+    return dv, dv0, da, db
+
+
+class _Attn29PackedVRes(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv, v0, a, b, bias2):
+        q, k, v = qkv.split(qkv.shape[-1] // 3, dim=-1)
+        vm = vres_mix(v, v0, a, b)
+        out = _load().attn29_fwd(q, k, vm, bias2)
+        ctx.save_for_backward(qkv, vm, v0, a, b, bias2)
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        qkv, vm, v0, a, b, bias2 = ctx.saved_tensors
+        d = qkv.shape[-1] // 3
+        q, k, v = qkv.split(d, dim=-1)
+        g = torch.empty_like(qkv)
+        dq, dk, dvs = g.split(d, dim=-1)
+        dvm = torch.empty_like(vm)
+        _load().attn29_bwd(q, k, vm, bias2, gout.contiguous(), dq, dk, dvm)
+        dv, dv0, da, db = _vres_grads(ctx, dvm, v, v0, a, b, 1)
+        dvs.copy_(dv)
+        return g, dv0, da, db, None
+
+
+class _Attn29QKVVRes(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, v0, a, b, bias2):
+        k, v = kv.split(q.shape[-1], dim=-1)
+        vm = vres_mix(v, v0, a, b)
+        out = _load().attn29_fwd(q, k, vm, bias2)
+        ctx.save_for_backward(q, kv, vm, v0, a, b, bias2)
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        q, kv, vm, v0, a, b, bias2 = ctx.saved_tensors
+        k, v = kv.split(q.shape[-1], dim=-1)
+        dq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        dkv = torch.empty_like(kv)
+        dk, dvs = dkv.split(q.shape[-1], dim=-1)
+        dvm = torch.empty_like(vm)
+        _load().attn29_bwd(q, k, vm, bias2, gout.contiguous(), dq, dk, dvm)
+        dv, dv0, da, db = _vres_grads(ctx, dvm, v, v0, a, b, 2)
+        dvs.copy_(dv)
+        return dq, dkv, dv0, da, db, None
+
+
+def attn29_packed_vres(qkv, v0, a, b, attn_bias):
+    """attn29_packed with block 0's values mixed in: attention over
+    (q, k, vres_mix(v, v0, a, b)) of the packed (B, 29, 3d) projection.
+    Gradients: ONE packed (B, 29, 3d) for qkv, plus v0 / a / b."""
+    B, T, W = qkv.shape
+    bias2 = attn_bias.reshape(B, T)
+    if not torch.is_grad_enabled():
+        q, k, v = qkv.split(W // 3, dim=-1)
+        return _load().attn29_fwd(q, k, vres_mix(v, v0, a, b), bias2)
+    return _Attn29PackedVRes.apply(qkv, v0, a, b, bias2)
+
+
+def attn29_qkv_vres(q, kv, v0, a, b, attn_bias):
+    """attn29_qkv with block 0's values mixed into kv's v half (the final
+    block's lead queries). Gradients: dq, ONE packed dkv, v0 / a / b."""
+    B, T, _ = kv.shape
+    bias2 = attn_bias.reshape(B, T)
+    if q.stride(-1) != 1 or q.stride(1) % 8 or q.stride(0) % 8:
+        q = q.contiguous()
+    if not torch.is_grad_enabled():
+        k, v = kv.split(q.shape[-1], dim=-1)
+        return _load().attn29_fwd(q, k, vres_mix(v, v0, a, b), bias2)
+    return _Attn29QKVVRes.apply(q, kv, v0, a, b, bias2)
+
+
 # --- fused block FFN (csrc/fused_ffn.cu, 2026-09-30, review item I13) -----
 # A non-final block's FFN plus the NEXT block's residual add + ln_attn runs
 # as ONE kernel: out = x + relu(h2 W0^T + b0) W2^T + b2, hn = LN(out). The
