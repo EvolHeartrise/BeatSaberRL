@@ -293,6 +293,14 @@ export const JOINT_LIMITS = [
   [-20 * RAD, 120 * RAD], [-40 * RAD, 45 * RAD], [-30 * RAD, 45 * RAD],
   [0, 150 * RAD], [-50 * RAD, 35 * RAD], [-20 * RAD, 20 * RAD],
 ];
+// Nominal body tables: the ORIGINAL body (branch body/original — wrist
+// bend 1.06 N·m, 50 rad/s wrist caps, uniform gears; the v60/v61 era).
+// They are the fallback for recordings that carry no header.body (pre-
+// format-2 JSON, Flux runs). Format-2 replays carry their own per-joint
+// tau_max / gear_frac, and replayBody() below fills in what older
+// headers leave out, so the gauges follow whichever body played: main's
+// body since 2026-10-03 is the v63x2 one (bend 1.431 N·m, 90 rad/s bend
+// cap, 1/2 fine gears on the bend joints).
 export const TAU_MAX = [
   600.00, 239.95, 375.00,
   85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,
@@ -300,8 +308,57 @@ export const TAU_MAX = [
   262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
   262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
 ];
+const WRIST_JOINTS = [7, 8, 9, 14, 15, 16];
+export const BEND_JOINTS = [8, 15];
+// 50 rad/s on the wrist tier since 2026-08-18 (40 before), 16 elsewhere
 export const OMEGA_CAP = JOINT_LIMITS.map((_, j) =>
-  j === 7 || j === 8 || j === 9 || j === 14 || j === 15 || j === 16 ? 40 : 16);
+  WRIST_JOINTS.includes(j) ? 50 : 16);
+// the wrist-bend tau_scale axis (constants.TAU_AXIS_OF_JOINT[8] / [15])
+const BEND_AXIS = 8;
+const BEND_TAU_ORIGINAL = 1.06, BEND_TAU_WRIST_BODY = 1.431;
+
+/** The body a format-2 replay was played with: {tau_max, gear_frac,
+ * omega_cap} per joint, or null without a header.body (callers fall back
+ * to the nominal TAU_MAX / gearTable / OMEGA_CAP).
+ *
+ * Writers since 2026-10-03 store all three explicitly. Older headers
+ * carry tau_max and gear_frac only, and the wrist-body runs (v62, v63,
+ * v63x, v63x2 — bend tau_max 1.431 x tau_scale) wrote the UNIFORM gear
+ * table although their sim took the bend joints' fine gears at 2x
+ * (lib.rs FINE_GEAR_MULT); their files store activation / torque columns
+ * for that reason, and this restores the per-joint table so the joint
+ * gauges agree with them. Their bend omega cap was 65 rad/s on
+ * v62/v63/v63x and 90 on v63x2 (main's); original-body files get 50. */
+export function replayBody(header) {
+  const b = header?.body;
+  if (!b || !Array.isArray(b.tau_max) || !Array.isArray(b.gear_frac)) return null;
+  const tau_max = b.tau_max.slice();
+  const gear_frac = b.gear_frac.map((row) => row.slice());
+  if (Array.isArray(b.omega_cap))
+    return { tau_max, gear_frac, omega_cap: b.omega_cap.slice() };
+  const sc = header.tau_scale?.[BEND_AXIS] ?? 1;
+  const bend = sc > 0 ? tau_max[BEND_JOINTS[0]] / sc : BEND_TAU_ORIGINAL;
+  const wristBody = Math.abs(bend - BEND_TAU_WRIST_BODY)
+    < Math.abs(bend - BEND_TAU_ORIGINAL);
+  const omega_cap = OMEGA_CAP.slice();
+  if (wristBody) {
+    const interim = /^(v62|v63|v63x)(?![\w])/.test(header.model ?? "");
+    for (const j of BEND_JOINTS) {
+      omega_cap[j] = interim ? 65 : 90;
+      // the uniform row -> the 2x fine gears the sim applied (only while
+      // the row still looks uniform, |fine| <= 1/4: never doubled twice)
+      const row = gear_frac[j];
+      if (row.length > 3 && Math.abs(row[3]) <= 0.25 + 1e-9)
+        gear_frac[j] = row.map((f, i) => (i >= 3 ? 2 * f : f));
+    }
+  }
+  return { tau_max, gear_frac, omega_cap };
+}
+
+/** ω cap of joint j for a decoded replay (its body's, else the nominal). */
+export function omegaCapOf(rep, j) {
+  return rep?.body?.omega_cap?.[j] ?? OMEGA_CAP[j];
+}
 // gauge grouping (§1.4 blocks)
 export const GROUPS = [
   { name: "spine", joints: [0, 1, 2] },
@@ -616,6 +673,7 @@ export function decodeReplay(bytes) {
   if (header.format !== 2)
     throw new Error("replay format " + header.format + " — this viewer reads format 2");
   const hz = parseTickHz(header.tick_hz);
+  const body = replayBody(header);
   // name -> { ent, v }: v = the block's integer values, row-major
   const blocks = {};
   let off = 12 + n;
@@ -694,7 +752,7 @@ export function decodeReplay(bytes) {
     }
     if (hd) head = col(hd, k, 7);
     let activation, torque;
-    if (!actB || !trqB) [activation, torque] = effortOf(action, header.body);
+    if (!actB || !trqB) [activation, torque] = effortOf(action, body);
     if (actB) activation = col(actB, k, 4);
     if (trqB) torque = col(trqB, k, 4);
     const contacts = [];
@@ -801,9 +859,10 @@ export function replayFromParts(header, ticks) {
     // setTickRate(tickHzOf(rep)) when the replay becomes active.
     tickHz: parseTickHz(header.tick_hz),
     actionRepeat: header.action_repeat ?? 1,
-    // format 2: the body this replay was played with ({tau_max, gear_frac}
-    // per joint); null on Flux recordings (tauOf falls back to TAU_MAX)
-    body: header.body ?? null,
+    // format 2: the body this replay was played with ({tau_max, gear_frac,
+    // omega_cap} per joint; legacy headers completed by replayBody); null
+    // on Flux recordings (tauOf falls back to TAU_MAX)
+    body: replayBody(header),
     config: header.config, chart, ticks, outcomes, posts, postsByNote,
     // env v15 header field: "head" -> head-anchored note track. Anything
     // else (including absent) means the pre-v15 FIXED track.
@@ -1125,10 +1184,10 @@ export function activationAt(rep, tickIdx) {
     return t.activation;
   }
   if (!Array.isArray(t.action)) return null;
-  const table = gearTable(rep.config?.gears ?? 3);
+  const table = gearTable(rep.config?.gears ?? 3), body = rep.body;
   const out = [0, 0, 0, 0];
   t.action.forEach((a, j) => {
-    const f = Math.abs(table[a] ?? 0);
+    const f = Math.abs((body ? body.gear_frac[j][a] : table[a]) ?? 0);
     out[0] += f;
     out[j < 3 ? 1 : j < 17 ? 2 : 3] += f;
   });

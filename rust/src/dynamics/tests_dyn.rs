@@ -79,8 +79,9 @@ fn rnea_gravity_holding_torques() {
     fk_all(m, &st, &mut ws);
     let v0 = vec![0.0; m.nv()];
     rnea(m, &mut ws, &v0, None);
-    let tau_pitch = 9.81 * (2.0 * 0.175 + 1.2 * 0.50 + 0.35 * 0.71);
-    let tau_elbow = 9.81 * (1.2 * 0.15 + 0.35 * 0.36);
+    // hand 0.35 -> 0.50 kg (main's v63x2 body, 2026-10-03)
+    let tau_pitch = 9.81 * (2.0 * 0.175 + 1.2 * 0.50 + 0.50 * 0.71);
+    let tau_elbow = 9.81 * (1.2 * 0.15 + 0.50 * 0.36);
     assert!(
         (ws.c[6 + 3] - tau_pitch).abs() <= 1e-9,
         "l_arm_pitch: got {} want {tau_pitch}",
@@ -96,7 +97,7 @@ fn rnea_gravity_holding_torques() {
     assert!((ws.c[6 + 13] - ws.c[6 + 6]).abs() <= 1e-9, "r_elbow mirror");
     // root force rows: required external force = +mg upward (RNEA's
     // F = m(a_c − g) convention — the force that HOLDS the body)
-    let w = 74.50 * 9.81;
+    let w = 74.80 * 9.81;
     assert!((ws.c[0]).abs() <= 1e-9 && (ws.c[2]).abs() <= 1e-9);
     assert!((ws.c[1] - w).abs() <= 1e-9, "root y force {} vs {w}", ws.c[1]);
 }

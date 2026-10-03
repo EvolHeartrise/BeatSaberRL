@@ -32,8 +32,10 @@ assert.equal(TAU_MAX.length, 29);
 assert.equal(OMEGA_CAP.length, 29);
 assert.equal(FRAMES.length, 30, "30 frames incl. the welded head");
 JOINT_LIMITS.forEach(([lo, hi], j) => assert.ok(lo < hi, `limits ${j}`));
-// wrist tier caps at 40, everything else 16
-for (const j of [7, 8, 9, 14, 15, 16]) assert.equal(OMEGA_CAP[j], 40);
+// nominal (body/original) wrist tier caps at 50 (40 before 2026-08-18;
+// a replay's own body may raise the bend cap: replayBody), everything
+// else 16
+for (const j of [7, 8, 9, 14, 15, 16]) assert.equal(OMEGA_CAP[j], 50);
 assert.equal(OMEGA_CAP[0], 16);
 assert.equal(OMEGA_CAP[20], 16);
 // groups partition 0..28

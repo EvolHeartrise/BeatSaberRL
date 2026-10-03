@@ -182,7 +182,8 @@ def decode_dat(path):
 # fixture is COMPRESSED — notes 0.05 s apart from 0.35 s, NJS 8 — to
 # resolve every object inside that window (swept: the whip at windup 10
 # cuts notes 0, 1 and 3 'ok', note 4 is a wrong-hand cut, the bomb
-# passes). The first note stays at 3 beats = 1.5 s real, which the
+# passes; with the 0.50 kg hands, 2026-10-03, windup 6 cuts notes 0 and
+# 1 'ok' and notes 2 and 3 miss). The first note stays at 3 beats = 1.5 s real, which the
 # offset arithmetic below pins.
 RAW_NOTES = [
     # (_time beats@120, line, layer, type(color), cutDirection)
@@ -221,12 +222,15 @@ def converted(tmp_path_factory):
     rng = np.random.default_rng(5)
     events, done, t = [], False, 0
     while not done:
-        # ticks 0-9: raise the right arm; 10-29: whip down through the
+        # ticks 0-5: raise the right arm; 6-29: whip down through the
         # notes (the P3 gate recipe, retimed for ground contact — see
-        # RAW_NOTES); then seeded random gears (flail) for the rest of
+        # RAW_NOTES; windup 10 -> 6 for the 0.50 kg hands, 2026-10-03:
+        # swept 5..14, windups 5-7 resolve every object before the tilt
+        # ends the episode at tick 18, 8+ end it at 17 with the last note
+        # unresolved); then seeded random gears (flail) for the rest of
         # the episode
         a = np.zeros(29, dtype=np.int64)
-        if t < 10:
+        if t < 6:
             a[10] = 1
         elif t < 30:
             a[10] = 2

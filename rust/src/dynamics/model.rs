@@ -116,9 +116,12 @@ const I_FARM: [Real; 3] = [0.013056, 0.013056, 0.000931];
 // literal composite mass over-prices swings and was feeding vertical
 // body jitter during play. Inertia rescaled with the mass
 // (0.000460 x 0.35/0.61).
-const M_HAND: Real = 0.35;
+// 0.35 -> 0.50 (user 2026-10-01; main's body since 2026-10-03, the
+// v63x2 body — the 0.35 kg hand lives on branch body/original),
+// inertia rescaled again (0.000460 x 0.50/0.61).
+const M_HAND: Real = 0.50;
 const COM_HAND: [Real; 3] = [0.0, 0.0, 0.06];
-const I_HAND: [Real; 3] = [0.000264, 0.000264, 0.000264];
+const I_HAND: [Real; 3] = [0.000377, 0.000377, 0.000377];
 const M_THIGH: Real = 10.60;
 const COM_THIGH: [Real; 3] = [0.0, -0.22, 0.0];
 const I_THIGH: [Real; 3] = [0.250198, 0.018493, 0.250198];
@@ -249,21 +252,23 @@ pub const HUMANOID_LIMITS: [(Real, Real); NQ] = [
 
 #[rustfmt::skip]
 pub const HUMANOID_TAU_MAX: [Real; NQ] = [
-    600.00, 239.95, 375.00,                          // spine
-    85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,  // arm_l
-    85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,  // arm_r
+    600.00, 239.95, 375.00,                           // spine
+    85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,  // arm_l (bend
+    85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,  // arm_r  +35%, 2026-10-01)
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,    // leg_l (2026-08-20: knee 250 -> 150,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,    // leg_r  all other leg joints -25%)
 ];
 
 // omega caps: 16 rad/s everywhere except the wrist tier's 50
 // (§1.4; 40 -> 50 per user 2026-08-18 — with the fist-only hand the
-// full-gear bend swing was cap-clipped mid-arc).
+// full-gear bend swing was cap-clipped mid-arc); bend 50 -> 65 (user
+// 2026-10-01); 65 -> 90 (user 2026-10-03) — main's v63x2 body; 50
+// everywhere on the wrist tier on branch body/original.
 #[rustfmt::skip]
 pub const HUMANOID_OMEGA_CAP: [Real; NQ] = [
     16.0, 16.0, 16.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
 ];

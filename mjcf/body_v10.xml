@@ -20,10 +20,14 @@
   - Stacked same-body joints are declared OUTER to INNER assuming MuJoCo
     composes them in declaration order; the P2b FK cross-check vs v9 fk()
     runs FIRST and catches a reversed convention.
-  - Hands are FIST-ONLY 0.35 kg (2026-08-18: controller mass removed —
-    real players exploit controller motion prediction and never truly
-    swing the composite mass); blades are massless ghost geoms
-    with no contacts.
+  - Hands are 0.50 kg (2026-08-18: fist-only 0.35, controller mass
+    removed — real players exploit controller motion prediction and
+    never truly swing the composite mass; 2026-10-03: 0.50, the v63x2
+    body that became main's — the 0.35 body lives on branch
+    body/original); blades are massless ghost geoms with no contacts.
+  - Motor gears are the P0-era torque limits: they set only the oracle
+    scenarios' pattern amplitudes and stabilizer kp (both exported per
+    file in refdata/), not the engine's live tau_max table.
 -->
 <mujoco model="beat_arena_body_v10">
   <compiler angle="radian" inertiafromgeom="false"/>
@@ -108,8 +112,8 @@
               <joint name="l_wrist_bend" type="hinge" axis="-1 0 0"
                      range="-1.6580627893946132 1.6580627893946132"
                      damping="0.00159"/>
-              <inertial pos="0 0 0.06" mass="0.35"
-                        diaginertia="0.000264 0.000264 0.000264"/>
+              <inertial pos="0 0 0.06" mass="0.50"
+                        diaginertia="0.000377 0.000377 0.000377"/>
               <geom name="g_fist_l" type="sphere" pos="0 0 0.06"
                     size="0.05" rgba="0.8 0.42 0.46 1"/>
               <geom name="g_blade_l" type="capsule"
@@ -150,8 +154,8 @@
               <joint name="r_wrist_bend" type="hinge" axis="-1 0 0"
                      range="-1.6580627893946132 1.6580627893946132"
                      damping="0.00159"/>
-              <inertial pos="0 0 0.06" mass="0.35"
-                        diaginertia="0.000264 0.000264 0.000264"/>
+              <inertial pos="0 0 0.06" mass="0.50"
+                        diaginertia="0.000377 0.000377 0.000377"/>
               <geom name="g_fist_r" type="sphere" pos="0 0 0.06"
                     size="0.05" rgba="0.38 0.62 0.85 1"/>
               <geom name="g_blade_r" type="capsule"

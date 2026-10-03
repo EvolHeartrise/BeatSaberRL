@@ -46,9 +46,10 @@ fn model_tables_sanity() {
     assert!(seen.iter().all(|&s| s), "coord map is not a permutation");
     assert_eq!(welded, 1, "head is the only welded frame");
     // §1.2 mass closure (2026-08-18 hands fist-only 0.35, no
-    // controller mass): 74.50 kg total
+    // controller mass): 74.50 kg total; 74.80 with main's v63x2
+    // experiment's 0.50 kg hands (2026-10-01)
     let total: f64 = m.base_mass + m.frames.iter().map(|f| f.mass).sum::<f64>();
-    assert!((total - 74.50).abs() < 1e-9, "total mass {total}");
+    assert!((total - 74.80).abs() < 1e-9, "total mass {total}");
     for j in 0..NQ {
         let (lo, hi) = m.limits[j];
         assert!(lo < hi, "limits[{j}]");

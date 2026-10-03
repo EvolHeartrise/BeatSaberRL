@@ -1036,10 +1036,12 @@ __device__ constexpr double F_AXIS[NF][3] = {
     {-1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}};
 // hand 0.61 -> 0.35 (user 2026-08-18): fist only, no controller mass
 // — real players exploit controller motion prediction and never truly
-// swing the composite mass; inertia rescaled with it (model.rs mirror)
+// swing the composite mass; inertia rescaled with it (model.rs mirror).
+// 0.35 -> 0.50 (main's v63x2 body since 2026-10-03; 0.35 on branch
+// body/original), inertia rescaled again (0.000460 x 0.50/0.61).
 __device__ constexpr double F_MASS[NF] = {
-    0, 0, 24.20, 5.20, 0, 0, 2.00, 1.20, 0, 0, 0.35,
-    0, 0, 2.00, 1.20, 0, 0, 0.35,
+    0, 0, 24.20, 5.20, 0, 0, 2.00, 1.20, 0, 0, 0.50,
+    0, 0, 2.00, 1.20, 0, 0, 0.50,
     0, 0, 10.60, 3.20, 0, 1.00,
     0, 0, 10.60, 3.20, 0, 1.00};
 __device__ constexpr double F_COM[NF][3] = {
@@ -1057,10 +1059,10 @@ __device__ constexpr double F_INERTIA[NF][3] = {
     {0.016848, 0.016848, 0.016848},
     {0, 0, 0}, {0, 0, 0}, {0.029222, 0.029222, 0.001966},
     {0.013056, 0.013056, 0.000931},
-    {0, 0, 0}, {0, 0, 0}, {0.000264, 0.000264, 0.000264},
+    {0, 0, 0}, {0, 0, 0}, {0.000377, 0.000377, 0.000377},
     {0, 0, 0}, {0, 0, 0}, {0.029222, 0.029222, 0.001966},
     {0.013056, 0.013056, 0.000931},
-    {0, 0, 0}, {0, 0, 0}, {0.000264, 0.000264, 0.000264},
+    {0, 0, 0}, {0, 0, 0}, {0.000377, 0.000377, 0.000377},
     {0, 0, 0}, {0, 0, 0}, {0.250198, 0.018493, 0.250198},
     {0.065964, 0.003161, 0.065964}, {0, 0, 0},
     {0.005617, 0.005883, 0.001083},
@@ -1109,16 +1111,18 @@ __device__ constexpr double LIMIT_HI[NQ] = {
     2.6179938779914944, 0.6108652381980153, 0.3490658503988659,
     2.0943951023931953, 0.7853981633974483, 0.7853981633974483,
     2.6179938779914944, 0.6108652381980153, 0.3490658503988659};
+// wrist bend 1.06 -> 1.431 (+35%; main's v63x2 body, model.rs mirror)
 __device__ constexpr double TAU_MAX[NQ] = {
     600.00, 239.95, 375.00,
-    85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,
-    85.38, 85.38, 19.45, 19.13, 1.06, 1.06, 1.06,
+    85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
+    85.38, 85.38, 19.45, 19.13, 1.06, 1.431, 1.06,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50};
+// wrist bend 50 -> 65 -> 90 rad/s (main's v63x2 body since 2026-10-03)
 __device__ constexpr double OMEGA_CAP[NQ] = {
     16.0, 16.0, 16.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 50.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0};
 __device__ constexpr double DAMPING[NQ] = {
@@ -1548,6 +1552,12 @@ __device__ constexpr double GEAR_TAB[3][7] = {
 __device__ __forceinline__ const double* gear_row(int gears) {
   return GEAR_TAB[gears == 5 ? 1 : (gears == 7 ? 2 : 0)];
 }
+// main's v63x2 body (since 2026-10-03): the wrist-bend joints (8, 15) take
+// their fine gears (ids >= 3) at 2x — K=5's 1/4 gear becomes 1/2 there
+// (lib.rs FINE_GEAR_MULT mirror; exact in both dtypes)
+__device__ constexpr double FINE_GEAR_MULT[NQ] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 // note kinds (constants.py)
 // KIND_NOTE=0, KIND_BOMB=1, KIND_CHAIN_HEAD=2, KIND_CHAIN_LINK=3 —
@@ -4832,7 +4842,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   double tau_grp[3] = {0.0, 0.0, 0.0};
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
-    const double frac = a < 7 ? gr[a] : 0.0;
+    const double frac =
+        a < 7 ? (a >= 3 ? gr[a] * FINE_GEAR_MULT[j] : gr[a]) : 0.0;
     // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
     const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
     tau[j] = T(frac) * CT(TAU_MAX, [j]) * T(ts);

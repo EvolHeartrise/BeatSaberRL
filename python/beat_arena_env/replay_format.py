@@ -48,9 +48,14 @@ replay.js decodeReplay):
   - activation [total, spine, arms, legs] = sum |gear fraction| and torque
     (same groups) = sum |fraction x tau_max| from action and header.body
     ({tau_max: 29 effective per-joint limits (TAU_MAX x the episode's
-    tau_scale), gear_frac: 29 rows of per-id signed fractions}) — the body
-    this replay was played with, so it is right for any body (e.g. the
-    wrist-body experiment's heavier bend). Also verified at write time
+    tau_scale), gear_frac: 29 rows of per-id signed fractions, omega_cap:
+    29 joint speed caps, rad/s (since 2026-10-03; display only)}) — the
+    body this replay was played with, so it is right for any body (main's
+    v63x2 body or body/original's). Writers before 2026-10-03 put the
+    uniform gear table in every row; on the wrist-body runs (v62-v63x2,
+    whose bend joints took 2x fine gears) that mismatched, so those files
+    store both columns (the viewer's replayBody restores their per-joint
+    table for its joint gauges). Also verified at write time
     (<= 1e-4 / 1e-3 N.m, the v1 record's precision); on a mismatch they
     are stored as blocks (activation z32 4 x T 1e-4, torque z32 4 x T
     1e-3).
@@ -69,8 +74,8 @@ import struct
 
 import numpy as np
 
-from .constants import (EVENT_REASONS, N_JOINTS, TAU_AXIS_OF_JOINT,
-                        TAU_MAX, gear_table)
+from .constants import (EVENT_REASONS, N_JOINTS, OMEGA_CAP, TAU_AXIS_OF_JOINT,
+                        TAU_MAX, joint_gear_table)
 from .kinematics import (FRAMES, F_HEAD, F_L_HAND, F_L_WRIST, F_R_HAND,
                          F_R_WRIST)
 
@@ -102,11 +107,15 @@ def body_tables(gears, tau_scale):
     """header.body for a sim with `gears` action ids and the 16 per-axis
     tau_scale values: the effective per-joint torque limits and per-joint
     signed gear fractions this build's sim applies (constants.TAU_MAX /
-    gear_table mirror rust lib.rs Body::tick)."""
+    joint_gear_table mirror rust lib.rs Body::tick, incl. the bend
+    joints' 2x fine gears). Per joint, so a decoder derives torque for
+    whichever body wrote the file: replays written before 2026-10-03
+    carry the body/original tables (1.06 bend, uniform gears)."""
     s = [float(tau_scale[TAU_AXIS_OF_JOINT[j]]) for j in range(N_JOINTS)]
-    g = [float(v) for v in gear_table(int(gears))]
     return {"tau_max": [TAU_MAX[j] * s[j] for j in range(N_JOINTS)],
-            "gear_frac": [list(g) for _ in range(N_JOINTS)]}
+            "gear_frac": [[float(v) for v in joint_gear_table(int(gears), j)]
+                          for j in range(N_JOINTS)],
+            "omega_cap": [float(c) for c in OMEGA_CAP]}
 
 
 def derive_effort(action, body):
