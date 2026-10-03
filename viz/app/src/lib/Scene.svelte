@@ -22,7 +22,6 @@
   import Notes from "./Notes.svelte";
   import Hud3D from "./Hud3D.svelte";
   import Saber from "./Saber.svelte";
-  import BodyGauges from "./BodyGauges.svelte";
   import { modelGeo } from "./models.js";
   import { FLUX, POSE } from "./build.js";
 
@@ -205,9 +204,6 @@
       maxDistance={25}
     />
   {/if}
-  {#if fkAll && pb.gauges && !pb.firstPerson}
-    <BodyGauges />
-  {/if}
 </T.PerspectiveCamera>
 
 <!-- First-person ('f'): a SECOND camera placed at the head (FK head
@@ -220,18 +216,14 @@
      position every frame (damping runs update() whether or not input is
      enabled), and leaving it untouched also means toggling back lands
      exactly where you were. The view is a pure function of the tick, so
-     scrubbing stays exact. The gauges follow the
-     active camera; the head sphere is hidden while on (Body showHead).
+     scrubbing stays exact. The head sphere is hidden while on (Body
+     showHead).
      Mounted only while on: unmounting hands the default back to the
      orbit camera. Live XR play is excluded — the headset owns the camera. -->
 {#if pb.firstPerson && !play.on && (fkAll || (human && humanHead))}
   {@const hp = fkAll ? fkAll.p[F_HEAD] : humanHead}
   <T.PerspectiveCamera makeDefault position={[hp[0], hp[1], -hp[2]]}
-    fov={pb.fpFov} near={FP_NEAR}>
-    {#if pb.gauges}
-      <BodyGauges fov={pb.fpFov} />
-    {/if}
-  </T.PerspectiveCamera>
+    fov={pb.fpFov} near={FP_NEAR} />
 {/if}
 
 <!-- Cel lighting (2026-09-09): the toon ramp turns dot(N, L) into three
