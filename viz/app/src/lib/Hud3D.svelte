@@ -56,6 +56,7 @@
   // both: the game's XR origin is the env body's plane (scene z 0.65, the
   // watch's "Player"), so the HUD sits where Beat Saber's does around the
   // player's head.
+  import { untrack } from "svelte";
   import { T } from "@threlte/core";
   import * as THREE from "three";
   import { pb, play, pose, game } from "./state.svelte.js";
@@ -241,13 +242,17 @@
     R.tex.needsUpdate = true;
   }
 
+  // Only the key (and the font) may re-run these: `h` is a fresh object
+  // whenever pb.cur moves, so reading it tracked redrew and re-uploaded
+  // both panels (600 x 1270 and 600 x 1060 px, ~5.4 MB) on every frame of
+  // playback, whatever they showed.
   $effect(() => {
     void fontReady;
-    if (leftKey) drawLeft(h);
+    if (leftKey) drawLeft(untrack(() => h));
   });
   $effect(() => {
     void fontReady;
-    if (rightKey) drawRight(h);
+    if (rightKey) drawRight(untrack(() => h));
   });
 
   // ---- the energy bar ------------------------------------------------------
