@@ -166,6 +166,8 @@ try {
   if (!(off < 1e-3) || !(pal.at <= pal.now))
     throw new Error("grip palms vs driven: " + JSON.stringify(pal));
   await page.screenshot({ path: "test/out/flux-xr-mid.png" });
+  // the viewer's DOM overlays stay out of the game: no joint gauges
+  if (await page.$(".gauges")) throw new Error("joint gauges shown in the WebXR game");
 
   await waitPlay(page, () => window.__fluxPlay.play.phase === "done", null, 240000);
   const st = await page.evaluate(() => ({ ...window.__fluxPlay.play.stats }));

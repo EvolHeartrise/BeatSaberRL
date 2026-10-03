@@ -1,5 +1,5 @@
 <script>
-  import { store, loadIndex, loadMetrics, mostRecentRun, runById } from "./data.svelte.js";
+  import { store, loadIndex, loadMetrics, mostRecentRun, runById, REFRESH_MS } from "./data.svelte.js";
   import { X_MODES, xValues, seriesValues, hasAny, label, color, fmt,
     fmtDuration, fmtSamples, gameOf, panelsFor } from "./series.js";
   import Chart from "./Chart.svelte";
@@ -78,7 +78,7 @@
   });
 
   $effect(() => {
-    const h = setInterval(refresh, 15000);  // always on
+    const h = setInterval(refresh, REFRESH_MS);  // always on
     return () => clearInterval(h);
   });
 </script>
@@ -129,7 +129,7 @@
   <div class="grid">
     {#each panels as p (p.id)}
       <div class="cell">
-        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} />
+        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} resetKey={run.id} />
       </div>
     {/each}
   </div>
