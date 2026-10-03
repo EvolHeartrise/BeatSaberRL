@@ -1,22 +1,20 @@
-<script>
-  // Billboard text via a canvas texture — self-contained (system font, no
-  // network font fetch) and rendered IN the WebGL canvas, so score popups
-  // and fail labels live in the 3D scene with everything else.
-  import { T } from "@threlte/core";
+<script module>
   import * as THREE from "three";
-
-  let {
-    text,
-    color = "#e8eaf0",
-    size = 0.12, // world height of the text
-    position = [0, 0, 0],
-    opacity = 1,
-    bold = true,
-  } = $props();
 
   const PX = 64; // texture text height in pixels
 
-  const made = $derived.by(() => {
+  // One texture per distinct (text, colour, weight), shared by every sprite
+  // showing it. Each score popup used to draw its own canvas and upload its
+  // own texture when it appeared — and again each time its number counted
+  // up — though a replay only ever shows a few dozen distinct strings
+  // ("115", "MISS", "X", a reason). Sprites hold references; a texture
+  // nobody shows waits in `idle` (oldest first) for the next popup that
+  // needs it, and only the IDLE_MAX most recent are kept.
+  const cache = new Map(); // key -> { key, tex, aspect, refs }
+  const idle = new Map();  // key -> entry, unused ones, oldest first
+  const IDLE_MAX = 64;
+
+  function draw(text, color, bold) {
     const cv = document.createElement("canvas");
     const ctx = cv.getContext("2d");
     const font = `${bold ? "bold " : ""}${PX}px system-ui, sans-serif`;
@@ -35,11 +33,58 @@
     const tex = new THREE.CanvasTexture(cv);
     tex.colorSpace = THREE.SRGBColorSpace;
     return { tex, aspect: w / cv.height };
-  });
+  }
 
+  /** The shared texture for this text (drawn on first use). A new entry
+   * starts idle: it is only held once a sprite's effect takes it. */
+  function textTexture(text, color, bold) {
+    const key = `${bold ? 1 : 0}${color}|${text}`;
+    let e = cache.get(key);
+    if (!e) {
+      e = { key, refs: 0, ...draw(text, color, bold) };
+      cache.set(key, e);
+      idle.set(key, e);
+    }
+    return e;
+  }
+  function hold(e) {
+    e.refs++;
+    idle.delete(e.key);
+  }
+  function release(e) {
+    if (--e.refs > 0) return;
+    if (cache.get(e.key) !== e) { e.tex.dispose(); return; } // evicted meanwhile
+    idle.delete(e.key); // re-insert: now the most recent
+    idle.set(e.key, e);
+    for (const [k, old] of idle) {
+      if (idle.size <= IDLE_MAX) break;
+      idle.delete(k);
+      cache.delete(k);
+      old.tex.dispose();
+    }
+  }
+</script>
+
+<script>
+  // Billboard text via a canvas texture — self-contained (system font, no
+  // network font fetch) and rendered IN the WebGL canvas, so score popups
+  // and fail labels live in the 3D scene with everything else.
+  import { T } from "@threlte/core";
+
+  let {
+    text,
+    color = "#e8eaf0",
+    size = 0.12, // world height of the text
+    position = [0, 0, 0],
+    opacity = 1,
+    bold = true,
+  } = $props();
+
+  const made = $derived(textTexture(text, color, bold));
   $effect(() => {
-    const t = made.tex;
-    return () => t.dispose();
+    const e = made;
+    hold(e);
+    return () => release(e);
   });
 </script>
 
