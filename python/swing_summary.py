@@ -221,8 +221,15 @@ def v1_updates(run_dir, seq0, n):
                 cnts.append(r["ep_stats_episodes"])
     except OSError:
         return out
-    if not cnts or any(b < a for a, b in zip(cnts, cnts[1:])):
-        return out                       # absent, or a counter reset
+    # the counter restarts with each trainer invocation; a resumed run's
+    # v1 rows (ep_stats.v1.f32) are the FIRST invocation's, so keep the
+    # records up to the first reset
+    for i, (a, b) in enumerate(zip(cnts, cnts[1:])):
+        if b < a:
+            upds, cnts = upds[:i + 1], cnts[:i + 1]
+            break
+    if not cnts:
+        return out
     cnts = np.asarray(cnts)
     seq = np.arange(seq0, seq0 + n)
     j = np.searchsorted(cnts, seq, side="right")
@@ -246,6 +253,7 @@ class State:
         self.tail_k = np.zeros((0, T_COLS))
         self.summary = None
         self.fallback = None
+        self.v1_stat = None
 
     def resize(self, L):
         def grow(a, shape, fill=0.0):
@@ -274,7 +282,7 @@ class State:
                 "ep_stat": _stat(os.path.join(run_dir, "ep_stats.f32")),
                 "last_update": self.last_update, "n_rows": self.n_rows,
                 "n_done": self.n_done, "summary": self.summary,
-                "fallback": self.fallback}
+                "fallback": self.fallback, "v1_stat": self.v1_stat}
         tmp = os.path.join(run_dir, STATE_NPZ + ".tmp.npz")
         np.savez_compressed(tmp, **{k: getattr(self, k) for k in self.ARRAYS})
         os.replace(tmp, os.path.join(run_dir, STATE_NPZ))
@@ -302,7 +310,7 @@ class State:
         except (OSError, ValueError, KeyError):
             return None
         for k in ("offset", "seq", "layout", "levels_stat", "last_update",
-                  "n_rows", "n_done", "summary", "fallback"):
+                  "n_rows", "n_done", "summary", "fallback", "v1_stat"):
             setattr(st, k, meta.get(k))
         return st
 
@@ -328,8 +336,12 @@ def _rank_from_end(lv):
     return ends[np.searchsorted(ends, i)] - i
 
 
-def ingest(st, rows, ver, levmap, run_dir):
-    """Fold new ep_stats rows into the state."""
+def ingest(st, rows, ver, levmap, run_dir, best_only=False):
+    """Fold new ep_stats rows into the state. best_only: rows without
+    swing columns folded into a swing run (a resumed run's pre-resume
+    ep_stats.v1.f32) — they count toward the run's best plays (the
+    best-possible totals) but not toward plays / accuracy / swing
+    averages, which would otherwise mix in plays with no swing data."""
     n = len(rows)
     if n == 0:
         return
@@ -352,19 +364,21 @@ def ingest(st, rows, ver, levmap, run_dir):
     done = (rows[:, 6] > 0.5) & good
     st.n_rows += int(n)
     st.n_done += int(done.sum())
-    fu = upd[np.isfinite(upd)]
-    if len(fu):
-        st.last_update = max(st.last_update or 0, int(fu.max()))
-    np.add.at(st.run_att, lev[good & ticks_ok], 1.0)
+    if not best_only:
+        fu = upd[np.isfinite(upd)]
+        if len(fu):
+            st.last_update = max(st.last_update or 0, int(fu.max()))
+        np.add.at(st.run_att, lev[good & ticks_ok], 1.0)
     if not done.any():
         return
     d_lev = lev[done]
     score = np.round(rows[done, 7].astype(np.float64))
     d_ms = ms[done]
     acc = np.where(d_ms > 0, np.minimum(1.0, score / np.maximum(d_ms, 1.0)), 0.0)
-    np.add.at(st.run_done, d_lev, 1.0)
-    np.add.at(st.acc_sum, d_lev, acc)
-    np.add.at(st.run_sum, d_lev, np.nan_to_num(part[done]))
+    if not best_only:
+        np.add.at(st.run_done, d_lev, 1.0)
+        np.add.at(st.acc_sum, d_lev, acc)
+        np.add.at(st.run_sum, d_lev, np.nan_to_num(part[done]))
     # the run's computed max per level (the env's scoring at run time)
     st.max_score[d_lev] = np.where(d_ms > 0, d_ms, st.max_score[d_lev])
     # best completed play per level (later plays win ties: max is max)
@@ -375,6 +389,8 @@ def ingest(st, rows, ver, levmap, run_dir):
     better = bs > st.best[bl]
     st.best[bl[better]] = bs[better]
     st.best_upd[bl[better]] = bu[better]
+    if best_only:
+        return
     tail = np.column_stack([d_lev.astype(np.float64), seq[done], upd[done],
                             acc, part[done]])
     st.tail_n = _keep_last_n(np.concatenate([st.tail_n, tail]), N_RING)
@@ -418,7 +434,10 @@ def window_stats(sums, plays, acc_sum, swing_ok):
 def build_summary(st, levmap, run_dir, swing_ok, levels_source):
     L = st.run_sum.shape[0]
     att = st.run_att[:L]
-    seen = np.flatnonzero((att > 0) | (st.run_done[:L] > 0))
+    # levels with a best play only (a resumed run's pre-resume rows,
+    # best_only) are listed too: they carry the best-possible totals
+    seen = np.flatnonzero((att > 0) | (st.run_done[:L] > 0)
+                          | (st.best[:L] >= 0))
     idx = {int(li): j for j, li in enumerate(seen)}
     lv = levmap.levels
     # whole-run per level + best-possible totals
@@ -552,7 +571,13 @@ def update_run(run_dir, force=False, log=None):
     if ep_st is None:
         return None
     lv_st = _stat(os.path.join(run_dir, "levels.json"))
+    # a resumed run's pre-resume rows: the trainer moves an old-layout
+    # file to ep_stats.v1.f32 when it starts writing v2 (best plays only)
+    v1p = os.path.join(run_dir, "ep_stats.v1.f32")
+    v1_st = _stat(v1p)
     meta = None if force else State.load_meta(run_dir)
+    if meta and meta.get("v1_stat") != v1_st:
+        meta = None                      # the v1 file appeared / changed
     out_path = os.path.join(run_dir, "swing.json")
     if (meta and meta.get("ep_stat") == ep_st
             and meta.get("levels_stat") == lv_st and meta.get("summary")
@@ -574,6 +599,11 @@ def update_run(run_dir, force=False, log=None):
         st = State(len(levmap.levels))
         st.layout = [ver, ncol]
         st.levels_stat = lv_st
+        if v1_st is not None and ver >= 2:
+            rows1, _, ver1, _ = es.read_rows(v1p, 0)
+            if ver1 is not None and len(rows1):
+                ingest(st, rows1, ver1, levmap, run_dir, best_only=True)
+    st.v1_stat = v1_st
     rows, off, ver2, _ = es.read_rows(ep, st.offset)
     if ver2 != ver:
         return None

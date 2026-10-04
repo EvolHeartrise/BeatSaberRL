@@ -450,3 +450,56 @@ def test_aggregator_imports_without_torch(tmp_path):
     out = subprocess.run([sys.executable, "-c", code, str(run)], cwd=here,
                          capture_output=True, text=True, check=True)
     assert float(out.stdout) > 0
+
+
+def test_resumed_run_counts_its_v1_rows_for_best_plays_only(tmp_path):
+    """A run resumed onto the v2 writer: the pre-resume rows (moved to
+    ep_stats.v1.f32) feed the best-possible totals — a run's best plays
+    are over the WHOLE run — but not plays / accuracy / swing averages
+    (they have no swing columns)."""
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "levels.json").write_text(json.dumps(LEVELS))
+    # before the resume: level B's best ever play (7900), no swing data
+    old = np.stack([env_row(2, 7900), env_row(0, 9000)])
+    es.build_rows(old, META, 1)[:, :16].tofile(run / "ep_stats.v1.f32")
+    recs = [{"upd": 50, "ep_stats_episodes": 2},
+            {"upd": 51, "ep_stats_episodes": 1}]          # counter resets
+    (run / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+    assert list(sw.v1_updates(str(run), 0, 2)) == [50, 50]
+    w = es.EpStatsWriter(str(run), log=lambda *a, **k: None)
+    for update, rows in enumerate(batches(), start=51):
+        w.append(es.build_rows(rows, META, update))
+    d = _summary(run)
+    b = _row(d, "b_Hard_Standard")
+    L = d["levels"]
+    assert L["ss_pp"][b] == round(scoresaber.pp_value(7900 / 8000, 168.47), 2)
+    assert L["best_upd"][b] == 50
+    assert L["done"][b] == 1                    # the v2 play only
+    # P1 = 80 % L / 90 % R: undiluted by the swing-less v1 play
+    assert d["win"]["all"]["pre"][b] == pytest.approx(85, abs=0.1)
+    assert d["last_update"] == 54
+    # a v1 file appearing later invalidates the cached state
+    (run / "ep_stats.v1.f32").unlink()
+    d2 = _summary(run)
+    assert d2["levels"]["ss_pp"][b] == round(scoresaber.pp_value(7000 / 8000, 168.47), 2)
+
+
+def test_level_with_only_pre_resume_plays_counts_in_totals(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "levels.json").write_text(json.dumps(LEVELS))
+    es.build_rows(np.stack([env_row(2, 7900)]), META, 1)[:, :16].tofile(
+        run / "ep_stats.v1.f32")                       # level B, pre-resume
+    w = es.EpStatsWriter(str(run), log=lambda *a, **k: None)
+    P1 = parts(560, 240, 120, 630, 270, 135)
+    w.append(es.build_rows(np.stack([env_row(0, 9000, parts=P1)]), META, 2))
+    d = _summary(run)
+    t = d["totals"]
+    ss_a = round(scoresaber.pp_value(9000 / 9800, 379.05), 2)
+    ss_b = round(scoresaber.pp_value(7900 / 8000, 168.47), 2)
+    assert t["ss_levels"] == 2
+    assert t["ss_upp"] == pytest.approx(ss_a + ss_b, abs=0.01)
+    b = _row(d, "b_Hard_Standard")
+    assert d["levels"]["done"][b] == 0                 # no swing-era plays
+    assert d["win"]["all"]["pre"][b] is None
