@@ -187,5 +187,8 @@ def test_cuda_pop_and_episode_record():
     ep = env.wrs[:, :, 3:5].sum(0).cpu().numpy()   # [[rL, sL], [rR, sR]]
     rl, rr, sl, sr = env.pop_wrist_resets()
     assert (rl, rr, sl, sr) == (ep[0, 0], ep[1, 0], ep[0, 1], ep[1, 1])
-    assert sl + sr > 0 and rl <= sl and rr <= sr
+    # exp/bend7: random play on this body may cut nothing in 150 ticks
+    # (real-swing coverage: the production lockstep asserts swings > 0)
+    assert (sl + sr > 0) == bool(env.good.sum() > 0)
+    assert rl <= sl and rr <= sr
     assert env.pop_wrist_resets() == (0, 0, 0, 0)
