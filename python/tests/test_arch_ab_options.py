@@ -1,13 +1,14 @@
 """Architecture A/B options (2026-10-03): --emb-ln, --value-residual,
---final-ln, --dwa, --trunk-arch simbav2.
+--final-ln, --trunk-arch simbav2 (--dwa, DenseFormer, lost the A/B and
+was removed 2026-10-04: load_policy refuses its checkpoints).
 
 Pinned here: all off = the pre-option network bit for bit (its own
-source, git 1ac0254); value residual at b = 0 and DWA at the identity
-are the baseline on the fp32 path; emb-LN / final-LN / SimBaV2 are
+source, git 1ac0254); value residual at b = 0 is the baseline on the
+fp32 path; emb-LN / final-LN / SimBaV2 are
 finite and train every parameter; the SimBaV2 rows stay unit-norm after
 a real Muon + Adam step; every option survives save -> load_policy and
 is inherited / refused on --resume like the other arch flags; a tiny
-CPU trainer run with all five on, then resumed. CUDA-only: each option
+CPU trainer run with all four on, then resumed. CUDA-only: each option
 on the production fp16 stream (fp16 all, fp16-accum all, fused FFN) —
 rollout and update forwards bitwise equal (the r1 contract), finite
 backward."""
@@ -31,11 +32,10 @@ KW = dict(embed=64, trunk_dim=96, n_blocks=3, n_heads=4, n_gears=5,
 OPTS = {"emb_ln": dict(emb_ln=True),
         "value_residual": dict(value_residual=True),
         "final_ln": dict(final_ln=True),
-        "dwa": dict(dwa=True),
         "simbav2": dict(trunk_arch="simbav2"),
         "all": dict(emb_ln=True, value_residual=True, final_ln=True,
-                    dwa=True, trunk_arch="simbav2")}
-NEW_KEYS = {"emb_ln", "value_residual", "final_ln", "dwa"}
+                    trunk_arch="simbav2")}
+NEW_KEYS = {"emb_ln", "value_residual", "final_ln"}
 
 
 def _obs(n=16, seed=1):
@@ -110,8 +110,8 @@ def test_all_off_is_bit_identical_to_the_pre_option_policy(tmp_path):
 
 def test_flags_default_off():
     a = tb.build_parser().parse_args([])
-    assert (a.emb_ln, a.value_residual, a.final_ln, a.dwa) == (
-        False, False, False, False)
+    assert (a.emb_ln, a.value_residual, a.final_ln) == (False, False, False)
+    assert not hasattr(a, "dwa")
     assert a.trunk_arch == "simba"
 
 
@@ -149,22 +149,10 @@ def test_value_residual_at_b0_is_the_baseline_and_v0_gets_gradient():
     assert not torch.allclose(p.blocks[0].v_proj.weight.grad, g0)
 
 
-def test_dwa_at_identity_is_the_baseline():
-    base, p = _baseline_and(dict(dwa=True))
-    for i, blk in enumerate(p.blocks):
-        w = torch.zeros(i + 2)
-        w[-1] = 1.0
-        assert torch.equal(blk.dwa.detach(), w)
-    obs = _obs()
-    lb, vb = _fwd_bwd(base, obs)
-    lp, vp = _fwd_bwd(p, obs)
-    assert torch.equal(lb, lp) and torch.equal(vb, vp)
-    pg = dict(p.named_parameters())
-    for n, a in base.named_parameters():
-        assert torch.equal(a.grad, pg[n].grad), n
-    # every mixing weight trains, the off-diagonal ones included
-    for blk in p.blocks:
-        assert (blk.dwa.grad.abs() > 0).all()
+def test_dwa_checkpoint_is_refused():
+    ck = {"arch": dict(_pol().arch, dwa=True), "state_dict": {}}
+    with pytest.raises(ValueError, match="dwa"):
+        P.load_policy(ck)
 
 
 def test_vmix_function_matches_plain_autograd():
@@ -184,13 +172,6 @@ def test_vmix_function_matches_plain_autograd():
         assert torch.allclose(x, y, rtol=1e-5, atol=1e-5)
 
 
-def test_dwa_mix_is_the_weighted_sum():
-    xs = [torch.randn(4, 29, 8) for _ in range(3)]
-    w = torch.tensor([0.2, -0.5, 1.3])
-    want = 0.2 * xs[0] - 0.5 * xs[1] + 1.3 * xs[2]
-    assert torch.allclose(P._dwa_mix(w, xs), want, atol=1e-6)
-
-
 @pytest.mark.parametrize("name", ["emb_ln", "final_ln", "simbav2", "all"])
 def test_non_equivalent_options_are_finite_and_train_everything(name):
     p = _pol(**OPTS[name])
@@ -208,18 +189,18 @@ def test_non_equivalent_options_are_finite_and_train_everything(name):
 def test_modules_exist_only_when_on():
     p = _pol()
     assert p.emb_ln is None and p.final_ln is None
-    assert all(b.vres_a is None and b.dwa is None for b in p.blocks)
+    assert all(b.vres_a is None for b in p.blocks)
     q = _pol(**OPTS["all"])
     names = {n for n, _ in q.named_parameters()}
     assert {"emb_ln.weight", "final_ln.weight", "blocks.1.vres_b",
-            "blocks.2.dwa", "trunk_alpha", "trunk_in.weight"} <= names
+            "trunk_alpha", "trunk_in.weight"} <= names
     assert not any(n.startswith(("trunk_proj", "trunk_ln", "trunk_fc"))
                    for n in names)
     # registration order: emb_ln before the blocks (enc diag group),
     # final_ln right before the trunk
     order = [n for n, _ in q.named_parameters()]
     assert order.index("emb_ln.bias") < order.index("blocks.0.ln_attn.weight")
-    assert (order.index("blocks.2.dwa") < order.index("final_ln.weight")
+    assert (order.index("blocks.2.vres_b") < order.index("final_ln.weight")
             < order.index("trunk_in.weight"))
 
 
@@ -230,7 +211,7 @@ def test_new_params_go_to_adam_and_simbav2_matrices_to_muon():
     muon = set(tb.muon_param_names(p))
     for n, q in p.named_parameters():
         if n.startswith(("emb_ln", "final_ln", "trunk_s_", "trunk_alpha")) \
-                or ".vres_" in n or n.endswith(".dwa"):
+                or ".vres_" in n:
             assert q.ndim == 1 and n not in muon, n
     assert {"trunk_in.weight", "trunk_w1.weight", "trunk_w2.weight"} <= muon
 
@@ -326,7 +307,7 @@ def _ckpt_args(**over):
 
 SCHED = {"lr": 7e-4, "lr_final": 1e-4, "ent_coef": 0.03, "ent_tau": 125,
          "warmup_updates": 34, "num_updates": 100, "lr_decay": "wsd"}
-ON = dict(emb_ln=True, value_residual=True, final_ln=True, dwa=True,
+ON = dict(emb_ln=True, value_residual=True, final_ln=True,
           trunk_arch="simbav2")
 
 
@@ -341,7 +322,7 @@ def test_resume_inherits_every_option():
 
 @pytest.mark.parametrize("argv,dest", [
     (["--no-emb-ln"], "emb_ln"), (["--no-value-residual"], "value_residual"),
-    (["--no-final-ln"], "final_ln"), (["--no-dwa"], "dwa"),
+    (["--no-final-ln"], "final_ln"),
     (["--trunk-arch", "simba"], "trunk_arch")])
 def test_resume_refuses_a_typed_option_change(argv, dest):
     argv = ["--resume", "t.pt", *argv]
@@ -372,7 +353,7 @@ def test_check_arch_options_follows_the_checkpoint_arch():
     assert tb.check_arch_options(args, set(), old, "--resume") == []
 
 
-# --- end to end: tiny CPU trainer, all five on, then resumed ---------------
+# --- end to end: tiny CPU trainer, all four on, then resumed ---------------
 
 COMMON = ["--device", "cpu", "--env", "rust", "--num-envs", "8",
           "--horizon", "8", "--minibatches", "1", "--n-blocks", "2",
@@ -392,10 +373,10 @@ def _run(*argv):
 def test_cpu_trainer_all_options_and_resume(tmp_path):
     d = tmp_path / "run"
     out = _run(*COMMON, "--total-steps", "128", "--ckpt-every", "1",
-               "--emb-ln", "--value-residual", "--final-ln", "--dwa",
+               "--emb-ln", "--value-residual", "--final-ln",
                "--trunk-arch", "simbav2", "--depth-init",
                "--run-dir", str(d))
-    assert "arch options: emb_ln, value_residual, final_ln, dwa" in out
+    assert "arch options: emb_ln, value_residual, final_ln" in out
     assert "readout trunk: simbav2" in out
     ck = torch.load(d / "trunk_upd00001.pt", map_location="cpu",
                     weights_only=True)
@@ -411,7 +392,7 @@ def test_cpu_trainer_all_options_and_resume(tmp_path):
                "--total-steps", "192", "--run-dir", str(d2))
     rec = json.load(open(d2 / "args.json"))["resolved"]
     assert {k: rec[k] for k in ON} == ON
-    assert "arch options: emb_ln, value_residual, final_ln, dwa" in out
+    assert "arch options: emb_ln, value_residual, final_ln" in out
 
 
 # --- CUDA: the production fp16 stream ---------------------------------------
@@ -494,10 +475,8 @@ def test_fp16_production_stream_r1_and_backward(name):
     with torch.no_grad():
         l32, _ = p.forward_stacked(obs.float())
     assert (l32 - lu.detach()).abs().max() < 0.05
-    if name in ("value_residual", "dwa"):
-        # baseline-equivalent at init on the fp16 stream too (near-tie
-        # numerics for dwa: the resolved residual instead of the fused
-        # delayed add)
+    if name == "value_residual":
+        # baseline-equivalent at init on the fp16 stream too
         torch.manual_seed(0)
         b = P.NotePolicy(embed=192, trunk_dim=384, n_blocks=4, n_heads=4,
                          n_gears=5, note_geo=True, fp16_accum="all",
@@ -507,7 +486,4 @@ def test_fp16_production_stream_r1_and_backward(name):
             lb, _ = b.forward_stacked(obs)
             p.fp16 = True
             lp, _ = p.forward_stacked(obs)
-        if name == "value_residual":
-            assert torch.equal(lb, lp)
-        else:
-            assert (lb - lp).abs().max() < 0.05
+        assert torch.equal(lb, lp)
