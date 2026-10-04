@@ -92,6 +92,8 @@ export function hasAny(recs, key) {
 // Panels: one chart each; `series` are metric keys drawn together.
 export const PANELS = [
   { id: "acc", title: "accuracy (note score / 115·cuts)", series: ["acc", "accL", "accR"] },
+  { id: "bestwpp", title: "best-possible WPP over training (each level's best completed play so far · SS / BL)", series: ["best_ss_wpp", "best_bl_wpp"] },
+  { id: "bestupp", title: "best-possible UPP over training (each level's best completed play so far · SS / BL)", series: ["best_ss_upp", "best_bl_upp"] },
   { id: "accparts", title: "accuracy by component (points / max over note cuts · pre-swing /70 · post-swing /30 · precision /15)", series: ["acc_pre", "acc_post", "acc_prec"] },
   { id: "return", title: "return (reward per env this update)", series: ["return"] },
   { id: "ent", title: "entropy (ent: last minibatch · entfull: full batch)", series: ["ent", "entfull"] },
@@ -131,7 +133,8 @@ export function panelsFor(game) {
 
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
-  "acc", "acc_pre", "acc_post", "acc_prec", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
+  "acc", "acc_pre", "acc_post", "acc_prec",
+  "best_ss_wpp", "best_ss_upp", "best_bl_wpp", "best_bl_upp", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "wrev", "lifts_per_1m",
   "activation", "activation_spine", "activation_arms", "activation_legs",
   "torque", "torque_spine", "torque_arms", "torque_legs",
@@ -144,6 +147,8 @@ export const DIFF_KEYS = ["acc", "return", "ent", "ev"];
 export const LABELS = {
   acc: "acc", accL: "accL", accR: "accR", return: "return",
   acc_pre: "pre-swing", acc_post: "post-swing", acc_prec: "precision",
+  best_ss_wpp: "SS WPP (best)", best_bl_wpp: "BL WPP (best)",
+  best_ss_upp: "SS UPP (best)", best_bl_upp: "BL UPP (best)",
   ent: "ent", entfull: "entfull", ev: "ev", sps_k: "steps/s (k)",
   falls_per_1m: "falls / 1M", tilts_per_1m: "tilts / 1M", lifts_per_1m: "lifts / 1M",
   falls_per_1m_pos: "falls / 1M (log)", tilts_per_1m_pos: "tilts / 1M (log)",
