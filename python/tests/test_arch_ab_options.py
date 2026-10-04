@@ -467,7 +467,12 @@ def test_fp16_production_stream_r1_and_backward(name):
     # r1: same arithmetic in both phases
     assert torch.equal(lr_, lu.detach()) and torch.equal(vr, vu.detach())
     assert torch.isfinite(lu).all() and torch.isfinite(vu).all()
-    (lu.float().square().mean() + vu.square().mean()).backward()
+    # exp/bend7: square only the live lanes (the masked ones are -1e9 by
+    # design; PPO reaches logits through log_softmax, zero grad there)
+    lg = lu.float()
+    if p._gear_valid is not None:
+        lg = lg.masked_fill(~p._gear_valid, 0.0)
+    (lg.square().mean() + vu.square().mean()).backward()
     for n, q in p.named_parameters():
         if q.requires_grad:
             assert q.grad is not None and torch.isfinite(q.grad).all(), n
