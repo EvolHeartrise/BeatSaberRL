@@ -358,10 +358,7 @@ def load_ranked_pool(sample=None, seed=0, device="cuda",
             os.replace(tmp, mpath)
         md = np.load(mpath)
         arrs.update({k: md[k] for k in md.files})
-    idx = None
-    if sample is not None and sample < P:
-        rng = np.random.default_rng(seed)
-        idx = np.sort(rng.choice(P, size=sample, replace=False))
+    idx = _sample_idx(P, sample, seed)
     arrs = _subset_ragged(arrs, idx)
     out = {k: torch.as_tensor(a, device=device) for k, a in arrs.items()}
     nn, nw = arrs["n_notes"], arrs["n_walls"]
@@ -371,6 +368,215 @@ def load_ranked_pool(sample=None, seed=0, device="cuda",
         f"{sum(v.numel() * v.element_size() for v in out.values()) / 2**20:.0f}"
         f" MB)", flush=True)
     return out
+
+
+def _sample_idx(P, sample, seed):
+    """The seeded without-replacement level subset load_ranked_pool
+    takes (None = the whole pool). One definition, so the levels.json
+    sidecar indexes exactly the charts the envs play."""
+    if sample is None or sample >= P:
+        return None
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(P, size=sample, replace=False))
+
+
+# ---------------------------------------------------------------------------
+# levels.json: chart_idx -> level (2026-10-04, dashboard swing table)
+# ---------------------------------------------------------------------------
+
+LEVELS_FORMAT = "beat-arena-levels"
+LEVELS_VERSION = 1
+
+
+def _pool_charts(catalog_path, lead_s, mirror):
+    """Per pool chart (the _build_segments order): [catalog index,
+    mirrored, scoreable notes, song duration s, computed max score].
+    Replays the SAME drop rules as _level_meta over the chart cache
+    (a pass over every payload: seconds warm, minutes cold), cached as
+    a .charts.json beside the pool npz (same cache key)."""
+    import json
+    import sys
+    sys.path.insert(0, _BASE)
+    import bench_scoresaber as bs
+    ver = bs.parser_version()
+    catalog = json.load(open(catalog_path, encoding="utf-8"))
+    cpath = _cache_path(ver, catalog_path, lead_s, mirror=mirror)
+    jpath = cpath[:-len(".npz")] + ".charts.json"
+    try:
+        with open(jpath, encoding="utf-8") as f:
+            return catalog, json.load(f)
+    except (OSError, ValueError):
+        pass
+    out = []
+    for i, entry in enumerate(catalog):
+        payload = _payload_or_none(bs, entry, ver)
+        if payload is None:
+            continue
+        tup = sorted(payload["tuples"], key=lambda t: t[0])
+        if not tup or tup[-1][0] < lead_s:
+            continue
+        win = [t for t in tup if lead_s <= t[0]]
+        n_sc = sum(1 for t in win if t[7] != KIND_BOMB)
+        if n_sc < MIN_SCOREABLE:
+            continue
+        rest = [n_sc, float(payload.get("duration_s") or 0.0),
+                float(payload.get("max_score", 0))]
+        out.append([i, 0] + rest)
+        if mirror:
+            out.append([i, 1] + rest)
+    try:
+        tmp = jpath + f".tmp{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f)
+        os.replace(tmp, jpath)
+    except OSError:
+        pass
+    return catalog, out
+
+
+def level_table(which="scoresaber", lead_s=RECIPE_LEAD_S,
+                mirror=RECIPE_MIRROR, sample=None, seed=0, log=print,
+                catalog_path=None, ss_catalog=None, bl_catalog=None):
+    """The levels.json dict for a ranked pool: `chart_level[c]` /
+    `chart_mirrored[c]` per pool chart c (the env's chart_idx, after the
+    --chart-pool subsample) and one `levels` entry per distinct level —
+    a level's original and mirrored copies share it. Each level carries
+    its SS view (id, stars, max_pp, the SS API maxScore) and its BL view
+    (id, stars, pass / acc / tech ratings, maxScore), joined by
+    beatleader.entry_key over maps/scoresaber_catalog.json and
+    maps/beatleader_catalog.json — so a level both leaderboards rank
+    counts on both even when the run trained on one catalog. None where
+    a leaderboard does not rank it. `max_score` is the env's computed
+    full-combo max (scoring v4), `nps` scoreable notes / song length."""
+    import json
+    import sys
+    from . import beatleader
+    from .scoresaber import PP_PER_STAR
+    sys.path.insert(0, _BASE)
+    import bench_scoresaber as bs
+    catalog_path = catalog_path or train_catalog_path(which)
+    catalog, charts = _pool_charts(catalog_path, lead_s, mirror)
+    idx = _sample_idx(len(charts), sample, seed)
+    if idx is not None:
+        charts = [charts[int(i)] for i in idx]
+    maps = os.path.join(_BASE, "maps")
+    if ss_catalog is None:
+        ss_catalog = json.load(open(os.path.join(
+            maps, "scoresaber_catalog.json"), encoding="utf-8"))
+    if bl_catalog is None:
+        bl_catalog = json.load(open(os.path.join(
+            maps, "beatleader_catalog.json"), encoding="utf-8"))
+    ss_by = {beatleader.entry_key(e): e for e in ss_catalog}
+    bl_by = {beatleader.entry_key(e): e for e in bl_catalog}
+    levels, by_cat, chart_level, chart_mirr = [], {}, [], []
+    for (ci, mirrored, n_sc, dur, max_score) in charts:
+        li = by_cat.get(ci)
+        if li is None:
+            e = catalog[ci]
+            key = e.get("level_key") or beatleader.entry_key(e)
+            ss = ss_by.get(key)
+            if (ss is None and "pass_rating" not in e
+                    and int(e.get("leaderboard_id", -1) or -1) > 0):
+                ss = e          # an SS-format entry the SS catalog lacks
+            bl = bl_by.get(key)
+            if bl is None and "pass_rating" in e:
+                bl = e
+            li = by_cat[ci] = len(levels)
+            levels.append({
+                "key": key, "hash": e.get("hash"), "song": e.get("song"),
+                "mapper": e.get("mapper"),
+                "difficulty": e.get("difficulty"),
+                "characteristic": e.get("characteristic", "Standard"),
+                "n_notes": int(n_sc), "duration_s": round(dur, 2),
+                "nps": round(n_sc / dur, 3) if dur > 0 else None,
+                "max_score": max_score,
+                "ss": None if ss is None else {
+                    "id": int(ss["leaderboard_id"]),
+                    "stars": float(ss.get("stars", 0.0)),
+                    "max_pp": float(ss.get("max_pp")
+                                    or float(ss.get("stars", 0.0))
+                                    * PP_PER_STAR),
+                    "max_score": ss.get("api_max_score")},
+                "bl": None if bl is None else {
+                    "id": str(bl["leaderboard_id"]),
+                    "stars": float(bl.get("stars", 0.0)),
+                    "pass": float(bl["pass_rating"]),
+                    "acc": float(bl["acc_rating"]),
+                    "tech": float(bl["tech_rating"]),
+                    "max_score": bl.get("api_max_score")},
+            })
+        chart_level.append(li)
+        chart_mirr.append(int(mirrored))
+    log(f"[levels] {len(chart_level)} pool charts -> {len(levels)} levels "
+        f"({sum(1 for v in levels if v['ss'])} SS-ranked, "
+        f"{sum(1 for v in levels if v['bl'])} BL-ranked)", flush=True)
+    return {"format": LEVELS_FORMAT, "version": LEVELS_VERSION,
+            "catalog": which, "lead_s": lead_s, "mirror": bool(mirror),
+            "sample": sample, "seed": seed,
+            "parser_version": bs.parser_version(),
+            "n_charts": len(chart_level), "chart_level": chart_level,
+            "chart_mirrored": chart_mirr, "levels": levels}
+
+
+def check_levels(table, lb=None, max_score=None):
+    """Mismatches of a levels table against per-chart SS leaderboard
+    ids / computed max scores (the pool's level_lb / level_max_score, or
+    an ep_stats file's cols 1 / 3 keyed by chart): the sidecar must index
+    the charts the run played. Arrays are indexed by chart; NaN / None
+    entries are skipped. Returns (n_checked, lb_bad, max_score_bad)."""
+    cl, lv = table["chart_level"], table["levels"]
+    n = len(cl) if lb is None else min(len(cl), len(lb))
+    checked = bad_lb = bad_ms = 0
+    for c in range(n):
+        L = lv[cl[c]]
+        if lb is not None:
+            want = lb[c]
+            if want is None or want != want:
+                continue
+            checked += 1
+            want = int(want)
+            have = L["ss"]["id"] if L["ss"] else -1
+            if want != have and not (want <= 0 and L["ss"] is None):
+                bad_lb += 1
+        if max_score is not None:
+            ms = max_score[c]
+            if ms is not None and ms == ms \
+                    and abs(float(ms) - float(L["max_score"])) > 0.5:
+                bad_ms += 1
+    return (checked if lb is not None else n), bad_lb, bad_ms
+
+
+def write_levels_json(path, which, lead_s=RECIPE_LEAD_S,
+                      mirror=RECIPE_MIRROR, sample=None, seed=0,
+                      expect=None, log=print, source="trainer"):
+    """level_table -> `path` (tmp + rename). `expect`: the loaded pool's
+    level_lb / level_max_score arrays; a table that disagrees with the
+    pool the envs actually play is refused (ValueError), not written."""
+    import json
+    import time
+    t0 = time.time()
+    table = level_table(which, lead_s=lead_s, mirror=mirror,
+                        sample=sample, seed=seed, log=log)
+    if expect is not None:
+        P = len(expect["level_lb"])
+        if table["n_charts"] != P:
+            raise ValueError(f"levels table has {table['n_charts']} "
+                             f"charts, the pool {P}")
+        n, bl, bm = check_levels(table, expect["level_lb"],
+                                 expect["level_max_score"])
+        if bl or bm:
+            raise ValueError(f"levels table disagrees with the pool: "
+                             f"{bl} leaderboard ids, {bm} max scores of "
+                             f"{n} charts")
+    table["source"] = source
+    table["written"] = time.time()
+    tmp = path + f".tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(table, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    log(f"[levels] {table['n_charts']} charts / {len(table['levels'])} "
+        f"levels -> {path} ({time.time() - t0:.1f}s)", flush=True)
+    return table
 
 
 def _gather_index(off, idx):

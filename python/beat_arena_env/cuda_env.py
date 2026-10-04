@@ -73,7 +73,12 @@ NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 # same-tick same-saber trackers share (arc, age) forever, so they
 # aggregate into ONE slot with a note COUNT — exact, not approximate.
 N_TRACKERS = FOLLOW_TIMEOUT + 1
-EP_REC = 28   # env v47 episode record width (cols 22..28 = ep_stats)
+# per-episode record width (kernel EP_REC): cols 0..21 tau_draws, 22..27
+# env v47 ep_stats, 28..39 per-hand swing components (2026-10-04)
+EP_REC = 40
+# cols 28..39: hand-major [L, R] x EP_PART_FIELDS (raw note points)
+EP_PART_COL = 28
+EP_PART_FIELDS = ("pre", "pre_max", "post", "post_max", "prec", "prec_max")
 # bench slot-refill record (kernel BENCH_REC): the host-facing columns
 # 0..18 = [good, bad, miss, score, bombs, pre, acc, post, flail_rad,
 # flail_ticks, cw_score, cw_maxc, cw_breaks, chart_idx, wrev_L, wrev_R,
@@ -976,6 +981,9 @@ class CudaBeatVecEnv:
         # precision max] (note cuts only); popped by pop_acc_parts, same
         # lifecycle as acc_pts
         self.acc_part = z(N, 2, 6)
+        # the same components per EPISODE (2026-10-04, user): zeroed by
+        # reset_env, copied into ep_rec cols 28..39 at done
+        self.ep_part = z(N, 2, 6)
         # env v20 start-pose jitter draws: (N, 12) in [-1, 1), refilled
         # in-place before every launch when enabled (in-place uniform_
         # keeps the fixed address CUDA graphs capture; torch's RNG
@@ -1053,7 +1061,7 @@ class CudaBeatVecEnv:
             self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
             self.wrev, self.wrev_ext, self.wrev_dir,
-            self.acc_pts, self.acc_cuts, self.acc_part,
+            self.acc_pts, self.acc_cuts, self.acc_part, self.ep_part,
             self.ground_imp,
             self.chart_idx,
             self.limit_rest, self.limit_rest_ticks,
@@ -1157,10 +1165,15 @@ class CudaBeatVecEnv:
         """Episodes that ended since the last pop, as an (M, EP_REC)
         float32 numpy array: [s0..s15, ep_ticks, ep_return, fell,
         good_cuts, score_pts, chart_idx, cw_score, max_combo, breaks,
-        completed, bad_cuts, misses] (the kernel writes a row at `done`
-        while tau_rand > 0 or ep_stats; cols 22.. are zero unless
-        ep_stats; an env ending twice inside one pop keeps the later
-        row — logging-grade). Two syncs; call once per update."""
+        completed, bad_cuts, misses, then 12 swing cols (2026-10-04):
+        per hand [L, R] x (pre pts, pre max, post pts, post max,
+        precision pts, precision max) — the episode's raw note points
+        before the combo multiplier, note cuts only (EP_PART_COL)] (the
+        kernel writes a row at `done` while tau_rand > 0 or ep_stats;
+        cols 22..27 are zero unless ep_stats; an env ending twice inside
+        one pop keeps the later row — logging-grade: an update is
+        horizon (32) ticks and a level lasts far longer, so only an
+        instant fall can lose a row). Two syncs; call once per update."""
         flags = self.ep_flag.bool()
         n = int(flags.sum().item())
         if n == 0:

@@ -446,6 +446,16 @@ def _check_episode_end(env, sim, e, walk, ret_r, ret_c, tau, max_steps):
         f"{(walk.score, walk.max_combo, walk.breaks)}"
     assert bool(rec[25]) == (reason == "completed"), f"{tag} completed"
     assert (int(rec[26]), int(rec[27])) == (sim.bad_cuts, sim.misses), tag
+    # 2026-10-04 swing cols 28..39 (per hand [pre, pre max, post, post
+    # max, precision, precision max]): summed over hands they are the
+    # Rust sim's own score decomposition of this episode
+    part = rec[28:40].reshape(2, 6)
+    pre_r, acc_r, post_r = sim.score_components()
+    assert abs(part[:, 0].sum() - pre_r) < 1e-9, f"{tag} pre {part[:, 0]} vs {pre_r}"
+    assert abs(part[:, 2].sum() - post_r) < 1e-9, f"{tag} post {part[:, 2]} vs {post_r}"
+    assert abs(part[:, 4].sum() - acc_r) < 1e-9, f"{tag} precision {part[:, 4]} vs {acc_r}"
+    np.testing.assert_allclose(part[:, 1] / 70.0, part[:, 5] / 15.0,
+                               err_msg=f"{tag} pre / precision maxima")
     # per-env telemetry accumulated over the episode (the kernel keeps
     # stepping an ended env, so read it on the done tick)
     act_r = sim.pop_activation()
