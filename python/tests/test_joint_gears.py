@@ -129,16 +129,23 @@ HG7 = tuple(7 if j in BEND else 5 for j in range(N))
 
 
 def test_uniform_policy_is_unchanged():
-    p = _policy(None)
+    p = _policy((5,) * N)
     assert p.head_sizes == (5,) * N and p.k_max == 5
     assert "head_gears" not in p.arch and p._gear_mask is None
     assert all(h.weight.shape == (5, 48) for h in p.heads)
-    # passing the uniform tuple explicitly is the same policy
-    q = _policy((5,) * N)
-    assert q.arch == p.arch
-    for (n1, t1), (n2, t2) in zip(p.state_dict().items(),
-                                  q.state_dict().items()):
-        assert n1 == n2 and torch.equal(t1, t2)
+
+
+def test_default_is_this_builds_layout(monkeypatch):
+    """head_gears=None = constants.joint_gear_counts(n_gears): on main
+    the uniform policy (no arch record), on an extras build its layout."""
+    for hg in (None, C.joint_gear_counts(5)):
+        p, q = _policy(None), _policy(hg)
+        assert p.head_sizes == C.joint_gear_counts(5) and q.arch == p.arch
+        for (n1, t1), (n2, t2) in zip(p.state_dict().items(),
+                                      q.state_dict().items()):
+            assert n1 == n2 and torch.equal(t1, t2)
+    _bend7(monkeypatch)
+    assert _policy(None).head_sizes == HG7
 
 
 def test_masked_heads():
@@ -206,8 +213,9 @@ def test_load_policy_rebuilds_and_checks_the_layout(monkeypatch):
     with torch.no_grad():
         assert torch.equal(p.forward_stacked(obs)[0],
                            q.forward_stacked(obs)[0])
-    # and on that build a uniform checkpoint is refused
-    u = _policy(None)
+    # and on that build a uniform checkpoint (no head_gears record) is
+    # refused — load_policy never applies the build default to it
+    u = _policy((5,) * N)
     with pytest.raises(SystemExit, match="per-joint gear counts"):
         load_policy({"state_dict": u.state_dict(), "arch": u.arch})
 
