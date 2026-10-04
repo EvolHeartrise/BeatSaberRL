@@ -453,6 +453,23 @@ pool (`level_lb`, `level_max_pp`, `level_max_score`; older pool caches get
 a `.meta.npz` sidecar instead of a rebuild). Plays are the sampled policy
 at the drawn body — tracking-grade, not comparable to bench upp.
 
+**Per-level swing telemetry (2026-10-04):** the kernel also accumulates
+each episode's pre-swing / post-swing / precision points and maxima per
+hand (`ep_part`, written into episode-record cols 28..39, `EP_REC = 40`),
+and `ep_stats.f32` became layout v2: a header row, the 16 v1 columns,
+the update index, then the 12 per-hand swing columns (`ep_stats.py`
+documents both layouts; v1 files still read). With `--ep-stats` the
+trainer also writes `<run-dir>/levels.json` (chart_idx -> level: song,
+SS / BL ids, stars, BL ratings, API max scores, NPS, mirrored flag;
+`ranked_pool.level_table`). `python/swing_summary.py` turns the two into
+`swing.json` (per-level windows + best-possible SS / BL WPP / UPP; the
+dashboard's Swing tab, refreshed by `metrics_backfill.py`). Old runs:
+`python/.venv/bin/python python/swing_summary.py --reconstruct <run_dir>`
+rebuilds their `levels.json` from args.json + the laptop maps, validated
+against the run's own ids. The kernel change was written without nvcc:
+run `pytest tests/test_ep_parts.py tests/test_production_lockstep.py`
+on the pod before the next training run.
+
 **Default-body search (`--tau-center` + `tau_fit.py`, 2026-09-19):** the
 τmax randomization draws `center × (1 ± r)` per axis (`--tau-center`, 16
 floats or group syntax; 1.0 = the `TAU_MAX` table; obs lanes stay

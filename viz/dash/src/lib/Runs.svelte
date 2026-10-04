@@ -23,6 +23,8 @@
     { key: "final.ent", label: "ent", num: true, fmt: (v) => fmt(v, 3) },
     { key: "bench.upp", label: "bench upp", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
     { key: "bench.wpp", label: "bench wpp", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(0)) },
+    { key: "swing.ss_upp", label: "train best SS upp", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
+    { key: "swing.bl_upp", label: "train best BL upp", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
     { key: "bench.wrev_l", label: "wrist rev L /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
     { key: "bench.wrev_r", label: "wrist rev R /s", num: true, fmt: (v) => (v == null ? "—" : v.toFixed(2)) },
     { key: "bench.wrev_total", label: "wrist rev total", num: true, fmt: (v) => (v == null ? "—" : Math.round(v).toLocaleString()) },
@@ -34,6 +36,7 @@
     if (key === "ckpts") return r.checkpoints?.length ?? 0;
     if (key === "game") return gameOf(r);
     if (key.startsWith("final.")) return r.final?.[key.slice(6)] ?? null;
+    if (key.startsWith("swing.")) return r.swing?.totals?.[key.slice(6)] ?? null;
     if (key.startsWith("bench.")) {
       const b = bestBench(r);
       return b ? b[key.slice(6)] : null;

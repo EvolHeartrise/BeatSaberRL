@@ -3,11 +3,13 @@
   import Live from "./lib/Live.svelte";
   import Compare from "./lib/Compare.svelte";
   import Runs from "./lib/Runs.svelte";
+  import Swing from "./lib/Swing.svelte";
 
-  const TABS = ["live", "compare", "runs"];
-  let tab = $state(location.hash.replace("#", "") in { live: 1, compare: 1, runs: 1 } ? location.hash.slice(1) : "live");
+  const TABS = ["live", "swing", "compare", "runs"];
+  let tab = $state(TABS.includes(location.hash.replace("#", "")) ? location.hash.slice(1) : "live");
   let xMode = $state("samples");
   let liveRun = $state(null);
+  let swingRun = $state(null);
   let selected = $state([]);
 
   $effect(() => { location.hash = tab; });
@@ -38,6 +40,8 @@
     <p class="muted">loading index.json…</p>
   {:else if tab === "live"}
     <Live bind:xMode bind:runId={liveRun} />
+  {:else if tab === "swing"}
+    <Swing bind:runId={swingRun} />
   {:else if tab === "compare"}
     <Compare bind:selected bind:xMode />
   {:else}
