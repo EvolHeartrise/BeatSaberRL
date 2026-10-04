@@ -428,9 +428,9 @@ HEAD_GROUPS = (("spine", 0, 3), ("armL", 3, 10), ("armR", 10, 17),
 MASK_BIAS = 16384.0
 
 # Logit of a head's lanes past its gear count (per-joint gear counts,
-# 2026-10-04), added in fp32 after the head GEMM: finite (so the entropy
-# term p*log p is 0 * -1e9 = 0, not 0 * -inf = nan), and exp() of it
-# underflows to exactly 0 — the lane has no probability and no gradient.
+# 2026-10-04), the fp32 fill the head outputs are copied into: finite (so
+# the entropy term p*log p is 0 * -1e9 = 0, not 0 * -inf = nan), and
+# exp() of it underflows to exactly 0 — the lane has no probability.
 MASKED_LOGIT = -1e9
 
 
@@ -1020,23 +1020,31 @@ class NotePolicy(nn.Module):
             self.trunk_alpha = nn.Parameter(torch.full((D,), a_scale))
             self.project_trunk_weights()
         # 29 factored joint heads, K = n_gears options each (env v8);
-        # per-joint counts (head_gears) pad every head to k_max outputs
-        # — one uniform packed GEMM — and mask the lanes past a head's
-        # count to MASKED_LOGIT (exp underflows to exactly 0: no
-        # probability, zero gradient, no entropy, never sampled)
+        # with per-joint counts (head_gears) head j has its own n_j rows
+        # (the packed GEMM is sum(n_j) wide) and its outputs are copied
+        # into the (B, 29, k_max) logits over a MASKED_LOGIT fill: the
+        # lanes past a head's count get exp() = 0 exactly (no
+        # probability, no entropy, never sampled) and have no weights.
+        # Padding every head to k_max rows instead made the packed
+        # GEMM 29 x 7 = 203 wide, a width at which cuBLAS picks
+        # different fp16-accumulate kernels for the rollout and the
+        # update shapes (r1 2e-5 at init vs 6e-7; 149 and 145 are
+        # bitwise consistent) — pinned by test_joint_gears on the pod.
         self.heads = nn.ModuleList(
-            nn.Linear(trunk_dim, self.k_max) for _ in self.head_sizes)
+            nn.Linear(trunk_dim, n) for n in self.head_sizes)
         if min(self.head_sizes) < self.k_max:
             valid = torch.tensor([[a < k for a in range(self.k_max)]
                                   for k in self.head_sizes])
             self.register_buffer("_gear_valid", valid, persistent=False)
             self.register_buffer(
-                "_gear_mask",
-                torch.zeros(valid.shape).masked_fill(~valid, MASKED_LOGIT),
+                "_gear_idx", torch.tensor(
+                    [j * self.k_max + a
+                     for j, k in enumerate(self.head_sizes)
+                     for a in range(k)], dtype=torch.long),
                 persistent=False)
         else:
             self._gear_valid = None
-            self._gear_mask = None
+            self._gear_idx = None
         # Critic (2026-08-19 redesign):
         # adapool_v1 = query-derived attention pooling (Brothers
         # 2506.09215: a state-DERIVED query wins over a free learned
@@ -1326,10 +1334,14 @@ class NotePolicy(nn.Module):
             else:
                 out = F.linear(h, w, b)                  # (B, 29K)
         value = self._critic(x_res, h, attn_bias)
-        out = out.view(B, N_ACTION_HEADS, self.k_max)
-        if self._gear_mask is not None:
-            out = out + self._gear_mask         # fp32: lanes past a head's count
-        return out, value
+        if self._gear_idx is not None:
+            # per-joint counts: (B, sum n_j) -> the padded (B, 29 k_max)
+            # over the MASKED_LOGIT fill (fp32; grad flows back through
+            # index_copy to the live lanes only)
+            out = out.new_full((B, N_ACTION_HEADS * self.k_max),
+                               MASKED_LOGIT).index_copy(1, self._gear_idx,
+                                                        out)
+        return out.view(B, N_ACTION_HEADS, self.k_max), value
 
     def _critic(self, x_res: torch.Tensor, h: torch.Tensor,
                 attn_bias: torch.Tensor) -> torch.Tensor:

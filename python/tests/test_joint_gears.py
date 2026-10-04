@@ -131,7 +131,7 @@ HG7 = tuple(7 if j in BEND else 5 for j in range(N))
 def test_uniform_policy_is_unchanged():
     p = _policy((5,) * N)
     assert p.head_sizes == (5,) * N and p.k_max == 5
-    assert "head_gears" not in p.arch and p._gear_mask is None
+    assert "head_gears" not in p.arch and p._gear_idx is None
     assert all(h.weight.shape == (5, 48) for h in p.heads)
 
 
@@ -185,17 +185,19 @@ def test_masked_heads():
             assert (a[:, j] < HG7[j]).all()
 
 
-def test_masked_lanes_get_no_gradient():
+def test_per_head_rows_and_gradients():
+    """Head j has exactly its own n_j rows (no weights behind the masked
+    lanes) and all of them learn."""
     p = _policy(HG7, depth_init=True)
+    assert [h.weight.shape[0] for h in p.heads] == list(HG7)
     obs = _obs(32)
     with torch.no_grad():
         act, _, _, _ = p.get_action_and_value(obs)
     _, lp, ent, v = p.get_action_and_value(obs, act)
     (lp.sum() + 0.1 * ent.sum() + v.sum()).backward()
-    for j, h in enumerate(p.heads):
-        k = HG7[j]
-        assert (h.weight.grad[k:] == 0).all() and (h.bias.grad[k:] == 0).all()
-        assert h.weight.grad[:k].abs().sum() > 0
+    for h in p.heads:
+        assert torch.isfinite(h.weight.grad).all()
+        assert (h.weight.grad.abs().sum(1) > 0).all()
 
 
 def test_load_policy_rebuilds_and_checks_the_layout(monkeypatch):
@@ -218,6 +220,33 @@ def test_load_policy_rebuilds_and_checks_the_layout(monkeypatch):
     u = _policy((5,) * N)
     with pytest.raises(SystemExit, match="per-joint gear counts"):
         load_policy({"state_dict": u.state_dict(), "arch": u.arch})
+
+
+@cuda
+@pytest.mark.parametrize("layout", ["build", "bend7"])
+def test_fp16_rollout_update_consistency(layout, monkeypatch):
+    """The trainer's r1 at init — |ratio - 1| between the rollout forward
+    (32768 rows, no grad) and the update micro-batch (8192, grad) on the
+    fp16 'all' + flat stream — stays at the uniform policy's ~6e-7 for a
+    per-joint layout (heads padded to 7 rows made the packed GEMM 203
+    wide: 2.2e-5)."""
+    import policy as P
+    if layout == "bend7":
+        _bend7(monkeypatch)
+    torch.manual_seed(0)
+    p = P.NotePolicy(embed=192, trunk_dim=384, n_blocks=4, n_heads=4,
+                     n_gears=5, note_geo=True, fp16_accum="all",
+                     fused_ffn="on").cuda()
+    P.apply_depth_init(p)
+    p.fp16 = True
+    p.flatten_fp16()
+    g = torch.Generator(device="cuda").manual_seed(1)
+    obs = torch.randn(32768, C.OBS_DIM, device="cuda", generator=g) * 0.5
+    with torch.no_grad():
+        a, lp_roll, _, _ = p.get_action_and_value(obs, need_entropy=False)
+    _, lp_upd, _, _ = p.get_action_and_value(obs[:8192], a[:8192])
+    r1 = (lp_upd.detach() - lp_roll[:8192]).exp().sub(1).abs().mean().item()
+    assert r1 < 5e-6, r1
 
 
 # --- replay format -----------------------------------------------------------
