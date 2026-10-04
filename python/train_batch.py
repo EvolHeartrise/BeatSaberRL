@@ -549,15 +549,6 @@ def build_parser():
                    help="LayerNorm on the 5 lead tokens' final-block "
                         "outputs before trunk_proj (they arrive at RMS "
                         "~30 otherwise)")
-    p.add_argument("--dwa", action=argparse.BooleanOptionalAction,
-                   default=False,
-                   help="DenseFormer depth-weighted average (arXiv "
-                        "2402.02622): after each block the stream is a "
-                        "learned mix of the embedding and every block "
-                        "output so far, init identity = the baseline. "
-                        "Bypasses the delayed-residual and --fused-ffn "
-                        "next-LN fusions (the residual-only fused FFN "
-                        "still runs)")
     p.add_argument("--trunk-arch", choices=["simba", "simbav2"],
                    default="simba",
                    help="readout trunk: simba (the production trunk) or "
@@ -1024,14 +1015,13 @@ RESUME_SCHEDULE = ("lr", "lr_final", "ent_coef", "ent_tau", "warmup_updates")
 RESUME_ARCH = frozenset({
     "embed", "trunk_dim", "n_blocks", "n_heads", "ffn_mult",
     "trunk_hidden", "note_geo", "hl_bins", "hl_vmax", "hl_sigma",
-    "emb_ln", "value_residual", "final_ln", "dwa", "trunk_arch"})
+    "emb_ln", "value_residual", "final_ln", "trunk_arch"})
 # the 2026-10-03 architecture A/B options: (args dest, arch key, value
 # when the checkpoint arch predates the key). A checkpoint's arch
 # decides them on --resume / --init-from (check_arch_options).
 ARCH_OPTIONS = (("emb_ln", "emb_ln", False),
                 ("value_residual", "value_residual", False),
                 ("final_ln", "final_ln", False),
-                ("dwa", "dwa", False),
                 ("trunk_arch", "trunk_arch", "simba"))
 
 
@@ -1716,7 +1706,7 @@ def main():
                             z_asinh=args.z_asinh, game=args.game,
                             emb_ln=args.emb_ln,
                             value_residual=args.value_residual,
-                            final_ln=args.final_ln, dwa=args.dwa,
+                            final_ln=args.final_ln,
                             trunk_arch=args.trunk_arch)
         if args.depth_init:
             from policy import apply_depth_init
@@ -1744,13 +1734,11 @@ def main():
     print(f"readout trunk: {policy.arch['trunk_arch']} "
           f"(hidden {policy.arch.get('trunk_hidden')}) — {n_trunk:,} params",
           flush=True)
-    _opts_on = [k for k in ("emb_ln", "value_residual", "final_ln", "dwa")
+    _opts_on = [k for k in ("emb_ln", "value_residual", "final_ln")
                 if policy.arch.get(k)]
     if _opts_on or policy.arch["trunk_arch"] != "simba":
         print(f"arch options: {', '.join(_opts_on) or '-'}; trunk "
-              f"{policy.arch['trunk_arch']}"
-              + (" (DWA: delayed-residual / fused next-LN bypassed)"
-                 if policy.arch.get("dwa") else ""), flush=True)
+              f"{policy.arch['trunk_arch']}", flush=True)
     policy = policy.to(device)
     policy.fp16 = args.fp16 == "all"
     if args.fp16 != "off":
