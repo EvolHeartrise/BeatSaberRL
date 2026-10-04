@@ -484,7 +484,7 @@ class Block(nn.Module):
     """
 
     def __init__(self, d: int, n_heads: int = 1, ffn_mult: int = 2,
-                 value_residual: bool = False, dwa_n: int = 0):
+                 value_residual: bool = False):
         super().__init__()
         assert d % n_heads == 0, f"embed {d} not divisible by {n_heads} heads"
         # FusedLayerNorm == nn.LayerNorm in state_dict/params; on CUDA
@@ -514,17 +514,6 @@ class Block(nn.Module):
             self.vres_b = nn.Parameter(torch.zeros(1))
         else:
             self.vres_a = self.vres_b = None
-        # --dwa (DenseFormer depth-weighted average, arXiv 2402.02622; arch
-        # "dwa"): this block's output stream is sum_j w_j x_j over
-        # [embedding, block 0 out, ..., this block's out] (dwa_n = its
-        # index + 2 entries), initialised to the identity (w = e_last).
-        # 1-D, so it lands on Adam and outside --weight-decay.
-        if dwa_n:
-            w = torch.zeros(dwa_n)
-            w[-1] = 1.0
-            self.dwa = nn.Parameter(w)
-        else:
-            self.dwa = None
 
     def forward(self, x: torch.Tensor, key_mask: torch.Tensor,
                 n_queries: int = 0, attn_bias: torch.Tensor | None = None,
@@ -532,8 +521,7 @@ class Block(nn.Module):
                 delta_bias: torch.Tensor | None = None,
                 want_resolved: bool = False,
                 next_ln: nn.Module | None = None,
-                v0: torch.Tensor | None = None, want_v: bool = False,
-                resolve: bool = False):
+                v0: torch.Tensor | None = None, want_v: bool = False):
         # x: (B, T, d); key_mask: (B, T), 1 = attendable
         #
         # n_queries > 0 computes the block's output for only the first
@@ -581,10 +569,6 @@ class Block(nn.Module):
         # packed gradient back); elsewhere the packed q|k|v / k|v buffer is
         # rebuilt with the mixed v.
         # want_v (block 0, non-final): also return its v as a 4th element.
-        # resolve (non-final, --dwa): return the RESOLVED output
-        # (x + ffn(h2), the final block's residual-only FFN path) as
-        # (x_out, None, None) — no delayed residual, no next-LN fusion —
-        # so the caller can form the depth-weighted average.
         B, T, _ = x.shape
         if delta_bias is _LN_DONE:
             h = delta
@@ -710,14 +694,6 @@ class Block(nn.Module):
             else:
                 out = x + _seq(self.ffn, h2)
             return (out, x_full) if want_resolved else out
-        if resolve:
-            # --dwa: the resolved stream (the final block's residual-only
-            # FFN path; the fused kernel without the LN where it applies)
-            if _fl.fused_ffn_ok(h2, self.ffn):
-                out = _fl.fused_ffn(x, h2, self.ffn)
-            else:
-                out = x + _seq(self.ffn, h2)
-            return (out, None, None, v_own) if want_v else (out, None, None)
         if next_ln is not None and _fl.fused_ffn_ok(h2, self.ffn, next_ln):
             # --fused-ffn: FFN + residual + the next block's ln_attn in one
             # kernel; the hidden never reaches memory in the rollout
@@ -755,18 +731,6 @@ class _VMix(torch.autograd.Function):
         da = (gf * v.float()).sum().view(1) if ctx.needs_input_grad[2] else None
         db = (gf * v0.float()).sum().view(1) if ctx.needs_input_grad[3] else None
         return dv, dv0, da, db
-
-
-def _dwa_mix(w: torch.Tensor, xs: list) -> torch.Tensor:
-    """--dwa depth-weighted average sum_j w[j] xs[j] (DenseFormer): fp32
-    accumulation (one addcmul per term), rounded once to the stream
-    dtype. Exactly xs[-1] at the identity init w = e_last (0 * x = 0,
-    0 + x = x), so an identity-initialised DWA policy computes the
-    baseline's resolved stream bit for bit on the fp32 path."""
-    y = xs[0].float() * w[0]
-    for j in range(1, len(xs)):
-        y = torch.addcmul(y, xs[j], w[j])
-    return y.to(xs[-1].dtype)
 
 
 def _l2n(x: torch.Tensor) -> torch.Tensor:
@@ -832,8 +796,7 @@ class NotePolicy(nn.Module):
                  z_asinh: float = 8.0, game: str = "standard",
                  fp16_accum: str = "off", fused_ffn: str = "off",
                  emb_ln: bool = False, value_residual: bool = False,
-                 final_ln: bool = False, dwa: bool = False,
-                 trunk_arch: str = "simba"):
+                 final_ln: bool = False, trunk_arch: str = "simba"):
         super().__init__()
         if trunk_arch not in TRUNK_ARCHS:
             raise ValueError(f"trunk_arch must be one of {TRUNK_ARCHS}, "
@@ -928,12 +891,12 @@ class NotePolicy(nn.Module):
                      # default, absent = off): LayerNorm on the 29 input
                      # tokens (--emb-ln), ResFormer value residual
                      # (--value-residual), LayerNorm on the 5 lead
-                     # outputs before the trunk (--final-ln), DenseFormer
-                     # depth-weighted averages (--dwa)
+                     # outputs before the trunk (--final-ln). (--dwa,
+                     # DenseFormer, lost the A/B and was removed
+                     # 2026-10-04; load_policy refuses its checkpoints.)
                      "emb_ln": bool(emb_ln),
                      "value_residual": bool(value_residual),
-                     "final_ln": bool(final_ln),
-                     "dwa": bool(dwa)}
+                     "final_ln": bool(final_ln)}
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -963,7 +926,6 @@ class NotePolicy(nn.Module):
         # scalars draw no RNG), so an all-off policy has today's
         # parameters, order and init stream exactly.
         self.value_residual = bool(value_residual)
-        self.dwa_on = bool(dwa)
         # --emb-ln: LayerNorm (learnable gain/bias) on the 29 input tokens
         # before block 0 — block 0 writes 15-27x the embeddings' RMS, so
         # the raw input barely survives in the stream. Registered before
@@ -971,8 +933,7 @@ class NotePolicy(nn.Module):
         self.emb_ln = FusedLayerNorm(embed) if emb_ln else None
         self.blocks = nn.ModuleList(
             Block(embed, n_heads, ffn_mult,
-                  value_residual=bool(value_residual) and i > 0,
-                  dwa_n=(i + 2) if dwa else 0)
+                  value_residual=bool(value_residual) and i > 0)
             for i in range(n_blocks))
         # --final-ln: LayerNorm on the 5 lead tokens' final-block outputs
         # before trunk_proj (they enter it at RMS ~30 otherwise)
@@ -1251,26 +1212,16 @@ class NotePolicy(nn.Module):
         # --value-residual: block 0 hands back its attention values v_0;
         # every later block mixes them in (Block.forward v0)
         v0 = None
-        # --dwa: every block returns its RESOLVED output (resolve=True:
-        # no delayed residual add, no fused next-LN — the DWA needs each
-        # x_j materialised); the stream entering block i + 1 is the
-        # depth-weighted average over [x_0 = the embedding, x_1..x_{i+1}]
-        dwa = self.dwa_on
-        xs = [tokens] if dwa else None
         for i, blk in enumerate(self.blocks[:-1]):
-            if dwa or self.value_residual:
+            if self.value_residual:
                 r = blk(tokens, None, attn_bias=attn_bias, delta=delta,
                         delta_bias=delta_b,
-                        next_ln=None if dwa else self.blocks[i + 1].ln_attn,
-                        v0=v0, want_v=self.value_residual and i == 0,
-                        resolve=dwa)
+                        next_ln=self.blocks[i + 1].ln_attn,
+                        v0=v0, want_v=i == 0)
                 if len(r) == 4:
                     tokens, delta, delta_b, v0 = r
                 else:
                     tokens, delta, delta_b = r
-                if dwa:
-                    xs.append(tokens)
-                    tokens = _dwa_mix(blk.dwa, xs)
                 continue
             tokens, delta, delta_b = blk(tokens, None, attn_bias=attn_bias,
                                          delta=delta, delta_bias=delta_b,
@@ -1296,16 +1247,10 @@ class NotePolicy(nn.Module):
         # there). fp16: the value moves at fp16-rounding level, the
         # class already accepted for the actor; r1 is untouched (the
         # value is not in the ratio). Pinned by tests/test_critic_fp16.
-        # (--dwa: x_res is the mixed stream entering the final block)
         tokens, x_res = self.blocks[-1](tokens, None, n_queries=self.n_lead,
                                         attn_bias=attn_bias, delta=delta,
                                         delta_bias=delta_b,
                                         want_resolved=True, v0=v0)
-        if dwa:
-            # the final block exists for the lead rows only: its mix runs
-            # over the lead rows of every earlier x_j
-            tokens = _dwa_mix(self.blocks[-1].dwa,
-                              [x[:, :self.n_lead] for x in xs] + [tokens])
         if self.final_ln is not None:
             tokens = self.final_ln(tokens)               # --final-ln
         h = self._trunk(tokens.reshape(B, -1))          # lead-token readout
@@ -1613,6 +1558,11 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
             "opt-in 'simbav2', 2026-10-03; the plain MLP trunk was "
             "removed, no back-compat). Check out a commit before "
             "2026-09-22 to bench or replay it.")
+    if arch.get("dwa"):
+        raise ValueError(
+            "checkpoint uses --dwa (DenseFormer depth-weighted averages), "
+            "which lost the 2026-10-03 architecture A/B and was removed "
+            "2026-10-04; no code path can rebuild it")
     policy = NotePolicy(
         embed=arch["embed"], trunk_dim=arch["trunk_dim"],
         n_blocks=arch["n_blocks"], n_heads=arch["n_heads"],
@@ -1632,7 +1582,6 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         emb_ln=arch.get("emb_ln", False),
         value_residual=arch.get("value_residual", False),
         final_ln=arch.get("final_ln", False),
-        dwa=arch.get("dwa", False),
         trunk_arch=arch["trunk_arch"])
     sd = ckpt["state_dict"]
     policy.upgraded_from = None
