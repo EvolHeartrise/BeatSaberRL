@@ -39,9 +39,9 @@ from datetime import datetime
 
 import numpy as np
 
-# env v47 --ep-stats row layout (float32; reader: ep_stats.py)
-EP_STATS_COLS = 16   # chart_idx, leaderboard_id, max_pp, max_score, ticks, fell, completed,
-                     # cw_score, acc, pp, max_combo, breaks, good, bad, miss, ep_return
+# env v47 --ep-stats row layout (float32; v2 since 2026-10-04 = header row
+# + the 16 v1 cols, update, 12 per-hand swing cols — see ep_stats.py)
+from ep_stats import EP_STATS_COLS, EpStatsWriter, build_rows as ep_stats_rows
 import torch
 import torch.nn as nn
 
@@ -2184,9 +2184,23 @@ def main():
                      "(the pool carries the per-level max score / max PP)")
         ep_meta = {k: venv.pool[k].cpu().numpy()
                    for k in ("level_lb", "level_max_pp", "level_max_score")}
+        ep_stats_w = EpStatsWriter(args.run_dir)
         print(f"--ep-stats: combo walk in the training envs; per-episode "
-              f"score/acc/PP rows -> {ep_stats_path} "
-              f"({EP_STATS_COLS} float32 cols)", flush=True)
+              f"score/acc/PP + per-hand swing rows -> {ep_stats_path} "
+              f"(v2: header + {EP_STATS_COLS} float32 cols)", flush=True)
+        # 2026-10-04: chart_idx -> level sidecar (song, SS / BL ids, stars,
+        # max scores, BL ratings, NPS, mirrored) for the dashboard's swing
+        # table + best-possible PP totals (python/swing_summary.py).
+        # Telemetry only: a failure never stops the run.
+        try:
+            from beat_arena_env.ranked_pool import write_levels_json
+            write_levels_json(
+                os.path.join(args.run_dir, "levels.json"), args.catalog,
+                lead_s=args.lead_s, mirror=args.mirror_augment,
+                sample=args.chart_pool, seed=args.seed,
+                expect=ep_meta, log=print)
+        except Exception as e:  # noqa: BLE001
+            print(f"--ep-stats: levels.json not written: {e!r}", flush=True)
     if args.tau_rand > 0.0 and getattr(venv, "tau_rand", 0.0) > 0.0:
         # printed only when the env actually draws (the flux Rust env
         # does not); the per-episode log needs the CUDA pop_episodes
@@ -2994,24 +3008,10 @@ def main():
             m_ev.update(tau_episodes=tau_n_episodes)
         if args.ep_stats and rows is not None and rows.shape[0]:
             # env v47: per-episode score -> accuracy -> PP at the level's
-            # max_pp (API maxPP), the bench's own curve (scoresaber.py)
-            from beat_arena_env.scoresaber import pp_multiplier
-            ci = rows[:, 21].astype(np.int64)
-            max_score = ep_meta["level_max_score"][ci]
-            acc = np.where(max_score > 0, rows[:, 22] / np.maximum(max_score, 1.0), 0.0)
-            acc = np.clip(acc, 0.0, 1.0)
-            completed = rows[:, 25] > 0.5
-            pp = np.array([pp_multiplier(float(x)) for x in acc], dtype=np.float32) \
-                * ep_meta["level_max_pp"][ci]
-            pp = np.where(completed, pp, 0.0)   # an unfinished map scores no PP
-            er = np.column_stack([
-                rows[:, 21], ep_meta["level_lb"][ci].astype(np.float32),
-                ep_meta["level_max_pp"][ci], max_score,
-                rows[:, 16], rows[:, 18], rows[:, 25], rows[:, 22], acc, pp,
-                rows[:, 23], rows[:, 24], rows[:, 19], rows[:, 26], rows[:, 27],
-                rows[:, 17]]).astype(np.float32)
-            with open(ep_stats_path, "ab") as f:
-                f.write(np.ascontiguousarray(er).tobytes())
+            # max_pp (API maxPP), the bench's own curve (scoresaber.py);
+            # v2 (2026-10-04) adds the update index + per-hand swing parts
+            er = ep_stats_rows(rows, ep_meta, update + 1)   # = metrics upd
+            ep_stats_w.append(er)
             ep_stats_n += int(er.shape[0])
             ep_stats_recent.append(er)
             if len(ep_stats_recent) > 400:

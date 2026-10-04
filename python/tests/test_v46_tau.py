@@ -298,16 +298,17 @@ def test_cuda_unit_scale_bit_identical_and_matches_rust_lanes():
 
 @cuda
 def test_cuda_pop_episodes_rows():
+    from beat_arena_env.cuda_env import EP_REC
     e = _cuda_env(32, tau_rand=0.25, seed=3, max_steps=40)
     e.reset()
     s = e.tau_scale.cpu().numpy().copy()
     act = torch.zeros((32, N_JOINTS), dtype=torch.int64, device="cuda")
-    rows = np.zeros((0, 28), dtype=np.float32)
+    rows = np.zeros((0, EP_REC), dtype=np.float32)
     for _ in range(45):                          # max_steps 40 -> every env ends once
         e.step(act)
         rows = np.concatenate([rows, e.pop_episodes()])
     assert rows.shape[0] >= 32
-    assert rows.shape[1] == 28
+    assert rows.shape[1] == EP_REC
     # the recorded body is the one that played (auto-reset redraws after)
     assert np.all(rows[:, :16] >= 0.75) and np.all(rows[:, :16] <= 1.25)
     assert np.all(rows[:, 16] >= 1)              # ep_ticks
@@ -315,4 +316,4 @@ def test_cuda_pop_episodes_rows():
     first = rows[:32]
     # first 32 rows: one per env, bodies match the reset draw
     assert sorted(first[:, 21].tolist()) == sorted(e.chart_idx.cpu().numpy().tolist()) or True
-    assert e.pop_episodes().shape == (0, 28)
+    assert e.pop_episodes().shape == (0, EP_REC)

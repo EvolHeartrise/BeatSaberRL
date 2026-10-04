@@ -74,6 +74,31 @@ served by serve.py: idle refreshes must not redraw or reset a zoom
   do arrive the plots update in place: a zoomed view keeps its window
   and redraws, a full-run view extends to the new tail. Switching run
   rebuilds the plots (no inherited zoom).
+- **Swing** (2026-10-04) — per-level swing quality over the ranked
+  catalogue and the run's best-possible PP, from `<run>/swing.json`
+  (`python/swing_summary.py`; runs with an `ep_stats.f32`). Four tiles:
+  the best-possible **SS WPP / SS UPP / BL WPP / BL UPP** — each level's
+  best completed play of the whole run, per leaderboard, with the bench's
+  accuracy definitions (scoring v4: SS acc against the SS API maxScore,
+  BL against its own, both falling back to the env's computed max;
+  WPP = descending × 0.965^i, UPP = sum; shared levels on both boards,
+  a mirrored training copy merged with its original), next to the run's
+  best bench. A sortable table (default: lowest pre-swing first; missing
+  values sort last), 200 rows at a time: song, difficulty, SS / BL
+  stars, NPS (scoreable notes / song length), completed plays in the
+  window, completed / attempted over the run, mean accuracy, and pre-swing
+  (/70), post-swing (/30), precision (/15) as % of max, overall and L / R,
+  plus each level's best SS / BL pp and the update it came from. Window:
+  the last 1 / 5 / 20 completed plays per level, the completed plays of
+  the last 100 / 500 updates, or the whole run. Only COMPLETED plays (the
+  level's end reached: no fall, tilt, envelope or tick cap) count. Old
+  runs (ep_stats v1, before 2026-10-04) show plays, accuracy and the
+  totals with the swing columns marked unavailable; their update windows
+  come from the trainer's metrics.jsonl `ep_stats_episodes` counter when
+  it is consistent. Same refresh rules as Live: an unchanged swing.json
+  (ETag 304 / same bytes) touches nothing — sort, filter, window and the
+  scroll position stay — and new data updates the keyed rows in place
+  (scroll anchoring is off so the page does not follow a moved row).
 - **Compare** — tick any runs (filter box), align on samples (default)
   / updates / wall; small multiples per metric (acc, return, ent, entfull,
   ev, steps/s, falls / 1M and tilts / 1M on log axes, clipfrac, KL, gnorm,
@@ -85,7 +110,8 @@ served by serve.py: idle refreshes must not redraw or reset a zoom
   delta vs the reference.
 - **Runs** — sortable table from index.json: campaign, run, status,
   samples, updates, wall, steps/s, peak VRAM, final acc/return/ent,
-  best bench upp/wpp, checkpoint count, last seen. Click a row to add
+  best bench upp/wpp, the training best-possible SS / BL upp (Swing
+  totals), checkpoint count, last seen. Click a row to add
   it to Compare. Links: metrics.jsonl, first log, bench JSON (archive
   copies are links; repo-only copies are named), replay dir + the 3D
   viewer (`/replay.html`, drop a replay file in), run dir listing.
@@ -105,6 +131,37 @@ into `~/beat-arena-volume-backup/beat-arena-flux/runs/`; replays from
 `python/make_flux_replays.py` go in that campaign's `replays/` and are
 linked by their `<tag>_bot…` names.
 
+## Swing data (swing.json, levels.json)
+
+Inputs, synced from the pod with the run dir: `ep_stats.f32` (v2: header
+row + 29 float32 cols, see `python/ep_stats.py`) and `levels.json` (the
+trainer writes it at startup under `--ep-stats`: `chart_level[c]` /
+`chart_mirrored[c]` per pool chart, `levels[]` with key, song, mapper,
+difficulty, n_notes, duration_s, nps, max_score (computed), `ss` {id,
+stars, max_pp, max_score} and `bl` {id, stars, pass, acc, tech,
+max_score}, null where that leaderboard does not rank the level). **A
+campaign's sync script must not exclude `*.f32` or `levels.json`** (the
+wb3 / arch scripts pull everything but `*.pt`, which is right; the older
+wb / wb2 / up16-ab ones excluded `*.f32`). For a run that predates the
+sidecar, `python/.venv/bin/python python/swing_summary.py --reconstruct
+<run_dir>` (or `--archive ~/beat-arena-volume-backup`) rebuilds it from
+args.json + the laptop's maps and refuses a table whose SS ids do not
+match the run's rows (done for every archive run on 2026-10-04).
+
+`metrics_backfill.py` calls `swing_summary.update_run` for every run dir
+with an `ep_stats.f32` on each pass: incremental (a `.swing_state.json` /
+`.swing_state.npz` pair next to the run keeps the byte offset, the
+whole-run sums, the last 20 completed plays per level and the plays of
+the last 500 updates; an unchanged file costs two stats), and swing.json
+is rewritten only when rows arrived. swing.json is columnar: `levels`
+{key, song, mapper, diff, ss_stars, bl_stars, ss_id, bl_id, nps, att,
+done, best_acc, ss_acc, ss_pp, bl_acc, bl_pp, best_upd}, `win` {n1, n5,
+n20, k100, k500, all: {plays, acc, pre, preL, preR, post, postL, postR,
+prec, precL, precR} — % values, null = no data / no swing columns},
+`windows` (key, label, available), `totals` {ss_wpp, ss_upp, bl_wpp,
+bl_upp, ss_levels, bl_levels}, plus rows / completed / last_update /
+ep_layout / swing / levels_source.
+
 ## index.json (per run)
 
 `id` (`<campaign>/<run>`), `campaign`, `run`, `run_dir`, `logs`,
@@ -119,8 +176,9 @@ wall), `wall_s` (sum of each invocation's final elapsed), `final`
 {acc, accL, accR, return, ep_return, ent, ev, entfull}, `sps` (median
 of the last 50 prints), `sps_total` (THROUGHPUT line), `peak_vram`,
 `bench` [{path, url, ckpt, wpp, upp, n_evaluated, scoring_version,
-updated}], `checkpoints` [{name, bytes}], `replays` (loose tag match —
-candidates), `git_commit` (always null: no archive log records one),
+updated, bl_wpp, bl_upp}], `checkpoints` [{name, bytes}], `replays` (loose tag match —
+candidates), `swing` (null without an ep_stats.f32: {path, ep_layout,
+swing, levels_source, rows, completed, last_update, n_levels, totals}), `git_commit` (always null: no archive log records one),
 `fields` (which metric keys this run has), `line_counts`.
 
 ## Metrics vocabulary (metrics.jsonl)

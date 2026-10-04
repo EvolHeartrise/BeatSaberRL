@@ -8,6 +8,7 @@ export const store = $state({
   error: null,
   metrics: {}, // run id -> {recs, at, bytes}
   loading: {}, // run id -> true while fetching
+  swingVer: {}, // run id -> bumped when that run's swing.json changed
 });
 
 const CANDIDATES = (() => {
@@ -172,4 +173,40 @@ export function archiveUrl(rel) {
   if (!rel) return null;
   if (rel.startsWith("/")) return null; // absolute repo path, not served
   return store.base + rel;
+}
+
+// Per-level swing summaries (swing.json, python/swing_summary.py): a few MB
+// of columnar arrays per run, so they live OUTSIDE the reactive store (a
+// $state proxy over 7k-element arrays costs on every read); the store only
+// carries a version number per run that views depend on. Same two-layer
+// change detection as metrics: a 304 or identical bytes leave the version
+// alone, so an idle refresh re-derives nothing (table sort / scroll stay).
+const swingData = new Map(); // run id -> parsed swing.json
+const swingBusy = new Set();
+
+export function swingOf(id) {
+  return id != null && store.swingVer[id] != null ? swingData.get(id) ?? null : null;
+}
+
+export async function loadSwing(run, { force = false } = {}) {
+  if (!run?.swing?.path) return null;
+  const cur = swingData.get(run.id);
+  if (cur && !force) return cur;
+  if (swingBusy.has(run.id)) return cur ?? null;
+  swingBusy.add(run.id);
+  const url = store.base + run.swing.path;
+  try {
+    const text = await fetchIfChanged(url, !!cur);
+    if (cur && (text == null || bodies.get(url) === text)) return cur;
+    const data = JSON.parse(text);
+    bodies.set(url, text);
+    swingData.set(run.id, data);
+    store.swingVer[run.id] = (store.swingVer[run.id] ?? 0) + 1;
+    return data;
+  } catch (e) {
+    store.error = `swing summary for ${run.id}: ${e.message}`;
+    return cur ?? null;
+  } finally {
+    swingBusy.delete(run.id);
+  }
 }
