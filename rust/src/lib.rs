@@ -260,8 +260,9 @@ const FLAIL_LEAD_S: Real = 1.0;
 // wrist-bend reversal telemetry (2026-09-22, user): a reversal is
 // counted when the wrist BEND axis (joints 8 / 15) turns back by
 // WREV_HYST from its running extreme (peak detection with hysteresis,
-// every tick). Mirrors the .cu twin exactly.
-const WREV_HYST: Real = 0.34906585;   // 20 deg
+// every tick). Mirrors the .cu twin exactly. 20 -> 60 deg (user,
+// 2026-10-04): only full swings count, not mid-size corrections.
+const WREV_HYST: Real = 1.0471975511965976;   // 60 deg (pi/3)
 // env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
 // env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
