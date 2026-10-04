@@ -495,6 +495,27 @@ against the run's own ids. The kernel change was written without nvcc:
 run `pytest tests/test_ep_parts.py tests/test_production_lockstep.py`
 on the pod before the next training run.
 
+**Wrist resets (2026-10-04, user):** per hand, every good note cut
+(notes, dots, chain heads; chain links are not hits) is classified by the
+sign of that hand's wrist-BEND angular velocity at the cut (joint 8 / 15
+only — not the note's arrow or the world swing direction), or the
+detector's committed direction when |qd| < 1 rad/s. A reversal of the
+bend motion is a 30° turn-back from the running extreme (angle-travel
+hysteresis `WRESET_HYST`, separate from the 60° `WREV_HYST`: 60° would
+miss resets with a short backswing, 30° stays above tremor). Hits of one
+continuous bend motion are one SWING (stacks, windows, sliders); a hit
+with the previous swing's sign and a reversal since the last hit is one
+RESET (any number of reversals in a break add at most one, and only when
+the next hit's sign matches); an opposite-sign hit is normal
+alternation. Bad cuts and misses neither break nor continue a swing.
+Rust (`WristReset`, `wrist_resets()` per episode) and the kernel agree
+tick by tick (`test_production_lockstep`). Outputs: episode-record cols
+40..43 (`EP_REC = 44`) -> `ep_stats.f32` layout v3 (+4 cols; a v2 file is
+upgraded in place on resume) -> `swing_summary.py` per-level `wrs` /
+`wrsL` / `wrsR` (resets per 100 swings) -> the dashboard Swing tab; and
+per update the `[wristreset]` line, `wreset` / `wreset_L` / `wreset_R`
+(per 100 swings) in metrics.jsonl and a Live panel.
+
 **Default-body search (`--tau-center` + `tau_fit.py`, 2026-09-19):** the
 τmax randomization draws `center × (1 ± r)` per axis (`--tau-center`, 16
 floats or group syntax; 1.0 = the `TAU_MAX` table; obs lanes stay

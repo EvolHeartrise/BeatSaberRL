@@ -56,6 +56,9 @@
     { key: "prec", label: "prec %", src: "win", f: pct, heat: true, swing: true, title: "precision (cut centre) points / 15 per note" },
     { key: "precL", label: "L", src: "win", f: pct, heat: true, swing: true },
     { key: "precR", label: "R", src: "win", f: pct, heat: true, swing: true },
+    { key: "wrs", label: "resets/100", src: "win", f: pct, heatUp: true, wrs: true, title: "wrist resets per 100 swings, both hands: a hit whose bend-velocity sign equals the previous swing's, with a ≥ 30° reversal of the bend in between (good note cuts; hits of one continuous bend motion are one swing)" },
+    { key: "wrsL", label: "L", src: "win", f: pct, heatUp: true, wrs: true, title: "wrist resets per 100 swings, left hand" },
+    { key: "wrsR", label: "R", src: "win", f: pct, heatUp: true, wrs: true, title: "wrist resets per 100 swings, right hand" },
     { key: "ss_pp", label: "best SS pp", src: "lv", f: (v) => (v == null ? "—" : v.toFixed(1)), title: "best completed play of the run, ScoreSaber" },
     { key: "bl_pp", label: "best BL pp", src: "lv", f: (v) => (v == null ? "—" : v.toFixed(1)), title: "best completed play of the run, BeatLeader" },
     { key: "best_upd", label: "best @upd", src: "lv", f: (v) => v ?? "—" },
@@ -108,6 +111,12 @@
   function heat(v) {
     if (v == null) return "";
     const a = Math.max(0, Math.min(60, (100 - v) * 2.5));
+    return `background: color-mix(in srgb, var(--bad) ${a.toFixed(0)}%, transparent)`;
+  }
+  // higher = worse (wrist resets per 100 swings): 24 / 100 is full tint
+  function heatUp(v) {
+    if (v == null) return "";
+    const a = Math.max(0, Math.min(60, v * 2.5));
     return `background: color-mix(in srgb, var(--bad) ${a.toFixed(0)}%, transparent)`;
   }
 
@@ -185,7 +194,8 @@
     · {data.n_levels.toLocaleString()} levels
     {#if data.last_update != null}· last update {data.last_update.toLocaleString()}{/if}
     · ep_stats v{data.ep_layout} · levels {data.levels_source ?? "unresolved (SS ids only)"}
-    {#if !data.swing}<span class="warn">swing columns unavailable: this run's ep_stats rows predate the per-hand swing log (2026-10-04)</span>{/if}
+    {#if !data.swing}<span class="warn">swing columns unavailable: this run's ep_stats rows predate the per-hand swing log (2026-10-04)</span>
+    {:else if !data.wreset}<span class="warn">wrist-reset columns unavailable: this run's ep_stats rows predate layout v3 (2026-10-04)</span>{/if}
   </div>
 
   <div class="tablewrap">
@@ -194,7 +204,7 @@
         <tr>
           <th class="num">#</th>
           {#each COLS as c (c.key)}
-            <th class:num={!c.text} class:dim={c.swing && !data.swing} title={c.src === "win" && c.key !== "plays" && stat === "best" ? `${c.title ?? c.label} — of the window's best play (highest accuracy)` : c.title} onclick={() => sortBy(c.key)}>{c.label}{activeSort === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>
+            <th class:num={!c.text} class:dim={(c.swing && !data.swing) || (c.wrs && !data.wreset)} title={c.src === "win" && c.key !== "plays" && stat === "best" ? `${c.title ?? c.label} — of the window's best play (highest accuracy)` : c.title} onclick={() => sortBy(c.key)}>{c.label}{activeSort === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>
           {/each}
         </tr>
       </thead>
@@ -209,7 +219,7 @@
               {:else if c.key === "done"}
                 <td class="num">{data.levels.done[i]}/{data.levels.att[i]}</td>
               {:else}
-                <td class:num={!c.text} style={c.heat ? heat(v) : ""}>{c.f ? c.f(v) : (v ?? "—")}</td>
+                <td class:num={!c.text} style={c.heat ? heat(v) : c.heatUp ? heatUp(v) : ""}>{c.f ? c.f(v) : (v ?? "—")}</td>
               {/if}
             {/each}
           </tr>
