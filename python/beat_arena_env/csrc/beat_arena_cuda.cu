@@ -1123,10 +1123,11 @@ __device__ constexpr double TAU_MAX[NQ] = {
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50};
 // wrist bend 50 -> 65 -> 90 rad/s (main's v63x2 body since 2026-10-03)
+// exp/bend7 (user 2026-10-04, branch only): bend 90 -> 105 rad/s
 __device__ constexpr double OMEGA_CAP[NQ] = {
     16.0, 16.0, 16.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 105.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 105.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0};
 __device__ constexpr double DAMPING[NQ] = {
@@ -1566,10 +1567,15 @@ __device__ constexpr double FINE_GEAR_MULT[NQ] = {
 // per-joint EXTRA gears (2026-10-04, lib.rs JOINT_EXTRA_N / _FRAC
 // mirror): signed fractions for joint j's ids gears, gears+1, ...; none
 // on main, so every joint keeps its `gears` ids
+// exp/bend7 (user 2026-10-04, branch only): the wrist bends (8, 15) get
+// +/-1/4 at ids gears, gears+1 — 7 gears at --gears 5
 __device__ constexpr int JOINT_EXTRA_N[NQ] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 2, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-__device__ constexpr double JOINT_EXTRA_FRAC[NQ][4] = {};
+__device__ constexpr double JOINT_EXTRA_FRAC[NQ][4] = {
+    {}, {}, {}, {}, {}, {}, {}, {}, {0.25, -0.25, 0.0, 0.0}, {}, {}, {},
+    {}, {}, {}, {0.25, -0.25, 0.0, 0.0}, {}, {}, {}, {}, {}, {}, {}, {},
+    {}, {}, {}, {}, {}};
 
 // note kinds (constants.py)
 // KIND_NOTE=0, KIND_BOMB=1, KIND_CHAIN_HEAD=2, KIND_CHAIN_LINK=3 —

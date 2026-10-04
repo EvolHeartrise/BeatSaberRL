@@ -90,7 +90,10 @@ def test_per_head_entropy_is_bounded_by_ln_k():
     pol = _policy()
     obs = torch.randn(16, OBS_DIM) * 0.7
     pol.get_action_and_value(obs)
-    assert pol._ent_h.max().item() <= math.log(3) + 1e-6
+    # per head: ln of that head's own gear count (exp/bend7: 7 on the
+    # bends at K=5, 5 at K=3)
+    bound = torch.tensor([math.log(k) for k in pol.head_sizes])
+    assert (pol._ent_h <= bound + 1e-6).all()
     assert pol._ent_h.min().item() >= -1e-6
 
 

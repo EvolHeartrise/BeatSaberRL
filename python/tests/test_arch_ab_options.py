@@ -85,7 +85,8 @@ def test_all_off_is_bit_identical_to_the_pre_option_policy(tmp_path):
         pytest.skip("policy.py at git 1ac0254 unavailable")
     torch.manual_seed(0)
     old = old_mod.NotePolicy(**KW)
-    new = _pol()
+    # exp/bend7: the pre-option policy had uniform heads
+    new = _pol(head_gears=(5,) * P.N_ACTION_HEADS)
     # same parameters, same order, same init stream
     so, sn = old.state_dict(), new.state_dict()
     assert list(so) == list(sn)
@@ -176,7 +177,7 @@ def test_vmix_function_matches_plain_autograd():
 def test_non_equivalent_options_are_finite_and_train_everything(name):
     p = _pol(**OPTS[name])
     lg, v = _fwd_bwd(p, _obs())
-    assert lg.shape == (16, P.N_ACTION_HEADS, 5) and v.shape == (16,)
+    assert lg.shape == (16, P.N_ACTION_HEADS, p.k_max) and v.shape == (16,)
     assert torch.isfinite(lg).all() and torch.isfinite(v).all()
     for n, q in p.named_parameters():
         if not q.requires_grad:

@@ -406,6 +406,11 @@ def test_pre_i07_checkpoint_output_is_unchanged(tmp_path, monkeypatch):
     torch.manual_seed(2)
     old = old_mod.NotePolicy(**_SMALL)
     ck = {"state_dict": old.state_dict(), "arch": dict(old.arch)}
+    if C.joint_gear_counts(old.n_gears) != (old.n_gears,) * C.N_JOINTS:
+        # exp/bend7: a uniform-gear checkpoint cannot run on this build
+        with pytest.raises(SystemExit, match="per-joint gear counts"):
+            load_policy(ck)
+        pytest.skip("uniform pre-I07 checkpoint refused on this gear layout")
     new = load_policy(ck)
     obs = _real_obs(n=12, seed=3)
     assert obs[:, P._OBS_HEAD_Z].abs().max() > 1e-4, "want a live z_off"

@@ -16,8 +16,22 @@ import pytest
 from beat_arena_env import RustBeatEnv
 from beat_arena_env.chart import Note, note_tuple
 from beat_arena_env.constants import (
-    GEAR_MAGS, N_JOINTS, OFF_QD, TAU_MAX, gear_table, q_lane,
+    GEAR_MAGS, N_JOINTS, OFF_QD, TAU_MAX, gear_table, joint_gear_counts,
+    joint_gear_table, q_lane,
 )
+
+
+def _ks():
+    """The base tables this build can run (exp/bend7: its bend extras do
+    not fit on K=7)."""
+    out = []
+    for k in (3, 5, 7):
+        try:
+            joint_gear_counts(k)
+        except ValueError:
+            continue
+        out.append(k)
+    return out
 from beat_arena_rs import RawBeatSim
 
 COAST = [0] * N_JOINTS
@@ -73,12 +87,17 @@ def test_gear_torque_scaling():
         obs, _, _, _ = sim.step(act)
         return _qd_obs(obs, R_BEND)
 
-    base = om_after(7, 0)
-    full, third, eighth = om_after(7, 1), om_after(7, 3), om_after(7, 5)
-    neg_full = om_after(7, 2)
-    quarter = om_after(5, 3)
-    assert full - base > third - base > eighth - base > 0.0
-    assert third - base > quarter - base > eighth - base
+    # every positive bend gear of every base table this build runs,
+    # ordered by its fraction (exp/bend7, K=5: +1 > +1/2 > +1/4)
+    base = om_after(5, 0)
+    for k in _ks():
+        t = joint_gear_table(k, R_BEND)
+        pos = sorted((i for i in range(len(t)) if t[i] > 0),
+                     key=lambda i: -t[i])
+        d = [om_after(k, i) - base for i in pos]
+        assert all(a > b for a, b in zip(d, d[1:])) and d[-1] > 0.0, (k, d)
+    full = om_after(5, 1)
+    neg_full = om_after(5, 2)
     assert neg_full - base < 0.0
     # +full and -full are roughly symmetric about the coast baseline
     # (gravity assists the - direction on the bend, so the band is wide)
@@ -115,7 +134,7 @@ def test_ternary_prefix_identical_across_k():
     rng = np.random.default_rng(7)
     acts = rng.integers(0, 3, size=(90, N_JOINTS))
     streams = {}
-    for k in (3, 5, 7):
+    for k in _ks():
         sim = _sim(k)
         obs_l, rew_l = [], []
         for a in acts:
@@ -123,14 +142,14 @@ def test_ternary_prefix_identical_across_k():
             obs_l.append(np.asarray(obs).copy())
             rew_l.append(r)
         streams[k] = (obs_l, rew_l)
-    for k in (5, 7):
+    for k in _ks()[1:]:
         np.testing.assert_array_equal(streams[3][0], streams[k][0])
         assert streams[3][1] == streams[k][1]
 
 
 def test_env_action_space_and_header():
     env = RustBeatEnv(gears=5, seed=0)
-    assert list(env.action_space.nvec) == [5] * N_JOINTS
+    assert list(env.action_space.nvec) == list(joint_gear_counts(5))
     with pytest.raises(AssertionError):
         RustBeatEnv(gears=4)
 
@@ -144,14 +163,15 @@ def test_policy_head_width_roundtrip():
 
     env = RustBeatEnv(gears=5, seed=0, chart_len_s=6.0)
     obs, _ = env.reset()
-    for k in (3, 5, 7):
+    for k in _ks():
         torch.manual_seed(0)
         policy = NotePolicy(n_gears=k)
-        assert policy.head_sizes == (k,) * N_JOINTS
+        assert policy.head_sizes == joint_gear_counts(k)
         with torch.no_grad():
             logits, value = policy.forward_stacked(
                 torch.as_tensor(obs).unsqueeze(0))
-        assert logits.shape == (1, N_JOINTS, k) and value.shape == (1,)
+        assert logits.shape == (1, N_JOINTS, max(joint_gear_counts(k)))
+        assert value.shape == (1,)
         ck = {"state_dict": policy.state_dict(), "arch": policy.arch}
         p2 = load_policy(ck)
         assert p2.n_gears == k and p2.arch == policy.arch
@@ -187,7 +207,7 @@ def test_gears_cuda_parity():
     acts = rng.integers(0, 3, size=(2, 1, N_JOINTS))
 
     streams = {}
-    for k in (3, 5, 7):
+    for k in _ks():
         env = CudaBeatVecEnv(1, charts=[[n_far]], max_steps=690,
                              device="cuda", dtype=torch.float64,
                              auto_reset=False, gears=k,
@@ -198,7 +218,7 @@ def test_gears_cuda_parity():
             obs, r, _d, _ = env.step(torch.as_tensor(acts[t]))
             obs_l.append(obs[0].cpu().numpy().copy())
         streams[k] = obs_l
-    for k in (5, 7):
+    for k in _ks()[1:]:
         np.testing.assert_array_equal(streams[3], streams[k])
 
     # (b) vs Rust, production table, 2 gentle ticks from neutral
