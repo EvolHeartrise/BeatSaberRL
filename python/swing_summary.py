@@ -62,7 +62,7 @@ import ep_stats as es  # noqa: E402
 
 SWING_FORMAT = "beat-arena-swing"
 SWING_VERSION = 1
-STATE_VERSION = 4   # 2: the best-possible history; 3/4: v1 update index chained across restarts / from episode ticks (2026-10-04)
+STATE_VERSION = 5   # 2: best-possible history; 3/4: v1 update index; 5: best-play stats (2026-10-04)
 N_WINDOWS = (1, 5, 20)
 K_WINDOWS = (100, 500)
 WINDOWS = ([("n%d" % n, "last %d play%s" % (n, "" if n == 1 else "s"))
@@ -322,10 +322,14 @@ class State:
         self.h_best = grow(getattr(self, "h_best", None), (L,), -1.0)
         self.h_ss = grow(getattr(self, "h_ss", None), (L,), np.nan)
         self.h_bl = grow(getattr(self, "h_bl", None), (L,), np.nan)
+        # the whole run's best play per level among plays WITH swing data
+        # (the Swing tab's "best" view): its accuracy and 12 swing cols
+        self.sw_best_acc = grow(getattr(self, "sw_best_acc", None), (L,), -1.0)
+        self.sw_best_part = grow(getattr(self, "sw_best_part", None), (L, 12), np.nan)
 
     ARRAYS = ("run_sum", "run_done", "run_att", "acc_sum", "best",
               "best_upd", "max_score", "tail_n", "tail_k",
-              "h_best", "h_ss", "h_bl", "hist")
+              "h_best", "h_ss", "h_bl", "hist", "sw_best_acc", "sw_best_part")
 
     def save(self, run_dir):
         meta = {"version": STATE_VERSION, "offset": self.offset,
@@ -499,6 +503,14 @@ def ingest(st, rows, ver, levmap, run_dir, best_only=False, total=None):
     st.best_upd[bl[better]] = bu[better]
     if best_only:
         return
+    # the best play per level of the plays folded here (by accuracy)
+    o2 = np.lexsort((acc, d_lev))
+    l2, a2, p2 = d_lev[o2], acc[o2], part[done][o2]
+    last2 = np.r_[l2[1:] != l2[:-1], True]
+    bl2, ba2, bp2 = l2[last2], a2[last2], p2[last2]
+    up = ba2 > st.sw_best_acc[bl2]
+    st.sw_best_acc[bl2[up]] = ba2[up]
+    st.sw_best_part[bl2[up]] = bp2[up]
     tail = np.column_stack([d_lev.astype(np.float64), seq[done], upd[done],
                             acc, part[done]])
     st.tail_n = _keep_last_n(np.concatenate([st.tail_n, tail]), N_RING)
@@ -602,6 +614,23 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
     avail = []
     S = len(seen)
 
+    def best_of(t):
+        """Per level the window's best play (highest accuracy): its swing
+        cols and accuracy, as window_stats input (one play each)."""
+        sums = np.full((S, 12), np.nan)
+        one = np.zeros(S)
+        accs = np.zeros(S)
+        if len(t):
+            j = np.array([idx.get(int(x), -1) for x in t[:, T_LEVEL]])
+            t, j = t[j >= 0], j[j >= 0]
+            o = np.lexsort((t[:, T_ACC], j))
+            t, j = t[o], j[o]
+            last = np.r_[j[1:] != j[:-1], True] if len(j) else np.zeros(0, bool)
+            sums[j[last]] = t[last, T_PART:]
+            one[j[last]] = 1.0
+            accs[j[last]] = t[last, T_ACC]
+        return sums, one, accs
+
     def from_tail(t):
         sums = np.zeros((S, 12))
         plays = np.zeros(S)
@@ -620,10 +649,13 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
         rank = _rank_from_end(tn[:, T_LEVEL])
     else:
         tn, rank = st.tail_n, np.zeros(0)
+    win_best = {}
     for key, label in WINDOWS:
         ok = True
+        bsrc = None
         if key.startswith("n"):
-            sums, plays, accs = from_tail(tn[rank < int(key[1:])])
+            bsrc = tn[rank < int(key[1:])]
+            sums, plays, accs = from_tail(bsrc)
         elif key.startswith("k"):
             K = int(key[1:])
             if st.last_update is None:
@@ -631,12 +663,24 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
                 sums, plays, accs = np.zeros((S, 12)), np.zeros(S), np.zeros(S)
             else:
                 t = st.tail_k
-                sums, plays, accs = from_tail(
-                    t[t[:, T_UPD] > st.last_update - K])
+                bsrc = t[t[:, T_UPD] > st.last_update - K]
+                sums, plays, accs = from_tail(bsrc)
         else:
             sums, plays, accs = (st.run_sum[seen], st.run_done[seen],
                                  st.acc_sum[seen])
         win[key] = window_stats(sums, plays, accs, swing_ok) if ok else None
+        if ok:
+            if bsrc is not None:
+                bs_, b1, ba = best_of(bsrc)
+            else:                                    # the whole run
+                bs_ = st.sw_best_part[seen]
+                ba = np.where(st.sw_best_acc[seen] >= 0, st.sw_best_acc[seen], 0.0)
+                b1 = (st.sw_best_acc[seen] >= 0).astype(float)
+            wb = window_stats(np.nan_to_num(bs_), b1, ba, swing_ok)
+            wb["plays"] = win[key]["plays"]          # the window's play count
+            win_best[key] = wb
+        else:
+            win_best[key] = None
         avail.append({"key": key, "label": label, "available": ok})
     tot = totals(pps_ss, pps_bl)
     tab = levmap.table or {}
@@ -654,6 +698,7 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
         "windows": avail,
         "levels": levels,
         "win": win,
+        "win_best": win_best,
     }
 
 
@@ -742,7 +787,7 @@ def update_run(run_dir, force=False, log=None):
         json.dump(hist, f, separators=(",", ":"))
     os.replace(tmp, os.path.join(run_dir, HIST_JSON))
     st.summary = {k: v for k, v in full.items()
-                  if k not in ("levels", "win")}
+                  if k not in ("levels", "win", "win_best")}
     st.save(run_dir)
     if log:
         log(f"[swing] {run_dir}: +{len(rows):,} rows ({st.n_rows:,} total, "

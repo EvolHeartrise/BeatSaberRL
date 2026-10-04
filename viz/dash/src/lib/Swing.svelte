@@ -13,6 +13,10 @@
 
   const WIN_KEY = "dash.swing.window";
   let winKey = $state((() => { try { return localStorage.getItem(WIN_KEY) || "n5"; } catch { return "n5"; } })());
+  // per-level stats as the window's mean, or its best play (highest
+  // accuracy: that play's own acc and swing %) — swing.json win / win_best
+  const STAT_KEY = "dash.swing.stat";
+  let stat = $state((() => { try { return localStorage.getItem(STAT_KEY) === "best" ? "best" : "mean"; } catch { return "mean"; } })());
   let sortKey = $state(null); // null = the default (pre-swing, or acc when the run has no swing columns)
   let sortDir = $state(1);
   let filter = $state("");
@@ -25,7 +29,7 @@
   const run = $derived(runId ? runById(runId) : newest);
   const ver = $derived(run ? store.swingVer[run.id] : undefined);
   const data = $derived(ver != null ? swingOf(run.id) : null);
-  const W = $derived(data?.win?.[winKey] ?? null);
+  const W = $derived((stat === "best" && data?.win_best ? data.win_best : data?.win)?.[winKey] ?? null);
   const bench = $derived.by(() => {
     let best = null;
     for (const b of run?.bench ?? []) if (!best || (b.upp ?? -1) > (best.upp ?? -1)) best = b;
@@ -42,7 +46,7 @@
     { key: "nps", label: "NPS", src: "lv", f: (v) => (v == null ? "—" : v.toFixed(2)), title: "scoreable notes / song length" },
     { key: "plays", label: "plays", src: "win", f: (v) => v ?? 0, title: "completed plays in the window" },
     { key: "done", label: "done/att", src: "lv", title: "whole run: completed / attempted (≥ 60 ticks)" },
-    { key: "acc", label: "acc %", src: "win", f: pct, heat: true, title: "mean accuracy (score / the env's max) over the window's plays" },
+    { key: "acc", label: "acc %", src: "win", f: pct, heat: true, title: "accuracy (score / the env's max)" },
     { key: "pre", label: "pre %", src: "win", f: pct, heat: true, swing: true, title: "pre-swing points / 70 per note" },
     { key: "preL", label: "L", src: "win", f: pct, heat: true, swing: true },
     { key: "preR", label: "R", src: "win", f: pct, heat: true, swing: true },
@@ -93,6 +97,10 @@
     if (activeSort === key) sortDir = -sortDir;
     else { sortKey = key; sortDir = 1; }
   }
+  function setStat(k) {
+    stat = k;
+    try { localStorage.setItem(STAT_KEY, k); } catch {}
+  }
   function setWin(k) {
     winKey = k;
     try { localStorage.setItem(WIN_KEY, k); } catch {}
@@ -136,6 +144,11 @@
     {#each data?.windows ?? [] as w (w.key)}
       <button class:on={winKey === w.key} disabled={!w.available} title={w.available ? "" : "no update index in this run's rows"} onclick={() => setWin(w.key)}>{w.label}</button>
     {/each}
+  </span>
+  <span class="wins" title="per-level stats: the mean over the window's plays, or the window's best play (highest accuracy) — that play's own accuracy and swing %">
+    stats:
+    <button class:on={stat === "mean"} onclick={() => setStat("mean")}>mean</button>
+    <button class:on={stat === "best"} disabled={!data?.win_best} onclick={() => setStat("best")}>best</button>
   </span>
   <select bind:value={board} title="leaderboard">
     <option value="all">all levels</option>
@@ -181,7 +194,7 @@
         <tr>
           <th class="num">#</th>
           {#each COLS as c (c.key)}
-            <th class:num={!c.text} class:dim={c.swing && !data.swing} title={c.title} onclick={() => sortBy(c.key)}>{c.label}{activeSort === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>
+            <th class:num={!c.text} class:dim={c.swing && !data.swing} title={c.src === "win" && c.key !== "plays" && stat === "best" ? `${c.title ?? c.label} — of the window's best play (highest accuracy)` : c.title} onclick={() => sortBy(c.key)}>{c.label}{activeSort === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>
           {/each}
         </tr>
       </thead>
