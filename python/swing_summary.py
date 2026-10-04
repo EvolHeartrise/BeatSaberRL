@@ -62,7 +62,7 @@ import ep_stats as es  # noqa: E402
 
 SWING_FORMAT = "beat-arena-swing"
 SWING_VERSION = 1
-STATE_VERSION = 2   # 2: the best-possible history (2026-10-04)
+STATE_VERSION = 4   # 2: the best-possible history; 3/4: v1 update index chained across restarts / from episode ticks (2026-10-04)
 N_WINDOWS = (1, 5, 20)
 K_WINDOWS = (100, 500)
 WINDOWS = ([("n%d" % n, "last %d play%s" % (n, "" if n == 1 else "s"))
@@ -201,43 +201,82 @@ class LevelMap:
 
 
 # ------------------------------------------------------ v1 update index
-def v1_updates(run_dir, seq0, n):
-    """Update index of v1 rows seq0..seq0+n-1 from the trainer's
-    metrics.jsonl `ep_stats_episodes` (cumulative rows after each update;
-    one trainer invocation per run dir). NaN where not recoverable."""
+def v1_updates(run_dir, seq0, n, ticks=None, tick0=0.0):
+    """Update index of v1 rows seq0..seq0+n-1 (the rows carry none), and
+    whether it is exact. NaN where not recoverable.
+
+    Exact: from metrics.jsonl `ep_stats_episodes` (rows written so far by
+    this trainer invocation, after each update). The counter restarts at
+    every invocation (a resume); the rows are appended in order, so the
+    counts chain across restarts: each restart continues from the previous
+    invocation's last count. (Checked on wb2_trunk and ab_on: the chained
+    total equals the file's rows exactly.)
+
+    Approximate (metrics that predate the counter): from the rows' own
+    episode lengths. Every update advances num_envs x horizon env-ticks,
+    and an episode's row is written when it ends, so the running sum of
+    the episode ticks written so far (tick0 + cumsum(ticks)) over
+    num_envs x horizon tracks the update count, behind it by the episodes
+    still in progress: R = E[L^2] / (2 E[L]) / horizon updates in steady
+    state (the mean residual of an episode in progress), ramping in from 0
+    — modelled as t = x + R (1 - exp(-t / R)), solved by iteration.
+    Checked against the exact counters: completed plays land within ~25
+    updates on single-invocation runs (about -100 per resume that retrains
+    updates, which the rows alone cannot reveal). Spreading rows evenly
+    over updates does not work: early training writes ~32k short fallen
+    episodes per update, late training a few hundred."""
     out = np.full(n, np.nan)
     p = os.path.join(run_dir, "metrics.jsonl")
     if n == 0 or not os.path.exists(p):
-        return out
-    upds, cnts = [], []
+        return out, True
+    upds, cnts, all_upd = [], [], []
     try:
         with open(p, encoding="utf-8") as f:
             for line in f:
-                if '"ep_stats_episodes"' not in line:
-                    continue
                 try:
                     r = json.loads(line)
                 except ValueError:
                     continue
-                upds.append(r["upd"])
-                cnts.append(r["ep_stats_episodes"])
+                if "upd" in r:
+                    all_upd.append(r["upd"])
+                if "ep_stats_episodes" in r:
+                    upds.append(r["upd"])
+                    cnts.append(r["ep_stats_episodes"])
     except OSError:
-        return out
-    # the counter restarts with each trainer invocation; a resumed run's
-    # v1 rows (ep_stats.v1.f32) are the FIRST invocation's, so keep the
-    # records up to the first reset
-    for i, (a, b) in enumerate(zip(cnts, cnts[1:])):
-        if b < a:
-            upds, cnts = upds[:i + 1], cnts[:i + 1]
-            break
-    if not cnts:
-        return out
-    cnts = np.asarray(cnts)
+        return out, True
     seq = np.arange(seq0, seq0 + n)
-    j = np.searchsorted(cnts, seq, side="right")
-    ok = j < len(cnts)
-    out[ok] = np.asarray(upds, np.float64)[j[ok]]
-    return out
+    if cnts:
+        chain, off, prev = [], 0, None
+        for c in cnts:
+            if prev is not None and c < prev:
+                off += prev                 # a restarted counter
+            chain.append(off + c)
+            prev = c
+        chain = np.asarray(chain)
+        j = np.searchsorted(chain, seq, side="right")
+        ok = j < len(chain)
+        out[ok] = np.asarray(upds, np.float64)[j[ok]]
+        return out, True
+    if ticks is not None and all_upd:
+        try:
+            with open(os.path.join(run_dir, "args.json"), encoding="utf-8") as f:
+                a = json.load(f)
+            a = a.get("resolved", a)
+            per_upd = float(a["num_envs"]) * float(a["horizon"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return out, True
+        lo, hi = min(all_upd), max(all_upd)
+        L = np.asarray(ticks, np.float64)
+        x = (tick0 + np.cumsum(L)) / per_upd
+        res = (float((L ** 2).mean()) / (2.0 * float(L.mean()))
+               / float(a["horizon"])) if L.size and L.mean() > 0 else 0.0
+        t = x.copy()
+        if res > 0:
+            for _ in range(30):
+                t = x + res * (1.0 - np.exp(-t / res))
+        out[:] = np.minimum(lo + np.floor(t), hi)
+        return out, False
+    return out, True
 
 
 # ---------------------------------------------------------------- state
@@ -256,6 +295,8 @@ class State:
         # [update, ss_wpp, ss_upp, bl_wpp, bl_upp], one row per update at
         # which the totals changed
         self.hist = np.zeros((0, 5))
+        self.hist_approx = False     # v1 update indices estimated (no counter)
+        self.v1_ticks = 0.0          # episode ticks of the v1 rows so far
         self.summary = None
         self.fallback = None
         self.v1_stat = None
@@ -293,7 +334,8 @@ class State:
                 "ep_stat": _stat(os.path.join(run_dir, "ep_stats.f32")),
                 "last_update": self.last_update, "n_rows": self.n_rows,
                 "n_done": self.n_done, "summary": self.summary,
-                "fallback": self.fallback, "v1_stat": self.v1_stat}
+                "fallback": self.fallback, "v1_stat": self.v1_stat,
+                "hist_approx": self.hist_approx, "v1_ticks": self.v1_ticks}
         tmp = os.path.join(run_dir, STATE_NPZ + ".tmp.npz")
         np.savez_compressed(tmp, **{k: getattr(self, k) for k in self.ARRAYS})
         os.replace(tmp, os.path.join(run_dir, STATE_NPZ))
@@ -321,7 +363,8 @@ class State:
         except (OSError, ValueError, KeyError):
             return None
         for k in ("offset", "seq", "layout", "levels_stat", "last_update",
-                  "n_rows", "n_done", "summary", "fallback", "v1_stat"):
+                  "n_rows", "n_done", "summary", "fallback", "v1_stat",
+                  "hist_approx", "v1_ticks"):
             setattr(st, k, meta.get(k))
         return st
 
@@ -396,7 +439,7 @@ def _history(st, levmap, d_lev, score, d_upd):
             st.hist = np.vstack([st.hist, row])
 
 
-def ingest(st, rows, ver, levmap, run_dir, best_only=False):
+def ingest(st, rows, ver, levmap, run_dir, best_only=False, total=None):
     """Fold new ep_stats rows into the state. best_only: rows without
     swing columns folded into a swing run (a resumed run's pre-resume
     ep_stats.v1.f32) — they count toward the run's best plays (the
@@ -410,7 +453,11 @@ def ingest(st, rows, ver, levmap, run_dir, best_only=False):
         upd = rows[:, es.COL_UPDATE].astype(np.float64)
         part = rows[:, es.COL_PART:es.COL_PART + 12].astype(np.float64)
     else:
-        upd = v1_updates(run_dir, st.seq, n)
+        upd, exact = v1_updates(run_dir, st.seq, n, ticks=rows[:, 4],
+                                tick0=st.v1_ticks)
+        st.v1_ticks += float(rows[:, 4].astype(np.float64).sum())
+        if not exact:
+            st.hist_approx = True
         part = np.full((n, 12), np.nan)
     st.seq += n
     chart = rows[:, 0].astype(np.int64)
@@ -686,6 +733,7 @@ def update_run(run_dir, force=False, log=None):
     # file, so a chart refresh never pulls the per-level arrays
     h = st.hist
     hist = {"format": "beat-arena-swing-hist", "version": 1,
+            "approx": bool(st.hist_approx),
             "upd": [int(x) for x in h[:, 0]],
             "ss_wpp": h[:, 1].tolist(), "ss_upp": h[:, 2].tolist(),
             "bl_wpp": h[:, 3].tolist(), "bl_upp": h[:, 4].tolist()}

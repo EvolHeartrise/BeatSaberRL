@@ -313,7 +313,7 @@ def test_v1_update_index_from_metrics(tmp_path):
     recs = [{"upd": 101, "ep_stats_episodes": 2}, {"upd": 102, "ep_stats_episodes": 4},
             {"upd": 103, "ep_stats_episodes": 7}, {"upd": 104, "ep_stats_episodes": 8}]
     (run / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
-    np.testing.assert_array_equal(sw.v1_updates(str(run), 0, 8),
+    np.testing.assert_array_equal(sw.v1_updates(str(run), 0, 8)[0],
                                   [101, 101, 102, 102, 103, 103, 103, 104])
     d = _summary(run)
     assert d["last_update"] == 104
@@ -469,7 +469,7 @@ def test_resumed_run_counts_its_v1_rows_for_best_plays_only(tmp_path):
     recs = [{"upd": 50, "ep_stats_episodes": 2},
             {"upd": 51, "ep_stats_episodes": 1}]          # counter resets
     (run / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
-    assert list(sw.v1_updates(str(run), 0, 2)) == [50, 50]
+    assert list(sw.v1_updates(str(run), 0, 2)[0]) == [50, 50]
     w = es.EpStatsWriter(str(run), log=lambda *a, **k: None)
     for update, rows in enumerate(batches(), start=51):
         w.append(es.build_rows(rows, META, update))
@@ -530,3 +530,48 @@ def test_best_possible_history(tmp_path):
     assert h["bl_wpp"][0] == pytest.approx(bl1[0] + 0.965 * bl1[1], abs=0.03)
     e = sw.index_entry(sw.update_run(str(run)), str(run), rel="c/runs/run")
     assert e["hist"] == "c/runs/run/swing_hist.json"
+
+
+def test_v1_update_index_chains_restarted_counters(tmp_path):
+    """One v1 file over two trainer invocations (a resume into the same
+    run dir before the v2 writer): the second invocation's counter
+    restarts at 0 and continues the first's count."""
+    run = tmp_path / "old"
+    run.mkdir()
+    recs = [{"upd": 1, "ep_stats_episodes": 2}, {"upd": 2, "ep_stats_episodes": 3},
+            {"upd": 3, "ep_stats_episodes": 2},              # resumed: restart
+            {"upd": 4, "ep_stats_episodes": 5}]
+    (run / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+    upd, exact = sw.v1_updates(str(run), 0, 8)
+    assert exact
+    np.testing.assert_array_equal(upd, [1, 1, 2, 3, 3, 4, 4, 4])
+
+
+def test_v1_update_index_from_episode_ticks_without_counter(tmp_path):
+    """Metrics without the counter (older runs): an episode's update is
+    estimated from the episode ticks written so far over num_envs x
+    horizon (env-ticks per update); flagged approximate."""
+    run = tmp_path / "old"
+    run.mkdir()
+    (run / "metrics.jsonl").write_text(
+        "".join(json.dumps({"upd": u}) + "\n" for u in range(1, 21)))
+    (run / "args.json").write_text(json.dumps({"resolved": {"num_envs": 4, "horizon": 10}}))
+    # 40 env-ticks per update; equal 40-tick episodes: residual R =
+    # 40^2 / (2 * 40) / horizon 10 = 2 updates of in-progress lag
+    upd, exact = sw.v1_updates(str(run), 0, 4, ticks=[40] * 4)
+    assert not exact
+    x = np.arange(1, 5, dtype=float)                   # completed-tick updates
+    t = x.copy()
+    for _ in range(30):
+        t = x + 2.0 * (1 - np.exp(-t / 2.0))
+    np.testing.assert_array_equal(upd, 1 + np.floor(t))
+    assert all(b > a for a, b in zip(upd, upd[1:]))
+    rows = np.concatenate(batches())                   # 8 rows x 900 ticks
+    (run / "args.json").write_text(json.dumps({"resolved": {"num_envs": 4, "horizon": 100}}))
+    es.build_rows(rows, META, 1)[:, :16].tofile(run / "ep_stats.f32")
+    (run / "levels.json").write_text(json.dumps(LEVELS))
+    d = _summary(run)
+    h = json.loads((run / "swing_hist.json").read_text())
+    assert h["approx"] is True and len(h["upd"]) >= 2
+    assert all(1 <= u <= 20 for u in h["upd"])
+    assert h["ss_wpp"][-1] == pytest.approx(d["totals"]["ss_wpp"], abs=0.01)
