@@ -301,6 +301,109 @@ const FLAIL_LEAD_S: Real = 1.0;
 // every tick). Mirrors the .cu twin exactly. 20 -> 60 deg (user,
 // 2026-10-04): only full swings count, not mid-size corrections.
 const WREV_HYST: Real = 1.0471975511965976;   // 60 deg (pi/3)
+// wrist-reset telemetry (2026-10-04, user): per hand, a good note cut
+// whose bend-velocity sign EQUALS the previous swing's, with a reversal
+// of the bend motion in between, is one WRIST RESET (the hand went back
+// without a hit). Reversals: the WREV state machine on the bend angle
+// with its own WRESET_HYST = 30 deg (user) — a turn-back of 30 deg from
+// the running extreme. 60 (WREV_HYST) would miss real resets with a
+// short backswing; 30 is above tremor and mid-swing corrections. A cut
+// with |bend velocity| < WRESET_VMIN takes the detector's committed
+// direction instead of the velocity's sign. Mirrors the .cu twin.
+const WRESET_HYST: Real = 0.5235987755982988;   // 30 deg (pi/6)
+const WRESET_VMIN: Real = 1.0;                  // rad/s
+
+/// Wrist-reset detector + counters for one hand (2026-10-04). Swings:
+/// consecutive good hits of one continuous bend motion (no reversal
+/// between them — a stack / slider / window cut in one motion) are ONE
+/// swing. At a hit with sign s: no previous swing, or s != the previous
+/// swing's sign (alternation), or a reversal since the last hit -> a
+/// new swing; same sign WITH a reversal in between -> also a reset.
+/// Same sign without one -> the same swing, nothing counted. Any number
+/// of reversals between two hits add at most one reset. Only good note
+/// cuts (chain heads count, links do not) are hits; bad cuts and misses
+/// neither break nor continue a swing.
+#[derive(Clone, Copy, Default)]
+struct WristReset {
+    dir: u8,      // 0 fresh, 3 armed (no direction yet), 1 moving +, 2 moving -
+    lo: Real,     // running extremes of the bend angle
+    hi: Real,
+    rev: bool,    // a reversal committed since the last hit
+    last: u8,     // previous swing's sign: 0 none, 1 +, 2 -
+    resets: u32,  // this episode
+    swings: u32,
+}
+
+impl WristReset {
+    /// One tick of the bend angle q (after the physics, before the
+    /// judge — the WREV detector's slot).
+    fn tick(&mut self, q: Real) {
+        let (mut lo, mut hi) = (self.lo, self.hi);
+        match self.dir {
+            0 => {
+                lo = q;
+                hi = q;
+                self.dir = 3;
+            }
+            3 => {
+                if q < lo {
+                    lo = q;
+                }
+                if q > hi {
+                    hi = q;
+                }
+                if q >= lo + WRESET_HYST {
+                    self.dir = 1;
+                    hi = q;
+                } else if q <= hi - WRESET_HYST {
+                    self.dir = 2;
+                    lo = q;
+                }
+            }
+            1 => {
+                if q > hi {
+                    hi = q;
+                } else if q <= hi - WRESET_HYST {
+                    self.rev = true;
+                    self.dir = 2;
+                    lo = q;
+                }
+            }
+            _ => {
+                if q < lo {
+                    lo = q;
+                } else if q >= lo + WRESET_HYST {
+                    self.rev = true;
+                    self.dir = 1;
+                    hi = q;
+                }
+            }
+        }
+        self.lo = lo;
+        self.hi = hi;
+    }
+
+    /// A good note cut by this hand with bend velocity qd. Returns
+    /// (reset, new swing).
+    fn hit(&mut self, qd: Real) -> (bool, bool) {
+        let s: u8 = if qd.abs() >= WRESET_VMIN {
+            if qd > 0.0 { 1 } else { 2 }
+        } else if self.dir == 1 || self.dir == 2 {
+            self.dir
+        } else if qd >= 0.0 {
+            1
+        } else {
+            2
+        };
+        let reset = self.last != 0 && s == self.last && self.rev;
+        let swing = self.last == 0 || s != self.last || self.rev;
+        self.resets += reset as u32;
+        self.swings += swing as u32;
+        self.last = s;
+        self.rev = false;
+        (reset, swing)
+    }
+}
 // env v20 episode-start arm stance (§1.4 indices): l/r arm_pitch -80
 // deg, l/r elbow 100 deg, l/r wrist_bend 70 deg.
 // env v21 (user, 2026-08-16): wide stance — hip_roll splays the legs
@@ -1215,6 +1318,10 @@ struct Core {
     wrev_lo: [Real; 2],
     wrev_hi: [Real; 2],
     wrev_dir: [u8; 2],
+    // wrist-reset telemetry (2026-10-04): per hand [L, R], THIS episode
+    // (zeroed by reset_state); the CUDA twin keeps the same per episode
+    // (ep_rec cols 40..43) plus a popped per-update accumulator.
+    wrs: [WristReset; 2],
     // env v17 (spec §12): obstacles, sorted by start_time; wall_passed
     // latches once the back face clears the head (monotone per wall);
     // first_wall advances over the passed prefix; walls_in counts ticks
@@ -1313,6 +1420,7 @@ impl Core {
             wrev_lo: [0.0, 0.0],
             wrev_hi: [0.0, 0.0],
             wrev_dir: [0, 0],
+            wrs: [WristReset::default(); 2],
             walls: Vec::new(),
             wall_passed: Vec::new(),
             first_wall: 0,
@@ -1416,6 +1524,7 @@ impl Core {
         self.flail_ticks = 0;
         self.wrev = [0, 0];
         self.wrev_dir = [0, 0];
+        self.wrs = [WristReset::default(); 2];
         self.prev_foot_pot = 0.0;
         self.finished = false;  // B4: every chart (re)install funnels here
         self.score = 0.0;
@@ -1930,6 +2039,8 @@ impl Core {
             self.wrev_dir[h] = dir;
             self.wrev_lo[h] = lo;
             self.wrev_hi[h] = hi;
+            // wrist-reset detector (30 deg), same slot
+            self.wrs[h].tick(q);
         }
 
         if self.flux {
@@ -2101,6 +2212,11 @@ impl Core {
                 if code == 0 {
                     self.status[i] = 1;
                     self.good_cuts += 1;
+                    if n.kind != KIND_CHAIN_LINK {
+                        // wrist-reset telemetry: this hand's bend velocity
+                        let qd = self.body.st.v[6 + if m == 0 { 8 } else { 15 }];
+                        self.wrs[m].hit(qd);
+                    }
                     let (pts, pre_pts, acc_pts) = if n.kind == KIND_CHAIN_LINK {
                         (CHAIN_LINK_PTS, 0.0, 0.0) // flat, regardless of swing
                     } else {
@@ -2966,6 +3082,12 @@ impl RawBeatSim {
     fn wrist_rev(&self) -> (u32, u32, u32) {
         (self.core.wrev[0], self.core.wrev[1], self.core.tick)
     }
+    /// wrist-reset telemetry, THIS episode (2026-10-04): (L resets, R
+    /// resets, L swings, R swings) — see WristReset. ADDITIVE getter.
+    fn wrist_resets(&self) -> (u32, u32, u32, u32) {
+        let w = &self.core.wrs;
+        (w[0].resets, w[1].resets, w[0].swings, w[1].swings)
+    }
     /// env v17: wall ENTRIES this episode — combo breaks under the
     /// §12b combo rule (edge-triggered; >= 1 tick out re-arms).
     #[getter]
@@ -3279,6 +3401,13 @@ impl VecBeatSim {
         (s.wrev[0], s.wrev[1], s.tick)
     }
 
+    /// wrist-reset telemetry for env i, THIS episode (2026-10-04): (L
+    /// resets, R resets, L swings, R swings). Same lifecycle as flail().
+    fn wrist_resets(&self, i: usize) -> (u32, u32, u32, u32) {
+        let w = &self.sims[i].wrs;
+        (w[0].resets, w[1].resets, w[0].swings, w[1].swings)
+    }
+
     /// Bench termination record for env i, THIS episode (review B09,
     /// 2026-09-30): (wall ENTRIES — the §12b combo-breaking edges, the
     /// wall_enters counter; termination flags). Flags, valid once the
@@ -3564,6 +3693,146 @@ mod env_tests {
         assert_eq!(b2.act_frac, 0.0, "coast must read zero activation");
         assert_eq!(b2.act_group, [0.0; 3]);
         assert_eq!(b2.tau_abs, 0.0, "coast must read zero torque");
+    }
+
+    /// Scripted wrist-reset sequences (2026-10-04, user spec). `bend`
+    /// walks the bend angle from `from` to `to` (deg) in 5 deg ticks.
+    fn bend(w: &mut WristReset, from: Real, to: Real) {
+        let n = ((to - from).abs() / 5.0).ceil().max(1.0) as usize;
+        for k in 1..=n {
+            w.tick((from + (to - from) * k as Real / n as Real).to_radians());
+        }
+    }
+    const DOWN: Real = -20.0; // bend velocity at a down cut, rad/s
+    const UP: Real = 20.0;
+
+    fn armed(start: Real) -> WristReset {
+        let mut w = WristReset::default();
+        w.tick(start.to_radians());
+        w
+    }
+
+    #[test]
+    fn wrist_reset_alternation_is_no_reset() {
+        // down - up - down, each cut mid-swing: 3 swings, 0 resets
+        let mut w = armed(60.0);
+        bend(&mut w, 60.0, -60.0);
+        assert_eq!(w.hit(DOWN), (false, true));
+        bend(&mut w, -60.0, 60.0);
+        assert_eq!(w.hit(UP), (false, true));
+        bend(&mut w, 60.0, -60.0);
+        assert_eq!(w.hit(DOWN), (false, true));
+        assert_eq!((w.resets, w.swings), (0, 3));
+    }
+
+    #[test]
+    fn wrist_reset_windback_is_one_reset() {
+        // down, wind back 40 deg (past 30) without a hit, down again
+        let mut w = armed(60.0);
+        bend(&mut w, 60.0, -60.0);
+        w.hit(DOWN);
+        bend(&mut w, -60.0, -20.0);
+        bend(&mut w, -20.0, -60.0);
+        assert_eq!(w.hit(DOWN), (true, true));
+        assert_eq!((w.resets, w.swings), (1, 2));
+        // the 30 deg boundary: a 25 deg wind-back is no reversal (same
+        // swing), a 35 deg one is (a reset)
+        let mut w = armed(60.0);
+        bend(&mut w, 60.0, -60.0);
+        w.hit(DOWN);
+        bend(&mut w, -60.0, -35.0);
+        bend(&mut w, -35.0, -60.0);
+        assert_eq!(w.hit(DOWN), (false, false));
+        bend(&mut w, -60.0, -25.0);
+        bend(&mut w, -25.0, -70.0);
+        assert_eq!(w.hit(DOWN), (true, true));
+        assert_eq!((w.resets, w.swings), (1, 2));
+    }
+
+    #[test]
+    fn wrist_reset_stack_and_slider_are_one_swing() {
+        // a stack (two hits on one tick) and a slider (hits along one
+        // continuous motion): one swing, no reset
+        let mut w = armed(80.0);
+        bend(&mut w, 80.0, 0.0);
+        assert_eq!(w.hit(DOWN), (false, true));
+        assert_eq!(w.hit(DOWN), (false, false));
+        for k in 0..4 {
+            bend(&mut w, -10.0 * k as Real, -10.0 * (k + 1) as Real);
+            assert_eq!(w.hit(DOWN), (false, false));
+        }
+        assert_eq!((w.resets, w.swings), (0, 1));
+    }
+
+    #[test]
+    fn wrist_reset_tremor_is_no_reversal() {
+        // +-12 deg (24 deg peak to peak < 30) tremor between two down hits
+        let mut w = armed(60.0);
+        bend(&mut w, 60.0, -40.0);
+        w.hit(DOWN);
+        for _ in 0..6 {
+            bend(&mut w, -40.0, -16.0);
+            bend(&mut w, -16.0, -40.0);
+        }
+        assert!(!w.rev && w.dir == 2);
+        assert_eq!(w.hit(DOWN), (false, false));
+        assert_eq!((w.resets, w.swings), (0, 1));
+    }
+
+    #[test]
+    fn wrist_reset_long_break_counts_at_most_one() {
+        // a long note-free stretch with several 60 deg back-and-forths:
+        // (a) then a same-sign hit -> exactly one reset; (b) then an
+        // opposite-sign hit -> none
+        for (sign, want) in [(DOWN, (true, true)), (UP, (false, true))] {
+            let mut w = armed(60.0);
+            bend(&mut w, 60.0, -60.0);
+            w.hit(DOWN);
+            for _ in 0..5 {
+                bend(&mut w, -60.0, 0.0);
+                bend(&mut w, 0.0, -60.0);
+            }
+            if sign > 0.0 {
+                bend(&mut w, -60.0, 0.0);
+            }
+            assert_eq!(w.hit(sign), want, "sign {sign}");
+            assert_eq!(w.resets, want.0 as u32);
+            assert_eq!(w.swings, 2);
+        }
+    }
+
+    #[test]
+    fn wrist_reset_hands_are_independent() {
+        // a reset on one hand never moves the other's counts
+        let mut w = [armed(60.0), armed(60.0)];
+        bend(&mut w[0], 60.0, -60.0);
+        bend(&mut w[1], 60.0, -60.0);
+        w[0].hit(DOWN);
+        w[1].hit(DOWN);
+        bend(&mut w[0], -60.0, 0.0); // L winds back, R holds still
+        bend(&mut w[0], 0.0, -60.0);
+        for _ in 0..12 {
+            w[1].tick((-60.0 as Real).to_radians());
+        }
+        assert_eq!(w[0].hit(DOWN), (true, true));
+        assert_eq!(w[1].hit(DOWN), (false, false));
+        assert_eq!((w[0].resets, w[0].swings, w[1].resets, w[1].swings),
+                   (1, 2, 0, 1));
+    }
+
+    #[test]
+    fn wrist_reset_near_zero_velocity_takes_the_committed_direction() {
+        let mut w = armed(60.0);
+        bend(&mut w, 60.0, -60.0); // committed: moving -
+        assert_eq!(w.hit(0.4), (false, true)); // |qd| < 1: sign -
+        assert_eq!(w.last, 2);
+        bend(&mut w, -60.0, 0.0); // reversal: moving +
+        assert_eq!(w.hit(-0.4), (false, true)); // committed +, opposite
+        assert_eq!(w.last, 1);
+        // no direction committed yet (armed): the velocity's own sign
+        let mut f = armed(0.0);
+        f.hit(-0.4);
+        assert_eq!(f.last, 2);
     }
 
     /// Per-joint gear rows (2026-10-04): ids below `gears` are exactly

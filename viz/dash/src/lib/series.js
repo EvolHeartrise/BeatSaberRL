@@ -106,6 +106,7 @@ export const PANELS = [
   { id: "entgroups", title: "entropy per head group (mean per head)", series: ["ent_spine", "ent_armL", "ent_armR", "ent_legL", "ent_legR"] },
   { id: "lifts", title: "foot lifts per 1M samples", series: ["lifts_per_1m"] },
   { id: "flail", title: "flail (rad / idle tick)", series: ["flail", "flail_L", "flail_R"] },
+  { id: "wreset", title: "wrist resets per 100 swings (per hand · a same-sign hit after a ≥ 30° bend reversal; good note cuts)", series: ["wreset_L", "wreset_R"] },
   { id: "wrev", title: "wrist-bend reversals per second (per hand · 60° hysteresis since 2026-10-04, 20° before; every tick)", series: ["wrev_L", "wrev_R"] },
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
   { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
@@ -135,7 +136,7 @@ export function panelsFor(game) {
 export const COMPARE_KEYS = [
   "acc", "acc_pre", "acc_post", "acc_prec",
   "best_ss_wpp", "best_ss_upp", "best_bl_wpp", "best_bl_upp", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
-  "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "wrev", "lifts_per_1m",
+  "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "wrev", "wreset", "wreset_L", "wreset_R", "lifts_per_1m",
   "activation", "activation_spine", "activation_arms", "activation_legs",
   "torque", "torque_spine", "torque_arms", "torque_legs",
   "contact", "contact_pct",
@@ -147,6 +148,7 @@ export const DIFF_KEYS = ["acc", "return", "ent", "ev"];
 export const LABELS = {
   acc: "acc", accL: "accL", accR: "accR", return: "return",
   acc_pre: "pre-swing", acc_post: "post-swing", acc_prec: "precision",
+  wreset: "wrist resets / 100 swings", wreset_L: "wrist resets L / 100", wreset_R: "wrist resets R / 100",
   best_ss_wpp: "SS WPP (best)", best_bl_wpp: "BL WPP (best)",
   best_ss_upp: "SS UPP (best)", best_bl_upp: "BL UPP (best)",
   ent: "ent", entfull: "entfull", ev: "ev", sps_k: "steps/s (k)",
