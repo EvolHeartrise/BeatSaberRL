@@ -22,8 +22,12 @@ _c = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_c)
 TAU_MAX = np.asarray(_c.TAU_MAX, dtype=np.float64)
 TAU_AXIS_OF_JOINT = list(_c.TAU_AXIS_OF_JOINT)
-# per joint: the bend joints' fine gears are 2x (constants.FINE_GEAR_MULT)
-GEAR = np.asarray([_c.joint_gear_table(5, j) for j in range(29)])
+# per joint: the bend joints' fine gears are 2x (constants.FINE_GEAR_MULT);
+# rows padded with 0 to the longest (a build's per-joint extra gears)
+_ROWS = [_c.joint_gear_table(5, j) for j in range(29)]
+GEAR = np.zeros((29, max(len(r) for r in _ROWS)))
+for _j, _r in enumerate(_ROWS):
+    GEAR[_j, :len(_r)] = _r
 sys.path.insert(0, PY)
 from beat_arena_env.replay_format import decode, read_raw  # noqa: E402
 
@@ -45,7 +49,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="")
     a = ap.parse_args()
-    counts = np.zeros((29, 5), dtype=np.int64)
+    counts = np.zeros((29, GEAR.shape[1]), dtype=np.int64)
     tau_scale = None
     tele = np.zeros(4)
     n_ticks = 0
@@ -59,7 +63,7 @@ def main():
         acts = d["action"].astype(np.int64)
         tele += d["torque"].sum(axis=0)
         for j in range(29):
-            counts[j] += np.bincount(acts[:, j], minlength=5)
+            counts[j] += np.bincount(acts[:, j], minlength=GEAR.shape[1])
         n_ticks += len(acts)
         per_file.append({"file": os.path.basename(f), "ticks": int(len(acts))})
     share = counts / max(n_ticks, 1)

@@ -19,7 +19,7 @@ import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple, wall_tuple
 from .constants import (TAU_FEAT, HANDLE_LEN,
-    EVENT_REASONS, N_JOINTS, OBS_DIM,
+    EVENT_REASONS, N_JOINTS, OBS_DIM, joint_gear_counts,
 )
 
 from . import replay_format
@@ -190,6 +190,9 @@ class RustBeatEnv(gym.Env):
         self.dt = 1.0 / self.tick_hz
         self.action_repeat = int(action_repeat)
         self.gears = gears
+        # per-joint action-id counts (constants.joint_gear_counts; the
+        # Rust sim's joint_gear_rows mirror decodes them)
+        self.joint_gears = joint_gear_counts(gears)
         # env v46: explicit per-axis torque-limit scales (all 1.0 = the
         # v45 body); recorded in the replay header (record_rev 5)
         self.tau_scale = [1.0] * TAU_FEAT
@@ -199,7 +202,7 @@ class RustBeatEnv(gym.Env):
         # env v10: 29 gear-id heads in SPEC-v10 §1.4 joint order —
         # spine(3), arm_l(7), arm_r(7), leg_l(6), leg_r(6); id 0 coast,
         # 1/2 = +/-full, finer +/- gear pairs append (constants.gear_table)
-        self.action_space = gym.spaces.MultiDiscrete([gears] * N_JOINTS)
+        self.action_space = gym.spaces.MultiDiscrete(list(self.joint_gears))
 
     def set_tau_scale(self, s16):
         """env v46: fix the 16 per-axis torque-limit scales (spine 3, arm 7

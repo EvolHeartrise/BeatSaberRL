@@ -155,6 +155,44 @@ fn gear_signed(gears: u8) -> [Real; 7] {
     }
 }
 
+// Per-joint EXTRA gears (2026-10-04, per-joint gear counts): signed
+// fractions for joint j's action ids gears, gears+1, ... (+/- pairs, not
+// scaled by FINE_GEAR_MULT); JOINT_EXTRA_N[j] of them are live. All
+// zero / 0 on main — every joint keeps its `gears` ids. MIRROR of
+// constants.JOINT_EXTRA_GEARS and the kernel's JOINT_EXTRA_FRAC.
+const JOINT_EXTRA_N: [usize; NQ] = [0; NQ];
+const JOINT_EXTRA_FRAC: [[Real; 4]; NQ] = [[0.0; 4]; NQ];
+
+/// Per-joint action id -> signed torque fraction (constants
+/// joint_gear_table, padded to 7 ids): gear_signed(gears) with the fine
+/// ids (>= 3) at FINE_GEAR_MULT[j], then joint j's extra ids. Ids past a
+/// joint's count read 0 (coast), as ids past `gears` always have. The
+/// fine products are formed here once instead of per tick — the same
+/// IEEE product, so the applied fractions are bit-identical.
+fn joint_gear_rows(gears: u8) -> [[Real; 7]; NQ] {
+    let base = gear_signed(gears);
+    let k = match gears {
+        5 => 5,
+        7 => 7,
+        _ => 3,
+    };
+    let mut rows = [[0.0 as Real; 7]; NQ];
+    for j in 0..NQ {
+        assert!(k + JOINT_EXTRA_N[j] <= 7,
+                "joint {j}: gears={gears} + {} extra ids exceeds 7", JOINT_EXTRA_N[j]);
+        for a in 0..7 {
+            rows[j][a] = if a < k {
+                if a >= 3 { base[a] * FINE_GEAR_MULT[j] } else { base[a] }
+            } else if a - k < JOINT_EXTRA_N[j] {
+                JOINT_EXTRA_FRAC[j][a - k]
+            } else {
+                0.0
+            };
+        }
+    }
+    rows
+}
+
 const N_BLADE_SAMPLES: usize = 8; // contact-point/velocity samples
 // live broad-phase reach gate (SPEC-v10 §4): note_z <=
 // max_hand(shoulder_z(t)) + 0.65 + 0.16 + 1.0 + 0.75 — the arm span past
@@ -854,20 +892,15 @@ impl Body {
     /// h = 1/240 (SPEC-v10 §3/§4; 8 at the 30 Hz default), accumulating
     /// activation and contact impulses, then FK-cache refresh +
     /// finite-diff wrist vel over rate.dt.
-    fn tick(&mut self, actions: &[u8; NQ], gear: &[Real; 7]) {
+    fn tick(&mut self, actions: &[u8; NQ], gear: &[[Real; 7]; NQ]) {
         let mut act = 0.0;
         let mut grp = [0.0 as Real; 3];
         let mut tau_abs = 0.0;
         let mut tgrp = [0.0 as Real; 3];
         for j in 0..NQ {
             let a = actions[j] as usize;
-            let frac = if a >= 7 {
-                0.0
-            } else if a >= 3 {
-                gear[a] * FINE_GEAR_MULT[j]
-            } else {
-                gear[a]
-            };
+            // per-joint row (joint_gear_rows: FINE_GEAR_MULT + extras)
+            let frac = if a >= 7 { 0.0 } else { gear[j][a] };
             // env v46: τ_max scaled per env (s = 1.0 is exact: bit-
             // identical to v45); same expression tree as the kernel
             self.tau[j] = frac * MODEL.tau_max[j] * self.tau_scale[j];
@@ -1059,7 +1092,9 @@ struct Core {
     // tick budget in SIM ticks (the constructor's max_steps is in 30 Hz
     // ticks and is scaled by TickRate::ratio, so it keeps its real time)
     max_steps: u32,
-    gear: [Real; 7],   // env v8: action id -> signed torque fraction
+    // env v8: action id -> signed torque fraction, per joint since
+    // 2026-10-04 (joint_gear_rows: FINE_GEAR_MULT + per-joint extras)
+    gear: [[Real; 7]; NQ],
     chart: Vec<Note>,
     tail_s: Real, // episode tail after the last hit_time (covers miss exit)
     min_speed: Real, // slowest object; (hit_time-t)*min_speed > reach_z is a
@@ -1235,7 +1270,7 @@ impl Core {
     fn new_core_rate(max_steps: u32, gears: u8, rate: TickRate) -> Self {
         Core {
             max_steps: max_steps.saturating_mul(rate.ratio),
-            gear: gear_signed(gears),
+            gear: joint_gear_rows(gears),
             chart: Vec::new(),
             tail_s: 0.5,
             min_speed: Real::INFINITY,
@@ -1706,9 +1741,8 @@ impl Core {
         let mut continued = [false; 2];
 
         // ── the physics tick (SPEC-v10 §3/§4) ─────────────────────────
-        let gear = self.gear;
         let rate = self.body.rate;
-        self.body.tick(actions, &gear);
+        self.body.tick(actions, &self.gear);
         // env v43 energy price on the applied Σ|τ| (the v23 fraction
         // price retired 2026-09-14) + always-on activation and torque
         // telemetry (accumulate at coef 0 too)
@@ -3490,6 +3524,7 @@ mod env_tests {
     /// 0 everywhere.
     #[test]
     fn activation_is_commanded_gear_fraction() {
+        let rows = joint_gear_rows(5);
         let gear = gear_signed(5);
         let mut acts = [0u8; NQ];
         acts[0] = 3;  // spine pitch, +1/4
@@ -3497,7 +3532,7 @@ mod env_tests {
         acts[15] = 1; // r wrist bend, full +
         acts[20] = 4; // l knee, −1/4
         let mut body = Body::new();
-        body.tick(&acts, &gear);
+        body.tick(&acts, &rows);
         let expect: Real = acts.iter().map(|&a| gear[a as usize].abs()).sum();
         assert_eq!(body.act_frac, expect, "total is the joint-order sum");
         assert_eq!(body.act_group[0], gear[3].abs(), "spine");
@@ -3518,17 +3553,50 @@ mod env_tests {
         let mut w = [0u8; NQ];
         w[7] = 1;
         let mut bw = Body::new();
-        bw.tick(&w, &gear);
+        bw.tick(&w, &rows);
         let mut sp = [0u8; NQ];
         sp[0] = 1;
         let mut bs = Body::new();
-        bs.tick(&sp, &gear);
+        bs.tick(&sp, &rows);
         assert!((bw.tau_abs / bs.tau_abs - MODEL.tau_max[7] / MODEL.tau_max[0]).abs() < 1e-12);
         let mut b2 = Body::new();
-        b2.tick(&[0u8; NQ], &gear);
+        b2.tick(&[0u8; NQ], &rows);
         assert_eq!(b2.act_frac, 0.0, "coast must read zero activation");
         assert_eq!(b2.act_group, [0.0; 3]);
         assert_eq!(b2.tau_abs, 0.0, "coast must read zero torque");
+    }
+
+    /// Per-joint gear rows (2026-10-04): ids below `gears` are exactly
+    /// the pre-2026-10-04 per-tick decode (gear_signed, fine ids x
+    /// FINE_GEAR_MULT — bitwise), the next JOINT_EXTRA_N[j] ids are the
+    /// joint's extra gears, everything after reads 0 (coast).
+    #[test]
+    fn joint_gear_rows_match_the_per_tick_decode() {
+        for gears in [3u8, 5, 7] {
+            let k = gears as usize;
+            if (0..NQ).any(|j| k + JOINT_EXTRA_N[j] > 7) {
+                continue; // this build's extras do not fit on that base
+            }
+            let g = gear_signed(gears);
+            let rows = joint_gear_rows(gears);
+            for j in 0..NQ {
+                for a in 0..7 {
+                    let want = if a < k {
+                        if a >= 3 { g[a] * FINE_GEAR_MULT[j] } else { g[a] }
+                    } else if a - k < JOINT_EXTRA_N[j] {
+                        JOINT_EXTRA_FRAC[j][a - k]
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(rows[j][a].to_bits(), want.to_bits(),
+                               "gears {gears} joint {j} id {a}");
+                }
+                // extras come as +/- pairs
+                for p in (0..JOINT_EXTRA_N[j]).step_by(2) {
+                    assert_eq!(JOINT_EXTRA_FRAC[j][p], -JOINT_EXTRA_FRAC[j][p + 1]);
+                }
+            }
+        }
     }
 
     /// B4: once an episode is done, re-stepping it WITHOUT a chart
@@ -3777,7 +3845,7 @@ mod env_tests {
     /// incl. full-torque ones and a non-unit tau_scale body.
     #[test]
     fn equal_strength_across_tick_rates() {
-        let gear = gear_signed(5);
+        let gear = joint_gear_rows(5);
         let mut patterns: Vec<(&str, [u8; NQ], bool)> = Vec::new();
         patterns.push(("coast", [0u8; NQ], false));
         patterns.push(("all full +", [1u8; NQ], false));
