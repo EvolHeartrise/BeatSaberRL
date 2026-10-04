@@ -144,7 +144,7 @@
     if (v == null) return "";
     const a = Math.abs(v);
     if (a >= 1e9) return (v / 1e9).toFixed(1) + "B";
-    if (a >= 1e6) return (v / 1e6).toFixed(0) + "M";
+    if (a >= 1e6) return +(v / 1e6).toFixed(1) + "M"; // 1.5M, not "2M" twice
     if (a >= 1e4) return (v / 1e3).toFixed(0) + "k";
     if (a >= 100) return v.toFixed(0);
     if (a >= 1) return +v.toFixed(2) + "";

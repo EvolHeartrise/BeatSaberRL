@@ -132,6 +132,25 @@ export function parseJsonl(text) {
   return [...byUpd.values()].sort((a, b) => a.upd - b.upd);
 }
 
+// The run's best-possible totals over training (swing_hist.json, written by
+// python/swing_summary.py next to swing.json): per update at which they
+// changed, SS / BL WPP and UPP over each level's best completed play so far.
+// Merged into the metrics records as step series (best_ss_wpp, ...: the last
+// value at or before each record's update), so Live and Compare chart them
+// like any metric. Returns new record objects only when there is a curve.
+export const BEST_KEYS = ["ss_wpp", "ss_upp", "bl_wpp", "bl_upp"];
+function mergeBest(recs, hist) {
+  if (!hist || !hist.upd?.length) return recs;
+  let j = 0, last = -1;
+  return recs.map((r) => {
+    while (j < hist.upd.length && hist.upd[j] <= r.upd) last = j++;
+    if (last < 0) return r;
+    const o = { ...r };
+    for (const k of BEST_KEYS) o["best_" + k] = hist[k][last];
+    return o;
+  });
+}
+
 export async function loadMetrics(run, { force = false } = {}) {
   if (!run) return null;
   const cur = store.metrics[run.id];
@@ -141,6 +160,7 @@ export async function loadMetrics(run, { force = false } = {}) {
   // re-check has nothing to show for itself
   if (!cur) store.loading[run.id] = true;
   const url = store.base + run.metrics;
+  const hurl = run.swing?.hist ? store.base + run.swing.hist : null;
   try {
     let text;
     try {
@@ -148,11 +168,32 @@ export async function loadMetrics(run, { force = false } = {}) {
     } catch (e) {
       throw new Error(`${e.message} for ${run.metrics}`);
     }
-    // 304, or the same bytes as last time: leave the store alone
-    if (cur && (text == null || bodies.get(url) === text)) return cur.recs;
-    const recs = parseJsonl(text);
-    bodies.set(url, text);
-    store.metrics[run.id] = { recs, at: Date.now(), bytes: text.length };
+    let htext = null;
+    if (hurl) {
+      try {
+        htext = await fetchIfChanged(hurl, !!cur?.hist);
+      } catch {
+        htext = null; // the curve is optional: a missing file shows no panel
+      }
+    }
+    const mSame = cur && (text == null || bodies.get(url) === text);
+    const hSame = !hurl || htext == null || bodies.get(hurl) === htext;
+    // 304s, or the same bytes as last time: leave the store alone
+    if (cur && mSame && hSame) return cur.recs;
+    const base = mSame ? cur.base : parseJsonl(text);
+    if (!mSame) bodies.set(url, text);
+    let hist = cur?.hist ?? null;
+    if (!hSame) {
+      try {
+        hist = JSON.parse(htext);
+        bodies.set(hurl, htext);
+      } catch {
+        /* a half-written file: keep the last curve */
+      }
+    }
+    const recs = mergeBest(base, hist);
+    store.metrics[run.id] = { recs, base, hist, at: Date.now(),
+                              bytes: mSame ? cur.bytes : text.length };
     return recs;
   } catch (e) {
     store.error = `metrics for ${run.id}: ${e.message}`;
