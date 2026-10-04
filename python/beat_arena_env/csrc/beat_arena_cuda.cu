@@ -771,6 +771,10 @@ constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
 // buffer (pose_jit precedent); otherwise whatever the wrapper wrote
 // (set_tau_scale; default 1.0 => lanes 0, torque bit-identical).
 constexpr int TAU_FEAT = 16;
+// per-episode outcome record width (cuda_env.EP_REC): [s0..s15, ticks,
+// return, fell, good, score, chart] 0..21, env v47 ep_stats 22..27,
+// per-hand swing components 28..39 (2026-10-04)
+constexpr int EP_REC = 40;
 constexpr double TAU_RAND_NORM = 0.25;
 constexpr int OFF_TAU = OFF_PREV_R + PREV_FEAT;                       // 608
 // env v49 (review item I07, 2026-09-30): per-hand blade-TIP world
@@ -3894,7 +3898,7 @@ struct Sim {
   uint8_t* __restrict__ prev_valid;
   // env v46: per-env axis torque-limit scales (N, 16), the wrapper's
   // U(-1,1) draw buffer (N, 16) consumed at reset when tau_rand > 0,
-  // the half-range, and the per-episode outcome record (N, 28) +
+  // the half-range, and the per-episode outcome record (N, EP_REC) +
   // flag written at `done` for the trainer's tau_draws log:
   // [s0..s15, ep_ticks, ep_return, fell, good_cuts, score_pts, chart]
   T* __restrict__ tau_scale;
@@ -4016,6 +4020,12 @@ struct Sim {
   // Flux circles / bars have no swing components. Same lifecycle as
   // acc_pts (popped + zeroed by pop_acc_parts, NOT touched by reset_env).
   T* __restrict__ acc_part;
+  // 2026-10-04 (user): the same components PER EPISODE, (env, hand) x 6
+  // in acc_part's order, credited at the same four sites. Zeroed by
+  // reset_env; copied into ep_rec cols 28..39 at `done` (before the
+  // auto-reset), so the trainer's ep_stats rows carry per-hand swing
+  // quality per level.
+  T* __restrict__ ep_part;
   // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
   // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
   // Body::ground_imp mirror. Written by the step tick, zeroed by
@@ -4417,6 +4427,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   P.score_pre[e] = T(0);
   P.score_acc[e] = T(0);
   P.score_post[e] = T(0);
+  for (int k = 0; k < 12; k++) P.ep_part[e * 12 + k] = T(0);
   P.wrev_dir[e * 2] = 0;       // wrist-reversal detector re-arms on the
   P.wrev_dir[e * 2 + 1] = 0;   // new episode's first tick (count kept)
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
@@ -5129,6 +5140,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         P.acc_pts[e * 2 + h] += pts * T(cnt);
         P.acc_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
         P.acc_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
+        P.ep_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
+        P.ep_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
         if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
@@ -5481,10 +5494,15 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           pre_pts = pre;
           acc_pts = acc;
           T* const ap = P.acc_part + (e * 2 + m) * 6;
+          T* const xp = P.ep_part + (e * 2 + m) * 6;
           ap[0] += pre;
           ap[1] += T(PTS_PRE);
           ap[4] += acc;
           ap[5] += T(PTS_ACC);
+          xp[0] += pre;
+          xp[1] += T(PTS_PRE);
+          xp[4] += acc;
+          xp[5] += T(PTS_ACC);
           if (is_head) {
             // chain heads: no follow-through (max 85), except one that is
             // also an arc head or tail (ChainHeadArcHead/ArcTail): the 30
@@ -5494,12 +5512,16 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
               P.score_post[e] += T(PTS_POST);
               ap[2] += T(PTS_POST);
               ap[3] += T(PTS_POST);
+              xp[2] += T(PTS_POST);
+              xp[3] += T(PTS_POST);
             }
           } else if (P.p_free_post[cb]) {
             pts += T(PTS_POST);
             P.score_post[e] += T(PTS_POST);
             ap[2] += T(PTS_POST);
             ap[3] += T(PTS_POST);
+            xp[2] += T(PTS_POST);
+            xp[3] += T(PTS_POST);
           } else {
             n_new[m] += 1;  // spawn a follow-through tracker
             spawn_tr = true;
@@ -5656,6 +5678,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         P.acc_pts[e * 2 + h] += pts * T(cnt);
         P.acc_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
         P.acc_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
+        P.ep_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
+        P.ep_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
         if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
@@ -5692,7 +5716,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     // env v46 tau_draws record (only while randomizing): the body this
     // episode played and how it went; the wrapper pops + clears flags
     if (P.tau_rand > T(0) || P.ep_stats) {
-      T* r = P.ep_rec + (size_t)e * 28;
+      T* r = P.ep_rec + (size_t)e * EP_REC;
       for (int a = 0; a < TAU_FEAT; a++) r[a] = P.tau_scale[e * TAU_FEAT + a];
       r[16] = T(tick_new);
       r[17] = ep;
@@ -5710,6 +5734,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
                && tick_new < P.max_steps) ? T(1) : T(0);
       r[26] = P.ep_stats ? T(P.bad[e]) : T(0);
       r[27] = P.ep_stats ? T(P.miss[e]) : T(0);
+      // 2026-10-04 cols 28..39: this episode's per-hand swing components
+      // [L: pre, pre max, post, post max, precision, precision max, then
+      // R: the same] — raw note points before the combo multiplier
+      for (int k = 0; k < 12; k++) r[28 + k] = P.ep_part[e * 12 + k];
       P.ep_flag[e] = 1;
     }
   }
@@ -5849,13 +5877,13 @@ enum {
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
   TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals: count (N,2), extremes (N,2,2), state (N,2) — 2026-09-22
-  TACCP, TACCC, TACCPART, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
+  TACCP, TACCC, TACCPART, TEPPART, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
   TTAUSTAT, // env v43 torque telemetry (N, 5) — 2026-09-14
   TPREVIDX, TPREVVALID, // env v45 prev-note record (N, 2) — 2026-09-15
-  TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,28: v47 cols 22..28), flag (N) — 2026-09-16/19
+  TTAUSCALE, TTAUJIT, TEPREC, TEPFLAG, // env v46 tau scales (N,16), draws (N,16), episode record (N,EP_REC: v47 cols 22..28, swing parts 28..40 since 2026-10-04), flag (N) — 2026-09-16/19
   TCWMULT, TCWPROG, TCWCOMBO, TCWMAXC, TCWBREAKS, TCWSCORE, TCWNOTEMULT, TTRMSUM, // bench combo walk — 2026-09-16
   TBENCHREC, TBENCHFLAG, // bench slot refill: level record (N,BENCH_REC) + flag (N) — 2026-09-16
   TPALMV,   // Flux palm velocity (N, 2, 3)
@@ -5951,6 +5979,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
     P.acc_cuts = ts[TACCC].data_ptr<int>();
     P.acc_part = ts[TACCPART].data_ptr<scalar_t>();
+    P.ep_part = ts[TEPPART].data_ptr<scalar_t>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.limit_rest = ts[TLIMREST].data_ptr<scalar_t>();
     P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();
@@ -6046,6 +6075,10 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.body_pt = ts[TBPPOS].data_ptr<scalar_t>();
     P.body_pt_vel = ts[TBPVEL].data_ptr<scalar_t>();
     P.pose_jit = ts[TPOSEJIT].data_ptr<scalar_t>();
+    TORCH_CHECK(ts[TEPREC].numel() == (int64_t)EP_REC * N
+                && ts[TEPPART].numel() == 12 * N
+                && ts[TEPPART].is_contiguous(),
+                "ep_rec must be (N, EP_REC=40) and ep_part (N, 2, 6)");
     TORCH_CHECK(ts[TSTARTKICK].numel() == 2 * N
                 && ts[TSTARTKICK].is_contiguous(),
                 "start_kick must be a contiguous (N, 2) tensor");

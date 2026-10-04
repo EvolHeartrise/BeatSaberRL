@@ -22,7 +22,11 @@ rewritten when its bytes change. A trainer-written `metrics.jsonl`
     python3 metrics_backfill.py --watch 30      # re-scan every 30 s
     python3 metrics_backfill.py --force         # ignore the cache
 
-stdlib only; runs under the system python3.
+stdlib only; runs under the system python3. Swing summaries
+(2026-10-04): every run dir holding an ep_stats.f32 also gets its
+swing.json brought up to date by swing_summary.py (incremental; needs
+numpy — skipped with one message if it is missing) and a `swing` record
+in index.json.
 """
 from __future__ import annotations
 
@@ -44,6 +48,8 @@ MARKER = ".metrics.backfill"
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", "pool_cache", "maps"}
 
 _RE_CKPT = re.compile(r"\.pt$")
+# bump when _bench_summary gains fields (cached summaries re-read)
+BENCH_SUMMARY_V = 2   # 2: bl_wpp / bl_upp (2026-10-04)
 
 
 def log(msg, *, verbose=True):
@@ -126,6 +132,7 @@ class Backfill:
                 pass
         self.cache.setdefault("logs", {})
         self.cache.setdefault("bench", {})
+        self._swing = None     # swing_summary module (lazy; False = off)
 
     # ------------------------------------------------------------ paths
     def rel(self, path):
@@ -268,12 +275,14 @@ class Backfill:
             seen.add(key)
             st = _stat(p)
             c = self.cache["bench"].get(key)
-            if c is None or c.get("stat") != st or self.force:
+            if (c is None or c.get("stat") != st or self.force
+                    or c.get("v") != BENCH_SUMMARY_V):
                 try:
-                    c = {"stat": st, "summary": self._bench_summary(p, key)}
+                    c = {"stat": st, "v": BENCH_SUMMARY_V,
+                         "summary": self._bench_summary(p, key)}
                 except Exception as e:   # a non-bench JSON must not kill the scan
                     log(f"  ! bench {key}: {e}", verbose=self.verbose)
-                    c = {"stat": st, "summary": None}
+                    c = {"stat": st, "v": BENCH_SUMMARY_V, "summary": None}
                 self.cache["bench"][key] = c
             summ = c["summary"]
             if summ and summ.get("run"):
@@ -306,6 +315,9 @@ class Backfill:
                 "ckpt": os.path.basename(ckpt_name or ckpt) or None,
                 "wpp": d.get("total_weighted_pp"),
                 "upp": d.get("total_unweighted_pp"),
+                # BeatLeader totals (beatleader / both catalogs)
+                "bl_wpp": d.get("bl_total_weighted_pp"),
+                "bl_upp": d.get("bl_total_unweighted_pp"),
                 # wrist-bend reversals / s per hand (2026-09-22)
                 "wrev_l": d.get("wrist_rev_per_s_l"),
                 "wrev_r": d.get("wrist_rev_per_s_r"),
@@ -452,6 +464,37 @@ class Backfill:
                                       "diag", "ckpt", "throughput")},
         }
 
+    def swing_record(self, rec):
+        """swing_summary.update_run for a run dir with an ep_stats.f32
+        (incremental: an unchanged file costs two stats); the small
+        index record, or None."""
+        rd = rec.get("run_dir")
+        if not rd and rec.get("campaign") and rec.get("run"):
+            # a cached record from before its run dir was synced
+            found = self.locate_run_dir(rec["campaign"], rec["run"])
+            rd = self.rel(found) if found else None
+        if not rd:
+            return None
+        run_dir = os.path.join(self.archive, rd)
+        if not os.path.exists(os.path.join(run_dir, "ep_stats.f32")):
+            return None
+        if self._swing is None:
+            try:
+                import swing_summary
+                self._swing = swing_summary
+            except ImportError as e:   # numpy missing: no swing tab
+                log(f"[backfill] swing summaries off: {e}", verbose=True)
+                self._swing = False
+        if self._swing is False:
+            return None
+        try:
+            s = self._swing.update_run(
+                run_dir, log=(lambda m: log(m, verbose=self.verbose)))
+        except Exception as e:  # noqa: BLE001 — one bad file must not
+            log(f"  ! swing {rd}: {e!r}", verbose=self.verbose)  # stop the scan
+            return None
+        return self._swing.index_entry(s, run_dir, rel=rd)
+
     def _write_if_changed(self, path, body):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.exists(path):
@@ -491,6 +534,8 @@ class Backfill:
             rec["bench"] = bench_by_run.get(rec["run"], [])
             rec["replays"] = matching_replays(rec["run"], replays)
             out.append(rec)
+        for rec in out:
+            rec["swing"] = self.swing_record(rec)
         out.sort(key=lambda x: -(x["t_last"] or 0))
         index = {
             "generated": time.time(),

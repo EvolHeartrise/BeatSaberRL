@@ -30,7 +30,8 @@ EP_COLS, TAU_COLS = 16, 22
 
 
 def load(run_dir, last=0):
-    E = np.fromfile(os.path.join(run_dir, "ep_stats.f32"), dtype=np.float32).reshape(-1, EP_COLS)
+    import ep_stats
+    E = ep_stats.load(run_dir)[:, :EP_COLS]   # v1 or v2 (cols 0..15 shared)
     T = np.fromfile(os.path.join(run_dir, "tau_draws.f32"), dtype=np.float32).reshape(-1, TAU_COLS)
     n = min(len(E), len(T))
     E, T = E[-n:], T[-n:]          # both files grow from the same pops; align on the tail

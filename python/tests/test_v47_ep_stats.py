@@ -1,5 +1,5 @@
 """env v47 (user order 2026-09-19): --ep-stats — the ScoreSaber combo walk
-runs in the TRAINING envs and every episode's outcome row (EP_REC = 28
+runs in the TRAINING envs and every episode's outcome row (EP_REC = 40
 cols) carries the multiplied score, max combo, breaks, completed flag,
 bad cuts and misses; the trainer turns them into per-map accuracy / PP
 using the pool's per-level meta (leaderboard id, max PP, max score)."""

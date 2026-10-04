@@ -10,7 +10,13 @@
 //   - appending rows must reach every chart (zoomed ones keep their
 //     window, full-extent ones grow to the new tail) and the status line;
 //   - a new run in the index (newer t_last) takes over "most recent";
-//     picking a run in the selector switches the charts to it.
+//     picking a run in the selector switches the charts to it;
+//   - Swing tab (2026-10-04): the per-level table from swing.json sorts
+//     (default: lowest pre-swing first), and an idle refresh keeps the
+//     sort, the scroll position and the very same row elements; new data
+//     updates the rows in place under the user's sort; a window switch
+//     changes the plays; an old (v1) run shows its totals and marks the
+//     swing columns unavailable.
 // Run: npm test  (= vite build && node test/refresh-browser.mjs)
 // One Chrome, no WebGL — still, keep it to one run at a time on the laptop.
 import { spawn } from "node:child_process";
@@ -76,6 +82,54 @@ mkdirSync(ARCH, { recursive: true });
 writeRun("camp/live_run", 1, 300);
 writeRun("camp/done_run", 1, 250);
 runs = [runEntry("camp/live_run", 300, "partial", T0 + 2100), runEntry("camp/done_run", 250, "finished", T0 + 1750)];
+
+// swing.json fixtures (python/swing_summary.py format): a v2 run with
+// swing columns and an old v1 run without; older t_last than the Live
+// runs so "most recent" stays theirs
+const NLEV = 400;
+const WKEYS = ["n1", "n5", "n20", "k100", "k500", "all"];
+function swingDoc(v2, bump = 0) {
+  const lv = { key: [], song: [], mapper: [], diff: [], ss_stars: [], bl_stars: [], ss_id: [], bl_id: [], nps: [],
+    att: [], done: [], best_acc: [], ss_acc: [], ss_pp: [], bl_acc: [], bl_pp: [], best_upd: [] };
+  for (let i = 0; i < NLEV; i++) {
+    lv.key.push(`h${i}_Expert_Standard`); lv.song.push(`Song ${String(i).padStart(3, "0")}`); lv.mapper.push("m");
+    lv.diff.push(i % 2 ? "Expert" : "ExpertPlus"); lv.ss_stars.push(i % 3 ? 2 + (i % 11) : null);
+    lv.bl_stars.push(i % 3 !== 1 ? 3 + (i % 7) : null); lv.ss_id.push(i); lv.bl_id.push(`b${i}`);
+    lv.nps.push(2 + (i % 9) / 2); lv.att.push(30); lv.done.push(25); lv.best_acc.push(95);
+    lv.ss_acc.push(95); lv.ss_pp.push(100 + i); lv.bl_acc.push(95); lv.bl_pp.push(120 + i); lv.best_upd.push(100);
+  }
+  const win = {};
+  WKEYS.forEach((k, wi) => {
+    const w = { plays: [], acc: [] };
+    for (const f of ["pre", "post", "prec"]) for (const h of ["", "L", "R"]) w[f + h] = v2 ? [] : null;
+    for (let i = 0; i < NLEV; i++) {
+      w.plays.push([1, 5, 20, 7, 25, 25][wi]);
+      w.acc.push(90 + ((i * 7) % 100) / 10);
+      if (v2) {
+        const pre = 80 + ((i * 37 + wi) % 200) / 10, post = 70 + ((i * 53 + bump) % 300) / 10, prec = 85 + ((i * 11) % 150) / 10;
+        w.pre.push(pre); w.preL.push(pre - 1); w.preR.push(pre + 1);
+        w.post.push(post); w.postL.push(post); w.postR.push(post);
+        w.prec.push(prec); w.precL.push(prec); w.precR.push(prec);
+      }
+    }
+    win[k] = w;
+  });
+  return { format: "beat-arena-swing", version: 1, generated: 1, ep_layout: v2 ? 2 : 1, swing: v2, levels_source: "trainer",
+    catalog: "both", rows: 12000, completed: 10000, last_update: 600, n_levels: NLEV,
+    totals: { ss_wpp: 23456.7 + bump, ss_upp: 3000000, bl_wpp: 31000, bl_upp: 2900000, ss_levels: 267, bl_levels: 267 },
+    windows: WKEYS.map((k) => ({ key: k, label: k, available: true })), levels: lv, win };
+}
+const swingPath = (id) => resolve(ARCH, id.split("/")[0], "runs", id.split("/")[1], "swing.json");
+function writeSwing(id, v2, bump = 0) {
+  writeFileSync(swingPath(id), JSON.stringify(swingDoc(v2, bump)));
+  const r = runs.find((x) => x.id === id);
+  r.swing = { path: `${id.split("/")[0]}/runs/${id.split("/")[1]}/swing.json`, swing: v2, totals: swingDoc(v2, bump).totals };
+}
+writeRun("camp/swing_v2", 1, 50);
+writeRun("camp/swing_v1", 1, 40);
+runs.push(runEntry("camp/swing_v2", 50, "finished", T0 + 500), runEntry("camp/swing_v1", 40, "finished", T0 + 400));
+writeSwing("camp/swing_v2", true);
+writeSwing("camp/swing_v1", false);
 writeIndex();
 
 // "backfill pass" with nothing new: index.json gets a fresh `generated`,
@@ -85,6 +139,7 @@ function noopPass() {
   for (const r of runs) {
     const p = metricsPath(r.id);
     writeFileSync(p, readFileSync(p));
+    if (r.swing) writeFileSync(swingPath(r.id), readFileSync(swingPath(r.id)));
   }
 }
 
@@ -257,6 +312,65 @@ try {
   const c1 = await snap();
   check(c1[0].id === c0[0].id && c1[0].min === c0[0].min && c1[0].max === c0[0].max, "compare, new rows: zoomed chart kept its window");
   check(c1.filter((c) => !c.title.startsWith("Δ")).every((c) => c.last === 320 * BATCH), "compare, new rows: small multiples reach the new tail");
+
+  // ---------------------------------------------------------- Swing tab
+  await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "swing").click());
+  await page.waitForSelector(".tablewrap tbody tr", { timeout: 8000 });
+  const colOf = (label) => page.$$eval(".tablewrap thead th", (ths, label) => ths.findIndex((t) => t.textContent.replace(/[▲▼]/g, "").trim() === label), label);
+  const column = async (label, n = 60) => {
+    const c = await colOf(label);
+    return page.$$eval(".tablewrap tbody tr", (trs, c, n) => trs.slice(0, n).map((tr) => tr.children[c].textContent.trim()), c, n);
+  };
+  const nums = (a) => a.map((x) => (x === "—" ? null : Number(x.replace(/,/g, ""))));
+  const sorted = (a, dir) => a.every((v, i) => i === 0 || (dir > 0 ? a[i - 1] <= v : a[i - 1] >= v));
+  check((await page.$eval(".status", (e) => e.textContent)).includes("camp/swing_v2"), "swing: most recent run with a swing summary selected");
+  check((await page.$eval(".totals", (e) => e.textContent)).includes("23,457"), "swing: best-possible SS WPP tile shown");
+  const sortedHdr = () => page.$eval(".tablewrap thead", (t) => [...t.querySelectorAll("th")].find((h) => /[▲▼]/.test(h.textContent))?.textContent.trim());
+  check((await sortedHdr()) === "pre % ▲", `swing: default sort is pre-swing ascending (${await sortedHdr()})`);
+  check(sorted(nums(await column("pre %")), 1), "swing: rows ordered by lowest pre-swing first");
+  // user sort: post-swing descending
+  await page.$$eval(".tablewrap thead th", (ths) => ths.find((t) => t.textContent.trim().startsWith("post %")).click());
+  await page.$$eval(".tablewrap thead th", (ths) => ths.find((t) => t.textContent.trim().startsWith("post %")).click());
+  await sleep(200);
+  check((await sortedHdr()) === "post % ▼" && sorted(nums(await column("post %")), -1), "swing: click sorts by post-swing, again reverses");
+  await page.evaluate(() => window.scrollTo(0, 900));
+  await sleep(200);
+  const mark = () => page.evaluate(() => {
+    const trs = [...document.querySelectorAll(".tablewrap tbody tr")];
+    trs.forEach((tr, i) => { if (tr.__mark == null) tr.__mark = i; });
+    return { y: window.scrollY, marks: trs.slice(0, 50).map((tr) => tr.__mark), text: document.querySelector(".tablewrap tbody").textContent };
+  });
+  const m0 = await mark();
+  check(m0.y > 500, `swing: scrolled the table (scrollY ${m0.y})`);
+  await idleRefreshes(3);
+  const m1 = await mark();
+  check(m1.y === m0.y, `swing, unchanged data: scroll position kept (${m0.y} -> ${m1.y})`);
+  check(m1.text === m0.text, "swing, unchanged data: table content unchanged");
+  check(m1.marks.every((v, i) => v === m0.marks[i]), "swing, unchanged data: the same row elements (no re-render)");
+  check((await sortedHdr()) === "post % ▼", "swing, unchanged data: sort kept");
+  // window switch: plays follow
+  await page.$$eval(".wins button", (bs) => bs.find((b) => b.textContent.trim() === "n20").click());
+  await sleep(200);
+  check((await column("plays", 5)).every((v) => v === "20"), "swing: window 'last 20 plays' shows 20 plays");
+  await page.$$eval(".wins button", (bs) => bs.find((b) => b.textContent.trim() === "n5").click());
+  await sleep(200);
+  // new data: post values move; the sort and the scroll stay
+  const firstPost0 = (await column("post %", 1))[0];
+  writeSwing("camp/swing_v2", true, 7);
+  writeIndex();
+  await page.waitForFunction(() => document.querySelector(".totals").textContent.includes("23,464"), { timeout: 8000 });
+  await sleep(300);
+  const m2 = await mark();
+  check((await sortedHdr()) === "post % ▼" && sorted(nums(await column("post %")), -1), "swing, new data: still sorted by post-swing descending");
+  check(Math.abs(m2.y - m0.y) < 2, `swing, new data: scroll position kept (${m0.y} -> ${m2.y})`);
+  check(m2.text !== m0.text, `swing, new data: rows updated (top post ${firstPost0} -> ${(await column("post %", 1))[0]})`);
+  // an old v1 run: totals yes, swing columns unavailable
+  await page.select(".bar select", "camp/swing_v1");
+  await page.waitForFunction(() => document.querySelector(".status")?.textContent.includes("camp/swing_v1"), { timeout: 8000 });
+  await sleep(200);
+  check((await page.$eval(".status", (e) => e.textContent)).includes("swing columns unavailable"), "swing, v1 run: swing columns marked unavailable");
+  check((await column("pre %", 20)).every((v) => v === "—"), "swing, v1 run: pre-swing cells empty");
+  check((await page.$eval(".totals", (e) => e.textContent)).includes("23,457"), "swing, v1 run: best-possible totals shown");
 } finally {
   await browser.close();
   srv.kill();
