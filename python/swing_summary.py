@@ -62,7 +62,7 @@ import ep_stats as es  # noqa: E402
 
 SWING_FORMAT = "beat-arena-swing"
 SWING_VERSION = 1
-STATE_VERSION = 1
+STATE_VERSION = 2   # 2: the best-possible history (2026-10-04)
 N_WINDOWS = (1, 5, 20)
 K_WINDOWS = (100, 500)
 WINDOWS = ([("n%d" % n, "last %d play%s" % (n, "" if n == 1 else "s"))
@@ -72,6 +72,8 @@ WINDOWS = ([("n%d" % n, "last %d play%s" % (n, "" if n == 1 else "s"))
 N_RING = max(N_WINDOWS)
 K_KEEP = max(K_WINDOWS)
 MIN_TICKS = 60            # ep_stats.py: shorter = lead-only episodes
+PP_DECAY = 0.965   # both boards: play i of the descending list weighs 0.965^i
+HIST_JSON = "swing_hist.json"
 STATE_JSON = ".swing_state.json"
 STATE_NPZ = ".swing_state.npz"
 # tail-table columns: level, seq, update, acc, then the 12 swing cols
@@ -251,6 +253,9 @@ class State:
         self.resize(L)
         self.tail_n = np.zeros((0, T_COLS))
         self.tail_k = np.zeros((0, T_COLS))
+        # [update, ss_wpp, ss_upp, bl_wpp, bl_upp], one row per update at
+        # which the totals changed
+        self.hist = np.zeros((0, 5))
         self.summary = None
         self.fallback = None
         self.v1_stat = None
@@ -271,9 +276,15 @@ class State:
         self.best = grow(getattr(self, "best", None), (L,), -1.0)
         self.best_upd = grow(getattr(self, "best_upd", None), (L,), np.nan)
         self.max_score = grow(getattr(self, "max_score", None), (L,), np.nan)
+        # the best-possible history: per level the best completed score
+        # and its SS / BL pp so far, replayed in update order
+        self.h_best = grow(getattr(self, "h_best", None), (L,), -1.0)
+        self.h_ss = grow(getattr(self, "h_ss", None), (L,), np.nan)
+        self.h_bl = grow(getattr(self, "h_bl", None), (L,), np.nan)
 
     ARRAYS = ("run_sum", "run_done", "run_att", "acc_sum", "best",
-              "best_upd", "max_score", "tail_n", "tail_k")
+              "best_upd", "max_score", "tail_n", "tail_k",
+              "h_best", "h_ss", "h_bl", "hist")
 
     def save(self, run_dir):
         meta = {"version": STATE_VERSION, "offset": self.offset,
@@ -336,6 +347,55 @@ def _rank_from_end(lv):
     return ends[np.searchsorted(ends, i)] - i
 
 
+def _wpp(pps):
+    """Profile total over a set of pp (both boards: descending, x 0.965^i)."""
+    if not len(pps):
+        return 0.0
+    v = np.sort(pps)[::-1]
+    return float(np.dot(v, PP_DECAY ** np.arange(len(v))))
+
+
+def _history(st, levmap, d_lev, score, d_upd):
+    """Replay completed plays in update order into the best-possible
+    history: per update, each level's best score so far -> its SS / BL pp
+    (ss_pp / bl_pp, the totals' own scoring) -> the four totals, appended
+    to st.hist when they changed. Rows whose update is unknown (an old run
+    without the metrics counter) count from the start (update NaN, not
+    plotted)."""
+    if not len(d_lev):
+        return
+    u = np.where(np.isfinite(d_upd), d_upd, -np.inf)
+    lv = levmap.levels
+    for g in np.unique(u):
+        m = u == g
+        gl, gs = d_lev[m], score[m]
+        top = np.full(st.h_best.shape[0], -1.0)
+        np.maximum.at(top, gl, gs)
+        changed = np.flatnonzero(top > st.h_best)
+        if not len(changed):
+            continue
+        for li in changed.tolist():
+            st.h_best[li] = top[li]
+            L_ = lv[li]
+            comp = st.max_score[li]
+            if not np.isfinite(comp) or comp <= 0:
+                comp = float(L_.get("max_score") or 0.0)
+            if L_.get("ss") is not None:
+                st.h_ss[li] = ss_pp(top[li], L_, comp)[1]
+            if L_.get("bl") is not None:
+                st.h_bl[li] = bl_pp(top[li], L_, comp)[1]
+        if not np.isfinite(g):
+            continue
+        ss = st.h_ss[np.isfinite(st.h_ss)]
+        bl = st.h_bl[np.isfinite(st.h_bl)]
+        row = [g, round(_wpp(ss), 2), round(float(ss.sum()), 2),
+               round(_wpp(bl), 2), round(float(bl.sum()), 2)]
+        if len(st.hist) and st.hist[-1, 0] == g:
+            st.hist[-1] = row
+        elif not len(st.hist) or (st.hist[-1, 1:] != row[1:]).any():
+            st.hist = np.vstack([st.hist, row])
+
+
 def ingest(st, rows, ver, levmap, run_dir, best_only=False):
     """Fold new ep_stats rows into the state. best_only: rows without
     swing columns folded into a swing run (a resumed run's pre-resume
@@ -381,6 +441,7 @@ def ingest(st, rows, ver, levmap, run_dir, best_only=False):
         np.add.at(st.run_sum, d_lev, np.nan_to_num(part[done]))
     # the run's computed max per level (the env's scoring at run time)
     st.max_score[d_lev] = np.where(d_ms > 0, d_ms, st.max_score[d_lev])
+    _history(st, levmap, d_lev, score, upd[done])
     # best completed play per level (later plays win ties: max is max)
     order = np.lexsort((score, d_lev))
     sl, ss, su = d_lev[order], score[order], upd[done][order]
@@ -554,7 +615,10 @@ def index_entry(summary, run_dir, rel=None):
     if not summary:
         return None
     path = os.path.join(run_dir, "swing.json")
+    hist = os.path.join(run_dir, HIST_JSON)
     return {"path": (rel + "/swing.json") if rel else path,
+            "hist": (((rel + "/" + HIST_JSON) if rel else hist)
+                     if os.path.exists(hist) else None),
             "ep_layout": summary["ep_layout"], "swing": summary["swing"],
             "levels_source": summary["levels_source"],
             "rows": summary["rows"], "completed": summary["completed"],
@@ -618,6 +682,17 @@ def update_run(run_dir, force=False, log=None):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(full, f, separators=(",", ":"))
     os.replace(tmp, out_path)
+    # the best-possible curve for the Live / Compare charts: its own small
+    # file, so a chart refresh never pulls the per-level arrays
+    h = st.hist
+    hist = {"format": "beat-arena-swing-hist", "version": 1,
+            "upd": [int(x) for x in h[:, 0]],
+            "ss_wpp": h[:, 1].tolist(), "ss_upp": h[:, 2].tolist(),
+            "bl_wpp": h[:, 3].tolist(), "bl_upp": h[:, 4].tolist()}
+    tmp = os.path.join(run_dir, HIST_JSON + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(hist, f, separators=(",", ":"))
+    os.replace(tmp, os.path.join(run_dir, HIST_JSON))
     st.summary = {k: v for k, v in full.items()
                   if k not in ("levels", "win")}
     st.save(run_dir)
