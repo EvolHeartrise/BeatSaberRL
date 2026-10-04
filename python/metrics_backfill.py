@@ -568,13 +568,21 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true",
                     help="ignore the (size, mtime) cache")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--exit-with-parent", action="store_true",
+                    help="--watch: stop when the launching process is gone "
+                         "(viz/dash/serve.py passes it, so an orphaned loop "
+                         "cannot keep rewriting index.json with stale code)")
     a = ap.parse_args(argv)
+    ppid = os.getppid()
     bf = Backfill(a.archive, a.repo_python, force=a.force,
                   verbose=not a.quiet)
     bf.run_once()
     bf.force = False
     while a.watch:
         time.sleep(a.watch)
+        if a.exit_with_parent and os.getppid() != ppid:
+            log("[backfill] parent gone: stopping the watch", verbose=True)
+            return
         try:
             bf.run_once()
         except Exception as e:  # noqa: BLE001 — keep watching

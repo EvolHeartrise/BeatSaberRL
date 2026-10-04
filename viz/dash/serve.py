@@ -19,6 +19,7 @@ import argparse
 import http.server
 import os
 import posixpath
+import signal
 import subprocess
 import sys
 import urllib.parse
@@ -105,10 +106,19 @@ def main():
               f"{HERE} (the /archive route still works)", flush=True)
     proc = None
     if not a.no_backfill:
+        # --exit-with-parent: the watch loop ends itself if this server
+        # dies without cleaning up (2026-10-04: three orphaned loops from
+        # earlier restarts kept rewriting index.json with old code)
         proc = subprocess.Popen([sys.executable, BACKFILL, "--archive",
-                                 a.archive, "--watch", str(a.watch), "-q"])
+                                 a.archive, "--watch", str(a.watch), "-q",
+                                 "--exit-with-parent"])
         print(f"[serve] backfill watch every {a.watch:g}s (pid {proc.pid})",
               flush=True)
+    # a plain `kill` (SIGTERM) must run the finally below too, or the
+    # backfill child outlives the server
+    def _term(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
     srv = Server((a.bind, a.port), make_handler(a.archive))
     print(f"[serve] http://{a.bind}:{a.port}/  (archive {a.archive})",
           flush=True)
