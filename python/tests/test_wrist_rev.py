@@ -1,5 +1,6 @@
 """Wrist-bend reversal telemetry (2026-09-22, user): per hand, a reversal
-is counted when the wrist bend axis (joints 8 / 15) turns back by 20 deg
+is counted when the wrist bend axis (joints 8 / 15) turns back by 60 deg
+(20 deg before 2026-10-04)
 from its running extreme, on every tick. Pins (1) the state machine on
 synthetic traces via a Python reference, (2) the CUDA kernel's count
 against that reference run on the kernel's own integrated angles
@@ -13,7 +14,7 @@ import torch
 
 from beat_arena_env.constants import N_JOINTS
 
-HYST = 0.34906585
+HYST = 1.0471975511965976   # 60 deg, = WREV_HYST in lib.rs / the .cu
 L_BEND, R_BEND = 8, 15
 
 
@@ -60,24 +61,28 @@ def _count(trace):
 def test_reference_semantics():
     deg = math.radians
     assert _count([0.0] * 50) == 0
-    # 30 deg flick and back: ONE reversal (the turn at the peak); the
+    # 90 deg flick and back: ONE reversal (the turn at the peak); the
     # first commitment out of rest is not a direction change
-    assert _count([0, deg(10), deg(20), deg(30), deg(20), deg(10), 0]) == 1
+    assert _count([0, deg(30), deg(60), deg(90), deg(60), deg(30), 0]) == 1
     # ... and back out again: the second turn makes 2
-    assert _count([0, deg(10), deg(20), deg(30), deg(20), deg(10), 0,
-                   deg(10), deg(20), deg(30)]) == 2
-    # 10 deg wiggle: never crosses the hysteresis -> 0
-    assert _count([0, deg(10), 0, deg(10), 0, deg(10), 0]) == 0
-    # 25 deg out, 15 back (not enough), then on to 40: no reversal yet;
+    assert _count([0, deg(30), deg(60), deg(90), deg(60), deg(30), 0,
+                   deg(30), deg(60), deg(90)]) == 2
+    # 30 deg wiggle (counted under the old 20 deg): under the
+    # hysteresis -> 0
+    assert _count([0, deg(30), 0, deg(30), 0, deg(30), 0]) == 0
+    # 75 deg out, 45 back (not enough), then on to 120: no reversal yet;
     # then back to 0: one reversal
-    assert _count([0, deg(25), deg(10), deg(40)]) == 0
-    assert _count([0, deg(25), deg(10), deg(40), 0]) == 1
+    assert _count([0, deg(75), deg(30), deg(120)]) == 0
+    assert _count([0, deg(75), deg(30), deg(120), 0]) == 1
+    # just under / just over the hysteresis
+    assert _count([0, deg(80), deg(20.5)]) == 0
+    assert _count([0, deg(80), deg(19.5)]) == 1
     # slow drift with tremor: 0
-    tr = [i * deg(0.5) + (deg(3) if i % 2 else 0) for i in range(200)]
+    tr = [i * deg(1.5) + (deg(9) if i % 2 else 0) for i in range(200)]
     assert _count(tr) == 0
-    # a 2 Hz 30 deg oscillation over 10 s at 30 Hz: one reversal per
-    # half cycle = 4 per second, minus the first commitment
-    osc = [deg(15) * math.sin(2 * math.pi * 2.0 * t / 30.0) for t in range(300)]
+    # a 2 Hz 90 deg (peak to peak) oscillation over 10 s at 30 Hz: one
+    # reversal per half cycle = 4 per second, minus the first commitment
+    osc = [deg(45) * math.sin(2 * math.pi * 2.0 * t / 30.0) for t in range(300)]
     assert 38 <= _count(osc) <= 40
 
 

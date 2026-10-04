@@ -490,6 +490,9 @@ def save_results(path, data, levels):
     data["wrist_rev_total_l"] = _wl
     data["wrist_rev_total_r"] = _wr
     data["wrist_rev_total"] = _wl + _wr
+    # the detector's hysteresis (deg): 20 before 2026-10-04 (absent on
+    # older files), 60 since; counts at different values do not compare
+    data["wrist_rev_hyst_deg"] = 60
     data["wrist_rev_ticks"] = _wt
     data["wrist_rev_per_s_l"] = round(_hz * _wl / _wt, 4) if _wt else 0.0
     data["wrist_rev_per_s_r"] = round(_hz * _wr / _wt, 4) if _wt else 0.0
@@ -808,7 +811,8 @@ def finish_slot(slot, info, combo, tick_hz=30):
         "flail_rad": round(info.get("flail_rad", 0.0), 3),
         "flail_ticks": info.get("flail_ticks", 0),
         # wrist-bend reversals (2026-09-22, user): per hand, counted by
-        # the sims' 20 deg-hysteresis peak detector on the bend axis on
+        # the sims' 60 deg-hysteresis peak detector (20 deg before
+        # 2026-10-04) on the bend axis on
         # every tick (one per direction change; a flick-and-return = 1);
         # rate = per second of played level time
         "wrist_rev_l": int(info.get("wrist_rev_l", 0)),
