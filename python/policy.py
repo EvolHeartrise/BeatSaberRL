@@ -835,12 +835,14 @@ class NotePolicy(nn.Module):
         self.n_heads = n_heads
         # n_gears = the env's BASE gear table (constants.gear_table); the
         # per-head action counts are head_gears (2026-10-04, per-joint
-        # gear counts) — the build's constants.joint_gear_counts(n_gears),
-        # which the trainer passes and load_policy checks. None = every
-        # head n_gears (main's build; today's policy exactly).
+        # gear counts). None = THIS build's layout,
+        # constants.joint_gear_counts(n_gears) — every head n_gears on
+        # main (today's policy exactly), the branch's counts on a body
+        # branch with extra gears. load_policy passes a checkpoint's own
+        # record instead (absent = uniform) and checks it.
         self.n_gears = n_gears
         if head_gears is None:
-            head_gears = (n_gears,) * N_ACTION_HEADS
+            head_gears = build_head_gears(n_gears)
         head_gears = tuple(int(k) for k in head_gears)
         assert len(head_gears) == N_ACTION_HEADS and all(
             3 <= k <= 7 for k in head_gears), (
@@ -1538,6 +1540,18 @@ def upgrade_pre_i07_state_dict(sd: dict, note_geo: bool) -> dict:
     return sd
 
 
+def build_head_gears(n_gears: int) -> tuple:
+    """This build's per-joint gear counts at base table n_gears
+    (constants.joint_gear_counts; raises ValueError when the build's
+    extra gears do not fit on that base). Imported lazily so policy.py
+    stays a leaf module; standalone (no beat_arena_env) = uniform."""
+    try:
+        from beat_arena_env.constants import joint_gear_counts
+    except ImportError:
+        return (n_gears,) * N_ACTION_HEADS
+    return joint_gear_counts(n_gears)
+
+
 def check_gear_layout(policy) -> None:
     """Refuse a policy whose per-head action counts are not this build's
     per-joint gear counts (constants.joint_gear_counts(n_gears): the base
@@ -1656,7 +1670,10 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         final_ln=arch.get("final_ln", False),
         trunk_arch=arch["trunk_arch"],
         # per-joint gear counts (2026-10-04): absent = n_gears everywhere
-        head_gears=arch.get("head_gears"))
+        # (never the build default: a uniform checkpoint stays uniform,
+        # and check_gear_layout refuses it on a build with extras)
+        head_gears=(arch.get("head_gears")
+                    or (arch["n_gears"],) * N_ACTION_HEADS))
     check_gear_layout(policy)
     sd = ckpt["state_dict"]
     policy.upgraded_from = None
