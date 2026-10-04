@@ -937,7 +937,7 @@ class CudaBeatVecEnv:
         self.flail_ticks = z(N, dt=torch.int32)
         # wrist-bend reversal telemetry (2026-09-22, user): per env x
         # hand — count since the last pop (kernel peak detection with a
-        # 20 deg hysteresis on the bend joints; flail lifecycle), the
+        # 60 deg hysteresis on the bend joints; flail lifecycle), the
         # running extremes and the detector state (reset per
         # episode by the kernel's reset_env). Popped by pop_wrist_rev.
         self.wrev = z(N, 2, dt=torch.int32)
@@ -1411,7 +1411,7 @@ class CudaBeatVecEnv:
 
     def pop_wrist_rev(self):
         """Wrist-bend reversals since the last pop, (L, R) counts summed
-        over envs (2026-09-22; 20 deg hysteresis peak detection in the
+        over envs (2026-09-22; 60 deg hysteresis since 2026-10-04, peak detection in the
         kernel, every tick). Zeroes the counters. The caller divides by
         the env-ticks it stepped (num_envs x horizon per update)."""
         per_hand = self.wrev.sum(dim=0)
