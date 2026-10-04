@@ -39,7 +39,11 @@ import shlex
 # dashboard can address any of them by name.
 UPDATE_FIELDS = (
     "upd", "n_upd", "steps", "t", "elapsed", "sps",
-    "acc", "accL", "accR", "return", "ep_return", "ent", "ev",
+    "acc", "accL", "accR",
+    # [accparts] (2026-10-04): acc's components — pre-swing / 70,
+    # post-swing / 30, precision / 15, over note cuts
+    "acc_pre", "acc_post", "acc_prec",
+    "return", "ep_return", "ent", "ev",
     "r1", "maxlr", "fp16_overflow", "fp16_scale",
     # [kl]
     "kl_first", "kl_last", "clipfrac_first", "clipfrac_last",
@@ -116,7 +120,8 @@ def entropy_groups(ent_head):
 
 def update_record(update, num_updates, global_step, *, t=None,
                   elapsed=None, rate=None, acc=None, acc_l=None,
-                  acc_r=None, ret=None, recent=None, ent=None, ev=None,
+                  acc_r=None, acc_pre=None, acc_post=None, acc_prec=None,
+                  ret=None, recent=None, ent=None, ev=None,
                   r1=None, maxlr=None, fp16_overflow=None,
                   fp16_scale=None, kl_first=None, kl_last=None,
                   cf_first=None, cf_last=None, gnorm=None, clipc=None,
@@ -138,6 +143,9 @@ def update_record(update, num_updates, global_step, *, t=None,
     rec["acc"] = _num(acc)
     rec["accL"] = _num(acc_l)
     rec["accR"] = _num(acc_r)
+    rec["acc_pre"] = _num(acc_pre)
+    rec["acc_post"] = _num(acc_post)
+    rec["acc_prec"] = _num(acc_prec)
     rec["return"] = _num(ret)
     rec["ep_return"] = _num(recent)
     rec["ent"] = _num(ent)
@@ -228,6 +236,8 @@ _RE_FLAIL = re.compile(
     r"^\[flail\] (\S+) rad/idle-tick \((?:L (\S+) / R (\S+); )?(\d+) "
     r"note-free")
 _RE_WREV = re.compile(r"^\[wrev\] L (\S+) /s +R (\S+) /s")
+_RE_ACCPARTS = re.compile(
+    r"^\[accparts\] pre (\S+)\s+post (\S+)\s+prec (\S+)")
 _RE_LIMITREST = re.compile(
     r"^\[limitrest\] (\S+) N\*m\*s/tick \(legs (\S+) / spine (\S+) / "
     r"arms (\S+)\)")
@@ -461,6 +471,13 @@ def parse_log(text, t_end=None):
             seg._pending["wrev_R"] = wr
             seg._pending["wrev"] = 0.5 * (wl + wr)
             seg._count("wrev")
+            continue
+        m = _RE_ACCPARTS.match(line)
+        if m:
+            seg._pending["acc_pre"] = _num(m.group(1))
+            seg._pending["acc_post"] = _num(m.group(2))
+            seg._pending["acc_prec"] = _num(m.group(3))
+            seg._count("accparts")
             continue
         m = _RE_LIMITREST.match(line)
         if m:

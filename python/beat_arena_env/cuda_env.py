@@ -971,6 +971,11 @@ class CudaBeatVecEnv:
         # continuous flow, phase-free by construction.
         self.acc_pts = z(N, 2)                  # per-hand [L, R]
         self.acc_cuts = z(N, 2, dt=torch.int32)
+        # 2026-10-04 (user): the acc broken into its components, per env
+        # x hand x [pre pts, pre max, post pts, post max, precision pts,
+        # precision max] (note cuts only); popped by pop_acc_parts, same
+        # lifecycle as acc_pts
+        self.acc_part = z(N, 2, 6)
         # env v20 start-pose jitter draws: (N, 12) in [-1, 1), refilled
         # in-place before every launch when enabled (in-place uniform_
         # keeps the fixed address CUDA graphs capture; torch's RNG
@@ -1048,7 +1053,7 @@ class CudaBeatVecEnv:
             self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
             self.wrev, self.wrev_ext, self.wrev_dir,
-            self.acc_pts, self.acc_cuts,
+            self.acc_pts, self.acc_cuts, self.acc_part,
             self.ground_imp,
             self.chart_idx,
             self.limit_rest, self.limit_rest_ticks,
@@ -1479,6 +1484,18 @@ class CudaBeatVecEnv:
         self.acc_pts.zero_()
         self.acc_cuts.zero_()
         return pts_l, pts_r, cuts_l, cuts_r
+
+    def pop_acc_parts(self):
+        """The training acc's components since the last pop (2026-10-04,
+        user): (pre, post, precision), each points credited / points
+        possible over note cuts — pre-swing out of 70, post-swing
+        (follow-through) out of 30, precision (cut centre distance) out of
+        15. NaN for a component with nothing credited. Sums the per-env x
+        hand accumulators and zeroes them — logging-grade, one sync."""
+        s = self.acc_part.sum(dim=(0, 1)).tolist()
+        self.acc_part.zero_()
+        f = lambda p, m: p / m if m > 0 else float("nan")  # noqa: E731
+        return f(s[0], s[1]), f(s[2], s[3]), f(s[4], s[5])
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate

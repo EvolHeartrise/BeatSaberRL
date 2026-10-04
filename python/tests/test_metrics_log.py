@@ -408,3 +408,24 @@ def test_archive_logs_if_present(rel):
     for s in segs:
         for r in s.updates:
             assert set(r) <= set(ml.UPDATE_FIELDS)
+
+
+def test_accparts_line_and_record():
+    """[accparts] (2026-10-04): the acc's components, printed before the
+    update line like [wrev], parse onto that update; the formatter
+    carries the same keys."""
+    log = ("[accparts] pre 0.9712  post 0.9488  prec 0.8123\n"
+           "update     3/100  steps   3145728  acc 0.9561  accL 0.9550  "
+           "accR 0.9572  return   5.10  ent 20.1  ev 0.996   150,000 "
+           "steps/s    21.0s\n")
+    u = ml.parse_log(log)[0].updates[0]
+    assert (u["acc_pre"], u["acc_post"], u["acc_prec"]) == (
+        0.9712, 0.9488, 0.8123)
+    rec = ml.update_record(3, 100, 3145728, acc=0.9561, acc_pre=0.9712,
+                           acc_post=0.9488, acc_prec=0.8123)
+    assert set(rec) <= set(ml.UPDATE_FIELDS)
+    assert {k: rec[k] for k in ("acc_pre", "acc_post", "acc_prec")} == {
+        "acc_pre": 0.9712, "acc_post": 0.9488, "acc_prec": 0.8123}
+    # a component with nothing credited (nan) is dropped, not written
+    rec = ml.update_record(1, 10, 100, acc_pre=float("nan"))
+    assert "acc_pre" not in rec
