@@ -575,3 +575,24 @@ def test_v1_update_index_from_episode_ticks_without_counter(tmp_path):
     assert h["approx"] is True and len(h["upd"]) >= 2
     assert all(1 <= u <= 20 for u in h["upd"])
     assert h["ss_wpp"][-1] == pytest.approx(d["totals"]["ss_wpp"], abs=0.01)
+
+
+def test_best_play_view(tmp_path):
+    """win_best: per level the window's best play (highest accuracy) —
+    its own accuracy and swing %, not the window means; play counts stay
+    the window's. Level A's completed plays: 9000 (P1: 80 % L / 90 % R),
+    9700 (P2: 100 %), 9100 (P3: 50 %, the latest)."""
+    d = _summary(write_run(tmp_path))
+    a = _row(d, "a_ExpertPlus_Standard")
+    B, M = d["win_best"], d["win"]
+    assert B["all"]["acc"][a] == pytest.approx(97.0)
+    assert B["all"]["pre"][a] == pytest.approx(100.0)
+    assert M["all"]["pre"][a] == pytest.approx((85 + 100 + 50) / 3, abs=0.1)
+    assert B["all"]["plays"][a] == M["all"]["plays"][a] == 3
+    assert B["n1"]["acc"][a] == pytest.approx(91.0)        # only the latest
+    assert B["n1"]["pre"][a] == pytest.approx(50.0)
+    assert B["n5"]["pre"][a] == pytest.approx(100.0)
+    assert B["n5"]["preL"][a] == B["n5"]["preR"][a] == pytest.approx(100.0)
+    # a window with no play for a level: no best either
+    c = _row(d, "c_Expert_Standard")
+    assert B["k100"]["plays"][c] == M["k100"]["plays"][c]
