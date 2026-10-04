@@ -51,7 +51,8 @@ pd floor) tick by tick. At each env's done tick: the ep_stats row
 (ticks, return, fell, good, score, combo walk vs scoresaber.ComboTracker
 fed Rust's events, completed, bad, misses, body) and the per-env
 telemetry (activation, torque, limit rest, self contact, wrist
-reversals).
+reversals, wrist resets — the latter's per-episode counts also EXACT
+every tick).
 """
 import sys
 
@@ -267,6 +268,8 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
                              env.walls_in], 1).cpu().numpy()
         sc_c = torch.stack([env.score, env.score_pre, env.score_acc,
                             env.score_post], 1).cpu().numpy()
+        # wrist resets this episode [resets L, R, swings L, R]
+        wrs_c = env.wrs[:, :, 3:5].transpose(1, 2).reshape(N, 4).cpu().numpy()
         pops_c = _cuda_pops(env)
         pops_r = np.zeros_like(pops_c)
         for e, sim in enumerate(sims):
@@ -337,6 +340,9 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
             assert sc_c[e].tolist() == [sim.score,
                                         *sim.score_components()], \
                 f"{tag} score decomposition"
+            assert wrs_c[e].tolist() == list(sim.wrist_resets()), \
+                f"{tag} wrist resets cuda {wrs_c[e].tolist()} rust " \
+                f"{sim.wrist_resets()}"
             # wall event contract (lib.rs / .cu wall block). walls_in is
             # compared CUDA vs Rust above; the combo break event 8
             # carries is checked through the combo walk at done.
@@ -409,6 +415,7 @@ def _lockstep(a, N, HELD, chart_s, seeds, walls):
     assert macro <= 0.08 * ticks, f"{macro}/{ticks} flips beyond 1e-3"
     # coverage: notes resolved; the dodged side wall never charged
     assert sum(s.good_cuts + s.bad_cuts + s.misses for s in sims) > 0
+    assert sum(sum(s.wrist_resets()[2:]) for s in sims) > 0, "no swings"
     assert sims[1].walls_in == 0 and sims[1].wall_enters == 0
     return ends, sims
 
@@ -480,6 +487,9 @@ def _check_episode_end(env, sim, e, walk, ret_r, ret_c, tau, max_steps):
     np.testing.assert_allclose(sc_c[0], sc_r[0], rtol=0.05, atol=1e-6,
                                err_msg=f"{tag} self contact")
     assert int(sc_c[2]) == sc_r[2], f"{tag} self-contact ticks"
+    # 2026-10-04 wrist resets cols 40..43 [resets L, R, swings L, R]
+    assert rec[40:44].tolist() == list(sim.wrist_resets()), \
+        f"{tag} wrist resets {rec[40:44]} vs {sim.wrist_resets()}"
     wl, wr, wt = sim.wrist_rev()
     assert env.wrev[e].tolist() == [wl, wr] and wt == sim.tick, \
         f"{tag} wrist reversals cuda {env.wrev[e].tolist()} rust {(wl, wr)}"
