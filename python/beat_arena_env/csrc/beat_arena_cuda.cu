@@ -773,8 +773,9 @@ constexpr int OFF_PREV_R = OFF_PREV_L + PREV_FEAT;                    // 603
 constexpr int TAU_FEAT = 16;
 // per-episode outcome record width (cuda_env.EP_REC): [s0..s15, ticks,
 // return, fell, good, score, chart] 0..21, env v47 ep_stats 22..27,
-// per-hand swing components 28..39 (2026-10-04)
-constexpr int EP_REC = 40;
+// per-hand swing components 28..39 (2026-10-04), wrist resets 40..43 =
+// [resets L, resets R, swings L, swings R] (2026-10-04)
+constexpr int EP_REC = 44;
 constexpr double TAU_RAND_NORM = 0.25;
 constexpr int OFF_TAU = OFF_PREV_R + PREV_FEAT;                       // 608
 // env v49 (review item I07, 2026-09-30): per-hand blade-TIP world
@@ -1506,6 +1507,14 @@ constexpr double FLAIL_LEAD_S = 1.0;
 // machine). 20 -> 60 deg (user, 2026-10-04): only full swings count,
 // not mid-size corrections.
 constexpr double WREV_HYST = 1.0471975511965976;   // 60 deg (pi/3)
+// wrist-reset telemetry (2026-10-04, user; lib.rs WristReset mirror): per
+// hand, a good note cut whose bend-velocity sign EQUALS the previous
+// swing's, with a reversal of the bend motion in between, is one reset.
+// Reversals: the WREV state machine with its own 30 deg hysteresis (60
+// misses short backswings; 30 is above tremor). |bend velocity| below
+// WRESET_VMIN at a cut takes the committed direction instead.
+constexpr double WRESET_HYST = 0.5235987755982988;  // 30 deg (pi/6)
+constexpr double WRESET_VMIN = 1.0;                 // rad/s
 // env v21 (lib.rs mirrors, exact shared f64 literals): wide stance —
 // hip_roll splays the legs +-8 deg, ankle_roll counter-rolls so the
 // soles stay flat. FOOT_X0 = the stance's per-side foot x (fk of
@@ -3997,6 +4006,16 @@ struct Sim {
   int* __restrict__ wrev;
   T* __restrict__ wrev_ext;
   int* __restrict__ wrev_dir;
+  // wrist-reset telemetry (2026-10-04; lib.rs WristReset): per env x
+  // hand x 5 = [detector dir (0 fresh, 3 armed, 1 +, 2 -), reversal since
+  // the last hit, previous swing's sign (0 none, 1 +, 2 -), resets this
+  // episode, swings this episode] (reset_env zeroes all five; ep_rec
+  // cols 40..43 at done), the running extremes [lo, hi] (N, 2, 2), and a
+  // per-update accumulator [resets, swings] (N, 2, 2) popped + zeroed by
+  // pop_wrist_resets (NOT touched by reset_env).
+  int* __restrict__ wrs;
+  T* __restrict__ wrs_ext;
+  int* __restrict__ wrs_acc;
   // env v34 (2026-08-21) limit-rest telemetry (per env, [legs, spine],
   // popped + zeroed by the wrapper's pop_limit_rest, NOT touched by
   // reset_env): tick-summed joint-limit-row impulses (N.m.s) the
@@ -4437,6 +4456,7 @@ __device__ void reset_env(Dyn<T>& __restrict__ d, const Sim<T>& P, int e,
   for (int k = 0; k < 12; k++) P.ep_part[e * 12 + k] = T(0);
   P.wrev_dir[e * 2] = 0;       // wrist-reversal detector re-arms on the
   P.wrev_dir[e * 2 + 1] = 0;   // new episode's first tick (count kept)
+  for (int k = 0; k < 10; k++) P.wrs[e * 10 + k] = 0;  // wrist resets
   for (int i = 0; i < P.C; i++) P.status[e * P.C + i] = 0;
   if (P.combo_walk) {  // bench combo walk: fresh walk per level
     P.cw_mult[e] = 1;
@@ -5250,6 +5270,26 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     P.wrev_dir[idx] = dir;
     P.wrev_ext[idx * 2] = lo;
     P.wrev_ext[idx * 2 + 1] = hi;
+    // wrist-reset detector (lib.rs WristReset::tick): the same machine
+    // at WRESET_HYST; a committed reversal arms ws[1]
+    int* const ws = P.wrs + idx * 5;
+    T rlo = P.wrs_ext[idx * 2], rhi = P.wrs_ext[idx * 2 + 1];
+    if (ws[0] == 0) {
+      rlo = rhi = q; ws[0] = 3;
+    } else if (ws[0] == 3) {
+      if (q < rlo) rlo = q;
+      if (q > rhi) rhi = q;
+      if (q >= rlo + T(WRESET_HYST)) { ws[0] = 1; rhi = q; }
+      else if (q <= rhi - T(WRESET_HYST)) { ws[0] = 2; rlo = q; }
+    } else if (ws[0] == 1) {
+      if (q > rhi) rhi = q;
+      else if (q <= rhi - T(WRESET_HYST)) { ws[1] = 1; ws[0] = 2; rlo = q; }
+    } else {
+      if (q < rlo) rlo = q;
+      else if (q >= rlo + T(WRESET_HYST)) { ws[1] = 1; ws[0] = 1; rhi = q; }
+    }
+    P.wrs_ext[idx * 2] = rlo;
+    P.wrs_ext[idx * 2 + 1] = rhi;
   }
 
   if constexpr (FX) {
@@ -5489,6 +5529,23 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       if (code == 0) {
         P.status[e * C + i] = 1;
         P.good[e] += 1;
+        if (!is_link) {
+          // wrist-reset telemetry (lib.rs WristReset::hit): this hand's
+          // bend velocity at the cut (d holds this tick's state)
+          int* const ws = P.wrs + (e * 2 + m) * 5;
+          const T qd = d.v[VOFF + (m ? 15 : 8)];
+          const int sg = fabs(qd) >= T(WRESET_VMIN) ? (qd > T(0) ? 1 : 2)
+                         : (ws[0] == 1 || ws[0] == 2) ? ws[0]
+                         : (qd >= T(0) ? 1 : 2);
+          const int reset = (ws[2] != 0 && sg == ws[2] && ws[1]) ? 1 : 0;
+          const int swing = (ws[2] == 0 || sg != ws[2] || ws[1]) ? 1 : 0;
+          ws[3] += reset;
+          ws[4] += swing;
+          P.wrs_acc[(e * 2 + m) * 2] += reset;
+          P.wrs_acc[(e * 2 + m) * 2 + 1] += swing;
+          ws[2] = sg;
+          ws[1] = 0;
+        }
         T pts, pre_pts = T(0), acc_pts = T(0);
         bool spawn_tr = false;
         if (is_link) {
@@ -5751,6 +5808,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       // [L: pre, pre max, post, post max, precision, precision max, then
       // R: the same] — raw note points before the combo multiplier
       for (int k = 0; k < 12; k++) r[28 + k] = P.ep_part[e * 12 + k];
+      // wrist resets this episode [resets L, R, swings L, R]
+      r[40] = T(P.wrs[e * 10 + 3]);
+      r[41] = T(P.wrs[e * 10 + 5 + 3]);
+      r[42] = T(P.wrs[e * 10 + 4]);
+      r[43] = T(P.wrs[e * 10 + 5 + 4]);
       P.ep_flag[e] = 1;
     }
   }
@@ -5890,6 +5952,7 @@ enum {
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
   TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals: count (N,2), extremes (N,2,2), state (N,2) — 2026-09-22
+  TWRS, TWRSEXT, TWRSACC, // wrist resets: state+counts (N,2,5) int, extremes (N,2,2), per-update acc (N,2,2) int — 2026-10-04
   TACCP, TACCC, TACCPART, TEPPART, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
@@ -5989,6 +6052,9 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wrev = ts[TWREV].data_ptr<int>();
     P.wrev_ext = ts[TWREVEXT].data_ptr<scalar_t>();
     P.wrev_dir = ts[TWREVDIR].data_ptr<int>();
+    P.wrs = ts[TWRS].data_ptr<int>();
+    P.wrs_ext = ts[TWRSEXT].data_ptr<scalar_t>();
+    P.wrs_acc = ts[TWRSACC].data_ptr<int>();
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
     P.acc_cuts = ts[TACCC].data_ptr<int>();
     P.acc_part = ts[TACCPART].data_ptr<scalar_t>();

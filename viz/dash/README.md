@@ -88,7 +88,10 @@ served by serve.py: idle refreshes must not redraw or reset a zoom
   stars, NPS (scoreable notes / song length), completed plays in the
   window, completed / attempted over the run, mean accuracy, and pre-swing
   (/70), post-swing (/30), precision (/15) as % of max, overall and L / R,
-  plus each level's best SS / BL pp and the update it came from. Window:
+  plus each level's best SS / BL pp and the update it came from, and
+  (ep_stats v3, 2026-10-04) wrist resets per 100 swings, overall and
+  L / R (resets / swings summed over the window's plays, or the best
+  play's own; higher = redder). Window:
   the last 1 / 5 / 20 completed plays per level, the completed plays of
   the last 100 / 500 updates, or the whole run. Only COMPLETED plays (the
   level's end reached: no fall, tilt, envelope or tick cap) count. Old

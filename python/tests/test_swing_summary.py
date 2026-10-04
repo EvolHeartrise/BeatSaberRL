@@ -13,11 +13,11 @@ import ep_stats as es
 import swing_summary as sw
 from beat_arena_env import beatleader, scoresaber
 
-EP_REC = 40
+EP_REC = 44
 
 
 class FakeEnv:
-    """pop_episodes() like CudaBeatVecEnv's: (M, 40) rows, one batch per
+    """pop_episodes() like CudaBeatVecEnv's: (M, 44) rows, one batch per
     call (the trainer pops once per update)."""
 
     def __init__(self, batches):
@@ -28,7 +28,7 @@ class FakeEnv:
 
 
 def env_row(chart, cw, completed=1, ticks=900, parts=None, good=10,
-            ret=1.5, fell=0):
+            ret=1.5, fell=0, wrs=(0, 0, 10, 10)):
     r = np.zeros(EP_REC, np.float32)
     r[:16] = 1.0
     r[16], r[17], r[18], r[19] = ticks, ret, fell, good
@@ -38,6 +38,7 @@ def env_row(chart, cw, completed=1, ticks=900, parts=None, good=10,
     r[26], r[27] = 2, 3
     if parts is not None:
         r[28:40] = parts
+    r[40:44] = wrs            # wrist resets [rL, rR, swings L, swings R]
     return r
 
 
@@ -83,12 +84,15 @@ def batches():
     P2 = parts(700, 300, 150, 700, 300, 150)           # 100 %
     P3 = parts(350, 150, 75, 350, 150, 75)             # 50 %
     return [
-        np.stack([env_row(0, 9000, parts=P1), env_row(4, 5000, parts=P3)]),
-        np.stack([env_row(1, 9990, completed=0, fell=1, parts=P2),
+        np.stack([env_row(0, 9000, parts=P1, wrs=(2, 0, 10, 20)),
+                  env_row(4, 5000, parts=P3)]),
+        np.stack([env_row(1, 9990, completed=0, fell=1, parts=P2,
+                          wrs=(9, 9, 9, 9)),
                   env_row(2, 7000, parts=P1)]),
-        np.stack([env_row(1, 9700, parts=P2), env_row(5, 5500, parts=P2),
+        np.stack([env_row(1, 9700, parts=P2, wrs=(0, 1, 10, 20)),
+                  env_row(5, 5500, parts=P2),
                   env_row(3, 7500, completed=0, ticks=30, parts=P2)]),
-        np.stack([env_row(0, 9100, parts=P3)]),
+        np.stack([env_row(0, 9100, parts=P3, wrs=(1, 3, 20, 20))]),
     ]
 
 
@@ -109,8 +113,8 @@ def write_run(tmp_path, upto=None, levels=True):
 def test_build_rows_layout_from_a_fake_env(tmp_path):
     run = write_run(tmp_path)
     R = es.load(str(run))
-    assert R.shape == (8, es.EP_STATS_COLS) == (8, 29)
-    assert es.file_layout(str(run / "ep_stats.f32"))[:2] == (2, 29)
+    assert R.shape == (8, es.EP_STATS_COLS) == (8, 33)
+    assert es.file_layout(str(run / "ep_stats.f32"))[:2] == (3, 33)
     r = R[0]
     assert r[0] == 0 and r[1] == 11 and r[3] == 10000      # chart, SS id, max
     assert r[4] == 900 and r[6] == 1 and r[7] == 9000
@@ -119,7 +123,9 @@ def test_build_rows_layout_from_a_fake_env(tmp_path):
     assert (r[10], r[11], r[12], r[13], r[14]) == (7, 1, 10, 2, 3)
     assert r[15] == pytest.approx(1.5)
     assert r[es.COL_UPDATE] == 1 and R[-1, es.COL_UPDATE] == 4
-    np.testing.assert_array_equal(r[es.COL_PART:], parts(560, 240, 120, 630, 270, 135))
+    np.testing.assert_array_equal(r[es.COL_PART:es.COL_WRS],
+                                  parts(560, 240, 120, 630, 270, 135))
+    np.testing.assert_array_equal(r[es.COL_WRS:], [2, 0, 10, 20])
     assert R[2, 9] == 0.0                                  # unfinished: no pp
 
 
@@ -140,11 +146,26 @@ def test_writer_moves_a_v1_file_aside(tmp_path):
     (tmp_path / "ep_stats.f32").write_bytes(v1.tobytes())
     w = es.EpStatsWriter(str(tmp_path), log=lambda *a, **k: None)
     assert (tmp_path / "ep_stats.v1.f32").read_bytes() == v1.tobytes()
-    assert es.file_layout(w.path)[:2] == (2, 29) and len(es.load(str(tmp_path))) == 0
-    # a v2 file is appended to, not rotated
-    w.append(np.zeros((1, 29), np.float32))
+    assert es.file_layout(w.path)[:2] == (3, 33) and len(es.load(str(tmp_path))) == 0
+    # a v3 file is appended to, not rotated
+    w.append(np.zeros((1, 33), np.float32))
     es.EpStatsWriter(str(tmp_path), log=lambda *a, **k: None)
     assert len(es.load(str(tmp_path))) == 1
+
+
+def test_writer_upgrades_a_v2_file_in_place(tmp_path):
+    """A resume onto a v2 file: the rows stay, gain 4 NaN wrist-reset
+    cols, and new v3 rows append after them."""
+    p = tmp_path / "ep_stats.f32"
+    v2 = np.arange(2 * 29, dtype=np.float32).reshape(2, 29)
+    p.write_bytes(es.header_row(29, 2).tobytes() + v2.tobytes())
+    w = es.EpStatsWriter(str(tmp_path), log=lambda *a, **k: None)
+    assert es.file_layout(w.path)[:2] == (3, 33)
+    assert not (tmp_path / "ep_stats.v2.f32").exists()
+    w.append(np.ones((1, 33), np.float32))
+    R = es.load(str(tmp_path))
+    np.testing.assert_array_equal(R[:2, :29], v2)
+    assert np.isnan(R[:2, 29:]).all() and (R[2] == 1).all()
 
 
 def test_tau_fit_reads_v2(tmp_path):
@@ -174,7 +195,8 @@ def test_totals_completed_only_and_mirror_merge(tmp_path):
     L = d["levels"]
     a, b, c = (_row(d, k) for k in ("a_ExpertPlus_Standard", "b_Hard_Standard",
                                     "c_Expert_Standard"))
-    assert d["n_levels"] == 3 and d["swing"] and d["ep_layout"] == 2
+    assert d["n_levels"] == 3 and d["swing"] and d["ep_layout"] == 3
+    assert d["wreset"]
     # A: 4 attempts over both copies, 3 completed; best = 9700 (the
     # 9990 play fell)
     assert L["att"][a] == 4 and L["done"][a] == 3
@@ -226,6 +248,16 @@ def test_windows(tmp_path):
     assert W["k100"]["plays"][a] == 3
     keys = [w["key"] for w in d["windows"]]
     assert keys == ["n1", "n5", "n20", "k100", "k500", "all"]
+    # wrist resets per 100 swings, summed over the window's completed
+    # plays (the fallen 9990 play's 9/9 never counts): A's plays (2, 0,
+    # 10, 20), (0, 1, 10, 20), (1, 3, 20, 20)
+    assert W["all"]["wrsL"][a] == round(100 * 3 / 40, 1)
+    assert W["all"]["wrsR"][a] == round(100 * 4 / 60, 1)
+    assert W["all"]["wrs"][a] == round(100 * 7 / 100, 1)
+    assert W["n1"]["wrsL"][a] == 5.0 and W["n1"]["wrsR"][a] == 15.0
+    # the best view: the window's best play (acc 0.97: the 9700 play)
+    B = d["win_best"]["all"]
+    assert B["wrsL"][a] == 0.0 and B["wrsR"][a] == 5.0
 
 
 def test_last_k_updates_window(tmp_path):
@@ -300,8 +332,24 @@ def test_v1_run_without_swing_cols(tmp_path):
     # no metrics.jsonl: the update windows are unavailable
     av = {w["key"]: w["available"] for w in d["windows"]}
     assert not av["k100"] and av["n1"] and av["all"]
-    v2 = _summary(write_run(tmp_path / "new"))
-    assert d["totals"] == v2["totals"]
+    v3 = _summary(write_run(tmp_path / "new"))
+    assert d["totals"] == v3["totals"]
+
+
+def test_v2_run_has_swing_but_no_wrist_resets(tmp_path):
+    """A 29-col v2 file still reads with swing columns; the wrist-reset
+    columns are null."""
+    run = tmp_path / "v2"
+    run.mkdir()
+    (run / "levels.json").write_text(json.dumps(LEVELS))
+    er = es.build_rows(np.concatenate(batches()), META, 1)[:, :29]
+    with open(run / "ep_stats.f32", "wb") as f:
+        f.write(es.header_row(29, 2).tobytes() + er.tobytes())
+    d = _summary(run)
+    a = _row(d, "a_ExpertPlus_Standard")
+    assert d["ep_layout"] == 2 and d["swing"] and not d["wreset"]
+    assert d["win"]["all"]["pre"][a] is not None
+    assert d["win"]["all"]["wrsL"] is None
 
 
 def test_v1_update_index_from_metrics(tmp_path):

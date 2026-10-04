@@ -22,9 +22,18 @@ Reads runs/<name>/ep_stats.f32 (raw float32 rows). Two layouts:
     precision out of 15 per note cut; chain links score none of them).
     Levels resolve through chart_idx -> the run's levels.json sidecar
     (ranked_pool.level_table: SS / BL ids, stars, max scores, ...).
+  v3 (2026-10-04): the same header row, EP_STATS_COLS = 33 cols: the 29
+    of v2 unchanged, then
+    29 wreset_l  30 wreset_r  31 wswing_l  32 wswing_r
+    — the episode's WRIST RESETS and swings per hand (lib.rs WristReset:
+    a good note cut whose bend-velocity sign equals the previous swing's
+    with a >= 30 deg reversal of the bend in between is a reset; hits of
+    one continuous bend motion are one swing). The trainer upgrades a v2
+    file IN PLACE when it resumes onto it (the v2 rows get NaN there).
 
-load() returns the data rows of either layout (header stripped); cols
-0..15 mean the same in both, so v1 readers keep working on col <= 15.
+load() returns the data rows of any layout (header stripped); cols
+0..15 mean the same in all, 16..28 in v2 and v3, so older readers keep
+working on their prefix.
 Rows are written in the SAME order as tau_draws.f32 (the same pop), so
 row i of both files is the same episode when both logs are on — that is
 what --tau joins on. Plays are the sampled training policy at the drawn
@@ -38,20 +47,25 @@ import numpy as np
 
 NCOL = 16                 # v1 width (kept for old callers)
 EP_STATS_COLS_V1 = 16
-EP_STATS_COLS = 29        # v2
-EP_STATS_VERSION = 2
+EP_STATS_COLS_V2 = 29
+EP_STATS_COLS = 33        # v3
+EP_STATS_VERSION = 3
 HEADER_MAGIC = -1234567.0  # exact in float32
 COL_UPDATE = 16
 COL_PART = 17             # 12 swing cols: hand-major [L, R] x PART_FIELDS
+COL_WRS = 29              # v3: [resets L, resets R, swings L, swings R]
+WRS_FIELDS = ("wreset_l", "wreset_r", "wswing_l", "wswing_r")
 PART_FIELDS = ("pre", "pre_max", "post", "post_max", "prec", "prec_max")
 COLUMNS_V1 = ("chart_idx", "leaderboard_id", "max_pp", "max_score", "ticks",
               "fell", "completed", "cw_score", "acc", "pp", "max_combo",
               "breaks", "good", "bad", "miss", "ep_return")
 COLUMNS = COLUMNS_V1 + ("update",) + tuple(
-    f"{f}_{h}" for h in ("l", "r") for f in PART_FIELDS)
+    f"{f}_{h}" for h in ("l", "r") for f in PART_FIELDS) + WRS_FIELDS
 assert len(COLUMNS) == EP_STATS_COLS
-# the env record's swing columns (cuda_env.EP_PART_COL)
+# the env record's swing / wrist-reset columns (cuda_env.EP_PART_COL,
+# EP_WRS_COL)
 EP_REC_PART_COL = 28
+EP_REC_WRS_COL = 40
 
 
 def header_row(ncol=EP_STATS_COLS, version=EP_STATS_VERSION):
@@ -128,25 +142,51 @@ def build_rows(rows, ep_meta, update):
         part = rows[:, EP_REC_PART_COL:EP_REC_PART_COL + 12]
     else:                               # an env without the swing cols
         part = np.full((rows.shape[0], 12), np.nan, np.float32)
+    if rows.shape[1] >= EP_REC_WRS_COL + 4:
+        wrs = rows[:, EP_REC_WRS_COL:EP_REC_WRS_COL + 4]
+    else:                               # an env without wrist resets
+        wrs = np.full((rows.shape[0], 4), np.nan, np.float32)
     return np.column_stack([
         rows[:, 21], ep_meta["level_lb"][ci].astype(np.float32),
         ep_meta["level_max_pp"][ci], max_score,
         rows[:, 16], rows[:, 18], rows[:, 25], rows[:, 22], acc, pp,
         rows[:, 23], rows[:, 24], rows[:, 19], rows[:, 26], rows[:, 27],
-        rows[:, 17], np.full(rows.shape[0], float(update)), part,
+        rows[:, 17], np.full(rows.shape[0], float(update)), part, wrs,
     ]).astype(np.float32)
 
 
+def upgrade_v2_file(path):
+    """Rewrite a v2 ep_stats file as v3 in place (temp file + rename):
+    the v3 header, every v2 row + 4 NaN wrist-reset cols. Returns the
+    row count."""
+    rows, _, ver, ncol = read_rows(path, 0)
+    assert (ver, ncol) == (2, EP_STATS_COLS_V2), (ver, ncol)
+    out = np.full((len(rows), EP_STATS_COLS), np.nan, np.float32)
+    out[:, :EP_STATS_COLS_V2] = rows
+    tmp = path + ".v3tmp"
+    with open(tmp, "wb") as f:
+        f.write(header_row().tobytes())
+        f.write(out.tobytes())
+    os.replace(tmp, path)
+    return len(rows)
+
+
 class EpStatsWriter:
-    """Appends v2 rows to <run_dir>/ep_stats.f32, writing the header row
-    on a fresh file. A run dir that already holds a v1 (headerless)
-    file — a resume across the layout change — gets it moved aside to
-    ep_stats.v1.f32 first (tau_fit / ep_stats --tau align on the tail,
-    so tau_draws.f32 keeps working)."""
+    """Appends v3 rows to <run_dir>/ep_stats.f32, writing the header row
+    on a fresh file. A run dir that already holds a v2 file — a resume
+    across the v3 change — has it upgraded in place (upgrade_v2_file: the
+    old rows keep their place, NaN wrist-reset cols); a v1 (headerless)
+    file is moved aside to ep_stats.v1.f32 first (tau_fit / ep_stats
+    --tau align on the tail, so tau_draws.f32 keeps working)."""
 
     def __init__(self, run_dir, log=print):
         self.path = os.path.join(run_dir, "ep_stats.f32")
         ver, ncol, _ = file_layout(self.path)
+        if (ver, ncol) == (2, EP_STATS_COLS_V2):
+            n = upgrade_v2_file(self.path)
+            log(f"--ep-stats: upgraded the v2 ep_stats.f32 ({n:,} rows) "
+                f"to v{EP_STATS_VERSION} in place", flush=True)
+            ver, ncol = EP_STATS_VERSION, EP_STATS_COLS
         if ver is not None and (ver, ncol) != (EP_STATS_VERSION,
                                                EP_STATS_COLS):
             old = os.path.join(run_dir, f"ep_stats.v{ver}.f32")
@@ -186,8 +226,8 @@ def main():
     print(f"completed: acc {C[:, 8].mean():.4f}  pp mean {C[:, 9].mean():.1f} "
           f"median {np.median(C[:, 9]):.1f} max {C[:, 9].max():.1f}  "
           f"FC {100 * (C[:, 11] == 0).mean():.1f}%")
-    if C.shape[1] >= EP_STATS_COLS:
-        # v2: swing components over the completed plays' note cuts
+    if C.shape[1] >= COL_PART + 12:
+        # v2+: swing components over the completed plays' note cuts
         P = np.nansum(C[:, COL_PART:COL_PART + 12], axis=0).reshape(2, 6)
         parts = []
         for name, k in (("pre", 0), ("post", 2), ("prec", 4)):
@@ -196,6 +236,12 @@ def main():
             parts.append(f"{name} {100 * tot:.1f}% (L {100 * lr[0]:.1f} / "
                          f"R {100 * lr[1]:.1f})")
         print("completed swing: " + "  ".join(parts))
+    if C.shape[1] >= COL_WRS + 4:
+        # v3: wrist resets per 100 swings over the completed plays
+        W = np.nansum(C[:, COL_WRS:COL_WRS + 4], axis=0)
+        f = lambda r, s: 100.0 * r / s if s > 0 else float("nan")  # noqa: E731
+        print(f"completed wrist resets / 100 swings: L {f(W[0], W[2]):.2f}"
+              f"  R {f(W[1], W[3]):.2f}  ({int(W[2] + W[3]):,} swings)")
     # per-map (leaderboard) aggregation over completed plays
     lbs = C[:, 1].astype(np.int64)
     ids, inv, cnt = np.unique(lbs, return_inverse=True, return_counts=True)

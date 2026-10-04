@@ -9,7 +9,8 @@ ep_stats.f32 (2026-10-04, user) — the dashboard's "swing" tab.
 
 Inputs, both in the run dir:
   ep_stats.f32  the trainer's per-episode rows (ep_stats.py; v1 = 16 cols,
-                v2 = + update index + 12 per-hand swing cols)
+                v2 = + update index + 12 per-hand swing cols, v3 = + 4
+                wrist-reset cols)
   levels.json   chart_idx -> level (ranked_pool.level_table; written by
                 the trainer since 2026-10-04, or by --reconstruct for an
                 older run, validated against the file's ids / max scores)
@@ -20,8 +21,10 @@ attempted; a level's mirrored training copy is the same level):
     the completed plays of the last K = 100 / 500 updates, the whole run —
     plays and the average pre-swing / post-swing / precision points as %
     of their max (70 / 30 / 15 per note), overall and per hand, plus the
-    mean accuracy; ONLY completed plays (the level's end reached: no fall,
-    tilt, envelope escape or tick cap) count;
+    mean accuracy, plus (v3 rows) WRIST RESETS per 100 swings, overall
+    and per hand (wrs / wrsL / wrsR: summed resets / summed swings);
+    ONLY completed plays (the level's end reached: no fall, tilt,
+    envelope escape or tick cap) count;
   - per level over the whole run: attempts, completions, the best
     completed play's score -> SS and BL accuracy / PP;
   - totals: the best-possible SS / BL WPP (descending, 0.965^i) and UPP
@@ -62,7 +65,7 @@ import ep_stats as es  # noqa: E402
 
 SWING_FORMAT = "beat-arena-swing"
 SWING_VERSION = 1
-STATE_VERSION = 5   # 2: best-possible history; 3/4: v1 update index; 5: best-play stats (2026-10-04)
+STATE_VERSION = 6   # 2: best-possible history; 3/4: v1 update index; 5: best-play stats; 6: wrist resets (2026-10-04)
 N_WINDOWS = (1, 5, 20)
 K_WINDOWS = (100, 500)
 WINDOWS = ([("n%d" % n, "last %d play%s" % (n, "" if n == 1 else "s"))
@@ -76,9 +79,13 @@ PP_DECAY = 0.965   # both boards: play i of the descending list weighs 0.965^i
 HIST_JSON = "swing_hist.json"
 STATE_JSON = ".swing_state.json"
 STATE_NPZ = ".swing_state.npz"
-# tail-table columns: level, seq, update, acc, then the 12 swing cols
+# per-play columns: the 12 swing cols, then the 4 wrist-reset cols
+# [resets L, resets R, swings L, swings R] (NaN on rows without them)
+P_SWING = 12
+P_COLS = P_SWING + 4
+# tail-table columns: level, seq, update, acc, then the P_COLS play cols
 T_LEVEL, T_SEQ, T_UPD, T_ACC, T_PART = 0, 1, 2, 3, 4
-T_COLS = T_PART + 12
+T_COLS = T_PART + P_COLS
 
 
 # ------------------------------------------------------------------ PP code
@@ -310,7 +317,7 @@ class State:
             b = np.full(shape, fill)
             b[:a.shape[0]] = a
             return b
-        self.run_sum = grow(getattr(self, "run_sum", None), (L, 12))
+        self.run_sum = grow(getattr(self, "run_sum", None), (L, P_COLS))
         self.run_done = grow(getattr(self, "run_done", None), (L,))
         self.run_att = grow(getattr(self, "run_att", None), (L,))
         self.acc_sum = grow(getattr(self, "acc_sum", None), (L,))
@@ -325,7 +332,8 @@ class State:
         # the whole run's best play per level among plays WITH swing data
         # (the Swing tab's "best" view): its accuracy and 12 swing cols
         self.sw_best_acc = grow(getattr(self, "sw_best_acc", None), (L,), -1.0)
-        self.sw_best_part = grow(getattr(self, "sw_best_part", None), (L, 12), np.nan)
+        self.sw_best_part = grow(getattr(self, "sw_best_part", None),
+                                 (L, P_COLS), np.nan)
 
     ARRAYS = ("run_sum", "run_done", "run_att", "acc_sum", "best",
               "best_upd", "max_score", "tail_n", "tail_k",
@@ -453,16 +461,19 @@ def ingest(st, rows, ver, levmap, run_dir, best_only=False, total=None):
     if n == 0:
         return
     seq = np.arange(st.seq, st.seq + n, dtype=np.float64)
-    if ver >= 2 and rows.shape[1] >= es.EP_STATS_COLS:
+    if ver >= 2 and rows.shape[1] >= es.COL_PART + 12:
         upd = rows[:, es.COL_UPDATE].astype(np.float64)
-        part = rows[:, es.COL_PART:es.COL_PART + 12].astype(np.float64)
+        part = np.full((n, P_COLS), np.nan)
+        part[:, :P_SWING] = rows[:, es.COL_PART:es.COL_PART + 12]
+        if rows.shape[1] >= es.COL_WRS + 4:          # v3: wrist resets
+            part[:, P_SWING:] = rows[:, es.COL_WRS:es.COL_WRS + 4]
     else:
         upd, exact = v1_updates(run_dir, st.seq, n, ticks=rows[:, 4],
                                 tick0=st.v1_ticks)
         st.v1_ticks += float(rows[:, 4].astype(np.float64).sum())
         if not exact:
             st.hist_approx = True
-        part = np.full((n, 12), np.nan)
+        part = np.full((n, P_COLS), np.nan)
     st.seq += n
     chart = rows[:, 0].astype(np.int64)
     lb = rows[:, 1].astype(np.int64)
@@ -533,11 +544,12 @@ def _r1(a):
     return [None if not np.isfinite(x) else round(float(x), 1) for x in a]
 
 
-def window_stats(sums, plays, acc_sum, swing_ok):
-    """{plays, pre, post, prec, preL, ..., acc} lists from per-level sums
-    (12 swing cols) and play counts."""
+def window_stats(sums, plays, acc_sum, swing_ok, wrs_ok=False):
+    """{plays, pre, post, prec, preL, ..., acc, wrs, wrsL, wrsR} lists
+    from per-level sums (P_COLS play cols) and play counts. wrs* = wrist
+    resets per 100 swings (None without v3 rows)."""
     out = {"plays": [int(x) for x in plays]}
-    P = sums.reshape(-1, 2, 6)
+    P = sums[:, :P_SWING].reshape(-1, 2, 6)
     for name, k in (("pre", 0), ("post", 2), ("prec", 4)):
         if swing_ok:
             out[name] = _r1(_pct(P[:, :, k].sum(1), P[:, :, k + 1].sum(1)))
@@ -548,10 +560,18 @@ def window_stats(sums, plays, acc_sum, swing_ok):
     with np.errstate(invalid="ignore", divide="ignore"):
         out["acc"] = _r1(np.where(plays > 0, 100.0 * acc_sum
                                   / np.maximum(plays, 1), np.nan))
+    if wrs_ok:
+        W = sums[:, P_SWING:]           # [resets L, R, swings L, R]
+        out["wrs"] = _r1(_pct(W[:, 0] + W[:, 1], W[:, 2] + W[:, 3]))
+        out["wrsL"] = _r1(_pct(W[:, 0], W[:, 2]))
+        out["wrsR"] = _r1(_pct(W[:, 1], W[:, 3]))
+    else:
+        out["wrs"] = out["wrsL"] = out["wrsR"] = None
     return out
 
 
-def build_summary(st, levmap, run_dir, swing_ok, levels_source):
+def build_summary(st, levmap, run_dir, swing_ok, levels_source,
+                  wrs_ok=False):
     L = st.run_sum.shape[0]
     att = st.run_att[:L]
     # levels with a best play only (a resumed run's pre-resume rows,
@@ -617,7 +637,7 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
     def best_of(t):
         """Per level the window's best play (highest accuracy): its swing
         cols and accuracy, as window_stats input (one play each)."""
-        sums = np.full((S, 12), np.nan)
+        sums = np.full((S, P_COLS), np.nan)
         one = np.zeros(S)
         accs = np.zeros(S)
         if len(t):
@@ -632,7 +652,7 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
         return sums, one, accs
 
     def from_tail(t):
-        sums = np.zeros((S, 12))
+        sums = np.zeros((S, P_COLS))
         plays = np.zeros(S)
         accs = np.zeros(S)
         if len(t):
@@ -660,7 +680,8 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
             K = int(key[1:])
             if st.last_update is None:
                 ok = False
-                sums, plays, accs = np.zeros((S, 12)), np.zeros(S), np.zeros(S)
+                sums, plays, accs = (np.zeros((S, P_COLS)), np.zeros(S),
+                                     np.zeros(S))
             else:
                 t = st.tail_k
                 bsrc = t[t[:, T_UPD] > st.last_update - K]
@@ -668,7 +689,8 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
         else:
             sums, plays, accs = (st.run_sum[seen], st.run_done[seen],
                                  st.acc_sum[seen])
-        win[key] = window_stats(sums, plays, accs, swing_ok) if ok else None
+        win[key] = (window_stats(sums, plays, accs, swing_ok, wrs_ok)
+                    if ok else None)
         if ok:
             if bsrc is not None:
                 bs_, b1, ba = best_of(bsrc)
@@ -676,7 +698,7 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
                 bs_ = st.sw_best_part[seen]
                 ba = np.where(st.sw_best_acc[seen] >= 0, st.sw_best_acc[seen], 0.0)
                 b1 = (st.sw_best_acc[seen] >= 0).astype(float)
-            wb = window_stats(np.nan_to_num(bs_), b1, ba, swing_ok)
+            wb = window_stats(np.nan_to_num(bs_), b1, ba, swing_ok, wrs_ok)
             wb["plays"] = win[key]["plays"]          # the window's play count
             win_best[key] = wb
         else:
@@ -689,6 +711,8 @@ def build_summary(st, levmap, run_dir, swing_ok, levels_source):
         "generated": time.time(),
         "ep_layout": st.layout[0] if st.layout else None,
         "swing": bool(swing_ok),
+        # v3 rows: per-level wrist resets per 100 swings (wrs / wrsL / wrsR)
+        "wreset": bool(wrs_ok),
         "levels_source": levels_source,
         "catalog": tab.get("catalog"),
         "rows": st.n_rows, "completed": st.n_done,
@@ -712,6 +736,7 @@ def index_entry(summary, run_dir, rel=None):
             "hist": (((rel + "/" + HIST_JSON) if rel else hist)
                      if os.path.exists(hist) else None),
             "ep_layout": summary["ep_layout"], "swing": summary["swing"],
+            "wreset": summary.get("wreset", False),
             "levels_source": summary["levels_source"],
             "rows": summary["rows"], "completed": summary["completed"],
             "last_update": summary["last_update"],
@@ -769,7 +794,7 @@ def update_run(run_dir, force=False, log=None):
     st.fallback = levmap.state()
     swing_ok = ver >= 2
     src = (table.get("source", "trainer") if table else None)
-    full = build_summary(st, levmap, run_dir, swing_ok, src)
+    full = build_summary(st, levmap, run_dir, swing_ok, src, wrs_ok=ver >= 3)
     tmp = out_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(full, f, separators=(",", ":"))
