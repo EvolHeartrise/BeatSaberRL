@@ -4008,6 +4008,14 @@ struct Sim {
   // phase-free by construction (no completion waves, no censoring).
   T* __restrict__ acc_pts;
   int* __restrict__ acc_cuts;
+  // 2026-10-04 (user): the training acc broken into its components, per
+  // (env, HAND) x 6 = [pre pts, pre max, post pts, post max, precision
+  // pts, precision max], credited at the same sites as acc_pts (pre and
+  // precision at the cut, post at follow-through resolution / free-post
+  // grant, x cnt for stacked trackers). Note cuts only: chain links and
+  // Flux circles / bars have no swing components. Same lifecycle as
+  // acc_pts (popped + zeroed by pop_acc_parts, NOT touched by reset_env).
+  T* __restrict__ acc_part;
   // env v12 (contact spec §7): tick-summed ground NORMAL impulses per
   // (env, bucket) — [L_heel, L_toe, R_heel, R_toe] (N·s), the lib.rs
   // Body::ground_imp mirror. Written by the step tick, zeroed by
@@ -5119,6 +5127,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
         P.acc_pts[e * 2 + h] += pts * T(cnt);
+        P.acc_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
+        P.acc_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
         if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
@@ -5470,6 +5480,11 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
           pts = pre + acc;
           pre_pts = pre;
           acc_pts = acc;
+          T* const ap = P.acc_part + (e * 2 + m) * 6;
+          ap[0] += pre;
+          ap[1] += T(PTS_PRE);
+          ap[4] += acc;
+          ap[5] += T(PTS_ACC);
           if (is_head) {
             // chain heads: no follow-through (max 85), except one that is
             // also an arc head or tail (ChainHeadArcHead/ArcTail): the 30
@@ -5477,10 +5492,14 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
             if (P.p_free_pre[cb] || P.p_free_post[cb]) {
               pts += T(PTS_POST);
               P.score_post[e] += T(PTS_POST);
+              ap[2] += T(PTS_POST);
+              ap[3] += T(PTS_POST);
             }
           } else if (P.p_free_post[cb]) {
             pts += T(PTS_POST);
             P.score_post[e] += T(PTS_POST);
+            ap[2] += T(PTS_POST);
+            ap[3] += T(PTS_POST);
           } else {
             n_new[m] += 1;  // spawn a follow-through tracker
             spawn_tr = true;
@@ -5635,6 +5654,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         P.score[e] += pts * T(cnt);
         P.score_post[e] += pts * T(cnt);
         P.acc_pts[e * 2 + h] += pts * T(cnt);
+        P.acc_part[(e * 2 + h) * 6 + 2] += pts * T(cnt);
+        P.acc_part[(e * 2 + h) * 6 + 3] += T(PTS_POST) * T(cnt);
         if (P.combo_walk) P.cw_score[e] += T((float)pts) * T(P.tr_msum[b]);
         P.tr_active[b] = false;
       }
@@ -5828,7 +5849,7 @@ enum {
   TGOOD, TBAD, TMISS, TBOMBS, TSCORE, TSPRE, TSACC, TSPOST,
   TCIMP, TCPT, TCARM, TPD, TENV, TFALL, TTILT, TLIFT, TFOOTDOWN,
   TFLAILR, TFLAILT, TWREV, TWREVEXT, TWREVDIR, // wrist-bend reversals: count (N,2), extremes (N,2,2), state (N,2) — 2026-09-22
-  TACCP, TACCC, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
+  TACCP, TACCC, TACCPART, TGIMP, TCIDX, TLIMREST, TLIMTICKS,
   TPOSEJIT, TFOOTPOT, TBPPOS, TBPVEL,
   TSCSTAT,  // env v41 self-contact telemetry (N, 3)
   TACTSTAT, // activation telemetry (N, 5) — 2026-09-13
@@ -5929,6 +5950,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.wrev_dir = ts[TWREVDIR].data_ptr<int>();
     P.acc_pts = ts[TACCP].data_ptr<scalar_t>();
     P.acc_cuts = ts[TACCC].data_ptr<int>();
+    P.acc_part = ts[TACCPART].data_ptr<scalar_t>();
     P.ground_imp = ts[TGIMP].data_ptr<scalar_t>();
     P.limit_rest = ts[TLIMREST].data_ptr<scalar_t>();
     P.limit_rest_ticks = ts[TLIMTICKS].data_ptr<int>();

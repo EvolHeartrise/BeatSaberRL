@@ -3078,6 +3078,14 @@ def main():
                 acc_l = p_l / (115.0 * c_l)
             if c_r:
                 acc_r = p_r / (115.0 * c_r)
+        # 2026-10-04 (user): the acc's components over the same window —
+        # pre-swing / 70, post-swing / 30, precision / 15 (note cuts;
+        # cuda_env.pop_acc_parts)
+        acc_pre = acc_post = acc_prec = float("nan")
+        if hasattr(venv, "pop_acc_parts"):
+            acc_pre, acc_post, acc_prec = venv.pop_acc_parts()
+            print(f"[accparts] pre {acc_pre:.4f}  post {acc_post:.4f}  "
+                  f"prec {acc_prec:.4f}", flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
@@ -3202,6 +3210,7 @@ def main():
         write_metrics(
             update + 1, num_updates, global_step, t=time.time(),
             elapsed=elapsed, rate=rate, acc=acc_now, acc_l=acc_l,
+            acc_pre=acc_pre, acc_post=acc_post, acc_prec=acc_prec,
             # ep_return(last100) dropped from the line and the record
             # (2026-09-12, user: too noisy; `return` over the update is
             # the stable population measure). Checkpoints still carry

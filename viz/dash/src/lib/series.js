@@ -92,6 +92,7 @@ export function hasAny(recs, key) {
 // Panels: one chart each; `series` are metric keys drawn together.
 export const PANELS = [
   { id: "acc", title: "accuracy (note score / 115·cuts)", series: ["acc", "accL", "accR"] },
+  { id: "accparts", title: "accuracy by component (points / max over note cuts · pre-swing /70 · post-swing /30 · precision /15)", series: ["acc_pre", "acc_post", "acc_prec"] },
   { id: "return", title: "return (reward per env this update)", series: ["return"] },
   { id: "ent", title: "entropy (ent: last minibatch · entfull: full batch)", series: ["ent", "entfull"] },
   { id: "ev", title: "explained variance", series: ["ev"] },
@@ -103,7 +104,7 @@ export const PANELS = [
   { id: "entgroups", title: "entropy per head group (mean per head)", series: ["ent_spine", "ent_armL", "ent_armR", "ent_legL", "ent_legR"] },
   { id: "lifts", title: "foot lifts per 1M samples", series: ["lifts_per_1m"] },
   { id: "flail", title: "flail (rad / idle tick)", series: ["flail", "flail_L", "flail_R"] },
-  { id: "wrev", title: "wrist-bend reversals per second (per hand · 20° hysteresis, every tick)", series: ["wrev_L", "wrev_R"] },
+  { id: "wrev", title: "wrist-bend reversals per second (per hand · 60° hysteresis since 2026-10-04, 20° before; every tick)", series: ["wrev_L", "wrev_R"] },
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
   { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
   { id: "torque", title: "joint torque Σ|τ| (N·m / env-tick · total / spine / arms / legs) — the energy price base (env v43)", series: ["torque", "torque_spine", "torque_arms", "torque_legs"] },
@@ -130,7 +131,7 @@ export function panelsFor(game) {
 
 // Compare view: scalar metrics worth a small multiple and a diff panel.
 export const COMPARE_KEYS = [
-  "acc", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
+  "acc", "acc_pre", "acc_post", "acc_prec", "return", "ent", "entfull", "ev", "sps_k", "falls_per_1m_pos", "tilts_per_1m_pos",
   "clipfrac_last", "kl_last_pos", "gnorm", "clipc", "limitrest", "flail", "wrev", "lifts_per_1m",
   "activation", "activation_spine", "activation_arms", "activation_legs",
   "torque", "torque_spine", "torque_arms", "torque_legs",
@@ -142,6 +143,7 @@ export const DIFF_KEYS = ["acc", "return", "ent", "ev"];
 
 export const LABELS = {
   acc: "acc", accL: "accL", accR: "accR", return: "return",
+  acc_pre: "pre-swing", acc_post: "post-swing", acc_prec: "precision",
   ent: "ent", entfull: "entfull", ev: "ev", sps_k: "steps/s (k)",
   falls_per_1m: "falls / 1M", tilts_per_1m: "tilts / 1M", lifts_per_1m: "lifts / 1M",
   falls_per_1m_pos: "falls / 1M (log)", tilts_per_1m_pos: "tilts / 1M (log)",
