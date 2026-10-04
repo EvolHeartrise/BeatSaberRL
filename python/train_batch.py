@@ -39,8 +39,9 @@ from datetime import datetime
 
 import numpy as np
 
-# env v47 --ep-stats row layout (float32; v2 since 2026-10-04 = header row
-# + the 16 v1 cols, update, 12 per-hand swing cols — see ep_stats.py)
+# env v47 --ep-stats row layout (float32; v3 since 2026-10-04 = header row
+# + the 16 v1 cols, update, 12 per-hand swing cols, 4 wrist-reset cols
+# — see ep_stats.py)
 from ep_stats import EP_STATS_COLS, EpStatsWriter, build_rows as ep_stats_rows
 import torch
 import torch.nn as nn
@@ -2199,7 +2200,7 @@ def main():
         ep_stats_w = EpStatsWriter(args.run_dir)
         print(f"--ep-stats: combo walk in the training envs; per-episode "
               f"score/acc/PP + per-hand swing rows -> {ep_stats_path} "
-              f"(v2: header + {EP_STATS_COLS} float32 cols)", flush=True)
+              f"(v3: header + {EP_STATS_COLS} float32 cols)", flush=True)
         # 2026-10-04: chart_idx -> level sidecar (song, SS / BL ids, stars,
         # max scores, BL ratings, NPS, mirrored) for the dashboard's swing
         # table + best-possible PP totals (python/swing_summary.py).
@@ -3098,6 +3099,18 @@ def main():
             acc_pre, acc_post, acc_prec = venv.pop_acc_parts()
             print(f"[accparts] pre {acc_pre:.4f}  post {acc_post:.4f}  "
                   f"prec {acc_prec:.4f}", flush=True)
+        # 2026-10-04 (user): wrist resets per 100 swings per hand over
+        # the same window (a same-sign hit after a >= 30 deg bend reversal;
+        # cuda_env.pop_wrist_resets / lib.rs WristReset)
+        wrs_l = wrs_r = wrs_t = float("nan")
+        if hasattr(venv, "pop_wrist_resets"):
+            r_l, r_r, s_l, s_r = venv.pop_wrist_resets()
+            per100 = lambda r, s: 100.0 * r / s if s else float("nan")  # noqa: E731
+            wrs_l, wrs_r = per100(r_l, s_l), per100(r_r, s_r)
+            wrs_t = per100(r_l + r_r, s_l + s_r)
+            print(f"[wristreset] L {wrs_l:.2f}  R {wrs_r:.2f} per 100 swings "
+                  f"(resets {r_l}/{r_r}, swings {s_l}/{s_r}; 30 deg "
+                  f"hysteresis)", flush=True)
         recent = (np.mean(list(ep_returns)[-100:]) if ep_returns
                   else float("nan"))
         elapsed = time.time() - start
@@ -3223,6 +3236,7 @@ def main():
             update + 1, num_updates, global_step, t=time.time(),
             elapsed=elapsed, rate=rate, acc=acc_now, acc_l=acc_l,
             acc_pre=acc_pre, acc_post=acc_post, acc_prec=acc_prec,
+            wreset=wrs_t, wreset_l=wrs_l, wreset_r=wrs_r,
             # ep_return(last100) dropped from the line and the record
             # (2026-09-12, user: too noisy; `return` over the update is
             # the stable population measure). Checkpoints still carry

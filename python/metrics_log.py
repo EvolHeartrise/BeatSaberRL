@@ -43,6 +43,9 @@ UPDATE_FIELDS = (
     # [accparts] (2026-10-04): acc's components — pre-swing / 70,
     # post-swing / 30, precision / 15, over note cuts
     "acc_pre", "acc_post", "acc_prec",
+    # [wristreset] (2026-10-04): wrist resets per 100 swings, both hands
+    # and per hand (a same-sign hit after a >= 30 deg bend reversal)
+    "wreset", "wreset_L", "wreset_R",
     "return", "ep_return", "ent", "ev",
     "r1", "maxlr", "fp16_overflow", "fp16_scale",
     # [kl]
@@ -121,7 +124,7 @@ def entropy_groups(ent_head):
 def update_record(update, num_updates, global_step, *, t=None,
                   elapsed=None, rate=None, acc=None, acc_l=None,
                   acc_r=None, acc_pre=None, acc_post=None, acc_prec=None,
-                  ret=None, recent=None, ent=None, ev=None,
+                  wreset=None, wreset_l=None, wreset_r=None, ret=None, recent=None, ent=None, ev=None,
                   r1=None, maxlr=None, fp16_overflow=None,
                   fp16_scale=None, kl_first=None, kl_last=None,
                   cf_first=None, cf_last=None, gnorm=None, clipc=None,
@@ -146,6 +149,9 @@ def update_record(update, num_updates, global_step, *, t=None,
     rec["acc_pre"] = _num(acc_pre)
     rec["acc_post"] = _num(acc_post)
     rec["acc_prec"] = _num(acc_prec)
+    rec["wreset"] = _num(wreset)
+    rec["wreset_L"] = _num(wreset_l)
+    rec["wreset_R"] = _num(wreset_r)
     rec["return"] = _num(ret)
     rec["ep_return"] = _num(recent)
     rec["ent"] = _num(ent)
@@ -236,6 +242,9 @@ _RE_FLAIL = re.compile(
     r"^\[flail\] (\S+) rad/idle-tick \((?:L (\S+) / R (\S+); )?(\d+) "
     r"note-free")
 _RE_WREV = re.compile(r"^\[wrev\] L (\S+) /s +R (\S+) /s")
+_RE_WRESET = re.compile(
+    r"^\[wristreset\] L (\S+)\s+R (\S+) per 100 swings "
+    r"\(resets (\d+)/(\d+), swings (\d+)/(\d+)")
 _RE_ACCPARTS = re.compile(
     r"^\[accparts\] pre (\S+)\s+post (\S+)\s+prec (\S+)")
 _RE_LIMITREST = re.compile(
@@ -471,6 +480,15 @@ def parse_log(text, t_end=None):
             seg._pending["wrev_R"] = wr
             seg._pending["wrev"] = 0.5 * (wl + wr)
             seg._count("wrev")
+            continue
+        m = _RE_WRESET.match(line)
+        if m:
+            seg._pending["wreset_L"] = _num(m.group(1))
+            seg._pending["wreset_R"] = _num(m.group(2))
+            rs = int(m.group(3)) + int(m.group(4))
+            sw = int(m.group(5)) + int(m.group(6))
+            seg._pending["wreset"] = 100.0 * rs / sw if sw else None
+            seg._count("wristreset")
             continue
         m = _RE_ACCPARTS.match(line)
         if m:

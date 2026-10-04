@@ -15,7 +15,7 @@ from tests._helpers import cuda
 @cuda
 def test_ep_parts_sum_to_the_episode_note_points():
     from beat_arena_env.cuda_env import EP_PART_COL, EP_REC, CudaBeatVecEnv
-    assert EP_REC == 40 and EP_PART_COL == 28
+    assert EP_REC == 44 and EP_PART_COL == 28
     env = CudaBeatVecEnv(256, chart_len_s=6.0, seed=7, device="cuda",
                          dtype=torch.float64, gears=5, ep_stats=True,
                          max_steps=200)

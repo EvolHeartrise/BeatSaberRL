@@ -74,8 +74,10 @@ NUM_PAIRS = 55  # SPEC-v10 §2 live pair table (rust dynamics/collide.rs)
 # aggregate into ONE slot with a note COUNT — exact, not approximate.
 N_TRACKERS = FOLLOW_TIMEOUT + 1
 # per-episode record width (kernel EP_REC): cols 0..21 tau_draws, 22..27
-# env v47 ep_stats, 28..39 per-hand swing components (2026-10-04)
-EP_REC = 40
+# env v47 ep_stats, 28..39 per-hand swing components (2026-10-04), 40..43
+# wrist resets [resets L, resets R, swings L, swings R] (2026-10-04)
+EP_REC = 44
+EP_WRS_COL = 40
 # cols 28..39: hand-major [L, R] x EP_PART_FIELDS (raw note points)
 EP_PART_COL = 28
 EP_PART_FIELDS = ("pre", "pre_max", "post", "post_max", "prec", "prec_max")
@@ -953,6 +955,14 @@ class CudaBeatVecEnv:
         self.wrev = z(N, 2, dt=torch.int32)
         self.wrev_ext = z(N, 2, 2)          # running [lo, hi] per hand
         self.wrev_dir = z(N, 2, dt=torch.int32)
+        # wrist resets (2026-10-04; lib.rs WristReset): per env x hand
+        # [dir, reversal since hit, last swing sign, resets, swings] this
+        # episode (zeroed by reset_env), the 30 deg detector's extremes,
+        # and the per-update [resets, swings] accumulator
+        # (pop_wrist_resets)
+        self.wrs = z(N, 2, 5, dt=torch.int32)
+        self.wrs_ext = z(N, 2, 2)
+        self.wrs_acc = z(N, 2, 2, dt=torch.int32)
         # env v34 limit-rest telemetry (per env, kernel-accrued):
         # tick-summed joint-limit-row impulses [legs, spine, arms]
         # (arms priced only under limit_arms — env v35)
@@ -1066,6 +1076,7 @@ class CudaBeatVecEnv:
             self._tilt_hits, self._lift_hits, self.foot_down_prev,
             self.flail_rad, self.flail_ticks,
             self.wrev, self.wrev_ext, self.wrev_dir,
+            self.wrs, self.wrs_ext, self.wrs_acc,
             self.acc_pts, self.acc_cuts, self.acc_part, self.ep_part,
             self.ground_imp,
             self.chart_idx,
@@ -1514,6 +1525,16 @@ class CudaBeatVecEnv:
         self.acc_part.zero_()
         f = lambda p, m: p / m if m > 0 else float("nan")  # noqa: E731
         return f(s[0], s[1]), f(s[2], s[3]), f(s[4], s[5])
+
+    def pop_wrist_resets(self):
+        """Wrist resets since the last pop (2026-10-04): (resets L,
+        resets R, swings L, swings R) summed over envs, then zeroed. A
+        reset = a good note cut whose bend-velocity sign equals the
+        previous swing's with a >= 30 deg reversal of the bend in between
+        (lib.rs WristReset). One sync, logging-grade."""
+        s = self.wrs_acc.sum(dim=0).tolist()     # [[rL, sL], [rR, sR]]
+        self.wrs_acc.zero_()
+        return int(s[0][0]), int(s[1][0]), int(s[0][1]), int(s[1][1])
 
     def pop_stats(self):
         """Episode returns finished since the last pop (order approximate

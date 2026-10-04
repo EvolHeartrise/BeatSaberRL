@@ -429,3 +429,25 @@ def test_accparts_line_and_record():
     # a component with nothing credited (nan) is dropped, not written
     rec = ml.update_record(1, 10, 100, acc_pre=float("nan"))
     assert "acc_pre" not in rec
+
+
+def test_wristreset_line_and_record():
+    """[wristreset] (2026-10-04): wrist resets per 100 swings per hand,
+    printed before the update line, parse onto that update (the combined
+    rate from the counts); the formatter carries the same keys."""
+    log = ("[wristreset] L 12.50  R 5.00 per 100 swings (resets 5/2, "
+           "swings 40/40; 30 deg hysteresis)\n"
+           "update     3/100  steps   3145728  acc 0.9561  accL 0.9550  "
+           "accR 0.9572  return   5.10  ent 20.1  ev 0.996   150,000 "
+           "steps/s    21.0s\n")
+    u = ml.parse_log(log)[0].updates[0]
+    assert (u["wreset_L"], u["wreset_R"]) == (12.5, 5.0)
+    assert u["wreset"] == 100.0 * 7 / 80
+    rec = ml.update_record(3, 100, 3145728, wreset=8.75, wreset_l=12.5,
+                           wreset_r=5.0)
+    assert set(rec) <= set(ml.UPDATE_FIELDS)
+    assert {k: rec[k] for k in ("wreset", "wreset_L", "wreset_R")} == {
+        "wreset": 8.75, "wreset_L": 12.5, "wreset_R": 5.0}
+    # no swings (nan) -> dropped, not written
+    assert "wreset_L" not in ml.update_record(1, 10, 100,
+                                              wreset_l=float("nan"))
