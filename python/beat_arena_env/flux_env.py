@@ -15,7 +15,8 @@ import json
 import gymnasium as gym
 import numpy as np
 
-from .constants import EVENT_REASONS, N_JOINTS, OBS_DIM, TAU_FEAT
+from .constants import (EVENT_REASONS, N_JOINTS, OBS_DIM, TAU_FEAT,
+                        joint_gear_counts)
 from .flux_chart import FluxConfig, flux_tuple, generate_flux_chart
 
 from beat_arena_rs import RawBeatSim, VecBeatSim
@@ -65,10 +66,11 @@ class RustFluxEnv(gym.Env):
                        fall_const=fall_const,
                        energy_coef=energy_coef, flux=True)
         self.gears = gears
+        self.joint_gears = joint_gear_counts(gears)
         self.tau_scale = [1.0] * TAU_FEAT
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
-        self.action_space = gym.spaces.MultiDiscrete([gears] * N_JOINTS)
+        self.action_space = gym.spaces.MultiDiscrete(list(self.joint_gears))
 
     def set_tau_scale(self, s16):
         s = [float(x) for x in s16]
@@ -189,6 +191,8 @@ class FluxVecEnv:
                  foot_shape_coef=0.0, energy_coef=0.0, self_contact_coef=0.0,
                  gears=3, seed=0, fall_const=5.0):
         self.num_envs = num_envs
+        self.gears = gears
+        self.joint_gears = joint_gear_counts(gears)
         self.cfg = _flux_cfg(chart_len_s, cols, rows, note_speed_min,
                              note_speed_max, circle_prob, bar_prob)
         self.sim = VecBeatSim(num_envs, max_steps=int(chart_len_s * 30) + 90,

@@ -200,11 +200,42 @@ def gear_table(n_gears):
 FINE_GEAR_MULT = tuple(2.0 if j in (8, 15) else 1.0 for j in range(N_JOINTS))
 
 
+# Per-joint EXTRA gears (2026-10-04, per-joint gear counts): magnitudes
+# appended to joint j's table as +/- pairs AFTER the n_gears ids (and
+# after FINE_GEAR_MULT, which they do not take), so joint j has
+# n_gears + 2 * len(JOINT_EXTRA_GEARS[j]) action ids, at most MAX_GEARS.
+# Empty on main (every joint has n_gears ids — today's tables exactly);
+# a body branch sets it (exp/bend7: the bend joints get +/-1/4 at ids
+# 5/6 on top of K=5's 0, +/-1, +/-1/2). Mirrors lib.rs / the kernel's
+# JOINT_EXTRA_FRAC (signed, ids n_gears..). A policy's per-head sizes
+# (NotePolicy head_gears, arch "head_gears") must equal
+# joint_gear_counts(n_gears) of the build it runs on.
+JOINT_EXTRA_GEARS = ((),) * N_JOINTS
+MAX_GEARS = 7
+
+
 def joint_gear_table(n_gears, j):
     """gear_table(n_gears) as joint j applies it (FINE_GEAR_MULT on the
-    fine ids) — the signed fraction of tau_max[j] per action id."""
-    return tuple(g * FINE_GEAR_MULT[j] if i >= 3 else g
-                 for i, g in enumerate(gear_table(n_gears)))
+    fine ids, then JOINT_EXTRA_GEARS[j]'s +/- pairs) — the signed
+    fraction of tau_max[j] per action id; its length is joint j's
+    action count."""
+    t = [g * FINE_GEAR_MULT[j] if i >= 3 else g
+         for i, g in enumerate(gear_table(n_gears))]
+    for m in JOINT_EXTRA_GEARS[j]:
+        t += [m, -m]
+    if len(t) > MAX_GEARS:
+        raise ValueError(
+            f"joint {j}: {len(t)} gear ids at n_gears={n_gears} (+ "
+            f"{len(JOINT_EXTRA_GEARS[j])} extra pair(s)) exceeds "
+            f"{MAX_GEARS}; this build's per-joint extra gears need a "
+            f"smaller base table")
+    return tuple(t)
+
+
+def joint_gear_counts(n_gears):
+    """Per-joint action-id count (29,) at base table n_gears — the
+    policy's head sizes. (n_gears,) * 29 when no joint has extra gears."""
+    return tuple(len(joint_gear_table(n_gears, j)) for j in range(N_JOINTS))
 
 
 # --- look-at-player (env v7.6; v10 head anchor is the LIVE FK head) ----------
