@@ -269,6 +269,9 @@ def test_incremental_equals_full(tmp_path):
     for k in ("generated",):
         inc.pop(k), full.pop(k)
     assert inc == full
+    # the best-possible history too
+    assert (json.loads((run / "swing_hist.json").read_text())
+            == json.loads((full_dir / "swing_hist.json").read_text()))
 
 
 def test_levels_change_rebuilds(tmp_path):
@@ -503,3 +506,27 @@ def test_level_with_only_pre_resume_plays_counts_in_totals(tmp_path):
     b = _row(d, "b_Hard_Standard")
     assert d["levels"]["done"][b] == 0                 # no swing-era plays
     assert d["win"]["all"]["pre"][b] is None
+
+
+def test_best_possible_history(tmp_path):
+    """swing_hist.json: per update, the totals over each level's best
+    completed play SO FAR — non-decreasing, ending on swing.json's totals;
+    the index entry points at it."""
+    run = write_run(tmp_path)
+    d = _summary(run)
+    h = json.loads((run / "swing_hist.json").read_text())
+    # completed plays land at updates 1, 2, 3 (update 4's 9100 on A does
+    # not beat its 9700): one point per update whose totals changed
+    assert h["upd"] == [1, 2, 3]
+    for k in ("ss_wpp", "ss_upp", "bl_wpp", "bl_upp"):
+        assert all(b >= a for a, b in zip(h[k], h[k][1:])), k
+        assert h[k][-1] == pytest.approx(d["totals"][k], abs=0.01), k
+    # update 1: A 9000 (SS + BL) and C 5000 (BL only)
+    ss1 = scoresaber.pp_value(9000 / 9800, 379.05)
+    bl1 = sorted([beatleader.pp_from_accuracy(9000 / 10000, 5.0, 9.0, 4.0)["pp"],
+                  beatleader.pp_from_accuracy(5000 / 6000, 3.0, 7.0, 2.0)["pp"]],
+                 reverse=True)
+    assert h["ss_upp"][0] == pytest.approx(ss1, abs=0.02)
+    assert h["bl_wpp"][0] == pytest.approx(bl1[0] + 0.965 * bl1[1], abs=0.03)
+    e = sw.index_entry(sw.update_run(str(run)), str(run), rel="c/runs/run")
+    assert e["hist"] == "c/runs/run/swing_hist.json"
