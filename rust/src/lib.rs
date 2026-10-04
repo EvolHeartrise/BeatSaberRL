@@ -160,8 +160,20 @@ fn gear_signed(gears: u8) -> [Real; 7] {
 // scaled by FINE_GEAR_MULT); JOINT_EXTRA_N[j] of them are live. All
 // zero / 0 on main — every joint keeps its `gears` ids. MIRROR of
 // constants.JOINT_EXTRA_GEARS and the kernel's JOINT_EXTRA_FRAC.
-const JOINT_EXTRA_N: [usize; NQ] = [0; NQ];
-const JOINT_EXTRA_FRAC: [[Real; 4]; NQ] = [[0.0; 4]; NQ];
+// exp/bend7 (user 2026-10-04, branch only): the wrist bends (8, 15) get
+// +/-1/4 at ids gears, gears+1 — 7 gears at --gears 5.
+const JOINT_EXTRA_N: [usize; NQ] = {
+    let mut n = [0; NQ];
+    n[8] = 2;
+    n[15] = 2;
+    n
+};
+const JOINT_EXTRA_FRAC: [[Real; 4]; NQ] = {
+    let mut f = [[0.0; 4]; NQ];
+    f[8] = [0.25, -0.25, 0.0, 0.0];
+    f[15] = [0.25, -0.25, 0.0, 0.0];
+    f
+};
 
 /// Per-joint action id -> signed torque fraction (constants
 /// joint_gear_table, padded to 7 ids): gear_signed(gears) with the fine

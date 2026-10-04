@@ -157,7 +157,7 @@ def test_policy_routes_tau_lanes():
     obs = torch.zeros(4, OBS_DIM)
     obs[:, OFF_TAU:OFF_TAU + 16] = torch.linspace(-1, 1, 16)
     logits, value = pol.forward_stacked(obs)
-    assert logits.shape == (4, 29, 5) and value.shape == (4,)
+    assert logits.shape == (4, 29, pol.k_max) and value.shape == (4,)
     assert torch.isfinite(logits).all()
     # the lanes actually reach the tokens: changing an arm lane moves the
     # saber tokens' output, changing a spine lane moves the body path

@@ -80,7 +80,7 @@ def test_shapes_and_marker():
     assert p3.trunk_proj.in_features == 5 * 64
     obs = _obs(8)
     logits, value = p3.forward_stacked(obs)
-    assert logits.shape == (8, 29, 5) and value.shape == (8,)
+    assert logits.shape == (8, 29, p3.k_max) and value.shape == (8,)
     assert torch.isfinite(logits).all() and torch.isfinite(value).all()
 
 
