@@ -427,6 +427,12 @@ HEAD_GROUPS = (("spine", 0, 3), ("armL", 3, 10), ("armR", 10, 17),
 # under either constant.
 MASK_BIAS = 16384.0
 
+# Logit of a head's lanes past its gear count (per-joint gear counts,
+# 2026-10-04), added in fp32 after the head GEMM: finite (so the entropy
+# term p*log p is 0 * -1e9 = 0, not 0 * -inf = nan), and exp() of it
+# underflows to exactly 0 — the lane has no probability and no gradient.
+MASKED_LOGIT = -1e9
+
 
 # Block.forward's delta_bias sentinel: the previous block's fused FFN
 # kernel (fp16_linear.fused_ffn, --fused-ffn) already ran THIS block's
@@ -796,7 +802,8 @@ class NotePolicy(nn.Module):
                  z_asinh: float = 8.0, game: str = "standard",
                  fp16_accum: str = "off", fused_ffn: str = "off",
                  emb_ln: bool = False, value_residual: bool = False,
-                 final_ln: bool = False, trunk_arch: str = "simba"):
+                 final_ln: bool = False, trunk_arch: str = "simba",
+                 head_gears: tuple | list | None = None):
         super().__init__()
         if trunk_arch not in TRUNK_ARCHS:
             raise ValueError(f"trunk_arch must be one of {TRUNK_ARCHS}, "
@@ -826,8 +833,23 @@ class NotePolicy(nn.Module):
         self.encoder = encoder
         self.embed = embed
         self.n_heads = n_heads
+        # n_gears = the env's BASE gear table (constants.gear_table); the
+        # per-head action counts are head_gears (2026-10-04, per-joint
+        # gear counts) — the build's constants.joint_gear_counts(n_gears),
+        # which the trainer passes and load_policy checks. None = every
+        # head n_gears (main's build; today's policy exactly).
         self.n_gears = n_gears
-        self.head_sizes = (n_gears,) * N_ACTION_HEADS
+        if head_gears is None:
+            head_gears = (n_gears,) * N_ACTION_HEADS
+        head_gears = tuple(int(k) for k in head_gears)
+        assert len(head_gears) == N_ACTION_HEADS and all(
+            3 <= k <= 7 for k in head_gears), (
+            f"head_gears must be {N_ACTION_HEADS} counts in [3, 7], got "
+            f"{head_gears}")
+        self.head_sizes = head_gears
+        # stacked logits are (B, 29, k_max): a head with fewer ids gets
+        # k_max outputs whose extra lanes are masked (_gear_mask)
+        self.k_max = max(head_gears)
         # arch record: load_policy REFUSES checkpoints whose markers
         # don't match the current era (obs 426 / ffn_mult present).
         self.arch = {"embed": embed, "trunk_dim": trunk_dim,
@@ -897,6 +919,11 @@ class NotePolicy(nn.Module):
                      "emb_ln": bool(emb_ln),
                      "value_residual": bool(value_residual),
                      "final_ln": bool(final_ln)}
+        # per-joint gear counts (2026-10-04): recorded only when they
+        # differ from n_gears everywhere, so a uniform policy's arch is
+        # unchanged; load_policy rebuilds the heads from it
+        if head_gears != (n_gears,) * N_ACTION_HEADS:
+            self.arch["head_gears"] = list(head_gears)
         self.value_bins = int(value_bins)
         self.value_sigma_bins = float(value_sigma)
         centers = torch.linspace(-float(value_vmax), float(value_vmax),
@@ -990,9 +1017,24 @@ class NotePolicy(nn.Module):
             self._v2_c_alpha = a_init / a_scale
             self.trunk_alpha = nn.Parameter(torch.full((D,), a_scale))
             self.project_trunk_weights()
-        # 29 factored joint heads, K = n_gears options each (env v8)
+        # 29 factored joint heads, K = n_gears options each (env v8);
+        # per-joint counts (head_gears) pad every head to k_max outputs
+        # — one uniform packed GEMM — and mask the lanes past a head's
+        # count to MASKED_LOGIT (exp underflows to exactly 0: no
+        # probability, zero gradient, no entropy, never sampled)
         self.heads = nn.ModuleList(
-            nn.Linear(trunk_dim, n) for n in self.head_sizes)
+            nn.Linear(trunk_dim, self.k_max) for _ in self.head_sizes)
+        if min(self.head_sizes) < self.k_max:
+            valid = torch.tensor([[a < k for a in range(self.k_max)]
+                                  for k in self.head_sizes])
+            self.register_buffer("_gear_valid", valid, persistent=False)
+            self.register_buffer(
+                "_gear_mask",
+                torch.zeros(valid.shape).masked_fill(~valid, MASKED_LOGIT),
+                persistent=False)
+        else:
+            self._gear_valid = None
+            self._gear_mask = None
         # Critic (2026-08-19 redesign):
         # adapool_v1 = query-derived attention pooling (Brothers
         # 2506.09215: a state-DERIVED query wins over a free learned
@@ -1282,7 +1324,10 @@ class NotePolicy(nn.Module):
             else:
                 out = F.linear(h, w, b)                  # (B, 29K)
         value = self._critic(x_res, h, attn_bias)
-        return out.view(B, N_ACTION_HEADS, self.n_gears), value
+        out = out.view(B, N_ACTION_HEADS, self.k_max)
+        if self._gear_mask is not None:
+            out = out + self._gear_mask         # fp32: lanes past a head's count
+        return out, value
 
     def _critic(self, x_res: torch.Tensor, h: torch.Tensor,
                 attn_bias: torch.Tensor) -> torch.Tensor:
@@ -1423,7 +1468,12 @@ class NotePolicy(nn.Module):
             # multinomial — the same accepted caveat the graphed
             # rollout capture already carried.
             g = torch.empty_like(logsm).exponential_()
-            action = (logsm - g.log()).argmax(-1)
+            score = logsm - g.log()
+            if self._gear_valid is not None:
+                # an E = 0 draw is +inf on ANY lane (log 0): pin the lanes
+                # past a head's count to -inf so they can never win
+                score = score.masked_fill(~self._gear_valid, -math.inf)
+            action = score.argmax(-1)
         elif action.dtype is not torch.long:
             # the trainer stores rollout actions as uint8 (2026-09-02,
             # Tier 1.3); gather needs an int64 index. Exact (integers),
@@ -1486,6 +1536,28 @@ def upgrade_pre_i07_state_dict(sd: dict, note_geo: bool) -> dict:
         nw[:, :w.shape[1]] = w
         sd["note_mlp.0.weight"] = nw
     return sd
+
+
+def check_gear_layout(policy) -> None:
+    """Refuse a policy whose per-head action counts are not this build's
+    per-joint gear counts (constants.joint_gear_counts(n_gears): the base
+    table plus the build's JOINT_EXTRA_GEARS). The env decodes gear ids
+    with the build's tables, so a checkpoint trained on another gear
+    layout (a body branch's, e.g. exp/bend7's 7-gear wrist bends) would
+    play the wrong torques silently — bench / replay it from its branch."""
+    from beat_arena_env import constants as _C
+    try:
+        build = _C.joint_gear_counts(policy.n_gears)
+    except ValueError as e:
+        raise SystemExit(f"n_gears={policy.n_gears} does not fit this "
+                         f"build's per-joint gears: {e}") from None
+    if tuple(policy.head_sizes) != build:
+        raise SystemExit(
+            f"the policy's per-joint gear counts {list(policy.head_sizes)} "
+            f"(n_gears={policy.n_gears}) are not this build's "
+            f"{list(build)} (constants.joint_gear_counts): the env would "
+            "decode its actions with different gear tables. Bench / replay "
+            "it from the branch it was trained on.")
 
 
 def load_policy(ckpt, game: str = "standard") -> NotePolicy:
@@ -1582,7 +1654,10 @@ def load_policy(ckpt, game: str = "standard") -> NotePolicy:
         emb_ln=arch.get("emb_ln", False),
         value_residual=arch.get("value_residual", False),
         final_ln=arch.get("final_ln", False),
-        trunk_arch=arch["trunk_arch"])
+        trunk_arch=arch["trunk_arch"],
+        # per-joint gear counts (2026-10-04): absent = n_gears everywhere
+        head_gears=arch.get("head_gears"))
+    check_gear_layout(policy)
     sd = ckpt["state_dict"]
     policy.upgraded_from = None
     if not blade_geo:
