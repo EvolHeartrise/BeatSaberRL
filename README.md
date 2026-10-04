@@ -97,6 +97,19 @@ on branch `body/original`**: v60/v61 benches, replays and checkpoints
 different body here. Replays carry their body (format 2 `header.body`),
 so the viewer shows either era correctly.
 
+**Per-joint gear counts (2026-10-04):** a build may give individual
+joints extra gear ids on top of the `--gears` base table
+(`constants.JOINT_EXTRA_GEARS`, mirrored as `JOINT_EXTRA_N` /
+`JOINT_EXTRA_FRAC` in `lib.rs` and the kernel; ± pairs at ids
+`gears`, `gears`+1, …, at most 7 ids per joint). Main has none, so every
+table, policy and checkpoint is unchanged. With extras the policy pads
+every head to the largest count and masks the extra lanes of the
+smaller heads (`NotePolicy(head_gears=…)`, arch `head_gears`; never
+sampled, no probability or gradient), the replay header's `gear_frac`
+rows are per-joint length, and `load_policy` refuses a checkpoint whose
+gear layout differs from the build's (`check_gear_layout`). Body
+branches use it (`exp/bend7`: 7-gear wrist bends).
+
 **Flux game mode (2026-09-26, user-specified — SPEC.md §Flux):** a
 second Beat Saber mode alongside the standard game, on the same body,
 physics, track and reward terms. No sabers: the hands are palm-centre

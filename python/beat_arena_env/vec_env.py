@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 
 from .chart import ChartConfig, generate_chart, note_tuple
-from .constants import OBS_DIM
+from .constants import OBS_DIM, joint_gear_counts
 
 from beat_arena_rs import VecBeatSim
 
@@ -46,6 +46,9 @@ class BeatVecEnv:
         is unchanged); tau_rand 0 + tau_center fixes every env at the
         center. No per-episode tau_draws log here (CUDA pop_episodes)."""
         self.num_envs = num_envs
+        self.gears = gears
+        # per-joint action-id counts (constants.joint_gear_counts)
+        self.joint_gears = joint_gear_counts(gears)
         self.cfg = ChartConfig(
             chart_len_s=chart_len_s, colors=colors,
             cols=tuple(cols), rows=tuple(rows),

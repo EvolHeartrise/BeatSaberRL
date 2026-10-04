@@ -1563,6 +1563,13 @@ __device__ __forceinline__ const double* gear_row(int gears) {
 __device__ constexpr double FINE_GEAR_MULT[NQ] = {
     1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+// per-joint EXTRA gears (2026-10-04, lib.rs JOINT_EXTRA_N / _FRAC
+// mirror): signed fractions for joint j's ids gears, gears+1, ...; none
+// on main, so every joint keeps its `gears` ids
+__device__ constexpr int JOINT_EXTRA_N[NQ] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+__device__ constexpr double JOINT_EXTRA_FRAC[NQ][4] = {};
 
 // note kinds (constants.py)
 // KIND_NOTE=0, KIND_BOMB=1, KIND_CHAIN_HEAD=2, KIND_CHAIN_LINK=3 —
@@ -4854,6 +4861,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // act_grp splits the same terms [spine, arms, legs] for telemetry
   T tau[NQ];
   const double* gr = gear_row(P.gears);
+  const int kb = P.gears == 5 ? 5 : (P.gears == 7 ? 7 : 3);
   double act = 0.0;
   double act_grp[3] = {0.0, 0.0, 0.0};
   // env v43 energy base: Σ|frac·τ_max| in double, joint order, matching
@@ -4862,8 +4870,13 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   double tau_grp[3] = {0.0, 0.0, 0.0};
   for (int j = 0; j < NQ; j++) {
     const int a = (int)P.actions[e * NQ + j];
+    // per-joint table (lib.rs joint_gear_rows): ids below kb = the base
+    // table (fine ids x FINE_GEAR_MULT), then the joint's extra ids, then
+    // coast
     const double frac =
-        a < 7 ? (a >= 3 ? gr[a] * FINE_GEAR_MULT[j] : gr[a]) : 0.0;
+        a >= 7 ? 0.0
+        : a < kb ? (a >= 3 ? gr[a] * FINE_GEAR_MULT[j] : gr[a])
+        : (a - kb < JOINT_EXTRA_N[j] ? JOINT_EXTRA_FRAC[j][a - kb] : 0.0);
     // env v46: per-env axis scale (1.0 exact when off; lib.rs mirror)
     const double ts = (double)P.tau_scale[e * TAU_FEAT + TAU_AXIS[j]];
     tau[j] = T(frac) * CT(TAU_MAX, [j]) * T(ts);

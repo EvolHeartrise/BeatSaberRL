@@ -722,6 +722,11 @@ class CudaBeatVecEnv:
         self.start_jitter = float(start_jitter)
         assert gears in (3, 5, 7), f"gears must be 3, 5, or 7, got {gears}"
         self.gears = int(gears)
+        # per-joint action-id counts (constants.joint_gear_counts: the
+        # build's JOINT_EXTRA_GEARS on top of the base table; raises if
+        # they do not fit) — the kernel's JOINT_EXTRA_* mirror decodes them
+        from .constants import joint_gear_counts
+        self.joint_gears = joint_gear_counts(self.gears)
         # pool=: prebuilt tensor dict (ranked_pool.py; ragged, or padded
         # (P, C) from an older builder — converted here) — unlike
         # charts=, resets keep the normal RANDOM chart draw (charts= is

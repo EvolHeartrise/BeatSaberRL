@@ -110,7 +110,9 @@ def body_tables(gears, tau_scale):
     joint_gear_table mirror rust lib.rs Body::tick, incl. the bend
     joints' 2x fine gears). Per joint, so a decoder derives torque for
     whichever body wrote the file: replays written before 2026-10-03
-    carry the body/original tables (1.06 bend, uniform gears)."""
+    carry the body/original tables (1.06 bend, uniform gears). Row j has
+    joint j's own id count (per-joint gear counts, 2026-10-04: a body
+    branch's extra gears make some rows longer — ragged)."""
     s = [float(tau_scale[TAU_AXIS_OF_JOINT[j]]) for j in range(N_JOINTS)]
     return {"tau_max": [TAU_MAX[j] * s[j] for j in range(N_JOINTS)],
             "gear_frac": [[float(v) for v in joint_gear_table(int(gears), j)]
@@ -121,7 +123,12 @@ def body_tables(gears, tau_scale):
 def derive_effort(action, body):
     """(activation, torque), each (T, 4) [total, spine, arms, legs], from
     action (T, 29) gear ids and header.body."""
-    frac = np.asarray(body["gear_frac"], dtype=np.float64)        # (29, K)
+    rows = body["gear_frac"]                                     # 29 rows
+    # rows may be ragged (per-joint gear counts): pad with 0 (coast) to
+    # the longest — ids past a joint's count are never recorded
+    frac = np.zeros((N_JOINTS, max(len(r) for r in rows)))
+    for j, r in enumerate(rows):
+        frac[j, :len(r)] = r                                     # (29, K)
     tau = np.asarray(body["tau_max"], dtype=np.float64)
     a = np.asarray(action, dtype=np.int64)
     f = frac[np.arange(N_JOINTS)[None, :], a]                     # (T, 29)

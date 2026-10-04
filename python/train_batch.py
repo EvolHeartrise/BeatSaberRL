@@ -46,7 +46,7 @@ import torch
 import torch.nn as nn
 
 from beat_arena_env.vec_env import BeatVecEnv
-from beat_arena_env.constants import parse_tau_scale
+from beat_arena_env.constants import joint_gear_counts, parse_tau_scale
 # the ranked pool's recipe (lead gap, mirror) lives with the pool: both
 # are in its npz cache key, so prefetch_maps and this trainer must agree
 from beat_arena_env.ranked_pool import RECIPE_LEAD_S, RECIPE_MIRROR
@@ -613,7 +613,10 @@ def build_parser():
                         "ternary coast/+full/-full; 5 adds +/-1/4-torque "
                         "gears; 7 adds +/-1/3 and +/-1/8 (fine control "
                         "under the doubled alpha/omega body). Resuming a "
-                        "geared checkpoint needs the matching --gears")
+                        "geared checkpoint needs the matching --gears. "
+                        "The BASE table: a build's per-joint extra gears "
+                        "(constants.JOINT_EXTRA_GEARS, e.g. exp/bend7's "
+                        "7-gear wrist bends) append on top of it")
     p.add_argument("--foot-contact", default=True,
                    action=argparse.BooleanOptionalAction,
                    help="DEPRECATED NO-OP: contact mode (env v11) is the "
@@ -1707,7 +1710,10 @@ def main():
                             emb_ln=args.emb_ln,
                             value_residual=args.value_residual,
                             final_ln=args.final_ln,
-                            trunk_arch=args.trunk_arch)
+                            trunk_arch=args.trunk_arch,
+                            # per-joint gear counts of this build (all
+                            # args.gears on main; 2026-10-04)
+                            head_gears=joint_gear_counts(args.gears))
         if args.depth_init:
             from policy import apply_depth_init
             print(f"--depth-init: {apply_depth_init(policy)}", flush=True)
@@ -1727,6 +1733,12 @@ def main():
         raise SystemExit(f"--gears {args.gears} but the checkpoint's heads "
                          f"are n_gears={policy.n_gears} — the env and "
                          f"policy action tables must match")
+    # per-joint gear counts (2026-10-04): the heads must be this build's
+    # (load_policy checks checkpoints; this covers every path)
+    if tuple(policy.head_sizes) != tuple(venv.joint_gears):
+        raise SystemExit(f"policy head sizes {list(policy.head_sizes)} != "
+                         f"the env's per-joint gear counts "
+                         f"{list(venv.joint_gears)}")
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"policy arch {policy.arch} — {n_params:,} params", flush=True)
     n_trunk = sum(p_.numel() for n_, p_ in policy.named_parameters()
