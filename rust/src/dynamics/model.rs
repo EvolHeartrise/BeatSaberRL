@@ -51,6 +51,15 @@ pub struct Model {
     // Cholesky dies. armature = I_ref/100 (1 % reflected inertia).
     pub armature: &'static [Real],
     pub gravity: [Real; 3],
+    /// Left/right MIRROR map of the actuated coordinates (an involution,
+    /// actuated order): `mirror[j]` is the coordinate the x → −x
+    /// reflection maps j onto — j itself for a central joint. The
+    /// solver's sequential passes (joint-limit rows, ω caps, step-11
+    /// clamps) visit the coordinates orbit by orbit and update the two
+    /// members of a mirror pair JOINTLY from the same pre-state, so no
+    /// side is ever solved first (sim/mirror-exact, 2026-10-04).
+    /// Identity for models without a mirror symmetry.
+    pub mirror: &'static [usize],
 }
 
 impl Model {
@@ -293,6 +302,22 @@ pub const HUMANOID_ARMATURE: [Real; NQ] = [
     0.030292, 0.0046866, 0.030222, 0.0043823, 0.000093419, 0.000023083,
 ];
 
+/// Actuated-coordinate mirror map: spine (0..3) central; arm_l (3..10)
+/// <-> arm_r (10..17); leg_l (17..23) <-> leg_r (23..29). Each pair's two
+/// joints share their axis convention up to the reflection (the yaw /
+/// twist / roll / dev / hip-yaw / hip-roll / ankle-roll coordinates flip
+/// sign, the rest keep it — python/beat_arena_env/mirror_ops.py), and
+/// every body table above is equal across a pair (limits negated where
+/// the sign flips) — pinned by `humanoid_tables_are_mirror_symmetric`.
+#[rustfmt::skip]
+pub const HUMANOID_MIRROR: [usize; NQ] = [
+    0, 1, 2,
+    10, 11, 12, 13, 14, 15, 16,
+    3, 4, 5, 6, 7, 8, 9,
+    23, 24, 25, 26, 27, 28,
+    17, 18, 19, 20, 21, 22,
+];
+
 /// The SPEC-v10 humanoid: floating pelvis + 29 actuated revolutes,
 /// NV = 35. Reference pose: root (0, 0.94, −0.65), identity, all zero.
 pub const HUMANOID: Model = Model {
@@ -309,4 +334,5 @@ pub const HUMANOID: Model = Model {
     damping: &HUMANOID_DAMPING,
     armature: &HUMANOID_ARMATURE,
     gravity: [0.0, -G, 0.0],
+    mirror: &HUMANOID_MIRROR,
 };

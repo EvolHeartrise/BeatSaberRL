@@ -3643,6 +3643,9 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(all(test, not(feature = "f32")))]
+mod mirror_tests;
+
 #[cfg(test)]
 mod env_tests {
     use super::*;

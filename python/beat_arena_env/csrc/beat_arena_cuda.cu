@@ -1170,6 +1170,50 @@ __device__ constexpr int PAIR_B[NUM_PAIRS] = {
     3, 5, 6, 7, 8, 9, 10, 11, 4, 6, 7, 8, 9, 10, 11,
     5, 7, 8, 9, 10, 11, 6, 8, 9, 10, 11, 7, 8, 9, 10, 11,
     8, 9, 10, 11, 9, 11, 10, 11};
+// MIRROR-EXACT orbit tables (collide.rs PAIR_MIRROR / PAIR_ORBIT_ORDER,
+// model.rs HUMANOID_MIRROR; sim/mirror-exact 2026-10-04). PAIR_MIRROR[p]
+// is pair p's mirror image (collider l <-> r twins swapped); the narrow
+// phase emits pairs in PAIR_ORBIT (each orbit's smaller id first, its
+// mirror right after) and the PGS updates an active orbit jointly.
+__device__ constexpr int PAIR_MIRROR[NUM_PAIRS] = {
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+    16, 24, 26, 25, 28, 27, 30, 29, 17, 19, 18, 21, 20, 23, 22,
+    31, 37, 39, 38, 41, 40, 32, 34, 33, 36, 35, 42, 48, 47, 50, 49,
+    44, 43, 46, 45, 51, 53, 52, 54};
+__device__ constexpr int PAIR_ORBIT[NUM_PAIRS] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 17, 24, 18, 26, 19, 25, 20, 28, 21, 27, 22, 30, 23, 29,
+    31, 32, 37, 33, 39, 34, 38, 35, 41, 36, 40, 42, 43, 48, 44, 47,
+    45, 50, 46, 49, 51, 52, 53, 54};
+// joint orbits, Rust's visiting order (j0 ascending, mirror[j0] >= j0):
+// the 3 central spine joints, then the 13 (left, right) pairs
+constexpr int N_JORB = 16;
+__device__ constexpr int JORB_A[N_JORB] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                                           17, 18, 19, 20, 21, 22};
+__device__ constexpr int JORB_B[N_JORB] = {0, 1, 2, 10, 11, 12, 13, 14, 15,
+                                           16, 23, 24, 25, 26, 27, 28};
+__device__ constexpr int JMIRROR[NQ] = {
+    0, 1, 2, 10, 11, 12, 13, 14, 15, 16, 3, 4, 5, 6, 7, 8, 9,
+    23, 24, 25, 26, 27, 28, 17, 18, 19, 20, 21, 22};
+constexpr bool pair_tables_ok() {
+  for (int k = 0; k < NUM_PAIRS; k++) {
+    if (PAIR_MIRROR[PAIR_MIRROR[k]] != k) return false;
+    const int cm[12] = {0, 1, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10};
+    const int a = cm[PAIR_A[k]], b = cm[PAIR_B[k]];
+    const int lo = a < b ? a : b, hi = a < b ? b : a;
+    if (PAIR_A[PAIR_MIRROR[k]] != lo || PAIR_B[PAIR_MIRROR[k]] != hi) return false;
+  }
+  int n = 0;
+  for (int k = 0; k < NUM_PAIRS; k++) {
+    if (PAIR_MIRROR[k] < k) continue;
+    if (PAIR_ORBIT[n++] != k) return false;
+    if (PAIR_MIRROR[k] != k && PAIR_ORBIT[n++] != PAIR_MIRROR[k]) return false;
+  }
+  for (int o = 0; o < N_JORB; o++)
+    if (JMIRROR[JORB_A[o]] != JORB_B[o]) return false;
+  return n == NUM_PAIRS;
+}
+static_assert(pair_tables_ok(), "mirror orbit tables out of sync with PAIR_A/B");
 // obs contact bits: collider ids 2/4/6 -> left arm, 3/5/7 -> right
 __device__ __forceinline__ bool is_arm_l(int id) {
   return id == 2 || id == 4 || id == 6;
@@ -1691,7 +1735,7 @@ struct GroundRows {
 };
 template <typename T>
 struct Solver : GroundRows<T> {
-  // contacts (compacted, pair-id order)
+  // contacts (compacted, PAIR_ORBIT order)
   int nc;
   int c_pair[NUM_PAIRS];
   // c_minv stays ROW-MAJOR. Transposing it to [NV][NUM_PAIRS] (K11's
@@ -1701,7 +1745,7 @@ struct Solver : GroundRows<T> {
   T c_J[NUM_PAIRS][NV], c_minv[NUM_PAIRS][NV];
   T c_bias[NUM_PAIRS], c_diag[NUM_PAIRS], c_lam[NUM_PAIRS];
   T c_pt[NUM_PAIRS][3];
-  // limit rows (joint order); l_j[nl..] carries the #6e predicted
+  // limit rows (joint orbit order); l_j[nl..] carries the #6e predicted
   // column list transiently (read by nothing past the column block)
   int nl;
   int l_j[NQ];
@@ -2839,6 +2883,94 @@ __device__ __forceinline__ T foot_row_dot(int m, int ch0, const T jr[3][2],
   return sum;
 }
 
+// solver.rs `pair_box_targets`, term for term (sim/mirror-exact): the
+// exact 2-variable box LCP projecting a mirror pair of joint rates a, b
+// onto [lo_a, hi_a] x [lo_b, hi_b] (omega caps: +-cap; step-11 stops:
+// lo == hi == the recovery target) with momentum-consistent impulses
+// along the plain columns ca = M^-1 e_a, cb = M^-1 e_b; continuous in the
+// data and symmetric under swapping a and b. Inlined at compile-time
+// va / vb, so every vr index folds to a register.
+template <typename T>
+__device__ __forceinline__ int box_side(T x, T lo, T hi) {
+  if (lo == hi) return x == lo ? 0 : 1;
+  return x > hi ? 1 : (x < lo ? -1 : 0);
+}
+template <typename T>
+__device__ __forceinline__ bool pair_box_targets(
+    T (&v)[NV], int va, int vb, T lo_a, T hi_a, T lo_b, T hi_b,
+    const T* __restrict__ ca, const T* __restrict__ cb, T maa, T mbb) {
+  const T mab = T(0.5) * (ca[vb] + cb[va]);
+  const T xa = v[va], xb = v[vb];
+  int sa = box_side(xa, lo_a, hi_a);
+  int sb = box_side(xb, lo_b, hi_b);
+  if (sa == 0 && sb == 0) return false;
+  const bool eq_a = lo_a == hi_a, eq_b = lo_b == hi_b;
+  const T pp = maa * mbb;
+  const T det = pp - mab * mab;
+  T la = T(0), lb = T(0), ta = xa, tb = xb;
+#pragma unroll 1
+  for (int it = 0; it < 4; it++) {
+    ta = sa > 0 ? hi_a : (sa < 0 ? lo_a : xa);
+    tb = sb > 0 ? hi_b : (sb < 0 ? lo_b : xb);
+    const T ba = ta - xa, bb = tb - xb;
+    if (sa != 0 && sb != 0) {
+      if (det > T(1e-9) * pp) {
+        la = (mbb * ba - mab * bb) / det;
+        lb = (maa * bb - mab * ba) / det;
+      } else {
+        la = ba / maa;
+        lb = bb / mbb;
+      }
+    } else if (sa != 0) {
+      la = ba / maa;
+      lb = T(0);
+    } else {
+      la = T(0);
+      lb = bb / mbb;
+    }
+    const bool drop_a = !eq_a && ((sa > 0 && la > T(0)) || (sa < 0 && la < T(0)));
+    const bool drop_b = !eq_b && ((sb > 0 && lb > T(0)) || (sb < 0 && lb < T(0)));
+    if (drop_a || drop_b) {
+      if (drop_a) sa = 0;
+      if (drop_b) sb = 0;
+      if (sa == 0 && sb == 0) return false;
+      continue;
+    }
+    const T ya = xa + maa * la + mab * lb;
+    const T yb = xb + mab * la + mbb * lb;
+    const bool add_a = sa == 0 && (ya > hi_a || ya < lo_a);
+    const bool add_b = sb == 0 && (yb > hi_b || yb < lo_b);
+    if (!(add_a || add_b)) break;
+    if (add_a) sa = ya > hi_a ? 1 : -1;
+    if (add_b) sb = yb > hi_b ? 1 : -1;
+  }
+#pragma unroll
+  for (int i = 0; i < NV; i++) v[i] += ca[i] * la + cb[i] * lb;
+  if (sa != 0) v[va] = ta;  // exact — an active cap / clamp is a hard bound
+  if (sb != 0) v[vb] = tb;
+  return true;
+}
+
+// solver.rs `single_box_target`: the box LCP's fast path when only twin
+// a is outside its interval — the single update of a (exactly the LCP's
+// first active-set step) is the answer whenever it leaves twin b inside
+// [lo_b, hi_b]. The coupling is read from a's own column (ca[vb]), so b's
+// column is never built here; mirror-equivariant, since in the mirrored
+// state b plays a. Returns false with v untouched when b would leave its
+// interval — the caller then solves the pair jointly.
+template <typename T>
+__device__ __forceinline__ bool single_box_target(
+    T (&v)[NV], int va, int vb, T ta, T lo_b, T hi_b,
+    const T* __restrict__ ca, T maa) {
+  const T la = (ta - v[va]) / maa;
+  const T yb = v[vb] + ca[vb] * la;
+  if (yb > hi_b || yb < lo_b) return false;
+#pragma unroll
+  for (int i = 0; i < NV; i++) v[i] += ca[i] * la;
+  v[va] = ta;  // exact — an active cap / clamp is a hard bound
+  return true;
+}
+
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
 template <typename T>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
@@ -2848,12 +2980,14 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 
   // -- env v11 GROUND BLOCK (rows ahead of the pair rows) ---------------------
   // MIRROR of collide.rs `ground_phase` + solver.rs `assemble_ground_rows`.
-  // The corner order is the spec §2 normative one (foot_l then foot_r,
-  // GROUND_CORNERS order within a foot), the row order the §3 one (normal,
-  // friction x, friction z). Rust packs the ACTIVE corners' rows from 0;
-  // G1 keeps every corner in its FIXED slot (3*c + t) with an active bit
-  // instead — the consumers walk the slots in ascending order and skip
-  // inactive ones, which visits exactly Rust's rows in Rust's order.
+  // The corner order is the spec §2 normative one (foot_l then foot_r;
+  // within a foot collide.rs `ground_corner_k` — the right foot walks the
+  // mirror images of the left foot's corners), the row order the §3 one
+  // (normal, friction x, friction z). Rust packs the ACTIVE corners' rows
+  // from 0; G1 keeps every corner in its FIXED slot (3*c + t) with an
+  // active bit instead — the PGS sweep walks each foot's slots in the
+  // ground_corner_k order and skips inactive ones, which visits exactly
+  // Rust's rows in Rust's order.
   //
   // audit #9: with any corner down, BOTH feet's six spatial rows are
   // built (Rust builds only the contacting feet; the extra foot's columns
@@ -2972,7 +3106,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
   }
 
-  // -- step 7: narrow phase + contact rows (pair-id order) --------------------
+  // -- step 7: narrow phase + contact rows (PAIR_ORBIT order) ----------------
   // The 55 pairs reference only NUM_COLLIDERS distinct capsules, so the
   // world-space endpoints are hoisted here: 24 transforms instead of 110.
   // Expression structure is identical to the old inline form, so every
@@ -3002,7 +3136,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     hlr[c] = T(0.5 * sqrt(ex * ex + ey * ey + ez * ez) + COL_R[c]);
   }
   s.nc = 0;
-  for (int pid = 0; pid < NUM_PAIRS; pid++) {
+  for (int pk = 0; pk < NUM_PAIRS; pk++) {
+    const int pid = PAIR_ORBIT[pk];  // mirror-exact orbit order
     const int ia = PAIR_A[pid], ib = PAIR_B[pid];
     {
       const T mx = mid[ia][0] - mid[ib][0];
@@ -3047,9 +3182,14 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     }
   }
 
-  // -- assembly: joint-limit rows, joint order (Divergences §15) --------------
+  // -- assembly: joint-limit rows, joint ORBIT order (Divergences §15; a
+  //    mirror pair's two rows adjacent — solver.rs, mirror-exact) --------
   s.nl = 0;
-  for (int j = 0; j < NQ; j++) {
+  for (int jk = 0; jk < NQ; jk++) {
+    // orbit sequence 0,1,2, 3,10, 4,11, ..., 9,16, 17,23, ..., 22,28
+    const int j = jk < 3 ? jk
+                : jk < 17 ? ((jk - 3) & 1 ? JMIRROR[3 + (jk - 3) / 2] : 3 + (jk - 3) / 2)
+                          : ((jk - 17) & 1 ? JMIRROR[17 + (jk - 17) / 2] : 17 + (jk - 17) / 2);
     const T gl = qpre[j] - CT(LIMIT_LO, [j]);
     const T gh = CT(LIMIT_HI, [j]) - qpre[j];
     const T reach = T(H_SUB) * CT(OMEGA_CAP, [j]);
@@ -3171,8 +3311,9 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
   // genuinely uncomputed and adjacent — the only place in the kernel
   // where a group of unit solves is known up front. Forward halves stay
   // per-column (each has its own m = VOFF + j); the dense back halves
-  // run 4 / 2 at a time. s.l_j is strictly ascending and its entries are
-  // distinct joints, so the batched pointers never alias.
+  // run 4 / 2 at a time. s.l_j's entries are distinct joints (joint
+  // orbit order since sim/mirror-exact), so the batched pointers never
+  // alias.
   // Width: s.nl measures mean 7.8, range 3-14 (f32 trace, 256 envs), so
   // an 8-wide tier was tried too and won NOTHING over 4 (7,283 -> 7,286
   // steps/s) for ~30 more lines — dropped. See the block-size note in
@@ -3202,6 +3343,16 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 #pragma unroll
     for (int j = 0; j < NQ; j++)
       if (fabs(v[VOFF + j]) >= T(0.9) * CT(OMEGA_CAP, [j])) want |= 1u << j;
+    // MIRROR-EXACT: the cap pass and step 11 decide a mirror pair
+    // jointly and, when either twin fires, read BOTH columns — so a
+    // predicted joint (or a limit row, whose stop step 11 may clamp)
+    // predicts its twin too; otherwise every twin is an out-of-line miss
+    want |= lmask;
+#pragma unroll
+    for (int o = 3; o < N_JORB; o++) {
+      const uint32_t pm = (1u << JORB_A[o]) | (1u << JORB_B[o]);
+      if (want & pm) want |= pm;
+    }
     want &= ~lmask;
     int nx = s.nl;
     while (want) {
@@ -3305,23 +3456,33 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // on every value; the arithmetic is unchanged operation for
     // operation.
     // G4: the register copy also carries the (b) contact sweep below.
+    // MIRROR-EXACT (solver.rs `pgs_ground_sweep`): the two FEET are a
+    // Jacobi pair — both feet's V = J_f v read the same pre-sweep vr, the
+    // corner sweeps run in foot space (the right foot in the mirror
+    // corner order kk ^ 2), and ONE combined update vr += G_L Lambda_L +
+    // G_R Lambda_R lands both (each foot's sum formed first, the two
+    // added to each other, then to vr — Rust's expression tree).
     {
       const T(*x)[2 * FOOT_ROWS] = s.g_minv;
+      T vf[2][FOOT_ROWS], lf[2][FOOT_ROWS];
+      bool any[2] = {false, false};
+#pragma unroll
+      for (int f = 0; f < 2; f++) {
+        const int ch0 = WJ_L0 + 6 * f;
+#pragma unroll
+        for (int m = 0; m < FOOT_ROWS; m++) {
+          vf[f][m] = foot_row_dot(m, ch0, s.g_fjr[f], s.g_fjc[f][m],
+                                  [&](int i) { return vr[i]; });
+          lf[f][m] = T(0);
+        }
+      }
 #pragma unroll
       for (int f = 0; f < 2; f++) {
         const uint32_t fbits = (s.g_act >> (CORNERS_PER_FOOT * f)) & 0xFu;
         if (!fbits) continue;
-        const int ch0 = WJ_L0 + 6 * f;
-        T vf[FOOT_ROWS], lf[FOOT_ROWS];
-#pragma unroll
-        for (int m = 0; m < FOOT_ROWS; m++) {
-          vf[m] = foot_row_dot(m, ch0, s.g_fjr[f], s.g_fjc[f][m],
-                               [&](int i) { return vr[i]; });
-          lf[m] = T(0);
-        }
-        bool any = false;
 #pragma unroll 1
-        for (int k = 0; k < CORNERS_PER_FOOT; k++) {
+        for (int kk = 0; kk < CORNERS_PER_FOOT; kk++) {
+          const int k = f == 0 ? kk : (kk ^ 2);  // collide.rs ground_corner_k
           if (!((fbits >> k) & 1u)) continue;
           const int nrow = GROUND_ROWS_PER_CORNER * (CORNERS_PER_FOOT * f + k);
           T bound = T(0);
@@ -3332,7 +3493,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
             const int b1 = 3 + GROUND_SPATIAL[t][1];
             const int b2 = 3 + GROUND_SPATIAL[t][2];
             const T c1 = s.g_coef[row][0], c2 = s.g_coef[row][1];
-            const T jv = vf[a] + c1 * vf[b1] + c2 * vf[b2];
+            const T jv = vf[f][a] + c1 * vf[f][b1] + c2 * vf[f][b2];
             const T dl = (s.g_bias[row] - jv) / s.g_diag[row];
             const T lam = s.g_lam[row];
             // |lambda_t| <= MU * lambda_n for the friction rows. Rust
@@ -3346,12 +3507,13 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
             const T dd = newl - lam;
             s.g_lam[row] = newl;
             if (dd != T(0)) {
-              lf[a] += dd;
-              lf[b1] += c1 * dd;
-              lf[b2] += c2 * dd;
+              lf[f][a] += dd;
+              lf[f][b1] += c1 * dd;
+              lf[f][b2] += c2 * dd;
 #pragma unroll
-              for (int i = 0; i < FOOT_ROWS; i++) vf[i] += s.g_u[row][i] * dd;
-              any = true;
+              for (int i = 0; i < FOOT_ROWS; i++)
+                vf[f][i] += s.g_u[row][i] * dd;
+              any[f] = true;
             }
             // the friction cone is read AFTER the normal update, so a
             // corner that just lost its normal impulse loses its friction
@@ -3359,28 +3521,61 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
             if (t == 0) bound = T(GROUND_MU) * s.g_lam[row];
           }
         }
-        if (any) {
+      }
+      if (any[0] || any[1]) {
 #pragma unroll
-          for (int i = 0; i < NV; i++) {
-            T vi = vr[i];
+        for (int i = 0; i < NV; i++) {
+          T sf[2];
 #pragma unroll
-            for (int m = 0; m < FOOT_ROWS; m++)
-              vi += x[i][FOOT_ROWS * f + m] * lf[m];
-            vr[i] = vi;
+          for (int f = 0; f < 2; f++) {
+            T acc = T(0);
+            if (any[f]) {
+#pragma unroll
+              for (int m = 0; m < FOOT_ROWS; m++)
+                acc += x[i][FOOT_ROWS * f + m] * lf[f][m];
+            }
+            sf[f] = acc;
           }
+          vr[i] += sf[0] + sf[1];
         }
       }
-      // (b) contacts, pair-id order: projected GS, lambda >= 0 — G4: on
+      // (b) contacts, orbit order: projected GS, lambda >= 0 — G4: on
       // vr. This dot is DENSE ON PURPOSE. c_J[ci] has 12-23 structurally
       // nonzero columns of 35 and K14 narrowed it to a two-segment cover
       // of the pair's compile-time support: -1.42% / -0.90% / -0.29% in
       // three forms, all reverted. The bound would be runtime, which
       // costs this loop its full unrolling — see the K14 block in the
       // header before touching it.
+      // MIRROR-EXACT: the rows come in PAIR_ORBIT order, so an active
+      // contact and its active mirror image are adjacent; that pair is
+      // one Jacobi step (both residuals from the same vr, one combined
+      // axpy — solver.rs `pgs_pair_update`).
       for (int ci = 0; ci < s.nc; ci++) {
+        const int p = s.c_pair[ci];
+        const bool paired = ci + 1 < s.nc && PAIR_MIRROR[p] != p
+                            && s.c_pair[ci + 1] == PAIR_MIRROR[p];
         T jv = T(0);
 #pragma unroll
         for (int i = 0; i < NV; i++) jv += s.c_J[ci][i] * vr[i];
+        if (paired) {
+          T jv2 = T(0);
+#pragma unroll
+          for (int i = 0; i < NV; i++) jv2 += s.c_J[ci + 1][i] * vr[i];
+          const T na = tmax(s.c_lam[ci] + (s.c_bias[ci] - jv) / s.c_diag[ci], T(0));
+          const T nb = tmax(s.c_lam[ci + 1]
+                                + (s.c_bias[ci + 1] - jv2) / s.c_diag[ci + 1],
+                            T(0));
+          const T da = na - s.c_lam[ci];
+          const T db = nb - s.c_lam[ci + 1];
+          s.c_lam[ci] = na;
+          s.c_lam[ci + 1] = nb;
+          if (da != T(0) || db != T(0))
+#pragma unroll
+            for (int i = 0; i < NV; i++)
+              vr[i] += s.c_minv[ci][i] * da + s.c_minv[ci + 1][i] * db;
+          ci++;
+          continue;
+        }
         const T dl = (s.c_bias[ci] - jv) / s.c_diag[ci];
         const T newl = tmax(s.c_lam[ci] + dl, T(0));
         const T dd = newl - s.c_lam[ci];
@@ -3390,7 +3585,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
           for (int i = 0; i < NV; i++) vr[i] += s.c_minv[ci][i] * dd;
       }
     }
-    // (c) limit rows, joint order (J = sign * e_j: exact-zero terms
+    // (c) limit rows, joint orbit order (J = sign * e_j: exact-zero terms
     // dropped — Divergences §20c sign-of-zero class)
     // These axpys are DELIBERATELY NOT FUSED across the limit-row group.
     // K13 built exactly that (phase-1 scalar chain on 4 local v
@@ -3403,6 +3598,8 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // G5: the rows run on vr. The runtime-indexed read v[VOFF + j]
     // becomes a select chain over compile-time slots (a copy of the one
     // selected value — exact), and the axpy has compile-time i.
+    // MIRROR-EXACT: rows in joint orbit order; an active mirror pair
+    // (adjacent rows j, JMIRROR[j]) is one Jacobi step (solver.rs).
     for (int li = 0; li < s.nl; li++) {
       const int j = s.l_j[li];
       T vj = vr[VOFF];
@@ -3410,6 +3607,30 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       for (int jj = 1; jj < NQ; jj++)
         if (j == jj) vj = vr[VOFF + jj];
       const T jv = s.l_sign[li] * vj;
+      const int jm = JMIRROR[j];
+      if (jm != j && li + 1 < s.nl && s.l_j[li + 1] == jm) {
+        T vm = vr[VOFF];
+#pragma unroll
+        for (int jj = 1; jj < NQ; jj++)
+          if (jm == jj) vm = vr[VOFF + jj];
+        const T jv2 = s.l_sign[li + 1] * vm;
+        const T na = tmax(s.l_lam[li] + (s.l_bias[li] - jv) / s.l_diag[li], T(0));
+        const T nb = tmax(s.l_lam[li + 1]
+                              + (s.l_bias[li + 1] - jv2) / s.l_diag[li + 1],
+                          T(0));
+        const T da = na - s.l_lam[li];
+        const T db = nb - s.l_lam[li + 1];
+        s.l_lam[li] = na;
+        s.l_lam[li + 1] = nb;
+        if (da != T(0) || db != T(0)) {
+          const T sa = s.l_sign[li] * da, sb = s.l_sign[li + 1] * db;
+#pragma unroll
+          for (int i = 0; i < NV; i++)
+            vr[i] += s.ecol[li][i] * sa + s.ecol[li + 1][i] * sb;  // #6a
+        }
+        li++;
+        continue;
+      }
       const T dl = (s.l_bias[li] - jv) / s.l_diag[li];
       const T newl = tmax(s.l_lam[li] + dl, T(0));
       const T dd = newl - s.l_lam[li];
@@ -3420,7 +3641,7 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
         for (int i = 0; i < NV; i++) vr[i] += s.ecol[li][i] * sd;  // #6a
       }
     }
-    // (d) omega-cap pass, joint order: momentum-consistent impulses
+    // (d) omega-cap pass, joint orbit order: momentum-consistent impulses
     // along the plain M^-1 e_j columns.
     // #6c (perf/kernel-limits; was G5's scan + local-memory fallback
     // loop): the pass runs on vr, unrolled over the 29 joints — per
@@ -3431,20 +3652,68 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
     // compile-time, and a column miss builds out of line. Trained
     // standard traffic caps ~21 times per env-substep (warp worst lane
     // ~54), in every one of the 12 iterations.
+    // MIRROR-EXACT (solver.rs): joint ORBIT order, compile-time — the 3
+    // central joints alone, then each (left, right) pair decided on the
+    // same vr and, when either fires, projected jointly onto its two
+    // caps by the exact 2-variable box LCP (`pair_box_targets`).
 #pragma unroll
-    for (int j = 0; j < NQ; j++) {
-      const int vj = VOFF + j;
-      const T cap = CT(OMEGA_CAP, [j]);
-      const T target = tclamp(vr[vj], -cap, cap);
-      if (target != vr[vj]) {
-        if (!s.pcomp[j]) ensure_pdiag_ool(d, s, j);
-        if (!isinf(s.pdiag[j])) {
-          const T lam = (target - vr[vj]) / s.pdiag[j];
-          const T* const col = ecol_of(s, j);
+    for (int o = 0; o < N_JORB; o++) {
+      const int ja = JORB_A[o], jb = JORB_B[o];
+      const int va = VOFF + ja, vb = VOFF + jb;
+      const T cap_a = CT(OMEGA_CAP, [ja]);
+      const T ta = tclamp(vr[va], -cap_a, cap_a);
+      const bool fa = ta != vr[va];
+      if (ja == jb) {
+        if (fa) {
+          if (!s.pcomp[ja]) ensure_pdiag_ool(d, s, ja);
+          if (!isinf(s.pdiag[ja])) {
+            const T lam = (ta - vr[va]) / s.pdiag[ja];
+            const T* const col = ecol_of(s, ja);
 #pragma unroll
-          for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
-          vr[vj] = target;  // exact — the cap is a hard bound
+            for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+            vr[va] = ta;  // exact — the cap is a hard bound
+          }
         }
+        continue;
+      }
+      const T cap_b = CT(OMEGA_CAP, [jb]);
+      const T tb = tclamp(vr[vb], -cap_b, cap_b);
+      const bool fb = tb != vr[vb];
+      if (!(fa || fb)) continue;
+      // one twin over its cap: its single update, unless that pushes
+      // the other twin past its own cap (single_box_target)
+      if (fa && !fb) {
+        if (!s.pcomp[ja]) ensure_pdiag_ool(d, s, ja);
+        if (isinf(s.pdiag[ja])) continue;  // a degenerate column: inert
+        if (single_box_target(vr, va, vb, ta, -cap_b, cap_b,
+                              ecol_of(s, ja), s.pdiag[ja]))
+          continue;
+      } else if (fb && !fa) {
+        if (!s.pcomp[jb]) ensure_pdiag_ool(d, s, jb);
+        if (isinf(s.pdiag[jb])) continue;
+        if (single_box_target(vr, vb, va, tb, -cap_a, cap_a,
+                              ecol_of(s, jb), s.pdiag[jb]))
+          continue;
+      }
+      if (!s.pcomp[ja]) ensure_pdiag_ool(d, s, ja);
+      if (!s.pcomp[jb]) ensure_pdiag_ool(d, s, jb);
+      const bool oka = !isinf(s.pdiag[ja]), okb = !isinf(s.pdiag[jb]);
+      if (oka && okb) {
+        pair_box_targets(vr, va, vb, -cap_a, cap_a, -cap_b, cap_b,
+                         ecol_of(s, ja), ecol_of(s, jb), s.pdiag[ja],
+                         s.pdiag[jb]);
+      } else if (oka && fa) {  // a degenerate column leaves that cap inert
+        const T lam = (ta - vr[va]) / s.pdiag[ja];
+        const T* const col = ecol_of(s, ja);
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+        vr[va] = ta;
+      } else if (okb && fb) {
+        const T lam = (tb - vr[vb]) / s.pdiag[jb];
+        const T* const col = ecol_of(s, jb);
+#pragma unroll
+        for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+        vr[vb] = tb;
       }
     }
   }
@@ -3543,7 +3812,7 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
         sqrt(qq[0] * qq[0] + qq[1] * qq[1] + qq[2] * qq[2] + qq[3] * qq[3]);
     for (int i = 0; i < 4; i++) d.quat[i] = qq[i] / qn;
   }
-  // 11. post-solve clamps as momentum-consistent impulses (joint order,
+  // 11. post-solve clamps as momentum-consistent impulses (orbit order,
   //     CLAMP_PASSES Gauss-Seidel passes with Rust's early-out). env
   //     v14: the direct-write guarantee pass is DELETED in both
   //     engines — its reaction-free writes manufactured up to ~335 N
@@ -3576,37 +3845,78 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   T vr[NV];
 #pragma unroll
   for (int i = 0; i < NV; i++) vr[i] = d.v[i];
+  // v14: at a stop the target is a Baumgarte recovery toward the bound
+  // with a SLOP_LIMIT dead-band (mirrors step.rs) — the impulse restores
+  // position reciprocally; a parked joint inside the slop fires nothing
+  auto target_of = [&](int j, T vj) -> T {
+    const T cap = CT(OMEGA_CAP, [j]);
+    if ((hitm >> j) & 1u) {
+      const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
+      const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
+      const T rec = fabs(over) - T(SLOP_LIMIT);
+      return rec <= T(0)
+                 ? T(0)
+                 : tclamp(T(BETA_LIMIT) * (over < T(0) ? -rec : rec) / T(H_SUB),
+                          -cap, cap);
+    }
+    return tclamp(vj, -cap, cap);
+  };
+  // MIRROR-EXACT (step.rs): joint ORBIT order, compile-time; a mirror
+  // pair decided on the same vr and, when either fires, projected
+  // jointly by the exact 2-variable box LCP (a joint past a stop: the
+  // equality interval [target, target]; a free one: its +-cap box).
   for (int pass = 0; pass < CLAMP_PASSES; pass++) {
     bool changed = false;
 #pragma unroll
-    for (int j = 0; j < NQ; j++) {
-      const int vj = VOFF + j;
-      const T cap = CT(OMEGA_CAP, [j]);
-      // v14: at a stop the target is a Baumgarte recovery toward the
-      // bound with a SLOP_LIMIT dead-band (mirrors step.rs) — the
-      // impulse restores position reciprocally; a parked joint inside
-      // the slop fires nothing
-      T target;
-      if ((hitm >> j) & 1u) {
-        const T lo = CT(LIMIT_LO, [j]), hi = CT(LIMIT_HI, [j]);
-        const T over = d.q[j] < lo ? lo - d.q[j] : hi - d.q[j];
-        const T rec = fabs(over) - T(SLOP_LIMIT);
-        target = rec <= T(0)
-                     ? T(0)
-                     : tclamp(T(BETA_LIMIT) * (over < T(0) ? -rec : rec) / T(H_SUB),
-                              -cap, cap);
-      } else {
-        target = tclamp(vr[vj], -cap, cap);
-      }
-      if (target != vr[vj]) {
-        if (!s.ecomp[j]) ensure_ecol_ool(d, s, j);
-        const T* const col = ecol_of(s, j);
-        const T lam = (target - vr[vj]) / col[vj];
+    for (int o = 0; o < N_JORB; o++) {
+      const int ja = JORB_A[o], jb = JORB_B[o];
+      const int va = VOFF + ja, vb = VOFF + jb;
+      const T ta = target_of(ja, vr[va]);
+      const bool fa = ta != vr[va];
+      if (ja == jb) {
+        if (fa) {
+          if (!s.ecomp[ja]) ensure_ecol_ool(d, s, ja);
+          const T* const col = ecol_of(s, ja);
+          const T lam = (ta - vr[va]) / col[va];
 #pragma unroll
-        for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
-        vr[vj] = target;  // exact — the clamp is a hard bound
-        changed = true;
+          for (int i = 0; i < NV; i++) vr[i] += col[i] * lam;
+          vr[va] = ta;  // exact — the clamp is a hard bound
+          changed = true;
+        }
+        continue;
       }
+      const T tb = target_of(jb, vr[vb]);
+      const bool fb = tb != vr[vb];
+      if (!(fa || fb)) continue;
+      const T cap_a = CT(OMEGA_CAP, [ja]), cap_b = CT(OMEGA_CAP, [jb]);
+      const bool ha = (hitm >> ja) & 1u, hb = (hitm >> jb) & 1u;
+      // one twin off its interval: its single update, unless that
+      // pushes the other twin off its own (single_box_target)
+      if (fa && !fb) {
+        if (!s.ecomp[ja]) ensure_ecol_ool(d, s, ja);
+        const T* const ca = ecol_of(s, ja);
+        if (single_box_target(vr, va, vb, ta, hb ? tb : -cap_b,
+                              hb ? tb : cap_b, ca, ca[va])) {
+          changed = true;
+          continue;
+        }
+      } else if (fb && !fa) {
+        if (!s.ecomp[jb]) ensure_ecol_ool(d, s, jb);
+        const T* const cb = ecol_of(s, jb);
+        if (single_box_target(vr, vb, va, tb, ha ? ta : -cap_a,
+                              ha ? ta : cap_a, cb, cb[vb])) {
+          changed = true;
+          continue;
+        }
+      }
+      if (!s.ecomp[ja]) ensure_ecol_ool(d, s, ja);
+      if (!s.ecomp[jb]) ensure_ecol_ool(d, s, jb);
+      const T* const ca = ecol_of(s, ja);
+      const T* const cb = ecol_of(s, jb);
+      if (pair_box_targets(vr, va, vb, ha ? ta : -cap_a, ha ? ta : cap_a,
+                           hb ? tb : -cap_b, hb ? tb : cap_b, ca, cb, ca[va],
+                           cb[vb]))
+        changed = true;
     }
     if (!changed) break;
   }
