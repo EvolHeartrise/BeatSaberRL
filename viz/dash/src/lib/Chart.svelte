@@ -204,4 +204,7 @@
   :global(.uplot .u-title) { font-size: 13px; font-weight: 600; color: var(--fg); }
   :global(.uplot .u-legend) { font-size: 11px; color: var(--fg); }
   :global(.uplot .u-legend .u-value) { min-width: 0; }
+  /* uPlot's first legend entry is the x series (updates / samples / h at
+     the cursor) — hidden; the legend shows only the metric series */
+  :global(.uplot .u-legend .u-series:first-child) { display: none; }
 </style>
