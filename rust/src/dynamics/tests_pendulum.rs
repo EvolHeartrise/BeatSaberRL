@@ -43,6 +43,7 @@ static PEND1: Model = Model {
     damping: &P1_ZERO,
     armature: &P1_ZERO,
     gravity: [0.0, -G, 0.0],
+    mirror: &[0],
 };
 
 // 2-link: two unit point masses, 1 m links, both revolute about z;
@@ -85,6 +86,7 @@ static PEND2: Model = Model {
     damping: &P2_ZERO,
     armature: &P2_ZERO,
     gravity: [0.0, -G, 0.0],
+    mirror: &[0, 1],
 };
 
 /// Run the engine for `n` substeps at step `h`, zero torque.

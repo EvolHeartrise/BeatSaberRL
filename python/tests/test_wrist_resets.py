@@ -177,12 +177,16 @@ def test_cuda_pop_and_episode_record():
     is pinned tick by tick in test_production_lockstep."""
     import torch
     from beat_arena_env.cuda_env import CudaBeatVecEnv
-    env = CudaBeatVecEnv(256, chart_len_s=6.0, seed=5, device="cuda",
+    # random play lands only ~1-2 good cuts per 256 envs (measured
+    # 2026-10-04, seeds 5-7), so 256 envs made sl + sr > 0 a coin flip
+    # on any physics change; 1024 envs keep it well clear of zero
+    n = 1024
+    env = CudaBeatVecEnv(n, chart_len_s=6.0, seed=5, device="cuda",
                          dtype=torch.float64, gears=5, auto_reset=False)
     env.reset()
     rng = np.random.default_rng(0)
     for _ in range(150):
-        env.step(torch.as_tensor(rng.integers(0, 5, (256, N_JOINTS)),
+        env.step(torch.as_tensor(rng.integers(0, 5, (n, N_JOINTS)),
                                  device="cuda"))
     ep = env.wrs[:, :, 3:5].sum(0).cpu().numpy()   # [[rL, sL], [rR, sR]]
     rl, rr, sl, sr = env.pop_wrist_resets()

@@ -44,15 +44,19 @@ fn ground_corners_touch_at_reference() {
     ground_phase(&ws, &mut gc);
     assert_eq!(gc.len(), NUM_GROUND_CORNERS, "all 8 corners must be active");
     for (i, c) in gc.iter().enumerate() {
-        assert_eq!(c.corner, i, "corner order must be the assembly order");
+        // assembly order: foot_l then foot_r, within a foot
+        // `ground_corner_k` (the right foot walks the mirror images of
+        // the left foot's corners — mirror-exact solve order)
+        let (f, kk) = (i / CORNERS_PER_FOOT, i % CORNERS_PER_FOOT);
+        let k = super::collide::ground_corner_k(f, kk);
+        assert_eq!(c.corner, f * CORNERS_PER_FOOT + k, "corner order must be the assembly order");
         // §2 says "exactly y = 0"; the FK chain that gets there
         // (0.94 − 0.44 − 0.43 − 0.07) leaves ±5.6e-17 of rounding, which
         // is what "exactly" means here. What the spec's claim actually
         // buys — active (gap < MARGIN) and touching at reset — is exact.
         assert!(c.gap.abs() < 1e-12, "corner {i} gap {} != 0 at the reference pose", c.gap);
-        // §2 order within a foot: (x−,z−), (x−,z+), (x+,z−), (x+,z+)
-        let k = i % CORNERS_PER_FOOT;
-        let foot_x = if i < CORNERS_PER_FOOT { -0.10 } else { 0.10 };
+        // §2 corner geometry: k = (x−,z−), (x−,z+), (x+,z−), (x+,z+)
+        let foot_x = if f == 0 { -0.10 } else { 0.10 };
         let want_x = foot_x + if k < 2 { -0.045 } else { 0.045 };
         let want_z = -0.65 + if k % 2 == 0 { -0.075 } else { 0.175 };
         assert!((c.point[0] - want_x).abs() < 1e-12, "corner {i} x {}", c.point[0]);
