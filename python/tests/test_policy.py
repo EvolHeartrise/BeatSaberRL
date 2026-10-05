@@ -32,7 +32,8 @@ def test_output_shapes():
     policy = NotePolicy()
     obs = _obs_batch()
     logits, value = policy(obs)
-    assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]
+    # exp/bend7: every head is k_max wide (masked past its count)
+    assert [l.shape for l in logits] == [(6, policy.k_max)] * len(HEAD_SIZES)
     assert value.shape == (6,)
     a, logp, ent, v = policy.get_action_and_value(obs)
     assert a.shape == (6, N_ACTION_HEADS) and logp.shape == (6,)
@@ -190,7 +191,7 @@ def test_note_geo_forward_and_arch_marker():
     assert pol.arch["blade_geo"] == 1
     obs = _obs_batch()
     logits, value = pol(obs)
-    assert [l.shape for l in logits] == [(6, n) for n in HEAD_SIZES]
+    assert [l.shape for l in logits] == [(6, pol.k_max)] * len(HEAD_SIZES)
     assert torch.isfinite(value).all()
     # the default model is untouched
     assert NotePolicy().note_mlp[0].in_features == NOTE_FEAT

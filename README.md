@@ -97,6 +97,18 @@ on branch `body/original`**: v60/v61 benches, replays and checkpoints
 different body here. Replays carry their body (format 2 `header.body`),
 so the viewer shows either era correctly.
 
+**This branch, `exp/bend7` (user 2026-10-04; never merged to main):**
+the v63x2 body plus three wrist-bend changes (joints 8, 15 only).
+(1) **7 gears**, −1, −½, −¼, 0, ¼, ½, 1 of τ_max, via
+`JOINT_EXTRA_GEARS` (±¼ at ids 5/6 on top of K=5's 0, ±1 and the 2×
+fine ±½); every other joint keeps 5, and `--gears` stays 5 (the base
+table; K=7 cannot carry the extras). (2) The default body's bend scale is
+1.2579 → **1.4466** (+15%), i.e. 1.80 → **2.07 N·m** on the 1.431 table.
+(3) The bend **ω cap is 90 → 105 rad/s** (2·h·ω_cap = 0.875 rad ≪ the
+±95° range; asserted in `tests_fk`). Benches, replays and resumes of
+bend7 checkpoints must run from this branch (`load_policy` refuses them
+elsewhere, and refuses main's checkpoints here).
+
 **Per-joint gear counts (2026-10-04):** a build may give individual
 joints extra gear ids on top of the `--gears` base table
 (`constants.JOINT_EXTRA_GEARS`, mirrored as `JOINT_EXTRA_N` /

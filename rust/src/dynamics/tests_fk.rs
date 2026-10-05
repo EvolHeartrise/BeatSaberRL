@@ -54,6 +54,12 @@ fn model_tables_sanity() {
         let (lo, hi) = m.limits[j];
         assert!(lo < hi, "limits[{j}]");
         assert!(m.omega_cap[j] > 0.0 && m.tau_max[j] > 0.0 && m.damping[j] > 0.0);
+        // the limit solver's reach invariant (solver.rs: only the nearer
+        // stop can be within reach h·ω_cap): every range exceeds
+        // 2·h·ω_cap — exp/bend7's 105 rad/s bend: 0.875 rad vs 3.32
+        assert!(hi - lo > 2.0 * super::step::H_SUB * m.omega_cap[j],
+                "joint {j}: range {} vs 2·h·ω_cap {}", hi - lo,
+                2.0 * super::step::H_SUB * m.omega_cap[j]);
     }
 }
 
