@@ -54,7 +54,9 @@ def test_param_counts_exact():
     # +38,500 over the scalar-head count (2,751,122)
     # I07 / env v49 (2026-09-30): saber 44 -> 47 lanes (+3 x 192) and the
     # note geo 14 -> 22 lanes (+8 x 192): +2,112
-    assert tot(s384) == 2_791_734
+    # exp/bend7: the bend heads' 2 extra rows each, of 384 + 1
+    extra = sum(n - 5 for n in s384.head_sizes) * (384 + 1)
+    assert tot(s384) == 2_791_734 + extra
     # the block's new 2-D matrices are the only additions besides LN/bias
     names = {n for n, _ in s384.named_parameters() if n.startswith("trunk")}
     assert names == {"trunk_proj.weight", "trunk_proj.bias",
@@ -72,7 +74,7 @@ def test_simba_forward_shapes_and_ln_scale():
     with torch.no_grad():
         logits, value = p.forward_stacked(obs)
     p._diag_stash = False
-    assert logits.shape == (16, N_ACTION_HEADS, 5)
+    assert logits.shape == (16, N_ACTION_HEADS, p.k_max)
     assert value.shape == (16,)
     assert torch.isfinite(logits).all() and torch.isfinite(value).all()
     h = p._diag_h

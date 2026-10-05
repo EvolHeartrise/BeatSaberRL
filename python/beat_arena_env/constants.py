@@ -129,7 +129,10 @@ TAU_MAX = (
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
     262.50, 75.00, 135.00, 150.00, 135.00, 37.50,
 )
-OMEGA_CAP = ((16.0,) * 7 + (50.0, 90.0, 50.0) + (16.0,) * 4 + (50.0, 90.0, 50.0)
+# exp/bend7 (user 2026-10-04, branch only): bend cap 90 -> 105 rad/s
+# (the limit solver's 2*H_SUB*cap = 0.875 rad stays far inside the
+# bend's +-95 deg = 3.32 rad range)
+OMEGA_CAP = ((16.0,) * 7 + (50.0, 105.0, 50.0) + (16.0,) * 4 + (50.0, 105.0, 50.0)
              + (16.0,) * 12)
 
 # §19b root-velocity envelope (dynamics/step.rs ROOT_W_MAX / ROOT_V_MAX,
@@ -210,7 +213,11 @@ FINE_GEAR_MULT = tuple(2.0 if j in (8, 15) else 1.0 for j in range(N_JOINTS))
 # JOINT_EXTRA_FRAC (signed, ids n_gears..). A policy's per-head sizes
 # (NotePolicy head_gears, arch "head_gears") must equal
 # joint_gear_counts(n_gears) of the build it runs on.
-JOINT_EXTRA_GEARS = ((),) * N_JOINTS
+# exp/bend7 (user 2026-10-04, branch only): the wrist bends (8, 15) get
+# +/-1/4 at ids 5/6, so at --gears 5 a bend joint has 7 gears: 0, +/-1,
+# +/-1/2 (the 2x fine ids 3/4), +/-1/4; every other joint keeps 5.
+JOINT_EXTRA_GEARS = tuple((0.25,) if j in (8, 15) else ()
+                          for j in range(N_JOINTS))
 MAX_GEARS = 7
 
 
@@ -406,8 +413,11 @@ TAU_GROUPS = {"spine": (0, 1, 2), "arms": (3, 4, 5, 6),
 # bench 2,946,594 upp vs 2,895,798 at the v51 body (+1.75%).
 # v63x2 body (user 2026-10-03, main's since): wrist bend 1.0567 ->
 # 1.2579, i.e. 1.51 -> 1.80 N.m on the 1.431 table.
+# exp/bend7 (user 2026-10-04, branch only): wrist bend +15% over what
+# arch_base_trunk trained with, 1.2579 x 1.15 = 1.4466, i.e. 1.80 ->
+# 2.07 N.m on the 1.431 table.
 TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
-                    1.1000, 1.1889, 1.2579, 1.0220, 0.9055, 1.0453,
+                    1.1000, 1.1889, 1.4466, 1.0220, 0.9055, 1.0453,
                     1.0608, 1.0269, 1.0668, 1.1428)
 TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
 assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)

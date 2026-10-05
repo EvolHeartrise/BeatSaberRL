@@ -272,12 +272,14 @@ pub const HUMANOID_TAU_MAX: [Real; NQ] = [
 // (§1.4; 40 -> 50 per user 2026-08-18 — with the fist-only hand the
 // full-gear bend swing was cap-clipped mid-arc); bend 50 -> 65 (user
 // 2026-10-01); 65 -> 90 (user 2026-10-03) — main's v63x2 body; 50
-// everywhere on the wrist tier on branch body/original.
+// everywhere on the wrist tier on branch body/original. 90 -> 105 (user
+// 2026-10-04, exp/bend7 only): 2*h*cap = 0.875 rad, far inside the
+// bend's +-95 deg range (the limit solver's reach invariant).
 #[rustfmt::skip]
 pub const HUMANOID_OMEGA_CAP: [Real; NQ] = [
     16.0, 16.0, 16.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
-    16.0, 16.0, 16.0, 16.0, 50.0, 90.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 105.0, 50.0,
+    16.0, 16.0, 16.0, 16.0, 50.0, 105.0, 50.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
     16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
 ];

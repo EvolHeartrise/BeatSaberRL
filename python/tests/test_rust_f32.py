@@ -19,7 +19,7 @@ def _pair(n=4):
     sims = []
     for mod in (beat_arena_rs, rs32):
         s = mod.VecBeatSim(n, max_steps=100_000, combo_walk=True,
-                           return_events=False, gears=7)
+                           return_events=False, gears=5)  # bend7: no K=7
         for i, c in enumerate(charts):
             s.set_chart(i, c, [])
         sims.append(s)
