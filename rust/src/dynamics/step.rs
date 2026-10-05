@@ -15,7 +15,7 @@ use super::algo::{crba, rnea, tc_factor, tc_solve_unit_v, tc_solve_v};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
-use super::solver::{pair_box_targets, single_hard_target};
+use super::solver::{pair_box_targets, single_box_target, single_hard_target};
 
 /// SPEC-v10 §3 substep h = 1/240 s (8 per 1/30 control tick).
 pub const H_SUB: Real = 1.0 / 240.0;
@@ -368,7 +368,27 @@ pub fn substep_opts(
             if !(fa || fb) {
                 continue;
             }
-            // both columns: the box LCP couples the pair even when one fires
+            // one twin off its interval: its single update, unless that
+            // pushes the other twin off its own (solver.rs
+            // `single_box_target` — needs only the firing twin's column)
+            if fa != fb {
+                let (js, jo, vs, vo, ts, to) =
+                    if fa { (j0, jm, va, vb, ta, tb) } else { (jm, j0, vb, va, tb, ta) };
+                #[cfg(feature = "stats")]
+                {
+                    s11_solves += s11_column(model, ws, js) as u64;
+                }
+                #[cfg(not(feature = "stats"))]
+                s11_column(model, ws, js);
+                let col = &ws.solcache[js * nv..(js + 1) * nv];
+                let co = model.omega_cap[jo];
+                let (lo_o, hi_o) = if ws.hit[jo] { (to, to) } else { (-co, co) };
+                if single_box_target(&mut st.v, nv, vs, vo, ts, lo_o, hi_o, col, col[vs]) {
+                    changed = true;
+                    continue;
+                }
+            }
+            // both columns: the box LCP couples the pair
             for jt in [j0, jm] {
                 #[cfg(feature = "stats")]
                 {

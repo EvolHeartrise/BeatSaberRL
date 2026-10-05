@@ -1611,7 +1611,32 @@ impl ConstraintSet {
                 if !(fa || fb) {
                     continue;
                 }
-                // both columns: the box LCP couples the pair even when one fires
+                // one twin over its cap: its single update, unless that
+                // pushes the other twin past its own cap
+                // (`single_box_target` — the LCP's fast path, which needs
+                // only the firing twin's column)
+                if fa != fb {
+                    let (js, vs, vo, ts, cap_o) = if fa {
+                        (j0, va, vb, ta, model.omega_cap[jm])
+                    } else {
+                        (jm, vb, va, tb, model.omega_cap[j0])
+                    };
+                    #[cfg(feature = "stats")]
+                    {
+                        cap_solves += self.ensure_capcol(ws, nv, voff, js) as u64;
+                    }
+                    #[cfg(not(feature = "stats"))]
+                    self.ensure_capcol(ws, nv, voff, js);
+                    if !self.capmass[js].is_finite() {
+                        continue; // a degenerate column: that cap is inert
+                    }
+                    let col = &self.capcol[js * nv..(js + 1) * nv];
+                    if single_box_target(v, nv, vs, vo, ts, -cap_o, cap_o, col,
+                                         self.capmass[js]) {
+                        continue;
+                    }
+                }
+                // both columns: the box LCP couples the pair
                 for jt in [j0, jm] {
                     #[cfg(feature = "stats")]
                     {
@@ -1670,6 +1695,33 @@ pub(crate) fn single_hard_target(v: &mut [Real], nv: usize, vj: usize, target: R
         v[i] += col[i] * lam;
     }
     v[vj] = target; // exact — the cap / clamp is a hard bound
+}
+
+/// `pair_box_targets`' fast path when only twin a is outside its
+/// interval: the single update of a (exactly the LCP's first active-set
+/// step, λ_a = (t_a − v_a)/m_aa, λ_b = 0) is the answer whenever it
+/// leaves twin b inside [lo_b, hi_b]. The coupling is read from a's own
+/// column (col_a[v_b]), so b's column is never needed here — still
+/// mirror-equivariant, since in the mirrored state b plays a. Returns
+/// false with `v` untouched when b would leave its interval; the caller
+/// then solves the pair jointly. (Measured on the CUDA twin, RTX 5090,
+/// trained standard sampled: 20.5 -> 18.4 ms/tick at N=32768; base
+/// left-first passes 15.7.)
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn single_box_target(v: &mut [Real], nv: usize, va: usize, vb: usize,
+                                ta: Real, lo_b: Real, hi_b: Real, ca: &[Real],
+                                maa: Real) -> bool {
+    let la = (ta - v[va]) / maa;
+    let yb = v[vb] + ca[vb] * la;
+    if yb > hi_b || yb < lo_b {
+        return false;
+    }
+    for i in 0..nv {
+        v[i] += ca[i] * la;
+    }
+    v[va] = ta; // exact — an active cap / clamp is a hard bound
+    true
 }
 
 /// MIRROR-EXACT joint projection of two mirror-paired joints a, b onto
