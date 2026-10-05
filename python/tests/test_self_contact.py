@@ -82,16 +82,28 @@ def test_coef_zero_is_bitwise_baseline_and_pricing_identity():
     s0.set_joints(q36, v35)
     s1.set_joints(q36, v35)
     act = _press_act()
-    r0, n0 = _run(s0, act, TICKS)
-    r1, n1 = _run(s1, act, TICKS)
-    assert n0 == n1
-    imp0, ct0, t0 = s0.pop_self_contact()
-    imp1, ct1, t1 = s1.pop_self_contact()
-    # the penalty does not touch the physics: identical telemetry
-    assert (imp0, ct0, t0) == (imp1, ct1, t1)
-    assert imp0 > 0.0
+    # per tick: the penalty does not touch the physics (identical
+    # telemetry), and on every NON-terminal tick the reward gap is c x
+    # that tick's impulse — a terminal (fall / tilt) tick's reward is
+    # the flat -fall_const in both sims, so its impulse goes unpriced
+    gap, priced, total_imp = 0.0, 0.0, 0.0
+    for _ in range(TICKS):
+        _o0, r0, d0, _e0 = s0.step(act)
+        _o1, r1, d1, _e1 = s1.step(act)
+        assert d0 == d1
+        imp0, ct0, t0 = s0.pop_self_contact()
+        imp1, ct1, t1 = s1.pop_self_contact()
+        assert (imp0, ct0, t0) == (imp1, ct1, t1)
+        total_imp += imp0
+        if d0:
+            assert r0 == r1
+            break
+        gap += r0 - r1
+        priced += COEF * imp0
+    assert total_imp > 0.0
+    assert priced > 0.0
     # reward gap == c * impulse, f64-exact up to summation order
-    assert abs((r0 - r1) - COEF * imp0) < 1e-9, (r0, r1, imp0)
+    assert abs(gap - priced) < 1e-9, (gap, priced)
 
 
 def test_zero_contact_ticks_are_unpriced():
@@ -123,21 +135,27 @@ def test_cuda_pricing_matches_telemetry():
         env.set_state(torch.tensor([q36] * n, dtype=torch.float64),
                       torch.tensor([v35] * n, dtype=torch.float64))
     act = torch.as_tensor([_press_act()] * n)
-    tot0 = torch.zeros(n, dtype=torch.float64)
-    tot1 = torch.zeros(n, dtype=torch.float64)
-    # stop at termination like the Rust runner: with auto_reset off the
-    # kernel keeps the telemetry accumulating on done envs while no
-    # reward is paid, so post-done ticks would break the identity
+    # per tick, like the Rust test above: identical telemetry, and on
+    # every NON-terminal tick the reward gap is c x that tick's impulse
+    # (all n envs are copies, so they terminate together). A terminal
+    # tick pays the flat -fall_const in both envs, so its impulse goes
+    # unpriced; stop there — with auto_reset off the kernel keeps the
+    # telemetry accumulating on done envs while no reward is paid.
+    gap, priced, total_imp, total_ct = 0.0, 0.0, 0.0, 0
     for _ in range(TICKS):
         _o, r0, d0, _ = e0.step(act)
-        _o, r1, _d1, _ = e1.step(act)
-        tot0 += r0.double().cpu()
-        tot1 += r1.double().cpu()
+        _o, r1, d1, _ = e1.step(act)
+        assert torch.equal(d0, d1)
+        imp0, ct0, t0 = e0.pop_self_contact()
+        imp1, ct1, t1 = e1.pop_self_contact()
+        assert t0 == t1 == n and ct0 == ct1 and abs(imp0 - imp1) < 1e-9
+        total_imp += imp0
+        total_ct += ct0
         if bool(d0.any()):
+            assert bool(d0.all()) and torch.equal(r0, r1)
             break
-    imp0, ct0, t0 = e0.pop_self_contact()
-    imp1, ct1, t1 = e1.pop_self_contact()
-    assert t0 == t1 and t0 > 0 and imp0 > 0.0 and ct0 > 0
-    assert abs(imp0 - imp1) < 1e-9 and ct0 == ct1
-    gap = float((tot0 - tot1).sum())
-    assert abs(gap - COEF * imp0) < 1e-6, (gap, imp0)
+        gap += float((r0.double() - r1.double()).sum().cpu())
+        priced += COEF * imp0
+    assert total_imp > 0.0 and total_ct > 0
+    assert priced > 0.0
+    assert abs(gap - priced) < 1e-6, (gap, priced)
