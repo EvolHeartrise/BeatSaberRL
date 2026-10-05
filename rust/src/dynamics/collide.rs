@@ -82,6 +82,67 @@ pub const PAIRS: [(usize, usize); NUM_PAIRS] = [
     /* 54 */ (10, 11),
 ];
 
+/// Mirror image (x → −x reflection) of each collider id: the body is
+/// left/right symmetric, so mirroring swaps every `_l` collider with its
+/// `_r` twin and leaves the two central ones (torso, head) in place.
+pub const COLLIDER_MIRROR: [usize; NUM_COLLIDERS] = [0, 1, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10];
+
+const fn pair_mirror_table() -> [usize; NUM_PAIRS] {
+    let mut t = [0usize; NUM_PAIRS];
+    let mut k = 0;
+    while k < NUM_PAIRS {
+        let (a, b) = PAIRS[k];
+        let (ma, mb) = (COLLIDER_MIRROR[a], COLLIDER_MIRROR[b]);
+        let (lo, hi) = if ma < mb { (ma, mb) } else { (mb, ma) };
+        let mut m = 0;
+        while !(PAIRS[m].0 == lo && PAIRS[m].1 == hi) {
+            m += 1; // the live table is mirror-closed (pinned by a test)
+        }
+        t[k] = m;
+        k += 1;
+    }
+    t
+}
+/// Pair id of each pair's mirror image (an involution; fixed points are
+/// the self-mirror pairs such as uarm_l–uarm_r).
+pub const PAIR_MIRROR: [usize; NUM_PAIRS] = pair_mirror_table();
+
+const fn pair_orbit_order() -> [usize; NUM_PAIRS] {
+    let mut t = [0usize; NUM_PAIRS];
+    let (mut k, mut n) = (0, 0);
+    while k < NUM_PAIRS {
+        let m = PAIR_MIRROR[k];
+        if m >= k {
+            t[n] = k;
+            n += 1;
+            if m != k {
+                t[n] = m;
+                n += 1;
+            }
+        }
+        k += 1;
+    }
+    t
+}
+/// MIRROR-EXACT EMISSION ORDER (sim/mirror-exact, 2026-10-04): the
+/// narrow phase visits the pairs ORBIT by orbit — each pair immediately
+/// followed by its mirror image, orbits keyed by their smaller pair id.
+/// The reflection maps this sequence to itself up to swapping the two
+/// members of an orbit, and the solver updates the two members of an
+/// active orbit jointly (Jacobi, from the same pre-state), so the
+/// within-orbit order carries no information either. The old pair-id
+/// order solved every left-limb contact before its right twin.
+pub const PAIR_ORBIT_ORDER: [usize; NUM_PAIRS] = pair_orbit_order();
+
+/// Ground-corner visiting order per foot (mirror-exact): the left foot
+/// walks (x−,z−) (x−,z+) (x+,z−) (x+,z+); the right foot walks the
+/// MIRROR images of those corners, (x+,z−) (x+,z+) (x−,z−) (x−,z+) —
+/// outer edge first on both feet. Corner ids (foot·4 + k) are unchanged.
+#[inline(always)]
+pub const fn ground_corner_k(foot: usize, kk: usize) -> usize {
+    if foot == 0 { kk } else { kk ^ 2 }
+}
+
 /// §2 excluded pairs (11) — kept as a table for the roster tests
 /// (live ∪ excluded must equal C(12,2)).
 #[rustfmt::skip]
@@ -269,8 +330,8 @@ pub struct Contact {
     pub gap: Real,
 }
 
-/// Narrow phase over the 55-pair table in PAIR-ID ORDER (normative —
-/// the PGS row order and the replay contact stream depend on it).
+/// Narrow phase over the 55-pair table in `PAIR_ORBIT_ORDER` (normative
+/// — the PGS row order and the replay contact stream depend on it).
 /// Requires fk_all in ws. Appends active contacts to `out` (cleared
 /// here; capacity NUM_PAIRS is reserved by the caller — no allocation
 /// inside a substep).
@@ -294,7 +355,8 @@ pub fn narrow_phase(ws: &Workspace, out: &mut Vec<Contact>) {
             mid[ci][k] = 0.5 * (wa[ci][k] + wb[ci][k]);
         }
     }
-    for (pid, &(ia, ib)) in PAIRS.iter().enumerate() {
+    for &pid in PAIR_ORBIT_ORDER.iter() {
+        let (ia, ib) = PAIRS[pid];
         // R11 part 2: conservative bounding-sphere reject (see MID_REJ2)
         let dm = sub3(mid[ia], mid[ib]);
         if dot3(dm, dm) > MID_REJ2[pid] {
@@ -383,9 +445,10 @@ pub struct GroundContact {
 }
 
 /// MIRROR: ground narrow phase, contact spec §2. 8 fixed corners against
-/// the plane y = 0 in NORMATIVE corner order (foot_l then foot_r, and
-/// `GROUND_CORNERS` order within a foot) — that order is the row order
-/// downstream, so it must not be permuted. Requires fk_all in ws.
+/// the plane y = 0 in NORMATIVE corner order (foot_l then foot_r; within
+/// a foot `ground_corner_k` — GROUND_CORNERS order on the left foot, its
+/// mirror image on the right) — that order is the row order downstream
+/// (the two feet are then solved jointly, see solver.rs). Requires fk_all in ws.
 /// Appends active corners to `out` (cleared here; capacity
 /// NUM_GROUND_CORNERS is reserved by the caller — no allocation inside a
 /// substep).
@@ -393,7 +456,8 @@ pub fn ground_phase(ws: &Workspace, out: &mut Vec<GroundContact>) {
     out.clear();
     for f in 0..GROUND_FRAMES.len() {
         let frame = GROUND_FRAMES[f];
-        for k in 0..CORNERS_PER_FOOT {
+        for kk in 0..CORNERS_PER_FOOT {
+            let k = ground_corner_k(f, kk);
             let point = add3(ws.p[frame], mat_vec(&ws.r[frame], GROUND_CORNERS[k]));
             // the plane is y = 0 and its normal is +ŷ, so the signed gap
             // is the corner's world y outright
@@ -423,7 +487,8 @@ pub fn narrow_phase_dense(ws: &Workspace, out: &mut Vec<Contact>) {
         wa[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.a));
         wb[ci] = add3(ws.p[c.frame], mat_vec(&ws.r[c.frame], c.b));
     }
-    for (pid, &(ia, ib)) in PAIRS.iter().enumerate() {
+    for &pid in PAIR_ORBIT_ORDER.iter() {
+        let (ia, ib) = PAIRS[pid];
         let ca = &COLLIDERS[ia];
         let cb = &COLLIDERS[ib];
         let (p1, q1) = (wa[ia], wb[ia]);

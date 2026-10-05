@@ -4,18 +4,36 @@
 //! Row layout (NORMATIVE; env v11 contact mode, the only mode since the
 //! 2026-09-27 weld removal — the v10 12-row foot-weld block is gone):
 //!   3 rows per ACTIVE sole corner, corners in the contact spec §2
-//!   normative order (foot_l then foot_r, (x−,z−) (x−,z+) (x+,z−)
-//!   (x+,z+) within a foot), rows normal / friction x̂ / friction ẑ,
-//!   then one normal row per ACTIVE contact, in pair-id order (§2),
-//!   then one unilateral JOINT-LIMIT row per joint whose nearer stop is
-//!   within h·ω_cap, joint order 0..28 (folded into the main solve —
-//!   the §3 anticipation "P2 may fold these rows"; see below).
+//!   normative order (foot_l then foot_r; (x−,z−) (x−,z+) (x+,z−)
+//!   (x+,z+) on the left foot, the mirror images (x+,z−) (x+,z+)
+//!   (x−,z−) (x−,z+) on the right), rows normal / friction x̂ /
+//!   friction ẑ, then one normal row per ACTIVE contact, in
+//!   `PAIR_ORBIT_ORDER` (each pair next to its mirror image), then one
+//!   unilateral JOINT-LIMIT row per joint whose nearer stop is within
+//!   h·ω_cap, in joint ORBIT order (central joints alone, each left
+//!   joint next to its mirror) (folded into the main solve — the §3
+//!   anticipation "P2 may fold these rows"; see below).
 //!
 //! Solve: exactly 12 iterations, no warm starting (λ = 0 each substep);
 //! each iteration = (a) the ground block (per contacting foot, its
 //! corners' rows in the §3 order, projected GS with the box friction
-//! clamp), then (b) contact + limit rows projected Gauss-Seidel to
-//! λ ≥ 0, in row order, then (c) the ω-cap pass. Effective masses and
+//! clamp; the two feet a Jacobi pair), then (b) contact + limit rows
+//! projected Gauss-Seidel to λ ≥ 0, in row order, then (c) the ω-cap
+//! pass in joint orbit order.
+//!
+//! MIRROR-EXACT (sim/mirror-exact, 2026-10-04): the body is left/right
+//! symmetric, and the solve is built so that env(M s, M a) = M env(s, a)
+//! for the x → −x reflection M (python/beat_arena_env/mirror_ops.py),
+//! up to floating-point rounding. Every sequential pass visits MIRROR
+//! ORBITS in an order M maps onto itself, and the two members of an
+//! active orbit are updated JOINTLY from the same pre-state: the feet
+//! and mirror-image contact / limit rows as Jacobi pairs, the ω-cap and
+//! step-11 pair rates by an exact 2-variable box projection
+//! (`pair_box_targets`). The previous fixed left-before-right orders
+//! made the solve itself handed (2026-10-04 symmetry audit: a 7 mrad
+//! ankle-roll split on the first tick from the symmetric stance, and a
+//! systematic +0.136 rad/s mean yaw rate per tick over symmetric
+//! near-stance states, from the cap pass). Effective masses and
 //! impulse propagation via M⁻¹Jᵀ columns solved with the substep's
 //! Cholesky factor (ws.l, audit-#10 tree order). Why limit rows in the
 //! solve: the stance parks knee/elbow/wrist-roll exactly ON a 0-stop,
@@ -38,8 +56,8 @@
 //! Step 11 (ω caps + limit clamps) REMAINS as the outer guarantee —
 //! with the solver limit-aware its impulses are near-null in ordinary
 //! motion. Full normative substep order: steps 1–6, 7–9 (this module:
-//! ground block + contacts pair-id order + limits joint order, 12
-//! iterations), 10 integrate, 11 clamp passes joint order 0..28.
+//! ground block + contacts orbit order + limits joint orbit order, 12
+//! iterations), 10 integrate, 11 clamp passes in joint orbit order.
 //!
 //! Loop bounds and evaluation order are fixed throughout — the
 //! torch/CUDA mirrors replicate these expression trees literally.
@@ -98,7 +116,7 @@ use super::algo::{
 };
 use super::collide::{
     ground_phase, narrow_phase, Contact, GroundContact, GROUND_FRAMES, NUM_GROUND_CORNERS,
-    NUM_PAIRS, SLOP,
+    NUM_PAIRS, PAIR_MIRROR, SLOP,
 };
 use super::fk::{cross3, dot3, sub3};
 use super::model::{Model, F_L_FOOT, F_R_FOOT};
@@ -586,6 +604,84 @@ impl ConstraintSet {
         }
     }
 
+    /// MIRROR-EXACT Jacobi step for two λ ≥ 0 rows that are each other's
+    /// mirror image (`pgs_row_update` for both, from the SAME residuals
+    /// `jv_a`, `jv_b`), with the two impulses propagated in one combined
+    /// axpy `v += m_a·d_a + m_b·d_b` — the two products summed first, so
+    /// the reflection maps the expression onto itself.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn pgs_pair_update(
+        ra: usize,
+        rb: usize,
+        nv: usize,
+        jv_a: Real,
+        jv_b: Real,
+        bias: &[Real],
+        diag: &[Real],
+        lambda: &mut [Real],
+        minvjt: &[Real],
+        v: &mut [Real],
+    ) {
+        let na = (lambda[ra] + (bias[ra] - jv_a) / diag[ra]).max(0.0);
+        let nb = (lambda[rb] + (bias[rb] - jv_b) / diag[rb]).max(0.0);
+        let da = na - lambda[ra];
+        let db = nb - lambda[rb];
+        lambda[ra] = na;
+        lambda[rb] = nb;
+        if da != 0.0 || db != 0.0 {
+            let ma = &minvjt[ra * nv..(ra + 1) * nv];
+            let mb = &minvjt[rb * nv..(rb + 1) * nv];
+            for i in 0..nv {
+                v[i] += ma[i] * da + mb[i] * db;
+            }
+        }
+    }
+
+    /// The ω-cap pass's lazily solved column M⁻¹e_jt (+ its mobility
+    /// verdict `capmass`), cached per substep. Returns whether a real
+    /// triangular solve ran (the R26 counter's event).
+    fn ensure_capcol(&mut self, ws: &mut Workspace, nv: usize, voff: usize, jt: usize) -> bool {
+        if self.capcached[jt] {
+            return false;
+        }
+        let vj = voff + jt;
+        if self.limpos[jt] >= 0 {
+            // DEDUPE (2026-08-03, R1 item 1f): joint jt has a LOWER-stop
+            // limit row this substep, whose right-hand side is +e_vj —
+            // the very column this pass is about to solve. So that row's
+            // `minvjt` IS this joint's `capcol`, bit for bit, and its
+            // `diag` IS `capmass` (`diag[row] = Σᵢ jr[i]·mr[i]` with jr =
+            // +e_vj collapses to `1.0 · mr[vj]` = the cap pass's `plain`,
+            // and a limit row's diag is asserted > 0, so the COMPOSITE_EPS
+            // verdict is the diag itself). ONLY the +1 sign is reused: a
+            // −e_vj row would need a negation, and −(+0.0) = −0.0 ≠ +0.0
+            // makes that NOT bitwise, which is why `limpos` records lower
+            // stops alone.
+            let lr = self.limpos[jt] as usize;
+            self.capcol[jt * nv..(jt + 1) * nv]
+                .copy_from_slice(&self.minvjt[lr * nv..(lr + 1) * nv]);
+            self.capmass[jt] = self.diag[lr];
+            self.capcached[jt] = true;
+            return false;
+        }
+        {
+            // unit RHS +e_vj: audit #10 chain forward (only vj's
+            // ancestors in the tree order — bitwise the full forward, see
+            // `tc_fwd_unit_lane`) then the dense back substitution.
+            let col = &mut self.capcol[jt * nv..(jt + 1) * nv];
+            tc_solve_unit_v(&ws.tc, &ws.l, vj, 1.0, col, &mut ws.esc);
+        }
+        let plain = self.capcol[jt * nv + vj];
+        self.capmass[jt] = if plain > COMPOSITE_EPS * plain {
+            plain
+        } else {
+            Real::INFINITY // degenerate column: cap inert
+        };
+        self.capcached[jt] = true;
+        true
+    }
+
     /// J·v of an assembled row (post-solve introspection).
     ///
     /// R23a: valid for a LIMIT row only when `LIMIT_J_ROWS` holds
@@ -843,49 +939,80 @@ impl ConstraintSet {
         }
     }
 
-    /// MIRROR: one PGS sweep over the ground block, corner order. Per
-    /// corner: the unilateral normal row first (λ_n ≥ 0, the §2 contact
-    /// path verbatim), then its two friction rows box-clamped against
-    /// the λ_n THIS sweep just produced — Gauss-Seidel coupling,
-    /// re-clamped every iteration (contact spec §3).
+    /// MIRROR: one PGS sweep over the ground block. Per corner: the
+    /// unilateral normal row first (λ_n ≥ 0, the §2 contact path
+    /// verbatim), then its two friction rows box-clamped against the λ_n
+    /// THIS sweep just produced — Gauss-Seidel coupling, re-clamped every
+    /// iteration (contact spec §3). Within a foot the corners are
+    /// Gauss-Seidel in `ground_corner_k` order (mirror images of each
+    /// other across the two feet).
+    ///
+    /// MIRROR-EXACT (sim/mirror-exact, 2026-10-04): the two FEET are a
+    /// Jacobi pair — both feet's corner sweeps read the same pre-sweep
+    /// `v`, and their impulses land in one combined update
+    /// `v += G_L Λ_L + G_R Λ_R` (the two foot sums added to each other
+    /// first, so the reflection maps the expression onto itself). The
+    /// old form swept the left foot, applied it, then swept the right
+    /// foot against the left's result: with a fixed 12-iteration budget
+    /// the left foot systematically took more of the load (measured: a
+    /// 7 mrad ankle-roll asymmetry on the first tick from the symmetric
+    /// stance). The feet couple only through the free leg chains and the
+    /// pelvis, so the Jacobi split costs no measurable convergence.
     ///
     /// Fixed trip count over the active corners, no early exit and no
     /// data-dependent branch inside the sweep: the §2 contact loop's
     /// contract, which parity and the K13 warp-divergence rule both
     /// require.
     fn pgs_ground_sweep(&mut self, v: &mut [Real]) {
-        // item 2: left-foot prefix then right-foot suffix — the same
-        // corners in the same order, each loop with its foot's
-        // compile-time support segment
         let (nl, n) = (self.ground_nleft, self.ground_contacts.len());
+        let mut lf = [[0.0 as Real; FOOT_ROWS]; 2];
+        let mut any = [false; 2];
         if nl > 0 {
-            self.pgs_ground_sweep_foot::<W_L_LO, W_L_HI>(0, 0, nl, v);
+            any[0] = self.pgs_ground_sweep_foot::<W_L_LO, W_L_HI>(0, 0, nl, v, &mut lf[0]);
         }
         if n > nl {
-            self.pgs_ground_sweep_foot::<W_R_LO, W_R_HI>(1, nl, n, v);
+            any[1] = self.pgs_ground_sweep_foot::<W_R_LO, W_R_HI>(1, nl, n, v, &mut lf[1]);
+        }
+        if any[0] || any[1] {
+            let nv = self.nv;
+            let gm = &self.gfoot_minv[..2 * FOOT_ROWS * nv];
+            for i in 0..nv {
+                let mut s = [0.0 as Real; 2];
+                for f in 0..2 {
+                    if any[f] {
+                        let mut x = 0.0;
+                        for m in 0..FOOT_ROWS {
+                            x += gm[(FOOT_ROWS * f + m) * nv + i] * lf[f][m];
+                        }
+                        s[f] = x;
+                    }
+                }
+                v[i] += s[0] + s[1];
+            }
         }
     }
 
-    /// `pgs_ground_sweep` over active corners `g0..g1` (≥ 1), all on foot
-    /// `f` whose chain columns are `LO..HI` — audit #9's 6-D form of the
-    /// per-row sweep (see `GROUND_SPATIAL`): V = J_f v once, each row's
-    /// residual c·V and its `pgs_row_update(_box)` λ step verbatim, the
-    /// impulse carried as Λ += c·Δλ / V += u·Δλ, then v += G_f Λ once.
+    /// One foot's share of `pgs_ground_sweep`: active corners `g0..g1`
+    /// (≥ 1), all on foot `f` whose chain columns are `LO..HI` — audit
+    /// #9's 6-D form of the per-row sweep (see `GROUND_SPATIAL`): V = J_f v
+    /// once (from the shared pre-sweep `v`), each row's residual c·V and
+    /// its λ step verbatim, the impulse carried as Λ += c·Δλ / V += u·Δλ.
+    /// Returns whether any λ moved; the caller applies `G_f Λ` to `v`.
     #[inline(always)]
     fn pgs_ground_sweep_foot<const LO: usize, const HI: usize>(
         &mut self,
         f: usize,
         g0: usize,
         g1: usize,
-        v: &mut [Real],
-    ) {
+        v: &[Real],
+        lf: &mut [Real; FOOT_ROWS],
+    ) -> bool {
         let nv = self.nv;
         let mut vf = [0.0 as Real; FOOT_ROWS];
         for a in 0..FOOT_ROWS {
             let r = FOOT_ROWS * f + a;
             vf[a] = ground_support_dot::<LO, HI>(&self.gfoot_j[r * nv..(r + 1) * nv], v);
         }
-        let mut lf = [0.0 as Real; FOOT_ROWS];
         let mut any = false;
         for gi in g0..g1 {
             let nrow = gi * GROUND_ROWS_PER_CORNER;
@@ -899,9 +1026,8 @@ impl ConstraintSet {
                 let dl = (self.bias[row] - jv) / self.diag[row];
                 let lam = self.lambda[row];
                 // the friction rows' SYMMETRIC BOX |λ_t| ≤ MU·λ_n (contact
-                // spec §3; the former `pgs_row_update_box`, verbatim):
-                // `.min(bound).max(-bound)` mirrors the normal row's
-                // `.max(0.0)` idiom — f64::min/max return the OTHER
+                // spec §3): `.min(bound).max(-bound)` mirrors the normal
+                // row's `.max(0.0)` idiom — f64::min/max return the OTHER
                 // operand on NaN, so an artifact λ collapses onto the
                 // bound; at bound == 0.0 a negative candidate lands on
                 // −0.0 and `d != 0.0` is false for a λ already at zero.
@@ -930,25 +1056,7 @@ impl ConstraintSet {
                 }
             }
         }
-        if any {
-            let r0 = FOOT_ROWS * f;
-            let gm = &self.gfoot_minv[r0 * nv..(r0 + FOOT_ROWS) * nv];
-            let (m0, t) = gm.split_at(nv);
-            let (m1, t) = t.split_at(nv);
-            let (m2, t) = t.split_at(nv);
-            let (m3, t) = t.split_at(nv);
-            let (m4, m5) = t.split_at(nv);
-            for i in 0..nv {
-                let mut x = v[i];
-                x += m0[i] * lf[0];
-                x += m1[i] * lf[1];
-                x += m2[i] * lf[2];
-                x += m3[i] * lf[3];
-                x += m4[i] * lf[4];
-                x += m5[i] * lf[5];
-                v[i] = x;
-            }
-        }
+        any
     }
 
     /// TEST HOOK (audit #9): the PRE-audit per-row ground sweep, verbatim
@@ -958,35 +1066,49 @@ impl ConstraintSet {
     #[cfg(test)]
     fn pgs_ground_sweep_rowwise(&mut self, v: &mut [Real]) {
         let nv = self.nv;
-        for gi in 0..self.ground_contacts.len() {
-            let nrow = gi * GROUND_ROWS_PER_CORNER;
-            let mut bound = 0.0;
-            for t in 0..GROUND_ROWS_PER_CORNER {
-                let row = nrow + t;
-                let jr = &self.j[row * nv..(row + 1) * nv];
-                let mut jv = 0.0;
-                for i in 0..nv {
-                    jv += jr[i] * v[i];
-                }
-                let dl = (self.bias[row] - jv) / self.diag[row];
-                let lam = self.lambda[row];
-                let newl = if t == 0 {
-                    (lam + dl).max(0.0)
-                } else {
-                    (lam + dl).min(bound).max(-bound)
-                };
-                let d = newl - lam;
-                self.lambda[row] = newl;
-                if d != 0.0 {
-                    let mr = &self.minvjt[row * nv..(row + 1) * nv];
+        let nl = self.ground_nleft;
+        // Jacobi between the feet (see `pgs_ground_sweep`): each foot's
+        // corners sweep against its own copy of the pre-sweep v, and the
+        // two feet's velocity changes are summed into v at the end
+        let v0: Vec<Real> = v.to_vec();
+        let mut dv = [vec![0.0 as Real; nv], vec![0.0 as Real; nv]];
+        for f in 0..2 {
+            let mut vw = v0.clone();
+            let (lo, hi) = if f == 0 { (0, nl) } else { (nl, self.ground_contacts.len()) };
+            for gi in lo..hi {
+                let nrow = gi * GROUND_ROWS_PER_CORNER;
+                let mut bound = 0.0;
+                for t in 0..GROUND_ROWS_PER_CORNER {
+                    let row = nrow + t;
+                    let jr = &self.j[row * nv..(row + 1) * nv];
+                    let mut jv = 0.0;
                     for i in 0..nv {
-                        v[i] += mr[i] * d;
+                        jv += jr[i] * vw[i];
+                    }
+                    let dl = (self.bias[row] - jv) / self.diag[row];
+                    let lam = self.lambda[row];
+                    let newl = if t == 0 {
+                        (lam + dl).max(0.0)
+                    } else {
+                        (lam + dl).min(bound).max(-bound)
+                    };
+                    let d = newl - lam;
+                    self.lambda[row] = newl;
+                    if d != 0.0 {
+                        let mr = &self.minvjt[row * nv..(row + 1) * nv];
+                        for i in 0..nv {
+                            vw[i] += mr[i] * d;
+                            dv[f][i] += mr[i] * d;
+                        }
+                    }
+                    if t == 0 {
+                        bound = MU * self.lambda[row];
                     }
                 }
-                if t == 0 {
-                    bound = MU * self.lambda[row];
-                }
             }
+        }
+        for i in 0..nv {
+            v[i] = v0[i] + (dv[0][i] + dv[1][i]);
         }
     }
 
@@ -1130,7 +1252,19 @@ impl ConstraintSet {
         for p in self.limpos.iter_mut() {
             *p = -1;
         }
-        for j in 0..model.nq {
+        // MIRROR-EXACT (sim/mirror-exact): the rows are assembled ORBIT
+        // by orbit — a central joint alone, a mirror pair (L, R) as two
+        // adjacent rows — and the PGS below updates an adjacent active
+        // pair jointly, so neither side's stop is solved first.
+        for j0 in 0..model.nq {
+            let jm = model.mirror[j0];
+            if jm < j0 {
+                continue;
+            }
+            for (k, j) in [j0, jm].into_iter().enumerate() {
+            if k == 1 && jm == j0 {
+                break; // central joint: one visit
+            }
             let (lo, hi) = model.limits[j];
             let gl = q[j] - lo;
             let gh = hi - q[j];
@@ -1163,6 +1297,7 @@ impl ConstraintSet {
                 }
                 self.limset.push((j, sign));
                 nrows += 1;
+            }
             }
         }
         self.nrows = nrows;
@@ -1380,124 +1515,125 @@ impl ConstraintSet {
             } else {
                 self.pgs_ground_sweep(v);
             }
-            // (b)+(c) contacts (pair-id order) then joint-limit rows
-            // (joint order): projected GS, λ ≥ 0.
-            // R10: the one loop is SPLIT at `ndense` — same rows, same
-            // order (contacts before limits, each in its own assembly
-            // order), but the limit half reads its residual straight off
-            // `v` instead of running a 35-wide dot against a row that is
-            // one ±1.0 in a field of +0.0. This is the hot site: 12 PGS
-            // iterations × ~6 limit rows per substep. (The `jv` argument
-            // is the only thing that differs — the λ update and the
-            // impulse propagation are the contact path's, verbatim.)
-            for row in nground..ndense {
-                let jr = &self.j[row * nv..(row + 1) * nv];
-                let mut jv = 0.0;
-                for i in 0..nv {
-                    jv += jr[i] * v[i];
+            // (b)+(c) contacts (orbit order) then joint-limit rows (orbit
+            // order): projected GS, λ ≥ 0 — except that the two members of
+            // an active MIRROR ORBIT (a contact pair and its mirror image,
+            // emitted adjacently by `narrow_phase`; a joint's limit row and
+            // its mirror joint's, assembled adjacently above) are one
+            // Jacobi step: both residuals from the same `v`, both
+            // impulses applied in one combined axpy (`pgs_pair_update`).
+            // R10: the loop is SPLIT at `ndense` — the limit half reads its
+            // residual straight off `v` instead of running a 35-wide dot
+            // against a row that is one ±1.0 in a field of +0.0.
+            let nc = self.contacts.len();
+            let mut ci = 0;
+            while ci < nc {
+                let row = nground + ci;
+                let p = self.contacts[ci].pair;
+                let paired = ci + 1 < nc
+                    && PAIR_MIRROR[p] != p
+                    && self.contacts[ci + 1].pair == PAIR_MIRROR[p];
+                let jv = dense_dot(&self.j[row * nv..(row + 1) * nv], v);
+                if paired {
+                    let jv2 = dense_dot(&self.j[(row + 1) * nv..(row + 2) * nv], v);
+                    Self::pgs_pair_update(row, row + 1, nv, jv, jv2,
+                                          &self.bias, &self.diag, &mut self.lambda,
+                                          &self.minvjt, v);
+                    ci += 2;
+                } else {
+                    Self::pgs_row_update(row, nv, jv, &self.bias, &self.diag,
+                                         &mut self.lambda, &self.minvjt, v);
+                    ci += 1;
                 }
-                Self::pgs_row_update(
-                    row,
-                    nv,
-                    jv,
-                    &self.bias,
-                    &self.diag,
-                    &mut self.lambda,
-                    &self.minvjt,
-                    v,
-                );
             }
-            for li in 0..self.limset.len() {
+            let nlim = self.limset.len();
+            let mut li = 0;
+            while li < nlim {
                 let (jt, sign) = self.limset[li];
                 let jv = 0.0 + sign * v[voff + jt]; // guard: see R10 note
-                Self::pgs_row_update(
-                    ndense + li,
-                    nv,
-                    jv,
-                    &self.bias,
-                    &self.diag,
-                    &mut self.lambda,
-                    &self.minvjt,
-                    v,
-                );
+                let jm = model.mirror[jt];
+                if jm != jt && li + 1 < nlim && self.limset[li + 1].0 == jm {
+                    let sign2 = self.limset[li + 1].1;
+                    let jv2 = 0.0 + sign2 * v[voff + jm];
+                    Self::pgs_pair_update(ndense + li, ndense + li + 1, nv, jv, jv2,
+                                          &self.bias, &self.diag,
+                                          &mut self.lambda, &self.minvjt, v);
+                    li += 2;
+                } else {
+                    Self::pgs_row_update(ndense + li, nv, jv, &self.bias, &self.diag,
+                                         &mut self.lambda, &self.minvjt, v);
+                    li += 1;
+                }
             }
-            // (d) ω-cap pass, joint order 0..28 (step-11's cap rows
-            // folded in — Divergence §13's anticipation): the solve may
-            // assign super-cap joint rates (under the v10 welds their
-            // h²·q̇² integration error measured 38 mm of foot drift);
-            // projecting the caps INSIDE the iteration lets the solve
-            // redistribute while integration only ever sees capped
-            // rates. Momentum-consistent internal impulses along
-            // M⁻¹e_j, lazily solved and cached per substep; a degenerate
-            // column (see COMPOSITE_EPS) is skipped.
-            for jt in 0..model.nq {
-                let vj = voff + jt;
-                let cap = model.omega_cap[jt];
-                let target = v[vj].clamp(-cap, cap);
-                if target != v[vj] {
-                    if !self.capcached[jt] && self.limpos[jt] >= 0 {
-                        // DEDUPE (2026-08-03, R1 item 1f): joint jt has
-                        // a LOWER-stop limit row this substep, whose
-                        // right-hand side is +e_vj — the very column
-                        // this pass is about to solve. So that row's
-                        // `minvjt` IS this joint's `capcol`, bit for
-                        // bit, and its `diag` IS `capmass`:
-                        //   · the two solves are the same call on the
-                        //     same RHS;
-                        //   · `diag[row] = Σᵢ jr[i]·mr[i]` with jr =
-                        //     +e_vj collapses to `1.0 · mr[vj]` (the
-                        //     other terms add ±0.0 to a non-zero
-                        //     partial sum, which is exact) = the cap
-                        //     pass's `plain`, and `plain > COMPOSITE_EPS ·
-                        //     plain` holds for any positive finite
-                        //     mobility (a limit row's diag is asserted
-                        //     > 0), so the cap pass's verdict is the
-                        //     row's diag itself.
-                        // ONLY the +1 sign is reused: a −e_vj row would
-                        // need a negation, and −(+0.0) = −0.0 ≠ +0.0
-                        // makes that NOT bitwise (an exactly-cancelling
-                        // entry flips its zero sign), which is why
-                        // `limpos` records lower stops alone.
-                        let lr = self.limpos[jt] as usize;
-                        self.capcol[jt * nv..(jt + 1) * nv]
-                            .copy_from_slice(&self.minvjt[lr * nv..(lr + 1) * nv]);
-                        self.capmass[jt] = self.diag[lr];
-                        self.capcached[jt] = true;
-                    }
-                    if !self.capcached[jt] {
-                        {
-                            // unit RHS +e_vj: audit #10 chain forward
-                            // (only vj's ancestors in the tree order —
-                            // bitwise the full forward, see
-                            // `tc_fwd_unit_lane`) then the dense back
-                            // substitution.
-                            let col = &mut self.capcol[jt * nv..(jt + 1) * nv];
-                            tc_solve_unit_v(&ws.tc, &ws.l, vj, 1.0, col, &mut ws.esc);
-                        }
-                        // R26: counted INSIDE the engage branch — only
-                        // a real chol_solve_unit call above bumps it
-                        // (the `limpos` dedupe path and every cached
-                        // re-entry are deliberately not counted).
+            // (d) ω-cap pass (step-11's cap rows folded in — Divergence
+            // §13's anticipation): the solve may assign super-cap joint
+            // rates (under the v10 welds their h²·q̇² integration error
+            // measured 38 mm of foot drift); projecting the caps INSIDE
+            // the iteration lets the solve redistribute while integration
+            // only ever sees capped rates. Momentum-consistent internal
+            // impulses along M⁻¹e_j, lazily solved and cached per
+            // substep; a degenerate column (see COMPOSITE_EPS) is skipped.
+            // MIRROR-EXACT (sim/mirror-exact): orbit order — a central
+            // joint alone, a mirror pair (L, R) decided on the same `v`;
+            // whenever a member fires, the pair is projected onto its two
+            // caps jointly by the exact 2-variable box LCP
+            // (`pair_box_targets`). The old pass (joint order 0..28)
+            // capped the left joint, then let the right joint's impulse
+            // knock it back off its cap: the systematic yaw / roll /
+            // sideways bias the 2026-10-04 symmetry audit traced to this
+            // loop (mean yaw rate +0.136 rad/s per tick over symmetric
+            // near-stance states).
+            for j0 in 0..model.nq {
+                let jm = model.mirror[j0];
+                if jm < j0 {
+                    continue;
+                }
+                let (va, vb) = (voff + j0, voff + jm);
+                let ta = v[va].clamp(-model.omega_cap[j0], model.omega_cap[j0]);
+                let fa = ta != v[va];
+                if jm == j0 {
+                    if fa {
                         #[cfg(feature = "stats")]
                         {
-                            cap_solves += 1;
+                            cap_solves += self.ensure_capcol(ws, nv, voff, j0) as u64;
                         }
-                        let plain = self.capcol[jt * nv + vj];
-                        self.capmass[jt] = if plain > COMPOSITE_EPS * plain {
-                            plain
-                        } else {
-                            Real::INFINITY // degenerate column: cap inert
-                        };
-                        self.capcached[jt] = true;
-                    }
-                    if self.capmass[jt].is_finite() {
-                        let col = &self.capcol[jt * nv..(jt + 1) * nv];
-                        let lam = (target - v[vj]) / self.capmass[jt];
-                        for i in 0..nv {
-                            v[i] += col[i] * lam;
+                        #[cfg(not(feature = "stats"))]
+                        self.ensure_capcol(ws, nv, voff, j0);
+                        if self.capmass[j0].is_finite() {
+                            let col = &self.capcol[j0 * nv..(j0 + 1) * nv];
+                            single_hard_target(v, nv, va, ta, col, self.capmass[j0]);
                         }
-                        v[vj] = target; // exact — the cap is a hard bound
                     }
+                    continue;
+                }
+                let tb = v[vb].clamp(-model.omega_cap[jm], model.omega_cap[jm]);
+                let fb = tb != v[vb];
+                if !(fa || fb) {
+                    continue;
+                }
+                // both columns: the box LCP couples the pair even when one fires
+                for jt in [j0, jm] {
+                    #[cfg(feature = "stats")]
+                    {
+                        cap_solves += self.ensure_capcol(ws, nv, voff, jt) as u64;
+                    }
+                    #[cfg(not(feature = "stats"))]
+                    self.ensure_capcol(ws, nv, voff, jt);
+                }
+                let (cap_a, cap_b) = (model.omega_cap[j0], model.omega_cap[jm]);
+                match (self.capmass[j0].is_finite(), self.capmass[jm].is_finite()) {
+                    (true, true) => {
+                        let ca = &self.capcol[j0 * nv..(j0 + 1) * nv];
+                        let cb = &self.capcol[jm * nv..(jm + 1) * nv];
+                        pair_box_targets(v, nv, va, vb, -cap_a, cap_a, -cap_b, cap_b,
+                                         ca, cb, self.capmass[j0], self.capmass[jm]);
+                    }
+                    // a degenerate column leaves that joint's cap inert
+                    (true, false) if fa => single_hard_target(
+                        v, nv, va, ta, &self.capcol[j0 * nv..(j0 + 1) * nv], self.capmass[j0]),
+                    (false, true) if fb => single_hard_target(
+                        v, nv, vb, tb, &self.capcol[jm * nv..(jm + 1) * nv], self.capmass[jm]),
+                    _ => {}
                 }
             }
         }
@@ -1509,6 +1645,141 @@ impl ConstraintSet {
             ws.stats.cap_solves_max = ws.stats.cap_solves_max.max(cap_solves);
         }
     }
+}
+
+/// Ascending dense dot `Σᵢ a[i]·b[i]` seeded +0.0 (the contact rows' PGS
+/// residual).
+#[inline(always)]
+fn dense_dot(a: &[Real], b: &[Real]) -> Real {
+    let mut s = 0.0;
+    for i in 0..a.len() {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+/// One hard rate target: the momentum-consistent internal impulse along
+/// the joint's column `col` = M⁻¹e_j that moves v[vj] onto `target`
+/// (mobility `mass` = col[vj]), then the exact write — the ω-cap pass's
+/// and step 11's single-joint update.
+#[inline(always)]
+pub(crate) fn single_hard_target(v: &mut [Real], nv: usize, vj: usize, target: Real,
+                                 col: &[Real], mass: Real) {
+    let lam = (target - v[vj]) / mass;
+    for i in 0..nv {
+        v[i] += col[i] * lam;
+    }
+    v[vj] = target; // exact — the cap / clamp is a hard bound
+}
+
+/// MIRROR-EXACT joint projection of two mirror-paired joints a, b onto
+/// their rate intervals [lo_a, hi_a] × [lo_b, hi_b] (ω caps: ±cap;
+/// step-11 stops: lo = hi = the recovery target), called when at least
+/// one of the two rates is outside its interval. This is the exact
+/// 2-variable box LCP of the momentum-consistent projection: impulses
+/// λ along the columns col_a = M⁻¹e_a, col_b = M⁻¹e_b with
+///   v' = v + col_a·λ_a + col_b·λ_b,
+///   λ_x > 0 only at lo_x, λ_x < 0 only at hi_x, λ_x = 0 strictly inside
+/// (A = [m_aa m_ab; m_ab m_bb] is the PD (M⁻¹) block, so the solution is
+/// unique and CONTINUOUS in the data — no switching jump when a rate
+/// sits exactly on its cap). Found by a ≤ 4-step active-set walk that
+/// starts from the violated bounds and updates BOTH joints' activity on
+/// the same iterate, then applied as one combined impulse plus exact
+/// writes of the active rates. Every expression is symmetric under
+/// swapping a and b (m_ab is averaged over its two symmetric copies
+/// col_a[v_b], col_b[v_a], equal up to rounding). Returns whether any
+/// impulse was applied.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pair_box_targets(v: &mut [Real], nv: usize, va: usize, vb: usize,
+                               lo_a: Real, hi_a: Real, lo_b: Real, hi_b: Real,
+                               ca: &[Real], cb: &[Real], maa: Real, mbb: Real) -> bool {
+    let mab = 0.5 * (ca[vb] + cb[va]);
+    let (xa, xb) = (v[va], v[vb]);
+    // activity: 0 free, -1 at lo, +1 at hi; an equality interval
+    // (lo == hi) is always active
+    let side = |x: Real, lo: Real, hi: Real| -> i8 {
+        if lo == hi {
+            if x == lo { 0 } else { 1 }
+        } else if x > hi {
+            1
+        } else if x < lo {
+            -1
+        } else {
+            0
+        }
+    };
+    let mut sa = side(xa, lo_a, hi_a);
+    let mut sb = side(xb, lo_b, hi_b);
+    if sa == 0 && sb == 0 {
+        return false;
+    }
+    let eq_a = lo_a == hi_a;
+    let eq_b = lo_b == hi_b;
+    let pp = maa * mbb;
+    let det = pp - mab * mab;
+    let (mut la, mut lb) = (0.0 as Real, 0.0 as Real);
+    let (mut ta, mut tb) = (xa, xb);
+    for _ in 0..4 {
+        ta = if sa > 0 { hi_a } else if sa < 0 { lo_a } else { xa };
+        tb = if sb > 0 { hi_b } else if sb < 0 { lo_b } else { xb };
+        let (ba, bb) = (ta - xa, tb - xb);
+        if sa != 0 && sb != 0 {
+            if det > 1e-9 * pp {
+                la = (mbb * ba - mab * bb) / det;
+                lb = (maa * bb - mab * ba) / det;
+            } else {
+                la = ba / maa;
+                lb = bb / mbb;
+            }
+        } else if sa != 0 {
+            la = ba / maa;
+            lb = 0.0;
+        } else {
+            la = 0.0;
+            lb = bb / mbb;
+        }
+        // KKT check on this iterate, both joints at once: drop an active
+        // inequality pushing the wrong way, else add a free joint that
+        // the other's impulse drove out of its interval
+        let drop_a = !eq_a && ((sa > 0 && la > 0.0) || (sa < 0 && la < 0.0));
+        let drop_b = !eq_b && ((sb > 0 && lb > 0.0) || (sb < 0 && lb < 0.0));
+        if drop_a || drop_b {
+            if drop_a {
+                sa = 0;
+            }
+            if drop_b {
+                sb = 0;
+            }
+            if sa == 0 && sb == 0 {
+                return false;
+            }
+            continue;
+        }
+        let ya = xa + maa * la + mab * lb;
+        let yb = xb + mab * la + mbb * lb;
+        let add_a = sa == 0 && (ya > hi_a || ya < lo_a);
+        let add_b = sb == 0 && (yb > hi_b || yb < lo_b);
+        if !(add_a || add_b) {
+            break;
+        }
+        if add_a {
+            sa = if ya > hi_a { 1 } else { -1 };
+        }
+        if add_b {
+            sb = if yb > hi_b { 1 } else { -1 };
+        }
+    }
+    for i in 0..nv {
+        v[i] += ca[i] * la + cb[i] * lb;
+    }
+    if sa != 0 {
+        v[va] = ta; // exact — an active cap / clamp is a hard bound
+    }
+    if sb != 0 {
+        v[vb] = tb;
+    }
+    true
 }
 
 /// Accumulate `sign · (n · J_point)` into a dense row: the Jacobian of
