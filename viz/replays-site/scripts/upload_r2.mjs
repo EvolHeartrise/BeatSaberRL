@@ -83,7 +83,10 @@ console.log(`${files.size} manifest files: ${have} already in R2, ${todo.length}
 /** @param {string[]} args */
 const run = (args) =>
 	new Promise((resolve) => {
-		const p = spawn(wrangler[0], [...wrangler.slice(1), ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+		// Windows: npx is npx.cmd, which only a shell can launch (no argument
+		// here has spaces: bucket keys and the store's file paths)
+		const p = spawn(wrangler[0], [...wrangler.slice(1), ...args],
+		                { stdio: ['ignore', 'ignore', 'pipe'], shell: process.platform === 'win32' });
 		let err = '';
 		p.stderr.on('data', (d) => (err += d));
 		p.on('close', (code) => resolve({ code, err }));
