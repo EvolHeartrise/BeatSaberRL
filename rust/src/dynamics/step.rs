@@ -15,6 +15,7 @@ use super::algo::{crba, rnea, tc_factor, tc_solve_unit_v, tc_solve_v};
 use super::fk::{fk_all, quat_mul};
 use super::model::Model;
 use super::{State, Workspace};
+use super::solver::{pair_box_targets, single_box_target, single_hard_target};
 
 /// SPEC-v10 §3 substep h = 1/240 s (8 per 1/30 control tick).
 pub const H_SUB: Real = 1.0 / 240.0;
@@ -312,71 +313,99 @@ pub fn substep_opts(
     // flushed once after it. Compiled out by default.
     #[cfg(feature = "stats")]
     let mut s11_solves = 0u64;
+    // v14: at a stop the rate target is a Baumgarte recovery toward the
+    // violated bound (β = BETA_LIMIT, the ground rows' push-out pattern)
+    // instead of dead zero — the impulse then restores POSITION too,
+    // reciprocally. Dead-band: inside SLOP_LIMIT a parked joint targets
+    // exactly 0 — once its rate dies no further impulse fires, so resting
+    // on a stop is leak-free.
+    let target_of = |j: usize, q: Real, vj: Real, hit: bool| -> Real {
+        let cap = model.omega_cap[j];
+        if hit {
+            let (lo, hi) = model.limits[j];
+            let over = if q < lo { lo - q } else { hi - q };
+            let rec = over.abs() - SLOP_LIMIT;
+            if rec <= 0.0 {
+                0.0
+            } else {
+                (BETA_LIMIT * over.signum() * rec / h).clamp(-cap, cap)
+            }
+        } else {
+            vj.clamp(-cap, cap)
+        }
+    };
+    // MIRROR-EXACT (sim/mirror-exact, 2026-10-04): each pass visits the
+    // joints ORBIT by orbit (`Model::mirror`) — a central joint alone, a
+    // mirror pair decided on the same `v` and, when either fires,
+    // projected jointly by the exact 2-variable box LCP (solver.rs
+    // `pair_box_targets`), so neither side is clamped first.
     for _pass in 0..CLAMP_PASSES {
         let mut changed = false;
-        for j in 0..model.nq {
-            let vj = voff + j;
-            let cap = model.omega_cap[j];
-            // v14: at a stop the rate target is a Baumgarte recovery
-            // toward the violated bound (β = BETA_LIMIT, the ground
-            // rows' push-out pattern) instead of dead zero — the
-            // impulse then restores POSITION too, reciprocally.
-            let target = if ws.hit[j] {
-                let (lo, hi) = model.limits[j];
-                let over = if st.q[j] < lo { lo - st.q[j] } else { hi - st.q[j] };
-                // dead-band: inside SLOP_LIMIT a parked joint targets
-                // exactly 0 — once its rate dies no further impulse
-                // fires, so resting on a stop is leak-free
-                let rec = over.abs() - SLOP_LIMIT;
-                if rec <= 0.0 {
-                    0.0
-                } else {
-                    (BETA_LIMIT * over.signum() * rec / h).clamp(-cap, cap)
-                }
-            } else {
-                st.v[vj].clamp(-cap, cap)
-            };
-            if target != st.v[vj] {
-                if !ws.cached[j] {
-                    // unit RHS +e_vj — audit #10: the forward pass runs
-                    // only e_vj's ancestor chain (≤ 16 rows, bitwise the
-                    // full forward — `tc_fwd_unit_lane`), then the dense
-                    // back pass
-                    //
-                    // R23d REVERTED (2026-08-07): solving STRAIGHT into
-                    // `ws.solcache[j*nv..(j+1)*nv]` and deleting `ws.sol`
-                    // with it compiles (the two are distinct fields, so
-                    // the borrow splits), is bitwise-identical, and saves
-                    // an nv-word copy on every cache miss — R26 measured
-                    // 5.27 of those per substep. It measured −0.03% alone
-                    // (noise) and **−0.84%** on top of the landed R23
-                    // package: 22,733 → 22,542 env-steps/s at N = 256,
-                    // 3 interleaved ABBA rounds, 6/6 paired losses,
-                    // ranges non-overlapping. The staging buffer is the
-                    // FAST form. Same rule as R23f (solver.rs `rw`): a
-                    // `chol_*` callee wants a dedicated, loop-invariant
-                    // scratch slice; a runtime-offset window into a
-                    // buffer the caller then re-reads through `col` two
-                    // lines later is worth ~1% to hand it instead. The
-                    // R15 order-dependence rule earned its keep here —
-                    // measured alone this item was indistinguishable
-                    // from zero.
-                    tc_solve_unit_v(&ws.tc, &ws.l, vj, 1.0, &mut ws.sol[..nv], &mut ws.esc);
-                    // R26: counted INSIDE the cache-miss branch — a
-                    // cached re-entry is not a solve.
+        for j0 in 0..model.nq {
+            let jm = model.mirror[j0];
+            if jm < j0 {
+                continue;
+            }
+            let (va, vb) = (voff + j0, voff + jm);
+            let ta = target_of(j0, st.q[j0], st.v[va], ws.hit[j0]);
+            let fa = ta != st.v[va];
+            if jm == j0 {
+                if fa {
                     #[cfg(feature = "stats")]
                     {
-                        s11_solves += 1;
+                        s11_solves += s11_column(model, ws, j0) as u64;
                     }
-                    ws.solcache[j * nv..(j + 1) * nv].copy_from_slice(&ws.sol[..nv]);
-                    ws.cached[j] = true;
+                    #[cfg(not(feature = "stats"))]
+                    s11_column(model, ws, j0);
+                    let col = &ws.solcache[j0 * nv..(j0 + 1) * nv];
+                    single_hard_target(&mut st.v, nv, va, ta, col, col[va]);
+                    changed = true;
                 }
-                let col = &ws.solcache[j * nv..(j + 1) * nv];
-                let lam = (target - st.v[vj]) / col[vj];
-                for i in 0..nv {
-                    st.v[i] += col[i] * lam;
+                continue;
+            }
+            let tb = target_of(jm, st.q[jm], st.v[vb], ws.hit[jm]);
+            let fb = tb != st.v[vb];
+            if !(fa || fb) {
+                continue;
+            }
+            // one twin off its interval: its single update, unless that
+            // pushes the other twin off its own (solver.rs
+            // `single_box_target` — needs only the firing twin's column)
+            if fa != fb {
+                let (js, jo, vs, vo, ts, to) =
+                    if fa { (j0, jm, va, vb, ta, tb) } else { (jm, j0, vb, va, tb, ta) };
+                #[cfg(feature = "stats")]
+                {
+                    s11_solves += s11_column(model, ws, js) as u64;
                 }
-                st.v[vj] = target; // exact — the clamp is a hard bound
+                #[cfg(not(feature = "stats"))]
+                s11_column(model, ws, js);
+                let col = &ws.solcache[js * nv..(js + 1) * nv];
+                let co = model.omega_cap[jo];
+                let (lo_o, hi_o) = if ws.hit[jo] { (to, to) } else { (-co, co) };
+                if single_box_target(&mut st.v, nv, vs, vo, ts, lo_o, hi_o, col, col[vs]) {
+                    changed = true;
+                    continue;
+                }
+            }
+            // both columns: the box LCP couples the pair
+            for jt in [j0, jm] {
+                #[cfg(feature = "stats")]
+                {
+                    s11_solves += s11_column(model, ws, jt) as u64;
+                }
+                #[cfg(not(feature = "stats"))]
+                s11_column(model, ws, jt);
+            }
+            let ca = &ws.solcache[j0 * nv..(j0 + 1) * nv];
+            let cb = &ws.solcache[jm * nv..(jm + 1) * nv];
+            // interval per joint: a joint past a stop has the equality
+            // target (lo = hi), a free one its ±cap box
+            let (ca_, cb_) = (model.omega_cap[j0], model.omega_cap[jm]);
+            let (lo_a, hi_a) = if ws.hit[j0] { (ta, ta) } else { (-ca_, ca_) };
+            let (lo_b, hi_b) = if ws.hit[jm] { (tb, tb) } else { (-cb_, cb_) };
+            if pair_box_targets(&mut st.v, nv, va, vb, lo_a, hi_a, lo_b, hi_b, ca, cb,
+                                ca[va], cb[vb]) {
                 changed = true;
             }
         }
@@ -443,4 +472,25 @@ pub fn substep_opts(
             st.v[2] *= s;
         }
     }
+}
+
+/// Step 11's lazily solved, per-substep-cached column M⁻¹e_j (unit RHS
+/// +e_vj — audit #10: the forward pass runs only e_vj's ancestor chain,
+/// ≤ 16 rows, bitwise the full forward — `tc_fwd_unit_lane` — then the
+/// dense back pass). Returns whether a real solve ran (R26's event).
+///
+/// R23d REVERTED (2026-08-07): solving STRAIGHT into `ws.solcache` and
+/// deleting `ws.sol` is bitwise-identical but measured −0.84% on top of
+/// the landed R23 package — a `chol_*` callee wants a dedicated,
+/// loop-invariant scratch slice, so the staging buffer is the FAST form.
+fn s11_column(model: &Model, ws: &mut Workspace, j: usize) -> bool {
+    if ws.cached[j] {
+        return false;
+    }
+    let nv = model.nv();
+    let vj = model.voff() + j;
+    tc_solve_unit_v(&ws.tc, &ws.l, vj, 1.0, &mut ws.sol[..nv], &mut ws.esc);
+    ws.solcache[j * nv..(j + 1) * nv].copy_from_slice(&ws.sol[..nv]);
+    ws.cached[j] = true;
+    true
 }
