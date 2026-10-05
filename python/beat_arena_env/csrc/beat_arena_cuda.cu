@@ -2951,6 +2951,26 @@ __device__ __forceinline__ bool pair_box_targets(
   return true;
 }
 
+// solver.rs `single_box_target`: the box LCP's fast path when only twin
+// a is outside its interval — the single update of a (exactly the LCP's
+// first active-set step) is the answer whenever it leaves twin b inside
+// [lo_b, hi_b]. The coupling is read from a's own column (ca[vb]), so b's
+// column is never built here; mirror-equivariant, since in the mirrored
+// state b plays a. Returns false with v untouched when b would leave its
+// interval — the caller then solves the pair jointly.
+template <typename T>
+__device__ __forceinline__ bool single_box_target(
+    T (&v)[NV], int va, int vb, T ta, T lo_b, T hi_b,
+    const T* __restrict__ ca, T maa) {
+  const T la = (ta - v[va]) / maa;
+  const T yb = v[vb] + ca[vb] * la;
+  if (yb > hi_b || yb < lo_b) return false;
+#pragma unroll
+  for (int i = 0; i < NV; i++) v[i] += ca[i] * la;
+  v[va] = ta;  // exact — an active cap / clamp is a hard bound
+  return true;
+}
+
 // ---- solver.rs ConstraintSet::solve (steps 7-9) -----------------------------
 template <typename T>
 __device__ void constraint_solve(Dyn<T>& __restrict__ d,
@@ -3323,6 +3343,16 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
 #pragma unroll
     for (int j = 0; j < NQ; j++)
       if (fabs(v[VOFF + j]) >= T(0.9) * CT(OMEGA_CAP, [j])) want |= 1u << j;
+    // MIRROR-EXACT: the cap pass and step 11 decide a mirror pair
+    // jointly and, when either twin fires, read BOTH columns — so a
+    // predicted joint (or a limit row, whose stop step 11 may clamp)
+    // predicts its twin too; otherwise every twin is an out-of-line miss
+    want |= lmask;
+#pragma unroll
+    for (int o = 3; o < N_JORB; o++) {
+      const uint32_t pm = (1u << JORB_A[o]) | (1u << JORB_B[o]);
+      if (want & pm) want |= pm;
+    }
     want &= ~lmask;
     int nx = s.nl;
     while (want) {
@@ -3650,6 +3680,21 @@ __device__ void constraint_solve(Dyn<T>& __restrict__ d,
       const T tb = tclamp(vr[vb], -cap_b, cap_b);
       const bool fb = tb != vr[vb];
       if (!(fa || fb)) continue;
+      // one twin over its cap: its single update, unless that pushes
+      // the other twin past its own cap (single_box_target)
+      if (fa && !fb) {
+        if (!s.pcomp[ja]) ensure_pdiag_ool(d, s, ja);
+        if (isinf(s.pdiag[ja])) continue;  // a degenerate column: inert
+        if (single_box_target(vr, va, vb, ta, -cap_b, cap_b,
+                              ecol_of(s, ja), s.pdiag[ja]))
+          continue;
+      } else if (fb && !fa) {
+        if (!s.pcomp[jb]) ensure_pdiag_ool(d, s, jb);
+        if (isinf(s.pdiag[jb])) continue;
+        if (single_box_target(vr, vb, va, tb, -cap_a, cap_a,
+                              ecol_of(s, jb), s.pdiag[jb]))
+          continue;
+      }
       if (!s.pcomp[ja]) ensure_pdiag_ool(d, s, ja);
       if (!s.pcomp[jb]) ensure_pdiag_ool(d, s, jb);
       const bool oka = !isinf(s.pdiag[ja]), okb = !isinf(s.pdiag[jb]);
@@ -3843,12 +3888,31 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       const T tb = target_of(jb, vr[vb]);
       const bool fb = tb != vr[vb];
       if (!(fa || fb)) continue;
+      const T cap_a = CT(OMEGA_CAP, [ja]), cap_b = CT(OMEGA_CAP, [jb]);
+      const bool ha = (hitm >> ja) & 1u, hb = (hitm >> jb) & 1u;
+      // one twin off its interval: its single update, unless that
+      // pushes the other twin off its own (single_box_target)
+      if (fa && !fb) {
+        if (!s.ecomp[ja]) ensure_ecol_ool(d, s, ja);
+        const T* const ca = ecol_of(s, ja);
+        if (single_box_target(vr, va, vb, ta, hb ? tb : -cap_b,
+                              hb ? tb : cap_b, ca, ca[va])) {
+          changed = true;
+          continue;
+        }
+      } else if (fb && !fa) {
+        if (!s.ecomp[jb]) ensure_ecol_ool(d, s, jb);
+        const T* const cb = ecol_of(s, jb);
+        if (single_box_target(vr, vb, va, tb, ha ? ta : -cap_a,
+                              ha ? ta : cap_a, cb, cb[vb])) {
+          changed = true;
+          continue;
+        }
+      }
       if (!s.ecomp[ja]) ensure_ecol_ool(d, s, ja);
       if (!s.ecomp[jb]) ensure_ecol_ool(d, s, jb);
       const T* const ca = ecol_of(s, ja);
       const T* const cb = ecol_of(s, jb);
-      const T cap_a = CT(OMEGA_CAP, [ja]), cap_b = CT(OMEGA_CAP, [jb]);
-      const bool ha = (hitm >> ja) & 1u, hb = (hitm >> jb) & 1u;
       if (pair_box_targets(vr, va, vb, ha ? ta : -cap_a, ha ? ta : cap_a,
                            hb ? tb : -cap_b, hb ? tb : cap_b, ca, cb, ca[va],
                            cb[vb]))
