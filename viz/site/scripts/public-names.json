@@ -32,6 +32,8 @@
 	"best4_wb2x_cd600_both": null,
 	"best6_wb2x_cd600_both": "v63x",
 	"best4_wb3_cd600_both": "v63x2",
+	"best4_bend7_cd1000_both": "v64",
+	"best4_bend7_cd1000_both.prewb": null,
 	"best2_v60_both": "v60",
 	"best4_ab_on_ext_cd600_v4_both": "v61"
 }
