@@ -1,0 +1,15 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "beat-arena-records",
+	"compatibility_date": "2026-09-24",
+	// static assets only — no Worker script
+	"assets": {
+		"directory": "./build",
+		"not_found_handling": "single-page-application"
+	},
+	"routes": [
+		{ "pattern": "beatsaber.flee.systems", "custom_domain": true },
+		{ "pattern": "beatsaber.alexandrorodriguez.com", "custom_domain": true }
+	],
+	"workers_dev": false
+}
