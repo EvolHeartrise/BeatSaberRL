@@ -82,16 +82,28 @@ def test_coef_zero_is_bitwise_baseline_and_pricing_identity():
     s0.set_joints(q36, v35)
     s1.set_joints(q36, v35)
     act = _press_act()
-    r0, n0 = _run(s0, act, TICKS)
-    r1, n1 = _run(s1, act, TICKS)
-    assert n0 == n1
-    imp0, ct0, t0 = s0.pop_self_contact()
-    imp1, ct1, t1 = s1.pop_self_contact()
-    # the penalty does not touch the physics: identical telemetry
-    assert (imp0, ct0, t0) == (imp1, ct1, t1)
-    assert imp0 > 0.0
+    # per tick: the penalty does not touch the physics (identical
+    # telemetry), and on every NON-terminal tick the reward gap is c x
+    # that tick's impulse — a terminal (fall / tilt) tick's reward is
+    # the flat -fall_const in both sims, so its impulse goes unpriced
+    gap, priced, total_imp = 0.0, 0.0, 0.0
+    for _ in range(TICKS):
+        _o0, r0, d0, _e0 = s0.step(act)
+        _o1, r1, d1, _e1 = s1.step(act)
+        assert d0 == d1
+        imp0, ct0, t0 = s0.pop_self_contact()
+        imp1, ct1, t1 = s1.pop_self_contact()
+        assert (imp0, ct0, t0) == (imp1, ct1, t1)
+        total_imp += imp0
+        if d0:
+            assert r0 == r1
+            break
+        gap += r0 - r1
+        priced += COEF * imp0
+    assert total_imp > 0.0
+    assert priced > 0.0
     # reward gap == c * impulse, f64-exact up to summation order
-    assert abs((r0 - r1) - COEF * imp0) < 1e-9, (r0, r1, imp0)
+    assert abs(gap - priced) < 1e-9, (gap, priced)
 
 
 def test_zero_contact_ticks_are_unpriced():
