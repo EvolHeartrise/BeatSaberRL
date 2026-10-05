@@ -1,0 +1,22 @@
+    Finished `release` profile [optimized] target(s) in 23.02s
+     Running unittests src/lib.rs (/tmp/claude-1000/-home-evolheartrise-git-projects-BeatSaberRL/dcb1a0a2-73f1-4c8b-9ec9-f6f9911b2ca5/scratchpad/sym_audit/tgt_base/release/deps/beat_arena_rs-fdafcc606af798cc)
+== soak (random arm gears, leg hold): 1597 ticks, 3 falls
+  ground normal unmet (m/s)   mean 2.296e-2 max 9.512e-1 (n 69527)
+  ground complementarity      mean 2.345e-3 max 1.303e0 (n 69527)
+  contact unmet (m/s)         mean 1.385e-3 max 2.046e-1 (n 9058)
+  limit-row unmet (rad/s)     mean 1.409e-3 max 1.852e0 (n 105176)
+  cap overshoot post-solve    mean 6.989e-6 max 7.797e-1 (n 370504)
+  penetration (m, per corner) mean 3.106e-3 max 1.481e-2 (n 47930)
+  max penetration per substep mean 3.542e-3 max 1.481e-2 (n 12776)
+  limit overshoot post-step   mean 6.324e-6 max 1.023e-2 (n 370504)
+  cap overshoot post-step     mean 3.144e-11 max 6.097e-6 (n 370504)
+== stance (leg hold, idle arms): 400 ticks, 0 falls
+  ground normal unmet (m/s)   mean 2.670e-2 max 4.897e-1 (n 18100)
+  ground complementarity      mean 2.358e-3 max 3.266e-1 (n 18100)
+  contact unmet (m/s)         mean 3.151e-7 max 6.289e-5 (n 3060)
+  limit-row unmet (rad/s)     mean 7.511e-4 max 4.514e-2 (n 19550)
+  cap overshoot post-solve    mean 1.081e-6 max 4.581e-3 (n 92800)
+  penetration (m, per corner) mean 3.758e-3 max 7.808e-3 (n 14180)
+  max penetration per substep mean 3.417e-3 max 7.808e-3 (n 3200)
+  limit overshoot post-step   mean 2.608e-6 max 3.434e-4 (n 92800)
+  cap overshoot post-step     mean 0.000e0 max 0.000e0 (n 92800)
