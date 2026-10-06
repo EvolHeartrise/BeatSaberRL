@@ -1885,6 +1885,28 @@ __device__ __forceinline__ T tendon_edge_x2(T r) {
   return x2;
 }
 
+// model.rs damp_centring / tendon_edge_b (2026-10-06): the edge damping
+// starts at 0 too — b_j = b_peak_j [x_ell(r)^2 + max(a^2 - y^2, 0)], a =
+// |u_j|, y = ((a - R0)/(1 - R0))_+ : pure axis b_peak a^2, corners unchanged
+template <typename T>
+__device__ __forceinline__ T damp_centring(T u) {
+  const T a = fabs(u);
+  const T y = a > T(TENDON_R0) ? (a - T(TENDON_R0)) / (T(1) - T(TENDON_R0))
+                               : T(0);
+  return tmax(a * a - y * y, T(0));
+}
+template <typename T>
+__device__ __forceinline__ void tendon_edge_b(T qb, T qd, T blo, T bhi, T dlo,
+                                              T dhi, T r, T& bb, T& bd) {
+  const T x2 = tendon_edge_x2(r);
+  const T lb = qb >= T(0) ? bhi : -blo;
+  const T ld = qd >= T(0) ? dhi : -dlo;
+  const T cb = damp_centring(qb / lb);
+  const T cd = damp_centring(qd / ld);
+  bb = T(TENDON_B_PEAK_BEND) * (x2 + cb);
+  bd = T(TENDON_B_PEAK_DEV) * (x2 + cd);
+}
+
 // Per-joint zone starts of the additive centring terms (model.rs
 // TENDON_S_BEND / TENDON_S_DEV, 2026-10-05)
 constexpr double TENDON_S_BEND = 0.0;
@@ -3853,9 +3875,9 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     T tb, td, r;
     wrist_tendon(d.q[jb], d.q[jd], CT(LIMIT_LO, [jb]), CT(LIMIT_HI, [jb]),
                  CT(LIMIT_LO, [jd]), CT(LIMIT_HI, [jd]), tb, td, r);
-    const T x2 = tendon_edge_x2(r);
-    const T bb = T(TENDON_B_PEAK_BEND) * x2;
-    const T bd = T(TENDON_B_PEAK_DEV) * x2;
+    T bb, bd;
+    tendon_edge_b(d.q[jb], d.q[jd], CT(LIMIT_LO, [jb]), CT(LIMIT_HI, [jb]),
+                  CT(LIMIT_LO, [jd]), CT(LIMIT_HI, [jd]), r, bb, bd);
     const T vb = d.v[VOFF + jb], vd = d.v[VOFF + jd];
     d.m[TREE_C.fcb[fb]] += T(H_SUB) * bb;
     d.m[TREE_C.fcb[fd]] += T(H_SUB) * bd;

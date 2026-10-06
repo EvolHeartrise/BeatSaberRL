@@ -87,6 +87,22 @@ def test_edge_damping_constants_and_shape():
     assert C.tendon_edge_x2(0.3) == 0.0 and C.tendon_edge_x2(0.5) == 0.0
     assert C.tendon_edge_x2(1.0) == 1.0
     assert C.tendon_edge_x2(math.sqrt(2)) == pytest.approx(3.343, abs=1e-3)
+    # 2026-10-06: the damping starts at 0 too (additive per-joint
+    # centring): pure axis b_peak u^2 from neutral, corners unchanged
+    for f in (0.0, 0.25, 0.5, 0.75, 1.0):
+        bb, bd = C.tendon_edge_b(f * LIM[8][1], 0.0, LIM[8], LIM[9])
+        assert bb == pytest.approx(C.TENDON_B_PEAK_BEND * f * f, abs=1e-15)
+        bb, bd = C.tendon_edge_b(0.0, f * LIM[9][0], LIM[8], LIM[9])
+        assert bd == pytest.approx(C.TENDON_B_PEAK_DEV * f * f, abs=1e-15)
+    bb, bd = C.tendon_edge_b(LIM[8][1], LIM[9][1], LIM[8], LIM[9])
+    x2 = (2 * math.sqrt(2) - 1) ** 2
+    assert (bb, bd) == pytest.approx((C.TENDON_B_PEAK_BEND * x2,
+                                      C.TENDON_B_PEAK_DEV * x2))
+    rng = np.random.default_rng(1)
+    for qb, qd in rng.uniform([-2.2, -0.9], [2.2, 0.9], (2000, 2)):
+        a = C.tendon_edge_b(qb, qd, LIM[8], LIM[9])
+        b = C.tendon_edge_b(qb, -qd, LIM[15], LIM[16])
+        assert a == b and min(a) >= 0.0
 
 
 @pytest.mark.parametrize("mod_name", ["beat_arena_rs", "beat_arena_rs32"])

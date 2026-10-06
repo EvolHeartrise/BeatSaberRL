@@ -13,7 +13,7 @@
 use crate::Real;
 use super::algo::{crba, rnea, tc_factor, tc_solve_unit_v, tc_solve_v};
 use super::fk::{fk_all, quat_mul};
-use super::model::{tendon_edge_x2, Model};
+use super::model::{tendon_edge_b, tendon_edge_x2, Model};
 use super::{State, Workspace};
 use super::solver::{pair_box_targets, single_box_target, single_hard_target};
 
@@ -163,9 +163,13 @@ pub fn substep_opts(
         let tp = pw.eval(model.limits, &st.q);
         for (s, &(jb, jd)) in pw.hands.iter().enumerate() {
             let (tb, td, r) = tp[s];
-            let x2 = tendon_edge_x2(r);
-            let bb = pw.b_peak_bend * x2;
-            let bd = pw.b_peak_dev * x2;
+            let (bb, bd) = if pw.damp_from_zero {
+                tendon_edge_b(st.q[jb], st.q[jd], model.limits[jb], model.limits[jd], r,
+                              pw.b_peak_bend, pw.b_peak_dev)
+            } else {
+                let x2 = tendon_edge_x2(r);
+                (pw.b_peak_bend * x2, pw.b_peak_dev * x2)
+            };
             let (vb, vd) = (st.v[voff + jb], st.v[voff + jd]);
             ws.m[(voff + jb) * nv + (voff + jb)] += h * bb;
             ws.m[(voff + jd) * nv + (voff + jd)] += h * bd;

@@ -449,9 +449,11 @@ assert TENDON_TAU_PEAK_BEND == (
 assert TENDON_TAU_PEAK_DEV == (
     TENDON_FRAC * TAU_MAX[9] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_dev")])
 # Edge-zone damping (issue #61; model.rs TENDON_B_PEAK_*): per wrist joint
-# tau_d = -b_peak_j x^2 qd_j, x = (r - R0)/(1 - R0) for r > R0 (the
-# tendon's radius, uncapped), b_peak = tau_peak / 30 rad/s (the damping
-# torque at r = 1, 30 rad/s equals tau_peak). Applied IMPLICITLY (h*b on
+# tau_d = -b_j qd_j, b_j = b_peak_j [x^2 + c(u_j)], x = (r - R0)/(1 - R0)
+# for r > R0 (the tendon's radius, uncapped) plus the additive per-joint
+# centring c (2026-10-06: damping starts at 0 too; pure axis b_peak u^2,
+# corners unchanged), b_peak = tau_peak / 30 rad/s (the damping torque at
+# the pure-axis limit, 30 rad/s equals tau_peak). Applied IMPLICITLY (h*b on
 # M's wrist diagonal). Passive: never priced / in [torque].
 TENDON_DAMP_REF_SPEED = 30.0
 TENDON_B_PEAK_BEND = TENDON_FRAC * 1.431 * 1.4466 / TENDON_DAMP_REF_SPEED
@@ -459,11 +461,32 @@ TENDON_B_PEAK_DEV = TENDON_FRAC * 1.06 * 1.0220 / TENDON_DAMP_REF_SPEED
 
 
 def tendon_edge_x2(r):
-    """Edge-damping shape x^2 of the tendon radius (model.rs mirror)."""
+    """Elliptical edge-damping shape x^2 of the tendon radius (model.rs
+    mirror)."""
     if not r > TENDON_R0:
         return 0.0
     x = (r - TENDON_R0) / (1.0 - TENDON_R0)
     return x * x
+
+
+def damp_centring(u):
+    """Per-joint centring part of the edge damping (2026-10-06):
+    max(a^2 - ((a - R0)/(1 - R0))^2_+, 0), a = |u| (model.rs mirror)."""
+    a = abs(u)
+    y = (a - TENDON_R0) / (1.0 - TENDON_R0) if a > TENDON_R0 else 0.0
+    return max(a * a - y * y, 0.0)
+
+
+def tendon_edge_b(qb, qd, lim_b, lim_d, bpb=None, bpd=None):
+    """(b_bend, b_dev) of one wrist: b_peak [x_ell(r)^2 + c(u_j)] — pure
+    axis b_peak u^2 from neutral, corners 3.34 b_peak (model.rs mirror)."""
+    bpb = TENDON_B_PEAK_BEND if bpb is None else bpb
+    bpd = TENDON_B_PEAK_DEV if bpd is None else bpd
+    lb = lim_b[1] if qb >= 0.0 else -lim_b[0]
+    ld = lim_d[1] if qd >= 0.0 else -lim_d[0]
+    ub, ud = qb / lb, qd / ld
+    x2 = tendon_edge_x2(math.sqrt(ub * ub + ud * ud))
+    return bpb * (x2 + damp_centring(ub)), bpd * (x2 + damp_centring(ud))
 
 
 TENDON_S_BEND = 0.0     # per-joint tendon zone starts (centring terms)

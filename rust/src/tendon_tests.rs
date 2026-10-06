@@ -14,7 +14,7 @@ use super::*;
 use dynamics::algo::{crba, energy, tc_factor, tc_solve_unit_v};
 use dynamics::fk::fk_all;
 use dynamics::model::{
-    tendon_edge_x2, wrist_tendon, wrist_tendon_energy, HUMANOID_LIMITS, HUMANOID_PASSIVE_WRIST,
+    tendon_edge_b, tendon_edge_x2, wrist_tendon, wrist_tendon_energy, HUMANOID_LIMITS, HUMANOID_PASSIVE_WRIST,
     TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV, TENDON_S_BEND, TENDON_S_DEV, TENDON_TAU_PEAK_BEND,
     TENDON_TAU_PEAK_DEV,
 };
@@ -451,14 +451,11 @@ fn variant(gravity: bool, joint_damping: bool, caps: bool, edge: bool) -> Model 
 ///     symplectic, and the stiff tendon shows its first-order energy
 ///     drift as a SECULAR gain (from the 55 %-corner start: see the printed rates) that
 ///     halves with h — integration error, asserted to converge.
-/// (3) The same with ONLY the edge damping on (issue #61): net
-///     dissipative at every h (ends below half of E0). Since the zone
-///     starts moved to 0 (centring torques active everywhere, edge
-///     damping still only for r > 0.5), the undamped hand also swings
-///     through the central region, where the explicit centring spring's
-///     small first-order gain is not damped: a transient excess of < 1 %
-///     of E0 at 1/240, shrinking with h (asserted < 2 %). The real body's
-///     joint damping removes it ((1): E never exceeds E0).
+/// (3) The same with ONLY the edge damping on (issue #61): energy never
+///     exceeds E0 and ends below half of it, at every h. (With the edge
+///     damping's onset at r = 0.5 and the centring springs active from
+///     0, the central region showed a +0.8 % transient at 1/240; the
+///     2026-10-06 per-joint damping centring removed it.)
 #[test]
 fn tendon_release_energy() {
     for (h, label) in [(H_SUB, "1/240"), (H_SUB * 0.5, "1/480")] {
@@ -483,7 +480,7 @@ fn tendon_release_energy() {
         println!("  + edge damping:    {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
                   drift {rate:+.4} J/s", );
         println!("    transient excess {:+.2e} J ({:.2} % of E0)", emax - e0, 100.0 * (emax - e0) / e0);
-        assert!(emax <= e0 * 1.02, "edge damping: energy rose {e0} -> {emax}");
+        assert!(emax <= e0 * (1.0 + 1e-9), "edge damping: energy rose {e0} -> {emax}");
         assert!(e1 < 0.5 * e0, "edge damping does not dissipate: {e0} -> {e1}");
     }
     for k in 1..gains.len() {
@@ -491,50 +488,85 @@ fn tendon_release_energy() {
     }
 }
 
-/// Edge damping shape (issue #61): b_j(r) = b_peak_j·x², x = (r − 0.5)/0.5
-/// for r > 0.5 — zero inside, continuous at the zone edge (x² → 0) and
-/// across q = 0 (r is), uncapped past r = 1; b_peak = τ_peak / 30 rad/s;
-/// ≥ 0 everywhere, so τ_d·q̇ = −b·q̇² ≤ 0 (strictly dissipative).
+/// Edge damping shape (issue #61 + 2026-10-06 centring): b_j =
+/// b_peak_j·[x_ell(r)² + c(u_j)], x_ell = (r − 0.5)/0.5 for r > 0.5,
+/// c(a) = max(a² − ((a − 0.5)/0.5)²₊, 0). Pure axis: b_peak·a² from
+/// neutral (b_peak at the limit); corners unchanged (x_ell² = 3.343,
+/// c = 0); ≥ 0 everywhere, so τ_d·q̇ = −b·q̇² ≤ 0; continuous across
+/// q = 0 and at r = 0.5 / a = 0.5; bit-identical across the mirror.
 #[test]
 fn edge_damping_shape() {
     assert!((TENDON_B_PEAK_BEND - TENDON_TAU_PEAK_BEND / 30.0).abs() < 1e-15);
     assert!((TENDON_B_PEAK_DEV - TENDON_TAU_PEAK_DEV / 30.0).abs() < 1e-15);
     println!("b_peak bend {TENDON_B_PEAK_BEND:.6}  dev {TENDON_B_PEAK_DEV:.6} N*m*s/rad");
-    assert_eq!(tendon_edge_x2(0.0), 0.0);
     assert_eq!(tendon_edge_x2(0.5), 0.0);
-    assert!(tendon_edge_x2(0.5 + 1e-9) < 1e-16);
     assert_eq!(tendon_edge_x2(1.0), 1.0);
-    assert!((tendon_edge_x2(2.0) - 9.0).abs() < 1e-14);
+    let (bhi, dlo, dhi) = (HUMANOID_LIMITS[LB].1, HUMANOID_LIMITS[LD].0, HUMANOID_LIMITS[LD].1);
+    // pure-axis profile b_peak·a², past the stops too (where the clamp
+    // keeps the centring part ≥ 0 and the ellipse keeps growing)
+    for i in -300..=300 {
+        let u = i as Real / 200.0;
+        let a = u.abs();
+        let (bb, bd0) = edge_b_left(u * bhi, 0.0);
+        let (bb0, bd) = edge_b_left(0.0, if u >= 0.0 { u * dhi } else { u * -dlo });
+        // the other joint of a pure axis sees only the elliptical part
+        assert!((bd0 - TENDON_B_PEAK_DEV * (tendon_edge_x2(a) + damp_c(0.0))).abs() < 1e-15);
+        assert!((bb0 - TENDON_B_PEAK_BEND * tendon_edge_x2(a)).abs() < 1e-15);
+        if a <= 1.0 {
+            assert!((bb - TENDON_B_PEAK_BEND * a * a).abs() < 1e-15, "bend u={u}: {bb}");
+            assert!((bd - TENDON_B_PEAK_DEV * a * a).abs() < 1e-15, "dev u={u}: {bd}");
+        } else {
+            assert!(bb >= TENDON_B_PEAK_BEND && bd >= TENDON_B_PEAK_DEV);
+        }
+    }
+    for f in [0.25, 0.5, 0.75, 1.0] {
+        let (bb, _) = edge_b_left(f * bhi, 0.0);
+        let (_, bd) = edge_b_left(0.0, f * dlo);
+        println!("  pure axis {:3.0}%: b_bend {bb:.5}  b_dev {bd:.5} N*m*s/rad", 100.0 * f);
+    }
+    // corners unchanged: x_ell² = (2√2 − 1)², centring 0 at the limits
+    for (qb, qd) in [(bhi, dhi), (bhi, dlo), (-bhi, dhi), (-bhi, dlo)] {
+        let (bb, bd) = edge_b_left(qb, qd);
+        let x2 = (2.0 * 2f64.sqrt() - 1.0).powi(2);
+        assert!((bb - TENDON_B_PEAK_BEND * x2).abs() < 1e-14 && (bd - TENDON_B_PEAK_DEV * x2).abs() < 1e-14,
+                "corner b changed: {bb} {bd}");
+    }
     let mut rng = Rng(0x7E4D_0005);
     for _ in 0..100_000 {
         let (qb, qd) = (rng.range(-2.2, 2.2), rng.range(-0.9, 0.9));
         let (vb, vd) = (rng.range(-120.0, 120.0), rng.range(-60.0, 60.0));
-        let (_, _, r) = tl(qb, qd);
-        let x2 = tendon_edge_x2(r);
-        let (bb, bd) = (TENDON_B_PEAK_BEND * x2, TENDON_B_PEAK_DEV * x2);
+        let (bb, bd) = edge_b_left(qb, qd);
         assert!(bb >= 0.0 && bd >= 0.0);
         assert!((-bb * vb) * vb + (-bd * vd) * vd <= 0.0, "power > 0");
-        if r <= 0.5 {
-            assert_eq!((bb, bd), (0.0, 0.0));
-        }
-        // mirror: the right wrist at the mirrored pose has the same r,
-        // hence bit-identical b
+        // mirror: the right wrist at the mirrored pose, bit for bit
         let (_, _, rr) = tr(qb, -qd);
-        assert_eq!(tendon_edge_x2(r).to_bits(), tendon_edge_x2(rr).to_bits());
+        let (rb, rd) = tendon_edge_b(qb, -qd, HUMANOID_LIMITS[RB], HUMANOID_LIMITS[RD], rr,
+                                     TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV);
+        assert_eq!((bb.to_bits(), bd.to_bits()), (rb.to_bits(), rd.to_bits()));
     }
-    // continuity across q = 0 (r continuous) and the zone edge
+    // continuity across q = 0, r = 0.5 and a = 0.5
     let mut worst: Real = 0.0;
     for i in 0..=100 {
         let qb = -2.0 + 4.0 * i as Real / 100.0;
-        let a = tendon_edge_x2(tl(qb, 1e-12).2);
-        let b = tendon_edge_x2(tl(qb, -1e-12).2);
-        worst = worst.max((a - b).abs());
+        let (a1, a2) = (edge_b_left(qb, 1e-12), edge_b_left(qb, -1e-12));
+        worst = worst.max((a1.0 - a2.0).abs()).max((a1.1 - a2.1).abs());
         let qd = -0.6 + 1.2 * i as Real / 100.0;
-        let a = tendon_edge_x2(tl(1e-12, qd).2);
-        let b = tendon_edge_x2(tl(-1e-12, qd).2);
-        worst = worst.max((a - b).abs());
+        let (a1, a2) = (edge_b_left(1e-12, qd), edge_b_left(-1e-12, qd));
+        worst = worst.max((a1.0 - a2.0).abs()).max((a1.1 - a2.1).abs());
+    }
+    for (qb, qd) in [(0.5 * bhi, 0.0), (0.0, 0.5 * dhi), (0.5 * bhi / 2f64.sqrt(), 0.5 * dhi / 2f64.sqrt())] {
+        let (a1, a2) = (edge_b_left(qb * (1.0 + 1e-12), qd * (1.0 + 1e-12)),
+                        edge_b_left(qb * (1.0 - 1e-12), qd * (1.0 - 1e-12)));
+        worst = worst.max((a1.0 - a2.0).abs()).max((a1.1 - a2.1).abs());
     }
     assert!(worst < 1e-10, "edge damping discontinuous: {worst:e}");
+}
+
+/// c(0) helper for the pure-axis check (the centring part at u = 0).
+fn damp_c(u: Real) -> Real {
+    let a = u.abs();
+    let y = if a > 0.5 { (a - 0.5) / 0.5 } else { 0.0 };
+    (a * a - y * y).max(0.0)
 }
 
 /// Step-level dissipativity: a wrist spun inside the zone with the
@@ -625,8 +657,7 @@ fn edge_damping_budget_and_zeta() {
         st.q[LD] = qd;
         let mi = wrist_minv(&st, LB, LD);
         let (_, _, r) = tl(qb, qd);
-        let x2 = tendon_edge_x2(r);
-        let (bb, bd) = (TENDON_B_PEAK_BEND * x2, TENDON_B_PEAK_DEV * x2);
+        let (bb, bd) = edge_b_left(qb, qd);
         // h·M⁻¹B: B diagonal
         let a = [[mi[0][0] * bb, mi[0][1] * bd], [mi[1][0] * bb, mi[1][1] * bd]];
         let bhi_ = max_eig2(a);
@@ -890,7 +921,10 @@ fn tendon_excluded_from_effort_and_counted_in_telemetry() {
     let tk = core.body.tendon_tick;
     println!("one coasting tick from the corners: tendon_tick {tk:?}");
     assert!(tk[0] > 0.0 && tk[1] > 0.0);
-    assert_eq!(tk[0].to_bits(), tk[1].to_bits(), "mirror-symmetric hands read equal");
+    // mirror-symmetric hands read equal (up to the tree-Cholesky's
+    // mirror rounding, mirror_tests: ~1e-13)
+    assert!((tk[0] - tk[1]).abs() <= 1e-9 * tk[0], "hands differ: {tk:?}");
+    assert!((tk[6] - tk[7]).abs() <= 1e-9 * tk[6], "hands differ: {tk:?}");
     assert_eq!(tk[2], N_SUB as Real);
     // the Core accumulator: one step through step_inner
     core.body.reset();
@@ -918,4 +952,96 @@ fn tendon_excluded_from_effort_and_counted_in_telemetry() {
     core.body.tick(&a, &gear);
     assert_eq!(core.body.tendon_tick, [0.0; 8]);
     assert_eq!(core.body.ws.tendon, [[0.0; 4]; 2]);
+}
+
+/// The cost of the passive wrist to fast swings (bend), reset arm pose,
+/// roll mid-range, gravity / ground off, joint damping and ω caps ON
+/// (105 rad/s bend). Three bodies: no passive wrist, tendon only (edge
+/// damping b_peak = 0), and the full passive wrist (tendon + edge
+/// damping from 0). Scenarios:
+///  A. full gear (default-body τmax 2.07 N·m) from rest at the −95° stop
+///     — speed crossing neutral and peak speed;
+///  B. a coasting swing through the centre: from −50 % bend at +100
+///     rad/s, no gear — speed at neutral and at +50 %.
+fn bend_swing(m: &Model, q0: Real, v0: Real, gear: bool) -> (Real, Real, Real) {
+    let mut st = State::neutral(m);
+    for (j, v) in Q_START_ARM {
+        st.q[j] = v;
+    }
+    st.q[7] = 1.0;
+    st.q[14] = -1.0;
+    st.q[LB] = q0;
+    st.q[RB] = q0;
+    st.v[6 + LB] = v0;
+    st.v[6 + RB] = v0;
+    let mut ws = Workspace::new(m);
+    let mut cs = ConstraintSet::new(m, false, false);
+    let mut tau = [0.0 as Real; NQ];
+    if gear {
+        tau[LB] = m.tau_max[LB] * TAU_BODY_DEFAULT[TAU_AXIS[LB]];
+        tau[RB] = tau[LB];
+    }
+    let half = 0.5 * HUMANOID_LIMITS[LB].1;
+    let (mut vz, mut vh, mut vmax) = (Real::NAN, Real::NAN, 0.0 as Real);
+    for _ in 0..(0.3 / H_SUB) as usize {
+        let q_prev = st.q[LB];
+        substep_constrained(m, &mut st, &tau, H_SUB, &mut ws, &mut cs);
+        vmax = vmax.max(st.v[6 + LB]);
+        if vz.is_nan() && q_prev < 0.0 && st.q[LB] >= 0.0 {
+            vz = st.v[6 + LB];
+        }
+        if vh.is_nan() && q_prev < half && st.q[LB] >= half {
+            vh = st.v[6 + LB];
+        }
+    }
+    (vz, vh, vmax)
+}
+
+#[test]
+fn bend_swing_speed_cost() {
+    let mut bare = HUMANOID;
+    bare.gravity = [0.0; 3];
+    bare.passive_wrist = None;
+    let mut tendon = HUMANOID;
+    tendon.gravity = [0.0; 3];
+    let mut pw = HUMANOID_PASSIVE_WRIST;
+    pw.b_peak_bend = 0.0;
+    pw.b_peak_dev = 0.0;
+    tendon.passive_wrist = Some(pw);
+    let mut old = HUMANOID;
+    old.gravity = [0.0; 3];
+    let mut pw = HUMANOID_PASSIVE_WRIST;
+    pw.damp_from_zero = false;
+    old.passive_wrist = Some(pw);
+    let mut full = HUMANOID;
+    full.gravity = [0.0; 3];
+    let lo = HUMANOID_LIMITS[LB].0;
+    let mut res = Vec::new();
+    for (name, m) in [("no passive wrist", &bare), ("tendon only", &tendon),
+                      ("+ edge damping r>0.5", &old), ("+ edge damping from 0", &full)] {
+        let (az, _, am) = bend_swing(m, lo, 0.0, true);
+        let (bz, bh, _) = bend_swing(m, 0.5 * lo, 80.0, false);
+        println!("  {name:22}: A full gear from -95: at neutral {az:6.1} rad/s, peak {am:6.1} | \
+                  B coast from -50 % at 80: at neutral {bz:6.1}, at +50 % {bh:6.1}");
+        res.push((az, am, bz, bh));
+    }
+    for (lbl, t, f) in [("from-0 vs r>0.5 damping", res[2], res[3]),
+                        ("from-0 damping vs tendon only", res[1], res[3])] {
+        println!("  {lbl}: A neutral {:+.1} %, peak {:+.1} %; B neutral {:+.1} %, +50 % {:+.1} %",
+                 100.0 * (f.0 / t.0 - 1.0), 100.0 * (f.1 / t.1 - 1.0),
+                 100.0 * (f.2 / t.2 - 1.0), 100.0 * (f.3 / t.3 - 1.0));
+    }
+    let (t, f) = (res[2], res[3]);
+    // braking torque of the edge damping at 50 % bend, 105 rad/s (pure axis)
+    let (bb, _) = edge_b_left(0.5 * HUMANOID_LIMITS[LB].1, 0.0);
+    println!("  edge damping at 50 % bend: b {bb:.5} N*m*s/rad -> {:.3} N*m at 105 rad/s \
+              (explicit-equivalent; full gear 2.07 N*m)", bb * 105.0);
+    assert!(f.2 < t.2, "edge damping must brake a coasting swing");
+}
+
+/// The left wrist's edge-damping coefficients (b_bend, b_dev) at a pose.
+fn edge_b_left(qb: Real, qd: Real) -> (Real, Real) {
+    let (_, _, r) = tl(qb, qd);
+    tendon_edge_b(qb, qd, HUMANOID_LIMITS[LB], HUMANOID_LIMITS[LD], r,
+                  TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV)
 }

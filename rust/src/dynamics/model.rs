@@ -101,13 +101,20 @@ pub struct PassiveWrist {
     pub zone_start_bend: Real,
     pub zone_start_dev: Real,
     /// Edge-zone damping peaks (issue #61, 2026-10-05): per joint
-    /// τ_d,j = −b_peak_j·x²·q̇_j, x = (r − R0)/(1 − R0) for r > R0 (the
-    /// tendon's radius; uncapped past r = 1), else 0. Diagonal and ≥ 0,
+    /// τ_d,j = −b_j·q̇_j, b_j = b_peak_j·[x_ell² + c(u_j)] with x_ell =
+    /// (r − R0)/(1 − R0) for r > R0 (the tendon's radius; uncapped past
+    /// r = 1), else 0, and the additive per-joint centring c (2026-10-06,
+    /// `damp_centring`: pure axis b_peak·u² from neutral, corners
+    /// unchanged). Diagonal and ≥ 0,
     /// so strictly dissipative. Applied IMPLICITLY (h·b on M's diagonal
     /// + −b·q̇ on the RHS — step.rs 4c; the explicit b·h/I_eff reaches
     /// ~0.4 at the corners and > 1 on reachable overshoot states).
     pub b_peak_bend: Real,
     pub b_peak_dev: Real,
+    /// The per-joint damping centring term (2026-10-06) on — true on
+    /// HUMANOID (the CUDA kernel has it unconditionally). false gives the
+    /// 2026-10-05 law b = b_peak·x_ell² (tests / A-B diagnostics only).
+    pub damp_from_zero: bool,
 }
 
 /// Tendon zone onset (normalized radius) and the τ_peak fraction.
@@ -158,6 +165,34 @@ pub fn tendon_edge_x2(r: Real) -> Real {
 #[inline(always)]
 fn tendon_lim(q: Real, lim: (Real, Real)) -> Real {
     if q >= 0.0 { lim.1 } else { -lim.0 }
+}
+
+/// Per-joint centring part of the edge damping (2026-10-06, user: the
+/// damping starts at 0 too): with a = |u|,
+///   c(a) = max(a² − ((a − R0)/(1 − R0))²₊, 0)
+/// ADDITIVE to the elliptical x_ell(r)², so a pure axis gets b_peak·a²
+/// from neutral (b_peak at the limit) while the box corners keep their
+/// 3.34·b_peak. ≥ 0 on [0, 1] (the bracket is (1 − a)(3a − 1) on
+/// [R0, 1]); the max(·, 0) only engages on overshoot past a stop
+/// (a > 1), so b never goes negative.
+#[inline(always)]
+fn damp_centring(u: Real) -> Real {
+    let a = u.abs();
+    let y = if a > TENDON_R0 { (a - TENDON_R0) / (1.0 - TENDON_R0) } else { 0.0 };
+    (a * a - y * y).max(0.0)
+}
+
+/// Edge-zone damping coefficients (b_bend, b_dev) of one wrist at
+/// (q_b, q_d) with tendon radius r: b_j = b_peak_j·[x_ell(r)² + c(u_j)]
+/// (`tendon_edge_x2` + `damp_centring`). Diagonal, ≥ 0 — strictly
+/// dissipative. The .cu `tendon_edge_b` transcribes this tree.
+#[inline]
+pub fn tendon_edge_b(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real), r: Real,
+                     bpb: Real, bpd: Real) -> (Real, Real) {
+    let x2 = tendon_edge_x2(r);
+    let cb = damp_centring(qb / tendon_lim(qb, lim_b));
+    let cd = damp_centring(qd / tendon_lim(qd, lim_d));
+    (bpb * (x2 + cb), bpd * (x2 + cd))
 }
 
 /// Passive tendon torque on one wrist: (τ_bend, τ_dev, r) from the
@@ -270,6 +305,7 @@ pub const HUMANOID_PASSIVE_WRIST: PassiveWrist = PassiveWrist {
     zone_start_dev: TENDON_S_DEV,
     b_peak_bend: TENDON_B_PEAK_BEND,
     b_peak_dev: TENDON_B_PEAK_DEV,
+    damp_from_zero: true,
 };
 
 impl Model {
