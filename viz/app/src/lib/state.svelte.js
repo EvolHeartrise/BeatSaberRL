@@ -4,6 +4,7 @@ import {
 } from "./replay.js";
 import { FLUX, POSE } from "./build.js";
 import { fluxHudAt, hudAt } from "./hud.js";
+import { TIP_TRAIL_DEFAULT_S, clampTrailS } from "./tiptrail.js";
 
 class Playback {
   // The active replay (set it through setRep). $state.raw: a parsed replay
@@ -22,8 +23,40 @@ class Playback {
   hitboxes = $state(false); // real v7 collision-volume wireframes ('h')
   firstPerson = $state(false); // camera at the head, fixed forward-level ('f')
   fpFov = $state(75); // first-person vertical field of view, degrees
+  tipTrail = $state(true); // the crisp blade-tip trail ('t'; lib/tiptrail.js)
+  tipTrailS = $state(TIP_TRAIL_DEFAULT_S); // its window, replay seconds
 }
 export const pb = new Playback();
+
+// The tip trail's switch and length are remembered in this browser (a
+// viewer who turns the line off, or wants it longer, should not have to
+// again on every replay).
+const TIP_TRAIL_KEY = "beat-arena.tipTrail";
+try {
+  const saved = JSON.parse(localStorage.getItem(TIP_TRAIL_KEY) ?? "null");
+  if (saved && typeof saved === "object") {
+    if (typeof saved.on === "boolean") pb.tipTrail = saved.on;
+    if (saved.s != null) pb.tipTrailS = clampTrailS(saved.s);
+  }
+} catch {
+  /* no storage (private window, node tests): the defaults */
+}
+function saveTipTrail() {
+  try {
+    localStorage.setItem(TIP_TRAIL_KEY,
+      JSON.stringify({ on: pb.tipTrail, s: pb.tipTrailS }));
+  } catch {
+    /* not remembered, still applied for this session */
+  }
+}
+export function setTipTrail(on) {
+  pb.tipTrail = !!on;
+  saveTipTrail();
+}
+export function setTipTrailS(s) {
+  pb.tipTrailS = clampTrailS(s);
+  saveTipTrail();
+}
 
 // The SONG's clock, published by App.svelte for Scene.svelte's frame loop
 // (see lib/sync.js): `tick()` returns the replay tick the song is sounding
