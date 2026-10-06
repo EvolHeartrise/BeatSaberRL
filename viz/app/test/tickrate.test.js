@@ -25,6 +25,21 @@ assert.throws(() => R.replayFromParts({ ...header, tick_hz: "bogus" }, ticks));
 
 // ---- the 60 Hz upsample ------------------------------------------------------
 const mid = (a, b) => a.map((v, i) => Array.isArray(v) ? mid(v, b[i]) : (v + b[i]) / 2);
+// The arm joints between ticks are a cubic Hermite through (q, ω) at both
+// ends (replay.js qAt). Splitting a cubic at its midpoint gives two cubics
+// whose end values and slopes are the midpoint's, so a 60 Hz tick carrying
+// the 30 Hz Hermite's midpoint angle AND rate makes the 60 Hz replay trace
+// the very same curves. In seconds: q(½) = (qa + qb)/2 + dt/8 (ωa − ωb),
+// q'(½) = 1.5 (qb − qa)/dt − (ωa + ωb)/4, dt = 1/30. (The root, spine and
+// legs, lerped, stay the linear midpoint.)
+const DT30 = 1 / 30;
+const isArm = (j) => j >= R.HERMITE_FIRST && j <= R.HERMITE_LAST; // the Hermite joints
+const hermiteMid = (a, b) => ({
+  q: a.q.map((v, i) => !isArm(i - 7) ? (v + b.q[i]) / 2
+    : (v + b.q[i]) / 2 + (DT30 / 8) * (a.omega[i - 7] - b.omega[i - 7])),
+  omega: a.omega.map((w, j) =>
+    (1.5 * (b.q[7 + j] - a.q[7 + j])) / DT30 - (w + b.omega[j]) / 4),
+});
 function upsample() {
   const head = { ...header, tick_hz: 60, action_repeat: 1 };
   const t30 = ticks;
@@ -33,12 +48,14 @@ function upsample() {
     const nxt = t30[Math.min(k + 1, t30.length - 1)];
     out.push({ ...t, t: 2 * k, time: (2 * k) / 60, events: [], contacts: [] });
     // the odd tick carries the 30 Hz tick's end-of-tick events (its END is
-    // (2k+2)/60 = (k+1)/30) and, as pose, the linear midpoint of 30 Hz
-    // ticks k and k+1 — exactly what the 30 Hz viewer interpolates at
-    // u = 0.5, so the two replays interpolate to the same poses.
+    // (2k+2)/60 = (k+1)/30) and, as pose, the Hermite midpoint of 30 Hz
+    // ticks k and k+1 (angle and rate) — exactly what the 30 Hz viewer
+    // interpolates at u = 0.5, so the two replays interpolate to the same
+    // poses. (The sabers stay the linear midpoint: only tipSpeed reads
+    // them, as a one-tick chord.)
     out.push({
       ...t, t: 2 * k + 1, time: (2 * k + 1) / 60,
-      q: mid(t.q, nxt.q), sabers: mid(t.sabers, nxt.sabers),
+      ...hermiteMid(t, nxt), sabers: mid(t.sabers, nxt.sabers),
       feet: t.feet, events: t.events, contacts: t.contacts,
     });
   });
@@ -76,7 +93,22 @@ assert.ok(nOut > 5, "fixture has outcomes");
 
 // ---- the scene at real time T: same at both rates ---------------------------
 const last = rep30.ticks.length - 1;
-let checked = 0;
+let checked = 0, jointsChecked = 0, clampSkipped = 0;
+// does the unclamped 30 Hz Hermite of joint j leave its (endpoint-widened)
+// limits anywhere in [k, k + 1]?
+function clampBinds(k, j) {
+  if (!isArm(j)) return false; // lerped: never past its endpoints
+  const a = rep30.ticks[k], b = rep30.ticks[k + 1];
+  const qa = a.q[7 + j], qb = b.q[7 + j];
+  const lo = Math.min(R.JOINT_LIMITS[j][0], qa, qb), hi = Math.max(R.JOINT_LIMITS[j][1], qa, qb);
+  for (let i = 0; i <= 64; i++) {
+    const u = i / 64, u2 = u * u, u3 = u2 * u;
+    const v = (2 * u3 - 3 * u2 + 1) * qa + (3 * u2 - 2 * u3) * qb
+      + DT30 * ((u3 - 2 * u2 + u) * a.omega[j] + (u3 - u2) * b.omega[j]);
+    if (v < lo - 1e-12 || v > hi + 1e-12) return true;
+  }
+  return false;
+}
 for (let k = 0; k < last; k++) {
   for (const frac of [0, 0.25, 0.5, 0.9]) {
     const T = (k + frac) / 30;
@@ -86,10 +118,19 @@ for (let k = 0; k < last; k++) {
       return R.qAt(rep, i, f - i);
     });
     const q30 = pose(rep30), q60 = pose(rep60);
-    // exact on the 30 Hz grid and at the midpoint; elsewhere both are
-    // linear between the same two 30 Hz samples
+    // root: exact on the 30 Hz grid and at the midpoint; elsewhere both
+    // are linear between the same two 30 Hz samples
     for (let j = 0; j < 7; j++)
       assert.ok(Math.abs(q30[j] - q60[j]) < 1e-9, `root q at T=${T}`);
+    // joints: the same Hermite curve at both rates — wherever the joint-
+    // limit clamp does not bind in this 30 Hz interval (where it does, the
+    // clamped curve is no cubic and the split need not reproduce it)
+    for (let j = 7; j < 36; j++) {
+      if (clampBinds(k, j - 7)) { clampSkipped++; continue; }
+      assert.ok(Math.abs(q30[j] - q60[j]) < 1e-9, `joint ${j - 7} at T=${T}: ` +
+        `${q30[j]} vs ${q60[j]}`);
+      jointsChecked++;
+    }
     const ids = (rep) => at(rep, () =>
       R.pendingNotes(rep, T).map((p) => p.i).join(","));
     assert.equal(ids(rep60), ids(rep30), `pending notes at T=${T}`);
@@ -107,6 +148,7 @@ for (let k = 0; k < last; k++) {
   }
 }
 assert.ok(checked > 1000);
+assert.ok(jointsChecked > 10 * clampSkipped, `joint checks: ${jointsChecked}, clamp-skipped ${clampSkipped}`);
 
 // ---- rates: per-tick quantities scale with the tick length -------------------
 {
@@ -146,4 +188,5 @@ assert.ok(checked > 1000);
 
 R.setTickRate();
 console.log(`tickrate OK: ${nOut} outcomes, ${checked} scene instants, ` +
+            `${jointsChecked} joint values (${clampSkipped} at a clamp skipped), ` +
             `60 Hz == 30 Hz upsampled`);

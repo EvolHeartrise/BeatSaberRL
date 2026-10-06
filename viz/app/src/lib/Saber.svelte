@@ -10,9 +10,9 @@
   import * as THREE from "three";
   import { pb, pose } from "./state.svelte.js";
   import {
-    DT, SABER_DARK, SABER_LEN, V_MIN, baseOf, fkSaber, handleLen, saberAt,
-    tipOf, tipSpeed,
+    SABER_DARK, SABER_LEN, V_MIN, baseOf, fkSaber, handleLen, tipOf, tipSpeed,
   } from "./replay.js";
+  import { BASE, RIBBON_S, TIP, bladeTrail, trailCover } from "./bladetrail.js";
   import { NOTE_COLORS, modelGeo, noteColors } from "./models.js";
   import { OUTLINE_SABER, RAMP } from "./toon.js";
 
@@ -71,40 +71,24 @@
   // rest of the scene: flat saber colour in three HARD alpha steps rather
   // than a gradient, with a thin ink border.
   //
-  // Two details make the steps hard and the head solid:
-  //   - every quad owns its four vertices instead of sharing them with its
-  //     neighbours, so an alpha step is a step and not a ramp across the
-  //     shared edge;
-  //   - the newest sample is taken at pb.cur itself, not at the last whole
-  //     tick, so the ribbon stays welded to the blade during playback (the
-  //     old line lagged it by up to a tick).
-  const TRAIL_S = 0.1;               // history window, seconds
-  // Resample at a fixed rate per 30 Hz tick of replay time rather than a
-  // fixed quad count: the smoothing below is a filter over SAMPLES, so
-  // pinning the sample density is what keeps its strength unchanged if the
-  // window length moves. The density is per SECOND (not per logged tick) so
-  // the geometry is sized once for any replay rate; the window in ticks,
-  // TRAIL_S / DT, is read live (3 logged samples at 30 Hz, 6 at 60 Hz).
-  const PER_TICK = 3;
-  const SEGS = Math.round(TRAIL_S * 30 * PER_TICK); // quads along the ribbon
+  // Its points are the shared blade history (lib/bladetrail.js): the DRAWN
+  // pose — qAt's joint-space Hermite + bodyFK, the very pose this
+  // component draws the blade from — sampled on a fixed 240 Hz replay-time
+  // grid, with the newest point at pb.cur itself and the oldest exactly
+  // RIBBON_S back. So the ribbon is welded to the drawn blade at every
+  // instant (not only at ticks), its outer edge is exactly the tip trail's
+  // line, and no smoothing is needed: the Hermite is already C1 across
+  // ticks. Every quad owns its four vertices instead of sharing them with
+  // its neighbours, so an alpha step is a step and not a ramp across the
+  // shared edge.
   const STEPS = [0.42, 0.24, 0.1];   // head -> tail alpha, no interpolation
-  // The logged sabers are tick_hz (30 by default) and saberAt is linear between them, so a
-  // fast swing samples as a chain of chords no matter how finely it is
-  // resampled. Two 3-tap passes over the interior round those corners; the
-  // head and tail samples are left untouched, which keeps the ribbon
-  // attached to the blade and its length constant.
-  const SMOOTH = 2;
-
-  const NS = SEGS + 1;
-  const tipPath = new Float32Array(NS * 3); // scene-space
-  const innPath = new Float32Array(NS * 3);
-  const scratch = new Float32Array(NS * 3);
+  const MAXQ = bladeTrail.trail.maxPts - 1; // quads (sized for any window)
 
   const ribGeo = new THREE.BufferGeometry();
-  const ribPos = new Float32Array(SEGS * 4 * 3);
-  const ribCol = new Float32Array(SEGS * 4 * 4); // RGBA: alpha per vertex
-  const ribIdx = new Uint16Array(SEGS * 6);
-  for (let q = 0; q < SEGS; q++) {
+  const ribPos = new Float32Array(MAXQ * 4 * 3);
+  const ribCol = new Float32Array(MAXQ * 4 * 4); // RGBA: alpha per vertex
+  const ribIdx = new Uint16Array(MAXQ * 6);
+  for (let q = 0; q < MAXQ; q++) {
     const v = q * 4;
     ribIdx.set([v, v + 1, v + 2, v, v + 2, v + 3], q * 6);
   }
@@ -114,88 +98,69 @@
 
   // ink: the ribbon's two long borders, one 2-vertex segment per quad
   const inkGeo = new THREE.BufferGeometry();
-  const inkPos = new Float32Array(SEGS * 4 * 3);
-  const inkCol = new Float32Array(SEGS * 4 * 4);
+  const inkPos = new Float32Array(MAXQ * 4 * 3);
+  const inkCol = new Float32Array(MAXQ * 4 * 4);
   inkGeo.setAttribute("position", new THREE.BufferAttribute(inkPos, 3));
   inkGeo.setAttribute("color", new THREE.BufferAttribute(inkCol, 4));
+  $effect(() => () => { ribGeo.dispose(); inkGeo.dispose(); });
 
   const RIB_RGB = new THREE.Color(NOTE_COLORS[s]);
   const INK_RGB = new THREE.Color("#0a0c10");
 
+  // dst vertex di <- the 3 floats at src[si ..]
   const copy3 = (dst, di, src, si) => {
-    dst[di * 3] = src[si * 3];
-    dst[di * 3 + 1] = src[si * 3 + 1];
-    dst[di * 3 + 2] = src[si * 3 + 2];
+    dst[di * 3] = src[si];
+    dst[di * 3 + 1] = src[si + 1];
+    dst[di * 3 + 2] = src[si + 2];
   };
   const paint = (dst, di, rgb, a) => {
     dst[di * 4] = rgb.r; dst[di * 4 + 1] = rgb.g;
     dst[di * 4 + 2] = rgb.b; dst[di * 4 + 3] = a;
   };
-  function smoothPath(path) {
-    for (let pass = 0; pass < SMOOTH; pass++) {
-      scratch.set(path);
-      for (let i = 1; i < NS - 1; i++)
-        for (let c = 0; c < 3; c++)
-          path[i * 3 + c] = 0.25 * scratch[(i - 1) * 3 + c]
-            + 0.5 * scratch[i * 3 + c] + 0.25 * scratch[(i + 1) * 3 + c];
-    }
-  }
 
   $effect(() => {
     const cur = pb.cur; // read the continuous clock: the ribbon is sub-tick
-    if (pose.on || !pb.rep) { // no trail for a static pose
+    if (pose.on || !pb.rep || pb.rep.ticks.length === 0) { // no trail for a static pose
       ribGeo.setDrawRange(0, 0);
       inkGeo.setDrawRange(0, 0);
       return;
     }
-    const t0 = Math.max(0, cur - TRAIL_S / DT); // clamped at the replay start
-    for (let i = 0; i < NS; i++) {
-      const t = t0 + (cur - t0) * (i / SEGS);
-      const k = Math.min(Math.floor(t), pb.rep.ticks.length - 1);
-      const sa = saberAt(pb.rep, k, t - k, s);
-      const tp = tipOf(sa, hl);
-      const bp = baseOf(sa, hl); // blade base (v42: hl past the grip)
-      tipPath[i * 3] = tp[0];
-      tipPath[i * 3 + 1] = tp[1];
-      tipPath[i * 3 + 2] = -tp[2];
-      innPath[i * 3] = bp[0];
-      innPath[i * 3 + 1] = bp[1];
-      innPath[i * 3 + 2] = -bp[2];
-    }
-    smoothPath(tipPath);
-    smoothPath(innPath);
-
-    for (let q = 0; q < SEGS; q++) {
-      const a = q, b = q + 1, v = q * 4, w = q * 4;
-      copy3(ribPos, v, innPath, a);
-      copy3(ribPos, v + 1, tipPath, a);
-      copy3(ribPos, v + 2, tipPath, b);
-      copy3(ribPos, v + 3, innPath, b);
-      const u = (q + 0.5) / SEGS; // 0 at the tail, 1 at the blade
+    bladeTrail.ensure(pb.rep, cur, trailCover(pb.tipTrail, pb.tipTrailS));
+    const view = bladeTrail.view(RIBBON_S);
+    const P = view.pts, age = view.age, S = bladeTrail.trail.stride;
+    const nq = Math.max(0, view.npts - 1);
+    const T0 = TIP(s), B0 = BASE(s);
+    for (let q = 0; q < nq; q++) {
+      const a = q * S, b = (q + 1) * S, v = q * 4;
+      copy3(ribPos, v, P, a + B0);
+      copy3(ribPos, v + 1, P, a + T0);
+      copy3(ribPos, v + 2, P, b + T0);
+      copy3(ribPos, v + 3, P, b + B0);
+      const u = 0.5 * (age[q] + age[q + 1]); // 0 at the tail, 1 at the blade
       const al = STEPS[u > 2 / 3 ? 0 : u > 1 / 3 ? 1 : 2];
       for (let j = 0; j < 4; j++) paint(ribCol, v + j, RIB_RGB, al);
       // borders: tip edge then base edge (LineSegments draws vertex pairs)
-      copy3(inkPos, w, tipPath, a);
-      copy3(inkPos, w + 1, tipPath, b);
-      copy3(inkPos, w + 2, innPath, a);
-      copy3(inkPos, w + 3, innPath, b);
-      for (let j = 0; j < 4; j++) paint(inkCol, w + j, INK_RGB, al * 0.9);
+      copy3(inkPos, v, P, a + T0);
+      copy3(inkPos, v + 1, P, b + T0);
+      copy3(inkPos, v + 2, P, a + B0);
+      copy3(inkPos, v + 3, P, b + B0);
+      for (let j = 0; j < 4; j++) paint(inkCol, v + j, INK_RGB, al * 0.9);
     }
-    ribGeo.setDrawRange(0, SEGS * 6);
-    inkGeo.setDrawRange(0, SEGS * 4);
-    ribGeo.attributes.position.needsUpdate = true;
-    ribGeo.attributes.color.needsUpdate = true;
-    inkGeo.attributes.position.needsUpdate = true;
-    inkGeo.attributes.color.needsUpdate = true;
-    ribGeo.computeBoundingSphere();
-    inkGeo.computeBoundingSphere();
+    ribGeo.setDrawRange(0, nq * 6);
+    inkGeo.setDrawRange(0, nq * 4);
+    for (const at of [ribGeo.attributes.position, ribGeo.attributes.color,
+      inkGeo.attributes.position, inkGeo.attributes.color]) {
+      at.clearUpdateRanges();
+      at.addUpdateRange(0, nq * 4 * at.itemSize); // only the quads drawn
+      at.needsUpdate = true;
+    }
   });
 </script>
 
 <!-- the ribbon and its ink: unlit (a lit trail would band against the toon
      ramp and read as a solid object), never depth-writing, and double-sided
      because a swing shows the viewer both faces -->
-<T.Mesh geometry={ribGeo}>
+<T.Mesh geometry={ribGeo} frustumCulled={false}>
   <T.MeshBasicMaterial
     vertexColors
     transparent
@@ -203,7 +168,7 @@
     side={THREE.DoubleSide}
   />
 </T.Mesh>
-<T.LineSegments geometry={inkGeo}>
+<T.LineSegments geometry={inkGeo} frustumCulled={false}>
   <T.LineBasicMaterial vertexColors transparent depthWrite={false} />
 </T.LineSegments>
 

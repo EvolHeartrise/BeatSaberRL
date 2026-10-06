@@ -13,7 +13,7 @@
     "build": "vite build",
     "build:site": "npm run wasm && vite build --mode site",
     "pretest": "npm run wasm",
-    "test": "node test/replay.test.js && node test/replay-v2.test.js && node test/urlload.test.js && node test/models.test.js && node test/hud.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/tiptrail.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
+    "test": "node test/replay.test.js && node test/replay-v2.test.js && node test/urlload.test.js && node test/models.test.js && node test/hud.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/tiptrail.test.js && node test/interp.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
