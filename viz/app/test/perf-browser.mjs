@@ -25,6 +25,7 @@ import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
+import { scrubTo } from "./bar.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -212,11 +213,7 @@ try {
     // speed: the bar's +/- keys double / halve
     for (let s = 1; s < SPEED; s *= 2) await page.keyboard.press("+");
     if (START != null) {
-      await page.evaluate((tick) => {
-        const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(r, tick);
-        r.dispatchEvent(new Event("input", { bubbles: true }));
-      }, +START);
+      await scrubTo(page, +START); // the timeline (test/bar.js)
       await page.keyboard.press(" "); // the scrub paused it
     }
     await sleep(3000); // warm up: programs compiled, notes on screen

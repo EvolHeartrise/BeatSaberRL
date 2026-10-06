@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
+import { clickBar, scrubTo } from "./bar.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -43,15 +44,9 @@ try {
     { timeout: 10000 });
   const kind = await page.evaluate(() => window.__viewerState());
   if (!kind.flux) throw new Error("not opened as a Flux replay: " + JSON.stringify(kind));
-  await page.evaluate(() => [...document.querySelectorAll("#bar button")]
-    .find((b) => b.textContent.includes("pause"))?.click());
-  const scrub = (tick) => page.evaluate((tick) => {
-    // the timeline is the last slider (volume / fov come first)
-    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
-      .set.call(r, tick);
-    r.dispatchEvent(new Event("input", { bubbles: true }));
-  }, tick);
+  await clickBar(page, "pause");
+  // the timeline: a pointer press on its track + arrow keys (test/bar.js)
+  const scrub = (tick) => scrubTo(page, tick);
   const shots = [[12, "approach"], [48, "mid"], [83, "bar"], [140, "late"]];
   for (const [tick, name] of shots) {
     await scrub(tick);

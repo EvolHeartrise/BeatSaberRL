@@ -695,7 +695,15 @@ title/summary line since 2026-09-30 — the map card names the song; with a
 replay loaded the pill just reads "📂 open replay…"),
 controls in a translucent panel at the bottom (no DOM score strip since
 2026-09-29 — the score readout is the in-scene HUD below)
-(`pointer-events: none` containers so drags reach the canvas). The
+(`pointer-events: none` containers so drags reach the canvas). Since
+2026-10-06 that panel (`src/lib/ControlBar.svelte`) is built from
+shadcn-svelte components (bits-ui) and Lucide icons, the same stack as the
+records site: the timeline slider on its own row, then icon buttons /
+toggles (aria-labels, `aria-pressed` on/off, tooltips naming each key);
+below 640 px the view toggles and their sliders fold into a "more
+controls" popover. Tailwind is scoped to the bar (`src/app.css`: no
+preflight, utilities generated from the bar's files only), so nothing
+else on the page is restyled; `node test/controls-browser.mjs` checks it. The
 gauge panels (a DOM overlay since 2026-10-02, camera-attached canvas
 sprites before) anchor to the viewport's bottom corners and sit above
 the floating bottom UI.
