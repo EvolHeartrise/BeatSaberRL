@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
+import { barButton, clickBar, scrubTo, toggleOn } from "./bar.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -48,16 +49,12 @@ try {
     () => window.__viewerState?.().loaded,
     { timeout: 60000 });
   // paused, so the scrubbed tick is the one on screen
-  await page.evaluate(() => [...document.querySelectorAll("#bar button")]
-    .find((b) => b.textContent.includes("pause"))?.click());
-  const scrub = (tick) => page.evaluate((tick) => {
-    // the timeline is the last slider in the bar (fov / volume come first)
-    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(r, tick);
-    r.dispatchEvent(new Event("input", { bubbles: true }));
-  }, tick);
-  const FP_ON = `[...document.querySelectorAll("#bar button")]
-    .some((b) => b.textContent.includes("first-person") && b.classList.contains("on"))`;
+  await clickBar(page, "pause");
+  // the timeline: a pointer press on its track + arrow keys (test/bar.js)
+  const scrub = (tick) => scrubTo(page, tick);
+  // (at a phone-width HUD_VIEW the toggle lives in the closed "more" menu:
+  // nothing to wait on there)
+  const FP_ON = `(${toggleOn("first-person")}) || !document.querySelector('${barButton("first-person")}')`;
   for (const view of ["orbit", "fp"]) {
     if (view === "fp") {
       await page.keyboard.press("f");

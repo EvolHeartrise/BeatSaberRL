@@ -11,6 +11,7 @@ import { resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 import puppeteer from "puppeteer-core";
 import { decodeReplay } from "../src/lib/replay.js";
+import { scrubTo } from "./bar.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -54,12 +55,8 @@ try {
     const s = window.__viewerState?.();
     return s?.loaded ? { t: s.t, tick: s.tick } : null;
   });
-  const scrub = (tick) => page.evaluate((tick) => {
-    // the timeline is the last slider (volume / fov come first)
-    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(r, tick);
-    r.dispatchEvent(new Event("input", { bubbles: true }));
-  }, tick);
+  // the timeline: a pointer press on its track + arrow keys (test/bar.js)
+  const scrub = (tick) => scrubTo(page, tick);
   const load = async (p) => {
     const input = await page.$("input[type=file]");
     await input.uploadFile(p);
@@ -86,7 +83,7 @@ try {
   // ---- playback covers real time; the song tracks the replay clock
   // the song comes from BeatSaver by the header's map hash: give it a while
   const hasSong = await page.waitForFunction(
-    () => !!document.querySelector("#snd input[type=range]"), { timeout: 30000 })
+    () => !!document.querySelector("#snd [role=slider]"), { timeout: 30000 })
     .then(() => true, () => false);
   await scrub(5 * HZ);
   await page.keyboard.press(" "); // play
