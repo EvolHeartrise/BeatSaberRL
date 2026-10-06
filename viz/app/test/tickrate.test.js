@@ -25,6 +25,40 @@ assert.throws(() => R.replayFromParts({ ...header, tick_hz: "bogus" }, ticks));
 
 // ---- the 60 Hz upsample ------------------------------------------------------
 const mid = (a, b) => a.map((v, i) => Array.isArray(v) ? mid(v, b[i]) : (v + b[i]) / 2);
+// Between ticks the joints and the root position are cubic Hermites through
+// (value, rate) at both ends (replay.js qAt). Splitting a cubic at its
+// midpoint gives two cubics whose end values and slopes are the midpoint's,
+// so a 60 Hz tick carrying the 30 Hz curve's midpoint pose AND rates makes
+// the 60 Hz replay trace the very same curves. In seconds: q'(½) = 1.5
+// (qb − qa)/dt − (ωa + ωb)/4, dt = 1/30. The root ROTATION's Hermite runs
+// in a rotation-vector chart anchored at its first tick, so the two halves
+// re-anchor at the midpoint and match the 30 Hz rotation only to second
+// order (checked below to 1e-4 rad, 0.006°); its rate at the midpoint is taken by
+// a central difference of the 30 Hz curve.
+const DT30 = 1 / 30;
+const qmul = (a, b) => [a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+  a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+  a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+  a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0]];
+const conj = (q) => [q[0], -q[1], -q[2], -q[3]];
+const qlog = (q) => { // world rotation vector of a unit quaternion
+  const s = q[0] < 0 ? -1 : 1, v = [s * q[1], s * q[2], s * q[3]];
+  const n = Math.hypot(...v), a = 2 * Math.atan2(n, s * q[0]);
+  return n < 1e-15 ? v.map((x) => 2 * x) : v.map((x) => (x * a) / n);
+};
+const rotAngle = (a, b) => Math.hypot(...qlog(qmul(b, conj(a)))); // rad between two
+const hermiteMid = (rep30, k, a, b) => {
+  const q = R.qAt(rep30, k, 0.5); // the 30 Hz viewer's own midpoint pose
+  const h = 1e-4, qp = R.qAt(rep30, k, 0.5 + h), qm = R.qAt(rep30, k, 0.5 - h);
+  const w = qlog(qmul(qp.slice(3, 7), conj(qm.slice(3, 7)))).map((x) => x / (2 * h * DT30));
+  const vel = (i, ra, rb) => (1.5 * (b.q[i] - a.q[i])) / DT30 - (ra + rb) / 4;
+  return {
+    q,
+    twist: [0, 1, 2].map((i) => vel(i, a.twist[i], b.twist[i])).concat(w),
+    omega: a.omega.map((wa, j) => vel(7 + j, wa, b.omega[j])),
+  };
+};
+const last30 = rep30.ticks.length - 1;
 function upsample() {
   const head = { ...header, tick_hz: 60, action_repeat: 1 };
   const t30 = ticks;
@@ -33,12 +67,15 @@ function upsample() {
     const nxt = t30[Math.min(k + 1, t30.length - 1)];
     out.push({ ...t, t: 2 * k, time: (2 * k) / 60, events: [], contacts: [] });
     // the odd tick carries the 30 Hz tick's end-of-tick events (its END is
-    // (2k+2)/60 = (k+1)/30) and, as pose, the linear midpoint of 30 Hz
-    // ticks k and k+1 — exactly what the 30 Hz viewer interpolates at
-    // u = 0.5, so the two replays interpolate to the same poses.
+    // (2k+2)/60 = (k+1)/30) and, as pose, the Hermite midpoint of 30 Hz
+    // ticks k and k+1 (pose and rates) — exactly what the 30 Hz viewer
+    // interpolates at u = 0.5, so the two replays interpolate to the same
+    // poses. (The sabers stay the linear midpoint: only tipSpeed reads
+    // them, as a one-tick chord.)
     out.push({
       ...t, t: 2 * k + 1, time: (2 * k + 1) / 60,
-      q: mid(t.q, nxt.q), sabers: mid(t.sabers, nxt.sabers),
+      ...hermiteMid(rep30, k, rep30.ticks[k], rep30.ticks[Math.min(k + 1, last30)]),
+      sabers: mid(t.sabers, nxt.sabers),
       feet: t.feet, events: t.events, contacts: t.contacts,
     });
   });
@@ -76,7 +113,21 @@ assert.ok(nOut > 5, "fixture has outcomes");
 
 // ---- the scene at real time T: same at both rates ---------------------------
 const last = rep30.ticks.length - 1;
-let checked = 0;
+let checked = 0, jointsChecked = 0, clampSkipped = 0, worstRot = 0;
+// does the unclamped 30 Hz Hermite of joint j leave its (endpoint-widened)
+// limits anywhere in [k, k + 1]?
+function clampBinds(k, j) {
+  const a = rep30.ticks[k], b = rep30.ticks[k + 1];
+  const qa = a.q[7 + j], qb = b.q[7 + j];
+  const lo = Math.min(R.JOINT_LIMITS[j][0], qa, qb), hi = Math.max(R.JOINT_LIMITS[j][1], qa, qb);
+  for (let i = 0; i <= 64; i++) {
+    const u = i / 64, u2 = u * u, u3 = u2 * u;
+    const v = (2 * u3 - 3 * u2 + 1) * qa + (3 * u2 - 2 * u3) * qb
+      + DT30 * ((u3 - 2 * u2 + u) * a.omega[j] + (u3 - u2) * b.omega[j]);
+    if (v < lo - 1e-12 || v > hi + 1e-12) return true;
+  }
+  return false;
+}
 for (let k = 0; k < last; k++) {
   for (const frac of [0, 0.25, 0.5, 0.9]) {
     const T = (k + frac) / 30;
@@ -86,10 +137,22 @@ for (let k = 0; k < last; k++) {
       return R.qAt(rep, i, f - i);
     });
     const q30 = pose(rep30), q60 = pose(rep60);
-    // exact on the 30 Hz grid and at the midpoint; elsewhere both are
-    // linear between the same two 30 Hz samples
-    for (let j = 0; j < 7; j++)
-      assert.ok(Math.abs(q30[j] - q60[j]) < 1e-9, `root q at T=${T}`);
+    // root position: the same cubic at both rates; rotation: the same to
+    // second order (the chart re-anchors at the 60 Hz midpoint tick)
+    for (let j = 0; j < 3; j++)
+      assert.ok(Math.abs(q30[j] - q60[j]) < 1e-9, `root position at T=${T}`);
+    const dRot = rotAngle(q30.slice(3, 7), q60.slice(3, 7));
+    worstRot = Math.max(worstRot, dRot);
+    assert.ok(dRot < 1e-4, `root rotation at T=${T}: ${dRot} rad apart`);
+    // joints: the same Hermite curve at both rates — wherever the joint-
+    // limit clamp does not bind in this 30 Hz interval (where it does, the
+    // clamped curve is no cubic and the split need not reproduce it)
+    for (let j = 7; j < 36; j++) {
+      if (clampBinds(k, j - 7)) { clampSkipped++; continue; }
+      assert.ok(Math.abs(q30[j] - q60[j]) < 1e-9, `joint ${j - 7} at T=${T}: ` +
+        `${q30[j]} vs ${q60[j]}`);
+      jointsChecked++;
+    }
     const ids = (rep) => at(rep, () =>
       R.pendingNotes(rep, T).map((p) => p.i).join(","));
     assert.equal(ids(rep60), ids(rep30), `pending notes at T=${T}`);
@@ -107,6 +170,7 @@ for (let k = 0; k < last; k++) {
   }
 }
 assert.ok(checked > 1000);
+assert.ok(jointsChecked > 10 * clampSkipped, `joint checks: ${jointsChecked}, clamp-skipped ${clampSkipped}`);
 
 // ---- rates: per-tick quantities scale with the tick length -------------------
 {
@@ -146,4 +210,6 @@ assert.ok(checked > 1000);
 
 R.setTickRate();
 console.log(`tickrate OK: ${nOut} outcomes, ${checked} scene instants, ` +
+            `${jointsChecked} joint values (${clampSkipped} at a clamp skipped), ` +
+            `root rotation within ${worstRot.toExponential(1)} rad, ` +
             `60 Hz == 30 Hz upsampled`);

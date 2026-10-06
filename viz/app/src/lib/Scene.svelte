@@ -22,6 +22,7 @@
   import Notes from "./Notes.svelte";
   import Hud3D from "./Hud3D.svelte";
   import Saber from "./Saber.svelte";
+  import TipTrail from "./TipTrail.svelte";
   import { modelGeo } from "./models.js";
   import { FLUX, POSE } from "./build.js";
 
@@ -332,6 +333,8 @@
   {:else}
     <Saber s={0} fk={fkAll} />
     <Saber s={1} fk={fkAll} />
+    <!-- the crisp blade-tip trails, over the swept ribbons -->
+    <TipTrail />
   {/if}
 {/if}
 

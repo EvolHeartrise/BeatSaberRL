@@ -27,7 +27,7 @@
   import { pb, pose } from "./state.svelte.js";
   import {
     GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
-    TAU_MAX, activationAt, footForces, gearTable, lerp, omegaCapOf,
+    TAU_MAX, activationAt, footForces, gearTable, omegaCapOf, qAt,
   } from "./replay.js";
 
   const W = 252;
@@ -159,6 +159,7 @@
 
   // The frame loop: Scene.svelte's clock moves pb.cur every frame while
   // playing, which re-runs this; nothing is allocated per joint.
+  const qNow = new Array(36); // qAt scratch
   $effect(() => {
     if (pose.on) { // gauges reflect the manually posed joints (ω = τ = 0)
       const q = pose.q;
@@ -172,7 +173,8 @@
     const k = Math.min(Math.floor(cur), n - 1);
     const k1 = Math.min(k + 1, n - 1);
     const u = cur - k;
-    const qa = rep.ticks[k].q, tb = rep.ticks[k1], qb = tb.q;
+    // the angles: the drawn pose (qAt, the joint-space Hermite)
+    const q = qAt(rep, k, u, qNow), tb = rep.ticks[k1];
     // applied τ (tauOf, one joint at a time) as the fraction of this
     // joint's limit, and the ω cap — the replay body's (replayBody: per
     // joint, so original-body and v63x2-body replays both read right),
@@ -184,7 +186,7 @@
         : (table[a] ?? 0) * TAU_MAX[j];
       const t = tau === 0 ? 0
         : Math.max(-1, Math.min(1, tau / (body?.tau_max[j] ?? TAU_MAX[j])));
-      joint(j, lerp(qa[7 + j], qb[7 + j], u), tb.omega[j], t, omegaCapOf(rep, j));
+      joint(j, q[7 + j], tb.omega[j], t, omegaCapOf(rep, j));
     }
     forces(footForces(rep, k1), activationAt(rep, k1));
   });
