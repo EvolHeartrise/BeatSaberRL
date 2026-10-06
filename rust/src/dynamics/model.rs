@@ -60,7 +60,135 @@ pub struct Model {
     /// side is ever solved first (sim/mirror-exact, 2026-10-04).
     /// Identity for models without a mirror symmetry.
     pub mirror: &'static [usize],
+    /// Passive wrist "tendon" torque (exp/wrist-tendon, 2026-10-05):
+    /// a conservative, state-dependent joint torque on each wrist's
+    /// (bend, dev) pair, added to the applied side of the substep RHS
+    /// next to τ_gear − b∘q̇ (step.rs step 4). Some on HUMANOID; None on
+    /// the test pendulums and other test tables. See `PassiveWrist`.
+    pub passive_wrist: Option<PassiveWrist>,
 }
+
+/// Passive wrist tendon parameters (exp/wrist-tendon, 2026-10-05).
+///
+/// Per hand, from the CURRENT (q_bend, q_dev) of every substep:
+///   u_j = q_j / L_j,  L_j = hi_j if q_j ≥ 0 else |lo_j|  (the limit the
+///         joint is heading to, read from `Model::limits` — mirror-exact
+///         because the right hand's dev limits are the left's negated)
+///   r   = sqrt(u_b² + u_d²)                         (elliptical radius)
+///   E   = P(r)·(Ē_b·u_b² + Ē_d·u_d²)/r²,  P(r) = ((r − R0)/(1 − R0))³
+///         for r > R0 = 0.5, else 0 — UNCAPPED past r = 1 (deliberate:
+///         box corners like full bend + full dev, anatomically
+///         unreachable, become effectively inaccessible)
+///   Ē_j = τ_peak_j·L_j·(1 − R0)/3  (the pure-axis energy stored at the
+///         limit: ∫ τ_peak·((u − R0)/(1 − R0))² L du over [R0, 1])
+///   τ_j = −∂E/∂q_j  (analytic; `wrist_tendon`)
+/// On a pure axis this is exactly τ = −sign(u)·τ_peak·((|u| − R0)/(1 − R0))²:
+/// zero inside half the range, τ_peak at the limit. τ_peak is FIXED in
+/// N·m (0.30 × the DEFAULT body's τmax, `TENDON_TAU_PEAK_*`) — not
+/// scaled by the per-env tau randomization or a bench body: tendon
+/// stiffness is not muscle strength.
+#[derive(Clone, Copy, Debug)]
+pub struct PassiveWrist {
+    /// per hand [L, R]: (bend coordinate, dev coordinate), actuated order
+    pub hands: [(usize, usize); 2],
+    pub tau_peak_bend: Real,
+    pub tau_peak_dev: Real,
+}
+
+/// Tendon zone onset (normalized radius) and the τ_peak fraction.
+pub const TENDON_R0: Real = 0.5;
+pub const TENDON_FRAC: f64 = 0.30;
+/// The DEFAULT body's wrist τmax scales (python constants.TAU_BODY_DEFAULT
+/// axes wrist_bend / wrist_dev — the exp/bend7 default body), restated
+/// here because the Rust sim has no default-body table of its own
+/// (constants.py asserts the two agree).
+pub const TAU_BODY_DEFAULT_WRIST_BEND: f64 = 1.4466;
+pub const TAU_BODY_DEFAULT_WRIST_DEV: f64 = 1.0220;
+/// τ_peak = 0.30 × default-body τmax, in N·m, computed in f64 and
+/// rounded once to Real (the CUDA kernel's `T(double constexpr)`):
+/// bend 0.30 × 1.431 × 1.4466 = 0.62103 N·m, dev 0.30 × 1.06 × 1.0220 =
+/// 0.32500 N·m.
+pub const TENDON_TAU_PEAK_BEND: Real = (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND) as Real;
+pub const TENDON_TAU_PEAK_DEV: Real = (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV) as Real;
+
+/// Distance to the limit a wrist coordinate is heading to.
+#[inline(always)]
+fn tendon_lim(q: Real, lim: (Real, Real)) -> Real {
+    if q >= 0.0 { lim.1 } else { -lim.0 }
+}
+
+/// Passive tendon torque on one wrist: (τ_bend, τ_dev, r) from the
+/// current angles, the two joints' limits and the two τ_peaks. Zero
+/// torque for r ≤ R0 (E ≡ 0 there, which also keeps r → 0 safe).
+/// Gradient of E (S = Ē_b u_b² + Ē_d u_d², ρ = r²):
+///   ∂E/∂u_b = u_b·[P'(r)·S/(r·ρ) + 2P·(Ē_b − Ē_d)·u_d²/ρ²]
+///   ∂E/∂u_d = u_d·[P'(r)·S/(r·ρ) + 2P·(Ē_d − Ē_b)·u_b²/ρ²]
+///   τ_j = −(∂E/∂u_j)/L_j.
+/// The CUDA kernel (`wrist_tendon`) transcribes this expression tree.
+#[inline]
+pub fn wrist_tendon(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real),
+                    tpb: Real, tpd: Real) -> (Real, Real, Real) {
+    let lb = tendon_lim(qb, lim_b);
+    let ld = tendon_lim(qd, lim_d);
+    let ub = qb / lb;
+    let ud = qd / ld;
+    let ub2 = ub * ub;
+    let ud2 = ud * ud;
+    let rho = ub2 + ud2;
+    let r = rho.sqrt();
+    if !(r > TENDON_R0) {
+        return (0.0, 0.0, r);
+    }
+    let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+    let p = x * x * x;
+    let dp = 3.0 * x * x / (1.0 - TENDON_R0);
+    let eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0);
+    let ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0);
+    let s = eb * ub2 + ed * ud2;
+    let k = dp * s / (r * rho);
+    let w = 2.0 * p / (rho * rho);
+    let gb = ub * (k + w * (eb - ed) * ud2);
+    let gd = ud * (k + w * (ed - eb) * ub2);
+    (-gb / lb, -gd / ld, r)
+}
+
+/// The tendon energy E(q_b, q_d) (J) — tests / diagnostics only.
+pub fn wrist_tendon_energy(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real),
+                           tpb: Real, tpd: Real) -> Real {
+    let lb = tendon_lim(qb, lim_b);
+    let ld = tendon_lim(qd, lim_d);
+    let (ub, ud) = (qb / lb, qd / ld);
+    let rho = ub * ub + ud * ud;
+    let r = rho.sqrt();
+    if !(r > TENDON_R0) {
+        return 0.0;
+    }
+    let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+    let eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0);
+    let ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0);
+    x * x * x * (eb * ub * ub + ed * ud * ud) / rho
+}
+
+impl PassiveWrist {
+    /// Tendon torques of both hands at pose `q` for `model`'s limits:
+    /// [(τ_bend, τ_dev, r); 2].
+    #[inline]
+    pub fn eval(&self, limits: &[(Real, Real)], q: &[Real]) -> [(Real, Real, Real); 2] {
+        let mut out = [(0.0, 0.0, 0.0); 2];
+        for (s, &(jb, jd)) in self.hands.iter().enumerate() {
+            out[s] = wrist_tendon(q[jb], q[jd], limits[jb], limits[jd],
+                                  self.tau_peak_bend, self.tau_peak_dev);
+        }
+        out
+    }
+}
+
+/// HUMANOID's tendon: wrists (8 bend, 9 dev) and (15 bend, 16 dev).
+pub const HUMANOID_PASSIVE_WRIST: PassiveWrist = PassiveWrist {
+    hands: [(8, 9), (15, 16)],
+    tau_peak_bend: TENDON_TAU_PEAK_BEND,
+    tau_peak_dev: TENDON_TAU_PEAK_DEV,
+};
 
 impl Model {
     /// Velocity-coordinate count (root 6 + actuated when free-based).
@@ -337,4 +465,5 @@ pub const HUMANOID: Model = Model {
     armature: &HUMANOID_ARMATURE,
     gravity: [0.0, -G, 0.0],
     mirror: &HUMANOID_MIRROR,
+    passive_wrist: Some(HUMANOID_PASSIVE_WRIST),
 };

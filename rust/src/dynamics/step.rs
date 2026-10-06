@@ -146,6 +146,24 @@ pub fn substep_opts(
     for j in 0..model.nq {
         ws.rhs[voff + j] = tau_act[j] - model.damping[j] * st.v[voff + j] - ws.c[voff + j];
     }
+    // 4c. exp/wrist-tendon: the passive wrist torque τ_p(q) (model.rs
+    //     `PassiveWrist`) joins the APPLIED side — the four wrist rows
+    //     are re-assembled as (τ_gear + τ_p) − b·q̇ − C. State-dependent:
+    //     evaluated at this substep's pre-integration q. Explicit, like
+    //     the damping (stability: tests_tendon::stiffness_*). The hard
+    //     joint limits are untouched. Not muscle effort: the env never
+    //     adds it to Body::tau (energy price / torque telemetry).
+    if let Some(pw) = &model.passive_wrist {
+        let tp = pw.eval(model.limits, &st.q);
+        for (s, &(jb, jd)) in pw.hands.iter().enumerate() {
+            let (tb, td, r) = tp[s];
+            ws.rhs[voff + jb] = (tau_act[jb] + tb) - model.damping[jb] * st.v[voff + jb]
+                - ws.c[voff + jb];
+            ws.rhs[voff + jd] = (tau_act[jd] + td) - model.damping[jd] * st.v[voff + jd]
+                - ws.c[voff + jd];
+            ws.tendon[s] = [tb, td, r];
+        }
+    }
     // 4b (harness only): current-velocity part of the implicit damping
     if let Some(d) = implicit_damp {
         for j in 0..model.nq {

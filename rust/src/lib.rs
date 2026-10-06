@@ -58,7 +58,7 @@ use geom::*;
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
 use dynamics::model::{
-    Model, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
+    Model, TENDON_R0, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
     F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHANK, F_R_SHOULDER,
     F_R_WRIST, HUMANOID, NQ, NV,
 };
@@ -814,6 +814,18 @@ struct Body {
     // act_frac; CUDA computes the identical double sum.
     tau_abs: Real,
     tau_group: [Real; 3],
+    // exp/wrist-tendon telemetry: this tick's passive wrist torque,
+    // summed over its substeps, per hand — [Σ(|τ_bend| + |τ_dev|) L, R
+    // (N·m), substeps in the zone r > R0 L, R, substeps beyond the
+    // ellipse r > 1 L, R]. The tendon is NOT muscle effort: it never
+    // enters `tau` / `tau_abs` (energy price, [torque], replay torque).
+    tendon_tick: [Real; 6],
+    // exp/wrist-tendon TEST/TOOLING switch: false steps the substeps with
+    // HUMANOID_NO_TENDON (identical tables, passive_wrist = None). Default
+    // true; training, bench and replays never touch it (the CUDA kernel
+    // has no switch). For kinematic judge fixtures that pose the wrist
+    // deep in the tendon zone (RawBeatSim.set_passive_wrist).
+    tendon_on: bool,
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -865,6 +877,9 @@ struct Body {
 }
 
 const MODEL: &Model = &HUMANOID;
+/// HUMANOID without the passive wrist tendon (Body::tendon_on = false —
+/// a test/tooling switch only).
+const HUMANOID_NO_TENDON: Model = Model { passive_wrist: None, ..HUMANOID };
 
 impl Body {
     #[cfg(test)]
@@ -900,6 +915,8 @@ impl Body {
             act_group: [0.0; 3],
             tau_abs: 0.0,
             tau_group: [0.0; 3],
+            tendon_tick: [0.0; 6],
+            tendon_on: true,
             tau_axis: [1.0; TAU_FEAT],
             tau_scale: [1.0; NQ],
             escaped: false,
@@ -954,6 +971,7 @@ impl Body {
         self.act_group = [0.0; 3];
         self.tau_abs = 0.0;
         self.tau_group = [0.0; 3];
+        self.tendon_tick = [0.0; 6];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -1055,9 +1073,26 @@ impl Body {
         // bounces back has still stopped being the standing task.
         let mut fell = false;
         let mut tilted = false;
+        self.tendon_tick = [0.0; 6];
+        let model: &Model = if self.tendon_on { MODEL } else { &HUMANOID_NO_TENDON };
+        if !self.tendon_on {
+            self.ws.tendon = [[0.0; 3]; 2]; // step 4c never writes it
+        }
         for _ in 0..self.rate.n_sub {
-            substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
+            substep_constrained(model, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
+            // exp/wrist-tendon telemetry: the passive torque step 4
+            // applied this substep (ws.tendon, [τ_b, τ_d, r] per hand)
+            for h in 0..2 {
+                let [tb, td, r] = self.ws.tendon[h];
+                self.tendon_tick[h] += tb.abs() + td.abs();
+                if r > TENDON_R0 {
+                    self.tendon_tick[2 + h] += 1.0;
+                }
+                if r > 1.0 {
+                    self.tendon_tick[4 + h] += 1.0;
+                }
+            }
 
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
@@ -1303,6 +1338,11 @@ struct Core {
     // (pop_torque; act_sum pattern). Total is the energy-priced quantity.
     tau_sum: [Real; 4],
     tau_ticks: u64,
+    // exp/wrist-tendon telemetry: Σ of Body::tendon_tick over ticks
+    // ([|τ_p| L, R, zone L, R, out L, R]) + the SUBSTEP count, until
+    // popped (pop_tendon; tau_sum pattern). Means are per substep.
+    tendon_sum: [Real; 6],
+    tendon_n: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
@@ -1422,6 +1462,8 @@ impl Core {
             act_ticks: 0,
             tau_sum: [0.0; 4],
             tau_ticks: 0,
+            tendon_sum: [0.0; 6],
+            tendon_n: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
@@ -1879,6 +1921,11 @@ impl Core {
         self.tau_sum[2] += self.body.tau_group[1];
         self.tau_sum[3] += self.body.tau_group[2];
         self.tau_ticks += 1;
+        // exp/wrist-tendon telemetry (never priced)
+        for k in 0..6 {
+            self.tendon_sum[k] += self.body.tendon_tick[k];
+        }
+        self.tendon_n += rate.n_sub as u64;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
@@ -2507,6 +2554,13 @@ impl Core {
         (s, std::mem::replace(&mut self.tau_ticks, 0))
     }
 
+    /// exp/wrist-tendon: (Σ over substeps of [|τ_p| L, |τ_p| R (N·m),
+    /// zone L, zone R, out L, out R], substeps), zeroed.
+    fn pop_tendon(&mut self) -> ([Real; 6], u64) {
+        let s = std::mem::replace(&mut self.tendon_sum, [0.0; 6]);
+        (s, std::mem::replace(&mut self.tendon_n, 0))
+    }
+
     fn pop_pd_hits(&mut self) -> u64 {
         std::mem::replace(&mut self.body.ws.pd_hits, 0)
     }
@@ -2902,6 +2956,16 @@ impl RawBeatSim {
         ]
     }
 
+    /// TEST/TOOLING HOOK (exp/wrist-tendon): switch the passive wrist
+    /// tendon off (False) / back on (True, the default) for this sim.
+    /// For kinematic judge fixtures that pose a wrist deep in the tendon
+    /// zone (bend ±90°) and want the pre-tendon passive wrist; training,
+    /// the bench and replays always run the tendon (the CUDA kernel has
+    /// no switch). Persists across resets.
+    fn set_passive_wrist(&mut self, on: bool) {
+        self.core.body.tendon_on = on;
+    }
+
     /// TEST/TOOLING HOOK (env v10): overwrite the FULL generalized
     /// state — q: 36 position coords (root pos, root quat wxyz, 29
     /// joints), v: 35 velocity coords (root linear world, root angular
@@ -2968,6 +3032,16 @@ impl RawBeatSim {
     fn pop_torque(&mut self) -> (Real, Real, Real, Real, u64) {
         let (s, t) = self.core.pop_torque();
         (s[0], s[1], s[2], s[3], t)
+    }
+
+    /// exp/wrist-tendon telemetry since the last pop: (Σ|τ_p| L, Σ|τ_p|
+    /// R in N·m, zone substeps L, R, beyond-ellipse substeps L, R,
+    /// substeps) — |τ_p| per hand = |τ_bend| + |τ_dev|, zone = r > 0.5,
+    /// beyond = r > 1, every quantity summed per SUBSTEP. CUDA
+    /// `pop_tendon` mirror.
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, u64) {
+        let (s, n) = self.core.pop_tendon();
+        (s[0], s[1], s[2], s[3], s[4], s[5], n)
     }
 
     /// f64 Cholesky pivot-floor engagements since the last pop
@@ -3522,6 +3596,21 @@ impl VecBeatSim {
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
 
+    /// exp/wrist-tendon telemetry summed over all envs since the last
+    /// pop — RawBeatSim.pop_tendon's tuple. CUDA `pop_tendon` mirror.
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 6];
+        let mut n = 0u64;
+        for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_tendon();
+            for k in 0..6 {
+                acc[k] += a[k];
+            }
+            n += t;
+        }
+        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], n)
+    }
+
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
@@ -3657,6 +3746,9 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, not(feature = "f32")))]
 mod mirror_tests;
+
+#[cfg(all(test, not(feature = "f32")))]
+mod tendon_tests;
 
 #[cfg(test)]
 mod env_tests {

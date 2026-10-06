@@ -363,6 +363,21 @@ fn humanoid_tables_are_mirror_symmetric() {
         assert_eq!(FINE_GEAR_MULT[j], FINE_GEAR_MULT[m]);
         assert_eq!(JOINT_EXTRA_N[j], JOINT_EXTRA_N[m]);
     }
+    // exp/wrist-tendon: the two hands' (bend, dev) coordinates are each
+    // other's mirror images, the bend keeps its sign and the dev flips
+    // (so the tendon's limit-normalized u_d is exactly negated, and
+    // E / the bend torque are bit-identical — tendon_tests::
+    // tendon_is_mirror_exact), and the τ_peaks are per-model scalars
+    // shared by both hands by construction.
+    let pw = MODEL.passive_wrist.expect("HUMANOID carries the wrist tendon");
+    for s in 0..2 {
+        let (jb, jd) = pw.hands[s];
+        assert_eq!((MODEL.mirror[jb], MODEL.mirror[jd]), pw.hands[1 - s],
+                   "tendon hands must be a mirror pair");
+        assert_eq!(JOINT_SIGN[jb], 1.0, "bend keeps its sign under the mirror");
+        assert_eq!(JOINT_SIGN[jd], -1.0, "dev flips sign under the mirror");
+    }
+    assert!(pw.tau_peak_bend > 0.0 && pw.tau_peak_dev > 0.0);
     for (k, &(a, b)) in PAIRS.iter().enumerate() {
         let mk = PAIR_MIRROR[k];
         assert_eq!(PAIR_MIRROR[mk], k);
