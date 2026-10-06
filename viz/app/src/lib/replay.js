@@ -516,36 +516,69 @@ export function fkSaber(fk, hand) {
 /** True when both ticks carry the 29 joint rates qAt's Hermite needs. */
 const hasOmega = (ta, tb) =>
   ta.omega?.length >= N_JOINTS && tb.omega?.length >= N_JOINTS;
-/** The joints qAt interpolates as a Hermite: both ARMS, shoulder to wrist
- * (§1.4 joints 3..16). The spine and legs hang off the root, whose velocity
- * is not recorded, and the sim holds the head and the planted feet steady
- * by counter-moving them against it: lerped together with the lerped root
- * their errors cancel, while a Hermite on them alone does not. Measured on
- * a 60 Hz replay decimated to 30 Hz (error at the dropped tick, median):
- * all-joint Hermite cut the blade-tip error 3.9 -> 2.1 cm but moved the head
- * 0.06 -> 0.7 cm and the feet 0.04 -> 0.9 cm; arms only cuts the tip to
- * 1.3 cm and leaves head, chest, wrists and feet as good as the lerp. */
+/** True when both ticks carry the root twist the root Hermite needs. */
+const hasTwist = (ta, tb) => ta.twist?.length >= 6 && tb.twist?.length >= 6;
+/** The joints the ARMS-ONLY fallback (ω but no root twist) interpolates as
+ * a Hermite: shoulder to wrist (§1.4 joints 3..16). The spine and legs hang
+ * off the root, and the sim holds the head and the planted feet steady by
+ * counter-moving them against it: with a lerped root they must be lerped
+ * too, or their errors stop cancelling (60 Hz replay decimated to 30 Hz,
+ * error at the dropped tick, median: an all-joint Hermite on a lerped root
+ * moved the head 0.06 -> 0.7 cm and the feet 0.04 -> 0.9 cm). With the
+ * recorded root twist all 29 joints take the Hermite. */
 export const HERMITE_FIRST = 3, HERMITE_LAST = 16;
+
+// [x, y, z] <- exact left-Jacobian inverse of SO(3) at rotation vector
+// (tx, ty, tz) applied to (vx, vy, vz): the rate of a rotation vector θ
+// whose rotation exp(θ) turns at world angular velocity v.
+//   J⁻¹(θ) v = v − ½ θ×v + (1/|θ|² − (1+cos|θ|)/(2|θ| sin|θ|)) θ×(θ×v)
+function jlInv(tx, ty, tz, vx, vy, vz, o) {
+  const a2 = tx * tx + ty * ty + tz * tz, a = Math.sqrt(a2);
+  const c = a < 1e-4 ? 1 / 12 + a2 / 720 // series: 1/12 + θ²/720 + ...
+    : 1 / a2 - (1 + Math.cos(a)) / (2 * a * Math.sin(a));
+  const cx = ty * vz - tz * vy, cy = tz * vx - tx * vz, cz = tx * vy - ty * vx;
+  const ccx = ty * cz - tz * cy, ccy = tz * cx - tx * cz, ccz = tx * cy - ty * cx;
+  o[0] = vx - 0.5 * cx + c * ccx;
+  o[1] = vy - 0.5 * cy + c * ccy;
+  o[2] = vz - 0.5 * cz + c * ccz;
+}
+const _wb = [0, 0, 0];
 
 /** Interpolated q36 at (tickIdx + u) — THE pose between ticks: the drawn
  * body and sabers, the gauges, the swept ribbon and the tip trail all come
- * from here, so they agree exactly.
+ * from here, so they agree exactly. Every path hits the recorded pose
+ * exactly at the ticks.
  *
- *   root   position lerp, quaternion nlerp (short arc): the root's
- *          velocity is not recorded.
- *   spine, legs  lerp (see HERMITE_FIRST: they move with the root).
- *   arms   cubic Hermite through q_k and q_k+1 with the recorded joint
- *          rates ω_k, ω_k+1 (rad/s) as end tangents, scaled by the tick
- *          length. ω_k is the state's velocity at the same instant as q_k
- *          (the format's q predictor integrates them as a trapezoid —
- *          replay_format._omega_pred), so the curve hits every recorded
- *          angle AND rate and is C1 across ticks: no corners at tick
- *          boundaries, as in the simulated motion. A Hermite can overshoot
- *          within a tick, so each joint is clamped to its limits
- *          (JOINT_LIMITS, which the sim holds to within 0.04°) widened to
- *          include both endpoints — a recorded angle is never moved.
- *          No joint wraps: every range is at most π wide inside (−π, π].
- *          Ticks without ω (older recordings) lerp, exactly as before.
+ * With the recorded root twist and joint rates on both ticks (every
+ * format-2 replay and Flux run; the sim's own velocities at the same
+ * instant as q):
+ *   root position  cubic Hermite with the twist's linear velocity
+ *                  (world frame, m/s; rust Core::rec_twist = body.st.v[0..3])
+ *                  as end tangents, scaled by the tick length.
+ *   root rotation  q(u) = exp(θ(u)) ⊗ q_k: θ a WORLD-frame rotation vector,
+ *                  a cubic Hermite from 0 to Θ = log(q_k+1 ⊗ q_k⁻¹) with
+ *                  tangents ω_k dt and J⁻¹(Θ) ω_k+1 dt, ω the twist's
+ *                  angular velocity (world frame, rad/s; st.v[3..6] — a
+ *                  one-tick finite difference of the recorded quaternions
+ *                  matches its trapezoid at 0.95-0.98 correlation per world
+ *                  axis, and worse in the body frame). So the rotation hits
+ *                  q_k and q_k+1 and turns at exactly ω_k and ω_k+1 there.
+ *   joints (all 29) cubic Hermite through q_k, q_k+1 with the recorded
+ *                  joint rates ω_k, ω_k+1 (rad/s, the format's q predictor
+ *                  pairs them as a trapezoid — replay_format._omega_pred).
+ * The whole body is then C1 across ticks, as in the simulated motion, and
+ * the root and the joints that counter-move against it stay consistent
+ * (dropped-tick error, 60 Hz -> 30 Hz, median: tip 1.31 -> 1.20 cm, head
+ * 0.06 -> 0.02 cm, wrists 0.22 -> 0.07 cm vs the arms-only path).
+ *
+ * Fallbacks, per interval: joint rates but no root twist -> root lerp /
+ * nlerp, Hermite on the arms only (HERMITE_FIRST..LAST); neither -> all
+ * lerp, exactly as before either existed.
+ *
+ * A joint Hermite can overshoot within a tick, so each is clamped to its
+ * limits (JOINT_LIMITS, which the sim holds to within 0.04°) widened to
+ * include both endpoints — a recorded angle is never moved. No joint wraps:
+ * every range is at most π wide inside (−π, π].
  *
  * `out` (optional) is filled and returned instead of a new array. */
 export function qAt(rep, tickIdx, u, out = new Array(36)) {
@@ -571,13 +604,45 @@ export function qAt(rep, tickIdx, u, out = new Array(36)) {
   const h00 = 2 * u3 - 3 * u2 + 1, h01 = 3 * u2 - 2 * u3;
   const h10 = (u3 - 2 * u2 + u) * dt, h11 = (u3 - u2) * dt;
   const wa = ta.omega, wb = tb.omega;
-  for (let j = HERMITE_FIRST; j <= HERMITE_LAST; j++) {
+  const full = hasTwist(ta, tb);
+  const j0 = full ? 0 : HERMITE_FIRST, j1 = full ? N_JOINTS - 1 : HERMITE_LAST;
+  for (let j = j0; j <= j1; j++) {
     const qa = a[7 + j], qb = b[7 + j];
     const v = h00 * qa + h01 * qb + h10 * wa[j] + h11 * wb[j];
     const lim = JOINT_LIMITS[j];
     const lo = Math.min(lim[0], qa, qb), hi = Math.max(lim[1], qa, qb);
     out[7 + j] = v < lo ? lo : v > hi ? hi : v;
   }
+  if (!full) return out;
+  const va = ta.twist, vb = tb.twist;
+  for (let i = 0; i < 3; i++)
+    out[i] = h00 * a[i] + h01 * b[i] + h10 * va[i] + h11 * vb[i];
+  // Θ = log(q_b ⊗ q_a⁻¹) (world), on the short arc
+  const aw = a[3], ax = a[4], ay = a[5], az = a[6];
+  const bw = s * b[3], bx = s * b[4], by = s * b[5], bz = s * b[6];
+  // q_b ⊗ conj(q_a)
+  const dw = bw * aw + bx * ax + by * ay + bz * az;
+  const dx = -bw * ax + bx * aw - by * az + bz * ay;
+  const dy = -bw * ay + bx * az + by * aw - bz * ax;
+  const dz = -bw * az - bx * ay + by * ax + bz * aw;
+  const vn = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const ang = 2 * Math.atan2(vn, dw); // dw >= 0 on the short arc
+  const f = vn < 1e-12 ? 2 : ang / vn;
+  const Tx = f * dx, Ty = f * dy, Tz = f * dz;
+  jlInv(Tx, Ty, Tz, vb[3], vb[4], vb[5], _wb);
+  const tx = h01 * Tx + h10 * va[3] + h11 * _wb[0];
+  const ty = h01 * Ty + h10 * va[4] + h11 * _wb[1];
+  const tz = h01 * Tz + h10 * va[5] + h11 * _wb[2];
+  // q = exp(θ) ⊗ q_a, normalised
+  const th = Math.sqrt(tx * tx + ty * ty + tz * tz);
+  const ew = Math.cos(th / 2), k = th < 1e-12 ? 0.5 : Math.sin(th / 2) / th;
+  const ex = k * tx, ey = k * ty, ez = k * tz;
+  const qw = ew * aw - ex * ax - ey * ay - ez * az;
+  const qx = ew * ax + ex * aw + ey * az - ez * ay;
+  const qy = ew * ay - ex * az + ey * aw + ez * ax;
+  const qz = ew * az + ex * ay - ey * ax + ez * aw;
+  const qn = Math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) || 1;
+  out[3] = qw / qn; out[4] = qx / qn; out[5] = qy / qn; out[6] = qz / qn;
   return out;
 }
 

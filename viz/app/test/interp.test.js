@@ -6,6 +6,7 @@
 // IS the tip line, and both end on the drawn blade.
 // Run: node test/interp.test.js
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import * as R from "../src/lib/replay.js";
 import { BASE, RIBBON_S, TIP, createBladeTrail } from "../src/lib/bladetrail.js";
 import { FIXTURE, readReplayFile } from "./fixture.js";
@@ -16,19 +17,25 @@ assert.ok(rep.ticks.every((t) => t.omega?.length === 29), "fixture carries ω");
 const near = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg}: ${a} vs ${b}`);
 
 // a synthetic replay: joints mid-range, smooth-ish random rates (no clamps)
-function synth({ omega = true, hzS = 30 } = {}) {
+function synth({ omega = true, twist = false, hzS = 30 } = {}) {
   let seed = 7;
   const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
   const ticks = [];
   for (let k = 0; k < 40; k++) {
-    const q = [0.1 * k, 1, -0.5, 1, 0, 0, 0];
+    // a root that turns ~0.08 rad per tick about a wandering axis
+    const ax = [Math.sin(0.2 * k), 1, Math.cos(0.3 * k)], an = Math.hypot(...ax);
+    const ang = 0.08 * k, sh = Math.sin(ang / 2) / an;
+    const q = [0.1 * k, 1, -0.5, Math.cos(ang / 2), ax[0] * sh, ax[1] * sh, ax[2] * sh];
     const w = [];
     for (let j = 0; j < 29; j++) {
       const [lo, hi] = R.JOINT_LIMITS[j];
       q.push((lo + hi) / 2 + 0.15 * (hi - lo) * Math.sin(0.3 * k + j));
       w.push(2 * rnd());
     }
-    ticks.push(omega ? { q, omega: w } : { q });
+    const t = { q };
+    if (omega) t.omega = w;
+    if (twist) t.twist = [3, 0.5, -1, 2.4, -1, 1.5].map((s) => s * (1 + 0.5 * rnd()));
+    ticks.push(t);
   }
   return { tickHz: hzS, ticks };
 }
@@ -121,6 +128,84 @@ for (const r of [rep, synth()]) {
   assert.deepEqual(out, R.qAt(rep, 10, 0.4));
 }
 
+// ---- the full path: root Hermite with the recorded twist, all 29 joints ----
+const qmul = (a, b) => [a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+  a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+  a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+  a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0]];
+const conj = (q) => [q[0], -q[1], -q[2], -q[3]];
+const qlog = (q) => {
+  const s = q[0] < 0 ? -1 : 1, v = [s * q[1], s * q[2], s * q[3]];
+  const n = Math.hypot(...v), a = 2 * Math.atan2(n, s * q[0]);
+  return n < 1e-15 ? v.map((x) => 2 * x) : v.map((x) => (x * a) / n);
+};
+const rot = (q) => q.slice(3, 7);
+{
+  const r = synth({ twist: true }), d = 1 / r.tickHz, h = 1e-6, n = r.ticks.length;
+  for (let k = 1; k < n - 1; k++) {
+    const t = r.ticks[k];
+    // exact at the ticks: position and rotation from both sides
+    for (const q of [R.qAt(r, k, 0), R.qAt(r, k - 1, 1)]) {
+      for (let i = 0; i < 3; i++) near(q[i], t.q[i], 1e-12, `root position at tick ${k}`);
+      near(Math.hypot(...qlog(qmul(rot(q), conj(rot(t.q))))), 0, 1e-9, `root rotation at tick ${k}`);
+    }
+    // the tangents at the ticks are the recorded twist, from both sides:
+    // linear velocity (m/s) and WORLD angular velocity (rad/s)
+    const after = R.qAt(r, k, h), before = R.qAt(r, k - 1, 1 - h), at0 = R.qAt(r, k, 0);
+    for (let i = 0; i < 3; i++) {
+      near((after[i] - at0[i]) / (h * d), t.twist[i], 1e-4, `v after tick ${k}`);
+      near((at0[i] - before[i]) / (h * d), t.twist[i], 1e-4, `v before tick ${k}`);
+    }
+    const wA = qlog(qmul(rot(after), conj(rot(at0)))).map((x) => x / (h * d));
+    const wB = qlog(qmul(rot(at0), conj(rot(before)))).map((x) => x / (h * d));
+    for (let i = 0; i < 3; i++) {
+      near(wA[i], t.twist[3 + i], 1e-4, `ω after tick ${k} axis ${i}`);
+      near(wB[i], t.twist[3 + i], 1e-4, `ω before tick ${k} axis ${i}`);
+    }
+    // all 29 joints are Hermite now (spine and legs included), C1
+    for (let j = 0; j < 29; j++) {
+      const want = t.omega[j] * d;
+      near((after[7 + j] - at0[7 + j]) / h, want, 1e-4, `joint ${j} slope after tick ${k}`);
+      near((at0[7 + j] - before[7 + j]) / h, want, 1e-4, `joint ${j} slope before tick ${k}`);
+    }
+  }
+  // a unit quaternion everywhere in between
+  for (const u of [0.1, 0.5, 0.93]) near(Math.hypot(...rot(R.qAt(r, 9, u))), 1, 1e-12, "unit");
+}
+
+// ---- fallback coverage ----------------------------------------------------------
+{
+  const a = synth({ twist: true }), c = synth({ omega: false, twist: true });
+  const b = { ...a, ticks: a.ticks.map(({ twist, ...t }) => t) }; // same ticks, no twist
+  // twist on one tick only: that interval takes the arms-only path
+  const mixed = synth({ twist: true });
+  delete mixed.ticks[6].twist;
+  const half = R.qAt(mixed, 5, 0.4), armsOnly = R.qAt(b, 5, 0.4);
+  for (let i = 0; i < 36; i++) assert.equal(half[i], armsOnly[i], "one tick without twist: arms-only");
+  const ok = R.qAt(mixed, 7, 0.4), full = R.qAt(a, 7, 0.4);
+  for (let i = 0; i < 36; i++) assert.equal(ok[i], full[i], "the next interval is full again");
+  // twist but no ω: everything lerps
+  const lin = R.qAt(c, 3, 0.6);
+  for (let i = 0; i < 3; i++) assert.equal(lin[i], R.lerp(c.ticks[3].q[i], c.ticks[4].q[i], 0.6));
+  for (let i = 7; i < 36; i++) assert.equal(lin[i], R.lerp(c.ticks[3].q[i], c.ticks[4].q[i], 0.6));
+}
+// the committed fixtures take the full path: a format-2 replay and a Flux run
+{
+  const flux = R.parseReplay(readFileSync(new URL("./fixtures/flux_scripted.jsonl", import.meta.url), "utf8"));
+  for (const [name, r] of [["format-2 fixture", rep], ["Flux fixture", flux]]) {
+    assert.ok(r.ticks.every((t) => t.twist?.length === 6 && t.omega?.length === 29), `${name} carries twist + ω`);
+    // a spine joint (lerped on the arms-only path) follows its Hermite
+    const k = 40, a = r.ticks[k], b = r.ticks[k + 1], d = 1 / R.tickHzOf(r);
+    const want = (a.q[7] + b.q[7]) / 2 + (d / 8) * (a.omega[0] - b.omega[0]);
+    const lim = R.JOINT_LIMITS[0];
+    const lo = Math.min(lim[0], a.q[7], b.q[7]), hi = Math.max(lim[1], a.q[7], b.q[7]);
+    near(R.qAt(r, k, 0.5)[7], Math.min(hi, Math.max(lo, want)), 1e-12, `${name}: spine on the full path`);
+  }
+  // human (WebXR) runs carry no body: the scene draws them from the palms
+  // and head (humanPalmsAt / humanHeadAt) and never calls qAt
+  assert.equal(R.isHuman({ ticks: [], player: "human" }), true, "the gate Scene.svelte uses");
+}
+
 // ---- the shared blade history on the fixture -----------------------------------
 const hl = R.handleLen(rep);
 const drawnTip = (cur, s) => { // Scene.svelte + Saber.svelte: the drawn blade
@@ -183,5 +268,6 @@ const F32 = 2e-6; // float32 storage of world coords (~2 m)
   assert.equal(bt.trail.ring.fills, fills + 1, "a new replay refills");
 }
 
-console.log(`interp OK: Hermite exact at ticks, C1, clamped, linear without ω; ` +
+console.log(`interp OK: root + joint Hermite exact at ticks, tangents = twist / ω, ` +
+  `fallbacks (arms-only, linear), clamped; ` +
   `ribbon edge == tip line == drawn blade`);

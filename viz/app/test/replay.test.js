@@ -436,16 +436,21 @@ const v15 = parseReplay(v15Text);
   assert.ok(hi - lo > 0.002,
     `head-anchored offset never moves (${hi - lo} m)`);
 
-  // interpolated ticks come from the interpolated pose, and stay bracketed
-  // to within 1 mm: FK of a slerped pose is not linear in the endpoints,
-  // so the head can overshoot its tick-end values by a fraction of a mm
-  // (0.2 mm worst in the committed Flux fixture)
-  for (let k = 0; k + 1 < v15.ticks.length; k += 7) {
+  // interpolated ticks come from the interpolated pose, and stay close to
+  // their bracket. Since qAt follows the recorded velocities (root twist +
+  // joint rates, a C1 curve through every tick) the head may legitimately
+  // swing a little past both tick values within a tick, as the simulated
+  // head does: in the committed Flux fixture 1 of 270 midpoints leaves the
+  // bracket by more than 1 mm, by 1.7 mm at worst (0.2 mm when everything
+  // was lerped). 2.5 mm catches a wrong velocity frame or scale, which
+  // throws the head centimetres off.
+  for (let k = 0; k + 1 < v15.ticks.length; k++) {
     const a = trackOffset(v15, k), b = trackOffset(v15, k + 1);
     const m = trackOffset(v15, k, 0.5);
-    assert.ok(m >= Math.min(a, b) - 1e-3 && m <= Math.max(a, b) + 1e-3,
+    assert.ok(m >= Math.min(a, b) - 2.5e-3 && m <= Math.max(a, b) + 2.5e-3,
       `interpolated z_off outside its bracket at ${k}`);
-    assert.equal(m, bodyFK(qAt(v15, k, 0.5)).p[F_HEAD][2] - PLANE_Z0);
+    if (k % 7 === 0)
+      assert.equal(m, bodyFK(qAt(v15, k, 0.5)).p[F_HEAD][2] - PLANE_Z0);
   }
 
   // rendered z = base + z_off for EVERY flying object at several ticks
