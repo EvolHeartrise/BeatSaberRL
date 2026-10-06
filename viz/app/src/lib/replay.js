@@ -513,12 +513,45 @@ export function fkSaber(fk, hand) {
   return [w[0], w[1], w[2], r[0][2], r[1][2], r[2][2]];
 }
 
-/** Interpolated q36 at (tickIdx + u): root position and joints lerp,
- * root quaternion nlerp (short arc). */
-export function qAt(rep, tickIdx, u) {
-  const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].q;
-  const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].q;
-  const out = new Array(36);
+/** True when both ticks carry the 29 joint rates qAt's Hermite needs. */
+const hasOmega = (ta, tb) =>
+  ta.omega?.length >= N_JOINTS && tb.omega?.length >= N_JOINTS;
+/** The joints qAt interpolates as a Hermite: both ARMS, shoulder to wrist
+ * (§1.4 joints 3..16). The spine and legs hang off the root, whose velocity
+ * is not recorded, and the sim holds the head and the planted feet steady
+ * by counter-moving them against it: lerped together with the lerped root
+ * their errors cancel, while a Hermite on them alone does not. Measured on
+ * a 60 Hz replay decimated to 30 Hz (error at the dropped tick, median):
+ * all-joint Hermite cut the blade-tip error 3.9 -> 2.1 cm but moved the head
+ * 0.06 -> 0.7 cm and the feet 0.04 -> 0.9 cm; arms only cuts the tip to
+ * 1.3 cm and leaves head, chest, wrists and feet as good as the lerp. */
+export const HERMITE_FIRST = 3, HERMITE_LAST = 16;
+
+/** Interpolated q36 at (tickIdx + u) — THE pose between ticks: the drawn
+ * body and sabers, the gauges, the swept ribbon and the tip trail all come
+ * from here, so they agree exactly.
+ *
+ *   root   position lerp, quaternion nlerp (short arc): the root's
+ *          velocity is not recorded.
+ *   spine, legs  lerp (see HERMITE_FIRST: they move with the root).
+ *   arms   cubic Hermite through q_k and q_k+1 with the recorded joint
+ *          rates ω_k, ω_k+1 (rad/s) as end tangents, scaled by the tick
+ *          length. ω_k is the state's velocity at the same instant as q_k
+ *          (the format's q predictor integrates them as a trapezoid —
+ *          replay_format._omega_pred), so the curve hits every recorded
+ *          angle AND rate and is C1 across ticks: no corners at tick
+ *          boundaries, as in the simulated motion. A Hermite can overshoot
+ *          within a tick, so each joint is clamped to its limits
+ *          (JOINT_LIMITS, which the sim holds to within 0.04°) widened to
+ *          include both endpoints — a recorded angle is never moved.
+ *          No joint wraps: every range is at most π wide inside (−π, π].
+ *          Ticks without ω (older recordings) lerp, exactly as before.
+ *
+ * `out` (optional) is filled and returned instead of a new array. */
+export function qAt(rep, tickIdx, u, out = new Array(36)) {
+  const ta = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)];
+  const tb = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)];
+  const a = ta.q, b = tb.q;
   for (let i = 0; i < 3; i++) out[i] = lerp(a[i], b[i], u);
   // nlerp with sign fix (short arc)
   let dot = 0;
@@ -532,6 +565,19 @@ export function qAt(rep, tickIdx, u) {
   n = Math.sqrt(n) || 1;
   for (let i = 3; i < 7; i++) out[i] /= n;
   for (let i = 7; i < 36; i++) out[i] = lerp(a[i], b[i], u);
+  if (ta === tb || u === 0 || !hasOmega(ta, tb)) return out;
+  // Hermite basis; the tangents are ω * dt (dt = this replay's tick length)
+  const dt = 1 / tickHzOf(rep), u2 = u * u, u3 = u2 * u;
+  const h00 = 2 * u3 - 3 * u2 + 1, h01 = 3 * u2 - 2 * u3;
+  const h10 = (u3 - 2 * u2 + u) * dt, h11 = (u3 - u2) * dt;
+  const wa = ta.omega, wb = tb.omega;
+  for (let j = HERMITE_FIRST; j <= HERMITE_LAST; j++) {
+    const qa = a[7 + j], qb = b[7 + j];
+    const v = h00 * qa + h01 * qb + h10 * wa[j] + h11 * wb[j];
+    const lim = JOINT_LIMITS[j];
+    const lo = Math.min(lim[0], qa, qb), hi = Math.max(lim[1], qa, qb);
+    out[7 + j] = v < lo ? lo : v > hi ? hi : v;
+  }
   return out;
 }
 
@@ -1010,7 +1056,9 @@ export function lerpAng(a, b, u) {
 
 /** Interpolated 6-field saber [wx,wy,wz,bx,by,bz] at (tickIdx + u):
  * wrist lerped, blade lerp-normalized — from the tick sabers (FK of the
- * tick's q; the skeleton uses bodyFK(qAt(...)), which agrees at ticks). */
+ * tick's q). Agrees with the drawn blade (bodyFK(qAt(...))) only AT
+ * ticks; nothing drawn uses it any more (the ribbon and tip trail sample
+ * the drawn pose, lib/bladetrail.js). */
 export function saberAt(rep, tickIdx, u, s) {
   const a = rep.ticks[Math.min(tickIdx, rep.ticks.length - 1)].sabers[s];
   const b = rep.ticks[Math.min(tickIdx + 1, rep.ticks.length - 1)].sabers[s];
