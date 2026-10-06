@@ -1,0 +1,115 @@
+/* Tailwind + shadcn-svelte for the control bar ONLY (ControlBar.svelte and
+ * the shadcn components under lib/components/ui), the same stack as the
+ * records site (viz/site: Tailwind 4, bits-ui, zinc tokens, "vega" style).
+ *
+ * Nothing here may restyle the rest of the viewer — the 3D canvas, the
+ * gauges overlay, the map card, the pose panel, the HUD:
+ *   - no Tailwind preflight. Its global element resets (svg/canvas
+ *     display:block, button/heading/list resets, border-box everywhere...)
+ *     would reach every one of those. A copy of the parts the shadcn
+ *     components rely on is scoped to `.ui` below instead; the bar and the
+ *     portalled tooltip / popover content carry that class.
+ *   - source(none) + explicit @source: utilities are generated from the
+ *     shadcn components and the control bar alone, never from a word that
+ *     happens to appear in the scene code or another component's markup
+ *     (a `class="hidden"` / `"grid"` / `"block"` elsewhere stays inert).
+ *   - the theme layer only declares custom properties on :root.
+ */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+@import "tw-animate-css";
+@import "shadcn-svelte/tailwind.css";
+
+@source "./lib/components/ui";
+@source "./lib/ControlBar.svelte";
+@source "./lib/BarTip.svelte";
+
+/* the viewer is dark-only: index.html puts .dark on <html>, as mode-watcher
+   does on the records site, so the components' dark: variants apply */
+@custom-variant dark (&:is(.dark *));
+
+/* shadcn-svelte zinc, dark values (viz/site/src/app.css `.dark`), plus the
+   viewer's own accent for "on" states (the blue the old bar lit toggles
+   with) */
+:root {
+	--background: oklch(0.141 0.005 285.823);
+	--foreground: oklch(0.985 0 0);
+	--card: oklch(0.21 0.006 285.885);
+	--card-foreground: oklch(0.985 0 0);
+	--popover: oklch(0.21 0.006 285.885);
+	--popover-foreground: oklch(0.985 0 0);
+	--primary: oklch(0.92 0.004 286.32);
+	--primary-foreground: oklch(0.21 0.006 285.885);
+	--secondary: oklch(0.274 0.006 286.033);
+	--secondary-foreground: oklch(0.985 0 0);
+	--muted: oklch(0.274 0.006 286.033);
+	--muted-foreground: oklch(0.705 0.015 286.067);
+	--accent: oklch(0.274 0.006 286.033);
+	--accent-foreground: oklch(0.985 0 0);
+	--destructive: oklch(0.704 0.191 22.216);
+	--border: oklch(1 0 0 / 10%);
+	--input: oklch(1 0 0 / 15%);
+	--ring: oklch(0.552 0.016 285.938);
+	--radius: 0.625rem;
+	--on: #7aa2f7;
+}
+
+@theme inline {
+	--color-ring: var(--ring);
+	--color-input: var(--input);
+	--color-border: var(--border);
+	--color-destructive: var(--destructive);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-accent: var(--accent);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-muted: var(--muted);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-secondary: var(--secondary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-primary: var(--primary);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-popover: var(--popover);
+	--color-card-foreground: var(--card-foreground);
+	--color-card: var(--card);
+	--color-foreground: var(--foreground);
+	--color-background: var(--background);
+	--color-on: var(--on);
+	--radius-sm: calc(var(--radius) * 0.6);
+	--radius-md: calc(var(--radius) * 0.8);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) * 1.4);
+}
+
+/* the slice of Tailwind's preflight the components assume, scoped to .ui
+   (zero specificity, base layer: any utility still wins) */
+@layer base {
+	:where(.ui, .ui *),
+	:where(.ui, .ui *)::before,
+	:where(.ui, .ui *)::after {
+		box-sizing: border-box;
+		margin: 0;
+		padding: 0;
+		border: 0 solid var(--color-border);
+		outline-color: color-mix(in oklab, var(--color-ring) 50%, transparent);
+	}
+	:where(.ui) {
+		font: 14px/1.4 system-ui, sans-serif;
+		color: var(--color-foreground);
+		-webkit-tap-highlight-color: transparent;
+	}
+	:where(.ui) :where(button, input, select, kbd) {
+		font: inherit;
+		color: inherit;
+		letter-spacing: inherit;
+		background-color: transparent;
+		border-radius: 0;
+	}
+	:where(.ui) :where(button) {
+		cursor: pointer;
+	}
+	:where(.ui) :where(svg) {
+		display: block;
+		vertical-align: middle;
+	}
+}

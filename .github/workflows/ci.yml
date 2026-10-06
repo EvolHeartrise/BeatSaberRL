@@ -116,6 +116,7 @@ jobs:
           PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
         run: |
           node test/browser.test.js
+          node test/controls-browser.mjs
           node test/flux-browser.mjs
           node test/flux-play-browser.mjs
           node test/flux-xr-browser.mjs

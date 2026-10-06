@@ -1,5 +1,7 @@
 import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import tailwindcss from "@tailwindcss/vite";
 import { viteSingleFile } from "vite-plugin-singlefile";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 
@@ -17,10 +19,15 @@ import basicSsl from "@vitejs/plugin-basic-ssl";
 // dist-site/ — __SITE__ switches off the Flux game + Flux replays, pose mode
 // and the file-picker button (src/lib/build.js), and the gated code is
 // tree-shaken out of that bundle.
+//
+// Tailwind serves the control bar's shadcn-svelte components only and is
+// scoped in src/app.css (no preflight; utilities from the bar's own files).
+// $lib is the alias the generated components import through.
 export default defineConfig(({ mode }) => ({
   base: "./",
   define: { __SITE__: JSON.stringify(mode === "site") },
-  plugins: [svelte(), viteSingleFile(), ...(mode === "xr" ? [basicSsl()] : [])],
+  resolve: { alias: { $lib: fileURLToPath(new URL("./src/lib", import.meta.url)) } },
+  plugins: [tailwindcss(), svelte(), viteSingleFile(), ...(mode === "xr" ? [basicSsl()] : [])],
   server: mode === "xr" ? { host: true } : {},
   build: {
     chunkSizeWarningLimit: 2048,
