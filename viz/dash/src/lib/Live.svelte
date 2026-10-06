@@ -142,8 +142,8 @@
   .status { font-size: 13px; color: var(--muted); margin: 4px 0 10px; }
   .status b { color: var(--fg); }
   .game { background: #8b5cf6; color: #fff; border-radius: 4px; padding: 0 5px; margin-left: 4px; font-size: 11px; font-weight: 700; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 10px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 8px; }
+  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px 2px; min-width: 0; }
   .xmode button.on, .win button.on { background: var(--accent); color: #fff; }
   .win input { width: 6em; }
   select { max-width: 52vw; }

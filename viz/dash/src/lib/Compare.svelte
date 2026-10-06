@@ -200,6 +200,10 @@
   .flux { color: #8b5cf6; font-size: 10px; }
   .layout { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
   aside { border-right: 1px solid var(--border); padding-right: 10px; }
+  /* grid items may shrink below their content (wide table, long inputs):
+     those scroll in place instead of widening the page at narrow widths */
+  aside, main { min-width: 0; }
+  .bar input { max-width: 100%; box-sizing: border-box; }
   aside > input { width: 100%; box-sizing: border-box; }
   .list { max-height: 75vh; overflow: auto; margin: 6px 0; font-size: 12px; }
   .list label { display: flex; gap: 6px; align-items: center; padding: 2px 2px; cursor: pointer; }
@@ -209,8 +213,8 @@
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 5px; margin-right: 6px; border: 1px solid var(--border); }
   .bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 6px 0; }
   .xmode button.on { background: var(--accent); color: #fff; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 10px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); gap: 8px; }
+  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px 2px; min-width: 0; }
   h3 { margin: 14px 0 6px; font-size: 14px; }
   .tablewrap { overflow-x: auto; }
   table { border-collapse: collapse; font-size: 12px; }
