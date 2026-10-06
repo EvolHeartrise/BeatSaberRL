@@ -25,7 +25,7 @@ def test_peaks_and_pure_axis():
     assert C.TENDON_TAU_PEAK_DEV == pytest.approx(0.32500, abs=5e-6)
     # per-joint zone starts (centring terms on the 0.5-onset ellipse):
     # pure axis tau = -sign(u) tau_peak ((|u| - s)/(1 - s))^2_+
-    assert (C.TENDON_S_BEND, C.TENDON_S_DEV) == (0.1, 0.0)
+    assert (C.TENDON_S_BEND, C.TENDON_S_DEV) == (0.0, 0.0)
 
     def ramp(u, tp, s0):
         a = abs(u)
@@ -46,9 +46,9 @@ def test_peaks_and_pure_axis():
             assert tb == 0.0 and td == pytest.approx(want, abs=1e-14)
     # the 70/70 points (left wrist; -30 deg dev side / +15 deg side)
     tb, td, _ = C.wrist_tendon(0.7 * LIM[8][1], 0.7 * LIM[9][0], LIM[8], LIM[9])
-    assert (tb, td) == pytest.approx((-0.4804, 0.7013), abs=1e-4)
+    assert (tb, td) == pytest.approx((-0.5087, 0.7013), abs=1e-4)
     tb, td, _ = C.wrist_tendon(0.7 * LIM[8][1], 0.7 * LIM[9][1], LIM[8], LIM[9])
-    assert (tb, td) == pytest.approx((-0.4687, -1.1487), abs=1e-4)
+    assert (tb, td) == pytest.approx((-0.4970, -1.1487), abs=1e-4)
 
 
 def test_mirror_and_corners():

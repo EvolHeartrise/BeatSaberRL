@@ -72,9 +72,9 @@ fn tendon_peaks_are_030_of_the_default_body() {
     assert_eq!(pw.hands, [(LB, LD), (RB, RD)]);
 }
 
-/// u_d = 0: τ_b = −sign·τ_peak·((|u_b| − s_b)/(1 − s_b))², zero below
-/// the bend zone start s_b = 0.1, τ_peak at the limit, no dev torque;
-/// likewise for dev (s_d = 0: τ = −sign·τ_peak·u_d² from 0) on both sides
+/// u_d = 0: τ_b = −sign·τ_peak·((|u_b| − s_b)/(1 − s_b))² with the bend
+/// zone start s_b = 0 (τ_peak_b·u_b² from neutral), τ_peak at the limit,
+/// no dev torque; likewise for dev (s_d = 0) on both sides
 /// of both hands (asymmetric 30°/15° limits). The elliptical term (onset
 /// r = 0.5) plus the per-joint centring term (tendon_centring) give
 /// exactly this ramp on a pure axis, past the stops too.
@@ -94,9 +94,6 @@ fn tendon_pure_axis() {
             let (tb, td, r) = f(q, 0.0);
             assert_eq!(td, 0.0);
             assert!((r - u.abs()).abs() < 1e-15);
-            if u.abs() < 0.1 {
-                assert_eq!(tb, 0.0, "bend inside its zone start");
-            }
             let want = ramp(u, TENDON_TAU_PEAK_BEND, TENDON_S_BEND);
             worst = worst.max((tb - want).abs());
             assert!((tb - want).abs() <= 1e-14 * (1.0 + want.abs()), "bend u={u}: {tb} vs {want}");
@@ -119,10 +116,11 @@ fn tendon_pure_axis() {
     assert!((at[1] - TENDON_TAU_PEAK_BEND).abs() < 1e-14);
     assert!((at[2] + TENDON_TAU_PEAK_DEV).abs() < 1e-14);
     assert!((at[3] - TENDON_TAU_PEAK_DEV).abs() < 1e-14);
-    // onsets: bend at 10 % of the range, dev immediately
-    assert_eq!(tl(0.1 * b_hi, 0.0).0, 0.0);
-    assert!(tl(0.1 * b_hi + 1e-6, 0.0).0 < 0.0);
+    // onsets: both joints centre from neutral (zone starts 0)
+    assert_eq!((TENDON_S_BEND, TENDON_S_DEV), (0.0, 0.0));
+    assert!(tl(1e-6, 0.0).0 < 0.0 && tl(-1e-6, 0.0).0 > 0.0);
     assert!(tl(0.0, 1e-6).1 < 0.0 && tl(0.0, -1e-6).1 > 0.0);
+    assert_eq!(tl(0.0, 0.0), (0.0, 0.0, 0.0));
     // pure-axis table (left wrist): bend / dev at fractions of the range
     for f in [0.1, 0.25, 0.5, 0.75, 1.0] {
         let (tb, _, _) = tl(f * b_hi, 0.0);
@@ -228,7 +226,7 @@ fn tendon_is_continuous_across_sign_boundaries() {
     let dhi = HUMANOID_LIMITS[LD].1;
     let h = 1e-7;
     for (name, f) in [
-        ("bend a=s_b", (|d: Real| tl((TENDON_S_BEND + d) * HUMANOID_LIMITS[LB].1, 0.0).0) as fn(Real) -> Real),
+        ("bend a=s_b (=0, across q=0)", (|d: Real| tl((TENDON_S_BEND + d) * HUMANOID_LIMITS[LB].1, 0.0).0) as fn(Real) -> Real),
         ("bend a=0.5", |d: Real| tl((0.5 + d) * HUMANOID_LIMITS[LB].1, 0.0).0),
         ("dev a=0.5", |d: Real| tl(0.0, (0.5 + d) * HUMANOID_LIMITS[LD].1).1),
     ] {
@@ -453,8 +451,14 @@ fn variant(gravity: bool, joint_damping: bool, caps: bool, edge: bool) -> Model 
 ///     symplectic, and the stiff tendon shows its first-order energy
 ///     drift as a SECULAR gain (from the 55 %-corner start: see the printed rates) that
 ///     halves with h — integration error, asserted to converge.
-/// (3) The same with ONLY the edge damping on (issue #61): the gain is
-///     gone — energy never exceeds E0 and is dissipated, at every h.
+/// (3) The same with ONLY the edge damping on (issue #61): net
+///     dissipative at every h (ends below half of E0). Since the zone
+///     starts moved to 0 (centring torques active everywhere, edge
+///     damping still only for r > 0.5), the undamped hand also swings
+///     through the central region, where the explicit centring spring's
+///     small first-order gain is not damped: a transient excess of < 1 %
+///     of E0 at 1/240, shrinking with h (asserted < 2 %). The real body's
+///     joint damping removes it ((1): E never exceeds E0).
 #[test]
 fn tendon_release_energy() {
     for (h, label) in [(H_SUB, "1/240"), (H_SUB * 0.5, "1/480")] {
@@ -478,7 +482,8 @@ fn tendon_release_energy() {
         let (e0, emax, e1, t, rate) = release(&edge, 0.55, h, 1.0);
         println!("  + edge damping:    {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
                   drift {rate:+.4} J/s", );
-        assert!(emax <= e0 * (1.0 + 1e-9), "edge damping: energy rose {e0} -> {emax}");
+        println!("    transient excess {:+.2e} J ({:.2} % of E0)", emax - e0, 100.0 * (emax - e0) / e0);
+        assert!(emax <= e0 * 1.02, "edge damping: energy rose {e0} -> {emax}");
         assert!(e1 < 0.5 * e0, "edge damping does not dissipate: {e0} -> {e1}");
     }
     for k in 1..gains.len() {

@@ -1887,7 +1887,7 @@ __device__ __forceinline__ T tendon_edge_x2(T r) {
 
 // Per-joint zone starts of the additive centring terms (model.rs
 // TENDON_S_BEND / TENDON_S_DEV, 2026-10-05)
-constexpr double TENDON_S_BEND = 0.1;
+constexpr double TENDON_S_BEND = 0.0;
 constexpr double TENDON_S_DEV = 0.0;
 
 // model.rs tendon_centring, verbatim tree
@@ -1919,7 +1919,7 @@ __device__ __forceinline__ void wrist_tendon(T qb, T qd, T blo, T bhi,
   r_out = r;
   // per-joint CENTRING torques, additive (model.rs tendon_centring): a
   // pure axis totals tau_peak ((|u| - s)/(1 - s))^2_+ with zone starts
-  // bend 0.1, dev 0; zero at the limit (corners unchanged)
+  // bend 0, dev 0; zero at the limit (corners unchanged)
   const T tcb = tendon_centring(qb, ub, T(TENDON_TAU_PEAK_BEND), T(TENDON_S_BEND));
   const T tcd = tendon_centring(qd, ud, T(TENDON_TAU_PEAK_DEV), T(TENDON_S_DEV));
   tb = tcb;

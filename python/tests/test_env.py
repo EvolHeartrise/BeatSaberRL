@@ -560,7 +560,10 @@ def _whip_events(kind=0, ticks=60):
     # windup is 13 ticks and both kinds use hit 0.75 (swept: the regular
     # note lands 70 pre + 30 post there, the chain head 70 pre, no post).
     # 0.75 -> 0.7 (exp/wrist-tendon edge damping, issue #61: see windup)
-    hit = 0.7
+    # 0.7 -> 0.65 (zone starts 0 on both wrist joints, 2026-10-05: swept
+    # hit 0.65-0.85 x windup 8-15 again; 0.65 / 9 is the only cell where
+    # the regular note lands 70 + 30 and the chain head 70+)
+    hit = 0.65
     sim = _sim_with_note(_note(hit, 2, 1, kind=kind), max_steps=300)
     # env v20: the whip is hand-tuned against the zero-arm start
     _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)

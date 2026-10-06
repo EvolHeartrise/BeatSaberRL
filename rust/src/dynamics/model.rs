@@ -85,7 +85,7 @@ pub struct Model {
 /// On a pure axis this is exactly τ = −sign(u)·τ_peak·((|u| − R0)/(1 − R0))²:
 /// zero inside half the range, τ_peak at the limit. PLUS (2026-10-05)
 /// additive per-joint centring terms (`tendon_centring`) that move each
-/// joint's pure-axis zone start to s_j (bend 0.1, dev 0): pure axis
+/// joint's pure-axis zone start to s_j (bend 0, dev 0): pure axis
 /// τ = −sign·τ_peak·((|u| − s)/(1 − s))²₊, corners unchanged. τ_peak is FIXED in
 /// N·m (0.30 × the DEFAULT body's τmax, `TENDON_TAU_PEAK_*`) — not
 /// scaled by the per-env tau randomization or a bench body: tendon
@@ -97,7 +97,7 @@ pub struct PassiveWrist {
     pub tau_peak_bend: Real,
     pub tau_peak_dev: Real,
     /// Per-joint tendon zone starts (normalized excursion) of the
-    /// additive centring terms (`tendon_centring`): bend 0.1, dev 0.
+    /// additive centring terms (`tendon_centring`): bend 0, dev 0.
     pub zone_start_bend: Real,
     pub zone_start_dev: Real,
     /// Edge-zone damping peaks (issue #61, 2026-10-05): per joint
@@ -126,9 +126,10 @@ pub const TAU_BODY_DEFAULT_WRIST_DEV: f64 = 1.0220;
 pub const TENDON_TAU_PEAK_BEND: Real = (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND) as Real;
 pub const TENDON_TAU_PEAK_DEV: Real = (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV) as Real;
 /// Per-joint tendon zone starts (2026-10-05, user): the pure-axis torque
-/// starts at |u| = s — bend 0.1, dev 0 (always centring) — via additive
-/// centring terms on top of the R0 = 0.5 elliptical coupling.
-pub const TENDON_S_BEND: Real = 0.1;
+/// starts at |u| = s — bend 0, dev 0 (both always centring; bend was 0.1
+/// for a few hours on 2026-10-05) — via additive centring terms on top of
+/// the R0 = 0.5 elliptical coupling.
+pub const TENDON_S_BEND: Real = 0.0;
 pub const TENDON_S_DEV: Real = 0.0;
 /// Edge-damping reference speed (issue #61): at r = 1 and |q̇| = 30 rad/s
 /// the damping torque equals the joint's tendon τ_peak, i.e.
@@ -198,7 +199,7 @@ pub fn wrist_tendon(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real)
 
 /// Per-joint CENTRING torque (2026-10-05, user: per-joint tendon zone
 /// starts — "always trying to center the hand"), ADDITIVE to the
-/// elliptical term. Joint zone start s (bend 0.1, dev 0), a = |u|:
+/// elliptical term. Joint zone start s (bend 0, dev 0), a = |u|:
 ///   τ_c = −sign(q)·τ_peak·[((a − s)/(1 − s))²₊ − ((a − R0)/(1 − R0))²₊]
 ///   E_c = τ_peak·L·[((1 − s)/3)·((a − s)/(1 − s))³₊
 ///                   − ((1 − R0)/3)·((a − R0)/(1 − R0))³₊]

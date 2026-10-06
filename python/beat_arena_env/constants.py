@@ -430,7 +430,7 @@ assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT
 #   P(r) = ((r - R0)/(1 - R0))^3 for r > R0 (uncapped past r = 1),
 #   Ebar_j = tau_peak_j L_j (1 - R0)/3; tau_j = -dE/dq_j.
 # Pure axis: tau = -sign(u) tau_peak ((|u| - R0)/(1 - R0))^2. PLUS additive
-# per-joint CENTRING terms (2026-10-05, user) with zone starts s (bend 0.1,
+# per-joint CENTRING terms (2026-10-05, user) with zone starts s (bend 0,
 # dev 0): tau_c = -sign(q) tau_peak [((a - s)/(1 - s))^2_+ -
 # ((a - R0)/(1 - R0))^2_+], a = |u|, so a pure axis totals tau_peak
 # ((a - s)/(1 - s))^2_+; zero at the limit (corners unchanged).
@@ -466,7 +466,7 @@ def tendon_edge_x2(r):
     return x * x
 
 
-TENDON_S_BEND = 0.1     # per-joint tendon zone starts (centring terms)
+TENDON_S_BEND = 0.0     # per-joint tendon zone starts (centring terms)
 TENDON_S_DEV = 0.0
 
 
