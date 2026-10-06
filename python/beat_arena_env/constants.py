@@ -422,6 +422,53 @@ TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
 TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
 assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)
 
+# exp/wrist-tendon (2026-10-05, branch only): PASSIVE wrist tendon torque
+# on each wrist's (bend, dev) pair — model.rs PassiveWrist / wrist_tendon,
+# the .cu wrist_tendon. Per hand, every substep, from the current angles:
+#   u_j = q_j / L_j, L_j = hi_j if q_j >= 0 else |lo_j| (JOINT_LIMITS)
+#   r = sqrt(u_b^2 + u_d^2); E = P(r) (Ebar_b u_b^2 + Ebar_d u_d^2) / r^2,
+#   P(r) = ((r - R0)/(1 - R0))^3 for r > R0 (uncapped past r = 1),
+#   Ebar_j = tau_peak_j L_j (1 - R0)/3; tau_j = -dE/dq_j.
+# Pure axis: tau = -sign(u) tau_peak ((|u| - R0)/(1 - R0))^2. tau_peak is
+# 0.30 x the DEFAULT body's tau_max, FIXED in N.m (not scaled by
+# --tau-rand / --tau-scale). Applied with the gear torque in the
+# substep RHS; NOT muscle effort (excluded from the energy price, the
+# limit-rest price, [torque]/[activation] and the replay torque fields).
+TENDON_R0 = 0.5
+TENDON_FRAC = 0.30
+TENDON_HANDS = ((8, 9), (15, 16))   # (bend, dev) joints per hand [L, R]
+TENDON_TAU_PEAK_BEND = TENDON_FRAC * 1.431 * 1.4466   # 0.62103 N.m
+TENDON_TAU_PEAK_DEV = TENDON_FRAC * 1.06 * 1.0220     # 0.32500 N.m
+assert TENDON_TAU_PEAK_BEND == (
+    TENDON_FRAC * TAU_MAX[8] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_bend")])
+assert TENDON_TAU_PEAK_DEV == (
+    TENDON_FRAC * TAU_MAX[9] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_dev")])
+
+
+def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
+                 tpd=TENDON_TAU_PEAK_DEV):
+    """(tau_bend, tau_dev, r) of one wrist — the model.rs wrist_tendon
+    expression tree in Python floats (reference / tests)."""
+    lb = lim_b[1] if qb >= 0.0 else -lim_b[0]
+    ld = lim_d[1] if qd >= 0.0 else -lim_d[0]
+    ub, ud = qb / lb, qd / ld
+    ub2, ud2 = ub * ub, ud * ud
+    rho = ub2 + ud2
+    r = math.sqrt(rho)
+    if not r > TENDON_R0:
+        return 0.0, 0.0, r
+    x = (r - TENDON_R0) / (1.0 - TENDON_R0)
+    p = x * x * x
+    dp = 3.0 * x * x / (1.0 - TENDON_R0)
+    eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0)
+    ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0)
+    s = eb * ub2 + ed * ud2
+    k = dp * s / (r * rho)
+    w = 2.0 * p / (rho * rho)
+    gb = ub * (k + w * (eb - ed) * ud2)
+    gd = ud * (k + w * (ed - eb) * ub2)
+    return -gb / lb, -gd / ld, r
+
 
 def parse_tau_scale(spec):
     """'--tau-scale' / '--tau-center' text -> list of 16 floats. Either

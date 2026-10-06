@@ -240,7 +240,10 @@ def _park(sim, hand):
 
 
 def _set_flat(sim, hand, azimuth, om_roll=0.0):
-    """test_env.py::_set_flat: FLAT pose, blade along `azimuth`."""
+    """test_env.py::_set_flat: FLAT pose, blade along `azimuth` (judge
+    fixture: the passive wrist tendon off, as there)."""
+    if hasattr(sim, "set_passive_wrist"):
+        sim.set_passive_wrist(False)
     lo, hi = joint_limits(hand)[4]
     roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
     bend = np.pi / 2

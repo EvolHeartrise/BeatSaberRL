@@ -106,7 +106,15 @@ def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=DELTA):
     deg, bend = +90 deg, dev = 0). For delta = DELTA the right wrist
     sits at FLAT_WRIST at t = 0; roll sweeps (om_roll) move the blade
     vertically. Under v10 dynamics this is the INITIAL condition — the
-    pose sags slightly within the tick."""
+    pose sags slightly within the tick.
+
+    exp/wrist-tendon: bend = +-90 deg is u = 0.95, deep in the passive
+    tendon zone (~0.5 N*m pulling it back — the blade would swing ~0.3
+    rad within the tick), so this kinematic JUDGE fixture switches the
+    tendon off on its sim (RawBeatSim.set_passive_wrist). The tendon
+    itself is pinned by rust/src/tendon_tests.rs + test_wrist_tendon."""
+    if hasattr(sim, "set_passive_wrist"):
+        sim.set_passive_wrist(False)
     lo, hi = joint_limits(hand)[4]
     roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
     bend = np.pi / 2
@@ -776,7 +784,14 @@ def test_joint_limits_clamp_and_kill_omega():
         v = np.zeros(NV)
         v[6 + j] = om0
         sim.set_joints(list(q), list(v))
-        sim.step(list(COAST))
+        a = list(COAST)
+        if j in (A_R_ARM + 5, A_R_ARM + 6):
+            # exp/wrist-tendon: a COASTING wrist no longer rests on its
+            # stop — the passive tendon (tau_peak 0.62 / 0.33 N*m at the
+            # bend / dev stop) pulls it back off. Drive it INTO the stop
+            # with its full gear (1.431 / 1.06 N*m > the tendon there).
+            a[j] = 1 if om0 > 0 else 2
+        sim.step(a)
         qq = np.asarray(sim.qpos())[7:]
         om = np.asarray(sim.omega())
         lo_j, hi_j = (lim, np.inf) if om0 < 0 else (-np.inf, lim)

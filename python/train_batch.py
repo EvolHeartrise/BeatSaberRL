@@ -3001,6 +3001,21 @@ def main():
                 print(f"[torque] {tq_t / tq_n:.3f} N*m/env-tick (spine "
                       f"{tq_s / tq_n:.3f} / arms {tq_a / tq_n:.3f} / legs "
                       f"{tq_l / tq_n:.3f})", flush=True)
+        # exp/wrist-tendon telemetry (2026-10-05): per hand, the mean
+        # passive tendon torque |tau_bend| + |tau_dev| (N*m) per substep,
+        # and the fraction of substeps in the tendon zone (r > 0.5) and
+        # beyond the ellipse (r > 1). Never priced (not muscle effort).
+        if hasattr(venv, "pop_tendon"):
+            tn_l, tn_r, tz_l, tz_r, to_l, to_r, tn_n = venv.pop_tendon()
+            if tn_n:
+                m_ev.update(tendon_L=tn_l / tn_n, tendon_R=tn_r / tn_n,
+                            tzone_L=tz_l / tn_n, tzone_R=tz_r / tn_n,
+                            tout_L=to_l / tn_n, tout_R=to_r / tn_n)
+                print(f"[tendon] L {tn_l / tn_n:.4f}  R {tn_r / tn_n:.4f} "
+                      f"N*m/substep  zone L {100.0 * tz_l / tn_n:.2f}%  "
+                      f"R {100.0 * tz_r / tn_n:.2f}%  beyond L "
+                      f"{100.0 * to_l / tn_n:.2f}%  R {100.0 * to_r / tn_n:.2f}%",
+                      flush=True)
         # env v46 body-draw log: every episode that ended this update
         # -> (s0..s15, ticks, return, fell, cuts, pts, chart) appended to
         # <run-dir>/tau_draws.f32 (raw float32 rows, 22 cols; reader:

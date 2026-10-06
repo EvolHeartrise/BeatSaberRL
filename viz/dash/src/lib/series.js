@@ -67,6 +67,11 @@ const DERIVED = {
   tilts_per_1m_pos: (r, i, recs) => { const v = per1M(r, "tilts", batchOf(recs, i)); return v > 0 ? v : null; },
   // env v41 [contact]: share of env-ticks with body-on-body contact, in %
   contact_pct: (r) => (r.contact_frac == null ? null : r.contact_frac * 100),
+  // exp/wrist-tendon [tendon] fractions -> percent of substeps
+  tzone_L_pct: (r) => (r.tzone_L == null ? null : r.tzone_L * 100),
+  tzone_R_pct: (r) => (r.tzone_R == null ? null : r.tzone_R * 100),
+  tout_L_pct: (r) => (r.tout_L == null ? null : r.tout_L * 100),
+  tout_R_pct: (r) => (r.tout_R == null ? null : r.tout_R * 100),
 };
 
 export function seriesValues(recs, key) {
@@ -111,6 +116,8 @@ export const PANELS = [
   { id: "limitrest", title: "limit rest (N·m·s / tick)", series: ["limitrest", "limitrest_legs", "limitrest_spine", "limitrest_arms"] },
   { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
   { id: "torque", title: "joint torque Σ|τ| (N·m / env-tick · total / spine / arms / legs)", series: ["torque", "torque_spine", "torque_arms", "torque_legs"] },
+  { id: "tendon", title: "passive wrist tendon |τ| (N·m / substep, per hand · exp/wrist-tendon; not priced)", series: ["tendon_L", "tendon_R"] },
+  { id: "tendon_zone", title: "wrist tendon: % of substeps in the zone (r > 0.5) / beyond the ellipse (r > 1), per hand", series: ["tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct"] },
   { id: "contact", title: "self-contact impulse (N·s / env-tick, env v41)", series: ["contact"] },
   { id: "contact_pct", title: "self-contact: % of env-ticks with body-on-body contact", series: ["contact_pct"] },
   { id: "fp16", title: "fp16 ratio diag r1 · max log-ratio", series: ["r1", "maxlr"] },
@@ -140,6 +147,7 @@ export const COMPARE_KEYS = [
   "activation", "activation_spine", "activation_arms", "activation_legs",
   "torque", "torque_spine", "torque_arms", "torque_legs",
   "contact", "contact_pct",
+  "tendon_L", "tendon_R", "tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct",
 ];
 // ep_return dropped from every view 2026-09-12 (user: too noisy; the
 // trainer no longer emits it — `return` over the update is the measure)
@@ -163,6 +171,8 @@ export const LABELS = {
   activation: "activation", activation_spine: "act. spine", activation_arms: "act. arms", activation_legs: "act. legs",
   torque: "Σ|τ| N·m", torque_spine: "τ spine", torque_arms: "τ arms", torque_legs: "τ legs",
   contact: "N·s / tick", contact_pct: "% ticks in contact",
+  tendon_L: "tendon |τ| L", tendon_R: "tendon |τ| R",
+  tzone_L_pct: "zone L %", tzone_R_pct: "zone R %", tout_L_pct: "beyond L %", tout_R_pct: "beyond R %",
   r1: "r1", maxlr: "maxlr", peak_vram: "peak VRAM",
 };
 export const label = (k) => LABELS[k] ?? k;
