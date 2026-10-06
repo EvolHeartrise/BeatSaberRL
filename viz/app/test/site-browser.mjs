@@ -48,7 +48,9 @@ try {
   await page.goto(url(path));
   await page.waitForSelector("#watch", { timeout: 120000 });
   const ui = await page.evaluate(() => {
-    const buttons = [...document.querySelectorAll("button")].map((b) => b.textContent.trim());
+    // accessible names: the bar's icon buttons carry aria-labels
+    const buttons = [...document.querySelectorAll("button")]
+      .map((b) => (b.getAttribute("aria-label") ?? b.textContent).trim());
     return {
       name: window.__viewerState().name,
       watch: document.querySelector("#watch")?.textContent.replace(/\s+/g, " ").trim(),

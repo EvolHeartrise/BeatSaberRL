@@ -101,9 +101,11 @@ const browser = await puppeteer.launch({
   executablePath: findBrowser(), headless: true,
   args: ["--use-angle=swiftshader", "--disable-gpu-sandbox", "--no-sandbox"],
 });
+// by accessible name: the aria-label of the bar's icon buttons, else the text
 const clickText = async (page, sel, text) => {
   const h = await page.evaluateHandle((sel, text) =>
-    [...document.querySelectorAll(sel)].find((e) => e.textContent.includes(text)),
+    [...document.querySelectorAll(sel)]
+      .find((e) => (e.getAttribute("aria-label") ?? e.textContent).includes(text)),
   sel, text);
   const el = h.asElement();
   if (!el) throw new Error(`no ${sel} with "${text}"`);
