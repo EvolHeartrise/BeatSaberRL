@@ -358,6 +358,16 @@ const levelCols = {
 // ---- per-bench results + summaries ---------------------------------------
 const round = (x, n) => Math.round(x * 10 ** n) / 10 ** n;
 
+// the published colors, read before the output dir is cleared (sticky
+// colors — see the color block below)
+/** @type {Record<string, string>} */
+const priorColors = {};
+try {
+	for (const m of JSON.parse(fs.readFileSync(path.join(outDir, 'models.json'), 'utf8')).models)
+		if (m.color) priorColors[m.id] = m.color;
+} catch {
+	// no published models.json yet: every model is new
+}
 fs.rmSync(outDir, { recursive: true, force: true });
 fs.mkdirSync(path.join(outDir, 'results'), { recursive: true });
 
@@ -689,15 +699,28 @@ for (const [file, b] of benches) {
 	});
 }
 models.sort((a, b) => b.totalPp - a.totalPp);
-// colors: single runs take the palette in rank order, composites from its
-// end (kept from when composites were shown apart), so a composite never
-// recolors the others
+// colors are STICKY (2026-10-05): a model keeps the color the published
+// models.json already gives it, so a new model never recolors the others
+// even when it ranks above them. A new model takes the first palette color
+// no kept model uses — single runs from the palette's start, composites
+// from its end (kept from when composites were shown apart) — and the old
+// rank-order rule only once the palette is exhausted.
 {
 	const compIds = new Set([...benches].filter(([, b]) => b.d.composite).map(([file]) => publicId.get(file)));
+	const prior = priorColors;
+	const used = new Set(models.map((m) => prior[m.id]).filter(Boolean));
 	let run = 0,
 		comp = 0;
-	for (const m of models)
-		/** @type {any} */ (m).color = compIds.has(m.id) ? PALETTE[PALETTE.length - 1 - (comp++ % PALETTE.length)] : PALETTE[run++ % PALETTE.length];
+	for (const m of models) {
+		const isComp = compIds.has(m.id);
+		const order = isComp ? [...PALETTE].reverse() : PALETTE;
+		const free = prior[m.id] ?? order.find((c) => !used.has(c));
+		const color = free ?? (isComp ? PALETTE[PALETTE.length - 1 - (comp % PALETTE.length)] : PALETTE[run % PALETTE.length]);
+		if (isComp) comp++;
+		else run++;
+		used.add(color);
+		/** @type {any} */ (m).color = color;
+	}
 }
 
 fs.writeFileSync(path.join(outDir, 'levels.json'), JSON.stringify(levelCols));
