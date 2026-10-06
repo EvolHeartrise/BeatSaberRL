@@ -41,7 +41,15 @@ Test: `npm test` builds and runs `test/refresh-browser.mjs` — one
 headless Chrome (from `~/.cache/puppeteer/chrome`, or
 `PUPPETEER_EXECUTABLE_PATH`) against a fake archive in `test/.archive`
 served by serve.py: idle refreshes must not redraw or reset a zoom
-(Live, window lock, Compare), appended rows must reach every chart.
+(Live, window lock, Compare), appended rows must reach every chart,
+hovering must not change any card's height.
+
+Chart cards (2026-10-06): the panel title floats on the plot's top-left
+corner, the legend under the plot is static (names + colours, click a
+name to hide/show that series; capped at three rows, scrolls past that),
+and the values at the cursor show in a floating tooltip on the hovered
+chart only — x in the header, series sorted by value with colour
+swatches, clamped to the viewport — so hovering never reflows the page.
 
 ## Views
 

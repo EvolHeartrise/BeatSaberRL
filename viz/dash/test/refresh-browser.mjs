@@ -313,6 +313,38 @@ try {
   check(c1[0].id === c0[0].id && c1[0].min === c0[0].min && c1[0].max === c0[0].max, "compare, new rows: zoomed chart kept its window");
   check(c1.filter((c) => !c.title.startsWith("Δ")).every((c) => c.last === 320 * BATCH), "compare, new rows: small multiples reach the new tail");
 
+  // hover (2026-10-06): values go to one floating tooltip (the hovered
+  // chart's), the title floats on the plot, and no card changes height
+  const hb = await page.evaluate(() => {
+    const el = [...document.querySelectorAll(".chart")].filter((e) => e.__uplot)[1];
+    el.scrollIntoView({ block: "center" });
+    const r = el.__uplot.over.getBoundingClientRect();
+    return { x: r.left, y: r.top, w: r.width, h: r.height, titleInPlot: !!el.__uplot.over.querySelector(".u-title") };
+  });
+  check(hb.titleInPlot, "hover: the title floats on the plot area");
+  const cellHs = () => page.$$eval(".cell", (cs) => cs.map((c) => c.getBoundingClientRect().height));
+  const visTips = () => page.$$eval(".dash-tip", (ts) => ts.filter((t) => t.style.display !== "none").map((t) =>
+    [...t.querySelectorAll(".dash-tip-row")].filter((r) => r.style.display !== "none").map((r) => r.querySelector(".dash-tip-val").textContent)));
+  const h0 = await cellHs();
+  const doc0 = await page.evaluate(() => document.documentElement.scrollHeight);
+  let moved = 0, tipCounts = new Set(), rowsOk = true;
+  for (let k = 0; k <= 20; k++) {
+    await page.mouse.move(hb.x + hb.w * (0.02 + (0.96 * k) / 20), hb.y + hb.h * (0.15 + 0.035 * k));
+    await sleep(20);
+    const h = await cellHs();
+    if (h.some((v, i) => v !== h0[i])) moved++;
+    const t = await visTips();
+    tipCounts.add(t.length);
+    if (t.length === 1 && !(t[0].length === 2 && t[0].every((v) => v && v !== "—"))) rowsOk = false;
+  }
+  check(moved === 0, `hover: no card changed height over 21 cursor positions (${moved} moved)`);
+  check((await page.evaluate(() => document.documentElement.scrollHeight)) === doc0, "hover: page height unchanged");
+  check(tipCounts.size === 1 && tipCounts.has(1), `hover: exactly one tooltip shown, the hovered chart's (${[...tipCounts]})`);
+  check(rowsOk, "hover: tooltip lists both runs with values");
+  await page.mouse.move(2, 2);
+  await sleep(50);
+  check((await visTips()).length === 0, "hover: tooltip gone when the cursor leaves");
+
   // ---------------------------------------------------------- Swing tab
   await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "swing").click());
   await page.waitForSelector(".tablewrap tbody tr", { timeout: 8000 });
