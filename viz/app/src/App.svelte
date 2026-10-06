@@ -6,7 +6,9 @@
   import MapCard from "./lib/MapCard.svelte";
   import BodyGauges from "./lib/BodyGauges.svelte";
   import { audio, pb, play, pose, songClock, lastTick, loadReplay,
-    restart, seekTo, setPlaying, setSpeed, step, togglePose } from "./lib/state.svelte.js";
+    restart, seekTo, setPlaying, setSpeed, setTipTrail, setTipTrailS, step,
+    togglePose } from "./lib/state.svelte.js";
+  import { TIP_TRAIL_MAX_S, TIP_TRAIL_MIN_S } from "./lib/tiptrail.js";
   import { toggleXRSession } from "@threlte/xr";
   import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
     watchRun } from "./lib/playctl.js";
@@ -245,7 +247,7 @@
   function onKey(e) {
     // keys aimed at the pose panel's own controls stay there (slider
     // arrow-key nudges must not step the replay)
-    if (e.target && e.target.closest && e.target.closest("#pose, #fp, #play")) return;
+    if (e.target && e.target.closest && e.target.closest("#pose, #fp, #tt, #play")) return;
     if (FLUX && play.on) {
       // the game owns the keyboard: Esc leaves, Enter (re)starts
       if (e.key === "Escape") exitPlay();
@@ -265,6 +267,7 @@
     else if (e.key === "g") pb.gauges = !pb.gauges;
     else if (e.key === "h") pb.hitboxes = !pb.hitboxes;
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
+    else if (e.key === "t") setTipTrail(!pb.tipTrail);
   }
 
   const speedLabel = $derived(
@@ -479,6 +482,20 @@
           </label>
         </span>
       {/if}
+      <button class:on={pb.tipTrail} onclick={() => setTipTrail(!pb.tipTrail)}
+        title="a crisp line tracing each blade tip's recent path (t)">
+        ✦ tip trail
+      </button>
+      {#if pb.tipTrail}
+        <span id="tt">
+          <label title="how much of the tip's path the line shows, in replay seconds">
+            len <input type="range" min={TIP_TRAIL_MIN_S} max={TIP_TRAIL_MAX_S}
+              step="0.05" value={pb.tipTrailS}
+              oninput={(e) => setTipTrailS(+e.target.value)} />
+            <span>{pb.tipTrailS.toFixed(2)} s</span>
+          </label>
+        </span>
+      {/if}
       {#if pb.rep}
         <!-- preservesPitch off: a speed change should sound like the game's
              practice mode (pitch follows the rate), not a time-stretch -->
@@ -563,11 +580,11 @@
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
   input[type="range"] { width: min(40vw, 480px); }
   #snd { display: flex; gap: 6px; align-items: center; }
-  #fp { display: flex; gap: 10px; align-items: center; color: #9aa0ae;
+  #fp, #tt { display: flex; gap: 10px; align-items: center; color: #9aa0ae;
     font-size: 12px; font-variant-numeric: tabular-nums; }
-  #fp label { display: flex; gap: 4px; align-items: center; }
-  #fp label > span { min-width: 4ch; color: #cfd3dc; }
-  #fp input[type="range"] { width: 80px; }
+  #fp label, #tt label { display: flex; gap: 4px; align-items: center; }
+  #fp label > span, #tt label > span { min-width: 4ch; color: #cfd3dc; }
+  #fp input[type="range"], #tt input[type="range"] { width: 80px; }
   #snd input[type="range"] { width: 70px; }
   #snd .dim { color: #6b7180; font-size: 12px; max-width: 22ch; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
