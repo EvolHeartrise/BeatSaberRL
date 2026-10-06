@@ -4,17 +4,17 @@
   // LineMaterial — a THREE.Line is stuck at 1 px), a near-white tint of
   // the saber colour at the tip shading to the plain saber colour at the
   // tail, opaque all the way and on a thin dark ink rim so it stays sharp
-  // over the translucent swept ribbon. Sampled from the same interpolated pose (body FK of the lerped
-  // joint angles) the sabers are drawn from, on a fixed replay-time grid.
+  // over the translucent swept ribbon. The points are the shared blade
+  // history (lib/bladetrail.js): the drawn pose (qAt + bodyFK) on a fixed
+  // replay-time grid, the same samples the ribbon's outer edge is made of.
   import { T } from "@threlte/core";
   import * as THREE from "three";
   import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
   import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
   import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
   import { pb, pose } from "./state.svelte.js";
-  import { DT, bodyFK, fkSaber, handleLen, qAt, tipOf } from "./replay.js";
   import { NOTE_COLORS } from "./models.js";
-  import { TipTrail } from "./tiptrail.js";
+  import { TIP, bladeTrail, trailCover } from "./bladetrail.js";
 
   const WIDTH_PX = 3; // core line width, CSS pixels
   const INK_PX = 6; // the dark ink line under it (the scene's cel outline)
@@ -22,8 +22,7 @@
   const TAIL_DIM = 0.85; // the tail end: the saber colour, slightly dimmed
   const INK = "#0a0c10"; // = the ribbon's ink (Saber.svelte)
 
-  const trail = new TipTrail({ stride: 6 }); // both tips per sample
-  const MAXSEG = trail.maxPts - 1;
+  const MAXSEG = bladeTrail.trail.maxPts - 1;
 
   // one line per hand, its instance buffers allocated once and rewritten in
   // place every frame (only the used prefix is uploaded). Under each core a
@@ -66,47 +65,24 @@
     for (const h of hands) { h.geo.dispose(); h.mat.dispose(); h.inkMat.dispose(); }
   });
 
-  // both blade tips at replay time t (s), in scene coords, from the same
-  // interpolation the drawn body uses (Scene.svelte: qAt + bodyFK)
-  let rep = null, hl = 0;
-  function sample(t, out, off) {
-    const c = t / DT;
-    const k = Math.min(Math.floor(c), rep.ticks.length - 1);
-    const fk = bodyFK(qAt(rep, k, c - k));
-    for (let s = 0; s < 2; s++) {
-      const tp = tipOf(fkSaber(fk, s), hl);
-      out[off + s * 3] = tp[0];
-      out[off + s * 3 + 1] = tp[1];
-      out[off + s * 3 + 2] = -tp[2];
-    }
-  }
-
   function hide() {
-    trail.reset();
     for (const h of hands) {
       h.geo.instanceCount = 0;
       h.line.visible = h.ink.visible = false;
     }
   }
 
-  // a new replay or a deliberate jump of the clock: start over (the ring
-  // would also refill on its own for any jump it cannot extend; this makes
-  // it explicit, and a forward step refills too)
-  $effect(() => {
-    void pb.rep; void pb.seek;
-    trail.reset();
-  });
-
+  // (a seek needs no handling here: the shared ring refills itself on any
+  // jump it cannot extend, and a new replay resets it)
   $effect(() => {
     const cur = pb.cur; // the continuous clock: the line is sub-tick
     const on = pb.tipTrail && !pose.on && !!pb.rep && pb.rep.ticks.length > 0;
     if (!on) { hide(); return; }
-    rep = pb.rep;
-    hl = handleLen(rep);
-    trail.update(cur * DT, pb.tipTrailS, sample);
+    bladeTrail.ensure(pb.rep, cur, trailCover(pb.tipTrail, pb.tipTrailS));
+    const view = bladeTrail.view(pb.tipTrailS);
     for (let s = 0; s < 2; s++) {
       const h = hands[s];
-      const n = trail.writeSegments(s * 3, h.pos.array, h.col.array, h.head, h.tail);
+      const n = view.writeSegments(TIP(s), h.pos.array, h.col.array, h.head, h.tail);
       h.pos.clearUpdateRanges();
       h.pos.addUpdateRange(0, n * 6);
       h.pos.needsUpdate = true;

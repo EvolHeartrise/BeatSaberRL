@@ -1,28 +1,25 @@
-// The TIP TRAIL (viewer cue, 2026-10-06): a thin, crisp polyline through
-// the path each blade tip took over the last fraction of a second, drawn
-// over the wide swept ribbon (Saber.svelte) so the tip's motion reads at a
-// glance. Pure JS (no three.js) so it can be unit-tested in node; the
-// drawing is TipTrail.svelte.
+// Blade history for the TIP TRAIL (TipTrail.svelte) and the swept RIBBON
+// (Saber.svelte): one fixed-size ring of samples on a replay-time grid,
+// read through windows of any length up to the ring's. Pure JS (no
+// three.js, no replay format) so it can be unit-tested in node; the FK
+// sampler that fills it is lib/bladetrail.js.
 //
-// Sampling: the tip is sampled from the INTERPOLATED pose — the same body
-// FK of the lerped joint angles that draws the sabers — on a fixed grid of
-// replay time (RATE samples per replay second), never per logged tick and
-// never per rendered frame. So the line is the same smooth curve at any
-// playback speed, while scrubbing and at any tick rate; the newest point
-// is taken at the playback clock itself, so the line stays welded to the
-// drawn tip, and the oldest is interpolated to exactly `window` seconds
-// back, so the length does not flicker between grid steps.
+// Sampling: a fixed grid of replay time (RATE samples per replay second),
+// never per logged tick and never per rendered frame, so a curve is the
+// same at any playback speed, while scrubbing and at any tick rate. The
+// newest point of every window is taken at the playback clock itself, so
+// it sits on the drawn blade, and the oldest is sampled exactly `window`
+// seconds back, so the length does not flicker between grid steps.
 //
-// Storage: a fixed-size ring of grid samples. Playing forward only samples
-// the grid points the clock passed since the last frame and drops the ones
-// that left the window; any jump the ring cannot extend (a seek back, a
-// skip past the window, a new replay) refills it from scratch. A grid
-// sample is a pure function of its time, so an extended ring and a
-// refilled one hold the same values: nothing stale can survive a seek.
-// Nothing here allocates after construction.
+// Storage: playing forward only samples the grid points the clock passed
+// since the last frame and drops the ones that left the window; any jump
+// the ring cannot extend (a seek back, a skip past the window) refills it
+// from scratch. A grid sample is a pure function of its time, so an
+// extended ring and a refilled one hold the same values: nothing stale can
+// survive a seek. Nothing here allocates after construction.
 
 export const TIP_TRAIL_RATE = 240;      // grid samples per replay second
-export const TIP_TRAIL_DEFAULT_S = 0.2; // window, replay seconds
+export const TIP_TRAIL_DEFAULT_S = 0.2; // tip trail window, replay seconds
 export const TIP_TRAIL_MIN_S = 0.05;
 export const TIP_TRAIL_MAX_S = 0.5;
 
@@ -83,58 +80,88 @@ export class TrailRing {
   }
 }
 
-/** The tip trail of `stride / 3` points sampled together (both blade tips
- * from one FK per sample time). `sample(t, out, off)` writes the points at
+/** The sampled history: a ring covering [tNow - cover, tNow] plus the
+ * sample at tNow itself. `sample(t, out, off)` writes `stride` floats for
  * replay time t (seconds) into out[off ..]. */
-export class TipTrail {
+export class PoseTrail {
   constructor({ stride = 6, maxS = TIP_TRAIL_MAX_S, rate = TIP_TRAIL_RATE } = {}) {
     this.stride = stride;
     this.rate = rate;
     this.ring = new TrailRing(stride, Math.ceil(maxS * rate) + 2);
-    // the ordered polyline: [tail] + ring samples + [head]
-    this.maxPts = this.ring.cap + 2;
-    this.pts = new Float32Array(this.maxPts * stride);
-    this.age = new Float32Array(this.maxPts); // 0 = tail .. 1 = head
-    this.npts = 0;
-    this._gridSample = null;
+    this.maxS = (this.ring.cap - 2) / rate;
+    this.maxPts = this.ring.cap + 2; // [tail] + ring + [head]
+    this.headBuf = new Float32Array(stride);
+    this.headOnGrid = false;
+    this.tNow = 0;
+    this.stamp = 0; // bumped by every update / reset (views rebuild on it)
+    this.sample = null;
     this._sample = null;
+    this._gridSample = null;
   }
 
-  /** Forget everything (a seek, a new replay, the trail switched off). */
+  /** Forget everything (a new replay). */
   reset() {
     this.ring.reset();
-    this.npts = 0;
+    this.stamp++;
   }
 
-  /** Rebuild the polyline for clock `tNow` (s) and window `windowS` (s). */
-  update(tNow, windowS, sample) {
+  /** Bring the history to clock `tNow` (s), covering `coverS` seconds. */
+  update(tNow, coverS, sample) {
     const rate = this.rate;
     if (this._sample !== sample) { // bind once per sampler, not per frame
       this._sample = sample;
       this._gridSample = (g, out, off) => sample(g / rate, out, off);
     }
-    const w = Math.min(windowS, (this.ring.cap - 2) / rate);
-    const tLo = Math.max(0, tNow - w);
-    const gLo = Math.ceil(tLo * rate - EPS);
+    this.sample = sample;
+    const w = Math.min(coverS, this.maxS);
+    const gLo = Math.ceil(Math.max(0, tNow - w) * rate - EPS);
     const gHi = Math.floor(tNow * rate + EPS);
     this.ring.cover(gLo, gHi, this._gridSample);
+    this.headOnGrid = gHi / rate >= tNow - EPS && this.ring.n > 0;
+    if (!this.headOnGrid) sample(tNow, this.headBuf, 0);
+    this.tNow = tNow;
+    this.stamp++;
+  }
+}
 
-    const S = this.stride, pts = this.pts, age = this.age;
+/** The last `windowS` seconds of a PoseTrail as an ordered polyline:
+ * pts (stride floats per point) and age (0 = tail .. 1 = head). */
+export class TrailView {
+  constructor(trail) {
+    this.trail = trail;
+    this.pts = new Float32Array(trail.maxPts * trail.stride);
+    this.age = new Float32Array(trail.maxPts);
+    this.npts = 0;
+    this.stamp = -1;
+    this.windowS = -1;
+  }
+
+  /** Rebuild for the trail's current clock (a no-op when nothing moved). */
+  build(windowS) {
+    const tr = this.trail;
+    if (this.stamp === tr.stamp && this.windowS === windowS) return this.npts;
+    this.stamp = tr.stamp;
+    this.windowS = windowS;
+    const S = tr.stride, rate = tr.rate, ring = tr.ring, tNow = tr.tNow;
+    const pts = this.pts, age = this.age;
+    if (ring.n === 0 && !tr.sample) { this.npts = 0; return 0; }
+    const w = Math.min(windowS, tr.maxS);
+    const tLo = Math.max(0, tNow - w);
     const span = tNow - tLo;
     const ageOf = (t) => (span > 0 ? (t - tLo) / span : 1);
+    let gLo = Math.max(ring.g0, Math.ceil(tLo * rate - EPS));
     let n = 0;
     if (gLo / rate > tLo + EPS) { // the tail, exactly `w` back
-      sample(tLo, pts, 0);
+      tr.sample(tLo, pts, 0);
       age[n++] = 0;
     }
-    const ring = this.ring;
-    for (let g = ring.g0; g < ring.g0 + ring.n; g++) {
+    for (let g = gLo; g < ring.g0 + ring.n; g++) {
       const src = ring.offsetOf(g), dst = n * S;
       for (let c = 0; c < S; c++) pts[dst + c] = ring.buf[src + c];
       age[n++] = ageOf(g / rate);
     }
-    if (gHi / rate < tNow - EPS || n === 0) { // the head, at the clock
-      sample(tNow, pts, n * S);
+    if (!tr.headOnGrid) { // the head, at the clock
+      pts.set(tr.headBuf, n * S);
       age[n++] = 1;
     }
     this.npts = n;
@@ -147,7 +174,7 @@ export class TipTrail {
    * RGB lerped from `tail` (age 0) to `head` (age 1) into `col`. Returns
    * the segment count. */
   writeSegments(comp, pos, col, head, tail) {
-    const S = this.stride, pts = this.pts, age = this.age;
+    const S = this.trail.stride, pts = this.pts, age = this.age;
     const nseg = Math.max(0, this.npts - 1);
     for (let i = 0; i < nseg; i++) {
       for (let e = 0; e < 2; e++) {
