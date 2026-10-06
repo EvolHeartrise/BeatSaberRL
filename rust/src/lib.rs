@@ -4320,8 +4320,10 @@ mod env_tests {
     /// (state, summed reward, events in tick order) and stops at done.
     #[test]
     fn action_repeat_matches_repeated_steps() {
+        // notes 0.3 -> 0.25 s (exp/wrist-tendon zone starts, 2026-10-05: the
+        // flipping-pitch body falls at ~0.6 s, before the 0.5 s note resolved)
         let chart: Vec<ChartTuple> = (0u8..3)
-            .map(|i| (0.3 + i as Real * 0.1, 0.0, 1.0, i % 2, 0.0, 6.0,
+            .map(|i| (0.25 + i as Real * 0.1, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
         let rate = TickRate::new(60).unwrap();
@@ -4358,7 +4360,7 @@ mod env_tests {
             // flip the action every decision so holding is actually tested
             acts[10] = if acts[10] == 1 { 2 } else { 1 };
         }
-        assert!(a.misses + a.good_cuts + a.bad_cuts == 3, "every note resolved");
+        assert!(a.misses + a.good_cuts + a.bad_cuts == 3, "every note resolved ({} {} {}, tick {}, falls {} tilts {})", a.misses, a.good_cuts, a.bad_cuts, a.tick, a.falls, a.tilts);
         // repeat = 1 is one plain step
         let mut c = Core::new_core_rate(100_000, 5, rate);
         let mut d = Core::new_core_rate(100_000, 5, rate);

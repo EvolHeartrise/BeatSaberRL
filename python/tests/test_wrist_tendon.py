@@ -23,22 +23,32 @@ LIM = C.JOINT_LIMITS
 def test_peaks_and_pure_axis():
     assert C.TENDON_TAU_PEAK_BEND == pytest.approx(0.62103, abs=5e-6)
     assert C.TENDON_TAU_PEAK_DEV == pytest.approx(0.32500, abs=5e-6)
+    # per-joint zone starts (centring terms on the 0.5-onset ellipse):
+    # pure axis tau = -sign(u) tau_peak ((|u| - s)/(1 - s))^2_+
+    assert (C.TENDON_S_BEND, C.TENDON_S_DEV) == (0.1, 0.0)
+
+    def ramp(u, tp, s0):
+        a = abs(u)
+        return 0.0 if a <= s0 else -math.copysign(
+            tp * ((a - s0) / (1.0 - s0)) ** 2, u)
+
     for (jb, jd) in C.TENDON_HANDS:
         for u in np.linspace(-1.4, 1.4, 57):
             lo, hi = LIM[jb]
             tb, td, r = C.wrist_tendon(u * (hi if u >= 0 else -lo), 0.0,
                                        LIM[jb], LIM[jd])
-            want = (0.0 if abs(u) <= 0.5 else
-                    -math.copysign(C.TENDON_TAU_PEAK_BEND
-                                   * ((abs(u) - 0.5) / 0.5) ** 2, u))
+            want = ramp(u, C.TENDON_TAU_PEAK_BEND, C.TENDON_S_BEND)
             assert td == 0.0 and tb == pytest.approx(want, abs=1e-14)
             lo, hi = LIM[jd]
             tb, td, r = C.wrist_tendon(0.0, u * (hi if u >= 0 else -lo),
                                        LIM[jb], LIM[jd])
-            want = (0.0 if abs(u) <= 0.5 else
-                    -math.copysign(C.TENDON_TAU_PEAK_DEV
-                                   * ((abs(u) - 0.5) / 0.5) ** 2, u))
+            want = ramp(u, C.TENDON_TAU_PEAK_DEV, C.TENDON_S_DEV)
             assert tb == 0.0 and td == pytest.approx(want, abs=1e-14)
+    # the 70/70 points (left wrist; -30 deg dev side / +15 deg side)
+    tb, td, _ = C.wrist_tendon(0.7 * LIM[8][1], 0.7 * LIM[9][0], LIM[8], LIM[9])
+    assert (tb, td) == pytest.approx((-0.4804, 0.7013), abs=1e-4)
+    tb, td, _ = C.wrist_tendon(0.7 * LIM[8][1], 0.7 * LIM[9][1], LIM[8], LIM[9])
+    assert (tb, td) == pytest.approx((-0.4687, -1.1487), abs=1e-4)
 
 
 def test_mirror_and_corners():
@@ -135,7 +145,9 @@ def test_vec_pop_tendon_sums_envs(mod_name):
         vec.step_into(acts, obs)
     s = vec.pop_tendon()
     assert len(s) == 9 and s[8] == n * 4 * 8
-    assert s[2] == s[3] == n * 4 * 8            # reset pose: all in the zone
+    # the reset pose starts in the zone (70 deg bend); the centring pulls
+    # the wrists out of it within the window — mirror-symmetric
+    assert 0 < s[2] == s[3] <= n * 4 * 8
 
 
 @cuda

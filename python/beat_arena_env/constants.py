@@ -429,7 +429,12 @@ assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT
 #   r = sqrt(u_b^2 + u_d^2); E = P(r) (Ebar_b u_b^2 + Ebar_d u_d^2) / r^2,
 #   P(r) = ((r - R0)/(1 - R0))^3 for r > R0 (uncapped past r = 1),
 #   Ebar_j = tau_peak_j L_j (1 - R0)/3; tau_j = -dE/dq_j.
-# Pure axis: tau = -sign(u) tau_peak ((|u| - R0)/(1 - R0))^2. tau_peak is
+# Pure axis: tau = -sign(u) tau_peak ((|u| - R0)/(1 - R0))^2. PLUS additive
+# per-joint CENTRING terms (2026-10-05, user) with zone starts s (bend 0.1,
+# dev 0): tau_c = -sign(q) tau_peak [((a - s)/(1 - s))^2_+ -
+# ((a - R0)/(1 - R0))^2_+], a = |u|, so a pure axis totals tau_peak
+# ((a - s)/(1 - s))^2_+; zero at the limit (corners unchanged).
+# tau_peak is
 # 0.30 x the DEFAULT body's tau_max, FIXED in N.m (not scaled by
 # --tau-rand / --tau-scale). Applied with the gear torque in the
 # substep RHS; NOT muscle effort (excluded from the energy price, the
@@ -461,8 +466,20 @@ def tendon_edge_x2(r):
     return x * x
 
 
+TENDON_S_BEND = 0.1     # per-joint tendon zone starts (centring terms)
+TENDON_S_DEV = 0.0
+
+
+def _tendon_centring(q, u, tp, s):
+    a = abs(u)
+    y0 = (a - s) / (1.0 - s) if a > s else 0.0
+    y = (a - TENDON_R0) / (1.0 - TENDON_R0) if a > TENDON_R0 else 0.0
+    c = tp * (y0 * y0 - y * y)
+    return -c if q >= 0.0 else c
+
+
 def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
-                 tpd=TENDON_TAU_PEAK_DEV):
+                 tpd=TENDON_TAU_PEAK_DEV, sb=TENDON_S_BEND, sd=TENDON_S_DEV):
     """(tau_bend, tau_dev, r) of one wrist — the model.rs wrist_tendon
     expression tree in Python floats (reference / tests)."""
     lb = lim_b[1] if qb >= 0.0 else -lim_b[0]
@@ -471,8 +488,11 @@ def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
     ub2, ud2 = ub * ub, ud * ud
     rho = ub2 + ud2
     r = math.sqrt(rho)
+    # additive per-joint centring (model.rs tendon_centring)
+    tcb = _tendon_centring(qb, ub, tpb, sb)
+    tcd = _tendon_centring(qd, ud, tpd, sd)
     if not r > TENDON_R0:
-        return 0.0, 0.0, r
+        return tcb, tcd, r
     x = (r - TENDON_R0) / (1.0 - TENDON_R0)
     p = x * x * x
     dp = 3.0 * x * x / (1.0 - TENDON_R0)
@@ -483,7 +503,7 @@ def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
     w = 2.0 * p / (rho * rho)
     gb = ub * (k + w * (eb - ed) * ud2)
     gd = ud * (k + w * (ed - eb) * ub2)
-    return -gb / lb, -gd / ld, r
+    return -gb / lb + tcb, -gd / ld + tcd, r
 
 
 def parse_tau_scale(spec):

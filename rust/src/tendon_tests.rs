@@ -15,7 +15,8 @@ use dynamics::algo::{crba, energy, tc_factor, tc_solve_unit_v};
 use dynamics::fk::fk_all;
 use dynamics::model::{
     tendon_edge_x2, wrist_tendon, wrist_tendon_energy, HUMANOID_LIMITS, HUMANOID_PASSIVE_WRIST,
-    TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV, TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
+    TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV, TENDON_S_BEND, TENDON_S_DEV, TENDON_TAU_PEAK_BEND,
+    TENDON_TAU_PEAK_DEV,
 };
 use dynamics::solver::{substep_constrained, ConstraintSet};
 
@@ -26,19 +27,21 @@ const RD: usize = 16;
 
 fn tl(qb: Real, qd: Real) -> (Real, Real, Real) {
     wrist_tendon(qb, qd, HUMANOID_LIMITS[LB], HUMANOID_LIMITS[LD],
-                 TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV)
+                 TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV, TENDON_S_BEND, TENDON_S_DEV)
 }
 fn tr(qb: Real, qd: Real) -> (Real, Real, Real) {
     wrist_tendon(qb, qd, HUMANOID_LIMITS[RB], HUMANOID_LIMITS[RD],
-                 TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV)
+                 TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV, TENDON_S_BEND, TENDON_S_DEV)
 }
 fn el(qb: Real, qd: Real) -> Real {
     wrist_tendon_energy(qb, qd, HUMANOID_LIMITS[LB], HUMANOID_LIMITS[LD],
-                        TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV)
+                        TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV, TENDON_S_BEND,
+                        TENDON_S_DEV)
 }
 fn er(qb: Real, qd: Real) -> Real {
     wrist_tendon_energy(qb, qd, HUMANOID_LIMITS[RB], HUMANOID_LIMITS[RD],
-                        TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV)
+                        TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV, TENDON_S_BEND,
+                        TENDON_S_DEV)
 }
 
 struct Rng(u64);
@@ -69,14 +72,17 @@ fn tendon_peaks_are_030_of_the_default_body() {
     assert_eq!(pw.hands, [(LB, LD), (RB, RD)]);
 }
 
-/// u_d = 0: τ_b = −sign·τ_peak·((|u_b| − 0.5)/0.5)², zero below
-/// |u_b| = 0.5, τ_peak at the limit, no dev torque; likewise for dev
-/// on both sides of both hands (asymmetric 30°/15° limits).
+/// u_d = 0: τ_b = −sign·τ_peak·((|u_b| − s_b)/(1 − s_b))², zero below
+/// the bend zone start s_b = 0.1, τ_peak at the limit, no dev torque;
+/// likewise for dev (s_d = 0: τ = −sign·τ_peak·u_d² from 0) on both sides
+/// of both hands (asymmetric 30°/15° limits). The elliptical term (onset
+/// r = 0.5) plus the per-joint centring term (tendon_centring) give
+/// exactly this ramp on a pure axis, past the stops too.
 #[test]
 fn tendon_pure_axis() {
-    let ramp = |u: Real, tp: Real| -> Real {
+    let ramp = |u: Real, tp: Real, s: Real| -> Real {
         let a = u.abs();
-        if a <= 0.5 { 0.0 } else { -u.signum() * tp * ((a - 0.5) / 0.5).powi(2) }
+        if a <= s { 0.0 } else { -u.signum() * tp * ((a - s) / (1.0 - s)).powi(2) }
     };
     let mut worst: Real = 0.0;
     for i in -300..=300 {
@@ -88,7 +94,10 @@ fn tendon_pure_axis() {
             let (tb, td, r) = f(q, 0.0);
             assert_eq!(td, 0.0);
             assert!((r - u.abs()).abs() < 1e-15);
-            let want = ramp(u, TENDON_TAU_PEAK_BEND);
+            if u.abs() < 0.1 {
+                assert_eq!(tb, 0.0, "bend inside its zone start");
+            }
+            let want = ramp(u, TENDON_TAU_PEAK_BEND, TENDON_S_BEND);
             worst = worst.max((tb - want).abs());
             assert!((tb - want).abs() <= 1e-14 * (1.0 + want.abs()), "bend u={u}: {tb} vs {want}");
             // dev axis
@@ -96,7 +105,7 @@ fn tendon_pure_axis() {
             let q = if u >= 0.0 { u * hi } else { u * -lo };
             let (tb, td, _) = f(0.0, q);
             assert_eq!(tb, 0.0);
-            let want = ramp(u, TENDON_TAU_PEAK_DEV);
+            let want = ramp(u, TENDON_TAU_PEAK_DEV, TENDON_S_DEV);
             worst = worst.max((td - want).abs());
             assert!((td - want).abs() <= 1e-14 * (1.0 + want.abs()), "dev u={u}: {td} vs {want}");
         }
@@ -110,9 +119,18 @@ fn tendon_pure_axis() {
     assert!((at[1] - TENDON_TAU_PEAK_BEND).abs() < 1e-14);
     assert!((at[2] + TENDON_TAU_PEAK_DEV).abs() < 1e-14);
     assert!((at[3] - TENDON_TAU_PEAK_DEV).abs() < 1e-14);
-    // onset exactly at half range
-    assert_eq!(tl(0.5 * b_hi, 0.0).0, 0.0);
-    assert!(tl(0.5 * b_hi + 1e-6, 0.0).0 < 0.0);
+    // onsets: bend at 10 % of the range, dev immediately
+    assert_eq!(tl(0.1 * b_hi, 0.0).0, 0.0);
+    assert!(tl(0.1 * b_hi + 1e-6, 0.0).0 < 0.0);
+    assert!(tl(0.0, 1e-6).1 < 0.0 && tl(0.0, -1e-6).1 > 0.0);
+    // pure-axis table (left wrist): bend / dev at fractions of the range
+    for f in [0.1, 0.25, 0.5, 0.75, 1.0] {
+        let (tb, _, _) = tl(f * b_hi, 0.0);
+        let (_, tdu, _) = tl(0.0, f * d_lo);
+        let (_, tdr, _) = tl(0.0, f * d_hi);
+        println!("  pure axis {:3.0}%: bend {tb:+.4}  dev(-30deg side) {tdu:+.4}  dev(+15deg side) {tdr:+.4}",
+                 100.0 * f);
+    }
 }
 
 /// τ = −∇E by central differences over the box and past the stops.
@@ -204,6 +222,22 @@ fn tendon_is_continuous_across_sign_boundaries() {
     }
     println!("max torque jump across the sign boundaries (|dq| = 2e-12): {worst:.2e} N*m");
     assert!(worst < 1e-9, "discontinuity {worst:e}");
+    // kink-free (C¹) at the centring onset a = s_b (bend) and at the
+    // ellipse onset a = 0.5: one-sided stiffness on both sides agrees
+    let bhi = HUMANOID_LIMITS[LB].1;
+    let dhi = HUMANOID_LIMITS[LD].1;
+    let h = 1e-7;
+    for (name, f) in [
+        ("bend a=s_b", (|d: Real| tl((TENDON_S_BEND + d) * HUMANOID_LIMITS[LB].1, 0.0).0) as fn(Real) -> Real),
+        ("bend a=0.5", |d: Real| tl((0.5 + d) * HUMANOID_LIMITS[LB].1, 0.0).0),
+        ("dev a=0.5", |d: Real| tl(0.0, (0.5 + d) * HUMANOID_LIMITS[LD].1).1),
+    ] {
+        let kl = (f(0.0) - f(-h)) / h;
+        let kr = (f(h) - f(0.0)) / h;
+        println!("  {name}: one-sided slopes {kl:+.3e} / {kr:+.3e} (per unit u)");
+        assert!((kl - kr).abs() < 1e-4, "{name}: kink {kl} vs {kr}");
+    }
+    let _ = (bhi, dhi);
 }
 
 /// Bitwise mirror-exactness: the right wrist at the mirrored pose
@@ -250,6 +284,7 @@ fn tendon_corner_torques() {
         ("corner -bend -dev(30)", -bhi, dlo),
         ("70/70 +bend +dev", 0.7 * bhi, 0.7 * dhi),
         ("70/70 +bend -dev", 0.7 * bhi, 0.7 * dlo),
+        ("50/50 +bend -dev", 0.5 * bhi, 0.5 * dlo),
     ] {
         let (tb, td, r) = tl(qb, qd);
         println!("  {name:24} q=({qb:+.4},{qd:+.4}) r={r:.3}  tau_bend {tb:+.4}  tau_dev {td:+.4} N*m  \
@@ -416,7 +451,7 @@ fn variant(gravity: bool, joint_damping: bool, caps: bool, edge: bool) -> Model 
 /// (2) The tendon ALONE (joint damping 0, caps off, edge damping off):
 ///     semi-implicit Euler with a configuration-dependent M is not
 ///     symplectic, and the stiff tendon shows its first-order energy
-///     drift as a SECULAR gain (~0.09 J/s from 0.17 J at 1/240) that
+///     drift as a SECULAR gain (from the 55 %-corner start: see the printed rates) that
 ///     halves with h — integration error, asserted to converge.
 /// (3) The same with ONLY the edge damping on (issue #61): the gain is
 ///     gone — energy never exceeds E0 and is dissipated, at every h.
@@ -435,12 +470,12 @@ fn tendon_release_energy() {
     let mut gains = Vec::new();
     for k in 0..4 {
         let h = H_SUB / (1 << k) as Real;
-        let (e0, emax, e1, t, rate) = release(&bare, 0.7, h, 1.0);
+        let (e0, emax, e1, t, rate) = release(&bare, 0.55, h, 1.0);
         println!("tendon only, h=1/{:.0}: {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
                   drift {rate:+.4} J/s", 1.0 / h);
         assert!(t > 0.9, "the undamped release hit a stop at {t} s");
         gains.push(emax - e0);
-        let (e0, emax, e1, t, rate) = release(&edge, 0.7, h, 1.0);
+        let (e0, emax, e1, t, rate) = release(&edge, 0.55, h, 1.0);
         println!("  + edge damping:    {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
                   drift {rate:+.4} J/s", );
         assert!(emax <= e0 * (1.0 + 1e-9), "edge damping: energy rose {e0} -> {emax}");

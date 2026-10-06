@@ -227,10 +227,12 @@ def converted(tmp_path_factory):
         # RAW_NOTES; windup 10 -> 6 for the 0.50 kg hands, 2026-10-03:
         # swept 5..14, windups 5-7 resolve every object before the tilt
         # ends the episode at tick 18, 8+ end it at 17 with the last note
-        # unresolved); then seeded random gears (flail) for the rest of
-        # the episode
+        # unresolved); 6 -> 5 (exp/wrist-tendon per-joint zone starts,
+        # 2026-10-05: swept 4..12, windups 4-5 resolve every object, 6+
+        # leave the 1.65 s note unresolved); then seeded random gears
+        # (flail) for the rest of the episode
         a = np.zeros(29, dtype=np.int64)
-        if t < 6:
+        if t < 5:
             a[10] = 1
         elif t < 30:
             a[10] = 2

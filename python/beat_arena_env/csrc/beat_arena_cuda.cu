@@ -1885,6 +1885,22 @@ __device__ __forceinline__ T tendon_edge_x2(T r) {
   return x2;
 }
 
+// Per-joint zone starts of the additive centring terms (model.rs
+// TENDON_S_BEND / TENDON_S_DEV, 2026-10-05)
+constexpr double TENDON_S_BEND = 0.1;
+constexpr double TENDON_S_DEV = 0.0;
+
+// model.rs tendon_centring, verbatim tree
+template <typename T>
+__device__ __forceinline__ T tendon_centring(T q, T u, T tp, T s) {
+  const T a = fabs(u);
+  const T y0 = a > s ? (a - s) / (T(1) - s) : T(0);
+  const T y = a > T(TENDON_R0) ? (a - T(TENDON_R0)) / (T(1) - T(TENDON_R0))
+                               : T(0);
+  const T c = tp * (y0 * y0 - y * y);
+  return q >= T(0) ? -c : c;
+}
+
 // One wrist: writes (tau_b, tau_d, r). Branch-light: two selects for the
 // limits, one r > R0 predicate around the gradient (E == 0 inside, which
 // also keeps r -> 0 safe).
@@ -1901,8 +1917,13 @@ __device__ __forceinline__ void wrist_tendon(T qb, T qd, T blo, T bhi,
   const T rho = ub2 + ud2;
   const T r = sqrt(rho);
   r_out = r;
-  tb = T(0);
-  td = T(0);
+  // per-joint CENTRING torques, additive (model.rs tendon_centring): a
+  // pure axis totals tau_peak ((|u| - s)/(1 - s))^2_+ with zone starts
+  // bend 0.1, dev 0; zero at the limit (corners unchanged)
+  const T tcb = tendon_centring(qb, ub, T(TENDON_TAU_PEAK_BEND), T(TENDON_S_BEND));
+  const T tcd = tendon_centring(qd, ud, T(TENDON_TAU_PEAK_DEV), T(TENDON_S_DEV));
+  tb = tcb;
+  td = tcd;
   if (r > T(TENDON_R0)) {
     const T x = (r - T(TENDON_R0)) / (T(1) - T(TENDON_R0));
     const T p = x * x * x;
@@ -1914,8 +1935,8 @@ __device__ __forceinline__ void wrist_tendon(T qb, T qd, T blo, T bhi,
     const T w = T(2) * p / (rho * rho);
     const T gb = ub * (k + w * (eb - ed) * ud2);
     const T gd = ud * (k + w * (ed - eb) * ub2);
-    tb = -gb / lb;
-    td = -gd / ld;
+    tb = -gb / lb + tcb;
+    td = -gd / ld + tcd;
   }
 }
 
