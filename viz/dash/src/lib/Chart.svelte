@@ -15,6 +15,17 @@
   // (data.svelte.js already skips unchanged files, this is the backstop
   // for re-derived but identical arrays). `resetKey` (Live: the run id)
   // rebuilds the plot, so a different run never inherits a zoom.
+  //
+  // Compact card layout (2026-10-06, user request): the title floats on
+  // the plot's top-left corner (moved into uPlot's .u-over, so it tracks
+  // the plot area through resizes; pointer-events: none), the x axis is
+  // tight and the y axis is sized to its widest tick label. Hover values
+  // never reflow the card: the legend below is static (names + colours,
+  // click toggles a series) and the values at the cursor go to a floating
+  // tooltip (position: fixed, clamped to the viewport, so it never
+  // changes layout or scroll height), series sorted by value with
+  // swatches; only the hovered chart shows it, the synced ones just
+  // draw the cursor line.
   import uPlot from "uplot";
 
   let {
@@ -68,24 +79,116 @@
         value: (self, v) => (v == null ? "—" : fmtVal(v)),
       })),
     ];
+    const tip = legendValues ? tooltip(valid) : null;
     const opts = {
       title,
       width: el.clientWidth || 600,
       height,
       cursor: { sync: { key: syncKey, setSeries: false }, drag: { x: true, y: false } },
-      legend: { show: true, live: legendValues },
+      // static legend: hover values live in the tooltip, never here
+      legend: { show: true, live: false },
       scales: { x: { time: false }, y: log ? { distr: 3 } : {} },
       axes: [
-        { stroke: fg, grid: { stroke: grid }, ticks: { stroke: grid },
+        { stroke: fg, grid: { stroke: grid }, ticks: { stroke: grid, size: 4 }, gap: 3, size: 24,
           values: (self, ticks) => ticks.map(fmtTick) },
-        { stroke: fg, grid: { stroke: grid }, ticks: { stroke: grid }, size: 58,
+        { stroke: fg, grid: { stroke: grid }, ticks: { stroke: grid, size: 4 }, gap: 4, size: yAxisSize,
           values: (self, ticks) => ticks.map(fmtTick) },
       ],
       series,
+      hooks: tip ? { setCursor: [tip.update], setSeries: [tip.update] } : {},
     };
     u = new uPlot(opts, data, el);
+    // the title floats on the plot area (CSS: .u-over > .u-title)
+    const t = u.root.querySelector(".u-title");
+    if (t) u.over.appendChild(t);
+    if (tip) tip.attach(u);
     el.__uplot = u; // test hook (test/refresh-browser.mjs)
     xExtent = extentOf(data);
+  }
+
+  // y axis just wide enough for its widest tick label (was a fixed 58 px).
+  // Within one size-convergence pass it only grows: a later cycle can
+  // bring more ticks (e.g. 0.25 steps once the plot got taller), and
+  // shrinking back would clip them.
+  function yAxisSize(self, values, axisIdx, cycleNum) {
+    const axis = self.axes[axisIdx];
+    let w = 0;
+    if (values && values.length) {
+      self.ctx.font = axis.font[0];
+      for (const v of values) if (v != null && v !== "") w = Math.max(w, self.ctx.measureText(String(v)).width);
+      w /= uPlot.pxRatio;
+    }
+    const size = Math.max(28, Math.ceil((axis.ticks?.size ?? 4) + (axis.gap ?? 4) + 5 + w));
+    return cycleNum > 1 ? Math.max(size, axis._size ?? 0) : size;
+  }
+
+  // floating hover readout: one row per series (swatch, name, value),
+  // sorted by value (top line first), x at the cursor in the header.
+  // position: fixed + viewport clamp = no effect on layout or scroll size.
+  function tooltip(valid) {
+    const box = document.createElement("div");
+    box.className = "dash-tip";
+    const head = document.createElement("div");
+    head.className = "dash-tip-head";
+    box.appendChild(head);
+    const list = document.createElement("div");
+    list.className = "dash-tip-rows";
+    box.appendChild(list);
+    const rows = valid.map((d, k) => {
+      const row = document.createElement("div");
+      row.className = "dash-tip-row";
+      const sw = document.createElement("span");
+      sw.className = "dash-tip-sw";
+      sw.style.borderColor = d.color;
+      if (d.dash) sw.style.borderTopStyle = "dashed";
+      const name = document.createElement("span");
+      name.className = "dash-tip-name";
+      name.textContent = d.label;
+      const val = document.createElement("span");
+      val.className = "dash-tip-val";
+      row.append(sw, name, val);
+      return { row, val, si: k + 1, v: null };
+    });
+    let hovering = false;
+    let order = "";
+    let plot = null;
+    function hide() { box.style.display = "none"; }
+    function update(self) {
+      const c = self.cursor;
+      if (!hovering || c.idx == null || c.left == null || c.left < 0) return hide();
+      for (const r of rows) {
+        const j = c.idxs?.[r.si] ?? c.idx;
+        const v = j == null ? null : self.data[r.si][j];
+        r.v = v == null || !Number.isFinite(v) ? null : v;
+        r.val.textContent = r.v == null ? "—" : fmtVal(r.v);
+        r.row.style.display = self.series[r.si].show ? "" : "none";
+      }
+      const sorted = [...rows].sort((a, b) => (b.v ?? -Infinity) - (a.v ?? -Infinity) || a.si - b.si);
+      const key = sorted.map((r) => r.si).join(",");
+      if (key !== order) { for (const r of sorted) list.appendChild(r.row); order = key; }
+      head.textContent = `${xLabel || "x"} ${fmtX(self.data[0][c.idx])}`;
+      box.style.display = "block";
+      // place right-below the cursor; flip left / up at the viewport edge
+      const o = self.over.getBoundingClientRect();
+      const w = box.offsetWidth, h = box.offsetHeight;
+      const vw = document.documentElement.clientWidth, vh = window.innerHeight, m = 4, gap = 14;
+      const cx = o.left + c.left, cy = o.top + c.top;
+      let x = cx + gap;
+      if (x + w > vw - m) x = cx - gap - w;
+      x = Math.max(m, Math.min(x, vw - m - w));
+      let y = cy + gap;
+      if (y + h > vh - m) y = cy - gap - h;
+      y = Math.max(m, Math.min(y, vh - m - h));
+      box.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    }
+    function attach(self) {
+      plot = self;
+      self.root.appendChild(box);
+      self.over.addEventListener("mouseenter", () => { hovering = true; });
+      self.over.addEventListener("mouseleave", () => { hovering = false; hide(); });
+      hide();
+    }
+    return { update: (self) => { if (self === plot) update(self); }, attach };
   }
 
   // Same series structure, new points: keep the plot. If the user had
@@ -152,6 +255,14 @@
     if (a < 1e-3) return v.toExponential(0);
     return +v.toFixed(4) + "";
   }
+  function fmtX(v) {
+    if (v == null) return "—";
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(3) + "B";
+    if (a >= 1e6) return (v / 1e6).toFixed(1) + "M";
+    if (Number.isInteger(v)) return v.toLocaleString();
+    return +v.toFixed(3) + "";
+  }
   function fmtVal(v) {
     const a = Math.abs(v);
     if (a >= 1e6) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
@@ -201,10 +312,37 @@
 <style>
   .chart { width: 100%; min-height: 60px; }
   .empty { color: var(--muted); font-size: 12px; padding: 12px 8px; }
-  :global(.uplot .u-title) { font-size: 13px; font-weight: 600; color: var(--fg); }
-  :global(.uplot .u-legend) { font-size: 11px; color: var(--fg); }
-  :global(.uplot .u-legend .u-value) { min-width: 0; }
-  /* uPlot's first legend entry is the x series (updates / samples / h at
-     the cursor) — hidden; the legend shows only the metric series */
-  :global(.uplot .u-legend .u-series:first-child) { display: none; }
+  /* title floats on the plot's top-left (moved into .u-over in build());
+     translucent plate so it reads over lines and grid; clicks and drags
+     pass through to the plot */
+  :global(.uplot .u-over > .u-title) {
+    position: absolute; top: 2px; left: 4px; z-index: 3; pointer-events: none;
+    max-width: calc(100% - 8px); padding: 0 6px; border-radius: 4px;
+    font-size: 12px; font-weight: 600; line-height: 18px; text-align: left; color: var(--fg);
+    background: color-mix(in srgb, var(--panel) 62%, transparent);
+    text-shadow: 0 0 2px var(--panel), 0 0 3px var(--panel), 0 0 5px var(--panel);
+  }
+  /* static legend (no hover values: those are in the tooltip), compact,
+     capped at three rows and scrolls past that (many runs in Compare) */
+  :global(.uplot .u-legend) {
+    font-size: 11px; line-height: 14px; color: var(--fg); margin-top: 1px;
+    max-height: 48px; overflow-y: auto; overscroll-behavior: contain;
+  }
+  :global(.uplot .u-legend.u-inline tr) { margin-right: 8px; height: 16px; }
+  :global(.uplot .u-legend .u-series > *) { padding: 1px 2px; }
+  :global(.uplot .u-legend .u-marker) { width: 0.9em; height: 0.9em; margin-right: 3px; }
+  /* (a non-live legend has no x-series entry: every row is a metric) */
+  :global(.dash-tip) {
+    position: fixed; left: 0; top: 0; z-index: 50; pointer-events: none;
+    max-width: min(340px, calc(100vw - 8px));
+    background: color-mix(in srgb, var(--bg) 94%, transparent); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 5px;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3);
+    padding: 3px 7px 4px; font-size: 11px; line-height: 15px;
+  }
+  :global(.dash-tip-head) { color: var(--muted); font-variant-numeric: tabular-nums; margin-bottom: 1px; white-space: nowrap; }
+  :global(.dash-tip-row) { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  :global(.dash-tip-sw) { flex: none; width: 12px; height: 0; border-top: 3px solid; }
+  :global(.dash-tip-name) { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  :global(.dash-tip-val) { flex: none; margin-left: 10px; font-variant-numeric: tabular-nums; font-weight: 600; }
 </style>
