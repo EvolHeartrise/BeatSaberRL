@@ -75,7 +75,8 @@ import struct
 import numpy as np
 
 from .constants import (EVENT_REASONS, N_JOINTS, OMEGA_CAP, TAU_AXIS_OF_JOINT,
-                        TAU_MAX, TENDON_HANDS, TENDON_R0,
+                        TAU_MAX, TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV,
+                        TENDON_HANDS, TENDON_R0,
                         TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
                         joint_gear_table)
 from .kinematics import (FRAMES, F_HEAD, F_L_HAND, F_L_WRIST, F_R_HAND,
@@ -118,7 +119,8 @@ def body_tables(gears, tau_scale):
 
     "tendon" (exp/wrist-tendon, 2026-10-05): the passive wrist tendon
     this body ran with — {hands [(bend, dev)] x2, tau_peak_bend,
-    tau_peak_dev (N.m, fixed), r0}. Its torque is NOT in the derived
+    tau_peak_dev (N.m, fixed), b_peak_bend, b_peak_dev (edge-zone
+    damping, N.m.s/rad — issue #61), r0}. Its torque is NOT in the derived
     torque (not muscle effort); a header without the key is a tendon-free
     body."""
     s = [float(tau_scale[TAU_AXIS_OF_JOINT[j]]) for j in range(N_JOINTS)]
@@ -129,6 +131,8 @@ def body_tables(gears, tau_scale):
             "tendon": {"hands": [list(h) for h in TENDON_HANDS],
                        "tau_peak_bend": float(TENDON_TAU_PEAK_BEND),
                        "tau_peak_dev": float(TENDON_TAU_PEAK_DEV),
+                       "b_peak_bend": float(TENDON_B_PEAK_BEND),
+                       "b_peak_dev": float(TENDON_B_PEAK_DEV),
                        "r0": float(TENDON_R0)}}
 
 

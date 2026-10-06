@@ -117,6 +117,7 @@ export const PANELS = [
   { id: "activation", title: "joint activation (Σ|gear fraction| / env-tick · total / spine / arms / legs)", series: ["activation", "activation_spine", "activation_arms", "activation_legs"] },
   { id: "torque", title: "joint torque Σ|τ| (N·m / env-tick · total / spine / arms / legs)", series: ["torque", "torque_spine", "torque_arms", "torque_legs"] },
   { id: "tendon", title: "passive wrist tendon |τ| (N·m / substep, per hand · exp/wrist-tendon; not priced)", series: ["tendon_L", "tendon_R"] },
+  { id: "tendon_diss", title: "wrist edge-zone damping: mean dissipated power (W / substep, per hand · issue #61)", series: ["tdiss_L", "tdiss_R"] },
   { id: "tendon_zone", title: "wrist tendon: % of substeps in the zone (r > 0.5) / beyond the ellipse (r > 1), per hand", series: ["tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct"] },
   { id: "contact", title: "self-contact impulse (N·s / env-tick, env v41)", series: ["contact"] },
   { id: "contact_pct", title: "self-contact: % of env-ticks with body-on-body contact", series: ["contact_pct"] },
@@ -148,6 +149,7 @@ export const COMPARE_KEYS = [
   "torque", "torque_spine", "torque_arms", "torque_legs",
   "contact", "contact_pct",
   "tendon_L", "tendon_R", "tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct",
+  "tdiss_L", "tdiss_R",
 ];
 // ep_return dropped from every view 2026-09-12 (user: too noisy; the
 // trainer no longer emits it — `return` over the update is the measure)
@@ -172,6 +174,7 @@ export const LABELS = {
   torque: "Σ|τ| N·m", torque_spine: "τ spine", torque_arms: "τ arms", torque_legs: "τ legs",
   contact: "N·s / tick", contact_pct: "% ticks in contact",
   tendon_L: "tendon |τ| L", tendon_R: "tendon |τ| R",
+  tdiss_L: "edge diss L (W)", tdiss_R: "edge diss R (W)",
   tzone_L_pct: "zone L %", tzone_R_pct: "zone R %", tout_L_pct: "beyond L %", tout_R_pct: "beyond R %",
   r1: "r1", maxlr: "maxlr", peak_vram: "peak VRAM",
 };

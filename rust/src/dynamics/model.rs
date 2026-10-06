@@ -93,6 +93,14 @@ pub struct PassiveWrist {
     pub hands: [(usize, usize); 2],
     pub tau_peak_bend: Real,
     pub tau_peak_dev: Real,
+    /// Edge-zone damping peaks (issue #61, 2026-10-05): per joint
+    /// τ_d,j = −b_peak_j·x²·q̇_j, x = (r − R0)/(1 − R0) for r > R0 (the
+    /// tendon's radius; uncapped past r = 1), else 0. Diagonal and ≥ 0,
+    /// so strictly dissipative. Applied IMPLICITLY (h·b on M's diagonal
+    /// + −b·q̇ on the RHS — step.rs 4c; the explicit b·h/I_eff reaches
+    /// ~0.4 at the corners and > 1 on reachable overshoot states).
+    pub b_peak_bend: Real,
+    pub b_peak_dev: Real,
 }
 
 /// Tendon zone onset (normalized radius) and the τ_peak fraction.
@@ -110,6 +118,28 @@ pub const TAU_BODY_DEFAULT_WRIST_DEV: f64 = 1.0220;
 /// 0.32500 N·m.
 pub const TENDON_TAU_PEAK_BEND: Real = (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND) as Real;
 pub const TENDON_TAU_PEAK_DEV: Real = (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV) as Real;
+/// Edge-damping reference speed (issue #61): at r = 1 and |q̇| = 30 rad/s
+/// the damping torque equals the joint's tendon τ_peak, i.e.
+/// b_peak = τ_peak / 30 — bend 0.020701, dev 0.010833 N·m·s/rad. Derived
+/// from the τ_peak expressions in f64, rounded once to Real (the .cu's
+/// `T(double constexpr)`); fixed, not scaled by tau draws / tau_fit.
+pub const TENDON_DAMP_REF_SPEED: f64 = 30.0;
+pub const TENDON_B_PEAK_BEND: Real =
+    (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND / TENDON_DAMP_REF_SPEED) as Real;
+pub const TENDON_B_PEAK_DEV: Real =
+    (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV / TENDON_DAMP_REF_SPEED) as Real;
+
+/// Edge-zone shape x² of the radius r: ((r − R0)/(1 − R0))² for r > R0,
+/// else 0 (uncapped). The edge damping is b_peak_j·tendon_edge_x2(r).
+#[inline]
+pub fn tendon_edge_x2(r: Real) -> Real {
+    if r > TENDON_R0 {
+        let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+        x * x
+    } else {
+        0.0
+    }
+}
 
 /// Distance to the limit a wrist coordinate is heading to.
 #[inline(always)]
@@ -188,6 +218,8 @@ pub const HUMANOID_PASSIVE_WRIST: PassiveWrist = PassiveWrist {
     hands: [(8, 9), (15, 16)],
     tau_peak_bend: TENDON_TAU_PEAK_BEND,
     tau_peak_dev: TENDON_TAU_PEAK_DEV,
+    b_peak_bend: TENDON_B_PEAK_BEND,
+    b_peak_dev: TENDON_B_PEAK_DEV,
 };
 
 impl Model {

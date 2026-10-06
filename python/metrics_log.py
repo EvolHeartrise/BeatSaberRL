@@ -71,6 +71,8 @@ UPDATE_FIELDS = (
     # wrist tendon |tau| per substep (N*m) and the fractions of substeps
     # in the zone (r > 0.5) / beyond the ellipse (r > 1)
     "tendon_L", "tendon_R", "tzone_L", "tzone_R", "tout_L", "tout_R",
+    # ... and the edge-zone damping's mean dissipated power (W, issue #61)
+    "tdiss_L", "tdiss_R",
     # env v41 [contact]: mean self-collision impulse per env-tick (N.s)
     # and the fraction of env-ticks with any body-on-body contact
     "contact", "contact_frac",
@@ -192,7 +194,7 @@ def update_record(update, num_updates, global_step, *, t=None,
                  "activation_legs", "torque", "torque_spine",
                  "torque_arms", "torque_legs", "contact", "contact_frac",
                  "tendon_L", "tendon_R", "tzone_L", "tzone_R", "tout_L",
-                 "tout_R"):
+                 "tout_R", "tdiss_L", "tdiss_R"):
             rec[k] = _num(v)
         else:
             rec[k] = _int(v)
@@ -264,7 +266,7 @@ _RE_TORQUE = re.compile(
     r"legs (\S+)\)")
 _RE_TENDON = re.compile(
     r"^\[tendon\] L (\S+)\s+R (\S+) N\*m/substep\s+zone L (\S+)%\s+R (\S+)%"
-    r"\s+beyond L (\S+)%\s+R (\S+)%")
+    r"\s+beyond L (\S+)%\s+R (\S+)%(?:\s+diss L (\S+)\s+R (\S+) W)?")
 _RE_CONTACT = re.compile(
     r"^\[contact\] (\S+) N\*s/tick \((\S+)% of env-ticks in self-contact\)")
 _RE_PDNET = re.compile(r"^\[pd-net\] (\d+) f32 pivot-floor")
@@ -540,6 +542,9 @@ def parse_log(text, t_end=None):
                            ("tout_R", 6)):
                 pct = _num(m.group(g))
                 seg._pending[key] = pct / 100.0 if pct is not None else None
+            if m.group(7) is not None:      # edge damping (issue #61)
+                seg._pending["tdiss_L"] = _num(m.group(7))
+                seg._pending["tdiss_R"] = _num(m.group(8))
             seg._count("tendon")
             continue
         m = _RE_CONTACT.match(line)

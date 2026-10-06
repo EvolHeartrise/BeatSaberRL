@@ -378,6 +378,9 @@ fn humanoid_tables_are_mirror_symmetric() {
         assert_eq!(JOINT_SIGN[jd], -1.0, "dev flips sign under the mirror");
     }
     assert!(pw.tau_peak_bend > 0.0 && pw.tau_peak_dev > 0.0);
+    // issue #61 edge damping: per-model scalars shared by both hands, on
+    // the shared radius r (bit-identical across the mirror), diagonal
+    assert!(pw.b_peak_bend > 0.0 && pw.b_peak_dev > 0.0);
     for (k, &(a, b)) in PAIRS.iter().enumerate() {
         let mk = PAIR_MIRROR[k];
         assert_eq!(PAIR_MIRROR[mk], k);

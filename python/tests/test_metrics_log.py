@@ -460,7 +460,7 @@ def test_tendon_line_and_record():
     fractions; the formatter carries the same keys from the events dict
     (train_batch's m_ev)."""
     log = ("[tendon] L 0.0412  R 0.0398 N*m/substep  zone L 21.50%  "
-           "R 19.25%  beyond L 1.75%  R 0.50%\n"
+           "R 19.25%  beyond L 1.75%  R 0.50%  diss L 0.0123  R 0.0101 W\n"
            "update     3/100  steps   3145728  acc 0.9561  accL 0.9550  "
            "accR 0.9572  return   5.10  ent 20.1  ev 0.996   150,000 "
            "steps/s    21.0s\n")
@@ -470,8 +470,10 @@ def test_tendon_line_and_record():
     assert u["tzone_R"] == pytest.approx(0.1925)
     assert u["tout_L"] == pytest.approx(0.0175)
     assert u["tout_R"] == pytest.approx(0.005)
+    assert (u["tdiss_L"], u["tdiss_R"]) == (0.0123, 0.0101)
     ev = {"tendon_L": 0.0412, "tendon_R": 0.0398, "tzone_L": 0.215,
-          "tzone_R": 0.1925, "tout_L": 0.0175, "tout_R": 0.005}
+          "tzone_R": 0.1925, "tout_L": 0.0175, "tout_R": 0.005,
+          "tdiss_L": 0.0123, "tdiss_R": 0.0101}
     rec = ml.update_record(3, 100, 3145728, events=ev)
     assert set(rec) <= set(ml.UPDATE_FIELDS)
     assert {k: rec[k] for k in ev} == ev       # floats, not truncated to int

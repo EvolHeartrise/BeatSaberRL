@@ -14,8 +14,8 @@ use super::*;
 use dynamics::algo::{crba, energy, tc_factor, tc_solve_unit_v};
 use dynamics::fk::fk_all;
 use dynamics::model::{
-    wrist_tendon, wrist_tendon_energy, HUMANOID_LIMITS, HUMANOID_PASSIVE_WRIST,
-    TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
+    tendon_edge_x2, wrist_tendon, wrist_tendon_energy, HUMANOID_LIMITS, HUMANOID_PASSIVE_WRIST,
+    TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV, TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
 };
 use dynamics::solver::{substep_constrained, ConstraintSet};
 
@@ -385,47 +385,315 @@ fn release(m: &Model, start: Real, h: Real, seconds: Real) -> (Real, Real, Real,
     (e0, emax, e1, t, (e1 - e0) / t.max(1e-9))
 }
 
-/// Energy behaviour of the explicit tendon (stability evidence).
+/// HUMANOID variants for the energy / vibration experiments.
+fn variant(gravity: bool, joint_damping: bool, caps: bool, edge: bool) -> Model {
+    static ZD: [Real; NQ] = [0.0; NQ];
+    static NOCAP: [Real; NQ] = [1e9; NQ];
+    let mut m = HUMANOID;
+    if !gravity {
+        m.gravity = [0.0; 3];
+    }
+    if !joint_damping {
+        m.damping = &ZD;
+    }
+    if !caps {
+        m.omega_cap = &NOCAP;
+    }
+    if !edge {
+        let mut pw = HUMANOID_PASSIVE_WRIST;
+        pw.b_peak_bend = 0.0;
+        pw.b_peak_dev = 0.0;
+        m.passive_wrist = Some(pw);
+    }
+    m
+}
+
+/// Energy behaviour (stability evidence).
 ///
-/// (1) The real body (damping + ω caps): released from 70 % of the
-///     corner, total energy never rises above E0 and ends well below it
-///     — net dissipative at h = 1/240 and 1/480.
-/// (2) Diagnostic, undamped and uncapped: semi-implicit Euler with a
-///     configuration-dependent M is not symplectic, and the stiff
-///     tendon makes its first-order energy drift visible — a SECULAR
-///     gain (~0.1 J/s from 0.17 J at 1/240) that halves with h. Asserted
-///     only to converge (it is integration error, not a modelling bug);
-///     on the real body the joint damping outweighs it (see (1)). The
-///     PR records the linearized-implicit fix if it ever matters.
+/// (1) The real body (joint damping + ω caps + edge damping): released
+///     from 70 % of the corner, total energy never rises above E0 and
+///     ends near 0 — at h = 1/240 and 1/480.
+/// (2) The tendon ALONE (joint damping 0, caps off, edge damping off):
+///     semi-implicit Euler with a configuration-dependent M is not
+///     symplectic, and the stiff tendon shows its first-order energy
+///     drift as a SECULAR gain (~0.09 J/s from 0.17 J at 1/240) that
+///     halves with h — integration error, asserted to converge.
+/// (3) The same with ONLY the edge damping on (issue #61): the gain is
+///     gone — energy never exceeds E0 and is dissipated, at every h.
 #[test]
 fn tendon_release_energy() {
     for (h, label) in [(H_SUB, "1/240"), (H_SUB * 0.5, "1/480")] {
-        let mut m = HUMANOID;
-        m.gravity = [0.0; 3];
+        let m = variant(false, true, true, true);
         let (e0, emax, e1, t, _) = release(&m, 0.7, h, 2.0);
-        println!("damped release h={label}: {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J");
+        println!("real-body release h={label}: {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J");
         assert!(emax <= e0 * (1.0 + 1e-9), "energy rose above its start: {e0} -> {emax}");
         assert!(e1 < 0.5 * e0, "not dissipative: {e0} -> {e1}");
         assert!(t > 0.5, "too short a stop-free window ({t} s)");
     }
-    static ZD: [Real; NQ] = [0.0; NQ];
-    static NOCAP: [Real; NQ] = [1e9; NQ];
-    let mut m = HUMANOID;
-    m.gravity = [0.0; 3];
-    m.damping = &ZD;
-    m.omega_cap = &NOCAP;
-    let mut rates = Vec::new();
+    let bare = variant(false, false, false, false);
+    let edge = variant(false, false, false, true);
+    let mut gains = Vec::new();
     for k in 0..4 {
         let h = H_SUB / (1 << k) as Real;
-        let (e0, emax, e1, t, rate) = release(&m, 0.7, h, 1.0);
-        println!("undamped release h=1/{:.0}: {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
+        let (e0, emax, e1, t, rate) = release(&bare, 0.7, h, 1.0);
+        println!("tendon only, h=1/{:.0}: {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
                   drift {rate:+.4} J/s", 1.0 / h);
         assert!(t > 0.9, "the undamped release hit a stop at {t} s");
-        rates.push(emax - e0);
+        gains.push(emax - e0);
+        let (e0, emax, e1, t, rate) = release(&edge, 0.7, h, 1.0);
+        println!("  + edge damping:    {t:.2} s  E0 {e0:.4} J  max {emax:.4} J  end {e1:.4} J  \
+                  drift {rate:+.4} J/s", );
+        assert!(emax <= e0 * (1.0 + 1e-9), "edge damping: energy rose {e0} -> {emax}");
+        assert!(e1 < 0.5 * e0, "edge damping does not dissipate: {e0} -> {e1}");
     }
-    for k in 1..rates.len() {
-        assert!(rates[k] < 0.75 * rates[k - 1], "energy error does not converge with h: {rates:?}");
+    for k in 1..gains.len() {
+        assert!(gains[k] < 0.75 * gains[k - 1], "energy error does not converge with h: {gains:?}");
     }
+}
+
+/// Edge damping shape (issue #61): b_j(r) = b_peak_j·x², x = (r − 0.5)/0.5
+/// for r > 0.5 — zero inside, continuous at the zone edge (x² → 0) and
+/// across q = 0 (r is), uncapped past r = 1; b_peak = τ_peak / 30 rad/s;
+/// ≥ 0 everywhere, so τ_d·q̇ = −b·q̇² ≤ 0 (strictly dissipative).
+#[test]
+fn edge_damping_shape() {
+    assert!((TENDON_B_PEAK_BEND - TENDON_TAU_PEAK_BEND / 30.0).abs() < 1e-15);
+    assert!((TENDON_B_PEAK_DEV - TENDON_TAU_PEAK_DEV / 30.0).abs() < 1e-15);
+    println!("b_peak bend {TENDON_B_PEAK_BEND:.6}  dev {TENDON_B_PEAK_DEV:.6} N*m*s/rad");
+    assert_eq!(tendon_edge_x2(0.0), 0.0);
+    assert_eq!(tendon_edge_x2(0.5), 0.0);
+    assert!(tendon_edge_x2(0.5 + 1e-9) < 1e-16);
+    assert_eq!(tendon_edge_x2(1.0), 1.0);
+    assert!((tendon_edge_x2(2.0) - 9.0).abs() < 1e-14);
+    let mut rng = Rng(0x7E4D_0005);
+    for _ in 0..100_000 {
+        let (qb, qd) = (rng.range(-2.2, 2.2), rng.range(-0.9, 0.9));
+        let (vb, vd) = (rng.range(-120.0, 120.0), rng.range(-60.0, 60.0));
+        let (_, _, r) = tl(qb, qd);
+        let x2 = tendon_edge_x2(r);
+        let (bb, bd) = (TENDON_B_PEAK_BEND * x2, TENDON_B_PEAK_DEV * x2);
+        assert!(bb >= 0.0 && bd >= 0.0);
+        assert!((-bb * vb) * vb + (-bd * vd) * vd <= 0.0, "power > 0");
+        if r <= 0.5 {
+            assert_eq!((bb, bd), (0.0, 0.0));
+        }
+        // mirror: the right wrist at the mirrored pose has the same r,
+        // hence bit-identical b
+        let (_, _, rr) = tr(qb, -qd);
+        assert_eq!(tendon_edge_x2(r).to_bits(), tendon_edge_x2(rr).to_bits());
+    }
+    // continuity across q = 0 (r continuous) and the zone edge
+    let mut worst: Real = 0.0;
+    for i in 0..=100 {
+        let qb = -2.0 + 4.0 * i as Real / 100.0;
+        let a = tendon_edge_x2(tl(qb, 1e-12).2);
+        let b = tendon_edge_x2(tl(qb, -1e-12).2);
+        worst = worst.max((a - b).abs());
+        let qd = -0.6 + 1.2 * i as Real / 100.0;
+        let a = tendon_edge_x2(tl(1e-12, qd).2);
+        let b = tendon_edge_x2(tl(-1e-12, qd).2);
+        worst = worst.max((a - b).abs());
+    }
+    assert!(worst < 1e-10, "edge damping discontinuous: {worst:e}");
+}
+
+/// Step-level dissipativity: a wrist spun inside the zone with the
+/// tendon stiffness zeroed (τ_peak = 0, b_peak kept), gravity / joint
+/// damping / caps / contacts / ground off, stops never reached: the
+/// edge damping alone strictly lowers the energy every substep relative
+/// to the same run with b_peak = 0, and never adds energy.
+#[test]
+fn edge_damping_dissipates_in_the_substep() {
+    let mut damped = variant(false, false, false, true);
+    let mut pw = HUMANOID_PASSIVE_WRIST;
+    pw.tau_peak_bend = 0.0;
+    pw.tau_peak_dev = 0.0;
+    damped.passive_wrist = Some(pw);
+    let mut bare = damped;
+    pw.b_peak_bend = 0.0;
+    pw.b_peak_dev = 0.0;
+    bare.passive_wrist = Some(pw);
+    let run = |m: &Model| -> Vec<Real> {
+        let mut st = State::neutral(m);
+        for (j, v) in Q_START_ARM {
+            st.q[j] = v;
+        }
+        st.q[7] = 1.0;
+        st.q[14] = -1.0;
+        // in the zone (u_b = 0.9) and moving along the dev axis
+        st.q[LB] = 0.9 * HUMANOID_LIMITS[LB].1;
+        st.q[RB] = 0.9 * HUMANOID_LIMITS[RB].1;
+        st.v[6 + LD] = -3.0;
+        st.v[6 + RD] = 3.0;
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, false, false);
+        let tau = [0.0 as Real; NQ];
+        let mut es = Vec::new();
+        for _ in 0..24 {
+            substep_constrained(m, &mut st, &tau, H_SUB, &mut ws, &mut cs);
+            fk_all(m, &st, &mut ws);
+            es.push(energy(m, &mut ws, &st.v));
+            for j in [LB, LD, RB, RD] {
+                assert!(st.q[j] > m.limits[j].0 && st.q[j] < m.limits[j].1);
+            }
+        }
+        es
+    };
+    let (ed, eb) = (run(&damped), run(&bare));
+    println!("spin energy after 24 substeps: edge-damped {:.6} J vs bare {:.6} J", ed[23], eb[23]);
+    for k in 0..24 {
+        assert!(ed[k] < eb[k], "substep {k}: damped {} >= bare {}", ed[k], eb[k]);
+    }
+    for k in 1..24 {
+        assert!(ed[k] <= ed[k - 1] + 1e-12, "edge damping added energy at substep {k}");
+    }
+}
+
+/// Stability of the edge damping and its damping ratios.
+///
+/// b·h/I_eff (largest eigenvalue of h·M⁻¹_ww·B, the model's own M⁻¹ at
+/// the reset arm pose) across the reachable range — explicit treatment
+/// would be fine only well below ~0.5; corners sit at ~0.4 and the
+/// one-substep overshoot past both stops above 1, so the damping is
+/// IMPLICIT (step.rs 4c). ζ per tendon mode: K φ = ω² M_eff φ (M_eff =
+/// (M⁻¹_ww)⁻¹), ζ = φᵀ(B + b_joint)φ / (2 ω φᵀM_eff φ), before (joint
+/// damping only) and after (+ edge damping).
+#[test]
+fn edge_damping_budget_and_zeta() {
+    let (bhi, dlo, dhi) = (HUMANOID_LIMITS[LB].1, HUMANOID_LIMITS[LD].0, HUMANOID_LIMITS[LD].1);
+    let ob = H_SUB * MODEL.omega_cap[LB];
+    let od = H_SUB * MODEL.omega_cap[LD];
+    let mut st = State::neutral(MODEL);
+    for (j, v) in Q_START_ARM {
+        st.q[j] = v;
+    }
+    let bj = MODEL.damping[LB];
+    let mut worst = 0.0 as Real;
+    for (name, qb, qd) in [
+        ("zone edge r=0.6 (bend)", 0.6 * bhi, 0.0),
+        ("zone edge r=0.6 (diag)", 0.6 / 2f64.sqrt() * bhi, 0.6 / 2f64.sqrt() * dhi),
+        ("bend stop r=1", bhi, 0.0),
+        ("dev stop (15) r=1", 0.0, dhi),
+        ("dev stop (30) r=1", 0.0, dlo),
+        ("70/70 (+dev)", 0.7 * bhi, 0.7 * dhi),
+        ("corner (+dev 15)", bhi, dhi),
+        ("corner (-dev 30)", bhi, dlo),
+        ("overshoot (+dev)", bhi + ob, dhi + od),
+        ("overshoot (-dev)", bhi + ob, dlo - od),
+    ] {
+        st.q[LB] = qb;
+        st.q[LD] = qd;
+        let mi = wrist_minv(&st, LB, LD);
+        let (_, _, r) = tl(qb, qd);
+        let x2 = tendon_edge_x2(r);
+        let (bb, bd) = (TENDON_B_PEAK_BEND * x2, TENDON_B_PEAK_DEV * x2);
+        // h·M⁻¹B: B diagonal
+        let a = [[mi[0][0] * bb, mi[0][1] * bd], [mi[1][0] * bb, mi[1][1] * bd]];
+        let bhi_ = max_eig2(a);
+        // M_eff = inv(M⁻¹_ww)
+        let det = mi[0][0] * mi[1][1] - mi[0][1] * mi[1][0];
+        let me = [[mi[1][1] / det, -mi[0][1] / det], [-mi[1][0] / det, mi[0][0] / det]];
+        let k = tendon_k(tl, qb, qd);
+        // generalized eigenproblem via A = M⁻¹K (2×2), eigenvectors
+        let ak = [[mi[0][0] * k[0][0] + mi[0][1] * k[1][0], mi[0][0] * k[0][1] + mi[0][1] * k[1][1]],
+                  [mi[1][0] * k[0][0] + mi[1][1] * k[1][0], mi[1][0] * k[0][1] + mi[1][1] * k[1][1]]];
+        let tr_ = ak[0][0] + ak[1][1];
+        let dt_ = ak[0][0] * ak[1][1] - ak[0][1] * ak[1][0];
+        let disc = (0.25 * tr_ * tr_ - dt_).max(0.0).sqrt();
+        let mut zs = String::new();
+        for lam in [0.5 * tr_ + disc, 0.5 * tr_ - disc] {
+            if lam <= 1e-9 {
+                zs += "  (mode ω²≤0)";
+                continue;
+            }
+            let w = lam.sqrt();
+            // eigenvector of ak for lam
+            let phi = if ak[0][1].abs() > 1e-12 { [ak[0][1], lam - ak[0][0]] }
+                      else if ak[1][0].abs() > 1e-12 { [lam - ak[1][1], ak[1][0]] }
+                      else if (lam - ak[0][0]).abs() < (lam - ak[1][1]).abs() { [1.0, 0.0] }
+                      else { [0.0, 1.0] };
+            let pmp = phi[0] * (me[0][0] * phi[0] + me[0][1] * phi[1])
+                + phi[1] * (me[1][0] * phi[0] + me[1][1] * phi[1]);
+            let pb0 = bj * (phi[0] * phi[0] + phi[1] * phi[1]);
+            let pb1 = pb0 + bb * phi[0] * phi[0] + bd * phi[1] * phi[1];
+            zs += &format!("  ω {:5.1} rad/s ({:4.1} Hz) ζ {:.4} -> {:.4}",
+                           w, w / (2.0 * std::f64::consts::PI),
+                           pb0 / (2.0 * w * pmp), pb1 / (2.0 * w * pmp));
+        }
+        println!("  {name:24} r {r:.3}  b_bend {bb:.4} b_dev {bd:.4}  b·h/I: 1/240 {:.3}  1/480 {:.3}{zs}",
+                 bhi_ * H_SUB, bhi_ * H_SUB * 0.5);
+        worst = worst.max(bhi_ * H_SUB);
+    }
+    println!("worst explicit b·h/I at 1/240: {worst:.3} (-> implicit edge damping)");
+    // the reason the damping is implicit: explicit would not be
+    // comfortably stable on reachable states
+    assert!(worst > 0.5);
+}
+
+/// Corner-release vibration, before (tendon only) and after (+ edge
+/// damping): the real body (gravity off, joint damping, caps, stops)
+/// released at rest from 98 % of the (+bend, +15° dev) corner (both
+/// hands, mirrored). Reports the ringing frequency (zero crossings of
+/// the left dev rate in the first 0.5 s), the remaining fraction of the
+/// released energy (kinetic + tendon) at fixed times, and the time to
+/// shed 90 % / 99 % of it.
+#[test]
+fn corner_release_vibration() {
+    let measure = |m: &Model| -> (Real, Vec<Real>, Real, Real) {
+        let mut st = State::neutral(m);
+        for (j, v) in Q_START_ARM {
+            st.q[j] = v;
+        }
+        st.q[7] = 1.0;
+        st.q[14] = -1.0;
+        st.q[LB] = 0.98 * HUMANOID_LIMITS[LB].1;
+        st.q[LD] = 0.98 * HUMANOID_LIMITS[LD].1;
+        st.q[RB] = 0.98 * HUMANOID_LIMITS[RB].1;
+        st.q[RD] = -0.98 * HUMANOID_LIMITS[LD].1;
+        let mut ws = Workspace::new(m);
+        let mut cs = ConstraintSet::new(m, false, false);
+        let tau = [0.0 as Real; NQ];
+        let total = |st: &State, ws: &mut Workspace| -> Real {
+            fk_all(m, st, ws);
+            energy(m, ws, &st.v) + el(st.q[LB], st.q[LD]) + er(st.q[RB], st.q[RD])
+        };
+        let e0 = total(&st, &mut ws);
+        let n = (3.0 / H_SUB) as usize;
+        let (mut zc, mut prev) = (0usize, 0.0 as Real);
+        let (mut t90, mut t99) = (Real::NAN, Real::NAN);
+        let mut at = Vec::new();
+        for i in 1..=n {
+            substep_constrained(m, &mut st, &tau, H_SUB, &mut ws, &mut cs);
+            let t = i as Real * H_SUB;
+            let vd = st.v[6 + LD];
+            if t <= 0.5 && i > 1 && vd * prev < 0.0 {
+                zc += 1;
+            }
+            prev = vd;
+            let f = total(&st, &mut ws) / e0;
+            if t90.is_nan() && f < 0.1 {
+                t90 = t;
+            }
+            if t99.is_nan() && f < 0.01 {
+                t99 = t;
+            }
+            for tt in [0.05, 0.1, 0.25, 0.5, 1.0] {
+                if i == (tt / H_SUB).round() as usize {
+                    at.push(f);
+                }
+            }
+        }
+        (zc as Real / 2.0 / 0.5, at, t90, t99)
+    };
+    let before = measure(&variant(false, true, true, false));
+    let after = measure(&variant(false, true, true, true));
+    for (name, (hz, at, t90, t99)) in [("tendon only", &before), ("+ edge damping", &after)] {
+        println!("corner release, {name:15}: ~{hz:.0} Hz; E/E0 at 0.05/0.1/0.25/0.5/1 s = \
+                  {:.3}/{:.3}/{:.3}/{:.3}/{:.4}; 90% shed in {t90:.3} s, 99% in {t99:.3} s",
+                 at[0], at[1], at[2], at[3], at[4]);
+    }
+    assert!(after.2 < before.2, "edge damping must shed the release energy faster");
+    assert!(after.1[2] < before.1[2]);
 }
 
 /// Default-body τ scales per joint (constants.TAU_BODY_DEFAULT).
@@ -502,7 +770,7 @@ fn corner_soak(m: &Model, h: Real, seconds: Real, seed: u64) -> Soak {
             done += 1;
             out.substeps += 1;
             for s in 0..2 {
-                let [tb, td, r] = ws.tendon[s];
+                let [tb, td, r, _] = ws.tendon[s];
                 out.rmax = out.rmax.max(r);
                 out.tmax = out.tmax.max(tb.abs()).max(td.abs());
                 if r > 0.5 {
@@ -608,6 +876,6 @@ fn tendon_excluded_from_effort_and_counted_in_telemetry() {
     core.body.st.q[LD] = 0.99 * dhi;
     core.body.refresh_fk();
     core.body.tick(&a, &gear);
-    assert_eq!(core.body.tendon_tick, [0.0; 6]);
-    assert_eq!(core.body.ws.tendon, [[0.0; 3]; 2]);
+    assert_eq!(core.body.tendon_tick, [0.0; 8]);
+    assert_eq!(core.body.ws.tendon, [[0.0; 4]; 2]);
 }

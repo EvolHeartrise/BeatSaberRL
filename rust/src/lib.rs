@@ -817,9 +817,11 @@ struct Body {
     // exp/wrist-tendon telemetry: this tick's passive wrist torque,
     // summed over its substeps, per hand — [Σ(|τ_bend| + |τ_dev|) L, R
     // (N·m), substeps in the zone r > R0 L, R, substeps beyond the
-    // ellipse r > 1 L, R]. The tendon is NOT muscle effort: it never
-    // enters `tau` / `tau_abs` (energy price, [torque], replay torque).
-    tendon_tick: [Real; 6],
+    // ellipse r > 1 L, R, edge-damping dissipated power Σ b_e·q̇² L, R
+    // (W, issue #61)]. Neither the tendon nor its damping is muscle
+    // effort: they never enter `tau` / `tau_abs` (energy price,
+    // [torque], replay torque).
+    tendon_tick: [Real; 8],
     // exp/wrist-tendon TEST/TOOLING switch: false steps the substeps with
     // HUMANOID_NO_TENDON (identical tables, passive_wrist = None). Default
     // true; training, bench and replays never touch it (the CUDA kernel
@@ -915,7 +917,7 @@ impl Body {
             act_group: [0.0; 3],
             tau_abs: 0.0,
             tau_group: [0.0; 3],
-            tendon_tick: [0.0; 6],
+            tendon_tick: [0.0; 8],
             tendon_on: true,
             tau_axis: [1.0; TAU_FEAT],
             tau_scale: [1.0; NQ],
@@ -971,7 +973,7 @@ impl Body {
         self.act_group = [0.0; 3];
         self.tau_abs = 0.0;
         self.tau_group = [0.0; 3];
-        self.tendon_tick = [0.0; 6];
+        self.tendon_tick = [0.0; 8];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -1073,10 +1075,10 @@ impl Body {
         // bounces back has still stopped being the standing task.
         let mut fell = false;
         let mut tilted = false;
-        self.tendon_tick = [0.0; 6];
+        self.tendon_tick = [0.0; 8];
         let model: &Model = if self.tendon_on { MODEL } else { &HUMANOID_NO_TENDON };
         if !self.tendon_on {
-            self.ws.tendon = [[0.0; 3]; 2]; // step 4c never writes it
+            self.ws.tendon = [[0.0; 4]; 2]; // step 4c never writes it
         }
         for _ in 0..self.rate.n_sub {
             substep_constrained(model, &mut self.st, &self.tau, H_SUB,
@@ -1084,8 +1086,9 @@ impl Body {
             // exp/wrist-tendon telemetry: the passive torque step 4
             // applied this substep (ws.tendon, [τ_b, τ_d, r] per hand)
             for h in 0..2 {
-                let [tb, td, r] = self.ws.tendon[h];
+                let [tb, td, r, pd] = self.ws.tendon[h];
                 self.tendon_tick[h] += tb.abs() + td.abs();
+                self.tendon_tick[6 + h] += pd;
                 if r > TENDON_R0 {
                     self.tendon_tick[2 + h] += 1.0;
                 }
@@ -1339,9 +1342,10 @@ struct Core {
     tau_sum: [Real; 4],
     tau_ticks: u64,
     // exp/wrist-tendon telemetry: Σ of Body::tendon_tick over ticks
-    // ([|τ_p| L, R, zone L, R, out L, R]) + the SUBSTEP count, until
-    // popped (pop_tendon; tau_sum pattern). Means are per substep.
-    tendon_sum: [Real; 6],
+    // ([|τ_p| L, R, zone L, R, out L, R, P_diss L, R]) + the SUBSTEP
+    // count, until popped (pop_tendon; tau_sum pattern). Means are per
+    // substep.
+    tendon_sum: [Real; 8],
     tendon_n: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
@@ -1462,7 +1466,7 @@ impl Core {
             act_ticks: 0,
             tau_sum: [0.0; 4],
             tau_ticks: 0,
-            tendon_sum: [0.0; 6],
+            tendon_sum: [0.0; 8],
             tendon_n: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
@@ -1922,7 +1926,7 @@ impl Core {
         self.tau_sum[3] += self.body.tau_group[2];
         self.tau_ticks += 1;
         // exp/wrist-tendon telemetry (never priced)
-        for k in 0..6 {
+        for k in 0..8 {
             self.tendon_sum[k] += self.body.tendon_tick[k];
         }
         self.tendon_n += rate.n_sub as u64;
@@ -2555,9 +2559,10 @@ impl Core {
     }
 
     /// exp/wrist-tendon: (Σ over substeps of [|τ_p| L, |τ_p| R (N·m),
-    /// zone L, zone R, out L, out R], substeps), zeroed.
-    fn pop_tendon(&mut self) -> ([Real; 6], u64) {
-        let s = std::mem::replace(&mut self.tendon_sum, [0.0; 6]);
+    /// zone L, zone R, out L, out R, P_diss L, P_diss R (W)], substeps),
+    /// zeroed.
+    fn pop_tendon(&mut self) -> ([Real; 8], u64) {
+        let s = std::mem::replace(&mut self.tendon_sum, [0.0; 8]);
         (s, std::mem::replace(&mut self.tendon_n, 0))
     }
 
@@ -3037,11 +3042,12 @@ impl RawBeatSim {
     /// exp/wrist-tendon telemetry since the last pop: (Σ|τ_p| L, Σ|τ_p|
     /// R in N·m, zone substeps L, R, beyond-ellipse substeps L, R,
     /// substeps) — |τ_p| per hand = |τ_bend| + |τ_dev|, zone = r > 0.5,
-    /// beyond = r > 1, every quantity summed per SUBSTEP. CUDA
-    /// `pop_tendon` mirror.
-    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, u64) {
+    /// beyond = r > 1, then the edge-damping dissipated power Σ b_e·q̇²
+    /// L, R (W, issue #61), every quantity summed per SUBSTEP — 9-tuple
+    /// (…, diss L, diss R, substeps). CUDA `pop_tendon` mirror.
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
         let (s, n) = self.core.pop_tendon();
-        (s[0], s[1], s[2], s[3], s[4], s[5], n)
+        (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], n)
     }
 
     /// f64 Cholesky pivot-floor engagements since the last pop
@@ -3598,17 +3604,17 @@ impl VecBeatSim {
 
     /// exp/wrist-tendon telemetry summed over all envs since the last
     /// pop — RawBeatSim.pop_tendon's tuple. CUDA `pop_tendon` mirror.
-    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, u64) {
-        let mut acc = [0.0 as Real; 6];
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 8];
         let mut n = 0u64;
         for s in self.sims.iter_mut() {
             let (a, t) = s.pop_tendon();
-            for k in 0..6 {
+            for k in 0..8 {
                 acc[k] += a[k];
             }
             n += t;
         }
-        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], n)
+        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], n)
     }
 
     /// env v41 self-contact telemetry summed over all envs since the

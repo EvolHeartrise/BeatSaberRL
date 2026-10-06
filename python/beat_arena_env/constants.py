@@ -443,6 +443,22 @@ assert TENDON_TAU_PEAK_BEND == (
     TENDON_FRAC * TAU_MAX[8] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_bend")])
 assert TENDON_TAU_PEAK_DEV == (
     TENDON_FRAC * TAU_MAX[9] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_dev")])
+# Edge-zone damping (issue #61; model.rs TENDON_B_PEAK_*): per wrist joint
+# tau_d = -b_peak_j x^2 qd_j, x = (r - R0)/(1 - R0) for r > R0 (the
+# tendon's radius, uncapped), b_peak = tau_peak / 30 rad/s (the damping
+# torque at r = 1, 30 rad/s equals tau_peak). Applied IMPLICITLY (h*b on
+# M's wrist diagonal). Passive: never priced / in [torque].
+TENDON_DAMP_REF_SPEED = 30.0
+TENDON_B_PEAK_BEND = TENDON_FRAC * 1.431 * 1.4466 / TENDON_DAMP_REF_SPEED
+TENDON_B_PEAK_DEV = TENDON_FRAC * 1.06 * 1.0220 / TENDON_DAMP_REF_SPEED
+
+
+def tendon_edge_x2(r):
+    """Edge-damping shape x^2 of the tendon radius (model.rs mirror)."""
+    if not r > TENDON_R0:
+        return 0.0
+    x = (r - TENDON_R0) / (1.0 - TENDON_R0)
+    return x * x
 
 
 def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,

@@ -559,7 +559,8 @@ def _whip_events(kind=0, ticks=60):
     # over — the episode ends on the tilt envelope ~17 ticks in — so the
     # windup is 13 ticks and both kinds use hit 0.75 (swept: the regular
     # note lands 70 pre + 30 post there, the chain head 70 pre, no post).
-    hit = 0.75
+    # 0.75 -> 0.7 (exp/wrist-tendon edge damping, issue #61: see windup)
+    hit = 0.7
     sim = _sim_with_note(_note(hit, 2, 1, kind=kind), max_steps=300)
     # env v20: the whip is hand-tuned against the zero-arm start
     _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)
@@ -576,7 +577,12 @@ def _whip_events(kind=0, ticks=60):
         # (2026-10-03, 0.50 kg hands: swept hit 0.6-0.85 x windup
         # 11-16, hit 0.75 / windup 11 is the cell where the regular note
         # lands 70 + 30 and the chain head 70; windup 13 now misses)
-        a[A_R_ARM] = 1 if t < 11 else 2
+        # 11 -> 9 (exp/wrist-tendon + edge-zone damping, 2026-10-05: the
+        # coasting wrist flops into the tendon zone and is braked there;
+        # swept hit 0.65-0.85 x windup 8-15, hit 0.7 / windup 9 is the
+        # cell where the regular note lands 70 + 30 and the chain head
+        # 70; 0.75 / 11 now misses)
+        a[A_R_ARM] = 1 if t < 9 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:

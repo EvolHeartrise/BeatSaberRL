@@ -1705,10 +1705,10 @@ struct Dyn {
   // trigger), env_n = the per-(env, substep) count the wrapper pops
   bool env_bad;
   int env_n;
-  // exp/wrist-tendon: THIS substep's passive wrist torque per hand [L, R]
-  // as [tau_b, tau_d, r] (step 4c; the [tendon] telemetry reads it) —
-  // lib.rs Workspace::tendon mirror
-  T tdn[2][3];
+  // exp/wrist-tendon: THIS substep's passive wrist terms per hand [L, R]
+  // as [tau_b, tau_d, r, P_diss] (step 4c; the [tendon] telemetry reads
+  // it) — lib.rs Workspace::tendon mirror
+  T tdn[2][4];
 };
 
 // GROUND-BLOCK scratch (unilateral-contact spec §3): 3 rows per ACTIVE
@@ -1864,6 +1864,26 @@ constexpr double TENDON_TAU_PEAK_DEV = 0.30 * 1.06 * 1.0220;    // 0.32500
 // HUMANOID_PASSIVE_WRIST.hands: (8, 9), (15, 16)) — scalars, not a
 // file-scope array (device code cannot read a host constexpr array)
 constexpr int TENDON_JB_L = 8, TENDON_JB_R = 15;  // dev = bend + 1
+// their FRAMES (M's tree-profile diagonal is d.m[TREE_C.fcb[frame]]):
+// l_wr_bend 10, l_wr_dev 9, r_wr_bend 17, r_wr_dev 16
+constexpr int TENDON_FB_L = 10, TENDON_FB_R = 17;  // dev frame = bend - 1
+// Edge-zone damping (issue #61; model.rs TENDON_B_PEAK_*): b_j(r) =
+// b_peak_j x^2, x = (r - R0)/(1 - R0) for r > R0 (uncapped), b_peak =
+// tau_peak / 30 rad/s, computed in double and rounded once to T.
+// IMPLICIT: h*b on M's wrist diagonal + (-b*qd) on the RHS (step.rs 4c).
+constexpr double TENDON_DAMP_REF_SPEED = 30.0;
+constexpr double TENDON_B_PEAK_BEND = 0.30 * 1.431 * 1.4466 / TENDON_DAMP_REF_SPEED;
+constexpr double TENDON_B_PEAK_DEV = 0.30 * 1.06 * 1.0220 / TENDON_DAMP_REF_SPEED;
+
+template <typename T>
+__device__ __forceinline__ T tendon_edge_x2(T r) {
+  T x2 = T(0);
+  if (r > T(TENDON_R0)) {
+    const T x = (r - T(TENDON_R0)) / (T(1) - T(TENDON_R0));
+    x2 = x * x;
+  }
+  return x2;
+}
 
 // One wrist: writes (tau_b, tau_d, r). Branch-light: two selects for the
 // limits, one r > R0 predicate around the gradient (E == 0 inside, which
@@ -3798,23 +3818,34 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   for (int j = 0; j < NQ; j++)
     d.rhs[VOFF + j] =
         tau[j] - CT(DAMPING, [j]) * d.v[VOFF + j] - d.c[VOFF + j];
-  // 4c. exp/wrist-tendon (step.rs 4c): the passive wrist torque joins the
-  // applied side — the four wrist rows re-assembled as
-  // (tau_gear + tau_p) - b*qd - C at this substep's pre-integration q.
-  // Not muscle effort: tau[] (energy price / [torque]) never carries it.
+  // 4c. exp/wrist-tendon (step.rs 4c): the passive wrist torque and the
+  // edge-zone damping (issue #61) join the applied side — the four wrist
+  // rows re-assembled as ((tau_gear + tau_p) - b_e*qd) - b*qd - C at this
+  // substep's pre-integration q, with h*b_e added to M's wrist diagonal
+  // BEFORE the factor (implicit edge damping; the constraint stage then
+  // works against the same damped operator, as in Rust). Not muscle
+  // effort: tau[] (energy price / [torque]) never carries either.
 #pragma unroll
   for (int h = 0; h < 2; h++) {
     const int jb = h == 0 ? TENDON_JB_L : TENDON_JB_R, jd = jb + 1;
+    const int fb = h == 0 ? TENDON_FB_L : TENDON_FB_R, fd = fb - 1;
     T tb, td, r;
     wrist_tendon(d.q[jb], d.q[jd], CT(LIMIT_LO, [jb]), CT(LIMIT_HI, [jb]),
                  CT(LIMIT_LO, [jd]), CT(LIMIT_HI, [jd]), tb, td, r);
-    d.rhs[VOFF + jb] = (tau[jb] + tb) - CT(DAMPING, [jb]) * d.v[VOFF + jb]
+    const T x2 = tendon_edge_x2(r);
+    const T bb = T(TENDON_B_PEAK_BEND) * x2;
+    const T bd = T(TENDON_B_PEAK_DEV) * x2;
+    const T vb = d.v[VOFF + jb], vd = d.v[VOFF + jd];
+    d.m[TREE_C.fcb[fb]] += T(H_SUB) * bb;
+    d.m[TREE_C.fcb[fd]] += T(H_SUB) * bd;
+    d.rhs[VOFF + jb] = ((tau[jb] + tb) - bb * vb) - CT(DAMPING, [jb]) * vb
                        - d.c[VOFF + jb];
-    d.rhs[VOFF + jd] = (tau[jd] + td) - CT(DAMPING, [jd]) * d.v[VOFF + jd]
+    d.rhs[VOFF + jd] = ((tau[jd] + td) - bd * vd) - CT(DAMPING, [jd]) * vd
                        - d.c[VOFF + jd];
     d.tdn[h][0] = tb;
     d.tdn[h][1] = td;
     d.tdn[h][2] = r;
+    d.tdn[h][3] = bb * vb * vb + bd * vd * vd;  // dissipated power (W)
   }
   // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
   // substep (crba rewrites the whole profile next substep). audit #10: in
@@ -4368,7 +4399,8 @@ struct Sim {
   T* __restrict__ tau_stat;
   // exp/wrist-tendon telemetry: per env [sum |tau_p| L, sum |tau_p| R
   // (N.m; |tau_b| + |tau_d| per hand), zone substeps L, R (r > R0),
-  // beyond-ellipse substeps L, R (r > 1), substeps], all summed per
+  // beyond-ellipse substeps L, R (r > 1), edge-damping dissipated power
+  // L, R (W), substeps], all summed per
   // SUBSTEP; tau_stat pattern (popped by pop_tendon, not touched by
   // reset_env). lib.rs Core::tendon_sum / tendon_n mirror.
   T* __restrict__ tendon_stat;
@@ -5327,8 +5359,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // env v41: this tick's self-collision row impulse (all pairs)
   T sc_imp = T(0);
   // exp/wrist-tendon telemetry over this tick's substeps (lib.rs
-  // Body::tendon_tick): [|tau_p| L, R, zone L, R, out L, R]
-  T tdn_acc[6] = {T(0), T(0), T(0), T(0), T(0), T(0)};
+  // Body::tendon_tick): [|tau_p| L, R, zone L, R, out L, R, P_diss L, R]
+  T tdn_acc[8] = {T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
 #pragma unroll
@@ -5336,6 +5368,7 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       tdn_acc[h] += fabs(d.tdn[h][0]) + fabs(d.tdn[h][1]);
       tdn_acc[2 + h] += d.tdn[h][2] > T(TENDON_R0) ? T(1) : T(0);
       tdn_acc[4 + h] += d.tdn[h][2] > T(1) ? T(1) : T(0);
+      tdn_acc[6 + h] += d.tdn[h][3];
     }
     for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
     for (int c = 0; c < NUM_GROUND_CORNERS; c++)  // G1 fixed slots
@@ -5456,8 +5489,8 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   P.tau_stat[e * 5 + 4] += T(1);
   // exp/wrist-tendon telemetry (never priced; lib.rs Core::tendon_sum)
 #pragma unroll
-  for (int k = 0; k < 6; k++) P.tendon_stat[e * 7 + k] += tdn_acc[k];
-  P.tendon_stat[e * 7 + 6] += T(N_SUB);
+  for (int k = 0; k < 8; k++) P.tendon_stat[e * 9 + k] += tdn_acc[k];
+  P.tendon_stat[e * 9 + 8] += T(N_SUB);
   if (P.bench_refill) {   // this level's torque (bench_rec cols 24..27)
     T* rb = P.bench_rec + (size_t)e * BENCH_REC + BENCH_TAU_ACC;
     rb[0] += T(tau_abs);
@@ -6374,7 +6407,7 @@ enum {
   TPALMV,   // Flux palm velocity (N, 2, 3)
   TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
   TTIPV,    // env v49 blade-tip velocity (N, 2, 3) — 2026-09-30
-  TTENDON,  // exp/wrist-tendon telemetry (N, 7) — 2026-10-05
+  TTENDON,  // exp/wrist-tendon telemetry (N, 9) — 2026-10-05
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)

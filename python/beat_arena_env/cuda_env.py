@@ -987,10 +987,11 @@ class CudaBeatVecEnv:
         self.tau_stat = z(N, 5)
         # exp/wrist-tendon telemetry per env: [sum |tau_p| L, sum |tau_p|
         # R (N.m, |tau_bend| + |tau_dev| per hand), zone substeps L, R
-        # (r > 0.5), beyond-ellipse substeps L, R (r > 1), substeps] —
-        # summed per SUBSTEP; popped + zeroed by pop_tendon, untouched by
-        # reset_env (tau_stat pattern; lib.rs Core::tendon_sum)
-        self.tendon_stat = z(N, 7)
+        # (r > 0.5), beyond-ellipse substeps L, R (r > 1), edge-damping
+        # dissipated power L, R (W, issue #61), substeps] — summed per
+        # SUBSTEP; popped + zeroed by pop_tendon, untouched by reset_env
+        # (tau_stat pattern; lib.rs Core::tendon_sum)
+        self.tendon_stat = z(N, 9)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -1509,15 +1510,17 @@ class CudaBeatVecEnv:
     def pop_tendon(self):
         """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,
         sum |tau_p| R in N.m, zone substeps L, R, beyond-ellipse substeps
-        L, R, substeps). |tau_p| per hand = |tau_bend| + |tau_dev|; zone =
-        r > 0.5, beyond = r > 1 (r the normalized elliptical radius);
-        every term summed per substep, so sum/substeps are per-substep
-        means and fractions. The passive torque is never priced. Rust
-        `pop_tendon` mirror. One sync."""
+        L, R, edge-damping dissipated power L, R in W, substeps).
+        |tau_p| per hand = |tau_bend| + |tau_dev|; zone = r > 0.5, beyond
+        = r > 1 (r the normalized elliptical radius); dissipated power =
+        sum b_e qd^2 (issue #61); every term summed per substep, so
+        sum/substeps are per-substep means and fractions. The passive
+        terms are never priced. Rust `pop_tendon` mirror. One sync."""
         s = self.tendon_stat.sum(dim=0).tolist()
         self.tendon_stat.zero_()
         return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
-                float(s[4]), float(s[5]), int(s[6]))
+                float(s[4]), float(s[5]), float(s[6]), float(s[7]),
+                int(s[8]))
 
     def pop_acc(self):
         """Training-accuracy telemetry since the last pop, PER HAND

@@ -3004,17 +3004,22 @@ def main():
         # exp/wrist-tendon telemetry (2026-10-05): per hand, the mean
         # passive tendon torque |tau_bend| + |tau_dev| (N*m) per substep,
         # and the fraction of substeps in the tendon zone (r > 0.5) and
-        # beyond the ellipse (r > 1). Never priced (not muscle effort).
+        # beyond the ellipse (r > 1), plus the edge-zone damping's mean
+        # dissipated power (W, issue #61). Never priced (not muscle
+        # effort).
         if hasattr(venv, "pop_tendon"):
-            tn_l, tn_r, tz_l, tz_r, to_l, to_r, tn_n = venv.pop_tendon()
+            (tn_l, tn_r, tz_l, tz_r, to_l, to_r, td_l, td_r,
+             tn_n) = venv.pop_tendon()
             if tn_n:
                 m_ev.update(tendon_L=tn_l / tn_n, tendon_R=tn_r / tn_n,
                             tzone_L=tz_l / tn_n, tzone_R=tz_r / tn_n,
-                            tout_L=to_l / tn_n, tout_R=to_r / tn_n)
+                            tout_L=to_l / tn_n, tout_R=to_r / tn_n,
+                            tdiss_L=td_l / tn_n, tdiss_R=td_r / tn_n)
                 print(f"[tendon] L {tn_l / tn_n:.4f}  R {tn_r / tn_n:.4f} "
                       f"N*m/substep  zone L {100.0 * tz_l / tn_n:.2f}%  "
                       f"R {100.0 * tz_r / tn_n:.2f}%  beyond L "
-                      f"{100.0 * to_l / tn_n:.2f}%  R {100.0 * to_r / tn_n:.2f}%",
+                      f"{100.0 * to_l / tn_n:.2f}%  R {100.0 * to_r / tn_n:.2f}%  "
+                      f"diss L {td_l / tn_n:.4f}  R {td_r / tn_n:.4f} W",
                       flush=True)
         # env v46 body-draw log: every episode that ended this update
         # -> (s0..s15, ticks, return, fell, cuts, pts, chart) appended to

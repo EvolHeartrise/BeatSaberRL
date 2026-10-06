@@ -118,7 +118,8 @@ class BeatVecEnv:
 
     def pop_tendon(self):
         """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,
-        sum |tau_p| R, zone L, zone R, beyond L, beyond R, substeps) —
+        sum |tau_p| R, zone L, zone R, beyond L, beyond R, dissipated
+        power L, dissipated power R, substeps) —
         forwarded to the Rust sim (CUDA pop_tendon mirror)."""
         return self.sim.pop_tendon()
 
