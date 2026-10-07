@@ -2,7 +2,8 @@
   import { store, loadIndex, loadMetrics, mostRecentRun, runById, REFRESH_MS } from "./data.svelte.js";
   import { X_MODES, xValues, seriesValues, hasAny, label, color, fmt,
     fmtDuration, fmtSamples, gameOf, panelsFor } from "./series.js";
-  import Chart from "./Chart.svelte";
+  import Panel from "./Panel.svelte";
+  import { isHidden } from "./hidden.svelte.js";
 
   let { xMode = $bindable("samples"), runId = $bindable(null) } = $props();
 
@@ -58,6 +59,11 @@
       };
     });
   });
+
+  // hidden panels (hidden.svelte.js): off this tab until restored from
+  // the header menu; the keyed list leaves the other charts (and their
+  // zoom) alone
+  const shown = $derived(panels.filter((p) => !isHidden("live", p.id)));
 
   async function refresh() {
     if (refreshing) return;
@@ -131,10 +137,8 @@
   </div>
 
   <div class="grid">
-    {#each panels as p (p.id)}
-      <div class="cell">
-        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} resetKey={run.id} />
-      </div>
+    {#each shown as p (p.id)}
+      <Panel tab="live" id={p.id} title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} resetKey={run.id} />
     {/each}
   </div>
 {:else}
@@ -146,8 +150,9 @@
   .status { font-size: 13px; color: var(--muted); margin: 4px 0 10px; }
   .status b { color: var(--fg); }
   .game { background: #8b5cf6; color: #fff; border-radius: 4px; padding: 0 5px; margin-left: 4px; font-size: 11px; font-weight: 700; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 8px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px 2px; min-width: 0; }
+  /* align start: a card keeps its own height, so hiding one never
+     stretches or shrinks another (2026-10-06) */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 8px; align-items: start; }
   .xmode button.on, .win button.on { background: var(--accent); color: #fff; }
   .win input { width: 6em; }
   select { max-width: 52vw; }
