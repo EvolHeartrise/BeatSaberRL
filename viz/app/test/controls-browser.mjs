@@ -6,13 +6,19 @@
 //   - toggles report on/off (aria-pressed) and follow their keys ('g', 'f',
 //     't'); the tip-trail length slider shows only while the trail is on; the
 //     trail's switch and length survive a reload (localStorage);
-//   - the timeline: Home / End / arrows on its thumb (one tick per press —
-//     the window's own arrow-key stepping must not add a second), a pointer
-//     drag pauses and seeks, and the thumb follows the clock while playing;
+//   - the timeline: Home / End / arrows on it (one tick per press — the
+//     window's own arrow-key stepping must not add a second), a pointer
+//     drag pauses and seeks, and the playhead follows the clock while
+//     playing;
+//   - the timeline's torque graph: painted from the replay's own per-tick
+//     torque (every canvas column's height = that column's max at the p99
+//     full scale), once per replay and size — never per frame — and redrawn
+//     on resize; hovering names the time and that tick's torque;
 //   - play/pause, restart and the speed buttons do what their keys do;
 //   - Tailwind does not leak: no preflight reset reaches the gauges overlay;
 //   - at phone width (390 px) nothing overflows horizontally and the view
-//     toggles live in a "more controls" popover that still drives them.
+//     toggles live in a "more controls" popover that still drives them; a
+//     touch drag on the timeline seeks.
 // Screenshots land in test/out/controls-*.png.
 // Run: node test/controls-browser.mjs [replay.rpl.gz]
 // (one Chrome, SwiftShader — keep it to one run at a time on the laptop)
@@ -20,7 +26,10 @@ import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
-import { barButton, barLabels, clickBar, toggleOn } from "./bar.js";
+import { SEEK, barButton, barLabels, clickBar, toggleOn } from "./bar.js";
+import { parseReplay } from "../src/lib/replay.js";
+import { downsample, mistakeTicks, robustMax, torqueSeries } from "../src/lib/torquegraph.js";
+import { readReplayFile } from "./fixture.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -130,7 +139,7 @@ try {
   if ((await speed()) !== "1.0×") fail("'+': " + (await speed()));
 
   // ---- the timeline: follows playback, keyboard, pointer drag
-  const thumb = "#seek [role=slider]";
+  const thumb = SEEK;
   const now = () => page.$eval(thumb, (t) => +t.getAttribute("aria-valuenow"));
   await sleep(300);
   const v0 = await now(); await sleep(800); const v1 = await now();
@@ -147,13 +156,16 @@ try {
     fail(`three arrow presses on the timeline should land on tick 3, got ${s.tick}`);
   await page.keyboard.press("ArrowLeft");
   if ((await state()).tick !== 2) fail("ArrowLeft on the timeline is not one tick back");
+  // space still plays/pauses from the timeline (mid-replay: at the last tick
+  // playback stops again on the next frame)
+  await page.keyboard.press(" ");
+  if (!(await state()).playing) fail("space on the timeline did not toggle playback");
+  await page.keyboard.press(" ");
   await page.keyboard.press("End");
   s = await state();
   if (s.tick !== s.lastTick) fail("End should land on the last tick: " + JSON.stringify(s));
-  await page.keyboard.press(" "); // space still plays/pauses from the timeline
-  if (!(await state()).playing) fail("space on the timeline did not toggle playback");
   await page.evaluate(() => document.activeElement.blur());
-  const box = await page.$eval("#seek [data-slot=slider]", (e) => {
+  const box = await page.$eval(SEEK, (e) => {
     const r = e.getBoundingClientRect();
     return { x: r.left, y: r.top + r.height / 2, w: r.width };
   });
@@ -171,6 +183,75 @@ try {
   await page.mouse.move(550, 200);
   await sleep(300);
   await page.screenshot({ path: "test/out/controls-desktop.png" });
+
+  // ---- the torque graph
+  const repData = parseReplay(readReplayFile(replay));
+  const series = torqueSeries(repData);
+  if (!series) fail("the fixture should carry torque");
+  const graph = () => page.evaluate(() => {
+    const bar = document.querySelector("#seekbar");
+    const dim = bar.querySelector("canvas");
+    const W = dim.width, H = dim.height;
+    const px = dim.getContext("2d").getImageData(0, 0, W, H).data;
+    const tops = [];
+    for (let x = 0; x < W; x++) {
+      let y = 0;
+      while (y < H && px[(y * W + x) * 4 + 3] === 0) y++;
+      tops.push(y);
+    }
+    return { kind: bar.dataset.graph, draws: +bar.dataset.draws, top: +bar.dataset.top,
+      cssW: bar.querySelector("[data-cols]").getBoundingClientRect().width, W, H, tops };
+  });
+  let g = await graph();
+  if (g.kind !== "torque") fail("no torque graph on the timeline");
+  const top = robustMax(series);
+  if (Math.abs(g.top - top) > 0.06) fail(`graph full scale ${g.top} != p99 ${top}`);
+  if (Math.abs(g.W - Math.round(g.cssW)) > 1) fail(`${g.W} columns for a ${g.cssW} px track`);
+  const ds = downsample(series, g.W);
+  const markX = new Set(mistakeTicks(repData).flatMap((k) => {
+    const x = Math.round((k / (series.length - 1)) * (g.W - 1));
+    return [x - 1, x, x + 1];
+  }));
+  let checked = 0, off = 0;
+  for (let x = 0; x < g.W; x++) {
+    if (markX.has(x)) continue;
+    const h = Math.round(Math.min(1, ds.max[x] / top) * g.H);
+    const want = ds.max[x] > top ? 0 : g.H - h;
+    checked++;
+    if (g.tops[x] !== want) off++;
+  }
+  console.log(`torque graph: ${g.W}x${g.H} px, p99 ${top.toFixed(1)} N·m, ` +
+    `${checked - off}/${checked} columns at their max`);
+  if (off > checked * 0.01) fail(`${off} of ${checked} graph columns off their data`);
+  // playback moves the playhead only: no repaint
+  await clickBar(page, "play");
+  await sleep(1200);
+  await clickBar(page, "pause");
+  const g2 = await graph();
+  if (g2.draws !== g.draws) fail(`the graph repainted during playback (${g.draws} -> ${g2.draws})`);
+  // hover: the time and that tick's torque
+  const bb = await page.$eval(SEEK, (e) => {
+    const r = e.getBoundingClientRect();
+    return { x: r.left, y: r.top + r.height / 2, w: r.width };
+  });
+  await page.mouse.move(bb.x + 0.25 * bb.w, bb.y);
+  const tipText = await page.waitForSelector("#seektip", { timeout: 3000 })
+    .then((el) => el.evaluate((e) => e.textContent.replace(/\s+/g, " ").trim()));
+  const hk = Math.round(0.25 * (series.length - 1)), hs = Math.floor(hk / 30);
+  const hWant = `${Math.floor(hs / 60)}:${String(hs % 60).padStart(2, "0")}`;
+  console.log("hover:", tipText);
+  if (!tipText.startsWith(hWant) || !tipText.includes(`${series[hk].toFixed(0)} N·m`)
+      || !/spine \d+ · arms \d+ · legs \d+/.test(tipText))
+    fail(`hover at tick ${hk} should read ${hWant} and ${series[hk].toFixed(0)} N·m: ${tipText}`);
+  await page.screenshot({ path: "test/out/controls-seek-hover.png" });
+  await page.mouse.move(550, 200);
+  if (await page.$("#seektip")) fail("the hover readout outlived the hover");
+  // a resize repaints at the new width
+  await page.setViewport({ width: 760, height: 800 }); // (the bar caps at 52rem)
+  await sleep(400);
+  const g3 = await graph();
+  if (g3.draws <= g2.draws || g3.W === g2.W) fail("the graph did not redraw on resize");
+  await page.setViewport({ width: 1100, height: 800 });
 
   // restart: tick 0 and playing (from the paused drag)
   await clickBar(page, "restart");
@@ -208,6 +289,19 @@ try {
   if (phone.scrollW > phone.w || phone.left < 0 || phone.right > phone.w)
     fail("the bar overflows at phone width: " + JSON.stringify(phone));
   if (await page.$(barButton("gauges"))) fail("view toggles still inline at phone width");
+  // a touch drag on the (compact) timeline seeks and pauses
+  const tb = await page.$eval(SEEK, (e) => {
+    const r = e.getBoundingClientRect();
+    return { x: r.left, y: r.top + r.height / 2, w: r.width, h: r.height };
+  });
+  if (tb.h > 32) fail("the phone timeline should be compact: " + tb.h);
+  await page.touchscreen.touchStart(tb.x + 0.3 * tb.w, tb.y);
+  await page.touchscreen.touchMove(tb.x + 0.45 * tb.w, tb.y);
+  await page.touchscreen.touchMove(tb.x + 0.6 * tb.w, tb.y);
+  await page.touchscreen.touchEnd();
+  s = await state();
+  if (s.playing || Math.abs(s.tick / s.lastTick - 0.6) > 0.04)
+    fail("a touch drag to 60% of the timeline: " + JSON.stringify(s));
   await page.tap(barButton("more controls"));
   await page.waitForSelector("#more", { timeout: 3000 });
   const more = await page.$$eval("#more button", (bs) => bs.map((b) => b.getAttribute("aria-label")));

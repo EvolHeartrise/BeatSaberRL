@@ -243,7 +243,7 @@
     // the arrow / Home / End keys on a focused bar slider (the timeline, the
     // volume) move that slider and nothing else: the timeline already steps
     // the replay itself, one tick per arrow press
-    if (SLIDER_KEYS.has(e.key) && e.target?.closest?.("[data-slot=slider-thumb]")) return;
+    if (SLIDER_KEYS.has(e.key) && e.target?.closest?.("[role=slider]")) return;
     if (FLUX && play.on) {
       // the game owns the keyboard: Esc leaves, Enter (re)starts
       if (e.key === "Escape") exitPlay();

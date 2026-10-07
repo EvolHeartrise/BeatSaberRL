@@ -12,7 +12,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import puppeteer from "puppeteer-core";
 import {
-  JOINT_LIMITS, TAU_MAX, activationAt, footForces, gearTable, parseReplay,
+  JOINT_LIMITS, TAU_MAX, footForces, gearTable, parseReplay,
   setTickRate, tickHzOf,
 } from "../src/lib/replay.js";
 import { readReplayFile } from "./fixture.js";
@@ -52,7 +52,8 @@ mkdirSync("test/out", { recursive: true });
 // Paused on a whole tick k, every joint row must read the replay's angle
 // (q at k), ω and applied τ (both at k + 1, as the viewer draws them), each
 // needle must point at the angle, and the force block must show tick k + 1's
-// foot reactions and joint activation. Also: the two panels sit in the
+// foot reactions — and no joint-activation row (removed 2026-10-06; the
+// timeline graphs torque instead). Also: the two panels sit in the
 // bottom corners at the sprites' old size (0.62 / (2 tan 27.5°) of the
 // stage height, 104 px above the bottom), and let pointer events through.
 async function checkGauges(page, file, k) {
@@ -86,7 +87,8 @@ async function checkGauges(page, file, k) {
         };
       }),
       feet: [0, 1].map((i) => $(`[data-foot="${i}"]`).textContent),
-      act: $("[data-act]").textContent,
+      forcesText: [...document.querySelectorAll(".gauges .fname, .gauges .val")]
+        .map((e) => e.textContent).join(" "),
       panels: [...document.querySelectorAll(".gauges .panel")].map((p) => {
         const r = p.getBoundingClientRect();
         return { left: r.left, right: r.right, bottom: r.bottom, height: r.height };
@@ -110,13 +112,13 @@ async function checkGauges(page, file, k) {
     if (w.t !== 0 && (g.tauNeg !== w.t < 0 || Math.abs(g.tauX2 - (189 + w.t * 49)) > 0.01))
       bad.push(`joint ${j} τ bar to ${g.tauX2}${g.tauNeg ? " (neg)" : ""} != ${189 + w.t * 49}`);
   });
-  const feet = footForces(rep, k1), act = activationAt(rep, k1);
+  const feet = footForces(rep, k1);
   [0, 1].forEach((i) => {
     const s = feet ? `${feet[i].toFixed(0)} N` : "n/a";
     if (got.feet[i] !== s) bad.push(`foot ${i}: ${got.feet[i]} != ${s}`);
   });
-  const as = act ? `${act[0].toFixed(1)}/29` : "n/a";
-  if (got.act !== as) bad.push(`activation ${got.act} != ${as}`);
+  if (/activ|\/29|spine \d/.test(got.forcesText))
+    bad.push("the activation row is back: " + got.forcesText);
   const H = got.stage.height, hWant = (0.62 / (2 * Math.tan((27.5 * Math.PI) / 180))) * H;
   if (got.panels.length !== 2) bad.push(`${got.panels.length} gauge panels`);
   for (const [i, p] of got.panels.entries()) {
@@ -127,8 +129,8 @@ async function checkGauges(page, file, k) {
     bad.push("panels not in the corners: " + JSON.stringify(got.panels));
   if (got.events !== "none") bad.push("the panels catch pointer events");
   if (bad.length) throw new Error(`gauges at tick ${k}:\n  ` + bad.join("\n  "));
-  console.log(`gauges at tick ${k}: 29 joints, feet ${got.feet.join(" / ")}, ` +
-    `activation ${got.act} — match the replay`);
+  console.log(`gauges at tick ${k}: 29 joints, feet ${got.feet.join(" / ")} ` +
+    "— match the replay");
 }
 
 const browser = await puppeteer.launch({
@@ -226,7 +228,7 @@ try {
 
   // ---- skeleton + gauges + contact-marker eyeball shots ('h' hitboxes on):
   // scrub to a mid-episode tick (the bot swinging, weight on the welds —
-  // gauges show τ bars, foot N and joint activation) and to a late tick.
+  // gauges show τ bars and foot N) and to a late tick.
   await page.keyboard.press("h");
   // the timeline: a pointer press on its track + arrow keys (test/bar.js)
   const scrub = (tick) => scrubTo(page, tick);

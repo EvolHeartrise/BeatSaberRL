@@ -29,28 +29,35 @@ export function barLabels(page) {
     .map((b) => (b.getAttribute("aria-label") ?? b.textContent).trim()));
 }
 
+export const SEEK = "#seekbar"; // the timeline (TorqueSeek.svelte): role="slider"
+
 /** Seek the timeline to `tick` ("max" = the last tick; past-the-end ticks
  * clamp, as the old range input did) like a user: a pointer press at the
  * tick's spot on the track (which pauses and seeks, as dragging always has),
- * then the arrow keys on the focused thumb — one tick per press — to land
+ * then the arrow keys on the focused timeline — one tick per press — to land
  * on it exactly. Throws unless the slider reads `tick` afterwards. Leaves
  * focus and the pointer off the bar. Resolves to the tick landed on. */
 export async function scrubTo(page, tick) {
-  const geo = await page.$eval("#seek [data-slot=slider]", (root) => {
-    const r = root.getBoundingClientRect();
-    const th = root.querySelector("[role=slider]");
+  const geo = await page.$eval(SEEK, (el) => {
+    const r = el.getBoundingClientRect();
     return { x: r.left, y: r.top + r.height / 2, w: r.width,
-      min: +th.getAttribute("aria-valuemin"), max: +th.getAttribute("aria-valuemax") };
+      min: +el.getAttribute("aria-valuemin"), max: +el.getAttribute("aria-valuemax") };
   });
   const want = tick === "max" ? geo.max : Math.min(Math.max(tick, geo.min), geo.max);
   const frac = (want - geo.min) / Math.max(1, geo.max - geo.min);
-  // (kept a pixel inside the track: a press on its very edge misses it)
+  const now = () => page.$eval(SEEK, (t) => +t.getAttribute("aria-valuenow"));
+  // (kept a pixel inside the bar: a press on its very edge misses it)
   await page.mouse.click(Math.min(Math.max(geo.x + frac * geo.w, geo.x + 1), geo.x + geo.w - 1),
     geo.y);
-  await page.focus("#seek [role=slider]"); // the press focused it; make sure
+  // the press alone lands within a pixel's worth of ticks of the spot
+  const tol = Math.ceil((geo.max - geo.min) / geo.w) + 2;
+  const pressed = await now();
+  if (Math.abs(pressed - want) > tol)
+    throw new Error(`a press on the timeline at tick ${want} landed on ${pressed}`);
+  const focused = await page.evaluate((s) => document.activeElement?.matches(s), SEEK);
+  if (!focused) throw new Error("a press on the timeline did not focus it");
   if (want === geo.max) await page.keyboard.press("End");
   else if (want === geo.min) await page.keyboard.press("Home");
-  const now = () => page.$eval("#seek [role=slider]", (t) => +t.getAttribute("aria-valuenow"));
   for (let guard = 0; guard < 400; guard++) {
     const v = await now();
     if (v === want) break;
