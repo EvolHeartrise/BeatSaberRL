@@ -24,6 +24,7 @@
 @source "./lib/components/ui";
 @source "./lib/ControlBar.svelte";
 @source "./lib/BarTip.svelte";
+@source "./lib/TorqueSeek.svelte";
 
 /* the viewer is dark-only: index.html puts .dark on <html>, as mode-watcher
    does on the records site, so the components' dark: variants apply */
