@@ -4,6 +4,8 @@
   import Compare from "./lib/Compare.svelte";
   import Runs from "./lib/Runs.svelte";
   import Swing from "./lib/Swing.svelte";
+  import HiddenMenu from "./lib/HiddenMenu.svelte";
+  import { HIDE_TABS } from "./lib/hidden.svelte.js";
 
   const TABS = ["live", "swing", "compare", "runs"];
   let tab = $state(TABS.includes(location.hash.replace("#", "")) ? location.hash.slice(1) : "live");
@@ -28,6 +30,7 @@
       <button class:on={tab === t} onclick={() => (tab = t)}>{t}</button>
     {/each}
   </nav>
+  {#if HIDE_TABS.includes(tab)}<HiddenMenu {tab} />{/if}
   <span class="src">{store.base ? `archive @ ${store.base}` : "locating archive…"}</span>
 </header>
 
