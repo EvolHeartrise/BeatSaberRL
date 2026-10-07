@@ -18,14 +18,14 @@
       || (r.game ?? "standard") === f);
   });
   const sel = $derived(selected.map((id) => runById(id)).filter(Boolean));
-  const loaded = $derived(sel.filter((r) => store.metrics[r.id]?.recs?.length));
+  const loaded = $derived(sel.filter((r) => store.metrics[r.id]?.n));
   const ref = $derived((refId && loaded.find((r) => r.id === refId)) || loaded[0] || null);
   const xLabel = $derived(X_MODES.find((m) => m.key === xMode)?.label ?? xMode);
 
   // one x array per loaded run, per mode
   const xs = $derived.by(() => {
     const m = {};
-    for (const r of loaded) m[r.id] = xValues(store.metrics[r.id].recs, xMode);
+    for (const r of loaded) m[r.id] = xValues(store.metrics[r.id], xMode);
     return m;
   });
 
@@ -33,9 +33,9 @@
     COMPARE_KEYS.map((k) => ({
       key: k,
       datasets: loaded
-        .filter((r) => hasAny(store.metrics[r.id].recs, k))
+        .filter((r) => hasAny(store.metrics[r.id], k))
         .map((r, i) => ({
-          label: r.run, x: xs[r.id], y: seriesValues(store.metrics[r.id].recs, k),
+          label: r.run, x: xs[r.id], y: seriesValues(store.metrics[r.id], k),
           color: color(loaded.indexOf(r)),
         })),
     })).filter((p) => p.datasets.length));
@@ -45,26 +45,39 @@
   const diffs = $derived.by(() => {
     if (!ref) return [];
     const rx = xs[ref.id];
-    const rrecs = store.metrics[ref.id].recs;
+    const R = store.metrics[ref.id];
     return DIFF_KEYS.map((k) => {
-      const ry = seriesValues(rrecs, k);
       const datasets = [];
       for (const r of loaded) {
         if (r.id === ref.id) continue;
-        const recs = store.metrics[r.id].recs;
-        if (!hasAny(recs, k) || !hasAny(rrecs, k)) continue;
-        const x = xs[r.id];
-        const y = seriesValues(recs, k);
-        const d = new Array(x.length);
-        for (let i = 0; i < x.length; i++) {
-          const rv = interp(rx, ry, x[i]);
-          d[i] = rv == null || y[i] == null ? null : y[i] - rv;
-        }
-        datasets.push({ label: `${r.run} − ${ref.run}`, x, y: rolling(d, window_), color: color(loaded.indexOf(r)) });
+        const D = store.metrics[r.id];
+        if (!hasAny(D, k) || !hasAny(R, k)) continue;
+        datasets.push({ label: `${r.run} − ${ref.run}`, x: xs[r.id], y: diffOf(D, R, k, xs[r.id], rx), color: color(loaded.indexOf(r)) });
       }
       return { key: k, datasets };
     }).filter((p) => p.datasets.length);
   });
+  // one run's smoothed difference, cached on its data until the run, the
+  // reference's data, the key, the window or the x mode changes (a
+  // refresh of one live run recomputes only what involves it)
+  const diffMemo = new WeakMap(); // RunData -> Map(key -> {R, sig, y})
+  function diffOf(D, R, k, x, rx) {
+    let m = diffMemo.get(D);
+    if (!m) diffMemo.set(D, (m = new Map()));
+    const sig = `${window_}|${xMode}`;
+    const hit = m.get(k);
+    if (hit && hit.R === R && hit.sig === sig) return hit.y;
+    const ry = seriesValues(R, k);
+    const y = seriesValues(D, k);
+    const d = new Array(x.length);
+    for (let i = 0; i < x.length; i++) {
+      const rv = interp(rx, ry, x[i]);
+      d[i] = rv == null || y[i] == null ? null : y[i] - rv;
+    }
+    const out = rolling(d, window_);
+    m.set(k, { R, sig, y: out });
+    return out;
+  }
 
   // matched-checkpoint table at chosen sample counts (default: the
   // reference's checkpointed sample counts, or 5 even splits)
@@ -72,10 +85,11 @@
     const typed = parseSampleList(sampleText);
     if (typed.length) return typed;
     if (!ref) return [];
-    const recs = store.metrics[ref.id].recs;
-    const ck = recs.filter((r) => r.ckpt).map((r) => r.steps);
+    const D = store.metrics[ref.id];
+    const ck = [];
+    for (let i = 0; i < D.n; i++) if (D.val(i, "ckpt")) ck.push(D.val(i, "steps") ?? undefined);
     if (ck.length >= 2 && ck.length <= 40) return ck;
-    const last = recs[recs.length - 1].steps;
+    const last = D.val(D.n - 1, "steps") ?? undefined;
     return [1, 2, 3, 4, 5].map((i) => Math.round((last * i) / 5));
   });
   const TABLE_KEYS = ["acc", "return", "ent", "ev"];
@@ -174,13 +188,13 @@
           <tbody>
             {#each samplePoints as s}
               {#each loaded as r, i (r.id)}
-                {@const rec = atSamples(store.metrics[r.id].recs, s)}
+                {@const rec = atSamples(store.metrics[r.id], s)}
                 <tr class:first={i === 0}>
                   <td>{i === 0 ? fmtSamples(s) : ""}</td>
                   <td><span class="dot" style:background={color(i)}></span>{r.run}</td>
                   {#each TABLE_KEYS as k}
                     <td class="num">{rec ? fmt(rec[k]) : "—"}{#if rec && ref && r.id !== ref.id}
-                      {@const rr = atSamples(store.metrics[ref.id].recs, s)}
+                      {@const rr = atSamples(store.metrics[ref.id], s)}
                       {#if rr && rec[k] != null && rr[k] != null}<small class="delta">{rec[k] - rr[k] >= 0 ? "+" : ""}{fmt(rec[k] - rr[k])}</small>{/if}
                     {/if}</td>
                   {/each}

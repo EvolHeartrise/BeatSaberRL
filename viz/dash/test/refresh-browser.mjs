@@ -174,7 +174,8 @@ try {
       (u.hooks.draw ??= []).push(() => u.__draws++);
     }
     return { id: u.__id, title: u.root.querySelector(".u-title")?.textContent ?? "", min: u.scales.x.min, max: u.scales.x.max,
-      n: u.data[0].length, last: u.data[0][u.data[0].length - 1], draws: u.__draws };
+      n: u.data[0].length, last: u.data[0][u.data[0].length - 1], draws: u.__draws,
+      vis: (() => { const r = el.getBoundingClientRect(); return r.bottom > -200 && r.top < innerHeight + 200; })() };
   }));
   const waitLen = (n, t = 8000) => page.waitForFunction((n) => {
     const us = [...document.querySelectorAll(".chart")].map((el) => el.__uplot).filter(Boolean);
@@ -311,7 +312,18 @@ try {
   await sleep(300);
   const c1 = await snap();
   check(c1[0].id === c0[0].id && c1[0].min === c0[0].min && c1[0].max === c0[0].max, "compare, new rows: zoomed chart kept its window");
-  check(c1.filter((c) => !c.title.startsWith("Δ")).every((c) => c.last === 320 * BATCH), "compare, new rows: small multiples reach the new tail");
+  check(c1.filter((c) => !c.title.startsWith("Δ") && c.vis).every((c) => c.last === 320 * BATCH), "compare, new rows: on-screen small multiples reach the new tail");
+  // off-screen charts (2026-10-06) keep their plot until scrolled into view
+  await page.evaluate(async () => {
+    for (const el of document.querySelectorAll(".chart")) {
+      el.scrollIntoView({ block: "center" });
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    await window.__dashChartsIdle();
+  });
+  const c1b = await snap();
+  check(c1b.filter((c) => !c.title.startsWith("Δ")).every((c) => c.last === 320 * BATCH), `compare, new rows: every small multiple has the new tail once scrolled into view (${c1b.length} charts)`);
+  check(c1b[0].id === c0[0].id && c1b[0].min === c0[0].min && c1b[0].max === c0[0].max, "compare, after scrolling: the zoomed chart kept its window");
 
   // hover (2026-10-06): values go to one floating tooltip (the hovered
   // chart's), the title floats on the plot, and no card changes height
@@ -344,6 +356,44 @@ try {
   await page.mouse.move(2, 2);
   await sleep(50);
   check((await visTips()).length === 0, "hover: tooltip gone when the cursor leaves");
+
+  // incremental reads (2026-10-06): a growing file is re-read from where
+  // the last read stopped (HTTP Range), a line cut mid-write (rsync
+  // --append-verify) waits for its end, a rewritten / shrunk file is read
+  // whole again
+  await page.evaluate(() => document.querySelector(".chart").scrollIntoView({ block: "center" }));
+  await page.evaluate(() => window.__dashChartsIdle());
+  const fs0 = await page.evaluate(() => window.__dashStats());
+  const lastOf = () => page.evaluate(() => {
+    const u = [...document.querySelectorAll(".chart")].map((e) => e.__uplot).find((u) => u && u.root.querySelector(".u-title")?.textContent === "acc");
+    const xs = u.data[0], i = xs.length - 1;
+    return { x: xs[i], ys: u.data.slice(1).map((s) => s[i]), n: xs.length };
+  });
+  const line321 = JSON.stringify(rec(321)) + "\n";
+  const cutAt = 40;
+  appendFileSync(metricsPath("camp/live_run"), line321.slice(0, cutAt));
+  const i0 = await snap();
+  await idleRefreshes(2);
+  const i1 = await snap();
+  check(i1.every((c, i) => c.draws === i0[i].draws && c.last === i0[i].last), "cut line: a half-written row changes nothing (no redraw)");
+  appendFileSync(metricsPath("camp/live_run"), line321.slice(cutAt));
+  runs[1] = runEntry("camp/live_run", 321, "partial", T0 + 2247);
+  writeIndex();
+  await page.waitForFunction(() => [...document.querySelectorAll(".chart")].some((e) => e.__uplot && e.__uplot.data[0].includes(321 * 1048576)), { timeout: 8000 });
+  await page.evaluate(() => window.__dashChartsIdle());
+  const l1 = await lastOf();
+  check(l1.x === 321 * BATCH && l1.ys.includes(rec(321).acc), `cut line completed: row 321 plotted with its value (acc ${rec(321).acc.toFixed(4)})`);
+  const fs1 = await page.evaluate(() => window.__dashStats());
+  check(fs1.ranged > fs0.ranged, `incremental: ranged reads used (${fs1.ranged - fs0.ranged} since)`);
+  check(fs1.bytes - fs0.bytes < 20000, `incremental: ${fs1.bytes - fs0.bytes} bytes fetched for the cut-line round, not whole files`);
+  // the file rewritten shorter (a fresh backfill): read whole again
+  writeRun("camp/live_run", 1, 200);
+  runs[1] = runEntry("camp/live_run", 200, "partial", T0 + 2300);
+  writeIndex();
+  await page.waitForFunction(() => {
+    const u = [...document.querySelectorAll(".chart")].map((e) => e.__uplot).find((u) => u && u.root.querySelector(".u-title")?.textContent === "acc");
+    return u && u.data.slice(1).some((s) => s.filter((v) => v != null).length === 200);
+  }, { timeout: 8000 }).then(() => check(true, "rewritten shorter file: re-read whole (200 rows)"), () => check(false, "rewritten shorter file: re-read whole (200 rows)"));
 
   // ---------------------------------------------------------- Swing tab
   await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "swing").click());

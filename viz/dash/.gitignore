@@ -2,3 +2,4 @@ node_modules/
 dist/
 test/.archive/
 test/.shots/
+test/.perf/
