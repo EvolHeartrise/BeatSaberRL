@@ -45,6 +45,9 @@ try {
   const kind = await page.evaluate(() => window.__viewerState());
   if (!kind.flux) throw new Error("not opened as a Flux replay: " + JSON.stringify(kind));
   await clickBar(page, "pause");
+  // an agent's Flux run logs its torque: the timeline graphs it
+  const graph = await page.$eval("#seekbar", (e) => e.dataset.graph);
+  if (graph !== "torque") throw new Error("an agent Flux run's timeline should graph torque: " + graph);
   // the timeline: a pointer press on its track + arrow keys (test/bar.js)
   const scrub = (tick) => scrubTo(page, tick);
   const shots = [[12, "approach"], [48, "mid"], [83, "bar"], [140, "late"]];

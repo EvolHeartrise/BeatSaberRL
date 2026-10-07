@@ -4,11 +4,10 @@
   // mini-dial (allowed arc lo→hi, ω-aware needle, orange within 10° of
   // a limit), the angle + angular velocity, and an applied-τ bar
   // (τ = gear_fraction × τ_max from the tick's logged action — τ is
-  // exactly derivable, not separately logged). NEW force block: per-
-  // foot vertical ground reaction (N, from the additive "feet" weld
-  // impulses) and the joint-activation meter (commanded Σ|gear
-  // fraction|, 0..29 — the --iso-coef base; record_rev 3 "activation"
-  // field, derived from the action for older replays).
+  // exactly derivable, not separately logged). Force block: per-foot
+  // vertical ground reaction (N, from the additive "feet" weld impulses).
+  // (The joint-activation meter that sat under it is gone, 2026-10-06: the
+  // timeline now graphs the replay's per-tick torque.)
   //
   // A DOM overlay over the WebGL canvas (2026-10-02; until then two
   // canvas-texture sprites hung off the camera, re-drawn and re-uploaded
@@ -27,7 +26,7 @@
   import { pb, pose } from "./state.svelte.js";
   import {
     GROUPS, JOINT_LIMITS, JOINT_NAMES, OMEGA_CAP, SABER_COLORS,
-    TAU_MAX, activationAt, footForces, gearTable, omegaCapOf, qAt,
+    TAU_MAX, footForces, gearTable, omegaCapOf, qAt,
   } from "./replay.js";
 
   const W = 252;
@@ -39,11 +38,13 @@
     { groups: [0, 1, 3], forces: false },  // spine, L arm, L leg
     { groups: [2, 4], forces: true },      // R arm, R leg + forces
   ];
-  const FORCES_H = 112;  // 2 foot rows + activation bar + group line
-  const panelH = (p) =>
-    2 * PAD +
-    p.groups.reduce((a, g) => a + HEAD_H + GROUPS[g].joints.length * ROW_H, 0) +
-    (p.forces ? HEAD_H + FORCES_H : 0);
+  const bodyH = (p) =>
+    2 * PAD + p.groups.reduce((a, g) => a + HEAD_H + GROUPS[g].joints.length * ROW_H, 0);
+  // the force block (two foot rows) fills the right panel out to the left
+  // panel's height: both panels are scaled to the same on-screen height, so
+  // equal unit heights keep their text the same size
+  const FORCES_H = bodyH(PANELS[0]) - bodyH(PANELS[1]) - HEAD_H;
+  const panelH = (p) => bodyH(p) + (p.forces ? HEAD_H + FORCES_H : 0);
 
   const groupColor = (g) =>
     g === 1 || g === 3 ? SABER_COLORS[0]
@@ -66,8 +67,7 @@
   };
   // τ bar: centre-anchored, ± τ_max full-scale
   const BX0 = 140, BX1 = W - 14, BMID = (BX0 + BX1) / 2;
-  // force bars: per-foot vertical reaction (full scale 1200 N) and the
-  // activation meter (full scale 29 = every joint at full gear)
+  // force bars: per-foot vertical reaction (full scale 1200 N)
   const FX0 = 60, FX1 = W - 64, FS = 1200;
   const forceY = (y0, row) => y0 + HEAD_H + 4 + 24 * row;
 
@@ -93,7 +93,7 @@
   // last wrote, so a value that did not change costs a comparison and no
   // DOM write.
   const J = Array.from({ length: 29 }, () => ({}));
-  const F = { feet: [{}, {}], act: {} };
+  const F = { feet: [{}, {}] };
   const last = new Map();
   function put(el, key, v, write) {
     if (!el) return;
@@ -136,7 +136,7 @@
     if (t !== 0) attr(r.tau, "x2", (BMID + t * (BX1 - BX0) / 2).toFixed(2));
   }
 
-  function forces(feet, act) {
+  function forces(feet) {
     for (const i of [0, 1]) {
       const n = feet ? feet[i] : null, f = F.feet[i];
       cls(f.bar, "off", n === null);
@@ -146,15 +146,6 @@
       text(f.val, n === null ? "n/a" : `${n.toFixed(0)} N`);
       cls(f.val, "na", n === null);
     }
-    const a = F.act;
-    cls(a.bar, "off", act === null);
-    if (act !== null)
-      attr(a.bar, "x2", (FX0 + Math.max(0, Math.min(1, act[0] / 29)) * (FX1 - FX0)).toFixed(2));
-    text(a.val, act === null ? "n/a" : `${act[0].toFixed(1)}/29`);
-    cls(a.val, "na", act === null);
-    // group split on the next line: spine / arms / legs
-    text(a.split, act === null ? "" : `spine ${act[1].toFixed(1)}  arms ${act[2].toFixed(1)}  `
-      + `legs ${act[3].toFixed(1)}`);
   }
 
   // The frame loop: Scene.svelte's clock moves pb.cur every frame while
@@ -164,7 +155,7 @@
     if (pose.on) { // gauges reflect the manually posed joints (ω = τ = 0)
       const q = pose.q;
       for (let j = 0; j < 29; j++) joint(j, q[j], 0, 0);
-      forces(null, null);
+      forces(null);
       return;
     }
     const rep = pb.rep, cur = pb.cur;
@@ -188,7 +179,7 @@
         : Math.max(-1, Math.min(1, tau / (body?.tau_max[j] ?? TAU_MAX[j])));
       joint(j, q[7 + j], tb.omega[j], t, omegaCapOf(rep, j));
     }
-    forces(footForces(rep, k1), activationAt(rep, k1));
+    forces(footForces(rep, k1));
   });
 
   // ---- on-screen placement -------------------------------------------------
@@ -200,8 +191,8 @@
   const VIEW_H = 2 * Math.tan((55 / 2) * Math.PI / 180); // camera units
   const SCREEN_H = 0.62 / VIEW_H;  // each panel's height
   const MARGIN = 0.015 / VIEW_H;   // gap to the left / right edge
-  // the control bar wrapped to two rows (buttons + timeline) is ~97 px
-  // tall with its padding; keep a small gap above it
+  // the control bar (torque timeline + buttons) is ~88 px
+  // tall with its padding (80 on phones); keep a small gap above it
   const BOTTOM_UI_PX = 104;
   let stageH = $state(0);
 </script>
@@ -226,7 +217,7 @@
           <line class="mid" x1={BMID} x2={BMID} y1={cy - 5} y2={cy + 5} />
         {/each}
         {#if p.forces}
-          {#each [0, 1, 2] as row (row)}
+          {#each [0, 1] as row (row)}
             {@const y = forceY(p.forcesY, row)}
             <line class="ftrack" x1={FX0} x2={FX1} y1={y} y2={y} />
           {/each}
@@ -243,15 +234,10 @@
           </g>
         {/each}
         {#if p.forces}
-          {#each [0, 1, 2] as row (row)}
+          {#each [0, 1] as row (row)}
             {@const y = forceY(p.forcesY, row)}
-            {#if row < 2}
-              <line class="fill off" x1={FX0} x2={FX0} y1={y} y2={y}
-                bind:this={F.feet[row].bar} />
-            {:else}
-              <line class="fill act off" x1={FX0} x2={FX0} y1={y} y2={y}
-                bind:this={F.act.bar} />
-            {/if}
+            <line class="fill off" x1={FX0} x2={FX0} y1={y} y2={y}
+              bind:this={F.feet[row].bar} />
           {/each}
         {/if}
       </svg>
@@ -267,18 +253,11 @@
       {#if p.forces}
         {@const y0 = p.forcesY}
         <span class="head fh" style:top="{y0 + 8}px">forces</span>
-        {#each ["L foot", "R foot", "activ."] as name, row (row)}
+        {#each ["L foot", "R foot"] as name, row (row)}
           <span class="fname" style:top="{forceY(y0, row)}px">{name}</span>
-          {#if row < 2}
-            <span class="val na" style:top="{forceY(y0, row)}px"
-              bind:this={F.feet[row].val} data-foot={row}> </span>
-          {:else}
-            <span class="val na" style:top="{forceY(y0, row)}px"
-              bind:this={F.act.val} data-act=""> </span>
-          {/if}
+          <span class="val na" style:top="{forceY(y0, row)}px"
+            bind:this={F.feet[row].val} data-foot={row}> </span>
         {/each}
-        <span class="split" style:top="{forceY(y0, 2) + 20}px"
-          bind:this={F.act.split}> </span>
       {/if}
     </div>
   {/each}
@@ -312,7 +291,7 @@
   }
   /* the spans rewritten every frame are sized boxes with strict
      containment, so a new number lays out that box alone */
-  .ang, .om, .val, .split { contain: strict; }
+  .ang, .om, .val { contain: strict; }
   .head { left: 10px; font-size: 12px; font-weight: bold; }
   .fh { color: #e8eaf0; }
 
@@ -339,9 +318,7 @@
   .ftrack { stroke: #3a4050; stroke-width: 5; }
   .fill { stroke: #7aa2f7; stroke-width: 6; }
   .fill.neg { stroke: #e06c75; }
-  .fill.act { stroke: #c5b3f0; }
   .fname { left: 10px; font-size: 11px; color: #9aa0ae; }
   .val { left: 194px; width: 56px; font-size: 11px; color: #cfd3dc; }
   .val.na { color: #6b7180; }
-  .split { left: 60px; width: 190px; font-size: 10px; color: #9aa0ae; }
 </style>
