@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import puppeteer from "puppeteer-core";
+import { clickBar, scrubTo } from "./bar.js";
 
 function findBrowser() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -29,8 +30,10 @@ const browser = await puppeteer.launch({
   executablePath: findBrowser(), headless: true,
   args: ["--use-angle=swiftshader", "--disable-gpu-sandbox", "--no-sandbox"],
 });
+// by accessible name: the aria-label of the bar's icon buttons, else the text
 const click = (page, sel, text) => page.evaluate((sel, text) => {
-  const b = [...document.querySelectorAll(sel)].find((e) => e.textContent.includes(text));
+  const b = [...document.querySelectorAll(sel)]
+    .find((e) => (e.getAttribute("aria-label") ?? e.textContent).includes(text));
   if (!b) throw new Error(`no ${sel} with "${text}"`);
   b.click();
 }, sel, text);
@@ -124,8 +127,10 @@ try {
   await page.waitForFunction(
     () => { const s = window.__viewerState?.(); return s?.loaded && s.flux && s.human; },
     { timeout: 10000 });
-  await page.evaluate(() => [...document.querySelectorAll("#bar button")]
-    .find((b) => b.textContent.includes("pause"))?.click());
+  await clickBar(page, "pause");
+  // a person's run has no torque: the timeline falls back to a plain track
+  const graph = await page.$eval("#seekbar", (e) => e.dataset.graph);
+  if (graph !== "none") throw new Error("a person's run should have no torque graph: " + graph);
   await new Promise((r) => setTimeout(r, 800));
   await page.screenshot({ path: "test/out/flux-play-watch.png" });
   // a person's run has no body to instrument — no gauges, not even from
@@ -135,13 +140,7 @@ try {
   if (await page.$(".gauges")) throw new Error("joint gauges shown on a person's run");
   await page.keyboard.press("f");
   // the viewer's tallies at the last tick are the run's own
-  await page.evaluate(() => {
-    // the timeline is the last slider (volume / fov come first)
-    const r = [...document.querySelectorAll("#bottom input[type=range]")].at(-1);
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
-      .set.call(r, r.max);
-    r.dispatchEvent(new Event("input", { bubbles: true }));
-  });
+  await scrubTo(page, "max"); // the timeline (test/bar.js)
   await new Promise((r) => setTimeout(r, 400));
   const vs = await page.evaluate(() => window.__viewerState());
   if (vs.tick !== vs.lastTick) throw new Error("did not scrub to the last tick: " + JSON.stringify(vs));

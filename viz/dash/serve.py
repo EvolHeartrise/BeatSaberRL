@@ -11,6 +11,10 @@ Routes:
                    logs, bench JSON, replays; directory listings allowed)
     /replay.html   viz/replay.html (the 3D replay viewer; drop a replay in)
 
+Files get an ETag (If-None-Match -> 304) and single byte ranges
+(Range: bytes=N- -> 206, past the end -> 416), so the dashboard re-reads
+a growing metrics.jsonl from where it stopped.
+
 Also runs `python/metrics_backfill.py --watch 30` in a subprocess so
 metrics.jsonl + index.json follow the archive while a campaign's rsync
 loop fills it. Read-only over the archive; never touches the pod.
@@ -49,6 +53,7 @@ def make_handler(archive):
         # compares content, so a plain http.server without this works too)
         def send_head(self):
             self._etag = None
+            self._range_left = None
             path = self.translate_path(self.path)
             try:
                 st = os.stat(path)
@@ -61,7 +66,63 @@ def make_handler(archive):
                     self.send_response(304)
                     self.end_headers()
                     return None
+                rng = self.byte_range(st.st_size)
+                if rng is not None:
+                    return self.send_range(path, st.st_size, *rng)
             return super().send_head()
+
+        # Range: bytes=N- / bytes=N-M (one range) -> 206 (2026-10-06): the
+        # dashboard re-reads a growing metrics.jsonl from where its last
+        # read stopped instead of the whole file every refresh. Start past
+        # the end -> 416 (the file shrank: the page re-reads it whole).
+        def byte_range(self, size):
+            h = self.headers.get("Range")
+            if not h or not h.startswith("bytes=") or "," in h:
+                return None
+            a, _, b = h[len("bytes="):].strip().partition("-")
+            try:
+                if a == "":  # suffix range: the last b bytes
+                    n = int(b)
+                    return (max(0, size - n), size - 1) if n > 0 else None
+                start = int(a)
+                end = int(b) if b else None
+            except ValueError:
+                return None
+            if start < 0 or (end is not None and end < start):
+                return None
+            if start >= size:
+                return start, start  # unsatisfiable: send_range answers 416
+            return start, size - 1 if end is None else min(end, size - 1)
+
+        def send_range(self, path, size, start, end):
+            if start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            f = open(path, "rb")
+            f.seek(start)
+            n = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Type", self.guess_type(path))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(n))
+            self.end_headers()
+            self._range_left = n
+            return f
+
+        def copyfile(self, source, outputfile):
+            left = getattr(self, "_range_left", None)
+            if left is None:
+                return super().copyfile(source, outputfile)
+            self._range_left = None
+            while left > 0:
+                buf = source.read(min(65536, left))
+                if not buf:
+                    break
+                outputfile.write(buf)
+                left -= len(buf)
 
         def end_headers(self):
             self.send_header("Cache-Control", "no-store")

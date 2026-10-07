@@ -13,22 +13,30 @@
     "build": "vite build",
     "build:site": "npm run wasm && vite build --mode site",
     "pretest": "npm run wasm",
-    "test": "node test/replay.test.js && node test/replay-v2.test.js && node test/urlload.test.js && node test/models.test.js && node test/hud.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/tiptrail.test.js && node test/interp.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
+    "test": "node test/replay.test.js && node test/replay-v2.test.js && node test/urlload.test.js && node test/models.test.js && node test/hud.test.js && node test/sync.test.js && node test/tickrate.test.js && node test/tiptrail.test.js && node test/torquegraph.test.js && node test/interp.test.js && node test/flux.test.js && node test/flux-parity.test.js && node test/flux-game.test.js"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "iwer": "^2.5.0",
     "puppeteer-core": "^25.3.0",
+    "shadcn-svelte": "^1.7.0",
     "svelte": "^5.0.0",
+    "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
     "vite": "^6.0.0",
     "vite-plugin-singlefile": "^2.0.0"
   },
   "dependencies": {
+    "@lucide/svelte": "^1.52.0",
     "@threlte/core": "^8.0.0",
     "@threlte/extras": "^9.0.0",
     "@threlte/xr": "^1.6.1",
+    "bits-ui": "^2.19.5",
+    "cn": "^0.4.0",
     "fflate": "^0.8.2",
+    "tailwind-variants": "^3.3.1",
     "three": "^0.170.0"
   }
 }

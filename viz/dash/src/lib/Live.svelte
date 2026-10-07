@@ -2,7 +2,8 @@
   import { store, loadIndex, loadMetrics, mostRecentRun, runById, REFRESH_MS } from "./data.svelte.js";
   import { X_MODES, xValues, seriesValues, hasAny, label, color, fmt,
     fmtDuration, fmtSamples, gameOf, panelsFor } from "./series.js";
-  import Chart from "./Chart.svelte";
+  import Panel from "./Panel.svelte";
+  import { isHidden } from "./hidden.svelte.js";
 
   let { xMode = $bindable("samples"), runId = $bindable(null) } = $props();
 
@@ -11,9 +12,13 @@
 
   const runs = $derived(store.index?.runs ?? []);
   const run = $derived(runId ? runById(runId) : mostRecentRun());
-  const recs = $derived(run ? (store.metrics[run.id]?.recs ?? null) : null);
-  const last = $derived(recs && recs.length ? recs[recs.length - 1] : null);
-  const x = $derived(recs ? xValues(recs, xMode) : []);
+  // primitives first: an index refresh replaces the run object (t_last
+  // moved) but must not re-derive the panels unless the data changed
+  const runKey = $derived(run?.id ?? null);
+  const game = $derived(gameOf(run));
+  const data = $derived(runKey ? (store.metrics[runKey] ?? null) : null);
+  const last = $derived(data && data.n ? data.last : null);
+  const x = $derived(data ? xValues(data, xMode) : []);
   const xLabel = $derived(X_MODES.find((m) => m.key === xMode)?.label ?? xMode);
 
   // Window lock (2026-09-14, user request): pin every chart's x range to
@@ -45,15 +50,20 @@
   const ago = $derived(lastT ? Math.max(0, now / 1000 - lastT) : null);
 
   const panels = $derived.by(() => {
-    if (!recs || !recs.length) return [];
-    return panelsFor(gameOf(run)).map((p) => {
-      const keys = p.series.filter((k) => hasAny(recs, k));
+    if (!data || !data.n) return [];
+    return panelsFor(game).map((p) => {
+      const keys = p.series.filter((k) => hasAny(data, k));
       return {
         ...p,
-        datasets: keys.map((k, i) => ({ label: label(k), x, y: seriesValues(recs, k), color: color(i) })),
+        datasets: keys.map((k, i) => ({ label: label(k), x, y: seriesValues(data, k), color: color(i) })),
       };
     });
   });
+
+  // hidden panels (hidden.svelte.js): off this tab until restored from
+  // the header menu; the keyed list leaves the other charts (and their
+  // zoom) alone
+  const shown = $derived(panels.filter((p) => !isHidden("live", p.id)));
 
   async function refresh() {
     if (refreshing) return;
@@ -127,10 +137,8 @@
   </div>
 
   <div class="grid">
-    {#each panels as p (p.id)}
-      <div class="cell">
-        <Chart title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} resetKey={run.id} />
-      </div>
+    {#each shown as p (p.id)}
+      <Panel tab="live" id={p.id} title={p.title} datasets={p.datasets} {xLabel} log={p.log} syncKey={"live-" + xMode} {xRange} resetKey={run.id} />
     {/each}
   </div>
 {:else}
@@ -142,8 +150,9 @@
   .status { font-size: 13px; color: var(--muted); margin: 4px 0 10px; }
   .status b { color: var(--fg); }
   .game { background: #8b5cf6; color: #fff; border-radius: 4px; padding: 0 5px; margin-left: 4px; font-size: 11px; font-weight: 700; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 8px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px 2px; min-width: 0; }
+  /* align start: a card keeps its own height, so hiding one never
+     stretches or shrinks another (2026-10-06) */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 8px; align-items: start; }
   .xmode button.on, .win button.on { background: var(--accent); color: #fff; }
   .win input { width: 6em; }
   select { max-width: 52vw; }

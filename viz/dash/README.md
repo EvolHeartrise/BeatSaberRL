@@ -37,12 +37,18 @@ Alternative with nothing but `http.server`: copy `viz/dash/dist/*` into
 from there — the page finds `./index.json` first, `/archive/index.json`
 second (`?archive=/some/prefix/` overrides). Development:
 `npm run dev` (vite on :5173, proxies `/archive` to serve.py on :8765).
-Test: `npm test` builds and runs `test/refresh-browser.mjs` — one
+Test: `npm test` builds, runs `test/incremental.mjs` (no browser:
+chunked / cut-line parsing gives the very columns and chart series of one
+full parse, incl. --resume re-appends and the swing_hist merge; also over
+the real archive's biggest metrics file when present) and
+`test/refresh-browser.mjs` — one
 headless Chrome (from `~/.cache/puppeteer/chrome`, or
 `PUPPETEER_EXECUTABLE_PATH`) against a fake archive in `test/.archive`
 served by serve.py: idle refreshes must not redraw or reset a zoom
 (Live, window lock, Compare), appended rows must reach every chart,
-hovering must not change any card's height.
+hovering must not change any card's height, a cut line changes nothing
+until complete, growing files are read by Range, a shrunk one whole;
+hiding / restoring graphs (menu, keyboard, reload, refresh, per tab).
 
 Chart cards (2026-10-06): the panel title floats on the plot's top-left
 corner, the legend under the plot is static (names + colours, click a
@@ -50,6 +56,15 @@ name to hide/show that series; capped at three rows, scrolls past that),
 and the values at the cursor show in a floating tooltip on the hovered
 chart only — x in the header, series sorted by value with colour
 swatches, clamped to the viewport — so hovering never reflows the page.
+
+Hidden graphs (2026-10-06): each card's eye-off button (top-right; on
+hover, always on touch screens) hides that panel; "Hidden (n)" in the
+header lists the current tab's hidden graphs — click one to bring it
+back, or "Show all" (Esc / outside click closes, arrow keys move). Live
+and Compare keep separate sets, keyed by the panel ids in series.js
+(Compare: the metric key, `diff:<key>` for the difference panels), in
+localStorage `dash.hidden.<tab>`; refreshes never un-hide, unknown ids
+are pruned, new panels start visible.
 
 ## Views
 
@@ -82,6 +97,18 @@ swatches, clamped to the viewport — so hovering never reflows the page.
   do arrive the plots update in place: a zoomed view keeps its window
   and redraws, a full-run view extends to the new tail. Switching run
   rebuilds the plots (no inherited zoom).
+  **Refreshes never block the page** (2026-10-06): fetching, change
+  detection and parsing run in a Web Worker (`src/lib/fetch.worker.js`);
+  a growing metrics.jsonl is re-read from where the last read stopped
+  (HTTP Range, which serve.py answers with 206; a plain `http.server`
+  sends the whole file and the worker checks the consumed prefix by hash)
+  and only the new lines are parsed (`src/lib/metricsCore.js`; a line cut
+  mid-write waits for its end). The page gets columns (Float64Arrays,
+  transferred), held outside Svelte's deep proxies; series are memoized
+  per run, so an unchanged run costs nothing. Chart work is queued and
+  run a few charts per ~8 ms slice (`src/lib/sched.js`); charts scrolled
+  out of view update when they come back. Hover on a joined grid
+  (Compare) finds each run's point by binary search.
 - **Swing** (2026-10-04) — per-level swing quality over the ranked
   catalogue and the run's best-possible PP, from `<run>/swing.json`
   (`python/swing_summary.py`; runs with an `ep_stats.f32`). Four tiles:

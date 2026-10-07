@@ -5,12 +5,12 @@
   import PosePanel from "./lib/PosePanel.svelte";
   import MapCard from "./lib/MapCard.svelte";
   import BodyGauges from "./lib/BodyGauges.svelte";
-  import { audio, pb, play, pose, songClock, lastTick, loadReplay,
-    restart, seekTo, setPlaying, setSpeed, setTipTrail, setTipTrailS, step,
+  import ControlBar from "./lib/ControlBar.svelte";
+  import { audio, pb, play, pose, songClock, loadReplay,
+    restart, setPlaying, setSpeed, setTipTrail, step,
     togglePose } from "./lib/state.svelte.js";
-  import { TIP_TRAIL_MAX_S, TIP_TRAIL_MIN_S } from "./lib/tiptrail.js";
   import { toggleXRSession } from "@threlte/xr";
-  import { chartEntries, enterPlay, exitPlay, exportRun, startRun,
+  import { chartEntries, exitPlay, exportRun, startRun,
     watchRun } from "./lib/playctl.js";
   import { sfx } from "./lib/sfx.js";
   import { songBlob } from "./lib/audio.js";
@@ -26,9 +26,6 @@
   let dropHover = $state(false);
   let fileInput = $state(null);
 
-  // the timeline slider's position
-  const tickIdx = $derived(
-    pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
   // the map card shows whenever the replay names a map (not in play mode)
   const cardShown = $derived(!!pb.rep?.map && !play.on);
   // the joint gauges ('g') instrument a BODY: a manual pose, or an agent
@@ -177,13 +174,6 @@
     return () => { songClock.tick = null; };
   });
 
-  const audioLabel = $derived(
-    audio.status === "ready" ? (audio.song || "song")
-    : audio.status === "loading" ? (audio.msg || "song…")
-    : audio.status === "error" ? "no audio"
-    : audio.status === "none" ? "no song"
-    : "");
-
   function load(data, name) {
     try {
       loadReplay(data, name);
@@ -244,10 +234,16 @@
     setPlaying(true);
   }
 
+  const SLIDER_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+    "Home", "End"]);
   function onKey(e) {
     // keys aimed at the pose panel's own controls stay there (slider
     // arrow-key nudges must not step the replay)
     if (e.target && e.target.closest && e.target.closest("#pose, #fp, #tt, #play")) return;
+    // the arrow / Home / End keys on a focused bar slider (the timeline, the
+    // volume) move that slider and nothing else: the timeline already steps
+    // the replay itself, one tick per arrow press
+    if (SLIDER_KEYS.has(e.key) && e.target?.closest?.("[role=slider]")) return;
     if (FLUX && play.on) {
       // the game owns the keyboard: Esc leaves, Enter (re)starts
       if (e.key === "Escape") exitPlay();
@@ -269,9 +265,6 @@
     else if (e.key === "f") pb.firstPerson = !pb.firstPerson;
     else if (e.key === "t") setTipTrail(!pb.tipTrail);
   }
-
-  const speedLabel = $derived(
-    pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
 
   // ---- the Flux WebXR game (play mode) ------------------------------------
   const entries = $derived(FLUX && play.on ? chartEntries() : []);
@@ -445,94 +438,18 @@
       {#if play.error}<div class="row warn">{play.error}</div>{/if}
     </div>
     {:else}
-    <div id="bar" class="panel">
-      <button onclick={() => setPlaying(!pb.playing)}>
-        {pb.playing ? "⏸ pause" : "▶ play"}
-      </button>
-      <button onclick={restart}>↺ restart</button>
-      <button onclick={() => setSpeed(pb.speed / 2)}>−</button>
-      <span>{speedLabel}</span>
-      <button onclick={() => setSpeed(pb.speed * 2)}>+</button>
-      {#if FLUX}
-        <button onclick={enterPlay}
-          title="play a Flux chart yourself in VR — the same judge the env uses">
-          🥽 play Flux
-        </button>
-      {/if}
-      {#if POSE}
-        <button class:on={pose.on} onclick={togglePose}>
-          {pose.on ? "🧍 posing" : "🧍 pose"}
-        </button>
-      {/if}
-      <button class:on={pb.gauges} onclick={() => (pb.gauges = !pb.gauges)}
-        title="per-joint dials, torque bars, foot forces and joint activation (g)">
-        📊 gauges
-      </button>
-      <button class:on={pb.firstPerson}
-        onclick={() => (pb.firstPerson = !pb.firstPerson)}
-        title="camera at the player's head, looking straight down the track (f)">
-        👁 first-person
-      </button>
-      {#if pb.firstPerson}
-        <span id="fp">
-          <label title="first-person vertical field of view">
-            fov <input type="range" min="40" max="110" step="1"
-              value={pb.fpFov} oninput={(e) => (pb.fpFov = +e.target.value)} />
-            <span>{pb.fpFov}°</span>
-          </label>
-        </span>
-      {/if}
-      <button class:on={pb.tipTrail} onclick={() => setTipTrail(!pb.tipTrail)}
-        title="a crisp line tracing each blade tip's recent path (t)">
-        ✦ tip trail
-      </button>
-      {#if pb.tipTrail}
-        <span id="tt">
-          <label title="how much of the tip's path the line shows, in replay seconds">
-            len <input type="range" min={TIP_TRAIL_MIN_S} max={TIP_TRAIL_MAX_S}
-              step="0.05" value={pb.tipTrailS}
-              oninput={(e) => setTipTrailS(+e.target.value)} />
-            <span>{pb.tipTrailS.toFixed(2)} s</span>
-          </label>
-        </span>
-      {/if}
-      {#if pb.rep}
-        <!-- preservesPitch off: a speed change should sound like the game's
-             practice mode (pitch follows the rate), not a time-stretch -->
-        <audio
-          bind:this={audioEl}
-          preload="auto"
-          onloadedmetadata={(e) => { e.currentTarget.preservesPitch = false; }}
-        ></audio>
-        <span id="snd" title={audio.msg || audio.song}>
-          <button
-            class:on={audio.status === "ready" && !audio.muted}
-            disabled={audio.status !== "ready"}
-            onclick={() => (audio.muted = !audio.muted)}
-          >{audio.status === "ready" ? (audio.muted ? "🔇" : "🔊") : "🔈"}</button>
-          {#if audio.status === "ready"}
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.02"
-              value={audio.vol}
-              oninput={(e) => (audio.vol = +e.target.value)}
-            />
-          {:else}
-            <span class="dim">{audioLabel}</span>
-          {/if}
-        </span>
-      {/if}
-      <input
-        type="range"
-        min="0"
-        max={lastTick()}
-        step="1"
-        value={tickIdx}
-        oninput={(e) => { setPlaying(false); seekTo(+e.target.value); }}
-      />
-    </div>
+    <ControlBar />
+    {#if pb.rep}
+      <!-- the song (sync: the effects above); it lives and dies with the bar,
+           as it always has. preservesPitch off: a speed change should sound
+           like the game's practice mode (pitch follows the rate), not a
+           time-stretch -->
+      <audio
+        bind:this={audioEl}
+        preload="auto"
+        onloadedmetadata={(e) => { e.currentTarget.preservesPitch = false; }}
+      ></audio>
+    {/if}
     {/if}
   </div>
 </main>
@@ -566,10 +483,6 @@
     background: rgba(17, 19, 25, 0.72); backdrop-filter: blur(6px);
   }
   #drop.hover { border-color: #7aa2f7; color: #cfd3dc; }
-  #bar {
-    display: flex; gap: 10px; align-items: center; padding: 8px 14px;
-    flex-wrap: wrap; justify-content: center; max-width: 94vw;
-  }
   button, select {
     background: #232733; color: #cfd3dc; border: 1px solid #3a4050;
     border-radius: 6px; padding: 4px 12px; cursor: pointer; font: inherit;
@@ -578,16 +491,7 @@
   button:hover { background: #2d3342; }
   button:disabled { opacity: 0.5; cursor: default; }
   button.on { border-color: #7aa2f7; color: #e8eaf0; }
-  input[type="range"] { width: min(40vw, 480px); }
-  #snd { display: flex; gap: 6px; align-items: center; }
-  #fp, #tt { display: flex; gap: 10px; align-items: center; color: #9aa0ae;
-    font-size: 12px; font-variant-numeric: tabular-nums; }
-  #fp label, #tt label { display: flex; gap: 4px; align-items: center; }
-  #fp label > span, #tt label > span { min-width: 4ch; color: #cfd3dc; }
-  #fp input[type="range"], #tt input[type="range"] { width: 80px; }
-  #snd input[type="range"] { width: 70px; }
-  #snd .dim { color: #6b7180; font-size: 12px; max-width: 22ch; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; }
+  /* the replay viewer's bar is lib/ControlBar.svelte (shadcn-svelte) */
   #playtitle { padding: 6px 14px; color: #9aa0ae; }
   #playtitle b { color: #e8eaf0; }
   #play {
