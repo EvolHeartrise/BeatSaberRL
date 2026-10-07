@@ -29,6 +29,8 @@ ANY non-bitwise mirror. The f64 tier is therefore:
 The whole module is skipped without CUDA (the kernel has no CPU path).
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -77,9 +79,18 @@ def _tame_states(n, seed):
     is intrinsically chaotic within ONE tick in Rust itself and is
     covered by the f32-style statistical tier instead.)"""
     rng = np.random.default_rng(seed)
+    # exp/shoulder-rom: the twist box's internal side widened to 190 deg;
+    # its new tail lies deep past the human axial range (the passive
+    # shoulder's stiff linear branch), which is not the moderate regime —
+    # draw the twists from the v10 window as before (measured on the pod,
+    # 4 seeds x 32 states: 3-7 knife-edge outliers per seed with or without
+    # the passive shoulder; the wtendon tree alone gives 3-7 too)
+    lims = list(JOINT_LIMITS)
+    lims[5] = (-math.pi / 2, math.radians(70.0))
+    lims[12] = (math.radians(-70.0), math.pi / 2)
     q36s, v35s = [], []
     for _ in range(n):
-        q = [float(rng.uniform(0.8 * lo, 0.8 * hi)) for lo, hi in JOINT_LIMITS]
+        q = [float(rng.uniform(0.8 * lo, 0.8 * hi)) for lo, hi in lims]
         rot = rng.normal(size=3) * 0.05
         quat = np.concatenate([[1.0], rot])
         quat /= np.linalg.norm(quat)

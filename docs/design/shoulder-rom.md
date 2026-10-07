@@ -1,7 +1,7 @@
 # Shoulder ROM design: position-dependent axial limits and a passive shoulder tendon
 
 Branch `exp/shoulder-rom` (from `origin/exp/wrist-tendon`, the v65 body lineage).
-**Status: PHASE 1, design only. Nothing in Rust or CUDA has changed.** The user reviews this before any implementation.
+**Status: PHASE 2 IMPLEMENTED (2026-10-07)** with the recommended defaults below, plus the user's decision 6: the twist box's internal side is widened to **−190° (left) / +190° (right)**, so every human IR limit of the fit is reachable: the worst direction (abduction plane, ~40° elevation) needs −184.3°, rounded out to −190° for ~6° of margin. See the PR for test, parity and throughput results. The phase-1 text below is kept as written; where it says "phase 2" it describes what was built.
 Date: 2026-10-07.
 
 Prototype scripts that check every number below are in [`docs/design/shoulder_rom/`](shoulder_rom/). How to run them is in §9.
@@ -266,7 +266,7 @@ The box is inside the human sinus (B.4). A cone term only becomes necessary if t
 
 - `B = b·JᵀJ` with J = (1, 0, −1) on (yaw, pitch, twist).
 - The right arm has J = (−1, 0, 1), which gives the same B.
-- Add h·b to M[yaw][yaw] and M[tw][tw], and −h·b to M[yaw][tw] and M[tw][yaw]. The yaw frame is an ancestor of the twist frame, so this entry is inside the tree profile (CUDA `d.m[fcb[F_UARM] + 1]`; slot 0 is pitch).
+- Add h·b to M[yaw][yaw] and M[tw][tw], and −h·b to M[yaw][tw] and M[tw][yaw]. The yaw frame is an ancestor of the twist frame, so this entry is inside the tree profile (CUDA `d.m[fcb[F_UARM] + 2]`: slot 0 is the twist itself, +1 the pitch row, +2 the yaw row).
 - RHS: −b·τ̇ on the yaw row, +b·τ̇ on the twist row.
 - PSD, so dissipative and unconditionally stable.
 
@@ -375,7 +375,7 @@ Other observations:
    - Mirror: the right arm reads exactly negated inputs, so its outputs are bitwise the left's. No `sin(−x) = −sin(x)` assumption is needed.
 3. **CUDA (`beat_arena_cuda.cu`).**
    - Device `shoulder_rom` (T-templated, `T(double constexpr)` constants), plus the same 4d block.
-   - Diagonals at `d.m[TREE_C.fcb[4|6|11|13]]`, off-diagonal at `d.m[TREE_C.fcb[6|13] + 1]` (pin with a `static_assert` on the ANC slot).
+   - Diagonals at `d.m[TREE_C.fcb[4|6|11|13]]`, off-diagonal at `d.m[TREE_C.fcb[6|13] + 2]` (slot +1 is the pitch row; pinned by the `srom_slots_ok` static_assert).
    - `pop_shoulder` telemetry.
    - Parity test against Rust on random states (pod: no GPU on the laptop).
 4. **Python.**
