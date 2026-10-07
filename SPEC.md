@@ -698,15 +698,28 @@ controls in a translucent panel at the bottom (no DOM score strip since
 (`pointer-events: none` containers so drags reach the canvas). Since
 2026-10-06 that panel (`src/lib/ControlBar.svelte`) is built from
 shadcn-svelte components (bits-ui) and Lucide icons, the same stack as the
-records site: the timeline slider on its own row, then icon buttons /
+records site: the timeline on its own row, then icon buttons /
 toggles (aria-labels, `aria-pressed` on/off, tooltips naming each key);
 below 640 px the view toggles and their sliders fold into a "more
 controls" popover. Tailwind is scoped to the bar (`src/app.css`: no
 preflight, utilities generated from the bar's files only), so nothing
-else on the page is restyled; `node test/controls-browser.mjs` checks it. The
+else on the page is restyled; `node test/controls-browser.mjs` checks it.
+The timeline (`src/lib/TorqueSeek.svelte`, since 2026-10-06) is a seek bar
+drawn as the replay's effort profile: every tick's applied torque (the
+"torque" total, Σ|τ| N·m) as a filled area across the track, reduced to
+one column per device pixel (column max as a faint envelope, column mean
+solid; `src/lib/torquegraph.js`), on a linear zero-based scale whose full
+height is the series' p99 (ticks above it clip, with an amber cap), with
+faint red marks at misses / bad cuts / bombs. The played part is tinted in
+the accent colour; the area is painted once per replay and track size and
+playback only moves a CSS variable. Click / drag / touch-drag seeks and
+pauses, arrows step one tick, Home / End jump, hover shows mm:ss and that
+tick's torque (with the spine / arms / legs split); a replay without
+torque (a person's Flux run) gets a plain track. The
 gauge panels (a DOM overlay since 2026-10-02, camera-attached canvas
 sprites before) anchor to the viewport's bottom corners and sit above
-the floating bottom UI.
+the floating bottom UI. Their force block shows the two foot reactions
+(the joint-activation row went with the torque timeline, 2026-10-06).
 Source in `viz/app/` (Vite + vite-plugin-singlefile); rebuild with
 `npm install && npm run build`, then copy `dist/index.html` over
 `../replay.html`. The hosted viewer at replays.flee.systems is a separate,

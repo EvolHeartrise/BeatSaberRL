@@ -128,6 +128,9 @@ try {
     () => { const s = window.__viewerState?.(); return s?.loaded && s.flux && s.human; },
     { timeout: 10000 });
   await clickBar(page, "pause");
+  // a person's run has no torque: the timeline falls back to a plain track
+  const graph = await page.$eval("#seekbar", (e) => e.dataset.graph);
+  if (graph !== "none") throw new Error("a person's run should have no torque graph: " + graph);
   await new Promise((r) => setTimeout(r, 800));
   await page.screenshot({ path: "test/out/flux-play-watch.png" });
   // a person's run has no body to instrument — no gauges, not even from

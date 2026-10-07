@@ -5,7 +5,8 @@
   // stay in App.svelte's onKey, and the tip trail's switch + length persist
   // through setTipTrail / setTipTrailS as before.
   //
-  //   row 1  the timeline (seek) slider, full width
+  //   row 1  the timeline: TorqueSeek, a seek bar drawn as the replay's
+  //          per-tick torque profile, full width
   //   row 2  play/pause, restart | slower, speed, faster | [view toggles] | sound
   //
   // Narrow screens (< 640 px) keep transport, speed and mute in the row and
@@ -34,24 +35,15 @@
   import * as Tooltip from "$lib/components/ui/tooltip/index.js";
   import * as Popover from "$lib/components/ui/popover/index.js";
   import BarTip from "./BarTip.svelte";
-  import { audio, lastTick, pb, pose, restart, seekTo, setPlaying, setSpeed,
+  import TorqueSeek from "./TorqueSeek.svelte";
+  import { audio, pb, pose, restart, setPlaying, setSpeed,
     setTipTrail, setTipTrailS, togglePose } from "./state.svelte.js";
   import { TIP_TRAIL_MAX_S, TIP_TRAIL_MIN_S } from "./tiptrail.js";
   import { enterPlay } from "./playctl.js";
-  import { DT } from "./replay.js";
   import { FLUX, POSE } from "./build.js";
 
   const narrow = new MediaQuery("max-width: 639.98px", false);
   let moreOpen = $state(false);
-
-  // the timeline slider's position
-  const tickIdx = $derived(
-    pb.rep ? Math.min(Math.floor(pb.cur), lastTick()) : 0);
-  const mmss = (s) => {
-    const t = Math.max(0, Math.floor(s));
-    return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
-  };
-  const seekText = $derived(`${mmss(tickIdx * DT)} of ${mmss(lastTick() * DT)}`);
 
   const speedLabel = $derived(
     pb.speed.toFixed(2).replace(/0+$/, "").replace(/\.$/, ".0") + "×");
@@ -71,7 +63,7 @@
       desc: "pose the body by hand: root and all 29 joints",
       on: pose.on, set: (v) => { if (v !== pose.on) togglePose(); } },
     { id: "gauges", label: "gauges", keys: ["G"], icon: Gauge,
-      desc: "per-joint dials, torque bars, foot forces and joint activation",
+      desc: "per-joint dials, torque bars and foot forces",
       on: pb.gauges, set: (v) => (pb.gauges = v) },
     { id: "first-person", label: "first-person", keys: ["F"], icon: Eye,
       desc: "camera at the player's head, looking straight down the track",
@@ -126,9 +118,7 @@
     rounded-[10px] border border-[rgba(58,64,80,0.6)] bg-[rgba(17,19,25,0.72)] px-3 py-1.5
     backdrop-blur-[6px]">
     <div id="seek" class="px-1">
-      <Slider type="single" min={0} max={Math.max(1, lastTick())} step={1}
-        class="py-1.5 [--primary:var(--on)]" thumbLabel="seek" valueText={seekText}
-        bind:value={() => tickIdx, (v) => { setPlaying(false); seekTo(v); }} />
+      <TorqueSeek compact={narrow.current} />
     </div>
 
     <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
