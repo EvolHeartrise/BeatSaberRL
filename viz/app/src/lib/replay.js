@@ -281,12 +281,16 @@ export const JOINT_NAMES = [
   "hip_p", "hip_y", "hip_r", "knee", "ank_p", "ank_r",
   "hip_p", "hip_y", "hip_r", "knee", "ank_p", "ank_r",
 ];
-// exact limit literals (model.rs HUMANOID_LIMITS)
+// exact limit literals (model.rs HUMANOID_LIMITS). exp/shoulder-rom
+// (2026-10-07): the twist box's internal side widened to 190 deg (l lo
+// -190, r hi +190) — a superset of the v10 box, so older replays still
+// draw inside it (only their near-stop "hot" marks at the old -90 / +90
+// twist stops are lost).
 export const JOINT_LIMITS = [
   [-20 * RAD, 45 * RAD], [-40 * RAD, 40 * RAD], [-30 * RAD, 30 * RAD],
-  [-90 * RAD, 65 * RAD], [-100 * RAD, 45 * RAD], [-90 * RAD, 70 * RAD],
+  [-90 * RAD, 65 * RAD], [-100 * RAD, 45 * RAD], [-190 * RAD, 70 * RAD],
   [0, 150 * RAD], [0, Math.PI], [-95 * RAD, 95 * RAD], [-30 * RAD, 15 * RAD],
-  [-90 * RAD, 65 * RAD], [-45 * RAD, 100 * RAD], [-70 * RAD, 90 * RAD],
+  [-90 * RAD, 65 * RAD], [-45 * RAD, 100 * RAD], [-70 * RAD, 190 * RAD],
   [0, 150 * RAD], [-Math.PI, 0], [-95 * RAD, 95 * RAD], [-15 * RAD, 30 * RAD],
   [-20 * RAD, 120 * RAD], [-45 * RAD, 40 * RAD], [-45 * RAD, 30 * RAD],
   [0, 150 * RAD], [-50 * RAD, 35 * RAD], [-20 * RAD, 20 * RAD],
@@ -578,7 +582,8 @@ const _wb = [0, 0, 0];
  * A joint Hermite can overshoot within a tick, so each is clamped to its
  * limits (JOINT_LIMITS, which the sim holds to within 0.04°) widened to
  * include both endpoints — a recorded angle is never moved. No joint wraps:
- * every range is at most π wide inside (−π, π].
+ * every range is narrower than 2π (the arm twist, −190…70°, the widest:
+ * the sim's q is never wrapped).
  *
  * `out` (optional) is filled and returned instead of a new array. */
 export function qAt(rep, tickIdx, u, out = new Array(36)) {

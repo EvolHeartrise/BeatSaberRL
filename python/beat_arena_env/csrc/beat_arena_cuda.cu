@@ -1095,9 +1095,12 @@ __device__ __forceinline__ int body_pt_frame(int i) {
   return f[i];
 }
 
+// exp/shoulder-rom (2026-10-07): the twist box's INTERNAL side widened,
+// l_arm_twist lo -90 -> -190 deg, r_arm_twist hi +90 -> +190 deg (model.rs
+// HUMANOID_LIMITS): every human IR limit of the passive shoulder is inside.
 __device__ constexpr double LIMIT_LO[NQ] = {
     -0.3490658503988659, -0.6981317007977318, -0.5235987755982988,
-    -1.5707963267948966, -1.7453292519943295, -1.5707963267948966,
+    -1.5707963267948966, -1.7453292519943295, -3.3161255787892263,
     0.0, 0.0, -1.6580627893946132, -0.5235987755982988,
     -1.5707963267948966, -0.7853981633974483, -1.2217304763960306,
     0.0, -3.141592653589793, -1.6580627893946132, -0.2617993877991494,
@@ -1110,7 +1113,7 @@ __device__ constexpr double LIMIT_HI[NQ] = {
     1.1344640137963142, 0.7853981633974483, 1.2217304763960306,
     2.6179938779914944, 3.141592653589793, 1.6580627893946132,
     0.2617993877991494,
-    1.1344640137963142, 1.7453292519943295, 1.5707963267948966,
+    1.1344640137963142, 1.7453292519943295, 3.3161255787892263,
     2.6179938779914944, 0.0, 1.6580627893946132, 0.5235987755982988,
     2.0943951023931953, 0.6981317007977318, 0.5235987755982988,
     2.6179938779914944, 0.6108652381980153, 0.3490658503988659,
@@ -1709,6 +1712,9 @@ struct Dyn {
   // as [tau_b, tau_d, r, P_diss] (step 4c; the [tendon] telemetry reads
   // it) — lib.rs Workspace::tendon mirror
   T tdn[2][4];
+  // exp/shoulder-rom: THIS substep's passive shoulder terms per arm [L, R]
+  // as [sum|tau_p|, u, b, P_diss] (step 4d) — lib.rs Workspace::shoulder
+  T srm[2][4];
 };
 
 // GROUND-BLOCK scratch (unilateral-contact spec §3): 3 rows per ACTIVE
@@ -1960,6 +1966,116 @@ __device__ __forceinline__ void wrist_tendon(T qb, T qd, T blo, T bhi,
     tb = -gb / lb + tcb;
     td = -gd / ld + tcd;
   }
+}
+
+// ---- exp/shoulder-rom (2026-10-07): passive shoulder axial limit ----------
+// model.rs PassiveShoulder / shoulder_rom, transcribed expression for
+// expression (docs/design/shoulder-rom.md). Per arm, LEFT-CANONICAL (y, p,
+// t) = (yaw, pitch, twist), the right arm at (-yaw, pitch, -twist) with
+// its yaw / twist torques negated (mirror-exact by construction):
+//   tau = y - t (axial, IR +); human limits f_k = a0 + c (a1 + c a2)
+//   + B (d_l - d_f) + (1 - c) phi, c = -sin p, phi = y + pi/2;
+//   u = (tau - m)/w; E = T w G(|u|); tau_joint = -dE/dq (analytic);
+//   edge damping b = b_peak z(min(|u|, uc))^2 on taudot = ydot - tdot,
+//   IMPLICIT (h b J^T J onto M's (yaw, twist) block).
+// T = 0.30 x the DEFAULT body's twist tau_max (19.45 x 0.8729), fixed N.m;
+// every constant computed in double and rounded once to T.
+constexpr double SROM_TAU_PEAK = 0.30 * 19.45 * 0.8729;  // 5.0933715
+constexpr double SROM_S = 0.3;
+constexpr double SROM_KB = 1.0;
+constexpr double SROM_WB = 0.25;
+constexpr double SROM_UC = 1.25;
+constexpr double SROM_B_PEAK = 0.30 * 19.45 * 0.8729 / 16.0;  // T / 16 rad/s
+constexpr double SROM_HALF_PI = 1.5707963267948966;
+// limit coefficients [a0, a1, a2, B] (rad): ER side (lo), IR side (hi)
+constexpr double SROM_LO0 = -1.8762289458939043, SROM_LO1 = 0.6741217713310772,
+                 SROM_LO2 = -0.19415622703263663, SROM_LO3 = 0.1308996938995747;
+constexpr double SROM_HI0 = 0.8726646259971648, SROM_HI1 = 1.3026652970940116,
+                 SROM_HI2 = -0.8314263990555426, SROM_HI3 = 0.17453292519943295;
+// (yaw, pitch, twist) per arm [L, R]: (4, 3, 5), (11, 10, 12); their yaw /
+// twist FRAMES l_sh_yaw 4, l_sh_twist 6, r 11, 13 (the twist column's slot
+// +2 is the yaw row: ANC order twist -> pitch -> yaw, pinned below)
+constexpr int SROM_JY_L = 4, SROM_JY_R = 11;    // pitch = yaw - 1, twist = yaw + 1
+constexpr int SROM_FY_L = 4, SROM_FY_R = 11;    // twist frame = yaw frame + 2
+constexpr bool srom_slots_ok() {
+  const TreeTabs t = tree_tabs();
+  return F_COORD[SROM_FY_L] == SROM_JY_L && F_COORD[SROM_FY_R] == SROM_JY_R
+      && F_COORD[SROM_FY_L + 2] == SROM_JY_L + 1
+      && F_COORD[SROM_FY_R + 2] == SROM_JY_R + 1
+      && F_COORD[SROM_FY_L + 1] == SROM_JY_L - 1
+      && F_COORD[SROM_FY_R + 1] == SROM_JY_R - 1
+      && t.vslot[t.fcb[SROM_FY_L + 2] + 2] == VOFF + SROM_JY_L
+      && t.vslot[t.fcb[SROM_FY_R + 2] + 2] == VOFF + SROM_JY_R;
+}
+static_assert(srom_slots_ok(),
+              "shoulder-rom: the twist column's profile slot +2 must be the yaw row");
+
+template <typename T>
+__device__ __forceinline__ void srom_raw(T a, T& g, T& gg, T& dg) {
+  const T s = T(SROM_S), kb = T(SROM_KB), wb = T(SROM_WB);
+  const T z = a > s ? (a - s) / (T(1) - s) : T(0);
+  const T x = a > T(1) ? (a - T(1)) / wb : T(0);
+  g = z * z + kb * (x * x);
+  gg = ((T(1) - s) / T(3)) * (z * z * z) + (kb * wb / T(3)) * (x * x * x);
+  dg = T(2) * z / (T(1) - s) + T(2) * kb * x / wb;
+}
+
+template <typename T>
+__device__ __forceinline__ void srom_limit(T k0, T k1, T k2, T k3, T c, T c_p,
+                                           T h, T h_y, T h_p, T lam, T lam_p,
+                                           T phi, T& f, T& f_y, T& f_p) {
+  f = (k0 + c * (k1 + c * k2)) + k3 * h + lam * phi;
+  f_y = k3 * h_y + lam;
+  f_p = (k1 + T(2) * c * k2) * c_p + k3 * h_p + lam_p * phi;
+}
+
+// One arm, left-canonical: writes (tau_y, tau_p, tau_t, u, b).
+template <typename T>
+__device__ __forceinline__ void shoulder_rom(T y, T p, T t, T& ty, T& tp,
+                                             T& tt, T& u_out, T& b_out) {
+  const T sy = sin(y), cy = cos(y);
+  const T sp = sin(p), cp = cos(p);
+  const T c = -sp;
+  const T c_p = -cp;
+  const T h = -cp * sy - cp * cy;
+  const T h_y = cp * sy - cp * cy;
+  const T h_p = sp * sy + sp * cy;
+  const T lam = T(1) - c;
+  const T lam_p = cp;
+  const T phi = y + T(SROM_HALF_PI);
+  T flo, flo_y, flo_p, fhi, fhi_y, fhi_p;
+  srom_limit(T(SROM_LO0), T(SROM_LO1), T(SROM_LO2), T(SROM_LO3), c, c_p, h,
+             h_y, h_p, lam, lam_p, phi, flo, flo_y, flo_p);
+  srom_limit(T(SROM_HI0), T(SROM_HI1), T(SROM_HI2), T(SROM_HI3), c, c_p, h,
+             h_y, h_p, lam, lam_p, phi, fhi, fhi_y, fhi_p);
+  const T m = T(0.5) * (fhi + flo);
+  const T w = T(0.5) * (fhi - flo);
+  const T m_y = T(0.5) * (fhi_y + flo_y);
+  const T m_p = T(0.5) * (fhi_p + flo_p);
+  const T w_y = T(0.5) * (fhi_y - flo_y);
+  const T w_p = T(0.5) * (fhi_p - flo_p);
+  const T u = ((y - t) - m) / w;
+  const T a = fabs(u);
+  T g, gg, dg;
+  if (a > T(SROM_UC)) {
+    T gc, ggc, dgc;
+    srom_raw(T(SROM_UC), gc, ggc, dgc);
+    const T dd = a - T(SROM_UC);
+    g = gc + dgc * dd;
+    gg = ggc + gc * dd + T(0.5) * dgc * (dd * dd);
+  } else {
+    srom_raw(a, g, gg, dg);
+  }
+  const T tg = T(SROM_TAU_PEAK) * g;
+  const T e_tau = u >= T(0) ? tg : -tg;
+  const T e_w = T(SROM_TAU_PEAK) * (gg - a * g);
+  const T ac = a < T(SROM_UC) ? a : T(SROM_UC);
+  const T zc = ac > T(SROM_S) ? (ac - T(SROM_S)) / (T(1) - T(SROM_S)) : T(0);
+  ty = -(e_tau * (T(1) - m_y) + e_w * w_y);
+  tp = e_tau * m_p - e_w * w_p;
+  tt = e_tau;
+  u_out = u;
+  b_out = T(SROM_B_PEAK) * (zc * zc);
 }
 
 // ---- fk.rs ------------------------------------------------------------------
@@ -3890,6 +4006,45 @@ __device__ void substep(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
     d.tdn[h][2] = r;
     d.tdn[h][3] = bb * vb * vb + bd * vd * vd;  // dissipated power (W)
   }
+  // 4d. exp/shoulder-rom (step.rs 4d): the passive shoulder axial-limit
+  // torque and its edge damping join each arm's (yaw, pitch, twist) rows
+  // as ((tau_gear + tau_p) + f_d) - b*qd - C, f_d = -b_s J^T (J qd), J =
+  // +-(1, 0, -1); IMPLICIT damping: h*b_s on the yaw and twist diagonals
+  // and -h*b_s on their profile entry (twist column, slot +2 = the yaw row;
+  // srom_slots_ok), BEFORE the factor. The right arm reads its canonical
+  // (-yaw, pitch, -twist) / (-v_yaw, -v_twist); outputs are exact
+  // negations (mirror-exact). Not muscle effort: tau[] never carries it.
+#pragma unroll
+  for (int s = 0; s < 2; s++) {
+    const int jy = s == 0 ? SROM_JY_L : SROM_JY_R, jp = jy - 1, jt = jy + 1;
+    const int fy = s == 0 ? SROM_FY_L : SROM_FY_R, ft = fy + 2;
+    T ty, tp, tt, u, b;
+    if (s == 0) {
+      shoulder_rom(d.q[jy], d.q[jp], d.q[jt], ty, tp, tt, u, b);
+    } else {
+      shoulder_rom(-d.q[jy], d.q[jp], -d.q[jt], ty, tp, tt, u, b);
+      ty = -ty;
+      tt = -tt;
+    }
+    const T vy = d.v[VOFF + jy], vp = d.v[VOFF + jp], vt = d.v[VOFF + jt];
+    const T tdot = s == 0 ? vy - vt : (-vy) - (-vt);
+    const T dmp = b * tdot;
+    const T fyd = s == 0 ? -dmp : dmp;
+    const T ftd = s == 0 ? dmp : -dmp;
+    const T hb = T(H_SUB) * b;
+    d.m[TREE_C.fcb[fy]] += hb;
+    d.m[TREE_C.fcb[ft]] += hb;
+    d.m[TREE_C.fcb[ft] + 2] -= hb;
+    d.rhs[VOFF + jy] = ((tau[jy] + ty) + fyd) - CT(DAMPING, [jy]) * vy
+                       - d.c[VOFF + jy];
+    d.rhs[VOFF + jp] = (tau[jp] + tp) - CT(DAMPING, [jp]) * vp - d.c[VOFF + jp];
+    d.rhs[VOFF + jt] = ((tau[jt] + tt) + ftd) - CT(DAMPING, [jt]) * vt
+                       - d.c[VOFF + jt];
+    d.srm[s][0] = fabs(ty) + fabs(tp) + fabs(tt);
+    d.srm[s][1] = u;
+    d.srm[s][2] = b;
+    d.srm[s][3] = dmp * tdot;  // dissipated power (W)
+  }
   // 5. Cholesky — IN PLACE: d.m holds L from here to the end of the
   // substep (crba rewrites the whole profile next substep). audit #10: in
   // the fill-free tree order (tree_factor; SPEC-v10 Divergences §25).
@@ -4447,6 +4602,11 @@ struct Sim {
   // SUBSTEP; tau_stat pattern (popped by pop_tendon, not touched by
   // reset_env). lib.rs Core::tendon_sum / tendon_n mirror.
   T* __restrict__ tendon_stat;
+  // exp/shoulder-rom telemetry: per env [sum |tau_p| L, R (N.m, L1 over
+  // yaw/pitch/twist), zone substeps L, R (|u| > 0.3), beyond-the-human-
+  // limit substeps L, R (|u| > 1), edge-damping power L, R (W),
+  // substeps]; tendon_stat pattern. lib.rs Core::srom_sum mirror.
+  T* __restrict__ shoulder_stat;
   int* __restrict__ pd_hits;  // f32 pivot-floor engagements (§20e)
   int* __restrict__ env_hits;  // pre-integration root-envelope hits (§23)
   // env v11 FALL terminations (unilateral-contact spec §4), counted per
@@ -5404,6 +5564,9 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
   // exp/wrist-tendon telemetry over this tick's substeps (lib.rs
   // Body::tendon_tick): [|tau_p| L, R, zone L, R, out L, R, P_diss L, R]
   T tdn_acc[8] = {T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0)};
+  // exp/shoulder-rom telemetry over this tick's substeps (lib.rs
+  // Body::srom_tick): [sum|tau_p| L, R, zone L, R, beyond L, R, P_diss L, R]
+  T srm_acc[8] = {T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0)};
   for (int sub = 0; sub < N_SUB; sub++) {
     substep(d, s, tau);
 #pragma unroll
@@ -5412,6 +5575,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
       tdn_acc[2 + h] += d.tdn[h][2] > T(TENDON_R0) ? T(1) : T(0);
       tdn_acc[4 + h] += d.tdn[h][2] > T(1) ? T(1) : T(0);
       tdn_acc[6 + h] += d.tdn[h][3];
+      srm_acc[h] += d.srm[h][0];
+      srm_acc[2 + h] += fabs(d.srm[h][1]) > T(SROM_S) ? T(1) : T(0);
+      srm_acc[4 + h] += fabs(d.srm[h][1]) > T(1) ? T(1) : T(0);
+      srm_acc[6 + h] += d.srm[h][3];
     }
     for (int ci = 0; ci < s.nc; ci++) sc_imp += tmax(s.c_lam[ci], T(0));
     for (int c = 0; c < NUM_GROUND_CORNERS; c++)  // G1 fixed slots
@@ -5534,6 +5701,10 @@ __device__ void step_env(Dyn<T>& __restrict__ d, Solver<T>& __restrict__ s,
 #pragma unroll
   for (int k = 0; k < 8; k++) P.tendon_stat[e * 9 + k] += tdn_acc[k];
   P.tendon_stat[e * 9 + 8] += T(N_SUB);
+  // exp/shoulder-rom telemetry (never priced; lib.rs Core::srom_sum)
+#pragma unroll
+  for (int k = 0; k < 8; k++) P.shoulder_stat[e * 9 + k] += srm_acc[k];
+  P.shoulder_stat[e * 9 + 8] += T(N_SUB);
   if (P.bench_refill) {   // this level's torque (bench_rec cols 24..27)
     T* rb = P.bench_rec + (size_t)e * BENCH_REC + BENCH_TAU_ACC;
     rb[0] += T(tau_abs);
@@ -6451,6 +6622,7 @@ enum {
   TSTARTKICK, // start-jitter kick [dvx, dvz] (N, 2) — review B10, 2026-09-30
   TTIPV,    // env v49 blade-tip velocity (N, 2, 3) — 2026-09-30
   TTENDON,  // exp/wrist-tendon telemetry (N, 9) — 2026-10-05
+  TSHOULDER,  // exp/shoulder-rom telemetry (N, 9) — 2026-10-07
   PHIT, PSPEED, PCENTER, PDVEC, PROT, PGHY, PBHY,
   PVALID, PISR, PANY, PBOMB, PHEAD, PLINK, PSHOW, PFPRE, PFPOST,
   PLEN, PSWEET,  // Flux bar length / sweet offset (0 elsewhere)
@@ -6570,6 +6742,7 @@ void step(std::vector<at::Tensor> ts, at::Tensor actions, at::Tensor cand,
     P.palm_vel = ts[TPALMV].data_ptr<scalar_t>();
     P.tip_vel = ts[TTIPV].data_ptr<scalar_t>();
     P.tendon_stat = ts[TTENDON].data_ptr<scalar_t>();
+    P.shoulder_stat = ts[TSHOULDER].data_ptr<scalar_t>();
     P.bench_refill = bench_refill != 0;
     P.tau_rand = (scalar_t)tau_rand;
     P.combo_walk = combo_walk != 0;

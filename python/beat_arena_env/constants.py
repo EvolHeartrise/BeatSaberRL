@@ -104,11 +104,17 @@ A_L_LEG = 17
 A_R_LEG = 23
 
 _D = math.radians      # limits below are the SPEC-v10 §1.4 literals
+# exp/shoulder-rom (2026-10-07): the arm twist box's INTERNAL side widened,
+# l_arm_twist lo -90 -> -190 deg, r_arm_twist hi +90 -> +190 deg (model.rs
+# HUMANOID_LIMITS, the .cu LIMIT_LO/HI): every human internal-rotation
+# limit of the passive shoulder (SROM_*) is reachable inside the box (the
+# worst direction needs -184.3 deg). The twist obs lane normalizer
+# max(|lo|, |hi|) moves 90 -> 190 deg with it.
 JOINT_LIMITS = (
     (_D(-20), _D(45)), (_D(-40), _D(40)), (_D(-30), _D(30)),          # spine
-    (_D(-90), _D(65)), (_D(-100), _D(45)), (_D(-90), _D(70)),         # l arm
+    (_D(-90), _D(65)), (_D(-100), _D(45)), (_D(-190), _D(70)),        # l arm
     (0.0, _D(150)), (0.0, math.pi), (_D(-95), _D(95)), (_D(-30), _D(15)),
-    (_D(-90), _D(65)), (_D(-45), _D(100)), (_D(-70), _D(90)),         # r arm
+    (_D(-90), _D(65)), (_D(-45), _D(100)), (_D(-70), _D(190)),        # r arm
     (0.0, _D(150)), (-math.pi, 0.0), (_D(-95), _D(95)), (_D(-15), _D(30)),
     (_D(-20), _D(120)), (_D(-45), _D(40)), (_D(-45), _D(30)),         # l leg
     (0.0, _D(150)), (_D(-50), _D(35)), (_D(-20), _D(20)),
@@ -527,6 +533,122 @@ def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
     gb = ub * (k + w * (eb - ed) * ud2)
     gd = ud * (k + w * (ed - eb) * ub2)
     return -gb / lb + tcb, -gd / ld + tcd, r
+
+
+# exp/shoulder-rom (2026-10-07, branch only): PASSIVE shoulder axial-rotation
+# limit — model.rs PassiveShoulder / shoulder_rom, the .cu shoulder_rom;
+# docs/design/shoulder-rom.md. Per arm, LEFT-CANONICAL (yaw y, pitch p,
+# twist t) — the right arm at (-yaw, pitch, -twist), yaw/twist torques
+# negated:
+#   tau = y - t (axial, IR +); c = -sin p; phi = y + pi/2;
+#   f_k = a0 + c (a1 + c a2) + B (d_l - d_f) + (1 - c) phi (k = lo ER, hi IR)
+#   u = (tau - m)/w (m, w = mid / half of [f_lo, f_hi]); E = T w G(|u|),
+#   pure axis torque -sign(u) T g, g = ((a - s)/(1 - s))^2_+ + kb ((a - 1)/
+#   wb)^2_+ up to uc, linear past it; tau_joint = -dE/dq.
+#   Edge damping b = b_peak z(min(|u|, uc))^2 on yawdot - twistdot,
+#   implicit. T = 0.30 x the DEFAULT body's twist tau_max, fixed N.m.
+SROM_FRAC = 0.30
+SROM_ARMS = ((4, 3, 5), (11, 10, 12))   # (yaw, pitch, twist) per arm [L, R]
+SROM_TAU_PEAK = SROM_FRAC * 19.45 * 0.8729          # 5.0933715 N.m
+assert SROM_TAU_PEAK == (
+    SROM_FRAC * TAU_MAX[5] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("arm_twist")])
+SROM_S = 0.3
+SROM_KB = 1.0
+SROM_WB = 0.25
+SROM_UC = 1.25
+SROM_DAMP_REF_SPEED = 16.0
+SROM_B_PEAK = SROM_FRAC * 19.45 * 0.8729 / SROM_DAMP_REF_SPEED
+# limit coefficients [a0, a1, a2, B] (rad) — the exact fit of the anchors
+# (tau deg, ER/IR): side (-80, 77), 90 abd (-100, 60), 90 flex (-25, 130),
+# top elev 155 / plane 40 (-75, 20); srom_fit_coeffs() recomputes them
+SROM_ANCHORS = ((0.0, 0.0, -80.0, 77.0), (90.0, 0.0, -100.0, 60.0),
+                (90.0, 90.0, -25.0, 130.0), (155.0, 40.0, -75.0, 20.0))
+SROM_COEF_LO = (-1.8762289458939043, 0.6741217713310772,
+                -0.19415622703263663, 0.1308996938995747)
+SROM_COEF_HI = (0.8726646259971648, 1.3026652970940116,
+                -0.8314263990555426, 0.17453292519943295)
+
+
+def srom_fit_coeffs():
+    """Closed-form 4-anchor fit -> (coef_lo, coef_hi) in rad (tests)."""
+    c = math.cos(_D(155.0))
+    h = math.sin(_D(155.0)) * (math.cos(_D(40.0)) - math.sin(_D(40.0)))
+    out = []
+    for i in (2, 3):
+        side, abd, flex, top = (a[i] for a in SROM_ANCHORS)
+        a0 = (abd + flex - 90.0) / 2.0
+        b = (abd - flex + 90.0) / 2.0
+        r1 = side - a0
+        r2 = top - a0 - b * h - (1.0 - c) * 40.0
+        a2 = (r2 - c * r1) / (c * c - c)
+        out.append(tuple(_D(x) for x in (a0, r1 - a2, a2, b)))
+    return tuple(out)
+
+
+def _srom_raw(a):
+    s, kb, wb = SROM_S, SROM_KB, SROM_WB
+    z = (a - s) / (1.0 - s) if a > s else 0.0
+    x = (a - 1.0) / wb if a > 1.0 else 0.0
+    g = z * z + kb * (x * x)
+    gg = ((1.0 - s) / 3.0) * (z * z * z) + (kb * wb / 3.0) * (x * x * x)
+    dg = 2.0 * z / (1.0 - s) + 2.0 * kb * x / wb
+    return g, gg, dg
+
+
+def srom_shape(a):
+    """(g, G): pure-axis torque / T and energy / (T w) at |u| = a."""
+    if a > SROM_UC:
+        gc, ggc, dgc = _srom_raw(SROM_UC)
+        d = a - SROM_UC
+        return gc + dgc * d, ggc + gc * d + 0.5 * dgc * (d * d)
+    g, gg, _ = _srom_raw(a)
+    return g, gg
+
+
+def shoulder_limits(y, p):
+    """(f_lo, f_hi): the human ER / IR limits on tau (rad) at canonical
+    (yaw, pitch)."""
+    c = -math.sin(p)
+    h = -math.cos(p) * math.sin(y) - math.cos(p) * math.cos(y)
+    phi = y + math.pi / 2
+    f = [(k[0] + c * (k[1] + c * k[2])) + k[3] * h + (1.0 - c) * phi
+         for k in (SROM_COEF_LO, SROM_COEF_HI)]
+    return f[0], f[1]
+
+
+def shoulder_rom(y, p, t):
+    """(tau_yaw, tau_pitch, tau_twist, u, b, E) of one arm at LEFT-
+    CANONICAL (y, p, t) — the model.rs shoulder_rom expression tree in
+    Python floats (reference / tests)."""
+    sy, cy = math.sin(y), math.cos(y)
+    sp, cp = math.sin(p), math.cos(p)
+    c, c_p = -sp, -cp
+    h = -cp * sy - cp * cy
+    h_y = cp * sy - cp * cy
+    h_p = sp * sy + sp * cy
+    lam, lam_p = 1.0 - c, cp
+    phi = y + math.pi / 2
+
+    def lim(k):
+        f = (k[0] + c * (k[1] + c * k[2])) + k[3] * h + lam * phi
+        f_y = k[3] * h_y + lam
+        f_p = (k[1] + 2.0 * c * k[2]) * c_p + k[3] * h_p + lam_p * phi
+        return f, f_y, f_p
+    flo, flo_y, flo_p = lim(SROM_COEF_LO)
+    fhi, fhi_y, fhi_p = lim(SROM_COEF_HI)
+    m, w = 0.5 * (fhi + flo), 0.5 * (fhi - flo)
+    m_y, m_p = 0.5 * (fhi_y + flo_y), 0.5 * (fhi_p + flo_p)
+    w_y, w_p = 0.5 * (fhi_y - flo_y), 0.5 * (fhi_p - flo_p)
+    u = ((y - t) - m) / w
+    a = abs(u)
+    g, gg = srom_shape(a)
+    tg = SROM_TAU_PEAK * g
+    e_tau = tg if u >= 0.0 else -tg
+    e_w = SROM_TAU_PEAK * (gg - a * g)
+    ac = min(a, SROM_UC)
+    zc = (ac - SROM_S) / (1.0 - SROM_S) if ac > SROM_S else 0.0
+    return (-(e_tau * (1.0 - m_y) + e_w * w_y), e_tau * m_p - e_w * w_p,
+            e_tau, u, SROM_B_PEAK * (zc * zc), SROM_TAU_PEAK * w * gg)
 
 
 def parse_tau_scale(spec):

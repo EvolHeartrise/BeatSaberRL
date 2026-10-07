@@ -224,6 +224,11 @@ class FluxVecEnv:
     def pop_torque(self):
         return self.sim.pop_torque()
 
+    def pop_shoulder(self):
+        """exp/shoulder-rom telemetry since the last pop (CUDA
+        pop_shoulder mirror), forwarded to the Rust sim."""
+        return self.sim.pop_shoulder()
+
     def pop_tendon(self):
         """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,
         sum |tau_p| R, zone L, zone R, beyond L, beyond R, dissipated

@@ -68,6 +68,11 @@ const DERIVED = {
   tzone_R_pct: (r) => (r.tzone_R == null ? null : r.tzone_R * 100),
   tout_L_pct: (r) => (r.tout_L == null ? null : r.tout_L * 100),
   tout_R_pct: (r) => (r.tout_R == null ? null : r.tout_R * 100),
+  // exp/shoulder-rom [shoulder] fractions -> percent of substeps
+  szone_L_pct: (r) => (r.szone_L == null ? null : r.szone_L * 100),
+  szone_R_pct: (r) => (r.szone_R == null ? null : r.szone_R * 100),
+  sout_L_pct: (r) => (r.sout_L == null ? null : r.sout_L * 100),
+  sout_R_pct: (r) => (r.sout_R == null ? null : r.sout_R * 100),
 };
 function refY(recs, key) {
   const f = DERIVED[key];

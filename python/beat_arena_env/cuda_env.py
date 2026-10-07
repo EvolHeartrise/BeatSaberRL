@@ -992,6 +992,12 @@ class CudaBeatVecEnv:
         # SUBSTEP; popped + zeroed by pop_tendon, untouched by reset_env
         # (tau_stat pattern; lib.rs Core::tendon_sum)
         self.tendon_stat = z(N, 9)
+        # exp/shoulder-rom telemetry per env: [sum |tau_p| L, sum |tau_p| R
+        # (N.m, L1 over yaw/pitch/twist), zone substeps L, R (|u| > 0.3),
+        # beyond-the-human-limit substeps L, R (|u| > 1), edge-damping
+        # dissipated power L, R (W), substeps] — summed per SUBSTEP;
+        # popped + zeroed by pop_shoulder (tendon_stat pattern)
+        self.shoulder_stat = z(N, 9)
         # 2026-08-20 training-accuracy telemetry (user metric decision):
         # note-score points as credited + good-cut count, per env.
         # Popped + zeroed by pop_acc; NOT zeroed by reset_env — a
@@ -1103,6 +1109,7 @@ class CudaBeatVecEnv:
             self._start_kick,
             self.tip_vel,
             self.tendon_stat,
+            self.shoulder_stat,
             p["hit"], p["speed"], p["center"], p["dvec"], p["rot"],
             p["good_hy"], p["bad_hy"],
             p["valid"], p["is_right"], p["any_dir"], p["is_bomb"],
@@ -1506,6 +1513,19 @@ class CudaBeatVecEnv:
         self.tau_stat.zero_()
         return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
                 int(s[4]))
+
+    def pop_shoulder(self):
+        """exp/shoulder-rom telemetry since the last pop: (sum |tau_p| L,
+        sum |tau_p| R in N.m — L1 over the arm's yaw/pitch/twist rows,
+        zone substeps L, R (|u| > 0.3), beyond-the-human-limit substeps
+        L, R (|u| > 1), edge-damping dissipated power L, R in W,
+        substeps); every term summed per substep. Never priced. Rust
+        `pop_shoulder` mirror. One sync."""
+        s = self.shoulder_stat.sum(dim=0).tolist()
+        self.shoulder_stat.zero_()
+        return (float(s[0]), float(s[1]), float(s[2]), float(s[3]),
+                float(s[4]), float(s[5]), float(s[6]), float(s[7]),
+                int(s[8]))
 
     def pop_tendon(self):
         """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,

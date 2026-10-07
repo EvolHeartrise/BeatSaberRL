@@ -828,6 +828,16 @@ struct Body {
     // has no switch). For kinematic judge fixtures that pose the wrist
     // deep in the tendon zone (RawBeatSim.set_passive_wrist).
     tendon_on: bool,
+    // exp/shoulder-rom telemetry: this tick's passive shoulder terms,
+    // summed over its substeps, per arm — [Σ(|τ_yaw| + |τ_pitch| +
+    // |τ_twist|) L, R (N·m), substeps in the zone |u| > s L, R, substeps
+    // beyond the human limit |u| > 1 L, R, edge-damping dissipated power
+    // Σ b·τ̇² L, R (W)]. Never muscle effort (not in `tau` / `tau_abs`).
+    srom_tick: [Real; 8],
+    // exp/shoulder-rom TEST/TOOLING switch (RawBeatSim.set_passive_
+    // shoulder): false steps with passive_shoulder = None. Default true;
+    // training, bench and replays never touch it (CUDA has no switch).
+    srom_on: bool,
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -882,6 +892,11 @@ const MODEL: &Model = &HUMANOID;
 /// HUMANOID without the passive wrist tendon (Body::tendon_on = false —
 /// a test/tooling switch only).
 const HUMANOID_NO_TENDON: Model = Model { passive_wrist: None, ..HUMANOID };
+/// ... without the passive shoulder (Body::srom_on = false), and without
+/// both — test/tooling switches only.
+const HUMANOID_NO_SROM: Model = Model { passive_shoulder: None, ..HUMANOID };
+const HUMANOID_NO_PASSIVE: Model =
+    Model { passive_wrist: None, passive_shoulder: None, ..HUMANOID };
 
 impl Body {
     #[cfg(test)]
@@ -919,6 +934,8 @@ impl Body {
             tau_group: [0.0; 3],
             tendon_tick: [0.0; 8],
             tendon_on: true,
+            srom_tick: [0.0; 8],
+            srom_on: true,
             tau_axis: [1.0; TAU_FEAT],
             tau_scale: [1.0; NQ],
             escaped: false,
@@ -974,6 +991,7 @@ impl Body {
         self.tau_abs = 0.0;
         self.tau_group = [0.0; 3];
         self.tendon_tick = [0.0; 8];
+        self.srom_tick = [0.0; 8];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -1076,10 +1094,20 @@ impl Body {
         let mut fell = false;
         let mut tilted = false;
         self.tendon_tick = [0.0; 8];
-        let model: &Model = if self.tendon_on { MODEL } else { &HUMANOID_NO_TENDON };
+        self.srom_tick = [0.0; 8];
+        let model: &Model = match (self.tendon_on, self.srom_on) {
+            (true, true) => MODEL,
+            (false, true) => &HUMANOID_NO_TENDON,
+            (true, false) => &HUMANOID_NO_SROM,
+            (false, false) => &HUMANOID_NO_PASSIVE,
+        };
         if !self.tendon_on {
             self.ws.tendon = [[0.0; 4]; 2]; // step 4c never writes it
         }
+        if !self.srom_on {
+            self.ws.shoulder = [[0.0; 4]; 2]; // step 4d never writes it
+        }
+        let srom_s = MODEL.passive_shoulder.map_or(0.0, |p| p.zone_start);
         for _ in 0..self.rate.n_sub {
             substep_constrained(model, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
@@ -1094,6 +1122,19 @@ impl Body {
                 }
                 if r > 1.0 {
                     self.tendon_tick[4 + h] += 1.0;
+                }
+            }
+            // exp/shoulder-rom telemetry (ws.shoulder, [Σ|τ_p|, u, b,
+            // P_diss] per arm)
+            for a in 0..2 {
+                let [tq, u, _b, pd] = self.ws.shoulder[a];
+                self.srom_tick[a] += tq;
+                self.srom_tick[6 + a] += pd;
+                if u.abs() > srom_s {
+                    self.srom_tick[2 + a] += 1.0;
+                }
+                if u.abs() > 1.0 {
+                    self.srom_tick[4 + a] += 1.0;
                 }
             }
 
@@ -1347,6 +1388,10 @@ struct Core {
     // substep.
     tendon_sum: [Real; 8],
     tendon_n: u64,
+    // exp/shoulder-rom telemetry: Σ of Body::srom_tick over ticks + the
+    // SUBSTEP count, until popped (pop_shoulder; tendon_sum pattern)
+    srom_sum: [Real; 8],
+    srom_n: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
@@ -1468,6 +1513,8 @@ impl Core {
             tau_ticks: 0,
             tendon_sum: [0.0; 8],
             tendon_n: 0,
+            srom_sum: [0.0; 8],
+            srom_n: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
@@ -1930,6 +1977,11 @@ impl Core {
             self.tendon_sum[k] += self.body.tendon_tick[k];
         }
         self.tendon_n += rate.n_sub as u64;
+        // exp/shoulder-rom telemetry (never priced)
+        for k in 0..8 {
+            self.srom_sum[k] += self.body.srom_tick[k];
+        }
+        self.srom_n += rate.n_sub as u64;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
@@ -2566,6 +2618,14 @@ impl Core {
         (s, std::mem::replace(&mut self.tendon_n, 0))
     }
 
+    /// exp/shoulder-rom: (Σ over substeps of [|τ_p| L, |τ_p| R (N·m, L1
+    /// over yaw/pitch/twist), zone L, zone R (|u| > s), beyond L, beyond R
+    /// (|u| > 1), P_diss L, P_diss R (W)], substeps), zeroed.
+    fn pop_shoulder(&mut self) -> ([Real; 8], u64) {
+        let s = std::mem::replace(&mut self.srom_sum, [0.0; 8]);
+        (s, std::mem::replace(&mut self.srom_n, 0))
+    }
+
     fn pop_pd_hits(&mut self) -> u64 {
         std::mem::replace(&mut self.body.ws.pd_hits, 0)
     }
@@ -2971,6 +3031,15 @@ impl RawBeatSim {
         self.core.body.tendon_on = on;
     }
 
+    /// TEST/TOOLING HOOK (exp/shoulder-rom): switch the passive shoulder
+    /// axial limit (and its edge damping) off (False) / back on (True,
+    /// the default). For fixtures that pose a shoulder beyond the human
+    /// axial range; training, the bench and replays always run it (the
+    /// CUDA kernel has no switch). Persists across resets.
+    fn set_passive_shoulder(&mut self, on: bool) {
+        self.core.body.srom_on = on;
+    }
+
     /// TEST/TOOLING HOOK (env v10): overwrite the FULL generalized
     /// state — q: 36 position coords (root pos, root quat wxyz, 29
     /// joints), v: 35 velocity coords (root linear world, root angular
@@ -3047,6 +3116,16 @@ impl RawBeatSim {
     /// (…, diss L, diss R, substeps). CUDA `pop_tendon` mirror.
     fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
         let (s, n) = self.core.pop_tendon();
+        (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], n)
+    }
+
+    /// exp/shoulder-rom telemetry since the last pop: (Σ|τ_p| L, Σ|τ_p| R
+    /// in N·m — L1 over the arm's yaw/pitch/twist rows, zone substeps L,
+    /// R (|u| > 0.3), beyond-the-human-limit substeps L, R (|u| > 1),
+    /// edge-damping dissipated power Σ b·τ̇² L, R (W), substeps) — every
+    /// quantity summed per SUBSTEP. CUDA `pop_shoulder` mirror.
+    fn pop_shoulder(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let (s, n) = self.core.pop_shoulder();
         (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], n)
     }
 
@@ -3617,6 +3696,21 @@ impl VecBeatSim {
         (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], n)
     }
 
+    /// exp/shoulder-rom telemetry summed over all envs since the last pop
+    /// — RawBeatSim.pop_shoulder's tuple. CUDA `pop_shoulder` mirror.
+    fn pop_shoulder(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 8];
+        let mut n = 0u64;
+        for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_shoulder();
+            for k in 0..8 {
+                acc[k] += a[k];
+            }
+            n += t;
+        }
+        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], n)
+    }
+
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
@@ -3755,6 +3849,9 @@ mod mirror_tests;
 
 #[cfg(all(test, not(feature = "f32")))]
 mod tendon_tests;
+
+#[cfg(all(test, not(feature = "f32")))]
+mod shoulder_tests;
 
 #[cfg(test)]
 mod env_tests {

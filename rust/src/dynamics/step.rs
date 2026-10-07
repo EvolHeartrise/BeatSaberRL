@@ -181,6 +181,43 @@ pub fn substep_opts(
             ws.tendon[s] = [tb, td, r, bb * vb * vb + bd * vd * vd];
         }
     }
+    // 4d. exp/shoulder-rom: the passive shoulder axial-limit torque
+    //     (model.rs `PassiveShoulder` / `shoulder_rom`) and its edge
+    //     damping join the APPLIED side of each arm's (yaw, pitch, twist)
+    //     rows: ((τ_gear + τ_p) + f_d) − b·q̇ − C, f_d = −b_s·Jᵀ(J·q̇) with
+    //     J = ±(1, 0, −1) the axial-rate row (τ̇ = ẏ − ṫ, left-canonical).
+    //     The damping is IMPLICIT: h·b_s·JᵀJ joins M's (yaw, twist) block
+    //     (two diagonals, the symmetric off-diagonal pair) before the
+    //     step-5 factor — PSD, unconditionally stable (explicit b·h/I_ax
+    //     reaches ~0.8 on reachable states). The tendon itself is explicit
+    //     (shoulder_tests::shoulder_stiffness_budget). Mirror-exact by
+    //     construction: the right arm is evaluated at its canonical
+    //     (−yaw, pitch, −twist) and (−v_yaw, −v_twist); its outputs are
+    //     exact negations. Not muscle effort (never in Body::tau).
+    if let Some(ps) = &model.passive_shoulder {
+        let sr = ps.eval(&st.q);
+        for (s, &(jy, jp, jt)) in ps.arms.iter().enumerate() {
+            let o = sr[s];
+            let (vy, vp, vt) = (st.v[voff + jy], st.v[voff + jp], st.v[voff + jt]);
+            // canonical axial rate and the damping force along it
+            let tdot = if s == 0 { vy - vt } else { (-vy) - (-vt) };
+            let d = o.b * tdot;
+            let (fy, ft) = if s == 0 { (-d, d) } else { (d, -d) };
+            let hb = h * o.b;
+            let (iy, it) = (voff + jy, voff + jt);
+            ws.m[iy * nv + iy] += hb;
+            ws.m[it * nv + it] += hb;
+            ws.m[it * nv + iy] -= hb;
+            ws.m[iy * nv + it] -= hb;
+            ws.rhs[iy] = ((tau_act[jy] + o.tau_y) + fy) - model.damping[jy] * vy - ws.c[iy];
+            ws.rhs[voff + jp] = (tau_act[jp] + o.tau_p) - model.damping[jp] * vp
+                - ws.c[voff + jp];
+            ws.rhs[it] = ((tau_act[jt] + o.tau_t) + ft) - model.damping[jt] * vt - ws.c[it];
+            // telemetry: |τ_p| (L1 over the three rows), u, b, dissipated power
+            ws.shoulder[s] = [o.tau_y.abs() + o.tau_p.abs() + o.tau_t.abs(), o.u, o.b,
+                              d * tdot];
+        }
+    }
     // 4b (harness only): current-velocity part of the implicit damping
     if let Some(d) = implicit_damp {
         for j in 0..model.nq {

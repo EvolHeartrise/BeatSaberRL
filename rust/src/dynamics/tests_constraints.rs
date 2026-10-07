@@ -43,7 +43,12 @@ fn contact_set(m: &super::model::Model) -> ConstraintSet {
 /// RNEA / CRBA / constraint-stage consistency: joints AND root stay put.
 #[test]
 fn static_stance_full_rnea_hold() {
-    let m = &HUMANOID;
+    // exp/shoulder-rom: the all-zero pose (arms forward, twist 0 = forearm
+    // plane vertical) sits at u ≈ −0.68 of the passive shoulder's axial
+    // range — a real ~1.5 N·m passive torque the RNEA compensation does
+    // not (and should not) cancel. This gate pins RNEA / CRBA / constraint
+    // consistency, so it runs on the table without the passive shoulder.
+    let m = &super::model::Model { passive_shoulder: None, ..HUMANOID };
     let mut ws = Workspace::new(m);
     let mut st = State::neutral(m);
     let p0 = st.p;

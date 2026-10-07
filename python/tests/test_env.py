@@ -585,7 +585,12 @@ def _whip_events(kind=0, ticks=60):
         # swept hit 0.65-0.85 x windup 8-15, hit 0.7 / windup 9 is the
         # cell where the regular note lands 70 + 30 and the chain head
         # 70; 0.75 / 11 now misses)
-        a[A_R_ARM] = 1 if t < 9 else 2
+        # 9 -> 10 (exp/shoulder-rom, 2026-10-07: the zero-arm start sits at
+        # u = -0.68 of the passive shoulder's axial range and the pitch
+        # whip moves the range under the twist; swept hit 0.6-0.85 x
+        # windup 7-15: at hit 0.65 windups 7, 8, 10, 11, 12 land the
+        # regular note 70 + 30 and the chain head 70+, 9 now misses)
+        a[A_R_ARM] = 1 if t < 10 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:
@@ -779,6 +784,7 @@ def test_joint_limits_clamp_and_kill_omega():
         (A_R_ARM + 0, 1.10, 8.0, np.radians(65.0)),    # pitch into +65
         (A_R_ARM + 1, 1.70, 8.0, np.radians(100.0)),   # r yaw into +100
         (A_R_ARM + 2, -1.15, -8.0, np.radians(-70.0)), # r twist into -70
+        (A_R_ARM + 2, 3.25, 8.0, np.radians(190.0)),   # r twist into +190
         (A_R_ARM + 3, 0.05, -8.0, 0.0),                # elbow into its floor
         (A_R_ARM + 5, 1.60, 15.0, np.radians(95.0)),   # bend into +95
         (A_R_ARM + 6, 0.50, 15.0, np.radians(30.0)),   # r dev into +30
@@ -800,6 +806,12 @@ def test_joint_limits_clamp_and_kill_omega():
             # bend / dev stop) pulls it back off. Drive it INTO the stop
             # with its full gear (1.431 / 1.06 N*m > the tendon there).
             a[j] = 1 if om0 > 0 else 2
+        # exp/shoulder-rom: in this zero-arm pose (arm forward) both twist
+        # stops lie far outside the human axial range (u -1.6 at -70 deg,
+        # +2.3 at +190), where the passive shoulder pushes harder than the
+        # twist gear can hold; this test is about the STOPS, so the
+        # twist rows run with the passive shoulder off
+        sim.set_passive_shoulder(j != A_R_ARM + 2)
         sim.step(a)
         qq = np.asarray(sim.qpos())[7:]
         om = np.asarray(sim.omega())

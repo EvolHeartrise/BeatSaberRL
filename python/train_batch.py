@@ -3021,6 +3021,25 @@ def main():
                       f"{100.0 * to_l / tn_n:.2f}%  R {100.0 * to_r / tn_n:.2f}%  "
                       f"diss L {td_l / tn_n:.4f}  R {td_r / tn_n:.4f} W",
                       flush=True)
+        # exp/shoulder-rom telemetry (2026-10-07): per arm, the mean
+        # passive shoulder torque (|tau_yaw| + |tau_pitch| + |tau_twist|,
+        # N*m) per substep, the fraction of substeps in the zone (|u| >
+        # 0.3) and beyond the human axial limit (|u| > 1), and the edge
+        # damping's mean dissipated power (W). Never priced.
+        if hasattr(venv, "pop_shoulder"):
+            (sr_l, sr_r, sz_l, sz_r, so_l, so_r, sd_l, sd_r,
+             sr_n) = venv.pop_shoulder()
+            if sr_n:
+                m_ev.update(srom_L=sr_l / sr_n, srom_R=sr_r / sr_n,
+                            szone_L=sz_l / sr_n, szone_R=sz_r / sr_n,
+                            sout_L=so_l / sr_n, sout_R=so_r / sr_n,
+                            sdiss_L=sd_l / sr_n, sdiss_R=sd_r / sr_n)
+                print(f"[shoulder] L {sr_l / sr_n:.4f}  R {sr_r / sr_n:.4f} "
+                      f"N*m/substep  zone L {100.0 * sz_l / sr_n:.2f}%  "
+                      f"R {100.0 * sz_r / sr_n:.2f}%  beyond L "
+                      f"{100.0 * so_l / sr_n:.2f}%  R {100.0 * so_r / sr_n:.2f}%  "
+                      f"diss L {sd_l / sr_n:.4f}  R {sd_r / sr_n:.4f} W",
+                      flush=True)
         # env v46 body-draw log: every episode that ended this update
         # -> (s0..s15, ticks, return, fell, cuts, pts, chart) appended to
         # <run-dir>/tau_draws.f32 (raw float32 rows, 22 cols; reader:

@@ -116,6 +116,13 @@ class BeatVecEnv:
         sum legs, env-ticks) of applied |tau| in N.m — CUDA mirror."""
         return self.sim.pop_torque()
 
+    def pop_shoulder(self):
+        """exp/shoulder-rom telemetry since the last pop: (sum |tau_p| L,
+        sum |tau_p| R, zone L, zone R, beyond L, beyond R, dissipated
+        power L, dissipated power R, substeps) — forwarded to the Rust sim
+        (CUDA pop_shoulder mirror)."""
+        return self.sim.pop_shoulder()
+
     def pop_tendon(self):
         """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,
         sum |tau_p| R, zone L, zone R, beyond L, beyond R, dissipated

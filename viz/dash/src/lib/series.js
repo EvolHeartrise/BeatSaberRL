@@ -102,6 +102,11 @@ const DERIVED = {
   tzone_R_pct: (d) => mapCol(d, "tzone_R", (v) => v * 100),
   tout_L_pct: (d) => mapCol(d, "tout_L", (v) => v * 100),
   tout_R_pct: (d) => mapCol(d, "tout_R", (v) => v * 100),
+  // exp/shoulder-rom [shoulder] fractions -> percent of substeps
+  szone_L_pct: (d) => mapCol(d, "szone_L", (v) => v * 100),
+  szone_R_pct: (d) => mapCol(d, "szone_R", (v) => v * 100),
+  sout_L_pct: (d) => mapCol(d, "sout_L", (v) => v * 100),
+  sout_R_pct: (d) => mapCol(d, "sout_R", (v) => v * 100),
 };
 
 export function seriesValues(data, key) {
@@ -162,6 +167,9 @@ export const PANELS = [
   { id: "tendon", title: "passive wrist tendon |τ| (N·m / substep, per hand · exp/wrist-tendon; not priced)", series: ["tendon_L", "tendon_R"] },
   { id: "tendon_diss", title: "wrist edge-zone damping: mean dissipated power (W / substep, per hand · issue #61)", series: ["tdiss_L", "tdiss_R"] },
   { id: "tendon_zone", title: "wrist tendon: % of substeps in the zone (r > 0.5) / beyond the ellipse (r > 1), per hand", series: ["tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct"] },
+  { id: "shoulder", title: "passive shoulder |τ| (N·m / substep, per arm, Σ yaw/pitch/twist · exp/shoulder-rom; not priced)", series: ["srom_L", "srom_R"] },
+  { id: "shoulder_diss", title: "shoulder axial edge damping: mean dissipated power (W / substep, per arm)", series: ["sdiss_L", "sdiss_R"] },
+  { id: "shoulder_zone", title: "shoulder axial rotation: % of substeps in the zone (|u| > 0.3) / beyond the human limit (|u| > 1), per arm", series: ["szone_L_pct", "szone_R_pct", "sout_L_pct", "sout_R_pct"] },
   { id: "contact", title: "self-contact impulse (N·s / env-tick, env v41)", series: ["contact"] },
   { id: "contact_pct", title: "self-contact: % of env-ticks with body-on-body contact", series: ["contact_pct"] },
   { id: "fp16", title: "fp16 ratio diag r1 · max log-ratio", series: ["r1", "maxlr"] },
@@ -193,6 +201,8 @@ export const COMPARE_KEYS = [
   "contact", "contact_pct",
   "tendon_L", "tendon_R", "tzone_L_pct", "tzone_R_pct", "tout_L_pct", "tout_R_pct",
   "tdiss_L", "tdiss_R",
+  "srom_L", "srom_R", "szone_L_pct", "szone_R_pct", "sout_L_pct", "sout_R_pct",
+  "sdiss_L", "sdiss_R",
 ];
 // ep_return dropped from every view 2026-09-12 (user: too noisy; the
 // trainer no longer emits it — `return` over the update is the measure)
@@ -219,6 +229,9 @@ export const LABELS = {
   tendon_L: "tendon |τ| L", tendon_R: "tendon |τ| R",
   tdiss_L: "edge diss L (W)", tdiss_R: "edge diss R (W)",
   tzone_L_pct: "zone L %", tzone_R_pct: "zone R %", tout_L_pct: "beyond L %", tout_R_pct: "beyond R %",
+  srom_L: "shoulder |τ| L", srom_R: "shoulder |τ| R",
+  sdiss_L: "sh. diss L (W)", sdiss_R: "sh. diss R (W)",
+  szone_L_pct: "sh. zone L %", szone_R_pct: "sh. zone R %", sout_L_pct: "sh. beyond L %", sout_R_pct: "sh. beyond R %",
   r1: "r1", maxlr: "maxlr", peak_vram: "peak VRAM",
 };
 export const label = (k) => LABELS[k] ?? k;
