@@ -2,11 +2,16 @@
 // HTTP (serve.py, or `python -m http.server` from the archive root when
 // dist/ is copied there). No backend: everything is a static file.
 
+// One run's metrics as columns: RunData (metricsCore.js), a class
+// instance, so the reactive store holds it as is.
+import { RunData } from "./metricsCore.js";
+export { RunData };
+
 export const store = $state({
   base: null, // URL prefix of the archive root ("./" or "/archive/")
   index: null, // parsed index.json
   error: null,
-  metrics: {}, // run id -> {recs, at, bytes}
+  metrics: {}, // run id -> RunData (columns; replaced whole when the file changed)
   loading: {}, // run id -> true while fetching
   swingVer: {}, // run id -> bumped when that run's swing.json changed
 });
@@ -26,65 +31,60 @@ export const REFRESH_MS = (() => {
   return v > 0 ? v * 1000 : 15000;
 })();
 
-function bust(url) {
-  return url + (url.includes("?") ? "&" : "?") + "t=" + Date.now();
-}
-
+// All fetching and parsing runs in a worker (fetch.worker.js, 2026-10-06:
+// each auto-refresh used to freeze the page — whole metrics files parsed
+// on the main thread into deeply reactive records, every panel re-derived
+// through the proxies). The page keeps only what the worker says changed.
+//
 // Change detection (2026-10-02, user request: an idle refresh reset the
 // zoom). A refresh must not write to `store` unless the data changed:
-// every write re-derives the panels and pokes the charts. Two layers:
-//   1. conditional GET: serve.py answers If-None-Match with 304 when the
-//      file's (mtime, size) ETag is unchanged, so there is no body to parse;
-//   2. content compare: a 200 whose bytes (metrics.jsonl), or whose JSON
-//      minus the `generated` stamp (index.json, which the backfill
-//      rewrites every pass), match what we already hold is a no-op. This
-//      layer alone also works on a plain `python -m http.server`.
-// Unchanged run entries keep their object identity across index updates,
-// so views on one run do not re-derive when another run changes.
-const etags = new Map(); // url (no cache-buster) -> ETag of what we hold
-const bodies = new Map(); // metrics url -> raw text parsed last
-let indexSig = null; // JSON of the held index minus `generated`
-const runSigs = new Map(); // run id -> JSON of its held index entry
-
-async function fetchIfChanged(url, holding) {
-  const headers = {};
-  const tag = holding ? etags.get(url) : null;
-  if (tag) headers["If-None-Match"] = tag;
-  const r = await fetch(bust(url), { cache: "no-store", headers });
-  if (r.status === 304) return null;
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  const text = await r.text();
-  const et = r.headers.get("ETag");
-  if (et) etags.set(url, et);
-  else etags.delete(url);
-  return text;
-}
-
-// merge a freshly fetched index into store.index, writing only what changed
-function applyIndex(idx) {
-  const { generated, ...rest } = idx;
-  const sig = JSON.stringify(rest);
-  if (store.index && sig === indexSig) {
-    if (store.index.generated !== generated) store.index.generated = generated;
-    return;
+// every write re-derives the panels and pokes the charts. The worker
+// answers "same" for a 304 (serve.py's mtime+size ETag), for identical
+// bytes (index.json compared minus its `generated` stamp, which the
+// backfill bumps every pass) and for a growing file whose new bytes hold
+// no complete new line. Unchanged run entries keep their object identity
+// across index updates, so views on one run do not re-derive when another
+// run changes.
+let worker = null;
+let seq = 0;
+const pending = new Map();
+function call(op, args) {
+  if (!worker) {
+    worker = new Worker(new URL("./fetch.worker.js", import.meta.url), { type: "module" });
+    worker.onmessage = (e) => {
+      const { id, ok, res, err } = e.data;
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (ok) p.resolve(res);
+      else p.reject(new Error(err));
+    };
   }
-  indexSig = sig;
-  const prev = new Map((store.index?.runs ?? []).map((r) => [r.id, r]));
-  const runs = idx.runs.map((r) => {
-    const rs = JSON.stringify(r);
-    const old = prev.get(r.id);
-    const same = old && runSigs.get(r.id) === rs;
-    runSigs.set(r.id, rs);
-    return same ? old : r;
+  return new Promise((resolve, reject) => {
+    const id = ++seq;
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ id, op, args });
   });
-  if (!store.index) {
-    store.index = { ...idx, runs };
+}
+// test hook: the worker's fetch counters (full / ranged / 304 reads, bytes)
+globalThis.__dashStats = () => call("stats", {});
+
+const abs = (rel) => new URL(rel, location.href).href;
+
+// apply the worker's index diff to store.index, writing only what changed
+function applyIndex(d) {
+  if (d.same) {
+    if (store.index && d.generated != null && store.index.generated !== d.generated) store.index.generated = d.generated;
     return;
   }
-  for (const k of Object.keys(idx)) {
-    if (k === "runs") continue;
-    if (JSON.stringify(store.index[k]) !== JSON.stringify(idx[k])) store.index[k] = idx[k];
+  const prev = new Map((store.index?.runs ?? []).map((r) => [r.id, r]));
+  const runs = d.order.map((id) => d.entries[id] ?? prev.get(id));
+  if (!store.index) {
+    store.index = { ...d.top, generated: d.generated, runs };
+    return;
   }
+  for (const k of Object.keys(d.top)) store.index[k] = d.top[k];
+  if (store.index.generated !== d.generated) store.index.generated = d.generated;
   const cur = store.index.runs;
   if (cur.length !== runs.length || runs.some((r, i) => r !== cur[i])) store.index.runs = runs;
 }
@@ -94,13 +94,9 @@ export async function loadIndex() {
   let lastErr = null;
   for (const b of bases) {
     try {
-      const text = await fetchIfChanged(b + "index.json", !!store.index && store.base === b);
-      if (text != null) {
-        const idx = JSON.parse(text);
-        if (!idx || !Array.isArray(idx.runs)) throw new Error("not an index");
-        if (store.base !== b) store.base = b;
-        applyIndex(idx);
-      }
+      const d = await call("index", { url: abs(b + "index.json"), holding: !!store.index && store.base === b });
+      if (store.base !== b) store.base = b;
+      applyIndex(d);
       if (store.error) store.error = null;
       return store.index;
     } catch (e) {
@@ -115,89 +111,31 @@ export function runById(id) {
   return store.index?.runs.find((r) => r.id === id) ?? null;
 }
 
-export function parseJsonl(text) {
-  const out = [];
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    try {
-      out.push(JSON.parse(line));
-    } catch {
-      /* partial last line of a live file */
-    }
-  }
-  // a trainer --resume re-appends from the checkpoint: last record per
-  // update wins, sorted by update index
-  const byUpd = new Map();
-  for (const r of out) byUpd.set(r.upd, r);
-  return [...byUpd.values()].sort((a, b) => a.upd - b.upd);
-}
-
-// The run's best-possible totals over training (swing_hist.json, written by
-// python/swing_summary.py next to swing.json): per update at which they
-// changed, SS / BL WPP and UPP over each level's best completed play so far.
-// Merged into the metrics records as step series (best_ss_wpp, ...: the last
-// value at or before each record's update), so Live and Compare chart them
-// like any metric. Returns new record objects only when there is a curve.
-export const BEST_KEYS = ["ss_wpp", "ss_upp", "bl_wpp", "bl_upp"];
-function mergeBest(recs, hist) {
-  if (!hist || !hist.upd?.length) return recs;
-  let j = 0, last = -1;
-  return recs.map((r) => {
-    while (j < hist.upd.length && hist.upd[j] <= r.upd) last = j++;
-    if (last < 0) return r;
-    const o = { ...r };
-    for (const k of BEST_KEYS) o["best_" + k] = hist[k][last];
-    return o;
-  });
-}
-
 export async function loadMetrics(run, { force = false } = {}) {
   if (!run) return null;
   const cur = store.metrics[run.id];
-  if (cur && !force) return cur.recs;
-  if (store.loading[run.id]) return cur?.recs ?? null;
+  if (cur && !force) return cur;
+  if (store.loading[run.id]) return cur ?? null;
   // flag only a first fetch: the flag is reactive, and a background
   // re-check has nothing to show for itself
   if (!cur) store.loading[run.id] = true;
-  const url = store.base + run.metrics;
-  const hurl = run.swing?.hist ? store.base + run.swing.hist : null;
   try {
-    let text;
+    let d;
     try {
-      text = await fetchIfChanged(url, !!cur);
+      d = await call("metrics", {
+        key: run.id, url: abs(store.base + run.metrics),
+        hurl: run.swing?.hist ? abs(store.base + run.swing.hist) : null, holding: !!cur,
+      });
     } catch (e) {
       throw new Error(`${e.message} for ${run.metrics}`);
     }
-    let htext = null;
-    if (hurl) {
-      try {
-        htext = await fetchIfChanged(hurl, !!cur?.hist);
-      } catch {
-        htext = null; // the curve is optional: a missing file shows no panel
-      }
-    }
-    const mSame = cur && (text == null || bodies.get(url) === text);
-    const hSame = !hurl || htext == null || bodies.get(hurl) === htext;
-    // 304s, or the same bytes as last time: leave the store alone
-    if (cur && mSame && hSame) return cur.recs;
-    const base = mSame ? cur.base : parseJsonl(text);
-    if (!mSame) bodies.set(url, text);
-    let hist = cur?.hist ?? null;
-    if (!hSame) {
-      try {
-        hist = JSON.parse(htext);
-        bodies.set(hurl, htext);
-      } catch {
-        /* a half-written file: keep the last curve */
-      }
-    }
-    const recs = mergeBest(base, hist);
-    store.metrics[run.id] = { recs, base, hist, at: Date.now(),
-                              bytes: mSame ? cur.bytes : text.length };
-    return recs;
+    if (d.same) return cur;
+    const data = new RunData(d.data);
+    store.metrics[run.id] = data;
+    return data;
   } catch (e) {
     store.error = `metrics for ${run.id}: ${e.message}`;
-    return cur?.recs ?? null;
+    return cur ?? null;
   } finally {
     if (store.loading[run.id]) delete store.loading[run.id];
   }
@@ -219,9 +157,9 @@ export function archiveUrl(rel) {
 // Per-level swing summaries (swing.json, python/swing_summary.py): a few MB
 // of columnar arrays per run, so they live OUTSIDE the reactive store (a
 // $state proxy over 7k-element arrays costs on every read); the store only
-// carries a version number per run that views depend on. Same two-layer
-// change detection as metrics: a 304 or identical bytes leave the version
-// alone, so an idle refresh re-derives nothing (table sort / scroll stay).
+// carries a version number per run that views depend on. Fetched and
+// parsed by the worker; a 304 or identical bytes leave the version alone,
+// so an idle refresh re-derives nothing (table sort / scroll stay).
 const swingData = new Map(); // run id -> parsed swing.json
 const swingBusy = new Set();
 
@@ -235,15 +173,12 @@ export async function loadSwing(run, { force = false } = {}) {
   if (cur && !force) return cur;
   if (swingBusy.has(run.id)) return cur ?? null;
   swingBusy.add(run.id);
-  const url = store.base + run.swing.path;
   try {
-    const text = await fetchIfChanged(url, !!cur);
-    if (cur && (text == null || bodies.get(url) === text)) return cur;
-    const data = JSON.parse(text);
-    bodies.set(url, text);
-    swingData.set(run.id, data);
+    const d = await call("swing", { url: abs(store.base + run.swing.path), holding: !!cur });
+    if (d.same) return cur;
+    swingData.set(run.id, d.data);
     store.swingVer[run.id] = (store.swingVer[run.id] ?? 0) + 1;
-    return data;
+    return d.data;
   } catch (e) {
     store.error = `swing summary for ${run.id}: ${e.message}`;
     return cur ?? null;
