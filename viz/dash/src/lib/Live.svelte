@@ -11,9 +11,13 @@
 
   const runs = $derived(store.index?.runs ?? []);
   const run = $derived(runId ? runById(runId) : mostRecentRun());
-  const recs = $derived(run ? (store.metrics[run.id]?.recs ?? null) : null);
-  const last = $derived(recs && recs.length ? recs[recs.length - 1] : null);
-  const x = $derived(recs ? xValues(recs, xMode) : []);
+  // primitives first: an index refresh replaces the run object (t_last
+  // moved) but must not re-derive the panels unless the data changed
+  const runKey = $derived(run?.id ?? null);
+  const game = $derived(gameOf(run));
+  const data = $derived(runKey ? (store.metrics[runKey] ?? null) : null);
+  const last = $derived(data && data.n ? data.last : null);
+  const x = $derived(data ? xValues(data, xMode) : []);
   const xLabel = $derived(X_MODES.find((m) => m.key === xMode)?.label ?? xMode);
 
   // Window lock (2026-09-14, user request): pin every chart's x range to
@@ -45,12 +49,12 @@
   const ago = $derived(lastT ? Math.max(0, now / 1000 - lastT) : null);
 
   const panels = $derived.by(() => {
-    if (!recs || !recs.length) return [];
-    return panelsFor(gameOf(run)).map((p) => {
-      const keys = p.series.filter((k) => hasAny(recs, k));
+    if (!data || !data.n) return [];
+    return panelsFor(game).map((p) => {
+      const keys = p.series.filter((k) => hasAny(data, k));
       return {
         ...p,
-        datasets: keys.map((k, i) => ({ label: label(k), x, y: seriesValues(recs, k), color: color(i) })),
+        datasets: keys.map((k, i) => ({ label: label(k), x, y: seriesValues(data, k), color: color(i) })),
       };
     });
   });

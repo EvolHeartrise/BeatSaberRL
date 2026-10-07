@@ -1,3 +1,13 @@
+<script module>
+  // a drag-zoom in progress: off-screen charts must follow its synced
+  // cursor moves too (the zoom is applied from them)
+  let dragging = false;
+  if (typeof window !== "undefined") {
+    addEventListener("mousedown", () => { dragging = true; }, true);
+    addEventListener("mouseup", () => { dragging = false; }, true);
+  }
+</script>
+
 <script>
   // uPlot wrapper. `datasets`: [{label, x: number[], y: (number|null)[],
   // color, dash?}] — each on its own x grid; uPlot.join aligns them on
@@ -27,6 +37,7 @@
   // swatches; only the hovered chart shows it, the synced ones just
   // draw the cursor line.
   import uPlot from "uplot";
+  import { schedule, cancel } from "./sched.js";
 
   let {
     title = "",
@@ -84,7 +95,10 @@
       title,
       width: el.clientWidth || 600,
       height,
-      cursor: { sync: { key: syncKey, setSeries: false }, drag: { x: true, y: false } },
+      cursor: {
+        sync: { key: syncKey, setSeries: false, filters: { pub: () => true, sub: (type) => visible || type !== "mousemove" || dragging } },
+        drag: { x: true, y: false }, dataIdx,
+      },
       // static legend: hover values live in the tooltip, never here
       legend: { show: true, live: false },
       scales: { x: { time: false }, y: log ? { distr: 3 } : {} },
@@ -95,8 +109,9 @@
           values: (self, ticks) => ticks.map(fmtTick) },
       ],
       series,
-      hooks: tip ? { setCursor: [tip.update], setSeries: [tip.update] } : {},
+      hooks: tip ? { setCursor: [tip.update], setSeries: [tip.update], setSize: [tip.dropRect], destroy: [tip.detach] } : {},
     };
+    holdX(valid);
     u = new uPlot(opts, data, el);
     // the title floats on the plot area (CSS: .u-over > .u-title)
     const t = u.root.querySelector(".u-title");
@@ -104,6 +119,41 @@
     if (tip) tip.attach(u);
     el.__uplot = u; // test hook (test/refresh-browser.mjs)
     xExtent = extentOf(data);
+  }
+
+  // Hover index per series: on a joined grid (Compare: every run on its
+  // own x) a series is undefined at most cursor positions, and uPlot's
+  // default scans the joined arrays for its nearest point — per series,
+  // per synced chart, per mouse move: 60-120 ms a move with 16 runs on
+  // 40 charts. Two binary searches instead: the nearest x of the series'
+  // own grid, then that x's slot on the joined grid.
+  let ownX = [null];
+  let sharedX = true;
+  function holdX(valid) {
+    ownX = [null, ...valid.map((d) => d.x)];
+    sharedX = valid.every((d) => d.x === valid[0].x);
+  }
+  function dataIdx(self, si, ci) {
+    if (si === 0 || sharedX || ci == null) return ci;
+    const ys = self.data[si];
+    if (ys[ci] !== undefined) return ci;
+    const xs = ownX[si], X = self.data[0];
+    if (!xs || !xs.length) return null;
+    const xv = X[ci];
+    let lo = 0, hi = xs.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (xs[mid] <= xv) lo = mid;
+      else hi = mid;
+    }
+    const xj = Math.abs(xs[hi] - xv) < Math.abs(xv - xs[lo]) ? xs[hi] : xs[lo];
+    let a = 0, b = X.length - 1;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (X[mid] < xj) a = mid + 1;
+      else b = mid;
+    }
+    return X[a] === xj ? a : null;
   }
 
   // y axis just wide enough for its widest tick label (was a fixed 58 px).
@@ -152,27 +202,39 @@
     let hovering = false;
     let order = "";
     let plot = null;
-    function hide() { box.style.display = "none"; }
+    function hide() { if (box.style.display !== "none") box.style.display = "none"; at = null; }
     function update(self) {
       const c = self.cursor;
       if (!hovering || c.idx == null || c.left == null || c.left < 0) return hide();
+      // no layout reads per move (each one forced a synchronous style +
+      // layout pass after uPlot's cursor writes): the plot's rect is
+      // cached (dropped on scroll / resize / re-enter), the box size
+      // comes from a ResizeObserver, unchanged text is not rewritten
+      if (!rect) rect = self.over.getBoundingClientRect();
       for (const r of rows) {
         const j = c.idxs?.[r.si] ?? c.idx;
         const v = j == null ? null : self.data[r.si][j];
         r.v = v == null || !Number.isFinite(v) ? null : v;
-        r.val.textContent = r.v == null ? "—" : fmtVal(r.v);
-        r.row.style.display = self.series[r.si].show ? "" : "none";
+        const t = r.v == null ? "—" : fmtVal(r.v);
+        if (r.text !== t) r.val.textContent = r.text = t;
+        const d = self.series[r.si].show ? "" : "none";
+        if (r.row.style.display !== d) r.row.style.display = d;
       }
       const sorted = [...rows].sort((a, b) => (b.v ?? -Infinity) - (a.v ?? -Infinity) || a.si - b.si);
       const key = sorted.map((r) => r.si).join(",");
       if (key !== order) { for (const r of sorted) list.appendChild(r.row); order = key; }
-      head.textContent = `${xLabel || "x"} ${fmtX(self.data[0][c.idx])}`;
-      box.style.display = "block";
-      // place right-below the cursor; flip left / up at the viewport edge
-      const o = self.over.getBoundingClientRect();
-      const w = box.offsetWidth, h = box.offsetHeight;
-      const vw = document.documentElement.clientWidth, vh = window.innerHeight, m = 4, gap = 14;
-      const cx = o.left + c.left, cy = o.top + c.top;
+      const ht = `${xLabel || "x"} ${fmtX(self.data[0][c.idx])}`;
+      if (head.textContent !== ht) head.textContent = ht;
+      if (box.style.display === "none") box.style.display = "block";
+      at = [rect.left + c.left, rect.top + c.top];
+      place();
+    }
+    // right-below the cursor; flip left / up at the viewport edge
+    let at = null, size = [0, 0];
+    function place() {
+      if (!at) return;
+      const [w, h] = size, [cx, cy] = at;
+      const vw = window.innerWidth, vh = window.innerHeight, m = 4, gap = 14;
       let x = cx + gap;
       if (x + w > vw - m) x = cx - gap - w;
       x = Math.max(m, Math.min(x, vw - m - w));
@@ -181,14 +243,29 @@
       y = Math.max(m, Math.min(y, vh - m - h));
       box.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
     }
+    const ro = new ResizeObserver((es) => {
+      const b = es[es.length - 1].borderBoxSize?.[0];
+      size = b ? [b.inlineSize, b.blockSize] : [box.offsetWidth, box.offsetHeight];
+      place();
+    });
+    ro.observe(box);
+    let rect = null;
+    const dropRect = () => { rect = null; };
     function attach(self) {
       plot = self;
       self.root.appendChild(box);
-      self.over.addEventListener("mouseenter", () => { hovering = true; });
+      self.over.addEventListener("mouseenter", () => { hovering = true; rect = null; });
       self.over.addEventListener("mouseleave", () => { hovering = false; hide(); });
+      addEventListener("scroll", dropRect, { capture: true, passive: true });
+      addEventListener("resize", dropRect, { passive: true });
       hide();
     }
-    return { update: (self) => { if (self === plot) update(self); }, attach };
+    function detach() {
+      ro.disconnect();
+      removeEventListener("scroll", dropRect, { capture: true });
+      removeEventListener("resize", dropRect);
+    }
+    return { update: (self) => { if (self === plot) update(self); }, attach, detach, dropRect };
   }
 
   // Same series structure, new points: keep the plot. If the user had
@@ -199,6 +276,7 @@
   // y over the new points.)
   function update(valid) {
     const data = uPlot.join(valid.map((d) => [d.x, d.y]));
+    holdX(valid);
     const sx = u.scales.x;
     if (isFull(sx)) u.setData(data);
     else {
@@ -233,6 +311,13 @@
   // the user changed it), never on an idle refresh; turning it off
   // (null) goes back to the whole run
   let heldRange = null;
+  function windowOf() {
+    return xRange && xRange[0] != null && xRange[1] != null && xRange[1] > xRange[0] ? xRange : null;
+  }
+  function rangeHeld() {
+    const r = windowOf();
+    return r && heldRange ? r[0] === heldRange[0] && r[1] === heldRange[1] : r === heldRange;
+  }
   function applyRange(force) {
     if (!u) return;
     const r = xRange && xRange[0] != null && xRange[1] != null && xRange[1] > xRange[0] ? xRange : null;
@@ -274,23 +359,62 @@
   // data / structure / window changes: nothing when the points are the
   // ones already plotted (only a moved window is applied), update in
   // place when only the points changed, rebuild when the series set, the
-  // options or `resetKey` (e.g. the run shown) did
+  // options or `resetKey` (e.g. the run shown) did. The work itself is
+  // queued (sched.js): many charts changing at once are drawn a few per
+  // slice, never in one long task that blocks input (2026-10-06).
+  // Off-screen charts (2026-10-06): a refresh updates only the charts in
+  // (or near) the viewport; one scrolled away keeps its plot and catches
+  // up when it comes back into view. Every chart is still built up front
+  // (so a drag-zoom syncs to all of them), and off-screen ones skip the
+  // synced cursor moves (40 charts x 16 runs of hover points per move).
+  const owner = {};
+  let alive = true;
+  let visible = true;
+  let deferred = false;
+  function queue() {
+    schedule(owner, () => {
+      if (!alive || !el) return;
+      const valid = validOf(datasets);
+      sync(valid, signature(valid));
+    });
+  }
   $effect(() => {
     void xRange;
     const valid = validOf(datasets);
     const s = signature(valid);
     if (!el) return;
-    if (u && s === sig && samePoints(valid)) { applyRange(false); return; }
-    if (u && s === sig) update(valid);
-    else { build(valid); sig = s; heldRange = null; }
-    held = valid.map((d) => [d.x, d.y]);
-    applyRange(true);
+    if (u && s === sig && samePoints(valid) && rangeHeld()) return;
+    if (u && !visible) { deferred = true; return; }
+    queue();
   });
+  $effect(() => {
+    if (!el) return;
+    const io = new IntersectionObserver((es) => {
+      visible = es[es.length - 1].isIntersecting;
+      if (visible && deferred) { deferred = false; queue(); }
+    }, { rootMargin: "200px 0px" });
+    io.observe(el);
+    return () => io.disconnect();
+  });
+  function sync(valid, s) {
+    if (u && s === sig && samePoints(valid)) { u.batch(() => applyRange(false)); return; }
+    if (u && s === sig) {
+      u.batch(() => { update(valid); held = valid.map((d) => [d.x, d.y]); applyRange(true); });
+      return;
+    }
+    build(valid); sig = s; heldRange = null;
+    held = valid.map((d) => [d.x, d.y]);
+    applyRange(true); // coalesces with the new plot's first draw
+  }
 
   // lifetime: destroy on unmount only (not on every data change)
   $effect(() => {
     void el;
-    return () => { if (u) { u.destroy(); u = null; sig = ""; held = null; heldRange = null; } };
+    return () => {
+      alive = false;
+      cancel(owner);
+      if (u) { u.destroy(); u = null; sig = ""; held = null; heldRange = null; }
+    };
   });
 
   $effect(() => {

@@ -1,4 +1,9 @@
-// Pure helpers over metrics records (the metrics_log.py vocabulary).
+// Pure helpers over a run's metrics (the metrics_log.py vocabulary), as
+// columns: `data` is a RunData (data.svelte.js) — n rows, cols[key] a
+// Float64Array with NaN for absent values. Series arrays (plain arrays,
+// null = gap, what uPlot takes) are memoized per RunData object: a run
+// whose file did not change keeps the very same arrays, so the views and
+// the charts see nothing to do (2026-10-06).
 
 export const X_MODES = [
   { key: "samples", label: "samples", unit: "steps" },
@@ -6,87 +11,125 @@ export const X_MODES = [
   { key: "wall", label: "wall-clock", unit: "h" },
 ];
 
+const memo = new WeakMap(); // RunData -> Map(key -> value)
+export function memoOf(data, key, f) {
+  let m = memo.get(data);
+  if (!m) memo.set(data, (m = new Map()));
+  if (!m.has(key)) m.set(key, f());
+  return m.get(key);
+}
+
+const NONE = new Float64Array(0);
+const col = (data, k) => data.cols[k] ?? null;
+const num = (c, i) => (c && i < c.length ? c[i] : NaN); // absent -> NaN (as undefined would be)
+
 // x values per record. Wall-clock: hours since the run's first record —
 // from the `t` epoch stamps when every record has one (trainer-written
 // or backfilled from the log mtime), else from `elapsed` made
 // cumulative across resumes (elapsed restarts per process).
-export function xValues(recs, mode) {
-  const n = recs.length;
-  const x = new Array(n);
-  if (mode === "samples") {
-    for (let i = 0; i < n; i++) x[i] = recs[i].steps;
-  } else if (mode === "updates") {
-    for (let i = 0; i < n; i++) x[i] = recs[i].upd;
-  } else {
-    const allT = n > 0 && recs.every((r) => typeof r.t === "number");
-    if (allT) {
-      const t0 = recs[0].t;
-      for (let i = 0; i < n; i++) x[i] = (recs[i].t - t0) / 3600;
+export function xValues(data, mode) {
+  return memoOf(data, "x:" + mode, () => {
+    const n = data.n;
+    const x = new Array(n);
+    if (mode === "samples" || mode === "updates") {
+      const c = col(data, mode === "samples" ? "steps" : "upd") ?? NONE;
+      for (let i = 0; i < n; i++) x[i] = Number.isNaN(num(c, i)) ? undefined : c[i];
     } else {
-      let off = 0, prev = 0;
-      for (let i = 0; i < n; i++) {
-        const e = recs[i].elapsed ?? prev;
-        if (e < prev) off += prev; // a resume restarted the process clock
-        prev = e;
-        x[i] = (off + e) / 3600;
+      const t = col(data, "t");
+      let allT = n > 0 && !!t;
+      if (allT) for (let i = 0; i < n; i++) if (Number.isNaN(t[i])) { allT = false; break; }
+      if (allT) {
+        const t0 = t[0];
+        for (let i = 0; i < n; i++) x[i] = (t[i] - t0) / 3600;
+      } else {
+        const el = col(data, "elapsed");
+        let off = 0, prev = 0;
+        for (let i = 0; i < n; i++) {
+          const v = num(el, i);
+          const e = Number.isNaN(v) ? prev : v;
+          if (e < prev) off += prev; // a resume restarted the process clock
+          prev = e;
+          x[i] = (off + e) / 3600;
+        }
       }
     }
-  }
-  return x;
-}
-
-function per1M(r, k, batch) {
-  const v = r[k];
-  if (v == null || !batch) return null;
-  return (v * 1e6) / batch;
+    return x;
+  });
 }
 
 // Batch size per update (steps advanced), for the per-1M-sample rates.
-export function batchOf(recs, i) {
+function batchOf(steps, upd, i, n) {
   if (i > 0) {
-    const d = recs[i].steps - recs[i - 1].steps;
+    const d = num(steps, i) - num(steps, i - 1);
     if (d > 0) return d;
   }
-  if (recs.length > 1 && i === 0) {
-    const d = recs[1].steps - recs[0].steps;
+  if (n > 1 && i === 0) {
+    const d = num(steps, 1) - num(steps, 0);
     if (d > 0) return d;
   }
-  return recs[i].steps / Math.max(1, recs[i].upd);
+  return num(steps, i) / Math.max(1, num(upd, i));
 }
-
+// per-row value function for a derived key, or null for a plain column
+function per1M(data, k, pos) {
+  const c = col(data, k), steps = col(data, "steps"), upd = col(data, "upd"), n = data.n;
+  return (i) => {
+    const v = num(c, i);
+    const b = batchOf(steps, upd, i, n);
+    if (Number.isNaN(v) || !b) return NaN;
+    const r = (v * 1e6) / b;
+    return pos && !(r > 0) ? NaN : r;
+  };
+}
+function mapCol(data, k, f) {
+  const c = col(data, k);
+  return (i) => f(num(c, i));
+}
 const DERIVED = {
-  falls_per_1m: (r, i, recs) => per1M(r, "falls", batchOf(recs, i)),
-  tilts_per_1m: (r, i, recs) => per1M(r, "tilts", batchOf(recs, i)),
-  lifts_per_1m: (r, i, recs) => per1M(r, "lifts", batchOf(recs, i)),
-  sps_k: (r) => (r.sps == null ? null : r.sps / 1000),
-  kl_first_pos: (r) => (r.kl_first > 0 ? r.kl_first : null),
-  kl_last_pos: (r) => (r.kl_last > 0 ? r.kl_last : null),
+  falls_per_1m: (d) => per1M(d, "falls", false),
+  tilts_per_1m: (d) => per1M(d, "tilts", false),
+  lifts_per_1m: (d) => per1M(d, "lifts", false),
+  sps_k: (d) => mapCol(d, "sps", (v) => v / 1000),
+  kl_first_pos: (d) => mapCol(d, "kl_first", (v) => (v > 0 ? v : NaN)),
+  kl_last_pos: (d) => mapCol(d, "kl_last", (v) => (v > 0 ? v : NaN)),
   // log-scale variants: a log axis cannot show 0, so zero-event updates
   // become gaps rather than dragging the axis to -inf (2026-09-03)
-  falls_per_1m_pos: (r, i, recs) => { const v = per1M(r, "falls", batchOf(recs, i)); return v > 0 ? v : null; },
-  tilts_per_1m_pos: (r, i, recs) => { const v = per1M(r, "tilts", batchOf(recs, i)); return v > 0 ? v : null; },
+  falls_per_1m_pos: (d) => per1M(d, "falls", true),
+  tilts_per_1m_pos: (d) => per1M(d, "tilts", true),
   // env v41 [contact]: share of env-ticks with body-on-body contact, in %
-  contact_pct: (r) => (r.contact_frac == null ? null : r.contact_frac * 100),
+  contact_pct: (d) => mapCol(d, "contact_frac", (v) => v * 100),
 };
 
-export function seriesValues(recs, key) {
-  const f = DERIVED[key];
-  const n = recs.length;
-  const y = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const v = f ? f(recs[i], i, recs) : recs[i][key];
-    y[i] = typeof v === "number" && Number.isFinite(v) ? v : null;
-  }
-  return y;
+export function seriesValues(data, key) {
+  return memoOf(data, "y:" + key, () => {
+    const n = data.n;
+    const y = new Array(n);
+    const f = DERIVED[key] ? DERIVED[key](data) : null;
+    const c = f ? null : col(data, key);
+    for (let i = 0; i < n; i++) {
+      const v = f ? f(i) : num(c, i);
+      y[i] = Number.isFinite(v) ? v : null;
+    }
+    return y;
+  });
 }
 
-export function hasAny(recs, key) {
-  const f = DERIVED[key];
-  for (let i = 0; i < recs.length; i++) {
-    const v = f ? f(recs[i], i, recs) : recs[i][key];
-    if (typeof v === "number" && Number.isFinite(v)) return true;
+export function hasAny(data, key) {
+  return memoOf(data, "any:" + key, () => {
+    if (!DERIVED[key] && !col(data, key)) return false;
+    return seriesValues(data, key).some((v) => v != null);
+  });
+}
+
+// Last row at or before `samples` (matched-checkpoint lookup), as a record
+// (treat as read-only: it is shared).
+export function atSamples(data, samples) {
+  const steps = col(data, "steps") ?? NONE;
+  let lo = 0, hi = data.n - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (steps[mid] <= samples) { ans = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  return false;
+  return ans >= 0 ? memoOf(data, "rec:" + ans, () => data.rec(ans)) : null; // cached: the table asks per cell
 }
 
 // Panels: one chart each; `series` are metric keys drawn together.
@@ -210,16 +253,6 @@ export function rolling(ys, w) {
     out[i] = cnt ? sum / cnt : null;
   }
   return out;
-}
-
-// Last record at or before `samples` (matched-checkpoint lookup).
-export function atSamples(recs, samples) {
-  let lo = 0, hi = recs.length - 1, ans = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (recs[mid].steps <= samples) { ans = mid; lo = mid + 1; } else hi = mid - 1;
-  }
-  return ans >= 0 ? recs[ans] : null;
 }
 
 export function fmt(v, digits = 4) {
