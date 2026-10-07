@@ -157,7 +157,9 @@ for (let i = 0; i < 50; i++) {
   await sleep(100);
 }
 
-const browser = await puppeteer.launch({ executablePath: findBrowser(), headless: true, args: ["--no-sandbox", "--disable-gpu"] });
+const browser = await puppeteer.launch({ executablePath: findBrowser(), headless: true, args: ["--no-sandbox", "--disable-gpu",
+  // a desktop pointer (headless reports hover: none): the hide buttons show on hover only
+  "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"] });
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1400, height: 1000 });
@@ -453,6 +455,113 @@ try {
   check((await page.$eval(".status", (e) => e.textContent)).includes("swing columns unavailable"), "swing, v1 run: swing columns marked unavailable");
   check((await column("pre %", 20)).every((v) => v === "—"), "swing, v1 run: pre-swing cells empty");
   check((await page.$eval(".totals", (e) => e.textContent)).includes("23,457"), "swing, v1 run: best-possible totals shown");
+  check((await page.$(".hidden-menu")) === null, "swing: no hidden-graphs menu (no graphs here)");
+
+  // ------------------------------------------------- hidden graphs (2026-10-06)
+  await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "live").click());
+  await page.waitForSelector(".bar select");
+  await page.select(".bar select", ""); // most recent: camp/new_run
+  await page.waitForFunction(() => document.querySelector(".status")?.textContent.includes("camp/new_run"), { timeout: 8000 });
+  await page.waitForFunction(() => [...document.querySelectorAll(".chart")].filter((e) => e.__uplot).length > 4, { timeout: 8000 });
+  await page.evaluate(() => window.__dashChartsIdle());
+  const panelIds = () => page.$$eval(".cell", (cs) => cs.map((c) => c.dataset.panel));
+  const cellHeights = () => page.$$eval(".cell", (cs) => Object.fromEntries(cs.map((c) => [c.dataset.panel, c.getBoundingClientRect().height])));
+  const menuLabel = () => page.$eval(".hidden-menu .trigger", (b) => b.textContent.replace(/\s+/g, " ").trim()).catch(() => null);
+  const menuItems = () => page.$$eval(".hidden-menu .pop [role=menuitem]", (es) => es.map((e) => e.textContent.trim()));
+  const titleOf = (id) => page.$eval(`.cell[data-panel="${id}"] .hide`, (e) => e.getAttribute("aria-label").replace(/^Hide graph: /, ""));
+  async function hideCard(id) {
+    await page.hover(`.cell[data-panel="${id}"]`);
+    await page.click(`.cell[data-panel="${id}"] .hide`);
+    await sleep(100);
+  }
+  const ids0 = await panelIds();
+  check((await menuLabel()) === null, "hidden: no menu while nothing is hidden");
+  check(ids0.length > 4 && (await page.$$(".cell .hide")).length === ids0.length, `hidden: every card has a hide button (${ids0.length})`);
+  check(await page.$eval(".cell .hide", (b) => !!b.getAttribute("aria-label")), "hidden: hide buttons have aria-labels");
+  {
+    await page.hover(`.cell[data-panel="${ids0[0]}"]`);
+    await sleep(250);
+    const op = await page.evaluate((a, b) => ({
+      touch: matchMedia("(hover: none)").matches,
+      on: getComputedStyle(document.querySelector(`.cell[data-panel="${a}"] .hide`)).opacity,
+      off: getComputedStyle(document.querySelector(`.cell[data-panel="${b}"] .hide`)).opacity,
+    }), ids0[0], ids0[ids0.length - 1]);
+    check(op.on === "1" && op.off === (op.touch ? "1" : "0"), `hidden: hide button shows on card hover${op.touch ? " (touch: always)" : ", hidden otherwise"} (${JSON.stringify(op)})`);
+  }
+  await dragZoom(0, 0.3, 0.6);
+  const z0 = (await snap())[0];
+  const hh0 = await cellHeights();
+  const hid = ids0[1];
+  const hidTitle = await titleOf(hid);
+  await hideCard(hid);
+  const ids1 = await panelIds();
+  check(!ids1.includes(hid) && ids1.length === ids0.length - 1, `hide: "${hidTitle}" card gone (${ids1.length} left)`);
+  const z1 = (await snap())[0];
+  check(z1.id === z0.id && z1.min === z0.min && z1.max === z0.max, "hide: the zoomed chart kept its zoom (not rebuilt)");
+  const hh1 = await cellHeights();
+  check(ids1.every((id) => hh1[id] === hh0[id]), "hide: the other cards keep their heights");
+  check((await menuLabel()) === "Hidden 1", `menu: shows the count (${await menuLabel()})`);
+  await page.click(".hidden-menu .trigger");
+  check(JSON.stringify(await menuItems()) === JSON.stringify([hidTitle, "Show all (1)"]), `menu: lists the hidden graph by title (${await menuItems()})`);
+  await page.keyboard.press("Escape");
+  await sleep(50);
+  check((await page.$(".hidden-menu .pop")) === null, "menu: Esc closes it");
+  check(await page.evaluate(() => document.activeElement?.classList.contains("trigger")), "menu: focus back on its button after Esc");
+  await page.click(".hidden-menu .trigger");
+  await page.mouse.click(5, 300);
+  await sleep(50);
+  check((await page.$(".hidden-menu .pop")) === null, "menu: an outside click closes it");
+  // keyboard: focus the button, arrow into the list, Enter restores
+  await page.focus(".hidden-menu .trigger");
+  await page.keyboard.press("ArrowDown");
+  await sleep(50);
+  check(await page.evaluate(() => document.activeElement?.getAttribute("role") === "menuitem"), "menu: ArrowDown opens it and focuses the first entry");
+  await page.keyboard.press("Enter");
+  await sleep(150);
+  check(JSON.stringify(await panelIds()) === JSON.stringify(ids0), "restore: the card is back in its place");
+  check((await menuLabel()) === null, "restore: menu gone once nothing is hidden");
+  // persistence: hide two, plus a stale id in storage; reload
+  await hideCard(ids0[2]);
+  await hideCard(ids0[3]);
+  await page.evaluate(() => {
+    const v = JSON.parse(localStorage.getItem("dash.hidden.live"));
+    localStorage.setItem("dash.hidden.live", JSON.stringify([...v, "no_such_panel"]));
+  });
+  await page.reload({ waitUntil: "load" });
+  await page.waitForFunction(() => [...document.querySelectorAll(".chart")].filter((e) => e.__uplot).length > 4, { timeout: 8000 });
+  await sleep(300);
+  let idsR = await panelIds();
+  check(!idsR.includes(ids0[2]) && !idsR.includes(ids0[3]) && idsR.length === ids0.length - 2, "reload: both graphs still hidden");
+  check((await menuLabel()) === "Hidden 2", `reload: menu count 2, the stale id ignored (${await menuLabel()})`);
+  check(!(await page.evaluate(() => localStorage.getItem("dash.hidden.live"))).includes("no_such_panel"), "reload: the stale id pruned from storage");
+  // an auto-refresh with new data restores nothing
+  appendFileSync(metricsPath("camp/new_run"), jsonl(126, 130));
+  runs[0] = runEntry("camp/new_run", 130, "partial", T0 + 9999 + 70);
+  writeIndex();
+  await page.waitForFunction(() => [...document.querySelectorAll(".chart")].some((e) => e.__uplot && e.__uplot.data[0].length === 130), { timeout: 8000 });
+  await idleRefreshes(2);
+  idsR = await panelIds();
+  check(!idsR.includes(ids0[2]) && !idsR.includes(ids0[3]) && (await menuLabel()) === "Hidden 2", "new data + refreshes: hidden graphs stay hidden");
+  // Compare keeps its own set
+  await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "compare").click());
+  await page.waitForSelector("aside .list label");
+  await page.$$eval("aside .list label", (ls) => { for (const l of ls) if (/live_run|done_run/.test(l.textContent)) l.querySelector("input").click(); });
+  await page.waitForFunction(() => document.querySelectorAll(".cell").length > 2, { timeout: 8000 });
+  check((await menuLabel()) === null, "compare: Live's hidden graphs are not hidden here (own set)");
+  const cid = (await panelIds())[0];
+  const cTitle = await titleOf(cid);
+  await hideCard(cid);
+  check(!(await panelIds()).includes(cid) && (await menuLabel()) === "Hidden 1", `compare: hid "${cTitle}"`);
+  await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "live").click());
+  await page.waitForFunction(() => document.querySelectorAll(".cell").length > 2, { timeout: 8000 });
+  check((await menuLabel()) === "Hidden 2", "live: still its own two hidden");
+  await page.click(".hidden-menu .trigger");
+  await page.$$eval(".hidden-menu .pop [role=menuitem]", (es) => es.find((e) => e.textContent.startsWith("Show all")).click());
+  await sleep(150);
+  check(JSON.stringify(await panelIds()) === JSON.stringify(ids0) && (await menuLabel()) === null, "Show all: every Live graph back, menu gone");
+  await page.$$eval("nav button", (bs) => bs.find((b) => b.textContent.trim() === "compare").click());
+  await sleep(200);
+  check((await menuLabel()) === "Hidden 1", "compare: its hidden graph unaffected by Live's Show all");
 } finally {
   await browser.close();
   srv.kill();

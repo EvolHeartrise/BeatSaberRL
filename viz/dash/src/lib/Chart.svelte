@@ -429,7 +429,7 @@
 
 <div class="chart" bind:this={el}>
   {#if !datasets.some((d) => d && d.x && d.x.length)}
-    <div class="empty">{title}<br /><small>no data for this metric</small></div>
+    <div class="empty" style:min-height={height + 16 + "px"}>{title}<br /><small>no data for this metric</small></div>
   {/if}
 </div>
 

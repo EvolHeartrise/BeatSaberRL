@@ -47,7 +47,8 @@ headless Chrome (from `~/.cache/puppeteer/chrome`, or
 served by serve.py: idle refreshes must not redraw or reset a zoom
 (Live, window lock, Compare), appended rows must reach every chart,
 hovering must not change any card's height, a cut line changes nothing
-until complete, growing files are read by Range, a shrunk one whole.
+until complete, growing files are read by Range, a shrunk one whole;
+hiding / restoring graphs (menu, keyboard, reload, refresh, per tab).
 
 Chart cards (2026-10-06): the panel title floats on the plot's top-left
 corner, the legend under the plot is static (names + colours, click a
@@ -55,6 +56,15 @@ name to hide/show that series; capped at three rows, scrolls past that),
 and the values at the cursor show in a floating tooltip on the hovered
 chart only — x in the header, series sorted by value with colour
 swatches, clamped to the viewport — so hovering never reflows the page.
+
+Hidden graphs (2026-10-06): each card's eye-off button (top-right; on
+hover, always on touch screens) hides that panel; "Hidden (n)" in the
+header lists the current tab's hidden graphs — click one to bring it
+back, or "Show all" (Esc / outside click closes, arrow keys move). Live
+and Compare keep separate sets, keyed by the panel ids in series.js
+(Compare: the metric key, `diff:<key>` for the difference panels), in
+localStorage `dash.hidden.<tab>`; refreshes never un-hide, unknown ids
+are pruned, new panels start visible.
 
 ## Views
 

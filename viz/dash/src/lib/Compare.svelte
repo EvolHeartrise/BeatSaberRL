@@ -2,7 +2,8 @@
   import { store, loadIndex, loadMetrics, runById, REFRESH_MS } from "./data.svelte.js";
   import { COMPARE_KEYS, DIFF_KEYS, X_MODES, xValues, seriesValues, hasAny,
     label, color, interp, rolling, atSamples, fmt, fmtSamples, parseSampleList } from "./series.js";
-  import Chart from "./Chart.svelte";
+  import Panel from "./Panel.svelte";
+  import { isHidden } from "./hidden.svelte.js";
 
   let { selected = $bindable([]), xMode = $bindable("samples") } = $props();
 
@@ -162,16 +163,17 @@
     {:else}
       <h3>small multiples — {loaded.length} run{loaded.length === 1 ? "" : "s"}</h3>
       <div class="grid">
-        {#each smalls as p (p.key)}
-          <div class="cell"><Chart title={label(p.key)} datasets={p.datasets} {xLabel} log={p.key === "kl_last_pos" || p.key === "falls_per_1m_pos" || p.key === "tilts_per_1m_pos"} height={200} syncKey={"cmp-" + xMode} /></div>
+        {#each smalls.filter((p) => !isHidden("compare", p.key)) as p (p.key)}
+          <Panel tab="compare" id={p.key} title={label(p.key)} datasets={p.datasets} {xLabel} log={p.key === "kl_last_pos" || p.key === "falls_per_1m_pos" || p.key === "tilts_per_1m_pos"} height={200} syncKey={"cmp-" + xMode} />
         {/each}
       </div>
 
-      {#if ref && loaded.length > 1}
+      {@const shownDiffs = diffs.filter((p) => !isHidden("compare", "diff:" + p.key))}
+      {#if ref && loaded.length > 1 && shownDiffs.length}
         <h3>difference vs {ref.run} (rolling mean, {window_} pts)</h3>
         <div class="grid">
-          {#each diffs as p (p.key)}
-            <div class="cell"><Chart title={"Δ " + label(p.key)} datasets={p.datasets} {xLabel} height={200} syncKey={"cmp-" + xMode} /></div>
+          {#each shownDiffs as p (p.key)}
+            <Panel tab="compare" id={"diff:" + p.key} title={"Δ " + label(p.key)} datasets={p.datasets} {xLabel} height={200} syncKey={"cmp-" + xMode} />
           {/each}
         </div>
       {/if}
@@ -227,8 +229,9 @@
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 5px; margin-right: 6px; border: 1px solid var(--border); }
   .bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 6px 0; }
   .xmode button.on { background: var(--accent); color: #fff; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); gap: 8px; }
-  .cell { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px 2px; min-width: 0; }
+  /* align start: a card keeps its own height, so hiding one never
+     stretches or shrinks another (2026-10-06) */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); gap: 8px; align-items: start; }
   h3 { margin: 14px 0 6px; font-size: 14px; }
   .tablewrap { overflow-x: auto; }
   table { border-collapse: collapse; font-size: 12px; }
