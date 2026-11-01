@@ -1,21 +1,47 @@
 # Beat Arena
 
+Reinforcement learning agents that learn to play Beat Saber from scratch.
+
+The simulator reimplements the real game: note geometry, hitboxes, swept-saber
+collision and the 115-point scoring formula. It has a Rust implementation and a
+GPU-resident CUDA implementation. Policies are transformers trained with PPO on pure
+game-score rewards. Checkpoints are benchmarked on every ranked ScoreSaber and
+BeatLeader map using the official pp curves, and replays can be watched in a browser
+viewer or played against in VR.
+
+**Early milestone:** on the hard two-handed training config, a policy reached 98% good
+cuts after 14M steps, beating the scripted bot's 96%, with no reward shaping and no
+curriculum. The environment has become much more realistic since then, so later numbers
+in the log below are not directly comparable.
+
+| Path | Contents |
+|---|---|
+| `rust/` | Simulator and Python bindings |
+| `python/` | Training, CUDA environment and benchmarks |
+| `viz/` | Replay viewer, VR mode and training dashboard |
+| `research/` | Notes and sources on the real game's mechanics |
+| `SPEC.md` | The full contract: constants, observation layout, file formats |
+
+Jump to: [Quick start](#quick-start), [ScoreSaber bench](#scoresaber-bench-checkpoint-evaluation-on-all-ranked-maps), [Status](#status)
+
+## Development log
+
 Beat Saber-style toy RL environment + transformer policy experiments.
 See `SPEC.md` for the full contract (constants, obs layout, file formats).
 
 Env v7 (real Beat Saber geometry & judgment on the v6 kinematic upper
-body): each hand is a chain from a fixed shoulder — upper arm, elbow,
+body): each hand is a chain from a fixed shoulder - upper arm, elbow,
 forearm, two-DOF wrist, 1 m blade; independent integrators with
 anatomical limits, slow shoulders (Ω ≤ 8 rad/s) vs snappy wrists
-(≤ 20) — position with the arm, whip with the wrist. The world is the
+(≤ 20) - position with the arm, whip with the wrist. The world is the
 REAL one (sourced from the ArcViewer/BeatLeader code inventory in
 `research/`): floor-based coords, 0.6 m lanes at x ±0.9/±0.3, rows at
-y 0.85/1.40/1.90, shoulders at (±0.2, 1.47, −0.65) — a 1.8 m player.
+y 0.85/1.40/1.90, shoulders at (±0.2, 1.47, −0.65) - a 1.8 m player.
 Collision uses the real axis-aligned hitboxes (good box 0.8×0.5×1.0
-shifted 0.25 m toward the player — early cuts are real; wrong-color
+shifted 0.25 m toward the player - early cuts are real; wrong-color
 small box 0.35³) with full swept-surface saber tests. Scoring is the
-real integer 115 — round(70·pre) + round(30·post) + round(15·acc)
-with the real 0.3 m accuracy normalizer — paid as reward/115. New
+real integer 115 - round(70·pre) + round(30·post) + round(15·acc)
+with the real 0.3 m accuracy normalizer - paid as reward/115. New
 object types: bombs (r 0.18, hit = −1.5 since env v7.8, pass = free),
 chains (head
 max 85, links flat 20 on the real Bézier layout), and arcs as
@@ -23,54 +49,54 @@ pre/post-swing grants. Per-tick discrete control at 30 Hz: 12 ternary
 joint heads (per hand: pitch, yaw, twist, elbow, roll, bend).
 
 Env v8 (2026-07-30, user-directed): joint α and ω caps DOUBLED (arm
-160 rad/s² / 16 rad/s, wrist 400 / 40 — effective in-game hand motion,
+160 rad/s² / 16 rad/s, wrist 400 / 40 - effective in-game hand motion,
 not biomechanics: tracking prediction lets real players beat physics)
 with **gear-table actions** restoring fine control: `--gears 5` adds
 ±¼-torque options per joint head, `--gears 7` adds ±⅓ and ±⅛; id
 0/1/2 stay coast/±full at every K. Effort scales by |fraction|.
 Pre-v8 checkpoints and references are a different body.
 
-Env v9 (2026-07-30, user-caught modeling gap): 7th joint per hand —
+Env v9 (2026-07-30, user-caught modeling gap): 7th joint per hand -
 **wrist radial/ulnar deviation** (right [−15°, +30°], left mirrored;
 wrist tier). The v5.2 roll+bend
 wrist could POINT anywhere but had out-of-plane blade speed
-`roll_rate·sin(bend)` — a pole singularity at straight wrists; blade is
+`roll_rate·sin(bend)` - a pole singularity at straight wrists; blade is
 now `Rz(roll)·Ry(dev)·Rx(−bend)·e_z` (dev = 0 reproduces v8 exactly).
-Obs 286 → 290, actions 12 → 14 heads, replay v8 — ALL v8 checkpoints,
+Obs 286 → 290, actions 12 → 14 heads, replay v8 - ALL v8 checkpoints,
 replays, and records retired. Fused policy kernels (bench
 `--fused-forward`, `--fused-update`) are v8-baked and guard out until
 ported; the production torch paths are shape-driven and unaffected.
 
-Env v10 (2026-07-31, P3 — SPEC-v10.md): the kinematic upper body is
-RETIRED. The body is a full **dynamic humanoid** — floating pelvis +
+Env v10 (2026-07-31, P3 - SPEC-v10.md): the kinematic upper body is
+RETIRED. The body is a full **dynamic humanoid** - floating pelvis +
 29 actuated revolute DoF (spine 3, arms 2×7 with the v9 arm chains
 verbatim, legs 2×6), de Leva masses on the v9 anchor geometry, feet
 welded to the floor (env v11 replaced the welds with unilateral ground
 contact; the weld test harness was removed 2026-09-27), 12-collider
-self-contact — integrated by a hand-rolled f64 engine (CRBA/RNEA/
+self-contact - integrated by a hand-rolled f64 engine (CRBA/RNEA/
 Cholesky + PGS constraint solver,
 `rust/src/dynamics/`) at 8 × 1/240 s per 30 Hz control tick. Actions
 are **29 gear heads** (τ = gear_fraction × τ_max); movement is priced by
 `--energy-coef` (env v43: the applied Σ|τ| per tick; the v23 `--iso-coef` fraction price is retired);
-`--tau-rand` (env v46: per-env randomized joint torque limits, symmetric L/R, scales in the obs — see the env v46 paragraph)
-and `--limit-coef --limit-arms` (limit rest) — the v10 positive-work
+`--tau-rand` (env v46: per-env randomized joint torque limits, symmetric L/R, scales in the obs - see the env v46 paragraph)
+and `--limit-coef --limit-arms` (limit rest) - the v10 positive-work
 "effort" price and its telemetry were retired 2026-09-13, and the
 activation itself is the energy telemetry (replay `activation`
 [total, spine, arms, legs] per tick, the trainer's `[activation]` line,
 the dashboard panel); the reach/miss gates and note look-at follow
 the LIVE pose; obs is 340 lanes; replay is JSONL "v10" (full q36 +
 root twist + ω29 + contact events; since P6 additive per-tick "feet"
-impulses — the ground reaction since the 2026-08-17 replay fix;
+impulses - the ground reaction since the 2026-08-17 replay fix;
 record_rev 3 "activation"). Gravity is real and nothing holds the body
-up — posture is the policy's problem now. ALL v9 checkpoints,
+up - posture is the policy's problem now. ALL v9 checkpoints,
 replays, and records are retired. The viewer is v10
-(P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` — the whole
+(P6); the CUDA kernel (P5, `csrc/beat_arena_cuda.cu` - the whole
 8-substep dynamics tick as ONE launch, one thread per env, f64 branch
 horizon-bounded tight-tolerance vs Rust) is the default training
 backend (`--env cuda`) since 2026-08-01. The P4 torch mirror
 (`--env torch`, f64-bitwise vs Rust) served as the batched parity
 witness through P4/P5 and was REMOVED 2026-08-03 (surface-area
-reduction — every physics change had been landing tri-tier); Rust is
+reduction - every physics change had been landing tri-tier); Rust is
 the reference and `tests/test_v10_parity_cuda.py` is the live gate.
 
 Env v42 (2026-09-14, user-directed): **hilt grip**. The hand now holds
@@ -81,7 +107,7 @@ reach gate grows by the same 0.16 m (1.91 m at the reference pose). Obs,
 actions, checkpoints and the replay format are unchanged (recordings
 carry `config.handle_len` so the viewer places the saber correctly for
 both eras). Every pre-v42 checkpoint plays a different game on this
-geometry — their bench numbers are not comparable; retrain.
+geometry - their bench numbers are not comparable; retrain.
 
 **Main's body since 2026-10-03: the v63x2 body** (user decision; from
 the `exp/wrist-body-90` experiment). Versus the body before it: hands
@@ -93,7 +119,7 @@ default body (`TAU_BODY_DEFAULT`) has wrist-bend scale 1.2579, i.e.
 1.80 N·m. Values live in `rust/src/dynamics/model.rs`, `rust/src/lib.rs`,
 `csrc/beat_arena_cuda.cu` and `constants.py`. **The original body lives
 on branch `body/original`**: v60/v61 benches, replays and checkpoints
-(and anything earlier) must be reproduced from that branch — they are a
+(and anything earlier) must be reproduced from that branch - they are a
 different body here. Replays carry their body (format 2 `header.body`),
 so the viewer shows either era correctly.
 
@@ -122,7 +148,7 @@ rows are per-joint length, and `load_policy` refuses a checkpoint whose
 gear layout differs from the build's (`check_gear_layout`). Body
 branches use it (`exp/bend7`: 7-gear wrist bends).
 
-**Flux game mode (2026-09-26, user-specified — SPEC.md §Flux):** a
+**Flux game mode (2026-09-26, user-specified - SPEC.md §Flux):** a
 second Beat Saber mode alongside the standard game, on the same body,
 physics, track and reward terms. No sabers: the hands are palm-centre
 points and the "Flux" is the segment between them. Circles (coloured,
@@ -139,7 +165,7 @@ cannot tunnel through a still hand. Charts come from a procedural generator
 checkpoints). The standard game is bit-identical with Flux compiled
 in.
 
-**Flux WebXR game (2026-09-27 — SPEC.md §Flux WebXR game):** play Flux
+**Flux WebXR game (2026-09-27 - SPEC.md §Flux WebXR game):** play Flux
 yourself in a headset, judged by the env's own code. The Flux rules
 live in three body-free Rust files (`rust/src/geom.rs`, `flux.rs`,
 `combo.rs`) that compile into the env crate AND into `rust/flux-wasm`
@@ -169,7 +195,7 @@ player with `npx wrangler secret put ALLOWED_DISCORD_IDS`
 ## Quick start
 
 Uses its own venv at `python/.venv` (gitignored). One-time setup
-(the laptop is torch-cpu; pods use the image's CUDA torch — see
+(the laptop is torch-cpu; pods use the image's CUDA torch - see
 `setup_pod.sh`):
 
 ```bash
@@ -247,12 +273,12 @@ telemetry stays. Both sims + parity gate.
 Env v45 (2026-09-15, user-directed; replaces the same-day env v44
 block): **per-hand previous-note obs block v2**. The user's purpose:
 "parity control, wind up positioning, and gaps in the song for holding
-saber position at the correct spot to swing at the next note" — a hand
+saber position at the correct spot to swing at the next note" - a hand
 that can see the note it last dealt with flails less and winds up
 better. Two 5-lane blocks appended to the obs (598..602 left hand,
 603..607 right; OBS_DIM 598 → 608, every earlier offset unchanged).
 Block s is the most recently RESOLVED scoreable note OF THAT HAND'S
-COLOUR — regardless of which saber resolved it and regardless of
+COLOUR - regardless of which saber resolved it and regardless of
 outcome (good cut, slow/angle cut, wrong-hand cut and miss all record on
 the note's colour; bombs and walls never). Lanes: head-relative x/y
 (recomputed against the live head each tick), cut-direction cos/sin
@@ -275,7 +301,7 @@ maps and a ~0.5-pt/cut drop in the 15-pt accuracy component); the two
 changes were not separated. The user's call: keep both. The v43 energy
 price then recovered all of it and more: `v43_energy` (same game + the
 torque price, 2026-09-14) trunk 0.9489, cd300 leaf 0.9685 (final-50) /
-0.9692 last, bench **2,405,918 upp / 17,099 wpp** — +10.7% vs v42_hilt_geo
+0.9692 last, bench **2,405,918 upp / 17,099 wpp** - +10.7% vs v42_hilt_geo
 (+0.5 pt accuracy per level, uniform across difficulty) and +2.2% vs the
 old geometry's 2,353,043, the first run to beat it. Those are the
 reference numbers now. Posture moved the way the user hoped, partly:
@@ -285,7 +311,7 @@ gain is the energy model vs. "arms became free" (control: fraction price
 with the arms exempt). Watch: 8 hard-map early falls per bench (acc<0.5).
 
 **`--note-geo` (2026-09-14, research/2026-09-14-architecture-brainstorm.md #1; DEFAULT ON, `--no-note-geo` opts out):**
-hand-relative geometry lanes on the note tokens — per (hand, note) the
+hand-relative geometry lanes on the note tokens - per (hand, note) the
 wrist→note offset in metres, its length, seconds to the head plane, and
 the swing-direction · cut-direction and blade · cut-direction dots (14
 lanes, wall rows masked), computed inside the policy from lanes the obs
@@ -322,7 +348,7 @@ numbers are `v46_whole` (pod igc6hvsqagfnrf, 2026-09-16): trunk final-50
 **0.9601**, cd300 leaf **0.9728**, bench **2,583,201 upp / 18,271 wpp**
 (previous: `v45_simba_c03` on 25-s segments, 0.9607 / 0.9721 /
 2,495,323 / 17,894). How they were chosen:
-the clip ladder on env v45 — 0.2 → 0.3 gave +0.8 pt trunk and +1.7% bench
+the clip ladder on env v45 - 0.2 → 0.3 gave +0.8 pt trunk and +1.7% bench
 (2,445,676 vs the v43-recipe 2,405,918), while 0.4 LOST −8.9% on the bench
 (2,227,709; 51 catastrophic levels) even though its leaf training acc
 (0.9697) barely moved, so training acc cannot rank clip settings on its
@@ -332,7 +358,7 @@ vs 0.9712, bench +2.0% with the gain growing with star rating (+0.10 at
 4–8★, +0.26 at 10–12★, +0.66 at 12–14★), srank of `h` 249/384 vs 204 at
 trunk end, calmer gradients (gnorm 2.2–2.4 vs 3.0–3.1), −15% torque.
 Open items: the leaf entropy floor is slightly higher under SimBa (9.8 vs
-8.5 — LN2 keeps the heads warmer through cooldown; a leaf-side knob), and
+8.5 - LN2 keeps the heads warmer through cooldown; a leaf-side knob), and
 the wrist τmax ceiling from the dead-gear census. The catastrophic-fall
 lottery (6 → 20 levels below 50% on the segment-trained SimBa leaf) was
 fixed by whole-level episodes (below): 20 → 4.
@@ -346,10 +372,10 @@ entries with `--mirror-augment`, 654 MB ragged, max 5,586 objects), the
 episode limit is the longest level's end + 90 ticks (18,075 ticks,
 602 s), and the only per-env per-object tensor is the 1-byte status
 array (181 MB at 32k envs). Front padding is exactly the bench parser's
-2.0-s first-note anchor — nothing is added — so every episode starts
+2.0-s first-note anchor - nothing is added - so every episode starts
 with a 2-s no-note lead (the 25-s windows mostly started at 0.5 s; the
 untrained policy falls before the first note, so training acc prints
-NaN for the first ~20 updates — expected). The probe (`v46_whole`, same
+NaN for the first ~20 updates - expected). The probe (`v46_whole`, same
 recipe otherwise): trunk final-50 0.9601 vs 0.9605 on segments
 (identical), leaf 0.9728 vs 0.9721, bench **2,583,201 vs 2,495,323 upp
 (+3.5%)**, catastrophic levels 20 → 4, full combos +12%, misses −15%,
@@ -359,23 +385,23 @@ episode structure the bench plays. The window machinery
 (`window_starts`, `MAX_OBJECTS`, `--seg-len`) is gone; the pool cache
 key is frozen at the whole-level form so existing caches are reused.
 
-**Env v46 (2026-09-16, user design) — per-env randomized joint torque
+**Env v46 (2026-09-16, user design) - per-env randomized joint torque
 limits, in the observation.** `--tau-rand r` (default 0.25 since the 2026-09-22 v58-recipe
 defaults, 03d6662; 0 = off): at every
 episode reset each env draws one scale per AXIS, s_a ~ U(1 − r, 1 + r),
-for 16 axes — spine 3, arm 7 shared by BOTH arms, leg 6 shared by BOTH
-legs (the user: the left side must always match the right) — and plays
+for 16 axes - spine 3, arm 7 shared by BOTH arms, leg 6 shared by BOTH
+legs (the user: the left side must always match the right) - and plays
 that level with τ_max,j = TAU_MAX[j] · s[axis(j)]. The scales feed the
-torque, the energy price (Σ|τ| — a joint 25% stronger costs 25% more for
+torque, the energy price (Σ|τ| - a joint 25% stronger costs 25% more for
 the same gear; the price stays per newton-metre by design, so the
-trained policy under-uses strong bodies — a stated bias in the sweep
+trained policy under-uses strong bodies - a stated bias in the sweep
 below) and the `[torque]` telemetry; activation (gear fractions) is
 unchanged. The 16 lanes (s − 1)/0.25 are appended at obs 608..624
 (OBS_DIM 608 → 624; policy: arm lanes into both saber tokens 37 → 44,
 spine + leg lanes into the body token 78 → 87); at r = 0 every scale is
 1.0, the lanes are 0 and the sims are bit-identical to v45. Purpose:
 learn a body-conditioned policy, then sweep the bench over fixed bodies
-to find the optimal τ_max — `bench_scoresaber.py --tau-scale` (16 floats
+to find the optimal τ_max - `bench_scoresaber.py --tau-scale` (16 floats
 or `spine=1.25,arms=1,wrists=0.8,legs=1,knees=1.1`) and
 `make_top10_replays.py --tau-scale` play a fixed body (`set_tau_scale`
 on every engine; the replay header records it, `record_rev` 5). While
@@ -388,15 +414,15 @@ accuracy, return) with bootstrap CIs. The CUDA env draws from its seeded
 generator (reproducible per seed); the Rust sim has no per-episode RNG
 and takes scales explicitly. Probe pending.
 
-**Env v49 (2026-09-30, review item I07) — the geometry the game
+**Env v49 (2026-09-30, review item I07) - the geometry the game
 scores, in the obs and the note tokens.** Accuracy is the note's
 distance to the plane the blade sweeps (`d_min = |cw·(blade ×
 tip_move)| / |…|`) and the direction check reads the contact point's
-velocity, but the policy only saw the WRIST velocity — blind to the
+velocity, but the policy only saw the WRIST velocity - blind to the
 saber's rotation on a 1.16 m lever. Six obs lanes are appended at
 624..630 (OBS_DIM 624 → 630, every earlier offset unchanged): per hand
 [L xyz, R xyz] the blade-TIP world velocity / V_NORM, the finite
-difference of wrist + (HANDLE_LEN + SABER_LEN)·blade across the tick —
+difference of wrist + (HANDLE_LEN + SABER_LEN)·blade across the tick -
 exactly the judge's `tip_move / DT`. Zero at reset and after a
 set_state refresh, zero in the Flux game (no blade). Rewards and
 dynamics are untouched. Both sims (CUDA: new `tip_vel` state tensor)
@@ -418,10 +444,10 @@ tests/test_i07_blade_geo.py; lib.rs `tip_vel_lanes_are_the_tip_finite_difference
 / `cut_plane_signed_distance_matches_the_judge`.
 
 **SimBa readout trunk (2026-09-15, research/2026-09-14-architecture-brainstorm.md
-#2; the only trunk since 2026-09-22 — the plain MLP trunk and
+#2; the only trunk since 2026-09-22 - the plain MLP trunk and
 `--trunk-arch` were removed):** the readout trunk that turns the lead
 tokens (576 lanes then; 960 since the 3-token body) into the 384-lane
-feature `h` used to be a plain Linear-ReLU-Linear — the one stage in the
+feature `h` used to be a plain Linear-ReLU-Linear - the one stage in the
 network with neither a LayerNorm nor a skip (the blocks are pre-LN
 residual, the critic pool has its own LN). SimBa replaced it with a Linear 576→384 projection, one
 residual block `x + fc2(relu(fc1(LN1 x)))`, and a final LN2 (modules
@@ -434,7 +460,7 @@ SimBaV2 (2502.15280) show plain MLPs lose monotone width scaling in RL
 while LN + residual blocks keep it; Creus Castanyer et al. (2506.15544)
 report the same for shared-trunk PPO on IsaacGym humanoids; Kumar et al.
 (2010.14498) tie rank collapse to bootstrapped losses through exactly such
-layers — and `h` is where the `[diag]` srank (≈60% of width under Muon,
+layers - and `h` is where the `[diag]` srank (≈60% of width under Muon,
 decayed 165→50 over a 4.7B Adam trunk) is measured. Watch items: LN2 fixes
 the feature scale the heads see, so `ent` and `clipfrac` may move in the
 first ~50 updates; srank is now measured AFTER LN2. Checkpoints carry the
@@ -442,16 +468,16 @@ marker `arch["trunk_arch"] = "simba"`; `load_policy` refuses any other
 (or a missing) marker.
 Note: the fused LN kernel is eligible only up to 256 lanes, so at trunk 384
 both trunk LNs run the stock fp32-stats fallback (bit-defined, slightly
-slower — a few small kernels per forward).
+slower - a few small kernels per forward).
 
 Since 2026-07-20 the Rust crate (`rust/`) is the reference sim
-and the transformer the only policy — the Python sim, pool encoder, and
+and the transformer the only policy - the Python sim, pool encoder, and
 serial trainer were deleted (surface-area reduction). The tensor-op
-port (`--env torch`, torch_env.py + torch_dynamics.py) — removed
+port (`--env torch`, torch_env.py + torch_dynamics.py) - removed
 2026-07-25 in the kinematic era, REBUILT at v10 P4 as a literal batched
-mirror of the dynamics engine (f64 CPU bitwise vs Rust) — is **removed
+mirror of the dynamics engine (f64 CPU bitwise vs Rust) - is **removed
 again, 2026-08-03**. It was Python-dispatch bound (~1 s/vector tick
-regardless of width — full-body dynamics is ~100k tensor ops/tick),
+regardless of width - full-body dynamics is ~100k tensor ops/tick),
 which is why P5 moved training to the CUDA kernel; after that it was
 consumed only by its own parity tests, so every physics change was
 paying a third tier for a witness of a backend nothing ran.
@@ -476,7 +502,7 @@ completed flag, cut counts) is appended to `<run-dir>/ep_stats.f32`
 line every 25 updates. Kernel cost ~0; the per-level meta comes from the
 pool (`level_lb`, `level_max_pp`, `level_max_score`; older pool caches get
 a `.meta.npz` sidecar instead of a rebuild). Plays are the sampled policy
-at the drawn body — tracking-grade, not comparable to bench upp.
+at the drawn body - tracking-grade, not comparable to bench upp.
 
 **Per-level swing telemetry (2026-10-04):** the kernel also accumulates
 each episode's pre-swing / post-swing / precision points and maxima per
@@ -498,7 +524,7 @@ on the pod before the next training run.
 **Wrist resets (2026-10-04, user):** per hand, every good note cut
 (notes, dots, chain heads; chain links are not hits) is classified by the
 sign of that hand's wrist-BEND angular velocity at the cut (joint 8 / 15
-only — not the note's arrow or the world swing direction), or the
+only - not the note's arrow or the world swing direction), or the
 detector's committed direction when |qd| < 1 rad/s. A reversal of the
 bend motion is a 30° turn-back from the running extreme (angle-travel
 hysteresis `WRESET_HYST`, separate from the 60° `WREV_HYST`: 60° would
@@ -530,7 +556,7 @@ one, then fold the settled center into `TAU_MAX`.
 
 `rust32/` (2026-09-16) compiles the SAME `rust/src` with `Real = f32`
 (`--features f32`) and exports it as `beat_arena_rs32`. It mirrors the
-CUDA kernel's f32 instantiation — the regime training runs — including
+CUDA kernel's f32 instantiation - the regime training runs - including
 the f32 Cholesky pivot floor (1e-8, counted only on pivots ≤ 0) and a
 1e-5 broad-phase slack. `bench_scoresaber.py --sim rust` uses it by
 default (`--sim-dtype f32`); `--sim-dtype f64` selects the original
@@ -539,21 +565,21 @@ across dtypes (files written before this carry no `sim_dtype` and are
 f64). Sim-only throughput, 64 real charts, 8-core laptop: f64 279k vs
 f32 601k env-steps/s (2.15×).
 
-Difficulty dials (generator v2, SPEC §Chart generation — colors is
+Difficulty dials (generator v2, SPEC §Chart generation - colors is
 always both since 2026-07-26; the `--colors` flag is gone):
 doubles the note stream; per-tick probabilities `--note-prob 0.25
 --extra-prob 0.125 --dot-prob 0.1 --bomb-prob 0.125` (the defaults) and
 the speed-walk clamp `--note-speed-min 2 --note-speed-max 8`. The v7.9
 tiered effort cost and its v10 work-price successor (`--effort-coef`) are
-RETIRED (2026-09-13; every recipe since v23 ran it at 0) — the live
+RETIRED (2026-09-13; every recipe since v23 ran it at 0) - the live
 movement prices are `--energy-coef` (env v43 torque energy, since 2026-09-14; was `--iso-coef` activation) and `--limit-coef
 --limit-arms` (limit rest). **Accuracy is judged against the
 infinite cutting plane since 2026-07-29** (user-caught v7.4-class fix:
 the swept-surface distance used before conflated timing with lateral
 error and capped accuracy at 0.870 = 100/115). **Real maps play at
-their real NJS since 2026-07-30** — the speed_scale rescale (NJS×0.3)
+their real NJS since 2026-07-30** - the speed_scale rescale (NJS×0.3)
 is removed. Bench results stamp `scoring_version` (2 = cut-plane acc
-at 0.3× speeds, 3 = real speeds) and never merge across rules —
+at 0.3× speeds, 3 = real speeds) and never merge across rules -
 pre-v3 numbers are a different physics regime.
 
 ## ScoreSaber bench (checkpoint evaluation on all ranked maps)
@@ -562,10 +588,10 @@ pre-v3 numbers are a different physics regime.
 $VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt [--stars 2 4]
 ```
 
-One greedy (argmax) rollout per ranked ScoreSaber leaderboard — ~6.1k
+One greedy (argmax) rollout per ranked ScoreSaber leaderboard - ~6.1k
 difficulties over ~2.5k songs; deterministic sim + fixed chart means one
 rollout is the exact answer. No replays are recorded. Scoring uses the
-REAL combo multiplier (1x/2x/4x/8x, halves on a combo break — bench-only;
+REAL combo multiplier (1x/2x/4x/8x, halves on a combo break - bench-only;
 the training gym stays multiplier-free) and ScoreSaber's official PP
 curve: pp = curve(acc) x maxPP, profile total weighted 0.965^rank.
 Computed max scores match the API's `maxScore` field exactly (validated).
@@ -573,7 +599,7 @@ Computed max scores match the API's `maxScore` field exactly (validated).
 Results land in `bench/<run>_<ckpt>.json`: checkpoint name + weight
 sha256, per-level entries (score, accuracy, pp, misses, bad cuts,
 bombs hit, highest combo, FC flag, combo breaks / wall entries / how the
-level ended, and — since 2026-10-01 — the applied joint torque spent:
+level ended, and - since 2026-10-01 - the applied joint torque spent:
 `torque_nm` = Σ over the level's ticks of Σ_j|τ_j| in N·m, the env v43
 energy base, plus `torque_nm_spine/arms/legs`, the rate-invariant
 `torque_nms` = torque_nm / tick_hz in N·m·s (use it across --tick-hz),
@@ -585,16 +611,16 @@ re-evaluates, and a different model writing to the same file is an
 error. The ranked catalog caches at `maps/scoresaber_catalog.json`
 (`--refresh-catalog` to refetch) and chart data at `maps/scoresaber/`
 (audio stripped, ~100 KB/song). `--limit N` for smoke runs;
-`--num-envs` maps play in parallel — one `VecBeatSim` FFI call per
+`--num-envs` maps play in parallel - one `VecBeatSim` FFI call per
 vector step (vectorized per-env events, 2026-07-24). Since 2026-07-27
 the defaults ARE the fast path (`--num-envs 512`, fused forward on;
 `--no-fused-forward` to opt out) and the results JSON records which
-forward path produced it — fused/graphed near-tie argmax flips mean
+forward path produced it - fused/graphed near-tie argmax flips mean
 per-level results only compare within one path, so cross-path merges
 are refused. Since 2026-07-27 the loop is a two-group software pipeline on the fused
 path (one group's forward+D2H in flight on the GPU while the CPU runs
 the other group's Rust sim; a `query()` after each issue flushes WDDM's
-submission batch, without which nothing overlaps) — plus the
+submission batch, without which nothing overlaps) - plus the
 last-block-pruned, register-blocked, smem-dieted kernel, pinned action
 D2H, and a JIT trust-the-cache startup. All bitwise-exact (the fused
 per-sample kernel is batch-size-invariant, verified over the full
@@ -606,7 +632,7 @@ reference and the default):** every level in range plays ONCE in a single
 `CudaBeatVecEnv` wave (`auto_reset=False`, walls loaded from the parsed
 payload, the checkpoint's `z_asinh` z encoding like the Rust path), with the
 ScoreSaber multiplier walk run IN the kernel at the event sites (the
-`combo_walk=True` construction: `lib.rs ComboWalk` transcribed — pinned
+`combo_walk=True` construction: `lib.rs ComboWalk` transcribed - pinned
 cut-time multipliers, follow-through points committed at the sum of a
 tracker's pinned multipliers, breaks on slow/angle/wrong-hand/miss/bomb
 hit/wall ENTRY) and a "finished level stays finished" freeze
@@ -629,7 +655,7 @@ Those figures are the KINEMATIC (v7) era and no longer apply: on the
 v10 dynamic body a full 6,097-difficulty bench measures **~18 min
 (~343 levels/min) on a 5090** (2026-08-31). The 7-10 min/checkpoint
 quoted in the 2026-08-08 migration notes is the v10/v11 env on a 4090
-and is also stale — walls and the (since-retired) 1,536-object window cap landed after it. Rate
+and is also stale - walls and the (since-retired) 1,536-object window cap landed after it. Rate
 is very uneven across the catalog (a high-star stretch runs ~134
 levels/min), so do NOT extrapolate a total from a short sample.
 
@@ -641,7 +667,7 @@ $VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt --catalog beatle
 $VENV/bin/python bench_scoresaber.py --ckpt runs/<run>/final.pt --catalog both
 ```
 
-`--catalog` picks the levels: `scoresaber` (the default — files and
+`--catalog` picks the levels: `scoresaber` (the default - files and
 behavior unchanged), `beatleader` (every playable BeatLeader-ranked
 level) or `both` (the union of the two). Files are stamped `catalog`;
 the default out path gets a `_beatleader` / `_both` suffix; results never
@@ -657,10 +683,10 @@ ranked leaderboards on 2026-09-30, of which 74 OneSaber are excluded (the
 env plays the Standard characteristic only, like the SoloStandard-only
 ScoreSaber catalog) → **3,878** playable, all parsed (9 levels of 3
 songs first failed with `KeyError('b')`: their v3 files omit zero-valued
-fields, e.g. the initial-tempo bpmEvent `{"m": 180.002}` with no beat —
+fields, e.g. the initial-tempo bpmEvent `{"m": 180.002}` with no beat -
 the parser now defaults omitted beat fields to 0, 2026-09-30).
-Each entry carries BeatLeader's OWN numbers — `stars`, `pass_rating`,
-`acc_rating`, `tech_rating`, `predicted_acc`, `api_max_score` — never
+Each entry carries BeatLeader's OWN numbers - `stars`, `pass_rating`,
+`acc_rating`, `tech_rating`, `predicted_acc`, `api_max_score` - never
 mixed with ScoreSaber's stars (different scale and model: on shared
 levels BL/SS stars has median 1.08, 10-90% range 0.75-1.21). Maps share the ScoreSaber
 caches (`maps/scoresaber/<hash>/` dats, `maps/chart_cache/`).
@@ -679,7 +705,7 @@ counts). `total_*_pp` is the file's primary leaderboard: ScoreSaber for
 on each leaderboard's own stars (a `both` level is in range if either
 rating is).
 
-**BeatLeader PP** — transcribed from BeatLeader-Server
+**BeatLeader PP** - transcribed from BeatLeader-Server
 `Utils/ReplayUtils.cs` @ `1474312940511b2810f403649cae80a15684baac`
 (GetPp / Inflate / Curve2 / PpFromScore), General context, no modifiers:
 
@@ -698,7 +724,7 @@ equals the computed full-combo max on 3,794 of the 3,869 levels checked on 2026-
 others are maps with chains where BeatLeader's max is higher by multiples
 of 30x8 (it prices a chain head like a 115-point note), so the same play
 has a slightly lower BL accuracy (`bl_accuracy` / `bl.accuracy`) than
-its ScoreSaber one — BeatLeader's rule, reproduced, capped at 1. A
+its ScoreSaber one - BeatLeader's rule, reproduced, capped at 1. A
 level the episode was cut short on (fall, tilt, envelope or the
 max-steps cap) scores **0 BL pp** (user decision, 2026-09-30): in game it
 is a failed play, but passPP does not depend on accuracy (a 7* level
@@ -715,10 +741,10 @@ $VENV/bin/python convert_scoresaber.py --replay replays/<x>.rpl.gz \
 Converts a replay of a REAL map into a ScoreSaber replay
 `.dat` that loads on watch.scoresaber.com (open/drag the file onto the
 page; the viewer fetches the map from BeatSaver by the embedded hash).
-Format reverse-engineered from the viewer's own source — vendored
+Format reverse-engineered from the viewer's own source - vendored
 snapshot + annotated format notes in
 `research/vendor/scoresaber-watch/` (full clone: `~/git projects/scoresaber-watch`).
-Pose frames come from the recorded joint state via the FK mirror —
+Pose frames come from the recorded joint state via the FK mirror -
 including the HEAD pose (position + rotation), which the viewer uses
 for real: first person is its default camera and its note-arrival
 plane sits at `head.z + 0.65`, so the exported head both aims the
@@ -726,7 +752,7 @@ camera and reproduces env v15's head-anchored note track. The
 final score reproduces the ScoreSaber bench's multiplied score exactly
 (per-note totals exact; the pre/acc split of a cut is reconstructed
 assuming full pre-swing, so per-component popups can differ on
-partial-swing cuts). Procedural-chart replays can't be converted — the
+partial-swing cuts). Procedural-chart replays can't be converted - the
 viewer needs a real BeatSaver map to render.
 
 ## Training dashboard (laptop, over the run archive)
@@ -737,7 +763,7 @@ values as the `update` / `[kl]` / event lines, no extra sync, never
 fatal). `python/metrics_backfill.py` rebuilds the same file from every
 stdout log in `~/beat-arena-volume-backup` (all eras back to v11) and
 writes an `index.json` registry; `viz/dash/` is a Vite + Svelte + uPlot
-page over them — Live (auto-refreshing, x = samples | updates | wall),
+page over them - Live (auto-refreshing, x = samples | updates | wall),
 Compare (matched-sample small multiples, difference-vs-reference panel,
 matched-checkpoint table) and a sortable Runs table with bench/replay
 links. No backend:
@@ -765,7 +791,7 @@ Then open `viz/replay.html` in a browser and drop a
 `make_replays_batched.py`, one batched sim for a whole set).
 
 Replays are **format 2** (2026-10-02, `python/beat_arena_env/replay_format.py`
-documents the layout): gzip around a JSON header and integer column blocks —
+documents the layout): gzip around a JSON header and integer column blocks -
 q at 1e-4 (deltas, joint rows predicted from omega), omega at 1e-2, twist /
 feet at 1e-3, reward at 1e-4, actions, contacts and score events. Sabers,
 head pose, activation and torque are NOT stored: both decoders (Python
@@ -777,37 +803,37 @@ writer checks that against the sim's own values (<= 1 mm / 0.1 deg,
 60 Hz tick, ~3.5x smaller than the retired JSONL format (~345 B), which no
 reader accepts any more (Flux runs are still JSONL). Since 2026-07-21 the viewer is a
 Svelte + Threlte (three.js) SPA with orbit controls (drag = orbit,
-wheel = zoom, right-drag = pan), compiled to that single static file —
+wheel = zoom, right-drag = pan), compiled to that single static file -
 source in `viz/app/`, rebuild with `npm install && npm run build` and
 copy `dist/index.html` over `replay.html`. Space = play/pause, ←/→ = tick-step,
 +/− = speed, `g` (or the 📊 button) = gauge panels, `h` = hitbox mode (real-hitbox wireframes plus the track
 datum: the floating tunnel grid, hit-plane cells and the reach and
-miss/head planes — hidden otherwise since 2026-09-06; plus each in-reach
+miss/head planes - hidden otherwise since 2026-09-06; plus each in-reach
 note's own bounding box, hidden otherwise since 2026-09-09), `f` (or the
 👁 button) = first-person since 2026-09-11: the camera sits at the FK
 head (or a person's tracked head) but, since 2026-09-30, ignores the
-head's rotation — it always looks straight down the track toward the
+head's rotation - it always looks straight down the track toward the
 incoming notes, level and unturned, so the view never swings with the
 head. A FOV slider (40–110°, default 75°) appears in the bar while it is
 on; the view is a pure function of the tick, so scrubbing matches
 playback; the head sphere is hidden
 while it is on (the gauges stay where they are), and the orbit camera
-keeps its place for when you toggle back — drag the scrub bar. White
+keeps its place for when you toggle back - drag the scrub bar. White
 ring around a saber = fast enough to cut (≥1 m/s); arrows = required
 swing direction; bombs are black spheres (red flash on hit), chain
 heads half-height cubes, links thin slabs, arc grants faint tubes; green
 split = good cut; orange/red flash = bad cut / miss. Since 2026-09-09 the
 flying hit scores follow the reference viewer's ScoreManager: the bare
 score (115 scale, white) pops up in the note's lane at the player's plane
-and eases away down the tunnel on a quartic ease-out over 0.7 s — good
-hits sinking, bad ones rising — fading in over 0.1 s and out over the
+and eases away down the tunnel on a quartic ease-out over 0.7 s - good
+hits sinking, bad ones rising - fading in over 0.1 s and out over the
 last 0.3 s. Misses read "MISS" and bad cuts/bombs an X, both in the
 reference's red, and a bad cut keeps a small reason label under its X.
 The sim scores a cut in two installments (pre-swing + accuracy at the cut,
 follow-through a few ticks later) but the indicator shows ONE number per
 note out of the full 115: it spawns with the cut's points and counts up
 when the follow-through lands (`landedPost`). Env v10 (P6): the viewer draws the REAL
-articulated skeleton (full-body FK from the replayed q36 — capsules at
+articulated skeleton (full-body FK from the replayed q36 - capsules at
 the SPEC-v10 collider dims, feet at their reference anchors), flashes
 yellow contact markers sized by impulse at self-collision events, and
 the `g` gauges are per-joint dials for all 29 joints (grouped spine /
@@ -823,7 +849,7 @@ and re-uploaded every frame; the frame loop writes only the values that
 changed into the elements. They show whenever there is a body (an agent
 replay or pose mode), never in the Flux WebXR game.
 Pose mode (`p`) drives root + all 29 joints with a copy-as-`set_joints`
-q36 export. Non-"v10" replays are rejected — re-record from a current
+q36 export. Non-"v10" replays are rejected - re-record from a current
 checkpoint.
 
 Since 2026-09-14 a map card sits in the TOP-LEFT corner of the render area
@@ -837,7 +863,7 @@ is looked up once per hash from the same BeatSaver API the song audio uses
 (`GET api.beatsaver.com/maps/hash/<hash>`, cached in memory and in
 localStorage under `beat-arena.mapmeta.v1`, and the request is debounced and
 stale-guarded so clicking through replays cannot show one map's metadata over
-another's). Offline — or for a hash BeatSaver does not have — the card shows
+another's). Offline - or for a hash BeatSaver does not have - the card shows
 what the header knows (song, difficulty badge, hash prefix) under a muted
 "metadata unavailable"; a replay with no `map` at all draws no card. The
 local map cache (`python/maps/scoresaber/<hash>/`) is NOT a fallback: it has
@@ -846,18 +872,18 @@ repo without a server.
 
 Since 2026-09-09 the whole scene is cel shaded (`viz/app/src/lib/toon.js`):
 every solid is a `MeshToonMaterial` on one shared three-band ramp and is
-drawn twice — once as an inverted-hull ink outline, once banded — over a
+drawn twice - once as an inverted-hull ink outline, once banded - over a
 key/rim/hemisphere rig with tone mapping off, so the bands stay flat.
 The body is white (arms washed ~60% toward their saber hue), which is
 what the ink and the bands are tuned against. The old full-width floor
 plane is gone since 2026-09-09 in favour of the game's player platform,
 lifted from the same reference (Previewer.unity "Player/PlayerPlatform"):
 a 3 x 0.05 x 2 m slab whose top face IS the y = 0 floor, with four 2 cm
-cyan glow strips inset 1 cm from its rim, fixed at world z -0.65 — which
+cyan glow strips inset 1 cm from its rim, fixed at world z -0.65 - which
 is where our own root sits. Cut debris falls under the sim's own g
 (9.81 -y) instead of drifting in a straight line. The saber trail is cut the
 same way: a 0.1 s ribbon swept between the tip path and the blade's base
-at the grip — the whole plane the blade passed through — in flat saber
+at the grip - the whole plane the blade passed through - in flat saber
 colour, three hard alpha steps and an ink border, sampled at `pb.cur` so
 it stays welded to the blade instead of lagging a tick behind it.
 
@@ -868,7 +894,7 @@ BeatSaver at view time (both its hosts send `access-control-allow-origin: *`,
 so it works from the `file://` page). A recording knows which song it is from
 its header field `"map": {hash, difficulty, song, audio_offset_s}`, which
 `make_top10_replays.py` / `make_replays_batched.py` write up front.
-`audio_offset_s` is the song time at replay t=0 and is NOT optional —
+`audio_offset_s` is the song time at replay t=0 and is NOT optional -
 recordings re-base the chart so the first note lands at 2 s, and the real
 offsets run from −0.04 s to +19.6 s.
 
@@ -876,7 +902,7 @@ Viewer side (`viz/app/src/lib/audio.js`): BeatSaver hash lookup → map `.zip`
 → the audio file `Info.dat` names (`.egg` is Ogg Vorbis, so it needs an
 explicit MIME type) → a blob an `<audio>` element plays, cached in IndexedDB
 by map hash so re-viewing costs no download. The tick clock stays
-authoritative and the audio follows it — seeks when it drifts past 80 ms,
+authoritative and the audio follows it - seeks when it drifts past 80 ms,
 `playbackRate` tracks the speed control, and it stays silent while the song
 time is still negative. Mute + volume sit in the bottom bar.
 
@@ -887,24 +913,24 @@ both the full build and the replays.flee.systems build.
 
 Cut debris lives half the aftermath window (0.35 s of the 0.7 s; the window
 itself is the flying score's lifetime and has to stay) and separates at
-2.8 m/s per half, up from 1.4 — the same 0.98 m of travel as before, covered
+2.8 m/s per half, up from 1.4 - the same 0.98 m of travel as before, covered
 twice as fast rather than half as far.
 
 The scene also paints its own `#0b0d11` background as of 2026-09-09. Threlte
 builds its renderer with `alpha: true` and nothing had set `scene.background`,
 so the canvas was transparent and the dark stage was the `#stage` CSS behind
-it — invisible in the browser, but anything reading the canvas itself got a
+it - invisible in the browser, but anything reading the canvas itself got a
 transparent background.
 
 Since 2026-09-06 the objects are the REAL Beat Saber models as
-ScoreSaber's replay viewer renders them — the canonical reference for
+ScoreSaber's replay viewer renders them - the canonical reference for
 every visual size: the 0.5 m beveled note cube with the game's triangle
 glyph (in the half away from the swing, apex past centre) and dot, the
 chain head (the note minus its swing-side portion, flat face toward the
 links) and 0.5 × 0.087 m links with their dots, the spiked bomb (~0.65 m
 over the spikes), the saber blade (r 0.018, 1 m) with its 0.16 m handle
 behind the grip (the watch headset model was tried and removed the
-same day — the skeleton's head stays bare), plus ScoreSaber's default
+same day - the skeleton's head stays bare), plus ScoreSaber's default
 note colours and glyph colour rules. Meshes are
 baked from the watch clone's `Assets/Models` (Unity import scale, prefab
 child transforms and scene scale applied; Unity's x negation on FBX
@@ -916,24 +942,24 @@ in `research/vendor/scoresaber-watch/SOURCE.md` ("Models"). GPL-3.0
 applies to the embedded meshes: `replay.html` is internal tooling; keep
 any redistribution GPL-compatible.
 
-Historical reference points (the env v10 P6 scripted bot —
+Historical reference points (the env v10 P6 scripted bot -
 gravity-compensated PD-over-IK on the dynamic body, REMOVED 2026-09-22
 with `record_replay.py`; 5 eps each, gears 5, seeds 0-4, 2026-07-31):
 easy (right-only, default dials) **36.4%** good cuts / 25.7 pts per
 note; hard (both hands, default dials) **36.9% / 28.3**, ~4 bombs
 hit/ep; dynamic (both hands, note_prob 0.35) **33.0% / 24.2**. Random
 actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
-59.1/66.2% are not comparable — different physics.)
+59.1/66.2% are not comparable - different physics.)
 
 ## Status
 
 - v0 (2026-07-20): env + chart gen + scripted bot + policies + PPO
   harness built (pool encoder + Python sim later deleted; see SPEC).
 - Raw reward proved too sparse to learn from (flat at random, entropy
-  stuck at uniform) → potential-based shaping added (since REMOVED —
+  stuck at uniform) → potential-based shaping added (since REMOVED -
   see the pure-reward era below) and takeoff needs patience: learning
   starts ~100–150k steps.
-- World v2 (same day): metric units (0.5 m lanes, 40 cm blocks — real
+- World v2 (same day): metric units (0.5 m lanes, 40 cm blocks - real
   Beat Saber size), hit plane at z=0 centered on the origin, notes carry
   (x, y, z, vz) instead of a time feature (z/|vz| IS time-until), spatial
   cut slab, 3D perspective viewer. Obs 188→200; pre-v2 checkpoints
@@ -941,11 +967,11 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
 - 500k-step results, easy chart, seed 0, unshaped eval over 30 eps:
   pre-metric **pool 93% good cuts / 17.7, transformer 75% / 12.3**;
   world-v2 **pool 93% / 17.6** (reparametrization-neutral, as predicted),
-  **transformer 91% / 16.9** (big single-seed jump — unexplained,
+  **transformer 91% / 16.9** (big single-seed jump - unexplained,
   needs paired seeds before believing it). Scripted ceiling 97% / 18.7.
 - Hard config (both hands + 8 dirs, rate 1.0): scripted 96%, but the
   transformer trained from scratch PLATEAUS at 3% good cuts (600k steps,
-  seed 0) — 70% misses, and half of all touches use the wrong hand.
+  seed 0) - 70% misses, and half of all touches use the wrong hand.
   Three skills stacked at once (hand assignment, direction-conditional
   swings, two-hand traffic) broke the shaping staircase. Curriculum
   warm-start from the easy checkpoint is the proposed next step.
@@ -953,39 +979,39 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   scoring (V_MIN 1 m/s; bad cut = miss = −0.5). The shaping mechanism
   itself was deleted from the code 2026-07-21.
 - **Hard config (both hands, 8 dirs) SOLVED at 14M steps: 98% good cuts,
-  beating the scripted bot (96%) — pure rewards, no shaping, no
+  beating the scripted bot (96%) - pure rewards, no shaping, no
   curriculum, ~65 min total training at ~4.4k steps/s.** Checkpoint arc:
   2.7% (1M) → 19% (4M) → 41% (8M) → 68% (12M) → 98% (14M).
 - Dynamic gym (env v4): continuous angles + per-note speeds; 19M-step
   policy reaches 75-80% vs scripted 81%.
 - **v3 milestone: real BeatSaver maps parse (v2+v3 schemas, dot notes,
-  precision angles) and sight-read** — e.g. 81% on Spectre [Easy] with
+  precision angles) and sight-read** - e.g. 81% on Spectre [Easy] with
   zero training on real charts.
 - GPU training (2026-07-21, Windows box): `--device cuda` on a GTX 1080
-  (torch cu126 wheels — the last line with Pascal kernels) sustains
+  (torch cu126 wheels - the last line with Pascal kernels) sustains
   ~24.7k steps/s vs 8.5k CPU; rollout is now the bottleneck (77%).
   20M-step dynamic-gym run from scratch in 13.5 min, seed 1: **84.7%
-  good cuts greedy — first policy above the 81% scripted ceiling.**
+  good cuts greedy - first policy above the 81% scripted ceiling.**
 - GPU-resident sim (2026-07-21): `--env torch` runs the whole vec env as
   tensor ops on the GPU (`beat_arena_env/torch_env.py`); Rust remains the
-  reference — float64 parity is exact (tests). 89k steps/s at N=8192
+  reference - float64 parity is exact (tests). 89k steps/s at N=8192
   (vs 24.7k at N=128), but so does Rust at wide N: the PPO update is the
   ceiling on this GPU, not the env. Scale `--minibatches` with N or WDDM
   memory oversubscription silently tanks throughput.
-- Wide-batch tuning (2026-07-21): update DENSITY is the lever — single-pass
+- Wide-batch tuning (2026-07-21): update DENSITY is the lever - single-pass
   wide arms all fail (1–8%) at any LR/schedule; epochs climb 73.5/81.6/92.2%
   (e2/e3/e4). **`--env torch --num-envs 4096 --minibatches 16 --lr 1e-3
   --epochs 4` beats the narrow default outright: 92.2% @ 20M in ~10 min vs
   84.7% in 13.5 (N=128).** Adding `--lr-decay cosine` → **95.3% @ 20M in
-  ~10 min** — the best one-command from-scratch recipe on this card:
+  ~10 min** - the best one-command from-scratch recipe on this card:
   `--env torch --num-envs 4096 --minibatches 16 --lr 1e-3 --epochs 4
   --lr-decay cosine`.
-- **Project record (2026-07-21): 98.2% good cuts / +46.3 on the dynamic gym
-  — 30M steps, one command, ~15 min from scratch** (`runs/wide_e4cos_30m`):
+- **Project record (2026-07-21): 98.2% good cuts / +46.3 on the dynamic gym -
+  30M steps, one command, ~15 min from scratch** (`runs/wide_e4cos_30m`):
   the wide-cosine recipe above with `--total-steps 30000000`.
 - Next: close the human-pattern distribution gap; recipe seed replication;
   density knee (e5-6).
-- **Env v5 (2026-07-21, user-designed): blade sabers** — wrist rotation
+- **Env v5 (2026-07-21, user-designed): blade sabers** - wrist rotation
   DOFs (azimuth + supination/pronation tilt), real 1 m saber, swept-blade
   cut geometry replacing the ±0.6 m slab, real-BS 115-point graded
   scoring (pre-swing/follow-through/accuracy) as reward. All v4
@@ -994,19 +1020,19 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   `viz/replay.html` ported to replay v4 (blade rendering, score popups,
   reach region).
 - **First v5 record (2026-07-21, night): 98.3% good / 0 miss /
-  score 104.1/115 / +42.67 on the dynamic gym — beats the scripted bot
+  score 104.1/115 / +42.67 on the dynamic gym - beats the scripted bot
   (94% / 95.8) on both axes.** 50M steps, wide-cosine recipe, one
   command, 28.5 min from scratch (`runs/v5_wide_e4cos_50m`). First v5
   full combo: seed 7000, 48/48 sampled, 105.2/115
   (`replays/v5_50m_ep00_seed7000.jsonl`). Pure rewards climbed the whole
   stab→swing staircase. SUPERSEDED by v5.1: that policy exploited
   unbounded wrist rolls.
-- **Env v5.1 (same night, user-specified): anatomical wrist limits** —
+- **Env v5.1 (same night, user-specified): anatomical wrist limits** -
   azimuth right [−100°, 180°] / left [0°, 280°] (280° arcs from the
   palm-down neutral), tilt ±95°; limits zero the angular velocity.
   Scripted bot refits arcs into range: easy 100%/95.9, hard 90%/80.0,
   dynamic 92%/83.1. **Fresh 50M run: 98.7% good / 0 miss / 99.1/115 /
-  +40.72 (`runs/v51_wide_e4cos_50m`)** — the limits delayed the surge
+  +40.72 (`runs/v51_wide_e4cos_50m`)** - the limits delayed the surge
   ~3–5M steps and taxed score −5, but engagement held completely;
   another sampled full combo (seed 7004, 46/46).
 - **Env v5.2 (user-caught model error): forearm-anchored joints.** The
@@ -1014,14 +1040,14 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   (impossible). New model: neutral blade = forearm extension pointing AT
   the notes; roll ψ (forearm CW/CCW, right [−190°, 90°] / left mirrored)
   orients the plane the wrist bends in; bend φ (±95° from forward,
-  ±90° = flat in the hit plane) — **the blade can never point back at
+  ±90° = flat in the hit plane) - **the blade can never point back at
   the player** (d_z ≥ cos 95°). Obs/replay semantics changed (replay v5;
   v5.0–v5.1 checkpoints and replays retired). Scripted bot swings flat
-  (bend 90° + roll): easy 100%/98.0, hard 85%/77.4, dynamic 84%/76.1 —
+  (bend 90° + roll): easy 100%/98.0, hard 85%/77.4, dynamic 84%/76.1 -
   this model is meaningfully harder. 41/41 tests green, torch parity
   exact, viewer + gauges updated (bend dial: 0 = notes, ±90 = flat).
 - **PROJECT RECORD (v5.2, 2026-07-21 night): 99.1% good / 0 miss /
-  score 107.7/115 / +44.37** — 50M wide-cosine from scratch
+  score 107.7/115 / +44.37** - 50M wide-cosine from scratch
   (`runs/v52_wide_e4cos_50m`), beating both prior v5.x runs on every
   axis ON the strictest body model. The correct joint configuration
   out-learned the exploit-era models: a better body beats extra
@@ -1029,36 +1055,36 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   easier") vindicated.
 - **Env v5.3 (2026-07-22): notes are their ACTUAL rotated boxes.** The
   collision volume is the 0.4 m cube rotated about the approach axis by
-  (angle − 270°) — down-swing notes stay axis-aligned, dot notes never
-  rotate — replacing the rotation-blind 0.28 m contact sphere; accuracy
+  (angle − 270°) - down-swing notes stay axis-aligned, dot notes never
+  rotate - replacing the rotation-blind 0.28 m contact sphere; accuracy
   still grades by distance-to-center, floored at 0 on corner clips.
   Torch env has exact float64 parity (unedited parity tests); the
   viewer renders the rotated cubes (and rotated split-halves/fail
   outlines). The v5.2 record ckpt re-evaled at **98.0% good / 0 miss /
-  106.8 / +43.72** on the stricter geometry (was 99.1/107.7) —
+  106.8 / +43.72** on the stricter geometry (was 99.1/107.7) -
   center-cutting generalizes.
 - **v6 PROJECT RECORD (2026-07-22): 99.5% good / 109.7 score / 0 miss /
-  +45.28** — 500M-schedule wide-cosine run (stopped externally at
+  +45.28** - 500M-schedule wide-cosine run (stopped externally at
   443M; eval = `runs/v6_wide_e4cos_500m/ckpt_upd0800.pt`, 419M steps,
   ~5.2 h). Beats v5.2's 99.1/107.7 on the far harder body and settles
   the 50M run's open question: 90.6 was budget starvation, not a d64
-  ceiling — the same 107k-param net plays the 12-DOF arm chain
+  ceiling - the same 107k-param net plays the 12-DOF arm chain
   near-perfectly given steps.
 - **First v6 result (2026-07-22): 90.6% good / 91.7 score / 1.3% miss /
-  +35.74 on the dynamic gym** — 50M wide-cosine from scratch
+  +35.74 on the dynamic gym** - 50M wide-cosine from scratch
   (`runs/v6_wide_e4cos_50m`, 37 min, 22.3k steps/s), 30-ep greedy eval.
   Pure rewards learned arm-positioning + wrist-whipping through the
   3^12 action space and beat the 61.2% scripted ceiling by 29 points;
   onset was late (return crossed 0 at ~34M vs v5.2's ~23M) and the run
   ended mid-surge under the cosine tail, so 90.6 is likely not this
-  body's ceiling. Residual errors are bad cuts (8.1%), not misses —
+  body's ceiling. Residual errors are bad cuts (8.1%), not misses -
   engagement solved; swing-credit under time pressure is the frontier.
 - **Env v6 (2026-07-22, user-designed): kinematic upper body.** Wrists
   stop free-floating: fixed shoulders at (±0.2, 0.45, −0.35), upper arm
   0.35 m, forearm 0.30 m, 4-DOF arm (shoulder pitch/yaw/twist + elbow)
   + the v5.2 wrist pair per hand, all with anatomical limits and tiered
   dynamics (shoulder/elbow 80 rad/s² / 8 rad/s; wrists 200 / 20). The
-  9-way translation head is gone — action = MultiDiscrete([3]×12); obs
+  9-way translation head is gone - action = MultiDiscrete([3]×12); obs
   140 → 166 (joint state + FK wrist/blade); contact velocity is the
   contact point's finite-difference displacement (no Jacobians
   anywhere); replay v6 logs joint state + FK wrist. Closed-form FK/IK
@@ -1092,79 +1118,79 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   and let training cheat with wrist-only swings. Right roll
   [−190°, 90°] → **[−180°, 0°]**, twist ±90° → **[−70°, 90°]**; left
   mirrored. With bend +90° a wrist roll now covers only a 180° blade
-  fan — 100°+ pre-swing arcs must come from the arm. Landed before any
+  fan - 100°+ pre-swing arcs must come from the arm. Landed before any
   v7 training run (no checkpoints invalidated); torch parity held with
   zero test edits; scripted bot drops to 83.2 / 72.0 / 64.1 (easy
   gate ≥80% still holds).
 - **First v7.1 run (2026-07-22): 68.5% good / 64.3 / 3.3% miss /
-  +19.10** — 50M wide-cosine (`runs/v71_wide_e4cos_50m`, 54 min,
+  +19.10** - 50M wide-cosine (`runs/v71_wide_e4cos_50m`, 54 min,
   15.4k steps/s), 30-ep greedy. Head-to-head #4: BOTH predictions
   missed HIGH (Claude score 76±10 and 4 more claims all wrong; user
-  82±4) — first joint over-prediction after five under-prediction
+  82±4) - first joint over-prediction after five under-prediction
   rounds. Autopsy: forgiving hitboxes make CONTACT free but convert
   clumsy swings into −0.5 bad cuts (403 bad vs 47 miss at eval);
-  return crossed 0 only at ~40M and the run froze mid-surge —
+  return crossed 0 only at ~40M and the run froze mid-surge -
   budget starvation again, v6-50M déjà vu.
 - **Env v7.2 (2026-07-22, user-specified): shoulder pitch capped at
-  +65°** (was ±90; straight-down unchanged) — overhead arm poses gone.
+  +65°** (was ±90; straight-down unchanged) - overhead arm poses gone.
   Suite green, torch parity zero-edit again; bot 87.3 / 72.0 / 63.5.
   The full-pre-swing test became a combined pitch+bend swing (same
-  rotation plane, chain sums the joints) — neither wrist roll (v7.1
+  rotation plane, chain sums the joints) - neither wrist roll (v7.1
   fan) nor pitch alone (155°) can bank 100° now.
 - **Env v7.3 (2026-07-22, user-specified): miss plane at the HEAD
-  (Z_MISS 2.65 → 0.65)** — a DELIBERATE deviation from real-game
+  (Z_MISS 2.65 → 0.65)** - a DELIBERATE deviation from real-game
   despawn rules, for credit assignment: the miss penalty lands ~5
   ticks after the play plane instead of ~20 (γλ trace over those 15
   ticks diluted the responsible actions' advantage to ~0.4x), and a
   passed note is certainly lost rather than ambiguously rescuable.
   Suite green, parity zero-edit. Bot: easy 87.3 / hard 69.9 /
-  dynamic 67.8 (dynamic UP from 63.5 — its stray late contacts
+  dynamic 67.8 (dynamic UP from 63.5 - its stray late contacts
   behind the head were mostly bad cuts, now silent misses cost less).
 - **First v7.3 run (2026-07-22): 97.8% good / 96.6 / 0.35% miss /
-  +39.48** — 50M wide-cosine (`runs/v73_wide_e4cos_50m`), onset ~21M
+  +39.48** - 50M wide-cosine (`runs/v73_wide_e4cos_50m`), onset ~21M
   (vs v7.1's ~40M): the user's miss-plane credit fix (+ pitch cap,
   confounded) transformed learning; best 50M in project history on the
   most restricted body. Claude's prediction 0-for-5 UNDER after going
-  0-for-5 OVER in round #4 — ledger 17-for-48.
+  0-for-5 OVER in round #4 - ledger 17-for-48.
 - **Env v7.4 (2026-07-22, user-caught): hitboxes rotate with the cut
-  direction** — v7.0 shipped them axis-aligned, misreading a
+  direction** - v7.0 shipped them axis-aligned, misreading a
   BeatLeader-viewer simplification (THREE.Box3); the game's colliders
   sit on the rotated note transform. Good + small boxes now rotate by
   (angle − 270°); links rotate with their tangent; dots stay square;
   research doc A6 corrected. Suite 60 green, parity zero-edit (8th).
   The v7.3 record ckpt re-evals BETTER on the honest geometry:
-  **98.6% / 97.8 / +40.16** — center-cutting generalizes, v5.3 pattern.
+  **98.6% / 97.8 / +40.16** - center-cutting generalizes, v5.3 pattern.
   Bot: 87.3 / 74.6 / 68.5.
 - **Env v7.5 (2026-07-22, user-directed): continuous generated
-  positions with an outer margin** — the procedural generator samples
+  positions with an outer margin** - the procedural generator samples
   x, y ~ U over the allowed cols/rows span padded 0.2 m per side
-  (x ±1.1, y 0.65-2.1; user-specified margin so the old edge cells —
-  measure-zero under uniform sampling — don't atrophy); chains go
+  (x ±1.1, y 0.65-2.1; user-specified margin so the old edge cells -
+  measure-zero under uniform sampling - don't atrophy); chains go
   0.6-1.2 m along the head's direction; real maps keep their cells;
   sim/obs unchanged (explicit positions since v7.0). **The
   cell-trained v7.3 record ckpt evals 98.9% / 98.8 / +40.78 on the
-  unpadded continuous gym — zero generalization gap** (spatial
-  control, not cell memorization) — and 97.6 / 96.7 with the margin
+  unpadded continuous gym - zero generalization gap** (spatial
+  control, not cell memorization) - and 97.6 / 96.7 with the margin
   (the padded extremes are genuinely new territory to train). Bot on
   the padded gym: 88.6 / 81.3 / 68.0.
 - **Env v7.6 (2026-07-22, user-directed after a formula deep-dive):
   look-at-player note orientation.** Plain notes blend their full 3D
   frame toward facing the head (anchor (0, 1.70, −0.65), vertical 80%
-  damped, weight λ = 1 − z/8 clamped — full billboard at the plane;
+  damped, weight λ = 1 − z/8 clamped - full billboard at the plane;
   ArcViewer/BeatLeader formulas in the research addendum). Applied to
   BOTH hitbox orientation (the good box's 0.25 m shift rides local z,
   extending toward the head at the edges) and the DIRECTION CHECK,
   which now runs in the note's local frame (forward-heavy swings at
-  edge notes lose direction credit — real-game behavior). Chain
+  edge notes lose direction credit - real-game behavior). Chain
   heads/links keep pure z-roll; freeze-after-pass and the
   spawn-settle info timeline deliberately skipped. λ = 0 reproduces
-  v7.4 exactly. Record ckpt on v7.6: **98.3 / 97.3 / +40.02** — still
+  v7.4 exactly. Record ckpt on v7.6: **98.3 / 97.3 / +40.02** - still
   rising. Bot: 82.9 / 77.7 / 68.9.
 - **Env v7.7 (2026-07-22, user-directed): bombs in the default gym**
-  (`bomb_rate` default 0.25/s everywhere — ChartConfig, env wrappers,
+  (`bomb_rate` default 0.25/s everywhere - ChartConfig, env wrappers,
   CLI flags; ~5 per 20 s chart, ~1:10 vs dynamic notes). The
   bomb-naive v7.3 record ckpt does NOT absorb this one: it slices
-  ~2/3 of bombs (61 hits / 30 eps → 92.7 / 89.5 / +34.44) — the first
+  ~2/3 of bombs (61 hits / 30 eps → 92.7 / 89.5 / +34.44) - the first
   v7.x change requiring retraining, i.e. the reason bombs belong in
   the training distribution. Suite 62 green.
 - **Generator v2 (2026-07-24, user-designed, hard replace): parity-flow
@@ -1175,12 +1201,12 @@ actions land 5-7% / ~5 on the same gyms. (The v9 kinematic bot's
   (+ N(0, 45°)), a shared ±0.4 m/s speed random walk clamped to
   2-8 m/s, swing-line EXTRA notes (1/8), and a 1/10 dot roll. Chains
   and arcs come only from real maps now. Same day (user-directed): the
-  lattice is SPEED-PACED — the tick interval scales by
+  lattice is SPEED-PACED - the tick interval scales by
   note_speed_max/walk_speed (top speed keeps the 0.15 s base; the
   tick-to-tick z-gap is speed-invariant ~1.2 m), so slow sections are
   sparse and fast sections dense like real maps (measured ~1.4 vs
   ~3.2 local notes/s; ~2.3 notes/s + ~0.6 bombs/s overall both-hands).
-  Scripted bot 59.1 / 66.2 (right / both) — new baseline, old bot
+  Scripted bot 59.1 / 66.2 (right / both) - new baseline, old bot
   references not comparable. Suite 83 green (f64 + f32 parity
   unchanged); viewer config summary updated + rebuilt. Fresh training
   run pending.

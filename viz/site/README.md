@@ -38,7 +38,7 @@ rules on the maps both boards rank; skipped with a warning unless its
 model_hash / tick_hz / action_repeat / obs_window match the bench). Their BL
 totals cover the shared maps only: models.json `bl.coverage` = {played,
 catalog}, shown as "N / M maps". Without a sidecar a
-ScoreSaber-only bench shows "—" in BL columns.
+ScoreSaber-only bench shows " - " in BL columns.
 Map pages live at `/maps/<ScoreSaber id>` for every level ScoreSaber ranks and
 `/maps/bl/<BeatLeader id>` for BeatLeader-only levels; a `/maps/bl/` id of a
 level ScoreSaber also ranks redirects to its `/maps/<ScoreSaber id>` page. A
