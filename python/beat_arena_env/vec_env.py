@@ -116,6 +116,13 @@ class BeatVecEnv:
         sum legs, env-ticks) of applied |tau| in N.m — CUDA mirror."""
         return self.sim.pop_torque()
 
+    def pop_tendon(self):
+        """exp/wrist-tendon telemetry since the last pop: (sum |tau_p| L,
+        sum |tau_p| R, zone L, zone R, beyond L, beyond R, dissipated
+        power L, dissipated power R, substeps) —
+        forwarded to the Rust sim (CUDA pop_tendon mirror)."""
+        return self.sim.pop_tendon()
+
     def set_tau_scale(self, s16):
         """env v46: fix the 16 per-axis torque-limit scales on every env
         (CUDA set_tau_scale mirror). Needs tau_rand == 0, otherwise the

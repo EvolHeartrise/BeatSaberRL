@@ -13,7 +13,7 @@
 use crate::Real;
 use super::algo::{crba, rnea, tc_factor, tc_solve_unit_v, tc_solve_v};
 use super::fk::{fk_all, quat_mul};
-use super::model::Model;
+use super::model::{tendon_edge_b, tendon_edge_x2, Model};
 use super::{State, Workspace};
 use super::solver::{pair_box_targets, single_box_target, single_hard_target};
 
@@ -145,6 +145,41 @@ pub fn substep_opts(
     }
     for j in 0..model.nq {
         ws.rhs[voff + j] = tau_act[j] - model.damping[j] * st.v[voff + j] - ws.c[voff + j];
+    }
+    // 4c. exp/wrist-tendon: the passive wrist torque τ_p(q) (model.rs
+    //     `PassiveWrist`) and the edge-zone damping τ_d = −b_e(r)·q̇
+    //     (issue #61) join the APPLIED side — the four wrist rows are
+    //     re-assembled as ((τ_gear + τ_p) − b_e·q̇) − b·q̇ − C. State-
+    //     dependent: evaluated at this substep's pre-integration q. The
+    //     tendon is explicit (tendon_tests::tendon_stiffness_budget); the
+    //     edge damping is IMPLICIT — h·b_e joins M's wrist diagonal before
+    //     the step-5 factor (the harness implicit-damping semantics, so the
+    //     constraint stage works against the same damped operator), which
+    //     is unconditionally stable for b_e ≥ 0 (explicit b_e·h/I_eff
+    //     reaches > 1 on reachable overshoot states). The hard joint limits
+    //     are untouched. Not muscle effort: the env never adds either to
+    //     Body::tau (energy price / torque telemetry).
+    if let Some(pw) = &model.passive_wrist {
+        let tp = pw.eval(model.limits, &st.q);
+        for (s, &(jb, jd)) in pw.hands.iter().enumerate() {
+            let (tb, td, r) = tp[s];
+            let (bb, bd) = if pw.damp_from_zero {
+                tendon_edge_b(st.q[jb], st.q[jd], model.limits[jb], model.limits[jd], r,
+                              pw.b_peak_bend, pw.b_peak_dev)
+            } else {
+                let x2 = tendon_edge_x2(r);
+                (pw.b_peak_bend * x2, pw.b_peak_dev * x2)
+            };
+            let (vb, vd) = (st.v[voff + jb], st.v[voff + jd]);
+            ws.m[(voff + jb) * nv + (voff + jb)] += h * bb;
+            ws.m[(voff + jd) * nv + (voff + jd)] += h * bd;
+            ws.rhs[voff + jb] = ((tau_act[jb] + tb) - bb * vb) - model.damping[jb] * vb
+                - ws.c[voff + jb];
+            ws.rhs[voff + jd] = ((tau_act[jd] + td) - bd * vd) - model.damping[jd] * vd
+                - ws.c[voff + jd];
+            // telemetry: dissipated power at the substep-start rate (W)
+            ws.tendon[s] = [tb, td, r, bb * vb * vb + bd * vd * vd];
+        }
     }
     // 4b (harness only): current-velocity part of the implicit damping
     if let Some(d) = implicit_damp {

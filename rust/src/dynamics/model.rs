@@ -60,7 +60,253 @@ pub struct Model {
     /// side is ever solved first (sim/mirror-exact, 2026-10-04).
     /// Identity for models without a mirror symmetry.
     pub mirror: &'static [usize],
+    /// Passive wrist "tendon" torque (exp/wrist-tendon, 2026-10-05):
+    /// a conservative, state-dependent joint torque on each wrist's
+    /// (bend, dev) pair, added to the applied side of the substep RHS
+    /// next to τ_gear − b∘q̇ (step.rs step 4). Some on HUMANOID; None on
+    /// the test pendulums and other test tables. See `PassiveWrist`.
+    pub passive_wrist: Option<PassiveWrist>,
 }
+
+/// Passive wrist tendon parameters (exp/wrist-tendon, 2026-10-05).
+///
+/// Per hand, from the CURRENT (q_bend, q_dev) of every substep:
+///   u_j = q_j / L_j,  L_j = hi_j if q_j ≥ 0 else |lo_j|  (the limit the
+///         joint is heading to, read from `Model::limits` — mirror-exact
+///         because the right hand's dev limits are the left's negated)
+///   r   = sqrt(u_b² + u_d²)                         (elliptical radius)
+///   E   = P(r)·(Ē_b·u_b² + Ē_d·u_d²)/r²,  P(r) = ((r − R0)/(1 − R0))³
+///         for r > R0 = 0.5, else 0 — UNCAPPED past r = 1 (deliberate:
+///         box corners like full bend + full dev, anatomically
+///         unreachable, become effectively inaccessible)
+///   Ē_j = τ_peak_j·L_j·(1 − R0)/3  (the pure-axis energy stored at the
+///         limit: ∫ τ_peak·((u − R0)/(1 − R0))² L du over [R0, 1])
+///   τ_j = −∂E/∂q_j  (analytic; `wrist_tendon`)
+/// On a pure axis this is exactly τ = −sign(u)·τ_peak·((|u| − R0)/(1 − R0))²:
+/// zero inside half the range, τ_peak at the limit. PLUS (2026-10-05)
+/// additive per-joint centring terms (`tendon_centring`) that move each
+/// joint's pure-axis zone start to s_j (bend 0, dev 0): pure axis
+/// τ = −sign·τ_peak·((|u| − s)/(1 − s))²₊, corners unchanged. τ_peak is FIXED in
+/// N·m (0.30 × the DEFAULT body's τmax, `TENDON_TAU_PEAK_*`) — not
+/// scaled by the per-env tau randomization or a bench body: tendon
+/// stiffness is not muscle strength.
+#[derive(Clone, Copy, Debug)]
+pub struct PassiveWrist {
+    /// per hand [L, R]: (bend coordinate, dev coordinate), actuated order
+    pub hands: [(usize, usize); 2],
+    pub tau_peak_bend: Real,
+    pub tau_peak_dev: Real,
+    /// Per-joint tendon zone starts (normalized excursion) of the
+    /// additive centring terms (`tendon_centring`): bend 0, dev 0.
+    pub zone_start_bend: Real,
+    pub zone_start_dev: Real,
+    /// Edge-zone damping peaks (issue #61, 2026-10-05): per joint
+    /// τ_d,j = −b_j·q̇_j, b_j = b_peak_j·[x_ell² + c(u_j)] with x_ell =
+    /// (r − R0)/(1 − R0) for r > R0 (the tendon's radius; uncapped past
+    /// r = 1), else 0, and the additive per-joint centring c (2026-10-06,
+    /// `damp_centring`: pure axis b_peak·u² from neutral, corners
+    /// unchanged). Diagonal and ≥ 0,
+    /// so strictly dissipative. Applied IMPLICITLY (h·b on M's diagonal
+    /// + −b·q̇ on the RHS — step.rs 4c; the explicit b·h/I_eff reaches
+    /// ~0.4 at the corners and > 1 on reachable overshoot states).
+    pub b_peak_bend: Real,
+    pub b_peak_dev: Real,
+    /// The per-joint damping centring term (2026-10-06) on — true on
+    /// HUMANOID (the CUDA kernel has it unconditionally). false gives the
+    /// 2026-10-05 law b = b_peak·x_ell² (tests / A-B diagnostics only).
+    pub damp_from_zero: bool,
+}
+
+/// Tendon zone onset (normalized radius) and the τ_peak fraction.
+pub const TENDON_R0: Real = 0.5;
+pub const TENDON_FRAC: f64 = 0.30;
+/// The DEFAULT body's wrist τmax scales (python constants.TAU_BODY_DEFAULT
+/// axes wrist_bend / wrist_dev — the exp/bend7 default body), restated
+/// here because the Rust sim has no default-body table of its own
+/// (constants.py asserts the two agree).
+pub const TAU_BODY_DEFAULT_WRIST_BEND: f64 = 1.4466;
+pub const TAU_BODY_DEFAULT_WRIST_DEV: f64 = 1.0220;
+/// τ_peak = 0.30 × default-body τmax, in N·m, computed in f64 and
+/// rounded once to Real (the CUDA kernel's `T(double constexpr)`):
+/// bend 0.30 × 1.431 × 1.4466 = 0.62103 N·m, dev 0.30 × 1.06 × 1.0220 =
+/// 0.32500 N·m.
+pub const TENDON_TAU_PEAK_BEND: Real = (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND) as Real;
+pub const TENDON_TAU_PEAK_DEV: Real = (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV) as Real;
+/// Per-joint tendon zone starts (2026-10-05, user): the pure-axis torque
+/// starts at |u| = s — bend 0, dev 0 (both always centring; bend was 0.1
+/// for a few hours on 2026-10-05) — via additive centring terms on top of
+/// the R0 = 0.5 elliptical coupling.
+pub const TENDON_S_BEND: Real = 0.0;
+pub const TENDON_S_DEV: Real = 0.0;
+/// Edge-damping reference speed (issue #61): at r = 1 and |q̇| = 30 rad/s
+/// the damping torque equals the joint's tendon τ_peak, i.e.
+/// b_peak = τ_peak / 30 — bend 0.020701, dev 0.010833 N·m·s/rad. Derived
+/// from the τ_peak expressions in f64, rounded once to Real (the .cu's
+/// `T(double constexpr)`); fixed, not scaled by tau draws / tau_fit.
+pub const TENDON_DAMP_REF_SPEED: f64 = 30.0;
+pub const TENDON_B_PEAK_BEND: Real =
+    (TENDON_FRAC * 1.431 * TAU_BODY_DEFAULT_WRIST_BEND / TENDON_DAMP_REF_SPEED) as Real;
+pub const TENDON_B_PEAK_DEV: Real =
+    (TENDON_FRAC * 1.06 * TAU_BODY_DEFAULT_WRIST_DEV / TENDON_DAMP_REF_SPEED) as Real;
+
+/// Edge-zone shape x² of the radius r: ((r − R0)/(1 − R0))² for r > R0,
+/// else 0 (uncapped). The edge damping is b_peak_j·tendon_edge_x2(r).
+#[inline]
+pub fn tendon_edge_x2(r: Real) -> Real {
+    if r > TENDON_R0 {
+        let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+        x * x
+    } else {
+        0.0
+    }
+}
+
+/// Distance to the limit a wrist coordinate is heading to.
+#[inline(always)]
+fn tendon_lim(q: Real, lim: (Real, Real)) -> Real {
+    if q >= 0.0 { lim.1 } else { -lim.0 }
+}
+
+/// Per-joint centring part of the edge damping (2026-10-06, user: the
+/// damping starts at 0 too): with a = |u|,
+///   c(a) = max(a² − ((a − R0)/(1 − R0))²₊, 0)
+/// ADDITIVE to the elliptical x_ell(r)², so a pure axis gets b_peak·a²
+/// from neutral (b_peak at the limit) while the box corners keep their
+/// 3.34·b_peak. ≥ 0 on [0, 1] (the bracket is (1 − a)(3a − 1) on
+/// [R0, 1]); the max(·, 0) only engages on overshoot past a stop
+/// (a > 1), so b never goes negative.
+#[inline(always)]
+fn damp_centring(u: Real) -> Real {
+    let a = u.abs();
+    let y = if a > TENDON_R0 { (a - TENDON_R0) / (1.0 - TENDON_R0) } else { 0.0 };
+    (a * a - y * y).max(0.0)
+}
+
+/// Edge-zone damping coefficients (b_bend, b_dev) of one wrist at
+/// (q_b, q_d) with tendon radius r: b_j = b_peak_j·[x_ell(r)² + c(u_j)]
+/// (`tendon_edge_x2` + `damp_centring`). Diagonal, ≥ 0 — strictly
+/// dissipative. The .cu `tendon_edge_b` transcribes this tree.
+#[inline]
+pub fn tendon_edge_b(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real), r: Real,
+                     bpb: Real, bpd: Real) -> (Real, Real) {
+    let x2 = tendon_edge_x2(r);
+    let cb = damp_centring(qb / tendon_lim(qb, lim_b));
+    let cd = damp_centring(qd / tendon_lim(qd, lim_d));
+    (bpb * (x2 + cb), bpd * (x2 + cd))
+}
+
+/// Passive tendon torque on one wrist: (τ_bend, τ_dev, r) from the
+/// current angles, the two joints' limits and the two τ_peaks. Zero
+/// torque for r ≤ R0 (E ≡ 0 there, which also keeps r → 0 safe).
+/// Gradient of E (S = Ē_b u_b² + Ē_d u_d², ρ = r²):
+///   ∂E/∂u_b = u_b·[P'(r)·S/(r·ρ) + 2P·(Ē_b − Ē_d)·u_d²/ρ²]
+///   ∂E/∂u_d = u_d·[P'(r)·S/(r·ρ) + 2P·(Ē_d − Ē_b)·u_b²/ρ²]
+///   τ_j = −(∂E/∂u_j)/L_j.
+/// The CUDA kernel (`wrist_tendon`) transcribes this expression tree.
+#[inline]
+pub fn wrist_tendon(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real),
+                    tpb: Real, tpd: Real, sb: Real, sd: Real) -> (Real, Real, Real) {
+    let lb = tendon_lim(qb, lim_b);
+    let ld = tendon_lim(qd, lim_d);
+    let ub = qb / lb;
+    let ud = qd / ld;
+    let ub2 = ub * ub;
+    let ud2 = ud * ud;
+    let rho = ub2 + ud2;
+    let r = rho.sqrt();
+    let tcb = tendon_centring(qb, ub, tpb, sb);
+    let tcd = tendon_centring(qd, ud, tpd, sd);
+    if !(r > TENDON_R0) {
+        return (tcb, tcd, r);
+    }
+    let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+    let p = x * x * x;
+    let dp = 3.0 * x * x / (1.0 - TENDON_R0);
+    let eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0);
+    let ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0);
+    let s = eb * ub2 + ed * ud2;
+    let k = dp * s / (r * rho);
+    let w = 2.0 * p / (rho * rho);
+    let gb = ub * (k + w * (eb - ed) * ud2);
+    let gd = ud * (k + w * (ed - eb) * ub2);
+    (-gb / lb + tcb, -gd / ld + tcd, r)
+}
+
+/// Per-joint CENTRING torque (2026-10-05, user: per-joint tendon zone
+/// starts — "always trying to center the hand"), ADDITIVE to the
+/// elliptical term. Joint zone start s (bend 0, dev 0), a = |u|:
+///   τ_c = −sign(q)·τ_peak·[((a − s)/(1 − s))²₊ − ((a − R0)/(1 − R0))²₊]
+///   E_c = τ_peak·L·[((1 − s)/3)·((a − s)/(1 − s))³₊
+///                   − ((1 − R0)/3)·((a − R0)/(1 − R0))³₊]
+/// so a pure axis totals exactly τ_peak·((a − s)/(1 − s))²₊ (the
+/// ellipse's R0-onset ramp plus this). The bracket is ≥ 0 for a ≤ 1 and
+/// ZERO at the limit, so the box-corner torques are unchanged; C¹ at
+/// a = s (quadratic onset) and zero gradient at q = 0 for s ≥ 0. Past the
+/// stop (a > 1, one substep of overshoot) the same expressions hold
+/// (still conservative). Sign by q with an exact-negation tree:
+/// mirror-exact. s = 0 makes (a − s)/(1 − s) exactly a.
+#[inline(always)]
+fn tendon_centring(q: Real, u: Real, tp: Real, s: Real) -> Real {
+    let a = u.abs();
+    let y0 = if a > s { (a - s) / (1.0 - s) } else { 0.0 };
+    let y = if a > TENDON_R0 { (a - TENDON_R0) / (1.0 - TENDON_R0) } else { 0.0 };
+    let c = tp * (y0 * y0 - y * y);
+    if q >= 0.0 { -c } else { c }
+}
+
+/// Centring energy of one joint (tests / diagnostics; see tendon_centring).
+fn tendon_centring_energy(u: Real, l: Real, tp: Real, s: Real) -> Real {
+    let a = u.abs();
+    let y0 = if a > s { (a - s) / (1.0 - s) } else { 0.0 };
+    let y = if a > TENDON_R0 { (a - TENDON_R0) / (1.0 - TENDON_R0) } else { 0.0 };
+    tp * l * (((1.0 - s) / 3.0) * y0 * y0 * y0 - ((1.0 - TENDON_R0) / 3.0) * y * y * y)
+}
+
+/// The tendon energy E(q_b, q_d) (J) — tests / diagnostics only.
+pub fn wrist_tendon_energy(qb: Real, qd: Real, lim_b: (Real, Real), lim_d: (Real, Real),
+                           tpb: Real, tpd: Real, sb: Real, sd: Real) -> Real {
+    let lb = tendon_lim(qb, lim_b);
+    let ld = tendon_lim(qd, lim_d);
+    let (ub, ud) = (qb / lb, qd / ld);
+    let rho = ub * ub + ud * ud;
+    let r = rho.sqrt();
+    // per-joint centring energies (additive; see tendon_centring)
+    let ec = tendon_centring_energy(ub, lb, tpb, sb) + tendon_centring_energy(ud, ld, tpd, sd);
+    if !(r > TENDON_R0) {
+        return ec;
+    }
+    let x = (r - TENDON_R0) / (1.0 - TENDON_R0);
+    let eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0);
+    let ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0);
+    x * x * x * (eb * ub * ub + ed * ud * ud) / rho + ec
+}
+
+impl PassiveWrist {
+    /// Tendon torques of both hands at pose `q` for `model`'s limits:
+    /// [(τ_bend, τ_dev, r); 2].
+    #[inline]
+    pub fn eval(&self, limits: &[(Real, Real)], q: &[Real]) -> [(Real, Real, Real); 2] {
+        let mut out = [(0.0, 0.0, 0.0); 2];
+        for (s, &(jb, jd)) in self.hands.iter().enumerate() {
+            out[s] = wrist_tendon(q[jb], q[jd], limits[jb], limits[jd],
+                                  self.tau_peak_bend, self.tau_peak_dev,
+                                  self.zone_start_bend, self.zone_start_dev);
+        }
+        out
+    }
+}
+
+/// HUMANOID's tendon: wrists (8 bend, 9 dev) and (15 bend, 16 dev).
+pub const HUMANOID_PASSIVE_WRIST: PassiveWrist = PassiveWrist {
+    hands: [(8, 9), (15, 16)],
+    tau_peak_bend: TENDON_TAU_PEAK_BEND,
+    tau_peak_dev: TENDON_TAU_PEAK_DEV,
+    zone_start_bend: TENDON_S_BEND,
+    zone_start_dev: TENDON_S_DEV,
+    b_peak_bend: TENDON_B_PEAK_BEND,
+    b_peak_dev: TENDON_B_PEAK_DEV,
+    damp_from_zero: true,
+};
 
 impl Model {
     /// Velocity-coordinate count (root 6 + actuated when free-based).
@@ -337,4 +583,5 @@ pub const HUMANOID: Model = Model {
     armature: &HUMANOID_ARMATURE,
     gravity: [0.0, -G, 0.0],
     mirror: &HUMANOID_MIRROR,
+    passive_wrist: Some(HUMANOID_PASSIVE_WRIST),
 };

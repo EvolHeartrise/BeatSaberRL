@@ -67,7 +67,9 @@ import torch
 from beat_arena_env import beatleader, scoresaber
 from beat_arena_env.beatsaver import load_beatmap
 from beat_arena_env.chart import note_tuple, wall_tuple
-from beat_arena_env.constants import N_JOINTS, OBS_DIM, parse_tau_scale
+from beat_arena_env.constants import (N_JOINTS, OBS_DIM, TENDON_B_PEAK_BEND,
+                                     TENDON_B_PEAK_DEV, TENDON_TAU_PEAK_BEND,
+                                     TENDON_TAU_PEAK_DEV, parse_tau_scale)
 from beat_arena_env.mirror import mirror_tuples, mirror_walls
 
 
@@ -1259,6 +1261,11 @@ def main():
         "global_step": ckpt.get("global_step"),
         "foot_contact": True,   # physics-regime provenance (the only mode)
         "tau_scale": parse_tau_scale(args.tau_scale),  # env v46 body
+        # exp/wrist-tendon body marker: the passive wrist tendon peaks
+        # (N.m) and edge-damping peaks (N.m.s/rad, issue #61) this sim ran
+        # with; absent = a tendon-free body
+        "wrist_tendon": [TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
+                         TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV],
         "mirror": args.mirror,               # charts left-right reflected
     }
     if bool(data.get("mirror")) != args.mirror:

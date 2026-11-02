@@ -75,7 +75,10 @@ import struct
 import numpy as np
 
 from .constants import (EVENT_REASONS, N_JOINTS, OMEGA_CAP, TAU_AXIS_OF_JOINT,
-                        TAU_MAX, joint_gear_table)
+                        TAU_MAX, TENDON_B_PEAK_BEND, TENDON_B_PEAK_DEV,
+                        TENDON_HANDS, TENDON_R0,
+                        TENDON_TAU_PEAK_BEND, TENDON_TAU_PEAK_DEV,
+                        joint_gear_table)
 from .kinematics import (FRAMES, F_HEAD, F_L_HAND, F_L_WRIST, F_R_HAND,
                          F_R_WRIST)
 
@@ -112,12 +115,25 @@ def body_tables(gears, tau_scale):
     whichever body wrote the file: replays written before 2026-10-03
     carry the body/original tables (1.06 bend, uniform gears). Row j has
     joint j's own id count (per-joint gear counts, 2026-10-04: a body
-    branch's extra gears make some rows longer — ragged)."""
+    branch's extra gears make some rows longer — ragged).
+
+    "tendon" (exp/wrist-tendon, 2026-10-05): the passive wrist tendon
+    this body ran with — {hands [(bend, dev)] x2, tau_peak_bend,
+    tau_peak_dev (N.m, fixed), b_peak_bend, b_peak_dev (edge-zone
+    damping, N.m.s/rad — issue #61), r0}. Its torque is NOT in the derived
+    torque (not muscle effort); a header without the key is a tendon-free
+    body."""
     s = [float(tau_scale[TAU_AXIS_OF_JOINT[j]]) for j in range(N_JOINTS)]
     return {"tau_max": [TAU_MAX[j] * s[j] for j in range(N_JOINTS)],
             "gear_frac": [[float(v) for v in joint_gear_table(int(gears), j)]
                           for j in range(N_JOINTS)],
-            "omega_cap": [float(c) for c in OMEGA_CAP]}
+            "omega_cap": [float(c) for c in OMEGA_CAP],
+            "tendon": {"hands": [list(h) for h in TENDON_HANDS],
+                       "tau_peak_bend": float(TENDON_TAU_PEAK_BEND),
+                       "tau_peak_dev": float(TENDON_TAU_PEAK_DEV),
+                       "b_peak_bend": float(TENDON_B_PEAK_BEND),
+                       "b_peak_dev": float(TENDON_B_PEAK_DEV),
+                       "r0": float(TENDON_R0)}}
 
 
 def derive_effort(action, body):

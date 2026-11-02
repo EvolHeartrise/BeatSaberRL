@@ -63,6 +63,11 @@ const DERIVED = {
   falls_per_1m_pos: (r, i, recs) => { const v = per1M(r, "falls", batchOf(recs, i)); return v > 0 ? v : null; },
   tilts_per_1m_pos: (r, i, recs) => { const v = per1M(r, "tilts", batchOf(recs, i)); return v > 0 ? v : null; },
   contact_pct: (r) => (r.contact_frac == null ? null : r.contact_frac * 100),
+  // exp/wrist-tendon [tendon] fractions -> percent of substeps
+  tzone_L_pct: (r) => (r.tzone_L == null ? null : r.tzone_L * 100),
+  tzone_R_pct: (r) => (r.tzone_R == null ? null : r.tzone_R * 100),
+  tout_L_pct: (r) => (r.tout_L == null ? null : r.tout_L * 100),
+  tout_R_pct: (r) => (r.tout_R == null ? null : r.tout_R * 100),
 };
 function refY(recs, key) {
   const f = DERIVED[key];
