@@ -58,7 +58,7 @@ use geom::*;
 use dynamics::collide::{CORNERS_PER_FOOT, NUM_PAIRS, PAIRS};
 use dynamics::fk::{cross3, dot3, quat_to_rot, sub3};
 use dynamics::model::{
-    Model, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
+    Model, TENDON_R0, F_HEAD, F_L_ELBOW, F_L_FOOT, F_L_HAND, F_L_SHANK, F_L_SHOULDER,
     F_L_WRIST, F_R_ELBOW, F_R_FOOT, F_R_HAND, F_R_SHANK, F_R_SHOULDER,
     F_R_WRIST, HUMANOID, NQ, NV,
 };
@@ -814,6 +814,30 @@ struct Body {
     // act_frac; CUDA computes the identical double sum.
     tau_abs: Real,
     tau_group: [Real; 3],
+    // exp/wrist-tendon telemetry: this tick's passive wrist torque,
+    // summed over its substeps, per hand — [Σ(|τ_bend| + |τ_dev|) L, R
+    // (N·m), substeps in the zone r > R0 L, R, substeps beyond the
+    // ellipse r > 1 L, R, edge-damping dissipated power Σ b_e·q̇² L, R
+    // (W, issue #61)]. Neither the tendon nor its damping is muscle
+    // effort: they never enter `tau` / `tau_abs` (energy price,
+    // [torque], replay torque).
+    tendon_tick: [Real; 8],
+    // exp/wrist-tendon TEST/TOOLING switch: false steps the substeps with
+    // HUMANOID_NO_TENDON (identical tables, passive_wrist = None). Default
+    // true; training, bench and replays never touch it (the CUDA kernel
+    // has no switch). For kinematic judge fixtures that pose the wrist
+    // deep in the tendon zone (RawBeatSim.set_passive_wrist).
+    tendon_on: bool,
+    // exp/shoulder-rom telemetry: this tick's passive shoulder terms,
+    // summed over its substeps, per arm — [Σ(|τ_yaw| + |τ_pitch| +
+    // |τ_twist|) L, R (N·m), substeps in the zone |u| > s L, R, substeps
+    // beyond the human limit |u| > 1 L, R, edge-damping dissipated power
+    // Σ b·τ̇² L, R (W)]. Never muscle effort (not in `tau` / `tau_abs`).
+    srom_tick: [Real; 8],
+    // exp/shoulder-rom TEST/TOOLING switch (RawBeatSim.set_passive_
+    // shoulder): false steps with passive_shoulder = None. Default true;
+    // training, bench and replays never touch it (CUDA has no switch).
+    srom_on: bool,
     // C backstop (2026-08-03, SPEC-v10 Divergences §23): did the
     // PRE-integration root envelope engage anywhere in THIS tick's 8
     // substeps? A1 makes such a trajectory bounded; it does not make it
@@ -865,6 +889,14 @@ struct Body {
 }
 
 const MODEL: &Model = &HUMANOID;
+/// HUMANOID without the passive wrist tendon (Body::tendon_on = false —
+/// a test/tooling switch only).
+const HUMANOID_NO_TENDON: Model = Model { passive_wrist: None, ..HUMANOID };
+/// ... without the passive shoulder (Body::srom_on = false), and without
+/// both — test/tooling switches only.
+const HUMANOID_NO_SROM: Model = Model { passive_shoulder: None, ..HUMANOID };
+const HUMANOID_NO_PASSIVE: Model =
+    Model { passive_wrist: None, passive_shoulder: None, ..HUMANOID };
 
 impl Body {
     #[cfg(test)]
@@ -900,6 +932,10 @@ impl Body {
             act_group: [0.0; 3],
             tau_abs: 0.0,
             tau_group: [0.0; 3],
+            tendon_tick: [0.0; 8],
+            tendon_on: true,
+            srom_tick: [0.0; 8],
+            srom_on: true,
             tau_axis: [1.0; TAU_FEAT],
             tau_scale: [1.0; NQ],
             escaped: false,
@@ -954,6 +990,8 @@ impl Body {
         self.act_group = [0.0; 3];
         self.tau_abs = 0.0;
         self.tau_group = [0.0; 3];
+        self.tendon_tick = [0.0; 8];
+        self.srom_tick = [0.0; 8];
         self.escaped = false;
         self.fell = false;
         self.tilted = false;
@@ -1055,9 +1093,50 @@ impl Body {
         // bounces back has still stopped being the standing task.
         let mut fell = false;
         let mut tilted = false;
+        self.tendon_tick = [0.0; 8];
+        self.srom_tick = [0.0; 8];
+        let model: &Model = match (self.tendon_on, self.srom_on) {
+            (true, true) => MODEL,
+            (false, true) => &HUMANOID_NO_TENDON,
+            (true, false) => &HUMANOID_NO_SROM,
+            (false, false) => &HUMANOID_NO_PASSIVE,
+        };
+        if !self.tendon_on {
+            self.ws.tendon = [[0.0; 4]; 2]; // step 4c never writes it
+        }
+        if !self.srom_on {
+            self.ws.shoulder = [[0.0; 4]; 2]; // step 4d never writes it
+        }
+        let srom_s = MODEL.passive_shoulder.map_or(0.0, |p| p.zone_start);
         for _ in 0..self.rate.n_sub {
-            substep_constrained(MODEL, &mut self.st, &self.tau, H_SUB,
+            substep_constrained(model, &mut self.st, &self.tau, H_SUB,
                                 &mut self.ws, &mut self.cs);
+            // exp/wrist-tendon telemetry: the passive torque step 4
+            // applied this substep (ws.tendon, [τ_b, τ_d, r] per hand)
+            for h in 0..2 {
+                let [tb, td, r, pd] = self.ws.tendon[h];
+                self.tendon_tick[h] += tb.abs() + td.abs();
+                self.tendon_tick[6 + h] += pd;
+                if r > TENDON_R0 {
+                    self.tendon_tick[2 + h] += 1.0;
+                }
+                if r > 1.0 {
+                    self.tendon_tick[4 + h] += 1.0;
+                }
+            }
+            // exp/shoulder-rom telemetry (ws.shoulder, [Σ|τ_p|, u, b,
+            // P_diss] per arm)
+            for a in 0..2 {
+                let [tq, u, _b, pd] = self.ws.shoulder[a];
+                self.srom_tick[a] += tq;
+                self.srom_tick[6 + a] += pd;
+                if u.abs() > srom_s {
+                    self.srom_tick[2 + a] += 1.0;
+                }
+                if u.abs() > 1.0 {
+                    self.srom_tick[4 + a] += 1.0;
+                }
+            }
 
             // contact aggregation: obs bits see every ACTIVE row this
             // substep; replay impulses sum the row lambdas (N·s)
@@ -1303,6 +1382,16 @@ struct Core {
     // (pop_torque; act_sum pattern). Total is the energy-priced quantity.
     tau_sum: [Real; 4],
     tau_ticks: u64,
+    // exp/wrist-tendon telemetry: Σ of Body::tendon_tick over ticks
+    // ([|τ_p| L, R, zone L, R, out L, R, P_diss L, R]) + the SUBSTEP
+    // count, until popped (pop_tendon; tau_sum pattern). Means are per
+    // substep.
+    tendon_sum: [Real; 8],
+    tendon_n: u64,
+    // exp/shoulder-rom telemetry: Σ of Body::srom_tick over ticks + the
+    // SUBSTEP count, until popped (pop_shoulder; tendon_sum pattern)
+    srom_sum: [Real; 8],
+    srom_n: u64,
     // env v41 (2026-09-12, user): self-contact penalty — price on the
     // tick-summed self-collision row impulses (Body::contact_imp over
     // all 55 pairs, N·s). 0 = the pre-v41 reward verbatim. CUDA
@@ -1422,6 +1511,10 @@ impl Core {
             act_ticks: 0,
             tau_sum: [0.0; 4],
             tau_ticks: 0,
+            tendon_sum: [0.0; 8],
+            tendon_n: 0,
+            srom_sum: [0.0; 8],
+            srom_n: 0,
             self_contact_coef: 0.0,
             sc_stat: [0.0; 3],
             prev_foot_pot: 0.0,
@@ -1879,6 +1972,16 @@ impl Core {
         self.tau_sum[2] += self.body.tau_group[1];
         self.tau_sum[3] += self.body.tau_group[2];
         self.tau_ticks += 1;
+        // exp/wrist-tendon telemetry (never priced)
+        for k in 0..8 {
+            self.tendon_sum[k] += self.body.tendon_tick[k];
+        }
+        self.tendon_n += rate.n_sub as u64;
+        // exp/shoulder-rom telemetry (never priced)
+        for k in 0..8 {
+            self.srom_sum[k] += self.body.srom_tick[k];
+        }
+        self.srom_n += rate.n_sub as u64;
         // env v34: limit-rest penalty + always-on telemetry (see
         // Body::limit_imp for scope/units)
         reward -= self.limit_coef
@@ -2507,6 +2610,22 @@ impl Core {
         (s, std::mem::replace(&mut self.tau_ticks, 0))
     }
 
+    /// exp/wrist-tendon: (Σ over substeps of [|τ_p| L, |τ_p| R (N·m),
+    /// zone L, zone R, out L, out R, P_diss L, P_diss R (W)], substeps),
+    /// zeroed.
+    fn pop_tendon(&mut self) -> ([Real; 8], u64) {
+        let s = std::mem::replace(&mut self.tendon_sum, [0.0; 8]);
+        (s, std::mem::replace(&mut self.tendon_n, 0))
+    }
+
+    /// exp/shoulder-rom: (Σ over substeps of [|τ_p| L, |τ_p| R (N·m, L1
+    /// over yaw/pitch/twist), zone L, zone R (|u| > s), beyond L, beyond R
+    /// (|u| > 1), P_diss L, P_diss R (W)], substeps), zeroed.
+    fn pop_shoulder(&mut self) -> ([Real; 8], u64) {
+        let s = std::mem::replace(&mut self.srom_sum, [0.0; 8]);
+        (s, std::mem::replace(&mut self.srom_n, 0))
+    }
+
     fn pop_pd_hits(&mut self) -> u64 {
         std::mem::replace(&mut self.body.ws.pd_hits, 0)
     }
@@ -2902,6 +3021,25 @@ impl RawBeatSim {
         ]
     }
 
+    /// TEST/TOOLING HOOK (exp/wrist-tendon): switch the passive wrist
+    /// tendon off (False) / back on (True, the default) for this sim.
+    /// For kinematic judge fixtures that pose a wrist deep in the tendon
+    /// zone (bend ±90°) and want the pre-tendon passive wrist; training,
+    /// the bench and replays always run the tendon (the CUDA kernel has
+    /// no switch). Persists across resets.
+    fn set_passive_wrist(&mut self, on: bool) {
+        self.core.body.tendon_on = on;
+    }
+
+    /// TEST/TOOLING HOOK (exp/shoulder-rom): switch the passive shoulder
+    /// axial limit (and its edge damping) off (False) / back on (True,
+    /// the default). For fixtures that pose a shoulder beyond the human
+    /// axial range; training, the bench and replays always run it (the
+    /// CUDA kernel has no switch). Persists across resets.
+    fn set_passive_shoulder(&mut self, on: bool) {
+        self.core.body.srom_on = on;
+    }
+
     /// TEST/TOOLING HOOK (env v10): overwrite the FULL generalized
     /// state — q: 36 position coords (root pos, root quat wxyz, 29
     /// joints), v: 35 velocity coords (root linear world, root angular
@@ -2968,6 +3106,27 @@ impl RawBeatSim {
     fn pop_torque(&mut self) -> (Real, Real, Real, Real, u64) {
         let (s, t) = self.core.pop_torque();
         (s[0], s[1], s[2], s[3], t)
+    }
+
+    /// exp/wrist-tendon telemetry since the last pop: (Σ|τ_p| L, Σ|τ_p|
+    /// R in N·m, zone substeps L, R, beyond-ellipse substeps L, R,
+    /// substeps) — |τ_p| per hand = |τ_bend| + |τ_dev|, zone = r > 0.5,
+    /// beyond = r > 1, then the edge-damping dissipated power Σ b_e·q̇²
+    /// L, R (W, issue #61), every quantity summed per SUBSTEP — 9-tuple
+    /// (…, diss L, diss R, substeps). CUDA `pop_tendon` mirror.
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let (s, n) = self.core.pop_tendon();
+        (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], n)
+    }
+
+    /// exp/shoulder-rom telemetry since the last pop: (Σ|τ_p| L, Σ|τ_p| R
+    /// in N·m — L1 over the arm's yaw/pitch/twist rows, zone substeps L,
+    /// R (|u| > 0.3), beyond-the-human-limit substeps L, R (|u| > 1),
+    /// edge-damping dissipated power Σ b·τ̇² L, R (W), substeps) — every
+    /// quantity summed per SUBSTEP. CUDA `pop_shoulder` mirror.
+    fn pop_shoulder(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let (s, n) = self.core.pop_shoulder();
+        (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], n)
     }
 
     /// f64 Cholesky pivot-floor engagements since the last pop
@@ -3522,6 +3681,36 @@ impl VecBeatSim {
         (acc[0], acc[1], acc[2], acc[3], tk)
     }
 
+    /// exp/wrist-tendon telemetry summed over all envs since the last
+    /// pop — RawBeatSim.pop_tendon's tuple. CUDA `pop_tendon` mirror.
+    fn pop_tendon(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 8];
+        let mut n = 0u64;
+        for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_tendon();
+            for k in 0..8 {
+                acc[k] += a[k];
+            }
+            n += t;
+        }
+        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], n)
+    }
+
+    /// exp/shoulder-rom telemetry summed over all envs since the last pop
+    /// — RawBeatSim.pop_shoulder's tuple. CUDA `pop_shoulder` mirror.
+    fn pop_shoulder(&mut self) -> (Real, Real, Real, Real, Real, Real, Real, Real, u64) {
+        let mut acc = [0.0 as Real; 8];
+        let mut n = 0u64;
+        for s in self.sims.iter_mut() {
+            let (a, t) = s.pop_shoulder();
+            for k in 0..8 {
+                acc[k] += a[k];
+            }
+            n += t;
+        }
+        (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], n)
+    }
+
     /// env v41 self-contact telemetry summed over all envs since the
     /// last pop: (impulse N·s, ticks with contact, env-ticks). CUDA
     /// `pop_self_contact` mirror.
@@ -3657,6 +3846,12 @@ fn beat_arena_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, not(feature = "f32")))]
 mod mirror_tests;
+
+#[cfg(all(test, not(feature = "f32")))]
+mod tendon_tests;
+
+#[cfg(all(test, not(feature = "f32")))]
+mod shoulder_tests;
 
 #[cfg(test)]
 mod env_tests {
@@ -4222,8 +4417,10 @@ mod env_tests {
     /// (state, summed reward, events in tick order) and stops at done.
     #[test]
     fn action_repeat_matches_repeated_steps() {
+        // notes 0.3 -> 0.25 s (exp/wrist-tendon zone starts, 2026-10-05: the
+        // flipping-pitch body falls at ~0.6 s, before the 0.5 s note resolved)
         let chart: Vec<ChartTuple> = (0u8..3)
-            .map(|i| (0.3 + i as Real * 0.1, 0.0, 1.0, i % 2, 0.0, 6.0,
+            .map(|i| (0.25 + i as Real * 0.1, 0.0, 1.0, i % 2, 0.0, 6.0,
                       false, KIND_NOTE, false, false))
             .collect();
         let rate = TickRate::new(60).unwrap();
@@ -4260,7 +4457,7 @@ mod env_tests {
             // flip the action every decision so holding is actually tested
             acts[10] = if acts[10] == 1 { 2 } else { 1 };
         }
-        assert!(a.misses + a.good_cuts + a.bad_cuts == 3, "every note resolved");
+        assert!(a.misses + a.good_cuts + a.bad_cuts == 3, "every note resolved ({} {} {}, tick {}, falls {} tilts {})", a.misses, a.good_cuts, a.bad_cuts, a.tick, a.falls, a.tilts);
         // repeat = 1 is one plain step
         let mut c = Core::new_core_rate(100_000, 5, rate);
         let mut d = Core::new_core_rate(100_000, 5, rate);

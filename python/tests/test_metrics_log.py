@@ -451,3 +451,53 @@ def test_wristreset_line_and_record():
     # no swings (nan) -> dropped, not written
     assert "wreset_L" not in ml.update_record(1, 10, 100,
                                               wreset_l=float("nan"))
+
+
+def test_tendon_line_and_record():
+    """[tendon] (exp/wrist-tendon, 2026-10-05): per-hand mean passive
+    tendon torque per substep + zone / beyond-ellipse fractions, printed
+    before the update line (as percent), parse onto that update as
+    fractions; the formatter carries the same keys from the events dict
+    (train_batch's m_ev)."""
+    log = ("[tendon] L 0.0412  R 0.0398 N*m/substep  zone L 21.50%  "
+           "R 19.25%  beyond L 1.75%  R 0.50%  diss L 0.0123  R 0.0101 W\n"
+           "update     3/100  steps   3145728  acc 0.9561  accL 0.9550  "
+           "accR 0.9572  return   5.10  ent 20.1  ev 0.996   150,000 "
+           "steps/s    21.0s\n")
+    u = ml.parse_log(log)[0].updates[0]
+    assert (u["tendon_L"], u["tendon_R"]) == (0.0412, 0.0398)
+    assert u["tzone_L"] == pytest.approx(0.215)
+    assert u["tzone_R"] == pytest.approx(0.1925)
+    assert u["tout_L"] == pytest.approx(0.0175)
+    assert u["tout_R"] == pytest.approx(0.005)
+    assert (u["tdiss_L"], u["tdiss_R"]) == (0.0123, 0.0101)
+    ev = {"tendon_L": 0.0412, "tendon_R": 0.0398, "tzone_L": 0.215,
+          "tzone_R": 0.1925, "tout_L": 0.0175, "tout_R": 0.005,
+          "tdiss_L": 0.0123, "tdiss_R": 0.0101}
+    rec = ml.update_record(3, 100, 3145728, events=ev)
+    assert set(rec) <= set(ml.UPDATE_FIELDS)
+    assert {k: rec[k] for k in ev} == ev       # floats, not truncated to int
+
+
+def test_shoulder_line_and_record():
+    """[shoulder] (exp/shoulder-rom, 2026-10-07): per-arm mean passive
+    shoulder torque per substep + zone / beyond-the-human-limit fractions
+    (percent on the line, fractions in records) + edge-damping power."""
+    log = ("[shoulder] L 0.8123  R 0.7951 N*m/substep  zone L 61.50%  "
+           "R 58.25%  beyond L 9.75%  R 8.50%  diss L 0.4123  R 0.3901 W\n"
+           "update     3/100  steps   3145728  acc 0.9561  accL 0.9550  "
+           "accR 0.9572  return   5.10  ent 20.1  ev 0.996   150,000 "
+           "steps/s    21.0s\n")
+    u = ml.parse_log(log)[0].updates[0]
+    assert (u["srom_L"], u["srom_R"]) == (0.8123, 0.7951)
+    assert u["szone_L"] == pytest.approx(0.615)
+    assert u["szone_R"] == pytest.approx(0.5825)
+    assert u["sout_L"] == pytest.approx(0.0975)
+    assert u["sout_R"] == pytest.approx(0.085)
+    assert (u["sdiss_L"], u["sdiss_R"]) == (0.4123, 0.3901)
+    ev = {"srom_L": 0.8123, "srom_R": 0.7951, "szone_L": 0.615,
+          "szone_R": 0.5825, "sout_L": 0.0975, "sout_R": 0.085,
+          "sdiss_L": 0.4123, "sdiss_R": 0.3901}
+    rec = ml.update_record(3, 100, 3145728, events=ev)
+    assert set(rec) <= set(ml.UPDATE_FIELDS)
+    assert {k: rec[k] for k in ev} == ev

@@ -104,11 +104,17 @@ A_L_LEG = 17
 A_R_LEG = 23
 
 _D = math.radians      # limits below are the SPEC-v10 §1.4 literals
+# exp/shoulder-rom (2026-10-07): the arm twist box's INTERNAL side widened,
+# l_arm_twist lo -90 -> -190 deg, r_arm_twist hi +90 -> +190 deg (model.rs
+# HUMANOID_LIMITS, the .cu LIMIT_LO/HI): every human internal-rotation
+# limit of the passive shoulder (SROM_*) is reachable inside the box (the
+# worst direction needs -184.3 deg). The twist obs lane normalizer
+# max(|lo|, |hi|) moves 90 -> 190 deg with it.
 JOINT_LIMITS = (
     (_D(-20), _D(45)), (_D(-40), _D(40)), (_D(-30), _D(30)),          # spine
-    (_D(-90), _D(65)), (_D(-100), _D(45)), (_D(-90), _D(70)),         # l arm
+    (_D(-90), _D(65)), (_D(-100), _D(45)), (_D(-190), _D(70)),        # l arm
     (0.0, _D(150)), (0.0, math.pi), (_D(-95), _D(95)), (_D(-30), _D(15)),
-    (_D(-90), _D(65)), (_D(-45), _D(100)), (_D(-70), _D(90)),         # r arm
+    (_D(-90), _D(65)), (_D(-45), _D(100)), (_D(-70), _D(190)),        # r arm
     (0.0, _D(150)), (-math.pi, 0.0), (_D(-95), _D(95)), (_D(-15), _D(30)),
     (_D(-20), _D(120)), (_D(-45), _D(40)), (_D(-45), _D(30)),         # l leg
     (0.0, _D(150)), (_D(-50), _D(35)), (_D(-20), _D(20)),
@@ -421,6 +427,228 @@ TAU_BODY_DEFAULT = (0.9012, 0.9804, 0.9370, 0.9616, 0.8482, 0.8729,
                     1.0608, 1.0269, 1.0668, 1.1428)
 TAU_BODY_DEFAULT_SPEC = ",".join(f"{x:.4f}" for x in TAU_BODY_DEFAULT)
 assert len(TAU_BODY_DEFAULT) == TAU_FEAT and all(x > 0 for x in TAU_BODY_DEFAULT)
+
+# exp/wrist-tendon (2026-10-05, branch only): PASSIVE wrist tendon torque
+# on each wrist's (bend, dev) pair — model.rs PassiveWrist / wrist_tendon,
+# the .cu wrist_tendon. Per hand, every substep, from the current angles:
+#   u_j = q_j / L_j, L_j = hi_j if q_j >= 0 else |lo_j| (JOINT_LIMITS)
+#   r = sqrt(u_b^2 + u_d^2); E = P(r) (Ebar_b u_b^2 + Ebar_d u_d^2) / r^2,
+#   P(r) = ((r - R0)/(1 - R0))^3 for r > R0 (uncapped past r = 1),
+#   Ebar_j = tau_peak_j L_j (1 - R0)/3; tau_j = -dE/dq_j.
+# Pure axis: tau = -sign(u) tau_peak ((|u| - R0)/(1 - R0))^2. PLUS additive
+# per-joint CENTRING terms (2026-10-05, user) with zone starts s (bend 0,
+# dev 0): tau_c = -sign(q) tau_peak [((a - s)/(1 - s))^2_+ -
+# ((a - R0)/(1 - R0))^2_+], a = |u|, so a pure axis totals tau_peak
+# ((a - s)/(1 - s))^2_+; zero at the limit (corners unchanged).
+# tau_peak is
+# 0.30 x the DEFAULT body's tau_max, FIXED in N.m (not scaled by
+# --tau-rand / --tau-scale). Applied with the gear torque in the
+# substep RHS; NOT muscle effort (excluded from the energy price, the
+# limit-rest price, [torque]/[activation] and the replay torque fields).
+TENDON_R0 = 0.5
+TENDON_FRAC = 0.30
+TENDON_HANDS = ((8, 9), (15, 16))   # (bend, dev) joints per hand [L, R]
+TENDON_TAU_PEAK_BEND = TENDON_FRAC * 1.431 * 1.4466   # 0.62103 N.m
+TENDON_TAU_PEAK_DEV = TENDON_FRAC * 1.06 * 1.0220     # 0.32500 N.m
+assert TENDON_TAU_PEAK_BEND == (
+    TENDON_FRAC * TAU_MAX[8] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_bend")])
+assert TENDON_TAU_PEAK_DEV == (
+    TENDON_FRAC * TAU_MAX[9] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("wrist_dev")])
+# Edge-zone damping (issue #61; model.rs TENDON_B_PEAK_*): per wrist joint
+# tau_d = -b_j qd_j, b_j = b_peak_j [x^2 + c(u_j)], x = (r - R0)/(1 - R0)
+# for r > R0 (the tendon's radius, uncapped) plus the additive per-joint
+# centring c (2026-10-06: damping starts at 0 too; pure axis b_peak u^2,
+# corners unchanged), b_peak = tau_peak / 30 rad/s (the damping torque at
+# the pure-axis limit, 30 rad/s equals tau_peak). Applied IMPLICITLY (h*b on
+# M's wrist diagonal). Passive: never priced / in [torque].
+TENDON_DAMP_REF_SPEED = 30.0
+TENDON_B_PEAK_BEND = TENDON_FRAC * 1.431 * 1.4466 / TENDON_DAMP_REF_SPEED
+TENDON_B_PEAK_DEV = TENDON_FRAC * 1.06 * 1.0220 / TENDON_DAMP_REF_SPEED
+
+
+def tendon_edge_x2(r):
+    """Elliptical edge-damping shape x^2 of the tendon radius (model.rs
+    mirror)."""
+    if not r > TENDON_R0:
+        return 0.0
+    x = (r - TENDON_R0) / (1.0 - TENDON_R0)
+    return x * x
+
+
+def damp_centring(u):
+    """Per-joint centring part of the edge damping (2026-10-06):
+    max(a^2 - ((a - R0)/(1 - R0))^2_+, 0), a = |u| (model.rs mirror)."""
+    a = abs(u)
+    y = (a - TENDON_R0) / (1.0 - TENDON_R0) if a > TENDON_R0 else 0.0
+    return max(a * a - y * y, 0.0)
+
+
+def tendon_edge_b(qb, qd, lim_b, lim_d, bpb=None, bpd=None):
+    """(b_bend, b_dev) of one wrist: b_peak [x_ell(r)^2 + c(u_j)] — pure
+    axis b_peak u^2 from neutral, corners 3.34 b_peak (model.rs mirror)."""
+    bpb = TENDON_B_PEAK_BEND if bpb is None else bpb
+    bpd = TENDON_B_PEAK_DEV if bpd is None else bpd
+    lb = lim_b[1] if qb >= 0.0 else -lim_b[0]
+    ld = lim_d[1] if qd >= 0.0 else -lim_d[0]
+    ub, ud = qb / lb, qd / ld
+    x2 = tendon_edge_x2(math.sqrt(ub * ub + ud * ud))
+    return bpb * (x2 + damp_centring(ub)), bpd * (x2 + damp_centring(ud))
+
+
+TENDON_S_BEND = 0.0     # per-joint tendon zone starts (centring terms)
+TENDON_S_DEV = 0.0
+
+
+def _tendon_centring(q, u, tp, s):
+    a = abs(u)
+    y0 = (a - s) / (1.0 - s) if a > s else 0.0
+    y = (a - TENDON_R0) / (1.0 - TENDON_R0) if a > TENDON_R0 else 0.0
+    c = tp * (y0 * y0 - y * y)
+    return -c if q >= 0.0 else c
+
+
+def wrist_tendon(qb, qd, lim_b, lim_d, tpb=TENDON_TAU_PEAK_BEND,
+                 tpd=TENDON_TAU_PEAK_DEV, sb=TENDON_S_BEND, sd=TENDON_S_DEV):
+    """(tau_bend, tau_dev, r) of one wrist — the model.rs wrist_tendon
+    expression tree in Python floats (reference / tests)."""
+    lb = lim_b[1] if qb >= 0.0 else -lim_b[0]
+    ld = lim_d[1] if qd >= 0.0 else -lim_d[0]
+    ub, ud = qb / lb, qd / ld
+    ub2, ud2 = ub * ub, ud * ud
+    rho = ub2 + ud2
+    r = math.sqrt(rho)
+    # additive per-joint centring (model.rs tendon_centring)
+    tcb = _tendon_centring(qb, ub, tpb, sb)
+    tcd = _tendon_centring(qd, ud, tpd, sd)
+    if not r > TENDON_R0:
+        return tcb, tcd, r
+    x = (r - TENDON_R0) / (1.0 - TENDON_R0)
+    p = x * x * x
+    dp = 3.0 * x * x / (1.0 - TENDON_R0)
+    eb = tpb * lb * ((1.0 - TENDON_R0) / 3.0)
+    ed = tpd * ld * ((1.0 - TENDON_R0) / 3.0)
+    s = eb * ub2 + ed * ud2
+    k = dp * s / (r * rho)
+    w = 2.0 * p / (rho * rho)
+    gb = ub * (k + w * (eb - ed) * ud2)
+    gd = ud * (k + w * (ed - eb) * ub2)
+    return -gb / lb + tcb, -gd / ld + tcd, r
+
+
+# exp/shoulder-rom (2026-10-07, branch only): PASSIVE shoulder axial-rotation
+# limit — model.rs PassiveShoulder / shoulder_rom, the .cu shoulder_rom;
+# docs/design/shoulder-rom.md. Per arm, LEFT-CANONICAL (yaw y, pitch p,
+# twist t) — the right arm at (-yaw, pitch, -twist), yaw/twist torques
+# negated:
+#   tau = y - t (axial, IR +); c = -sin p; phi = y + pi/2;
+#   f_k = a0 + c (a1 + c a2) + B (d_l - d_f) + (1 - c) phi (k = lo ER, hi IR)
+#   u = (tau - m)/w (m, w = mid / half of [f_lo, f_hi]); E = T w G(|u|),
+#   pure axis torque -sign(u) T g, g = ((a - s)/(1 - s))^2_+ + kb ((a - 1)/
+#   wb)^2_+ up to uc, linear past it; tau_joint = -dE/dq.
+#   Edge damping b = b_peak z(min(|u|, uc))^2 on yawdot - twistdot,
+#   implicit. T = 0.30 x the DEFAULT body's twist tau_max, fixed N.m.
+SROM_FRAC = 0.30
+SROM_ARMS = ((4, 3, 5), (11, 10, 12))   # (yaw, pitch, twist) per arm [L, R]
+SROM_TAU_PEAK = SROM_FRAC * 19.45 * 0.8729          # 5.0933715 N.m
+assert SROM_TAU_PEAK == (
+    SROM_FRAC * TAU_MAX[5] * TAU_BODY_DEFAULT[TAU_AXIS_NAMES.index("arm_twist")])
+SROM_S = 0.3
+SROM_KB = 1.0
+SROM_WB = 0.25
+SROM_UC = 1.25
+SROM_DAMP_REF_SPEED = 16.0
+SROM_B_PEAK = SROM_FRAC * 19.45 * 0.8729 / SROM_DAMP_REF_SPEED
+# limit coefficients [a0, a1, a2, B] (rad) — the exact fit of the anchors
+# (tau deg, ER/IR): side (-80, 77), 90 abd (-100, 60), 90 flex (-25, 130),
+# top elev 155 / plane 40 (-75, 20); srom_fit_coeffs() recomputes them
+SROM_ANCHORS = ((0.0, 0.0, -80.0, 77.0), (90.0, 0.0, -100.0, 60.0),
+                (90.0, 90.0, -25.0, 130.0), (155.0, 40.0, -75.0, 20.0))
+SROM_COEF_LO = (-1.8762289458939043, 0.6741217713310772,
+                -0.19415622703263663, 0.1308996938995747)
+SROM_COEF_HI = (0.8726646259971648, 1.3026652970940116,
+                -0.8314263990555426, 0.17453292519943295)
+
+
+def srom_fit_coeffs():
+    """Closed-form 4-anchor fit -> (coef_lo, coef_hi) in rad (tests)."""
+    c = math.cos(_D(155.0))
+    h = math.sin(_D(155.0)) * (math.cos(_D(40.0)) - math.sin(_D(40.0)))
+    out = []
+    for i in (2, 3):
+        side, abd, flex, top = (a[i] for a in SROM_ANCHORS)
+        a0 = (abd + flex - 90.0) / 2.0
+        b = (abd - flex + 90.0) / 2.0
+        r1 = side - a0
+        r2 = top - a0 - b * h - (1.0 - c) * 40.0
+        a2 = (r2 - c * r1) / (c * c - c)
+        out.append(tuple(_D(x) for x in (a0, r1 - a2, a2, b)))
+    return tuple(out)
+
+
+def _srom_raw(a):
+    s, kb, wb = SROM_S, SROM_KB, SROM_WB
+    z = (a - s) / (1.0 - s) if a > s else 0.0
+    x = (a - 1.0) / wb if a > 1.0 else 0.0
+    g = z * z + kb * (x * x)
+    gg = ((1.0 - s) / 3.0) * (z * z * z) + (kb * wb / 3.0) * (x * x * x)
+    dg = 2.0 * z / (1.0 - s) + 2.0 * kb * x / wb
+    return g, gg, dg
+
+
+def srom_shape(a):
+    """(g, G): pure-axis torque / T and energy / (T w) at |u| = a."""
+    if a > SROM_UC:
+        gc, ggc, dgc = _srom_raw(SROM_UC)
+        d = a - SROM_UC
+        return gc + dgc * d, ggc + gc * d + 0.5 * dgc * (d * d)
+    g, gg, _ = _srom_raw(a)
+    return g, gg
+
+
+def shoulder_limits(y, p):
+    """(f_lo, f_hi): the human ER / IR limits on tau (rad) at canonical
+    (yaw, pitch)."""
+    c = -math.sin(p)
+    h = -math.cos(p) * math.sin(y) - math.cos(p) * math.cos(y)
+    phi = y + math.pi / 2
+    f = [(k[0] + c * (k[1] + c * k[2])) + k[3] * h + (1.0 - c) * phi
+         for k in (SROM_COEF_LO, SROM_COEF_HI)]
+    return f[0], f[1]
+
+
+def shoulder_rom(y, p, t):
+    """(tau_yaw, tau_pitch, tau_twist, u, b, E) of one arm at LEFT-
+    CANONICAL (y, p, t) — the model.rs shoulder_rom expression tree in
+    Python floats (reference / tests)."""
+    sy, cy = math.sin(y), math.cos(y)
+    sp, cp = math.sin(p), math.cos(p)
+    c, c_p = -sp, -cp
+    h = -cp * sy - cp * cy
+    h_y = cp * sy - cp * cy
+    h_p = sp * sy + sp * cy
+    lam, lam_p = 1.0 - c, cp
+    phi = y + math.pi / 2
+
+    def lim(k):
+        f = (k[0] + c * (k[1] + c * k[2])) + k[3] * h + lam * phi
+        f_y = k[3] * h_y + lam
+        f_p = (k[1] + 2.0 * c * k[2]) * c_p + k[3] * h_p + lam_p * phi
+        return f, f_y, f_p
+    flo, flo_y, flo_p = lim(SROM_COEF_LO)
+    fhi, fhi_y, fhi_p = lim(SROM_COEF_HI)
+    m, w = 0.5 * (fhi + flo), 0.5 * (fhi - flo)
+    m_y, m_p = 0.5 * (fhi_y + flo_y), 0.5 * (fhi_p + flo_p)
+    w_y, w_p = 0.5 * (fhi_y - flo_y), 0.5 * (fhi_p - flo_p)
+    u = ((y - t) - m) / w
+    a = abs(u)
+    g, gg = srom_shape(a)
+    tg = SROM_TAU_PEAK * g
+    e_tau = tg if u >= 0.0 else -tg
+    e_w = SROM_TAU_PEAK * (gg - a * g)
+    ac = min(a, SROM_UC)
+    zc = (ac - SROM_S) / (1.0 - SROM_S) if ac > SROM_S else 0.0
+    return (-(e_tau * (1.0 - m_y) + e_w * w_y), e_tau * m_p - e_w * w_p,
+            e_tau, u, SROM_B_PEAK * (zc * zc), SROM_TAU_PEAK * w * gg)
 
 
 def parse_tau_scale(spec):

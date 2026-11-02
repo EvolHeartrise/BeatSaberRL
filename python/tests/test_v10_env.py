@@ -425,10 +425,13 @@ def test_sim_plays_a_chart_scripted_torques():
     # 14 -> 10 (2026-09-27, ground contact: see the hit note above)
     # 10 -> 8 (2026-10-03, 0.50 kg hands: swept whip 6..16 at hit 0.6,
     # whips 7/8/9 land 112/105/100; 10 now misses)
-    sim, events = run(8)
+    # 8 -> 7 (exp/wrist-tendon, 2026-10-05: the coasting wrist flops into
+    # the passive tendon zone during the whip; swept whip 4..19 at hit
+    # 0.6: whips 5/6/7/9 land 100/105/111/100, 8 now misses)
+    sim, events = run(7)
     if not any(c == 0 for _, c, *_ in events):
         # crude deterministic fallback search (seeded ordering)
-        for whip in (12, 14, 16, 18, 13, 17):
+        for whip in (6, 9, 5, 12, 14, 16, 18, 13, 17):
             sim, events = run(whip)
             if any(c == 0 for _, c, *_ in events):
                 break

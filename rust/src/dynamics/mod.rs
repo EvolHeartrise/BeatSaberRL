@@ -194,6 +194,19 @@ pub struct Workspace {
     // the trajectory stopped being physics (the env layer terminates
     // the episode on it; see lib.rs Body::escaped).
     pub env_hits: u64,
+    /// exp/wrist-tendon: THIS substep's passive wrist terms per hand
+    /// [L, R] as [τ_bend, τ_dev, r, P_diss] (r = the normalized
+    /// elliptical radius, P_diss = Σ b_e·q̇² the edge damping's power at
+    /// the substep-start rate, W) — written by step 4c when
+    /// `Model::passive_wrist` is Some, read by the env's [tendon]
+    /// telemetry. All zero otherwise.
+    pub tendon: [[Real; 4]; 2],
+    /// exp/shoulder-rom: THIS substep's passive shoulder terms per arm
+    /// [L, R] as [Σ|τ_p| over (yaw, pitch, twist), u, b, P_diss] (u the
+    /// normalized axial excursion, b the edge-damping coefficient, P_diss =
+    /// b·τ̇² at the substep-start rate, W) — written by step 4d when
+    /// `Model::passive_shoulder` is Some, read by the [shoulder] telemetry.
+    pub shoulder: [[Real; 4]; 2],
     // R26 instrumentation counters — EXISTS ONLY under the `stats`
     // feature so the shipping build's Workspace layout is untouched.
     #[cfg(feature = "stats")]
@@ -246,6 +259,8 @@ impl Workspace {
             hit: vec![false; model.nq],
             pd_hits: 0,
             env_hits: 0,
+            tendon: [[0.0; 4]; 2],
+            shoulder: [[0.0; 4]; 2],
             #[cfg(feature = "stats")]
             stats: DbgStats::default(),
             #[cfg(test)]

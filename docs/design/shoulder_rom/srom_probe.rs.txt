@@ -1,0 +1,30 @@
+//! TEMPORARY design probe (exp/shoulder-rom phase 1, not committed):
+//! dumps the model's own joint-space mass matrix M(q) (CRBA + armature)
+//! for poses listed in $SROM_POSES (one line of 29 joint angles each)
+//! to $SROM_OUT (one line of nv*nv values each).
+use super::*;
+use dynamics::algo::crba;
+use dynamics::fk::fk_all;
+use std::io::{BufRead, Write};
+
+#[test]
+fn srom_dump_mass_matrices() {
+    let (Ok(inp), Ok(out)) = (std::env::var("SROM_POSES"), std::env::var("SROM_OUT")) else {
+        return;
+    };
+    let m = &dynamics::model::HUMANOID;
+    let nv = m.nv();
+    let mut ws = Workspace::new(m);
+    let mut st = State::neutral(m);
+    let f = std::fs::File::open(inp).unwrap();
+    let mut o = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    for line in std::io::BufReader::new(f).lines() {
+        let line = line.unwrap();
+        let v: Vec<Real> = line.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        st.q.copy_from_slice(&v[..m.nq]);
+        fk_all(m, &st, &mut ws);
+        crba(m, &mut ws);
+        let s: Vec<String> = ws.m[..nv * nv].iter().map(|x| format!("{x:.12e}")).collect();
+        writeln!(o, "{}", s.join(" ")).unwrap();
+    }
+}

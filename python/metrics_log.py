@@ -67,6 +67,18 @@ UPDATE_FIELDS = (
     # [torque] (env v43, 2026-09-14): mean applied sum |tau| over the 29
     # joints per env-tick in N*m (the --energy-coef base) + groups
     "torque", "torque_spine", "torque_arms", "torque_legs",
+    # [tendon] (exp/wrist-tendon, 2026-10-05): per hand, mean passive
+    # wrist tendon |tau| per substep (N*m) and the fractions of substeps
+    # in the zone (r > 0.5) / beyond the ellipse (r > 1)
+    "tendon_L", "tendon_R", "tzone_L", "tzone_R", "tout_L", "tout_R",
+    # ... and the edge-zone damping's mean dissipated power (W, issue #61)
+    "tdiss_L", "tdiss_R",
+    # [shoulder] (exp/shoulder-rom, 2026-10-07): per arm, mean passive
+    # shoulder |tau| per substep (N*m, L1 over yaw/pitch/twist), the
+    # fractions of substeps in the zone (|u| > 0.3) / beyond the human
+    # axial limit (|u| > 1), and the edge damping's dissipated power (W)
+    "srom_L", "srom_R", "szone_L", "szone_R", "sout_L", "sout_R",
+    "sdiss_L", "sdiss_R",
     # env v41 [contact]: mean self-collision impulse per env-tick (N.s)
     # and the fraction of env-ticks with any body-on-body contact
     "contact", "contact_frac",
@@ -186,7 +198,11 @@ def update_record(update, num_updates, global_step, *, t=None,
                  "limitrest_legs", "limitrest_spine", "limitrest_arms",
                  "activation", "activation_spine", "activation_arms",
                  "activation_legs", "torque", "torque_spine",
-                 "torque_arms", "torque_legs", "contact", "contact_frac"):
+                 "torque_arms", "torque_legs", "contact", "contact_frac",
+                 "tendon_L", "tendon_R", "tzone_L", "tzone_R", "tout_L",
+                 "tout_R", "tdiss_L", "tdiss_R",
+                 "srom_L", "srom_R", "szone_L", "szone_R", "sout_L",
+                 "sout_R", "sdiss_L", "sdiss_R"):
             rec[k] = _num(v)
         else:
             rec[k] = _int(v)
@@ -256,6 +272,12 @@ _RE_ACTIVATION = re.compile(
 _RE_TORQUE = re.compile(
     r"^\[torque\] (\S+) N\*m/env-tick \(spine (\S+) / arms (\S+) / "
     r"legs (\S+)\)")
+_RE_TENDON = re.compile(
+    r"^\[tendon\] L (\S+)\s+R (\S+) N\*m/substep\s+zone L (\S+)%\s+R (\S+)%"
+    r"\s+beyond L (\S+)%\s+R (\S+)%(?:\s+diss L (\S+)\s+R (\S+) W)?")
+_RE_SHOULDER = re.compile(
+    r"^\[shoulder\] L (\S+)\s+R (\S+) N\*m/substep\s+zone L (\S+)%\s+R (\S+)%"
+    r"\s+beyond L (\S+)%\s+R (\S+)%\s+diss L (\S+)\s+R (\S+) W")
 _RE_CONTACT = re.compile(
     r"^\[contact\] (\S+) N\*s/tick \((\S+)% of env-ticks in self-contact\)")
 _RE_PDNET = re.compile(r"^\[pd-net\] (\d+) f32 pivot-floor")
@@ -520,6 +542,34 @@ def parse_log(text, t_end=None):
             seg._pending["torque_arms"] = _num(m.group(3))
             seg._pending["torque_legs"] = _num(m.group(4))
             seg._count("torque")
+            continue
+        m = _RE_TENDON.match(line)
+        if m:
+            # the line prints the fractions as percent; records carry
+            # fractions (train_batch writes tz / substeps)
+            seg._pending["tendon_L"] = _num(m.group(1))
+            seg._pending["tendon_R"] = _num(m.group(2))
+            for key, g in (("tzone_L", 3), ("tzone_R", 4), ("tout_L", 5),
+                           ("tout_R", 6)):
+                pct = _num(m.group(g))
+                seg._pending[key] = pct / 100.0 if pct is not None else None
+            if m.group(7) is not None:      # edge damping (issue #61)
+                seg._pending["tdiss_L"] = _num(m.group(7))
+                seg._pending["tdiss_R"] = _num(m.group(8))
+            seg._count("tendon")
+            continue
+        m = _RE_SHOULDER.match(line)
+        if m:
+            # exp/shoulder-rom; percent on the line, fractions in records
+            seg._pending["srom_L"] = _num(m.group(1))
+            seg._pending["srom_R"] = _num(m.group(2))
+            for key, g in (("szone_L", 3), ("szone_R", 4), ("sout_L", 5),
+                           ("sout_R", 6)):
+                pct = _num(m.group(g))
+                seg._pending[key] = pct / 100.0 if pct is not None else None
+            seg._pending["sdiss_L"] = _num(m.group(7))
+            seg._pending["sdiss_R"] = _num(m.group(8))
+            seg._count("shoulder")
             continue
         m = _RE_CONTACT.match(line)
         if m:

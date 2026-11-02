@@ -106,7 +106,15 @@ def _set_flat(sim, hand, azimuth, om_roll=0.0, om_bend=0.0, delta=DELTA):
     deg, bend = +90 deg, dev = 0). For delta = DELTA the right wrist
     sits at FLAT_WRIST at t = 0; roll sweeps (om_roll) move the blade
     vertically. Under v10 dynamics this is the INITIAL condition — the
-    pose sags slightly within the tick."""
+    pose sags slightly within the tick.
+
+    exp/wrist-tendon: bend = +-90 deg is u = 0.95, deep in the passive
+    tendon zone (~0.5 N*m pulling it back — the blade would swing ~0.3
+    rad within the tick), so this kinematic JUDGE fixture switches the
+    tendon off on its sim (RawBeatSim.set_passive_wrist). The tendon
+    itself is pinned by rust/src/tendon_tests.rs + test_wrist_tendon."""
+    if hasattr(sim, "set_passive_wrist"):
+        sim.set_passive_wrist(False)
     lo, hi = joint_limits(hand)[4]
     roll = (azimuth - np.pi / 2 + np.pi) % (2 * np.pi) - np.pi
     bend = np.pi / 2
@@ -551,7 +559,11 @@ def _whip_events(kind=0, ticks=60):
     # over — the episode ends on the tilt envelope ~17 ticks in — so the
     # windup is 13 ticks and both kinds use hit 0.75 (swept: the regular
     # note lands 70 pre + 30 post there, the chain head 70 pre, no post).
-    hit = 0.75
+    # 0.75 -> 0.7 (exp/wrist-tendon edge damping, issue #61: see windup)
+    # 0.7 -> 0.65 (zone starts 0 on both wrist joints, 2026-10-05: swept
+    # hit 0.65-0.85 x windup 8-15 again; 0.65 / 9 is the only cell where
+    # the regular note lands 70 + 30 and the chain head 70+)
+    hit = 0.65
     sim = _sim_with_note(_note(hit, 2, 1, kind=kind), max_steps=300)
     # env v20: the whip is hand-tuned against the zero-arm start
     _set_arm(sim, 0, [0.0] * 7, [0.0] * 7)
@@ -568,7 +580,17 @@ def _whip_events(kind=0, ticks=60):
         # (2026-10-03, 0.50 kg hands: swept hit 0.6-0.85 x windup
         # 11-16, hit 0.75 / windup 11 is the cell where the regular note
         # lands 70 + 30 and the chain head 70; windup 13 now misses)
-        a[A_R_ARM] = 1 if t < 11 else 2
+        # 11 -> 9 (exp/wrist-tendon + edge-zone damping, 2026-10-05: the
+        # coasting wrist flops into the tendon zone and is braked there;
+        # swept hit 0.65-0.85 x windup 8-15, hit 0.7 / windup 9 is the
+        # cell where the regular note lands 70 + 30 and the chain head
+        # 70; 0.75 / 11 now misses)
+        # 9 -> 10 (exp/shoulder-rom, 2026-10-07: the zero-arm start sits at
+        # u = -0.68 of the passive shoulder's axial range and the pitch
+        # whip moves the range under the twist; swept hit 0.6-0.85 x
+        # windup 7-15: at hit 0.65 windups 7, 8, 10, 11, 12 land the
+        # regular note 70 + 30 and the chain head 70+, 9 now misses)
+        a[A_R_ARM] = 1 if t < 10 else 2
         _, _, done, ev = sim.step(a)
         events.extend(ev)
         if done:
@@ -762,6 +784,7 @@ def test_joint_limits_clamp_and_kill_omega():
         (A_R_ARM + 0, 1.10, 8.0, np.radians(65.0)),    # pitch into +65
         (A_R_ARM + 1, 1.70, 8.0, np.radians(100.0)),   # r yaw into +100
         (A_R_ARM + 2, -1.15, -8.0, np.radians(-70.0)), # r twist into -70
+        (A_R_ARM + 2, 3.25, 8.0, np.radians(190.0)),   # r twist into +190
         (A_R_ARM + 3, 0.05, -8.0, 0.0),                # elbow into its floor
         (A_R_ARM + 5, 1.60, 15.0, np.radians(95.0)),   # bend into +95
         (A_R_ARM + 6, 0.50, 15.0, np.radians(30.0)),   # r dev into +30
@@ -776,7 +799,20 @@ def test_joint_limits_clamp_and_kill_omega():
         v = np.zeros(NV)
         v[6 + j] = om0
         sim.set_joints(list(q), list(v))
-        sim.step(list(COAST))
+        a = list(COAST)
+        if j in (A_R_ARM + 5, A_R_ARM + 6):
+            # exp/wrist-tendon: a COASTING wrist no longer rests on its
+            # stop — the passive tendon (tau_peak 0.62 / 0.33 N*m at the
+            # bend / dev stop) pulls it back off. Drive it INTO the stop
+            # with its full gear (1.431 / 1.06 N*m > the tendon there).
+            a[j] = 1 if om0 > 0 else 2
+        # exp/shoulder-rom: in this zero-arm pose (arm forward) both twist
+        # stops lie far outside the human axial range (u -1.6 at -70 deg,
+        # +2.3 at +190), where the passive shoulder pushes harder than the
+        # twist gear can hold; this test is about the STOPS, so the
+        # twist rows run with the passive shoulder off
+        sim.set_passive_shoulder(j != A_R_ARM + 2)
+        sim.step(a)
         qq = np.asarray(sim.qpos())[7:]
         om = np.asarray(sim.omega())
         lo_j, hi_j = (lim, np.inf) if om0 < 0 else (-np.inf, lim)
